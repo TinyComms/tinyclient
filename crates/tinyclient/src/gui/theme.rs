@@ -368,3 +368,21 @@ pub fn tint(index: usize) -> (Hsla, Hsla) {
     let hue = HUES[index % HUES.len()] / 360.;
     (hsla(hue, 0.30, 0.22, 1.), hsla(hue, 0.70, 0.82, 1.))
 }
+
+/// A color the network packs itself (a Telegram topic's `icon_color`): its RGB drawn as the
+/// tile's fill, letters white over it, exactly the official list. The low 24 bits hold a RGB.
+pub fn tint_pack(color: u32) -> (Hsla, Hsla) {
+    let (r, g, b) = ((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
+    let (top, low) = (
+        [r, g, b].iter().max().copied().unwrap(),
+        [r, g, b].iter().min().copied().unwrap(),
+    );
+    let range = (top - low).max(1) as f32 / 255.;
+    let seat = match top {
+        top if top == r => (g as f32 - b as f32) / range / 255. / 6.,
+        top if top == g => (2. + (b as f32 - r as f32) / range / 255.) / 6.,
+        _ => (4. + (r as f32 - g as f32) / range / 255.) / 6.,
+    };
+    let hue = (seat + 1.).fract();
+    (hsla(hue, 0.56, 0.55, 1.), hsla(0., 0., 1., 1.))
+}

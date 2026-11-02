@@ -531,6 +531,156 @@ fn a_forum_topic_is_a_thread_under_the_forum() {
     world.rows_on_screen(&["u7002"]);
     sleep(Duration::from_millis(300));
     assert_eq!(world.called("GetHistory u7002"), 0);
+
+    // Read in a topic is told for the topic.
+    world.ask(Request::MarkRead { conversation: key("c9002_31"), message_id: "42".into() });
+    world.until("the topic to be read", || world.calls().contains(&"ReadDiscussion c9002_31 42".to_owned()).then_some(()));
+    // The topic's own color, the tile the list draws its icon with, and its picture: the
+    // icon's thumbnail lands on disk and the row shows it.
+    let topic = world.conversation("c9002_31").unwrap();
+    assert_eq!(topic.topic_icon, Some(3), "the topic's own icon color");
+    world.until("the topic's picture to land", || world.conversation("c9002_31").filter(|row| row.avatar.as_ref().and_then(|file| file.path.as_ref()).is_some()).map(|_| ()));
+    let path = world.conversation("c9002_31").unwrap().avatar.as_ref().and_then(|file| file.path.as_ref()).unwrap().to_owned();
+    // The picture arrives as Telegram serves it, a gzip member: what is kept is the file
+    // inside, which the shell can read as its picture or animation.
+    let kept = std::fs::read(&path).expect("the topic's picture is on disk");
+    assert!(kept.starts_with(b"{"), "the gzip member is unpacked to what is inside: {:02x?}", &kept[..kept.len().min(8)]);
+
+    // General's own icon is an animated emoji — no still thumbnail named in its document.
+    // It is asked whole: its file lands, and what lands is the Lottie JSON it is drawn as,
+    // the same still the official list shows before the frames play.
+    world.until("General's animated icon to land", || world.conversation("c9002_1").filter(|row| row.avatar.as_ref().and_then(|file| file.path.as_ref()).is_some()).map(|_| ()));
+    let moved = world.conversation("c9002_1").unwrap().avatar.as_ref().and_then(|file| file.path.as_ref()).and_then(|path| std::fs::read(path).ok()).expect("General's animated icon is on disk");
+    assert!(moved.starts_with(b"{"), "the animated emoji's file is what is drawn: {:02x?}", &moved[..moved.len().min(8)]);
+}
+
+#[test]
+fn a_channel_posts_comments_count_rides_the_post() {
+    let world = World::signed_in();
+    world.connected();
+    // The channel is opened: its post is stored, with nothing said of comments yet.
+    world.until("the channel's page", || world.message("c9001", "5"));
+    world.steer("comments");
+    // Telegram says the section on the post itself, as an edit: the count is its own, and the
+    // id it names is the one the footer opens the comments under.
+    let post = world.arrived("c9001", "5");
+    let section = post.thread.as_ref().expect("the post carries its comment count");
+    assert_eq!((section.replies, section.id.as_str(), section.last), (2, "c9001_5", 0));
+    let thread = world.conversation("c9001_5").unwrap();
+    assert_eq!(
+        (thread.kind, thread.title.as_str(), thread.parent.as_deref(), thread.root.as_deref(), thread.read_only),
+        (ConversationKind::Thread, "Comments", Some("c9001"), Some("5"), true),
+    );
+}
+
+#[test]
+fn asking_a_channel_posts_comments_reads_the_discussion_group_under_the_post() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments");
+    world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+
+    // The thread opens on its own id: Telegram is asked once for the replies to the post, and
+    // the comments are its answer, the discussion group's people and messages.
+    world.until("the comments", || {
+        let page = world.messages("c9001_5");
+        (page.len() == 2).then_some(page)
+    });
+    // The comments as the shell reads a page: oldest first.
+    let comments: Vec<(String, String, String)> =
+        world.messages("c9001_5").into_iter().map(|comment| (comment.id, comment.sender.name, comment.text)).collect();
+    let said: Vec<(&str, &str, &str)> = comments.iter().map(|comment| (comment.0.as_str(), comment.1.as_str(), comment.2.as_str())).collect();
+    assert_eq!(said, [("50", "Tobin Reyes", "On my way up front?"), ("51", "Odalys Brandt", "Yes, at the hut now.")]);
+    assert_eq!(world.called("GetReplies c9001_5"), 1, "{:#?}", world.calls());
+    assert_eq!(world.called("GetHistory c9001_5"), 0);
+
+    // The newest comment's time rides the post's footer, as "last reply", once the page was
+    // read: the section itself names no date. Comment 51 went at 2026-10-13 11:59:20 UTC.
+    let fresh = world.until("the footer's last reply", || {
+        world.message("c9001", "5").filter(|post| post.thread.as_ref().is_some_and(|section| section.last == 1_791_892_760))
+    });
+    let section = fresh.thread.as_ref().unwrap();
+    assert_eq!(section.replies, 2, "{section:?}");
+}
+
+#[test]
+fn a_chat_pinned_by_a_folder_beyond_the_pages_gets_its_row() {
+    // The Work folder pins a chat that no dialog page the sign-on read carries: only the
+    // folder rule speaks of it, and what nothing stored says of is asked for alone.
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_LOST_PIN", "1")]);
+    world.connected();
+    world.until("the pinned chat to be asked for", || (world.called("GetPeerDialogs g8001") >= 1).then_some(()));
+    assert!(world.conversation("g8001").is_some(), "the folder's pinned chat gets its row");
+}
+
+#[test]
+fn a_draft_typed_on_the_phone_shows_as_its_conversations_draft() {
+    let world = World::signed_in();
+    world.connected();
+    // Odalys had a draft typed elsewhere before this sign-in: her dialog carried it, and the
+    // row says so.
+    assert_eq!(world.conversation("u7002").unwrap().draft, "Finished packing. Meet at the ridge?");
+    // A draft the phone types while we are online follows the row just the same.
+    world.steer("draft");
+    world.until("the draft typed on the phone", || {
+        world.conversation("u7002").filter(|row| row.draft == "Riding up with Tobin.").map(|_| ())
+    });
+    // And one the phone cleared empties the row again.
+    world.steer("draft-none");
+    world.until("the draft the phone cleared", || {
+        world.conversation("u7002").filter(|row| row.draft.is_empty()).map(|_| ())
+    });
+}
+
+#[test]
+fn a_draft_kept_here_is_told_to_telegram_and_only_once() {
+    let world = World::signed_in();
+    world.connected();
+    // What the user settled on here is asked of Telegram with the same words, and a cleared
+    // draft is asked of it empty.
+    world.ask(Request::SetDraft { conversation: key("u7002"), text: "Bringing the map, then.".into() });
+    world.until("the draft to be told", || (world.called("SaveDraft u7002 Bringing the map, then.") == 1).then_some(()));
+    world.ask(Request::SetDraft { conversation: key("u7002"), text: String::new() });
+    world.until("the clear to be told", || (world.called("SaveDraft u7002") == 2).then_some(()));
+    // The same for a group, where the draft is the chat's and not the person's. What the store
+    // kept says so on the row, until the echo of the save says no more than that.
+    world.ask(Request::SetDraft { conversation: key("g8001"), text: "Snacks are on me".into() });
+    world.until("the group's draft to be told", || (world.called("SaveDraft g8001 Snacks are on me") == 1).then_some(()));
+    assert_eq!(world.conversation("g8001").unwrap().draft, "Snacks are on me");
+    // Nothing of the echo litters the log: one save per settled draft.
+    sleep(Duration::from_millis(400));
+    assert_eq!(world.called("SaveDraft g8001"), 1, "{:#?}", world.calls());
+}
+
+#[test]
+fn a_forum_opened_while_the_link_was_down_comes_back_at_the_next_connect() {
+    let world = World::signed_in();
+    world.connected();
+    // Telegram drops. The user opens the forum while it is down, nothing leaves chatd, the
+    // store keeps its empty answer, and the ask stands held for the next connect, which
+    // hears of it and fills the list.
+    world.steer("drop");
+    let _ = world.messages("c9002");
+    world.until("the forum's topics to be asked again", || (world.called("GetForumTopics c9002") >= 1).then_some(()));
+    world.until("the topics on the list", || world.conversation("c9002_1").map(|_| ()));
+}
+
+#[test]
+fn a_read_lost_on_the_way_is_told_again_and_the_badge_stays() {
+    let world = World::signed_in();
+    world.connected();
+    // Telegram never heard that the group was read up to 20, the way it goes when a tell went
+    // out while the link was down for it: its dialog counts unread again, up to what it had.
+    world.steer("lost-read");
+    // A default notify change defers the chats to when they are asked for, which is now.
+    world.steer("notify-changed");
+    world.ask(Request::Home { network: Network::Telegram, account: None, folder: None, shelf: Shelf::Main, offset: 0, limit: 200 });
+    // The read goes again, and what that tell left is counted, so the badge is not pushed back
+    // to the unread the network forgot.
+    world.until("the read to be told again", || (world.called("ReadHistory g8001 20") == 1).then_some(()));
+    world.until("the counts to be asked again", || (world.called("GetPeerDialogs g8001") == 1).then_some(()));
+    let read = world.conversation("g8001").unwrap();
+    assert_eq!((read.unread, read.last_read.as_deref()), (0, Some("20")));
 }
 
 #[test]
@@ -568,8 +718,12 @@ fn typing_reading_and_presence_go_both_ways_and_are_never_withheld() {
     world.until("reading to be told", || world.calls().contains(&"channels.ReadHistory c9001 5".to_owned()).then_some(()));
     sleep(Duration::from_millis(200));
     assert_eq!(world.called("SetTyping u7003"), 1);
-    // g8001 was already read up to 20, so there was nothing to tell for it.
-    assert_eq!((world.called("ReadHistory g8001"), world.called("UpdateStatus")), (0, 1));
+    // g8001 was already read up to 20, so there was nothing to tell for it. Being here is said
+    // once at connect, before any acting, and never again: acting's own here() is throttled.
+    let calls = world.calls();
+    let connect_here = calls.iter().position(|call| call == "UpdateStatus");
+    let acting = calls.iter().position(|call| call.starts_with("SetTyping u7003"));
+    assert!(connect_here.is_some_and(|at| acting.is_some_and(|last| at < last)), "the connect must say we are here before acting does");
 }
 
 #[test]

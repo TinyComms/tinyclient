@@ -16,12 +16,13 @@ use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, Transaction};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Raise this when a table changes. `open` then drops the cache and starts over.
 /// 6 rebuilds caches written at 5 before `conversation.voice_limit` existed. That column
 /// was added without a version change, so Win+K died with `no such column: c.voice_limit`.
-const SCHEMA: i32 = 7;
+const SCHEMA: i32 = 8;
 
 /// Retention: the newest messages kept per conversation.
 pub const KEEP_MESSAGES: u32 = 2_000;
@@ -146,6 +147,9 @@ const TABLES: &str = "
         delivered_to TEXT NOT NULL DEFAULT '',
         -- End-to-end encrypted or not, where the network says: 'unknown', 'plain', 'end_to_end'.
         encryption TEXT NOT NULL DEFAULT 'unknown',
+        -- Telegram's own topic color for a forum topic row (a palette index), never absent for
+        -- a topic and always empty for anything else.
+        icon INTEGER,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -246,7 +250,7 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit, c.encryption
+           c.voice_limit, c.encryption, c.icon
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -324,6 +328,9 @@ pub struct ConversationRow {
     pub mark: Option<Mark>,
     /// Not opted in to (Discord's "show all channels" off).
     pub opted_out: bool,
+    /// Telegram's own topic color for a forum topic row (a palette index), `None`
+    /// otherwise.
+    pub icon: Option<i32>,
     /// How the network files it. `None` leaves what is stored, so a tree that does not know
     /// (a Slack tree reload) never undoes a pin or a follow; `Some` replaces it.
     pub filing: Option<Filing>,
@@ -414,6 +421,7 @@ impl ConversationRow {
             mark: None,
             opted_out: false,
             filing: None,
+            icon: None,
         }
     }
 }
@@ -635,6 +643,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         delivered: row.get(46)?,
         sending: row.get(47)?,
         encryption: from_word(row.get(49)?)?,
+        topic_icon: row.get(50)?,
     })
 }
 
@@ -751,9 +760,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed, voice_limit, encryption)
+              folders, archived, pin, hidden, followed, voice_limit, encryption, icon)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -763,6 +772,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              meeting = excluded.meeting, special = excluded.special, mark = excluded.mark,
              opted_out = excluded.opted_out, voice_limit = excluded.voice_limit,
              encryption = CASE WHEN excluded.encryption = 'unknown' THEN encryption ELSE excluded.encryption END,
+             icon = excluded.icon,
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -799,6 +809,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             filing.followed,
             row.limit,
             word(&row.encryption),
+            row.icon,
         ],
     )?;
     Ok(())
@@ -1353,7 +1364,9 @@ impl Store {
         hidden: &[AccountKey],
     ) -> rusqlite::Result<(Vec<Conversation>, u32, InboxCounts)> {
         let shelf = match shelf {
-            Shelf::Main => "NOT c.archived AND c.special != 'request'",
+            // A pinned chat stands on the network's own list whatever its archive holds: the pin
+            // groups it above the rest, archive without a pin stays in its own drill.
+            Shelf::Main => "(NOT c.archived OR c.pin IS NOT NULL) AND c.special != 'request'",
             Shelf::Archive => "c.archived AND c.special != 'request'",
             Shelf::Requests => "c.special = 'request'",
         };
@@ -1366,6 +1379,13 @@ impl Store {
         );
         let in_folder_pins = "(SELECT instr(f.pinned, ',' || c.id || ',') FROM folder f
                                 WHERE f.network = c.network AND f.account = c.account AND f.id = ?3)";
+        let order = match folder {
+            // A folder is a filter: its own pins on top, in its own order.
+            Some(_) => format!("coalesce(nullif({in_folder_pins}, 0), 2147483647),"),
+            // The whole network's list is Telegram's own: its own pins, then recency. The
+            // pins the folders hold are theirs alone, never lifted onto this list.
+            None => "coalesce(c.pin, 2147483647),".to_owned(),
+        };
         let key = params![word(&network), account.map(|account| account.account.as_str()), folder];
         let counts = self.db.query_row(
             &format!(
@@ -1376,12 +1396,11 @@ impl Store {
             key,
             counts_from,
         )?;
-        let rows = self
+        let mut rows = self
             .db
             .prepare(&format!(
                 "{CONVERSATION} WHERE {belongs}
-                 ORDER BY CASE WHEN ?3 IS NULL THEN coalesce(c.pin, 2147483647)
-                               ELSE coalesce(nullif({in_folder_pins}, 0), 2147483647) END,
+                 ORDER BY {order}
                           c.updated DESC, c.account, c.id
                  LIMIT ?4 OFFSET ?5"
             ))?
@@ -1389,8 +1408,39 @@ impl Store {
                 params![word(&network), account.map(|account| account.account.as_str()), folder, limit, offset],
                 conversation_from,
             )?
-            .collect::<rusqlite::Result<_>>()?;
+            .collect::<rusqlite::Result<Vec<protocol::Conversation>>>()?;
+        // A chat a folder pins is pinned on that folder's tab: its place among the folder's
+        // pins is written into the answer, since the stored row keeps no folder places. A pin
+        // of the chat's own stands, and the network's whole list lifts nothing.
+        if let Some(folder) = folder {
+            let pins = self.folder_pins(&word(&network), folder)?;
+            for row in &mut rows {
+                if row.pin.is_none() {
+                    if let Some(place) = pins.get(&(row.key.account.clone(), row.key.id.clone())) {
+                        row.pin = Some(*place);
+                    }
+                }
+            }
+        }
         Ok((rows, counts.all, counts))
+    }
+
+    /// Which chats one folder pins, by account and chat id, with the folder's place for each.
+    fn folder_pins(&self, network: &str, folder: &str) -> rusqlite::Result<HashMap<(String, String), i32>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT account, pinned FROM folder WHERE network = ?1 AND id = ?2 AND pinned != ''")?;
+        let held: Vec<(String, String)> = statement
+            .query_map(params![network, folder], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut pins: HashMap<(String, String), i32> = HashMap::new();
+        for (account, pinned) in held {
+            for (at, id) in from_id_list(&pinned).into_iter().enumerate() {
+                let place = at as i32 + 1;
+                pins.entry((account.clone(), id)).and_modify(|kept| *kept = (*kept).min(place)).or_insert(place);
+            }
+        }
+        Ok(pins)
     }
 
     /// A forum's topics: its pins in order, then newest first, and how many there are.
@@ -3116,6 +3166,9 @@ mod tests {
             chat("ben", &["work"], Some(1), false),
             chat("cy", &[], Some(0), false),
             chat("dee", &["family"], None, true),
+            chat("fin", &["work"], None, false),
+            // A pin stands whatever its archive says: Telegram keeps such chats on the list.
+            chat("jay", &[], Some(0), true),
             ConversationRow { special: Special::Request, ..ConversationRow::new("eve", ConversationKind::Direct, "eve") },
         ] {
             store.upsert_conversation(&account, &row).unwrap();
@@ -3127,7 +3180,7 @@ mod tests {
         }
         store
             .replace_folders(&account, &[
-                FolderRow { id: "work".into(), name: "Work".into(), position: 0, pinned: vec!["ben".into()], ..FolderRow::default() },
+                FolderRow { id: "work".into(), name: "Work".into(), position: 0, pinned: vec!["ben".into(), "fin".into()], ..FolderRow::default() },
                 FolderRow { id: "family".into(), name: "Family".into(), position: 1, pinned: vec!["dee".into()], ..FolderRow::default() },
             ])
             .unwrap();
@@ -3136,12 +3189,30 @@ mod tests {
             assert_eq!(rows.len() as u32, total);
             rows.into_iter().map(|row| row.key.id).collect()
         };
-        // Pins in their order, then newest first; the channel of the Space is not in it.
-        assert_eq!(ids(&store, None, Shelf::Main), ["cy", "ben", "ana"]);
-        assert_eq!(ids(&store, None, Shelf::Archive), ["dee"]);
+        // The rows carry where they are pinned: its own pin where one stands, else the
+        // folder's place, so the shell keeps the pinned chats in one group and draws the pin.
+        let pins = |store: &Store, folder: Option<&str>| -> Vec<(String, Option<i32>)> {
+            store
+                .home(Network::Discord, None, folder, Shelf::Main, 0, 20, &[])
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|row| (row.key.id, row.pin))
+                .collect()
+        };
+        // Pins in their order, then newest first; the channel of the Space is not in it. The pins
+        // a folder holds never lift onto the network's own list: `fin` stays by recency, and its
+        // place is on the folder's own tab alone.
+        assert_eq!(ids(&store, None, Shelf::Main), ["cy", "jay", "ben", "ana", "fin"]);
+        assert_eq!(
+            pins(&store, None),
+            [("cy".to_owned(), Some(0)), ("jay".to_owned(), Some(0)), ("ben".to_owned(), Some(1)), ("ana".to_owned(), None), ("fin".to_owned(), None)]
+        );
+        assert_eq!(ids(&store, None, Shelf::Archive), ["jay", "dee"]);
         assert_eq!(ids(&store, None, Shelf::Requests), ["eve"]);
         // A chat in two folders is in both; a folder's own pins come first, archived or not.
-        assert_eq!(ids(&store, Some("work"), Shelf::Main), ["ben", "ana"]);
+        assert_eq!(ids(&store, Some("work"), Shelf::Main), ["ben", "fin", "ana"]);
+        assert_eq!(pins(&store, Some("work")), [("ben".to_owned(), Some(1)), ("fin".to_owned(), Some(2)), ("ana".to_owned(), None)]);
         assert_eq!(ids(&store, Some("family"), Shelf::Main), ["dee", "ana"]);
         let folders = store.folders(Some(Network::Discord)).unwrap();
         let counted: Vec<(String, u32)> = folders.into_iter().map(|folder| (folder.name, folder.unread)).collect();
@@ -3149,9 +3220,9 @@ mod tests {
 
         // A tree reload that does not know the filing leaves it; one that does replaces it.
         store.upsert_conversation(&account, &ConversationRow::new("ben", ConversationKind::Direct, "ben")).unwrap();
-        assert_eq!(ids(&store, Some("work"), Shelf::Main), ["ben", "ana"]);
+        assert_eq!(ids(&store, Some("work"), Shelf::Main), ["ben", "fin", "ana"]);
         assert!(store.set_filing(&Key::new(&account, "ben"), &Filing::default()).unwrap());
-        assert_eq!(ids(&store, Some("work"), Shelf::Main), ["ana"]);
+        assert_eq!(ids(&store, Some("work"), Shelf::Main), ["fin", "ana"]);
     }
 
     #[test]
@@ -3482,6 +3553,55 @@ mod tests {
         let names: Vec<String> = info.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         assert!(names.iter().any(|name| name == "voice_limit"), "{names:?}");
         assert!(store.settings().unwrap().iter().any(|setting| setting.key == "keep_days" && setting.value == "14"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_cache_shaped_for_another_version_7_is_rebuilt() {
+        // Two builds both called their layout version 7: main's (with `encryption`, without
+        // `icon`) and the forum-topics pass's (with `icon`, without `encryption`). A cache from
+        // either opens empty here and is refilled by the networks, with today's shape.
+        let path = scratch("topic-icon-shape");
+        let mut store = Store::open(&path).unwrap();
+        store.set_setting("", "keep_days", Some("14")).unwrap();
+        store
+            .db
+            .execute_batch(
+                "DROP TABLE conversation;
+                 CREATE TABLE conversation (
+                     network TEXT NOT NULL,
+                     account TEXT NOT NULL,
+                     id TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     title TEXT NOT NULL,
+                     space TEXT NOT NULL DEFAULT '',
+                     position INTEGER NOT NULL DEFAULT 0,
+                     avatar TEXT NOT NULL DEFAULT '',
+                     peer TEXT NOT NULL DEFAULT '',
+                     archived INTEGER NOT NULL DEFAULT 0,
+                     icon INTEGER,
+                     PRIMARY KEY (network, account, id)
+                 ) WITHOUT ROWID;
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        let version: i32 = store.db.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA);
+        let names: Vec<String> = {
+            let mut info = store.db.prepare("PRAGMA table_info(conversation)").unwrap();
+            info.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+        assert!(names.iter().any(|name| name == "icon"), "{names:?}");
+        assert!(names.iter().any(|name| name == "encryption"), "{names:?}");
+        assert!(store.settings().unwrap().iter().any(|setting| setting.key == "keep_days" && setting.value == "14"));
+        // Reads on the rebuilt shape answer, and a row lands whole.
+        let account = AccountKey { network: Network::Telegram, account: "me".into() };
+        let key = Key::new(&account, "c1");
+        store.upsert_conversation(&account, &ConversationRow::new("c1", ConversationKind::Group, "Test")).unwrap();
+        let row = store.conversation(&key).unwrap().expect("the row reads back");
+        assert_eq!(row.title, "Test");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

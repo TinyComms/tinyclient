@@ -856,6 +856,7 @@ mod tests {
             meeting: false,
             special: Default::default(),
             mark: None,
+            topic_icon: None,
             opted_out: false,
             quiet: false,
             preview_from: String::new(),

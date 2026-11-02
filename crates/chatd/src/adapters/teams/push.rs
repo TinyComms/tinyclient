@@ -3,7 +3,7 @@
 //! be answered. See the notes at the top of `teams.rs` for where each step was read.
 
 use super::{bare, escaped, now_ms, uuid, Auth, Body, Fault, Teams, SPACES};
-use crate::adapters::net::{address, Socket};
+use crate::adapters::net::{address, gunzip, Socket};
 use crate::adapters::{Command, Failure};
 use base64::Engine;
 use serde_json::{json, Value};
@@ -44,28 +44,6 @@ fn ack(frame: &str) -> Option<&str> {
     (!id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())).then_some(id)
 }
 
-/// A gzip member unpacked, at most [`BODY`] bytes of it.
-fn gunzip(data: &[u8]) -> Option<Vec<u8>> {
-    if data.len() < 18 || data[..3] != [0x1f, 0x8b, 8] {
-        return None;
-    }
-    let flags = data[3];
-    let mut at = 10;
-    if flags & 4 != 0 {
-        at += 2 + usize::from(u16::from_le_bytes([*data.get(at)?, *data.get(at + 1)?]));
-    }
-    // The file name, then the comment: each runs to a zero byte.
-    for flag in [8, 16] {
-        if flags & flag != 0 {
-            at += data.get(at..)?.iter().position(|byte| *byte == 0)? + 1;
-        }
-    }
-    if flags & 2 != 0 {
-        at += 2;
-    }
-    miniz_oxide::inflate::decompress_to_vec_with_limit(data.get(at..)?, BODY).ok()
-}
-
 /// An event's body as text: as sent, or unpacked when its headers say it was packed.
 fn unpacked(request: &Value) -> Option<String> {
     let body = request["body"].as_str()?;
@@ -77,7 +55,7 @@ fn unpacked(request: &Value) -> Option<String> {
         return Some(body.to_owned());
     }
     let bytes = base64::engine::general_purpose::STANDARD.decode(body).ok()?;
-    String::from_utf8(gunzip(&bytes)?).ok()
+    String::from_utf8(gunzip(&bytes, BODY)?).ok()
 }
 
 impl Teams {

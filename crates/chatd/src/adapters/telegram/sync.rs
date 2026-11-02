@@ -331,7 +331,56 @@ pub(super) fn dialogs(account: &Account) -> Result<(), Fault> {
             }
         }
     }
+    // Folder pins name chats the pages may never have carried: a pin whose dialog lies past
+    // the newest 500 would sit missing for ever, so what nothing stored says of is asked
+    // for alone. The order the folders hold is already in the store.
+    pinned_missing(account);
     Ok(())
+}
+
+/// The chats the folder rules pin that no dialog page carried: each one dialog, asked of
+/// `getPeerDialogs`, so a pin never sits missing only because it lies far down the list.
+fn pinned_missing(account: &Account) {
+    let rules = account.live().filed.rules.clone();
+    let mut asked = HashSet::new();
+    for rule in rules {
+        for who in rule.pinned {
+            if !asked.insert(who) {
+                continue;
+            }
+            let id = who.text();
+            if matches!(account.ctx.known(&id), Ok(Some(_))) {
+                continue;
+            }
+            let Ok(peer) = account.input(who) else {
+                continue;
+            };
+            let request = tl::functions::messages::GetPeerDialogs {
+                peers: vec![tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer })],
+            };
+            let found = match account.ask(&request) {
+                Ok(tl::enums::messages::PeerDialogs::Dialogs(found)) => found,
+                _ => {
+                    continue;
+                }
+            };
+            account.learn(&found.users, &found.chats);
+            for dialog in found.dialogs {
+                if let tl::enums::Dialog::Dialog(dialog) = dialog {
+                    let list = usize::from(dialog.folder_id == Some(1));
+                    let newest = found
+                        .messages
+                        .iter()
+                        .find(|message| match message {
+                            tl::enums::Message::Message(before) => before.id == dialog.top_message,
+                            tl::enums::Message::Service(before) => before.id == dialog.top_message,
+                            tl::enums::Message::Empty(_) => false,
+                        });
+                    record(account, list, &dialog, newest);
+                }
+            }
+        }
+    }
 }
 
 /// One page of a list (0 the main list, 1 the archive) from `offset`, written row by row.
@@ -405,12 +454,62 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
             let _ = account.ctx.history(&id, std::slice::from_ref(&mapped.message));
         }
     }
-    let read = (dialog.read_inbox_max_id > 0).then(|| dialog.read_inbox_max_id.to_string());
-    let _ = account.ctx.counts(&id, unread, dialog.unread_mentions_count.max(0) as u32, read.as_deref(), updated);
+    // Telegram's word on what is unread here. Where this user read further than the dialog says,
+    // the read was told while the link was down and lost on the whole: the tell goes again, and
+    // the counts are asked of the dialog once more, for the read may not have been the last word
+    // on the unread (`GetPeerDialogs` answers what the tell left). If that answer fails, the row
+    // stands untouched: the tell is on its way and the next dialog count is the truth.
+    let mut unread = unread;
+    let mut mentions = dialog.unread_mentions_count.max(0) as u32;
+    let mut read = (dialog.read_inbox_max_id > 0).then(|| dialog.read_inbox_max_id.to_string());
+    let mut counted = true;
+    if let Some(up_to) = account.ctx.read_up_to(&id) {
+        let mine = up_to.parse::<i32>().ok();
+        let theirs = read.as_deref().and_then(|value| value.parse::<i32>().ok());
+        if mine.is_some_and(|mine| theirs.is_some_and(|theirs| mine > theirs)) {
+            super::mark_read(account, &id, &up_to);
+            match peer_dialog(account, who) {
+                Some(fresh) => {
+                    unread = (fresh.unread_count.max(0) as u32).max(u32::from(fresh.unread_mark));
+                    mentions = fresh.unread_mentions_count.max(0) as u32;
+                    read = (fresh.read_inbox_max_id > 0).then(|| fresh.read_inbox_max_id.to_string());
+                }
+                None => counted = false,
+            }
+        }
+    }
+    if counted {
+        let _ = account.ctx.counts(&id, unread, mentions, read.as_deref(), updated);
+    }
     let _ = account.ctx.muted(&id, is_muted);
+    // The cloud draft rides the dialog: what the phone left on this chat shows on its row as
+    // "Draft:", and a draft the phone dropped is dropped here too. An empty one clears.
+    let draft_text = match &dialog.draft {
+        Some(tl::enums::DraftMessage::Message(draft)) => draft.message.as_str(),
+        _ => "",
+    };
+    let _ = account.ctx.draft(&id, draft_text);
     // ✓✓: the other side read my messages up to here. Not for my own notes or a broadcast.
     if dialog.read_outbox_max_id > 0 && who != Who::User(account.me) && !known.broadcast {
         let _ = account.ctx.seen(&id, &dialog.read_outbox_max_id.to_string());
+    }
+}
+
+/// One dialog as the network counts it right now, what a read told again leaves.
+fn peer_dialog(account: &Account, who: Who) -> Option<tl::types::Dialog> {
+    let peer = account.input(who).ok()?;
+    let request = tl::functions::messages::GetPeerDialogs { peers: vec![tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer })] };
+    match account.ask(&request) {
+        Ok(tl::enums::messages::PeerDialogs::Dialogs(found)) => {
+            found.dialogs.into_iter().find_map(|dialog| match dialog {
+                tl::enums::Dialog::Dialog(dialog) => Some(dialog),
+                _ => None,
+            })
+        }
+        Err(fault) => {
+            eprintln!("chatd: Telegram: the read told again: {fault}");
+            None
+        }
     }
 }
 
@@ -531,6 +630,12 @@ fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
         };
         let id = thread_id(forum, topic.id);
         let mut thread = ConversationRow::new(id.clone(), ConversationKind::Thread, topic.title.clone());
+        // The topic's own icon color: the tile it draws wherever its list shows. Its picture:
+        // the custom emoji the icon names, shown wherever the row stands.
+        thread.icon = Some(topic.icon_color);
+        if let Some(icon) = topic.icon_emoji_id {
+            thread.avatar = Some(format!("e{icon}"));
+        }
         thread.parent = Some(forum.text());
         thread.root = Some(topic.id.to_string());
         // Pinned topics first, then as Telegram lists them: the most recently active first.
@@ -551,7 +656,82 @@ fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
         let _ = account.ctx.counts(&id, topic.unread_count.max(0) as u32, topic.unread_mentions_count.max(0) as u32, read.as_deref(), updated);
         let _ = account.ctx.muted(&id, muted(account, forum, &topic.notify_settings));
     }
+    fetch_icons(account, forum, &found.topics);
     Ok(count)
+}
+
+/// The topics' own pictures: one request for every icon the pages say, and a fetch for each
+/// that is not on disk yet (the same file may hang off several topics). The pictures are the
+/// emoji documents Telegram names in the topic list, small and shown at list size.
+fn fetch_icons(account: &Account, forum: Who, topics: &[tl::enums::ForumTopic]) {
+    // The topics that carry an icon: one pair per (emoji, row), so the rows that hang off
+    // the same picture are each told when their picture lands.
+    let mut icons: Vec<(i64, String)> = Vec::new();
+    for topic in topics {
+        let tl::enums::ForumTopic::Topic(topic) = topic else {
+            continue;
+        };
+        let Some(icon) = topic.icon_emoji_id else {
+            continue;
+        };
+        let row = thread_id(forum, topic.id);
+        if icons.iter().any(|(held, held_row)| *held == icon && *held_row == row) {
+            continue;
+        }
+        icons.push((icon, row));
+    }
+    let emoji_ids: Vec<i64> = icons.iter().map(|(icon, _)| *icon).collect();
+    let mut emoji_ids = emoji_ids;
+    emoji_ids.sort_unstable();
+    emoji_ids.dedup();
+    if emoji_ids.is_empty() {
+        return;
+    }
+    let documents = match account.ask(&tl::functions::messages::GetCustomEmojiDocuments { document_id: emoji_ids }) {
+        Ok(documents) => documents,
+        Err(fault) => {
+            eprintln!("chatd: Telegram: topic icons: {fault}");
+            return;
+        }
+    };
+    // What is fetched is whatever the icon can be drawn from: the still thumbnail Telegram
+    // names in the document ("m" first) when it names one, and the document whole otherwise —
+    // an animated icon is its Lottie JSON the same play the messages render, gzip unpacked
+    // where the file lands.
+    let wants = icons.into_iter().filter_map(|(icon, topic_row)| {
+        // The picture's row: the topic whose row hung it, so the list refreshes on its turn.
+        let document = documents.iter().find(|document| match document {
+            tl::enums::Document::Document(document) => document.id == icon,
+            _ => false,
+        })?;
+        let tl::enums::Document::Document(document) = document else {
+            return None;
+        };
+        let still = document.thumbs.as_ref().and_then(|thumbs| {
+            thumbs.iter().find_map(|thumb| match thumb {
+                tl::enums::PhotoSize::Size(size) if size.r#type == "m" => Some(size.r#type.clone()),
+                _ => None,
+            }).or_else(|| thumbs.iter().find_map(|thumb| match thumb {
+                tl::enums::PhotoSize::Size(size) => Some(size.r#type.clone()),
+                _ => None,
+            }))
+        });
+        let thumb_size = still.unwrap_or_default();
+        Some(Want {
+            file: MediaFile::new(format!("e{}", icon), MediaKind::Emoji),
+            dc: document.dc_id,
+            location: tl::enums::InputFileLocation::InputDocumentFileLocation(tl::types::InputDocumentFileLocation {
+                id: document.id,
+                access_hash: document.access_hash,
+                file_reference: document.file_reference.clone(),
+                thumb_size,
+            }),
+            inline: None,
+            row: Some(topic_row),
+            original: false,
+        })
+    }).collect();
+    account.files.want(wants);
 }
 
 /// Where in a conversation a page of history is wanted.
@@ -598,6 +778,49 @@ pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped,
         mapped.message.reply_to = Some(quote(account, conversation, page, reply));
     }
     account.place(mapped.peer, mapped.id, conversation);
+    comment_thread(account, conversation, mapped);
+}
+
+/// The thread a channel post's comments hang off. The post carries the count; the row it opens
+/// under is written with it, so the footer's ask never lands on a conversation that is not
+/// there. The newest comment's time only comes with the page of comments, so the value a stored
+/// post keeps is kept on its way in again.
+fn comment_thread(account: &Account, conversation: &str, mapped: &mut Mapped) {
+    let Some(thread) = &mut mapped.message.thread else {
+        return;
+    };
+    if let Ok(Some(stored)) = account.ctx.stored_message(conversation, &mapped.message.id) {
+        if let Some(old) = &stored.thread {
+            if old.id == thread.id && old.last > thread.last {
+                thread.last = old.last;
+            }
+        }
+    }
+    let id = thread.id.clone();
+    if matches!(account.ctx.known(&id), Ok(Some(_))) {
+        return;
+    }
+    let mut row = ConversationRow::new(id, ConversationKind::Thread, "Comments");
+    row.parent = Some(mapped.peer.text());
+    row.root = Some(mapped.message.id.clone());
+    // Reading is what this client opens the comments for: writing into the discussion group
+    // behind them, with the post's echo there, is its own step, so the composer stays shut.
+    row.read_only = true;
+    let _ = account.ctx.conversation(&row);
+}
+
+/// The footer's "last reply": the newest comment's time, written onto the post it hangs off
+/// once its comments were read. A page of the channel read later would otherwise stamp the
+/// post anew without one (`comment_thread` keeps the value on its way in).
+fn comment_time(account: &Account, post_at: Who, root: i32, sent: i64) {
+    let Ok(Some(mut post)) = account.ctx.stored_message(&post_at.text(), &root.to_string()) else {
+        return;
+    };
+    let Some(section) = post.thread.as_mut().filter(|section| section.last < sent) else {
+        return;
+    };
+    section.last = sent;
+    let _ = account.ctx.history(&post_at.text(), std::slice::from_ref(&post));
 }
 
 /// One request for a page of a conversation's messages, newest first as Telegram answers.
@@ -693,6 +916,16 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
         }
     }
     let _ = account.ctx.history(conversation, &messages);
+    // A thread of comments read: its newest time is the post's footer's "last reply", and the
+    // post carries the count but not the time. A forum's topics are asked the same way, but
+    // they carry no comment section and stand as rows of their own.
+    if let Some((parent, Some(root))) = Who::parse(conversation) {
+        if account.dir().get(parent).is_some_and(|known| known.broadcast) {
+            if let Some(newest) = messages.first().map(|message| message.sent) {
+                comment_time(account, parent, root, newest);
+            }
+        }
+    }
     wants.extend(avatar(account, who));
     wants.extend(authors.into_iter().take(20).filter_map(|author| avatar(account, author)));
     account.files.want(wants);
@@ -718,7 +951,9 @@ pub(super) fn backfill(account: &Account, conversation: &str) {
         return;
     }
     let newest = history(account, conversation, Around::Newest);
-    if broadcast {
+    // The sponsored post belongs at the foot of the channel's own page; a comments thread
+    // under one of its posts is read the same way but is not that page.
+    if broadcast && topic.is_none() {
         sponsored(account, who, conversation, newest);
     }
 }
