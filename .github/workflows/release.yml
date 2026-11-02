@@ -272,6 +272,8 @@ jobs:
         if: github.ref_type == 'tag' && (github.event_name == 'push' || inputs.publish)
         with:
           files: dist/*
+          # Notes from the merged PRs since the last tag, so a release never ships with an empty body.
+          generate_release_notes: true
       # The release lands in the community's #releases channel once the webhook's URL sits in
       # the DISCORD_WEBHOOK_URL secret (an admin sets it). Nothing posts while it is unset, and
       # a Discord hiccup does not fail a published release.
