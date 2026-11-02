@@ -558,6 +558,45 @@ fn a_chat_pinned_by_a_folder_beyond_the_pages_gets_its_row() {
 }
 
 #[test]
+fn a_draft_typed_on_the_phone_shows_as_its_conversations_draft() {
+    let world = World::signed_in();
+    world.connected();
+    // Odalys had a draft typed elsewhere before this sign-in: her dialog carried it, and the
+    // row says so.
+    assert_eq!(world.conversation("u7002").unwrap().draft, "Finished packing. Meet at the ridge?");
+    // A draft the phone types while we are online follows the row just the same.
+    world.steer("draft");
+    world.until("the draft typed on the phone", || {
+        world.conversation("u7002").filter(|row| row.draft == "Riding up with Tobin.").map(|_| ())
+    });
+    // And one the phone cleared empties the row again.
+    world.steer("draft-none");
+    world.until("the draft the phone cleared", || {
+        world.conversation("u7002").filter(|row| row.draft.is_empty()).map(|_| ())
+    });
+}
+
+#[test]
+fn a_draft_kept_here_is_told_to_telegram_and_only_once() {
+    let world = World::signed_in();
+    world.connected();
+    // What the user settled on here is asked of Telegram with the same words, and a cleared
+    // draft is asked of it empty.
+    world.ask(Request::SetDraft { conversation: key("u7002"), text: "Bringing the map, then.".into() });
+    world.until("the draft to be told", || (world.called("SaveDraft u7002 Bringing the map, then.") == 1).then_some(()));
+    world.ask(Request::SetDraft { conversation: key("u7002"), text: String::new() });
+    world.until("the clear to be told", || (world.called("SaveDraft u7002") == 2).then_some(()));
+    // The same for a group, where the draft is the chat's and not the person's. What the store
+    // kept says so on the row, until the echo of the save says no more than that.
+    world.ask(Request::SetDraft { conversation: key("g8001"), text: "Snacks are on me".into() });
+    world.until("the group's draft to be told", || (world.called("SaveDraft g8001 Snacks are on me") == 1).then_some(()));
+    assert_eq!(world.conversation("g8001").unwrap().draft, "Snacks are on me");
+    // Nothing of the echo litters the log: one save per settled draft.
+    sleep(Duration::from_millis(400));
+    assert_eq!(world.called("SaveDraft g8001"), 1, "{:#?}", world.calls());
+}
+
+#[test]
 fn a_forum_opened_while_the_link_was_down_comes_back_at_the_next_connect() {
     let world = World::signed_in();
     world.connected();
