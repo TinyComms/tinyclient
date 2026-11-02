@@ -233,8 +233,10 @@ impl Shell {
                 None if c.key.network == Network::Telegram => {
                     // A topic's own tile: the color Telegram packs in `icon_color`, exactly
                     // the one its own list paints, else the palette's hue for that row.
+                    // The official tile carries the title's FIRST non-emoji letter alone,
+                    // not a pair of initials.
                     match topic_fill(c.topic_icon) {
-                        Some(color) => Avatar::new(&c.key, &c.title, size).shape(Shape::Place).fill(color).build(),
+                        Some(color) => Avatar::new(&c.key, &c.title, size).shape(Shape::Place).fill(color).letters(1).build(),
                         None => Avatar::new(&c.key, &c.title, size).tint(tint_from(&c.key, c.topic_icon)).shape(Shape::Place).build(),
                     }
                 }
