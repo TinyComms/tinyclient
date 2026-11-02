@@ -2,14 +2,16 @@
 //! link is, my microphone and headphones, and the voice settings. While a call is up its second
 //! line is the state of the call with signal bars and the round trip, and a click on it opens
 //! Call health: the link graded in words, what to do about it, and the numbers (ping, jitter,
-//! loss, bitrate and the path the audio takes).
+//! loss, bitrate and the path the audio takes), with a minute of ping and receive on a graph.
 
 use super::Float;
-use crate::gui::call::health::{self, Grade, Health};
+use crate::gui::call::health::{self, ChartSample, Grade, Health};
 use crate::gui::components::{glyph, tip, Avatar};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
-use gpui::{div, prelude::*, px, Context, Div, Rgba, SharedString, Stateful};
+use gpui::{
+    canvas, div, fill, point, prelude::*, px, size, Bounds, Context, Div, PathBuilder, Rgba, SharedString, Stateful,
+};
 use protocol::{CallPath, CallState, Presence};
 
 pub(super) const PANEL: f32 = 52.;
@@ -63,6 +65,191 @@ pub(super) fn path_words(path: CallPath) -> &'static str {
         CallPath::Relay => "Relayed",
         CallPath::Unknown => "Not known yet",
     }
+}
+
+fn path_pill(path: CallPath) -> &'static str {
+    match path {
+        CallPath::Udp => "Direct · UDP",
+        CallPath::Tcp => "Direct · TCP",
+        CallPath::Relay => "Relayed",
+        CallPath::Unknown => "Not known yet",
+    }
+}
+
+fn grade_badge(grade: Grade) -> &'static str {
+    match grade {
+        Grade::Unknown => "…",
+        Grade::Poor => "Poor",
+        Grade::Fair => "Fair",
+        Grade::Good => "Good",
+        Grade::Great => "Excellent",
+    }
+}
+
+fn meta_row(label: &'static str, value: impl IntoElement) -> Div {
+    div()
+        .h(px(26.))
+        .flex()
+        .items_center()
+        .child(div().flex_1().type_ui().text_color(theme::text_soft()).child(label))
+        .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(value))
+}
+
+fn kpi(label: &'static str, value: String, unit: &'static str) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .px(px(8.))
+        .py(px(8.))
+        .rounded(px(theme::R_CONTROL))
+        .border_1()
+        .border_color(theme::border())
+        .bg(theme::field())
+        .child(div().type_micro().font_weight(theme::SEMIBOLD).text_color(theme::text_soft()).child(label))
+        .child(
+            div()
+                .mt(px(2.))
+                .flex()
+                .items_baseline()
+                .gap(px(2.))
+                .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::positive()).child(value))
+                .child(div().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child(unit)),
+        )
+}
+
+/// Ping (filled) and receive bitrate over the last minute.
+fn health_chart(samples: Vec<ChartSample>) -> Div {
+    let (now_rtt, now_recv) = samples.last().map(|sample| (sample.rtt_ms, sample.recv_kbps)).unwrap_or((0, 0));
+    let chart = canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            if samples.is_empty() {
+                return;
+            }
+            let width = f32::from(bounds.size.width);
+            let height = f32::from(bounds.size.height);
+            let origin_x = f32::from(bounds.origin.x);
+            let origin_y = f32::from(bounds.origin.y);
+            for frac in [0.25_f32, 0.5, 0.75] {
+                let y = origin_y + height * frac;
+                window.paint_quad(fill(Bounds::new(point(px(origin_x), px(y)), size(px(width), px(1.))), theme::hairline()));
+            }
+            let count = samples.len();
+            let span = (count.saturating_sub(1)).max(1) as f32;
+            let max_rtt = samples.iter().map(|sample| sample.rtt_ms).max().unwrap_or(1).max(1) as f32;
+            let max_recv = samples.iter().map(|sample| sample.recv_kbps).max().unwrap_or(1).max(1) as f32;
+            let x_at = |index: usize| origin_x + width * (index as f32) / span;
+            let ping_y = |rtt: u32| {
+                let t = (rtt as f32 / (max_rtt * 1.2)).clamp(0., 1.);
+                origin_y + height * (0.42 + 0.5 * (1. - t))
+            };
+            let recv_y = |kbps: u32| {
+                let t = (kbps as f32 / (max_recv * 1.2)).clamp(0., 1.);
+                origin_y + height * (0.06 + 0.3 * (1. - t))
+            };
+
+            let mut area = PathBuilder::fill();
+            area.move_to(point(px(x_at(0)), px(origin_y + height)));
+            for (index, sample) in samples.iter().enumerate() {
+                area.line_to(point(px(x_at(index)), px(ping_y(sample.rtt_ms))));
+            }
+            area.line_to(point(px(x_at(count - 1)), px(origin_y + height)));
+            area.close();
+            if let Ok(path) = area.build() {
+                window.paint_path(path, theme::positive_soft());
+            }
+
+            let mut ping = PathBuilder::stroke(px(2.));
+            for (index, sample) in samples.iter().enumerate() {
+                let at = point(px(x_at(index)), px(ping_y(sample.rtt_ms)));
+                if index == 0 {
+                    ping.move_to(at);
+                } else {
+                    ping.line_to(at);
+                }
+            }
+            if let Ok(path) = ping.build() {
+                window.paint_path(path, theme::positive());
+            }
+
+            let mut recv = PathBuilder::stroke(px(1.75)).dash_array(&[px(3.), px(3.)]);
+            for (index, sample) in samples.iter().enumerate() {
+                let at = point(px(x_at(index)), px(recv_y(sample.recv_kbps)));
+                if index == 0 {
+                    recv.move_to(at);
+                } else {
+                    recv.line_to(at);
+                }
+            }
+            if let Ok(path) = recv.build() {
+                window.paint_path(path, theme::accent());
+            }
+
+            if let Some(last) = samples.last() {
+                let cx = x_at(count - 1);
+                let cy = ping_y(last.rtt_ms);
+                window.paint_quad(fill(
+                    Bounds::new(point(px(cx - 5.), px(cy - 5.)), size(px(10.), px(10.))),
+                    theme::positive_soft(),
+                ));
+                window.paint_quad(fill(
+                    Bounds::new(point(px(cx - 2.5), px(cy - 2.5)), size(px(5.), px(5.))),
+                    theme::positive(),
+                ));
+            }
+        },
+    )
+    .h(px(92.))
+    .w_full();
+
+    div()
+        .mb(px(10.))
+        .p(px(10.))
+        .rounded(px(theme::R_CONTROL))
+        .border_1()
+        .border_color(theme::border())
+        .bg(theme::field())
+        .child(
+            div()
+                .mb(px(6.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(div().type_micro().font_weight(theme::SEMIBOLD).text_color(theme::text_soft()).child("Last 60s"))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(5.))
+                                .child(div().size(px(7.)).rounded_full().bg(theme::positive()))
+                                .child(div().type_micro().text_color(theme::text_soft()).child("Ping")),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(5.))
+                                .child(div().size(px(7.)).rounded_full().bg(theme::accent()))
+                                .child(div().type_micro().text_color(theme::text_soft()).child("Recv")),
+                        ),
+                ),
+        )
+        .child(chart)
+        .child(
+            div()
+                .mt(px(4.))
+                .flex()
+                .justify_between()
+                .type_micro()
+                .text_color(theme::text_soft())
+                .child("−60s")
+                .child(format!("Now · {now_rtt} ms · {now_recv} kb/s")),
+        )
 }
 
 impl Shell {
@@ -165,34 +352,64 @@ impl Shell {
         self.tiny_state.stats.as_ref().map(|stats| self.tiny_state.steady.applied(Health::from_polls(before, stats)))
     }
 
-    /// Call health, over the panel: the link graded, what to do about it in words, then the
-    /// connection's numbers.
+    /// Call health, over the panel: the link graded, what to do about it in words, the last
+    /// minute on a graph, key numbers, then the connection's details.
     pub(super) fn tiny_stats_card(&self) -> Div {
-        let row = |label: &'static str, value: String| {
-            div()
-                .h(px(24.))
-                .flex()
-                .items_center()
-                .child(div().flex_1().type_ui().text_color(theme::text_soft()).child(label))
-                .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child(value))
-        };
         let room = self.tiny_page_facts().and_then(|page| page.mine.and_then(|id| page.community.rooms.iter().find(|room| room.id == id)).map(|room| (room.name.clone(), room.bitrate())));
         let health = self.tiny_health().unwrap_or_default();
         let grade = health.grade();
-        let mut card = div().w(px(288.)).flex().flex_col().gap(px(2.)).child(
+        let mut card = div().w(px(320.)).flex().flex_col().child(
             div()
-                .pb(px(8.))
+                .pb(px(10.))
                 .flex()
-                .items_center()
+                .items_start()
+                .justify_between()
                 .gap(px(8.))
-                .child(health::bars(grade, 14.))
-                .child(div().flex_1().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("Call health"))
-                .child(div().type_small().text_color(grade.color()).child(grade.words())),
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(health::bars(grade, 14.))
+                                .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("Call health")),
+                        )
+                        .children(health.hints().into_iter().take(1).map(|hint| {
+                            div()
+                                .mt(px(6.))
+                                .flex()
+                                .items_start()
+                                .gap(px(6.))
+                                .child(div().pt(px(1.)).child(glyph(hint.level.icon(), 12., hint.level.color())))
+                                .child(div().flex_1().min_w_0().whitespace_normal().type_small().text_color(hint.level.color()).child(hint.words))
+                        })),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .px(px(8.))
+                        .py(px(3.))
+                        .rounded_full()
+                        .bg(match grade {
+                            Grade::Great | Grade::Good => theme::positive_soft(),
+                            Grade::Fair => theme::warning_soft(),
+                            Grade::Poor => theme::danger_soft(),
+                            Grade::Unknown => theme::field(),
+                        })
+                        .type_micro()
+                        .font_weight(theme::SEMIBOLD)
+                        .text_color(grade.color())
+                        .child(grade_badge(grade)),
+                ),
         );
+
         let hints = health.hints();
-        if !hints.is_empty() {
+        if hints.len() > 1 {
             card = card.child(
-                div().pb(px(8.)).mb(px(4.)).border_b_1().border_color(theme::hairline()).flex().flex_col().gap(px(6.)).children(hints.into_iter().take(3).map(|hint| {
+                div().pb(px(8.)).mb(px(4.)).border_b_1().border_color(theme::hairline()).flex().flex_col().gap(px(6.)).children(hints.into_iter().skip(1).take(2).map(|hint| {
                     div()
                         .flex()
                         .items_start()
@@ -202,19 +419,42 @@ impl Shell {
                 })),
             );
         }
-        if let Some((name, kbps)) = &room {
-            card = card.child(row("Channel", name.clone())).child(row("Channel bitrate", format!("{kbps} kb/s")));
-        }
+
         match &self.tiny_state.stats {
             Some(stats) => {
+                let samples: Vec<_> = self.tiny_state.stats_chart.iter().copied().collect();
+                if !samples.is_empty() {
+                    card = card.child(health_chart(samples));
+                }
                 card = card
-                    .child(row("Ping", format!("{} ms", health.rtt_ms.unwrap_or(0))))
-                    .child(row("Jitter", format!("{} ms", health.jitter_ms.unwrap_or(0))))
-                    .child(row("Packet loss", format!("{:.1} %", f32::from(health.loss_permille.unwrap_or(0)) / 10.)))
-                    .child(row("Sending", format!("{} kb/s", stats.send_kbps)))
-                    .child(row("Receiving", format!("{} kb/s", stats.receive_kbps)))
-                    .child(row("Path", path_words(stats.path).to_owned()))
-                    .when(!stats.codec.is_empty(), |card| card.child(row("Codec", stats.codec.clone())));
+                    .child(
+                        div()
+                            .mb(px(10.))
+                            .flex()
+                            .gap(px(8.))
+                            .child(kpi("Ping", format!("{}", health.rtt_ms.unwrap_or(0)), "ms"))
+                            .child(kpi("Jitter", format!("{}", health.jitter_ms.unwrap_or(0)), "ms"))
+                            .child(kpi("Loss", format!("{:.1}", f32::from(health.loss_permille.unwrap_or(0)) / 10.), "%")),
+                    )
+                    .when_some(room.as_ref(), |card, (name, kbps)| {
+                        card.child(meta_row("Channel", name.clone())).child(meta_row("Channel bitrate", format!("{kbps} kb/s")))
+                    })
+                    .child(meta_row("Sending", format!("{} kb/s", stats.send_kbps)))
+                    .child(meta_row("Receiving", format!("{} kb/s", stats.receive_kbps)))
+                    .child(meta_row(
+                        "Path",
+                        div()
+                            .px(px(7.))
+                            .py(px(2.))
+                            .rounded_full()
+                            .bg(theme::selected())
+                            .flex()
+                            .items_center()
+                            .gap(px(5.))
+                            .child(div().size(px(6.)).rounded_full().bg(theme::positive()))
+                            .child(div().type_micro().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(path_pill(stats.path))),
+                    ))
+                    .when(!stats.codec.is_empty(), |card| card.child(meta_row("Codec", stats.codec.clone())));
             }
             None => {
                 let words: SharedString = self.tiny_state.stats_note.clone().unwrap_or_else(|| "Measuring…".to_owned()).into();
@@ -249,5 +489,7 @@ mod tests {
         assert_eq!(quality(&stats(40, 40)), theme::warning());
         assert_eq!(quality(&stats(400, 0)), theme::danger());
         assert_eq!(path_words(CallPath::Relay), "Relayed");
+        assert_eq!(path_pill(CallPath::Udp), "Direct · UDP");
+        assert_eq!(grade_badge(Grade::Great), "Excellent");
     }
 }

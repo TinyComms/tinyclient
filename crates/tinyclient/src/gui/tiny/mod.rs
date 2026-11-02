@@ -40,7 +40,7 @@ use crate::gui::call::health;
 use gpui::{prelude::*, Bounds, ClipboardItem, Context, Entity, Focusable, PathPromptOptions, Pixels, Point, Task, Window};
 use protocol::{AccountKey, CallStats, Change, Key, Link, Network, Presence, Request, Response, TinyCommunity};
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -196,6 +196,8 @@ pub struct State {
     /// The poll before `stats`, so the audio counters (counts over the whole call) can be read
     /// as what grew in the last second.
     stats_before: Option<CallStats>,
+    /// The last minute of ping and receive bitrate for Call health's time graph.
+    stats_chart: VecDeque<health::ChartSample>,
     /// The polls over the last several seconds: what the bars and the numbers show.
     steady: health::Steady,
     /// Why there are no numbers, when mediad said.
@@ -277,6 +279,7 @@ impl State {
             sliding: None,
             stats: None,
             stats_before: None,
+            stats_chart: VecDeque::new(),
             steady: health::Steady::default(),
             stats_note: None,
             stats_task: None,
@@ -881,6 +884,7 @@ impl Shell {
             if self.tiny_state.stats_task.take().is_some() {
                 self.tiny_state.stats = None;
                 self.tiny_state.stats_before = None;
+                self.tiny_state.stats_chart.clear();
                 self.tiny_state.steady = health::Steady::default();
                 self.tiny_state.stats_note = None;
             }
@@ -892,6 +896,7 @@ impl Shell {
         self.tiny_state.applied = call;
         #[cfg(feature = "gui-shot")]
         if let Some(stats) = crate::gui::call::shot_stats() {
+            self.tiny_state.stats_chart = health::seed_chart(&stats);
             self.tiny_state.stats = Some(stats);
             return;
         }
@@ -905,6 +910,7 @@ impl Shell {
                 match answer {
                     Ok(Response::CallStats { stats }) => {
                         this.tiny_state.steady.feed(&stats, Instant::now());
+                        health::push_chart(&mut this.tiny_state.stats_chart, &stats);
                         this.tiny_state.stats_before = this.tiny_state.stats.replace(stats);
                         this.tiny_state.stats_note = None;
                     }
@@ -912,6 +918,7 @@ impl Shell {
                     Ok(Response::Error { detail, .. }) => {
                         this.tiny_state.stats = None;
                         this.tiny_state.stats_before = None;
+                        this.tiny_state.stats_chart.clear();
                         this.tiny_state.steady = health::Steady::default();
                         this.tiny_state.stats_note = Some(detail);
                     }
