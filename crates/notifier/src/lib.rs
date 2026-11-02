@@ -14,6 +14,7 @@
 //! - macOS: UNUserNotificationCenter, only inside the app bundle (it refuses a bare binary);
 //!   elsewhere nothing is posted and the reason is logged. The bundle carries the sound files.
 //! - Linux: org.freedesktop.Notifications, with `suppress-sound` as on Windows.
+//! - Android and iOS: nothing yet; each post is refused with the reason.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -21,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios"))))]
 mod linux;
 #[cfg(windows)]
 mod windows;
@@ -121,7 +122,7 @@ pub fn system(app: &App, tell: Tell) -> Box<dyn Sink> {
     return Box::new(windows::Toasts::new(app, tell));
     #[cfg(target_os = "macos")]
     return Box::new(macos::Center::new(app, tell));
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios"))))]
     return Box::new(linux::Bus::new(app, tell));
     #[allow(unreachable_code)]
     {

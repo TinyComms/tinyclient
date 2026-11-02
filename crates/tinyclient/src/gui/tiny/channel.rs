@@ -544,7 +544,7 @@ impl Shell {
             .border_2()
             .border_color(ring)
             .when(speaking, |tile| tile.shadow(vec![gpui::BoxShadow {
-                color: gpui::Hsla::from(if seat.priority { theme::accent_text() } else { theme::positive() }).opacity(0.25),
+                color: gpui::Rgba { alpha: 0.25, ..if seat.priority { theme::accent_text() } else { theme::positive() } }.into(),
                 offset: gpui::point(px(0.), px(0.)),
                 blur_radius: px(12.),
                 spread_radius: px(0.),
@@ -659,7 +659,11 @@ impl Shell {
                 pill(
                     "tiny-pill-muted",
                     "icons/mic-off.svg",
-                    format!("You're muted · {} to talk", crate::gui::shortcuts::label("⌘⇧M")),
+                    if crate::gui::phone::active() {
+                        "You're muted · tap to talk".to_owned()
+                    } else {
+                        format!("You're muted · {} to talk", crate::gui::shortcuts::label("⌘⇧M"))
+                    },
                     theme::on_accent(),
                     theme::danger_fill(),
                 )

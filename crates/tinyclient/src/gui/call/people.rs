@@ -6,6 +6,7 @@ use super::{in_call, Subject};
 use crate::gui::components::{glyph, Avatar};
 use crate::gui::theme;
 use gpui::{div, prelude::*, px, AnyElement, Div, FontWeight, Hsla};
+use palette::IntoColor;
 use protocol::{Call, Key, Participant};
 
 /// Rows drawn under a voice channel before "+ N more".
@@ -16,7 +17,7 @@ const LISTED: usize = 10;
 /// An avatar in its speaking-ring slot: a 2 px gap and a 2 px border around it, always laid out
 /// and transparent when off, so a ring switching on moves nothing.
 pub(in crate::gui) fn ringed(avatar: Div, size: f32, speaking: bool) -> Div {
-    let ring: Hsla = if speaking { theme::positive().into() } else { gpui::transparent_black() };
+    let ring: Hsla = if speaking { theme::positive().into_color() } else { gpui::transparent_black() };
     div().relative().size(px(size)).flex_none().child(avatar).child(
         div()
             .absolute()

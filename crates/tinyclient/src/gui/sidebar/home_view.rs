@@ -266,7 +266,7 @@ impl Shell {
         };
         let focused = self.sidebar_state.listed() && self.sidebar_state.cursor == Some(ix) && (self.sidebar_state.focus.is_focused(window) || self.focus.is_focused(window));
         let network = self.sidebar_state.home.network;
-        let click = move |row: Stateful<Div>, cx: &mut Context<Self>| row.on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.activate_home(ix, cx)));
+        let click = |row: Stateful<Div>, cx: &mut Context<Self>| self.tap(row, crate::gui::phone::token(&["home-item", &ix.to_string()]), None, move |this, cx| this.activate_home(ix, cx), cx);
         match item {
             Item::Header { label, first } => section_header(label, first).into_any_element(),
             Item::Chat(c) => {
@@ -444,17 +444,24 @@ impl Shell {
             .when(join, |row| row.group("voice"));
         let picked = c.clone();
         list_row(super::row_id("voice", &c.key), theme::row_height(theme::ROW_TWO), selected, focused, content)
-            .on_mouse_down(
-                MouseButton::Left,
-                // A voice channel joins on a double-click here too; a single click only opens.
-                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                    if join && event.click_count == 2 {
-                        this.call_start(picked.key.clone(), cx);
-                    } else {
-                        this.pick_row(&picked, cx);
-                    }
-                }),
-            )
+            .map(|row| {
+                if crate::gui::phone::active() {
+                    let token = crate::gui::phone::token(&["row", picked.key.network.label(), &picked.key.account, &picked.key.id]);
+                    let menu = Some(picked.clone());
+                    return self.tap(row, token, menu, move |this, cx| this.pick_row(&picked, cx), cx);
+                }
+                row.on_mouse_down(
+                    MouseButton::Left,
+                    // A voice channel joins on a double-click here too; a single click only opens.
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        if join && event.click_count == 2 {
+                            this.call_start(picked.key.clone(), cx);
+                        } else {
+                            this.pick_row(&picked, cx);
+                        }
+                    }),
+                )
+            })
     }
 
     /// Telegram's folder tabs under the jump strip: All, then each folder with its count.

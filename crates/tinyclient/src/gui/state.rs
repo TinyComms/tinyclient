@@ -209,6 +209,8 @@ pub struct Shell {
     pub(super) slots: Slots,
     pub(super) layout_state: layout::State,
     pub(super) sidebar_state: sidebar::State,
+    /// The phone form: which tab, each tab's stack, the list's scope (`gui/phone`).
+    pub(super) phone_state: super::phone::State,
     // Each view's own state lives in its own file. They are only held here.
     #[allow(dead_code)]
     pub(super) conversation_state: conversation::State,
@@ -254,6 +256,8 @@ impl Shell {
         Self::watch(cx);
         Self::watch_updates(cx);
         Self::wake_at_thresholds(cx);
+        #[cfg(debug_assertions)]
+        Self::debug_launch_watch(cx);
         let subscriptions = [
             cx.observe_window_activation(window, |this, window, cx| {
                 this.active = window.is_window_active();
@@ -288,6 +292,7 @@ impl Shell {
             },
             layout_state: layout::State::default(),
             sidebar_state: sidebar::State::new(cx),
+            phone_state: super::phone::State::default(),
             conversation_state: conversation::State::default(),
             people_state: people::State::default(),
             composer_state: composer::State::default(),
@@ -792,13 +797,18 @@ impl Shell {
 
     /// `shift-esc`: the open conversation is read up to its newest message.
     pub(super) fn mark_open_read(&mut self, cx: &mut Context<Self>) {
+        if let Some(conversation) = self.open.clone() {
+            self.mark_read(conversation, cx);
+        }
+    }
+
+    /// Marks a conversation read up to its newest message, here and on the network: a row's
+    /// menu, or the open conversation's Mark as Read.
+    pub(super) fn mark_read(&mut self, conversation: Key, cx: &mut Context<Self>) {
         // A screenshot or a driven test never reads anything on a network.
         if cfg!(feature = "gui-shot") {
             return;
         }
-        let Some(conversation) = self.open.clone() else {
-            return;
-        };
         let read = move || -> io::Result<()> {
             let newest = Request::Messages { conversation: conversation.clone(), page: Page::Newest, limit: 1 };
             if let Response::Messages { messages, .. } = ask(&newest)? {

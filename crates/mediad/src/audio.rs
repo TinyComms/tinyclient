@@ -466,7 +466,7 @@ fn devices_of(system: &dyn Host, input: bool) -> (Vec<AudioDevice>, String) {
 
 /// Asks the system what exists. Opens nothing.
 pub fn listing() -> Listing {
-    if let Ok(kind) = std::env::var("TINYCLIENT_MEDIAD_AUDIO") {
+    if let Ok(kind) = crate::out::var("TINYCLIENT_MEDIAD_AUDIO").ok_or(()) {
         let stand_in = |name: &str| AudioDevice { id: name.to_owned(), name: name.to_owned(), default: true, auto: true, ..AudioDevice::default() };
         return Listing {
             inputs: vec![stand_in(&kind)],
@@ -948,7 +948,7 @@ fn trim_front(samples: &mut Vec<f32>, keep: usize, fade: usize) {
 impl Audio {
     /// True when the environment replaced the devices, so no permission applies.
     pub fn simulated() -> bool {
-        std::env::var_os("TINYCLIENT_MEDIAD_AUDIO").is_some()
+        crate::out::var_os("TINYCLIENT_MEDIAD_AUDIO").is_some()
     }
 
     /// Opens the microphone and speaker, or their stand-ins.
@@ -979,7 +979,7 @@ impl Audio {
     /// Opens only the microphone (`sides.0`) or only the speaker (`sides.1`), for a test.
     pub fn open_sides(want_input: Option<String>, want_output: Option<String>, sides: (bool, bool)) -> Result<Audio, AudioError> {
         let mut audio = Audio::empty(want_input, want_output, sides);
-        if let Ok(kind) = std::env::var("TINYCLIENT_MEDIAD_AUDIO") {
+        if let Ok(kind) = crate::out::var("TINYCLIENT_MEDIAD_AUDIO").ok_or(()) {
             let tone = |hz: f64| Source::Tone { phase: 0., step: hz * std::f64::consts::TAU / f64::from(RATE) };
             let pitch = kind.strip_prefix("tone:").and_then(|hz| hz.parse().ok());
             audio.source = match (kind.as_str(), pitch) {
@@ -988,7 +988,7 @@ impl Audio {
                 ("onset", _) => Source::Onset { at: 0 },
                 _ => Source::Silence,
             };
-            audio.sink = match std::env::var_os("TINYCLIENT_MEDIAD_SINK") {
+            audio.sink = match crate::out::var_os("TINYCLIENT_MEDIAD_SINK") {
                 Some(path) => Sink::File(File::create(path).map_err(|e| AudioError::Speaker(e.to_string()))?),
                 None => Sink::Null,
             };
@@ -1295,7 +1295,7 @@ impl Speaker {
     pub fn open(want: Option<&str>) -> Result<Speaker, AudioError> {
         let mut speaker = Speaker { sink: Sink::Null, began: Instant::now(), given: 0, scratch: Vec::new(), name: "null".to_owned() };
         if Audio::simulated() {
-            if let Some(path) = std::env::var_os("TINYCLIENT_MEDIAD_SINK") {
+            if let Some(path) = crate::out::var_os("TINYCLIENT_MEDIAD_SINK") {
                 speaker.sink = Sink::File(File::create(path).map_err(|e| AudioError::Speaker(e.to_string()))?);
             }
             return Ok(speaker);

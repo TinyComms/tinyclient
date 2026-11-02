@@ -618,7 +618,7 @@ impl Loop {
         announce(&self.setup.audio);
         let mut datagram = [0u8; 2048];
         let mut next = Instant::now() + TICK;
-        while !self.setup.stop.load(Ordering::Relaxed) {
+        while !self.setup.stop.load(Ordering::Relaxed) && !crate::out::over() {
             let now = Instant::now();
             if now < next {
                 let _ = self
@@ -1032,9 +1032,9 @@ impl DeviceDesk {
     fn start() -> DeviceDesk {
         let (orders_tx, orders_rx) = mpsc::channel();
         let (notes_tx, notes_rx) = mpsc::channel();
-        let join = thread::Builder::new()
-            .name("mediad-devices".to_owned())
-            .spawn(move || {
+        let join = crate::out::spawn(thread::Builder::new()
+            .name("mediad-devices".to_owned()),
+            move || {
                 while let Ok(order) = orders_rx.recv() {
                     match order {
                         Order::Open(ask) => {

@@ -20,6 +20,10 @@ pub(super) const DENIED: &str = "Allow the microphone in your system privacy set
 #[cfg(windows)]
 pub(super) const DENIED: &str = "Allow the microphone in Windows Settings › Privacy › Microphone, then call again.";
 
+/// Android and iOS: the reason names no settings path there.
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+pub(super) const DENIED: &str = "Allow the microphone in the system settings, then call again.";
+
 /// How long the system's prompt may stay unanswered before the call is started anyway. mediad
 /// then finds the permission still unasked and watches for the answer itself.
 const PATIENCE: Duration = Duration::from_secs(120);

@@ -44,6 +44,8 @@ pub fn tip(
     let words: SharedString = crate::gui::shortcuts::label(&words).into();
     move |_, cx| {
         let words = words.clone();
+        // A phone has no keyboard: a tooltip there (a long press shows one) names no keys.
+        let shortcut = shortcut.filter(|_| !crate::gui::phone::active());
         cx.new(|_| Tip { words, shortcut: shortcut.map(|keys| crate::gui::shortcuts::label(keys).into()) }).into()
     }
 }
@@ -104,27 +106,34 @@ fn menu_row(
     icon_color: Rgba,
     highlight: Rgba,
 ) -> Stateful<Div> {
+    // On a phone every menu is a sheet: 48 pt rows, a 20 pt glyph and 16 pt words, as the
+    // message sheet has them, lit while pressed rather than under a pointer.
+    let phone = crate::gui::phone::active();
+    let glyph_size = if phone { 20. } else { 16. };
     let lead = icon.map(|icon| match icon {
-        NO_GLYPH => div().flex_none().size(px(16.)).into_any_element(),
-        icon => glyph(icon, 16., icon_color).into_any_element(),
+        NO_GLYPH => div().flex_none().size(px(glyph_size)).into_any_element(),
+        icon => glyph(icon, glyph_size, icon_color).into_any_element(),
     });
+    let words = crate::gui::phone::tokens::scaled(16.);
     div()
         .id(id)
         .group("menu-item")
         .flex_none()
-        .h(px(theme::row_height(theme::ROW_ONE)))
-        .px(px(8.))
-        .rounded(px(theme::R_CONTROL))
+        .h(px(if phone { (crate::gui::phone::tokens::scaled(22.) + 26.).max(48.) } else { theme::row_height(theme::ROW_ONE) }))
+        .px(px(if phone { 12. } else { 8. }))
+        .rounded(px(if phone { theme::R_CARD } else { theme::R_CONTROL }))
         .flex()
         .items_center()
-        .gap(px(8.))
+        .gap(px(if phone { 14. } else { 8. }))
         .cursor_pointer()
         .text_color(color)
-        .hover(move |style| style.bg(highlight))
+        .when(phone, |row| row.text_size(px(words)).line_height(px(crate::gui::phone::tokens::scaled(22.))).active(move |style| style.bg(highlight)))
+        .when(!phone, |row| row.hover(move |style| style.bg(highlight)))
         .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
         .children(lead)
         .child(div().flex_1().min_w_0().truncate().child(label.into()))
-        .children(shortcut.map(|keys| {
+        // A phone has no keyboard: its menus name no keys.
+        .children(shortcut.filter(|_| !crate::gui::phone::active()).map(|keys| {
             div()
                 .flex_none()
                 .type_small()
@@ -220,7 +229,7 @@ pub fn slider_value(x: f32, left: f32, width: f32) -> f32 {
 }
 
 pub fn menu_separator() -> Div {
-    div().flex_none().my(px(4.)).h(px(1.)).bg(theme::hairline())
+    div().flex_none().my(px(4.)).when(crate::gui::phone::active(), |rule| rule.mx(px(12.))).h(px(1.)).bg(theme::hairline())
 }
 
 /// A menu's own label: 24 high, 11/500 `text_faint`, sentence case.
@@ -294,7 +303,24 @@ pub fn fade_in<E: IntoElement + Styled + 'static>(
 ) -> AnimationElement<E> {
     let milliseconds = if crate::gui::app::reduce_motion() { 0 } else { milliseconds };
     let animation = Animation::new(Duration::from_millis(milliseconds.max(1))).with_easing(gpui::ease_out_quint());
-    element.with_animation(id, animation, |element, delta| element.opacity(delta))
+    // A still starts where the fade ends: its first frame may be the picture.
+    let still = still();
+    element.with_animation(id, animation, move |element, delta| element.opacity(if still { 1. } else { delta }))
+}
+
+/// A screenshot (`--shot`) is a still: what fades in is drawn as it ends. A layer opened by the
+/// frame the picture is taken from (the composer's picker, staged once its button has a place)
+/// would otherwise be caught at the start of its fade, invisible.
+fn still() -> bool {
+    #[cfg(feature = "gui-shot")]
+    {
+        static STILL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *STILL.get_or_init(|| std::env::args().any(|arg| arg == "--shot") && !std::env::args().any(|arg| arg == "--frames"))
+    }
+    #[cfg(not(feature = "gui-shot"))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]

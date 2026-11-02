@@ -344,7 +344,7 @@ pub fn sheet() -> Option<AnyElement> {
             .child("Enlarged 4x")
             .children([Shape::Online, Shape::Idle, Shape::Dnd, Shape::Offline].map(big)),
     );
-    Some(deferred(gpui::anchored().position(point(px(0.), px(0.))).child(sheet)).with_priority(3).into_any_element())
+    Some(deferred(gpui::anchored().position(point(px(0.), px(0.))).child(sheet)).priority(3).into_any_element())
 }
 
 /// Details states, with live data from a scratch daemon and `--open N`: `d-open` (Details of

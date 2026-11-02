@@ -6,7 +6,6 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 use std::time::Duration;
-use ureq::tls::{TlsConfig, TlsProvider};
 
 /// How long one request may take. A redirect is not followed, so this is one host.
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -54,12 +53,7 @@ pub struct BotMe {
 
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
-        .tls_config(
-            TlsConfig::builder()
-                .provider(TlsProvider::NativeTls)
-                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                .build(),
-        )
+        .tls_config(crate::tls::config())
         .timeout_global(Some(TIMEOUT))
         .http_status_as_error(false)
         .max_redirects(0)

@@ -727,9 +727,8 @@ fn uploads_to(network: Network, url: &str) -> bool {
 }
 
 fn agent() -> ureq::Agent {
-    use ureq::tls::{TlsConfig, TlsProvider};
     ureq::Agent::config_builder()
-        .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
+        .tls_config(crate::tls::config())
         .timeout_connect(Some(Duration::from_secs(10)))
         // A large file on a slow line is one request, so nothing limits the body; the answer
         // after it may take the network a while to make.

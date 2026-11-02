@@ -3,7 +3,8 @@
 //! about its connection: trouble shows as a banner in the pane concerned.
 
 use super::components::{badge_dot, divider, glyph, network_icon, tip, Avatar, Shape};
-use super::layout::{drags_window, Menu, RAIL_WIDTH, TOP_BAR};
+use super::layout::{drags_window, rail_width, Menu, TOP_BAR};
+use super::phone::tokens;
 use super::people::presence;
 use super::sidebar::Mode;
 use super::state::{Shell, Snapshot};
@@ -52,6 +53,7 @@ impl Shell {
     fn rail_button(&self, id: impl Into<ElementId>, place: Place, cx: &mut Context<Self>) -> Stateful<Div> {
         let Place { mode, content, waiting: (attention, unread), mention, counted, faint, name, index: place } = place;
         let lit = self.sidebar_state.mode == mode;
+        let phone = super::phone::active();
         const KEYS: [&str; 9] = ["⌘1", "⌘2", "⌘3", "⌘4", "⌘5", "⌘6", "⌘7", "⌘8", "⌘9"];
         div()
             .id(id)
@@ -64,7 +66,8 @@ impl Shell {
             .justify_center()
             .cursor_pointer()
             .when(lit, |button| button.bg(theme::selected()))
-            .when(!lit, |button| button.hover(|style| style.bg(theme::hover())))
+            .when(!lit && !phone, |button| button.hover(|style| style.bg(theme::hover())))
+            .when(phone, |button| button.active(|style| style.bg(theme::pressed())))
             .tooltip(tip(format!("{name}{}", waiting(attention, unread)), KEYS.get(place).copied()))
             .on_click(cx.listener(move |this, _, window, cx| this.visit(mode.clone(), window, cx)))
             .child(div().when(faint, |content| content.opacity(0.4)).child(content))
@@ -79,7 +82,7 @@ impl Shell {
         // A rail click always brings a hidden sidebar back.
         state.sidebar_hidden = false;
         if super::layout::plan(width, state.sidebar_width, false, None).sidebar.is_none() {
-            state.floating = !(state.floating && self.sidebar_state.mode == mode);
+            state.floating = !super::phone::active() && !(state.floating && self.sidebar_state.mode == mode);
         }
         self.go(mode, cx);
         cx.notify();
@@ -187,6 +190,7 @@ impl Shell {
         let mine = mine.build().children(
             presence::Shape::of(self.own_presence()).and_then(|shape| presence::dot(shape, 32., &presence::Ring::on(theme::rail()))),
         );
+        let phone = super::phone::active();
         let chrome = |id: &'static str, menu: Menu, words: &'static str| {
             let lit = matches!((&self.layout_state.menu, &menu), (Some(Menu::Add), Menu::Add) | (Some(Menu::Own), Menu::Own));
             div()
@@ -199,13 +203,14 @@ impl Shell {
                 .justify_center()
                 .cursor_pointer()
                 .when(lit, |button| button.bg(theme::selected()))
-                .hover(|style| style.bg(theme::hover()))
+                .when(!phone, |button| button.hover(|style| style.bg(theme::hover())))
+                .when(phone, |button| button.active(|style| style.bg(theme::pressed())))
                 .tooltip(tip(words, None))
                 .on_click(cx.listener(move |this, _, _, cx| this.open_menu(menu.clone(), cx)))
         };
 
         div()
-            .w(px(RAIL_WIDTH))
+            .w(px(rail_width()))
             .h_full()
             .flex_none()
             .flex()
@@ -214,19 +219,22 @@ impl Shell {
             .bg(theme::rail())
             .border_r_1()
             .border_color(theme::hairline())
-            .child(drags_window(div().h(px(TOP_BAR)).w_full().flex_none()))
+            // On a phone the status bar takes the strip's place, and the Inbox button sits level with
+            // the sidebar's title: 4 above a 44 button in a 52 strip.
+            .child(drags_window(div().h(px(if phone { tokens::safe_top() + 4. } else { TOP_BAR })).w_full().flex_none()))
             .child(div().flex().flex_col().items_center().gap(px(8.)).child(inbox).child(people))
             // The networks and pins scroll together; what is above and below never moves.
             .child(div().id("rail-places").mt(px(8.)).flex_1().min_h_0().w_full().overflow_y_scroll().child(places))
             .child(
                 div()
                     .flex_none()
-                    .py(px(8.))
+                    .pt(px(8.))
+                    .pb(px(8. + if phone { tokens::safe_bottom() } else { 0. }))
                     .flex()
                     .flex_col()
                     .items_center()
                     .gap(px(4.))
-                    .child(chrome("rail-add", Menu::Add, "Add an account").size(px(32.)).child(glyph("icons/plus.svg", 16., theme::text_faint())))
+                    .child(chrome("rail-add", Menu::Add, "Add an account").size(px(if phone { 44. } else { 32. })).child(glyph("icons/plus.svg", 16., theme::text_faint())))
                     .child({
                         let (words, waiting) = match crate::update::shown() {
                             crate::update::Shown::Ready { .. } => ("Update ready", true),

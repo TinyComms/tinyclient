@@ -272,7 +272,7 @@ fn frame_at(delays: &[Duration], plays: Option<u32>, played: Duration) -> (usize
 pub fn paint(bounds: Bounds<Pixels>, image: &Arc<RenderImage>, fit: ObjectFit, radius: Pixels, play: Play, window: &mut Window, cx: &mut App) {
     let frame = if image.frame_count() > 1 { frame_now(bounds, image, play, window, cx) } else { 0 };
     let fitted = fit.get_bounds(bounds, image.size(frame));
-    let _ = window.paint_image(bounds, fitted, Corners::all(radius), image.clone(), frame, false);
+    let _ = window.paint_image(bounds, fitted, Corners::all(radius), 0., image.clone(), frame, false);
 }
 
 fn frame_now(bounds: Bounds<Pixels>, image: &Arc<RenderImage>, play: Play, window: &mut Window, cx: &mut App) -> usize {

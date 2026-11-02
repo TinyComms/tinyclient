@@ -46,6 +46,7 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
 ] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSResponder"] }
 
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-# org.freedesktop.Notifications on the session bus. Already in the tree through GPUI.
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios"))))'.dependencies]
+# org.freedesktop.Notifications on the session bus. Already in the tree through GPUI. Phones
+# have no session bus: they get the sink that refuses each post (`Unsupported`).
 zbus = "5"

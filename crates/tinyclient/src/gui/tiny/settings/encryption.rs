@@ -265,7 +265,10 @@ fn device_row(
                 )
                 .child(
                     div()
-                        .truncate()
+                        // Whole on a phone, where the row is too narrow for it: it is what two
+                        // screens compare.
+                        .when(!crate::gui::phone::active(), |line| line.truncate())
+                        .when(crate::gui::phone::active(), |line| line.whitespace_normal())
                         .type_small()
                         .font_family(theme::MONO)
                         .text_color(theme::text_soft())
@@ -532,6 +535,8 @@ pub(in crate::gui::tiny) fn encryption(
         };
         people = people.child(
             kit::table_row(SharedString::from(format!("tiny-e2ee-person-{ix}")), false)
+                // On a phone the buttons go under the number, which keeps the width it needs.
+                .when(crate::gui::phone::active(), |row| row.flex_col().items_start().gap(px(6.)))
                 .child(
                     div()
                         .flex_1()

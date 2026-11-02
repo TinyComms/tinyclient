@@ -5,6 +5,7 @@
 //! the next frame is drawn: a switch and the pane that follows it land in the same frame, and
 //! the old subject is never drawn beside the new conversation.
 
+use palette::IntoColor;
 use crate::gui::pane::{self, Layer, Showing, Stack, Step};
 use super::{Pane, PaneEvent};
 use crate::client::ask;
@@ -221,7 +222,7 @@ fn matched(text: &str, words: &str) -> Vec<Range<usize>> {
 
 /// The heavier letters a match is drawn with, as the switcher's rows do.
 fn lit() -> HighlightStyle {
-    HighlightStyle { color: Some(theme::text().into()), font_weight: Some(FontWeight::SEMIBOLD), ..Default::default() }
+    HighlightStyle { color: Some(theme::text().into_color()), font_weight: Some(FontWeight::SEMIBOLD), ..Default::default() }
 }
 
 impl Side {
@@ -488,7 +489,9 @@ impl Shell {
         let shell = cx.weak_entity();
         let root = root.clone();
         let view = cx.new(|cx| {
-            let mut view = Pane::new(super::tokens::Metrics::DENSE, shell, cx);
+            // On a phone the thread is a page of its own, read as the conversation is.
+            let metrics = if crate::gui::phone::active() { super::tokens::Metrics::PHONE } else { super::tokens::Metrics::DENSE };
+            let mut view = Pane::new(metrics, true, shell, cx);
             view.show_thread(key, &title, &me, root, cx);
             view
         });
@@ -557,7 +560,7 @@ impl Shell {
     }
 
     /// The header's Details button.
-    pub(super) fn toggle_details(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn toggle_details(&mut self, cx: &mut Context<Self>) {
         self.restore_switches();
         let Some(open) = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref()).map(pane_open) else {
             return;
@@ -573,7 +576,7 @@ impl Shell {
     }
 
     /// The header's Members button.
-    pub(super) fn toggle_member_list(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn toggle_member_list(&mut self, cx: &mut Context<Self>) {
         self.restore_switches();
         let Some(open) = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref()).map(pane_open) else {
             return;
@@ -1010,9 +1013,18 @@ impl Shell {
 
     /// The crumb's way back: the pushed layer goes.
     fn pop(&mut self, cx: &mut Context<Self>) {
-        if self.conversation_state.side.stack.push.take().is_some() {
-            self.install(cx);
+        self.pane_pop(cx);
+    }
+
+    /// Back from a layer pushed over another in the right pane (a Profile over Members): the
+    /// pushed one goes. False when nothing was pushed, so back closes the pane.
+    pub(in crate::gui) fn pane_pop(&mut self, cx: &mut Context<Self>) -> bool {
+        let side = &mut self.conversation_state.side;
+        if side.stack.base.is_none() || side.stack.push.take().is_none() {
+            return false;
         }
+        self.install(cx);
+        true
     }
 
     /// What is up that the Escape ladder (07 §6) passes before the pane. The composer's own
@@ -1045,6 +1057,12 @@ impl Shell {
     /// closes a thread; with nothing open it reads to the newest, and the composer keeps focus.
     #[allow(dead_code)]
     pub(in crate::gui) fn composer_escaped(&mut self, cx: &mut Context<Self>) {
+        // On a phone Escape is back (Android's back key arrives as it): one pushed page, so the
+        // composer's having the keys does not keep the conversation from being left.
+        if crate::gui::phone::active() {
+            self.phone_back(None, cx);
+            return;
+        }
         let showing = Showing { autocomplete: false, editing: false, replying: false, ..self.showing(cx) };
         let step = pane::escape(showing, &self.conversation_state.side.stack);
         self.escape_step(step, None, cx);
@@ -1164,7 +1182,9 @@ fn draw_side(shell: &Shell, window: &mut Window, cx: &mut Context<Shell>) -> Any
         Layer::Pinned(conversation) => draw_pins(shell, conversation, cx),
         Layer::Search => draw_search(shell, window, cx),
     };
-    let crumb = stack.push.as_ref().and(stack.base.as_ref()).map(|base| crumb(base.title(), cx));
+    // A phone's page has one way back, its strip's chevron, which pops the pushed layer first:
+    // no second back bar under it.
+    let crumb = stack.push.as_ref().and(stack.base.as_ref()).filter(|_| !crate::gui::phone::active()).map(|base| crumb(base.title(), cx));
     div()
         .size_full()
         .flex()

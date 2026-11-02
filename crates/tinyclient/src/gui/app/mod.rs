@@ -111,6 +111,20 @@ impl Shell {
     pub(in crate::gui) fn watch(cx: &mut Context<Self>) {
         // The Settings window reads the accounts from this shell.
         super::settings::attach(cx.entity().downgrade(), cx);
+        if !crate::gui::mobile_core_available() {
+            // No chatd on a phone, so nothing is started and nothing is polled. With no service
+            // there are no accounts: the empty snapshot and a settled phase make the first-run
+            // screen the way in. Replace this branch when the in-process core lands.
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    this.service.answered(0, protocol::Keychain::default(), unix_now());
+                    this.snapshot = Some(super::state::Snapshot::waiting());
+                    cx.notify();
+                });
+            })
+            .detach();
+            return;
+        }
         // The voice keys work in any app for as long as the window lives.
         super::hotkeys::start(cx.entity().downgrade(), cx);
         cx.spawn(async move |this, cx| loop {

@@ -101,7 +101,7 @@ impl Shell {
 /// A list under a trigger, as the page's pickers drop one.
 fn dropdown(list: Div, cx: &mut Context<Shell>) -> AnyElement {
     let list = list.on_mouse_down_out(cx.listener(|this, _, _, cx| this.tiny_members_draft(cx, |draft| draft.open = None)));
-    deferred(anchored().snap_to_window().child(div().mt(px(4.)).child(list))).with_priority(2).into_any_element()
+    deferred(anchored().snap_to_window().child(div().mt(px(4.)).child(list))).priority(2).into_any_element()
 }
 
 pub(in crate::gui::tiny) fn members(shell: &Shell, facts: &Facts, window: &mut Window, cx: &mut Context<Shell>) -> AnyElement {

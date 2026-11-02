@@ -351,6 +351,8 @@ pub trait Source {
     fn camera(&mut self, high: Option<Ask>, low: Option<Ask>)
         -> Result<(Encoded, Encoded), String>;
     fn close_camera(&mut self);
+    /// The share went off. A desktop's screen has nothing to close.
+    fn close_share(&mut self) {}
 }
 
 impl Source for Outgoing {
@@ -368,6 +370,11 @@ impl Source for Outgoing {
 
     fn close_camera(&mut self) {
         Outgoing::close_camera(self);
+    }
+
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    fn close_share(&mut self) {
+        Outgoing::close_share(self);
     }
 }
 
@@ -581,6 +588,9 @@ fn capture<S: Source>(mut work: Capture<S>, orders: &Orders) {
             }
             if seen.keep_camera && !wants.keep_camera {
                 work.source.close_camera();
+            }
+            if seen.share && !wants.share {
+                work.source.close_share();
             }
             seen = wants;
             continue;
@@ -798,9 +808,7 @@ fn start_capture<S: Source>(
     let (tell, words) = sync_channel(ENCODED);
     let (ended, done) = channel::<()>();
     let theirs = orders.clone();
-    std::thread::Builder::new()
-        .name("video-out".to_owned())
-        .spawn(move || {
+    out::spawn(std::thread::Builder::new().name("video-out".to_owned()), move || {
             let _ended: Sender<()> = ended;
             let work = Capture {
                 source: make(),
@@ -811,7 +819,7 @@ fn start_capture<S: Source>(
                 epoch: None,
             };
             capture(work, &theirs);
-        })?;
+    })?;
     Ok(Capturing {
         orders,
         words,
@@ -827,9 +835,7 @@ fn start_decode<P: Screen>(
     let inbox = Arc::new(Inbox::default());
     let (ended, done) = channel::<()>();
     let theirs = inbox.clone();
-    std::thread::Builder::new()
-        .name("video-in".to_owned())
-        .spawn(move || {
+    out::spawn(std::thread::Builder::new().name("video-in".to_owned()), move || {
             let _ended: Sender<()> = ended;
             rt::worker_thread();
             picture::warm();
@@ -842,7 +848,7 @@ fn start_decode<P: Screen>(
                 painted: None,
             }
             .run();
-        })?;
+    })?;
     Ok(Watcher { inbox, done })
 }
 

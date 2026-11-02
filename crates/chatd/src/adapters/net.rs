@@ -7,7 +7,6 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::http::HeaderValue;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
-use ureq::tls::{TlsConfig, TlsProvider};
 
 /// Where a network is reached. `var` names an environment variable that replaces `default`, so a
 /// test can point an adapter at a local fake replaying a recorded session (`http://` and `ws://`
@@ -48,7 +47,7 @@ pub fn redact(text: &str) -> String {
 
 pub fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
-        .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
+        .tls_config(crate::tls::config())
         .timeout_global(Some(Duration::from_secs(30)))
         .http_status_as_error(false)
         .user_agent(browser())
@@ -67,10 +66,8 @@ impl Socket {
             request.headers_mut().insert(*name, value);
         }
         let (socket, _) = tungstenite::connect(request).map_err(io::Error::other)?;
-        let tcp = match socket.get_ref() {
-            MaybeTlsStream::NativeTls(tls) => tls.get_ref(),
-            MaybeTlsStream::Plain(tcp) => tcp,
-            _ => return Err(io::Error::other("unexpected stream")),
+        let Some(tcp) = crate::tls::tcp(socket.get_ref()) else {
+            return Err(io::Error::other("unexpected stream"));
         };
         tcp.set_read_timeout(Some(tick))?;
         Ok(Socket(socket))

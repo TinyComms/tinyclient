@@ -1,0 +1,248 @@
+#!/usr/bin/env pwsh
+# Renders every screen of the phone UI with made-up data (`--shot --demo`), for design review
+# from screenshots. No chatd is started or asked, and nobody's real chats are read: the window
+# answers itself from crates/tinyclient/src/gui/shot_demo.rs, and APPDATA / LOCALAPPDATA point at
+# a scratch directory so no saved state of this machine leaks in.
+#
+#   .\scripts\mobile\phone-shots.ps1
+#   .\scripts\mobile\phone-shots.ps1 -Out C:\tmp\shots
+#   .\scripts\mobile\phone-shots.ps1 -NoBuild          # reuse target\debug\tinyclient.exe
+#
+# Files are named NN-state-WxH.png: each phone state at 390x844 and 360x780, the Inbox and the
+# conversation again at 150% text, and desktop-*.png at 1280x800 for reference.
+[CmdletBinding()]
+param(
+    [string]$Out = (Join-Path (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))) '_proof\design\before'),
+    [switch]$NoBuild,
+    # Only the call screens (40-59) and the desktop call dock, for work on calls.
+    [switch]$CallsOnly
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+
+function Fail([string]$message) {
+    Write-Host "phone-shots: $message" -ForegroundColor Red
+    exit 1
+}
+
+$cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue) -and (Test-Path (Join-Path $cargoBin 'cargo.exe'))) {
+    $env:PATH = "$cargoBin;$env:PATH"
+}
+
+if (-not $NoBuild) {
+    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+        Fail "cargo is not on PATH. Install Rust from https://rustup.rs, or add $cargoBin to PATH."
+    }
+    Write-Host 'phone-shots: building tinyclient --features gui-shot'
+    Push-Location $root
+    try {
+        cargo build -p tinyclient --features gui-shot --locked
+        if ($LASTEXITCODE -ne 0) { Fail 'the build failed' }
+    } finally {
+        Pop-Location
+    }
+}
+
+$exe = Join-Path $root 'target\debug\tinyclient.exe'
+if (-not (Test-Path $exe)) { Fail "no $exe; run without -NoBuild" }
+
+$Out = [System.IO.Path]::GetFullPath($Out)
+New-Item -ItemType Directory -Force -Path $Out | Out-Null
+
+# A scratch profile: no prefs, no crash log, no sign-ins of this machine.
+$scratch = Join-Path ([System.IO.Path]::GetTempPath()) "tinyclient-phone-shots-$PID"
+New-Item -ItemType Directory -Force -Path (Join-Path $scratch 'roaming'), (Join-Path $scratch 'local') | Out-Null
+$saved = @{ APPDATA = $env:APPDATA; LOCALAPPDATA = $env:LOCALAPPDATA }
+$env:APPDATA = Join-Path $scratch 'roaming'
+$env:LOCALAPPDATA = Join-Path $scratch 'local'
+
+# The shot hooks some states are reached through. Cleared before every shot.
+$hookVars = @(
+    'TINYCLIENT_SHOT_AT', 'TINYCLIENT_SHOT_HOVER', 'TINYCLIENT_SHOT_MENU', 'TINYCLIENT_SHOT_STEPS',
+    'TINYCLIENT_SHOT_CALL', 'TINYCLIENT_SIGNIN_SHOT', 'TINYCLIENT_S6', 'TINYCLIENT_SHOT_VIEW'
+)
+
+$made = New-Object System.Collections.Generic.List[string]
+$missing = New-Object System.Collections.Generic.List[string]
+
+function Shot([string]$name, [string]$size, [string[]]$arguments, [hashtable]$vars = @{}) {
+    foreach ($var in $hookVars) { Remove-Item "Env:$var" -ErrorAction SilentlyContinue }
+    foreach ($key in $vars.Keys) { Set-Item "Env:$key" $vars[$key] }
+    $file = Join-Path $Out "$name-$size.png"
+    Remove-Item $file -ErrorAction SilentlyContinue
+    $all = @('--shot', $file, '--size', $size, '--demo') + $arguments
+    # The window quits by itself once the frame is written. Piping its output is what makes
+    # PowerShell wait for a GUI program; the output itself is not a result.
+    & $exe @all 2>&1 | Out-Null
+    foreach ($key in $vars.Keys) { Remove-Item "Env:$key" -ErrorAction SilentlyContinue }
+    if (Test-Path $file) {
+        $made.Add((Split-Path -Leaf $file))
+        Write-Host "  $(Split-Path -Leaf $file)"
+    } else {
+        $missing.Add((Split-Path -Leaf $file))
+        Write-Host "  $(Split-Path -Leaf $file): not written" -ForegroundColor Yellow
+    }
+}
+
+# Row 1 of the list is "Foray carpool 🍄", the conversation with one of every kind of message;
+# row 2 is the direct conversation with Yusuf Demirci; row 3 is Slack's #platform.
+$carpool = @('--open', '1')
+# The phone is the desktop's rail and sidebar; a conversation and the right pane push over them.
+$phone = @(
+    @{ n = '01-inbox';               a = @() },
+    @{ n = '02-inbox-unread';        a = @('--filter', 'unread') },
+    @{ n = '03-inbox-mentions';      a = @('--filter', 'mentions') },
+    @{ n = '04-people';              a = @('--mode', 'people') },
+    @{ n = '05-discord';             a = @('--mode', 'discord') },
+    @{ n = '06-discord-server';      a = @('--mode', 'space', '--space', '1') },
+    @{ n = '07-slack';               a = @('--mode', 'slack') },
+    @{ n = '08-jump-to';             a = @('--switcher') },
+    @{ n = '09-account-sheet';       a = @('--menu', 'account') },
+    @{ n = '10-add-sheet';           a = @('--menu', 'add') },
+    @{ n = '11-row-sheet';           a = @('--menu', 'row') },
+    @{ n = '12-conversation-bottom'; a = $carpool },
+    @{ n = '13-conversation-top';    a = $carpool; v = @{ TINYCLIENT_SHOT_AT = 'm01' } },
+    @{ n = '14-conversation-link-image'; a = $carpool; v = @{ TINYCLIENT_SHOT_AT = 'm08' } },
+    @{ n = '15-conversation-code-reply-file'; a = $carpool; v = @{ TINYCLIENT_SHOT_AT = 'm12' } },
+    @{ n = '16-composer-text';       a = $carpool + @('--compose', 'Running 10 min late, save me a coffee') },
+    @{ n = '17-message-actions';     a = $carpool; v = @{ TINYCLIENT_SHOT_HOVER = 'm25' } },
+    @{ n = '18-message-menu';        a = $carpool; v = @{ TINYCLIENT_SHOT_MENU = 'm25' } },
+    # The right pane as a pushed page: a channel's Details and members, a person's profile.
+    @{ n = '19-channel-details';     a = @('--open', '3', '--right', 'details') },
+    @{ n = '20-channel-members';     a = @('--open', '3', '--right', 'member-list') },
+    @{ n = '21-profile';             a = @('--open', '2', '--right', 'details') },
+    # A tap on a person (their face, their name, an @mention, a member) opens their Profile
+    # page on a phone, never the desktop's card: this stages the card and shows the page.
+    @{ n = '22-profile-card';        a = @('--open', '2'); v = @{ TINYCLIENT_S6 = 'd-card' } },
+    @{ n = '23-first-run';           a = @('--demo-empty') },
+    @{ n = '24-sign-in-sheet';       a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'phone' } },
+    # Every sign-in flow as a phone page (`gui/signin/page.rs`), with made-up steps.
+    @{ n = '24a-sign-in-telegram';   a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'qr' } },
+    @{ n = '24b-sign-in-code-wrong'; a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'code-wrong' } },
+    @{ n = '24c-sign-in-password';   a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'password' } },
+    @{ n = '24d-sign-in-tiny';       a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'tiny' } },
+    @{ n = '24e-sign-in-tiny-error'; a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'tiny-error' } },
+    @{ n = '24f-sign-in-discord';    a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'discord' } },
+    @{ n = '24g-sign-in-discord-waiting'; a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'discord-waiting' } },
+    @{ n = '24h-sign-in-slack';      a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'slack' } },
+    @{ n = '24i-sign-in-teams';      a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'teams' } },
+    # Slack's #platform with the thread under its first message opened as a page.
+    @{ n = '28-slack-thread';        a = @('--open', '3'); v = @{ TINYCLIENT_SHOT_STEPS = 'wait:1500;thread' } },
+    # The viewer, from the picture in "Sunrise at the weir".
+    @{ n = '29-image-viewer';        a = $carpool; v = @{ TINYCLIENT_SHOT_VIEW = 'm10' } },
+    @{ n = '30-jump-to-query';       a = @('--switcher', 'mo') },
+    # The Tiny server "Premier" as its owner sees it, in the sidebar's place.
+    @{ n = '31-tiny-server';         a = @('--mode', 'tiny') },
+    @{ n = '32-reply-bar';           a = $carpool + @('--composer', 'reply') },
+    @{ n = '33-emoji-picker';        a = $carpool + @('--composer', 'picker-emoji') },
+    # End-to-end encrypted text on a Tiny server: Ana's direct conversation says so under its
+    # title (a tap opens Encryption), and a message sent before this device joined says it can't
+    # be opened. Encryption itself, with the safety numbers, is a pushed page on a phone.
+    @{ n = '34-tiny-encrypted-dm';   a = @('--open', '6') },
+    @{ n = '35-tiny-encryption';     a = @('--mode', 'tiny', '--tiny-settings', 'encryption') },
+    @{ n = '36-tiny-encryption-people'; a = @('--mode', 'tiny', '--tiny-settings', 'encryption', '--tiny-scroll', '600') }
+)
+# A call on a phone (`gui/call/phone`): its own screen, the bar over every other screen when it
+# is minimised, its pages and sheets. Each is a made-up call (`gui/call/shot.rs`, `phone_*`).
+$callShots = @(
+    @{ n = '40-call-voice';          c = 'phone_voice' },
+    @{ n = '41-call-video';          c = 'phone_video' },
+    @{ n = '42-call-group';          c = 'phone_group' },
+    @{ n = '43-call-crowd';          c = 'phone_crowd' },
+    @{ n = '44-call-share';          c = 'phone_share' },
+    @{ n = '45-call-incoming';       c = 'phone_incoming' },
+    @{ n = '46-call-incoming-video'; c = 'phone_incoming_video' },
+    @{ n = '47-call-outgoing';       c = 'phone_outgoing' },
+    @{ n = '48-call-connecting';     c = 'phone_connecting' },
+    @{ n = '49-call-reconnecting';   c = 'phone_reconnecting' },
+    @{ n = '50-call-pill-inbox';     c = 'phone_pill' },
+    @{ n = '51-call-pill-conversation'; c = 'phone_pill'; a = @('--open', '1') },
+    @{ n = '52-call-people';         c = 'phone_people' },
+    @{ n = '53-call-devices';        c = 'phone_devices' },
+    @{ n = '54-call-more';           c = 'phone_more' },
+    @{ n = '55-call-security';       c = 'phone_security' },
+    @{ n = '55a-call-security-blocked'; c = 'phone_security_blocked' },
+    @{ n = '56-call-mic-denied';     c = 'phone_denied' },
+    @{ n = '57-call-camera-denied';  c = 'phone_camera_denied' },
+    @{ n = '58-call-no-answer';      c = 'phone_failed' },
+    @{ n = '59-call-ended';          c = 'phone_ended' }
+)
+# Settings on a phone is a page of the one window (`gui/settings/phone_page.rs`); the shot draws
+# that page in a window of its own at the phone's size. `list` is the list of sections.
+$settingsShots = @(
+    @{ n = '25-settings';            a = @('--settings', 'accounts') },
+    @{ n = '25a-settings-list';      a = @('--settings', 'list') },
+    @{ n = '25b-settings-appearance'; a = @('--settings', 'appearance') },
+    @{ n = '25c-settings-messages';  a = @('--settings', 'messages') },
+    @{ n = '25d-settings-privacy';   a = @('--settings', 'privacy') },
+    @{ n = '25e-settings-storage';   a = @('--settings', 'storage') },
+    @{ n = '25f-settings-about';     a = @('--settings', 'about') },
+    @{ n = '25g-settings-confirm';   a = @('--settings', 'about', '--settings-confirm', 'reset') },
+    @{ n = '25h-settings-search';    a = @('--settings', 'list', '--settings-search', 'text') }
+)
+
+function CallShots([string]$size) {
+    Write-Host "phone-shots: calls at $size"
+    foreach ($shot in $callShots) {
+        $arguments = if ($shot.ContainsKey('a')) { $shot.a } else { @() }
+        Shot $shot.n $size $arguments @{ TINYCLIENT_SHOT_CALL = $shot.c }
+    }
+}
+
+try {
+    if ($CallsOnly) {
+        foreach ($size in @('390x844', '360x780')) { CallShots $size }
+        Shot 'desktop-call-dock' '1280x800' @('--open', '1') @{ TINYCLIENT_SHOT_CALL = 'joined' }
+        Write-Host "phone-shots: $($made.Count) written to $Out"
+        if ($missing.Count -gt 0) { Write-Host "phone-shots: not written: $($missing -join ', ')" -ForegroundColor Yellow; exit 1 }
+        exit 0
+    }
+    foreach ($size in @('390x844', '360x780')) {
+        CallShots $size
+        Write-Host "phone-shots: phone at $size"
+        foreach ($shot in $phone) {
+            $vars = if ($shot.ContainsKey('v')) { $shot.v } else { @{} }
+            Shot $shot.n $size $shot.a $vars
+        }
+        # Settings: drawn at the phone's size beside a held main window.
+        foreach ($shot in $settingsShots) {
+            $settings = Join-Path $Out "$($shot.n)-$size.png"
+            Remove-Item $settings -ErrorAction SilentlyContinue
+            foreach ($var in $hookVars) { Remove-Item "Env:$var" -ErrorAction SilentlyContinue }
+            $throwaway = Join-Path $scratch 'settings-main.png'
+            $all = @('--shot', $throwaway, '--size', $size, '--demo', '--hold', '3') + $shot.a + @('--settings-shot', $settings, '--settings-size', $size)
+            & $exe @all 2>&1 | Out-Null
+            if (Test-Path $settings) { $made.Add((Split-Path -Leaf $settings)); Write-Host "  $(Split-Path -Leaf $settings)" }
+            else { $missing.Add((Split-Path -Leaf $settings)); Write-Host "  $(Split-Path -Leaf $settings): not written" -ForegroundColor Yellow }
+        }
+    }
+
+    Write-Host 'phone-shots: 150% text'
+    Shot '26-inbox-text150' '390x844' @('--text-scale', '1.5')
+    Shot '27-conversation-text150' '390x844' ($carpool + @('--text-scale', '1.5'))
+
+    Write-Host 'phone-shots: desktop, for reference'
+    Shot 'desktop-inbox' '1280x800' @()
+    Shot 'desktop-conversation' '1280x800' @('--open', '1')
+    # The call dock lives in the desktop sidebar; the phone form does not draw it.
+    Shot 'desktop-call-dock' '1280x800' @('--open', '1') @{ TINYCLIENT_SHOT_CALL = 'joined' }
+    Shot 'desktop-first-run' '1280x800' @('--demo-empty')
+    Shot 'desktop-sign-in-sheet' '1280x800' @('--demo-empty') @{ TINYCLIENT_SIGNIN_SHOT = 'phone' }
+} finally {
+    $env:APPDATA = $saved.APPDATA
+    $env:LOCALAPPDATA = $saved.LOCALAPPDATA
+    foreach ($var in $hookVars) { Remove-Item "Env:$var" -ErrorAction SilentlyContinue }
+    Remove-Item -Recurse -Force $scratch -ErrorAction SilentlyContinue
+}
+
+Write-Host "phone-shots: $($made.Count) written to $Out"
+if ($missing.Count -gt 0) {
+    Write-Host "phone-shots: not written: $($missing -join ', ')" -ForegroundColor Yellow
+    exit 1
+}
+
+exit 0

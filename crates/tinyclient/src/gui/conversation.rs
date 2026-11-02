@@ -213,6 +213,8 @@ type Seen = Rc<RefCell<Vec<(usize, Bounds<Pixels>)>>>;
 /// The messages of one conversation, or of one thread.
 pub struct Pane {
     metrics: Metrics,
+    /// A thread's pane, not a conversation's.
+    thread: bool,
     shell: WeakEntity<Shell>,
     open: Option<Open>,
     window: pages::Window,
@@ -279,6 +281,9 @@ pub struct Pane {
     viewer: Option<viewer::Viewer>,
     /// The message under the pointer, which shows the toolbar.
     hover: Option<String>,
+    /// A phone's press on a message, where it went down, and the timer that shows the toolbar
+    /// if it holds still (`actions::LONG_PRESS`). Dropping the task cancels it.
+    press: Option<(gpui::Task<()>, (f32, f32))>,
     menu: Option<actions::Menu>,
     picker: Option<actions::Picking>,
     /// The message the delete dialog asks about.
@@ -312,6 +317,10 @@ pub struct Pane {
 
     /// How wide the list was when last drawn; 0 before the first draw.
     width: f32,
+    /// A phone's first frame after opening, before the rows can be measured: a conversation
+    /// that fits the viewport is then left at its start, and one that overflows opens at its
+    /// newest message.
+    opening: bool,
     /// Where each row drawn this frame is, for knowing what is on screen.
     seen: Seen,
     #[cfg(feature = "gui-shot")]
@@ -319,11 +328,14 @@ pub struct Pane {
 }
 
 impl Pane {
-    fn new(metrics: Metrics, shell: WeakEntity<Shell>, cx: &mut Context<Self>) -> Pane {
+    /// `thread`: the pane under a message, which reads down from its root and has no
+    /// conversation's own staging. A desktop draws it `DENSE`; a phone, as its conversations.
+    fn new(metrics: Metrics, thread: bool, shell: WeakEntity<Shell>, cx: &mut Context<Self>) -> Pane {
         // A thread reads down from its root; a conversation up from its newest message.
-        let alignment = if metrics == Metrics::DENSE { ListAlignment::Top } else { ListAlignment::Bottom };
+        let alignment = if thread { ListAlignment::Top } else { ListAlignment::Bottom };
         Pane {
             metrics,
+            thread,
             shell,
             open: None,
             window: pages::Window::default(),
@@ -362,6 +374,7 @@ impl Pane {
             flash: None,
             viewer: None,
             hover: None,
+            press: None,
             menu: None,
             picker: None,
             confirm: None,
@@ -377,14 +390,15 @@ impl Pane {
             scrub_bounds: Rc::default(),
             play_after: None,
             width: 0.,
+            opening: false,
             seen: Rc::default(),
             #[cfg(feature = "gui-shot")]
-            script: if metrics == Metrics::DENSE { shot::Script::default() } else { shot::Script::from_env() },
+            script: if thread { shot::Script::default() } else { shot::Script::from_env() },
         }
     }
 
     fn is_thread(&self) -> bool {
-        self.metrics == Metrics::DENSE
+        self.thread
     }
 
     /// Shows this conversation. The same one again only takes its new title, picture and the
@@ -483,6 +497,7 @@ impl Pane {
         self.confirm = None;
         self.hold = None;
         self.land = false;
+        self.opening = false;
         self.uploads.clear();
         self.pending_at.clear();
         self.relay(true, ListOffset::default());
@@ -650,7 +665,12 @@ impl Pane {
             Purpose::Bottom => self.snap_to_end(),
             Purpose::Restore(id, offset) => self.restore(id, *offset),
             // Unread that may not fit: placed once the rows can be measured.
-            Purpose::Open => self.land = !super::app::prefs::choices().newest && self.items.iter().any(|item| matches!(item, Item::New)),
+            Purpose::Open => {
+                self.land = !super::app::prefs::choices().newest && self.items.iter().any(|item| matches!(item, Item::New));
+                // A phone decides where the open lands once the rows are measured; placing
+                // unread wins over both.
+                self.opening = self.metrics == Metrics::PHONE && !self.thread && !self.land;
+            }
             _ if mine => self.snap_to_end(),
             _ => {}
         }
@@ -869,7 +889,7 @@ impl Pane {
             }
             self.known.insert(file.id.clone(), path.clone());
             if let Some((then, name)) = self.then.remove(&file.id) {
-                draw::open_file(path, &name, then);
+                draw::open_file(path, &name, then, cx);
             }
             self.play_landed(&file.id, cx);
         } else if file.failed.is_some() {
@@ -954,7 +974,7 @@ impl Pane {
         let file = &attachment.file;
         let name = media::disk_name(attachment);
         if let Some(path) = file.path.clone().or_else(|| self.known.get(&file.id).cloned()) {
-            draw::open_file(&path, &name, then);
+            draw::open_file(&path, &name, then, cx);
             return;
         }
         self.then.insert(file.id.clone(), (then, name));
@@ -1012,6 +1032,39 @@ impl Pane {
 
     /// Runs once the rows are laid out: asks for what they need, and notes how far the user
     /// has read. Nothing here draws.
+    /// A phone decides where an open lands once its rows can be measured. A conversation that
+    /// fits is left at its start, where the list's own bottom clamp rests its last message on
+    /// the composer with the whole start block in view; one that overflows opens at its newest
+    /// message. GPUI's bottom-aligned list clamps a fitting list to the bottom by itself, so the
+    /// fit case is offset 0 and the overflow case is the end.
+    fn settle_open(&mut self, seen: &[(usize, Bounds<Pixels>)], viewport: Bounds<Pixels>) {
+        if !self.opening || self.items.is_empty() || viewport.size.height <= px(0.) {
+            return;
+        }
+        let last = self.items.len() - 1;
+        // Both ends drawn: the span between them is the whole content, wherever the list has
+        // put it. A missing start row means the list is taller than the viewport.
+        let start = seen.iter().find(|(ix, _)| *ix == 0).map(|(_, bounds)| bounds.top());
+        let end = seen.iter().find(|(ix, _)| *ix == last).map(|(_, bounds)| bounds.bottom());
+        let (Some(start), Some(end)) = (start, end) else {
+            if seen.iter().any(|(ix, _)| *ix == last) {
+                self.opening = false;
+                self.list.scroll_to_end();
+                self.unseen = 0;
+                self.away = false;
+            }
+            return;
+        };
+        self.opening = false;
+        if end - start > viewport.size.height {
+            self.list.scroll_to_end();
+            self.unseen = 0;
+            self.away = false;
+        } else {
+            self.list.scroll_to(ListOffset::default());
+        }
+    }
+
     fn after_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.images.sweep(window, cx);
         let scale = window.scale_factor();
@@ -1036,6 +1089,7 @@ impl Pane {
             cx.notify();
         }
         let seen = self.seen.borrow().clone();
+        self.settle_open(&seen, viewport);
         let on_screen = |bounds: &Bounds<Pixels>| bounds.bottom() > viewport.top() && bounds.top() < viewport.bottom();
 
         let built = |ix: usize| seen.iter().any(|(seen, _)| *seen == ix);
@@ -1234,6 +1288,9 @@ impl Render for Pane {
         div()
             .id("messages")
             .size_full()
+            // A phone leaves 11 pt under the last row so it never touches the composer and the
+            // last message's words sit 12–20 pt above the card.
+            .when(self.metrics == Metrics::PHONE, |body| body.pb(px(11.)))
             .relative()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
@@ -1277,7 +1334,8 @@ impl Shell {
             .pane
             .get_or_init(|| {
                 let shell = cx.weak_entity();
-                cx.new(|cx| Pane::new(Metrics::FULL, shell, cx))
+                let metrics = if super::phone::active() { Metrics::PHONE } else { Metrics::FULL };
+                cx.new(|cx| Pane::new(metrics, false, shell, cx))
             })
             .clone();
         self.subscribe_pane(&pane, cx);
@@ -1290,6 +1348,14 @@ impl Shell {
         let account = conversation.account();
         let accounts = self.snapshot.iter().flat_map(|snapshot| &snapshot.accounts);
         accounts.filter(|status| status.key == account).map(|status| status.me.clone()).next().unwrap_or_default()
+    }
+
+    /// Back on a phone: what a pane of messages has over it (the viewer, a message's sheet, the
+    /// picker, the delete question) closes first, the thread's before the conversation's.
+    pub(in crate::gui) fn panes_back(&mut self, cx: &mut Context<Self>) -> bool {
+        let thread = self.conversation_state.thread.borrow().clone().filter(|_| self.layout_state.right.is_some());
+        let main = self.conversation_state.pane.get().cloned().filter(|_| self.open.is_some());
+        thread.into_iter().chain(main).any(|pane| pane.update(cx, |pane, cx| pane.phone_back(cx)))
     }
 
     /// Draws the panes again: a player in them moved on. Only marks them, so it is safe from
@@ -1363,7 +1429,9 @@ impl Shell {
         let typing = open.special != Special::Service;
         pane.update(cx, |pane, cx| pane.show(open, &me, picture, typing, cx));
         let keys = pane.clone();
-        div()
+        let phone = super::phone::active();
+        let mut view = div()
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -1372,13 +1440,29 @@ impl Shell {
                 if matches!(event.keystroke.key.as_str(), "pageup" | "pagedown") {
                     keys.update(cx, |pane, cx| pane.key_down(event, window, cx));
                 }
-            })
-            .child(self.strip(open, link, window, cx))
-            .child(div().flex_1().min_h_0().child(pane))
-            .child(match open.special {
-                Special::Service => self.no_composer(open, cx),
-                _ => self.composer(open, link, cx),
-            })
+            });
+        if phone {
+            // The back gesture: a drag that began in the left 20 pt and passed 60 pops, as
+            // iOS's edge swipe does (`01-ia-navigation.md` §5.2).
+            view = view
+                .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        this.phone_drag_back(f32::from(event.position.x), true, cx);
+                    }
+                }))
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.phone_release_edge()));
+        }
+        view.child(if phone {
+            self.phone_strip(open, link, window, cx)
+        } else {
+            self.strip(open, link, window, cx)
+        })
+        .child(div().flex_1().min_h_0().child(pane))
+        .child(match open.special {
+            Special::Service => self.no_composer(open, cx),
+            _ => self.composer(open, link, cx),
+        })
+        .children(phone.then(|| self.phone_edge(cx)))
     }
 
     /// The network's own account (Telegram's service notifications) takes no messages: a line

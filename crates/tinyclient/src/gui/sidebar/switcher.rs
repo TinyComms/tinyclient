@@ -3,6 +3,7 @@
 //! Spaces, each ranked, and what arrives later from the networks goes in below the selected row,
 //! never above it. chatd finds the conversations (`Find`) and people (`People`); the shell ranks.
 
+use palette::IntoColor;
 use super::rank;
 use super::Mode;
 use crate::client::ask;
@@ -592,11 +593,12 @@ impl Shell {
             (_, Some(words)) => Some(div().flex_none().type_small().text_color(theme::text_soft()).child(words)),
             (Target::Conversation(c), None) => row_badge(c),
             (Target::Space(key), None) => self.spaces.iter().find(|s| &s.key == key).and_then(|s| rollup_badge(s.attention, s.unread)),
-            (Target::Search(_), None) => Some(keycap("⌘⇧F")),
+            // A phone has no keys to name.
+            (Target::Search(_), None) if !crate::gui::phone::active() => Some(keycap("⌘⇧F")),
             _ => None,
         };
         // The letters that matched are heavier: the order is the rank, and this is why.
-        let lit = HighlightStyle { color: Some(theme::text().into()), font_weight: Some(FontWeight::SEMIBOLD), ..Default::default() };
+        let lit = HighlightStyle { color: Some(theme::text().into_color()), font_weight: Some(FontWeight::SEMIBOLD), ..Default::default() };
         let title = hit.title.trim_start_matches('#');
         let shift = hit.title.len() - title.len();
         let highlights: Vec<(Range<usize>, HighlightStyle)> =
@@ -655,7 +657,14 @@ impl Shell {
         let switcher = self.sidebar_state.switcher.as_ref()?;
         let query = switcher.input.read(cx).text().trim().to_owned();
         let viewport = window.viewport_size();
-        let frame = switcher_frame((f32::from(viewport.width), f32::from(viewport.height)), ROW);
+        let phone = crate::gui::phone::active();
+        let (wide, tall) = (f32::from(viewport.width), f32::from(viewport.height));
+        // On a phone the switcher is a page of its own: the whole screen, under the status bar.
+        let frame = if phone {
+            crate::gui::components::place::Frame { x: 0., y: 0., w: wide, h: tall - crate::gui::phone::tokens::safe_top() - crate::gui::phone::tokens::safe_bottom() + 32. + 10. }
+        } else {
+            switcher_frame((wide, tall), ROW)
+        };
         let hint = |keys: &'static str, words: &'static str| div().flex().items_center().gap(px(6.)).child(keycap(keys)).child(words);
         let nothing = switcher.hits.iter().all(|hit| matches!(hit.target, Target::Search(_) | Target::Asking(_)));
         let said = if switcher.down {
@@ -677,13 +686,15 @@ impl Shell {
             });
             rows = rows.child(div().flex_none().children(label).child(self.hit_row(ix, hit, ix == switcher.selected, marks, cx)));
         }
+        let close = cx.listener(|this, _: &gpui::ClickEvent, window, cx| this.close_switcher(window, cx));
         let sheet = div()
             .w(px(frame.w))
-            .rounded(px(theme::R_MODAL))
-            .bg(theme::overlay())
-            .border_1()
-            .border_color(theme::overlay_edge())
-            .shadow(theme::shadow_modal())
+            .when(!phone, |sheet| {
+                sheet.rounded(px(theme::R_MODAL)).bg(theme::overlay()).border_1().border_color(theme::overlay_edge()).shadow(theme::shadow_modal())
+            })
+            .when(phone, |sheet| {
+                sheet.h_full().bg(theme::sidebar()).pt(px(crate::gui::phone::tokens::safe_top())).pb(px(crate::gui::phone::tokens::safe_bottom()))
+            })
             .occlude()
             .overflow_hidden()
             .flex()
@@ -701,11 +712,29 @@ impl Shell {
                     .border_color(theme::hairline())
                     .child(glyph("icons/search.svg", 16., theme::text_soft()))
                     .child(div().flex_1().min_w_0().text_size(px(16.)).line_height(px(22.)).child(switcher.input.clone()))
-                    .child(keycap("esc")),
+                    .when(!phone, |strip| strip.child(keycap("esc")))
+                    // No Escape key on a phone: Cancel says how out.
+                    .when(phone, |strip| {
+                        strip.mr(px(-8.)).child(
+                            div()
+                                .id("switcher-cancel")
+                                .flex_none()
+                                .h(px(44.))
+                                .px(px(8.))
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .type_ui()
+                                .text_color(theme::accent_text())
+                                .on_click(close)
+                                .child("Cancel"),
+                        )
+                    }),
             )
             .children(said.map(|words| div().h(px(ROW)).flex_none().px(px(16.)).flex().items_center().type_ui().text_color(theme::text_soft()).child(words)))
             .child(rows)
-            .child(
+            // The keys it names are a keyboard's; a phone has none.
+            .when(!phone, |sheet| sheet.child(
                 div()
                     .h(px(32.))
                     .flex_none()
@@ -721,7 +750,7 @@ impl Shell {
                     .child(hint("↵", "Open"))
                     .child(hint("#", "Channels"))
                     .child(hint("@", "People")),
-            );
+            ));
         Some(
             div()
                 .absolute()

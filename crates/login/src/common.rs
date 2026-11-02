@@ -212,6 +212,7 @@ pub fn session(mut probed: serde_json::Value, cookie: Option<String>, agent: &st
     probed
 }
 
+/// Prints the session and exits: the helper binary's end. Never called in chatd.
 pub fn finish(session: serde_json::Value) -> ! {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{session}");

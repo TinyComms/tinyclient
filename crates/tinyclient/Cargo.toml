@@ -5,20 +5,29 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+# iOS links a static library into the Xcode app (+ XCFramework in mobile/ios); Android loads a
+# cdylib from jniLibs. `rlib` keeps `cargo test` and any in-process caller working. The desktop
+# binary (src/main.rs) is untouched.
+name = "tinyclient"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
 [dependencies]
 protocol.workspace = true
 tracing.workspace = true
 # The taskbar button's or Dock icon's number and flash (`gui/attention.rs`).
 notifier = { path = "../notifier", optional = true }
 sha2 = "0.10"
+# Init failures are logged here; on Android the records go to logcat (see lib.rs `android_log`).
+log = "0.4"
 # Socket requests block; deliver their thread results without occupying GUI workers.
 futures-channel = "0.3"
 
 # GPUI is the shell. It is behind `gui` so `cargo test` and the daemons never pull the GPU stack.
 #   cargo run -p tinyclient --features gui
-# Pinned to a Zed commit: gpui_platform is not on crates.io. `runtime_shaders` lets it build with
-# Command Line Tools only (no Xcode `metal` compiler).
-gpui = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a6d80d034119888b534aa0d9067fb5aee", optional = true }
+# gpui-ce 0.3 is the maintained fork with iOS and Android backends (gpui_ios, gpui_mobile).
+# Zed's pin had no mobile platform crate, so a phone build could not link.
+gpui = { package = "gpui-ce", version = "0.3.0", optional = true, default-features = false, features = ["font-kit"] }
 unicode-segmentation = { version = "1.10", optional = true }
 libc = { version = "0.2", optional = true }
 # Avatars are decoded at the size they are drawn. Both are already in the tree through GPUI.
@@ -26,9 +35,11 @@ image = { version = "0.25", optional = true, default-features = false, features 
 smallvec = { version = "1.6", optional = true }
 # Reads `mediad --devices` for Settings › Audio & video. Already in the tree through protocol.
 serde_json = { workspace = true, optional = true }
+# gpui-ce's colours are palette types (`Rgba`, `Hsla`). The `IntoColor` bound its own helpers take
+# is palette's trait, and gpui does not re-export palette, so the same 0.7 line as gpui-ce.
+palette = { version = "0.7", optional = true }
 
 # URL-only Wikipedia cards use the public summary API off the UI thread.
-ureq = { version = "3", default-features = false, features = ["native-tls"], optional = true }
 url = { version = "2", optional = true }
 
 # Native CPU rendering of Discord Lottie stickers, pinned for reproducible builds.
@@ -40,16 +51,55 @@ futures-lite = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 [features]
-gui = ["dep:notifier", "dep:tlottie", "dep:ureq", "dep:url", "dep:gpui", "dep:gpui_platform", "dep:unicode-segmentation", "dep:libc", "dep:image", "dep:smallvec", "dep:serde_json", "dep:windows-sys"]
+gui = ["dep:notifier", "dep:tlottie", "dep:ureq", "dep:url", "dep:gpui", "dep:gpui_platform", "dep:unicode-segmentation", "dep:libc", "dep:image", "dep:smallvec", "dep:serde_json", "dep:palette", "dep:windows-sys"]
 # Adds `--shot out.png`: render the window to a file and quit, for design review without
 # Screen Recording permission. Pulls GPUI's test support, so it is not part of `gui`.
 gui-shot = ["gui", "gpui/test-support", "gpui_platform/test-support"]
+# Entry points for the iOS and Android shells (src/lib.rs). `mobile` is `gui` plus the platform
+# entry symbol, and deliberately not `gui-shot`: the screenshot harness renders to a file and
+# pulls GPUI's test support, which has no meaning on a phone (device shots come from adb/simctl).
+# Desktop-only modules inside `gui/` (window chrome, menubar, settings window, self-update) still
+# compile on mobile for now; see docs/mobile-build.md, "Feature gating".
+mobile = ["gui", "dep:android-activity", "dep:chatd", "dep:mediad", "ios-platform"]
+# The iOS platform crates (objc2 and Apple's frameworks); only linked on iOS.
+ios-platform = ["dep:objc2", "dep:block2", "dep:dispatch2", "dep:objc2-foundation", "dep:objc2-core-foundation", "dep:objc2-ui-kit", "dep:objc2-avf-audio", "dep:objc2-av-foundation", "dep:objc2-core-media", "dep:objc2-core-video", "dep:objc2-video-toolbox", "dep:objc2-authentication-services", "dep:objc2-replay-kit"]
+# The made-up chatd of `--shot --demo` (src/gui/shot_demo.rs) without the screenshot harness, for
+# proof builds on a phone: `--features "mobile demo"`. On Android and iOS it is on from launch (a
+# phone has no flags), and the pictures it shows are compiled in. Never in a release or a default
+# build: it answers every request with invented data and never reaches the real core.
+demo = ["gui"]
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+# Avoid an OpenSSL cross-build on Android; rustls validates against bundled WebPKI roots.
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+# The core, run inside the app on phones (`src/lib.rs`, `inprocess`). Default features are off:
+# the phone build does not link libsignal.
+chatd = { path = "../chatd", optional = true, default-features = false }
+# The call engine, run on threads of the app on phones (`mediad::inproc`, registered in
+# `src/mobile.rs`): a phone cannot start the mediad binary.
+mediad = { path = "../mediad", optional = true }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+# Keep the desktop's existing native TLS provider and behavior.
+ureq = { version = "3", default-features = false, features = ["native-tls"], optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Provides ANativeActivity_onCreate and calls our `android_main`. Only linked on Android, so a
+# host build never sees it. `native-activity` is the plain NativeActivity glue (no GameActivity).
+android-activity = { version = "0.6", optional = true, default-features = false, features = ["native-activity"] }
+gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = true, default-features = false }
+gpui_mobile = { package = "gpui_ce_mobile", version = "0.3.0" }
+# The call platform and the web sign-in (`src/mobile/android`) call the app's Java classes
+# (`mobile/android/app/src/main/java/dev/tinyclient/app`) through JNI. The JavaVM and the activity
+# come from `ndk-context`, which android-activity fills in before `android_main`.
+jni = "0.21"
+ndk-context = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a6d80d034119888b534aa0d9067fb5aee", optional = true, default-features = false, features = ["font-kit", "runtime_shaders"] }
+gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = true, default-features = false, features = ["font-kit", "runtime_shaders"] }
 
 [target.'cfg(windows)'.dependencies]
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a6d80d034119888b534aa0d9067fb5aee", optional = true, default-features = false, features = ["font-kit"] }
+gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = true, default-features = false, features = ["font-kit"] }
 # `--version` and `--text` print to the terminal from a windowed program, a call's link opens
 # through ShellExecuteW, and the voice keys are read with GetAsyncKeyState. Already in the tree.
 windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
@@ -61,5 +111,26 @@ embed-resource = "3"
 
 # Wayland and X11 are features of their own, off without default features: without them the
 # window cannot open at all ("the environment names no allowed Wayland or X11 display server").
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a6d80d034119888b534aa0d9067fb5aee", optional = true, default-features = false, features = ["font-kit", "wayland", "x11"] }
+# Android and iOS are unix too; they use gpui-ce's mobile backends, not a display server.
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
+gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = true, default-features = false, features = ["font-kit", "wayland", "x11"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = true, default-features = false, features = ["runtime_shaders"] }
+# The iOS call platform and web sign-in (`src/mobile/ios`), written against Apple's frameworks
+# through objc2: the same objc2 0.6 / framework 0.3 line gpui-ce's iOS backend already links.
+# The debug-build encoding check rejects some correct Apple messages (NSUUID initWithUUIDBytes:,
+# isEqualToString: on Swift-backed strings) and panics across the Objective-C boundary.
+objc2 = { version = "0.6", optional = true, features = ["disable-encoding-assertions"] }
+block2 = { version = "0.6", optional = true }
+dispatch2 = { version = "0.3", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+objc2-core-foundation = { version = "0.3", optional = true }
+objc2-ui-kit = { version = "0.3", optional = true }
+objc2-avf-audio = { version = "0.3", optional = true }
+objc2-av-foundation = { version = "0.3", optional = true }
+objc2-core-media = { version = "0.3", optional = true }
+objc2-core-video = { version = "0.3", optional = true }
+objc2-video-toolbox = { version = "0.3", optional = true }
+objc2-authentication-services = { version = "0.3", optional = true }
+objc2-replay-kit = { version = "0.3", optional = true }

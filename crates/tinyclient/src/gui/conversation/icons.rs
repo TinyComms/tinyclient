@@ -2,6 +2,7 @@
 //! set for the drawn size: 1.5 points at every size, which a fixed SVG file cannot do.
 
 use gpui::{prelude::*, px, svg, Hsla, Svg};
+use palette::IntoColor;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -85,7 +86,7 @@ thread_local! {
 }
 
 /// A glyph `size` points across in `color`.
-pub fn icon(which: Icon, size: f32, color: impl Into<Hsla>) -> Svg {
+pub fn icon(which: Icon, size: f32, color: impl IntoColor<Hsla>) -> Svg {
     BUILT.with_borrow_mut(|built| {
         let data = built.entry((which, size as u32)).or_insert_with(|| {
             // The path data is drawn on a 24 unit grid.
@@ -96,6 +97,6 @@ pub fn icon(which: Icon, size: f32, color: impl Into<Hsla>) -> Svg {
             )
             .into_bytes()
         });
-        svg().data(data).size(px(size)).flex_none().text_color(color.into())
+        svg().data(data).size(px(size)).flex_none().text_color(color.into_color())
     })
 }

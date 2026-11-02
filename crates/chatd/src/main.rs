@@ -1,6 +1,4 @@
-use chatd::server::{serve, Chat};
-use chatd::store::Store;
-use protocol::{chat_sock_path, support_dir, ChatListener};
+use chatd::{spawn_core, Host};
 use std::io::{self, Write};
 
 fn main() -> io::Result<()> {
@@ -11,31 +9,32 @@ fn main() -> io::Result<()> {
     }
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());
     protocol::crash::install_panic_hook("chatd");
-    let dir = support_dir();
-    protocol::private::dir(&dir)?;
-    // One chatd per support directory. A shell starts chatd whenever it finds none answering,
-    // so two may be started at once: the second finds the lock held and leaves the first be.
-    // Held until the process exits.
-    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("chatd.lock"))?;
-    if let Err(err) = lock.try_lock() {
-        // The operator file gets the path. Stderr always gets the short line: this process
-        // is about to exit, and the launcher reads stderr even when it is not a terminal.
-        tracing::warn!("chatd: another chatd is already running for {} ({err})", dir.display());
-        let _ = writeln!(io::stderr(), "chatd: another chatd is already running");
-        return Ok(());
-    }
-    let mut store = Store::open(&dir.join("chat.sqlite")).map_err(io::Error::other)?;
-
-    if let Some(mode) = chatd::demo::requested(std::env::args()) {
-        if std::env::var_os("TINYCLIENT_DIR").is_none() {
-            tracing::warn!("chatd: --seed-demo needs TINYCLIENT_DIR so it cannot write to the real store");
-            std::process::exit(64);
+    let dir = protocol::support_dir();
+    let demo = chatd::demo::requested(std::env::args());
+    let seed_dir = dir.clone();
+    let core = spawn_core(dir, Host::Process, move |store| {
+        if let Some(mode) = demo {
+            if std::env::var_os("TINYCLIENT_DIR").is_none() {
+                tracing::warn!("chatd: --seed-demo needs TINYCLIENT_DIR so it cannot write to the real store");
+                std::process::exit(64);
+            }
+            chatd::demo::seed(store, &seed_dir, mode).map_err(io::Error::other)?;
         }
-        chatd::demo::seed(&mut store, &dir, mode).map_err(io::Error::other)?;
-    }
-
-    let path = chat_sock_path();
-    let listener = ChatListener::bind(&path)?;
-    tracing::warn!("chatd listening on {}", path.display());
-    serve(listener, Chat::new(store))
+        Ok(())
+    });
+    let core = match core {
+        Ok(core) => core,
+        // A shell starts chatd whenever it finds none answering, so two may start at once: the
+        // second finds the first one's lock and leaves it be. The operator file gets the path.
+        // Stderr always gets the short line: this process is about to exit, and the launcher
+        // reads stderr even when it is not a terminal.
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            tracing::warn!("chatd: {err}");
+            let _ = writeln!(io::stderr(), "chatd: another chatd is already running");
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
+    // The core serves until the process exits: a `Shutdown` exits it.
+    core.join().map_err(|_| io::Error::other("chatd stopped"))
 }

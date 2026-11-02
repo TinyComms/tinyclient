@@ -20,7 +20,14 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub const SOURCE: &str = "members";
-const ROW: f32 = theme::ROW_ONE;
+/// A member row: the desktop's 28, and on a phone 48, as the other pages' person rows.
+fn row() -> f32 {
+    if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE).max(48.) } else { theme::ROW_ONE }
+}
+/// A member's face: the desktop's 20, and 32 on a phone, beside its larger name.
+fn face() -> f32 {
+    if crate::gui::phone::active() { 32. } else { 20. }
+}
 const PAGE: u32 = 50;
 /// Pages of members held; the ones farthest from the viewport go first.
 const PAGES_KEPT: usize = 64;
@@ -409,7 +416,21 @@ impl MemberList {
         let in_call = !person.bot && in_call(&self.hub, &self.scene, &person.key);
         let (profile, shell) = (person.key.clone(), self.shell.clone());
         let (menu_of, menu_shell) = (person.key.clone(), self.shell.clone());
-        div().id(("member", ix)).w_full().h(px(ROW)).px(px(theme::INSET)).child(
+        let phone = crate::gui::phone::active();
+        let tapped = (profile.clone(), shell.clone());
+        div()
+            .id(("member", ix))
+            .w_full()
+            .h(px(row()))
+            .px(px(theme::INSET))
+            // A finger's press may be the start of a scroll: a phone opens the person on release.
+            .when(phone, |row| {
+                row.on_click(move |event, _, cx| {
+                    let (profile, shell) = tapped.clone();
+                    let _ = shell.update(cx, |shell, cx| shell.open_profile(profile, event.position(), cx));
+                })
+            })
+            .child(
             div()
                 .group("member")
                 .size_full()
@@ -417,11 +438,13 @@ impl MemberList {
                 .rounded(px(theme::R_CONTROL))
                 .flex()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(if phone { 12. } else { 8. }))
                 .cursor_pointer()
-                .hover(|style| style.bg(theme::hover()))
-                .on_mouse_down(MouseButton::Left, move |event, _, cx| {
-                    let _ = shell.update(cx, |shell, cx| shell.open_profile(profile.clone(), event.position, cx));
+                .when(!phone, |row| row.hover(|style| style.bg(theme::hover())))
+                .when(!phone, |row| {
+                    row.on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                        let _ = shell.update(cx, |shell, cx| shell.open_profile(profile.clone(), event.position, cx));
+                    })
                 })
                 .on_mouse_down(MouseButton::Right, move |event, _, cx| {
                     let _ = menu_shell.update(cx, |shell, cx| shell.open_row_menu(menu_of.clone(), event.position, cx));
@@ -430,14 +453,16 @@ impl MemberList {
                     div()
                         .flex_none()
                         .when(away, |avatar| avatar.opacity(0.45))
-                        .child(person_avatar(&self.hub, person, 20., &ring, in_call, cx)),
+                        .child(person_avatar(&self.hub, person, face(), &ring, in_call, cx)),
                 )
                 .child(
                     div()
                         .min_w_0()
                         .truncate()
-                        .type_ui()
-                        .text_color(if away { theme::text_faint() } else { theme::text_soft() })
+                        // A phone's names are the size the other pages' rows are (Details, a
+                        // profile, the sidebar): 16, not the desktop's interface size scaled.
+                        .map(|name| if phone { name.type_body() } else { name.type_ui() })
+                        .text_color(if away { theme::text_faint() } else if phone { theme::text() } else { theme::text_soft() })
                         .child(person.name.clone()),
                 )
                 .when(person.bot, |row| row.child(super::list::bot_tag())),
@@ -448,7 +473,7 @@ impl MemberList {
 fn header(title: &str) -> Div {
     div()
         .w_full()
-        .h(px(ROW))
+        .h(px(row()))
         .px(px(16.))
         .pb(px(4.))
         .flex()
@@ -462,12 +487,12 @@ fn header(title: &str) -> Div {
 fn waiting_row() -> Div {
     div()
         .w_full()
-        .h(px(ROW))
+        .h(px(row()))
         .px(px(16.))
         .flex()
         .items_center()
         .gap(px(8.))
-        .child(div().size(px(20.)).rounded(px(10.)).bg(theme::hover()))
+        .child(div().size(px(face())).rounded_full().bg(theme::hover()))
         .child(skeleton(104., 10.))
 }
 

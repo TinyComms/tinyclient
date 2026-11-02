@@ -6,12 +6,24 @@
 //! room, so nobody's ring stays lit. Everything else, replies and state changes above all, always
 //! arrives: past [`LIMIT`] the caller waits for chatd, which only a chatd that has stopped
 //! reading can cause.
+//!
+//! As a process (desktop) this is the real stdout and the real `exit`. In process (phones,
+//! `inproc`), each mediad is an [`Instance`]: its frames go to the pipe chatd reads, its stdin is
+//! the pipe chatd writes, its environment is the command's, and its `exit` ends only that mediad.
+//! Which instance a thread belongs to is a thread-local, set by `inproc` on the first thread and
+//! carried to every thread mediad starts through [`spawn`]. Each instance has a [`Line`] and a
+//! writer of its own, which drains what is queued and then closes the pipe.
 
+use protocol::media_host::{Closer, Exit, PipeReader};
 use protocol::{write_frame, CallFailure, MediaResponse};
+use serde::Serialize;
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Write};
+use std::ffi::OsString;
+use std::io::{self, Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// Frames waiting before what may be lost is let go.
@@ -28,6 +40,10 @@ struct Queue {
     owed: HashMap<String, bool>,
     /// The writer holds a frame it took from `frames`.
     writing: bool,
+    /// In process, this mediad ended: the writer drains what is here and goes.
+    closing: bool,
+    /// The writer has gone. Nothing queued now would ever arrive.
+    closed: bool,
 }
 
 impl Queue {
@@ -63,7 +79,7 @@ impl Queue {
     }
 
     fn busy(&self) -> bool {
-        self.writing || !self.frames.is_empty() || !self.owed.is_empty()
+        !self.closed && (self.writing || !self.frames.is_empty() || !self.owed.is_empty())
     }
 }
 
@@ -79,30 +95,48 @@ struct Line {
 }
 
 impl Line {
+    /// In process a thread can panic anywhere, and the app goes on: a poisoned lock is no reason
+    /// for another mediad thread to fail, least of all the one saying so.
+    fn lock(&self) -> MutexGuard<'_, Queue> {
+        self.queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn send(&self, frame: &MediaResponse) {
         let mut bytes = Vec::new();
         if write_frame(&mut bytes, frame).is_err() {
-            std::process::exit(0);
+            exit(0);
         }
-        let mut queue = self.queue.lock().unwrap();
-        if !queue.admit(frame) {
-            return;
+        if self.lock().admit(frame) {
+            self.push(bytes);
         }
-        while queue.frames.len() >= LIMIT {
-            queue = self.room.wait(queue).unwrap();
+    }
+
+    /// Queues bytes that must arrive. Once the writer has gone, so has chatd, and so has the call.
+    fn push(&self, bytes: Vec<u8>) {
+        let mut queue = self.lock();
+        while queue.frames.len() >= LIMIT && !queue.closed {
+            queue = self.room.wait(queue).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        if queue.closed {
+            drop(queue);
+            exit(0);
         }
         queue.frames.push_back(bytes);
         self.ready.notify_one();
     }
 
-    /// Writes until `to` fails. It only fails once chatd is gone.
+    /// Writes until `to` fails, which it only does once chatd is gone, or until this mediad ended
+    /// and all that it said is out.
     fn write(&self, mut to: impl Write) -> io::Result<()> {
-        let mut queue = self.queue.lock().unwrap();
+        let mut queue = self.lock();
         loop {
             queue.writing = false;
             let Some(frame) = queue.next() else {
                 self.idle.notify_all();
-                queue = self.ready.wait(queue).unwrap();
+                if queue.closing {
+                    return Ok(());
+                }
+                queue = self.ready.wait(queue).unwrap_or_else(|poisoned| poisoned.into_inner());
                 continue;
             };
             queue.writing = true;
@@ -110,24 +144,31 @@ impl Line {
             drop(queue);
             to.write_all(&frame)?;
             to.flush()?;
-            queue = self.queue.lock().unwrap();
+            queue = self.lock();
         }
     }
 
+    /// The writer has gone: nobody waits on it any more.
+    fn closed(&self) {
+        self.lock().closed = true;
+        self.room.notify_all();
+        self.idle.notify_all();
+    }
+
     fn flush(&self, within: Duration) {
-        let queue = self.queue.lock().unwrap();
-        let _ = self.idle.wait_timeout_while(queue, within, |queue| queue.busy()).unwrap();
+        let queue = self.lock();
+        let _ = self.idle.wait_timeout_while(queue, within, |queue| queue.busy()).unwrap_or_else(|poisoned| poisoned.into_inner());
     }
 }
 
-static LINE: OnceLock<Line> = OnceLock::new();
+static LINE: OnceLock<Arc<Line>> = OnceLock::new();
 
-/// The line to chatd, with its writer running.
-fn line() -> &'static Line {
+/// The process's line to chatd, with its writer running.
+fn process_line() -> &'static Arc<Line> {
     let mut started = false;
     let line = LINE.get_or_init(|| {
         started = true;
-        Line::default()
+        Arc::default()
     });
     if started {
         // A closed pipe means chatd is gone, and so is the call. A mediad that cannot start this
@@ -144,17 +185,108 @@ fn line() -> &'static Line {
     line
 }
 
+/// The line this thread's mediad talks to chatd on.
+fn line() -> Arc<Line> {
+    match instance() {
+        Some(instance) => instance.line.clone(),
+        None => process_line().clone(),
+    }
+}
+
+/// One mediad running inside another process.
+pub struct Instance {
+    line: Arc<Line>,
+    stdin: Mutex<Option<PipeReader>>,
+    /// Closes stdin from anywhere, so the thread reading it sees end of file when this ends.
+    input: Closer,
+    env: Vec<(String, Option<String>)>,
+    exit: Arc<Exit>,
+}
+
+impl Instance {
+    /// With its writer running, or the thread's error: a mediad that cannot speak does not start.
+    pub fn new(launch: protocol::media_host::Launch) -> io::Result<Arc<Instance>> {
+        let input = launch.stdin.closer();
+        let instance = Arc::new(Instance {
+            line: Arc::default(),
+            stdin: Mutex::new(Some(launch.stdin)),
+            input,
+            env: launch.env,
+            exit: launch.exit,
+        });
+        let writer = instance.clone();
+        let stdout = launch.stdout;
+        // Never an instance's own thread: it outlives `finish`, for as long as frames remain, and
+        // dropping `stdout` as it goes is what chatd reads as this mediad's end.
+        std::thread::Builder::new().name("out".to_owned()).spawn(move || {
+            if writer.line.write(stdout).is_err() {
+                writer.finish(0);
+            }
+            writer.line.closed();
+        })?;
+        Ok(instance)
+    }
+
+    /// Ends this mediad with `code`: chatd sees its stdout close and reads the code, as a process
+    /// exiting. What it had queued still goes first. Its threads find out through [`over`].
+    pub fn finish(&self, code: i32) {
+        self.exit.finish(code);
+        self.line.lock().closing = true;
+        self.line.ready.notify_all();
+        self.input.close();
+    }
+}
+
+thread_local! {
+    static INSTANCE: RefCell<Option<Arc<Instance>>> = const { RefCell::new(None) };
+}
+
+/// The instance this thread belongs to, in process.
+pub fn instance() -> Option<Arc<Instance>> {
+    INSTANCE.with(|held| held.borrow().clone())
+}
+
+/// Makes this thread part of `instance`.
+pub fn enter(instance: Option<Arc<Instance>>) {
+    INSTANCE.with(|held| *held.borrow_mut() = instance);
+}
+
+/// What `exit` unwinds with, in process. Caught where each of mediad's threads starts.
+pub struct Exited(pub i32);
+
 /// Hands one frame to chatd's writer. Returns at once unless chatd has stopped reading and the
 /// frame is one that must arrive.
 pub fn send(frame: &MediaResponse) {
     line().send(frame);
 }
 
+/// Any frame (the player's events are not `MediaResponse`s). It must arrive.
+pub fn write(frame: &impl Serialize) {
+    let mut bytes = Vec::new();
+    if write_frame(&mut bytes, frame).is_err() {
+        exit(0);
+    }
+    line().push(bytes);
+}
+
 /// Waits for what is queued to reach chatd, as long as it takes up to a moment. Every way out of
-/// the process comes through here, so the last word is not lost with it.
+/// a mediad comes through here, so the last word is not lost with it.
 pub fn flush() {
-    if let Some(line) = LINE.get() {
-        line.flush(FLUSH);
+    let line = match instance() {
+        Some(instance) => instance.line.clone(),
+        None => match LINE.get() {
+            Some(line) => line.clone(),
+            None => return,
+        },
+    };
+    line.flush(FLUSH);
+}
+
+/// One line on stdout (`--devices`).
+pub fn print_line(line: &str) {
+    match instance() {
+        None => println!("{line}"),
+        Some(instance) => instance.line.push(format!("{line}\n").into_bytes()),
     }
 }
 
@@ -163,17 +295,94 @@ pub fn fail(reason: CallFailure, detail: impl Into<String>) -> ! {
     let detail = detail.into();
     tracing::warn!("mediad: failed ({reason:?}): {detail}");
     send(&MediaResponse::Failed { reason, detail });
-    flush();
-    std::process::exit(2);
+    exit(2);
 }
 
 /// Runs what the call lives on. Should it panic, the call is over and chatd is told: a thread
-/// that just ended leaves this process up with no call in it, and nothing says so.
+/// that just ended leaves this mediad up with no call in it, and nothing says so. An `exit` on the
+/// way out, in process, is not a panic, and goes on up.
 pub fn or_fail<R>(reason: CallFailure, detail: &str, work: impl FnOnce() -> R) -> R {
     match catch_unwind(AssertUnwindSafe(work)) {
         Ok(done) => done,
+        Err(payload) if payload.is::<Exited>() => std::panic::resume_unwind(payload),
         Err(_) => fail(reason, detail),
     }
+}
+
+/// Ends this mediad: the process, or in process this instance and the thread that called it.
+/// What is queued for chatd goes first.
+pub fn exit(code: i32) -> ! {
+    flush();
+    match instance() {
+        None => std::process::exit(code),
+        Some(instance) => {
+            instance.finish(code);
+            std::panic::resume_unwind(Box::new(Exited(code)))
+        }
+    }
+}
+
+/// True once this mediad has ended (in process: finished or killed). Always false as a process,
+/// whose end takes every thread with it.
+pub fn over() -> bool {
+    instance().is_some_and(|instance| instance.exit.ended())
+}
+
+/// chatd's frames to us: stdin, or this instance's pipe. In process it may be taken once.
+pub fn stdin() -> Box<dyn Read + Send> {
+    match instance() {
+        None => Box::new(io::stdin()),
+        Some(instance) => match instance.stdin.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+            Some(pipe) => Box::new(pipe),
+            None => Box::new(io::empty()),
+        },
+    }
+}
+
+/// An environment variable, as the command that started this mediad set it.
+pub fn var_os(name: &str) -> Option<OsString> {
+    if let Some(instance) = instance() {
+        if let Some((_, value)) = instance.env.iter().rev().find(|(known, _)| known == name) {
+            return value.clone().map(OsString::from);
+        }
+    }
+    std::env::var_os(name)
+}
+
+/// [`var_os`] as a string, like `std::env::var`.
+pub fn var(name: &str) -> Option<String> {
+    var_os(name).and_then(|value| value.into_string().ok())
+}
+
+/// Starts one of mediad's threads. As a process this is `builder.spawn(f)`. In process the
+/// thread joins this thread's instance, and a panic or an `exit` on it ends the instance, not
+/// the app: a crash in a call takes down the call. The thread then ends as a panicked thread
+/// does (`join` is `Err`), without running the panic hook a second time.
+pub fn spawn<F, T>(builder: std::thread::Builder, f: F) -> io::Result<JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let Some(instance) = instance() else {
+        return builder.spawn(f);
+    };
+    builder.spawn(move || {
+        enter(Some(instance.clone()));
+        match guarded(&instance, f) {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
+}
+
+/// Runs `f` for `instance`, turning an `exit` or a panic into the instance's end.
+pub fn guarded<T>(instance: &Arc<Instance>, f: impl FnOnce() -> T) -> Result<T, Box<dyn std::any::Any + Send>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).inspect_err(|payload| {
+        if !payload.is::<Exited>() {
+            tracing::warn!("mediad: a thread panicked; this mediad ends and the app goes on");
+            instance.finish(101);
+        }
+    })
 }
 
 #[cfg(test)]
@@ -212,6 +421,59 @@ mod tests {
         let alone = std::process::Command::new(std::env::current_exe().unwrap()).args([test, "--exact"]).env(ALONE, "1").output().unwrap();
         assert_eq!(alone.status.code(), Some(2), "{alone:?}");
         assert!(String::from_utf8_lossy(&alone.stdout).contains("the call stopped"), "{alone:?}");
+    }
+
+    /// One mediad in this process, as `inproc` runs it, doing `$body` on its first thread.
+    macro_rules! in_process {
+        ($body:expr) => {{
+            fn start(launch: protocol::media_host::Launch) -> io::Result<()> {
+                let instance = Instance::new(launch)?;
+                std::thread::spawn(move || {
+                    enter(Some(instance.clone()));
+                    let code = guarded(&instance, $body).map_or(101, |()| 0);
+                    instance.finish(code);
+                    enter(None);
+                });
+                Ok(())
+            }
+            let spawned = protocol::media_host::spawn_with(start, &std::process::Command::new("mediad")).unwrap();
+            let mut bytes = Vec::new();
+            spawned.stdout.unwrap().read_to_end(&mut bytes).unwrap();
+            let mut child = spawned.child;
+            let code = child.wait().unwrap();
+            let mut frames: Vec<MediaResponse> = Vec::new();
+            let mut left = &bytes[..];
+            while let Ok(frame) = read_frame(&mut left) {
+                frames.push(frame);
+            }
+            (frames, code.code)
+        }};
+    }
+
+    #[test]
+    fn in_process_a_panic_in_the_call_fails_that_mediad_and_the_app_goes_on() {
+        let (frames, code) = in_process!(|| or_fail(CallFailure::Engine, "the call stopped", || panic!("the tick")));
+        assert!(matches!(&frames[..], [MediaResponse::Failed { detail, .. }] if detail == "the call stopped"), "{frames:?}");
+        assert_eq!(code, Some(2));
+    }
+
+    #[test]
+    fn in_process_an_exit_inside_the_call_is_not_a_panic() {
+        let (frames, code) = in_process!(|| or_fail(CallFailure::Engine, "the call stopped", || exit(7)));
+        assert!(frames.is_empty(), "{frames:?}");
+        assert_eq!(code, Some(7));
+    }
+
+    #[test]
+    fn in_process_everything_said_before_the_end_arrives() {
+        let (frames, code) = in_process!(|| {
+            for n in 0..2000 {
+                send(&MediaResponse::Notice { detail: n.to_string() });
+            }
+        });
+        assert_eq!(frames.len(), 2000);
+        assert_eq!(frames.last(), Some(&MediaResponse::Notice { detail: "1999".to_owned() }));
+        assert_eq!(code, Some(0));
     }
 
     fn stalled() -> (Arc<Line>, std::sync::mpsc::SyncSender<()>, Arc<Mutex<Vec<u8>>>) {

@@ -19,6 +19,15 @@ assets!(
     "networks/signal.svg",
     "networks/messages.svg",
     "networks/tiny.svg",
+    "networks/tiny-mark.svg",
+    // The phone's call screen (`gui/call/phone`).
+    "icons/audio-lines.svg",
+    "icons/bluetooth.svg",
+    "icons/hand.svg",
+    "icons/monitor-off.svg",
+    "icons/smartphone.svg",
+    "icons/switch-camera.svg",
+    "icons/video-off.svg",
     "icons/arrow-down.svg",
     "icons/arrow-left.svg",
     "icons/arrow-right.svg",
@@ -136,13 +145,36 @@ impl AssetSource for Assets {
         })
     }
 
+    /// Every path [`load`](Self::load) answers, sized ones included. gpui-ce builds its registry
+    /// once from this list and then looks paths up exactly, so a `name@size` that is not listed
+    /// draws nothing: that is how every icon went blank after the move to gpui-ce. The sized
+    /// entries load on demand, so listing them costs only their keys.
     fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
-        Ok(ASSETS
-            .iter()
-            .filter(|(name, _)| name.starts_with(path))
-            .map(|(name, _)| (*name).into())
-            .collect())
+        let mut out = Vec::new();
+        for (name, _) in ASSETS {
+            if name.starts_with(path) {
+                out.push((*name).into());
+            }
+            if name.ends_with(".svg") {
+                for points in SIZES {
+                    let sized = format!("{name}@{points}");
+                    if sized.starts_with(path) {
+                        out.push(sized.into());
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
+}
+
+/// The sizes, in whole points, an SVG can be asked for. A phone at 200% text draws a 24 pt glyph
+/// at 48, so the top leaves room.
+const SIZES: std::ops::RangeInclusive<u32> = 1..=160;
+
+/// The listed size nearest `points`.
+fn points_key(points: f32) -> u32 {
+    (points.round() as u32).clamp(*SIZES.start(), *SIZES.end())
 }
 
 /// The network's icon, to be drawn `points` across.
@@ -160,13 +192,23 @@ pub fn network_asset(network: Network, points: f32) -> SharedString {
         Network::Messages => "messages",
         Network::Tiny => "tiny",
     };
-    format!("networks/{name}.svg@{}", points.ceil()).into()
+    format!("networks/{name}.svg@{}", points_key(points.ceil())).into()
+}
+
+/// The network's mark in one color, to be drawn `points` across as a mask. The same file as
+/// [`network_asset`] except for Tiny, whose full mark is a filled plate: as a mask that is a
+/// plain square, so its mark is the bubble with the ts cut out.
+pub fn network_mark_asset(network: Network, points: f32) -> SharedString {
+    match network {
+        Network::Tiny => format!("networks/tiny-mark.svg@{}", points_key(points.ceil())).into(),
+        network => network_asset(network, points),
+    }
 }
 
 /// tinyclient's own mark, to be drawn `points` across. Its own file, not the Tiny server's
 /// `networks/tiny.svg`, so the two can part.
 pub fn brand_asset(points: f32) -> SharedString {
-    format!("brand/tinyclient.svg@{}", points.ceil()).into()
+    format!("brand/tinyclient.svg@{}", points_key(points.ceil())).into()
 }
 
 /// The same SVG, declaring a size that fits `points` square and keeps its shape.
@@ -234,7 +276,7 @@ fn view_box(text: &str) -> Option<(f32, f32)> {
 
 /// A glyph's path for being drawn `points` across (see [`stroked`]).
 pub fn glyph_asset(name: &str, points: f32) -> SharedString {
-    format!("{name}@{points}").into()
+    format!("{name}@{}", points_key(points)).into()
 }
 
 /// The same glyph with its stroke set so that it draws 1.5 points wide at `points` across. GPUI
@@ -266,5 +308,26 @@ mod tests {
         let discord = root(&sized(include_bytes!("../../assets/networks/discord.svg"), 24.));
         assert_eq!(discord.matches("width=").count(), 1, "{discord}");
         assert_eq!(discord.matches("height=").count(), 1, "{discord}");
+    }
+
+    /// Through gpui-ce's own registry, which answers only listed paths: the sized paths the views
+    /// ask for must all resolve, fractional phone sizes included.
+    #[test]
+    fn every_sized_path_the_views_ask_for_resolves_in_the_registry() {
+        use super::{brand_asset, glyph_asset, network_asset, Assets};
+        let registry = gpui::AssetRegistry::from(Assets);
+        let mut paths = vec![brand_asset(56.), brand_asset(96.)];
+        for network in [protocol::Network::Discord, protocol::Network::Slack, protocol::Network::Tiny] {
+            paths.push(network_asset(network, 32.));
+            paths.push(network_asset(network, 14.5));
+        }
+        for points in [12., 14., 15.5, 22., 33., 48.] {
+            paths.push(glyph_asset("icons/inbox.svg", points));
+            paths.push(glyph_asset("icons/x.svg", points));
+        }
+        for path in paths {
+            assert!(registry.load(&path).is_some(), "{path} is not in the registry");
+        }
+        assert!(registry.load("icons/inbox.svg").is_some());
     }
 }

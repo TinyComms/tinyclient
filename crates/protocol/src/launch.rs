@@ -82,13 +82,31 @@ fn start_systemd(mut command: std::process::Command) -> io::Result<()> {
     }
 }
 
+/// Starts chatd inside the shell's own process. A phone has no chatd binary to run, so the mobile
+/// entry registers this (see [`register_in_process`]) and the shell calls it where it would spawn.
+/// Returns once the core is listening, or says why it is not. Must be idempotent: a call while
+/// the core is already running returns `Ok`.
+pub type InProcessStarter = fn() -> io::Result<()>;
+
+static IN_PROCESS: std::sync::OnceLock<InProcessStarter> = std::sync::OnceLock::new();
+
+/// Registers the in-process starter. Only the first registration counts.
+pub fn register_in_process(starter: InProcessStarter) {
+    let _ = IN_PROCESS.set(starter);
+}
+
 /// Starts chatd in its own process group, so it outlives the shell and a terminal's ^C.
 /// stderr is discarded: chatd writes its own capped log. The child inherits the environment
 /// (`TINYCLIENT_DIR` included) and receives `TINYCLIENT_SESSION` when this process has one and
 /// the variable is unset. The child is reaped on a thread of its own. Answers its pid. With the
 /// optional user unit enabled, asks systemd to start it instead and returns no child pid. A
-/// failed service start never falls back to an unmanaged daemon.
+/// failed service start never falls back to an unmanaged daemon. Where a starter is registered
+/// (phones), chatd runs in this process instead and no pid is returned.
 pub fn start_chatd() -> io::Result<Option<u32>> {
+    if let Some(starter) = IN_PROCESS.get() {
+        starter()?;
+        return Ok(None);
+    }
     #[cfg(target_os = "linux")]
     if systemd_chatd() {
         start_systemd(std::process::Command::new("systemctl"))?;

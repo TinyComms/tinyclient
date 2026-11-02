@@ -272,7 +272,7 @@ impl Shell {
 
 fn dropdown<E: InteractiveElement + Styled + IntoElement + 'static>(list: E, cx: &mut Context<Shell>) -> AnyElement {
     let list = list.max_h(px(360.)).on_mouse_down_out(cx.listener(|this, _, _, cx| this.tiny_audit_open(None, cx)));
-    deferred(anchored().snap_to_window().child(div().mt(px(4.)).child(list))).with_priority(2).into_any_element()
+    deferred(anchored().snap_to_window().child(div().mt(px(4.)).child(list))).priority(2).into_any_element()
 }
 
 pub(in crate::gui::tiny) fn audit(shell: &Shell, facts: &Facts, window: &mut Window, cx: &mut Context<Shell>) -> AnyElement {

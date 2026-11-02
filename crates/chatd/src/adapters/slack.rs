@@ -28,7 +28,6 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use tree::Counted;
-use ureq::tls::{TlsConfig, TlsProvider};
 
 const HISTORY: &str = "50";
 /// Messages asked for on each side of one the user jumped to.
@@ -477,7 +476,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         }
         let moved = api != session.url;
         let agent = ureq::Agent::config_builder()
-            .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
+            .tls_config(crate::tls::config())
             .timeout_global(Some(Duration::from_secs(30)))
             .http_status_as_error(false)
             .user_agent(&session.user_agent)

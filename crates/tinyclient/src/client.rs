@@ -25,6 +25,12 @@ pub fn ask(request: &Request) -> io::Result<Response> {
 /// [`ask`] with its own read timeout: `Status` at launch is asked within 3 s, so a chatd stuck
 /// behind a keychain prompt is told apart from one that is not there.
 pub fn ask_within(request: &Request, read: Option<Duration>) -> io::Result<Response> {
+    // `--shot --demo`, or a `demo` phone build: a made-up chatd answers, and the real one is
+    // never reached.
+    #[cfg(any(feature = "gui-shot", feature = "demo"))]
+    if crate::gui::shot_demo::on() {
+        return crate::gui::shot_demo::answer(request);
+    }
     let mut stream = ChatStream::connect(&chat_sock_path())?;
     stream.set_read_timeout(read)?;
     let _ = stream.set_write_timeout(Some(WRITE));
