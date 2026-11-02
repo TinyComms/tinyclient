@@ -621,8 +621,12 @@ fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
         };
         let id = thread_id(forum, topic.id);
         let mut thread = ConversationRow::new(id.clone(), ConversationKind::Thread, topic.title.clone());
-        // The topic's own icon color: the tile it draws wherever its list shows.
+        // The topic's own icon color: the tile it draws wherever its list shows. Its picture:
+        // the custom emoji the icon names, shown wherever the row stands.
         thread.icon = Some(topic.icon_color);
+        if let Some(icon) = topic.icon_emoji_id {
+            thread.avatar = Some(format!("e{icon}"));
+        }
         thread.parent = Some(forum.text());
         thread.root = Some(topic.id.to_string());
         // Pinned topics first, then as Telegram lists them: the most recently active first.
@@ -643,7 +647,48 @@ fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
         let _ = account.ctx.counts(&id, topic.unread_count.max(0) as u32, topic.unread_mentions_count.max(0) as u32, read.as_deref(), updated);
         let _ = account.ctx.muted(&id, muted(account, forum, &topic.notify_settings));
     }
+    fetch_icons(account, &found.topics);
     Ok(count)
+}
+
+/// The topics' own pictures: one request for every icon the pages say, and a fetch for each
+/// that is not on disk yet (the same file may hang off several topics). The pictures are the
+/// emoji documents Telegram names in the topic list, small and shown at list size.
+fn fetch_icons(account: &Account, topics: &[tl::enums::ForumTopic]) {
+    let icons = topics.iter().filter_map(|topic| match topic {
+        tl::enums::ForumTopic::Topic(topic) => topic.icon_emoji_id,
+        _ => None,
+    }).collect::<Vec<i64>>();
+    let mut icons: Vec<i64> = icons;
+    icons.sort_unstable();
+    icons.dedup();
+    if icons.is_empty() {
+        return;
+    }
+    let documents = match account.ask(&tl::functions::messages::GetCustomEmojiDocuments { document_id: icons }) {
+        Ok(documents) => documents,
+        Err(fault) => {
+            eprintln!("chatd: Telegram: topic icons: {fault}");
+            return;
+        }
+    };
+    let wants = documents.into_iter().filter_map(|document| match document {
+        tl::enums::Document::Document(document) => Some(Want {
+            file: MediaFile::new(format!("e{}", document.id), MediaKind::Emoji),
+            dc: document.dc_id,
+            location: tl::enums::InputFileLocation::InputDocumentFileLocation(tl::types::InputDocumentFileLocation {
+                id: document.id,
+                access_hash: document.access_hash,
+                file_reference: document.file_reference.clone(),
+                thumb_size: String::new(),
+            }),
+            inline: None,
+            row: None,
+            original: false,
+        }),
+        _ => None,
+    }).collect();
+    account.files.want(wants);
 }
 
 /// Where in a conversation a page of history is wanted.

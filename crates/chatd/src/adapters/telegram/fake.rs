@@ -1001,17 +1001,37 @@ impl World {
             self.log(&format!("GetReplies {place}"));
             return answer(self.page(&place, request.offset_id, request.add_offset, request.limit));
         }
+        if let Some(request) = asked::<f::messages::GetCustomEmojiDocuments>(body) {
+            // A topic's icon picture: the documents the emoji ids name, stills at list size.
+            let documents: Vec<tl::enums::Document> = request.document_id.iter().map(|&id| {
+                tl::enums::Document::Document(tl::types::Document {
+                    id,
+                    access_hash: i64::from(id) + 7,
+                    file_reference: vec![1u8, 2u8, 3u8],
+                    date: T0 - 90,
+                    mime_type: "image/webp".to_owned(),
+                    size: 4_096 + 9,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 2,
+                    attributes: Vec::new(),
+                })
+            }).collect();
+            self.log(&format!("GetCustomEmojiDocuments {}", documents.len()));
+            return answer(documents);
+        }
         if let Some(request) = asked::<f::messages::GetForumTopics>(body) {
             let forum = input_who(&request.peer);
             self.log(&format!("GetForumTopics {}", forum.text()));
             let topic = |id: i32, title: &str, top: i32, unread: i32| {
                 let mut topic: tl::types::ForumTopic = blank(&[
-                    &put(0u32),
+                    &put(1u32),
                     &put(id),
                     &put(T0 - 80_000),
                     &put(forum.peer()),
                     &put(title.to_owned()),
                     &put(3i32),
+                    &put(5001i64),
                     &put(top),
                     &put(0i32),
                     &put(0i32),
