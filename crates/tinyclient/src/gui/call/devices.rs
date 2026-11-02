@@ -128,6 +128,9 @@ impl Shell {
         if menu == Some(Menu::Devices) {
             self.call_meter(true, cx);
         }
+        if before == Some(Menu::Security) && menu != Some(Menu::Security) {
+            self.call_state.security_more = false;
+        }
         cx.notify();
     }
 
@@ -145,7 +148,9 @@ impl Shell {
             .call_state
             .menu_closed
             .take()
-            .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
+            // Only long enough to absorb the button's own click after mouse_down_out closed the
+            // popover. 400ms also ate a deliberate reopen after dismissing, so the lock felt dead.
+            .is_some_and(|at| at.elapsed() < Duration::from_millis(50));
         if self.call_state.menu == Some(menu) || just_closed {
             self.call_menu_set(None, cx);
         } else {

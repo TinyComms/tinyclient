@@ -1,5 +1,6 @@
 //! Encryption: this device and the person's other devices, approving a new one, the people this
-//! account shares encrypted conversations with and their safety numbers, and the recovery key.
+//! account shares encrypted conversations with (four emojis from each safety number, Telegram-
+//! style), and the recovery key.
 //!
 //! It says what holds and no more. A device on the server's list that no device of its owner
 //! signed is shown as not approved: the server may have added it, and nothing is encrypted to it.
@@ -15,8 +16,8 @@ use crate::gui::theme::{self, Type};
 use crate::gui::tiny::Page as Facts;
 use gpui::{div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, SharedString, Window};
 use protocol::{
-    grouped_safety, DeviceState, E2eeAsk, E2eeDevice, E2eePerson, E2eeStatus, Request, Response,
-    Trust,
+    grouped_safety, safety_emojis, DeviceState, E2eeAsk, E2eeDevice, E2eePerson, E2eeStatus, Request,
+    Response, Trust,
 };
 
 /// What the page has read and what it is doing.
@@ -314,7 +315,7 @@ pub(in crate::gui::tiny) fn encryption(
     let fields = &shell.tiny_state.settings_fields;
     let mut page = div().flex().flex_col().gap(px(20.)).child(page_head(
         "Encryption",
-        "End-to-end encrypted conversations can be read only on the members' devices. The server stores ciphertext and can't read them. It still sees who is in a conversation, when messages are sent and how large they are.",
+        "Only people's devices can read end-to-end encrypted conversations. The server stores ciphertext.",
     ));
     if let Some(error) = &draft.error {
         page = page.child(kit::note(
@@ -528,14 +529,36 @@ pub(in crate::gui::tiny) fn encryption(
             (_, Trust::Verified) => theme::positive(),
             _ => theme::text_soft(),
         };
-        let safety = if person.safety.is_empty() {
-            "No safety number yet".to_owned()
+        let emojis = safety_emojis(&person.safety);
+        let emoji_row = if emojis.is_empty() {
+            div()
+                .type_small()
+                .text_color(theme::text_faint())
+                .child("No key to compare yet")
+                .into_any_element()
         } else {
-            grouped_safety(&person.safety)
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(6.))
+                .children(emojis.into_iter().enumerate().map(|(ei, face)| {
+                    div()
+                        .id(SharedString::from(format!("tiny-e2ee-emoji-{ix}-{ei}")))
+                        .size(px(36.))
+                        .rounded(px(8.))
+                        .bg(theme::hover())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(20.))
+                        .line_height(px(24.))
+                        .child(face)
+                }))
+                .into_any_element()
         };
         people = people.child(
             kit::table_row(SharedString::from(format!("tiny-e2ee-person-{ix}")), false)
-                // On a phone the buttons go under the number, which keeps the width it needs.
+                // On a phone the buttons go under the key, which keeps the width it needs.
                 .when(crate::gui::phone::active(), |row| row.flex_col().items_start().gap(px(6.)))
                 .child(
                     div()
@@ -543,23 +566,37 @@ pub(in crate::gui::tiny) fn encryption(
                         .min_w_0()
                         .flex()
                         .flex_col()
-                        .gap(px(2.))
+                        .gap(px(6.))
                         .child(
                             div()
-                                .truncate()
-                                .type_ui()
-                                .font_weight(theme::MEDIUM)
-                                .text_color(theme::text())
-                                .child(name),
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .type_ui()
+                                        .font_weight(theme::MEDIUM)
+                                        .text_color(theme::text())
+                                        .child(name),
+                                )
+                                .when(verified && !person.identity_changed && person.trust != Trust::Changed, |row| {
+                                    row.child(glyph("icons/badge-check.svg", 14., theme::positive()))
+                                }),
                         )
-                        .child(
-                            div()
-                                .whitespace_normal()
-                                .type_small()
-                                .font_family(theme::MONO)
-                                .text_color(theme::text())
-                                .child(safety),
-                        )
+                        .child(emoji_row)
+                        .when(!person.safety.is_empty(), |column| {
+                            column.child(
+                                div()
+                                    .whitespace_normal()
+                                    .type_small()
+                                    .font_family(theme::MONO)
+                                    .text_color(theme::text_faint())
+                                    .child(grouped_safety(&person.safety)),
+                            )
+                        })
                         .child(
                             div()
                                 .whitespace_normal()
@@ -598,8 +635,8 @@ pub(in crate::gui::tiny) fn encryption(
         );
     }
     page = page.child(
-        super::section("Safety numbers")
-            .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child("Compare a safety number with the person in a call or face to face. If it matches on both screens, nobody, the server included, has put a device of their own between you."))
+        super::section("People")
+            .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child("Same four emojis on both screens? Nobody, the server included, has put a device between you. Digits stay under the emojis for a precise check."))
             .child(people),
     );
     if let Some(person) = &draft.person {
