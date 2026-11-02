@@ -172,6 +172,31 @@ impl Shell {
 
     /// The picture of a conversation: a person round with their presence, a group as two of its
     /// people, a channel as its Space's icon, a Telegram place as a rounded square.
+    /// The dot on a direct conversation's face. `None` for a bot, a special conversation or
+    /// nothing known, where there is none.
+    pub(in crate::gui) fn presence_dot(&self, c: &Conversation) -> Option<presence::Shape> {
+        if c.kind != ConversationKind::Direct || c.bot || c.special != Special::None {
+            return None;
+        }
+        let peer = c.peer.as_ref()?;
+        let person = Key { id: peer.clone(), ..c.key.clone() };
+        let presence = self.presence_of(&person);
+        if self.in_call(&person) {
+            Some(presence::Shape::InCall)
+        } else if c.key.network == Network::Telegram && presence != protocol::Presence::Online {
+            // Telegram's "last seen" is words, never a dot (`03` §2).
+            None
+        } else {
+            presence::Shape::of(presence)
+        }
+    }
+
+    /// What the dot means, for its tooltip.
+    pub(in crate::gui) fn presence_words(&self, c: &Conversation) -> Option<&'static str> {
+        self.presence_dot(c)?;
+        self.peer_line(&c.key).map(|line| line.word).filter(|word| !word.is_empty())
+    }
+
     pub(in crate::gui) fn conversation_avatar(&self, c: &Conversation, size: f32, surface: Rgba, cx: &mut Context<Self>) -> Div {
         let picture = self.conversation_face(c, cx);
         match c.special {
@@ -195,19 +220,7 @@ impl Shell {
                 if c.bot || c.special != Special::None {
                     return avatar;
                 }
-                let shape = c.peer.as_ref().and_then(|peer| {
-                    let person = Key { id: peer.clone(), ..c.key.clone() };
-                    let presence = self.presence_of(&person);
-                    if self.in_call(&person) {
-                        Some(presence::Shape::InCall)
-                    } else if c.key.network == Network::Telegram && presence != protocol::Presence::Online {
-                        // Telegram's "last seen" is words, never a dot (`03` §2).
-                        None
-                    } else {
-                        presence::Shape::of(presence)
-                    }
-                });
-                avatar.children(shape.and_then(|shape| presence::dot(shape, size, &presence::Ring::on(surface))))
+                avatar.children(self.presence_dot(c).and_then(|shape| presence::dot(shape, size, &presence::Ring::on(surface))))
             }
             // One look per group at every size: its picture, else two of its people when its
             // title names them, else its two letters (`components::pair`).
