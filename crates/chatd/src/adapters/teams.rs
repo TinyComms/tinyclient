@@ -123,13 +123,7 @@ const PRESENCE: &str = "https://presence.teams.microsoft.com";
 /// that Teams' client id may mint it.
 const GRAPH: &str = "https://graph.microsoft.com";
 /// Hosts a service address handed out by Teams may be on. A token goes nowhere else.
-const OURS: &[&str] = &[
-    "teams.microsoft.com",
-    "skype.com",
-    "teams.cloud.microsoft",
-    "teams.office.com",
-    "graph.microsoft.com",
-];
+const OURS: &[&str] = &["teams.microsoft.com", "skype.com", "teams.cloud.microsoft", "teams.office.com", "graph.microsoft.com"];
 
 /// Messages per page of history, and per opening of a reply chain.
 const PAGE: u32 = 50;
@@ -181,10 +175,7 @@ enum Fault {
     /// Rate limited, for this many seconds.
     Limited(u64),
     /// The service said no.
-    Refused {
-        status: u16,
-        message: String,
-    },
+    Refused { status: u16, message: String },
     Net(String),
 }
 
@@ -214,9 +205,7 @@ fn reason(fault: Fault) -> String {
         Fault::Refused { status: 403, .. } => "Teams does not let you do that here.".to_owned(),
         Fault::Refused { status: 404, .. } => "Teams cannot find that any more.".to_owned(),
         Fault::Refused { status: 413, .. } => "The message is too long for Teams.".to_owned(),
-        Fault::Refused { status, message } if message.is_empty() => {
-            format!("Teams refused ({status}).")
-        }
+        Fault::Refused { status, message } if message.is_empty() => format!("Teams refused ({status})."),
         Fault::Refused { status, message } => format!("Teams refused ({status}: {message})."),
     }
 }
@@ -224,20 +213,8 @@ fn reason(fault: Fault) -> String {
 /// Why Microsoft would not renew the sign-in, for the account's banner. `description` is
 /// Entra's own, which starts with its `AADSTS` code.
 fn ended(error: &str, description: &str) -> String {
-    let code = description
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .find(|word| word.starts_with("AADSTS"))
-        .unwrap_or(error);
-    let policy = [
-        "AADSTS53000",
-        "AADSTS53001",
-        "AADSTS53002",
-        "AADSTS53003",
-        "AADSTS53004",
-        "AADSTS530002",
-        "AADSTS530003",
-        "AADSTS50105",
-    ];
+    let code = description.split(|c: char| !c.is_ascii_alphanumeric()).find(|word| word.starts_with("AADSTS")).unwrap_or(error);
+    let policy = ["AADSTS53000", "AADSTS53001", "AADSTS53002", "AADSTS53003", "AADSTS53004", "AADSTS530002", "AADSTS530003", "AADSTS50105"];
     if policy.contains(&code) {
         format!("Your organization's policy does not allow this app ({code}). Teams stays in the Teams app.")
     } else {
@@ -350,9 +327,7 @@ pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
         if id.is_empty() || refresh.is_empty() || found.iter().any(|signed| signed.account == id) {
             continue;
         }
-        let name = Some(text(&tenant["name"]))
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "Teams".to_owned());
+        let name = Some(text(&tenant["name"])).filter(|name| !name.is_empty()).unwrap_or_else(|| "Teams".to_owned());
         let session = json!({
             "tenant": id, "name": name, "refresh_token": refresh,
             "client_id": text(&parsed["client_id"]), "user_agent": text(&parsed["user_agent"]),
@@ -384,10 +359,7 @@ pub fn without(session: &str, account: &str) -> Option<String> {
 /// The stored session with one tenant's refresh token replaced.
 fn renewed(stored: &str, tenant: &str, refresh: &str) -> Option<String> {
     let mut parsed: Value = serde_json::from_str(stored).ok()?;
-    let entry = parsed["tenants"]
-        .as_array_mut()?
-        .iter_mut()
-        .find(|entry| entry["id"] == tenant)?;
+    let entry = parsed["tenants"].as_array_mut()?.iter_mut().find(|entry| entry["id"] == tenant)?;
     entry["refresh_token"] = refresh.into();
     Some(parsed.to_string())
 }
@@ -400,9 +372,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     if session.client_id.is_empty() {
         session.client_id = CLIENT.to_owned();
     }
-    let api = address("TINYCLIENT_TEAMS_API", TEAMS)
-        .trim_end_matches('/')
-        .to_owned();
+    let api = address("TINYCLIENT_TEAMS_API", TEAMS).trim_end_matches('/').to_owned();
     let agent = ureq::Agent::config_builder()
         .tls_config(crate::tls::config())
         .timeout_global(Some(Duration::from_secs(30)))
@@ -419,13 +389,9 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     let teams = Arc::new(Teams {
         ctx,
         agent,
-        login: address("TINYCLIENT_TEAMS_LOGIN", LOGIN)
-            .trim_end_matches('/')
-            .to_owned(),
+        login: address("TINYCLIENT_TEAMS_LOGIN", LOGIN).trim_end_matches('/').to_owned(),
         moved: (api != TEAMS).then(|| api.clone()),
-        graph: address("TINYCLIENT_TEAMS_GRAPH", GRAPH)
-            .trim_end_matches('/')
-            .to_owned(),
+        graph: address("TINYCLIENT_TEAMS_GRAPH", GRAPH).trim_end_matches('/').to_owned(),
         api,
         session,
         state: Mutex::new(state),
@@ -481,10 +447,7 @@ fn bare(url: &str) -> &str {
 
 /// The host of an `https` address, or `None` for anything that is not plainly one.
 fn https_host(url: &str) -> Option<&str> {
-    let authority = url
-        .strip_prefix("https://")?
-        .split(['/', '?', '#'])
-        .next()?;
+    let authority = url.strip_prefix("https://")?.split(['/', '?', '#']).next()?;
     if authority.contains('@') {
         return None;
     }
@@ -492,10 +455,7 @@ fn https_host(url: &str) -> Option<&str> {
 }
 
 fn within(host: &str, domain: &str) -> bool {
-    host == domain
-        || host
-            .strip_suffix(domain)
-            .is_some_and(|sub| sub.ends_with('.'))
+    host == domain || host.strip_suffix(domain).is_some_and(|sub| sub.ends_with('.'))
 }
 
 /// An id Teams writes as text in one place and as a number in another.
@@ -513,20 +473,16 @@ fn millis(id: &str) -> i64 {
 }
 
 fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis() as i64)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis() as i64)
 }
 
 /// Unix seconds from `2021-04-11T09:31:49.3620000Z`. 0 for anything else.
 fn seconds(iso: &str) -> i64 {
-    let number =
-        |range: std::ops::Range<usize>| iso.get(range).and_then(|part| part.parse::<i64>().ok());
+    let number = |range: std::ops::Range<usize>| iso.get(range).and_then(|part| part.parse::<i64>().ok());
     let (Some(year), Some(month), Some(day)) = (number(0..4), number(5..7), number(8..10)) else {
         return 0;
     };
-    let (Some(hour), Some(minute), Some(second)) = (number(11..13), number(14..16), number(17..19))
-    else {
+    let (Some(hour), Some(minute), Some(second)) = (number(11..13), number(14..16), number(17..19)) else {
         return 0;
     };
     // Days from the civil date, counting years from March so the leap day falls last.
@@ -542,30 +498,20 @@ fn seconds(iso: &str) -> i64 {
 fn uuid() -> String {
     use std::io::Read;
     let mut bytes = [0u8; 16];
-    let read =
-        std::fs::File::open("/dev/urandom").and_then(|mut source| source.read_exact(&mut bytes));
+    let read = std::fs::File::open("/dev/urandom").and_then(|mut source| source.read_exact(&mut bytes));
     if read.is_err() {
         bytes = (u128::from(now_ms().unsigned_abs()) * 0x9E37_79B9_7F4A_7C15).to_be_bytes();
     }
     bytes[6] = bytes[6] & 0x0f | 0x40;
     bytes[8] = bytes[8] & 0x3f | 0x80;
     let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..]
-    )
+    format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..])
 }
 
 /// One claim of a token's middle part. Nothing is verified: it is only read for our own id.
 fn claim(token: &str, name: &str) -> Option<String> {
     let payload = token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload.trim_end_matches('='))
-        .ok()?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
     let claims: Value = serde_json::from_slice(&bytes).ok()?;
     claims[name].as_str().map(str::to_owned)
 }
@@ -586,30 +532,21 @@ impl Teams {
             Err(Failure::SignedOut(why)) => {
                 self.state().expired.get_or_insert(why);
             }
-            Err(Failure::Dropped(why)) => {
-                tracing::warn!("chatd: Teams: {}", super::net::redact(&why))
-            }
+            Err(Failure::Dropped(why)) => tracing::warn!("chatd: Teams: {}", super::net::redact(&why)),
         }
     }
 
     /// True for an address Teams' own services are at.
     fn ours(&self, url: &str) -> bool {
-        self.moved
-            .as_ref()
-            .is_some_and(|base| url.starts_with(base.as_str()))
+        self.moved.as_ref().is_some_and(|base| url.starts_with(base.as_str()))
             || (self.graph != GRAPH && url.starts_with(self.graph.as_str()))
             || https_host(url).is_some_and(|host| OURS.iter().any(|domain| within(host, domain)))
     }
 
     /// True for an address a picture in a message may be fetched from: the media store.
     fn pictures(&self, url: &str) -> bool {
-        let media = |host: &str| {
-            within(host, "asm.skype.com") || within(host, "asyncgw.teams.microsoft.com")
-        };
-        self.moved
-            .as_ref()
-            .is_some_and(|base| url.starts_with(base.as_str()))
-            || https_host(url).is_some_and(media)
+        let media = |host: &str| within(host, "asm.skype.com") || within(host, "asyncgw.teams.microsoft.com");
+        self.moved.as_ref().is_some_and(|base| url.starts_with(base.as_str())) || https_host(url).is_some_and(media)
     }
 
     /// Waits until the last call is [`GAP`] behind.
@@ -632,11 +569,7 @@ impl Teams {
             return Ok(token.value.clone());
         }
         let refresh = self.state().refresh.clone();
-        let url = format!(
-            "{}/{}/oauth2/v2.0/token",
-            self.login,
-            escaped(&self.session.tenant)
-        );
+        let url = format!("{}/{}/oauth2/v2.0/token", self.login, escaped(&self.session.tenant));
         let scopes = format!("{scope}/.default openid profile offline_access");
         let form = [
             ("client_id", self.session.client_id.as_str()),
@@ -645,46 +578,29 @@ impl Teams {
             ("scope", scopes.as_str()),
         ];
         self.pace();
-        let mut response = self
-            .agent
-            .post(&url)
-            .send_form(form)
-            .map_err(|err| Fault::Net(format!("token: {err}")))?;
+        let mut response = self.agent.post(&url).send_form(form).map_err(|err| Fault::Net(format!("token: {err}")))?;
         let status = response.status().as_u16();
         let body: Value = response.body_mut().read_json().unwrap_or(Value::Null);
         if let (200, Some(access)) = (status, body["access_token"].as_str()) {
-            let life = body["expires_in"]
-                .as_u64()
-                .unwrap_or(3600)
-                .clamp(60, 86_400);
+            let life = body["expires_in"].as_u64().unwrap_or(3600).clamp(60, 86_400);
             let token = Token {
                 value: access.to_owned(),
                 until: Instant::now() + Duration::from_secs(life),
             };
-            let next = body["refresh_token"]
-                .as_str()
-                .filter(|next| !next.is_empty() && *next != refresh);
+            let next = body["refresh_token"].as_str().filter(|next| !next.is_empty() && *next != refresh);
             let mut state = self.state();
             state.access.insert(scope, token);
             if let Some(next) = next {
                 state.refresh = next.to_owned();
                 drop(state);
                 let tenant = &self.session.tenant;
-                self.ctx
-                    .save_session(|stored| renewed(stored, tenant, next));
+                self.ctx.save_session(|stored| renewed(stored, tenant, next));
             }
             return Ok(access.to_owned());
         }
         let error = body["error"].as_str().unwrap_or("");
         // What Entra answers when no retry can help: the grant is gone, or policy forbids it.
-        const OVER: &[&str] = &[
-            "invalid_grant",
-            "interaction_required",
-            "invalid_client",
-            "unauthorized_client",
-            "consent_required",
-            "login_required",
-        ];
+        const OVER: &[&str] = &["invalid_grant", "interaction_required", "invalid_client", "unauthorized_client", "consent_required", "login_required"];
         if matches!(status, 400 | 401 | 403) && OVER.contains(&error) {
             let why = ended(error, body["error_description"].as_str().unwrap_or(""));
             self.state().expired = Some(why.clone());
@@ -736,15 +652,10 @@ impl Teams {
             let body: Value = response.body_mut().read_json().unwrap_or(Value::Null);
             if status == 401 {
                 self.forget(Auth::Bearer(SPACES));
-                refused = Some(Fault::Auth(
-                    "Teams no longer accepts this sign-in. Sign in again.".to_owned(),
-                ));
+                refused = Some(Fault::Auth("Teams no longer accepts this sign-in. Sign in again.".to_owned()));
                 continue;
             }
-            let Some(token) = body["tokens"]["skypeToken"]
-                .as_str()
-                .filter(|_| status == 200)
-            else {
+            let Some(token) = body["tokens"]["skypeToken"].as_str().filter(|_| status == 200) else {
                 let code = body["errorCode"].as_str().unwrap_or("");
                 // No licence, or a tenant that keeps Teams from this user: retrying cannot help.
                 if status == 403 {
@@ -755,33 +666,19 @@ impl Teams {
                 return Err(Fault::Net(format!("authz: {status} {code}")));
             };
             let gtms = &body["regionGtms"];
-            let named = |name: &str| {
-                gtms[name]
-                    .as_str()
-                    .map(|url| url.trim_end_matches('/').to_owned())
-                    .filter(|url| self.ours(url))
-            };
+            let named = |name: &str| gtms[name].as_str().map(|url| url.trim_end_matches('/').to_owned()).filter(|url| self.ours(url));
             let (Some(chat), Some(middle)) = (named("chatService"), named("middleTier")) else {
-                return Err(Fault::Net(
-                    "authz named no chat service of Microsoft's".to_owned(),
-                ));
+                return Err(Fault::Net("authz named no chat service of Microsoft's".to_owned()));
             };
             let place = Arc::new(Place {
                 chat,
                 middle,
                 presence: named("unifiedPresence").unwrap_or_else(|| PRESENCE.to_owned()),
             });
-            let life = body["tokens"]["expiresIn"]
-                .as_u64()
-                .unwrap_or(3600)
-                .clamp(60, 86_400);
-            let me = claim(token, "skypeid")
-                .map(|id| format!("8:{id}"))
-                .or_else(|| {
-                    Some(&self.session.oid)
-                        .filter(|oid| !oid.is_empty())
-                        .map(|oid| format!("8:orgid:{oid}"))
-                });
+            let life = body["tokens"]["expiresIn"].as_u64().unwrap_or(3600).clamp(60, 86_400);
+            let me = claim(token, "skypeid").map(|id| format!("8:{id}")).or_else(|| {
+                Some(&self.session.oid).filter(|oid| !oid.is_empty()).map(|oid| format!("8:orgid:{oid}"))
+            });
             let mut state = self.state();
             state.skype = Some(Token {
                 value: token.to_owned(),
@@ -806,25 +703,14 @@ impl Teams {
         Ok(match auth {
             Auth::Skype => vec![("Authentication", format!("skypetoken={}", self.skype()?.0))],
             Auth::Push => vec![("X-Skypetoken", self.skype()?.0)],
-            Auth::Bearer(scope) => {
-                vec![("Authorization", format!("Bearer {}", self.token(scope)?))]
-            }
+            Auth::Bearer(scope) => vec![("Authorization", format!("Bearer {}", self.token(scope)?))],
             Auth::Both(scope) => {
-                vec![
-                    ("Authorization", format!("Bearer {}", self.token(scope)?)),
-                    ("X-Skypetoken", self.skype()?.0),
-                ]
+                vec![("Authorization", format!("Bearer {}", self.token(scope)?)), ("X-Skypetoken", self.skype()?.0)]
             }
         })
     }
 
-    fn send(
-        &self,
-        method: &str,
-        url: &str,
-        headers: &[(&'static str, String)],
-        body: &Body,
-    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    fn send(&self, method: &str, url: &str, headers: &[(&'static str, String)], body: &Body) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         macro_rules! dressed {
             ($request:expr) => {{
                 let mut request = $request
@@ -840,30 +726,19 @@ impl Teams {
         }
         match (method, body) {
             ("GET", _) => dressed!(self.agent.get(url)).call(),
-            ("DELETE", Body::Json(body)) => dressed!(self.agent.delete(url))
-                .force_send_body()
-                .send_json(*body),
+            ("DELETE", Body::Json(body)) => dressed!(self.agent.delete(url)).force_send_body().send_json(*body),
             ("DELETE", _) => dressed!(self.agent.delete(url)).call(),
             ("PUT", Body::Json(body)) => dressed!(self.agent.put(url)).send_json(*body),
             ("PUT", _) => dressed!(self.agent.put(url)).send_empty(),
             (_, Body::Json(body)) => dressed!(self.agent.post(url)).send_json(*body),
-            (_, Body::Text(text)) => dressed!(self.agent.post(url))
-                .header("Content-Type", "application/json")
-                .send(*text),
+            (_, Body::Text(text)) => dressed!(self.agent.post(url)).header("Content-Type", "application/json").send(*text),
             (_, Body::None) => dressed!(self.agent.post(url)).send_empty(),
         }
     }
 
     /// One call to a Teams service. A token the service refuses is minted again once; a short
     /// rate limit is waited out when `patient`, and a send is not: the user is told instead.
-    fn call(
-        &self,
-        method: &str,
-        url: &str,
-        auth: Auth,
-        body: Body,
-        patient: bool,
-    ) -> Result<Answer, Fault> {
+    fn call(&self, method: &str, url: &str, auth: Auth, body: Body, patient: bool) -> Result<Answer, Fault> {
         if let Some(why) = self.state().expired.clone() {
             return Err(Fault::Auth(why));
         }
@@ -881,28 +756,12 @@ impl Teams {
             };
             let mut response = self.send(method, url, &headers, &body).map_err(failed)?;
             let status = response.status().as_u16();
-            let header = |name: &str| {
-                response
-                    .headers()
-                    .get(name)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("")
-                    .to_owned()
-            };
-            let (retry, location) = (
-                header("retry-after").parse::<u64>().ok(),
-                header("location"),
-            );
+            let header = |name: &str| response.headers().get(name).and_then(|value| value.to_str().ok()).unwrap_or("").to_owned();
+            let (retry, location) = (header("retry-after").parse::<u64>().ok(), header("location"));
             let text = response.body_mut().read_to_string().unwrap_or_default();
             let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
             match status {
-                200..=299 => {
-                    return Ok(Answer {
-                        body,
-                        text,
-                        location,
-                    })
-                }
+                200..=299 => return Ok(Answer { body, text, location }),
                 401 if !renewed => {
                     renewed = true;
                     self.forget(auth);
@@ -917,16 +776,8 @@ impl Teams {
                     sleep(Duration::from_secs(wait));
                 }
                 _ => {
-                    let message = [
-                        &body["message"],
-                        &body["errorCode"],
-                        &body["standardizedError"]["errorDescription"],
-                    ];
-                    let message = message
-                        .into_iter()
-                        .filter_map(Value::as_str)
-                        .next()
-                        .unwrap_or("");
+                    let message = [&body["message"], &body["errorCode"], &body["standardizedError"]["errorDescription"]];
+                    let message = message.into_iter().filter_map(Value::as_str).next().unwrap_or("");
                     return Err(Fault::Refused {
                         status,
                         message: message.chars().take(120).collect(),
@@ -962,11 +813,7 @@ impl Teams {
         // Files are off until they can be shared with the chat's members only. The OneDrive path
         // below made an organization-wide link, which is not what the Teams app does and shows
         // up in a company's audit logs.
-        self.ctx.capabilities(protocol::Capabilities {
-            max_file_bytes: 0,
-            max_files: 0,
-            ..protocol::Capabilities::default()
-        });
+        self.ctx.capabilities(protocol::Capabilities { max_file_bytes: 0, max_files: 0, ..protocol::Capabilities::default() });
         {
             let mut state = self.state();
             state.watched.clear();
@@ -988,66 +835,22 @@ impl Teams {
     fn serve(self: &Arc<Self>, command: Command) {
         let refuse = |fault: Fault| Refusal::Refused(reason(fault));
         match command {
-            Command::History {
-                conversation_id,
-                before,
-            } => self.report(self.older(&conversation_id, &before).map_err(Failure::from)),
-            Command::HistoryAfter {
-                conversation_id,
-                after,
-            } => self.report(self.after(&conversation_id, &after).map_err(Failure::from)),
-            Command::HistoryAround {
-                conversation_id,
-                around,
-            } => self.report(
-                self.around(&conversation_id, &around)
-                    .map_err(Failure::from),
-            ),
-            Command::OpenSpace(_) | Command::OpenHome => {
-                self.report(self.open_space().map_err(Failure::from))
+            Command::History { conversation_id, before } => self.report(self.older(&conversation_id, &before).map_err(Failure::from)),
+            Command::HistoryAfter { conversation_id, after } => self.report(self.after(&conversation_id, &after).map_err(Failure::from)),
+            Command::HistoryAround { conversation_id, around } => self.report(self.around(&conversation_id, &around).map_err(Failure::from)),
+            Command::OpenSpace(_) | Command::OpenHome => self.report(self.open_space().map_err(Failure::from)),
+            Command::MarkRead { conversation_id, message_id } => self.report(self.mark_read(&conversation_id, &message_id).map_err(Failure::from)),
+            Command::Send { conversation_id, client_id, text, reply_to } => {
+                self.post(&conversation_id, &client_id, &text, reply_to.as_deref())
             }
-            Command::MarkRead {
-                conversation_id,
-                message_id,
-            } => self.report(
-                self.mark_read(&conversation_id, &message_id)
-                    .map_err(Failure::from),
-            ),
-            Command::Send {
-                conversation_id,
-                client_id,
-                text,
-                reply_to,
-            } => self.post(&conversation_id, &client_id, &text, reply_to.as_deref()),
-            Command::React {
-                conversation_id,
-                message_id,
-                emoji,
-                on,
-                reply,
-            } => {
-                let _ = reply.send(
-                    self.react(&conversation_id, &message_id, &emoji, on)
-                        .map_err(refuse),
-                );
+            Command::React { conversation_id, message_id, emoji, on, reply } => {
+                let _ = reply.send(self.react(&conversation_id, &message_id, &emoji, on).map_err(refuse));
             }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(message::reaction_rules()))),
-            Command::Edit {
-                conversation_id,
-                message_id,
-                text,
-                reply,
-            } => {
-                let _ = reply.send(
-                    self.edit(&conversation_id, &message_id, &text)
-                        .map_err(refuse),
-                );
+            Command::Edit { conversation_id, message_id, text, reply } => {
+                let _ = reply.send(self.edit(&conversation_id, &message_id, &text).map_err(refuse));
             }
-            Command::Delete {
-                conversation_id,
-                message_id,
-                reply,
-            } => {
+            Command::Delete { conversation_id, message_id, reply } => {
                 let _ = reply.send(self.delete(&conversation_id, &message_id).map_err(refuse));
             }
             Command::Typing(conversation) => self.typing(&conversation),
@@ -1056,16 +859,8 @@ impl Teams {
                 self.report(self.search(&query).map_err(Failure::from));
                 self.ctx.searched(&query);
             }
-            Command::Members {
-                conversation_id,
-                offset,
-                limit,
-                reply,
-            } => {
-                let _ = reply.send(
-                    self.members(&conversation_id, offset, limit)
-                        .map_err(refuse),
-                );
+            Command::Members { conversation_id, offset, limit, reply } => {
+                let _ = reply.send(self.members(&conversation_id, offset, limit).map_err(refuse));
             }
             Command::StartDirect { person_id, reply } => {
                 let _ = reply.send(self.start_direct(&person_id).map_err(refuse));
@@ -1073,55 +868,26 @@ impl Teams {
             Command::Profile { person_id, reply } => {
                 let _ = reply.send(self.profile(&person_id).map_err(refuse));
             }
-            Command::ConversationInfo {
-                conversation_id,
-                reply,
-            } => {
+            Command::ConversationInfo { conversation_id, reply } => {
                 let _ = reply.send(self.conversation_info(&conversation_id).map_err(refuse));
             }
-            Command::SetMute {
-                conversation_id,
-                notify,
-                reply,
-            } => {
+            Command::SetMute { conversation_id, notify, reply } => {
                 let _ = reply.send(self.set_mute(&conversation_id, notify).map_err(refuse));
             }
-            Command::SendWith {
-                conversation_id,
-                client_id,
-                text,
-                reply_to,
-                with,
-            } => {
-                self.send_with(
-                    &conversation_id,
-                    &client_id,
-                    &text,
-                    reply_to.as_deref(),
-                    *with,
-                );
+            Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+                self.send_with(&conversation_id, &client_id, &text, reply_to.as_deref(), *with);
             }
             Command::CancelSend { client_id, .. } => self.cancel_send(&client_id),
             // Each row's line comes with the chat list (`lastMessage`); a row still without one
             // has no message, or one the list did not show.
             Command::Previews(_) => {}
-            Command::SetPresence {
-                presence,
-                status,
-                reply,
-            } => {
-                let _ = reply.send(
-                    self.set_presence(presence, status.as_deref())
-                        .map_err(refuse),
-                );
+            Command::SetPresence { presence, status, reply } => {
+                let _ = reply.send(self.set_presence(presence, status.as_deref()).map_err(refuse));
             }
             Command::Download { url, reply, .. } => {
                 let _ = reply.send(self.download(url).map_err(refuse));
             }
-            Command::Handoff {
-                conversation_id,
-                reply,
-            } => {
+            Command::Handoff { conversation_id, reply } => {
                 let _ = reply.send(Ok(self.call_link(&conversation_id)));
             }
             // The refresh token is Microsoft's to revoke, from the account's own security
@@ -1136,42 +902,27 @@ impl Teams {
     fn download(&self, url: String) -> Result<Download, Fault> {
         let mut headers = vec![("User-Agent".to_owned(), self.session.user_agent.clone())];
         if self.pictures(&url) {
-            headers.push((
-                "Authorization".to_owned(),
-                format!("skype_token {}", self.skype()?.0),
-            ));
+            headers.push(("Authorization".to_owned(), format!("skype_token {}", self.skype()?.0)));
         } else if self.ours(&url) {
             let cookie = format!("authtoken=Bearer={}&Origin={TEAMS}", self.token(SPACES)?);
             headers.push(("Cookie".to_owned(), cookie));
-            headers.push((
-                "Referer".to_owned(),
-                "https://teams.microsoft.com/".to_owned(),
-            ));
+            headers.push(("Referer".to_owned(), "https://teams.microsoft.com/".to_owned()));
         }
-        Ok(Download {
-            url,
-            headers,
-            sealed: None,
-        })
+        Ok(Download { url, headers, sealed: None })
     }
 
     /// Tells the conversation the user is typing, at most once per [`TYPING_EVERY`].
     fn typing(&self, conversation: &str) {
         {
             let mut state = self.state();
-            let recent = |(place, at): &(String, Instant)| {
-                place == conversation && at.elapsed() < TYPING_EVERY
-            };
+            let recent = |(place, at): &(String, Instant)| place == conversation && at.elapsed() < TYPING_EVERY;
             if state.typed.as_ref().is_some_and(recent) {
                 return;
             }
             state.typed = Some((conversation.to_owned(), Instant::now()));
         }
         let body = json!({"content": "", "contenttype": "Application/Message", "messagetype": "Control/Typing"});
-        let path = format!(
-            "/v1/users/ME/conversations/{}/messages",
-            escaped(conversation)
-        );
+        let path = format!("/v1/users/ME/conversations/{}/messages", escaped(conversation));
         if let Err(Fault::Auth(why)) = self.chat("POST", &path, Body::Json(&body), false) {
             self.state().expired.get_or_insert(why);
         }
@@ -1183,10 +934,7 @@ impl Teams {
             return Ok(());
         }
         // Teams keeps one marker for a channel, its reply chains included.
-        let path = format!(
-            "/v1/users/ME/conversations/{}/properties?name=consumptionhorizon",
-            escaped(thread_of(conversation))
-        );
+        let path = format!("/v1/users/ME/conversations/{}/properties?name=consumptionhorizon", escaped(thread_of(conversation)));
         let horizon = json!({"consumptionhorizon": format!("{message};{};{message}", now_ms())});
         self.chat("PUT", &path, Body::Json(&horizon), true)?;
         Ok(())
@@ -1212,39 +960,16 @@ mod tests {
     #[test]
     fn one_sign_in_is_one_account_per_tenant_and_each_can_be_removed() {
         let found = accounts(&session()).unwrap();
-        let listed: Vec<(&str, &str)> = found
-            .iter()
-            .map(|signed| (signed.account.as_str(), signed.name.as_str()))
-            .collect();
-        assert_eq!(
-            listed,
-            [("11111111-aaaa", "Contoso"), ("22222222-bbbb", "Teams")]
-        );
+        let listed: Vec<(&str, &str)> = found.iter().map(|signed| (signed.account.as_str(), signed.name.as_str())).collect();
+        assert_eq!(listed, [("11111111-aaaa", "Contoso"), ("22222222-bbbb", "Teams")]);
         let guest: Session = serde_json::from_str(&found[1].session).unwrap();
-        assert_eq!(
-            (guest.tenant.as_str(), guest.refresh_token.as_str()),
-            ("22222222-bbbb", "rt-guest")
-        );
-        assert_eq!(
-            (
-                guest.client_id.as_str(),
-                guest.user_agent.as_str(),
-                guest.oid.as_str()
-            ),
-            (CLIENT, "Safari/1", "me-oid")
-        );
+        assert_eq!((guest.tenant.as_str(), guest.refresh_token.as_str()), ("22222222-bbbb", "rt-guest"));
+        assert_eq!((guest.client_id.as_str(), guest.user_agent.as_str(), guest.oid.as_str()), (CLIENT, "Safari/1", "me-oid"));
 
         let left = without(&session(), "11111111-aaaa").unwrap();
-        let ids: Vec<String> = accounts(&left)
-            .unwrap()
-            .into_iter()
-            .map(|signed| signed.account)
-            .collect();
+        let ids: Vec<String> = accounts(&left).unwrap().into_iter().map(|signed| signed.account).collect();
         assert_eq!(ids, ["22222222-bbbb"]);
-        assert_eq!(
-            without(&without(&left, "33333333-cccc").unwrap(), "22222222-bbbb"),
-            None
-        );
+        assert_eq!(without(&without(&left, "33333333-cccc").unwrap(), "22222222-bbbb"), None);
         assert!(accounts("{}").is_err() && accounts("not json").is_err());
     }
 
@@ -1252,107 +977,45 @@ mod tests {
     fn a_renewed_refresh_token_replaces_only_its_tenants() {
         let saved = renewed(&session(), "22222222-bbbb", "rt-next").unwrap();
         let found = accounts(&saved).unwrap();
-        let tokens: Vec<String> = found
-            .iter()
-            .map(|signed| {
-                serde_json::from_str::<Session>(&signed.session)
-                    .unwrap()
-                    .refresh_token
-            })
-            .collect();
+        let tokens: Vec<String> = found.iter().map(|signed| serde_json::from_str::<Session>(&signed.session).unwrap().refresh_token).collect();
         assert_eq!(tokens, ["rt-home", "rt-next"]);
         assert_eq!(renewed(&session(), "no-such-tenant", "rt-next"), None);
     }
 
     #[test]
     fn ids_times_and_addresses_are_read_as_teams_writes_them() {
-        assert_eq!(
-            chain_of("19:general@thread.tacv2;messageid=1760000200200"),
-            Some(("19:general@thread.tacv2", "1760000200200"))
-        );
+        assert_eq!(chain_of("19:general@thread.tacv2;messageid=1760000200200"), Some(("19:general@thread.tacv2", "1760000200200")));
         assert_eq!(chain_of("19:a_b@unq.gbl.spaces"), None);
-        assert_eq!(
-            thread_of(&chain_id("19:x@thread.tacv2", "17")),
-            "19:x@thread.tacv2"
-        );
-        assert_eq!(
-            escaped("19:x@thread.tacv2;messageid=1"),
-            "19%3Ax%40thread.tacv2%3Bmessageid%3D1"
-        );
+        assert_eq!(thread_of(&chain_id("19:x@thread.tacv2", "17")), "19:x@thread.tacv2");
+        assert_eq!(escaped("19:x@thread.tacv2;messageid=1"), "19%3Ax%40thread.tacv2%3Bmessageid%3D1");
         assert_eq!(seconds("2021-04-11T09:31:49.3620000Z"), 1_618_133_509);
         assert_eq!(seconds("2024-02-29T23:59:59Z"), 1_709_251_199);
         assert_eq!(seconds("soon"), 0);
-        assert_eq!(
-            (millis("1618133509362"), millis("abc"), millis("-4")),
-            (1_618_133_509_362, 0, 0)
-        );
-        assert_eq!(
-            bare("https://x.trouter.teams.microsoft.com/v4/f/abc?sig=secret"),
-            "https://x.trouter.teams.microsoft.com/v4/f/abc"
-        );
-        assert_eq!(
-            https_host("https://teams.microsoft.com:pw@evil.example/a"),
-            None
-        );
-        assert!(within(
-            "emea.ng.msg.teams.microsoft.com",
-            "teams.microsoft.com"
-        ));
-        assert!(!within(
-            "notteams.microsoft.com.evil.example",
-            "teams.microsoft.com"
-        ));
+        assert_eq!((millis("1618133509362"), millis("abc"), millis("-4")), (1_618_133_509_362, 0, 0));
+        assert_eq!(bare("https://x.trouter.teams.microsoft.com/v4/f/abc?sig=secret"), "https://x.trouter.teams.microsoft.com/v4/f/abc");
+        assert_eq!(https_host("https://teams.microsoft.com:pw@evil.example/a"), None);
+        assert!(within("emea.ng.msg.teams.microsoft.com", "teams.microsoft.com"));
+        assert!(!within("notteams.microsoft.com.evil.example", "teams.microsoft.com"));
         let id = uuid();
-        assert_eq!(
-            id.split('-').map(str::len).collect::<Vec<_>>(),
-            [8, 4, 4, 4, 12]
-        );
+        assert_eq!(id.split('-').map(str::len).collect::<Vec<_>>(), [8, 4, 4, 4, 12]);
         assert!(id.split('-').nth(2).unwrap().starts_with('4'));
     }
 
     #[test]
     fn our_own_id_is_read_from_the_skype_token() {
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(r#"{"skypeid":"orgid:0000-me","exp":1}"#);
-        assert_eq!(
-            claim(&format!("e30.{payload}.sig"), "skypeid").as_deref(),
-            Some("orgid:0000-me")
-        );
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"skypeid":"orgid:0000-me","exp":1}"#);
+        assert_eq!(claim(&format!("e30.{payload}.sig"), "skypeid").as_deref(), Some("orgid:0000-me"));
         assert_eq!(claim("opaque", "skypeid"), None);
     }
 
     #[test]
     fn a_refused_renewal_says_whether_signing_in_again_can_help() {
-        let policy = ended(
-            "invalid_grant",
-            "AADSTS53003: Access has been blocked by Conditional Access policies. Trace ID: x",
-        );
-        assert!(
-            policy.contains("AADSTS53003") && policy.contains("organization"),
-            "{policy}"
-        );
-        let gone = ended(
-            "invalid_grant",
-            "AADSTS700082: The refresh token has expired due to inactivity.",
-        );
-        assert_eq!(
-            gone,
-            "Microsoft ended this sign-in (AADSTS700082). Sign in again."
-        );
-        assert_eq!(
-            ended("invalid_grant", ""),
-            "Microsoft ended this sign-in (invalid_grant). Sign in again."
-        );
-        assert_eq!(
-            reason(Fault::Limited(7)),
-            "Teams is rate limiting you. Try again in 7 s."
-        );
-        assert_eq!(
-            reason(Fault::Refused {
-                status: 403,
-                message: "x".into()
-            }),
-            "Teams does not let you do that here."
-        );
+        let policy = ended("invalid_grant", "AADSTS53003: Access has been blocked by Conditional Access policies. Trace ID: x");
+        assert!(policy.contains("AADSTS53003") && policy.contains("organization"), "{policy}");
+        let gone = ended("invalid_grant", "AADSTS700082: The refresh token has expired due to inactivity.");
+        assert_eq!(gone, "Microsoft ended this sign-in (AADSTS700082). Sign in again.");
+        assert_eq!(ended("invalid_grant", ""), "Microsoft ended this sign-in (invalid_grant). Sign in again.");
+        assert_eq!(reason(Fault::Limited(7)), "Teams is rate limiting you. Try again in 7 s.");
+        assert_eq!(reason(Fault::Refused { status: 403, message: "x".into() }), "Teams does not let you do that here.");
     }
 }

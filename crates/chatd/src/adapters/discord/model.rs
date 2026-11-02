@@ -87,9 +87,7 @@ fn overwrite_kind<'de, D: Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
 }
 
 /// A field that is `null`, absent or a value: all but the last are `None`.
-fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default>(
-    de: D,
-) -> Result<T, D::Error> {
+fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default>(de: D) -> Result<T, D::Error> {
     Ok(Option::<T>::deserialize(de)?.unwrap_or_default())
 }
 
@@ -135,10 +133,7 @@ impl User {
         PersonRow {
             link: user_link(&self.id),
             id: self.id.clone(),
-            name: name
-                .filter(|name| !name.is_empty())
-                .unwrap_or(self.name())
-                .to_owned(),
+            name: name.filter(|name| !name.is_empty()).unwrap_or(self.name()).to_owned(),
             handle: self.username.clone(),
             avatar: Some(self.avatar().0.id),
             bot: self.bot,
@@ -170,11 +165,7 @@ pub fn avatar(user: &str, hash: Option<&str>, discriminator: &str) -> (MediaFile
     match hash {
         Some(hash) if !hash.is_empty() => (
             sized(format!("avatar:{user}:{hash}"), MediaKind::Avatar, 80),
-            format!(
-                "{}/avatars/{user}/{hash}.webp?size=80{}",
-                cdn(),
-                moving(hash)
-            ),
+            format!("{}/avatars/{user}/{hash}.webp?size=80{}", cdn(), moving(hash)),
         ),
         _ => {
             // New-style names (discriminator 0) pick by id, old ones by discriminator.
@@ -199,31 +190,13 @@ pub fn avatar_variants(file: &str) -> Option<Vec<(u32, String)>> {
     if user == "default" {
         return None;
     }
-    Some(
-        [128, 256]
-            .into_iter()
-            .map(|size| {
-                (
-                    size,
-                    format!(
-                        "{}/avatars/{user}/{hash}.webp?size={size}{}",
-                        cdn(),
-                        moving(hash)
-                    ),
-                )
-            })
-            .collect(),
-    )
+    Some([128, 256].into_iter().map(|size| (size, format!("{}/avatars/{user}/{hash}.webp?size={size}{}", cdn(), moving(hash)))).collect())
 }
 
 pub fn guild_icon(guild: &str, hash: &str) -> (MediaFile, String) {
     (
         sized(format!("icon:{guild}:{hash}"), MediaKind::Icon, 96),
-        format!(
-            "{}/icons/{guild}/{hash}.webp?size=96{}",
-            cdn(),
-            moving(hash)
-        ),
+        format!("{}/icons/{guild}/{hash}.webp?size=96{}", cdn(), moving(hash)),
     )
 }
 
@@ -232,11 +205,7 @@ pub fn guild_icon(guild: &str, hash: &str) -> (MediaFile, String) {
 pub fn group_icon(channel: &str, hash: &str) -> (MediaFile, String) {
     (
         sized(format!("gicon:{channel}:{hash}"), MediaKind::Avatar, 80),
-        format!(
-            "{}/channel-icons/{channel}/{hash}.webp?size=80{}",
-            cdn(),
-            moving(hash)
-        ),
+        format!("{}/channel-icons/{channel}/{hash}.webp?size=80{}", cdn(), moving(hash)),
     )
 }
 
@@ -244,11 +213,7 @@ pub fn group_icon(channel: &str, hash: &str) -> (MediaFile, String) {
 pub fn emoji(id: &str, animated: bool) -> (MediaFile, String) {
     (
         sized(format!("emoji:{id}"), MediaKind::Emoji, 48),
-        format!(
-            "{}/emojis/{id}.webp?size=48{}",
-            cdn(),
-            if animated { "&animated=true" } else { "" }
-        ),
+        format!("{}/emojis/{id}.webp?size=48{}", cdn(), if animated { "&animated=true" } else { "" }),
     )
 }
 
@@ -385,22 +350,12 @@ impl Kept {
             limit: channel.user_limit,
             parent: channel.parent_id.clone(),
             topic: channel.topic.clone().filter(|topic| !topic.is_empty()),
-            overwrites: overwrites
-                .map(|over| (over.id.clone(), over.member, over.allow, over.deny))
-                .collect(),
+            overwrites: overwrites.map(|over| (over.id.clone(), over.member, over.allow, over.deny)).collect(),
         }
     }
 
     pub fn channel(self) -> Channel {
-        let overwrites = self
-            .overwrites
-            .into_iter()
-            .map(|(id, member, allow, deny)| Overwrite {
-                id,
-                member,
-                allow,
-                deny,
-            });
+        let overwrites = self.overwrites.into_iter().map(|(id, member, allow, deny)| Overwrite { id, member, allow, deny });
         Channel {
             id: self.id,
             kind: self.kind,
@@ -518,10 +473,7 @@ fn nullable_yes<'de, D: Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
 /// the picker and a sent sticker share one file. Lottie JSON is rendered by the shell.
 pub fn sticker(id: &str, format: u8) -> Option<(MediaFile, String)> {
     let (kind, url) = match format {
-        1 => (
-            MediaKind::Image,
-            format!("{}/stickers/{id}.png?size=160", media()),
-        ),
+        1 => (MediaKind::Image, format!("{}/stickers/{id}.png?size=160", media())),
         2 => (MediaKind::Image, apng_sticker(id)),
         3 => (MediaKind::File, format!("{}/stickers/{id}.json", cdn())),
         4 => (MediaKind::Gif, format!("{}/stickers/{id}.gif", media())),
@@ -538,26 +490,17 @@ pub fn apng_sticker(id: &str) -> String {
 
 impl Guild {
     pub fn name(&self) -> &str {
-        let wrapped = self
-            .properties
-            .as_ref()
-            .and_then(|properties| properties.name.as_deref());
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.name.as_deref());
         wrapped.or(self.name.as_deref()).unwrap_or("Server")
     }
 
     pub fn icon(&self) -> Option<&str> {
-        let wrapped = self
-            .properties
-            .as_ref()
-            .and_then(|properties| properties.icon.as_deref());
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.icon.as_deref());
         wrapped.or(self.icon.as_deref())
     }
 
     pub fn owner(&self) -> &str {
-        let wrapped = self
-            .properties
-            .as_ref()
-            .and_then(|properties| properties.owner_id.as_deref());
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.owner_id.as_deref());
         wrapped.or(self.owner_id.as_deref()).unwrap_or("")
     }
 }
@@ -737,17 +680,13 @@ impl PresenceUpdate {
     /// The custom status line (activity type 4).
     pub fn status(&self) -> &str {
         let custom = self.activities.iter().find(|activity| activity.kind == 4);
-        custom
-            .and_then(|activity| activity.state.as_deref())
-            .unwrap_or("")
+        custom.and_then(|activity| activity.state.as_deref()).unwrap_or("")
     }
 
     /// The custom status's emoji when it is a Unicode one; a server's own has no glyph to show.
     pub fn emoji(&self) -> &str {
         let custom = self.activities.iter().find(|activity| activity.kind == 4);
-        let emoji = custom
-            .and_then(|activity| activity.emoji.as_ref())
-            .filter(|emoji| emoji.id.is_none());
+        let emoji = custom.and_then(|activity| activity.emoji.as_ref()).filter(|emoji| emoji.id.is_none());
         emoji.and_then(|emoji| emoji.name.as_deref()).unwrap_or("")
     }
 
@@ -1030,13 +969,11 @@ fn nonce<'de, D: Deserializer<'de>>(de: D) -> Result<Option<String>, D::Error> {
         Number(u64),
         Text(String),
     }
-    Ok(
-        match Option::<Either>::deserialize(de).map_err(de::Error::custom)? {
-            Some(Either::Number(number)) => Some(number.to_string()),
-            Some(Either::Text(text)) => Some(text),
-            None => None,
-        },
-    )
+    Ok(match Option::<Either>::deserialize(de).map_err(de::Error::custom)? {
+        Some(Either::Number(number)) => Some(number.to_string()),
+        Some(Either::Text(text)) => Some(text),
+        None => None,
+    })
 }
 
 #[derive(Deserialize, Default)]
@@ -1081,10 +1018,7 @@ pub struct Profile {
 impl Profile {
     /// Their own words, cut to what a card holds.
     pub fn bio(&self) -> String {
-        let mut bio = self
-            .user_profile
-            .as_ref()
-            .map_or_else(String::new, |profile| profile.bio.clone());
+        let mut bio = self.user_profile.as_ref().map_or_else(String::new, |profile| profile.bio.clone());
         protocol::clip(&mut bio, 1_000);
         bio
     }
@@ -1113,10 +1047,7 @@ mod tests {
     fn ids_carry_their_time() {
         // The example id from Discord's documentation, created 2016-04-30 11:18:25 UTC.
         assert_eq!(seconds("175928847299117063"), 1_462_015_105);
-        assert_eq!(
-            iso_seconds("2016-04-30T11:18:25.796000+00:00"),
-            Some(1_462_015_105)
-        );
+        assert_eq!(iso_seconds("2016-04-30T11:18:25.796000+00:00"), Some(1_462_015_105));
     }
 
     #[test]

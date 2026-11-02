@@ -17,35 +17,19 @@ const SMALL: usize = 20;
 
 impl Teams {
     fn described(&self, thread: &str) -> Result<Value, Fault> {
-        Ok(self
-            .chat(
-                "GET",
-                &format!("/v1/threads/{}?view=msnp24Equivalent", escaped(thread)),
-                Body::None,
-                true,
-            )?
-            .body)
+        Ok(self.chat("GET", &format!("/v1/threads/{}?view=msnp24Equivalent", escaped(thread)), Body::None, true)?.body)
     }
 
     pub(super) fn conversation_info(&self, conversation: &str) -> Result<ConversationAbout, Fault> {
         let thread = thread_of(conversation);
         let row = self.ctx.known(thread)?;
-        let notify = if row.as_ref().is_some_and(|row| row.muted) {
-            Notify::Nothing
-        } else {
-            Notify::All
-        };
+        let notify = if row.as_ref().is_some_and(|row| row.muted) { Notify::Nothing } else { Notify::All };
         if thread.starts_with("48:") {
-            return Ok(ConversationAbout {
-                notify,
-                ..ConversationAbout::default()
-            });
+            return Ok(ConversationAbout { notify, ..ConversationAbout::default() });
         }
         let described = self.described(thread)?;
         let properties = &described["properties"];
-        let members = described["members"]
-            .as_array()
-            .map(|members| members.len() as u32);
+        let members = described["members"].as_array().map(|members| members.len() as u32);
         let text = |name: &str| properties[name].as_str().unwrap_or("").trim().to_owned();
         let creator = text("creator");
         let creator = match creator.is_empty() {
@@ -63,13 +47,7 @@ impl Teams {
             created: (created > 0).then_some(created),
             creator,
             notify,
-            external: if properties["sharedChannel"] == true
-                || properties["threadType"] == "sharedChannel"
-            {
-                "Shared channel".to_owned()
-            } else {
-                String::new()
-            },
+            external: if properties["sharedChannel"] == true || properties["threadType"] == "sharedChannel" { "Shared channel".to_owned() } else { String::new() },
             ..ConversationAbout::default()
         })
     }
@@ -79,16 +57,8 @@ impl Teams {
     pub(super) fn set_mute(&self, conversation: &str, notify: Notify) -> Result<(), Fault> {
         let thread = thread_of(conversation);
         let muted = notify != Notify::All;
-        let path = format!(
-            "/v1/users/ME/conversations/{}/properties?name=alerts",
-            escaped(thread)
-        );
-        self.chat(
-            "PUT",
-            &path,
-            Body::Json(&json!({"alerts": if muted { "false" } else { "true" }})),
-            false,
-        )?;
+        let path = format!("/v1/users/ME/conversations/{}/properties?name=alerts", escaped(thread));
+        self.chat("PUT", &path, Body::Json(&json!({"alerts": if muted { "false" } else { "true" }})), false)?;
         self.ctx.muted(thread, muted)?;
         Ok(())
     }
@@ -99,11 +69,7 @@ impl Teams {
         let Some(row) = self.ctx.known(conversation)? else {
             return Ok(());
         };
-        if row.kind == ConversationKind::Channel
-            || row.kind == ConversationKind::Thread
-            || conversation.starts_with("48:")
-            || !row.preview_mine
-        {
+        if row.kind == ConversationKind::Channel || row.kind == ConversationKind::Thread || conversation.starts_with("48:") || !row.preview_mine {
             return Ok(());
         }
         let path = format!("/v1/threads/{}/consumptionhorizons", escaped(conversation));
@@ -119,13 +85,7 @@ impl Teams {
             .into_iter()
             .flatten()
             .filter(|member| member["id"].as_str().is_some_and(|id| id != me))
-            .filter_map(|member| {
-                member["consumptionhorizon"]
-                    .as_str()?
-                    .split(';')
-                    .next()
-                    .map(millis)
-            })
+            .filter_map(|member| member["consumptionhorizon"].as_str()?.split(';').next().map(millis))
             .collect();
         if horizons.is_empty() || horizons.len() > SMALL {
             return Ok(());

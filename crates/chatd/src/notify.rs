@@ -14,13 +14,10 @@
 use crate::hub::{lock, now, Hub};
 use crate::server::Chat;
 use notifier::{Activation, Kind, Note, Sink};
-use protocol::media_host::MediaChild;
 use protocol::settings::{self, Values, GLOBAL};
-use protocol::{
-    Call, CallState, Conversation, ConversationKind, Key, Message, Network, Request, Response,
-    Special, Watching,
-};
+use protocol::{Call, CallState, Conversation, ConversationKind, Key, Message, Network, Request, Response, Special, Watching};
 use std::collections::{HashMap, VecDeque};
+use protocol::media_host::MediaChild;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, Weak};
@@ -98,66 +95,37 @@ pub fn in_window(from: u32, to: u32, minute: u32) -> bool {
 
 /// N7 and N8: nothing is posted now.
 fn hushed(values: &Values, moment: &Moment) -> bool {
-    let quiet = values.on(settings::QUIET_HOURS)
-        && in_window(
-            values.minute(settings::QUIET_FROM),
-            values.minute(settings::QUIET_TO),
-            moment.minute,
-        );
+    let quiet = values.on(settings::QUIET_HOURS) && in_window(values.minute(settings::QUIET_FROM), values.minute(settings::QUIET_TO), moment.minute);
     quiet || values.paused(moment.now).is_some()
 }
 
 /// The level that applies to a conversation: its own, else its account's, else the global one.
 fn level<'a>(values: &'a Values, conversation: &Key) -> &'a str {
-    let own = values.stored(
-        &settings::conversation_scope(conversation),
-        settings::NOTIFY_ABOUT,
-    );
-    let account = values.stored(
-        &settings::account_scope(&conversation.account()),
-        settings::NOTIFY_ABOUT,
-    );
-    own.or(account)
-        .unwrap_or_else(|| values.word(GLOBAL, settings::NOTIFY_ABOUT))
+    let own = values.stored(&settings::conversation_scope(conversation), settings::NOTIFY_ABOUT);
+    let account = values.stored(&settings::account_scope(&conversation.account()), settings::NOTIFY_ABOUT);
+    own.or(account).unwrap_or_else(|| values.word(GLOBAL, settings::NOTIFY_ABOUT))
 }
 
 /// The sound for a message: the conversation's (S6), the account's (S5), then S3 or S2.
 fn sound_word(values: &Values, conversation: &Key, mention: bool) -> String {
     let own = values.stored(&settings::conversation_scope(conversation), settings::SOUND);
-    let account = values.stored(
-        &settings::account_scope(&conversation.account()),
-        settings::SOUND,
-    );
+    let account = values.stored(&settings::account_scope(&conversation.account()), settings::SOUND);
     let message = values.word(GLOBAL, settings::MESSAGE_SOUND);
-    let chosen =
-        own.or(account)
-            .unwrap_or_else(|| match values.word(GLOBAL, settings::MENTION_SOUND) {
-                "same" => message,
-                mention_sound if mention => mention_sound,
-                _ => message,
-            });
+    let chosen = own.or(account).unwrap_or_else(|| match values.word(GLOBAL, settings::MENTION_SOUND) {
+        "same" => message,
+        mention_sound if mention => mention_sound,
+        _ => message,
+    });
     chosen.to_owned()
 }
 
 /// The preview that applies now: the locked one while the screen is locked.
 fn preview(values: &Values, locked: bool) -> Preview {
-    Preview::of(values.word(
-        GLOBAL,
-        if locked {
-            settings::PREVIEW_LOCKED
-        } else {
-            settings::PREVIEW
-        },
-    ))
+    Preview::of(values.word(GLOBAL, if locked { settings::PREVIEW_LOCKED } else { settings::PREVIEW }))
 }
 
 /// Whether one live message notifies, in the order of the settings doc's silence rules.
-pub fn decide(
-    values: &Values,
-    conversation: &Conversation,
-    message: &Message,
-    moment: &Moment,
-) -> Option<Verdict> {
+pub fn decide(values: &Values, conversation: &Conversation, message: &Message, moment: &Moment) -> Option<Verdict> {
     let key = &conversation.key;
     // Mine, from any device; catch-up after a connect; the conversation being read.
     if message.outgoing || message.deleted || moment.now - message.sent > STALE {
@@ -166,11 +134,7 @@ pub fn decide(
     if moment.watching.focused && moment.watching.conversation.as_ref() == Some(key) {
         return None;
     }
-    if !values.on(settings::NOTIFY)
-        || conversation.muted
-        || conversation.hidden
-        || conversation.special == Special::Request
-    {
+    if !values.on(settings::NOTIFY) || conversation.muted || conversation.hidden || conversation.special == Special::Request {
         return None;
     }
     let mention = message.mentions_me;
@@ -181,12 +145,7 @@ pub fn decide(
         "off" => false,
         "all" => mention || !quiet_row,
         // Direct messages and mentions; a conversation set to mentions only means it.
-        _ if values
-            .stored(&settings::conversation_scope(key), settings::NOTIFY_ABOUT)
-            .is_some() =>
-        {
-            mention
-        }
+        _ if values.stored(&settings::conversation_scope(key), settings::NOTIFY_ABOUT).is_some() => mention,
         _ => mention || (conversation.kind.is_direct() && !quiet_row),
     };
     let kind_on = match conversation.kind {
@@ -195,9 +154,7 @@ pub fn decide(
         _ if mention => values.on(settings::NOTIFY_MENTIONS),
         _ => true,
     };
-    let tiny_on = key.network != Network::Tiny
-        || conversation.kind.is_direct()
-        || values.on(settings::NOTIFY_TINY);
+    let tiny_on = key.network != Network::Tiny || conversation.kind.is_direct() || values.on(settings::NOTIFY_TINY);
     if !wanted || !kind_on || !tiny_on {
         return None;
     }
@@ -215,12 +172,7 @@ pub fn decide(
         || moment.sounded_here
         || moment.sounded_any;
     let sound = Some(sound_word(values, key, mention)).filter(|word| !silent && word != "none");
-    Some(Verdict {
-        banner: true,
-        sound,
-        preview: preview(values, moment.locked),
-        mention,
-    })
+    Some(Verdict { banner: true, sound, preview: preview(values, moment.locked), mention })
 }
 
 /// Whether a ring posts (N5, N9, N3) and whether it is heard. `None`: nothing at all.
@@ -236,33 +188,17 @@ pub fn decide_ring(values: &Values, conversation: &Key, moment: &Moment) -> Opti
         return None;
     }
     let ring = values.word(GLOBAL, settings::RING_SOUND);
-    let sound =
-        (calls == "ring" && values.on(settings::SOUNDS) && ring != "none").then(|| ring.to_owned());
-    Some(Verdict {
-        banner: !moment.watching.focused,
-        sound,
-        preview: preview(values, moment.locked),
-        mention: false,
-    })
+    let sound = (calls == "ring" && values.on(settings::SOUNDS) && ring != "none").then(|| ring.to_owned());
+    Some(Verdict { banner: !moment.watching.focused, sound, preview: preview(values, moment.locked), mention: false })
 }
 
 /// The notification's id for a conversation, stable across messages.
 pub fn note_id(conversation: &Key) -> String {
-    format!(
-        "m:{}:{}:{}",
-        conversation.network.label(),
-        conversation.account,
-        conversation.id
-    )
+    format!("m:{}:{}:{}", conversation.network.label(), conversation.account, conversation.id)
 }
 
 fn ring_id(conversation: &Key) -> String {
-    format!(
-        "r:{}:{}:{}",
-        conversation.network.label(),
-        conversation.account,
-        conversation.id
-    )
+    format!("r:{}:{}:{}", conversation.network.label(), conversation.account, conversation.id)
 }
 
 /// Where a message was said, for the subtitle: a group's name, `#channel · Space`.
@@ -271,14 +207,8 @@ fn place(conversation: &Conversation) -> String {
         ConversationKind::Direct => String::new(),
         ConversationKind::Group => conversation.title.clone(),
         ConversationKind::Thread => format!("Thread in {}", conversation.title),
-        _ if conversation.space_title.is_empty() => {
-            format!("#{}", conversation.title.trim_start_matches('#'))
-        }
-        _ => format!(
-            "#{} · {}",
-            conversation.title.trim_start_matches('#'),
-            conversation.space_title
-        ),
+        _ if conversation.space_title.is_empty() => format!("#{}", conversation.title.trim_start_matches('#')),
+        _ => format!("#{} · {}", conversation.title.trim_start_matches('#'), conversation.space_title),
     }
 }
 
@@ -306,13 +236,7 @@ pub struct Notes {
 
 impl Notes {
     pub fn new(sink: Box<dyn Sink>) -> Notes {
-        Notes {
-            sink,
-            groups: HashMap::new(),
-            ids: HashMap::new(),
-            ringing: None,
-            sounded: None,
-        }
+        Notes { sink, groups: HashMap::new(), ids: HashMap::new(), ringing: None, sounded: None }
     }
 
     /// The conversation a note is about.
@@ -322,32 +246,16 @@ impl Notes {
 
     /// The parts of `Moment` this keeps: whether a sound was heard lately.
     pub fn quiet(&self, conversation: &Key, at: Instant) -> (bool, bool) {
-        let here = self
-            .groups
-            .get(conversation)
-            .and_then(|group| group.sounded)
-            .is_some_and(|then| at.duration_since(then) < REPLACED_QUIET);
-        let any = self
-            .sounded
-            .is_some_and(|then| at.duration_since(then) < ANY_QUIET);
+        let here = self.groups.get(conversation).and_then(|group| group.sounded).is_some_and(|then| at.duration_since(then) < REPLACED_QUIET);
+        let any = self.sounded.is_some_and(|then| at.duration_since(then) < ANY_QUIET);
         (here, any)
     }
 
     /// A message that notifies: posts or replaces its conversation's notification. Answers the
     /// sound to play, if any.
-    pub fn message(
-        &mut self,
-        conversation: &Conversation,
-        message: &Message,
-        verdict: &Verdict,
-        at: Instant,
-    ) -> Option<String> {
+    pub fn message(&mut self, conversation: &Conversation, message: &Message, verdict: &Verdict, at: Instant) -> Option<String> {
         let key = &conversation.key;
-        let group = self.groups.entry(key.clone()).or_insert_with(|| Group {
-            lines: VecDeque::new(),
-            mention: false,
-            sounded: None,
-        });
+        let group = self.groups.entry(key.clone()).or_insert_with(|| Group { lines: VecDeque::new(), mention: false, sounded: None });
         let text = crate::store::preview_text(message);
         group.lines.push_back((message.sender.name.clone(), text));
         while group.lines.len() > LINES {
@@ -359,28 +267,14 @@ impl Notes {
         let body = group
             .lines
             .iter()
-            .map(|(sender, text)| {
-                if several {
-                    format!("{sender}: {text}")
-                } else {
-                    text.clone()
-                }
-            })
+            .map(|(sender, text)| if several { format!("{sender}: {text}") } else { text.clone() })
             .collect::<Vec<_>>()
             .join("\n");
-        let what = if group.mention {
-            "New mention"
-        } else {
-            "New message"
-        };
+        let what = if group.mention { "New mention" } else { "New message" };
         let (title, subtitle, body) = match verdict.preview {
             Preview::Full => (newest.clone(), place(conversation), body),
             Preview::Sender => (newest.clone(), place(conversation), what.to_owned()),
-            Preview::Nothing => (
-                key.network.label().to_owned(),
-                String::new(),
-                what.to_owned(),
-            ),
+            Preview::Nothing => (key.network.label().to_owned(), String::new(), what.to_owned()),
         };
         let id = note_id(key);
         let can_reply = !conversation.read_only;
@@ -389,28 +283,13 @@ impl Notes {
             title,
             subtitle,
             body,
-            kind: if can_reply {
-                Kind::Message
-            } else {
-                Kind::ReadOnly
-            },
+            kind: if can_reply { Kind::Message } else { Kind::ReadOnly },
             reply_hint: if can_reply {
-                format!(
-                    "Reply to {}",
-                    if conversation.kind.is_direct() {
-                        first_name(&newest)
-                    } else {
-                        &conversation.title
-                    }
-                )
+                format!("Reply to {}", if conversation.kind.is_direct() { first_name(&newest) } else { &conversation.title })
             } else {
                 String::new()
             },
-            sound: verdict
-                .sound
-                .as_deref()
-                .filter(|word| system_plays(word))
-                .and_then(sound_file),
+            sound: verdict.sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
             locked_body: what.to_owned(),
         };
         if let Err(err) = self.sink.post(&note) {
@@ -441,13 +320,7 @@ impl Notes {
     /// Answers whether the ring sound should start (`Some(word)`) or stop (`Some("")`).
     /// `verdict` is [`decide_ring`]'s for the ringing conversation, and `place` and `network`
     /// name it ("#general · Northwind", "Discord").
-    pub fn call(
-        &mut self,
-        call: Option<&Call>,
-        verdict: Option<Verdict>,
-        place: &str,
-        network: &str,
-    ) -> Option<String> {
+    pub fn call(&mut self, call: Option<&Call>, verdict: Option<Verdict>, place: &str, network: &str) -> Option<String> {
         let ringing = call.and_then(|call| match &call.state {
             CallState::RingingIn { from } => Some((call.conversation.clone(), from.clone())),
             _ => None,
@@ -463,21 +336,10 @@ impl Notes {
                 if !verdict.banner {
                     return verdict.sound;
                 }
-                let caller = if from.is_empty() {
-                    place.to_owned()
-                } else {
-                    from
-                };
+                let caller = if from.is_empty() { place.to_owned() } else { from };
                 let (title, subtitle) = match verdict.preview {
                     Preview::Nothing => (network.to_owned(), String::new()),
-                    _ => (
-                        caller,
-                        if place.is_empty() {
-                            format!("{network} · Incoming call")
-                        } else {
-                            format!("{place} · Incoming call")
-                        },
-                    ),
+                    _ => (caller, if place.is_empty() { format!("{network} · Incoming call") } else { format!("{place} · Incoming call") }),
                 };
                 let id = ring_id(&key);
                 let note = Note {
@@ -487,11 +349,7 @@ impl Notes {
                     body: "Incoming call".to_owned(),
                     kind: Kind::Call,
                     reply_hint: String::new(),
-                    sound: verdict
-                        .sound
-                        .as_deref()
-                        .filter(|word| system_plays(word))
-                        .and_then(sound_file),
+                    sound: verdict.sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
                     locked_body: "Incoming call".to_owned(),
                 };
                 if let Err(err) = self.sink.post(&note) {
@@ -536,21 +394,13 @@ impl Notes {
             body,
             kind: Kind::Plain,
             reply_hint: String::new(),
-            sound: sound
-                .as_deref()
-                .filter(|word| system_plays(word))
-                .and_then(sound_file),
+            sound: sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
             locked_body: "New message".to_owned(),
         };
         match self.sink.post(&note) {
             Ok(()) => {
                 let listed = self.sink.listed("test");
-                let detail = if listed {
-                    String::new()
-                } else {
-                    "The system took it but does not list it: check Focus or Do Not Disturb."
-                        .to_owned()
-                };
+                let detail = if listed { String::new() } else { "The system took it but does not list it: check Focus or Do Not Disturb.".to_owned() };
                 (listed, detail, sound.filter(|word| !system_plays(word)))
             }
             Err(err) => (false, err, None),
@@ -594,10 +444,7 @@ pub fn local_minute(unix: i64) -> u32 {
 /// What the hub tells the notification thread.
 pub enum Event {
     /// A new live message from someone else, stored.
-    Message {
-        conversation: Key,
-        message: Box<Message>,
-    },
+    Message { conversation: Key, message: Box<Message> },
     /// A conversation's row changed: it may have been read.
     Row(Key),
     Call(Option<Call>),
@@ -614,35 +461,14 @@ pub type Line = Mutex<Sender<Event>>;
 /// changes how an installed tinyclient's notifications look.
 pub fn app() -> notifier::App {
     let release = !cfg!(debug_assertions);
-    let id = if release {
-        "dev.tinyclient.app"
-    } else {
-        "dev.tinyclient.app.debug"
-    };
-    let name = if release {
-        "tinyclient"
-    } else {
-        "tinyclient (dev)"
-    };
+    let id = if release { "dev.tinyclient.app" } else { "dev.tinyclient.app.debug" };
+    let name = if release { "tinyclient" } else { "tinyclient (dev)" };
     let exe = std::env::current_exe().ok();
-    let icon = exe
-        .as_ref()
-        .and_then(|exe| exe.parent())
-        .map(|dir| dir.join("tinyclient.ico"))
-        .filter(|icon| icon.is_file())
-        .or_else(|| {
-            // Under cargo the icon is in the repository, three levels over `target/<profile>`.
-            exe.as_ref()?
-                .ancestors()
-                .nth(3)
-                .map(|root| root.join("packaging/windows/tinyclient.ico"))
-                .filter(|icon| icon.is_file())
-        });
-    notifier::App {
-        id: id.to_owned(),
-        name: name.to_owned(),
-        icon,
-    }
+    let icon = exe.as_ref().and_then(|exe| exe.parent()).map(|dir| dir.join("tinyclient.ico")).filter(|icon| icon.is_file()).or_else(|| {
+        // Under cargo the icon is in the repository, three levels over `target/<profile>`.
+        exe.as_ref()?.ancestors().nth(3).map(|root| root.join("packaging/windows/tinyclient.ico")).filter(|icon| icon.is_file())
+    });
+    notifier::App { id: id.to_owned(), name: name.to_owned(), icon }
 }
 
 /// `TINYCLIENT_NOTIFY=on` turns notifications on in a scratch directory (`TINYCLIENT_DIR`),
@@ -655,8 +481,7 @@ pub fn enabled() -> bool {
 }
 
 /// Why the test notification could not be sent when [`enabled`] is false.
-pub const DISABLED: &str =
-    "Notifications are off for a scratch directory. TINYCLIENT_NOTIFY=on turns them on.";
+pub const DISABLED: &str = "Notifications are off for a scratch directory. TINYCLIENT_NOTIFY=on turns them on.";
 
 /// Starts the notification thread; the hub sends it [`Event`]s from then on.
 pub fn start(hub: Arc<Hub>, chat: Weak<Chat>) {
@@ -674,12 +499,10 @@ pub fn start(hub: Arc<Hub>, chat: Weak<Chat>) {
         let _ = lock(&back).send(Event::Activated(done));
     });
     hub.set_notifier(tell);
-    let spawned = std::thread::Builder::new()
-        .name("notify".into())
-        .spawn(move || {
-            let sink = notifier::system(&app, activated);
-            run(&hub, &chat, Notes::new(sink), &told);
-        });
+    let spawned = std::thread::Builder::new().name("notify".into()).spawn(move || {
+        let sink = notifier::system(&app, activated);
+        run(&hub, &chat, Notes::new(sink), &told);
+    });
     if let Err(err) = spawned {
         tracing::warn!("chatd: notifications: {err}");
     }
@@ -687,14 +510,8 @@ pub fn start(hub: Arc<Hub>, chat: Weak<Chat>) {
 
 /// The account's own status is Do Not Disturb.
 fn dnd(hub: &Hub, conversation: &Key) -> bool {
-    let me = hub.store().accounts().ok().and_then(|rows| {
-        rows.into_iter()
-            .find(|row| row.key == conversation.account())
-            .map(|row| row.me)
-    });
-    me.filter(|me| !me.is_empty()).is_some_and(|me| {
-        hub.presence(&Key::new(&conversation.account(), &me)) == protocol::Presence::Dnd
-    })
+    let me = hub.store().accounts().ok().and_then(|rows| rows.into_iter().find(|row| row.key == conversation.account()).map(|row| row.me));
+    me.filter(|me| !me.is_empty()).is_some_and(|me| hub.presence(&Key::new(&conversation.account(), &me)) == protocol::Presence::Dnd)
 }
 
 /// What is true now. Do Not Disturb is left out: it reads every account, so it is asked only of a
@@ -702,12 +519,7 @@ fn dnd(hub: &Hub, conversation: &Key) -> bool {
 fn moment(hub: &Hub, conversation: &Key, notes: &Notes, at: Instant) -> Moment {
     let now = now();
     let (sounded_here, sounded_any) = notes.quiet(conversation, at);
-    let in_call = hub.calls.describe().0.is_some_and(|call| {
-        matches!(
-            call.state,
-            CallState::Joined | CallState::Connecting | CallState::Reconnecting
-        )
-    });
+    let in_call = hub.calls.describe().0.is_some_and(|call| matches!(call.state, CallState::Joined | CallState::Connecting | CallState::Reconnecting));
     Moment {
         now,
         minute: local_minute(now),
@@ -724,19 +536,9 @@ fn moment(hub: &Hub, conversation: &Key, notes: &Notes, at: Instant) -> Moment {
 fn play(word: &str, volume: u32, repeat: Option<u64>, limit: u64) -> Option<MediaChild> {
     let mediad = crate::media::mediad_path().ok()?;
     let mut command = Command::new(mediad);
-    command
-        .arg("--sound")
-        .arg(word)
-        .arg(volume.min(100).to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    command.arg("--sound").arg(word).arg(volume.min(100).to_string()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     if let Some(gap) = repeat {
-        command
-            .arg("--repeat")
-            .arg(gap.to_string())
-            .arg("--for")
-            .arg(limit.to_string());
+        command.arg("--repeat").arg(gap.to_string()).arg("--for").arg(limit.to_string());
     }
     #[cfg(windows)]
     {
@@ -747,16 +549,9 @@ fn play(word: &str, volume: u32, repeat: Option<u64>, limit: u64) -> Option<Medi
     // In process (phones) there is no stdio to discard: its pipes are dropped at once, and a
     // sound says nothing on them.
     if protocol::media_host::in_process() {
-        return protocol::media_host::spawn(&mut command)
-            .map(|spawned| spawned.child)
-            .map_err(|err| tracing::warn!("chatd: sound: {err}"))
-            .ok();
+        return protocol::media_host::spawn(&mut command).map(|spawned| spawned.child).map_err(|err| tracing::warn!("chatd: sound: {err}")).ok();
     }
-    command
-        .spawn()
-        .map(MediaChild::from)
-        .map_err(|err| tracing::warn!("chatd: sound: {err}"))
-        .ok()
+    command.spawn().map(MediaChild::from).map_err(|err| tracing::warn!("chatd: sound: {err}")).ok()
 }
 
 /// How long an incoming ring sounds before it gives up by itself: past the network's own
@@ -808,22 +603,15 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
         let values = hub.settings().clone();
         let volume = values.number(settings::ALERT_VOLUME);
         match event {
-            Event::Message {
-                conversation,
-                message,
-            } => {
-                let Ok(Some(row)) = hub.store().conversation(&conversation) else {
-                    continue;
-                };
+            Event::Message { conversation, message } => {
+                let Ok(Some(row)) = hub.store().conversation(&conversation) else { continue };
                 let at = Instant::now();
                 let mut moment = moment(hub, &conversation, &notes, at);
                 if decide(&values, &row, &message, &moment).is_none() {
                     continue;
                 }
                 moment.dnd = dnd(hub, &conversation);
-                let Some(verdict) = decide(&values, &row, &message, &moment) else {
-                    continue;
-                };
+                let Some(verdict) = decide(&values, &row, &message, &moment) else { continue };
                 if let Some(word) = notes.message(&row, &message, &verdict, at) {
                     playing.extend(play(&word, volume, None, 0));
                 }
@@ -832,49 +620,31 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                 if !notes.has(&conversation) {
                     continue;
                 }
-                let read = hub
-                    .store()
-                    .conversation(&conversation)
-                    .ok()
-                    .flatten()
-                    .is_none_or(|row| row.unread == 0 && row.mentions == 0);
+                let read = hub.store().conversation(&conversation).ok().flatten().is_none_or(|row| row.unread == 0 && row.mentions == 0);
                 if read {
                     notes.read(&conversation);
                 }
             }
             Event::Call(call) => {
-                let ringing = call
-                    .as_ref()
-                    .filter(|call| matches!(call.state, CallState::RingingIn { .. }))
-                    .map(|call| call.conversation.clone());
+                let ringing = call.as_ref().filter(|call| matches!(call.state, CallState::RingingIn { .. })).map(|call| call.conversation.clone());
                 let (verdict, place) = match &ringing {
                     Some(key) => {
                         let row = hub.store().conversation(key).ok().flatten();
-                        let place = row
-                            .filter(|row| row.kind != ConversationKind::Direct)
-                            .map(|row| place(&row))
-                            .unwrap_or_default();
-                        let moment = Moment {
-                            dnd: dnd(hub, key),
-                            ..moment(hub, key, &notes, Instant::now())
-                        };
+                        let place = row.filter(|row| row.kind != ConversationKind::Direct).map(|row| place(&row)).unwrap_or_default();
+                        let moment = Moment { dnd: dnd(hub, key), ..moment(hub, key, &notes, Instant::now()) };
                         (decide_ring(&values, key, &moment), place)
                     }
                     None => (None, String::new()),
                 };
                 // A ring back is mine, not a notification: it plays while I am calling
                 // someone, on every network, and stops the instant they answer or I cancel.
-                let calling = call
-                    .as_ref()
-                    .is_some_and(|call| call.state == CallState::RingingOut);
+                let calling = call.as_ref().is_some_and(|call| call.state == CallState::RingingOut);
                 match (calling, ringback_word(&values)) {
                     (true, Some(word)) => {
                         let already = back.as_ref().is_some_and(|(playing, _)| *playing == word);
                         if !already {
                             stop_back(&mut back);
-                            if let Some(child) =
-                                play(&word, volume, Some(RINGBACK_GAP), RINGBACK_FOR)
-                            {
+                            if let Some(child) = play(&word, volume, Some(RINGBACK_GAP), RINGBACK_FOR) {
                                 tracing::info!("chatd: ringing back with {word}");
                                 back = Some((word, child));
                             }
@@ -883,10 +653,7 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                     _ => stop_back(&mut back),
                 }
                 let network = ringing.as_ref().map_or("", |key| key.network.label());
-                match notes
-                    .call(call.as_ref(), verdict, &place, network)
-                    .as_deref()
-                {
+                match notes.call(call.as_ref(), verdict, &place, network).as_deref() {
                     Some("") => stop(&mut ring),
                     Some(word) => {
                         stop(&mut ring);
@@ -914,19 +681,13 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
 /// Brings the window forward on `conversation`: tells a shell that is up, or starts one.
 fn open(hub: &Hub, conversation: &Key) {
     notifier::allow_foreground();
-    hub.changed(protocol::Change::Open {
-        conversation: conversation.clone(),
-    });
+    hub.changed(protocol::Change::Open { conversation: conversation.clone() });
     if hub.shell_asked().elapsed() < SHELL_ALIVE {
         return;
     }
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
+    let Ok(exe) = std::env::current_exe() else { return };
     let shell = exe.with_file_name(format!("tinyclient{}", std::env::consts::EXE_SUFFIX));
-    let Ok(key) = serde_json::to_string(conversation) else {
-        return;
-    };
+    let Ok(key) = serde_json::to_string(conversation) else { return };
     if let Err(err) = Command::new(&shell).arg(format!("--open={key}")).spawn() {
         tracing::warn!("chatd: could not start {}: {err}", shell.display());
     }
@@ -936,32 +697,16 @@ fn open(hub: &Hub, conversation: &Key) {
 fn act(hub: &Hub, chat: &Weak<Chat>, notes: &Notes, done: Activation) {
     let Some(chat) = chat.upgrade() else { return };
     let id = match &done {
-        Activation::Open(id)
-        | Activation::MarkRead(id)
-        | Activation::Accept(id)
-        | Activation::Decline(id) => id,
+        Activation::Open(id) | Activation::MarkRead(id) | Activation::Accept(id) | Activation::Decline(id) => id,
         Activation::Reply { id, .. } => id,
     };
     // The test notification is about nothing.
-    let Some(conversation) = notes.conversation(id).cloned() else {
-        return;
-    };
+    let Some(conversation) = notes.conversation(id).cloned() else { return };
     let read = |chat: &Chat| {
-        let newest = chat.handle(Request::Messages {
-            conversation: conversation.clone(),
-            page: protocol::Page::Newest,
-            limit: 1,
-        });
+        let newest = chat.handle(Request::Messages { conversation: conversation.clone(), page: protocol::Page::Newest, limit: 1 });
         if let Response::Messages { messages, .. } = newest {
-            if let Some(last) = messages
-                .iter()
-                .rev()
-                .find(|message| message.state == protocol::SendState::Sent)
-            {
-                let _ = chat.handle(Request::MarkRead {
-                    conversation: conversation.clone(),
-                    message_id: last.id.clone(),
-                });
+            if let Some(last) = messages.iter().rev().find(|message| message.state == protocol::SendState::Sent) {
+                let _ = chat.handle(Request::MarkRead { conversation: conversation.clone(), message_id: last.id.clone() });
             }
         }
     };
@@ -969,11 +714,7 @@ fn act(hub: &Hub, chat: &Weak<Chat>, notes: &Notes, done: Activation) {
         Activation::Open(_) => open(hub, &conversation),
         Activation::MarkRead(_) => read(&chat),
         Activation::Reply { text, .. } => {
-            if let Response::Conversation { conversation: row } =
-                chat.handle(Request::Conversation {
-                    conversation: conversation.clone(),
-                })
-            {
+            if let Response::Conversation { conversation: row } = chat.handle(Request::Conversation { conversation: conversation.clone() }) {
                 if row.read_only {
                     tracing::warn!("chatd: reply from a notification not sent: you can read {} but not post in it", row.title);
                     open(hub, &conversation);
@@ -981,13 +722,7 @@ fn act(hub: &Hub, chat: &Weak<Chat>, notes: &Notes, done: Activation) {
                 }
             }
             let client_id = format!("notify-{}-{}", now(), std::process::id());
-            let sent = chat.handle(Request::Send {
-                conversation: conversation.clone(),
-                client_id,
-                text,
-                reply_to: None,
-                with: Default::default(),
-            });
+            let sent = chat.handle(Request::Send { conversation: conversation.clone(), client_id, text, reply_to: None, with: Default::default() });
             if let Response::Error { detail, .. } = sent {
                 tracing::warn!("chatd: reply from a notification not sent: {detail}");
                 open(hub, &conversation);

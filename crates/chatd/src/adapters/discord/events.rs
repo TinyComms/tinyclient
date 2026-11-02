@@ -2,9 +2,7 @@
 
 use super::super::Failure;
 use super::content::{self, Place};
-use super::model::{
-    self, number, seconds, Channel, Emoji, Member, Posted, Relationship, Role, User,
-};
+use super::model::{self, number, seconds, Channel, Emoji, Member, Posted, Relationship, Role, User};
 use super::{proto, Discord, Lookup};
 use protocol::{ConversationKind, Reaction, Relation};
 use serde::Deserialize;
@@ -135,22 +133,13 @@ impl Discord {
             "MESSAGE_UPDATE" => self.updated(from_str(data)?)?,
             "MESSAGE_DELETE" | "MESSAGE_DELETE_BULK" => {
                 let removed: Removed = from_str(data)?;
-                for id in removed
-                    .ids
-                    .iter()
-                    .chain(Some(&removed.id))
-                    .filter(|id| !id.is_empty())
-                {
+                for id in removed.ids.iter().chain(Some(&removed.id)).filter(|id| !id.is_empty()) {
                     self.ctx.deleted(&removed.channel_id, id)?;
                 }
             }
-            "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_ADD_MANY" => {
-                self.reacted(from_str(data)?, true)?
-            }
+            "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_ADD_MANY" => self.reacted(from_str(data)?, true)?,
             "MESSAGE_REACTION_REMOVE" => self.reacted(from_str(data)?, false)?,
-            "MESSAGE_REACTION_REMOVE_ALL" | "MESSAGE_REACTION_REMOVE_EMOJI" => {
-                self.unreacted(from_str(data)?)?
-            }
+            "MESSAGE_REACTION_REMOVE_ALL" | "MESSAGE_REACTION_REMOVE_EMOJI" => self.unreacted(from_str(data)?)?,
             "CHANNEL_CREATE" | "CHANNEL_UPDATE" => self.channel_changed(from_str(data)?)?,
             "CHANNEL_DELETE" | "THREAD_DELETE" => self.channel_deleted(from_str(data)?)?,
             "THREAD_CREATE" | "THREAD_UPDATE" => self.thread_changed(from_str(data)?, false)?,
@@ -218,9 +207,7 @@ impl Discord {
             "GUILD_MEMBER_LIST_UPDATE" => self.member_list(from_str(data)?),
             "GUILD_MEMBERS_CHUNK" => self.members_chunk(from_str(data)?)?,
             "VOICE_STATE_UPDATE" => self.voice_state(from_str(data)?),
-            "GUILD_EMOJIS_UPDATE" | "GUILD_STICKERS_UPDATE" => {
-                self.pickables_changed(from_str(data)?)
-            }
+            "GUILD_EMOJIS_UPDATE" | "GUILD_STICKERS_UPDATE" => self.pickables_changed(from_str(data)?),
             "VOICE_SERVER_UPDATE" => self.voice_server(from_str(data)?),
             "CALL_CREATE" | "CALL_UPDATE" => self.call_changed(from_str(data)?),
             "CALL_DELETE" => self.call_deleted(from_str(data)?),
@@ -257,25 +244,15 @@ impl Discord {
                 }
             }
         };
-        let guild = posted
-            .guild_id
-            .clone()
-            .or_else(|| self.guild_of(&conversation));
+        let guild = posted.guild_id.clone().or_else(|| self.guild_of(&conversation));
         let (message, files) = self.convert(&posted, guild.as_deref(), conversation.kind);
         let always = conversation.kind.is_direct() || conversation.kind == ConversationKind::Thread;
-        if always || message.mentions_me || message.outgoing || self.ctx.newest(&channel)?.is_some()
-        {
+        if always || message.mentions_me || message.outgoing || self.ctx.newest(&channel)?.is_some() {
             files.register(&self.ctx)?;
             self.thread_of(&posted, &conversation)?;
             self.ctx.message(&channel, &message)?;
         } else {
-            self.ctx.counts(
-                &channel,
-                conversation.unread.max(1),
-                conversation.mentions,
-                None,
-                message.sent,
-            )?;
+            self.ctx.counts(&channel, conversation.unread.max(1), conversation.mentions, None, message.sent)?;
             self.ctx.typing_stopped(&channel, &message.sender.id);
         }
         Ok(())
@@ -291,10 +268,7 @@ impl Discord {
         let Some(conversation) = self.ctx.known(channel)? else {
             return Ok(());
         };
-        let guild = posted
-            .guild_id
-            .clone()
-            .or_else(|| self.guild_of(&conversation));
+        let guild = posted.guild_id.clone().or_else(|| self.guild_of(&conversation));
         let files = if posted.author.is_some() {
             // Whole: translate it again, keeping what only the first arrival knew.
             let (mut message, files) = self.convert(&posted, guild.as_deref(), conversation.kind);
@@ -331,14 +305,8 @@ impl Discord {
 
     fn reacted(&self, reacting: Reacting, added: bool) -> Result<(), Failure> {
         let me = self.me();
-        let single = reacting
-            .emoji
-            .iter()
-            .map(|emoji| (emoji, std::slice::from_ref(&reacting.user_id)));
-        let many = reacting
-            .reactions
-            .iter()
-            .map(|many| (&many.emoji, many.users.as_slice()));
+        let single = reacting.emoji.iter().map(|emoji| (emoji, std::slice::from_ref(&reacting.user_id)));
+        let many = reacting.reactions.iter().map(|many| (&many.emoji, many.users.as_slice()));
         for (emoji, users) in single.chain(many) {
             let (spelled, file) = emoji.spelled();
             if let Some(file) = &file {
@@ -351,8 +319,7 @@ impl Discord {
                     count: 1,
                     mine: *user == me,
                 };
-                self.ctx
-                    .reacted(&reacting.channel_id, &reacting.message_id, &reaction, added)?;
+                self.ctx.reacted(&reacting.channel_id, &reacting.message_id, &reaction, added)?;
             }
         }
         Ok(())
@@ -360,10 +327,7 @@ impl Discord {
 
     /// Every reaction removed, or every one of a single emoji.
     fn unreacted(&self, removed: Reacting) -> Result<(), Failure> {
-        let Some(mut stored) = self
-            .ctx
-            .stored_message(&removed.channel_id, &removed.message_id)?
-        else {
+        let Some(mut stored) = self.ctx.stored_message(&removed.channel_id, &removed.message_id)? else {
             return Ok(());
         };
         match removed.emoji.as_ref().map(|emoji| emoji.spelled().0) {
@@ -380,11 +344,7 @@ impl Discord {
         };
         // An ack of a marker we have already passed is Discord repeating the old one. Applying
         // it would unread a blocked DM whose ack Discord refused.
-        if let Some(last) = conversation
-            .last_read
-            .as_deref()
-            .filter(|id| !id.is_empty())
-        {
+        if let Some(last) = conversation.last_read.as_deref().filter(|id| !id.is_empty()) {
             let ack_n = number(&acked.message_id);
             let last_n = number(last);
             let already = conversation.unread == 0 && conversation.mentions == 0;
@@ -399,13 +359,7 @@ impl Discord {
             (false, true) => (mentions.max(1), 0),
             (false, false) => (1, mentions),
         };
-        self.ctx.counts(
-            &acked.channel_id,
-            unread,
-            mentions,
-            Some(&acked.message_id),
-            conversation.updated,
-        )?;
+        self.ctx.counts(&acked.channel_id, unread, mentions, Some(&acked.message_id), conversation.updated)?;
         Ok(())
     }
 
@@ -418,9 +372,7 @@ impl Discord {
             let mut state = self.state.lock().unwrap();
             state.users.insert(user.id.clone(), row.name.clone());
             state.rows.insert(user.id.clone(), row.clone());
-            state
-                .relations
-                .insert(user.id.clone(), relationship.relation());
+            state.relations.insert(user.id.clone(), relationship.relation());
         }
         self.ctx.media(&[user.avatar()])?;
         self.ctx.people(&[row])?;
@@ -432,55 +384,26 @@ impl Discord {
         if typing.user_id == self.me() {
             return;
         }
-        let named = typing
-            .member
-            .as_ref()
-            .map(|member| member.name().to_owned())
-            .filter(|name| !name.is_empty());
-        let named = named.or_else(|| {
-            self.state
-                .lock()
-                .unwrap()
-                .users
-                .get(&typing.user_id)
-                .cloned()
-        });
+        let named = typing.member.as_ref().map(|member| member.name().to_owned()).filter(|name| !name.is_empty());
+        let named = named.or_else(|| self.state.lock().unwrap().users.get(&typing.user_id).cloned());
         let name = named.unwrap_or_else(|| "Someone".to_owned());
-        self.ctx
-            .typing(&typing.channel_id, &typing.user_id, &name, TYPING_SECONDS);
+        self.ctx.typing(&typing.channel_id, &typing.user_id, &name, TYPING_SECONDS);
     }
 
     /// Channels of a server we hold no subscription for got newer messages: their rows turn
     /// unread without the messages being fetched.
     fn passive(&self, passive: Passive) -> Result<(), Failure> {
-        for newest in passive
-            .channel_unread_updates
-            .iter()
-            .chain(&passive.updated_channels)
-        {
-            let (Some(last), Some(conversation)) =
-                (&newest.last_message_id, self.ctx.known(&newest.id)?)
-            else {
+        for newest in passive.channel_unread_updates.iter().chain(&passive.updated_channels) {
+            let (Some(last), Some(conversation)) = (&newest.last_message_id, self.ctx.known(&newest.id)?) else {
                 continue;
             };
             let listed = matches!(
                 conversation.kind,
-                ConversationKind::Channel
-                    | ConversationKind::Announcement
-                    | ConversationKind::Thread
+                ConversationKind::Channel | ConversationKind::Announcement | ConversationKind::Thread
             );
-            let read = conversation
-                .last_read
-                .as_deref()
-                .is_some_and(|read| number(read) >= number(last));
+            let read = conversation.last_read.as_deref().is_some_and(|read| number(read) >= number(last));
             if listed && !read && seconds(last) > conversation.updated {
-                self.ctx.counts(
-                    &newest.id,
-                    conversation.unread.max(1),
-                    conversation.mentions,
-                    None,
-                    seconds(last),
-                )?;
+                self.ctx.counts(&newest.id, conversation.unread.max(1), conversation.mentions, None, seconds(last))?;
             }
         }
         if !passive.updated_voice_states.is_empty() || !passive.removed_voice_states.is_empty() {

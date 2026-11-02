@@ -9,15 +9,14 @@
 //! server has the adapter leave on the network, so nobody is left ringing or shown in a channel.
 
 use crate::hub::{now, Hub};
-use protocol::media_host::MediaChild;
 use protocol::settings::{GLOBAL, INPUT, JOIN_MUTED, OUTPUT, REQUIRE_CALL_E2EE};
 use protocol::{
-    clip, read_frame, write_frame, AudioDevice, Call, CallFailure, CallPicture, CallState, Change,
-    Content, Cue, Direction, Key, MediaRequest, MediaResponse, Participant, TinyOffer, TinySlot,
-    VideoStream, VoiceJoin, DEVICES_LIMIT, OCCUPANTS_LIMIT,
+    clip, read_frame, write_frame, AudioDevice, Call, CallFailure, CallPicture, CallState, Change, Content, Cue, Direction, Key, MediaRequest,
+    MediaResponse, Participant, TinyOffer, TinySlot, VideoStream, VoiceJoin, DEVICES_LIMIT, OCCUPANTS_LIMIT,
 };
 use std::io::{self, BufReader};
 use std::path::PathBuf;
+use protocol::media_host::MediaChild;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver};
@@ -51,8 +50,7 @@ pub const NO_ANSWER: &str = "Nobody picked up.";
 /// What the dock shows when mediad is gone or mute; what mediad or the system said is logged.
 const ENGINE_STOPPED: &str = "The call engine stopped.";
 const ENGINE_SILENT: &str = "The call engine stopped answering. Try again.";
-const ENGINE_MISSING: &str =
-    "The call engine could not start. Reinstall tinyclient, then try again.";
+const ENGINE_MISSING: &str = "The call engine could not start. Reinstall tinyclient, then try again.";
 /// A Tiny server call asked for while another network's call is up.
 pub const IN_ANOTHER_CALL: &str = "Leave the call you're in first.";
 
@@ -148,34 +146,23 @@ impl Tester {
         protocol::launch::no_console(&mut command);
         protocol::log_policy::share_session(&mut command);
         // The process on a desktop; mediad's threads in this process on a phone.
-        let protocol::media_host::Spawned {
-            child,
-            stdin,
-            stdout,
-        } = protocol::media_host::spawn(&mut command)?;
+        let protocol::media_host::Spawned { child, stdin, stdout } = protocol::media_host::spawn(&mut command)?;
         let mut stdout = BufReader::new(stdout.expect("stdout is piped"));
         let reader = hub.clone();
-        std::thread::Builder::new()
-            .stack_size(256 * 1024)
-            .spawn(move || {
-                // Ends when mediad exits.
-                while let Ok(frame) = read_frame::<MediaResponse>(&mut stdout) {
-                    if let MediaResponse::Levels { input, .. } = frame {
-                        reader.changed(Change::Meter {
-                            level: Some(input.min(100)),
-                        });
-                    }
+        std::thread::Builder::new().stack_size(256 * 1024).spawn(move || {
+            // Ends when mediad exits.
+            while let Ok(frame) = read_frame::<MediaResponse>(&mut stdout) {
+                if let MediaResponse::Levels { input, .. } = frame {
+                    reader.changed(Change::Meter { level: Some(input.min(100)) });
                 }
-                reader.calls.tester_gone(&reader, id);
-            })?;
+            }
+            reader.calls.tester_gone(&reader, id);
+        })?;
         Ok(Tester { id, child, stdin })
     }
 
     fn send(&mut self, request: &MediaRequest) -> io::Result<()> {
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| io::Error::other(ENGINE_SILENT))?;
+        let stdin = self.stdin.as_mut().ok_or_else(|| io::Error::other(ENGINE_SILENT))?;
         write_frame(stdin, request)
     }
 }
@@ -203,15 +190,9 @@ pub(crate) fn mediad_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("TINYCLIENT_MEDIAD") {
         return Ok(PathBuf::from(path));
     }
-    let beside =
-        std::env::current_exe()?.with_file_name(format!("mediad{}", std::env::consts::EXE_SUFFIX));
-    let helper = beside
-        .parent()
-        .and_then(|dir| dir.parent())
-        .map(|contents| contents.join(format!("Helpers/mediad{}", std::env::consts::EXE_SUFFIX)));
-    Ok(helper
-        .filter(|helper| !beside.exists() && helper.exists())
-        .unwrap_or(beside))
+    let beside = std::env::current_exe()?.with_file_name(format!("mediad{}", std::env::consts::EXE_SUFFIX));
+    let helper = beside.parent().and_then(|dir| dir.parent()).map(|contents| contents.join(format!("Helpers/mediad{}", std::env::consts::EXE_SUFFIX)));
+    Ok(helper.filter(|helper| !beside.exists() && helper.exists()).unwrap_or(beside))
 }
 
 fn new_call(conversation: Key, state: CallState) -> Live {
@@ -304,9 +285,7 @@ impl Live {
     /// An outgoing ring is answered when the adapter says so, or when someone else is in the
     /// call. Until then our own voice connection being up does not make it a call.
     fn unanswered(&self) -> bool {
-        self.call.state == CallState::RingingOut
-            && !self.answered
-            && self.call.participants.is_empty()
+        self.call.state == CallState::RingingOut && !self.answered && self.call.participants.is_empty()
     }
 
     /// The other side picked up. It is a call once our media is up too; until then it is
@@ -354,26 +333,13 @@ impl Live {
             }
             // Only a call that was up can be interrupted. While it still rings or connects,
             // mediad changing voice server is part of getting there.
-            MediaResponse::Interrupted if self.call.state == CallState::Joined => {
-                self.enter(CallState::Reconnecting)
-            }
+            MediaResponse::Interrupted if self.call.state == CallState::Joined => self.enter(CallState::Reconnecting),
             MediaResponse::Interrupted => return false,
-            MediaResponse::Failed { reason, detail } => {
-                self.enter(CallState::Failed { reason, detail })
-            }
-            MediaResponse::Speaking { user_id, speaking } => {
-                return self.speaking(&user_id, speaking)
-            }
+            MediaResponse::Failed { reason, detail } => self.enter(CallState::Failed { reason, detail }),
+            MediaResponse::Speaking { user_id, speaking } => return self.speaking(&user_id, speaking),
             // The roster is the adapter's to change. Someone who left is no longer speaking.
             MediaResponse::Gone { user_id } => return self.speaking(&user_id, false),
-            MediaResponse::Devices {
-                mut input,
-                mut output,
-                mut input_id,
-                mut output_id,
-                notice,
-                stuck,
-            } => {
+            MediaResponse::Devices { mut input, mut output, mut input_id, mut output_id, notice, stuck } => {
                 for text in [&mut input, &mut output, &mut input_id, &mut output_id] {
                     clip(text, 400);
                 }
@@ -382,15 +348,7 @@ impl Live {
                     words
                 });
                 let call = &self.call;
-                if (
-                    &call.input,
-                    &call.output,
-                    &call.input_id,
-                    &call.output_id,
-                    &call.device_notice,
-                    call.device_stuck,
-                ) == (&input, &output, &input_id, &output_id, &notice, stuck)
-                {
+                if (&call.input, &call.output, &call.input_id, &call.output_id, &call.device_notice, call.device_stuck) == (&input, &output, &input_id, &output_id, &notice, stuck) {
                     return false;
                 }
                 self.call.input = input;
@@ -435,57 +393,21 @@ impl Live {
                 }
                 self.call.security = security;
             }
-            MediaResponse::Source { .. }
-            | MediaResponse::TinyE2ee { .. }
-            | MediaResponse::TinyRenegotiate { .. } => return false,
-            MediaResponse::Picture {
-                path,
-                width,
-                height,
-                generation,
-                user_id,
-                kind,
-            } => {
-                let picture = (!path.is_empty()).then(|| CallPicture {
-                    path,
-                    width,
-                    height,
-                    generation,
-                    user_id,
-                    kind,
-                });
+            MediaResponse::Source { .. } | MediaResponse::TinyE2ee { .. } | MediaResponse::TinyRenegotiate { .. } => return false,
+            MediaResponse::Picture { path, width, height, generation, user_id, kind } => {
+                let picture = (!path.is_empty()).then(|| CallPicture { path, width, height, generation, user_id, kind });
                 if self.call.picture == picture {
                     return false;
                 }
                 self.call.picture = picture;
             }
             MediaResponse::Sending { share, camera } => {
-                let mut video: Vec<VideoStream> = self
-                    .call
-                    .video
-                    .iter()
-                    .filter(|stream| stream.direction != Direction::Encode)
-                    .cloned()
-                    .collect();
+                let mut video: Vec<VideoStream> = self.call.video.iter().filter(|stream| stream.direction != Direction::Encode).cloned().collect();
                 if camera {
-                    video.insert(
-                        0,
-                        VideoStream {
-                            direction: Direction::Encode,
-                            content: Content::Camera,
-                            source: String::new(),
-                        },
-                    );
+                    video.insert(0, VideoStream { direction: Direction::Encode, content: Content::Camera, source: String::new() });
                 }
                 if share {
-                    video.insert(
-                        0,
-                        VideoStream {
-                            direction: Direction::Encode,
-                            content: Content::Share,
-                            source: String::new(),
-                        },
-                    );
+                    video.insert(0, VideoStream { direction: Direction::Encode, content: Content::Share, source: String::new() });
                 }
                 if video == self.call.video {
                     return false;
@@ -515,19 +437,12 @@ impl Live {
         let network = self.call.conversation.network.label();
         let waited = self.since.elapsed();
         match self.call.state {
-            CallState::Connecting if self.joining && waited > CONNECT => {
-                Some(failed(CallFailure::Engine, ENGINE_SILENT))
-            }
+            CallState::Connecting if self.joining && waited > CONNECT => Some(failed(CallFailure::Engine, ENGINE_SILENT)),
             CallState::Connecting if !self.joining && waited > SESSION => {
                 let seconds = SESSION.as_secs();
-                Some(failed(
-                    CallFailure::Lost,
-                    format!("No reply from {network} after {seconds} seconds."),
-                ))
+                Some(failed(CallFailure::Lost, format!("No reply from {network} after {seconds} seconds.")))
             }
-            CallState::RingingOut if waited > RING => {
-                Some(failed(CallFailure::NoAnswer, NO_ANSWER))
-            }
+            CallState::RingingOut if waited > RING => Some(failed(CallFailure::NoAnswer, NO_ANSWER)),
             _ => None,
         }
     }
@@ -542,11 +457,7 @@ impl ActiveCall {
         protocol::log_policy::share_session(&mut command);
         // The process on a desktop; mediad's threads in this process on a phone.
         let spawned = protocol::media_host::spawn(&mut command);
-        let protocol::media_host::Spawned {
-            mut child,
-            stdin,
-            stdout,
-        } = spawned.map_err(|err| {
+        let protocol::media_host::Spawned { mut child, stdin, stdout } = spawned.map_err(|err| {
             tracing::warn!("chatd: could not run {}: {err}", path.display());
             io::Error::other(ENGINE_MISSING)
         })?;
@@ -556,20 +467,14 @@ impl ActiveCall {
         // stale binary, one wedged before its first word) must fail the call rather than hold
         // every Status answer and every ring with it.
         let (said, answered) = channel();
-        let spawned = std::thread::Builder::new()
-            .name("mediad-ready".into())
-            .stack_size(128 * 1024)
-            .spawn(move || {
-                let frame = read_frame::<MediaResponse>(&mut stdout);
-                let _ = said.send((frame, stdout));
-            });
+        let spawned = std::thread::Builder::new().name("mediad-ready".into()).stack_size(128 * 1024).spawn(move || {
+            let frame = read_frame::<MediaResponse>(&mut stdout);
+            let _ = said.send((frame, stdout));
+        });
         if let Err(err) = spawned {
             let _ = child.kill();
             let _ = child.wait();
-            tracing::warn!(
-                "chatd: the reader of {} did not start: {err}",
-                path.display()
-            );
+            tracing::warn!("chatd: the reader of {} did not start: {err}", path.display());
             return Err(io::Error::other(ENGINE_MISSING));
         }
         let (frame, mut stdout) = match answered.recv_timeout(READY) {
@@ -579,11 +484,7 @@ impl ActiveCall {
                 let _ = child.wait();
                 tracing::warn!("mediad frame was not ready");
                 let silent = matches!(answer, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
-                return Err(io::Error::other(if silent {
-                    ENGINE_SILENT
-                } else {
-                    ENGINE_MISSING
-                }));
+                return Err(io::Error::other(if silent { ENGINE_SILENT } else { ENGINE_MISSING }));
             }
         };
         let engine_linked = match frame {
@@ -605,67 +506,61 @@ impl ActiveCall {
         let (reply, replies) = channel();
 
         let (reader, seen) = (hub.clone(), live.clone());
-        std::thread::Builder::new()
-            .stack_size(256 * 1024)
-            .spawn(move || {
-                // Ends when mediad closes its stdout, which is when it exits.
-                while let Ok(frame) = read_frame::<MediaResponse>(&mut stdout) {
-                    if frame.is_reply() {
-                        let _ = reply.send(frame);
-                        continue;
-                    }
-                    if let MediaResponse::DeviceList { inputs, outputs } = &frame {
-                        learn_devices(&reader, inputs, outputs);
-                    }
-                    // A frame for the server: the adapter of the call's account sends it.
-                    if let MediaResponse::TinyE2ee { frame } = &frame {
-                        let conversation = crate::hub::lock(&seen).call.conversation.clone();
-                        reader.calls.signal(&conversation, frame.clone());
-                        continue;
-                    }
-                    if let MediaResponse::TinyRenegotiate { sdp } = &frame {
-                        let conversation = crate::hub::lock(&seen).call.conversation.clone();
-                        reader.calls.offer(&conversation, sdp.clone());
-                        continue;
-                    }
-                    let notify = match &frame {
-                        MediaResponse::Interrupted => Some(false),
-                        MediaResponse::Connected { .. } => Some(true),
-                        _ => None,
-                    };
-                    let mut live = crate::hub::lock(&seen);
-                    let conversation = live.call.conversation.clone();
-                    let draw = live.apply(frame);
-                    let call = draw.then(|| live.call.clone());
-                    let state_now = live.call.state.clone();
-                    drop(live);
-                    // Outside the call lock. A drop while already reconnecting does not redraw, and
-                    // still has to be resumed; the first connect is not one.
-                    if conversation.network == protocol::Network::Tiny {
-                        match notify {
-                            Some(false) if matches!(state_now, CallState::Reconnecting) => {
-                                reader.calls.tiny_down(&conversation)
-                            }
-                            Some(true) => reader.calls.tiny_up(&conversation),
-                            _ => {}
-                        }
-                    }
-                    if let Some(call) = call {
-                        reader.changed(Change::Call { call: Some(call) });
+        std::thread::Builder::new().stack_size(256 * 1024).spawn(move || {
+            // Ends when mediad closes its stdout, which is when it exits.
+            while let Ok(frame) = read_frame::<MediaResponse>(&mut stdout) {
+                if frame.is_reply() {
+                    let _ = reply.send(frame);
+                    continue;
+                }
+                if let MediaResponse::DeviceList { inputs, outputs } = &frame {
+                    learn_devices(&reader, inputs, outputs);
+                }
+                // A frame for the server: the adapter of the call's account sends it.
+                if let MediaResponse::TinyE2ee { frame } = &frame {
+                    let conversation = crate::hub::lock(&seen).call.conversation.clone();
+                    reader.calls.signal(&conversation, frame.clone());
+                    continue;
+                }
+                if let MediaResponse::TinyRenegotiate { sdp } = &frame {
+                    let conversation = crate::hub::lock(&seen).call.conversation.clone();
+                    reader.calls.offer(&conversation, sdp.clone());
+                    continue;
+                }
+                let notify = match &frame {
+                    MediaResponse::Interrupted => Some(false),
+                    MediaResponse::Connected { .. } => Some(true),
+                    _ => None,
+                };
+                let mut live = crate::hub::lock(&seen);
+                let conversation = live.call.conversation.clone();
+                let draw = live.apply(frame);
+                let call = draw.then(|| live.call.clone());
+                let state_now = live.call.state.clone();
+                drop(live);
+                // Outside the call lock. A drop while already reconnecting does not redraw, and
+                // still has to be resumed; the first connect is not one.
+                if conversation.network == protocol::Network::Tiny {
+                    match notify {
+                        Some(false) if matches!(state_now, CallState::Reconnecting) => reader.calls.tiny_down(&conversation),
+                        Some(true) => reader.calls.tiny_up(&conversation),
+                        _ => {}
                     }
                 }
-                reader.calls.reap(&reader, id);
-            })?;
+                if let Some(call) = call {
+                    reader.changed(Change::Call { call: Some(call) });
+                }
+            }
+            reader.calls.reap(&reader, id);
+        })?;
 
         let watcher = hub.clone();
-        std::thread::Builder::new()
-            .stack_size(256 * 1024)
-            .spawn(move || {
-                // Ends with the call it watches.
-                while watcher.calls.watch(&watcher, id) {
-                    sleep(WATCH);
-                }
-            })?;
+        std::thread::Builder::new().stack_size(256 * 1024).spawn(move || {
+            // Ends with the call it watches.
+            while watcher.calls.watch(&watcher, id) {
+                sleep(WATCH);
+            }
+        })?;
         Ok(ActiveCall {
             id,
             child,
@@ -683,10 +578,7 @@ impl ActiveCall {
     fn request(&mut self, request: &MediaRequest) -> io::Result<MediaResponse> {
         let stdin = self.stdin.as_mut().expect("stdin is open until drop");
         write_frame(stdin, request)?;
-        let reply = self
-            .replies
-            .recv_timeout(REPLY)
-            .map_err(|_| io::Error::other(ENGINE_SILENT))?;
+        let reply = self.replies.recv_timeout(REPLY).map_err(|_| io::Error::other(ENGINE_SILENT))?;
         match reply {
             MediaResponse::Streams { video } => {
                 crate::hub::lock(&self.live).call.video = video.clone();
@@ -761,9 +653,7 @@ impl Calls {
     }
 
     fn tell(&self, hub: &Hub) {
-        hub.changed(Change::Call {
-            call: self.describe().0,
-        });
+        hub.changed(Change::Call { call: self.describe().0 });
     }
 
     /// Who hears of a call that failed: the server, which has the adapter leave on the network.
@@ -817,18 +707,11 @@ impl Calls {
 
     /// The user verified someone, or took it back: the call on `account` shows it at once.
     pub fn reverify(&self, hub: &Hub, account: &protocol::AccountKey) {
-        let Some(call) = self
-            .describe()
-            .0
-            .filter(|call| call.conversation.account() == *account)
-        else {
+        let Some(call) = self.describe().0.filter(|call| call.conversation.account() == *account) else {
             return;
         };
         let refreshed = self.update(hub, &call.conversation, |live| {
-            live.call.security = live
-                .secured
-                .clone()
-                .map(|security| crate::verified::trusted(account, security));
+            live.call.security = live.secured.clone().map(|security| crate::verified::trusted(account, security));
         });
         if refreshed {
             self.tell(hub);
@@ -838,9 +721,7 @@ impl Calls {
     /// A call with a mediad just turned into a failure. Drops the mediad, which waits for it to
     /// exit, and says so; both outside the slot's lock.
     fn stopped(&self, hub: &Hub, stopped: Option<ActiveCall>) {
-        let conversation = stopped
-            .as_ref()
-            .map(|active| crate::hub::lock(&active.live).call.conversation.clone());
+        let conversation = stopped.as_ref().map(|active| crate::hub::lock(&active.live).call.conversation.clone());
         drop(stopped);
         self.tell(hub);
         if let Some(conversation) = conversation {
@@ -865,14 +746,7 @@ impl Calls {
         let (tuning, input, output, muted, mode, processing) = {
             let settings = hub.settings();
             let mode = input_mode(&settings, false);
-            (
-                settings.tuning(),
-                settings.device(INPUT),
-                settings.device(OUTPUT),
-                settings.on(JOIN_MUTED),
-                mode,
-                settings.processing(),
-            )
+            (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT), settings.on(JOIN_MUTED), mode, settings.processing())
         };
         {
             let mut slot = crate::hub::lock(&self.slot);
@@ -882,8 +756,7 @@ impl Calls {
             // The old mediad, if any, is reaped before the new one starts.
             *slot = Slot::Idle;
             let id = self.next.fetch_add(1, Ordering::Relaxed);
-            let mut active =
-                ActiveCall::start(hub, id, conversation.clone()).map_err(CallError::Media)?;
+            let mut active = ActiveCall::start(hub, id, conversation.clone()).map_err(CallError::Media)?;
             // The user's defaults, before the voice session arrives: mediad opens the devices
             // only once it holds one. A mediad that refuses them still carries the call.
             crate::hub::lock(&active.live).call.muted = muted;
@@ -893,11 +766,7 @@ impl Calls {
             // V9: everyone on this account whose volume for me is not the default.
             let gains = hub.settings().gains(&conversation.account());
             for (user_id, percent, muted) in gains {
-                let _ = active.request(&MediaRequest::Gain {
-                    user_id,
-                    percent,
-                    muted,
-                });
+                let _ = active.request(&MediaRequest::Gain { user_id, percent, muted });
             }
             if input.is_some() || output.is_some() {
                 let _ = active.request(&MediaRequest::Devices { input, output });
@@ -948,33 +817,15 @@ impl Calls {
     }
 
     /// One person's volume for me (V9), for the call if it is on `account`.
-    pub fn gain(
-        &self,
-        hub: &Hub,
-        account: &protocol::AccountKey,
-        user_id: String,
-        percent: u16,
-        muted: bool,
-    ) {
+    pub fn gain(&self, hub: &Hub, account: &protocol::AccountKey, user_id: String, percent: u16, muted: bool) {
         let (call, running) = self.describe();
         if running && call.is_some_and(|call| call.conversation.account() == *account) {
-            let _ = self.request(
-                hub,
-                &MediaRequest::Gain {
-                    user_id,
-                    percent,
-                    muted,
-                },
-            );
+            let _ = self.request(hub, &MediaRequest::Gain { user_id, percent, muted });
         }
     }
 
     /// The running test mediad, started with the user's devices and tuning if there is none.
-    fn tester<'a>(
-        &self,
-        hub: &Arc<Hub>,
-        held: &'a mut Option<Tester>,
-    ) -> Result<&'a mut Tester, CallError> {
+    fn tester<'a>(&self, hub: &Arc<Hub>, held: &'a mut Option<Tester>) -> Result<&'a mut Tester, CallError> {
         if held.is_none() {
             let id = self.next.fetch_add(1, Ordering::Relaxed);
             let mut tester = Tester::start(hub, id).map_err(|err| {
@@ -983,12 +834,7 @@ impl Calls {
             })?;
             let (tuning, input, output, processing) = {
                 let settings = hub.settings();
-                (
-                    settings.tuning(),
-                    settings.device(INPUT),
-                    settings.device(OUTPUT),
-                    settings.processing(),
-                )
+                (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT), settings.processing())
             };
             // The meter is of the microphone as a call would send it: processed.
             let told = tester
@@ -1004,12 +850,7 @@ impl Calls {
     /// Settings' microphone test. In a call it is the call's own meter; otherwise a test mediad
     /// carries it, and stops it after 30 s by itself. `loopback` also plays the microphone back,
     /// processed, on the speaker; only outside a call, where nobody else is listening.
-    pub fn test_microphone(
-        &self,
-        hub: &Arc<Hub>,
-        on: bool,
-        loopback: bool,
-    ) -> Result<(), CallError> {
+    pub fn test_microphone(&self, hub: &Arc<Hub>, on: bool, loopback: bool) -> Result<(), CallError> {
         if self.in_call() {
             return self.meter(hub, on);
         }
@@ -1021,11 +862,7 @@ impl Calls {
             }
             return Ok(());
         }
-        let ask = |tester: &mut Tester| {
-            tester
-                .send(&MediaRequest::Meter { on: true })
-                .and_then(|()| tester.send(&MediaRequest::Loopback { on: loopback }))
-        };
+        let ask = |tester: &mut Tester| tester.send(&MediaRequest::Meter { on: true }).and_then(|()| tester.send(&MediaRequest::Loopback { on: loopback }));
         let tester = self.tester(hub, &mut held)?;
         if ask(tester).is_err() {
             // It had just exited: start it again.
@@ -1044,9 +881,7 @@ impl Calls {
         let mut held = crate::hub::lock(&self.tester);
         if self.tester(hub, &mut held)?.send(&test).is_err() {
             *held = None;
-            self.tester(hub, &mut held)?
-                .send(&test)
-                .map_err(CallError::Media)?;
+            self.tester(hub, &mut held)?.send(&test).map_err(CallError::Media)?;
         }
         Ok(())
     }
@@ -1065,9 +900,7 @@ impl Calls {
     /// Answers the ring. Gives the conversation, for the adapter to join on the network.
     pub fn accept(&self, hub: &Arc<Hub>) -> Result<Key, CallError> {
         let ringing = match &*crate::hub::lock(&self.slot) {
-            Slot::Shown(live) if matches!(live.call.state, CallState::RingingIn { .. }) => {
-                live.call.conversation.clone()
-            }
+            Slot::Shown(live) if matches!(live.call.state, CallState::RingingIn { .. }) => live.call.conversation.clone(),
             _ => return Err(CallError::NoCall),
         };
         if let Err(err) = self.start(hub, ringing.clone()) {
@@ -1116,12 +949,7 @@ impl Calls {
                 let _ = active.child.kill();
                 let _ = active.child.wait();
             }
-            let clean = active
-                .child
-                .try_wait()
-                .ok()
-                .flatten()
-                .is_some_and(|status| status.success());
+            let clean = active.child.try_wait().ok().flatten().is_some_and(|status| status.success());
             let mut live = crate::hub::lock(&active.live);
             // A failure mediad named itself is the better word; this is for one that said nothing.
             let silent = !matches!(live.call.state, CallState::Failed { .. });
@@ -1239,9 +1067,7 @@ impl Calls {
             if matches!(&*slot, Slot::Active(_)) {
                 return;
             }
-            let state = CallState::RingingIn {
-                from: from.to_owned(),
-            };
+            let state = CallState::RingingIn { from: from.to_owned() };
             *slot = Slot::Shown(Box::new(new_call(conversation, state)));
         }
         self.tell(hub);
@@ -1280,12 +1106,7 @@ impl Calls {
 
     /// Everyone in the call but us, as the network lists them. Who is speaking is mediad's to say
     /// and is carried over.
-    pub fn set_participants(
-        &self,
-        hub: &Hub,
-        conversation: &Key,
-        mut participants: Vec<Participant>,
-    ) {
+    pub fn set_participants(&self, hub: &Hub, conversation: &Key, mut participants: Vec<Participant>) {
         let mut cue = None;
         self.update(hub, conversation, |live| {
             cue = arrival(&live.call, &participants, now());
@@ -1294,10 +1115,7 @@ impl Calls {
             }
             live.call.participants = participants;
             // The first other person in a call we rang is the answer.
-            if live.call.state == CallState::RingingOut
-                && live.connected
-                && !live.call.participants.is_empty()
-            {
+            if live.call.state == CallState::RingingOut && live.connected && !live.call.participants.is_empty() {
                 live.join();
             }
         });
@@ -1325,19 +1143,11 @@ impl Calls {
         if !known {
             return;
         }
-        let request = if again {
-            MediaRequest::Rejoin(voice)
-        } else {
-            MediaRequest::Join(voice)
-        };
+        let request = if again { MediaRequest::Rejoin(voice) } else { MediaRequest::Join(voice) };
         // What mediad refuses it refuses in words (`Refused`); a pipe that broke is not words.
         if let Err(CallError::Media(err)) = self.request(hub, &request) {
             tracing::warn!("chatd: mediad did not take the voice session: {err}");
-            let detail = if err.kind() == io::ErrorKind::Other {
-                err.to_string()
-            } else {
-                ENGINE_SILENT.to_owned()
-            };
+            let detail = if err.kind() == io::ErrorKind::Other { err.to_string() } else { ENGINE_SILENT.to_owned() };
             self.set_state(hub, conversation, failed(CallFailure::Engine, detail));
         }
     }
@@ -1371,33 +1181,22 @@ impl Calls {
     /// the seat; any other call is in the way. What failed is said in words. A person who only
     /// joins end-to-end encrypted calls (`REQUIRE_CALL_E2EE`) has `required` set on the offer, and
     /// is refused here when the offer has no encryption.
-    pub fn tiny_offer(
-        &self,
-        hub: &Arc<Hub>,
-        conversation: &Key,
-        mut offer: TinyOffer,
-    ) -> Result<String, String> {
+    pub fn tiny_offer(&self, hub: &Arc<Hub>, conversation: &Key, mut offer: TinyOffer) -> Result<String, String> {
         let required = hub.settings().on(REQUIRE_CALL_E2EE);
         require_end_to_end(required, &mut offer)?;
         let (call, running) = self.describe();
-        let here = call
-            .as_ref()
-            .is_some_and(|call| call.conversation == *conversation)
-            && running;
+        let here = call.as_ref().is_some_and(|call| call.conversation == *conversation) && running;
         if !here {
             match call {
-                Some(call) if running && call.conversation.account() != conversation.account() => {
-                    return Err(IN_ANOTHER_CALL.to_owned())
-                }
+                Some(call) if running && call.conversation.account() != conversation.account() => return Err(IN_ANOTHER_CALL.to_owned()),
                 Some(call) if running => drop(self.end_if(hub, &call.conversation)),
                 _ => {}
             }
-            self.start(hub, conversation.clone())
-                .map_err(|err| match err {
-                    CallError::Active => IN_ANOTHER_CALL.to_owned(),
-                    CallError::NoCall => ENGINE_STOPPED.to_owned(),
-                    CallError::Media(err) => err.to_string(),
-                })?;
+            self.start(hub, conversation.clone()).map_err(|err| match err {
+                CallError::Active => IN_ANOTHER_CALL.to_owned(),
+                CallError::NoCall => ENGINE_STOPPED.to_owned(),
+                CallError::Media(err) => err.to_string(),
+            })?;
         }
         self.update(hub, conversation, |live| {
             offer.muted = live.call.muted;
@@ -1416,9 +1215,7 @@ impl Calls {
                     self.end_if(hub, conversation);
                 }
                 Err(match answer {
-                    Err(CallError::Media(err)) if err.kind() == io::ErrorKind::Other => {
-                        err.to_string()
-                    }
+                    Err(CallError::Media(err)) if err.kind() == io::ErrorKind::Other => err.to_string(),
                     _ => ENGINE_SILENT.to_owned(),
                 })
             }
@@ -1436,11 +1233,7 @@ impl Calls {
         }
         if let Err(CallError::Media(err)) = self.request(hub, &MediaRequest::TinyAnswer { sdp }) {
             tracing::warn!("chatd: mediad did not take the answer: {err}");
-            let detail = if err.kind() == io::ErrorKind::Other {
-                err.to_string()
-            } else {
-                ENGINE_SILENT.to_owned()
-            };
+            let detail = if err.kind() == io::ErrorKind::Other { err.to_string() } else { ENGINE_SILENT.to_owned() };
             self.set_state(hub, conversation, failed(CallFailure::Engine, detail));
         }
     }
@@ -1494,9 +1287,7 @@ impl Calls {
             let here = match &*slot {
                 Slot::Idle => false,
                 Slot::Shown(live) => live.call.conversation == *conversation,
-                Slot::Active(active) => {
-                    crate::hub::lock(&active.live).call.conversation == *conversation
-                }
+                Slot::Active(active) => crate::hub::lock(&active.live).call.conversation == *conversation,
             };
             if !here {
                 return false;
@@ -1512,11 +1303,7 @@ impl Calls {
 /// The cue a new roster calls for: someone joined or left a call that has been up a moment,
 /// and at most [`OCCUPANTS_LIMIT`] people are in it (a busy channel would chime all day).
 fn arrival(call: &Call, roster: &[Participant], now: i64) -> Option<Cue> {
-    if call.state != CallState::Joined
-        || call.joined == 0
-        || now - call.joined < SETTLING
-        || roster.len() > OCCUPANTS_LIMIT
-    {
+    if call.state != CallState::Joined || call.joined == 0 || now - call.joined < SETTLING || roster.len() > OCCUPANTS_LIMIT {
         return None;
     }
     let had = |id: &str| call.participants.iter().any(|p| p.id == id);
@@ -1559,26 +1346,16 @@ mod tests {
     }
 
     fn person(id: &str) -> Participant {
-        Participant {
-            id: id.into(),
-            name: id.to_uppercase(),
-            ..Participant::default()
-        }
+        Participant { id: id.into(), name: id.to_uppercase(), ..Participant::default() }
     }
 
     #[test]
     fn only_the_voice_connection_being_up_makes_a_call_joined() {
         let mut live = live(CallState::Connecting);
-        assert!(!live.apply(MediaResponse::Source {
-            user_id: "a".into(),
-            ssrc: 7
-        }));
+        assert!(!live.apply(MediaResponse::Source { user_id: "a".into(), ssrc: 7 }));
         assert_eq!(live.call.state, CallState::Connecting);
         assert_eq!(live.call.joined, 0);
-        assert!(live.apply(MediaResponse::Connected {
-            ssrc: 1,
-            dave_version: 1
-        }));
+        assert!(live.apply(MediaResponse::Connected { ssrc: 1, dave_version: 1 }));
         assert_eq!(live.call.state, CallState::Joined);
         let joined = live.call.joined;
         assert!(joined > 0);
@@ -1587,60 +1364,28 @@ mod tests {
         let mut early = self::live(CallState::RingingOut);
         assert!(!early.apply(MediaResponse::Interrupted));
         assert_eq!(early.call.state, CallState::RingingOut);
-        assert!(!early.apply(MediaResponse::Connected {
-            ssrc: 1,
-            dave_version: 1
-        }));
-        assert_eq!(
-            early.call.state,
-            CallState::RingingOut,
-            "and it is still not an answer"
-        );
+        assert!(!early.apply(MediaResponse::Connected { ssrc: 1, dave_version: 1 }));
+        assert_eq!(early.call.state, CallState::RingingOut, "and it is still not an answer");
 
         // A drop and a resume do not restart the clock.
         assert!(live.apply(MediaResponse::Interrupted));
         assert_eq!(live.call.state, CallState::Reconnecting);
-        assert!(live.apply(MediaResponse::Connected {
-            ssrc: 1,
-            dave_version: 1
-        }));
-        assert_eq!(
-            (live.call.state.clone(), live.call.joined),
-            (CallState::Joined, joined)
-        );
-        assert!(
-            !live.apply(MediaResponse::Connected {
-                ssrc: 1,
-                dave_version: 1
-            }),
-            "nothing new to draw"
-        );
+        assert!(live.apply(MediaResponse::Connected { ssrc: 1, dave_version: 1 }));
+        assert_eq!((live.call.state.clone(), live.call.joined), (CallState::Joined, joined));
+        assert!(!live.apply(MediaResponse::Connected { ssrc: 1, dave_version: 1 }), "nothing new to draw");
 
         // A second drop while already reconnecting stays there. It is not a failure, and not drawn again.
         assert!(live.apply(MediaResponse::Interrupted));
         assert_eq!(live.call.state, CallState::Reconnecting);
-        assert!(
-            !live.apply(MediaResponse::Interrupted),
-            "already reconnecting is not drawn again"
-        );
-        assert!(
-            matches!(live.call.state, CallState::Reconnecting),
-            "the call is still up"
-        );
+        assert!(!live.apply(MediaResponse::Interrupted), "already reconnecting is not drawn again");
+        assert!(matches!(live.call.state, CallState::Reconnecting), "the call is still up");
     }
 
     #[test]
     fn a_ring_we_placed_is_a_call_only_once_someone_answers() {
         let mut live = live(CallState::RingingOut);
-        assert!(!live.apply(MediaResponse::Connected {
-            ssrc: 1,
-            dave_version: 1
-        }));
-        assert_eq!(
-            live.call.state,
-            CallState::RingingOut,
-            "our own media being up is not an answer"
-        );
+        assert!(!live.apply(MediaResponse::Connected { ssrc: 1, dave_version: 1 }));
+        assert_eq!(live.call.state, CallState::RingingOut, "our own media being up is not an answer");
         assert!(live.unanswered());
         live.call.participants = vec![person("a")];
         assert!(!live.unanswered());
@@ -1649,16 +1394,10 @@ mod tests {
         let mut live = self::live(CallState::RingingOut);
         live.answer();
         assert_eq!(live.call.state, CallState::Connecting);
-        assert!(live.apply(MediaResponse::Connected {
-            ssrc: 1,
-            dave_version: 1
-        }));
+        assert!(live.apply(MediaResponse::Connected { ssrc: 1, dave_version: 1 }));
         assert_eq!(live.call.state, CallState::Joined);
         let mut live = self::live(CallState::RingingOut);
-        assert!(!live.apply(MediaResponse::Connected {
-            ssrc: 1,
-            dave_version: 1
-        }));
+        assert!(!live.apply(MediaResponse::Connected { ssrc: 1, dave_version: 1 }));
         live.answer();
         assert_eq!(live.call.state, CallState::Joined);
     }
@@ -1667,74 +1406,37 @@ mod tests {
     fn speaking_is_merged_by_user_id_and_kept_for_a_roster_that_comes_later() {
         let mut live = live(CallState::Joined);
         // Nobody by that id is listed yet: nothing to draw, but it is remembered.
-        assert!(!live.apply(MediaResponse::Speaking {
-            user_id: "a".into(),
-            speaking: true
-        }));
+        assert!(!live.apply(MediaResponse::Speaking { user_id: "a".into(), speaking: true }));
         assert_eq!(live.talking, ["a"]);
         live.call.participants = vec![person("a"), person("b")];
-        assert!(live.apply(MediaResponse::Speaking {
-            user_id: "b".into(),
-            speaking: true
-        }));
-        assert!(
-            !live.apply(MediaResponse::Speaking {
-                user_id: "b".into(),
-                speaking: true
-            }),
-            "no change, no repaint"
-        );
+        assert!(live.apply(MediaResponse::Speaking { user_id: "b".into(), speaking: true }));
+        assert!(!live.apply(MediaResponse::Speaking { user_id: "b".into(), speaking: true }), "no change, no repaint");
         assert!(live.call.participants[1].speaking);
-        assert!(
-            live.apply(MediaResponse::Gone {
-                user_id: "b".into()
-            }),
-            "who left stops speaking"
-        );
+        assert!(live.apply(MediaResponse::Gone { user_id: "b".into() }), "who left stops speaking");
         assert!(!live.call.participants[1].speaking);
         assert_eq!(live.talking, ["a"]);
         // Our own speaking is the call's, once the voice session has said who we are.
-        assert!(!live.apply(MediaResponse::Speaking {
-            user_id: "me".into(),
-            speaking: true
-        }));
+        assert!(!live.apply(MediaResponse::Speaking { user_id: "me".into(), speaking: true }));
         live.me = "me".into();
-        assert!(live.apply(MediaResponse::Speaking {
-            user_id: "me".into(),
-            speaking: true
-        }));
+        assert!(live.apply(MediaResponse::Speaking { user_id: "me".into(), speaking: true }));
         assert!(live.call.speaking);
         assert!(live.call.participants.iter().all(|who| who.id != "me"));
     }
 
+
     fn tiny_offer(e2ee: Option<protocol::TinyE2ee>) -> TinyOffer {
-        TinyOffer {
-            user_id: "me".into(),
-            host: "127.0.0.1".into(),
-            slots: 11,
-            muted: false,
-            deafened: false,
-            e2ee,
-        }
+        TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots: 11, muted: false, deafened: false, e2ee }
     }
 
     fn sealed_offer() -> TinyOffer {
-        tiny_offer(Some(protocol::TinyE2ee {
-            room_id: "room".into(),
-            identity: "/keys/me".into(),
-            required: false,
-        }))
+        tiny_offer(Some(protocol::TinyE2ee { room_id: "room".into(), identity: "/keys/me".into(), required: false }))
     }
 
     #[test]
     fn the_setting_sets_required_on_an_offer_that_has_encryption() {
         let mut offer = sealed_offer();
         require_end_to_end(false, &mut offer).unwrap();
-        assert_eq!(
-            offer.e2ee.as_ref().map(|e2ee| e2ee.required),
-            Some(false),
-            "off leaves the offer as the adapter made it"
-        );
+        assert_eq!(offer.e2ee.as_ref().map(|e2ee| e2ee.required), Some(false), "off leaves the offer as the adapter made it");
         require_end_to_end(true, &mut offer).unwrap();
         assert_eq!(offer.e2ee.as_ref().map(|e2ee| e2ee.required), Some(true));
         // Off with no encryption on the server is a call that carries on, as before.
@@ -1746,14 +1448,8 @@ mod tests {
     #[test]
     fn a_person_who_requires_encryption_does_not_join_a_server_that_lacks_it() {
         let mut plain = tiny_offer(None);
-        assert_eq!(
-            require_end_to_end(true, &mut plain),
-            Err(SERVER_CANNOT_ENCRYPT.to_owned())
-        );
-        assert!(
-            SERVER_CANNOT_ENCRYPT.contains("Settings"),
-            "it says where to change it"
-        );
+        assert_eq!(require_end_to_end(true, &mut plain), Err(SERVER_CANNOT_ENCRYPT.to_owned()));
+        assert!(SERVER_CANNOT_ENCRYPT.contains("Settings"), "it says where to change it");
     }
 
     #[test]
@@ -1761,27 +1457,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tc-media-require-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let hub = Arc::new(Hub::new(
-            crate::store::Store::open(&dir.join("chat.sqlite")).unwrap(),
-        ));
-        let key = Key {
-            network: Network::Tiny,
-            account: "me".into(),
-            id: "room".into(),
-        };
+        let hub = Arc::new(Hub::new(crate::store::Store::open(&dir.join("chat.sqlite")).unwrap()));
+        let key = Key { network: Network::Tiny, account: "me".into(), id: "room".into() };
         // Required, and the offer has no encryption: refused in words, with no call started.
-        hub.set_setting(GLOBAL, REQUIRE_CALL_E2EE, Some("on".into()))
-            .unwrap();
+        hub.set_setting(GLOBAL, REQUIRE_CALL_E2EE, Some("on".into())).unwrap();
         assert!(hub.settings().on(REQUIRE_CALL_E2EE));
-        assert_eq!(
-            hub.calls.tiny_offer(&hub, &key, tiny_offer(None)),
-            Err(SERVER_CANNOT_ENCRYPT.to_owned())
-        );
+        assert_eq!(hub.calls.tiny_offer(&hub, &key, tiny_offer(None)), Err(SERVER_CANNOT_ENCRYPT.to_owned()));
         let (call, running) = hub.calls.describe();
-        assert!(
-            call.is_none() && !running,
-            "nothing was started for a server that cannot encrypt"
-        );
+        assert!(call.is_none() && !running, "nothing was started for a server that cannot encrypt");
         drop(hub);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1796,33 +1479,15 @@ mod tests {
         {
             let hub = Hub::new(crate::store::Store::open(&path).unwrap());
             // As 0.2.19 stored it: the name alone. The speaker was never chosen.
-            hub.set_setting(GLOBAL, INPUT, Some(HEADSET.into()))
-                .unwrap();
-            let device = |id: &str, name: &str| AudioDevice {
-                id: id.into(),
-                name: name.into(),
-                ..AudioDevice::default()
-            };
-            let inputs = [
-                device("k", "Krisp Microphone (Krisp Audio)"),
-                device(id, HEADSET),
-            ];
+            hub.set_setting(GLOBAL, INPUT, Some(HEADSET.into())).unwrap();
+            let device = |id: &str, name: &str| AudioDevice { id: id.into(), name: name.into(), ..AudioDevice::default() };
+            let inputs = [device("k", "Krisp Microphone (Krisp Audio)"), device(id, HEADSET)];
             learn_devices(&hub, &inputs, &[device("s", "Speakers")]);
-            assert_eq!(
-                hub.settings().device_choice(INPUT),
-                protocol::settings::DeviceChoice::device(HEADSET, id)
-            );
-            assert_eq!(
-                hub.settings().device(OUTPUT),
-                None,
-                "nothing chosen is nothing stored"
-            );
+            assert_eq!(hub.settings().device_choice(INPUT), protocol::settings::DeviceChoice::device(HEADSET, id));
+            assert_eq!(hub.settings().device(OUTPUT), None, "nothing chosen is nothing stored");
         }
         let hub = Hub::new(crate::store::Store::open(&path).unwrap());
-        assert_eq!(
-            hub.settings().device(INPUT),
-            Some(format!("{HEADSET}\t{id}"))
-        );
+        assert_eq!(hub.settings().device(INPUT), Some(format!("{HEADSET}\t{id}")));
         drop(hub);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1830,85 +1495,28 @@ mod tests {
     #[test]
     fn devices_and_failures_reach_the_call_and_levels_do_not() {
         let mut live = live(CallState::Joined);
-        let devices = MediaResponse::Devices {
-            input: "Mic".into(),
-            output: "Speakers".into(),
-            input_id: "m".into(),
-            output_id: "s".into(),
-            notice: None,
-            stuck: false,
-        };
+        let devices = MediaResponse::Devices { input: "Mic".into(), output: "Speakers".into(), input_id: "m".into(), output_id: "s".into(), notice: None, stuck: false };
         assert!(live.apply(devices.clone()));
         assert!(!live.apply(devices));
-        assert_eq!(
-            (live.call.input.as_str(), live.call.output.as_str()),
-            ("Mic", "Speakers")
-        );
-        assert_eq!(
-            (live.call.input_id.as_str(), live.call.output_id.as_str()),
-            ("m", "s")
-        );
+        assert_eq!((live.call.input.as_str(), live.call.output.as_str()), ("Mic", "Speakers"));
+        assert_eq!((live.call.input_id.as_str(), live.call.output_id.as_str()), ("m", "s"));
         // A stand-in is said in words until the chosen device is back.
         let notice = Some("Headset isn't connected. Using Mic until it's back.".to_owned());
-        let standing_in = MediaResponse::Devices {
-            input: "Mic".into(),
-            output: "Speakers".into(),
-            input_id: "m".into(),
-            output_id: "s".into(),
-            notice: notice.clone(),
-            stuck: false,
-        };
+        let standing_in = MediaResponse::Devices { input: "Mic".into(), output: "Speakers".into(), input_id: "m".into(), output_id: "s".into(), notice: notice.clone(), stuck: false };
         assert!(live.apply(standing_in));
         assert_eq!(live.call.device_notice, notice);
-        assert!(
-            !live.apply(MediaResponse::Levels {
-                input: 40,
-                output: 10
-            }),
-            "nobody has the device menu open"
-        );
+        assert!(!live.apply(MediaResponse::Levels { input: 40, output: 10 }), "nobody has the device menu open");
         live.metering = true;
-        assert!(live.apply(MediaResponse::Levels {
-            input: 40,
-            output: 10
-        }));
-        assert!(
-            !live.apply(MediaResponse::Levels {
-                input: 40,
-                output: 10
-            }),
-            "nothing changed"
-        );
-        assert!(
-            live.apply(MediaResponse::Levels {
-                input: 40,
-                output: 90
-            }),
-            "the speaker has a meter too"
-        );
-        assert_eq!(
-            (live.call.level, live.call.output_level),
-            (Some(40), Some(90))
-        );
-        let device = |name: &str| AudioDevice {
-            id: format!("id-{name}"),
-            name: name.into(),
-            ..AudioDevice::default()
-        };
-        let listed = MediaResponse::DeviceList {
-            inputs: vec![device("Mic"); 40],
-            outputs: vec![device("Speakers")],
-        };
+        assert!(live.apply(MediaResponse::Levels { input: 40, output: 10 }));
+        assert!(!live.apply(MediaResponse::Levels { input: 40, output: 10 }), "nothing changed");
+        assert!(live.apply(MediaResponse::Levels { input: 40, output: 90 }), "the speaker has a meter too");
+        assert_eq!((live.call.level, live.call.output_level), (Some(40), Some(90)));
+        let device = |name: &str| AudioDevice { id: format!("id-{name}"), name: name.into(), ..AudioDevice::default() };
+        let listed = MediaResponse::DeviceList { inputs: vec![device("Mic"); 40], outputs: vec![device("Speakers")] };
         assert!(live.apply(listed.clone()));
         assert!(!live.apply(listed));
-        assert_eq!(
-            (live.call.inputs.len(), live.call.outputs.len()),
-            (DEVICES_LIMIT, 1)
-        );
-        let failure = MediaResponse::Failed {
-            reason: CallFailure::Encryption,
-            detail: "why".into(),
-        };
+        assert_eq!((live.call.inputs.len(), live.call.outputs.len()), (DEVICES_LIMIT, 1));
+        let failure = MediaResponse::Failed { reason: CallFailure::Encryption, detail: "why".into() };
         assert!(live.apply(failure));
         assert_eq!(live.call.state, failed(CallFailure::Encryption, "why"));
     }
@@ -1918,65 +1526,34 @@ mod tests {
         let mut live = live(CallState::Joined);
         live.call.joined = 1_000;
         live.call.participants = vec![person("a")];
-        assert_eq!(
-            arrival(&live.call, &[person("a"), person("b")], 1_001),
-            None,
-            "the roster is still arriving"
-        );
-        assert_eq!(
-            arrival(&live.call, &[person("a"), person("b")], 1_010),
-            Some(Cue::Joined)
-        );
+        assert_eq!(arrival(&live.call, &[person("a"), person("b")], 1_001), None, "the roster is still arriving");
+        assert_eq!(arrival(&live.call, &[person("a"), person("b")], 1_010), Some(Cue::Joined));
         assert_eq!(arrival(&live.call, &[], 1_010), Some(Cue::Left));
         assert_eq!(arrival(&live.call, &[person("a")], 1_010), None);
         let crowd: Vec<Participant> = (0..30).map(|n| person(&n.to_string())).collect();
-        assert_eq!(
-            arrival(&live.call, &crowd, 1_010),
-            None,
-            "a crowded channel stays quiet"
-        );
+        assert_eq!(arrival(&live.call, &crowd, 1_010), None, "a crowded channel stays quiet");
         live.enter(CallState::Reconnecting);
-        assert_eq!(
-            arrival(&live.call, &[person("a"), person("b")], 1_010),
-            None
-        );
+        assert_eq!(arrival(&live.call, &[person("a"), person("b")], 1_010), None);
     }
 
     #[test]
     fn each_waiting_state_has_its_deadline_and_a_joined_call_has_none() {
-        let ago = |live: &mut Live, waited: Duration| {
-            live.since = Instant::now().checked_sub(waited).unwrap()
-        };
+        let ago = |live: &mut Live, waited: Duration| live.since = Instant::now().checked_sub(waited).unwrap();
         let mut live = live(CallState::Connecting);
         assert_eq!(live.overdue(), None);
         ago(&mut live, SESSION + Duration::from_secs(1));
-        assert_eq!(
-            live.overdue(),
-            Some(failed(
-                CallFailure::Lost,
-                "No reply from Discord after 10 seconds."
-            ))
-        );
+        assert_eq!(live.overdue(), Some(failed(CallFailure::Lost, "No reply from Discord after 10 seconds.")));
 
         // Once mediad holds the session the wait is the longer one.
         live.joining = true;
         assert_eq!(live.overdue(), None);
         ago(&mut live, CONNECT + Duration::from_secs(1));
-        assert_eq!(
-            live.overdue(),
-            Some(failed(
-                CallFailure::Engine,
-                "The call engine stopped answering. Try again."
-            ))
-        );
+        assert_eq!(live.overdue(), Some(failed(CallFailure::Engine, "The call engine stopped answering. Try again.")));
 
         live.enter(CallState::RingingOut);
         assert_eq!(live.overdue(), None, "entering a state restarts the clock");
         ago(&mut live, RING + Duration::from_secs(1));
-        assert_eq!(
-            live.overdue(),
-            Some(failed(CallFailure::NoAnswer, "Nobody picked up."))
-        );
+        assert_eq!(live.overdue(), Some(failed(CallFailure::NoAnswer, "Nobody picked up.")));
 
         live.join();
         ago(&mut live, Duration::from_secs(3600));

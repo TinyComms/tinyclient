@@ -49,17 +49,12 @@ fn unpacked(request: &Value) -> Option<String> {
     let body = request["body"].as_str()?;
     let headers = request["headers"].as_object();
     let packed = headers.into_iter().flatten().any(|(name, value)| {
-        name.eq_ignore_ascii_case("X-Microsoft-Skype-Content-Encoding")
-            && value
-                .as_str()
-                .is_some_and(|how| how.eq_ignore_ascii_case("gzip"))
+        name.eq_ignore_ascii_case("X-Microsoft-Skype-Content-Encoding") && value.as_str().is_some_and(|how| how.eq_ignore_ascii_case("gzip"))
     });
     if !packed {
         return Some(body.to_owned());
     }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(body)
-        .ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(body).ok()?;
     String::from_utf8(gunzip(&bytes, BODY)?).ok()
 }
 
@@ -76,63 +71,28 @@ impl Teams {
         });
         let base = address("TINYCLIENT_TEAMS_TROUTER", TROUTER);
         let base = base.trim_end_matches('/');
-        let named = self
-            .call(
-                "POST",
-                &format!("{base}/v4/a?epid={}", escaped(&endpoint)),
-                Auth::Push,
-                Body::None,
-                true,
-            )?
-            .body;
-        let socketio = named["socketio"]
-            .as_str()
-            .unwrap_or(base)
-            .trim_end_matches('/')
-            .to_owned();
+        let named = self.call("POST", &format!("{base}/v4/a?epid={}", escaped(&endpoint)), Auth::Push, Body::None, true)?.body;
+        let socketio = named["socketio"].as_str().unwrap_or(base).trim_end_matches('/').to_owned();
         let surl = named["surl"].as_str().unwrap_or("").to_owned();
         if surl.is_empty() || !self.ours(&surl) || !self.ours(&socketio) {
-            return Err(Failure::Dropped(
-                "trouter named no address of Microsoft's".to_owned(),
-            ));
+            return Err(Failure::Dropped("trouter named no address of Microsoft's".to_owned()));
         }
         let query = |visit: u32| {
             let mut query = "v=v4".to_owned();
             for (name, value) in named["connectparams"].as_object().into_iter().flatten() {
-                query.push_str(&format!(
-                    "&{}={}",
-                    escaped(name),
-                    escaped(value.as_str().unwrap_or(""))
-                ));
+                query.push_str(&format!("&{}={}", escaped(name), escaped(value.as_str().unwrap_or(""))));
             }
             let told = json!({"cv": TRACE, "ua": "TeamsCDL", "hr": "", "v": VERSION}).to_string();
-            query.push_str(&format!(
-                "&tc={}&con_num={}_{visit}&epid={}",
-                escaped(&told),
-                now_ms(),
-                escaped(&endpoint)
-            ));
+            query.push_str(&format!("&tc={}&con_num={}_{visit}&epid={}", escaped(&told), now_ms(), escaped(&endpoint)));
             if let Some(ccid) = named["ccid"].as_str().filter(|ccid| !ccid.is_empty()) {
                 query.push_str(&format!("&ccid={}", escaped(ccid)));
             }
             query.push_str("&auth=true&timeout=40");
             query
         };
-        let session = self
-            .call(
-                "GET",
-                &format!("{socketio}/socket.io/1/?{}", query(1)),
-                Auth::Push,
-                Body::None,
-                true,
-            )?
-            .text;
+        let session = self.call("GET", &format!("{socketio}/socket.io/1/?{}", query(1)), Auth::Push, Body::None, true)?.text;
         let id = session.split(':').next().unwrap_or("").trim();
-        if id.is_empty()
-            || !id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
-        {
+        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte)) {
             return Err(Failure::Dropped("trouter opened no session".to_owned()));
         }
         let at = match socketio.split_once("://") {
@@ -142,18 +102,10 @@ impl Teams {
         };
         let url = format!("{at}/socket.io/1/websocket/{id}?{}", query(2));
         let (skype, _) = self.skype()?;
-        let headers = [
-            ("X-Skypetoken", skype.as_str()),
-            ("User-Agent", self.session.user_agent.as_str()),
-        ];
+        let headers = [("X-Skypetoken", skype.as_str()), ("User-Agent", self.session.user_agent.as_str())];
         // The address carries trouter's signature, and the library's error repeats the address.
-        let socket = Socket::connect(&url, &headers, TICK).map_err(|err| {
-            Failure::Dropped(format!(
-                "the push socket at {} did not open ({:?})",
-                bare(&at),
-                err.kind()
-            ))
-        })?;
+        let socket = Socket::connect(&url, &headers, TICK)
+            .map_err(|err| Failure::Dropped(format!("the push socket at {} did not open ({:?})", bare(&at), err.kind())))?;
         Ok(Push {
             socket,
             surl,
@@ -174,8 +126,7 @@ impl Teams {
         }
         if push.pinged.elapsed() > PING {
             push.sent += 1;
-            push.socket
-                .send(format!("5:{}+::{{\"name\":\"ping\"}}", push.sent))?;
+            push.socket.send(format!("5:{}+::{{\"name\":\"ping\"}}", push.sent))?;
             push.pinged = Instant::now();
         }
         if push.registered.is_some_and(|at| at.elapsed() > RENEW) {
@@ -198,9 +149,7 @@ impl Teams {
             }
             Some(b'2') => push.socket.send("2::".to_owned())?,
             Some(b'3') => {
-                let Some(request) =
-                    payload(frame).and_then(|text| serde_json::from_str::<Value>(text).ok())
-                else {
+                let Some(request) = payload(frame).and_then(|text| serde_json::from_str::<Value>(text).ok()) else {
                     return Ok(());
                 };
                 // Answered before it is read: trouter sends again what is not answered.
@@ -214,8 +163,7 @@ impl Teams {
                 if let Some(id) = ack(frame) {
                     push.socket.send(format!("6:{id}::"))?;
                 }
-                let event =
-                    payload(frame).and_then(|text| serde_json::from_str::<Value>(text).ok());
+                let event = payload(frame).and_then(|text| serde_json::from_str::<Value>(text).ok());
                 if event.is_some_and(|event| event["name"] == "trouter.message_loss") {
                     // Something was not delivered: read the lists again and deliver here anew.
                     self.state().resync = true;
@@ -255,17 +203,11 @@ impl Teams {
         let handled = if path.ends_with("/messaging") {
             match (body["type"].as_str(), body["resourceType"].as_str()) {
                 (Some("EventMessage"), Some("NewMessage")) => self.heard(&body["resource"], true),
-                (Some("EventMessage"), Some("MessageUpdate")) => {
-                    self.heard(&body["resource"], false)
-                }
-                (Some("EventMessage"), Some("ConversationUpdate")) => {
-                    self.read_elsewhere(&body["resource"])
-                }
+                (Some("EventMessage"), Some("MessageUpdate")) => self.heard(&body["resource"], false),
+                (Some("EventMessage"), Some("ConversationUpdate")) => self.read_elsewhere(&body["resource"]),
                 _ => Ok(()),
             }
-        } else if path.ends_with("/TeamsUnifiedPresenceService")
-            || path.ends_with("/unifiedPresenceService")
-        {
+        } else if path.ends_with("/TeamsUnifiedPresenceService") || path.ends_with("/unifiedPresenceService") {
             self.presences(&body["presence"]);
             Ok(())
         } else {
@@ -277,13 +219,8 @@ impl Teams {
     /// `ConversationUpdate`: the read marker moved on another device. Unverified: no client
     /// read handles it; the shape is the conversation object the read marker is written to.
     fn read_elsewhere(&self, conversation: &Value) -> Result<(), Fault> {
-        let horizon = conversation["properties"]["consumptionhorizon"]
-            .as_str()
-            .and_then(|horizon| horizon.split(';').next());
-        let (Some(id), Some(read)) = (
-            conversation["id"].as_str(),
-            horizon.filter(|read| super::millis(read) > 0),
-        ) else {
+        let horizon = conversation["properties"]["consumptionhorizon"].as_str().and_then(|horizon| horizon.split(';').next());
+        let (Some(id), Some(read)) = (conversation["id"].as_str(), horizon.filter(|read| super::millis(read) > 0)) else {
             return Ok(());
         };
         let Some(row) = self.ctx.known(id)? else {
@@ -294,8 +231,7 @@ impl Teams {
             None => self.ctx.newest(id)?,
         };
         if newest.is_some_and(|newest| super::millis(&newest) > super::millis(read)) {
-            self.ctx
-                .counts(id, row.unread, row.mentions, Some(read), 0)?;
+            self.ctx.counts(id, row.unread, row.mentions, Some(read), 0)?;
         } else {
             self.ctx.counts(id, 0, 0, Some(read), 0)?;
         }
@@ -309,44 +245,23 @@ mod tests {
 
     #[test]
     fn frames_are_cut_at_their_third_colon() {
-        assert_eq!(
-            payload("3:::{\"id\":7,\"url\":\"/v4/f/x/messaging\"}"),
-            Some("{\"id\":7,\"url\":\"/v4/f/x/messaging\"}")
-        );
-        assert_eq!(
-            payload("5:12+::{\"name\":\"trouter.message_loss\"}"),
-            Some("{\"name\":\"trouter.message_loss\"}")
-        );
+        assert_eq!(payload("3:::{\"id\":7,\"url\":\"/v4/f/x/messaging\"}"), Some("{\"id\":7,\"url\":\"/v4/f/x/messaging\"}"));
+        assert_eq!(payload("5:12+::{\"name\":\"trouter.message_loss\"}"), Some("{\"name\":\"trouter.message_loss\"}"));
         assert_eq!(payload("1::"), None);
-        assert_eq!(
-            (ack("5:12+::{}"), ack("5:::{}"), ack("5:x::{}")),
-            (Some("12"), None, None)
-        );
+        assert_eq!((ack("5:12+::{}"), ack("5:::{}"), ack("5:x::{}")), (Some("12"), None, None));
     }
 
     #[test]
     fn a_packed_body_is_unpacked_and_a_plain_one_left_alone() {
         // `{"type":"EventMessage"}` through gzip, with a file name in the header.
         let mut packed = vec![0x1f, 0x8b, 8, 8, 0, 0, 0, 0, 0, 3, b'a', 0];
-        packed.extend(miniz_oxide::deflate::compress_to_vec(
-            br#"{"type":"EventMessage"}"#,
-            6,
-        ));
+        packed.extend(miniz_oxide::deflate::compress_to_vec(br#"{"type":"EventMessage"}"#, 6));
         packed.extend([0u8; 8]);
         let body = base64::engine::general_purpose::STANDARD.encode(&packed);
-        let request =
-            json!({"headers": {"x-microsoft-skype-content-encoding": "GZIP"}, "body": body});
-        assert_eq!(
-            unpacked(&request).as_deref(),
-            Some(r#"{"type":"EventMessage"}"#)
-        );
+        let request = json!({"headers": {"x-microsoft-skype-content-encoding": "GZIP"}, "body": body});
+        assert_eq!(unpacked(&request).as_deref(), Some(r#"{"type":"EventMessage"}"#));
         let plain = json!({"headers": {"MS-CV": "x"}, "body": "{\"a\":1}"});
         assert_eq!(unpacked(&plain).as_deref(), Some("{\"a\":1}"));
-        assert_eq!(
-            unpacked(
-                &json!({"headers": {"X-Microsoft-Skype-Content-Encoding": "gzip"}, "body": "bm90IGd6aXA="})
-            ),
-            None
-        );
+        assert_eq!(unpacked(&json!({"headers": {"X-Microsoft-Skype-Content-Encoding": "gzip"}, "body": "bm90IGd6aXA="})), None);
     }
 }

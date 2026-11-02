@@ -13,10 +13,10 @@
 //! Text channels and direct messages are conversations (`messages`): the shell's own pane
 //! draws them.
 
-mod browser;
 pub(crate) mod e2ee;
 pub(crate) mod live;
 pub(crate) mod manage;
+mod browser;
 mod messages;
 mod sealing;
 pub mod signin;
@@ -25,14 +25,14 @@ use super::{serve_commands, Command, Context, Signed};
 use crate::hub::Hub;
 use crate::session;
 use protocol::{
-    join_host, text_or_null, tiny_allowed, tiny_name, tiny_rows, AccountKey, ErrorCode, Key,
-    Network, Presence, Response, TinyAudit, TinyCode, TinyCommunity, TinyInvite, TinyMember,
-    TinyRoom, TinySeat,
+    join_host, text_or_null, tiny_allowed, tiny_name, tiny_rows, AccountKey, ErrorCode, Key, Network,
+    Presence, Response, TinyAudit, TinyCode, TinyCommunity, TinyInvite, TinyMember, TinyRoom,
+    TinySeat,
 };
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// How long one request may take. A redirect is not followed, so this is one host.
@@ -105,9 +105,7 @@ fn permitted(saved: Saved) -> Result<Saved, String> {
     if plain_http_allowed(&saved.base_url, saved.plain_http_ok) {
         Ok(saved)
     } else {
-        tracing::warn!(
-            "chatd: a Tiny session over plain http outside the person's network was not used"
-        );
+        tracing::warn!("chatd: a Tiny session over plain http outside the person's network was not used");
         Err(PLAIN_HTTP_REFUSED.to_owned())
     }
 }
@@ -163,10 +161,7 @@ pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
     }
     let mut found = Vec::new();
     for saved in saved_rows(session)? {
-        if found
-            .iter()
-            .any(|signed: &Signed| signed.account == saved.user_id)
-        {
+        if found.iter().any(|signed: &Signed| signed.account == saved.user_id) {
             continue;
         }
         let one = serde_json::to_string(&saved)
@@ -185,36 +180,19 @@ pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
 
 /// Exact server origins for locally saved accounts, without contacting any server or exposing tokens.
 fn local_origins(session: &str) -> Result<Vec<(AccountKey, String)>, String> {
-    Ok(saved_rows(session)?
-        .into_iter()
-        .map(|saved| {
-            (
-                AccountKey {
-                    network: Network::Tiny,
-                    account: saved.user_id,
-                },
-                saved.base_url,
-            )
-        })
-        .collect())
+    Ok(saved_rows(session)?.into_iter().map(|saved| (
+        AccountKey { network: Network::Tiny, account: saved.user_id }, saved.base_url,
+    )).collect())
 }
 
 pub fn local_servers() -> Response {
     match session::read(Network::Tiny) {
         session::Stored::Found(session) => match local_origins(&session) {
             Ok(servers) => Response::TinyLocalServers { servers },
-            Err(_) => error(
-                ErrorCode::Internal,
-                "The Tiny server session is unreadable.".to_owned(),
-            ),
+            Err(_) => error(ErrorCode::Internal, "The Tiny server session is unreadable.".to_owned()),
         },
-        session::Stored::Absent => Response::TinyLocalServers {
-            servers: Vec::new(),
-        },
-        session::Stored::Unreadable(_) => error(
-            ErrorCode::Internal,
-            "The Tiny server session is unreadable.".to_owned(),
-        ),
+        session::Stored::Absent => Response::TinyLocalServers { servers: Vec::new() },
+        session::Stored::Unreadable(_) => error(ErrorCode::Internal, "The Tiny server session is unreadable.".to_owned()),
     }
 }
 
@@ -260,9 +238,7 @@ pub fn without(session: &str, account: &str) -> Option<String> {
 pub(crate) fn combine(existing: &str, fresh: &str) -> Result<String, String> {
     let fresh_saved = parse(fresh)?;
     let mut kept = saved_rows(existing)?;
-    kept.retain(|saved| {
-        saved.user_id != fresh_saved.user_id && saved.base_url != fresh_saved.base_url
-    });
+    kept.retain(|saved| saved.user_id != fresh_saved.user_id && saved.base_url != fresh_saved.base_url);
     if kept.is_empty() {
         return Ok(fresh.to_owned());
     }
@@ -275,9 +251,7 @@ pub(crate) fn combine(existing: &str, fresh: &str) -> Result<String, String> {
 pub(crate) fn with_role(session: &str, user_id: &str, role: &str) -> Option<String> {
     let value: Value = serde_json::from_str(session).ok()?;
     let mut rows = saved_rows(session).ok()?;
-    let saved = rows
-        .iter_mut()
-        .find(|saved| saved.user_id == user_id && saved.role != role)?;
+    let saved = rows.iter_mut().find(|saved| saved.user_id == user_id && saved.role != role)?;
     saved.role = role.to_owned();
     if value.is_array() {
         serde_json::to_string(&rows).ok()
@@ -398,17 +372,10 @@ fn endpoint(base: &str, path: &str) -> String {
 /// The provider's name, from `GET /v1/auth/config`. A server that does not sign in through a
 /// provider (a tinyserver from before it did) is told apart from one that cannot be reached.
 fn auth_config(base: &str) -> Result<String, Fault> {
-    let (status, body) = call_with_timeout(
-        "GET",
-        &endpoint(base, "/v1/auth/config"),
-        None,
-        None,
-        AUTH_TIMEOUT,
-    )?;
+    let (status, body) = call_with_timeout("GET", &endpoint(base, "/v1/auth/config"), None, None, AUTH_TIMEOUT)?;
     match status {
         200 => {
-            let answer: ConfigAnswer =
-                serde_json::from_value(body).map_err(|_| Fault::BadAnswer)?;
+            let answer: ConfigAnswer = serde_json::from_value(body).map_err(|_| Fault::BadAnswer)?;
             if !answer.methods.iter().any(|method| method == "oidc") {
                 return Err(Fault::Words(NO_BROWSER));
             }
@@ -423,13 +390,7 @@ fn auth_config(base: &str) -> Result<String, Fault> {
 
 /// Where to send the browser: `POST /v1/auth/start`. Only the challenge goes; the verifier stays
 /// here until the code comes back. The invite is the bare token, never the pasted code.
-fn auth_start(
-    base: &str,
-    redirect_uri: &str,
-    challenge: &str,
-    state: &str,
-    invite: Option<&str>,
-) -> Result<String, Fault> {
+fn auth_start(base: &str, redirect_uri: &str, challenge: &str, state: &str, invite: Option<&str>) -> Result<String, Fault> {
     let mut body = serde_json::json!({
         "redirect_uri": redirect_uri,
         "code_challenge": challenge,
@@ -439,13 +400,7 @@ fn auth_start(
     if let Some(invite) = invite {
         body["invite"] = Value::String(invite.to_owned());
     }
-    let (status, body) = call_with_timeout(
-        "POST",
-        &endpoint(base, "/v1/auth/start"),
-        None,
-        Some(body),
-        AUTH_TIMEOUT,
-    )?;
+    let (status, body) = call_with_timeout("POST", &endpoint(base, "/v1/auth/start"), None, Some(body), AUTH_TIMEOUT)?;
     match status {
         200 => body
             .get("authorize_url")
@@ -478,12 +433,8 @@ fn auth_token(base: &str, code: &str, verifier: &str) -> Result<Saved, Fault> {
     match status {
         200 => saved_from(base, body),
         _ if banned(&body) => Err(Fault::Words(BANNED)),
-        400 | 401 if body.get("error").and_then(Value::as_str) == Some("invalid_grant") => {
-            Err(Fault::Words(RAN_OUT))
-        }
-        400 | 401 => Err(Fault::Words(
-            "The server rejected this sign-in. Open the sign-in page again to try again.",
-        )),
+        400 | 401 if body.get("error").and_then(Value::as_str) == Some("invalid_grant") => Err(Fault::Words(RAN_OUT)),
+        400 | 401 => Err(Fault::Words("The server rejected this sign-in. Open the sign-in page again to try again.")),
         429 => Err(Fault::SlowDown),
         500..=599 => Err(Fault::Unavailable),
         _ => Err(Fault::Unreachable),
@@ -571,10 +522,8 @@ const CHECK: &str = "That didn't work. Check it and try again.";
 const UNREADABLE: &str = "The server's answer could not be read.";
 const UNREACHABLE: &str = "Couldn't reach that server. Check the address and your connection.";
 const SIGNED_OUT: &str = "Tiny server signed you out.";
-const NO_BROWSER: &str =
-    "This server doesn't sign in through a browser yet. Ask its owner to update tinyserver.";
-const RAN_OUT: &str =
-    "The server no longer accepts this sign-in code. Open the sign-in page again to try again.";
+const NO_BROWSER: &str = "This server doesn't sign in through a browser yet. Ask its owner to update tinyserver.";
+const RAN_OUT: &str = "The server no longer accepts this sign-in code. Open the sign-in page again to try again.";
 const BANNED: &str = "You're banned from this server.";
 const NAME_SIZE: &str = "A name is 1 to 80 characters.";
 const ROOM_NAME_SIZE: &str = "A room name is 1 to 80 characters.";
@@ -653,10 +602,7 @@ fn open(account: &AccountKey) -> Result<Saved, Response> {
         session::Stored::Unreadable(why) => {
             return Err(error(
                 ErrorCode::Internal,
-                format!(
-                    "The session could not be read from {}: {why}",
-                    session::STORE
-                ),
+                format!("The session could not be read from {}: {why}", session::STORE),
             ));
         }
     };
@@ -667,18 +613,8 @@ fn open(account: &AccountKey) -> Result<Saved, Response> {
     }
 }
 
-fn asked(
-    method: &str,
-    saved: &Saved,
-    path: &str,
-    body: Option<Value>,
-) -> Result<(u16, Value), &'static str> {
-    match call(
-        method,
-        &endpoint(&saved.base_url, path),
-        Some(&saved.token),
-        body,
-    ) {
+fn asked(method: &str, saved: &Saved, path: &str, body: Option<Value>) -> Result<(u16, Value), &'static str> {
+    match call(method, &endpoint(&saved.base_url, path), Some(&saved.token), body) {
         Ok(answer) => Ok(answer),
         Err(_) => Err(UNREACHABLE),
     }
@@ -729,15 +665,7 @@ fn rooms_of(saved: &Saved) -> Listed<Vec<TinyRoom>> {
         Ok((403 | 404, _)) => Listed::Empty,
         // Who sits in each call comes from the live socket, never from this list.
         Ok((200, body)) => match rows::<TinyRoom>(body, "rooms") {
-            Ok(rooms) => Listed::Rows(
-                rooms
-                    .into_iter()
-                    .map(|room| TinyRoom {
-                        participants: Vec::new(),
-                        ..room
-                    })
-                    .collect(),
-            ),
+            Ok(rooms) => Listed::Rows(rooms.into_iter().map(|room| TinyRoom { participants: Vec::new(), ..room }).collect()),
             Err(()) => Listed::Failed(UNREADABLE),
         },
         Ok((status, body)) => Listed::Failed(explain(status, &body, Missing::Plain)),
@@ -844,16 +772,10 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
     };
     manage::remember(&saved, |kept| kept.rooms = rooms.clone());
     // A call in one of these rooms follows a change to its bitrate or push-to-talk.
-    if let Some(call) = hub
-        .calls
-        .describe()
-        .0
-        .filter(|call| call.conversation.account() == account)
-    {
+    if let Some(call) = hub.calls.describe().0.filter(|call| call.conversation.account() == account) {
         if rooms.iter().any(|room| room.id == call.conversation.id) {
             let (kbps, push_to_talk) = manage::room_audio(&saved, &call.conversation.id);
-            hub.calls
-                .tiny_room(hub, &call.conversation, kbps, push_to_talk);
+            hub.calls.tiny_room(hub, &call.conversation, kbps, push_to_talk);
         }
     }
     // Who sits where is the hub's, as the live socket put it; what the server says of each seat
@@ -865,12 +787,7 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
                 .people
                 .into_iter()
                 .map(|occupant| {
-                    let flags = flagged
-                        .and_then(|seats| {
-                            seats.iter().find(|seat| seat.user_id == occupant.person.id)
-                        })
-                        .cloned()
-                        .unwrap_or_default();
+                    let flags = flagged.and_then(|seats| seats.iter().find(|seat| seat.user_id == occupant.person.id)).cloned().unwrap_or_default();
                     TinySeat {
                         user_id: occupant.person.id,
                         muted: occupant.muted,
@@ -887,11 +804,7 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
                 .collect();
         }
     }
-    let extras = if known.capabilities.features.is_empty() {
-        None
-    } else {
-        Some(manage::extras(&saved, &account, &known))
-    };
+    let extras = if known.capabilities.features.is_empty() { None } else { Some(manage::extras(&saved, &account, &known)) };
     let online = members
         .iter()
         .filter(|member| hub.presence(&Key::new(&account, &member.user_id)) == Presence::Online)
@@ -938,12 +851,7 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
 /// as an older server does not. A 503 still says it.
 pub(crate) fn media_of(base: &str) -> String {
     match call("GET", &endpoint(base, "/health"), None, None) {
-        Ok((_, body)) => body
-            .get("media")
-            .and_then(Value::as_str)
-            .filter(|media| matches!(*media, "off" | "up" | "down"))
-            .unwrap_or("")
-            .to_owned(),
+        Ok((_, body)) => body.get("media").and_then(Value::as_str).filter(|media| matches!(*media, "off" | "up" | "down")).unwrap_or("").to_owned(),
         Err(_) => String::new(),
     }
 }
@@ -966,12 +874,7 @@ pub(crate) fn create_room(account: AccountKey, name: String) -> Response {
     let Some(name) = tiny_name(&name) else {
         return refused(ROOM_NAME_SIZE);
     };
-    match asked(
-        "POST",
-        &saved,
-        "/v1/rooms",
-        Some(serde_json::json!({ "name": name })),
-    ) {
+    match asked("POST", &saved, "/v1/rooms", Some(serde_json::json!({ "name": name }))) {
         Err(detail) => refused(detail),
         Ok((201, _)) => Response::Ok,
         Ok((400, _)) => refused(ROOM_NAME_SIZE),
@@ -991,12 +894,7 @@ pub(crate) fn rename_room(account: AccountKey, room_id: String, name: String) ->
         return refused(ROOM_NAME_SIZE);
     };
     let path = format!("/v1/rooms/{room_id}");
-    match asked(
-        "PATCH",
-        &saved,
-        &path,
-        Some(serde_json::json!({ "name": name })),
-    ) {
+    match asked("PATCH", &saved, &path, Some(serde_json::json!({ "name": name }))) {
         Err(detail) => refused(detail),
         Ok((200, _)) => Response::Ok,
         Ok((400, _)) => refused(ROOM_NAME_SIZE),
@@ -1103,11 +1001,7 @@ pub(crate) fn revoke(account: AccountKey, invite_id: String) -> Response {
         Ok(saved) => saved,
         Err(error) => return error,
     };
-    if !tiny_allowed(
-        manage::known(&saved).access.as_ref(),
-        &saved.role,
-        "community.invites.revoke",
-    ) {
+    if !tiny_allowed(manage::known(&saved).access.as_ref(), &saved.role, "community.invites.revoke") {
         return refused("You can't do that.");
     }
     if !safe_id(&invite_id) {
@@ -1154,14 +1048,7 @@ pub(crate) fn e2ee_ask(account: AccountKey, ask: protocol::E2eeAsk) -> Response 
         Ok(saved) => saved,
         Err(answer) => return answer,
     };
-    let names: std::collections::HashMap<String, String> = members_of(&saved)
-        .map(|members| {
-            members
-                .into_iter()
-                .map(|member| (member.user_id, member.display_name))
-                .collect()
-        })
-        .unwrap_or_default();
+    let names: std::collections::HashMap<String, String> = members_of(&saved).map(|members| members.into_iter().map(|member| (member.user_id, member.display_name)).collect()).unwrap_or_default();
     e2ee::answer(&saved, ask, &names)
 }
 
@@ -1178,12 +1065,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     start_with(ctx, session, inbox, live::SERVER)
 }
 
-pub(crate) fn start_with(
-    ctx: Context,
-    session: &str,
-    inbox: Receiver<Command>,
-    timing: live::Timing,
-) -> Result<(), String> {
+pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, timing: live::Timing) -> Result<(), String> {
     let saved = permitted(parse(session)?)?;
     if saved.user_id != ctx.account.account {
         return Err("the Tiny server session is for another account".to_owned());
@@ -1210,9 +1092,7 @@ pub(crate) fn start_with(
                     Command::Tiny(ask) => live.ask(ask),
                     // chatd's call in a room ended (hung up, or failed), or its mute changed.
                     Command::CallLeave(room_id) => live.ask(live::Ask::Hangup { room_id }),
-                    Command::CallAudio { muted, deafened } => {
-                        live.ask(live::Ask::State { muted, deafened })
-                    }
+                    Command::CallAudio { muted, deafened } => live.ask(live::Ask::State { muted, deafened }),
                     Command::SignOut(reply) => {
                         // This install stops being a device of the person: revoked on the server
                         // while the session still works, its keys and cache forgotten here.
@@ -1241,39 +1121,17 @@ pub(crate) mod tests {
     #[test]
     fn a_blocked_upload_and_a_missed_scan_are_said_in_words() {
         let body = |code: &str| serde_json::json!({ "error": code });
-        assert_eq!(
-            explain(403, &body("blocked"), Missing::Plain),
-            "Tiny blocked that file"
-        );
-        assert_eq!(
-            explain(503, &body("unavailable"), Missing::Plain),
-            "Tiny couldn't scan that file"
-        );
-        assert_eq!(
-            explain_media(413, &body("too_large")),
-            "That file is too big for this server."
-        );
-        assert_eq!(
-            explain_media(415, &body("unsupported_media")),
-            "That file isn't a kind this server takes."
-        );
-        assert_eq!(
-            explain(413, &body("too_large"), Missing::Plain),
-            "That picture is too big. The most is 256 KB."
-        );
-        assert_eq!(
-            explain(415, &body("unsupported_media"), Missing::Plain),
-            "That picture isn't a PNG, JPEG or WebP."
-        );
+        assert_eq!(explain(403, &body("blocked"), Missing::Plain), "Tiny blocked that file");
+        assert_eq!(explain(503, &body("unavailable"), Missing::Plain), "Tiny couldn't scan that file");
+        assert_eq!(explain_media(413, &body("too_large")), "That file is too big for this server.");
+        assert_eq!(explain_media(415, &body("unsupported_media")), "That file isn't a kind this server takes.");
+        assert_eq!(explain(413, &body("too_large"), Missing::Plain), "That picture is too big. The most is 256 KB.");
+        assert_eq!(explain(415, &body("unsupported_media"), Missing::Plain), "That picture isn't a PNG, JPEG or WebP.");
     }
 
     fn session_at(base: &str, confirmed: Option<bool>) -> String {
-        let flag = confirmed
-            .map(|yes| format!(r#","plain_http_ok":{yes}"#))
-            .unwrap_or_default();
-        format!(
-            r#"{{"base_url":"{base}","token":"t","user_id":"11111111-1111-1111-1111-111111111111","email":null,"display_name":"Ada","role":"owner"{flag}}}"#
-        )
+        let flag = confirmed.map(|yes| format!(r#","plain_http_ok":{yes}"#)).unwrap_or_default();
+        format!(r#"{{"base_url":"{base}","token":"t","user_id":"11111111-1111-1111-1111-111111111111","email":null,"display_name":"Ada","role":"owner"{flag}}}"#)
     }
 
     #[test]
@@ -1293,34 +1151,21 @@ pub(crate) mod tests {
             assert!(permitted(saved).is_ok(), "{allowed}");
         }
         // Plain http to anything else is not used, until the person agreed to it.
-        for refused in [
-            "http://chat.example",
-            "http://203.0.113.9:8080",
-            "http://chat.example:80",
-        ] {
+        for refused in ["http://chat.example", "http://203.0.113.9:8080", "http://chat.example:80"] {
             let saved = parse(&session_at(refused, None)).unwrap();
-            assert_eq!(
-                permitted(saved).err().as_deref(),
-                Some(PLAIN_HTTP_REFUSED),
-                "{refused}"
-            );
+            assert_eq!(permitted(saved).err().as_deref(), Some(PLAIN_HTTP_REFUSED), "{refused}");
             let saved = parse(&session_at(refused, Some(false))).unwrap();
             assert!(permitted(saved).is_err(), "{refused} with a no");
             let saved = parse(&session_at(refused, Some(true))).unwrap();
             assert!(permitted(saved).is_ok(), "{refused} with a yes");
         }
-        assert!(
-            plain_http_allowed("http://chat.example", true)
-                && !plain_http_allowed("http://chat.example", false)
-        );
+        assert!(plain_http_allowed("http://chat.example", true) && !plain_http_allowed("http://chat.example", false));
         // The yes survives being saved and read back, and its absence is not written.
         let saved = parse(&session_at("http://chat.example", Some(true))).unwrap();
         let again = serde_json::to_string(&saved).unwrap();
         assert!(again.contains("\"plain_http_ok\":true") && parse(&again).unwrap().plain_http_ok);
         let plain = parse(&session_at("https://chat.example", None)).unwrap();
-        assert!(!serde_json::to_string(&plain)
-            .unwrap()
-            .contains("plain_http_ok"));
+        assert!(!serde_json::to_string(&plain).unwrap().contains("plain_http_ok"));
     }
 
     #[test]
@@ -1330,14 +1175,8 @@ pub(crate) mod tests {
         let one = session_at("http://chat.example", None);
         let accounts = accounts(&one).unwrap();
         assert_eq!(accounts.len(), 1);
-        assert!(
-            without(&one, &accounts[0].account).is_none(),
-            "signing out of it empties the session"
-        );
-        let both = format!(
-            "[{one},{}]",
-            session_at("https://other.example", None).replace("1111", "2222")
-        );
+        assert!(without(&one, &accounts[0].account).is_none(), "signing out of it empties the session");
+        let both = format!("[{one},{}]", session_at("https://other.example", None).replace("1111", "2222"));
         assert_eq!(super::accounts(&both).unwrap().len(), 2);
         let left = without(&both, "11111111-1111-1111-1111-111111111111").unwrap();
         assert_eq!(super::accounts(&left).unwrap().len(), 1);
@@ -1364,9 +1203,7 @@ pub(crate) mod tests {
         // Someone whose provider gave no email: the session still reads, and says so.
         let none = r#"{"base_url":"http://127.0.0.1:8080","token":"t","user_id":"u1","email":null,"display_name":"Ada","role":"member"}"#;
         assert_eq!(parse(none).unwrap().email, None);
-        assert!(serde_json::to_string(&parse(none).unwrap())
-            .unwrap()
-            .contains(r#""email":null"#));
+        assert!(serde_json::to_string(&parse(none).unwrap()).unwrap().contains(r#""email":null"#));
     }
 
     fn other() -> &'static str {
@@ -1401,10 +1238,7 @@ pub(crate) mod tests {
         assert_eq!(second.base_url, "https://other.example");
         assert!(saved_for(&both, "no-such-person").is_err());
 
-        assert_eq!(
-            without(&both, "someone-else").as_deref(),
-            Some(both.as_str())
-        );
+        assert_eq!(without(&both, "someone-else").as_deref(), Some(both.as_str()));
         assert_eq!(
             without(&both, "22222222-2222-2222-2222-222222222222").as_deref(),
             Some(session())
@@ -1426,11 +1260,7 @@ pub(crate) mod tests {
     fn authentication_allows_a_server_slower_than_ten_seconds() {
         let base = serve(|_| {
             std::thread::sleep(Duration::from_secs(11));
-            http(
-                200,
-                "OK",
-                r#"{"methods":["oidc"],"provider_name":"Slow provider"}"#,
-            )
+            http(200, "OK", r#"{"methods":["oidc"],"provider_name":"Slow provider"}"#)
         });
         assert_eq!(auth_config(&base).ok().as_deref(), Some("Slow provider"));
     }
@@ -1444,11 +1274,7 @@ pub(crate) mod tests {
             let first = request.lines().next().unwrap_or("");
             let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
             if first.starts_with("GET /v1/auth/config ") {
-                return http(
-                    200,
-                    "OK",
-                    r#"{"methods":["oidc"],"provider_name":"Tinyauth"}"#,
-                );
+                return http(200, "OK", r#"{"methods":["oidc"],"provider_name":"Tinyauth"}"#);
             }
             if first.starts_with("POST /v1/auth/start ") {
                 if body.contains("slow") {
@@ -1460,11 +1286,7 @@ pub(crate) mod tests {
                 if body.contains("bad") {
                     return http(400, "Bad Request", r#"{"error":"bad_request"}"#);
                 }
-                return http(
-                    200,
-                    "OK",
-                    r#"{"authorize_url":"https://auth.example/authorize?state=s"}"#,
-                );
+                return http(200, "OK", r#"{"authorize_url":"https://auth.example/authorize?state=s"}"#);
             }
             if first.starts_with("POST /v1/auth/token ") {
                 if body.contains("rejected") {
@@ -1500,29 +1322,13 @@ pub(crate) mod tests {
         });
 
         assert_eq!(auth_config(&base).ok().as_deref(), Some("Tinyauth"));
-        let start = |state: &str| {
-            auth_start(
-                &base,
-                "http://127.0.0.1:5/callback",
-                "challenge",
-                state,
-                None,
-            )
-        };
+        let start = |state: &str| auth_start(&base, "http://127.0.0.1:5/callback", "challenge", state, None);
         assert!(matches!(start("slow"), Err(Fault::SlowDown)));
         assert!(matches!(start("boom"), Err(Fault::Unavailable)));
         assert!(matches!(start("bad"), Err(Fault::Words(CHECK))));
-        assert_eq!(
-            start("fine").ok().as_deref(),
-            Some("https://auth.example/authorize?state=s")
-        );
-        assert!(matches!(
-            auth_token(&base, "used", "verifier"),
-            Err(Fault::Words(RAN_OUT))
-        ));
-        assert!(
-            matches!(auth_token(&base, "rejected", "verifier"), Err(Fault::Words(words)) if words != RAN_OUT)
-        );
+        assert_eq!(start("fine").ok().as_deref(), Some("https://auth.example/authorize?state=s"));
+        assert!(matches!(auth_token(&base, "used", "verifier"), Err(Fault::Words(RAN_OUT))));
+        assert!(matches!(auth_token(&base, "rejected", "verifier"), Err(Fault::Words(words)) if words != RAN_OUT));
         let saved = match auth_token(&base, "one-time", "verifier") {
             Ok(saved) => saved,
             Err(_) => panic!("token failed"),
@@ -1551,27 +1357,12 @@ pub(crate) mod tests {
 
         // A tinyserver from before the browser sign-in has no config route.
         let barred = serve(|_| http(403, "Forbidden", r#"{"error":"banned"}"#));
-        assert!(matches!(
-            auth_start(
-                &barred,
-                "http://127.0.0.1:5/callback",
-                "c",
-                "s",
-                Some("invite")
-            ),
-            Err(Fault::Words(BANNED))
-        ));
-        assert!(matches!(
-            auth_token(&barred, "code", "verifier"),
-            Err(Fault::Words(BANNED))
-        ));
+        assert!(matches!(auth_start(&barred, "http://127.0.0.1:5/callback", "c", "s", Some("invite")), Err(Fault::Words(BANNED))));
+        assert!(matches!(auth_token(&barred, "code", "verifier"), Err(Fault::Words(BANNED))));
         let older = serve(|_| http(404, "Not Found", r#"{"error":"not_found"}"#));
         assert!(matches!(auth_config(&older), Err(Fault::Words(NO_BROWSER))));
         let passwords = serve(|_| http(200, "OK", r#"{"methods":["password"]}"#));
-        assert!(matches!(
-            auth_config(&passwords),
-            Err(Fault::Words(NO_BROWSER))
-        ));
+        assert!(matches!(auth_config(&passwords), Err(Fault::Words(NO_BROWSER))));
     }
 
     /// A session from a tinyserver that is already serving: `TINY_LIVE_SESSION` holds one saved
@@ -1589,14 +1380,8 @@ pub(crate) mod tests {
             Ok(me) => me,
             Err(_) => panic!("me failed"),
         };
-        assert_eq!(
-            Some(me.email).filter(|email| !email.is_empty()),
-            saved.email
-        );
-        assert!(
-            auth_config(&saved.base_url).is_ok(),
-            "the server signs in through a browser"
-        );
+        assert_eq!(Some(me.email).filter(|email| !email.is_empty()), saved.email);
+        assert!(auth_config(&saved.base_url).is_ok(), "the server signs in through a browser");
     }
 
     /// The account routes against a tinyserver that is already serving, with the same variable.
@@ -1609,10 +1394,7 @@ pub(crate) mod tests {
         let name = saved.display_name.clone();
         let user_id = saved.user_id.clone();
         with_saved(&session, &user_id, |account| {
-            assert_eq!(
-                rename(account.clone(), "tinyclient live test".into()),
-                Response::Ok
-            );
+            assert_eq!(rename(account.clone(), "tinyclient live test".into()), Response::Ok);
             assert_eq!(rename(account.clone(), name.clone()), Response::Ok);
             assert_eq!(rename(account.clone(), "a".repeat(81)), refused(NAME_SIZE));
 
@@ -1621,10 +1403,7 @@ pub(crate) mod tests {
                 other => panic!("invite: {other:?}"),
             };
             assert_eq!(revoke(account.clone(), code.id.clone()), Response::Ok);
-            assert_eq!(
-                revoke(account.clone(), code.id),
-                refused("That invite is gone or was already used.")
-            );
+            assert_eq!(revoke(account.clone(), code.id), refused("That invite is gone or was already used."));
 
             assert!(end_sessions(&account).is_ok());
         });
@@ -1642,10 +1421,7 @@ pub(crate) mod tests {
     fn with_saved(session: &str, user_id: &str, run: impl FnOnce(AccountKey)) {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let name = format!(
-            "TINYCLIENT_SESSION_{}",
-            Network::Tiny.label().to_uppercase()
-        );
+        let name = format!("TINYCLIENT_SESSION_{}", Network::Tiny.label().to_uppercase());
         // Not the temp root. A file there is one the user picked, and anything under
         // TINYCLIENT_DIR is refused. These tests share a process with that check.
         let scratch = std::env::temp_dir().join(format!("tinyclient-tiny-{}", std::process::id()));
@@ -1673,10 +1449,7 @@ pub(crate) mod tests {
         fn set(key: &str, value: impl AsRef<std::ffi::OsStr>) -> Restore {
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
-            Restore {
-                key: key.to_owned(),
-                previous,
-            }
+            Restore { key: key.to_owned(), previous }
         }
     }
 
@@ -1691,8 +1464,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_session_scratch_does_not_hide_a_file_the_user_picked() {
-        let picked =
-            std::env::temp_dir().join(format!("tinyclient-beside-{}.txt", std::process::id()));
+        let picked = std::env::temp_dir().join(format!("tinyclient-beside-{}.txt", std::process::id()));
         std::fs::write(&picked, b"hello").unwrap();
         with_session("http://127.0.0.1:9", "member", |_| {
             let answer = crate::blobs::upload::allowed(&picked.to_string_lossy());
@@ -1720,20 +1492,18 @@ pub(crate) mod tests {
             }
             http(500, "Internal Server Error", r#"{"error":"no"}"#)
         });
-        with_session(&base, "member", |account| {
-            match community(&test_hub(), account) {
-                Response::TinyCommunity { community } => {
-                    assert_eq!(community.role, "member");
-                    assert_eq!(community.origin, base);
-                    assert_eq!(community.members.len(), 1);
-                    assert_eq!(community.members[0].display_name, "Ada");
-                    assert_eq!(community.members[0].email, "ada@example.com");
-                    assert_eq!(community.members[0].role, "owner");
-                    assert!(community.invites.is_empty());
-                    assert!(community.audit.is_empty());
-                }
-                other => panic!("load: {other:?}"),
+        with_session(&base, "member", |account| match community(&test_hub(), account) {
+            Response::TinyCommunity { community } => {
+                assert_eq!(community.role, "member");
+                assert_eq!(community.origin, base);
+                assert_eq!(community.members.len(), 1);
+                assert_eq!(community.members[0].display_name, "Ada");
+                assert_eq!(community.members[0].email, "ada@example.com");
+                assert_eq!(community.members[0].role, "owner");
+                assert!(community.invites.is_empty());
+                assert!(community.audit.is_empty());
             }
+            other => panic!("load: {other:?}"),
         });
         let lines = log.lock().unwrap();
         assert!(lines.iter().any(|line| line.contains("GET /v1/members ")));
@@ -1771,28 +1541,24 @@ pub(crate) mod tests {
             }
             http(500, "Internal Server Error", r#"{"error":"no"}"#)
         });
-        with_session(&base, "admin", |account| {
-            match community(&test_hub(), account) {
-                Response::TinyCommunity { community } => {
-                    assert_eq!(community.role, "admin");
-                    assert_eq!(community.members.len(), 1);
-                    assert_eq!(community.members[0].role, "member");
-                    assert!(community.invites.is_empty());
-                    assert_eq!(community.audit.len(), 2);
-                    assert_eq!(community.audit[0].id, 7);
-                    assert_eq!(community.audit[0].detail, r#"{"to":"admin"}"#);
-                    assert_eq!(community.audit[1].detail, "");
-                    assert_eq!(community.audit[1].actor_id, None);
-                }
-                other => panic!("load: {other:?}"),
+        with_session(&base, "admin", |account| match community(&test_hub(), account) {
+            Response::TinyCommunity { community } => {
+                assert_eq!(community.role, "admin");
+                assert_eq!(community.members.len(), 1);
+                assert_eq!(community.members[0].role, "member");
+                assert!(community.invites.is_empty());
+                assert_eq!(community.audit.len(), 2);
+                assert_eq!(community.audit[0].id, 7);
+                assert_eq!(community.audit[0].detail, r#"{"to":"admin"}"#);
+                assert_eq!(community.audit[1].detail, "");
+                assert_eq!(community.audit[1].actor_id, None);
             }
+            other => panic!("load: {other:?}"),
         });
         let lines = log.lock().unwrap();
         assert!(lines.iter().any(|line| line.contains("GET /v1/members ")));
         assert!(lines.iter().any(|line| line.contains("GET /v1/invites ")));
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("GET /v1/audit?limit=50")));
+        assert!(lines.iter().any(|line| line.contains("GET /v1/audit?limit=50")));
     }
 
     /// The server's own owner invite has no creator, and a newer server sends fields this
@@ -1816,51 +1582,29 @@ pub(crate) mod tests {
                 );
             }
             if first.starts_with("GET /v1/audit") {
-                return http(
-                    200,
-                    "OK",
-                    r#"[{"id":1,"actor_id":null,"action":"server.bootstrap","subject":null,"detail":null,"created_at":"t","actor_name":null},{"id":"two"}]"#,
-                );
+                return http(200, "OK", r#"[{"id":1,"actor_id":null,"action":"server.bootstrap","subject":null,"detail":null,"created_at":"t","actor_name":null},{"id":"two"}]"#);
             }
             if first.starts_with("GET /v1/rooms ") {
-                return http(
-                    200,
-                    "OK",
-                    r#"[{"id":"r1","name":"Lobby","position":0,"topic":null},{"name":"No id"}]"#,
-                );
+                return http(200, "OK", r#"[{"id":"r1","name":"Lobby","position":0,"topic":null},{"name":"No id"}]"#);
             }
             http(404, "Not Found", r#"{"error":"not_found"}"#)
         });
-        with_session(&base, "owner", |account| {
-            match community(&test_hub(), account) {
-                Response::TinyCommunity { community } => {
-                    assert_eq!(community.members.len(), 1);
-                    assert_eq!(community.members[0].email, "");
-                    assert_eq!(
-                        community
-                            .invites
-                            .iter()
-                            .map(|invite| invite.id.as_str())
-                            .collect::<Vec<_>>(),
-                        ["inv1", "inv2"]
-                    );
-                    assert_eq!(
-                        community.invites[0].created_by, "",
-                        "the server's own invite has no creator"
-                    );
-                    assert_eq!(community.audit.len(), 1);
-                    assert_eq!(community.audit[0].subject, "");
-                    assert_eq!(community.rooms.len(), 1);
-                }
-                other => panic!("load: {other:?}"),
+        with_session(&base, "owner", |account| match community(&test_hub(), account) {
+            Response::TinyCommunity { community } => {
+                assert_eq!(community.members.len(), 1);
+                assert_eq!(community.members[0].email, "");
+                assert_eq!(community.invites.iter().map(|invite| invite.id.as_str()).collect::<Vec<_>>(), ["inv1", "inv2"]);
+                assert_eq!(community.invites[0].created_by, "", "the server's own invite has no creator");
+                assert_eq!(community.audit.len(), 1);
+                assert_eq!(community.audit[0].subject, "");
+                assert_eq!(community.rooms.len(), 1);
             }
+            other => panic!("load: {other:?}"),
         });
     }
 
     pub(crate) fn test_hub() -> Arc<Hub> {
-        Arc::new(Hub::new(
-            crate::store::Store::open(std::path::Path::new(":memory:")).expect("a store in memory"),
-        ))
+        Arc::new(Hub::new(crate::store::Store::open(std::path::Path::new(":memory:")).expect("a store in memory")))
     }
 
     const BEA: &str = "22222222-2222-2222-2222-222222222222";
@@ -1873,9 +1617,7 @@ pub(crate) mod tests {
         let members = format!(
             r#"[{{"user_id":"11111111-1111-1111-1111-111111111111","email":"ada@example.com","display_name":"Ada","role":"owner","created_at":"2020-01-01T00:00:00Z"}},{{"user_id":"{BEA}","email":"bea@example.com","display_name":"Bea","role":"member","created_at":"2020-01-01T00:00:00Z"}}]"#
         );
-        let rooms = format!(
-            r#"[{{"id":"{LOBBY}","name":"Lobby","created_by":"x","created_at":"t"}},{{"id":"44444444-4444-4444-4444-444444444444","name":"Quiet","created_by":"x","created_at":"t"}}]"#
-        );
+        let rooms = format!(r#"[{{"id":"{LOBBY}","name":"Lobby","created_by":"x","created_at":"t"}},{{"id":"44444444-4444-4444-4444-444444444444","name":"Quiet","created_by":"x","created_at":"t"}}]"#);
         let base = serve(move |request| {
             let first = request.lines().next().unwrap_or("");
             if first.starts_with("GET /v1/members ") {
@@ -1885,44 +1627,21 @@ pub(crate) mod tests {
                 return http(200, "OK", &rooms);
             }
             if first.starts_with("GET /health ") {
-                assert!(
-                    !request.contains("Bearer"),
-                    "health is asked without the session"
-                );
+                assert!(!request.contains("Bearer"), "health is asked without the session");
                 return http(200, "OK", r#"{"ok":true,"media":"up"}"#);
             }
             http(200, "OK", "[]")
         });
         let hub = test_hub();
         with_session(&base, "owner", |account| {
-            let seat = protocol::Occupant {
-                person: Key::new(&account, BEA),
-                name: "Bea".into(),
-                muted: true,
-                deafened: false,
-                speaking: false,
-                streaming: false,
-            };
-            hub.set_occupants(
-                Key::new(&account, LOBBY),
-                protocol::Occupants {
-                    people: vec![seat],
-                    total: 1,
-                },
-            );
+            let seat = protocol::Occupant { person: Key::new(&account, BEA), name: "Bea".into(), muted: true, deafened: false, speaking: false, streaming: false };
+            hub.set_occupants(Key::new(&account, LOBBY), protocol::Occupants { people: vec![seat], total: 1 });
             hub.set_presence(Key::new(&account, BEA), Presence::Online, "", true);
             match community(&hub, account) {
                 Response::TinyCommunity { community } => {
                     assert_eq!(community.rooms.len(), 2);
                     assert_eq!(community.rooms[0].name, "Lobby");
-                    assert_eq!(
-                        community.rooms[0].participants,
-                        [TinySeat {
-                            user_id: BEA.into(),
-                            muted: true,
-                            ..TinySeat::default()
-                        }]
-                    );
+                    assert_eq!(community.rooms[0].participants, [TinySeat { user_id: BEA.into(), muted: true, ..TinySeat::default() }]);
                     assert_eq!(community.media, "up");
                     assert!(community.rooms[1].participants.is_empty());
                     assert_eq!(community.online, [BEA]);
@@ -1938,14 +1657,12 @@ pub(crate) mod tests {
             }
             http(200, "OK", "[]")
         });
-        with_session(&older, "member", |account| {
-            match community(&test_hub(), account) {
-                Response::TinyCommunity { community } => {
-                    assert!(community.rooms.is_empty());
-                    assert_eq!(community.media, "", "an older server says nothing of audio");
-                }
-                other => panic!("load: {other:?}"),
+        with_session(&older, "member", |account| match community(&test_hub(), account) {
+            Response::TinyCommunity { community } => {
+                assert!(community.rooms.is_empty());
+                assert_eq!(community.media, "", "an older server says nothing of audio");
             }
+            other => panic!("load: {other:?}"),
         });
     }
 
@@ -1961,22 +1678,10 @@ pub(crate) mod tests {
                 if body.contains("Refused") {
                     return http(400, "Bad Request", r#"{"error":"invalid"}"#);
                 }
-                return http(
-                    201,
-                    "Created",
-                    &format!(
-                        r#"{{"id":"{LOBBY}","name":"Lobby","created_by":"x","created_at":"t"}}"#
-                    ),
-                );
+                return http(201, "Created", &format!(r#"{{"id":"{LOBBY}","name":"Lobby","created_by":"x","created_at":"t"}}"#));
             }
             if first.starts_with(&format!("PATCH /v1/rooms/{LOBBY} ")) {
-                return http(
-                    200,
-                    "OK",
-                    &format!(
-                        r#"{{"id":"{LOBBY}","name":"Den","created_by":"x","created_at":"t"}}"#
-                    ),
-                );
+                return http(200, "OK", &format!(r#"{{"id":"{LOBBY}","name":"Den","created_by":"x","created_at":"t"}}"#));
             }
             if first.starts_with(&format!("DELETE /v1/rooms/{LOBBY} ")) {
                 return http(204, "No Content", "");
@@ -1986,109 +1691,51 @@ pub(crate) mod tests {
         let last = || log.lock().unwrap().last().cloned().unwrap_or_default();
         let count = || log.lock().unwrap().len();
         with_session(&base, "admin", |account| {
-            assert_eq!(
-                create_room(account.clone(), "  Lobby  ".into()),
-                Response::Ok
-            );
+            assert_eq!(create_room(account.clone(), "  Lobby  ".into()), Response::Ok);
             assert!(last().starts_with("POST /v1/rooms "));
             assert_eq!(json_body(&last())["name"], "Lobby");
             assert!(last().contains("Bearer t"));
-            assert_eq!(
-                create_room(account.clone(), "Refused".into()),
-                refused(ROOM_NAME_SIZE)
-            );
-            assert_eq!(
-                rename_room(account.clone(), LOBBY.into(), "Den".into()),
-                Response::Ok
-            );
+            assert_eq!(create_room(account.clone(), "Refused".into()), refused(ROOM_NAME_SIZE));
+            assert_eq!(rename_room(account.clone(), LOBBY.into(), "Den".into()), Response::Ok);
             assert!(last().starts_with(&format!("PATCH /v1/rooms/{LOBBY} ")));
             assert_eq!(json_body(&last())["name"], "Den");
-            assert_eq!(
-                rename_room(account.clone(), "44444444".into(), "Den".into()),
-                refused("That room is gone.")
-            );
+            assert_eq!(rename_room(account.clone(), "44444444".into(), "Den".into()), refused("That room is gone."));
             assert_eq!(delete_room(account.clone(), LOBBY.into()), Response::Ok);
             assert!(last().starts_with(&format!("DELETE /v1/rooms/{LOBBY} ")));
-            assert_eq!(
-                delete_room(account.clone(), "44444444".into()),
-                refused("That room is gone.")
-            );
+            assert_eq!(delete_room(account.clone(), "44444444".into()), refused("That room is gone."));
             let before = count();
-            assert_eq!(
-                create_room(account.clone(), "   ".into()),
-                refused(ROOM_NAME_SIZE)
-            );
-            assert_eq!(
-                rename_room(account.clone(), LOBBY.into(), "a".repeat(81)),
-                refused(ROOM_NAME_SIZE)
-            );
-            assert_eq!(
-                rename_room(account.clone(), "a/b".into(), "Den".into()),
-                refused(CHECK)
-            );
+            assert_eq!(create_room(account.clone(), "   ".into()), refused(ROOM_NAME_SIZE));
+            assert_eq!(rename_room(account.clone(), LOBBY.into(), "a".repeat(81)), refused(ROOM_NAME_SIZE));
+            assert_eq!(rename_room(account.clone(), "a/b".into(), "Den".into()), refused(CHECK));
             assert_eq!(delete_room(account.clone(), "../x".into()), refused(CHECK));
             assert_eq!(count(), before);
             assert!(call_allowed(&account, "community.calls.kick", &[LOBBY, BEA]).is_ok());
-            assert_eq!(
-                call_allowed(&account, "community.calls.join", &["a/b"]).unwrap_err(),
-                refused(CHECK)
-            );
+            assert_eq!(call_allowed(&account, "community.calls.join", &["a/b"]).unwrap_err(), refused(CHECK));
         });
         with_session(&base, "member", |account| {
             let before = count();
-            assert_eq!(
-                create_room(account.clone(), "Lobby".into()),
-                refused(NOT_YOURS)
-            );
-            assert_eq!(
-                rename_room(account.clone(), LOBBY.into(), "Den".into()),
-                refused(NOT_YOURS)
-            );
-            assert_eq!(
-                delete_room(account.clone(), LOBBY.into()),
-                refused(NOT_YOURS)
-            );
-            assert_eq!(
-                call_allowed(&account, "community.calls.kick", &[LOBBY, BEA]).unwrap_err(),
-                refused(NOT_YOURS)
-            );
+            assert_eq!(create_room(account.clone(), "Lobby".into()), refused(NOT_YOURS));
+            assert_eq!(rename_room(account.clone(), LOBBY.into(), "Den".into()), refused(NOT_YOURS));
+            assert_eq!(delete_room(account.clone(), LOBBY.into()), refused(NOT_YOURS));
+            assert_eq!(call_allowed(&account, "community.calls.kick", &[LOBBY, BEA]).unwrap_err(), refused(NOT_YOURS));
             assert!(call_allowed(&account, "community.calls.join", &[LOBBY]).is_ok());
-            assert_eq!(
-                count(),
-                before,
-                "nothing a member may not do is asked of the server"
-            );
+            assert_eq!(count(), before, "nothing a member may not do is asked of the server");
         });
     }
 
     #[test]
     fn a_new_role_is_written_into_the_session_it_came_from() {
-        let changed =
-            with_role(session(), "11111111-1111-1111-1111-111111111111", "admin").unwrap();
+        let changed = with_role(session(), "11111111-1111-1111-1111-111111111111", "admin").unwrap();
         assert!(!changed.starts_with('['));
         assert_eq!(parse(&changed).unwrap().role, "admin");
         assert_eq!(parse(&changed).unwrap().token, "t");
-        assert_eq!(
-            with_role(session(), "11111111-1111-1111-1111-111111111111", "owner"),
-            None,
-            "the same role writes nothing"
-        );
+        assert_eq!(with_role(session(), "11111111-1111-1111-1111-111111111111", "owner"), None, "the same role writes nothing");
         assert_eq!(with_role(session(), "someone-else", "admin"), None);
         let both = combine(session(), other()).unwrap();
         let changed = with_role(&both, "22222222-2222-2222-2222-222222222222", "admin").unwrap();
         assert!(changed.starts_with('['));
-        assert_eq!(
-            saved_for(&changed, "22222222-2222-2222-2222-222222222222")
-                .unwrap()
-                .role,
-            "admin"
-        );
-        assert_eq!(
-            saved_for(&changed, "11111111-1111-1111-1111-111111111111")
-                .unwrap()
-                .role,
-            "owner"
-        );
+        assert_eq!(saved_for(&changed, "22222222-2222-2222-2222-222222222222").unwrap().role, "admin");
+        assert_eq!(saved_for(&changed, "11111111-1111-1111-1111-111111111111").unwrap().role, "owner");
     }
 
     #[test]
@@ -2144,17 +1791,10 @@ pub(crate) mod tests {
                 other => panic!("invite: {other:?}"),
             }
             let posted = log.lock().unwrap().last().cloned().unwrap_or_default();
-            assert!(posted
-                .lines()
-                .next()
-                .unwrap_or("")
-                .starts_with("POST /v1/invites "));
+            assert!(posted.lines().next().unwrap_or("").starts_with("POST /v1/invites "));
             assert_eq!(json_body(&posted)["role"], "member");
             let id = "22222222-2222-2222-2222-222222222222";
-            assert_eq!(
-                set_role(account.clone(), id.into(), "admin".into()),
-                Response::Ok
-            );
+            assert_eq!(set_role(account.clone(), id.into(), "admin".into()), Response::Ok);
             let patched = log.lock().unwrap().last().cloned().unwrap_or_default();
             assert!(patched
                 .lines()
@@ -2168,10 +1808,7 @@ pub(crate) mod tests {
             );
             assert_eq!(remove(account.clone(), id.into()), Response::Ok);
             let deleted = log.lock().unwrap().last().cloned().unwrap_or_default();
-            assert!(
-                deleted.contains(&format!("DELETE /v1/members/{id} ")),
-                "{deleted}"
-            );
+            assert!(deleted.contains(&format!("DELETE /v1/members/{id} ")), "{deleted}");
             let before = quiet();
             assert_eq!(
                 remove(account, "a/b".into()),
@@ -2226,20 +1863,13 @@ pub(crate) mod tests {
         with_session(&base, "owner", |account| {
             let id = "33333333-3333-3333-3333-333333333333";
             assert_eq!(revoke(account.clone(), id.into()), Response::Ok);
-            assert!(
-                last().starts_with(&format!("DELETE /v1/invites/{id} ")),
-                "{}",
-                last()
-            );
+            assert!(last().starts_with(&format!("DELETE /v1/invites/{id} ")), "{}", last());
             assert!(last().contains("Bearer t"));
             assert_eq!(
                 revoke(account.clone(), "gone".into()),
                 refused("That invite is gone or was already used.")
             );
-            assert_eq!(
-                revoke(account.clone(), "theirs".into()),
-                refused("You can't do that.")
-            );
+            assert_eq!(revoke(account.clone(), "theirs".into()), refused("You can't do that."));
             let before = count();
             assert_eq!(revoke(account.clone(), "a/b".into()), refused(CHECK));
             assert_eq!(count(), before);
@@ -2260,10 +1890,7 @@ pub(crate) mod tests {
         });
         with_session(&base, "member", |account| {
             let before = count();
-            assert_eq!(
-                revoke(account.clone(), "33333333".into()),
-                refused("You can't do that.")
-            );
+            assert_eq!(revoke(account.clone(), "33333333".into()), refused("You can't do that."));
             assert_eq!(count(), before);
         });
     }
@@ -2272,9 +1899,7 @@ pub(crate) mod tests {
     #[test]
     fn signing_out_everywhere_forgets_an_ended_session_and_keeps_one_on_a_failure() {
         let ended = serve(|_| http(401, "Unauthorized", r#"{"error":"unauthorized"}"#));
-        with_session(&ended, "member", |account| {
-            assert!(end_sessions(&account).is_ok())
-        });
+        with_session(&ended, "member", |account| assert!(end_sessions(&account).is_ok()));
         let broken = serve(|_| http(500, "Internal Server Error", r#"{"error":"no"}"#));
         with_session(&broken, "member", |account| {
             assert_eq!(
@@ -2301,21 +1926,12 @@ pub(crate) mod tests {
     }
 
     /// One read. A timeout is not the end of the request: the body can arrive in a later packet.
-    fn read_some(
-        stream: &mut std::net::TcpStream,
-        got: &mut Vec<u8>,
-        deadline: std::time::Instant,
-    ) -> bool {
+    fn read_some(stream: &mut std::net::TcpStream, got: &mut Vec<u8>, deadline: std::time::Instant) -> bool {
         let mut buf = [0u8; 2048];
         while std::time::Instant::now() < deadline {
             match std::io::Read::read(stream, &mut buf) {
                 Ok(0) => return false,
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::TimedOut
-                        || err.kind() == std::io::ErrorKind::WouldBlock =>
-                {
-                    continue
-                }
+                Err(err) if err.kind() == std::io::ErrorKind::TimedOut || err.kind() == std::io::ErrorKind::WouldBlock => continue,
                 Err(_) => return false,
                 Ok(read) => {
                     got.extend_from_slice(&buf[..read]);
@@ -2340,9 +1956,7 @@ pub(crate) mod tests {
                         let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
                         let mut got = Vec::new();
                         let header_end = loop {
-                            if let Some(at) =
-                                got.windows(4).position(|window| window == b"\r\n\r\n")
-                            {
+                            if let Some(at) = got.windows(4).position(|window| window == b"\r\n\r\n") {
                                 break Some(at + 4);
                             }
                             if !read_some(&mut stream, &mut got, deadline) {
@@ -2360,10 +1974,7 @@ pub(crate) mod tests {
                                 }
                             });
                             if let Some(length) = length {
-                                while got.len() < header_end + length
-                                    && read_some(&mut stream, &mut got, deadline)
-                                {
-                                }
+                                while got.len() < header_end + length && read_some(&mut stream, &mut got, deadline) {}
                             }
                         }
                         let request = String::from_utf8_lossy(&got).into_owned();

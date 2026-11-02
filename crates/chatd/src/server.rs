@@ -6,12 +6,11 @@ use crate::session;
 use crate::store::Store;
 use protocol::settings;
 use protocol::{
-    clip, read_frame_bytes, support_dir, write_frame, AccountKey, AccountStatus, CallSupport,
-    Capabilities, CatalogKind, Change, ChatListener, ChatStream, Conversation, ConversationInfo,
-    ConversationKind, ErrorCode, InboxCounts, Key, Link, Media, MediaFile, MediaKind, MediaRequest,
-    Message, MessageKind, Network, NetworkStatus, Outgoing, Page, Person, Presence, Profile,
-    Reaction, RelateAction, Relation, Request, Response, SendState, SharedKind, SpaceInfo,
-    Watching, MUTUAL_SPACES, PAGE_LIMIT, SEARCH_MIN_CHARS, WATCH_LIMIT,
+    clip, read_frame_bytes, support_dir, write_frame, CatalogKind, ConversationInfo, MediaFile, MediaKind, Outgoing, SharedKind, SpaceInfo, AccountKey, AccountStatus, CallSupport, Capabilities,
+    Change, ChatListener, ChatStream, Conversation, ConversationKind, ErrorCode, InboxCounts, Key,
+    Link, Media, MediaRequest, Message, MessageKind, Network, NetworkStatus, Page, Person, Presence,
+    Profile, Reaction, RelateAction, Relation, Request, Response, SendState, Watching,
+    MUTUAL_SPACES, PAGE_LIMIT, SEARCH_MIN_CHARS, WATCH_LIMIT,
 };
 use std::collections::HashMap;
 use std::io::{self, ErrorKind};
@@ -62,35 +61,20 @@ impl Searches {
         let mut state = lock(&self.state);
         loop {
             let at = Instant::now();
-            let due: Vec<AccountKey> = state
-                .waiting
-                .iter()
-                .filter(|(_, (_, due))| *due <= at)
-                .map(|(account, _)| account.clone())
-                .collect();
+            let due: Vec<AccountKey> = state.waiting.iter().filter(|(_, (_, due))| *due <= at).map(|(account, _)| account.clone()).collect();
             for account in due {
                 let Some((query, _)) = state.waiting.remove(&account) else {
                     continue;
                 };
-                state
-                    .sent
-                    .retain(|_, (_, sent)| sent.elapsed() < SEARCH_AGAIN);
+                state.sent.retain(|_, (_, sent)| sent.elapsed() < SEARCH_AGAIN);
                 state.sent.insert(account.clone(), (query.clone(), at));
                 if let Some(adapter) = lock(adapters).get(&account) {
                     adapter.command(Command::SearchPeople(query));
                 }
             }
             state = match state.waiting.values().map(|(_, due)| *due).min() {
-                Some(next) => {
-                    self.wake
-                        .wait_timeout(state, next.saturating_duration_since(at))
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .0
-                }
-                None => self
-                    .wake
-                    .wait(state)
-                    .unwrap_or_else(PoisonError::into_inner),
+                Some(next) => self.wake.wait_timeout(state, next.saturating_duration_since(at)).unwrap_or_else(PoisonError::into_inner).0,
+                None => self.wake.wait(state).unwrap_or_else(PoisonError::into_inner),
             };
         }
     }
@@ -101,15 +85,8 @@ impl Searches {
     /// queued after the pause.
     fn ask(&self, account: AccountKey, query: &str) -> bool {
         let mut state = lock(&self.state);
-        let fresh = state
-            .sent
-            .get(&account)
-            .filter(|(_, at)| at.elapsed() < SEARCH_AGAIN)
-            .map(|(sent, _)| sent.clone());
-        let waiting = state
-            .waiting
-            .get(&account)
-            .map(|(waiting, _)| waiting.clone());
+        let fresh = state.sent.get(&account).filter(|(_, at)| at.elapsed() < SEARCH_AGAIN).map(|(sent, _)| sent.clone());
+        let waiting = state.waiting.get(&account).map(|(waiting, _)| waiting.clone());
         match search_fate(fresh.as_deref(), waiting.as_deref(), query) {
             SearchFate::Repeated => {
                 state.waiting.remove(&account);
@@ -117,9 +94,7 @@ impl Searches {
             }
             SearchFate::Waiting => false,
             SearchFate::Queue => {
-                state
-                    .waiting
-                    .insert(account, (query.to_owned(), Instant::now() + SEARCH_PAUSE));
+                state.waiting.insert(account, (query.to_owned(), Instant::now() + SEARCH_PAUSE));
                 drop(state);
                 self.wake.notify_all();
                 false
@@ -186,8 +161,7 @@ pub(crate) fn login_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("TINYCLIENT_LOGIN") {
         return Ok(PathBuf::from(path));
     }
-    Ok(std::env::current_exe()?
-        .with_file_name(format!("tinyclient-login{}", std::env::consts::EXE_SUFFIX)))
+    Ok(std::env::current_exe()?.with_file_name(format!("tinyclient-login{}", std::env::consts::EXE_SUFFIX)))
 }
 
 /// How a web sign-in that did not finish ended, in the user's words: the helper's exit code
@@ -196,20 +170,9 @@ fn sign_in_ended(network: Network, code: Option<i32>) -> Response {
     let name = network.label();
     match code {
         Some(1) => error(ErrorCode::SignIn, "The sign-in window was closed."),
-        Some(3) => error(
-            ErrorCode::SignInUnreachable,
-            format!(
-                "{name}'s sign-in page could not be loaded. Check the connection and try again."
-            ),
-        ),
-        Some(4) => error(
-            ErrorCode::SignInBlocked,
-            format!("Your organization does not allow signing in to {name} this way."),
-        ),
-        _ => error(
-            ErrorCode::SignIn,
-            "The sign-in window stopped before it finished.",
-        ),
+        Some(3) => error(ErrorCode::SignInUnreachable, format!("{name}'s sign-in page could not be loaded. Check the connection and try again.")),
+        Some(4) => error(ErrorCode::SignInBlocked, format!("Your organization does not allow signing in to {name} this way.")),
+        _ => error(ErrorCode::SignIn, "The sign-in window stopped before it finished."),
     }
 }
 
@@ -219,18 +182,13 @@ fn test_keychain_delay() -> Option<Duration> {
     if session::enabled() {
         return None;
     }
-    std::env::var("TINYCLIENT_TEST_KEYCHAIN_MS")
-        .ok()?
-        .parse()
-        .ok()
-        .map(Duration::from_millis)
+    std::env::var("TINYCLIENT_TEST_KEYCHAIN_MS").ok()?.parse().ok().map(Duration::from_millis)
 }
 
 /// `TINYCLIENT_TEST_PANIC`: in a scratch directory, a `Find` for this query panics while it holds
 /// the store, as a bug in one request would. Never read otherwise.
 fn test_panic(query: &str) -> bool {
-    !session::enabled()
-        && std::env::var("TINYCLIENT_TEST_PANIC").is_ok_and(|panics| panics == query)
+    !session::enabled() && std::env::var("TINYCLIENT_TEST_PANIC").is_ok_and(|panics| panics == query)
 }
 
 impl Chat {
@@ -299,20 +257,14 @@ impl Chat {
             }
         });
         let (searches, adapters) = (chat.searches.clone(), chat.adapters.clone());
-        let spawned = std::thread::Builder::new()
-            .name("search".into())
-            .stack_size(256 * 1024)
-            .spawn(move || searches.run(&adapters));
+        let spawned = std::thread::Builder::new().name("search".into()).stack_size(256 * 1024).spawn(move || searches.run(&adapters));
         if let Err(err) = spawned {
             tracing::warn!("chatd: people search: {err}");
         }
         // A seeded demo serves its own accounts.
         lock(&chat.adapters).extend(crate::demo::attach(&chat.hub));
         // Whatever was on its way when chatd last stopped did not go.
-        let _ = chat
-            .hub
-            .store()
-            .fail_pending(i64::MAX, "tinyclient was restarted before this was sent.");
+        let _ = chat.hub.store().fail_pending(i64::MAX, "tinyclient was restarted before this was sent.");
         // Retention runs behind the socket, at start, once a day, and when its setting changes.
         // A sleeping thread costs nothing in between.
         let hub = chat.hub.clone();
@@ -336,10 +288,7 @@ impl Chat {
     /// sits behind a macOS prompt is `waiting`. After the first read of every network, the
     /// cache of accounts with no session left goes.
     pub fn read_sessions(chat: &Arc<Chat>, networks: Vec<Network>, first: bool) {
-        let networks: Vec<Network> = networks
-            .into_iter()
-            .filter(|network| adapters::supported(*network))
-            .collect();
+        let networks: Vec<Network> = networks.into_iter().filter(|network| adapters::supported(*network)).collect();
         chat.hub.reading(&networks);
         let chat = chat.clone();
         let spawned = std::thread::Builder::new().name("sessions".into()).stack_size(256 * 1024).spawn(move || {
@@ -382,15 +331,12 @@ impl Chat {
     fn read_session(&self, network: Network) -> session::Stored {
         self.hub.read_now(network, true, false);
         let (done, read) = channel();
-        let spawned = std::thread::Builder::new()
-            .name("keychain".into())
-            .stack_size(128 * 1024)
-            .spawn(move || {
-                if let Some(delay) = test_keychain_delay() {
-                    std::thread::sleep(delay);
-                }
-                let _ = done.send(session::read_waiting(network));
-            });
+        let spawned = std::thread::Builder::new().name("keychain".into()).stack_size(128 * 1024).spawn(move || {
+            if let Some(delay) = test_keychain_delay() {
+                std::thread::sleep(delay);
+            }
+            let _ = done.send(session::read_waiting(network));
+        });
         if let Err(err) = spawned {
             return session::Stored::Unreadable(err.to_string());
         }
@@ -398,11 +344,7 @@ impl Chat {
             Ok(stored) => stored,
             Err(_) => {
                 self.hub.read_waiting();
-                read.recv().unwrap_or_else(|_| {
-                    session::Stored::Unreadable(
-                        "the keychain read ended without an answer".to_owned(),
-                    )
-                })
+                read.recv().unwrap_or_else(|_| session::Stored::Unreadable("the keychain read ended without an answer".to_owned()))
             }
         }
     }
@@ -457,10 +399,7 @@ impl Chat {
             None => settings::known(&scope, &key),
         };
         if !allowed {
-            return error(
-                ErrorCode::Refused,
-                format!("{key} cannot be {value:?} here"),
-            );
+            return error(ErrorCode::Refused, format!("{key} cannot be {value:?} here"));
         }
         if let Err(err) = self.hub.set_setting(&scope, &key, value) {
             return internal(err);
@@ -503,10 +442,7 @@ impl Chat {
         let dir = support_dir();
         let size = |name: &str| std::fs::metadata(dir.join(name)).map_or(0, |meta| meta.len());
         let messages = size("chat.sqlite") + size("chat.sqlite-wal") + size("chat.sqlite-shm");
-        Response::Storage {
-            messages,
-            files: self.blobs.bytes(),
-        }
+        Response::Storage { messages, files: self.blobs.bytes() }
     }
 
     /// Clear (D3): the files, then the messages, then every window reads what is left.
@@ -525,23 +461,17 @@ impl Chat {
         // Inside an app the core is the app's: exiting would close the window too. Refused, not
         // answered Ok, so no caller reads a stop that did not happen.
         if self.in_process {
-            return error(
-                ErrorCode::Unsupported,
-                "chatd runs inside the app and stops when the app does",
-            );
+            return error(ErrorCode::Unsupported, "chatd runs inside the app and stops when the app does");
         }
         if let Some(conversation) = self.hub.calls.end(&self.hub) {
             self.command(&conversation.account(), Command::CallLeave(conversation.id));
         }
-        let spawned = std::thread::Builder::new()
-            .name("shutdown".into())
-            .stack_size(64 * 1024)
-            .spawn(|| {
-                // Time for this answer to be written and the adapter to say goodbye.
-                std::thread::sleep(Duration::from_millis(300));
-                tracing::warn!("chatd: asked to stop, exiting");
-                std::process::exit(0);
-            });
+        let spawned = std::thread::Builder::new().name("shutdown".into()).stack_size(64 * 1024).spawn(|| {
+            // Time for this answer to be written and the adapter to say goodbye.
+            std::thread::sleep(Duration::from_millis(300));
+            tracing::warn!("chatd: asked to stop, exiting");
+            std::process::exit(0);
+        });
         if spawned.is_err() {
             std::process::exit(0);
         }
@@ -555,11 +485,7 @@ impl Chat {
     }
 
     /// Asks an account's adapter something and waits for its answer.
-    fn ask<T>(
-        &self,
-        account: &AccountKey,
-        command: impl FnOnce(Reply<T>) -> Command,
-    ) -> Result<T, Refused> {
+    fn ask<T>(&self, account: &AccountKey, command: impl FnOnce(Reply<T>) -> Command) -> Result<T, Refused> {
         let (reply, answer) = channel();
         match lock(&self.adapters).get(account) {
             Some(adapter) => adapter.command(command(reply)),
@@ -637,19 +563,12 @@ impl Chat {
                     // it, has no live link yet and would otherwise read as signed out.
                     link: published_link(
                         self.hub.network_link(network),
-                        accounts
-                            .iter()
-                            .filter(|account| account.key.network == network)
-                            .map(|account| account.link),
+                        accounts.iter().filter(|account| account.key.network == network).map(|account| account.link),
                     ),
                 })
                 .collect(),
             accounts,
-            media: if running {
-                Media::Running
-            } else {
-                Media::Stopped
-            },
+            media: if running { Media::Running } else { Media::Stopped },
             call,
             seq: self.hub.seq(),
             keychain,
@@ -693,18 +612,14 @@ impl Chat {
 
     /// A row as the shell is told it: what is stored, and who is in it right now.
     fn row(&self, mut conversation: Conversation) -> Conversation {
-        if conversation.kind == ConversationKind::Voice || conversation.call == CallSupport::Native
-        {
+        if conversation.kind == ConversationKind::Voice || conversation.call == CallSupport::Native {
             conversation.occupants = self.hub.occupants(&conversation.key);
         }
         conversation
     }
 
     fn rows(&self, conversations: Vec<Conversation>) -> Vec<Conversation> {
-        conversations
-            .into_iter()
-            .map(|conversation| self.row(conversation))
-            .collect()
+        conversations.into_iter().map(|conversation| self.row(conversation)).collect()
     }
 
     /// People as the shell is told them: what is stored, and what they are doing now.
@@ -729,18 +644,10 @@ impl Chat {
         offset: u32,
         limit: u32,
     ) -> Response {
-        let query = query
-            .map(|query| query.trim().to_owned())
-            .filter(|query| !query.is_empty());
+        let query = query.map(|query| query.trim().to_owned()).filter(|query| !query.is_empty());
         // An explicit Telegram username lookup still searches cached display names/handles.
         let cached_query = query.as_deref().map(|query| query.trim_start_matches('@'));
-        let found = self.hub.store().people(
-            network,
-            relation,
-            cached_query,
-            offset,
-            limit.min(PAGE_LIMIT),
-        );
+        let found = self.hub.store().people(network, relation, cached_query, offset, limit.min(PAGE_LIMIT));
         let mut settled = Vec::new();
         if let (Some(query), 0) = (&query, offset) {
             // The cache answers at once; the network's own search lands as a `People` change,
@@ -750,10 +657,7 @@ impl Chat {
             let worth = query.chars().count() >= SEARCH_MIN_CHARS;
             for linked in self.hub.links() {
                 let account = linked.account;
-                if worth
-                    && linked.link == Link::Connected
-                    && network.is_none_or(|network| network == account.network)
-                {
+                if worth && linked.link == Link::Connected && network.is_none_or(|network| network == account.network) {
                     if self.searches.ask(account.clone(), query) {
                         settled.push(account);
                     }
@@ -776,16 +680,10 @@ impl Chat {
         self.fill_previews(&watching.rows);
         let people = {
             let store = self.hub.store();
-            let known = watching
-                .people
-                .iter()
-                .filter_map(|person| store.person(person).ok().flatten());
+            let known = watching.people.iter().filter_map(|person| store.person(person).ok().flatten());
             known.collect()
         };
-        let typists = watching
-            .conversation
-            .as_ref()
-            .map_or_else(Vec::new, |open| self.hub.typists(open));
+        let typists = watching.conversation.as_ref().map_or_else(Vec::new, |open| self.hub.typists(open));
         // Focus alone is chatd's own business (notifications): the networks are not told again.
         let mut before = (*self.hub.watching()).clone();
         before.focused = watching.focused;
@@ -805,11 +703,7 @@ impl Chat {
     /// Rows on screen with no preview line are asked of their network, each once, paced by
     /// the adapter. Never on Discord: a fetch per DM is the burst that flags accounts there.
     fn fill_previews(&self, rows: &[Key]) {
-        let wanted: Vec<Key> = rows
-            .iter()
-            .filter(|row| row.network != Network::Discord)
-            .cloned()
-            .collect();
+        let wanted: Vec<Key> = rows.iter().filter(|row| row.network != Network::Discord).cloned().collect();
         if wanted.is_empty() {
             return;
         }
@@ -836,10 +730,7 @@ impl Chat {
         let Some((parent_id, root_id)) = derivable_thread(conversation) else {
             return Ok(());
         };
-        let parent_key = Key {
-            id: parent_id.clone(),
-            ..conversation.clone()
-        };
+        let parent_key = Key { id: parent_id.clone(), ..conversation.clone() };
         let Some(parent) = store.conversation(&parent_key)? else {
             return Ok(());
         };
@@ -848,25 +739,15 @@ impl Chat {
         }
         // A Teams chat quotes. Only a channel's reply chain is a thread.
         if conversation.network == Network::Teams
-            && !matches!(
-                parent.kind,
-                ConversationKind::Channel | ConversationKind::Announcement
-            )
+            && !matches!(parent.kind, ConversationKind::Channel | ConversationKind::Announcement)
         {
             return Ok(());
         }
         let title = match conversation.network {
             Network::Teams => {
-                let text = store
-                    .message(&parent_key, &root_id)?
-                    .map(|message| message.text)
-                    .unwrap_or_default();
+                let text = store.message(&parent_key, &root_id)?.map(|message| message.text).unwrap_or_default();
                 let title = first_line(&text, 40);
-                if title.is_empty() {
-                    "Replies".to_owned()
-                } else {
-                    title
-                }
+                if title.is_empty() { "Replies".to_owned() } else { title }
             }
             Network::Slack => {
                 if parent.kind.is_direct() {
@@ -877,8 +758,7 @@ impl Chat {
             }
             _ => return Ok(()),
         };
-        let mut row =
-            crate::store::ConversationRow::new(&conversation.id, ConversationKind::Thread, title);
+        let mut row = crate::store::ConversationRow::new(&conversation.id, ConversationKind::Thread, title);
         row.parent = Some(parent_id);
         row.root = Some(root_id);
         row.private = parent.private;
@@ -886,9 +766,7 @@ impl Chat {
         let account = conversation.account();
         store.upsert_conversation(&account, &row)?;
         drop(store);
-        self.hub.changed(Change::Conversation {
-            conversation: conversation.clone(),
-        });
+        self.hub.changed(Change::Conversation { conversation: conversation.clone() });
         Ok(())
     }
 
@@ -896,10 +774,7 @@ impl Chat {
     /// not ask for one. The adapter records the conversation before it answers.
     fn start_thread(&self, conversation: Key, message: String) -> Response {
         if conversation.network != Network::Discord {
-            return error(
-                ErrorCode::Unsupported,
-                format!("{} cannot do this yet", conversation.network.label()),
-            );
+            return error(ErrorCode::Unsupported, format!("{} cannot do this yet", conversation.network.label()));
         }
         if let Err(refused) = self.online(&conversation.account()) {
             return *refused;
@@ -909,14 +784,8 @@ impl Chat {
             Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
             Err(err) => return internal(err),
         };
-        if !matches!(
-            parent.kind,
-            ConversationKind::Channel | ConversationKind::Announcement
-        ) {
-            return error(
-                ErrorCode::Refused,
-                "A thread starts from a channel message.",
-            );
+        if !matches!(parent.kind, ConversationKind::Channel | ConversationKind::Announcement) {
+            return error(ErrorCode::Refused, "A thread starts from a channel message.");
         }
         let stored = match self.hub.store().message(&conversation, &message) {
             Ok(Some(stored)) => stored,
@@ -938,18 +807,9 @@ impl Chat {
             Ok(id) => id,
             Err(refused) => return *refused,
         };
-        match self
-            .hub
-            .store()
-            .conversation(&Key::new(&conversation.account(), id))
-        {
-            Ok(Some(thread)) => Response::Conversation {
-                conversation: self.row(thread),
-            },
-            Ok(None) => error(
-                ErrorCode::Internal,
-                "the thread started, but was not recorded",
-            ),
+        match self.hub.store().conversation(&Key::new(&conversation.account(), id)) {
+            Ok(Some(thread)) => Response::Conversation { conversation: self.row(thread) },
+            Ok(None) => error(ErrorCode::Internal, "the thread started, but was not recorded"),
             Err(err) => internal(err),
         }
     }
@@ -971,14 +831,8 @@ impl Chat {
         let read = {
             let mut store = self.hub.store();
             let failed = store.fail_pending(now() - SEND_SECONDS, "The network did not answer.");
-            for stuck in failed
-                .iter()
-                .flatten()
-                .filter(|stuck| **stuck != conversation)
-            {
-                self.hub.changed(Change::Messages {
-                    conversation: stuck.clone(),
-                });
+            for stuck in failed.iter().flatten().filter(|stuck| **stuck != conversation) {
+                self.hub.changed(Change::Messages { conversation: stuck.clone() });
             }
             failed.and_then(|_| store.messages(&conversation, &page, limit.min(PAGE_LIMIT), now()))
         };
@@ -990,44 +844,18 @@ impl Chat {
                 match &page {
                     Page::Newest => self.command(&account, Command::Backfill(conversation_id)),
                     Page::Before { id } if !found.older => {
-                        let before = found
-                            .messages
-                            .first()
-                            .map_or(id, |oldest| &oldest.id)
-                            .clone();
-                        self.command(
-                            &account,
-                            Command::History {
-                                conversation_id,
-                                before,
-                            },
-                        );
+                        let before = found.messages.first().map_or(id, |oldest| &oldest.id).clone();
+                        self.command(&account, Command::History { conversation_id, before });
                     }
                     // The cache cannot see a gap in itself, so the adapter is asked each time
                     // and fetches only what it finds missing.
                     Page::After { id } => {
                         let after = id.clone();
-                        self.command(
-                            &account,
-                            Command::HistoryAfter {
-                                conversation_id,
-                                after,
-                            },
-                        );
+                        self.command(&account, Command::HistoryAfter { conversation_id, after });
                     }
-                    Page::Around { id }
-                        if !found.older
-                            || !found.newer
-                            || !found.messages.iter().any(|message| message.id == *id) =>
-                    {
+                    Page::Around { id } if !found.older || !found.newer || !found.messages.iter().any(|message| message.id == *id) => {
                         let around = id.clone();
-                        self.command(
-                            &account,
-                            Command::HistoryAround {
-                                conversation_id,
-                                around,
-                            },
-                        );
+                        self.command(&account, Command::HistoryAround { conversation_id, around });
                     }
                     _ => {}
                 }
@@ -1064,13 +892,7 @@ impl Chat {
                 // others would see as a receipt.
                 let account = conversation.account();
                 if self.hub.settings().receipts(&account) && !marker.is_empty() {
-                    self.command(
-                        &account,
-                        Command::MarkRead {
-                            conversation_id,
-                            message_id: marker,
-                        },
-                    );
+                    self.command(&account, Command::MarkRead { conversation_id, message_id: marker });
                 }
                 self.hub.changed(Change::Conversation { conversation });
                 self.hub.changed(Change::Status);
@@ -1103,9 +925,7 @@ impl Chat {
                             .filter(|id| !id.is_empty())
                             .unwrap_or(message_id);
                         if !request && !marker.is_empty() {
-                            told.entry(key.account())
-                                .or_default()
-                                .push((key.id.clone(), marker));
+                            told.entry(key.account()).or_default().push((key.id.clone(), marker));
                         }
                         touched.push(key);
                     }
@@ -1120,22 +940,11 @@ impl Chat {
             }
             if account.network == Network::Discord {
                 for chunk in reads.chunks(50) {
-                    self.command(
-                        &account,
-                        Command::AckBulk {
-                            reads: chunk.to_vec(),
-                        },
-                    );
+                    self.command(&account, Command::AckBulk { reads: chunk.to_vec() });
                 }
             } else {
                 for (conversation_id, message_id) in reads {
-                    self.command(
-                        &account,
-                        Command::MarkRead {
-                            conversation_id,
-                            message_id,
-                        },
-                    );
+                    self.command(&account, Command::MarkRead { conversation_id, message_id });
                 }
             }
         }
@@ -1149,9 +958,7 @@ impl Chat {
     fn forget_conversation(&self, conversation: Key) -> Response {
         match self.hub.store().forget_conversation(&conversation) {
             Ok(true) => {
-                self.hub.changed(Change::Messages {
-                    conversation: conversation.clone(),
-                });
+                self.hub.changed(Change::Messages { conversation: conversation.clone() });
                 self.hub.changed(Change::Conversation { conversation });
                 self.hub.changed(Change::Status);
                 Response::Ok
@@ -1163,24 +970,11 @@ impl Chat {
 
     /// Stores the message as pending and hands it to the adapter. The answer does not wait for
     /// the network; the outcome arrives as a `Messages` change.
-    fn send(
-        &self,
-        conversation: Key,
-        mut message: Message,
-        reply_to: Option<String>,
-        with: Outgoing,
-    ) -> Response {
+    fn send(&self, conversation: Key, mut message: Message, reply_to: Option<String>, with: Outgoing) -> Response {
         let account = conversation.account();
         if self.hub.link(&account) != Link::Connected {
-            let what = if with.files.is_empty() {
-                ""
-            } else {
-                " Files need a connection."
-            };
-            return error(
-                ErrorCode::Offline,
-                format!("{} is offline.{what}", account.network.label()),
-            );
+            let what = if with.files.is_empty() { "" } else { " Files need a connection." };
+            return error(ErrorCode::Offline, format!("{} is offline.{what}", account.network.label()));
         }
         if let Err(refused) = self.allowed(&account, &with) {
             return *refused;
@@ -1194,12 +988,7 @@ impl Chat {
         let stored = {
             let mut store = self.hub.store();
             match store.conversation(&conversation) {
-                Ok(Some(row)) if row.read_only => {
-                    return error(
-                        ErrorCode::Refused,
-                        format!("You can read {} but not post in it.", row.title),
-                    )
-                }
+                Ok(Some(row)) if row.read_only => return error(ErrorCode::Refused, format!("You can read {} but not post in it.", row.title)),
                 Ok(Some(_)) => store.ingest(&conversation, &message, false),
                 Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
                 Err(err) => Err(err),
@@ -1208,27 +997,12 @@ impl Chat {
         if let Err(err) = stored {
             return internal(err);
         }
-        self.hub.changed(Change::Messages {
-            conversation: conversation.clone(),
-        });
-        self.hub.changed(Change::Conversation {
-            conversation: conversation.clone(),
-        });
+        self.hub.changed(Change::Messages { conversation: conversation.clone() });
+        self.hub.changed(Change::Conversation { conversation: conversation.clone() });
         let (conversation_id, text) = (conversation.id, message.text.clone());
         let command = match with.is_plain() {
-            true => Command::Send {
-                conversation_id,
-                client_id,
-                text,
-                reply_to,
-            },
-            false => Command::SendWith {
-                conversation_id,
-                client_id,
-                text,
-                reply_to,
-                with: Box::new(with),
-            },
+            true => Command::Send { conversation_id, client_id, text, reply_to },
+            false => Command::SendWith { conversation_id, client_id, text, reply_to, with: Box::new(with) },
         };
         self.command(&account, command);
         Response::Sent { message }
@@ -1244,9 +1018,7 @@ impl Chat {
             return Ok(());
         }
         if can.max_file_bytes == 0 {
-            return refuse(format!(
-                "Files can't be sent to {name} from tinyclient yet."
-            ));
+            return refuse(format!("Files can't be sent to {name} from tinyclient yet."));
         }
         let most = (can.max_files.max(1) as usize).min(protocol::ATTACHMENTS_LIMIT);
         if with.files.len() > most {
@@ -1261,14 +1033,9 @@ impl Chat {
                 Err(why) => return refuse(format!("{named} {why}")),
             };
             match std::fs::metadata(&real) {
-                Ok(meta) if meta.is_dir() => {
-                    return refuse(format!("{named}: folders can't be sent. Zip it first."))
-                }
+                Ok(meta) if meta.is_dir() => return refuse(format!("{named}: folders can't be sent. Zip it first.")),
                 Ok(meta) if meta.len() > can.max_file_bytes => {
-                    return refuse(format!(
-                        "{named} is too big for {name} (limit {}).",
-                        megabytes(can.max_file_bytes)
-                    ))
+                    return refuse(format!("{named} is too big for {name} (limit {}).", megabytes(can.max_file_bytes)))
                 }
                 Ok(_) => {}
                 Err(_) => return refuse(format!("{named} is no longer there.")),
@@ -1277,14 +1044,7 @@ impl Chat {
         Ok(())
     }
 
-    fn new_message(
-        &self,
-        conversation: &Key,
-        client_id: String,
-        text: String,
-        reply_to: Option<&str>,
-        with: &Outgoing,
-    ) -> Message {
+    fn new_message(&self, conversation: &Key, client_id: String, text: String, reply_to: Option<&str>, with: &Outgoing) -> Message {
         let mut message = Message::plain(&client_id, "You", text, now(), true);
         // The files are listed at once, from where they are, so the pending row shows them.
         message.attachments = with
@@ -1297,11 +1057,7 @@ impl Chat {
                 let id = format!("upload-{client_id}-{at}");
                 let mut attached = protocol::Attachment::new(
                     file_name(file),
-                    MediaFile {
-                        bytes,
-                        path: Some(file.path.clone()),
-                        ..MediaFile::new(id, kind_of(&file.path))
-                    },
+                    MediaFile { bytes, path: Some(file.path.clone()), ..MediaFile::new(id, kind_of(&file.path)) },
                 );
                 attached.spoiler = file.spoiler;
                 attached
@@ -1312,8 +1068,7 @@ impl Chat {
         let quoted = reply_to.and_then(|id| store.message(conversation, id).ok().flatten());
         message.reply_to = quoted.map(|quoted| protocol::ReplyTo {
             id: quoted.id,
-            person: (!quoted.sender.id.is_empty())
-                .then(|| Key::new(&conversation.account(), quoted.sender.id)),
+            person: (!quoted.sender.id.is_empty()).then(|| Key::new(&conversation.account(), quoted.sender.id)),
             sender: quoted.sender.name,
             snippet: quoted.text.chars().take(120).collect(),
             deleted: quoted.deleted,
@@ -1325,10 +1080,7 @@ impl Chat {
     fn online(&self, account: &AccountKey) -> Result<(), Refused> {
         match self.hub.link(account) {
             Link::Connected => Ok(()),
-            _ => Err(Box::new(error(
-                ErrorCode::Offline,
-                format!("{} is offline", account.network.label()),
-            ))),
+            _ => Err(Box::new(error(ErrorCode::Offline, format!("{} is offline", account.network.label())))),
         }
     }
 
@@ -1339,10 +1091,7 @@ impl Chat {
             return Ok(rules);
         }
         let conversation_id = conversation.id.clone();
-        let mut rules = self.ask(&conversation.account(), |reply| Command::ReactionRules {
-            conversation_id,
-            reply,
-        })?;
+        let mut rules = self.ask(&conversation.account(), |reply| Command::ReactionRules { conversation_id, reply })?;
         rules.bound();
         self.hub.reactions.keep(conversation.clone(), rules.clone());
         Ok(rules)
@@ -1350,10 +1099,7 @@ impl Chat {
 
     fn reactions(&self, conversation: Key) -> Response {
         match self.reaction_rules(&conversation) {
-            Ok(rules) => Response::Reactions {
-                conversation,
-                rules,
-            },
+            Ok(rules) => Response::Reactions { conversation, rules },
             Err(refused) => *refused,
         }
     }
@@ -1378,20 +1124,14 @@ impl Chat {
             Ok(None) => return error(ErrorCode::NotFound, "no such message"),
             Err(err) => return internal(err),
         };
-        let known = self
-            .hub
-            .store()
-            .media(&account, std::slice::from_ref(&emoji))
-            .is_ok_and(|known| !known.is_empty());
+        let known = self.hub.store().media(&account, std::slice::from_ref(&emoji)).is_ok_and(|known| !known.is_empty());
         // Rules the adapter cannot give leave it to the network, as before there were any.
         let (emoji, replacing) = match (on, self.reaction_rules(&conversation)) {
-            (true, Ok(rules)) => {
-                match rules.check(&message.reactions, &emoji, known || emoji.starts_with(':')) {
-                    // Sent as the network spells it, so its own word of it is the same reaction.
-                    Ok(replacing) => (rules.spelled(&emoji).to_owned(), replacing),
-                    Err(why) => return error(ErrorCode::Refused, why),
-                }
-            }
+            (true, Ok(rules)) => match rules.check(&message.reactions, &emoji, known || emoji.starts_with(':')) {
+                // Sent as the network spells it, so its own word of it is the same reaction.
+                Ok(replacing) => (rules.spelled(&emoji).to_owned(), replacing),
+                Err(why) => return error(ErrorCode::Refused, why),
+            },
             _ => (emoji, Vec::new()),
         };
         let shown = {
@@ -1401,9 +1141,7 @@ impl Chat {
                     return internal(err);
                 }
             }
-            let on_it = message.reactions.iter().any(|have| {
-                have.emoji == emoji || have.file.as_ref().is_some_and(|file| file.id == emoji)
-            });
+            let on_it = message.reactions.iter().any(|have| have.emoji == emoji || have.file.as_ref().is_some_and(|file| file.id == emoji));
             if known && !on_it {
                 false
             } else {
@@ -1414,9 +1152,7 @@ impl Chat {
             }
         };
         if shown || !replacing.is_empty() {
-            self.hub.changed(Change::Messages {
-                conversation: conversation.clone(),
-            });
+            self.hub.changed(Change::Messages { conversation: conversation.clone() });
         }
         let (conversation_id, id) = (conversation.id.clone(), message_id.clone());
         let asked = self.ask(&account, |reply| Command::React {
@@ -1432,27 +1168,10 @@ impl Chat {
                 // What the network refused may be what the kept rules allowed: ask again next time.
                 self.hub.reactions.forget(&conversation);
                 let mut store = self.hub.store();
-                let mut undone = shown
-                    && store
-                        .react(&conversation, &message_id, &ours(&emoji), !on)
-                        .unwrap_or(false);
+                let mut undone = shown && store.react(&conversation, &message_id, &ours(&emoji), !on).unwrap_or(false);
                 for old in &replacing {
-                    let had = message
-                        .reactions
-                        .iter()
-                        .find(|have| have.emoji == *old)
-                        .map(|have| Reaction {
-                            count: 1,
-                            ..have.clone()
-                        });
-                    undone |= store
-                        .react(
-                            &conversation,
-                            &message_id,
-                            &had.unwrap_or_else(|| ours(old)),
-                            true,
-                        )
-                        .unwrap_or(false);
+                    let had = message.reactions.iter().find(|have| have.emoji == *old).map(|have| Reaction { count: 1, ..have.clone() });
+                    undone |= store.react(&conversation, &message_id, &had.unwrap_or_else(|| ours(old)), true).unwrap_or(false);
                 }
                 drop(store);
                 if undone {
@@ -1476,22 +1195,12 @@ impl Chat {
             Err(err) => return internal(err),
         };
         if message.state != SendState::Sent {
-            return error(
-                ErrorCode::Refused,
-                "This message was never sent. Discard it instead.",
-            );
+            return error(ErrorCode::Refused, "This message was never sent. Discard it instead.");
         }
         let conversation_id = conversation.id;
         let asked = match text {
-            Some(_) if !message.outgoing => {
-                return error(ErrorCode::Refused, "Only your own messages can be edited.")
-            }
-            Some(text) if text.trim().is_empty() => {
-                return error(
-                    ErrorCode::Refused,
-                    "A message cannot be edited to nothing. Delete it instead.",
-                )
-            }
+            Some(_) if !message.outgoing => return error(ErrorCode::Refused, "Only your own messages can be edited."),
+            Some(text) if text.trim().is_empty() => return error(ErrorCode::Refused, "A message cannot be edited to nothing. Delete it instead."),
             Some(text) => self.ask(&account, |reply| Command::Edit {
                 conversation_id,
                 message_id,
@@ -1516,32 +1225,19 @@ impl Chat {
             return *refused;
         }
         let person_id = person.id;
-        match self.ask(&account, |reply| Command::Relate {
-            person_id,
-            action,
-            reply,
-        }) {
+        match self.ask(&account, |reply| Command::Relate { person_id, action, reply }) {
             Ok(()) => Response::Ok,
             Err(refused) => *refused,
         }
     }
 
     /// Our own presence, shown at once and put back if the network refuses it.
-    fn set_presence(
-        &self,
-        account: AccountKey,
-        presence: Presence,
-        status: Option<String>,
-    ) -> Response {
+    fn set_presence(&self, account: AccountKey, presence: Presence, status: Option<String>) -> Response {
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
         let stored = self.hub.store().accounts().unwrap_or_default();
-        let me = stored
-            .into_iter()
-            .find(|row| row.key == account)
-            .map(|row| row.me)
-            .filter(|me| !me.is_empty());
+        let me = stored.into_iter().find(|row| row.key == account).map(|row| row.me).filter(|me| !me.is_empty());
         let me = me.map(|me| Key::new(&account, me));
         let status = status.map(|mut status| {
             clip(&mut status, 128);
@@ -1549,15 +1245,10 @@ impl Chat {
         });
         let before = me.as_ref().map(|me| self.hub.shown(me));
         if let (Some(me), Some((_, old))) = (&me, &before) {
-            self.hub
-                .set_presence(me.clone(), presence, status.as_deref().unwrap_or(old), true);
+            self.hub.set_presence(me.clone(), presence, status.as_deref().unwrap_or(old), true);
             self.hub.changed(Change::Status);
         }
-        match self.ask(&account, |reply| Command::SetPresence {
-            presence,
-            status,
-            reply,
-        }) {
+        match self.ask(&account, |reply| Command::SetPresence { presence, status, reply }) {
             Ok(()) => Response::Ok,
             Err(refused) => {
                 if let (Some(me), Some((presence, status))) = (me, before) {
@@ -1580,33 +1271,15 @@ impl Chat {
         let cached = (person.clone(), space.clone());
         if let Some(mut profile) = self.hub.profiles.get(&cached) {
             profile.person = self.with_presence(vec![known]).remove(0);
-            return Response::Profile {
-                profile: Box::new(profile),
-            };
+            return Response::Profile { profile: Box::new(profile) };
         }
         let account = person.account();
-        let space_id = space
-            .filter(|space| space.account() == account)
-            .map(|space| space.id);
+        let space_id = space.filter(|space| space.account() == account).map(|space| space.id);
         let asked = match space_id {
             Some(space_id) => {
                 let person_id = person.id.clone();
-                match self.ask(&account, |reply| Command::ProfileIn {
-                    person_id,
-                    space_id,
-                    reply,
-                }) {
-                    Err(refused)
-                        if matches!(
-                            *refused,
-                            Response::Error {
-                                code: ErrorCode::Unsupported,
-                                ..
-                            }
-                        ) =>
-                    {
-                        None
-                    }
+                match self.ask(&account, |reply| Command::ProfileIn { person_id, space_id, reply }) {
+                    Err(refused) if matches!(*refused, Response::Error { code: ErrorCode::Unsupported, .. }) => None,
                     asked => Some(asked),
                 }
             }
@@ -1622,9 +1295,7 @@ impl Chat {
         };
         let profile = typed_profile(self.with_presence(vec![known]).remove(0), about);
         self.hub.profiles.keep(cached, profile.clone());
-        Response::Profile {
-            profile: Box::new(profile),
-        }
+        Response::Profile { profile: Box::new(profile) }
     }
 
     /// A conversation's info: its row, and what the network says beyond it, kept five minutes.
@@ -1636,15 +1307,10 @@ impl Chat {
         };
         if let Some(mut info) = self.hub.infos.get(&conversation) {
             info.conversation = row;
-            return Response::ConversationInfo {
-                info: Box::new(info),
-            };
+            return Response::ConversationInfo { info: Box::new(info) };
         }
         let conversation_id = conversation.id.clone();
-        let about = match self.ask(&conversation.account(), |reply| Command::ConversationInfo {
-            conversation_id,
-            reply,
-        }) {
+        let about = match self.ask(&conversation.account(), |reply| Command::ConversationInfo { conversation_id, reply }) {
             Ok(about) => about,
             Err(refused) => return *refused,
         };
@@ -1665,17 +1331,11 @@ impl Chat {
         clip(&mut info.external, 100);
         clip(&mut info.link, 300);
         self.hub.infos.keep(conversation, info.clone());
-        Response::ConversationInfo {
-            info: Box::new(info),
-        }
+        Response::ConversationInfo { info: Box::new(info) }
     }
 
     fn space_info(&self, space: Key) -> Response {
-        let stored = self
-            .hub
-            .store()
-            .spaces(Some(space.network))
-            .map(|spaces| spaces.into_iter().find(|known| known.key == space));
+        let stored = self.hub.store().spaces(Some(space.network)).map(|spaces| spaces.into_iter().find(|known| known.key == space));
         let known = match stored {
             Ok(Some(known)) => known,
             Ok(None) => return error(ErrorCode::NotFound, "no such space"),
@@ -1683,15 +1343,10 @@ impl Chat {
         };
         if let Some(mut info) = self.hub.space_infos.get(&space) {
             info.space = known;
-            return Response::SpaceInfo {
-                info: Box::new(info),
-            };
+            return Response::SpaceInfo { info: Box::new(info) };
         }
         let space_id = space.id.clone();
-        let about = match self.ask(&space.account(), |reply| Command::SpaceInfo {
-            space_id,
-            reply,
-        }) {
+        let about = match self.ask(&space.account(), |reply| Command::SpaceInfo { space_id, reply }) {
             Ok(about) => about,
             Err(refused) => return *refused,
         };
@@ -1709,18 +1364,12 @@ impl Chat {
         info.roles.truncate(protocol::PROFILE_ROLES);
         info.roles.iter_mut().for_each(|role| clip(role, 100));
         self.hub.space_infos.keep(space, info.clone());
-        Response::SpaceInfo {
-            info: Box::new(info),
-        }
+        Response::SpaceInfo { info: Box::new(info) }
     }
 
     /// Something the user did to a conversation on the network: mute, leave, close. The answer
     /// is the network's; the row changes when the adapter reports it.
-    fn act(
-        &self,
-        conversation: &Key,
-        command: impl FnOnce(String, Reply<()>) -> Command,
-    ) -> Response {
+    fn act(&self, conversation: &Key, command: impl FnOnce(String, Reply<()>) -> Command) -> Response {
         let account = conversation.account();
         if let Err(refused) = self.online(&account) {
             return *refused;
@@ -1741,68 +1390,36 @@ impl Chat {
             return *refused;
         }
         let conversation_id = conversation.id.clone();
-        match self.ask(&account, |reply| Command::Pinned {
-            conversation_id,
-            reply,
-        }) {
+        match self.ask(&account, |reply| Command::Pinned { conversation_id, reply }) {
             Ok(mut messages) => {
                 messages.truncate(protocol::PINNED_LIMIT);
                 messages.iter_mut().for_each(Message::bound);
-                Response::Pinned {
-                    conversation,
-                    messages,
-                }
+                Response::Pinned { conversation, messages }
             }
             Err(refused) => *refused,
         }
     }
 
-    fn catalog(
-        &self,
-        account: AccountKey,
-        kind: CatalogKind,
-        space: Option<Key>,
-        query: String,
-        cursor: Option<String>,
-    ) -> Response {
+    fn catalog(&self, account: AccountKey, kind: CatalogKind, space: Option<Key>, query: String, cursor: Option<String>) -> Response {
         let mut query = query.trim().to_owned();
         clip(&mut query, 100);
-        let asked = (
-            account.clone(),
-            kind,
-            space.clone(),
-            query.clone(),
-            cursor.clone(),
-        );
+        let asked = (account.clone(), kind, space.clone(), query.clone(), cursor.clone());
         if let Some((items, cursor)) = self.hub.catalogs.get(&asked) {
             return Response::Catalog { items, cursor };
         }
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
-        let space_id = space
-            .filter(|space| space.account() == account)
-            .map(|space| space.id);
-        match self.ask(&account, |reply| Command::Catalog {
-            kind,
-            space_id,
-            query,
-            cursor,
-            reply,
-        }) {
+        let space_id = space.filter(|space| space.account() == account).map(|space| space.id);
+        match self.ask(&account, |reply| Command::Catalog { kind, space_id, query, cursor, reply }) {
             Ok(mut page) => {
                 page.items.truncate(protocol::CATALOG_LIMIT);
                 for item in &mut page.items {
                     clip(&mut item.name, 100);
                     clip(&mut item.pack, 100);
                 }
-                self.hub
-                    .catalogs
-                    .keep(asked, (page.items.clone(), page.cursor.clone()));
-                Response::Catalog {
-                    items: page.items,
-                    cursor: page.cursor,
-                }
+                self.hub.catalogs.keep(asked, (page.items.clone(), page.cursor.clone()));
+                Response::Catalog { items: page.items, cursor: page.cursor }
             }
             Err(refused) => *refused,
         }
@@ -1811,13 +1428,9 @@ impl Chat {
     /// Voice channels and calls with a friend in them now, the fullest first.
     fn in_voice(&self, network: Option<Network>) -> Response {
         let mut occupied = self.hub.occupied();
-        occupied.retain(|(conversation, _)| {
-            network.is_none_or(|network| conversation.network == network)
-        });
+        occupied.retain(|(conversation, _)| network.is_none_or(|network| conversation.network == network));
         occupied.retain(|(conversation, _)| self.shows(&conversation.account()));
-        occupied.sort_by_key(|(conversation, occupants)| {
-            (std::cmp::Reverse(occupants.total), conversation.id.clone())
-        });
+        occupied.sort_by_key(|(conversation, occupants)| (std::cmp::Reverse(occupants.total), conversation.id.clone()));
         let mut rows = Vec::new();
         {
             let store = self.hub.store();
@@ -1826,11 +1439,7 @@ impl Chat {
                     continue;
                 };
                 let friend = occupants.people.iter().any(|occupant| {
-                    store
-                        .person(&occupant.person)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|person| person.relation == Relation::Friend)
+                    store.person(&occupant.person).ok().flatten().is_some_and(|person| person.relation == Relation::Friend)
                 });
                 if friend || row.kind.is_direct() {
                     rows.push(row);
@@ -1841,11 +1450,7 @@ impl Chat {
             }
         }
         let total = rows.len() as u32;
-        Response::Conversations {
-            conversations: self.rows(rows),
-            total,
-            counts: InboxCounts::default(),
-        }
+        Response::Conversations { conversations: self.rows(rows), total, counts: InboxCounts::default() }
     }
 
     /// Who could I talk to now: in a call, around, talked to lately. Bots never.
@@ -1863,17 +1468,12 @@ impl Chat {
         };
         let (mut in_call, mut online, mut recent) = (Vec::new(), Vec::new(), Vec::new());
         let mut seen = std::collections::HashSet::new();
-        let talked_ids: std::collections::HashSet<Key> =
-            talked.iter().map(|person| person.key.clone()).collect();
+        let talked_ids: std::collections::HashSet<Key> = talked.iter().map(|person| person.key.clone()).collect();
         for person in self.with_presence(owned.into_iter().chain(talked).collect()) {
             if !self.shows(&person.key.account()) || !seen.insert(person.key.clone()) {
                 continue;
             }
-            if person
-                .activity
-                .as_ref()
-                .is_some_and(|activity| activity.kind.in_call())
-            {
+            if person.activity.as_ref().is_some_and(|activity| activity.kind.in_call()) {
                 in_call.push(person);
             } else if person.presence.is_around() {
                 online.push(person);
@@ -1885,41 +1485,19 @@ impl Chat {
             section.sort_by_cached_key(|person| person.name.to_lowercase());
             section.truncate(protocol::AROUND_LIMIT);
         }
-        Response::Around {
-            requests,
-            in_call,
-            online,
-            recent,
-        }
+        Response::Around { requests, in_call, online, recent }
     }
 
     /// What was shared: from the cache, saying it is only that; or, because the user asked,
     /// from the network's own search.
-    fn shared(
-        &self,
-        conversation: Key,
-        kind: SharedKind,
-        before: Option<String>,
-        limit: u32,
-        search: bool,
-    ) -> Response {
+    fn shared(&self, conversation: Key, kind: SharedKind, before: Option<String>, limit: u32, search: bool) -> Response {
         if !self.shows(&conversation.account()) {
             return error(ErrorCode::NotFound, "signed out");
         }
         let limit = limit.min(PAGE_LIMIT);
         if !search {
-            return match self
-                .hub
-                .store()
-                .shared(&conversation, kind, before.as_deref(), limit)
-            {
-                Ok(Some((items, more))) => Response::Shared {
-                    conversation,
-                    items,
-                    more,
-                    complete: false,
-                    total: None,
-                },
+            return match self.hub.store().shared(&conversation, kind, before.as_deref(), limit) {
+                Ok(Some((items, more))) => Response::Shared { conversation, items, more, complete: false, total: None },
                 Ok(None) => error(ErrorCode::NotFound, "no such conversation"),
                 Err(err) => internal(err),
             };
@@ -1929,22 +1507,10 @@ impl Chat {
             return *refused;
         }
         let conversation_id = conversation.id.clone();
-        match self.ask(&account, |reply| Command::SearchShared {
-            conversation_id,
-            kind,
-            before,
-            limit,
-            reply,
-        }) {
+        match self.ask(&account, |reply| Command::SearchShared { conversation_id, kind, before, limit, reply }) {
             Ok(mut page) => {
                 page.items.truncate(limit as usize);
-                Response::Shared {
-                    conversation,
-                    items: page.items,
-                    more: page.more,
-                    complete: true,
-                    total: page.total,
-                }
+                Response::Shared { conversation, items: page.items, more: page.more, complete: true, total: page.total }
             }
             Err(refused) => *refused,
         }
@@ -1954,10 +1520,7 @@ impl Chat {
     fn unsent(&self, conversation: &Key, client_id: &str) -> Result<Message, Refused> {
         match self.hub.store().message(conversation, client_id) {
             Ok(Some(message)) if message.state != SendState::Sent => Ok(message),
-            Ok(_) => Err(Box::new(error(
-                ErrorCode::NotFound,
-                "no such unsent message",
-            ))),
+            Ok(_) => Err(Box::new(error(ErrorCode::NotFound, "no such unsent message"))),
             Err(err) => Err(Box::new(internal(err))),
         }
     }
@@ -1973,17 +1536,11 @@ impl Chat {
         // Signal links this computer from the phone, in the sheet the shell draws itself
         // (`SignInBegin`); it has no sign-in page for a window to show.
         if network == Network::Signal {
-            return error(
-                ErrorCode::Unsupported,
-                "Signal signs in by linking from your phone, not in a window.",
-            );
+            return error(ErrorCode::Unsupported, "Signal signs in by linking from your phone, not in a window.");
         }
         // Tiny signs in through the sheet (`SignInBegin`), never the browser helper.
         if network == Network::Tiny {
-            return error(
-                ErrorCode::Unsupported,
-                "A Tiny server signs in in the sheet, not in a window.",
-            );
+            return error(ErrorCode::Unsupported, "A Tiny server signs in in the sheet, not in a window.");
         }
         // A scratch directory signs nobody in. A test may still name a helper of its own, to
         // see what it is run with and how its answer is told; its session is never kept.
@@ -1991,10 +1548,7 @@ impl Chat {
         // logic as the helper's runs here (`login::web`); a desktop runs the helper.
         let web = protocol::web_sign_in::provider();
         if !session::enabled() && std::env::var_os("TINYCLIENT_LOGIN").is_none() && web.is_none() {
-            return error(
-                ErrorCode::SignIn,
-                "sign-in is off while TINYCLIENT_DIR is set",
-            );
+            return error(ErrorCode::SignIn, "sign-in is off while TINYCLIENT_DIR is set");
         }
         let session = match web {
             Some(web) => match login::web::sign_in(&*web, &network.label().to_lowercase()) {
@@ -2030,14 +1584,9 @@ impl Chat {
             helper.stderr(std::process::Stdio::inherit()).output()
         });
         match helper {
-            Ok(output) if output.status.success() => {
-                Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-            }
+            Ok(output) if output.status.success() => Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned()),
             Ok(output) => Err(Box::new(sign_in_ended(network, output.status.code()))),
-            Err(err) => Err(Box::new(error(
-                ErrorCode::SignIn,
-                format!("sign-in could not start: {err}"),
-            ))),
+            Err(err) => Err(Box::new(error(ErrorCode::SignIn, format!("sign-in could not start: {err}")))),
         }
     }
 
@@ -2048,13 +1597,9 @@ impl Chat {
         let (hub, adapters) = (self.hub.clone(), self.adapters.clone());
         let adopt = move |session: &str| adopt(&hub, &adapters, network, session);
         let step = match network {
-            Network::Telegram => {
-                adapters::telegram::signin::step(&self.hub, input, Box::new(adopt))
-            }
+            Network::Telegram => adapters::telegram::signin::step(&self.hub, input, Box::new(adopt)),
             Network::Signal => adapters::signal::signin::step(&self.hub, input, Box::new(adopt)),
-            Network::Messages => {
-                adapters::messages::signin::step(&self.hub, input, Box::new(adopt))
-            }
+            Network::Messages => adapters::messages::signin::step(&self.hub, input, Box::new(adopt)),
             Network::Tiny => adapters::tiny::signin::step(&self.hub, input, Box::new(adopt)),
             _ => Err(format!("{} signs in in its own window.", network.label())),
         };
@@ -2078,18 +1623,9 @@ impl Chat {
             session::Stored::Found(session) => Some(session),
             session::Stored::Absent => None,
             // Forgetting the item now would sign out every other account it holds.
-            session::Stored::Unreadable(why) => {
-                return error(
-                    ErrorCode::Internal,
-                    format!(
-                        "The session could not be read from {}: {why}",
-                        session::STORE
-                    ),
-                )
-            }
+            session::Stored::Unreadable(why) => return error(ErrorCode::Internal, format!("The session could not be read from {}: {why}", session::STORE)),
         };
-        let left = stored
-            .and_then(|session| adapters::without(account.network, &session, &account.account));
+        let left = stored.and_then(|session| adapters::without(account.network, &session, &account.account));
         match left {
             Some(session) => {
                 if let Err(why) = session::save(account.network, &session) {
@@ -2108,13 +1644,7 @@ impl Chat {
 
     /// A seat in a Tiny room's call, or someone else's taken away, over that server's live
     /// socket. The answer is the server's.
-    fn tiny_call(
-        &self,
-        account: &AccountKey,
-        may: &str,
-        ids: &[String],
-        ask: impl FnOnce(Reply<()>) -> adapters::tiny::live::Ask,
-    ) -> Response {
+    fn tiny_call(&self, account: &AccountKey, may: &str, ids: &[String], ask: impl FnOnce(Reply<()>) -> adapters::tiny::live::Ask) -> Response {
         let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
         if let Err(answer) = adapters::tiny::call_allowed(account, may, &ids) {
             return answer;
@@ -2123,13 +1653,7 @@ impl Chat {
     }
 
     /// Server mute, deafen or move, on a server with voice moderation, over its live socket.
-    fn tiny_moderate(
-        &self,
-        account: &AccountKey,
-        needs: &[&str],
-        ids: &[&str],
-        ask: impl FnOnce(Reply<()>) -> adapters::tiny::live::Ask,
-    ) -> Response {
+    fn tiny_moderate(&self, account: &AccountKey, needs: &[&str], ids: &[&str], ask: impl FnOnce(Reply<()>) -> adapters::tiny::live::Ask) -> Response {
         let feature = protocol::TINY_FEATURE_VOICE_MODERATION;
         if let Err(answer) = adapters::tiny::manage::call_allowed(account, feature, needs, ids) {
             return answer;
@@ -2137,11 +1661,7 @@ impl Chat {
         self.tiny_ask(account, ask)
     }
 
-    fn tiny_ask(
-        &self,
-        account: &AccountKey,
-        ask: impl FnOnce(Reply<()>) -> adapters::tiny::live::Ask,
-    ) -> Response {
+    fn tiny_ask(&self, account: &AccountKey, ask: impl FnOnce(Reply<()>) -> adapters::tiny::live::Ask) -> Response {
         if let Err(refused) = self.online(account) {
             return *refused;
         }
@@ -2156,24 +1676,10 @@ impl Chat {
     fn tiny_join(&self, account: AccountKey, room_id: String) -> Response {
         let ids = [room_id.clone()];
         let room = Key::new(&account, &room_id);
-        let answer = self.tiny_call(&account, "community.calls.join", &ids, |reply| {
-            adapters::tiny::live::Ask::Join { room_id, reply }
-        });
+        let answer = self.tiny_call(&account, "community.calls.join", &ids, |reply| adapters::tiny::live::Ask::Join { room_id, reply });
         if answer == Response::Ok {
-            if let Some(call) = self
-                .hub
-                .calls
-                .describe()
-                .0
-                .filter(|call| call.conversation == room && (call.muted || call.deafened))
-            {
-                self.command(
-                    &account,
-                    Command::CallAudio {
-                        muted: call.muted,
-                        deafened: call.deafened,
-                    },
-                );
+            if let Some(call) = self.hub.calls.describe().0.filter(|call| call.conversation == room && (call.muted || call.deafened)) {
+                self.command(&account, Command::CallAudio { muted: call.muted, deafened: call.deafened });
             }
         }
         answer
@@ -2192,20 +1698,9 @@ impl Chat {
         match self.hub.store().conversation(&conversation) {
             Ok(Some(row)) if row.call == CallSupport::Native => {}
             Ok(Some(row)) if row.call == CallSupport::Handoff => {
-                return error(
-                    ErrorCode::Unsupported,
-                    format!(
-                        "{} calls open in its own app.",
-                        conversation.network.label()
-                    ),
-                )
+                return error(ErrorCode::Unsupported, format!("{} calls open in its own app.", conversation.network.label()))
             }
-            Ok(Some(_)) => {
-                return error(
-                    ErrorCode::Unsupported,
-                    "This conversation has no calls tinyclient can join.",
-                )
-            }
+            Ok(Some(_)) => return error(ErrorCode::Unsupported, "This conversation has no calls tinyclient can join."),
             Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
             Err(err) => return internal(err),
         }
@@ -2221,13 +1716,7 @@ impl Chat {
         let account = conversation.account();
         self.command(&account, Command::CallJoin(conversation.id));
         if self.hub.settings().on(settings::JOIN_MUTED) {
-            self.command(
-                &account,
-                Command::CallAudio {
-                    muted: true,
-                    deafened: false,
-                },
-            );
+            self.command(&account, Command::CallAudio { muted: true, deafened: false });
         }
     }
 
@@ -2241,26 +1730,15 @@ impl Chat {
             Request::Status => self.status(),
             Request::Wait { since } => {
                 let (seq, reset, changes) = self.hub.wait(since, WAIT);
-                Response::Changes {
-                    seq,
-                    reset,
-                    changes,
-                }
+                Response::Changes { seq, reset, changes }
             }
 
-            Request::Inbox {
-                network,
-                filter,
-                offset,
-                limit,
-            } => {
+            Request::Inbox { network, filter, offset, limit } => {
                 let hidden = self.withheld();
                 let read = {
                     let store = self.hub.store();
                     let page = store.inbox(network, filter, offset, limit.min(PAGE_LIMIT), &hidden);
-                    page.and_then(|(conversations, total)| {
-                        Ok((conversations, total, store.inbox_counts(network, &hidden)?))
-                    })
+                    page.and_then(|(conversations, total)| Ok((conversations, total, store.inbox_counts(network, &hidden)?)))
                 };
                 match read {
                     Ok((conversations, total, counts)) => Response::Conversations {
@@ -2271,41 +1749,19 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
-            Request::Home {
-                network,
-                account,
-                folder,
-                shelf,
-                offset,
-                limit,
-            } => {
+            Request::Home { network, account, folder, shelf, offset, limit } => {
                 let hidden = self.withheld();
-                let read = self.hub.store().home(
-                    network,
-                    account.as_ref(),
-                    folder.as_deref(),
-                    shelf,
-                    offset,
-                    limit.min(PAGE_LIMIT),
-                    &hidden,
-                );
+                let read = self.hub.store().home(network, account.as_ref(), folder.as_deref(), shelf, offset, limit.min(PAGE_LIMIT), &hidden);
                 if offset == 0 {
                     for linked in self.hub.links() {
-                        let mine = linked.account.network == network
-                            && account
-                                .as_ref()
-                                .is_none_or(|account| *account == linked.account);
+                        let mine = linked.account.network == network && account.as_ref().is_none_or(|account| *account == linked.account);
                         if mine && linked.link == Link::Connected {
                             self.command(&linked.account, Command::OpenHome);
                         }
                     }
                 }
                 match read {
-                    Ok((conversations, total, counts)) => Response::Conversations {
-                        conversations: self.rows(conversations),
-                        total,
-                        counts,
-                    },
+                    Ok((conversations, total, counts)) => Response::Conversations { conversations: self.rows(conversations), total, counts },
                     Err(err) => internal(err),
                 }
             }
@@ -2313,68 +1769,35 @@ impl Chat {
                 Ok(folders) => Response::Folders { folders },
                 Err(err) => internal(err),
             },
-            Request::Threads {
-                space,
-                offset,
-                limit,
-            } => {
+            Request::Threads { space, offset, limit } => {
                 if !self.shows(&space.account()) {
-                    return Response::Conversations {
-                        conversations: Vec::new(),
-                        total: 0,
-                        counts: InboxCounts::default(),
-                    };
+                    return Response::Conversations { conversations: Vec::new(), total: 0, counts: InboxCounts::default() };
                 }
-                let read = self
-                    .hub
-                    .store()
-                    .threads(&space, offset, limit.min(PAGE_LIMIT));
+                let read = self.hub.store().threads(&space, offset, limit.min(PAGE_LIMIT));
                 if offset == 0 {
                     self.command(&space.account(), Command::OpenThreads(space.id.clone()));
                 }
                 match read {
-                    Ok((conversations, total)) => Response::Conversations {
-                        conversations: self.rows(conversations),
-                        total,
-                        counts: InboxCounts::default(),
-                    },
+                    Ok((conversations, total)) => {
+                        Response::Conversations { conversations: self.rows(conversations), total, counts: InboxCounts::default() }
+                    }
                     Err(err) => internal(err),
                 }
             }
-            Request::Topics {
-                forum,
-                offset,
-                limit,
-            } => {
+            Request::Topics { forum, offset, limit } => {
                 if !self.shows(&forum.account()) {
-                    return Response::Conversations {
-                        conversations: Vec::new(),
-                        total: 0,
-                        counts: InboxCounts::default(),
-                    };
+                    return Response::Conversations { conversations: Vec::new(), total: 0, counts: InboxCounts::default() };
                 }
-                match self
-                    .hub
-                    .store()
-                    .topics(&forum, offset, limit.min(PAGE_LIMIT))
-                {
-                    Ok((conversations, total)) => Response::Conversations {
-                        conversations: self.rows(conversations),
-                        total,
-                        counts: InboxCounts::default(),
-                    },
+                match self.hub.store().topics(&forum, offset, limit.min(PAGE_LIMIT)) {
+                    Ok((conversations, total)) => {
+                        Response::Conversations { conversations: self.rows(conversations), total, counts: InboxCounts::default() }
+                    }
                     Err(err) => internal(err),
                 }
             }
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),
-            Request::Catalog {
-                account,
-                kind,
-                space,
-                query,
-                cursor,
-            } => self.catalog(account, kind, space, query, cursor),
+            Request::Catalog { account, kind, space, query, cursor } => self.catalog(account, kind, space, query, cursor),
             Request::ReadSessions => {
                 let denied = self.hub.keychain().denied;
                 if let Some(chat) = self.this.get().and_then(Weak::upgrade) {
@@ -2384,11 +1807,7 @@ impl Chat {
                 }
                 self.status()
             }
-            Request::Find {
-                network,
-                query,
-                limit,
-            } => {
+            Request::Find { network, query, limit } => {
                 let query = query.trim();
                 if test_panic(query) {
                     let _held = self.hub.store();
@@ -2400,10 +1819,7 @@ impl Chat {
                 };
                 match found {
                     Ok(conversations) => {
-                        let conversations: Vec<_> = conversations
-                            .into_iter()
-                            .filter(|row| self.shows(&row.key.account()))
-                            .collect();
+                        let conversations: Vec<_> = conversations.into_iter().filter(|row| self.shows(&row.key.account())).collect();
                         Response::Conversations {
                             total: conversations.len() as u32,
                             conversations: self.rows(conversations),
@@ -2413,65 +1829,36 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
-            Request::SearchMessages {
-                conversation,
-                network,
-                space,
-                query,
-                limit,
-            } => {
+            Request::SearchMessages { conversation, network, space, query, limit } => {
                 let query = query.trim();
                 let found = match query.is_empty() {
                     true => Ok(Vec::new()),
-                    false => self.hub.store().search_messages(
-                        conversation.as_ref(),
-                        network,
-                        space.as_ref(),
-                        query,
-                        limit.min(PAGE_LIMIT),
-                    ),
+                    false => self.hub.store().search_messages(conversation.as_ref(), network, space.as_ref(), query, limit.min(PAGE_LIMIT)),
                 };
                 match found {
                     Ok(hits) => {
-                        let hits: Vec<_> = hits
-                            .into_iter()
-                            .filter(|hit| self.shows(&hit.conversation.account()))
-                            .collect();
+                        let hits: Vec<_> = hits.into_iter().filter(|hit| self.shows(&hit.conversation.account())).collect();
                         Response::MessageHits { hits }
                     }
                     Err(err) => internal(err),
                 }
             }
-            Request::SearchNetwork {
-                conversation,
-                space,
-                query,
-            } => {
+            Request::SearchNetwork { conversation, space, query } => {
                 let query = query.trim().to_owned();
                 if query.is_empty() {
                     Response::MessageHits { hits: Vec::new() }
                 } else {
                     let (account, scope) = match (&conversation, &space) {
-                        (Some(key), _) => {
-                            (key.account(), SearchScope::Conversation(key.id.clone()))
-                        }
+                        (Some(key), _) => (key.account(), SearchScope::Conversation(key.id.clone())),
                         (None, Some(key)) => (key.account(), SearchScope::Space(key.id.clone())),
                         (None, None) => {
-                            return error(
-                                ErrorCode::Unsupported,
-                                "a search on the network names a conversation or a Space",
-                            )
+                            return error(ErrorCode::Unsupported, "a search on the network names a conversation or a Space")
                         }
                     };
                     if !self.shows(&account) {
                         return Response::MessageHits { hits: Vec::new() };
                     }
-                    match self.ask(&account, |reply| Command::Search {
-                        query,
-                        scope,
-                        at: std::time::Instant::now(),
-                        reply,
-                    }) {
+                    match self.ask(&account, |reply| Command::Search { query, scope, at: std::time::Instant::now(), reply }) {
                         Ok(hits) => Response::MessageHits { hits },
                         Err(refused) => *refused,
                     }
@@ -2486,13 +1873,7 @@ impl Chat {
                 // The account hears of the settled draft beside the store, so what the
                 // networks that keep one are told of it.
                 if answer.is_ok() && self.hub.link(&conversation.account()) == Link::Connected {
-                    self.command(
-                        &conversation.account(),
-                        Command::Draft {
-                            conversation_id: conversation.id.clone(),
-                            text,
-                        },
-                    );
+                    self.command(&conversation.account(), Command::Draft { conversation_id: conversation.id.clone(), text });
                 }
                 match answer {
                     Ok(()) => Response::Ok,
@@ -2501,20 +1882,12 @@ impl Chat {
             }
             Request::Spaces { network } => match self.hub.store().spaces(network) {
                 Ok(spaces) => {
-                    let spaces = spaces
-                        .into_iter()
-                        .filter(|space| self.shows(&space.key.account()))
-                        .collect();
+                    let spaces = spaces.into_iter().filter(|space| self.shows(&space.key.account())).collect();
                     Response::Spaces { spaces }
                 }
                 Err(err) => internal(err),
             },
-            Request::Tree {
-                space,
-                offset,
-                limit,
-                peek,
-            } => {
+            Request::Tree { space, offset, limit, peek } => {
                 if !self.shows(&space.account()) {
                     return error(ErrorCode::NotFound, "signed out");
                 }
@@ -2540,26 +1913,19 @@ impl Chat {
                     return error(ErrorCode::NotFound, "signed out");
                 }
                 match self.hub.store().conversation(&conversation) {
-                    Ok(Some(conversation)) => Response::Conversation {
-                        conversation: self.row(conversation),
-                    },
+                    Ok(Some(conversation)) => Response::Conversation { conversation: self.row(conversation) },
                     Ok(None) => error(ErrorCode::NotFound, "no such conversation"),
                     Err(err) => internal(err),
                 }
             }
-            Request::Collapse {
-                space,
-                group,
-                collapsed,
-            } => match self.hub.store().set_collapsed(&space, &group, collapsed) {
-                Ok(true) => Response::Ok,
-                Ok(false) => error(ErrorCode::NotFound, "no such group"),
-                Err(err) => internal(err),
-            },
-            Request::Star {
-                conversation,
-                starred,
-            } => match self.hub.store().set_starred(&conversation, starred) {
+            Request::Collapse { space, group, collapsed } => {
+                match self.hub.store().set_collapsed(&space, &group, collapsed) {
+                    Ok(true) => Response::Ok,
+                    Ok(false) => error(ErrorCode::NotFound, "no such group"),
+                    Err(err) => internal(err),
+                }
+            }
+            Request::Star { conversation, starred } => match self.hub.store().set_starred(&conversation, starred) {
                 Ok(changed) => {
                     if changed {
                         self.hub.changed(Change::Conversation { conversation });
@@ -2569,18 +1935,10 @@ impl Chat {
                 Err(err) => internal(err),
             },
 
-            Request::People {
-                network,
-                relation,
-                query,
-                offset,
-                limit,
-            } => self.people(network, relation, query, offset, limit),
-            Request::Members {
-                conversation,
-                offset,
-                limit,
-            } => {
+            Request::People { network, relation, query, offset, limit } => {
+                self.people(network, relation, query, offset, limit)
+            }
+            Request::Members { conversation, offset, limit } => {
                 let conversation_id = conversation.id.clone();
                 let limit = limit.min(100);
                 let asked = self.ask(&conversation.account(), |reply| Command::Members {
@@ -2602,129 +1960,60 @@ impl Chat {
             }
             Request::StartDirect { person } => {
                 let person_id = person.id.clone();
-                let started = self.ask(&person.account(), |reply| Command::StartDirect {
-                    person_id,
-                    reply,
-                });
+                let started = self.ask(&person.account(), |reply| Command::StartDirect { person_id, reply });
                 let id = match started {
                     Ok(id) => id,
                     Err(refused) => return *refused,
                 };
-                match self
-                    .hub
-                    .store()
-                    .conversation(&Key::new(&person.account(), id))
-                {
-                    Ok(Some(conversation)) => Response::Conversation {
-                        conversation: self.row(conversation),
-                    },
+                match self.hub.store().conversation(&Key::new(&person.account(), id)) {
+                    Ok(Some(conversation)) => Response::Conversation { conversation: self.row(conversation) },
                     Ok(None) => error(ErrorCode::Internal, "started, but not recorded"),
                     Err(err) => internal(err),
                 }
             }
-            Request::StartThread {
-                conversation,
-                message,
-            } => self.start_thread(conversation, message),
+            Request::StartThread { conversation, message } => self.start_thread(conversation, message),
             Request::Profile { person, space } => self.profile(person, space),
             Request::ConversationInfo { conversation } => self.conversation_info(conversation),
             Request::SpaceInfo { space } => self.space_info(space),
-            Request::SetMute {
-                conversation,
-                notify,
-            } => self.act(&conversation, |conversation_id, reply| Command::SetMute {
-                conversation_id,
-                notify,
-                reply,
-            }),
-            Request::Leave { conversation } => {
-                self.act(&conversation, |conversation_id, reply| Command::Leave {
-                    conversation_id,
-                    reply,
-                })
+            Request::SetMute { conversation, notify } => {
+                self.act(&conversation, |conversation_id, reply| Command::SetMute { conversation_id, notify, reply })
             }
+            Request::Leave { conversation } => self.act(&conversation, |conversation_id, reply| Command::Leave { conversation_id, reply }),
             Request::CloseDirect { conversation } => {
-                self.act(&conversation, |conversation_id, reply| {
-                    Command::CloseDirect {
-                        conversation_id,
-                        reply,
-                    }
-                })
+                self.act(&conversation, |conversation_id, reply| Command::CloseDirect { conversation_id, reply })
             }
             Request::Pinned { conversation } => self.pinned(conversation),
-            Request::Shared {
-                conversation,
-                kind,
-                before,
-                limit,
-                search,
-            } => self.shared(conversation, kind, before, limit, search),
+            Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::Relate { person, action } => self.relate(person, action),
-            Request::SetPresence {
-                account,
-                presence,
-                status,
-            } => self.set_presence(account, presence, status),
+            Request::SetPresence { account, presence, status } => self.set_presence(account, presence, status),
             Request::Watch(watching) => self.watch(watching),
 
-            Request::Messages {
-                conversation,
-                page,
-                limit,
-            } => self.messages(conversation, page, limit),
-            Request::MarkRead {
-                conversation,
-                message_id,
-            } => self.mark_read(conversation, message_id),
+            Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
+            Request::MarkRead { conversation, message_id } => self.mark_read(conversation, message_id),
             Request::MarkAllRead { network } => self.mark_all_read(network),
             Request::Forget { conversation } => self.forget_conversation(conversation),
-            Request::Send {
-                conversation,
-                client_id,
-                text,
-                reply_to,
-                with,
-            } => {
-                let message =
-                    self.new_message(&conversation, client_id, text, reply_to.as_deref(), &with);
+            Request::Send { conversation, client_id, text, reply_to, with } => {
+                let message = self.new_message(&conversation, client_id, text, reply_to.as_deref(), &with);
                 self.send(conversation, message, reply_to, with)
             }
-            Request::CancelSend {
-                conversation,
-                client_id,
-            } => {
+            Request::CancelSend { conversation, client_id } => {
                 if let Err(refused) = self.unsent(&conversation, &client_id) {
                     return *refused;
                 }
                 let conversation_id = conversation.id.clone();
-                self.command(
-                    &conversation.account(),
-                    Command::CancelSend {
-                        conversation_id,
-                        client_id,
-                    },
-                );
+                self.command(&conversation.account(), Command::CancelSend { conversation_id, client_id });
                 Response::Ok
             }
-            Request::Retry {
-                conversation,
-                client_id,
-            } => match self.unsent(&conversation, &client_id) {
+            Request::Retry { conversation, client_id } => match self.unsent(&conversation, &client_id) {
                 Ok(message) => {
                     let reply_to = message.reply_to.as_ref().map(|quoted| quoted.id.clone());
                     // The files go again from where they were; the options were the first try's.
-                    let with = Outgoing {
-                        files: outgoing_files(&message),
-                        ..Outgoing::default()
-                    };
+                    let with = Outgoing { files: outgoing_files(&message), ..Outgoing::default() };
                     self.send(conversation, message, reply_to, with)
                 }
                 Err(refused) => *refused,
             },
-            Request::Discard {
-                conversation,
-                client_id,
-            } => {
+            Request::Discard { conversation, client_id } => {
                 let message = match self.unsent(&conversation, &client_id) {
                     Ok(message) => message,
                     Err(refused) => return *refused,
@@ -2742,37 +2031,18 @@ impl Chat {
             Request::Typing { conversation } => {
                 let account = conversation.account();
                 // P1: off, the network never hears it.
-                if self.hub.link(&account) == Link::Connected
-                    && self.hub.settings().typing(&account)
-                {
+                if self.hub.link(&account) == Link::Connected && self.hub.settings().typing(&account) {
                     self.command(&account, Command::Typing(conversation.id));
                 }
                 Response::Ok
             }
 
-            Request::React {
-                conversation,
-                message_id,
-                emoji,
-                on,
-            } => self.react(conversation, message_id, emoji, on),
+            Request::React { conversation, message_id, emoji, on } => self.react(conversation, message_id, emoji, on),
             Request::Reactions { conversation } => self.reactions(conversation),
-            Request::Edit {
-                conversation,
-                message_id,
-                text,
-            } => self.rewrite(conversation, message_id, Some(text)),
-            Request::Delete {
-                conversation,
-                message_id,
-            } => self.rewrite(conversation, message_id, None),
+            Request::Edit { conversation, message_id, text } => self.rewrite(conversation, message_id, Some(text)),
+            Request::Delete { conversation, message_id } => self.rewrite(conversation, message_id, None),
 
-            Request::Fetch {
-                account,
-                ids,
-                size,
-                retry,
-            } => {
+            Request::Fetch { account, ids, size, retry } => {
                 let adapter = lock(&self.adapters).get(&account).map(Adapter::sender);
                 let ids = &ids[..ids.len().min(PAGE_LIMIT as usize)];
                 // What the cache is asked for is decided here: a failure the user wants tried
@@ -2780,15 +2050,9 @@ impl Chat {
                 // at a larger registered size, which makes it not fetched yet.
                 let prepared = {
                     let mut store = self.hub.store();
-                    let retried = if retry {
-                        store.media_retry(&account, ids).map(drop)
-                    } else {
-                        Ok(())
-                    };
+                    let retried = if retry { store.media_retry(&account, ids).map(drop) } else { Ok(()) };
                     retried.and_then(|()| match size {
-                        Some(size) => store
-                            .media_sized(&account, ids, size.min(LARGEST))
-                            .map(drop),
+                        Some(size) => store.media_sized(&account, ids, size.min(LARGEST)).map(drop),
                         None => Ok(()),
                     })
                 };
@@ -2801,11 +2065,7 @@ impl Chat {
                 match self.blobs.request(&account, ids, adapter.clone()) {
                     Ok(files) => {
                         // What the cache has never heard of may be the adapter's to fetch itself.
-                        let unknown: Vec<String> = ids
-                            .iter()
-                            .filter(|id| !files.iter().any(|file| file.id == **id))
-                            .cloned()
-                            .collect();
+                        let unknown: Vec<String> = ids.iter().filter(|id| !files.iter().any(|file| file.id == **id)).cloned().collect();
                         if let (false, Some(adapter)) = (unknown.is_empty(), adapter) {
                             let _ = adapter.send(Command::Wanted(unknown));
                         }
@@ -2836,186 +2096,62 @@ impl Chat {
                 adapters::tiny::community(&self.hub, account)
             }
             Request::TinyRoomCreate { account, name } => adapters::tiny::create_room(account, name),
-            Request::TinyRoomRename {
-                account,
-                room_id,
-                name,
-            } => adapters::tiny::rename_room(account, room_id, name),
-            Request::TinyRoomDelete { account, room_id } => {
-                adapters::tiny::delete_room(account, room_id)
-            }
+            Request::TinyRoomRename { account, room_id, name } => adapters::tiny::rename_room(account, room_id, name),
+            Request::TinyRoomDelete { account, room_id } => adapters::tiny::delete_room(account, room_id),
             Request::TinyCallJoin { account, room_id } => self.tiny_join(account, room_id),
-            Request::TinyCallLeave { account } => {
-                self.tiny_call(&account, "community.calls.join", &[], |reply| {
-                    adapters::tiny::live::Ask::Leave { reply }
-                })
-            }
-            Request::TinyCallKick {
-                account,
-                room_id,
-                user_id,
-            } => {
+            Request::TinyCallLeave { account } => self.tiny_call(&account, "community.calls.join", &[], |reply| adapters::tiny::live::Ask::Leave { reply }),
+            Request::TinyCallKick { account, room_id, user_id } => {
                 let ids = [room_id.clone(), user_id.clone()];
-                self.tiny_call(&account, "community.calls.kick", &ids, |reply| {
-                    adapters::tiny::live::Ask::Kick {
-                        room_id,
-                        user_id,
-                        reply,
-                    }
-                })
+                self.tiny_call(&account, "community.calls.kick", &ids, |reply| adapters::tiny::live::Ask::Kick { room_id, user_id, reply })
             }
-            Request::TinyVerify {
-                account,
-                user_id,
-                key,
-                verified,
-            } => match crate::verified::set(&account, &user_id, &key, verified) {
+            Request::TinyVerify { account, user_id, key, verified } => match crate::verified::set(&account, &user_id, &key, verified) {
                 Ok(()) => {
                     self.hub.calls.reverify(&self.hub, &account);
                     Response::Ok
                 }
-                Err(err) => error(
-                    ErrorCode::Refused,
-                    format!("That key couldn't be remembered: {err}"),
-                ),
+                Err(err) => error(ErrorCode::Refused, format!("That key couldn't be remembered: {err}")),
             },
             Request::TinyE2ee { account, ask } => adapters::tiny::e2ee_ask(account, ask),
             Request::TinyInvite { account, role } => adapters::tiny::invite(account, role),
-            Request::TinyRole {
-                account,
-                user_id,
-                role,
-            } => adapters::tiny::set_role(account, user_id, role),
+            Request::TinyRole { account, user_id, role } => adapters::tiny::set_role(account, user_id, role),
             Request::TinyRemove { account, user_id } => adapters::tiny::remove(account, user_id),
-            Request::TinyRevoke { account, invite_id } => {
-                adapters::tiny::revoke(account, invite_id)
-            }
-            Request::TinyRename {
-                account,
-                display_name,
-            } => adapters::tiny::rename(account, display_name),
+            Request::TinyRevoke { account, invite_id } => adapters::tiny::revoke(account, invite_id),
+            Request::TinyRename { account, display_name } => adapters::tiny::rename(account, display_name),
             // Ended on the server first, then forgotten here exactly as one sign-out is.
-            Request::TinySignOutEverywhere { account } => {
-                match adapters::tiny::end_sessions(&account) {
-                    Ok(()) => self.sign_out(account),
-                    Err(answer) => answer,
-                }
-            }
-            Request::TinyServerUpdate { account, edit } => {
-                adapters::tiny::manage::server_update(account, edit)
-            }
-            Request::TinyServerIcon { account, path } => {
-                adapters::tiny::manage::server_icon(account, path)
-            }
-            Request::TinyAvatar { account, path } => {
-                adapters::tiny::manage::user_avatar(account, path)
-            }
-            Request::TinyRoleCreate { account, role } => {
-                adapters::tiny::manage::role_create(account, role)
-            }
-            Request::TinyRoleUpdate {
-                account,
-                role_id,
-                role,
-            } => adapters::tiny::manage::role_update(account, role_id, role),
-            Request::TinyRoleDelete { account, role_id } => {
-                adapters::tiny::manage::role_delete(account, role_id)
-            }
-            Request::TinyRoleOrder { account, role_ids } => {
-                adapters::tiny::manage::role_order(account, role_ids)
-            }
-            Request::TinyMemberRoles {
-                account,
-                user_id,
-                role_ids,
-            } => adapters::tiny::manage::member_roles(account, user_id, role_ids),
-            Request::TinyMemberOwner {
-                account,
-                user_id,
-                owner,
-            } => adapters::tiny::manage::member_owner(account, user_id, owner),
-            Request::TinyTimeout {
-                account,
-                user_id,
-                until,
-                reason,
-            } => adapters::tiny::manage::timeout(account, user_id, until, reason),
-            Request::TinyKick {
-                account,
-                user_id,
-                reason,
-            } => adapters::tiny::manage::kick(account, user_id, reason),
-            Request::TinyBan {
-                account,
-                user_id,
-                reason,
-                expires_at,
-            } => adapters::tiny::manage::ban(account, user_id, reason, expires_at),
-            Request::TinyUnban { account, user_id } => {
-                adapters::tiny::manage::unban(account, user_id)
-            }
-            Request::TinyCategoryCreate { account, name } => {
-                adapters::tiny::manage::category_create(account, name)
-            }
-            Request::TinyCategoryRename {
-                account,
-                category_id,
-                name,
-            } => adapters::tiny::manage::category_rename(account, category_id, name),
-            Request::TinyCategoryDelete {
-                account,
-                category_id,
-            } => adapters::tiny::manage::category_delete(account, category_id),
-            Request::TinyLayout { account, groups } => {
-                adapters::tiny::manage::layout(account, groups)
-            }
-            Request::TinyRoomCreateWith { account, room } => {
-                adapters::tiny::manage::room_create(account, room)
-            }
-            Request::TinyRoomUpdate {
-                account,
-                room_id,
-                room,
-            } => adapters::tiny::manage::room_update(account, room_id, room),
-            Request::TinyOverrideSet {
-                account,
-                room_id,
-                role_id,
-                allow,
-                deny,
-            } => adapters::tiny::manage::override_set(account, room_id, role_id, allow, deny),
-            Request::TinyOverrideClear {
-                account,
-                room_id,
-                role_id,
-            } => adapters::tiny::manage::override_clear(account, room_id, role_id),
-            Request::TinyInviteWith { account, options } => {
-                adapters::tiny::manage::invite_with(account, options)
-            }
-            Request::TinyAudit { account, filter } => {
-                adapters::tiny::manage::audit(account, filter)
-            }
+            Request::TinySignOutEverywhere { account } => match adapters::tiny::end_sessions(&account) {
+                Ok(()) => self.sign_out(account),
+                Err(answer) => answer,
+            },
+            Request::TinyServerUpdate { account, edit } => adapters::tiny::manage::server_update(account, edit),
+            Request::TinyServerIcon { account, path } => adapters::tiny::manage::server_icon(account, path),
+            Request::TinyAvatar { account, path } => adapters::tiny::manage::user_avatar(account, path),
+            Request::TinyRoleCreate { account, role } => adapters::tiny::manage::role_create(account, role),
+            Request::TinyRoleUpdate { account, role_id, role } => adapters::tiny::manage::role_update(account, role_id, role),
+            Request::TinyRoleDelete { account, role_id } => adapters::tiny::manage::role_delete(account, role_id),
+            Request::TinyRoleOrder { account, role_ids } => adapters::tiny::manage::role_order(account, role_ids),
+            Request::TinyMemberRoles { account, user_id, role_ids } => adapters::tiny::manage::member_roles(account, user_id, role_ids),
+            Request::TinyMemberOwner { account, user_id, owner } => adapters::tiny::manage::member_owner(account, user_id, owner),
+            Request::TinyTimeout { account, user_id, until, reason } => adapters::tiny::manage::timeout(account, user_id, until, reason),
+            Request::TinyKick { account, user_id, reason } => adapters::tiny::manage::kick(account, user_id, reason),
+            Request::TinyBan { account, user_id, reason, expires_at } => adapters::tiny::manage::ban(account, user_id, reason, expires_at),
+            Request::TinyUnban { account, user_id } => adapters::tiny::manage::unban(account, user_id),
+            Request::TinyCategoryCreate { account, name } => adapters::tiny::manage::category_create(account, name),
+            Request::TinyCategoryRename { account, category_id, name } => adapters::tiny::manage::category_rename(account, category_id, name),
+            Request::TinyCategoryDelete { account, category_id } => adapters::tiny::manage::category_delete(account, category_id),
+            Request::TinyLayout { account, groups } => adapters::tiny::manage::layout(account, groups),
+            Request::TinyRoomCreateWith { account, room } => adapters::tiny::manage::room_create(account, room),
+            Request::TinyRoomUpdate { account, room_id, room } => adapters::tiny::manage::room_update(account, room_id, room),
+            Request::TinyOverrideSet { account, room_id, role_id, allow, deny } => adapters::tiny::manage::override_set(account, room_id, role_id, allow, deny),
+            Request::TinyOverrideClear { account, room_id, role_id } => adapters::tiny::manage::override_clear(account, room_id, role_id),
+            Request::TinyInviteWith { account, options } => adapters::tiny::manage::invite_with(account, options),
+            Request::TinyAudit { account, filter } => adapters::tiny::manage::audit(account, filter),
             Request::TinySetupRead { account } => adapters::tiny::manage::setup_read(account),
-            Request::TinySetupApply { account, apply } => {
-                adapters::tiny::manage::setup_apply(account, apply)
-            }
+            Request::TinySetupApply { account, apply } => adapters::tiny::manage::setup_apply(account, apply),
             Request::TinyPasskeyLink { account } => adapters::tiny::manage::passkey_link(account),
             Request::TinyBots { account } => adapters::tiny::manage::bots_list(account),
-            Request::TinyBotCreate {
-                account,
-                name,
-                scopes,
-            } => adapters::tiny::manage::bots_create(account, name, scopes),
-            Request::TinyBotRevoke { account, bot_id } => {
-                adapters::tiny::manage::bots_revoke(account, bot_id)
-            }
-            Request::TinyCallModerate {
-                account,
-                room_id,
-                user_id,
-                server_muted,
-                server_deafened,
-            } => {
+            Request::TinyBotCreate { account, name, scopes } => adapters::tiny::manage::bots_create(account, name, scopes),
+            Request::TinyBotRevoke { account, bot_id } => adapters::tiny::manage::bots_revoke(account, bot_id),
+            Request::TinyCallModerate { account, room_id, user_id, server_muted, server_deafened } => {
                 let mut needs = Vec::new();
                 if server_muted.is_some() {
                     needs.push("community.calls.mute");
@@ -3027,48 +2163,21 @@ impl Chat {
                     return Response::Ok;
                 }
                 let ids = [room_id.as_str(), user_id.as_str()];
-                let ask = |reply| adapters::tiny::live::Ask::Moderate {
-                    room_id: room_id.clone(),
-                    user_id: user_id.clone(),
-                    server_muted,
-                    server_deafened,
-                    reply,
-                };
+                let ask = |reply| adapters::tiny::live::Ask::Moderate { room_id: room_id.clone(), user_id: user_id.clone(), server_muted, server_deafened, reply };
                 self.tiny_moderate(&account, &needs, &ids, ask)
             }
-            Request::TinyCallMove {
-                account,
-                user_id,
-                room_id,
-            } => {
+            Request::TinyCallMove { account, user_id, room_id } => {
                 let ids = [room_id.as_str(), user_id.as_str()];
-                let ask = |reply| adapters::tiny::live::Ask::Move {
-                    user_id: user_id.clone(),
-                    room_id: room_id.clone(),
-                    reply,
-                };
+                let ask = |reply| adapters::tiny::live::Ask::Move { user_id: user_id.clone(), room_id: room_id.clone(), reply };
                 self.tiny_moderate(&account, &["community.calls.move"], &ids, ask)
             }
             // The key is the mediad's to act on; a priority key on a Tiny call is also the
             // server's to hear, as `call.state`.
-            Request::CallTalk { held, priority } => match self
-                .hub
-                .calls
-                .request(&self.hub, &MediaRequest::Talk { held, priority })
-            {
+            Request::CallTalk { held, priority } => match self.hub.calls.request(&self.hub, &MediaRequest::Talk { held, priority }) {
                 Ok(_) => {
-                    if let Some(call) = self
-                        .hub
-                        .calls
-                        .describe()
-                        .0
-                        .filter(|call| call.conversation.network == Network::Tiny)
-                    {
+                    if let Some(call) = self.hub.calls.describe().0.filter(|call| call.conversation.network == Network::Tiny) {
                         let on = held && priority;
-                        self.command(
-                            &call.conversation.account(),
-                            Command::Tiny(adapters::tiny::live::Ask::Priority { on }),
-                        );
+                        self.command(&call.conversation.account(), Command::Tiny(adapters::tiny::live::Ask::Priority { on }));
                     }
                     Response::Ok
                 }
@@ -3076,57 +2185,30 @@ impl Chat {
             },
             // Kept per account and person, and applied to the call at once if it is on that
             // account. A call that is not up is no reason to refuse: the choice is kept.
-            Request::CallGain {
-                account,
-                user_id,
-                percent,
-                muted,
-            } => {
+            Request::CallGain { account, user_id, percent, muted } => {
                 let key = settings::gain_key(&user_id);
-                let (scope, value) = (
-                    settings::account_scope(&account),
-                    settings::gain_value(percent, muted),
-                );
-                let allowed = value.as_deref().map_or_else(
-                    || settings::known(&scope, &key),
-                    |value| settings::valid(&scope, &key, value),
-                );
+                let (scope, value) = (settings::account_scope(&account), settings::gain_value(percent, muted));
+                let allowed = value.as_deref().map_or_else(|| settings::known(&scope, &key), |value| settings::valid(&scope, &key, value));
                 if !allowed {
                     return error(ErrorCode::Refused, "That volume can't be kept for them.");
                 }
                 if let Err(err) = self.hub.set_setting(&scope, &key, value) {
                     return internal(err);
                 }
-                self.hub
-                    .calls
-                    .gain(&self.hub, &account, user_id, percent, muted);
+                self.hub.calls.gain(&self.hub, &account, user_id, percent, muted);
                 Response::Ok
             }
             // Only ever from the person's own click: nothing else turns a blocked call to clear.
-            Request::CallCarryOnUnencrypted => match self
-                .hub
-                .calls
-                .request(&self.hub, &MediaRequest::TinyTransport)
-            {
+            Request::CallCarryOnUnencrypted => match self.hub.calls.request(&self.hub, &MediaRequest::TinyTransport) {
                 Ok(protocol::MediaResponse::Done) => Response::Ok,
-                Ok(protocol::MediaResponse::Refused { detail }) => {
-                    error(ErrorCode::Refused, detail)
-                }
-                Ok(_) => error(
-                    ErrorCode::Unsupported,
-                    "This call can't carry on without encryption.",
-                ),
+                Ok(protocol::MediaResponse::Refused { detail }) => error(ErrorCode::Refused, detail),
+                Ok(_) => error(ErrorCode::Unsupported, "This call can't carry on without encryption."),
                 Err(err) => call_error(err),
             },
             Request::CallStats => match self.hub.calls.request(&self.hub, &MediaRequest::Stats) {
                 Ok(protocol::MediaResponse::Stats(stats)) => Response::CallStats { stats },
-                Ok(protocol::MediaResponse::Refused { detail }) => {
-                    error(ErrorCode::Unsupported, detail)
-                }
-                Ok(_) => error(
-                    ErrorCode::Unsupported,
-                    "This call can't report its connection.",
-                ),
+                Ok(protocol::MediaResponse::Refused { detail }) => error(ErrorCode::Unsupported, detail),
+                Ok(_) => error(ErrorCode::Unsupported, "This call can't report its connection."),
                 Err(err) => call_error(err),
             },
 
@@ -3146,38 +2228,24 @@ impl Chat {
                 }
                 self.status()
             }
-            Request::CallSet { muted, deafened } => {
-                match self.hub.calls.set_audio(&self.hub, muted, deafened) {
-                    Ok(conversation) => {
-                        self.command(
-                            &conversation.account(),
-                            Command::CallAudio { muted, deafened },
-                        );
-                        self.status()
-                    }
-                    Err(err) => call_error(err),
+            Request::CallSet { muted, deafened } => match self.hub.calls.set_audio(&self.hub, muted, deafened) {
+                Ok(conversation) => {
+                    self.command(&conversation.account(), Command::CallAudio { muted, deafened });
+                    self.status()
                 }
-            }
+                Err(err) => call_error(err),
+            },
             Request::Handoff { conversation } => {
                 let conversation_id = conversation.id.clone();
-                match self.ask(&conversation.account(), |reply| Command::Handoff {
-                    conversation_id,
-                    reply,
-                }) {
+                match self.ask(&conversation.account(), |reply| Command::Handoff { conversation_id, reply }) {
                     Ok(url) => Response::Link { url },
                     Err(refused) => *refused,
                 }
             }
-            Request::Play(request) => {
-                match self
-                    .hub
-                    .player
-                    .request(&self.hub, &support_dir().join("media"), request)
-                {
-                    Ok(()) => Response::Ok,
-                    Err(detail) => error(ErrorCode::Media, detail),
-                }
-            }
+            Request::Play(request) => match self.hub.player.request(&self.hub, &support_dir().join("media"), request) {
+                Ok(()) => Response::Ok,
+                Err(detail) => error(ErrorCode::Media, detail),
+            },
             Request::Media(request) => {
                 let asked = match request {
                     // Joining is the adapter's to ask for, with what the network handed out.
@@ -3206,32 +2274,23 @@ impl Chat {
                 Ok((messages, bytes)) => Response::Prunable { messages, bytes },
                 Err(err) => internal(err),
             },
-            Request::TestMicrophone { on, loopback } => {
-                match self.hub.calls.test_microphone(&self.hub, on, loopback) {
-                    Ok(()) => Response::Ok,
-                    Err(err) => call_error(err),
-                }
-            }
+            Request::TestMicrophone { on, loopback } => match self.hub.calls.test_microphone(&self.hub, on, loopback) {
+                Ok(()) => Response::Ok,
+                Err(err) => call_error(err),
+            },
             Request::TestSound => match self.hub.calls.test_sound(&self.hub) {
                 Ok(()) => Response::Ok,
                 Err(err) => call_error(err),
             },
             Request::NotifyTest => {
                 if !crate::notify::enabled() {
-                    return Response::NotifyTested {
-                        posted: false,
-                        detail: crate::notify::DISABLED.to_owned(),
-                    };
+                    return Response::NotifyTested { posted: false, detail: crate::notify::DISABLED.to_owned() };
                 }
                 let (tell, told) = std::sync::mpsc::channel();
                 self.hub.notify(crate::notify::Event::Test(tell));
                 match told.recv_timeout(Duration::from_secs(5)) {
                     Ok((posted, detail)) => Response::NotifyTested { posted, detail },
-                    Err(_) => Response::NotifyTested {
-                        posted: false,
-                        detail: "Notifications are not running in tinyclient's background service."
-                            .to_owned(),
-                    },
+                    Err(_) => Response::NotifyTested { posted: false, detail: "Notifications are not running in tinyclient's background service.".to_owned() },
                 }
             }
             Request::SaveLogs => {
@@ -3246,11 +2305,7 @@ impl Chat {
                 if let Ok(Some(path)) = guard.export_bundle() {
                     paths.push(path.display().to_string());
                 }
-                if let Ok(protocol::MediaResponse::LogsSaved { path }) = self
-                    .hub
-                    .calls
-                    .request(&self.hub, &protocol::MediaRequest::SaveLogs)
-                {
+                if let Ok(protocol::MediaResponse::LogsSaved { path }) = self.hub.calls.request(&self.hub, &protocol::MediaRequest::SaveLogs) {
                     if !path.is_empty() {
                         paths.push(path);
                     }
@@ -3258,12 +2313,10 @@ impl Chat {
                 Response::LogsSaved { paths }
             }
             Request::PlaySound { sound } => {
-                let known = sound != "none"
-                    && settings::sound_word(&sound)
-                    && match sound.strip_prefix("custom:") {
-                        Some(id) => self.hub.settings().custom_sound(id).is_some(),
-                        None => true,
-                    };
+                let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
+                    Some(id) => self.hub.settings().custom_sound(id).is_some(),
+                    None => true,
+                };
                 if !known {
                     return error(ErrorCode::NotFound, "no such sound");
                 }
@@ -3282,22 +2335,16 @@ fn merged(network: Network, session: &str) -> Result<String, String> {
     }
     match session::read(Network::Tiny) {
         session::Stored::Absent => Ok(session.to_owned()),
-        session::Stored::Unreadable(why) => Err(format!(
-            "The session could not be read from {}: {why}",
-            session::STORE
-        )),
+        session::Stored::Unreadable(why) => {
+            Err(format!("The session could not be read from {}: {why}", session::STORE))
+        }
         session::Stored::Found(existing) => adapters::tiny::combine(&existing, session),
     }
 }
 
 /// Keeps the session a sign-in drawn by the shell ended with and starts its accounts, as
 /// `Chat::sign_in` does with a helper's. Answers the accounts it started.
-fn adopt(
-    hub: &Arc<Hub>,
-    adapters: &Adapters,
-    network: Network,
-    session: &str,
-) -> Result<Vec<AccountKey>, String> {
+fn adopt(hub: &Arc<Hub>, adapters: &Adapters, network: Network, session: &str) -> Result<Vec<AccountKey>, String> {
     // Read and fold before stopping the adapters. A failed read leaves the signed-in server up.
     let session = merged(network, session)?;
     // A scratch directory keeps no session. The account still starts there, for a test.
@@ -3311,9 +2358,7 @@ fn adopt(
             network,
             account: signed.account,
         };
-        hub.store()
-            .set_account(&account, &signed.name, "")
-            .map_err(|err| err.to_string())?;
+        hub.store().set_account(&account, &signed.name, "").map_err(|err| err.to_string())?;
         let adapter = adapters::start(account.clone(), &signed.session, hub.clone())?;
         lock(adapters).insert(account.clone(), adapter);
         started.push(account);
@@ -3341,13 +2386,9 @@ fn serve_connection(chat: &Chat, mut stream: ChatStream) -> io::Result<()> {
             Err(err) => error(ErrorCode::Unsupported, format!("chatd does not understand this request; tinyclient and chatd may be different versions ({err})")),
         };
         match write_frame(&mut stream, &answer) {
-            Err(err) if err.kind() == ErrorKind::InvalidData => write_frame(
-                &mut stream,
-                &error(
-                    ErrorCode::TooLarge,
-                    "The answer was too large. Ask for a smaller page.",
-                ),
-            )?,
+            Err(err) if err.kind() == ErrorKind::InvalidData => {
+                write_frame(&mut stream, &error(ErrorCode::TooLarge, "The answer was too large. Ask for a smaller page."))?
+            }
             written => written?,
         }
     }
@@ -3372,14 +2413,11 @@ pub fn serve(listener: ChatListener, chat: Chat) -> io::Result<()> {
             }
         };
         let chat = chat.clone();
-        let spawned = std::thread::Builder::new()
-            .name("connection".into())
-            .stack_size(256 * 1024)
-            .spawn(move || {
-                if let Err(err) = serve_connection(&chat, stream) {
-                    tracing::warn!("chatd: connection: {err}");
-                }
-            });
+        let spawned = std::thread::Builder::new().name("connection".into()).stack_size(256 * 1024).spawn(move || {
+            if let Err(err) = serve_connection(&chat, stream) {
+                tracing::warn!("chatd: connection: {err}");
+            }
+        });
         if let Err(err) = spawned {
             tracing::warn!("chatd: connection thread: {err}");
             std::thread::sleep(Duration::from_millis(100));
@@ -3392,18 +2430,12 @@ fn file_name(file: &protocol::OutgoingFile) -> String {
     if !file.name.is_empty() {
         return file.name.clone();
     }
-    std::path::Path::new(&file.path).file_name().map_or_else(
-        || file.path.clone(),
-        |name| name.to_string_lossy().into_owned(),
-    )
+    std::path::Path::new(&file.path).file_name().map_or_else(|| file.path.clone(), |name| name.to_string_lossy().into_owned())
 }
 
 /// What a file to be sent is, from its name: enough for the pending row to draw it.
 fn kind_of(path: &str) -> MediaKind {
-    let extension = std::path::Path::new(path)
-        .extension()
-        .map(|extension| extension.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
+    let extension = std::path::Path::new(path).extension().map(|extension| extension.to_string_lossy().to_lowercase()).unwrap_or_default();
     match extension.as_str() {
         "png" | "jpg" | "jpeg" | "webp" => MediaKind::Image,
         "gif" => MediaKind::Gif,
@@ -3422,10 +2454,7 @@ fn megabytes(bytes: u64) -> String {
 
 /// The files of an unsent message, to send again from where they were.
 fn outgoing_files(message: &Message) -> Vec<protocol::OutgoingFile> {
-    let ours = message
-        .attachments
-        .iter()
-        .filter(|attachment| attachment.file.id.starts_with("upload-"));
+    let ours = message.attachments.iter().filter(|attachment| attachment.file.id.starts_with("upload-"));
     ours.filter_map(|attachment| {
         Some(protocol::OutgoingFile {
             path: attachment.file.path.clone()?,
@@ -3452,22 +2481,11 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
             "title" | "job title" if empty(&about.title) => about.title = value,
             "department" if empty(&about.department) => about.department = value,
             "nickname" if empty(&about.nickname) => about.nickname = value,
-            "email" | "e-mail" => about.contacts.push(protocol::Contact {
-                kind: protocol::ContactKind::Email,
-                value,
-                masked: false,
-            }),
-            "phone" | "mobile" => about.contacts.push(protocol::Contact {
-                kind: protocol::ContactKind::Phone,
-                value,
-                masked: true,
-            }),
-            "roles" if about.roles.is_empty() => {
-                about.roles = value.split(", ").map(str::to_owned).collect()
-            }
+            "email" | "e-mail" => about.contacts.push(protocol::Contact { kind: protocol::ContactKind::Email, value, masked: false }),
+            "phone" | "mobile" => about.contacts.push(protocol::Contact { kind: protocol::ContactKind::Phone, value, masked: true }),
+            "roles" if about.roles.is_empty() => about.roles = value.split(", ").map(str::to_owned).collect(),
             // The handle is on the person already.
-            "username" | "handle"
-                if value.trim_start_matches('@') == person.handle.trim_start_matches('@') => {}
+            "username" | "handle" if value.trim_start_matches('@') == person.handle.trim_start_matches('@') => {}
             _ => leftovers.push((label, value)),
         }
     }
@@ -3476,23 +2494,14 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
         clip(label, 40);
         clip(value, 200);
     }
-    for text in [
-        &mut about.nickname,
-        &mut about.pronouns,
-        &mut about.title,
-        &mut about.department,
-        &mut about.away,
-    ] {
+    for text in [&mut about.nickname, &mut about.pronouns, &mut about.title, &mut about.department, &mut about.away] {
         clip(text, 200);
     }
     clip(&mut about.bio, 1_000);
     clip(&mut about.note, 1_000);
     clip(&mut about.time_zone, 64);
     about.mutual_spaces.truncate(MUTUAL_SPACES);
-    about
-        .mutual_spaces
-        .iter_mut()
-        .for_each(|title| clip(title, 100));
+    about.mutual_spaces.iter_mut().for_each(|title| clip(title, 100));
     about.roles.retain(|role| !role.is_empty());
     about.roles.truncate(protocol::PROFILE_ROLES);
     about.roles.iter_mut().for_each(|role| clip(role, 100));
@@ -3554,16 +2563,9 @@ fn derivable_thread(conversation: &Key) -> Option<(String, String)> {
 
 /// The first non-empty line, cut to `most` characters with an ellipsis when it ran over.
 fn first_line(text: &str, most: usize) -> String {
-    let first = text
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("");
+    let first = text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("");
     if first.chars().count() > most {
-        format!(
-            "{}…",
-            first.chars().take(most).collect::<String>().trim_end()
-        )
+        format!("{}…", first.chars().take(most).collect::<String>().trim_end())
     } else {
         first.to_owned()
     }
@@ -3574,11 +2576,7 @@ fn thread_name(text: &str) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let name: String = flat.chars().take(100).collect();
     let name = name.trim().to_owned();
-    if name.is_empty() {
-        "Thread".to_owned()
-    } else {
-        name
-    }
+    if name.is_empty() { "Thread".to_owned() } else { name }
 }
 
 /// The link the shell uses to decide a network is on the rail. A live connection wins. When the
@@ -3622,40 +2620,18 @@ mod tests {
 
     #[test]
     fn a_stored_account_stays_on_the_rail_while_its_session_is_unread() {
-        assert_eq!(
-            published_link(Link::SignedOut, [Link::Offline]),
-            Link::Offline
-        );
-        assert_eq!(
-            published_link(Link::SignedOut, std::iter::empty()),
-            Link::SignedOut
-        );
-        assert_eq!(
-            published_link(Link::Connected, [Link::Offline]),
-            Link::Connected
-        );
-        assert_eq!(
-            published_link(Link::Expired, [Link::Offline]),
-            Link::Expired
-        );
+        assert_eq!(published_link(Link::SignedOut, [Link::Offline]), Link::Offline);
+        assert_eq!(published_link(Link::SignedOut, std::iter::empty()), Link::SignedOut);
+        assert_eq!(published_link(Link::Connected, [Link::Offline]), Link::Connected);
+        assert_eq!(published_link(Link::Expired, [Link::Offline]), Link::Expired);
     }
 
     #[test]
     fn a_thread_id_names_its_parent_and_a_discord_name_is_one_line() {
         use protocol::{AccountKey, Key, Network};
-        let key = |network, id: &str| {
-            Key::new(
-                &AccountKey {
-                    network,
-                    account: "a".into(),
-                },
-                id,
-            )
-        };
+        let key = |network, id: &str| Key::new(&AccountKey { network, account: "a".into() }, id);
         assert_eq!(
-            super::derivable_thread(&key(Network::Slack, "C0:1.2"))
-                .as_ref()
-                .map(|(parent, root)| (parent.as_str(), root.as_str())),
+            super::derivable_thread(&key(Network::Slack, "C0:1.2")).as_ref().map(|(parent, root)| (parent.as_str(), root.as_str())),
             Some(("C0", "1.2"))
         );
         assert_eq!(
@@ -3664,24 +2640,12 @@ mod tests {
                 .map(|(parent, root)| (parent.as_str(), root.as_str())),
             Some(("19:c@thread.tacv2", "9"))
         );
-        assert_eq!(
-            super::derivable_thread(&key(Network::Slack, "C0:1.2:3")),
-            None
-        );
-        assert_eq!(
-            super::derivable_thread(&key(Network::Discord, "4101")),
-            None
-        );
+        assert_eq!(super::derivable_thread(&key(Network::Slack, "C0:1.2:3")), None);
+        assert_eq!(super::derivable_thread(&key(Network::Discord, "4101")), None);
         assert_eq!(super::thread_name("  Hello\nthere"), "Hello there");
         assert_eq!(super::thread_name("   "), "Thread");
         assert_eq!(super::thread_name(&"x".repeat(150)).chars().count(), 100);
-        assert_eq!(
-            super::first_line("Release train\nWho drives", 40),
-            "Release train"
-        );
-        assert!(
-            super::first_line("A post with no subject that goes on for quite a while", 40)
-                .ends_with('…')
-        );
+        assert_eq!(super::first_line("Release train\nWho drives", 40), "Release train");
+        assert!(super::first_line("A post with no subject that goes on for quite a while", 40).ends_with('…'));
     }
 }

@@ -18,10 +18,7 @@ const PROVIDER: TlsProvider = TlsProvider::Rustls;
 /// loads them), so a Windows machine that trusts a root Mozilla's list lacks still connects.
 #[cfg(not(target_os = "android"))]
 pub fn config() -> TlsConfig {
-    TlsConfig::builder()
-        .provider(PROVIDER)
-        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-        .build()
+    TlsConfig::builder().provider(PROVIDER).root_certs(ureq::tls::RootCerts::PlatformVerifier).build()
 }
 
 /// The `ureq` TLS settings for a request: rustls and its bundled WebPKI roots.

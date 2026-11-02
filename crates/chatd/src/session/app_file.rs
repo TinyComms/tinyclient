@@ -34,9 +34,7 @@ fn failed(err: impl std::fmt::Display) -> Error {
 }
 
 fn path() -> Result<&'static Path> {
-    FILE.get()
-        .map(PathBuf::as_path)
-        .ok_or_else(|| failed("the app's sign-in store is not installed"))
+    FILE.get().map(PathBuf::as_path).ok_or_else(|| failed("the app's sign-in store is not installed"))
 }
 
 /// Every entry in the file. A missing file holds none.
@@ -52,14 +50,8 @@ fn write_all(path: &Path, entries: &BTreeMap<String, String>) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let temp = path.with_extension("json.tmp");
     let _ = std::fs::remove_file(&temp);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temp)
-        .map_err(failed)?;
-    file.write_all(&serde_json::to_vec(entries).map_err(failed)?)
-        .map_err(failed)?;
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp).map_err(failed)?;
+    file.write_all(&serde_json::to_vec(entries).map_err(failed)?).map_err(failed)?;
     file.sync_all().map_err(failed)?;
     std::fs::rename(&temp, path).map_err(failed)
 }
@@ -89,10 +81,7 @@ impl CredentialApi for Slot {
         let path = path()?;
         let _one = ONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut entries = read_all(path)?;
-        entries.insert(
-            self.0.clone(),
-            base64::engine::general_purpose::STANDARD.encode(secret),
-        );
+        entries.insert(self.0.clone(), base64::engine::general_purpose::STANDARD.encode(secret));
         write_all(path, &entries)
     }
 
@@ -101,9 +90,7 @@ impl CredentialApi for Slot {
         let _one = ONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let entries = read_all(path)?;
         let encoded = entries.get(&self.0).ok_or(Error::NoEntry)?;
-        base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(failed)
+        base64::engine::general_purpose::STANDARD.decode(encoded).map_err(failed)
     }
 
     fn delete_credential(&self) -> Result<()> {

@@ -613,8 +613,7 @@ fn decode_thumbnails(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
             let thumbnail = fields(&thumbnail.bytes);
             let participant = field_text(&thumbnail, 1);
             let picture = field_bytes(&fields(&field_bytes(&thumbnail, 2)), 3);
-            (!participant.is_empty() && crate::blobs::is_picture(&picture))
-                .then_some((participant, picture))
+            (!participant.is_empty() && crate::blobs::is_picture(&picture)).then_some((participant, picture))
         })
         .collect()
 }
@@ -1976,10 +1975,7 @@ mod tests {
         }
         let notes = decode_messages(&wrap.0);
         let said: Vec<Option<Receipt>> = notes.iter().map(|note| receipt(note.status)).collect();
-        assert_eq!(
-            said,
-            [None, Some(Receipt::Delivered), Some(Receipt::Read), None]
-        );
+        assert_eq!(said, [None, Some(Receipt::Delivered), Some(Receipt::Read), None]);
     }
 
     #[test]
@@ -2001,14 +1997,7 @@ mod tests {
         let mut list = Buf::new();
         list.msg(2, &conv.0);
         let chats = decode_chats(&list.0);
-        assert_eq!(
-            (
-                chats[0].peer.as_str(),
-                chats[0].mine.as_str(),
-                chats[0].title.as_str()
-            ),
-            ("p-grace", "p-me", "Grace")
-        );
+        assert_eq!((chats[0].peer.as_str(), chats[0].mine.as_str(), chats[0].title.as_str()), ("p-grace", "p-me", "Grace"));
         assert_eq!(thumbnail_request(&["p-grace".to_owned()]), {
             let mut req = Buf::new();
             req.text(1, "p-grace");
@@ -2029,9 +2018,6 @@ mod tests {
         // Someone the phone has no picture for, and something that is not a picture.
         answer.msg(1, &thumbnail("p-alan", &[]));
         answer.msg(1, &thumbnail("p-odd", b"<html>"));
-        assert_eq!(
-            decode_thumbnails(&answer.0),
-            [("p-grace".to_owned(), jpeg.to_vec())]
-        );
+        assert_eq!(decode_thumbnails(&answer.0), [("p-grace".to_owned(), jpeg.to_vec())]);
     }
 }

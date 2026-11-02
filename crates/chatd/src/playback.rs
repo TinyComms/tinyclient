@@ -9,8 +9,8 @@
 use crate::hub::{lock, Hub};
 use crate::media::mediad_path;
 use protocol::{
-    read_frame, write_frame, AccountKey, Change, Key, PlayRequest, PlayState, Playback,
-    PlayerEvent, PlayerRequest, RATES,
+    read_frame, write_frame, AccountKey, Change, Key, PlayRequest, PlayState, Playback, PlayerEvent,
+    PlayerRequest, RATES,
 };
 use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -22,9 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const NO_PLAYER: &str = "Playing stopped. Try again.";
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
 #[derive(Default)]
@@ -59,48 +57,18 @@ impl Player {
     }
 
     fn tell(&self, hub: &Hub) {
-        hub.changed(Change::Playback {
-            playback: self.shown(),
-        });
+        hub.changed(Change::Playback { playback: self.shown() });
     }
 
     /// The shell's request. Errors are words for the user.
-    pub fn request(
-        &self,
-        hub: &Arc<Hub>,
-        media: &Path,
-        request: PlayRequest,
-    ) -> Result<(), String> {
+    pub fn request(&self, hub: &Arc<Hub>, media: &Path, request: PlayRequest) -> Result<(), String> {
         match request {
-            PlayRequest::Start {
-                account,
-                file,
-                path,
-                conversation,
-                message,
-                title,
-                at,
-                rate,
-                output,
-            } => {
+            PlayRequest::Start { account, file, path, conversation, message, title, at, rate, output } => {
                 let path = PathBuf::from(path);
                 if !inside(media, &path) {
                     return Err("That file is not in tinyclient's media cache.".to_owned());
                 }
-                self.start(
-                    hub,
-                    Start {
-                        account,
-                        file,
-                        path,
-                        conversation,
-                        message,
-                        title,
-                        at,
-                        rate,
-                        output,
-                    },
-                );
+                self.start(hub, Start { account, file, path, conversation, message, title, at, rate, output });
             }
             PlayRequest::Pause => self.pause(hub),
             PlayRequest::Seek { at } => self.seek(hub, at),
@@ -116,21 +84,14 @@ impl Player {
         slot.stdin = None;
         slot.generation += 1;
         let generation = slot.generation;
-        let same = slot
-            .shown
-            .as_ref()
-            .filter(|shown| shown.is(&start.account, &start.file));
+        let same = slot.shown.as_ref().filter(|shown| shown.is(&start.account, &start.file));
         // Pressing play on a paused file goes on from where it was; on an ended one, from the top.
         let at = start.at.unwrap_or_else(|| match same {
             Some(shown) if shown.state != PlayState::Ended => shown.at,
             _ => 0,
         });
         let duration = same.map_or(0, |shown| shown.duration);
-        let rate = if RATES.contains(&start.rate) {
-            start.rate
-        } else {
-            100
-        };
+        let rate = if RATES.contains(&start.rate) { start.rate } else { 100 };
         slot.shown = Some(Playback {
             account: start.account,
             file: start.file,
@@ -150,9 +111,7 @@ impl Player {
             Err(err) => {
                 tracing::warn!("chatd: the player did not start: {err}");
                 if let Some(shown) = &mut slot.shown {
-                    shown.state = PlayState::Failed {
-                        detail: NO_PLAYER.to_owned(),
-                    };
+                    shown.state = PlayState::Failed { detail: NO_PLAYER.to_owned() };
                 }
             }
         }
@@ -161,22 +120,11 @@ impl Player {
     }
 
     /// Runs `mediad --play` for the slot's file, from the slot's place.
-    fn spawn(
-        &self,
-        hub: &Arc<Hub>,
-        slot: &Slot,
-        generation: u64,
-    ) -> io::Result<Box<dyn Write + Send>> {
+    fn spawn(&self, hub: &Arc<Hub>, slot: &Slot, generation: u64) -> io::Result<Box<dyn Write + Send>> {
         let shown = slot.shown.as_ref().expect("a file to play");
         // The process on a desktop; mediad's threads in this process on a phone.
-        let spawned = protocol::media_host::spawn(protocol::launch::no_console(
-            Command::new(mediad_path()?).arg("--play"),
-        ))?;
-        let protocol::media_host::Spawned {
-            mut child,
-            stdin,
-            stdout,
-        } = spawned;
+        let spawned = protocol::media_host::spawn(protocol::launch::no_console(Command::new(mediad_path()?).arg("--play")))?;
+        let protocol::media_host::Spawned { mut child, stdin, stdout } = spawned;
         let mut stdin = stdin.expect("stdin is piped");
         let mut stdout = BufReader::new(stdout.expect("stdout is piped"));
         let open = PlayerRequest::Open {
@@ -187,17 +135,14 @@ impl Player {
         };
         write_frame(&mut stdin, &open)?;
         let hub = hub.clone();
-        std::thread::Builder::new()
-            .name("player".into())
-            .stack_size(128 * 1024)
-            .spawn(move || {
-                // Ends when mediad exits, which it does when the file ends or its stdin closes.
-                while let Ok(event) = read_frame::<PlayerEvent>(&mut stdout) {
-                    hub.player.heard(&hub, generation, event);
-                }
-                let clean = child.wait().is_ok_and(|status| status.success());
-                hub.player.gone(&hub, generation, clean);
-            })?;
+        std::thread::Builder::new().name("player".into()).stack_size(128 * 1024).spawn(move || {
+            // Ends when mediad exits, which it does when the file ends or its stdin closes.
+            while let Ok(event) = read_frame::<PlayerEvent>(&mut stdout) {
+                hub.player.heard(&hub, generation, event);
+            }
+            let clean = child.wait().is_ok_and(|status| status.success());
+            hub.player.gone(&hub, generation, clean);
+        })?;
         Ok(stdin)
     }
 
@@ -254,9 +199,7 @@ impl Player {
         if let Some(shown) = &mut slot.shown {
             if matches!(shown.state, PlayState::Loading | PlayState::Playing) {
                 tracing::warn!("chatd: the player exited (clean: {clean}) while playing");
-                shown.state = PlayState::Failed {
-                    detail: NO_PLAYER.to_owned(),
-                };
+                shown.state = PlayState::Failed { detail: NO_PLAYER.to_owned() };
             }
         }
         drop(slot);
@@ -283,11 +226,7 @@ impl Player {
         let Some(shown) = &mut slot.shown else {
             return;
         };
-        let at = if shown.duration > 0 {
-            at.min(shown.duration)
-        } else {
-            at
-        };
+        let at = if shown.duration > 0 { at.min(shown.duration) } else { at };
         shown.at = at;
         shown.since = now_ms();
         if shown.state == PlayState::Ended {
@@ -337,10 +276,7 @@ impl Player {
 
     /// Sign-out: a file of that account stops, since its cache is about to go.
     pub fn forget(&self, hub: &Hub, account: &AccountKey) {
-        let playing = lock(&self.slot)
-            .shown
-            .as_ref()
-            .is_some_and(|shown| &shown.account == account);
+        let playing = lock(&self.slot).shown.as_ref().is_some_and(|shown| &shown.account == account);
         if playing {
             self.stop(hub);
         }
@@ -372,14 +308,8 @@ mod tests {
         std::fs::write(dir.join("secret"), b"x").unwrap();
         assert!(inside(&media, &media.join("discord/me/voice")));
         assert!(!inside(&media, &dir.join("secret")));
-        assert!(
-            !inside(&media, &media.join("discord/me/../../secret")),
-            "climbing out is refused"
-        );
-        assert!(
-            !inside(&media, &media.join("discord/me")),
-            "a directory is not a file"
-        );
+        assert!(!inside(&media, &media.join("discord/me/../../secret")), "climbing out is refused");
+        assert!(!inside(&media, &media.join("discord/me")), "a directory is not a file");
         assert!(!inside(&media, &media.join("discord/me/missing")));
         let _ = std::fs::remove_dir_all(dir);
     }

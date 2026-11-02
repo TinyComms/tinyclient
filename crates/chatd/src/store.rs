@@ -41,6 +41,7 @@ pub const QUIET_SECONDS: i64 = 30 * 86_400;
 /// "Talked to lately", for People's Recent section.
 pub const RECENT_SECONDS: i64 = 14 * 86_400;
 
+
 const TABLES: &str = "
     CREATE TABLE account (
         network TEXT NOT NULL,
@@ -267,8 +268,7 @@ const IN_INBOX: &str = "(NOT c.hidden AND c.special != 'request'
                         AND f.conversation = c.id AND f.pending = 2)))";
 /// The Inbox filters. Unread and Mentions are different questions: what have I not seen, and
 /// who is waiting on me. A bot's or an archived chat's plain unread is neither.
-const IS_UNREAD: &str =
-    "(((c.unread > 0 AND NOT c.bot AND NOT c.archived) OR c.mentions > 0) AND NOT c.muted)";
+const IS_UNREAD: &str = "(((c.unread > 0 AND NOT c.bot AND NOT c.archived) OR c.mentions > 0) AND NOT c.muted)";
 const IS_MENTION: &str = "(c.mentions > 0)";
 const IS_APP: &str = "(c.bot AND c.unread > 0)";
 
@@ -384,12 +384,7 @@ pub struct PreviewLine {
 
 /// As stored: folder and Space ids never hold the comma that separates them.
 fn id_list(ids: &[String], limit: usize) -> String {
-    let kept: Vec<String> = ids
-        .iter()
-        .take(limit)
-        .map(|id| id.replace(',', ""))
-        .filter(|id| !id.is_empty())
-        .collect();
+    let kept: Vec<String> = ids.iter().take(limit).map(|id| id.replace(',', "")).filter(|id| !id.is_empty()).collect();
     if kept.is_empty() {
         return String::new();
     }
@@ -397,11 +392,7 @@ fn id_list(ids: &[String], limit: usize) -> String {
 }
 
 fn from_id_list(stored: &str) -> Vec<String> {
-    stored
-        .split(',')
-        .filter(|id| !id.is_empty())
-        .map(str::to_owned)
-        .collect()
+    stored.split(',').filter(|id| !id.is_empty()).map(str::to_owned).collect()
 }
 
 impl ConversationRow {
@@ -506,18 +497,9 @@ fn not_these(hidden: &[AccountKey]) -> String {
         .iter()
         .filter(|account| {
             let id = account.account.as_str();
-            !id.is_empty()
-                && id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+            !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
         })
-        .map(|account| {
-            format!(
-                "(c.network = '{}' AND c.account = '{}')",
-                word(&account.network),
-                account.account
-            )
-        })
+        .map(|account| format!("(c.network = '{}' AND c.account = '{}')", word(&account.network), account.account))
         .collect();
     if parts.is_empty() {
         String::new()
@@ -577,11 +559,7 @@ pub(crate) fn snippet(text: &str, query: &str) -> String {
     let needle = query.to_lowercase();
     // A lowercased byte index can sit off a boundary or past the end by a character or two
     // (some letters lowercase to more than one); walking back to one is close enough.
-    let mut from = flat
-        .to_lowercase()
-        .find(&needle)
-        .map_or(0, |at| at.saturating_sub(60))
-        .min(flat.len());
+    let mut from = flat.to_lowercase().find(&needle).map_or(0, |at| at.saturating_sub(60)).min(flat.len());
     while from > 0 && !flat.is_char_boundary(from) {
         from -= 1;
     }
@@ -734,19 +712,8 @@ fn preview_of(message: &Message) -> String {
         };
     };
     let count = message.attachments.len();
-    let all = |kind: MediaKind| {
-        message
-            .attachments
-            .iter()
-            .all(|attachment| attachment.file.kind == kind)
-    };
-    let words = |one: &str, many: &str| {
-        if count == 1 {
-            one.to_owned()
-        } else {
-            format!("{count} {many}")
-        }
-    };
+    let all = |kind: MediaKind| message.attachments.iter().all(|attachment| attachment.file.kind == kind);
+    let words = |one: &str, many: &str| if count == 1 { one.to_owned() } else { format!("{count} {many}") };
     if first.sticker {
         "Sticker".to_owned()
     } else if !first.waveform.is_empty() {
@@ -785,11 +752,7 @@ fn drop_orphan_threads(tx: &Transaction, account: &AccountKey) -> rusqlite::Resu
     Ok(())
 }
 
-fn upsert_conversation(
-    tx: &Transaction,
-    account: &AccountKey,
-    row: &ConversationRow,
-) -> rusqlite::Result<()> {
+fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &ConversationRow) -> rusqlite::Result<()> {
     let mut topic = row.topic.lines().next().unwrap_or("").to_owned();
     clip(&mut topic, TOPIC);
     let filing = row.filing.clone().unwrap_or_default();
@@ -881,13 +844,8 @@ impl Store {
         // last writes to this cache of what the networks hold, and never corrupts it. FULL
         // flushed the disk at every write; on Windows four chatds seeding the demo at once took
         // over a minute that way, and 3 s this way.
-        db.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -1024;",
-        )?;
-        for suffix in ["-wal", "-shm"]
-            .into_iter()
-            .filter(|_| path != Path::new(":memory:"))
-        {
+        db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -1024;")?;
+        for suffix in ["-wal", "-shm"].into_iter().filter(|_| path != Path::new(":memory:")) {
             let mut side = path.as_os_str().to_owned();
             side.push(suffix);
             protocol::private::tighten_file(Path::new(&side));
@@ -925,46 +883,29 @@ impl Store {
 
     /// Every stored setting, the version row included.
     pub fn settings(&self) -> rusqlite::Result<Vec<protocol::settings::Setting>> {
-        let mut query = self
-            .db
-            .prepare("SELECT scope, key, value FROM settings ORDER BY scope, key")?;
+        let mut query = self.db.prepare("SELECT scope, key, value FROM settings ORDER BY scope, key")?;
         let rows = query.query_map([], |row| {
-            Ok(protocol::settings::Setting {
-                scope: row.get(0)?,
-                key: row.get(1)?,
-                value: row.get(2)?,
-            })
+            Ok(protocol::settings::Setting { scope: row.get(0)?, key: row.get(1)?, value: row.get(2)? })
         })?;
         rows.collect()
     }
 
     /// Stores one value, or deletes the row so the default applies again.
-    pub fn set_setting(
-        &mut self,
-        scope: &str,
-        key: &str,
-        value: Option<&str>,
-    ) -> rusqlite::Result<()> {
+    pub fn set_setting(&mut self, scope: &str, key: &str, value: Option<&str>) -> rusqlite::Result<()> {
         match value {
             Some(value) => self.db.execute(
                 "INSERT INTO settings (scope, key, value) VALUES (?1, ?2, ?3)
                  ON CONFLICT (scope, key) DO UPDATE SET value = excluded.value",
                 params![scope, key, value],
             )?,
-            None => self.db.execute(
-                "DELETE FROM settings WHERE scope = ?1 AND key = ?2",
-                params![scope, key],
-            )?,
+            None => self.db.execute("DELETE FROM settings WHERE scope = ?1 AND key = ?2", params![scope, key])?,
         };
         self.settle()
     }
 
     /// Reset all (B3): every row but the version.
     pub fn reset_settings(&mut self) -> rusqlite::Result<()> {
-        self.db.execute(
-            "DELETE FROM settings WHERE NOT (scope = '' AND key = ?1)",
-            params![protocol::settings::VERSION],
-        )?;
+        self.db.execute("DELETE FROM settings WHERE NOT (scope = '' AND key = ?1)", params![protocol::settings::VERSION])?;
         self.settle()
     }
 
@@ -973,8 +914,7 @@ impl Store {
     /// user just made is not, and a power cut must not undo it. A checkpoint syncs the log and
     /// the file; settings change a few times a day, so its cost does not matter.
     fn settle(&self) -> rusqlite::Result<()> {
-        self.db
-            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
+        self.db.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
     }
 
     // Storage.
@@ -986,8 +926,7 @@ impl Store {
         tx.execute("DELETE FROM message WHERE pending = 0", [])?;
         tx.execute("UPDATE media SET path = NULL WHERE path IS NOT NULL", [])?;
         tx.commit()?;
-        self.db
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
+        self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
     }
 
     /// What `prune` with `days` would delete by age now: messages, and about how many bytes
@@ -1007,12 +946,7 @@ impl Store {
 
     // Accounts.
 
-    pub fn set_account(
-        &mut self,
-        account: &AccountKey,
-        name: &str,
-        me: &str,
-    ) -> rusqlite::Result<()> {
+    pub fn set_account(&mut self, account: &AccountKey, name: &str, me: &str) -> rusqlite::Result<()> {
         self.db.execute(
             "INSERT INTO account (network, id, name, me) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (network, id) DO UPDATE SET
@@ -1060,21 +994,8 @@ impl Store {
         let tx = self.db.transaction()?;
         let key = params![word(&account.network), account.account];
         tx.execute("DELETE FROM account WHERE network = ?1 AND id = ?2", key)?;
-        for table in [
-            "message",
-            "conversation",
-            "section",
-            "space",
-            "folder",
-            "person",
-            "media",
-            "media_variant",
-            "name",
-        ] {
-            tx.execute(
-                &format!("DELETE FROM {table} WHERE network = ?1 AND account = ?2"),
-                key,
-            )?;
+        for table in ["message", "conversation", "section", "space", "folder", "person", "media", "media_variant", "name"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE network = ?1 AND account = ?2"), key)?;
         }
         // No trace of a removed account stays in its settings either: its own and its
         // conversations'.
@@ -1090,39 +1011,23 @@ impl Store {
     // Spaces and their trees.
 
     /// The account's Spaces, all of them. A Space that is no longer listed goes, with its tree.
-    pub fn replace_spaces(
-        &mut self,
-        account: &AccountKey,
-        spaces: &[SpaceRow],
-    ) -> rusqlite::Result<()> {
+    pub fn replace_spaces(&mut self, account: &AccountKey, spaces: &[SpaceRow]) -> rusqlite::Result<()> {
         let tx = self.db.transaction()?;
         let (network, id) = (word(&account.network), &account.account);
         let old: Vec<String> = tx
             .prepare("SELECT id FROM space WHERE network = ?1 AND account = ?2")?
             .query_map(params![network, id], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        for gone in old
-            .iter()
-            .filter(|old| !spaces.iter().any(|space| space.id == **old))
-        {
+        for gone in old.iter().filter(|old| !spaces.iter().any(|space| space.id == **old)) {
             let key = params![network, id, gone];
             tx.execute(
                 "DELETE FROM message WHERE network = ?1 AND account = ?2 AND conversation IN
                      (SELECT id FROM conversation WHERE network = ?1 AND account = ?2 AND space = ?3)",
                 key,
             )?;
-            tx.execute(
-                "DELETE FROM conversation WHERE network = ?1 AND account = ?2 AND space = ?3",
-                key,
-            )?;
-            tx.execute(
-                "DELETE FROM section WHERE network = ?1 AND account = ?2 AND space = ?3",
-                key,
-            )?;
-            tx.execute(
-                "DELETE FROM space WHERE network = ?1 AND account = ?2 AND id = ?3",
-                key,
-            )?;
+            tx.execute("DELETE FROM conversation WHERE network = ?1 AND account = ?2 AND space = ?3", key)?;
+            tx.execute("DELETE FROM section WHERE network = ?1 AND account = ?2 AND space = ?3", key)?;
+            tx.execute("DELETE FROM space WHERE network = ?1 AND account = ?2 AND id = ?3", key)?;
         }
         for space in spaces {
             tx.execute(
@@ -1130,14 +1035,7 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (network, account, id) DO UPDATE SET
                      name = excluded.name, icon = excluded.icon, position = excluded.position",
-                params![
-                    network,
-                    id,
-                    space.id,
-                    space.name,
-                    text(&space.icon),
-                    space.position
-                ],
+                params![network, id, space.id, space.name, text(&space.icon), space.position],
             )?;
         }
         tx.commit()
@@ -1218,10 +1116,7 @@ impl Store {
             )?
             .query_map(key, |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        tx.execute(
-            "DELETE FROM section WHERE network = ?1 AND account = ?2 AND space = ?3",
-            key,
-        )?;
+        tx.execute("DELETE FROM section WHERE network = ?1 AND account = ?2 AND space = ?3", key)?;
         for group in groups {
             tx.execute(
                 "INSERT OR REPLACE INTO section
@@ -1287,7 +1182,12 @@ impl Store {
 
     /// A Space's groups, and one page of its conversations in the network's order. `None` when
     /// there is no such Space.
-    pub fn tree(&self, space: &Key, offset: u32, limit: u32) -> rusqlite::Result<Option<Tree>> {
+    pub fn tree(
+        &self,
+        space: &Key,
+        offset: u32,
+        limit: u32,
+    ) -> rusqlite::Result<Option<Tree>> {
         let key = params![word(&space.network), space.account, space.id];
         let known: bool = self.db.query_row(
             "SELECT EXISTS (SELECT 1 FROM space WHERE network = ?1 AND account = ?2 AND id = ?3)",
@@ -1344,22 +1244,11 @@ impl Store {
         }))
     }
 
-    pub fn set_collapsed(
-        &mut self,
-        space: &Key,
-        group: &str,
-        collapsed: bool,
-    ) -> rusqlite::Result<bool> {
+    pub fn set_collapsed(&mut self, space: &Key, group: &str, collapsed: bool) -> rusqlite::Result<bool> {
         let changed = self.db.execute(
             "UPDATE section SET collapsed = ?5
               WHERE network = ?1 AND account = ?2 AND space = ?3 AND id = ?4",
-            params![
-                word(&space.network),
-                space.account,
-                space.id,
-                group,
-                collapsed
-            ],
+            params![word(&space.network), space.account, space.id, group, collapsed],
         )?;
         Ok(changed == 1)
     }
@@ -1368,11 +1257,7 @@ impl Store {
 
     /// Records one conversation outside a tree replacement: a direct message, a channel the
     /// network just created.
-    pub fn upsert_conversation(
-        &mut self,
-        account: &AccountKey,
-        row: &ConversationRow,
-    ) -> rusqlite::Result<()> {
+    pub fn upsert_conversation(&mut self, account: &AccountKey, row: &ConversationRow) -> rusqlite::Result<()> {
         let tx = self.db.transaction()?;
         upsert_conversation(&tx, account, row)?;
         tx.commit()
@@ -1380,19 +1265,9 @@ impl Store {
 
     pub fn remove_conversation(&mut self, conversation: &Key) -> rusqlite::Result<()> {
         let tx = self.db.transaction()?;
-        let key = params![
-            word(&conversation.network),
-            conversation.account,
-            conversation.id
-        ];
-        tx.execute(
-            "DELETE FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3",
-            key,
-        )?;
-        tx.execute(
-            "DELETE FROM conversation WHERE network = ?1 AND account = ?2 AND id = ?3",
-            key,
-        )?;
+        let key = params![word(&conversation.network), conversation.account, conversation.id];
+        tx.execute("DELETE FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3", key)?;
+        tx.execute("DELETE FROM conversation WHERE network = ?1 AND account = ?2 AND id = ?3", key)?;
         drop_orphan_threads(&tx, &conversation.account())?;
         tx.commit()
     }
@@ -1401,11 +1276,7 @@ impl Store {
         self.db
             .query_row(
                 &format!("{CONVERSATION} WHERE c.network = ?1 AND c.account = ?2 AND c.id = ?3"),
-                params![
-                    word(&conversation.network),
-                    conversation.account,
-                    conversation.id
-                ],
+                params![word(&conversation.network), conversation.account, conversation.id],
                 conversation_from,
             )
             .optional()
@@ -1419,20 +1290,10 @@ impl Store {
             .query_row(
                 "SELECT NOT c.hidden AND c.special != 'request' \
                    FROM conversation c WHERE c.network = ?1 AND c.account = ?2 AND c.id = ?3",
-                params![
-                    word(&conversation.network),
-                    conversation.account,
-                    conversation.id
-                ],
+                params![word(&conversation.network), conversation.account, conversation.id],
                 |row| row.get::<_, bool>(0),
             )
-            .or_else(|err| {
-                if err == rusqlite::Error::QueryReturnedNoRows {
-                    Ok(false)
-                } else {
-                    Err(err)
-                }
-            })
+            .or_else(|err| if err == rusqlite::Error::QueryReturnedNoRows { Ok(false) } else { Err(err) })
     }
 
     /// What the Inbox holds (`IN_INBOX`, said in words on `Request::Inbox`). All: starred
@@ -1452,10 +1313,7 @@ impl Store {
             InboxFilter::Mentions => IS_MENTION,
             InboxFilter::Directs => "c.kind IN ('direct', 'group')",
         };
-        let belongs = format!(
-            "{IN_INBOX} AND (?1 IS NULL OR c.network = ?1) AND {narrowed}{}",
-            not_these(hidden)
-        );
+        let belongs = format!("{IN_INBOX} AND (?1 IS NULL OR c.network = ?1) AND {narrowed}{}", not_these(hidden));
         let first = match filter {
             InboxFilter::Unread | InboxFilter::Mentions => "c.mentions > 0",
             InboxFilter::All | InboxFilter::Directs => "c.starred",
@@ -1479,11 +1337,7 @@ impl Store {
     }
 
     /// How many rows each Inbox filter holds, in one pass.
-    pub fn inbox_counts(
-        &self,
-        network: Option<Network>,
-        hidden: &[AccountKey],
-    ) -> rusqlite::Result<InboxCounts> {
+    pub fn inbox_counts(&self, network: Option<Network>, hidden: &[AccountKey]) -> rusqlite::Result<InboxCounts> {
         self.db.query_row(
             &format!(
                 "SELECT COUNT(*), COALESCE(SUM({IS_UNREAD}), 0), COALESCE(SUM({IS_MENTION}), 0),
@@ -1532,11 +1386,7 @@ impl Store {
             // pins the folders hold are theirs alone, never lifted onto this list.
             None => "coalesce(c.pin, 2147483647),".to_owned(),
         };
-        let key = params![
-            word(&network),
-            account.map(|account| account.account.as_str()),
-            folder
-        ];
+        let key = params![word(&network), account.map(|account| account.account.as_str()), folder];
         let counts = self.db.query_row(
             &format!(
                 "SELECT COUNT(*), COALESCE(SUM({IS_UNREAD}), 0), COALESCE(SUM({IS_MENTION}), 0),
@@ -1555,13 +1405,7 @@ impl Store {
                  LIMIT ?4 OFFSET ?5"
             ))?
             .query_map(
-                params![
-                    word(&network),
-                    account.map(|account| account.account.as_str()),
-                    folder,
-                    limit,
-                    offset
-                ],
+                params![word(&network), account.map(|account| account.account.as_str()), folder, limit, offset],
                 conversation_from,
             )?
             .collect::<rusqlite::Result<Vec<protocol::Conversation>>>()?;
@@ -1582,84 +1426,50 @@ impl Store {
     }
 
     /// Which chats one folder pins, by account and chat id, with the folder's place for each.
-    fn folder_pins(
-        &self,
-        network: &str,
-        folder: &str,
-    ) -> rusqlite::Result<HashMap<(String, String), i32>> {
-        let mut statement = self.db.prepare(
-            "SELECT account, pinned FROM folder WHERE network = ?1 AND id = ?2 AND pinned != ''",
-        )?;
+    fn folder_pins(&self, network: &str, folder: &str) -> rusqlite::Result<HashMap<(String, String), i32>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT account, pinned FROM folder WHERE network = ?1 AND id = ?2 AND pinned != ''")?;
         let held: Vec<(String, String)> = statement
-            .query_map(params![network, folder], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?
+            .query_map(params![network, folder], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let mut pins: HashMap<(String, String), i32> = HashMap::new();
         for (account, pinned) in held {
             for (at, id) in from_id_list(&pinned).into_iter().enumerate() {
                 let place = at as i32 + 1;
-                pins.entry((account.clone(), id))
-                    .and_modify(|kept| *kept = (*kept).min(place))
-                    .or_insert(place);
+                pins.entry((account.clone(), id)).and_modify(|kept| *kept = (*kept).min(place)).or_insert(place);
             }
         }
         Ok(pins)
     }
 
     /// A forum's topics: its pins in order, then newest first, and how many there are.
-    pub fn topics(
-        &self,
-        forum: &Key,
-        offset: u32,
-        limit: u32,
-    ) -> rusqlite::Result<(Vec<Conversation>, u32)> {
+    pub fn topics(&self, forum: &Key, offset: u32, limit: u32) -> rusqlite::Result<(Vec<Conversation>, u32)> {
         let belongs = "c.network = ?1 AND c.account = ?2 AND c.parent = ?3 AND NOT c.hidden";
         let key = params![word(&forum.network), forum.account, forum.id];
-        let total = self.db.query_row(
-            &format!("SELECT COUNT(*) FROM conversation c WHERE {belongs}"),
-            key,
-            |row| row.get(0),
-        )?;
+        let total = self.db.query_row(&format!("SELECT COUNT(*) FROM conversation c WHERE {belongs}"), key, |row| row.get(0))?;
         let rows = self
             .db
             .prepare(&format!(
                 "{CONVERSATION} WHERE {belongs}
                  ORDER BY coalesce(c.pin, 2147483647), c.updated DESC, c.id LIMIT ?4 OFFSET ?5"
             ))?
-            .query_map(
-                params![word(&forum.network), forum.account, forum.id, limit, offset],
-                conversation_from,
-            )?
+            .query_map(params![word(&forum.network), forum.account, forum.id, limit, offset], conversation_from)?
             .collect::<rusqlite::Result<_>>()?;
         Ok((rows, total))
     }
 
     /// The followed threads of a Space, newest first, and how many there are.
-    pub fn threads(
-        &self,
-        space: &Key,
-        offset: u32,
-        limit: u32,
-    ) -> rusqlite::Result<(Vec<Conversation>, u32)> {
+    pub fn threads(&self, space: &Key, offset: u32, limit: u32) -> rusqlite::Result<(Vec<Conversation>, u32)> {
         let belongs = "c.network = ?1 AND c.account = ?2 AND c.kind = 'thread' AND c.followed
              AND (c.space = ?3 OR c.parent IN (SELECT p.id FROM conversation p
                    WHERE p.network = ?1 AND p.account = ?2 AND p.space = ?3))";
         let key = params![word(&space.network), space.account, space.id];
-        let total = self.db.query_row(
-            &format!("SELECT COUNT(*) FROM conversation c WHERE {belongs}"),
-            key,
-            |row| row.get(0),
-        )?;
+        let total = self.db.query_row(&format!("SELECT COUNT(*) FROM conversation c WHERE {belongs}"), key, |row| row.get(0))?;
         let rows = self
             .db
-            .prepare(&format!(
-                "{CONVERSATION} WHERE {belongs} ORDER BY c.updated DESC, c.id LIMIT ?4 OFFSET ?5"
-            ))?
-            .query_map(
-                params![word(&space.network), space.account, space.id, limit, offset],
-                conversation_from,
-            )?
+            .prepare(&format!("{CONVERSATION} WHERE {belongs} ORDER BY c.updated DESC, c.id LIMIT ?4 OFFSET ?5"))?
+            .query_map(params![word(&space.network), space.account, space.id, limit, offset], conversation_from)?
             .collect::<rusqlite::Result<_>>()?;
         Ok((rows, total))
     }
@@ -1687,17 +1497,10 @@ impl Store {
     // Folders.
 
     /// The account's folders, all of them, in the network's order. A folder no longer listed goes.
-    pub fn replace_folders(
-        &mut self,
-        account: &AccountKey,
-        folders: &[FolderRow],
-    ) -> rusqlite::Result<()> {
+    pub fn replace_folders(&mut self, account: &AccountKey, folders: &[FolderRow]) -> rusqlite::Result<()> {
         let tx = self.db.transaction()?;
         let key = params![word(&account.network), account.account];
-        tx.execute(
-            "DELETE FROM folder WHERE network = ?1 AND account = ?2",
-            key,
-        )?;
+        tx.execute("DELETE FROM folder WHERE network = ?1 AND account = ?2", key)?;
         for folder in folders.iter().take(FOLDERS_LIMIT) {
             let mut name = folder.name.clone();
             clip(&mut name, 100);
@@ -1748,12 +1551,7 @@ impl Store {
     }
 
     /// A Space's own settings: muted as a whole, and the user's "hide muted channels".
-    pub fn set_space_flags(
-        &mut self,
-        space: &Key,
-        muted: bool,
-        hide_muted: bool,
-    ) -> rusqlite::Result<bool> {
+    pub fn set_space_flags(&mut self, space: &Key, muted: bool, hide_muted: bool) -> rusqlite::Result<bool> {
         let changed = self.db.execute(
             "UPDATE space SET muted = ?4, hide_muted = ?5
               WHERE network = ?1 AND account = ?2 AND id = ?3 AND (muted != ?4 OR hide_muted != ?5)",
@@ -1766,18 +1564,10 @@ impl Store {
 
     /// The newest message as a line, for a network that lists only that. Kept only when it is
     /// not older than what the row already shows.
-    pub fn set_preview(
-        &mut self,
-        conversation: &Key,
-        line: &PreviewLine,
-    ) -> rusqlite::Result<bool> {
+    pub fn set_preview(&mut self, conversation: &Key, line: &PreviewLine) -> rusqlite::Result<bool> {
         let mut text = line.text.clone();
         clip(&mut text, 120);
-        let mut sender = if line.mine {
-            String::new()
-        } else {
-            line.sender.clone()
-        };
+        let mut sender = if line.mine { String::new() } else { line.sender.clone() };
         clip(&mut sender, 80);
         let changed = self.db.execute(
             "UPDATE conversation SET preview = ?4, preview_from = ?5, preview_mine = ?6, preview_id = ?7,
@@ -1804,32 +1594,18 @@ impl Store {
             "UPDATE conversation SET seen_to = ?4
               WHERE network = ?1 AND account = ?2 AND id = ?3
                 AND (seen_to = '' OR (length(seen_to), seen_to) < (length(?4), ?4))",
-            params![
-                word(&conversation.network),
-                conversation.account,
-                conversation.id,
-                message_id
-            ],
+            params![word(&conversation.network), conversation.account, conversation.id, message_id],
         )?;
         Ok(changed == 1)
     }
 
     /// My messages up to `message_id` reached the other side's device. True if the row changed.
-    pub fn set_delivered(
-        &mut self,
-        conversation: &Key,
-        message_id: &str,
-    ) -> rusqlite::Result<bool> {
+    pub fn set_delivered(&mut self, conversation: &Key, message_id: &str) -> rusqlite::Result<bool> {
         let changed = self.db.execute(
             "UPDATE conversation SET delivered_to = ?4
               WHERE network = ?1 AND account = ?2 AND id = ?3
                 AND (delivered_to = '' OR (length(delivered_to), delivered_to) < (length(?4), ?4))",
-            params![
-                word(&conversation.network),
-                conversation.account,
-                conversation.id,
-                message_id
-            ],
+            params![word(&conversation.network), conversation.account, conversation.id, message_id],
         )?;
         Ok(changed == 1)
     }
@@ -1849,22 +1625,14 @@ impl Store {
     }
 
     /// Conversations whose title contains `query`, most recently active first.
-    pub fn find(
-        &self,
-        network: Option<Network>,
-        query: &str,
-        limit: u32,
-    ) -> rusqlite::Result<Vec<Conversation>> {
+    pub fn find(&self, network: Option<Network>, query: &str, limit: u32) -> rusqlite::Result<Vec<Conversation>> {
         let pattern = format!("%{}", like_prefix(query));
         self.db
             .prepare(&format!(
                 "{CONVERSATION} WHERE (?1 IS NULL OR c.network = ?1) AND c.title LIKE ?2 ESCAPE '\\'
                  ORDER BY c.updated DESC, c.network, c.account, c.id LIMIT ?3"
             ))?
-            .query_map(
-                params![network.map(|network| word(&network)), pattern, limit],
-                conversation_from,
-            )?
+            .query_map(params![network.map(|network| word(&network)), pattern, limit], conversation_from)?
             .collect()
     }
 
@@ -1933,12 +1701,7 @@ impl Store {
         clip(&mut draft, DRAFT_LIMIT);
         let changed = self.db.execute(
             "UPDATE conversation SET draft = ?4 WHERE network = ?1 AND account = ?2 AND id = ?3",
-            params![
-                word(&conversation.network),
-                conversation.account,
-                conversation.id,
-                draft
-            ],
+            params![word(&conversation.network), conversation.account, conversation.id, draft],
         )?;
         Ok(changed == 1)
     }
@@ -1982,12 +1745,7 @@ impl Store {
                 "UPDATE conversation SET {column} = ?4
                   WHERE network = ?1 AND account = ?2 AND id = ?3 AND {column} != ?4"
             ),
-            params![
-                word(&conversation.network),
-                conversation.account,
-                conversation.id,
-                on
-            ],
+            params![word(&conversation.network), conversation.account, conversation.id, on],
         )?;
         Ok(changed == 1)
     }
@@ -2005,21 +1763,13 @@ impl Store {
     /// loaded. A marker older than the one already stored is ignored, so seeing an earlier
     /// message on screen cannot undo a catch-up. True when the row changed.
     pub fn mark_read(&mut self, conversation: &Key, message_id: &str) -> rusqlite::Result<bool> {
-        let target = if message_id.is_empty() {
-            self.preview_id(conversation)?
-        } else {
-            message_id.to_owned()
-        };
+        let target = if message_id.is_empty() { self.preview_id(conversation)? } else { message_id.to_owned() };
         let current: Option<(u32, u32, String)> = self
             .db
             .query_row(
                 "SELECT unread, mentions, last_read FROM conversation
                   WHERE network = ?1 AND account = ?2 AND id = ?3",
-                params![
-                    word(&conversation.network),
-                    conversation.account,
-                    conversation.id
-                ],
+                params![word(&conversation.network), conversation.account, conversation.id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
@@ -2027,24 +1777,18 @@ impl Store {
             return Ok(false);
         };
         // Never move the marker backwards. An empty target still clears a badge.
-        let marker =
-            if !target.is_empty() && (last_read.is_empty() || !id_is_ahead(&last_read, &target)) {
-                target
-            } else {
-                last_read.clone()
-            };
+        let marker = if !target.is_empty() && (last_read.is_empty() || !id_is_ahead(&last_read, &target)) {
+            target
+        } else {
+            last_read.clone()
+        };
         if unread == 0 && mentions == 0 && marker == last_read {
             return Ok(false);
         }
         let changed = self.db.execute(
             "UPDATE conversation SET unread = 0, mentions = 0, last_read = ?4
               WHERE network = ?1 AND account = ?2 AND id = ?3",
-            params![
-                word(&conversation.network),
-                conversation.account,
-                conversation.id,
-                marker
-            ],
+            params![word(&conversation.network), conversation.account, conversation.id, marker],
         )?;
         Ok(changed == 1)
     }
@@ -2059,12 +1803,7 @@ impl Store {
             "UPDATE conversation SET preview_id = ?4
               WHERE network = ?1 AND account = ?2 AND id = ?3
                 AND (preview_id = '' OR (length(preview_id), preview_id) < (length(?4), ?4))",
-            params![
-                word(&conversation.network),
-                conversation.account,
-                conversation.id,
-                message_id
-            ],
+            params![word(&conversation.network), conversation.account, conversation.id, message_id],
         )?;
         Ok(changed == 1)
     }
@@ -2090,11 +1829,7 @@ impl Store {
             .query_row(
                 "SELECT preview_id, last_read, kind FROM conversation
                   WHERE network = ?1 AND account = ?2 AND id = ?3",
-                params![
-                    word(&conversation.network),
-                    conversation.account,
-                    conversation.id
-                ],
+                params![word(&conversation.network), conversation.account, conversation.id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
@@ -2103,17 +1838,9 @@ impl Store {
         };
         tx.execute(
             "DELETE FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3",
-            params![
-                word(&conversation.network),
-                conversation.account,
-                conversation.id
-            ],
+            params![word(&conversation.network), conversation.account, conversation.id],
         )?;
-        let marker = if last_read.is_empty() || id_is_ahead(&preview, &last_read) {
-            preview
-        } else {
-            last_read
-        };
+        let marker = if last_read.is_empty() || id_is_ahead(&preview, &last_read) { preview } else { last_read };
         let hide = kind == "direct" || kind == "group";
         tx.execute(
             "UPDATE conversation SET unread = 0, mentions = 0, preview = '', preview_from = '', preview_mine = 0,
@@ -2128,10 +1855,7 @@ impl Store {
 
     /// Every conversation with a badge. The message id is the newest known, for the ack.
     /// The bool is a message request: read here, and not told to the network.
-    pub fn unread_marks(
-        &self,
-        network: Option<Network>,
-    ) -> rusqlite::Result<Vec<(Key, String, bool)>> {
+    pub fn unread_marks(&self, network: Option<Network>) -> rusqlite::Result<Vec<(Key, String, bool)>> {
         let mut stmt = self.db.prepare(
             "SELECT network, account, id, preview_id, last_read, special FROM conversation
               WHERE (unread > 0 OR mentions > 0) AND (?1 IS NULL OR network = ?1)",
@@ -2146,9 +1870,7 @@ impl Store {
             let preview: String = row.get(3)?;
             let last_read: String = row.get(4)?;
             let request = row.get::<_, String>(5)? == "request";
-            let marker = if !preview.is_empty()
-                && (last_read.is_empty() || id_is_ahead(&preview, &last_read))
-            {
+            let marker = if !preview.is_empty() && (last_read.is_empty() || id_is_ahead(&preview, &last_read)) {
                 preview
             } else {
                 last_read
@@ -2167,23 +1889,10 @@ impl Store {
     /// because the network already said how much of it is unread. A new outgoing message that is
     /// the newest clears the count: replying from any device means it was read. A message that
     /// carries the `client_id` of one still pending here replaces it.
-    pub fn ingest(
-        &mut self,
-        conversation: &Key,
-        message: &Message,
-        unread: bool,
-    ) -> rusqlite::Result<Stored> {
+    pub fn ingest(&mut self, conversation: &Key, message: &Message, unread: bool) -> rusqlite::Result<Stored> {
         let tx = self.db.transaction()?;
-        let (network, account, id) = (
-            word(&conversation.network),
-            &conversation.account,
-            &conversation.id,
-        );
-        if let Some(client_id) = message
-            .client_id
-            .as_deref()
-            .filter(|client_id| *client_id != message.id)
-        {
+        let (network, account, id) = (word(&conversation.network), &conversation.account, &conversation.id);
+        if let Some(client_id) = message.client_id.as_deref().filter(|client_id| *client_id != message.id) {
             tx.execute(
                 "DELETE FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3
                     AND id = ?4 AND pending != 0",
@@ -2218,17 +1927,7 @@ impl Store {
                 "INSERT OR REPLACE INTO message
                      (network, account, conversation, id, sent, text, pending, client_id, body)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    network,
-                    account,
-                    id,
-                    message.id,
-                    message.sent,
-                    message.text,
-                    pending,
-                    message.client_id,
-                    body
-                ],
+                params![network, account, id, message.id, message.sent, message.text, pending, message.client_id, body],
             )?;
         }
         let counts = unread && !message.outgoing;
@@ -2297,11 +1996,7 @@ impl Store {
                       WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND pending = 0
                       {NEWEST_FIRST} LIMIT 1"
                 ),
-                params![
-                    word(&conversation.network),
-                    conversation.account,
-                    conversation.id
-                ],
+                params![word(&conversation.network), conversation.account, conversation.id],
                 message_from,
             )
             .optional()?;
@@ -2311,11 +2006,7 @@ impl Store {
             PreviewLine {
                 id: message.id,
                 text,
-                sender: if mine {
-                    String::new()
-                } else {
-                    message.sender.name
-                },
+                sender: if mine { String::new() } else { message.sender.name },
                 mine,
                 sent: message.sent,
             }
@@ -2327,12 +2018,7 @@ impl Store {
             .query_row(
                 "SELECT id, text, body FROM message
                   WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
-                params![
-                    word(&conversation.network),
-                    conversation.account,
-                    conversation.id,
-                    id
-                ],
+                params![word(&conversation.network), conversation.account, conversation.id, id],
                 message_from,
             )
             .optional()
@@ -2358,10 +2044,7 @@ impl Store {
             )?;
         }
         // The body is the protocol's JSON, so a reply names its original in exactly this form.
-        let naming = format!(
-            "\"reply_to\":{{\"id\":{}",
-            serde_json::to_string(id).map_err(broken)?
-        );
+        let naming = format!("\"reply_to\":{{\"id\":{}", serde_json::to_string(id).map_err(broken)?);
         let replies: Vec<String> = self
             .db
             .prepare(
@@ -2397,11 +2080,7 @@ impl Store {
             return Ok(false);
         };
         let same = |have: &Reaction| {
-            have.emoji == reaction.emoji
-                || have
-                    .file
-                    .as_ref()
-                    .is_some_and(|file| file.id == reaction.emoji)
+            have.emoji == reaction.emoji || have.file.as_ref().is_some_and(|file| file.id == reaction.emoji)
         };
         let at = message.reactions.iter().position(same);
         match (at, added) {
@@ -2431,13 +2110,7 @@ impl Store {
     /// The ids stored between two message ids, both included, oldest first: what an adapter
     /// compares a page from the network against to find what was deleted while it was away.
     /// Ids are compared as the numbers they are written as (shorter first, then by text).
-    pub fn ids_between(
-        &self,
-        conversation: &Key,
-        oldest: &str,
-        newest: &str,
-        limit: u32,
-    ) -> rusqlite::Result<Vec<String>> {
+    pub fn ids_between(&self, conversation: &Key, oldest: &str, newest: &str, limit: u32) -> rusqlite::Result<Vec<String>> {
         self.db
             .prepare(&format!(
                 "SELECT id FROM message
@@ -2469,15 +2142,11 @@ impl Store {
         // The body is the protocol's JSON, so a message that holds one says so in these words.
         let holds = match kind {
             SharedKind::Media | SharedKind::Files => "instr(body, '\"attachments\"') > 0",
-            SharedKind::Links => {
-                "(instr(body, '\"previews\"') > 0 OR instr(body, '\"style\":\"link\"') > 0)"
-            }
+            SharedKind::Links => "(instr(body, '\"previews\"') > 0 OR instr(body, '\"style\":\"link\"') > 0)",
         };
         let below = match before {
-            Some(_) => {
-                "AND (sent, length(id), id) < (SELECT sent, length(id), id FROM message
-                           WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4)"
-            }
+            Some(_) => "AND (sent, length(id), id) < (SELECT sent, length(id), id FROM message
+                           WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4)",
             None => "AND ?4 IS NULL",
         };
         let mut query = self.db.prepare(&format!(
@@ -2485,13 +2154,7 @@ impl Store {
               WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND pending = 0 {below} AND {holds}
               {NEWEST_FIRST} LIMIT ?5"
         ))?;
-        let key = params![
-            word(&conversation.network),
-            conversation.account,
-            conversation.id,
-            before,
-            KEEP_MESSAGES
-        ];
+        let key = params![word(&conversation.network), conversation.account, conversation.id, before, KEEP_MESSAGES];
         let mut items: Vec<SharedItem> = Vec::new();
         let mut more = false;
         for message in query.query_map(key, message_from)? {
@@ -2509,18 +2172,12 @@ impl Store {
                 title: title.to_owned(),
             };
             let pictured = |kind: protocol::MediaKind| {
-                matches!(
-                    kind,
-                    protocol::MediaKind::Image
-                        | protocol::MediaKind::Video
-                        | protocol::MediaKind::Gif
-                )
+                matches!(kind, protocol::MediaKind::Image | protocol::MediaKind::Video | protocol::MediaKind::Gif)
             };
             match kind {
                 SharedKind::Media | SharedKind::Files => {
                     let wanted = message.attachments.iter().filter(|attachment| {
-                        !attachment.sticker
-                            && pictured(attachment.file.kind) == (kind == SharedKind::Media)
+                        !attachment.sticker && pictured(attachment.file.kind) == (kind == SharedKind::Media)
                     });
                     items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
                 }
@@ -2545,14 +2202,11 @@ impl Store {
             "SELECT path, bytes, failed FROM media WHERE network = ?1 AND account = ?2 AND id = ?3",
         )?;
         let files = items.iter_mut().filter_map(|item| item.attachment.as_mut());
-        for file in files.flat_map(|attachment| {
-            std::iter::once(&mut attachment.file).chain(&mut attachment.thumb)
-        }) {
+        for file in files.flat_map(|attachment| std::iter::once(&mut attachment.file).chain(&mut attachment.thumb)) {
             let known: Option<(Option<String>, i64, Option<String>)> = path
-                .query_row(
-                    params![word(&conversation.network), conversation.account, file.id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
+                .query_row(params![word(&conversation.network), conversation.account, file.id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
                 .optional()?;
             match known {
                 Some((Some(on_disk), bytes, _)) => {
@@ -2575,11 +2229,7 @@ impl Store {
                       WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND pending = 0
                       {NEWEST_FIRST} LIMIT 1"
                 ),
-                params![
-                    word(&conversation.network),
-                    conversation.account,
-                    conversation.id
-                ],
+                params![word(&conversation.network), conversation.account, conversation.id],
                 |row| row.get(0),
             )
             .optional()
@@ -2612,11 +2262,7 @@ impl Store {
             return Ok(None);
         };
         // One more than asked for says whether there is more in that direction.
-        let run = |side: &str,
-                   order: &str,
-                   anchor: Option<&str>,
-                   limit: u32|
-         -> rusqlite::Result<(Vec<Message>, bool)> {
+        let run = |side: &str, order: &str, anchor: Option<&str>, limit: u32| -> rusqlite::Result<(Vec<Message>, bool)> {
             let mut values = key.to_vec();
             let place = match anchor {
                 Some(anchor) => {
@@ -2670,9 +2316,7 @@ impl Store {
         )?;
         for file in messages.iter_mut().flat_map(Message::files_mut) {
             let known: Option<(Option<String>, i64, Option<String>)> = path
-                .query_row(params![key[0], key[1], file.id], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })
+                .query_row(params![key[0], key[1], file.id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                 .optional()?;
             match known {
                 Some((Some(on_disk), bytes, _)) => {
@@ -2722,11 +2366,7 @@ impl Store {
     // People.
 
     /// People seen: authors, friends, search results. A person's relationship is left alone.
-    pub fn upsert_people(
-        &mut self,
-        account: &AccountKey,
-        people: &[PersonRow],
-    ) -> rusqlite::Result<()> {
+    pub fn upsert_people(&mut self, account: &AccountKey, people: &[PersonRow]) -> rusqlite::Result<()> {
         let tx = self.db.transaction()?;
         for person in people {
             tx.execute(
@@ -2757,23 +2397,14 @@ impl Store {
         let changed = self.db.execute(
             "UPDATE person SET relation = ?4
               WHERE network = ?1 AND account = ?2 AND id = ?3 AND relation != ?4",
-            params![
-                word(&person.network),
-                person.account,
-                person.id,
-                word(&relation)
-            ],
+            params![word(&person.network), person.account, person.id, word(&relation)],
         )?;
         Ok(changed == 1)
     }
 
     /// The account's whole owned list, as the network sent it at connect. Anyone not in it is no
     /// longer a friend or contact.
-    pub fn replace_relations(
-        &mut self,
-        account: &AccountKey,
-        relations: &[(String, Relation)],
-    ) -> rusqlite::Result<()> {
+    pub fn replace_relations(&mut self, account: &AccountKey, relations: &[(String, Relation)]) -> rusqlite::Result<()> {
         let tx = self.db.transaction()?;
         let (network, id) = (word(&account.network), &account.account);
         tx.execute(
@@ -2828,20 +2459,13 @@ impl Store {
                 "{PERSON} WHERE {matching}
                  ORDER BY p.name COLLATE NOCASE, p.network, p.account, p.id LIMIT ?4 OFFSET ?5"
             ))?
-            .query_map(
-                params![network, relation, pattern, limit, offset],
-                person_from,
-            )?
+            .query_map(params![network, relation, pattern, limit, offset], person_from)?
             .collect::<rusqlite::Result<_>>()?;
         Ok((people, total))
     }
 
     /// What a person's row says beyond `PersonRow`: their title, time zone and tag.
-    pub fn set_details(
-        &mut self,
-        account: &AccountKey,
-        people: &[(String, PersonDetails)],
-    ) -> rusqlite::Result<()> {
+    pub fn set_details(&mut self, account: &AccountKey, people: &[(String, PersonDetails)]) -> rusqlite::Result<()> {
         let tx = self.db.transaction()?;
         for (id, details) in people {
             let mut title = details.title.clone();
@@ -2849,14 +2473,7 @@ impl Store {
             tx.execute(
                 "UPDATE person SET title = ?4, utc_offset = ?5, mark = ?6
                   WHERE network = ?1 AND account = ?2 AND id = ?3",
-                params![
-                    word(&account.network),
-                    account.account,
-                    id,
-                    title,
-                    details.utc_offset,
-                    mark_word(&details.mark)
-                ],
+                params![word(&account.network), account.account, id, title, details.utc_offset, mark_word(&details.mark)],
             )?;
         }
         tx.commit()
@@ -2875,12 +2492,7 @@ impl Store {
     }
 
     /// The people of direct conversations with a message since `since`, bots never, A to Z.
-    pub fn talked_to(
-        &self,
-        network: Option<Network>,
-        since: i64,
-        limit: u32,
-    ) -> rusqlite::Result<Vec<Person>> {
+    pub fn talked_to(&self, network: Option<Network>, since: i64, limit: u32) -> rusqlite::Result<Vec<Person>> {
         self.db
             .prepare(&format!(
                 "{PERSON} WHERE (?1 IS NULL OR p.network = ?1) AND NOT p.bot AND EXISTS
@@ -2889,10 +2501,7 @@ impl Store {
                          AND c.kind = 'direct' AND c.updated >= ?2 AND NOT c.bot)
                  ORDER BY p.name COLLATE NOCASE, p.network, p.account, p.id LIMIT ?3"
             ))?
-            .query_map(
-                params![network.map(|network| word(&network)), since, limit],
-                person_from,
-            )?
+            .query_map(params![network.map(|network| word(&network)), since, limit], person_from)?
             .collect()
     }
 
@@ -2907,12 +2516,7 @@ impl Store {
 
     /// A picture the adapter fetched itself is the row's and the person's of this id, whichever
     /// are recorded; nothing else of either changes. Answers (row, person): which were.
-    pub fn set_avatar(
-        &mut self,
-        account: &AccountKey,
-        id: &str,
-        avatar: &str,
-    ) -> rusqlite::Result<(bool, bool)> {
+    pub fn set_avatar(&mut self, account: &AccountKey, id: &str, avatar: &str) -> rusqlite::Result<(bool, bool)> {
         let at = params![word(&account.network), account.account, id, avatar];
         let row = self.db.execute(
             "UPDATE conversation SET avatar = ?4 WHERE network = ?1 AND account = ?2 AND id = ?3 AND avatar != ?4",
@@ -2929,11 +2533,7 @@ impl Store {
 
     /// Files the network can serve and where from. A file already on disk stays there; a fresh
     /// address replaces an expired one, and is worth one more try after a failure.
-    pub fn register_media(
-        &mut self,
-        account: &AccountKey,
-        files: &[(MediaFile, String)],
-    ) -> rusqlite::Result<()> {
+    pub fn register_media(&mut self, account: &AccountKey, files: &[(MediaFile, String)]) -> rusqlite::Result<()> {
         let tx = self.db.transaction()?;
         for (file, url) in files {
             tx.execute(
@@ -2944,27 +2544,14 @@ impl Store {
                      url = CASE WHEN size = 0 THEN excluded.url ELSE url END,
                      width = max(width, excluded.width), height = max(height, excluded.height),
                      bytes = CASE WHEN path IS NULL THEN excluded.bytes ELSE bytes END",
-                params![
-                    word(&account.network),
-                    account.account,
-                    file.id,
-                    word(&file.kind),
-                    file.width,
-                    file.height,
-                    file.bytes as i64,
-                    url
-                ],
+                params![word(&account.network), account.account, file.id, word(&file.kind), file.width, file.height, file.bytes as i64, url],
             )?;
         }
         tx.commit()
     }
 
     /// What is known about these files, and where each is fetched from. Unknown ids are left out.
-    pub fn media(
-        &self,
-        account: &AccountKey,
-        ids: &[String],
-    ) -> rusqlite::Result<Vec<(MediaFile, String)>> {
+    pub fn media(&self, account: &AccountKey, ids: &[String]) -> rusqlite::Result<Vec<(MediaFile, String)>> {
         let mut query = self.db.prepare(
             "SELECT id, kind, width, height, bytes, path, failed, url FROM media
               WHERE network = ?1 AND account = ?2 AND id = ?3",
@@ -2972,10 +2559,9 @@ impl Store {
         let mut files = Vec::with_capacity(ids.len());
         for id in ids {
             let found = query
-                .query_row(
-                    params![word(&account.network), account.account, id],
-                    |row| Ok((file_at(row, 0)?, row.get(7)?)),
-                )
+                .query_row(params![word(&account.network), account.account, id], |row| {
+                    Ok((file_at(row, 0)?, row.get(7)?))
+                })
                 .optional()?;
             if let Some((Some(file), url)) = found {
                 files.push((file, url));
@@ -2996,38 +2582,20 @@ impl Store {
         self.db.execute(
             "UPDATE media SET path = ?4, bytes = ?5, used = ?6, failed = NULL
               WHERE network = ?1 AND account = ?2 AND id = ?3",
-            params![
-                word(&account.network),
-                account.account,
-                id,
-                path,
-                bytes as i64,
-                now
-            ],
+            params![word(&account.network), account.account, id, path, bytes as i64, now],
         )?;
-        Ok(self
-            .media(account, &[id.to_owned()])?
-            .pop()
-            .map(|(file, _)| file))
+        Ok(self.media(account, &[id.to_owned()])?.pop().map(|(file, _)| file))
     }
 
     /// The fetch failed because of the file, and why in plain words. Until `media_retry`, or a
     /// fresh address from the adapter, the file is answered with this reason and not fetched.
     /// `None` when no such file was registered. A failure of the line is not recorded here.
-    pub fn media_failed(
-        &mut self,
-        account: &AccountKey,
-        id: &str,
-        reason: &str,
-    ) -> rusqlite::Result<Option<MediaFile>> {
+    pub fn media_failed(&mut self, account: &AccountKey, id: &str, reason: &str) -> rusqlite::Result<Option<MediaFile>> {
         self.db.execute(
             "UPDATE media SET failed = ?4 WHERE network = ?1 AND account = ?2 AND id = ?3 AND path IS NULL",
             params![word(&account.network), account.account, id, reason],
         )?;
-        Ok(self
-            .media(account, &[id.to_owned()])?
-            .pop()
-            .map(|(file, _)| file))
+        Ok(self.media(account, &[id.to_owned()])?.pop().map(|(file, _)| file))
     }
 
     /// The user asked for these again: their failures are forgotten. Answers how many had one.
@@ -3052,9 +2620,7 @@ impl Store {
         let tx = self.db.transaction()?;
         let failed: Vec<(String, String, String, String)> = tx
             .prepare("SELECT network, account, id, failed FROM media WHERE failed IS NOT NULL")?
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let mut forgiven = 0;
         for (network, account, id, why) in failed.iter().filter(|(.., why)| passing(why)) {
@@ -3069,12 +2635,7 @@ impl Store {
 
     /// The adapter exchanged an expired address for a fresh one (`Command::Download`): keep it,
     /// so the next fetch does not have to ask again.
-    pub fn media_refreshed(
-        &mut self,
-        account: &AccountKey,
-        id: &str,
-        url: &str,
-    ) -> rusqlite::Result<()> {
+    pub fn media_refreshed(&mut self, account: &AccountKey, id: &str, url: &str) -> rusqlite::Result<()> {
         self.db.execute(
             "UPDATE media SET url = ?4 WHERE network = ?1 AND account = ?2 AND id = ?3",
             params![word(&account.network), account.account, id, url],
@@ -3086,18 +2647,10 @@ impl Store {
     /// from, at most [`VARIANTS`]. Replaces what was registered for the file before. The file
     /// itself must have been registered; its own address is the size its `width` and `height`
     /// say.
-    pub fn register_variants(
-        &mut self,
-        account: &AccountKey,
-        id: &str,
-        variants: &[(u32, String)],
-    ) -> rusqlite::Result<()> {
+    pub fn register_variants(&mut self, account: &AccountKey, id: &str, variants: &[(u32, String)]) -> rusqlite::Result<()> {
         let tx = self.db.transaction()?;
         let key = params![word(&account.network), account.account, id];
-        tx.execute(
-            "DELETE FROM media_variant WHERE network = ?1 AND account = ?2 AND id = ?3",
-            key,
-        )?;
+        tx.execute("DELETE FROM media_variant WHERE network = ?1 AND account = ?2 AND id = ?3", key)?;
         for (size, url) in variants.iter().take(VARIANTS) {
             tx.execute(
                 "INSERT OR REPLACE INTO media_variant (network, account, id, size, url) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -3117,12 +2670,7 @@ impl Store {
     /// that is large enough (the largest there is, failing that) and loses its path, so the
     /// next fetch brings the larger one. A file never goes back to a smaller size. Answers the
     /// ids that changed.
-    pub fn media_sized(
-        &mut self,
-        account: &AccountKey,
-        ids: &[String],
-        size: u32,
-    ) -> rusqlite::Result<Vec<String>> {
+    pub fn media_sized(&mut self, account: &AccountKey, ids: &[String], size: u32) -> rusqlite::Result<Vec<String>> {
         let tx = self.db.transaction()?;
         let mut changed = Vec::new();
         for id in ids {
@@ -3161,12 +2709,7 @@ impl Store {
     }
 
     /// The files were asked for again, so they are the last to be evicted.
-    pub fn media_used(
-        &mut self,
-        account: &AccountKey,
-        ids: &[String],
-        now: i64,
-    ) -> rusqlite::Result<()> {
+    pub fn media_used(&mut self, account: &AccountKey, ids: &[String], now: i64) -> rusqlite::Result<()> {
         let tx = self.db.transaction()?;
         for id in ids {
             tx.execute(
@@ -3189,11 +2732,7 @@ impl Store {
     }
 
     /// Files on disk, least recently used first. With an account: that account's only.
-    pub fn media_on_disk(
-        &self,
-        account: Option<&AccountKey>,
-        limit: u32,
-    ) -> rusqlite::Result<Vec<OnDisk>> {
+    pub fn media_on_disk(&self, account: Option<&AccountKey>, limit: u32) -> rusqlite::Result<Vec<OnDisk>> {
         let network = account.map(|account| word(&account.network));
         let id = account.map(|account| account.account.as_str());
         let mut query = self.db.prepare(
@@ -3237,12 +2776,7 @@ impl Store {
             .optional()
     }
 
-    pub fn set_name(
-        &mut self,
-        account: &AccountKey,
-        id: &str,
-        value: &str,
-    ) -> rusqlite::Result<()> {
+    pub fn set_name(&mut self, account: &AccountKey, id: &str, value: &str) -> rusqlite::Result<()> {
         self.db.execute(
             "INSERT OR REPLACE INTO name (network, account, id, value) VALUES (?1, ?2, ?3, ?4)",
             params![word(&account.network), account.account, id, value],
@@ -3282,12 +2816,7 @@ impl Store {
                               WHERE network = ?1 AND account = ?2 AND conversation = ?3
                               {NEWEST_FIRST} LIMIT ?4)"
                 ),
-                params![
-                    word(&conversation.network),
-                    conversation.account,
-                    conversation.id,
-                    KEEP_MESSAGES
-                ],
+                params![word(&conversation.network), conversation.account, conversation.id, KEEP_MESSAGES],
             )?;
         }
         // A thread goes with its first message, unless the user opened it lately.
@@ -3304,10 +2833,7 @@ impl Store {
             ),
             params![cutoff],
         )?;
-        tx.execute(
-            &format!("DELETE FROM conversation AS t WHERE {aged}"),
-            params![cutoff],
-        )?;
+        tx.execute(&format!("DELETE FROM conversation AS t WHERE {aged}"), params![cutoff])?;
         // And one whose parent is gone altogether goes whatever its age.
         let orphaned = "t.parent != '' AND NOT EXISTS
                 (SELECT 1 FROM conversation p
@@ -3321,10 +2847,7 @@ impl Store {
             ),
             [],
         )?;
-        tx.execute(
-            &format!("DELETE FROM conversation AS t WHERE {orphaned}"),
-            [],
-        )?;
+        tx.execute(&format!("DELETE FROM conversation AS t WHERE {orphaned}"), [])?;
         tx.commit()?;
         Ok(gone)
     }
@@ -3338,15 +2861,10 @@ mod tests {
     const NOW: i64 = 1_800_000_000;
 
     fn store() -> (Store, Key) {
-        let mut store = Store {
-            db: Connection::open_in_memory().unwrap(),
-        };
+        let mut store = Store { db: Connection::open_in_memory().unwrap() };
         store.db.execute_batch(TABLES).unwrap();
         store.db.execute_batch(SETTINGS).unwrap();
-        let account = AccountKey {
-            network: Network::Discord,
-            account: "me".into(),
-        };
+        let account = AccountKey { network: Network::Discord, account: "me".into() };
         let row = ConversationRow::new("general", ConversationKind::Channel, "#general");
         store.upsert_conversation(&account, &row).unwrap();
         (store, Key::new(&account, "general"))
@@ -3357,221 +2875,90 @@ mod tests {
     }
 
     fn ids(page: &MessagePage) -> Vec<&str> {
-        page.messages
-            .iter()
-            .map(|message| message.id.as_str())
-            .collect()
+        page.messages.iter().map(|message| message.id.as_str()).collect()
     }
 
     #[test]
-    fn a_message_search_finds_the_words_said_newest_first_and_skips_what_never_went_or_went_hidden()
-    {
+    fn a_message_search_finds_the_words_said_newest_first_and_skips_what_never_went_or_went_hidden() {
         let (mut store, key) = store();
         let account = key.account();
         let hidden = Key::new(&account, "secret");
         store
-            .upsert_conversation(
-                &account,
-                &ConversationRow {
-                    filing: Some(Filing {
-                        hidden: true,
-                        ..Filing::default()
-                    }),
-                    ..ConversationRow::new("secret", ConversationKind::Direct, "Hidden")
-                },
-            )
+            .upsert_conversation(&account, &ConversationRow {
+                filing: Some(Filing { hidden: true, ..Filing::default() }),
+                ..ConversationRow::new("secret", ConversationKind::Direct, "Hidden")
+            })
             .unwrap();
-        store
-            .ingest(&key, &said("1", "hello world", 10), false)
-            .unwrap();
-        store
-            .ingest(&key, &said("2", "WORLD peace", 20), true)
-            .unwrap();
-        let never = Message {
-            state: SendState::Pending,
-            ..said("3", "world in waiting", 30)
-        };
+        store.ingest(&key, &said("1", "hello world", 10), false).unwrap();
+        store.ingest(&key, &said("2", "WORLD peace", 20), true).unwrap();
+        let never = Message { state: SendState::Pending, ..said("3", "world in waiting", 30) };
         store.ingest(&key, &never, false).unwrap();
-        store
-            .ingest(&hidden, &said("4", "world of secrets", 40), true)
-            .unwrap();
+        store.ingest(&hidden, &said("4", "world of secrets", 40), true).unwrap();
         let request = Key::new(&account, "stranger");
         store
-            .upsert_conversation(
-                &account,
-                &ConversationRow {
-                    special: Special::Request,
-                    ..ConversationRow::new("stranger", ConversationKind::Direct, "Stranger")
-                },
-            )
+            .upsert_conversation(&account, &ConversationRow {
+                special: Special::Request,
+                ..ConversationRow::new("stranger", ConversationKind::Direct, "Stranger")
+            })
             .unwrap();
-        store
-            .ingest(&request, &said("5", "world of tickets", 50), true)
-            .unwrap();
+        store.ingest(&request, &said("5", "world of tickets", 50), true).unwrap();
 
-        let hits = store
-            .search_messages(None, None, None, "world", 10)
-            .unwrap();
-        assert_eq!(
-            hits.iter()
-                .map(|hit| hit.message_id.as_str())
-                .collect::<Vec<_>>(),
-            ["2", "1"]
-        );
-        assert_eq!(
-            (hits[0].sender.as_str(), hits[0].snippet.as_str()),
-            ("mara", "WORLD peace")
-        );
+        let hits = store.search_messages(None, None, None, "world", 10).unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.message_id.as_str()).collect::<Vec<_>>(), ["2", "1"]);
+        assert_eq!((hits[0].sender.as_str(), hits[0].snippet.as_str()), ("mara", "WORLD peace"));
         assert!(!hits[0].outgoing && hits[0].title == "#general");
         assert_eq!(hits[0].conversation, key);
 
         // Named conversation and network narrow; a hidden conversation answers nothing at all.
-        assert_eq!(
-            store
-                .search_messages(Some(&key), None, None, "world", 10)
-                .unwrap()
-                .len(),
-            2
-        );
-        assert!(store
-            .search_messages(Some(&hidden), None, None, "world", 10)
-            .unwrap()
-            .is_empty());
-        assert_eq!(
-            store
-                .search_messages(None, Some(Network::Slack), None, "world", 10)
-                .unwrap()
-                .len(),
-            0
-        );
-        assert_eq!(
-            store
-                .search_messages(None, Some(Network::Discord), None, "world", 10)
-                .unwrap()
-                .len(),
-            2
-        );
+        assert_eq!(store.search_messages(Some(&key), None, None, "world", 10).unwrap().len(), 2);
+        assert!(store.search_messages(Some(&hidden), None, None, "world", 10).unwrap().is_empty());
+        assert_eq!(store.search_messages(None, Some(Network::Slack), None, "world", 10).unwrap().len(), 0);
+        assert_eq!(store.search_messages(None, Some(Network::Discord), None, "world", 10).unwrap().len(), 2);
 
         // Case goes for nothing, a longer cut carries the marker, and an empty query finds none.
         let cut = store.search_messages(None, None, None, "peace", 1).unwrap();
         assert_eq!(cut.len(), 1);
-        assert!(store
-            .search_messages(None, None, None, "  ", 10)
-            .unwrap()
-            .is_empty());
+        assert!(store.search_messages(None, None, None, "  ", 10).unwrap().is_empty());
 
         // What the user typed means itself: a percent is not a wildcard.
-        store
-            .ingest(&key, &said("5", "we matched 50% there", 50), false)
-            .unwrap();
-        assert_eq!(
-            store
-                .search_messages(None, None, None, "50%", 10)
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            store
-                .search_messages(None, None, None, "0%_t", 10)
-                .unwrap()
-                .len(),
-            0
-        );
+        store.ingest(&key, &said("5", "we matched 50% there", 50), false).unwrap();
+        assert_eq!(store.search_messages(None, None, None, "50%", 10).unwrap().len(), 1);
+        assert_eq!(store.search_messages(None, None, None, "0%_t", 10).unwrap().len(), 0);
 
         // A match far into a long message is still the hit's window, marked on both ends.
-        let long = format!(
-            "{} the needle turns up here {}",
-            "filler ".repeat(60),
-            "and the text goes on".repeat(20)
-        );
+        let long = format!("{} the needle turns up here {}", "filler ".repeat(60), "and the text goes on".repeat(20));
         store.ingest(&key, &said("6", &long, 60), false).unwrap();
-        let far = store
-            .search_messages(None, None, None, "needle", 1)
-            .unwrap();
+        let far = store.search_messages(None, None, None, "needle", 1).unwrap();
         assert_eq!(far.len(), 1);
-        assert!(
-            far[0].snippet.starts_with("...") && far[0].snippet.ends_with("..."),
-            "{}",
-            far[0].snippet
-        );
-        assert!(
-            far[0].snippet.contains("needle turns up"),
-            "{}",
-            far[0].snippet
-        );
+        assert!(far[0].snippet.starts_with("...") && far[0].snippet.ends_with("..."), "{}", far[0].snippet);
+        assert!(far[0].snippet.contains("needle turns up"), "{}", far[0].snippet);
     }
 
     #[test]
     fn a_message_search_narrows_to_one_space() {
         let (mut store, key) = store();
         let account = key.account();
-        for (id, title, space) in [
-            ("guilded", "#in the space", Some("guild")),
-            ("loose", "#no space", None),
-        ] {
+        for (id, title, space) in [("guilded", "#in the space", Some("guild")), ("loose", "#no space", None)] {
             let mut row = ConversationRow::new(id, ConversationKind::Channel, title);
             row.space = space.map(|space| space.to_owned());
             store.upsert_conversation(&account, &row).unwrap();
         }
-        store
-            .ingest(
-                &Key::new(&account, "guilded"),
-                &said("1", "world of the guild", 10),
-                false,
-            )
-            .unwrap();
-        store
-            .ingest(
-                &Key::new(&account, "loose"),
-                &said("2", "world outside", 20),
-                false,
-            )
-            .unwrap();
+        store.ingest(&Key::new(&account, "guilded"), &said("1", "world of the guild", 10), false).unwrap();
+        store.ingest(&Key::new(&account, "loose"), &said("2", "world outside", 20), false).unwrap();
 
         store
-            .replace_spaces(
-                &account,
-                &[SpaceRow {
-                    id: "guild".into(),
-                    name: "Moss & Lichen".into(),
-                    icon: None,
-                    position: 0,
-                }],
-            )
+            .replace_spaces(&account, &[SpaceRow { id: "guild".into(), name: "Moss & Lichen".into(), icon: None, position: 0 }])
             .unwrap();
         let space = Key::new(&account, "guild");
-        let hits = store
-            .search_messages(None, None, Some(&space), "world", 10)
-            .unwrap();
-        assert_eq!(
-            hits.iter()
-                .map(|hit| hit.message_id.as_str())
-                .collect::<Vec<_>>(),
-            ["1"]
-        );
+        let hits = store.search_messages(None, None, Some(&space), "world", 10).unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.message_id.as_str()).collect::<Vec<_>>(), ["1"]);
         assert_eq!(hits[0].title, "#in the space");
         assert_eq!(hits[0].space_title, "Moss & Lichen");
         // The same space id on another network or account holds other rows: nothing answers.
-        let elsewhere = Key::new(
-            &AccountKey {
-                network: Network::Slack,
-                account: "me".into(),
-            },
-            "guild",
-        );
-        assert!(store
-            .search_messages(None, None, Some(&elsewhere), "world", 10)
-            .unwrap()
-            .is_empty());
+        let elsewhere = Key::new(&AccountKey { network: Network::Slack, account: "me".into() }, "guild");
+        assert!(store.search_messages(None, None, Some(&elsewhere), "world", 10).unwrap().is_empty());
         // With no space named, the cache answers as a whole.
-        assert_eq!(
-            store
-                .search_messages(None, None, None, "world", 10)
-                .unwrap()
-                .len(),
-            2
-        );
+        assert_eq!(store.search_messages(None, None, None, "world", 10).unwrap().len(), 2);
     }
 
     #[test]
@@ -3581,44 +2968,24 @@ mod tests {
         for (id, sent) in [("8", 10), ("9", 20), ("10", 20), ("11", 20), ("12", 30)] {
             store.ingest(&key, &said(id, id, sent), false).unwrap();
         }
-        let page = |store: &mut Store, page: Page, limit| {
-            store.messages(&key, &page, limit, NOW).unwrap().unwrap()
-        };
+        let page = |store: &mut Store, page: Page, limit| store.messages(&key, &page, limit, NOW).unwrap().unwrap();
 
         let newest = page(&mut store, Page::Newest, 2);
-        assert_eq!(
-            (ids(&newest), newest.older, newest.newer),
-            (vec!["11", "12"], true, false)
-        );
+        assert_eq!((ids(&newest), newest.older, newest.newer), (vec!["11", "12"], true, false));
 
         let before = page(&mut store, Page::Before { id: "11".into() }, 2);
-        assert_eq!(
-            (ids(&before), before.older, before.newer),
-            (vec!["9", "10"], true, true)
-        );
+        assert_eq!((ids(&before), before.older, before.newer), (vec!["9", "10"], true, true));
         let first = page(&mut store, Page::Before { id: "9".into() }, 2);
         assert_eq!((ids(&first), first.older), (vec!["8"], false));
 
         let after = page(&mut store, Page::After { id: "9".into() }, 5);
-        assert_eq!(
-            (ids(&after), after.older, after.newer),
-            (vec!["10", "11", "12"], true, false)
-        );
+        assert_eq!((ids(&after), after.older, after.newer), (vec!["10", "11", "12"], true, false));
 
         let around = page(&mut store, Page::Around { id: "10".into() }, 2);
-        assert_eq!(
-            (ids(&around), around.older, around.newer),
-            (vec!["9", "10", "11"], true, true)
-        );
+        assert_eq!((ids(&around), around.older, around.newer), (vec!["9", "10", "11"], true, true));
 
-        let missing = Key {
-            id: "nowhere".into(),
-            ..key.clone()
-        };
-        assert!(store
-            .messages(&missing, &Page::Newest, 2, NOW)
-            .unwrap()
-            .is_none());
+        let missing = Key { id: "nowhere".into(), ..key.clone() };
+        assert!(store.messages(&missing, &Page::Newest, 2, NOW).unwrap().is_none());
     }
 
     #[test]
@@ -3633,10 +3000,7 @@ mod tests {
         assert_eq!(store.ingest(&key, &mention, true).unwrap(), Stored::Same);
 
         let row = store.conversation(&key).unwrap().unwrap();
-        assert_eq!(
-            (row.unread, row.mentions, row.preview.as_str()),
-            (2, 1, "@you look")
-        );
+        assert_eq!((row.unread, row.mentions, row.preview.as_str()), (2, 1, "@you look"));
         assert_eq!(row.badge(), Badge::Count(1));
         assert_eq!(store.accounts().unwrap(), []);
 
@@ -3645,15 +3009,9 @@ mod tests {
         assert_eq!((account.attention, account.unread), (1, false));
 
         assert!(store.mark_read(&key, "2").unwrap());
-        assert!(
-            !store.mark_read(&key, "2").unwrap(),
-            "reading twice is not a change"
-        );
+        assert!(!store.mark_read(&key, "2").unwrap(), "reading twice is not a change");
         let row = store.conversation(&key).unwrap().unwrap();
-        assert_eq!(
-            (row.unread, row.mentions, row.last_read.as_deref()),
-            (0, 0, Some("2"))
-        );
+        assert_eq!((row.unread, row.mentions, row.last_read.as_deref()), (0, 0, Some("2")));
     }
 
     #[test]
@@ -3661,56 +3019,24 @@ mod tests {
         let (mut store, key) = store();
         let account = key.account();
         let dm = Key::new(&account, "dm");
-        store
-            .upsert_conversation(
-                &account,
-                &ConversationRow::new("dm", ConversationKind::Direct, "Mara"),
-            )
-            .unwrap();
+        store.upsert_conversation(&account, &ConversationRow::new("dm", ConversationKind::Direct, "Mara")).unwrap();
         store.ingest(&dm, &said("10", "hello", 10), true).unwrap();
         assert!(store.note_newest(&dm, "20").unwrap());
-        assert!(
-            !store.note_newest(&dm, "5").unwrap(),
-            "an older id does not replace the newest"
-        );
-        assert!(
-            store.mark_read(&dm, "").unwrap(),
-            "an empty id catches up to the newest known"
-        );
+        assert!(!store.note_newest(&dm, "5").unwrap(), "an older id does not replace the newest");
+        assert!(store.mark_read(&dm, "").unwrap(), "an empty id catches up to the newest known");
         let row = store.conversation(&dm).unwrap().unwrap();
         assert_eq!((row.unread, row.last_read.as_deref()), (0, Some("20")));
-        assert!(
-            !store.mark_read(&dm, "10").unwrap(),
-            "an older marker does not rewind a caught-up chat"
-        );
-        assert_eq!(
-            store
-                .conversation(&dm)
-                .unwrap()
-                .unwrap()
-                .last_read
-                .as_deref(),
-            Some("20")
-        );
+        assert!(!store.mark_read(&dm, "10").unwrap(), "an older marker does not rewind a caught-up chat");
+        assert_eq!(store.conversation(&dm).unwrap().unwrap().last_read.as_deref(), Some("20"));
 
         store.set_counts(&dm, 1, 0, None, 10).unwrap();
         let marks = store.unread_marks(Some(Network::Discord)).unwrap();
-        assert!(marks
-            .iter()
-            .any(|(found, marker, request)| found == &dm && marker == "20" && !request));
+        assert!(marks.iter().any(|(found, marker, request)| found == &dm && marker == "20" && !request));
         assert!(store.forget_conversation(&dm).unwrap());
         let row = store.conversation(&dm).unwrap().unwrap();
         assert!(row.hidden);
-        assert_eq!(
-            (row.unread, row.preview.as_str(), row.last_read.as_deref()),
-            (0, "", Some("20"))
-        );
-        assert!(store
-            .messages(&dm, &Page::Newest, 10, NOW)
-            .unwrap()
-            .unwrap()
-            .messages
-            .is_empty());
+        assert_eq!((row.unread, row.preview.as_str(), row.last_read.as_deref()), (0, "", Some("20")));
+        assert!(store.messages(&dm, &Page::Newest, 10, NOW).unwrap().unwrap().messages.is_empty());
         // A message that is not newer leaves it hidden, as a history fill of what was deleted would.
         store.ingest(&dm, &said("20", "hello", 20), false).unwrap();
         assert!(store.conversation(&dm).unwrap().unwrap().hidden);
@@ -3729,12 +3055,8 @@ mod tests {
         let quiet = ConversationRow::new("quiet", ConversationKind::Channel, "#quiet");
         store.upsert_conversation(&account, &direct).unwrap();
         store.upsert_conversation(&account, &quiet).unwrap();
-        store
-            .ingest(&Key::new(&account, "dm"), &said("1", "hi", 10), true)
-            .unwrap();
-        store
-            .ingest(&Key::new(&account, "quiet"), &said("1", "noise", 30), true)
-            .unwrap();
+        store.ingest(&Key::new(&account, "dm"), &said("1", "hi", 10), true).unwrap();
+        store.ingest(&Key::new(&account, "quiet"), &said("1", "noise", 30), true).unwrap();
         let mut mention = said("1", "@you", 20);
         mention.mentions_me = true;
         store.ingest(&key, &mention, true).unwrap();
@@ -3746,63 +3068,30 @@ mod tests {
         };
         assert_eq!(titles(&store, InboxFilter::All), ["#general", "Mara"]);
 
-        store
-            .set_starred(&Key::new(&account, "quiet"), true)
-            .unwrap();
-        assert_eq!(
-            titles(&store, InboxFilter::All),
-            ["#quiet", "#general", "Mara"]
-        );
+        store.set_starred(&Key::new(&account, "quiet"), true).unwrap();
+        assert_eq!(titles(&store, InboxFilter::All), ["#quiet", "#general", "Mara"]);
         // A direct message nobody mentioned me in is unread, not a mention.
         assert_eq!(titles(&store, InboxFilter::Mentions), ["#general"]);
         // Unread is a triage list: mentions first, then newest.
-        assert_eq!(
-            titles(&store, InboxFilter::Unread),
-            ["#general", "#quiet", "Mara"]
-        );
+        assert_eq!(titles(&store, InboxFilter::Unread), ["#general", "#quiet", "Mara"]);
         assert_eq!(titles(&store, InboxFilter::Directs), ["Mara"]);
 
         store.set_muted(&Key::new(&account, "dm"), true).unwrap();
         assert_eq!(titles(&store, InboxFilter::Unread), ["#general", "#quiet"]);
         let counts = store.inbox_counts(None, &[]).unwrap();
         assert_eq!((counts.all, counts.unread, counts.mentions), (3, 2, 1));
-        assert_eq!(
-            store
-                .inbox(Some(Network::Slack), InboxFilter::All, 0, 10, &[])
-                .unwrap()
-                .1,
-            0
-        );
+        assert_eq!(store.inbox(Some(Network::Slack), InboxFilter::All, 0, 10, &[]).unwrap().1, 0);
     }
 
     #[test]
     fn the_inbox_leaves_out_an_account_that_is_signed_out() {
         let (mut store, key) = store();
-        let other = AccountKey {
-            network: Network::Telegram,
-            account: "123".into(),
-        };
-        store
-            .upsert_conversation(
-                &other,
-                &ConversationRow::new("elyse", ConversationKind::Direct, "Elyse"),
-            )
-            .unwrap();
-        store
-            .ingest(&Key::new(&other, "elyse"), &said("1", "hi", 10), true)
-            .unwrap();
+        let other = AccountKey { network: Network::Telegram, account: "123".into() };
+        store.upsert_conversation(&other, &ConversationRow::new("elyse", ConversationKind::Direct, "Elyse")).unwrap();
+        store.ingest(&Key::new(&other, "elyse"), &said("1", "hi", 10), true).unwrap();
         // The seeded channel has no message, so the only inbox row is the signed-out chat.
-        assert_eq!(
-            store
-                .inbox(None, InboxFilter::All, 0, 10, &[])
-                .unwrap()
-                .0
-                .len(),
-            1
-        );
-        let (rows, total) = store
-            .inbox(None, InboxFilter::All, 0, 10, &[other.clone()])
-            .unwrap();
+        assert_eq!(store.inbox(None, InboxFilter::All, 0, 10, &[]).unwrap().0.len(), 1);
+        let (rows, total) = store.inbox(None, InboxFilter::All, 0, 10, &[other.clone()]).unwrap();
         assert!(rows.is_empty() && total == 0);
         assert_eq!(store.inbox_counts(None, &[other]).unwrap().all, 0);
         let _ = key;
@@ -3817,95 +3106,36 @@ mod tests {
         let row = |id: &str, kind, title: &str| ConversationRow::new(id, kind, title);
         let rows = [
             row("old", ConversationKind::Direct, "Old friend"),
-            ConversationRow {
-                filing: Some(Filing {
-                    pin: Some(0),
-                    ..Filing::default()
-                }),
-                ..row("starred-old", ConversationKind::Direct, "Starred old")
-            },
+            ConversationRow { filing: Some(Filing { pin: Some(0), ..Filing::default() }), ..row("starred-old", ConversationKind::Direct, "Starred old") },
             row("empty", ConversationKind::Direct, "Never spoke"),
-            ConversationRow {
-                bot: true,
-                ..row("app", ConversationKind::Direct, "GitHub")
-            },
-            ConversationRow {
-                filing: Some(Filing {
-                    archived: true,
-                    ..Filing::default()
-                }),
-                ..row("archived", ConversationKind::Group, "Archived")
-            },
-            ConversationRow {
-                special: Special::Request,
-                ..row("stranger", ConversationKind::Direct, "Stranger")
-            },
-            ConversationRow {
-                filing: Some(Filing {
-                    hidden: true,
-                    ..Filing::default()
-                }),
-                ..row("hidden", ConversationKind::Group, "Hidden")
-            },
+            ConversationRow { bot: true, ..row("app", ConversationKind::Direct, "GitHub") },
+            ConversationRow { filing: Some(Filing { archived: true, ..Filing::default() }), ..row("archived", ConversationKind::Group, "Archived") },
+            ConversationRow { special: Special::Request, ..row("stranger", ConversationKind::Direct, "Stranger") },
+            ConversationRow { filing: Some(Filing { hidden: true, ..Filing::default() }), ..row("hidden", ConversationKind::Group, "Hidden") },
             row("recent", ConversationKind::Direct, "Recent"),
         ];
         for row in &rows {
             store.upsert_conversation(&account, row).unwrap();
         }
         let at = |id: &str| Key::new(&account, id);
-        for (id, days) in [
-            ("old", 40),
-            ("starred-old", 40),
-            ("app", 1),
-            ("archived", 1),
-            ("stranger", 1),
-            ("hidden", 1),
-            ("recent", 2),
-        ] {
-            store
-                .ingest(
-                    &at(id),
-                    &said(&format!("{id}-1"), "hello", now - days * day),
-                    true,
-                )
-                .unwrap();
+        for (id, days) in [("old", 40), ("starred-old", 40), ("app", 1), ("archived", 1), ("stranger", 1), ("hidden", 1), ("recent", 2)] {
+            store.ingest(&at(id), &said(&format!("{id}-1"), "hello", now - days * day), true).unwrap();
         }
         store.set_starred(&at("starred-old"), true).unwrap();
         store.mark_read(&at("old"), "old-1").unwrap();
         let titles = |store: &Store, filter| -> Vec<String> {
-            store
-                .inbox(None, filter, 0, 20, &[])
-                .unwrap()
-                .0
-                .into_iter()
-                .map(|row| row.title)
-                .collect()
+            store.inbox(None, filter, 0, 20, &[]).unwrap().0.into_iter().map(|row| row.title).collect()
         };
         // Old, empty, archived, hidden and request rows are out; a starred old one stays; the
         // app is in, flagged, for the shell to fold.
-        assert_eq!(
-            titles(&store, InboxFilter::All),
-            ["Starred old", "GitHub", "Recent"]
-        );
+        assert_eq!(titles(&store, InboxFilter::All), ["Starred old", "GitHub", "Recent"]);
         let counts = store.inbox_counts(None, &[]).unwrap();
         // The app's unread raises no count but its own dot; the archived one and the request
         // count for nothing.
-        assert_eq!(
-            (counts.all, counts.unread, counts.apps),
-            (3, 2, 1),
-            "{counts:?}"
-        );
+        assert_eq!((counts.all, counts.unread, counts.apps), (3, 2, 1), "{counts:?}");
         store.set_account(&account, "Robin", "").unwrap();
-        let attention: u32 = store
-            .accounts()
-            .unwrap()
-            .iter()
-            .map(|row| row.attention)
-            .sum();
-        assert_eq!(
-            attention, 2,
-            "the starred and the recent direct message, nothing else"
-        );
+        let attention: u32 = store.accounts().unwrap().iter().map(|row| row.attention).sum();
+        assert_eq!(attention, 2, "the starred and the recent direct message, nothing else");
 
         // A mention brings the archived chat in; a channel that mentioned me stays a day after
         // it was read.
@@ -3916,18 +3146,9 @@ mod tests {
         ping.mentions_me = true;
         store.ingest(&key, &ping, true).unwrap();
         store.mark_read(&key, "ping").unwrap();
-        assert_eq!(
-            titles(&store, InboxFilter::All),
-            ["Starred old", "Archived", "#general", "GitHub", "Recent"]
-        );
+        assert_eq!(titles(&store, InboxFilter::All), ["Starred old", "Archived", "#general", "GitHub", "Recent"]);
         // Kept a day only: the channel's mention is a day and a minute old.
-        store
-            .db
-            .execute(
-                "UPDATE conversation SET noticed = ?1 WHERE id = 'general'",
-                params![now - day - 60],
-            )
-            .unwrap();
+        store.db.execute("UPDATE conversation SET noticed = ?1 WHERE id = 'general'", params![now - day - 60]).unwrap();
         assert!(!titles(&store, InboxFilter::All).contains(&"#general".to_owned()));
     }
 
@@ -3937,12 +3158,7 @@ mod tests {
         let account = key.account();
         let now = crate::hub::now();
         let chat = |id: &str, folders: &[&str], pin: Option<i32>, archived: bool| ConversationRow {
-            filing: Some(Filing {
-                folders: folders.iter().map(|id| (*id).to_owned()).collect(),
-                pin,
-                archived,
-                ..Filing::default()
-            }),
+            filing: Some(Filing { folders: folders.iter().map(|id| (*id).to_owned()).collect(), pin, archived, ..Filing::default() }),
             ..ConversationRow::new(id, ConversationKind::Direct, id)
         };
         for row in [
@@ -3953,55 +3169,23 @@ mod tests {
             chat("fin", &["work"], None, false),
             // A pin stands whatever its archive says: Telegram keeps such chats on the list.
             chat("jay", &[], Some(0), true),
-            ConversationRow {
-                special: Special::Request,
-                ..ConversationRow::new("eve", ConversationKind::Direct, "eve")
-            },
+            ConversationRow { special: Special::Request, ..ConversationRow::new("eve", ConversationKind::Direct, "eve") },
         ] {
             store.upsert_conversation(&account, &row).unwrap();
         }
         // The fixture's channel belongs to a Space, as every channel of a Space does.
-        store
-            .db
-            .execute(
-                "UPDATE conversation SET space = 'guild' WHERE id = 'general'",
-                [],
-            )
-            .unwrap();
+        store.db.execute("UPDATE conversation SET space = 'guild' WHERE id = 'general'", []).unwrap();
         for (at, id) in ["dee", "cy", "ben", "ana", "eve"].iter().enumerate() {
-            store
-                .ingest(
-                    &Key::new(&account, *id),
-                    &said(&format!("{id}-1"), "hi", now - 100 + at as i64),
-                    true,
-                )
-                .unwrap();
+            store.ingest(&Key::new(&account, *id), &said(&format!("{id}-1"), "hi", now - 100 + at as i64), true).unwrap();
         }
         store
-            .replace_folders(
-                &account,
-                &[
-                    FolderRow {
-                        id: "work".into(),
-                        name: "Work".into(),
-                        position: 0,
-                        pinned: vec!["ben".into(), "fin".into()],
-                        ..FolderRow::default()
-                    },
-                    FolderRow {
-                        id: "family".into(),
-                        name: "Family".into(),
-                        position: 1,
-                        pinned: vec!["dee".into()],
-                        ..FolderRow::default()
-                    },
-                ],
-            )
+            .replace_folders(&account, &[
+                FolderRow { id: "work".into(), name: "Work".into(), position: 0, pinned: vec!["ben".into(), "fin".into()], ..FolderRow::default() },
+                FolderRow { id: "family".into(), name: "Family".into(), position: 1, pinned: vec!["dee".into()], ..FolderRow::default() },
+            ])
             .unwrap();
         let ids = |store: &Store, folder: Option<&str>, shelf| -> Vec<String> {
-            let (rows, total, _) = store
-                .home(Network::Discord, None, folder, shelf, 0, 20, &[])
-                .unwrap();
+            let (rows, total, _) = store.home(Network::Discord, None, folder, shelf, 0, 20, &[]).unwrap();
             assert_eq!(rows.len() as u32, total);
             rows.into_iter().map(|row| row.key.id).collect()
         };
@@ -4019,57 +3203,25 @@ mod tests {
         // Pins in their order, then newest first; the channel of the Space is not in it. The pins
         // a folder holds never lift onto the network's own list: `fin` stays by recency, and its
         // place is on the folder's own tab alone.
-        assert_eq!(
-            ids(&store, None, Shelf::Main),
-            ["cy", "jay", "ben", "ana", "fin"]
-        );
+        assert_eq!(ids(&store, None, Shelf::Main), ["cy", "jay", "ben", "ana", "fin"]);
         assert_eq!(
             pins(&store, None),
-            [
-                ("cy".to_owned(), Some(0)),
-                ("jay".to_owned(), Some(0)),
-                ("ben".to_owned(), Some(1)),
-                ("ana".to_owned(), None),
-                ("fin".to_owned(), None)
-            ]
+            [("cy".to_owned(), Some(0)), ("jay".to_owned(), Some(0)), ("ben".to_owned(), Some(1)), ("ana".to_owned(), None), ("fin".to_owned(), None)]
         );
         assert_eq!(ids(&store, None, Shelf::Archive), ["jay", "dee"]);
         assert_eq!(ids(&store, None, Shelf::Requests), ["eve"]);
         // A chat in two folders is in both; a folder's own pins come first, archived or not.
-        assert_eq!(
-            ids(&store, Some("work"), Shelf::Main),
-            ["ben", "fin", "ana"]
-        );
-        assert_eq!(
-            pins(&store, Some("work")),
-            [
-                ("ben".to_owned(), Some(1)),
-                ("fin".to_owned(), Some(2)),
-                ("ana".to_owned(), None)
-            ]
-        );
+        assert_eq!(ids(&store, Some("work"), Shelf::Main), ["ben", "fin", "ana"]);
+        assert_eq!(pins(&store, Some("work")), [("ben".to_owned(), Some(1)), ("fin".to_owned(), Some(2)), ("ana".to_owned(), None)]);
         assert_eq!(ids(&store, Some("family"), Shelf::Main), ["dee", "ana"]);
         let folders = store.folders(Some(Network::Discord)).unwrap();
-        let counted: Vec<(String, u32)> = folders
-            .into_iter()
-            .map(|folder| (folder.name, folder.unread))
-            .collect();
+        let counted: Vec<(String, u32)> = folders.into_iter().map(|folder| (folder.name, folder.unread)).collect();
         assert_eq!(counted, [("Work".to_owned(), 2), ("Family".to_owned(), 2)]);
 
         // A tree reload that does not know the filing leaves it; one that does replaces it.
-        store
-            .upsert_conversation(
-                &account,
-                &ConversationRow::new("ben", ConversationKind::Direct, "ben"),
-            )
-            .unwrap();
-        assert_eq!(
-            ids(&store, Some("work"), Shelf::Main),
-            ["ben", "fin", "ana"]
-        );
-        assert!(store
-            .set_filing(&Key::new(&account, "ben"), &Filing::default())
-            .unwrap());
+        store.upsert_conversation(&account, &ConversationRow::new("ben", ConversationKind::Direct, "ben")).unwrap();
+        assert_eq!(ids(&store, Some("work"), Shelf::Main), ["ben", "fin", "ana"]);
+        assert!(store.set_filing(&Key::new(&account, "ben"), &Filing::default()).unwrap());
         assert_eq!(ids(&store, Some("work"), Shelf::Main), ["fin", "ana"]);
     }
 
@@ -4082,9 +3234,7 @@ mod tests {
         store.ingest(&key, &going, false).unwrap();
         assert_eq!(receipt(&store), Some(Receipt::Sending));
 
-        store
-            .ingest(&key, &Message::plain("12", "me", "there", 200, true), false)
-            .unwrap();
+        store.ingest(&key, &Message::plain("12", "me", "there", 200, true), false).unwrap();
         assert_eq!(receipt(&store), Some(Receipt::Sent));
         // Received up to an older one of mine says nothing of this one.
         assert!(store.set_delivered(&key, "9").unwrap());
@@ -4097,9 +3247,7 @@ mod tests {
         assert!(store.set_seen(&key, "12").unwrap());
         assert_eq!(receipt(&store), Some(Receipt::Read));
         // Read before the delivery receipt came: read it stays.
-        store
-            .ingest(&key, &Message::plain("13", "me", "again", 300, true), false)
-            .unwrap();
+        store.ingest(&key, &Message::plain("13", "me", "again", 300, true), false).unwrap();
         assert!(store.set_seen(&key, "13").unwrap());
         assert!(!store.set_delivered(&key, "12").unwrap());
         assert_eq!(receipt(&store), Some(Receipt::Read));
@@ -4114,35 +3262,13 @@ mod tests {
         let (mut store, key) = store();
         store.ingest(&key, &said("10", "ok", 100), true).unwrap();
         let row = store.conversation(&key).unwrap().unwrap();
-        assert_eq!(
-            (
-                row.preview.as_str(),
-                row.preview_from.as_str(),
-                row.preview_mine
-            ),
-            ("ok", "mara", false)
-        );
+        assert_eq!((row.preview.as_str(), row.preview_from.as_str(), row.preview_mine), ("ok", "mara", false));
 
         let mut mine = Message::plain("11", "me", "", 200, true);
-        mine.attachments = (0..2)
-            .map(|at| {
-                protocol::Attachment::new(
-                    format!("p{at}.png"),
-                    MediaFile::new(format!("p{at}"), MediaKind::Image),
-                )
-            })
-            .collect();
+        mine.attachments = (0..2).map(|at| protocol::Attachment::new(format!("p{at}.png"), MediaFile::new(format!("p{at}"), MediaKind::Image))).collect();
         store.ingest(&key, &mine, false).unwrap();
         let row = store.conversation(&key).unwrap().unwrap();
-        assert_eq!(
-            (
-                row.preview.as_str(),
-                row.preview_from.as_str(),
-                row.preview_mine,
-                row.seen
-            ),
-            ("2 photos", "", true, false)
-        );
+        assert_eq!((row.preview.as_str(), row.preview_from.as_str(), row.preview_mine, row.seen), ("2 photos", "", true, false));
         // Read up to an older message of mine is not read up to this one.
         assert!(store.set_seen(&key, "9").unwrap());
         assert!(!store.conversation(&key).unwrap().unwrap().seen);
@@ -4150,24 +3276,12 @@ mod tests {
         assert!(store.conversation(&key).unwrap().unwrap().seen);
 
         // A line from a list that carries only that, never older than what is shown.
-        let line = |id: &str, sent| PreviewLine {
-            id: id.into(),
-            text: "from the list".into(),
-            sender: "Ana".into(),
-            mine: false,
-            sent,
-        };
+        let line = |id: &str, sent| PreviewLine { id: id.into(), text: "from the list".into(), sender: "Ana".into(), mine: false, sent };
         assert!(!store.set_preview(&key, &line("5", 150)).unwrap());
         assert!(store.set_preview(&key, &line("12", 300)).unwrap());
         let row = store.conversation(&key).unwrap().unwrap();
-        assert_eq!(
-            (row.preview.as_str(), row.preview_from.as_str(), row.updated),
-            ("from the list", "Ana", 300)
-        );
-        assert_eq!(
-            store.previewless(std::slice::from_ref(&key)).unwrap(),
-            Vec::<Key>::new()
-        );
+        assert_eq!((row.preview.as_str(), row.preview_from.as_str(), row.updated), ("from the list", "Ana", 300));
+        assert_eq!(store.previewless(std::slice::from_ref(&key)).unwrap(), Vec::<Key>::new());
     }
 
     #[test]
@@ -4177,19 +3291,12 @@ mod tests {
         pending.state = SendState::Pending;
         pending.client_id = Some("c-1".into());
         store.ingest(&key, &pending, false).unwrap();
-        assert_eq!(
-            store.newest(&key).unwrap(),
-            None,
-            "a pending message is not on the network"
-        );
+        assert_eq!(store.newest(&key).unwrap(), None, "a pending message is not on the network");
 
         let mut echoed = Message::plain("777", "me", "on it", 101, true);
         echoed.client_id = Some("c-1".into());
         assert_eq!(store.ingest(&key, &echoed, true).unwrap(), Stored::New);
-        let page = store
-            .messages(&key, &Page::Newest, 10, NOW)
-            .unwrap()
-            .unwrap();
+        let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
         assert_eq!(ids(&page), ["777"]);
         assert_eq!(page.messages[0].state, SendState::Sent);
 
@@ -4197,22 +3304,10 @@ mod tests {
         stuck.id = "c-2".into();
         stuck.client_id = Some("c-2".into());
         store.ingest(&key, &stuck, false).unwrap();
-        assert_eq!(
-            store.fail_pending(100, "no answer").unwrap(),
-            [],
-            "not old enough yet"
-        );
-        assert_eq!(
-            store.fail_pending(101, "no answer").unwrap(),
-            std::slice::from_ref(&key)
-        );
+        assert_eq!(store.fail_pending(100, "no answer").unwrap(), [], "not old enough yet");
+        assert_eq!(store.fail_pending(101, "no answer").unwrap(), std::slice::from_ref(&key));
         let failed = store.message(&key, "c-2").unwrap().unwrap();
-        assert_eq!(
-            failed.state,
-            SendState::Failed {
-                reason: "no answer".into()
-            }
-        );
+        assert_eq!(failed.state, SendState::Failed { reason: "no answer".into() });
         assert_eq!(store.fail_pending(i64::MAX, "no answer").unwrap(), []);
     }
 
@@ -4221,12 +3316,7 @@ mod tests {
         let (mut store, key) = store();
         let account = key.account();
         let space = Key::new(&account, "guild");
-        let spaces = [SpaceRow {
-            id: "guild".into(),
-            name: "Rust".into(),
-            icon: None,
-            position: 0,
-        }];
+        let spaces = [SpaceRow { id: "guild".into(), name: "Rust".into(), icon: None, position: 0 }];
         store.replace_spaces(&account, &spaces).unwrap();
         let group = |id: &str| Group::new(id, id, 0);
         let channel = |id: &str, position| ConversationRow {
@@ -4234,57 +3324,22 @@ mod tests {
             group: Some("text".into()),
             ..ConversationRow::new(id, ConversationKind::Channel, format!("#{id}"))
         };
-        store
-            .replace_tree(
-                &space,
-                &[group("text")],
-                &[channel("b", 2), channel("a", 1)],
-            )
-            .unwrap();
-        store
-            .ingest(&Key::new(&account, "a"), &said("1", "hi", 10), true)
-            .unwrap();
-        store
-            .ingest(&Key::new(&account, "b"), &said("1", "yo", 10), true)
-            .unwrap();
+        store.replace_tree(&space, &[group("text")], &[channel("b", 2), channel("a", 1)]).unwrap();
+        store.ingest(&Key::new(&account, "a"), &said("1", "hi", 10), true).unwrap();
+        store.ingest(&Key::new(&account, "b"), &said("1", "yo", 10), true).unwrap();
         assert!(store.set_collapsed(&space, "text", true).unwrap());
 
-        store
-            .replace_tree(
-                &space,
-                &[group("text"), group("voice")],
-                &[channel("a", 1), channel("c", 3)],
-            )
-            .unwrap();
-        let Tree {
-            groups,
-            conversations: rows,
-            total,
-        } = store.tree(&space, 0, 10).unwrap().unwrap();
-        let listed: Vec<_> = rows
-            .iter()
-            .map(|row| (row.key.id.as_str(), row.unread))
-            .collect();
+        store.replace_tree(&space, &[group("text"), group("voice")], &[channel("a", 1), channel("c", 3)]).unwrap();
+        let Tree { groups, conversations: rows, total } = store.tree(&space, 0, 10).unwrap().unwrap();
+        let listed: Vec<_> = rows.iter().map(|row| (row.key.id.as_str(), row.unread)).collect();
         assert_eq!((listed, total), (vec![("a", 1), ("c", 0)], 2));
-        assert_eq!(
-            groups
-                .iter()
-                .map(|g| (g.id.as_str(), g.collapsed))
-                .collect::<Vec<_>>(),
-            [("text", true), ("voice", false)]
-        );
-        assert!(store
-            .messages(&Key::new(&account, "b"), &Page::Newest, 10, NOW)
-            .unwrap()
-            .is_none());
+        assert_eq!(groups.iter().map(|g| (g.id.as_str(), g.collapsed)).collect::<Vec<_>>(), [("text", true), ("voice", false)]);
+        assert!(store.messages(&Key::new(&account, "b"), &Page::Newest, 10, NOW).unwrap().is_none());
         // The conversation outside the Space was not the tree's to remove.
         assert!(store.conversation(&key).unwrap().is_some());
         let space_row = &store.spaces(Some(Network::Discord)).unwrap()[0];
         assert_eq!((space_row.attention, space_row.unread), (0, true));
-        assert!(store
-            .tree(&Key::new(&account, "elsewhere"), 0, 10)
-            .unwrap()
-            .is_none());
+        assert!(store.tree(&Key::new(&account, "elsewhere"), 0, 10).unwrap().is_none());
     }
 
     #[test]
@@ -4292,66 +3347,30 @@ mod tests {
         let (mut store, key) = store();
         let account = key.account();
         let mut message = said("1", "look", 10);
-        let thumb = MediaFile {
-            width: 800,
-            height: 600,
-            ..MediaFile::new("att-1", protocol::MediaKind::Image)
-        };
+        let thumb = MediaFile { width: 800, height: 600, ..MediaFile::new("att-1", protocol::MediaKind::Image) };
         message.attachments.push(protocol::Attachment {
             thumb: Some(thumb.clone()),
             mime: "image/png".into(),
-            ..protocol::Attachment::new(
-                "shot.png",
-                MediaFile::new("att-1-full", protocol::MediaKind::Image),
-            )
+            ..protocol::Attachment::new("shot.png", MediaFile::new("att-1-full", protocol::MediaKind::Image))
         });
-        store
-            .register_media(&account, &[(thumb, "https://cdn.example/att-1".into())])
-            .unwrap();
+        store.register_media(&account, &[(thumb, "https://cdn.example/att-1".into())]).unwrap();
         store.ingest(&key, &message, false).unwrap();
 
-        let thumbs_up = |mine| Reaction {
-            emoji: "👍".into(),
-            file: None,
-            count: 1,
-            mine,
-        };
+        let thumbs_up = |mine| Reaction { emoji: "👍".into(), file: None, count: 1, mine };
         assert!(store.react(&key, "1", &thumbs_up(false), true).unwrap());
         assert!(store.react(&key, "1", &thumbs_up(true), true).unwrap());
         assert!(store.react(&key, "1", &thumbs_up(false), false).unwrap());
-        assert!(!store
-            .react(
-                &key,
-                "1",
-                &Reaction {
-                    emoji: "🎉".into(),
-                    ..thumbs_up(false)
-                },
-                false
-            )
-            .unwrap());
+        assert!(!store.react(&key, "1", &Reaction { emoji: "🎉".into(), ..thumbs_up(false) }, false).unwrap());
 
         assert_eq!(store.media_bytes().unwrap(), 0);
-        let landed = store
-            .media_landed(&account, "att-1", "/tmp/media/att-1", 4_096, NOW)
-            .unwrap()
-            .unwrap();
+        let landed = store.media_landed(&account, "att-1", "/tmp/media/att-1", 4_096, NOW).unwrap().unwrap();
         assert_eq!((landed.width, landed.bytes), (800, 4_096));
-        let page = store
-            .messages(&key, &Page::Newest, 10, NOW)
-            .unwrap()
-            .unwrap();
+        let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
         let shown = &page.messages[0];
         assert_eq!(shown.reactions, [thumbs_up(true)]);
         let attachment = &shown.attachments[0];
-        assert_eq!(
-            attachment.thumb.as_ref().unwrap().path.as_deref(),
-            Some("/tmp/media/att-1")
-        );
-        assert_eq!(
-            attachment.file.path, None,
-            "the full file was never fetched"
-        );
+        assert_eq!(attachment.thumb.as_ref().unwrap().path.as_deref(), Some("/tmp/media/att-1"));
+        assert_eq!(attachment.file.path, None, "the full file was never fetched");
         assert_eq!(store.media_on_disk(Some(&account), 10).unwrap().len(), 1);
 
         store.forget(&account).unwrap();
@@ -4363,47 +3382,19 @@ mod tests {
     fn a_failure_of_the_line_is_forgiven_and_one_about_the_file_stands() {
         let (mut store, key) = store();
         let account = key.account();
-        let avatar = |id: &str| {
-            (
-                MediaFile::new(id, protocol::MediaKind::Avatar),
-                format!("https://cdn.example/{id}.png"),
-            )
-        };
-        store
-            .register_media(&account, &[avatar("a"), avatar("b"), avatar("c")])
-            .unwrap();
-        store
-            .media_failed(
-                &account,
-                "a",
-                "The download failed: tls: invalid peer certificate.",
-            )
-            .unwrap();
-        store
-            .media_failed(&account, "b", "The file is no longer there (404).")
-            .unwrap();
+        let avatar = |id: &str| (MediaFile::new(id, protocol::MediaKind::Avatar), format!("https://cdn.example/{id}.png"));
+        store.register_media(&account, &[avatar("a"), avatar("b"), avatar("c")]).unwrap();
+        store.media_failed(&account, "a", "The download failed: tls: invalid peer certificate.").unwrap();
+        store.media_failed(&account, "b", "The file is no longer there (404).").unwrap();
         // Registered again at the same address, a failure stands: only a fresh address clears it.
-        store
-            .register_media(&account, &[avatar("a"), avatar("b")])
-            .unwrap();
-        let failed = |store: &Store, id: &str| {
-            store
-                .media(&account, &[id.to_owned()])
-                .unwrap()
-                .pop()
-                .unwrap()
-                .0
-                .failed
-        };
+        store.register_media(&account, &[avatar("a"), avatar("b")]).unwrap();
+        let failed = |store: &Store, id: &str| store.media(&account, &[id.to_owned()]).unwrap().pop().unwrap().0.failed;
         assert!(failed(&store, "a").is_some());
 
         let passing = |why: &str| why.starts_with("The download failed:");
         assert_eq!(store.media_forgive(passing).unwrap(), 1);
         assert_eq!(failed(&store, "a"), None);
-        assert_eq!(
-            failed(&store, "b").as_deref(),
-            Some("The file is no longer there (404).")
-        );
+        assert_eq!(failed(&store, "b").as_deref(), Some("The file is no longer there (404)."));
         assert_eq!(failed(&store, "c"), None);
         assert_eq!(store.media_forgive(passing).unwrap(), 0);
     }
@@ -4414,24 +3405,11 @@ mod tests {
         let account = key.account();
         let old = NOW - (KEEP_DAYS + 1) * 86_400;
         let opened = Key::new(&account, "opened");
-        store
-            .upsert_conversation(
-                &account,
-                &ConversationRow::new("opened", ConversationKind::Direct, "Mara"),
-            )
-            .unwrap();
-        store
-            .ingest(&key, &said("1", "ancient", old), false)
-            .unwrap();
-        store
-            .ingest(&key, &said("2", "recent", NOW - 60), false)
-            .unwrap();
-        store
-            .ingest(&opened, &said("1", "ancient but read lately", old), false)
-            .unwrap();
-        store
-            .messages(&opened, &Page::Newest, 1, NOW - 3_600)
-            .unwrap();
+        store.upsert_conversation(&account, &ConversationRow::new("opened", ConversationKind::Direct, "Mara")).unwrap();
+        store.ingest(&key, &said("1", "ancient", old), false).unwrap();
+        store.ingest(&key, &said("2", "recent", NOW - 60), false).unwrap();
+        store.ingest(&opened, &said("1", "ancient but read lately", old), false).unwrap();
+        store.messages(&opened, &Page::Newest, 1, NOW - 3_600).unwrap();
 
         assert_eq!(store.prune(NOW, KEEP_DAYS as u32).unwrap(), 1);
         assert!(store.message(&key, "1").unwrap().is_none());
@@ -4442,15 +3420,9 @@ mod tests {
     #[test]
     fn a_shorter_retention_is_counted_first_and_then_deletes_just_that() {
         let (mut store, key) = store();
-        store
-            .ingest(&key, &said("1", "five weeks old", NOW - 35 * 86_400), false)
-            .unwrap();
-        store
-            .ingest(&key, &said("2", "ten days old", NOW - 10 * 86_400), false)
-            .unwrap();
-        store
-            .ingest(&key, &said("3", "today", NOW - 60), false)
-            .unwrap();
+        store.ingest(&key, &said("1", "five weeks old", NOW - 35 * 86_400), false).unwrap();
+        store.ingest(&key, &said("2", "ten days old", NOW - 10 * 86_400), false).unwrap();
+        store.ingest(&key, &said("3", "today", NOW - 60), false).unwrap();
         assert_eq!(store.prunable(NOW, 90).unwrap().0, 0);
         let (messages, bytes) = store.prunable(NOW, 7).unwrap();
         assert_eq!(messages, 2);
@@ -4474,42 +3446,18 @@ mod tests {
         let path = scratch("settings");
         let mut store = Store::open(&path).unwrap();
         let (slack, discord) = (
-            AccountKey {
-                network: Network::Slack,
-                account: "T1".into(),
-            },
-            AccountKey {
-                network: Network::Discord,
-                account: "D1".into(),
-            },
+            AccountKey { network: Network::Slack, account: "T1".into() },
+            AccountKey { network: Network::Discord, account: "D1".into() },
         );
         store.set_setting("", "keep_days", Some("30")).unwrap();
-        store
-            .set_setting(&account_scope(&slack), "typing", Some("off"))
-            .unwrap();
-        store
-            .set_setting(
-                &conversation_scope(&Key::new(&slack, "C1")),
-                "sound",
-                Some("chime"),
-            )
-            .unwrap();
-        store
-            .set_setting(&account_scope(&discord), "typing", Some("on"))
-            .unwrap();
+        store.set_setting(&account_scope(&slack), "typing", Some("off")).unwrap();
+        store.set_setting(&conversation_scope(&Key::new(&slack, "C1")), "sound", Some("chime")).unwrap();
+        store.set_setting(&account_scope(&discord), "typing", Some("on")).unwrap();
         store.set_setting("", "keep_days", Some("7")).unwrap();
         let read = |store: &Store| -> Vec<(String, String, String)> {
-            store
-                .settings()
-                .unwrap()
-                .into_iter()
-                .map(|s| (s.scope, s.key, s.value))
-                .collect()
+            store.settings().unwrap().into_iter().map(|s| (s.scope, s.key, s.value)).collect()
         };
-        assert!(
-            read(&store).contains(&(String::new(), "keep_days".into(), "7".into())),
-            "a second write replaces the first"
-        );
+        assert!(read(&store).contains(&(String::new(), "keep_days".into(), "7".into())), "a second write replaces the first");
         assert!(read(&store).contains(&(String::new(), VERSION.into(), "1".into())));
 
         // A schema change drops the cache and keeps the user's choices.
@@ -4520,24 +3468,13 @@ mod tests {
 
         store.forget(&slack).unwrap();
         let left = read(&store);
-        assert!(
-            left.iter().all(|(scope, _, _)| !scope.contains(":slack:")),
-            "{left:?}"
-        );
-        assert!(left
-            .iter()
-            .any(|(scope, _, _)| *scope == account_scope(&discord)));
+        assert!(left.iter().all(|(scope, _, _)| !scope.contains(":slack:")), "{left:?}");
+        assert!(left.iter().any(|(scope, _, _)| *scope == account_scope(&discord)));
 
         store.set_setting("", "keep_days", None).unwrap();
-        assert!(
-            !read(&store).iter().any(|(_, key, _)| key == "keep_days"),
-            "reset to the default is no row"
-        );
+        assert!(!read(&store).iter().any(|(_, key, _)| key == "keep_days"), "reset to the default is no row");
         store.reset_settings().unwrap();
-        assert_eq!(
-            read(&store),
-            [(String::new(), VERSION.to_owned(), "1".to_owned())]
-        );
+        assert_eq!(read(&store), [(String::new(), VERSION.to_owned(), "1".to_owned())]);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -4549,18 +3486,8 @@ mod tests {
             store.set_setting("", "preview", Some("full")).unwrap();
         }
         let store = Store::open(&path).unwrap();
-        let rows: Vec<_> = store
-            .settings()
-            .unwrap()
-            .into_iter()
-            .filter(|s| s.key == "preview")
-            .map(|s| s.value)
-            .collect();
-        assert_eq!(
-            rows,
-            ["full"],
-            "opening the store does not rewrite a choice"
-        );
+        let rows: Vec<_> = store.settings().unwrap().into_iter().filter(|s| s.key == "preview").map(|s| s.value).collect();
+        assert_eq!(rows, ["full"], "opening the store does not rewrite a choice");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -4582,8 +3509,7 @@ mod tests {
             // A database an older build made wide is narrowed on the next start, with its logs.
             for file in [path.clone(), side("-wal"), side("-shm")] {
                 if file.exists() {
-                    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
-                        .unwrap();
+                    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
                 }
             }
             let store = Store::open(&path).unwrap();
@@ -4593,17 +3519,9 @@ mod tests {
                 }
             }
             // The log and the index SQLite makes while it runs follow the file.
-            store
-                .db
-                .execute_batch(
-                    "CREATE TABLE IF NOT EXISTS probe (x); INSERT INTO probe VALUES (1);",
-                )
-                .unwrap();
+            store.db.execute_batch("CREATE TABLE IF NOT EXISTS probe (x); INSERT INTO probe VALUES (1);").unwrap();
             for suffix in ["-wal", "-shm"] {
-                assert!(
-                    side(suffix).exists(),
-                    "{suffix} exists while the store is open"
-                );
+                assert!(side(suffix).exists(), "{suffix} exists while the store is open");
                 assert_eq!(mode(&side(suffix)), 0o600, "{suffix}");
             }
         }
@@ -4629,23 +3547,12 @@ mod tests {
             .unwrap();
         drop(store);
         let store = Store::open(&path).unwrap();
-        let version: i32 = store
-            .db
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
+        let version: i32 = store.db.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
         assert_eq!(version, SCHEMA);
         let mut info = store.db.prepare("PRAGMA table_info(conversation)").unwrap();
-        let names: Vec<String> = info
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
+        let names: Vec<String> = info.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         assert!(names.iter().any(|name| name == "voice_limit"), "{names:?}");
-        assert!(store
-            .settings()
-            .unwrap()
-            .iter()
-            .any(|setting| setting.key == "keep_days" && setting.value == "14"));
+        assert!(store.settings().unwrap().iter().any(|setting| setting.key == "keep_days" && setting.value == "14"));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -4680,41 +3587,20 @@ mod tests {
             .unwrap();
         drop(store);
         let mut store = Store::open(&path).unwrap();
-        let version: i32 = store
-            .db
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
+        let version: i32 = store.db.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
         assert_eq!(version, SCHEMA);
         let names: Vec<String> = {
             let mut info = store.db.prepare("PRAGMA table_info(conversation)").unwrap();
-            info.query_map([], |row| row.get::<_, String>(1))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap()
+            info.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
         };
         assert!(names.iter().any(|name| name == "icon"), "{names:?}");
         assert!(names.iter().any(|name| name == "encryption"), "{names:?}");
-        assert!(store
-            .settings()
-            .unwrap()
-            .iter()
-            .any(|setting| setting.key == "keep_days" && setting.value == "14"));
+        assert!(store.settings().unwrap().iter().any(|setting| setting.key == "keep_days" && setting.value == "14"));
         // Reads on the rebuilt shape answer, and a row lands whole.
-        let account = AccountKey {
-            network: Network::Telegram,
-            account: "me".into(),
-        };
+        let account = AccountKey { network: Network::Telegram, account: "me".into() };
         let key = Key::new(&account, "c1");
-        store
-            .upsert_conversation(
-                &account,
-                &ConversationRow::new("c1", ConversationKind::Group, "Test"),
-            )
-            .unwrap();
-        let row = store
-            .conversation(&key)
-            .unwrap()
-            .expect("the row reads back");
+        store.upsert_conversation(&account, &ConversationRow::new("c1", ConversationKind::Group, "Test")).unwrap();
+        let row = store.conversation(&key).unwrap().expect("the row reads back");
         assert_eq!(row.title, "Test");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -4723,25 +3609,14 @@ mod tests {
     fn clearing_the_cache_takes_messages_and_files_and_leaves_drafts_and_rows() {
         let path = scratch("clear");
         let mut store = Store::open(&path).unwrap();
-        let account = AccountKey {
-            network: Network::Discord,
-            account: "me".into(),
-        };
-        store
-            .upsert_conversation(
-                &account,
-                &ConversationRow::new("general", ConversationKind::Channel, "#general"),
-            )
-            .unwrap();
+        let account = AccountKey { network: Network::Discord, account: "me".into() };
+        store.upsert_conversation(&account, &ConversationRow::new("general", ConversationKind::Channel, "#general")).unwrap();
         let key = Key::new(&account, "general");
         store.ingest(&key, &said("1", "hello", NOW), false).unwrap();
         store.set_draft(&key, "half a thought").unwrap();
         store.clear_cache().unwrap();
         assert!(store.message(&key, "1").unwrap().is_none());
-        let row = store
-            .conversation(&key)
-            .unwrap()
-            .expect("the conversation stays");
+        let row = store.conversation(&key).unwrap().expect("the conversation stays");
         assert_eq!(row.draft, "half a thought");
         assert_eq!(store.media_bytes().unwrap(), 0);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

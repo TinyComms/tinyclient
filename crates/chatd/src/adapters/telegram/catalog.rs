@@ -32,13 +32,7 @@ pub(super) fn remember(account: &Account, id: &str, pick: Pick) {
 }
 
 pub(super) fn find(account: &Account, id: &str) -> Option<Pick> {
-    account
-        .live()
-        .picks
-        .iter()
-        .rev()
-        .find(|(held, _)| held == id)
-        .map(|(_, pick)| pick.clone())
+    account.live().picks.iter().rev().find(|(held, _)| held == id).map(|(_, pick)| pick.clone())
 }
 
 /// A document as a picker item: its still, queued to be fetched, and remembered for sending.
@@ -60,27 +54,17 @@ fn item(account: &Account, document: &tl::enums::Document, pack: &str) -> Option
     };
     let mut wants = Vec::new();
     let attachment = content::document(&media, document, &mut wants);
-    let name = document
-        .attributes
-        .iter()
-        .find_map(|attribute| match attribute {
-            tl::enums::DocumentAttribute::Sticker(sticker) => Some(sticker.alt.clone()),
-            _ => None,
-        });
-    let animated = matches!(
-        document.mime_type.as_str(),
-        "application/x-tgsticker" | "video/webm" | "video/mp4" | "image/gif"
-    );
+    let name = document.attributes.iter().find_map(|attribute| match attribute {
+        tl::enums::DocumentAttribute::Sticker(sticker) => Some(sticker.alt.clone()),
+        _ => None,
+    });
+    let animated = matches!(document.mime_type.as_str(), "application/x-tgsticker" | "video/webm" | "video/mp4" | "image/gif");
     account.files.want(wants);
     let id = format!("d{}", document.id);
     remember(
         account,
         &id,
-        Pick::Document(tl::types::InputDocument {
-            id: document.id,
-            access_hash: document.access_hash,
-            file_reference: document.file_reference.clone(),
-        }),
+        Pick::Document(tl::types::InputDocument { id: document.id, access_hash: document.access_hash, file_reference: document.file_reference.clone() }),
     );
     Some(CatalogItem {
         id,
@@ -92,74 +76,43 @@ fn item(account: &Account, document: &tl::enums::Document, pack: &str) -> Option
     })
 }
 
-pub(super) fn catalog(
-    account: &Account,
-    kind: CatalogKind,
-    query: &str,
-    cursor: Option<&str>,
-) -> Result<CatalogPage, Fault> {
+pub(super) fn catalog(account: &Account, kind: CatalogKind, query: &str, cursor: Option<&str>) -> Result<CatalogPage, Fault> {
     match kind {
         // Custom emoji are Premium's; this account is offered none (`Capabilities`).
         CatalogKind::Emoji => Ok(CatalogPage::default()),
         CatalogKind::Gifs if query.is_empty() => saved_gifs(account),
         CatalogKind::Gifs => gif_search(account, query, cursor.unwrap_or("")),
-        CatalogKind::Stickers => stickers(
-            account,
-            cursor.and_then(|cursor| cursor.parse().ok()).unwrap_or(0),
-        ),
+        CatalogKind::Stickers => stickers(account, cursor.and_then(|cursor| cursor.parse().ok()).unwrap_or(0)),
     }
 }
 
 fn saved_gifs(account: &Account) -> Result<CatalogPage, Fault> {
-    let tl::enums::messages::SavedGifs::Gifs(found) =
-        account.ask(&tl::functions::messages::GetSavedGifs { hash: 0 })?
-    else {
+    let tl::enums::messages::SavedGifs::Gifs(found) = account.ask(&tl::functions::messages::GetSavedGifs { hash: 0 })? else {
         return Ok(CatalogPage::default());
     };
-    let items = found
-        .gifs
-        .iter()
-        .take(protocol::CATALOG_LIMIT)
-        .filter_map(|gif| item(account, gif, "Saved"))
-        .collect();
-    Ok(CatalogPage {
-        items,
-        cursor: None,
-    })
+    let items = found.gifs.iter().take(protocol::CATALOG_LIMIT).filter_map(|gif| item(account, gif, "Saved")).collect();
+    Ok(CatalogPage { items, cursor: None })
 }
 
 /// The bot Telegram's apps search GIFs with, resolved once and remembered.
 // Telegram names it in `help.getConfig` (`gif_search_username`); it has been `gif` for years
 // and asking the whole config for one name is not worth a request (unverified for every region).
 fn gif_bot(account: &Account) -> Result<(tl::enums::InputUser, tl::enums::InputPeer), Fault> {
-    let bot = Who::User(
-        match account.ctx.note("gifbot").and_then(|id| id.parse().ok()) {
-            Some(id) => id,
-            None => {
-                let request = tl::functions::contacts::ResolveUsername {
-                    username: "gif".to_owned(),
-                    referer: None,
-                };
-                let tl::enums::contacts::ResolvedPeer::Peer(found) = account.ask(&request)?;
-                account.learn(&found.users, &found.chats);
-                let Who::User(id) = Who::of(&found.peer) else {
-                    return Err(Fault::Rpc {
-                        code: 400,
-                        name: "BOT_INVALID".to_owned(),
-                        value: None,
-                    });
-                };
-                account.ctx.set_note("gifbot", &id.to_string());
-                id
-            }
-        },
-    );
+    let bot = Who::User(match account.ctx.note("gifbot").and_then(|id| id.parse().ok()) {
+        Some(id) => id,
+        None => {
+            let request = tl::functions::contacts::ResolveUsername { username: "gif".to_owned(), referer: None };
+            let tl::enums::contacts::ResolvedPeer::Peer(found) = account.ask(&request)?;
+            account.learn(&found.users, &found.chats);
+            let Who::User(id) = Who::of(&found.peer) else {
+                return Err(Fault::Rpc { code: 400, name: "BOT_INVALID".to_owned(), value: None });
+            };
+            account.ctx.set_note("gifbot", &id.to_string());
+            id
+        }
+    });
     let peer = account.input(bot)?;
-    let user = account.dir().input_user(bot).ok_or_else(|| Fault::Rpc {
-        code: 400,
-        name: "BOT_INVALID".to_owned(),
-        value: None,
-    })?;
+    let user = account.dir().input_user(bot).ok_or_else(|| Fault::Rpc { code: 400, name: "BOT_INVALID".to_owned(), value: None })?;
     Ok((user, peer))
 }
 
@@ -178,9 +131,7 @@ fn gif_search(account: &Account, query: &str, offset: &str) -> Result<CatalogPag
     let mut items = Vec::new();
     for result in &found.results {
         let (id, document) = match result {
-            tl::enums::BotInlineResult::BotInlineMediaResult(result) => {
-                (result.id.clone(), result.document.as_ref())
-            }
+            tl::enums::BotInlineResult::BotInlineMediaResult(result) => (result.id.clone(), result.document.as_ref()),
             tl::enums::BotInlineResult::Result(result) => (result.id.clone(), None),
         };
         let pick_id = format!("i{}:{id}", found.query_id);
@@ -188,21 +139,11 @@ fn gif_search(account: &Account, query: &str, offset: &str) -> Result<CatalogPag
             continue;
         };
         // Sent as the bot's result, not as the document: that is what the bot was asked for.
-        remember(
-            account,
-            &pick_id,
-            Pick::Inline {
-                query_id: found.query_id,
-                result: id,
-            },
-        );
+        remember(account, &pick_id, Pick::Inline { query_id: found.query_id, result: id });
         shown.id = pick_id;
         items.push(shown);
     }
-    Ok(CatalogPage {
-        items,
-        cursor: found.next_offset.filter(|next| !next.is_empty()),
-    })
+    Ok(CatalogPage { items, cursor: found.next_offset.filter(|next| !next.is_empty()) })
 }
 
 /// One installed pack a page, in the user's order: the list of packs, then that pack.
@@ -211,9 +152,7 @@ fn stickers(account: &Account, at: usize) -> Result<CatalogPage, Fault> {
     let sets = match held {
         Some(sets) => sets,
         None => {
-            let tl::enums::messages::AllStickers::Stickers(all) =
-                account.ask(&tl::functions::messages::GetAllStickers { hash: 0 })?
-            else {
+            let tl::enums::messages::AllStickers::Stickers(all) = account.ask(&tl::functions::messages::GetAllStickers { hash: 0 })? else {
                 return Ok(CatalogPage::default());
             };
             let sets: Vec<(i64, i64, String)> = all
@@ -228,21 +167,10 @@ fn stickers(account: &Account, at: usize) -> Result<CatalogPage, Fault> {
     let Some((id, access_hash, title)) = sets.get(at).cloned() else {
         return Ok(CatalogPage::default());
     };
-    let request = tl::functions::messages::GetStickerSet {
-        stickerset: tl::types::InputStickerSetId { id, access_hash }.into(),
-        hash: 0,
-    };
+    let request = tl::functions::messages::GetStickerSet { stickerset: tl::types::InputStickerSetId { id, access_hash }.into(), hash: 0 };
     let tl::enums::messages::StickerSet::Set(set) = account.ask(&request)? else {
         return Ok(CatalogPage::default());
     };
-    let items = set
-        .documents
-        .iter()
-        .take(protocol::CATALOG_LIMIT)
-        .filter_map(|sticker| item(account, sticker, &title))
-        .collect();
-    Ok(CatalogPage {
-        items,
-        cursor: (at + 1 < sets.len()).then(|| (at + 1).to_string()),
-    })
+    let items = set.documents.iter().take(protocol::CATALOG_LIMIT).filter_map(|sticker| item(account, sticker, &title)).collect();
+    Ok(CatalogPage { items, cursor: (at + 1 < sets.len()).then(|| (at + 1).to_string()) })
 }

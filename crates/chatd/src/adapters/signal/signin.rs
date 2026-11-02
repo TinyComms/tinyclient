@@ -36,43 +36,23 @@ fn current() -> MutexGuard<'static, Option<Arc<Flow>>> {
 }
 
 fn waiting() -> SignInStep {
-    SignInStep::Qr {
-        link: String::new(),
-        expires: 0,
-        problem: None,
-    }
+    SignInStep::Qr { link: String::new(), expires: 0, problem: None }
 }
 
 /// Begins a sign-in, or with `input` answers the step on show. Answers the step to draw.
 /// `Err` when this build cannot sign in to Signal at all, and why.
-pub fn step(
-    hub: &Arc<Hub>,
-    input: Option<SignInInput>,
-    adopt: Adopt,
-) -> Result<SignInStep, String> {
+pub fn step(hub: &Arc<Hub>, input: Option<SignInInput>, adopt: Adopt) -> Result<SignInStep, String> {
     if !supported() {
         return Err(unsupported_reason());
     }
     let mut held = current();
-    let live = held
-        .as_ref()
-        .filter(|flow| !flow.ended.load(Ordering::Relaxed))
-        .cloned();
+    let live = held.as_ref().filter(|flow| !flow.ended.load(Ordering::Relaxed)).cloned();
     let flow = match (live, &input) {
         (Some(flow), _) => flow,
-        (None, Some(_)) => {
-            return Ok(SignInStep::Failed {
-                reason: "That sign-in is over. Start again.".to_owned(),
-            })
-        }
+        (None, Some(_)) => return Ok(SignInStep::Failed { reason: "That sign-in is over. Start again.".to_owned() }),
         (None, None) => {
             let linker = linker()?;
-            let flow = Arc::new(Flow {
-                hub: hub.clone(),
-                step: Mutex::new(waiting()),
-                ended: AtomicBool::new(false),
-                cancelled: Arc::default(),
-            });
+            let flow = Arc::new(Flow { hub: hub.clone(), step: Mutex::new(waiting()), ended: AtomicBool::new(false), cancelled: Arc::default() });
             let running = flow.clone();
             super::presage_thread("signal-link")
                 .spawn(move || running.run(linker, adopt))
@@ -109,9 +89,7 @@ pub fn cancel() {
 
 impl Flow {
     fn step(&self) -> MutexGuard<'_, SignInStep> {
-        self.step
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.step.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Shows a step, and tells the shell when it changed without being asked.
@@ -126,23 +104,14 @@ impl Flow {
             changed
         };
         if changed {
-            self.hub.changed(Change::SignIn {
-                network: Network::Signal,
-                step,
-            });
+            self.hub.changed(Change::SignIn { network: Network::Signal, step });
         }
     }
 
     fn run(&self, mut linker: Box<dyn super::wire::Linker>, adopt: Adopt) {
         let mut tries = 0;
         let outcome = loop {
-            let show = |link: String| {
-                self.show(SignInStep::Qr {
-                    link,
-                    expires: 0,
-                    problem: None,
-                })
-            };
+            let show = |link: String| self.show(SignInStep::Qr { link, expires: 0, problem: None });
             match linker.link(DEVICE, &show, self.cancelled.clone()) {
                 Ok(linked) => break Ok(linked),
                 Err(_) if self.cancelled.load(Ordering::Relaxed) => return,
@@ -150,15 +119,8 @@ impl Flow {
                 // code, a few times, before the sheet says so.
                 Err(Fault::Net(why)) if tries + 1 < TRIES => {
                     tries += 1;
-                    tracing::warn!(
-                        "chatd: Signal: linking: {}",
-                        super::super::net::redact(&why)
-                    );
-                    self.show(SignInStep::Qr {
-                        link: String::new(),
-                        expires: 0,
-                        problem: Some(SignInProblem::Unreachable),
-                    });
+                    tracing::warn!("chatd: Signal: linking: {}", super::super::net::redact(&why));
+                    self.show(SignInStep::Qr { link: String::new(), expires: 0, problem: Some(SignInProblem::Unreachable) });
                     linker = match super::linker() {
                         Ok(linker) => linker,
                         Err(why) => break Err(why),
@@ -169,14 +131,8 @@ impl Flow {
         };
         let step = match outcome {
             Ok(linked) => match adopt(&linked.session) {
-                Ok(accounts) => SignInStep::Done {
-                    account: accounts.into_iter().next(),
-                },
-                Err(why) => SignInStep::Failed {
-                    reason: format!(
-                        "Signal linked, but tinyclient could not keep the session: {why}"
-                    ),
-                },
+                Ok(accounts) => SignInStep::Done { account: accounts.into_iter().next() },
+                Err(why) => SignInStep::Failed { reason: format!("Signal linked, but tinyclient could not keep the session: {why}") },
             },
             Err(reason) => SignInStep::Failed { reason },
         };
@@ -188,9 +144,7 @@ impl Flow {
 impl Fault {
     fn words_for_link(&self) -> String {
         match self {
-            Fault::Net(_) => {
-                "Couldn't reach Signal. Check your connection and try again.".to_owned()
-            }
+            Fault::Net(_) => "Couldn't reach Signal. Check your connection and try again.".to_owned(),
             Fault::Refused(why) | Fault::Ended(why) => why.clone(),
         }
     }

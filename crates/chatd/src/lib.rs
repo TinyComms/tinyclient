@@ -40,24 +40,21 @@ pub fn spawn_core(
     seed: impl FnOnce(&mut store::Store) -> io::Result<()> + Send + 'static,
 ) -> io::Result<JoinHandle<()>> {
     let (ready, answer) = std::sync::mpsc::channel::<io::Result<()>>();
-    let spawned = std::thread::Builder::new()
-        .name("chatd".into())
-        .stack_size(8 * 1024 * 1024)
-        .spawn(move || {
-            let (lock, listener, chat) = match setup(&dir, host, seed) {
-                Ok(parts) => parts,
-                Err(err) => {
-                    let _ = ready.send(Err(err));
-                    return;
-                }
-            };
-            let _ = ready.send(Ok(()));
-            // Held until serve ends: a second chatd for this directory finds it busy.
-            let _lock = lock;
-            if let Err(err) = server::serve(listener, chat) {
-                tracing::warn!("chatd: {err}");
+    let spawned = std::thread::Builder::new().name("chatd".into()).stack_size(8 * 1024 * 1024).spawn(move || {
+        let (lock, listener, chat) = match setup(&dir, host, seed) {
+            Ok(parts) => parts,
+            Err(err) => {
+                let _ = ready.send(Err(err));
+                return;
             }
-        })?;
+        };
+        let _ = ready.send(Ok(()));
+        // Held until serve ends: a second chatd for this directory finds it busy.
+        let _lock = lock;
+        if let Err(err) = server::serve(listener, chat) {
+            tracing::warn!("chatd: {err}");
+        }
+    })?;
     match answer.recv() {
         Ok(Ok(())) => Ok(spawned),
         Ok(Err(err)) => {
@@ -68,27 +65,13 @@ pub fn spawn_core(
     }
 }
 
-fn setup(
-    dir: &Path,
-    host: Host,
-    seed: impl FnOnce(&mut store::Store) -> io::Result<()>,
-) -> io::Result<(File, ChatListener, server::Chat)> {
+fn setup(dir: &Path, host: Host, seed: impl FnOnce(&mut store::Store) -> io::Result<()>) -> io::Result<(File, ChatListener, server::Chat)> {
     std::fs::create_dir_all(dir)?;
     // One chatd per support directory. A shell starts chatd whenever it finds none answering,
     // so two may be started at once: the second finds the lock held and leaves the first be.
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join("chatd.lock"))?;
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("chatd.lock"))?;
     if let Err(err) = lock.try_lock() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "another chatd is already running for {} ({err})",
-                dir.display()
-            ),
-        ));
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("another chatd is already running for {} ({err})", dir.display())));
     }
     #[cfg(target_os = "android")]
     session::app_file::install(dir);

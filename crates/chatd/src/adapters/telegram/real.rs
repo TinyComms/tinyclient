@@ -16,9 +16,7 @@ use grammers_client::client::{ClientConfiguration, NoRetries, UpdatesConfigurati
 use grammers_client::peer::{Peer, PeerMap};
 use grammers_client::Client;
 use grammers_mtsender::{ConnectionParams, InvocationError, SenderPool};
-use grammers_session::types::{
-    ChannelState, DcOption, PeerAuth, PeerId, PeerInfo, UpdateState, UpdatesState,
-};
+use grammers_session::types::{ChannelState, DcOption, PeerAuth, PeerId, PeerInfo, UpdateState, UpdatesState};
 use grammers_session::updates::UpdatesLike;
 use grammers_session::{BoxFuture, Session, SessionData};
 use grammers_tl_types as tl;
@@ -70,12 +68,7 @@ impl Vault {
                         ipv6: v6.unwrap_or(known.ipv6),
                         auth_key: key,
                     },
-                    (None, Some(ipv4), Some(ipv6)) => DcOption {
-                        id: dc.id,
-                        ipv4,
-                        ipv6,
-                        auth_key: key,
-                    },
+                    (None, Some(ipv4), Some(ipv6)) => DcOption { id: dc.id, ipv4, ipv6, auth_key: key },
                     _ => continue,
                 };
                 data.dc_options.insert(dc.id, option);
@@ -99,10 +92,7 @@ impl Vault {
     }
 
     fn saved(&self, user: i64, name: &str) -> Saved {
-        let data = self
-            .data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut dcs: Vec<SavedDc> = data
             .dc_options
             .values()
@@ -133,10 +123,7 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) || !text.is_ascii() {
         return None;
     }
-    (0..text.len())
-        .step_by(2)
-        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok())
-        .collect()
+    (0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok()).collect()
 }
 
 impl Session for Vault {
@@ -161,10 +148,7 @@ impl Session for Vault {
     fn set_dc_option(&self, dc_option: &DcOption) -> BoxFuture<'_, Result<(), Poisoned>> {
         let dc_option = dc_option.clone();
         Box::pin(async move {
-            let before = self
-                .data()?
-                .dc_options
-                .insert(dc_option.id, dc_option.clone());
+            let before = self.data()?.dc_options.insert(dc_option.id, dc_option.clone());
             if before.as_ref() != Some(&dc_option) {
                 self.unsaved.store(true, Ordering::Relaxed);
             }
@@ -185,13 +169,7 @@ impl Session for Vault {
     fn cache_peer(&self, peer: &PeerInfo) -> BoxFuture<'_, Result<(), Poisoned>> {
         let peer = peer.clone();
         Box::pin(async move {
-            if matches!(
-                peer,
-                PeerInfo::User {
-                    is_self: Some(true),
-                    ..
-                }
-            ) {
+            if matches!(peer, PeerInfo::User { is_self: Some(true), .. }) {
                 *self.me.lock().map_err(|_| Poisoned)? = Some(peer);
                 return Ok(());
             }
@@ -199,10 +177,7 @@ impl Session for Vault {
             if data.peer_infos.len() >= PEERS_KEPT {
                 data.peer_infos.clear();
             }
-            data.peer_infos
-                .entry(peer.id())
-                .or_insert_with(|| peer.clone())
-                .extend_info(&peer);
+            data.peer_infos.entry(peer.id()).or_insert_with(|| peer.clone()).extend_info(&peer);
             Ok(())
         })
     }
@@ -223,9 +198,7 @@ impl Session for Vault {
                 }
                 UpdateState::Secondary { qts } => data.updates_state.qts = qts,
                 UpdateState::Channel { id, pts } => {
-                    data.updates_state
-                        .channels
-                        .retain(|channel| channel.id != id);
+                    data.updates_state.channels.retain(|channel| channel.id != id);
                     data.updates_state.channels.push(ChannelState { id, pts });
                 }
             }
@@ -257,9 +230,7 @@ impl Real {
         std::thread::Builder::new()
             .name("telegram".into())
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build();
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
                 match runtime {
                     Ok(runtime) => runtime.block_on(run(api_id, held, inbox, events)),
                     Err(err) => drop(events.send(Event::Closed(format!("no runtime: {err}")))),
@@ -313,14 +284,7 @@ async fn follow(client: Client, updates: UnboundedReceiver<UpdatesLike>, events:
         match stream.next_raw().await {
             Ok((update, _, peers)) => {
                 let (users, chats) = named(&peers);
-                if events
-                    .send(Event::Update {
-                        update: Box::new(update),
-                        users,
-                        chats,
-                    })
-                    .is_err()
-                {
+                if events.send(Event::Update { update: Box::new(update), users, chats }).is_err() {
                     return;
                 }
             }
@@ -329,12 +293,7 @@ async fn follow(client: Client, updates: UnboundedReceiver<UpdatesLike>, events:
     }
 }
 
-async fn run(
-    api_id: i32,
-    vault: Arc<Vault>,
-    mut jobs: UnboundedReceiver<Job>,
-    events: Sender<Event>,
-) {
+async fn run(api_id: i32, vault: Arc<Vault>, mut jobs: UnboundedReceiver<Job>, events: Sender<Event>) {
     // What the account's device list shows for this session, beside the system version grammers
     // reads from the OS.
     let device_model = if cfg!(target_os = "macos") {
@@ -351,11 +310,7 @@ async fn run(
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
         ..ConnectionParams::default()
     };
-    let SenderPool {
-        runner,
-        handle,
-        updates,
-    } = SenderPool::with_configuration(vault.clone(), api_id, params);
+    let SenderPool { runner, handle, updates } = SenderPool::with_configuration(vault.clone(), api_id, params);
     // Flood waits are the adapter's to honor (`wire::patient`), so the library retries nothing.
     let configuration = ClientConfiguration {
         retry_policy: Box::new(NoRetries),
@@ -388,9 +343,7 @@ impl Wire for Real {
             None => return Err(closed()),
         }
         // The library answers every request, with an error once its connection is gone.
-        answer
-            .recv()
-            .unwrap_or_else(|_| Err(Fault::Net("the connection is closed".to_owned())))
+        answer.recv().unwrap_or_else(|_| Err(Fault::Net("the connection is closed".to_owned())))
     }
 
     fn events(&self) -> Option<Receiver<Event>> {
@@ -447,26 +400,15 @@ mod tests {
             user: 7001,
             name: "Mira".into(),
             home: 4,
-            dcs: vec![SavedDc {
-                id: 4,
-                v4: "149.154.167.92:443".into(),
-                v6: "[2001:67c:4e8:f004::a]:443".into(),
-                key: key.clone(),
-            }],
+            dcs: vec![SavedDc { id: 4, v4: "149.154.167.92:443".into(), v6: "[2001:67c:4e8:f004::a]:443".into(), key: key.clone() }],
         };
         let vault = Vault::new(Some(&saved));
         assert_eq!(vault.home_dc_id().unwrap(), 4);
-        assert_eq!(
-            vault.dc_option(4).unwrap().unwrap().auth_key,
-            Some([0xab; 256])
-        );
+        assert_eq!(vault.dc_option(4).unwrap().unwrap().auth_key, Some([0xab; 256]));
         // The other datacenters are known by address and have no key yet.
         assert_eq!(vault.dc_option(2).unwrap().unwrap().auth_key, None);
         let back = vault.saved(7001, "Mira");
-        assert_eq!(
-            (back.home, back.dcs.len(), back.dcs[0].key.as_str()),
-            (4, 1, key.as_str())
-        );
+        assert_eq!((back.home, back.dcs.len(), back.dcs[0].key.as_str()), (4, 1, key.as_str()));
         assert_eq!(unhex("zz"), None);
     }
 }

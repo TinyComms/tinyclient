@@ -12,17 +12,13 @@ use std::time::Duration;
 pub fn start() -> io::Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let origin = format!("http://{}", listener.local_addr()?);
-    std::thread::Builder::new()
-        .name("demo-files".into())
-        .spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let _ = std::thread::Builder::new()
-                    .stack_size(256 * 1024)
-                    .spawn(move || {
-                        let _ = answer(stream);
-                    });
-            }
-        })?;
+    std::thread::Builder::new().name("demo-files".into()).spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let _ = std::thread::Builder::new().stack_size(256 * 1024).spawn(move || {
+                let _ = answer(stream);
+            });
+        }
+    })?;
     Ok(origin)
 }
 
@@ -50,10 +46,7 @@ fn pdf(size: usize) -> Vec<u8> {
         for offset in offsets {
             out.extend(format!("{offset:010} 00000 n \n").bytes());
         }
-        let trailer = format!(
-            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
-            objects.len() + 1
-        );
+        let trailer = format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1);
         out.extend(trailer.bytes());
         out
     };
@@ -74,12 +67,7 @@ fn zip(size: usize) -> Vec<u8> {
     let name = b"camera.log";
     let fixed = 30 + name.len() + 46 + name.len() + 22;
     let line = b"03:12:44 motion on trail camera 2, 14 frames kept\n";
-    let data: Vec<u8> = line
-        .iter()
-        .copied()
-        .cycle()
-        .take(size.saturating_sub(fixed))
-        .collect();
+    let data: Vec<u8> = line.iter().copied().cycle().take(size.saturating_sub(fixed)).collect();
     let crc = png::crc32(&[&data]);
     let length = data.len() as u32;
     let mut out = Vec::with_capacity(size);
@@ -140,18 +128,13 @@ fn wav(seconds: u32) -> Vec<u8> {
 fn file(path: &str) -> Option<(&'static str, Vec<u8>)> {
     let mut parts = path.trim_start_matches('/').split('/');
     let kind = parts.next()?;
-    let art = if kind == "art" {
-        Art::from_letter(parts.next()?)
-    } else {
-        None
-    };
+    let art = if kind == "art" { Art::from_letter(parts.next()?) } else { None };
     let mut number = || parts.next()?.parse::<u32>().ok();
     match kind {
         "art" => {
             let (seed, width, height) = (number()?, number()?, number()?);
             let art = art?;
-            (width <= 4096 && height <= 4096)
-                .then(|| ("image/png", png::encode(art, seed, width, height)))
+            (width <= 4096 && height <= 4096).then(|| ("image/png", png::encode(art, seed, width, height)))
         }
         "pdf" => Some(("application/pdf", pdf(number()? as usize))),
         "zip" => Some(("application/zip", zip(number()? as usize))),
@@ -176,10 +159,7 @@ fn answer(stream: TcpStream) -> io::Result<()> {
     let target = request.split_whitespace().nth(1).unwrap_or("/");
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     // `?wait=MS` holds the answer back so the loading state can be seen.
-    if let Some(wait) = query
-        .strip_prefix("wait=")
-        .and_then(|wait| wait.parse::<u64>().ok())
-    {
+    if let Some(wait) = query.strip_prefix("wait=").and_then(|wait| wait.parse::<u64>().ok()) {
         sleep(Duration::from_millis(wait.min(10_000)));
     }
     let mut stream = reader.into_inner();
@@ -192,8 +172,7 @@ fn answer(stream: TcpStream) -> io::Result<()> {
             stream.write_all(head.as_bytes())?;
             stream.write_all(&bytes)
         }
-        None => stream
-            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+        None => stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
     }
 }
 

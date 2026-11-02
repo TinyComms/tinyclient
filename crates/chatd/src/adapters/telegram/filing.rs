@@ -72,17 +72,9 @@ impl Filed {
         let facts = self.facts.get(&who).copied().unwrap_or_default();
         let list = usize::from(facts.archived);
         Filing {
-            folders: self
-                .rules
-                .iter()
-                .filter(|rule| rule.holds(who, known, facts))
-                .map(|rule| rule.id.to_string())
-                .collect(),
+            folders: self.rules.iter().filter(|rule| rule.holds(who, known, facts)).map(|rule| rule.id.to_string()).collect(),
             archived: facts.archived,
-            pin: self.pins[list]
-                .iter()
-                .position(|pinned| *pinned == who)
-                .map(|at| at as i32),
+            pin: self.pins[list].iter().position(|pinned| *pinned == who).map(|at| at as i32),
             hidden: false,
             followed: false,
         }
@@ -123,9 +115,7 @@ impl Rule {
             Who::Channel(_) if known.broadcast => self.broadcasts,
             _ => self.groups,
         };
-        kind && !(self.exclude_muted && facts.muted)
-            && !(self.exclude_read && facts.read)
-            && !(self.exclude_archived && facts.archived)
+        kind && !(self.exclude_muted && facts.muted) && !(self.exclude_read && facts.read) && !(self.exclude_archived && facts.archived)
     }
 }
 
@@ -146,23 +136,14 @@ fn title(title: &tl::enums::TextWithEntities) -> String {
 
 /// One of Telegram's dialog filters as a folder. The default (All) is no folder.
 pub(super) fn rule(filter: &tl::enums::DialogFilter, me: i64) -> Option<Rule> {
-    let whos = |peers: &[tl::enums::InputPeer]| {
-        peers
-            .iter()
-            .filter_map(|peer| input_who(peer, me))
-            .collect::<Vec<Who>>()
-    };
+    let whos = |peers: &[tl::enums::InputPeer]| peers.iter().filter_map(|peer| input_who(peer, me)).collect::<Vec<Who>>();
     Some(match filter {
         tl::enums::DialogFilter::Filter(filter) => {
             let pinned = whos(&filter.pinned_peers);
             Rule {
                 id: filter.id,
                 title: title(&filter.title),
-                named: pinned
-                    .iter()
-                    .copied()
-                    .chain(whos(&filter.include_peers))
-                    .collect(),
+                named: pinned.iter().copied().chain(whos(&filter.include_peers)).collect(),
                 pinned,
                 left_out: whos(&filter.exclude_peers).into_iter().collect(),
                 contacts: filter.contacts,
@@ -180,11 +161,7 @@ pub(super) fn rule(filter: &tl::enums::DialogFilter, me: i64) -> Option<Rule> {
             Rule {
                 id: list.id,
                 title: title(&list.title),
-                named: pinned
-                    .iter()
-                    .copied()
-                    .chain(whos(&list.include_peers))
-                    .collect(),
+                named: pinned.iter().copied().chain(whos(&list.include_peers)).collect(),
                 pinned,
                 ..Rule::default()
             }
@@ -195,13 +172,8 @@ pub(super) fn rule(filter: &tl::enums::DialogFilter, me: i64) -> Option<Rule> {
 
 /// The folders, one request.
 pub(super) fn ask_rules(account: &Account) -> Result<Vec<Rule>, Fault> {
-    let tl::enums::messages::DialogFilters::Filters(found) =
-        account.ask(&tl::functions::messages::GetDialogFilters {})?;
-    Ok(found
-        .filters
-        .iter()
-        .filter_map(|filter| rule(filter, account.me))
-        .collect())
+    let tl::enums::messages::DialogFilters::Filters(found) = account.ask(&tl::functions::messages::GetDialogFilters {})?;
+    Ok(found.filters.iter().filter_map(|filter| rule(filter, account.me)).collect())
 }
 
 /// The folder list, as it is held, to the store.
@@ -266,10 +238,7 @@ pub(super) fn apply(account: &Account, update: &tl::enums::Update) -> bool {
                 if pinned.pinned {
                     pins.insert(0, who);
                 }
-                before
-                    .into_iter()
-                    .chain(std::iter::once(who))
-                    .collect::<Vec<_>>()
+                before.into_iter().chain(std::iter::once(who)).collect::<Vec<_>>()
             };
             refile(account, moved);
         }
@@ -315,10 +284,7 @@ pub(super) fn apply(account: &Account, update: &tl::enums::Update) -> bool {
             {
                 let mut live = account.live();
                 let rules = &mut live.filed.rules;
-                let made = changed
-                    .filter
-                    .as_ref()
-                    .and_then(|filter| rule(filter, account.me));
+                let made = changed.filter.as_ref().and_then(|filter| rule(filter, account.me));
                 match (rules.iter().position(|held| held.id == changed.id), made) {
                     (Some(at), Some(made)) => rules[at] = made,
                     (None, Some(made)) => rules.push(made),
@@ -333,13 +299,7 @@ pub(super) fn apply(account: &Account, update: &tl::enums::Update) -> bool {
             {
                 let mut live = account.live();
                 let rules = &mut live.filed.rules;
-                rules.sort_by_key(|rule| {
-                    order
-                        .order
-                        .iter()
-                        .position(|id| *id == rule.id)
-                        .unwrap_or(usize::MAX)
-                });
+                rules.sort_by_key(|rule| order.order.iter().position(|id| *id == rule.id).unwrap_or(usize::MAX));
             }
             report(account);
         }
@@ -363,8 +323,7 @@ pub(super) fn apply(account: &Account, update: &tl::enums::Update) -> bool {
 
 /// The pinned chats of one list, in order: one request.
 fn pinned(account: &Account, folder_id: i32) -> Result<Vec<Who>, Fault> {
-    let tl::enums::messages::PeerDialogs::Dialogs(found) =
-        account.ask(&tl::functions::messages::GetPinnedDialogs { folder_id })?;
+    let tl::enums::messages::PeerDialogs::Dialogs(found) = account.ask(&tl::functions::messages::GetPinnedDialogs { folder_id })?;
     account.learn(&found.users, &found.chats);
     Ok(found
         .dialogs
@@ -386,12 +345,7 @@ pub(super) fn facts_changed(account: &Account, who: Who, change: impl FnOnce(&mu
         };
         let before = *facts;
         change(facts);
-        *facts != before
-            && live
-                .filed
-                .rules
-                .iter()
-                .any(|rule| rule.exclude_muted || rule.exclude_read)
+        *facts != before && live.filed.rules.iter().any(|rule| rule.exclude_muted || rule.exclude_read)
     };
     if changed {
         refile(account, [who]);
@@ -412,55 +366,24 @@ mod tests {
             exclude_muted: true,
             ..Rule::default()
         };
-        let contact = Known {
-            contact: true,
-            ..Known::default()
-        };
-        let quiet = Facts {
-            muted: true,
-            ..Facts::default()
-        };
-        assert!(
-            rule.holds(Who::Group(1), &Known::default(), quiet),
-            "named chats are in whatever their state"
-        );
+        let contact = Known { contact: true, ..Known::default() };
+        let quiet = Facts { muted: true, ..Facts::default() };
+        assert!(rule.holds(Who::Group(1), &Known::default(), quiet), "named chats are in whatever their state");
         assert!(rule.holds(Who::User(2), &contact, Facts::default()));
-        assert!(
-            !rule.holds(Who::User(2), &contact, quiet),
-            "a muted contact is excluded"
-        );
-        assert!(
-            !rule.holds(Who::User(9), &contact, Facts::default()),
-            "a left-out chat never is"
-        );
+        assert!(!rule.holds(Who::User(2), &contact, quiet), "a muted contact is excluded");
+        assert!(!rule.holds(Who::User(9), &contact, Facts::default()), "a left-out chat never is");
         assert!(!rule.holds(Who::Group(5), &Known::default(), Facts::default()));
     }
 
     #[test]
     fn a_chat_is_filed_in_every_folder_that_holds_it_with_its_pin() {
         let mut filed = Filed::default();
-        let one = |id, named: &[Who]| Rule {
-            id,
-            named: named.iter().copied().collect(),
-            ..Rule::default()
-        };
-        filed.rules = vec![
-            one(2, &[Who::Group(1)]),
-            one(3, &[Who::Group(1), Who::User(4)]),
-        ];
+        let one = |id, named: &[Who]| Rule { id, named: named.iter().copied().collect(), ..Rule::default() };
+        filed.rules = vec![one(2, &[Who::Group(1)]), one(3, &[Who::Group(1), Who::User(4)])];
         filed.pins[0] = vec![Who::User(4), Who::Group(1)];
         let filing = filed.filing(Who::Group(1), &Known::default());
-        assert_eq!(
-            (filing.folders, filing.pin, filing.archived),
-            (vec!["2".to_owned(), "3".to_owned()], Some(1), false)
-        );
-        filed.note(
-            Who::User(4),
-            Facts {
-                archived: true,
-                ..Facts::default()
-            },
-        );
+        assert_eq!((filing.folders, filing.pin, filing.archived), (vec!["2".to_owned(), "3".to_owned()], Some(1), false));
+        filed.note(Who::User(4), Facts { archived: true, ..Facts::default() });
         // An archived chat is pinned only among the archive's pins.
         assert_eq!(filed.filing(Who::User(4), &Known::default()).pin, None);
     }

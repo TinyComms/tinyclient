@@ -337,30 +337,17 @@ fn a_chat_on_screen_shows_the_picture_the_phone_keeps_for_its_person() {
     // Only the one-to-one chat's person is asked about; a group has no picture of its own.
     world.heard("thumbnails participant-grace");
     let avatar = world.until("Grace's picture", || {
-        world
-            .conversation(GRACE)
-            .and_then(|row| row.avatar)
-            .filter(|file| file.path.is_some())
+        world.conversation(GRACE).and_then(|row| row.avatar).filter(|file| file.path.is_some())
     });
     assert_eq!(avatar.kind, MediaKind::Avatar);
-    assert_eq!(
-        &std::fs::read(avatar.path.unwrap()).unwrap()[..4],
-        b"\x89PNG"
-    );
+    assert_eq!(&std::fs::read(avatar.path.unwrap()).unwrap()[..4], b"\x89PNG");
     assert!(world.conversation(CLUB).unwrap().avatar.is_none());
 
     // It is not asked for twice on one connection.
-    world.ask(Request::Watch(protocol::Watching {
-        rows: vec![key(GRACE)],
-        ..Default::default()
-    }));
+    world.ask(Request::Watch(protocol::Watching { rows: vec![key(GRACE)], ..Default::default() }));
     world.ask(Request::Watch(watching));
     sleep(Duration::from_millis(300));
-    let asked = world
-        .calls()
-        .iter()
-        .filter(|call| call.starts_with("thumbnails"))
-        .count();
+    let asked = world.calls().iter().filter(|call| call.starts_with("thumbnails")).count();
     assert_eq!(asked, 1);
     assert!(world.conversation(GRACE).unwrap().avatar.is_some());
 }
@@ -552,16 +539,16 @@ fn pairing_uses_google_browser_then_phone_emoji_confirmation() {
         .iter()
         .all(|status| status.key.network != Network::Messages || status.link == Link::SignedOut));
     let (_, seq) = world.status();
-    assert!(matches!(
-        world.sign_in(None),
-        SignInStep::Browser { waiting: false, .. }
-    ));
+    assert!(matches!(world.sign_in(None), SignInStep::Browser { waiting: false, .. }));
     world.sign_in(Some(SignInInput::OpenBrowser));
     let first = world.until("an emoji", || match world.sign_in(None) {
         SignInStep::Emoji { emoji } if !emoji.is_empty() => Some(emoji),
         _ => None,
     });
-    assert!(!first.starts_with("https://"), "{first}");
+    assert!(
+        !first.starts_with("https://"),
+        "{first}"
+    );
     let typed = world.sign_in(Some(SignInInput::UsePhone));
     assert!(
         matches!(&typed, SignInStep::Emoji { emoji } if *emoji == first),
@@ -593,42 +580,21 @@ fn pairing_uses_google_browser_then_phone_emoji_confirmation() {
 #[test]
 fn google_pairing_can_be_cancelled_and_restarted() {
     let world = World::start(None);
-    assert!(matches!(
-        world.sign_in(None),
-        SignInStep::Browser { waiting: false, .. }
-    ));
+    assert!(matches!(world.sign_in(None), SignInStep::Browser { waiting: false, .. }));
     // Legacy QR requests must never begin the obsolete pairing flow.
-    assert!(matches!(
-        world.sign_in(Some(SignInInput::UseQr)),
-        SignInStep::Browser { waiting: false, .. }
-    ));
+    assert!(matches!(world.sign_in(Some(SignInInput::UseQr)), SignInStep::Browser { waiting: false, .. }));
     world.sign_in(Some(SignInInput::OpenBrowser));
-    world.until("the emoji challenge", || {
-        matches!(world.sign_in(None), SignInStep::Emoji { .. }).then_some(())
-    });
-    world.ask(Request::SignInCancel {
-        network: Network::Messages,
-    });
-    assert!(matches!(
-        world.sign_in(Some(SignInInput::OpenBrowser)),
-        SignInStep::Failed { .. }
-    ));
-    assert!(matches!(
-        world.sign_in(None),
-        SignInStep::Browser { waiting: false, .. }
-    ));
+    world.until("the emoji challenge", || matches!(world.sign_in(None), SignInStep::Emoji { .. }).then_some(()));
+    world.ask(Request::SignInCancel { network: Network::Messages });
+    assert!(matches!(world.sign_in(Some(SignInInput::OpenBrowser)), SignInStep::Failed { .. }));
+    assert!(matches!(world.sign_in(None), SignInStep::Browser { waiting: false, .. }));
     world.heard("pairing stopped");
     world.sign_in(Some(SignInInput::OpenBrowser));
-    world.until("the restarted emoji challenge", || {
-        matches!(world.sign_in(None), SignInStep::Emoji { .. }).then_some(())
-    });
+    world.until("the restarted emoji challenge", || matches!(world.sign_in(None), SignInStep::Emoji { .. }).then_some(()));
     let (_, seq) = world.status();
     world.steer_link("confirm");
     world.changed(seq, "restarted pairing completion", |change| match change {
-        Change::SignIn {
-            network: Network::Messages,
-            step: SignInStep::Done { .. },
-        } => Some(()),
+        Change::SignIn { network: Network::Messages, step: SignInStep::Done { .. } } => Some(()),
         _ => None,
     });
     world.connected();
@@ -639,21 +605,12 @@ fn google_pairing_failure_is_reported_without_adopting_an_account() {
     let world = World::start(None);
     world.sign_in(None);
     world.sign_in(Some(SignInInput::OpenBrowser));
-    world.until("the emoji challenge", || {
-        matches!(world.sign_in(None), SignInStep::Emoji { .. }).then_some(())
-    });
+    world.until("the emoji challenge", || matches!(world.sign_in(None), SignInStep::Emoji { .. }).then_some(()));
     let (_, seq) = world.status();
     world.steer_link("fail");
     world.changed(seq, "pairing failure", |change| match change {
-        Change::SignIn {
-            network: Network::Messages,
-            step: SignInStep::Failed { reason },
-        } => Some(reason.clone()),
+        Change::SignIn { network: Network::Messages, step: SignInStep::Failed { reason } } => Some(reason.clone()),
         _ => None,
     });
-    assert!(world
-        .status()
-        .0
-        .iter()
-        .all(|status| status.key.network != Network::Messages || status.link == Link::SignedOut));
+    assert!(world.status().0.iter().all(|status| status.key.network != Network::Messages || status.link == Link::SignedOut));
 }

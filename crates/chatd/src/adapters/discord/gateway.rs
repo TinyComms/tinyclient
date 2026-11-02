@@ -74,31 +74,18 @@ impl SendQueue {
     fn push(&mut self, op: u8, data: Value) {
         if op == 37 {
             if let Some(guilds) = data.get("subscriptions").and_then(Value::as_object) {
-                self.subscriptions.extend(
-                    guilds
-                        .iter()
-                        .map(|(guild, state)| (guild.clone(), state.clone())),
-                );
+                self.subscriptions.extend(guilds.iter().map(|(guild, state)| (guild.clone(), state.clone())));
             }
-        } else {
-            self.commands
-                .push_back(json!({"op": op, "d": data}).to_string());
-        }
+        } else { self.commands.push_back(json!({"op": op, "d": data}).to_string()); }
     }
 
     /// The next frame the allowance lets go at `now`.
     fn pop(&mut self, now: Instant) -> Option<String> {
-        if self.due(now)? > now {
-            return None;
-        }
+        if self.due(now)? > now { return None; }
         let subscription = self.commands.is_empty();
         self.sent.push_back((now, subscription));
-        if !subscription {
-            return self.commands.pop_front();
-        }
-        for guild in self.subscriptions.keys() {
-            self.subscribed.insert(guild.clone(), now);
-        }
+        if !subscription { return self.commands.pop_front(); }
+        for guild in self.subscriptions.keys() { self.subscribed.insert(guild.clone(), now); }
         let frame = json!({"op": 37, "d": {"subscriptions": &self.subscriptions}}).to_string();
         self.written.extend(std::mem::take(&mut self.subscriptions));
         Some(frame)
@@ -107,57 +94,32 @@ impl SendQueue {
     /// When the next waiting frame may go, or `None` with nothing waiting. Commands go first and
     /// may take the whole allowance; subscriptions are spaced and capped below it.
     fn due(&mut self, now: Instant) -> Option<Instant> {
-        while self
-            .sent
-            .front()
-            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= MINUTE)
-        {
-            self.sent.pop_front();
-        }
-        self.subscribed
-            .retain(|_, at| now.saturating_duration_since(*at) < MINUTE);
+        while self.sent.front().is_some_and(|(at, _)| now.saturating_duration_since(*at) >= MINUTE) { self.sent.pop_front(); }
+        self.subscribed.retain(|_, at| now.saturating_duration_since(*at) < MINUTE);
         let free = match self.sent.front() {
             Some((at, _)) if self.sent.len() >= SENDS_A_MINUTE => *at + MINUTE,
             _ => now,
         };
-        if !self.commands.is_empty() {
-            return Some(free);
-        }
-        if self.subscriptions.is_empty() {
-            return None;
-        }
+        if !self.commands.is_empty() { return Some(free); }
+        if self.subscriptions.is_empty() { return None; }
         let used = self.sent.len();
         let spaced = if used >= SUBSCRIPTIONS_A_MINUTE {
             self.sent[used - SUBSCRIPTIONS_A_MINUTE].0 + MINUTE
-        } else if self
-            .sent
-            .iter()
-            .filter(|(_, subscription)| *subscription)
-            .count()
-            < SUBSCRIPTION_BURST
-        {
+        } else if self.sent.iter().filter(|(_, subscription)| *subscription).count() < SUBSCRIPTION_BURST {
             now
         } else {
             // A guild not subscribed this minute, a server just opened, goes at once.
             let gap = MINUTE / (SUBSCRIPTIONS_A_MINUTE - used) as u32;
-            self.subscriptions
-                .keys()
-                .map(|guild| self.subscribed.get(guild).map_or(now, |at| *at + gap))
-                .min()
-                .unwrap_or(now)
+            self.subscriptions.keys().map(|guild| self.subscribed.get(guild).map_or(now, |at| *at + gap)).min().unwrap_or(now)
         };
         Some(spaced.max(free).max(now))
     }
 
     /// A heartbeat went. Discord reads in order, so its answer means it heard what was written
     /// before it.
-    fn beat(&mut self) {
-        self.unanswered.extend(std::mem::take(&mut self.written));
-    }
+    fn beat(&mut self) { self.unanswered.extend(std::mem::take(&mut self.written)); }
 
-    fn answered(&mut self) {
-        self.unanswered.clear();
-    }
+    fn answered(&mut self) { self.unanswered.clear(); }
 
     /// A new connection, with a minute of its own: Discord's allowance is per connection. Commands
     /// were for the old one. A resumed session still needs every subscription change Discord may
@@ -165,18 +127,9 @@ impl SendQueue {
     fn reconnected(&mut self, resuming: bool) {
         let mut kept = serde_json::Map::new();
         if resuming {
-            for changes in [
-                &mut self.unanswered,
-                &mut self.written,
-                &mut self.subscriptions,
-            ] {
-                kept.extend(std::mem::take(changes));
-            }
+            for changes in [&mut self.unanswered, &mut self.written, &mut self.subscriptions] { kept.extend(std::mem::take(changes)); }
         }
-        *self = Self {
-            subscriptions: kept,
-            ..Self::default()
-        };
+        *self = Self { subscriptions: kept, ..Self::default() };
     }
 }
 
@@ -193,15 +146,11 @@ impl Pollable {
     pub(crate) fn from_tcp(tcp: &TcpStream) -> Pollable {
         #[cfg(unix)]
         {
-            Pollable {
-                fd: tcp.as_raw_fd(),
-            }
+            Pollable { fd: tcp.as_raw_fd() }
         }
         #[cfg(windows)]
         {
-            Pollable {
-                socket: tcp.as_raw_socket(),
-            }
+            Pollable { socket: tcp.as_raw_socket() }
         }
     }
 }
@@ -217,10 +166,7 @@ pub(crate) const POLL_IN: i16 = windows_sys::Win32::Networking::WinSock::POLLRDN
 pub(crate) const POLL_OUT: i16 = windows_sys::Win32::Networking::WinSock::POLLWRNORM as i16;
 
 pub(crate) fn wait_sockets(until: Instant, sockets: &[(Pollable, i16)]) {
-    let ms = until
-        .saturating_duration_since(Instant::now())
-        .as_millis()
-        .min(60_000) as i32;
+    let ms = until.saturating_duration_since(Instant::now()).as_millis().min(60_000) as i32;
     if ms <= 0 {
         return;
     }
@@ -235,25 +181,17 @@ pub(crate) fn wait_sockets(until: Instant, sockets: &[(Pollable, i16)]) {
             })
             .collect();
         // SAFETY: `fds` is valid for the length of the call.
-        unsafe {
-            libc::poll(
-                fds.as_mut_ptr(),
-                fds.len() as libc::nfds_t,
-                ms as libc::c_int,
-            )
-        };
+        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms as libc::c_int) };
     }
     #[cfg(windows)]
     {
         let mut fds: Vec<windows_sys::Win32::Networking::WinSock::WSAPOLLFD> = sockets
             .iter()
-            .map(
-                |(socket, events)| windows_sys::Win32::Networking::WinSock::WSAPOLLFD {
-                    fd: socket.socket as _,
-                    events: *events,
-                    revents: 0,
-                },
-            )
+            .map(|(socket, events)| windows_sys::Win32::Networking::WinSock::WSAPOLLFD {
+                fd: socket.socket as _,
+                events: *events,
+                revents: 0,
+            })
             .collect();
         // SAFETY: `fds` is valid for the length of the call.
         unsafe {
@@ -362,22 +300,14 @@ struct Wire {
 impl Wire {
     fn connect(url: &str, user_agent: &str) -> io::Result<Wire> {
         let mut request = url.into_client_request().map_err(io::Error::other)?;
-        let headers = [
-            ("User-Agent", user_agent),
-            ("Origin", "https://discord.com"),
-        ];
+        let headers = [("User-Agent", user_agent), ("Origin", "https://discord.com")];
         for (name, value) in headers {
-            request.headers_mut().insert(
-                name,
-                HeaderValue::from_str(value).map_err(io::Error::other)?,
-            );
+            request.headers_mut().insert(name, HeaderValue::from_str(value).map_err(io::Error::other)?);
         }
         // READY for an account in many servers is larger than the default frame limit.
-        let config = WebSocketConfig::default()
-            .max_frame_size(Some(64 << 20))
-            .max_message_size(Some(128 << 20));
-        let (socket, _) = tungstenite::client::connect_with_config(request, Some(config), 3)
-            .map_err(io::Error::other)?;
+        let config = WebSocketConfig::default().max_frame_size(Some(64 << 20)).max_message_size(Some(128 << 20));
+        let (socket, _) =
+            tungstenite::client::connect_with_config(request, Some(config), 3).map_err(io::Error::other)?;
         let Some(tcp) = crate::tls::tcp(socket.get_ref()) else {
             return Err(io::Error::other("unexpected stream"));
         };
@@ -393,16 +323,12 @@ impl Wire {
             match self.socket.read() {
                 Ok(Message::Text(text)) => return Ok(Some(text)),
                 Ok(Message::Close(frame)) => {
-                    let (code, reason) = frame.map_or((0, String::new()), |f| {
-                        (u16::from(f.code), f.reason.to_string())
-                    });
+                    let (code, reason) = frame.map_or((0, String::new()), |f| (u16::from(f.code), f.reason.to_string()));
                     return Err(Lost::Closed(code, reason));
                 }
                 // Pings are answered by tungstenite on the next read or write.
                 Ok(_) => {}
-                Err(tungstenite::Error::Io(err)) if err.kind() == ErrorKind::WouldBlock => {
-                    return Ok(None)
-                }
+                Err(tungstenite::Error::Io(err)) if err.kind() == ErrorKind::WouldBlock => return Ok(None),
                 Err(err) => return Err(Lost::Broken(err.to_string())),
             }
         }
@@ -414,27 +340,18 @@ impl Wire {
         for _ in 0..50 {
             match sent {
                 Err(tungstenite::Error::Io(err)) if err.kind() == ErrorKind::WouldBlock => {
-                    wait_sockets(
-                        Instant::now() + Duration::from_millis(200),
-                        &[(self.poll, POLL_OUT)],
-                    );
+                    wait_sockets(Instant::now() + Duration::from_millis(200), &[(self.poll, POLL_OUT)]);
                     sent = self.socket.flush();
                 }
                 other => return other.map_err(io::Error::other),
             }
         }
-        Err(io::Error::new(
-            ErrorKind::TimedOut,
-            "the gateway is not taking what is sent",
-        ))
+        Err(io::Error::new(ErrorKind::TimedOut, "the gateway is not taking what is sent"))
     }
 
     /// Sleeps until the socket has something, the wake socket is written to, or `limit` passes.
     fn wait(&self, wake: Pollable, limit: Duration) {
-        wait_sockets(
-            Instant::now() + limit,
-            &[(self.poll, POLL_IN), (wake, POLL_IN)],
-        );
+        wait_sockets(Instant::now() + limit, &[(self.poll, POLL_IN), (wake, POLL_IN)]);
     }
 }
 
@@ -551,9 +468,7 @@ impl Discord {
                 self.identify_failed(format!("gateway closed {code} {}", reason.trim()).trim());
                 Failure::Dropped(format!("gateway closed: {code} {reason}"))
             }
-            Lost::Closed(code, reason) => {
-                Failure::Dropped(format!("gateway closed: {code} {reason}"))
-            }
+            Lost::Closed(code, reason) => Failure::Dropped(format!("gateway closed: {code} {reason}")),
             Lost::Broken(why) => Failure::Dropped(why),
         }
     }
@@ -565,11 +480,7 @@ impl Discord {
             None => address("TINYCLIENT_DISCORD_GATEWAY", GATEWAY),
         };
         let mut wire = Wire::connect(&url, &self.rest.identity().user_agent)?;
-        self.outbox
-            .queue
-            .lock()
-            .unwrap()
-            .reconnected(session.is_some());
+        self.outbox.queue.lock().unwrap().reconnected(session.is_some());
         let mut beat = Beat {
             every: Duration::from_millis(41_250),
             next: Instant::now() + Duration::from_secs(60),
@@ -607,11 +518,7 @@ impl Discord {
                     return Err(Failure::Dropped("the gateway stopped answering".to_owned()));
                 }
                 let sequence = self.sequence.load(Ordering::Relaxed);
-                let sequence = if sequence == 0 {
-                    Value::Null
-                } else {
-                    json!(sequence)
-                };
+                let sequence = if sequence == 0 { Value::Null } else { json!(sequence) };
                 wire.send(json!({"op": 1, "d": sequence}).to_string())?;
                 self.outbox.queue.lock().unwrap().beat();
                 beat.acked = false;
@@ -623,11 +530,7 @@ impl Discord {
             }
             let pending = self.tick();
             let until_beat = beat.next.saturating_duration_since(Instant::now());
-            let mut limit = if pending {
-                Duration::from_millis(500)
-            } else {
-                IDLE
-            };
+            let mut limit = if pending { Duration::from_millis(500) } else { IDLE };
             if beat.ready {
                 if let Some(due) = self.outbox.queue.lock().unwrap().due(Instant::now()) {
                     limit = limit.min(due.saturating_duration_since(Instant::now()));
@@ -660,10 +563,7 @@ impl Discord {
             // session we had or say who we are.
             (10, _) => {
                 let hello: Value = serde_json::from_str(data)?;
-                let interval = hello["heartbeat_interval"]
-                    .as_u64()
-                    .unwrap_or(41_250)
-                    .max(1000);
+                let interval = hello["heartbeat_interval"].as_u64().unwrap_or(41_250).max(1000);
                 beat.every = Duration::from_millis(interval);
                 beat.next = Instant::now() + Duration::from_millis(random() % interval);
                 beat.acked = true;
@@ -698,18 +598,14 @@ impl Discord {
                     }
                 }
                 std::thread::sleep(jitter(1000, 5000));
-                return Err(Failure::Dropped(
-                    "Discord asked for the session again".to_owned(),
-                ));
+                return Err(Failure::Dropped("Discord asked for the session again".to_owned()));
             }
             (0, Some("READY")) => {
                 let ready: Ready = match serde_json::from_str(data) {
                     Ok(ready) => ready,
                     // Asking again would get the same answer: it counts as a refused session.
                     Err(err) => {
-                        self.identify_failed(&format!(
-                            "its first message could not be read: {err}"
-                        ));
+                        self.identify_failed(&format!("its first message could not be read: {err}"));
                         return Err(err.into());
                     }
                 };
@@ -728,9 +624,7 @@ impl Discord {
             }
             (0, Some(event)) => {
                 // One event that cannot be read is not a reason to drop the connection.
-                if let Err(Failure::SignedOut(why) | Failure::Dropped(why)) =
-                    self.dispatch(event, data)
-                {
+                if let Err(Failure::SignedOut(why) | Failure::Dropped(why)) = self.dispatch(event, data) {
                     self.log(event, why);
                 }
             }
@@ -761,26 +655,16 @@ mod send_queue_tests {
     /// Everything the queue lets go at `now`, as the socket loop would send it.
     fn flush(queue: &mut SendQueue, now: Instant, sent: &mut Vec<(Instant, bool)>) {
         while let Some(frame) = queue.pop(now) {
-            sent.push((
-                now,
-                serde_json::from_str::<Value>(&frame).unwrap()["op"] == 37,
-            ));
+            sent.push((now, serde_json::from_str::<Value>(&frame).unwrap()["op"] == 37));
         }
     }
 
     /// No rolling minute holds more than the allowance, of everything or of subscriptions.
     fn within_allowance(sent: &[(Instant, bool)]) {
         for (index, (start, _)) in sent.iter().enumerate() {
-            let minute = sent[index..]
-                .iter()
-                .take_while(|(at, _)| *at < *start + MINUTE);
-            let (all, subscriptions) = minute.fold((0, 0), |(all, subs), (_, sub)| {
-                (all + 1, subs + usize::from(*sub))
-            });
-            assert!(
-                all <= SENDS_A_MINUTE && subscriptions <= SUBSCRIPTIONS_A_MINUTE,
-                "{all} frames, {subscriptions} subscriptions in a minute"
-            );
+            let minute = sent[index..].iter().take_while(|(at, _)| *at < *start + MINUTE);
+            let (all, subscriptions) = minute.fold((0, 0), |(all, subs), (_, sub)| (all + 1, subs + usize::from(*sub)));
+            assert!(all <= SENDS_A_MINUTE && subscriptions <= SUBSCRIPTIONS_A_MINUTE, "{all} frames, {subscriptions} subscriptions in a minute");
         }
     }
 
@@ -788,29 +672,17 @@ mod send_queue_tests {
     fn scrolling_coalesces_only_unsent_snapshots_without_an_artificial_delay() {
         let mut queue = SendQueue::default();
         let now = Instant::now();
-        for step in 0..600 {
-            queue.push(37, json!({"subscriptions": {"guild": {"window": step}}}));
-        }
+        for step in 0..600 { queue.push(37, json!({"subscriptions": {"guild": {"window": step}}})); }
         assert_eq!(queue.subscriptions.len(), 1);
         assert_eq!(window(&queue.pop(now).unwrap()), 599);
         for step in 1..SUBSCRIPTION_BURST {
             queue.push(37, json!({"subscriptions": {"guild": {"window": step}}}));
-            assert!(
-                queue.pop(now).is_some(),
-                "a short scroll does not wait for a timer"
-            );
+            assert!(queue.pop(now).is_some(), "a short scroll does not wait for a timer");
         }
         queue.push(37, json!({"subscriptions": {"guild": {"window": "next"}}}));
-        assert!(
-            queue.pop(now).is_none(),
-            "past the burst a snapshot is spaced"
-        );
+        assert!(queue.pop(now).is_none(), "past the burst a snapshot is spaced");
         let due = queue.due(now).unwrap();
-        assert!(
-            due > now && due - now < Duration::from_secs(1),
-            "{:?}",
-            due - now
-        );
+        assert!(due > now && due - now < Duration::from_secs(1), "{:?}", due - now);
         assert_eq!(window(&queue.pop(due).unwrap()), "next");
     }
 
@@ -819,29 +691,17 @@ mod send_queue_tests {
         let mut queue = SendQueue::default();
         let now = Instant::now();
         queue.push(37, json!({"subscriptions": {"a": {"typing": true}}}));
-        queue.push(
-            37,
-            json!({"subscriptions": {"a": {"typing": false}, "b": {"typing": true}}}),
-        );
+        queue.push(37, json!({"subscriptions": {"a": {"typing": false}, "b": {"typing": true}}}));
         queue.push(4, json!({"channel_id": "voice"}));
         let command: Value = serde_json::from_str(&queue.pop(now).unwrap()).unwrap();
         assert_eq!(command["op"], 4);
         let subscription: Value = serde_json::from_str(&queue.pop(now).unwrap()).unwrap();
-        assert_eq!(
-            subscription["d"]["subscriptions"],
-            json!({"a": {"typing": false}, "b": {"typing": true}})
-        );
+        assert_eq!(subscription["d"]["subscriptions"], json!({"a": {"typing": false}, "b": {"typing": true}}));
         assert!(queue.pop(now).is_none());
-        assert!(
-            queue.due(now).is_none(),
-            "nothing waiting, nothing to wake for"
-        );
+        assert!(queue.due(now).is_none(), "nothing waiting, nothing to wake for");
         queue.reconnected(false);
         queue.push(37, json!({"subscriptions": {"c": {}}}));
-        assert!(
-            queue.pop(now).is_some(),
-            "a new connection sends its first subscription immediately"
-        );
+        assert!(queue.pop(now).is_some(), "a new connection sends its first subscription immediately");
     }
 
     /// Five minutes of a viewport moving every 10 ms with a presence change every ten seconds
@@ -858,54 +718,29 @@ mod send_queue_tests {
                 queue.push(3, json!({"status": "online"}));
                 let before = sent.len();
                 flush(&mut queue, now, &mut sent);
-                assert!(
-                    sent[before..].iter().any(|(_, sub)| !sub),
-                    "a command waited behind scrolling at {:?}",
-                    now - start
-                );
+                assert!(sent[before..].iter().any(|(_, sub)| !sub), "a command waited behind scrolling at {:?}", now - start);
             }
             flush(&mut queue, now, &mut sent);
-            assert!(
-                queue.subscriptions.len() <= 1
-                    && queue.commands.is_empty()
-                    && queue.subscribed.len() <= 1,
-                "the queue grows"
-            );
+            assert!(queue.subscriptions.len() <= 1 && queue.commands.is_empty() && queue.subscribed.len() <= 1, "the queue grows");
             assert!(queue.sent.len() <= SENDS_A_MINUTE);
             now += Duration::from_millis(10);
         }
         within_allowance(&sent);
         let delivered = sent.iter().filter(|(_, sub)| *sub).count();
-        assert!(
-            delivered < 5 * SUBSCRIPTIONS_A_MINUTE,
-            "{delivered} subscription frames in five minutes"
-        );
+        assert!(delivered < 5 * SUBSCRIPTIONS_A_MINUTE, "{delivered} subscription frames in five minutes");
         // The pace settles with a reserve left: well under the share was spent in the last minute.
-        let recent = sent
-            .iter()
-            .filter(|(at, sub)| *sub && *at + MINUTE > now)
-            .count();
-        assert!(
-            recent <= SUBSCRIPTIONS_A_MINUTE * 3 / 4,
-            "{recent} subscriptions in the last minute"
-        );
+        let recent = sent.iter().filter(|(at, sub)| *sub && *at + MINUTE > now).count();
+        assert!(recent <= SUBSCRIPTIONS_A_MINUTE * 3 / 4, "{recent} subscriptions in the last minute");
 
         // The scroll stops: the last viewport goes when the loop next wakes, within a second or two.
         let due = queue.due(now).expect("the last viewport is waiting");
-        assert!(
-            due - now <= Duration::from_secs(2),
-            "the last viewport waits {:?}",
-            due - now
-        );
+        assert!(due - now <= Duration::from_secs(2), "the last viewport waits {:?}", due - now);
         assert_eq!(window(&queue.pop(due).unwrap()), 29_999);
         assert!(queue.due(due).is_none());
 
         // A server opened right after still goes at once.
         queue.push(37, json!({"subscriptions": {"other": {"typing": true}}}));
-        assert!(
-            queue.pop(due).is_some(),
-            "navigation waited behind scrolling"
-        );
+        assert!(queue.pop(due).is_some(), "navigation waited behind scrolling");
     }
 
     #[test]
@@ -915,28 +750,15 @@ mod send_queue_tests {
         let mut sent = Vec::new();
         // Servers not yet subscribed each go at once, until the subscription share is spent.
         for guild in 0..SUBSCRIPTIONS_A_MINUTE + 10 {
-            queue.push(
-                37,
-                json!({"subscriptions": {guild.to_string(): {"typing": true}}}),
-            );
-            flush(
-                &mut queue,
-                start + Duration::from_millis(guild as u64),
-                &mut sent,
-            );
+            queue.push(37, json!({"subscriptions": {guild.to_string(): {"typing": true}}}));
+            flush(&mut queue, start + Duration::from_millis(guild as u64), &mut sent);
         }
         assert_eq!(sent.len(), SUBSCRIPTIONS_A_MINUTE);
         assert_eq!(queue.subscriptions.len(), 10, "the rest wait as one frame");
         let now = start + Duration::from_secs(1);
-        for _ in 0..SENDS_A_MINUTE {
-            queue.push(3, json!({"status": "idle"}));
-        }
+        for _ in 0..SENDS_A_MINUTE { queue.push(3, json!({"status": "idle"})); }
         flush(&mut queue, now, &mut sent);
-        assert_eq!(
-            sent.len(),
-            SENDS_A_MINUTE,
-            "commands take what subscriptions leave, and no more"
-        );
+        assert_eq!(sent.len(), SENDS_A_MINUTE, "commands take what subscriptions leave, and no more");
         assert_eq!(queue.commands.len(), SUBSCRIPTIONS_A_MINUTE);
         within_allowance(&sent);
         // The oldest frame ages out after a minute, and commands go before subscriptions.
@@ -951,38 +773,24 @@ mod send_queue_tests {
     fn a_resumed_connection_keeps_unheard_subscriptions_and_a_new_session_does_not() {
         let mut queue = SendQueue::default();
         let now = Instant::now();
-        let subscriptions = |frame: Option<String>| {
-            serde_json::from_str::<Value>(&frame.unwrap()).unwrap()["d"]["subscriptions"].clone()
-        };
+        let subscriptions = |frame: Option<String>| serde_json::from_str::<Value>(&frame.unwrap()).unwrap()["d"]["subscriptions"].clone();
         // Heard: a heartbeat written after it was answered.
         queue.push(37, json!({"subscriptions": {"a": {"typing": true}}}));
         assert!(queue.pop(now).is_some());
         queue.beat();
         queue.answered();
         // Written and not known to be heard, on either side of a heartbeat still unanswered.
-        queue.push(
-            37,
-            json!({"subscriptions": {"a": {"typing": false}, "b": {"typing": true}}}),
-        );
+        queue.push(37, json!({"subscriptions": {"a": {"typing": false}, "b": {"typing": true}}}));
         assert!(queue.pop(now).is_some());
         queue.beat();
         queue.push(37, json!({"subscriptions": {"b": {"window": 1}}}));
         assert!(queue.pop(now).is_some());
         // Never written.
-        queue.push(
-            37,
-            json!({"subscriptions": {"b": {"window": 2}, "c": {"typing": false}}}),
-        );
+        queue.push(37, json!({"subscriptions": {"b": {"window": 2}, "c": {"typing": false}}}));
         queue.push(4, json!({"channel_id": "voice"}));
         queue.reconnected(true);
-        assert_eq!(
-            subscriptions(queue.pop(now)),
-            json!({"a": {"typing": false}, "b": {"window": 2}, "c": {"typing": false}})
-        );
-        assert!(
-            queue.pop(now).is_none(),
-            "commands are not carried to the next connection"
-        );
+        assert_eq!(subscriptions(queue.pop(now)), json!({"a": {"typing": false}, "b": {"window": 2}, "c": {"typing": false}}));
+        assert!(queue.pop(now).is_none(), "commands are not carried to the next connection");
 
         // What was heard before the drop is not said again.
         queue.beat();
@@ -993,10 +801,7 @@ mod send_queue_tests {
         assert!(queue.pop(now).is_some());
         queue.push(37, json!({"subscriptions": {"b": {"window": 3}}}));
         queue.reconnected(false);
-        assert!(
-            queue.pop(now).is_none(),
-            "a new session starts with nothing subscribed"
-        );
+        assert!(queue.pop(now).is_none(), "a new session starts with nothing subscribed");
     }
 
     /// Discord counts each connection's minute on its own, and a suspended machine's clock stands
@@ -1007,48 +812,26 @@ mod send_queue_tests {
         let now = Instant::now();
         let mut sent = Vec::new();
         for guild in 0..SUBSCRIPTIONS_A_MINUTE {
-            queue.push(
-                37,
-                json!({"subscriptions": {guild.to_string(): {"typing": true}}}),
-            );
+            queue.push(37, json!({"subscriptions": {guild.to_string(): {"typing": true}}}));
             flush(&mut queue, now, &mut sent);
         }
-        for _ in 0..SENDS_A_MINUTE {
-            queue.push(3, json!({"status": "idle"}));
-        }
+        for _ in 0..SENDS_A_MINUTE { queue.push(3, json!({"status": "idle"})); }
         flush(&mut queue, now, &mut sent);
         assert_eq!(sent.len(), SENDS_A_MINUTE);
         queue.beat();
         queue.answered();
         queue.push(37, json!({"subscriptions": {"guild": {"window": "kept"}}}));
-        assert!(
-            queue.due(now).is_some_and(|due| due - now > MINUTE / 2),
-            "the old connection's minute is spent"
-        );
+        assert!(queue.due(now).is_some_and(|due| due - now > MINUTE / 2), "the old connection's minute is spent");
 
         queue.reconnected(true);
-        let kept: Value =
-            serde_json::from_str(&queue.pop(now).expect("the kept viewport waits for nothing"))
-                .unwrap();
-        assert_eq!(
-            kept["d"]["subscriptions"],
-            json!({"guild": {"window": "kept"}})
-        );
-        assert!(
-            queue.pop(now).is_none(),
-            "commands are not carried to the next connection"
-        );
+        let kept: Value = serde_json::from_str(&queue.pop(now).expect("the kept viewport waits for nothing")).unwrap();
+        assert_eq!(kept["d"]["subscriptions"], json!({"guild": {"window": "kept"}}));
+        assert!(queue.pop(now).is_none(), "commands are not carried to the next connection");
         queue.push(3, json!({"status": "online"}));
-        assert!(
-            queue.pop(now).is_some(),
-            "a command waits for nothing either"
-        );
+        assert!(queue.pop(now).is_some(), "a command waits for nothing either");
         for step in 1..SUBSCRIPTION_BURST {
             queue.push(37, json!({"subscriptions": {"guild": {"window": step}}}));
-            assert!(
-                queue.pop(now).is_some(),
-                "the new connection has its own burst"
-            );
+            assert!(queue.pop(now).is_some(), "the new connection has its own burst");
         }
     }
 }

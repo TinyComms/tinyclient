@@ -11,35 +11,13 @@ use serde_json::Value;
 
 /// Subtypes Slack words itself as one line about the conversation: "@Ana has joined the channel".
 const SYSTEM: &[&str] = &[
-    "channel_join",
-    "channel_leave",
-    "channel_topic",
-    "channel_purpose",
-    "channel_name",
-    "channel_archive",
-    "channel_unarchive",
-    "channel_convert_to_private",
-    "channel_convert_to_public",
-    "channel_posting_permissions",
-    "group_join",
-    "group_leave",
-    "group_topic",
-    "group_purpose",
-    "group_name",
-    "group_archive",
-    "group_unarchive",
-    "pinned_item",
-    "unpinned_item",
-    "bot_add",
-    "bot_remove",
-    "joiner_notification",
-    "joiner_notification_for_inviter",
-    "reminder_add",
-    "ekm_access_denied",
-    "channel_canvas_updated",
-    "huddle_thread",
-    "sh_room_created",
-    "sh_room_shared",
+    "channel_join", "channel_leave", "channel_topic", "channel_purpose", "channel_name",
+    "channel_archive", "channel_unarchive", "channel_convert_to_private",
+    "channel_convert_to_public", "channel_posting_permissions", "group_join", "group_leave",
+    "group_topic", "group_purpose", "group_name", "group_archive", "group_unarchive",
+    "pinned_item", "unpinned_item", "bot_add", "bot_remove", "joiner_notification",
+    "joiner_notification_for_inviter", "reminder_add", "ekm_access_denied",
+    "channel_canvas_updated", "huddle_thread", "sh_room_created", "sh_room_shared",
 ];
 
 /// The sizes Slack makes of an uploaded picture, by longest side: `thumb_360` and so on. One
@@ -64,17 +42,12 @@ fn colour(value: &Value) -> Option<u32> {
         "good" => Some(0x2e_b886),
         "warning" => Some(0xda_a038),
         "danger" => Some(0xa3_0200),
-        hex => u32::from_str_radix(hex.trim_start_matches('#'), 16)
-            .ok()
-            .filter(|_| hex.trim_start_matches('#').len() == 6),
+        hex => u32::from_str_radix(hex.trim_start_matches('#'), 16).ok().filter(|_| hex.trim_start_matches('#').len() == 6),
     }
 }
 
 fn first<'a>(values: &[&'a Value]) -> Option<&'a str> {
-    values
-        .iter()
-        .filter_map(|value| value.as_str())
-        .find(|text| !text.is_empty())
+    values.iter().filter_map(|value| value.as_str()).find(|text| !text.is_empty())
 }
 
 fn pixels(value: &Value) -> u32 {
@@ -83,10 +56,7 @@ fn pixels(value: &Value) -> u32 {
 
 /// A huddle's one line. Slack keeps the same message and marks the room ended.
 fn huddle(room: &Value) -> String {
-    let (start, end) = (
-        room["date_start"].as_i64().unwrap_or(0),
-        room["date_end"].as_i64().unwrap_or(0),
-    );
+    let (start, end) = (room["date_start"].as_i64().unwrap_or(0), room["date_end"].as_i64().unwrap_or(0));
     if room["has_ended"] == true || end > 0 {
         match (end - start) / 60 {
             minutes if start > 0 && minutes > 0 => format!("A huddle happened · {minutes} min"),
@@ -119,10 +89,7 @@ impl Names for Slack {
             return None;
         }
         let named = self.api("conversations.info", &[("channel", id)]).ok();
-        let Some(name) = named
-            .as_ref()
-            .and_then(|info| info["channel"]["name"].as_str())
-        else {
+        let Some(name) = named.as_ref().and_then(|info| info["channel"]["name"].as_str()) else {
             self.unknown(id);
             return None;
         };
@@ -191,8 +158,7 @@ impl Slack {
                 match value.strip_prefix("alias:") {
                     Some(other) => match emoji::standard(other) {
                         Some(standard) => {
-                            self.ctx
-                                .set_note(&format!("e:{name}"), &format!("={standard}"));
+                            self.ctx.set_note(&format!("e:{name}"), &format!("={standard}"));
                             value = "";
                         }
                         None => value = all.get(other).and_then(Value::as_str).unwrap_or(""),
@@ -210,10 +176,7 @@ impl Slack {
     pub(super) fn emoji_changed(&self, event: &Value) {
         match event["subtype"].as_str() {
             Some("add") => {
-                let (name, value) = (
-                    event["name"].as_str().unwrap_or(""),
-                    event["value"].as_str().unwrap_or(""),
-                );
+                let (name, value) = (event["name"].as_str().unwrap_or(""), event["value"].as_str().unwrap_or(""));
                 if !name.is_empty() && self.hosted(value) {
                     self.ctx.set_note(&format!("e:{name}"), value);
                     let names = self.ctx.note("emoji:names").unwrap_or_default();
@@ -223,12 +186,7 @@ impl Slack {
                 }
             }
             Some("remove") => {
-                for name in event["names"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                {
+                for name in event["names"].as_array().into_iter().flatten().filter_map(Value::as_str) {
                     self.ctx.set_note(&format!("e:{name}"), "");
                 }
             }
@@ -251,11 +209,7 @@ impl Slack {
 
     /// Where the official app shows this message.
     fn permalink(&self, channel: &str, ts: &str, thread: Option<&str>) -> String {
-        let link = format!(
-            "{}archives/{channel}/p{}",
-            self.session.url,
-            ts.replace('.', "")
-        );
+        let link = format!("{}archives/{channel}/p{}", self.session.url, ts.replace('.', ""));
         match thread {
             Some(thread) => format!("{link}?thread_ts={thread}&cid={channel}"),
             None => link,
@@ -277,9 +231,7 @@ impl Slack {
         }
         let profile = &event["bot_profile"];
         let icons = [&event["icons"], &profile["icons"]];
-        let icon = icons
-            .iter()
-            .find_map(|icons| first(&[&icons["image_72"], &icons["image_64"], &icons["image_48"]]));
+        let icon = icons.iter().find_map(|icons| first(&[&icons["image_72"], &icons["image_64"], &icons["image_48"]]));
         let avatar = icon.filter(|icon| self.hosted(icon)).map(|icon| {
             let file = MediaFile {
                 width: 72,
@@ -291,10 +243,7 @@ impl Slack {
         });
         Sender {
             id: event["user"].as_str().unwrap_or_default().to_owned(),
-            name: chosen
-                .or(first(&[&profile["name"]]))
-                .unwrap_or("App")
-                .to_owned(),
+            name: chosen.or(first(&[&profile["name"]])).unwrap_or("App").to_owned(),
             avatar,
             bot: true,
         }
@@ -305,16 +254,9 @@ impl Slack {
     ///
     /// The picture a row shows is registered at the size a row normally draws, and every other
     /// size Slack made of it as a variant, so a 2x screen is given one large enough.
-    fn file(
-        &self,
-        file: &Value,
-        media: &mut Registered,
-        variants: &mut Sizes,
-    ) -> Option<Attachment> {
+    fn file(&self, file: &Value, media: &mut Registered, variants: &mut Sizes) -> Option<Attachment> {
         let id = file["id"].as_str()?;
-        let url = file["url_private"]
-            .as_str()
-            .filter(|url| self.hosted(url))?;
+        let url = file["url_private"].as_str().filter(|url| self.hosted(url))?;
         let mime = file["mimetype"].as_str().unwrap_or("");
         let kind = match mime.split_once('/') {
             Some(("image", "gif")) => MediaKind::Gif,
@@ -333,10 +275,7 @@ impl Slack {
 
         let still = |key: &str, side: u32| {
             let url = file[key].as_str().filter(|url| self.hosted(url))?;
-            let (width, height) = (
-                pixels(&file[format!("{key}_w")]),
-                pixels(&file[format!("{key}_h")]),
-            );
+            let (width, height) = (pixels(&file[format!("{key}_w")]), pixels(&file[format!("{key}_h")]));
             let longest = match width.max(height) {
                 0 => side,
                 longest => longest,
@@ -350,33 +289,23 @@ impl Slack {
             .filter(|_| kind == MediaKind::Gif)
             .filter_map(|side| {
                 let (url, ..) = still(&format!("thumb_{side}_gif"), *side)?;
-                let (_, width, height, longest) =
-                    still(&format!("thumb_{side}"), *side).unwrap_or((String::new(), 0, 0, *side));
+                let (_, width, height, longest) = still(&format!("thumb_{side}"), *side).unwrap_or((String::new(), 0, 0, *side));
                 Some((url, width, height, longest))
             })
             .collect();
         let mut sizes = match kind {
             MediaKind::Gif if !moving.is_empty() => moving,
-            MediaKind::Image | MediaKind::Gif => THUMBS
-                .iter()
-                .filter_map(|side| still(&format!("thumb_{side}"), *side))
-                .collect(),
+            MediaKind::Image | MediaKind::Gif => THUMBS.iter().filter_map(|side| still(&format!("thumb_{side}"), *side)).collect(),
             MediaKind::Video => still("thumb_video", 0).into_iter().collect(),
             MediaKind::File => still("thumb_pdf", 0).into_iter().collect::<Vec<_>>(),
             _ => Vec::new(),
         };
         // The picture itself, where it is small enough to stand in for a size Slack did not make.
         let longest = whole.width.max(whole.height);
-        if kind == MediaKind::Image
-            && longest <= WHOLE
-            && sizes.last().is_some_and(|(.., largest)| *largest < longest)
-        {
+        if kind == MediaKind::Image && longest <= WHOLE && sizes.last().is_some_and(|(.., largest)| *largest < longest) {
             sizes.push((url.to_owned(), whole.width, whole.height, longest));
         }
-        let shown = sizes
-            .iter()
-            .position(|(.., longest)| *longest >= SHOWN)
-            .or(sizes.len().checked_sub(1));
+        let shown = sizes.iter().position(|(.., longest)| *longest >= SHOWN).or(sizes.len().checked_sub(1));
         let thumb = match shown {
             Some(shown) => {
                 let (url, width, height, _) = sizes.remove(shown);
@@ -387,40 +316,24 @@ impl Slack {
                 };
                 media.push((thumb.clone(), url));
                 // After the file itself, which `message` registers first.
-                let others = sizes
-                    .into_iter()
-                    .map(|(url, .., longest)| (longest, url))
-                    .collect();
+                let others = sizes.into_iter().map(|(url, .., longest)| (longest, url)).collect();
                 variants.push((thumb.id.clone(), others));
                 Some(thumb)
             }
             // Slack makes no smaller copy of a picture that is already small.
-            None if kind == MediaKind::Image && (1..=800).contains(&whole.width) => {
-                Some(whole.clone())
-            }
+            None if kind == MediaKind::Image && (1..=800).contains(&whole.width) => Some(whole.clone()),
             None => None,
         };
         // A voice clip's loudness over time, as Slack samples it: 0 to 100, a hundred or so.
-        let samples: Vec<u64> = file["audio_wave_samples"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_u64)
-            .collect();
+        let samples: Vec<u64> = file["audio_wave_samples"].as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
         let every = samples.len().div_ceil(WAVEFORM_LIMIT).max(1);
-        let waveform = samples
-            .iter()
-            .step_by(every)
-            .map(|sample| ((*sample).min(100) * 255 / 100) as u8)
-            .collect();
+        let waveform = samples.iter().step_by(every).map(|sample| ((*sample).min(100) * 255 / 100) as u8).collect();
         Some(Attachment {
             // Slack has neither spoilers nor stickers.
             spoiler: false,
             sticker: false,
             waveform,
-            name: first(&[&file["name"], &file["title"]])
-                .unwrap_or("untitled")
-                .to_owned(),
+            name: first(&[&file["name"], &file["title"]]).unwrap_or("untitled").to_owned(),
             file: whole,
             thumb,
             mime: mime.to_owned(),
@@ -439,28 +352,21 @@ impl Slack {
 
     /// A link's card as Slack built it. The picture is kept only when Slack serves it.
     fn preview(&self, card: &Value, url: &str, media: &mut Registered) -> Preview {
-        let wide = first(&[&card["image_url"]])
-            .map(|url| (url, &card["image_width"], &card["image_height"]));
-        let small = first(&[&card["thumb_url"]])
-            .map(|url| (url, &card["thumb_width"], &card["thumb_height"]));
-        let image =
-            wide.or(small)
-                .filter(|(url, ..)| self.hosted(url))
-                .map(|(url, width, height)| {
-                    let file = MediaFile {
-                        width: pixels(width),
-                        height: pixels(height),
-                        ..MediaFile::new(format!("preview:{:x}", fnv(url)), MediaKind::Image)
-                    };
-                    media.push((file.clone(), url.to_owned()));
-                    file
-                });
+        let wide = first(&[&card["image_url"]]).map(|url| (url, &card["image_width"], &card["image_height"]));
+        let small = first(&[&card["thumb_url"]]).map(|url| (url, &card["thumb_width"], &card["thumb_height"]));
+        let image = wide.or(small).filter(|(url, ..)| self.hosted(url)).map(|(url, width, height)| {
+            let file = MediaFile {
+                width: pixels(width),
+                height: pixels(height),
+                ..MediaFile::new(format!("preview:{:x}", fnv(url)), MediaKind::Image)
+            };
+            media.push((file.clone(), url.to_owned()));
+            file
+        });
         let description = self.words(first(&[&card["text"], &card["fallback"]]).unwrap_or(""));
         Preview {
             url: url.to_owned(),
-            site: first(&[&card["service_name"], &card["author_name"]])
-                .unwrap_or("")
-                .to_owned(),
+            site: first(&[&card["service_name"], &card["author_name"]]).unwrap_or("").to_owned(),
             title: first(&[&card["title"]]).unwrap_or("").to_owned(),
             description: description.chars().take(DESCRIPTION).collect(),
             image,
@@ -474,17 +380,11 @@ impl Slack {
     // newest message is only a card previews as nothing.
     fn framed(&self, card: &Value, rich: &mut Rich) -> Option<Card> {
         let words = |value: &Value| self.words(value.as_str().unwrap_or(""));
-        let fields = card["fields"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .take(CARD_FIELDS);
+        let fields = card["fields"].as_array().into_iter().flatten().take(CARD_FIELDS);
         let mut framed = Card {
             title: words(&card["title"]),
             text: words(&card["text"]),
-            fields: fields
-                .map(|field| (words(&field["title"]), words(&field["value"])))
-                .collect(),
+            fields: fields.map(|field| (words(&field["title"]), words(&field["value"]))).collect(),
             footer: words(&card["footer"]),
             color: colour(&card["color"]),
         };
@@ -505,14 +405,7 @@ impl Slack {
     /// as the message's own text and files.
     // CONTRACT: `Forwarded` keeps no place for what the forwarder wrote themselves, apart from
     // what was forwarded: both are the message's text, the forwarder's words first.
-    fn forwarded(
-        &self,
-        card: &Value,
-        rich: &mut Rich,
-        media: &mut Registered,
-        variants: &mut Sizes,
-        attachments: &mut Vec<Attachment>,
-    ) -> Forwarded {
+    fn forwarded(&self, card: &Value, rich: &mut Rich, media: &mut Registered, variants: &mut Sizes, attachments: &mut Vec<Attachment>) -> Forwarded {
         rich.line();
         let blocks = card["message_blocks"][0]["message"]["blocks"].as_array();
         if !blocks.is_some_and(|blocks| rich.blocks(blocks)) {
@@ -522,14 +415,8 @@ impl Slack {
             attachments.extend(self.file(file, media, variants));
         }
         // From the cache alone: a forward is not worth a lookup.
-        let place = card["channel_id"]
-            .as_str()
-            .and_then(|id| self.ctx.known(id).ok().flatten());
-        let from_title = match (
-            place,
-            first(&[&card["channel_name"]]),
-            first(&[&card["author_name"]]),
-        ) {
+        let place = card["channel_id"].as_str().and_then(|id| self.ctx.known(id).ok().flatten());
+        let from_title = match (place, first(&[&card["channel_name"]]), first(&[&card["author_name"]])) {
             (Some(place), ..) => place.title,
             (None, Some(name), _) => format!("#{}", name.trim_start_matches('#')),
             (None, None, Some(author)) => author.to_owned(),
@@ -561,11 +448,7 @@ impl Slack {
             rich.mrkdwn(title);
             let end = rich.text.len() as u32;
             if end > start {
-                rich.spans.push(protocol::Span {
-                    start,
-                    end,
-                    style: Style::Bold,
-                });
+                rich.spans.push(protocol::Span { start, end, style: Style::Bold });
             }
         }
         if let Some(text) = first(&[&card["text"]]) {
@@ -593,10 +476,7 @@ impl Slack {
     pub(super) fn message(&self, channel: &str, event: &Value) -> Option<Message> {
         let ts = event["ts"].as_str()?;
         let subtype = event["subtype"].as_str();
-        let handled_apart = matches!(
-            subtype,
-            Some("message_changed" | "message_deleted" | "message_replied")
-        );
+        let handled_apart = matches!(subtype, Some("message_changed" | "message_deleted" | "message_replied"));
         if handled_apart || event["hidden"] == true {
             return None;
         }
@@ -611,10 +491,7 @@ impl Slack {
         let system = subtype.is_some_and(|subtype| SYSTEM.contains(&subtype));
         if event["room"].is_object() {
             rich.text = huddle(&event["room"]);
-        } else if !event["blocks"]
-            .as_array()
-            .is_some_and(|blocks| rich.blocks(blocks))
-        {
+        } else if !event["blocks"].as_array().is_some_and(|blocks| rich.blocks(blocks)) {
             rich.mrkdwn(event["text"].as_str().unwrap_or(""));
         }
 
@@ -623,27 +500,15 @@ impl Slack {
         let (mut framed, mut forwarded) = (None, None);
         for card in event["attachments"].as_array().into_iter().flatten() {
             if card["is_share"] == true && forwarded.is_none() {
-                forwarded = Some(Box::new(self.forwarded(
-                    card,
-                    &mut rich,
-                    &mut media,
-                    &mut variants,
-                    &mut attachments,
-                )));
+                forwarded = Some(Box::new(self.forwarded(card, &mut rich, &mut media, &mut variants, &mut attachments)));
                 continue;
             }
-            match first(&[
-                &card["from_url"],
-                &card["original_url"],
-                &card["title_link"],
-            ]) {
+            match first(&[&card["from_url"], &card["original_url"], &card["title_link"]]) {
                 Some(url) => previews.push(self.preview(card, url, &mut media)),
-                None if framed.is_none() && !card["blocks"].is_array() => {
-                    match self.framed(card, &mut rich) {
-                        Some(card) => framed = Some(Box::new(card)),
-                        None => self.card(card, &mut rich),
-                    }
-                }
+                None if framed.is_none() && !card["blocks"].is_array() => match self.framed(card, &mut rich) {
+                    Some(card) => framed = Some(Box::new(card)),
+                    None => self.card(card, &mut rich),
+                },
                 None => self.card(card, &mut rich),
             }
         }
@@ -654,8 +519,7 @@ impl Slack {
                 Some("tombstone") => continue,
                 Some("hidden_by_limit") => {
                     rich.line();
-                    rich.text
-                        .push_str("[A file is past this workspace's history limit]");
+                    rich.text.push_str("[A file is past this workspace's history limit]");
                     continue;
                 }
                 _ => {}
@@ -665,8 +529,7 @@ impl Slack {
                 // Kept somewhere Slack does not serve (Drive, Dropbox): a link to it.
                 None => {
                     rich.line();
-                    let target =
-                        first(&[&file["url_private"], &file["permalink"]]).unwrap_or(&link);
+                    let target = first(&[&file["url_private"], &file["permalink"]]).unwrap_or(&link);
                     rich.link(target, Some(name));
                 }
             }
@@ -679,46 +542,27 @@ impl Slack {
         rich.finish();
         if subtype == Some("me_message") && !rich.text.is_empty() {
             let end = rich.text.len() as u32;
-            rich.spans.push(protocol::Span {
-                start: 0,
-                end,
-                style: Style::Italic,
-            });
+            rich.spans.push(protocol::Span { start: 0, end, style: Style::Italic });
         }
 
         let mine = Names::me(self);
-        let reactions = event["reactions"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|reaction| {
-                let (emoji, file) = self.reaction(reaction["name"].as_str()?);
-                let users = reaction["users"].as_array();
-                Some(Reaction {
-                    emoji,
-                    file,
-                    count: reaction["count"]
-                        .as_u64()
-                        .or(users.map(|users| users.len() as u64))
-                        .unwrap_or(1) as u32,
-                    mine: users.is_some_and(|users| users.iter().any(|user| user == mine)),
-                })
-            });
+        let reactions = event["reactions"].as_array().into_iter().flatten().filter_map(|reaction| {
+            let (emoji, file) = self.reaction(reaction["name"].as_str()?);
+            let users = reaction["users"].as_array();
+            Some(Reaction {
+                emoji,
+                file,
+                count: reaction["count"].as_u64().or(users.map(|users| users.len() as u64)).unwrap_or(1) as u32,
+                mine: users.is_some_and(|users| users.iter().any(|user| user == mine)),
+            })
+        });
         let reactions: Vec<Reaction> = reactions.collect();
 
         let replies = event["reply_count"].as_u64().unwrap_or(0) as u32;
         // Unverified: `reply_users` is taken to list repliers oldest first, so the latest
         // ones are at its end. Slack documents the field and not its order.
-        let repliers = event["reply_users"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str);
-        let repliers: Vec<protocol::Key> = repliers
-            .rev()
-            .take(THREAD_FACES)
-            .map(|id| self.ctx.key(id))
-            .collect();
+        let repliers = event["reply_users"].as_array().into_iter().flatten().filter_map(Value::as_str);
+        let repliers: Vec<protocol::Key> = repliers.rev().take(THREAD_FACES).map(|id| self.ctx.key(id)).collect();
         let summary = (thread == Some(ts) && replies > 0).then(|| ThreadSummary {
             participants: repliers,
             // Slack says how many only for a thread the user follows, and only where it sends
@@ -732,21 +576,14 @@ impl Slack {
         let mut message = Message::plain(ts, "", "", seconds(ts), outgoing);
         let muted = self.state().muted.contains(channel);
         message.mentions_me = !outgoing && (rich.mentioned || (rich.broadcast && !muted));
-        let empty = rich.text.is_empty()
-            && attachments.is_empty()
-            && previews.is_empty()
-            && framed.is_none();
+        let empty = rich.text.is_empty() && attachments.is_empty() && previews.is_empty() && framed.is_none();
         // What Slack leaves of a deleted message that a thread still hangs off.
         let tombstone = subtype == Some("tombstone");
         message.kind = if tombstone {
             MessageKind::Normal
         } else if empty {
             // Never blank, never dropped: one line and the way to the real thing.
-            let what = if rich.undrawn {
-                "An interactive message"
-            } else {
-                "A message tinyclient cannot show yet"
-            };
+            let what = if rich.undrawn { "An interactive message" } else { "A message tinyclient cannot show yet" };
             rich.text = format!("{what} from {}", sender.name);
             MessageKind::Unsupported { link }
         } else if system || event["room"].is_object() {
@@ -764,9 +601,7 @@ impl Slack {
         message.card = framed;
         message.forwarded = forwarded;
         message.edited = event["edited"].is_object();
-        message.pinned = event["pinned_to"]
-            .as_array()
-            .is_some_and(|pinned| !pinned.is_empty());
+        message.pinned = event["pinned_to"].as_array().is_some_and(|pinned| !pinned.is_empty());
         if outgoing {
             message.client_id = event["client_msg_id"].as_str().and_then(super::client_id);
         }
@@ -774,10 +609,7 @@ impl Slack {
             message.tombstone();
         }
         let mut sized = variants.iter().filter(|(_, sizes)| !sizes.is_empty());
-        let registered = self
-            .ctx
-            .media(&media)
-            .and_then(|()| sized.try_for_each(|(id, sizes)| self.ctx.media_variants(id, sizes)));
+        let registered = self.ctx.media(&media).and_then(|()| sized.try_for_each(|(id, sizes)| self.ctx.media_variants(id, sizes)));
         if let Err(err) = registered {
             tracing::warn!("chatd: Slack: {err}");
         }

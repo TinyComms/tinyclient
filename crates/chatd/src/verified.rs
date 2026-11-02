@@ -21,13 +21,7 @@ const KEY: usize = 130;
 fn dir(base: &Path, account: &AccountKey) -> PathBuf {
     let safe: String = format!("{:?}-{}", account.network, account.account)
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
         .take(120)
         .collect();
     base.join("e2ee").join(safe)
@@ -53,10 +47,7 @@ fn verified_path(base: &Path, account: &AccountKey) -> PathBuf {
 
 /// User id to the key the user verified for them.
 fn read(base: &Path, account: &AccountKey) -> BTreeMap<String, String> {
-    std::fs::read(verified_path(base, account))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    std::fs::read(verified_path(base, account)).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
 }
 
 /// Remembers `user_id`'s `key` as verified, or forgets that they were.
@@ -64,19 +55,9 @@ pub fn set(account: &AccountKey, user_id: &str, key: &str, verified: bool) -> io
     set_in(&base(), account, user_id, key, verified)
 }
 
-fn set_in(
-    base: &Path,
-    account: &AccountKey,
-    user_id: &str,
-    key: &str,
-    verified: bool,
-) -> io::Result<()> {
+fn set_in(base: &Path, account: &AccountKey, user_id: &str, key: &str, verified: bool) -> io::Result<()> {
     let key = key.trim().to_ascii_lowercase();
-    if user_id.is_empty()
-        || key.is_empty()
-        || key.len() > KEY
-        || !key.bytes().all(|b| b.is_ascii_hexdigit())
-    {
+    if user_id.is_empty() || key.is_empty() || key.len() > KEY || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a key"));
     }
     let mut known = read(base, account);
@@ -120,54 +101,24 @@ mod tests {
     use protocol::{Network, SecureMember, SecurityMode};
 
     fn member(user: &str, key: &str) -> SecureMember {
-        SecureMember {
-            user_id: user.into(),
-            key: key.into(),
-            ..SecureMember::default()
-        }
+        SecureMember { user_id: user.into(), key: key.into(), ..SecureMember::default() }
     }
 
     #[test]
     fn a_verified_key_is_verified_until_it_changes_and_forgetting_it_is_unverified() {
         let scratch = std::env::temp_dir().join(format!("chatd-verified-{}", std::process::id()));
-        let account = AccountKey {
-            network: Network::Tiny,
-            account: "me/../x".into(),
-        };
-        assert!(
-            dir(&scratch, &account).parent() == Some(&scratch.join("e2ee")),
-            "a hostile id stays inside"
-        );
-        let (set, trusted) = (
-            |user: &str, key: &str, on| set_in(&scratch, &account, user, key, on),
-            |s| trusted_in(&scratch, &account, s),
-        );
-        let security = CallSecurity {
-            mode: SecurityMode::EndToEnd,
-            members: vec![member("ada", "aa01"), member("bea", "bb02")],
-            ..CallSecurity::default()
-        };
-        assert!(trusted(security.clone())
-            .members
-            .iter()
-            .all(|m| m.trust == Trust::Unverified));
+        let account = AccountKey { network: Network::Tiny, account: "me/../x".into() };
+        assert!(dir(&scratch, &account).parent() == Some(&scratch.join("e2ee")), "a hostile id stays inside");
+        let (set, trusted) = (|user: &str, key: &str, on| set_in(&scratch, &account, user, key, on), |s| trusted_in(&scratch, &account, s));
+        let security = CallSecurity { mode: SecurityMode::EndToEnd, members: vec![member("ada", "aa01"), member("bea", "bb02")], ..CallSecurity::default() };
+        assert!(trusted(security.clone()).members.iter().all(|m| m.trust == Trust::Unverified));
 
         set("ada", "AA01", true).unwrap();
         let seen = trusted(security.clone());
-        assert_eq!(
-            (seen.members[0].trust, seen.members[1].trust),
-            (Trust::Verified, Trust::Unverified)
-        );
+        assert_eq!((seen.members[0].trust, seen.members[1].trust), (Trust::Verified, Trust::Unverified));
 
-        let changed = CallSecurity {
-            members: vec![member("ada", "cc03")],
-            ..security.clone()
-        };
-        assert_eq!(
-            trusted(changed).members[0].trust,
-            Trust::Changed,
-            "a new key under a verified name is loud"
-        );
+        let changed = CallSecurity { members: vec![member("ada", "cc03")], ..security.clone() };
+        assert_eq!(trusted(changed).members[0].trust, Trust::Changed, "a new key under a verified name is loud");
 
         set("ada", "aa01", false).unwrap();
         assert_eq!(trusted(security).members[0].trust, Trust::Unverified);
@@ -178,20 +129,13 @@ mod tests {
 
     #[test]
     fn the_verified_list_is_written_whole_and_for_its_owner_alone() {
-        let scratch =
-            std::env::temp_dir().join(format!("chatd-verified-modes-{}", std::process::id()));
+        let scratch = std::env::temp_dir().join(format!("chatd-verified-modes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
-        let account = AccountKey {
-            network: Network::Tiny,
-            account: "me".into(),
-        };
+        let account = AccountKey { network: Network::Tiny, account: "me".into() };
         set_in(&scratch, &account, "ada", "aa01", true).unwrap();
         set_in(&scratch, &account, "bea", "bb02", true).unwrap();
         let folder = dir(&scratch, &account);
-        let mut names: Vec<_> = std::fs::read_dir(&folder)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
+        let mut names: Vec<_> = std::fs::read_dir(&folder).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
         names.sort();
         assert_eq!(names, ["verified.json"], "no partial file is left");
         assert_eq!(read(&scratch, &account).len(), 2);

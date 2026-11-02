@@ -33,10 +33,7 @@ pub struct Hosts {
 
 /// A host that is `name` or ends in `.name`.
 pub(super) fn under(host: &str, name: &str) -> bool {
-    host == name
-        || host
-            .strip_suffix(name)
-            .is_some_and(|rest| rest.ends_with('.'))
+    host == name || host.strip_suffix(name).is_some_and(|rest| rest.ends_with('.'))
 }
 
 impl Hosts {
@@ -57,25 +54,12 @@ impl Hosts {
         let (open, session): (&[&str], &[&str]) = match network {
             // The CDN and the media proxy. Their addresses are signed and expire.
             // Discord's own GIF search answers with stills on Tenor's host.
-            Network::Discord => (
-                &["cdn.discordapp.com", "discordapp.net", "media.tenor.com"],
-                &[],
-            ),
+            Network::Discord => (&["cdn.discordapp.com", "discordapp.net", "media.tenor.com"], &[]),
             // Avatars, emoji and unfurled images are public; files need the workspace's token.
-            Network::Slack => (
-                &["slack-edge.com", "slack-imgs.com", "slack-files.com"],
-                &["files.slack.com"],
-            ),
+            Network::Slack => (&["slack-edge.com", "slack-imgs.com", "slack-files.com"], &["files.slack.com"]),
             // Pictures in messages and people's pictures, each behind the session's own token;
             // GIFs from Teams' Giphy button, public, on Giphy's host.
-            Network::Teams => (
-                &["giphy.com"],
-                &[
-                    "asm.skype.com",
-                    "asyncgw.teams.microsoft.com",
-                    "teams.microsoft.com",
-                ],
-            ),
+            Network::Teams => (&["giphy.com"], &["asm.skype.com", "asyncgw.teams.microsoft.com", "teams.microsoft.com"]),
             Network::Telegram => (&[], &[]),
             // Attachments are encrypted end to end: the adapter fetches and opens them itself.
             Network::Signal => (&[], &[]),
@@ -109,10 +93,7 @@ pub(super) fn host_of(url: &str) -> Option<(bool, String)> {
         Some(_) => return None,
         None => authority,
     };
-    let plain = !host.is_empty()
-        && host
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'-');
+    let plain = !host.is_empty() && host.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'-');
     plain.then(|| (secure, host.to_ascii_lowercase()))
 }
 
@@ -128,9 +109,7 @@ pub fn cap(file: &MediaFile, cache: u64) -> u64 {
         MediaKind::Avatar | MediaKind::Icon | MediaKind::Emoji => MB,
         // A thumbnail, or an original the network gave a size for.
         MediaKind::Image => declared.max(8 * MB),
-        MediaKind::Video | MediaKind::Gif | MediaKind::Audio | MediaKind::File if declared > 0 => {
-            declared
-        }
+        MediaKind::Video | MediaKind::Gif | MediaKind::Audio | MediaKind::File if declared > 0 => declared,
         MediaKind::Video | MediaKind::Gif | MediaKind::Audio | MediaKind::File => 100 * MB,
     };
     cap.min(cache)
@@ -173,15 +152,11 @@ fn ask(adapter: Option<&Sender<Command>>, id: &str, url: &str) -> Result<Downloa
         url: url.to_owned(),
         reply,
     };
-    adapter
-        .send(command)
-        .map_err(|_| "The account is not connected.")?;
+    adapter.send(command).map_err(|_| "The account is not connected.")?;
     match answer.recv_timeout(ANSWER) {
         Ok(Ok(download)) => Ok(download),
         Ok(Err(Refusal::Refused(why))) => Err(why),
-        Ok(Err(Refusal::Unsupported)) => {
-            Err("This network's files cannot be fetched yet.".to_owned())
-        }
+        Ok(Err(Refusal::Unsupported)) => Err("This network's files cannot be fetched yet.".to_owned()),
         Err(_) => Err("The network did not answer.".to_owned()),
     }
 }
@@ -207,9 +182,7 @@ fn run_out(network: Network, url: &str) -> bool {
     if network != Network::Discord {
         return false;
     }
-    let ends = url
-        .split(['?', '&'])
-        .find_map(|part| i64::from_str_radix(part.strip_prefix("ex=")?, 16).ok());
+    let ends = url.split(['?', '&']).find_map(|part| i64::from_str_radix(part.strip_prefix("ex=")?, 16).ok());
     ends.is_some_and(|ends| ends < crate::hub::now() + 60)
 }
 
@@ -220,10 +193,7 @@ fn run_out(network: Network, url: &str) -> bool {
 fn renew(want: &Want) -> Result<Download, String> {
     if let Some(adapter) = want.adapter {
         let others = (want.also)();
-        for (id, url) in others
-            .into_iter()
-            .filter(|(id, url)| *id != want.file.id && run_out(want.network, url))
-        {
+        for (id, url) in others.into_iter().filter(|(id, url)| *id != want.file.id && run_out(want.network, url)) {
             let (reply, _) = channel();
             let _ = adapter.send(Command::Download { id, url, reply });
         }
@@ -232,10 +202,7 @@ fn renew(want: &Want) -> Result<Download, String> {
 }
 
 fn expects_image(kind: MediaKind) -> bool {
-    matches!(
-        kind,
-        MediaKind::Avatar | MediaKind::Icon | MediaKind::Emoji | MediaKind::Image
-    )
+    matches!(kind, MediaKind::Avatar | MediaKind::Icon | MediaKind::Emoji | MediaKind::Image)
 }
 
 /// Redirects followed for one file. Each one must lead to a host of the same network.
@@ -248,9 +215,7 @@ fn redirected(from: &str, location: &str) -> Option<String> {
     }
     let (scheme, rest) = from.split_once("://")?;
     let authority = rest.split(['/', '?', '#']).next()?;
-    location
-        .starts_with('/')
-        .then(|| format!("{scheme}://{authority}{location}"))
+    location.starts_with('/').then(|| format!("{scheme}://{authority}{location}"))
 }
 
 /// One GET, streamed into `want.part`. Headers go only to a host this network's sessions are for.
@@ -258,33 +223,15 @@ fn redirected(from: &str, location: &str) -> Option<String> {
 /// A redirect is followed only to another host this network serves files from, checked the same
 /// way as the first: Slack answers some avatar addresses with the address of the picture.
 /// Anything else a redirect names is refused unasked.
-fn get(
-    hosts: &Hosts,
-    agent: &ureq::Agent,
-    want: &Want,
-    from: &Download,
-    buffer: &mut [u8],
-) -> Result<u64, Failed> {
-    let elsewhere = || {
-        Failed::Other(format!(
-            "{} does not serve files from that address.",
-            want.network.label()
-        ))
-    };
+fn get(hosts: &Hosts, agent: &ureq::Agent, want: &Want, from: &Download, buffer: &mut [u8]) -> Result<u64, Failed> {
+    let elsewhere = || Failed::Other(format!("{} does not serve files from that address.", want.network.label()));
     let mut url = from.url.clone();
     let mut hops = 0;
     let mut response = loop {
         let Some(trust) = hosts.trust(want.network, &url) else {
             // The host alone, for the log: it is how a wrong guess about a network gets found.
-            let host = url
-                .split("://")
-                .nth(1)
-                .and_then(|rest| rest.split(['/', '?', '#']).next())
-                .unwrap_or("?");
-            tracing::warn!(
-                "chatd: {}: a file was at or moved to {host}, which is not on the list",
-                want.network.label()
-            );
+            let host = url.split("://").nth(1).and_then(|rest| rest.split(['/', '?', '#']).next()).unwrap_or("?");
+            tracing::warn!("chatd: {}: a file was at or moved to {host}, which is not on the list", want.network.label());
             return Err(elsewhere());
         };
         let mut request = agent.get(&url);
@@ -293,20 +240,13 @@ fn get(
                 request = request.header(name.as_str(), value.as_str());
             }
         }
-        let response = request
-            .call()
-            .map_err(|err| Failed::Other(format!("The download failed: {err}.")))?;
+        let response = request.call().map_err(|err| Failed::Other(format!("The download failed: {err}.")))?;
         match response.status().as_u16() {
             200 => break response,
             gone @ (403 | 404) => return Err(Failed::Gone(gone)),
             moved @ (301 | 302 | 303 | 307 | 308) if hops < REDIRECTS => {
-                let location = response
-                    .headers()
-                    .get("location")
-                    .and_then(|value| value.to_str().ok());
-                url = location
-                    .and_then(|location| redirected(&url, location))
-                    .ok_or_else(|| Failed::Other(format!("The server answered {moved}.")))?;
+                let location = response.headers().get("location").and_then(|value| value.to_str().ok());
+                url = location.and_then(|location| redirected(&url, location)).ok_or_else(|| Failed::Other(format!("The server answered {moved}.")))?;
                 hops += 1;
             }
             other => return Err(Failed::Other(format!("The server answered {other}."))),
@@ -316,23 +256,11 @@ fn get(
     let mime = body.mime_type().unwrap_or("").to_ascii_lowercase();
     // A sign-in page where a file should be is the usual way a session shows it has ended. A
     // sealed file is opaque bytes on the wire whatever it is; its type is checked once opened.
-    if mime == "text/html"
-        || (expects_image(want.file.kind) && from.sealed.is_none() && !mime.starts_with("image/"))
-    {
-        return Err(Failed::Other(format!(
-            "The server sent {mime:?}, not the file."
-        )));
+    if mime == "text/html" || (expects_image(want.file.kind) && from.sealed.is_none() && !mime.starts_with("image/")) {
+        return Err(Failed::Other(format!("The server sent {mime:?}, not the file.")));
     }
-    let too_large = || {
-        Failed::Other(format!(
-            "The file is larger than {} MB.",
-            want.cap.div_ceil(MB)
-        ))
-    };
-    if body
-        .content_length()
-        .is_some_and(|length| length > want.cap)
-    {
+    let too_large = || Failed::Other(format!("The file is larger than {} MB.", want.cap.div_ceil(MB)));
+    if body.content_length().is_some_and(|length| length > want.cap) {
         return Err(too_large());
     }
     let broken = |err: std::io::Error| Failed::Other(format!("The download failed: {err}."));
@@ -368,10 +296,7 @@ pub fn passing(why: &str) -> bool {
     if PASSING.iter().any(|start| why.starts_with(start)) {
         return true;
     }
-    let status = why
-        .strip_prefix("The server answered ")
-        .and_then(|rest| rest.strip_suffix('.'))
-        .and_then(|code| code.parse::<u16>().ok());
+    let status = why.strip_prefix("The server answered ").and_then(|rest| rest.strip_suffix('.')).and_then(|code| code.parse::<u16>().ok());
     status.is_some_and(|status| status >= 500 || status == 429 || status == 408)
 }
 
@@ -386,23 +311,17 @@ fn open_sealed(want: &Want, sealed: &crate::adapters::SealedFile) -> Result<u64,
     let dir = want.part.parent().ok_or_else(refused)?;
     let kept = |err: std::io::Error| format!("The file could not be kept: {err}.");
     // The hash first: nothing is decrypted from a blob that is not the one the message names.
-    let hashed =
-        attachment::sha256_of(File::open(want.part).map_err(kept)?).map_err(|_| refused())?;
+    let hashed = attachment::sha256_of(File::open(want.part).map_err(kept)?).map_err(|_| refused())?;
     if hashed != sealed.sha256 {
         return Err(refused());
     }
     let blob = std::io::BufReader::new(File::open(want.part).map_err(kept)?);
     let key = AttachmentKey::from_bytes(sealed.key);
-    let expect = attachment::Expect {
-        sha256: Some(&sealed.sha256),
-        plain_len: sealed.plain_len,
-    };
-    let opened = attachment::decrypt_to_temp(&key, &sealed.context, blob, dir, expect)
-        .map_err(|_| refused())?;
+    let expect = attachment::Expect { sha256: Some(&sealed.sha256), plain_len: sealed.plain_len };
+    let opened = attachment::decrypt_to_temp(&key, &sealed.context, blob, dir, expect).map_err(|_| refused())?;
     let mut head = [0u8; 64];
     let read = {
-        let mut file = File::open(opened.path())
-            .map_err(|err| format!("The file could not be kept: {err}."))?;
+        let mut file = File::open(opened.path()).map_err(|err| format!("The file could not be kept: {err}."))?;
         let mut filled = 0;
         while filled < head.len() {
             match file.read(&mut head[filled..]) {
@@ -417,9 +336,7 @@ fn open_sealed(want: &Want, sealed: &crate::adapters::SealedFile) -> Result<u64,
         return Err(why.to_owned());
     }
     let _ = std::fs::remove_file(want.part);
-    opened
-        .persist(want.part)
-        .map_err(|err| format!("The file could not be kept: {err}."))?;
+    opened.persist(want.part).map_err(|err| format!("The file could not be kept: {err}."))?;
     Ok(sealed.plain_len)
 }
 
@@ -445,19 +362,7 @@ pub fn sniff(head: &[u8]) -> Sniffed {
         Sniffed::Webp
     } else if starts(b"GIF87a") || starts(b"GIF89a") {
         Sniffed::Gif
-    } else if starts(b"MZ")
-        || starts(b"\x7fELF")
-        || starts(b"#!")
-        || [
-            [0xFE, 0xED, 0xFA, 0xCE],
-            [0xFE, 0xED, 0xFA, 0xCF],
-            [0xCE, 0xFA, 0xED, 0xFE],
-            [0xCF, 0xFA, 0xED, 0xFE],
-            [0xCA, 0xFE, 0xBA, 0xBE],
-        ]
-        .iter()
-        .any(|magic| starts(magic))
-    {
+    } else if starts(b"MZ") || starts(b"\x7fELF") || starts(b"#!") || [[0xFE, 0xED, 0xFA, 0xCE], [0xFE, 0xED, 0xFA, 0xCF], [0xCE, 0xFA, 0xED, 0xFE], [0xCF, 0xFA, 0xED, 0xFE], [0xCA, 0xFE, 0xBA, 0xBE]].iter().any(|magic| starts(magic)) {
         Sniffed::Program
     } else {
         Sniffed::Other
@@ -466,46 +371,14 @@ pub fn sniff(head: &[u8]) -> Sniffed {
 
 /// A name that says the file is a program, so opening it is no surprise.
 fn says_program(name: &str) -> bool {
-    let extension = name
-        .rsplit_once('.')
-        .map(|(_, ext)| ext.to_ascii_lowercase())
-        .unwrap_or_default();
-    matches!(
-        extension.as_str(),
-        "exe"
-            | "dll"
-            | "msi"
-            | "com"
-            | "scr"
-            | "bat"
-            | "cmd"
-            | "ps1"
-            | "sh"
-            | "bash"
-            | "zsh"
-            | "py"
-            | "pl"
-            | "rb"
-            | "app"
-            | "bin"
-            | "elf"
-            | "so"
-            | "dylib"
-            | "command"
-            | "run"
-            | "appimage"
-    )
+    let extension = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+    matches!(extension.as_str(), "exe" | "dll" | "msi" | "com" | "scr" | "bat" | "cmd" | "ps1" | "sh" | "bash" | "zsh" | "py" | "pl" | "rb" | "app" | "bin" | "elf" | "so" | "dylib" | "command" | "run" | "appimage")
 }
 
 /// Whether an opened sealed file is what its message says: a picture shown as one must be one
 /// of the formats the shell decodes, and a program must not come dressed as anything else. The
 /// sender is a member, and a member can be hostile.
-pub fn what_it_says(
-    kind: MediaKind,
-    mime: &str,
-    name: &str,
-    head: &[u8],
-) -> Result<(), &'static str> {
+pub fn what_it_says(kind: MediaKind, mime: &str, name: &str, head: &[u8]) -> Result<(), &'static str> {
     let found = sniff(head);
     let picture = match mime {
         "image/png" => Some(Sniffed::Png),
@@ -515,18 +388,8 @@ pub fn what_it_says(
         _ => None,
     };
     match kind {
-        MediaKind::Image
-        | MediaKind::Gif
-        | MediaKind::Avatar
-        | MediaKind::Icon
-        | MediaKind::Emoji
-            if picture != Some(found) =>
-        {
-            Err("The file is not the picture its message says it is, so it was not opened.")
-        }
-        _ if found == Sniffed::Program && !says_program(name) => {
-            Err("The file is a program that says it is something else, so it was not opened.")
-        }
+        MediaKind::Image | MediaKind::Gif | MediaKind::Avatar | MediaKind::Icon | MediaKind::Emoji if picture != Some(found) => Err("The file is not the picture its message says it is, so it was not opened."),
+        _ if found == Sniffed::Program && !says_program(name) => Err("The file is a program that says it is something else, so it was not opened."),
         _ => Ok(()),
     }
 }
@@ -534,12 +397,7 @@ pub fn what_it_says(
 /// Fetches one file into `want.part` and answers its size and the address it came from, or why
 /// it could not be fetched, in words the user can read. Whatever a failure left of the part
 /// file is removed.
-pub fn download(
-    hosts: &Hosts,
-    agent: &ureq::Agent,
-    want: &Want,
-    buffer: &mut [u8],
-) -> Result<(u64, String), String> {
+pub fn download(hosts: &Hosts, agent: &ureq::Agent, want: &Want, buffer: &mut [u8]) -> Result<(u64, String), String> {
     let fetched = fetch(hosts, agent, want, buffer);
     if fetched.is_err() {
         let _ = std::fs::remove_file(want.part);
@@ -547,12 +405,7 @@ pub fn download(
     fetched
 }
 
-fn fetch(
-    hosts: &Hosts,
-    agent: &ureq::Agent,
-    want: &Want,
-    buffer: &mut [u8],
-) -> Result<(u64, String), String> {
+fn fetch(hosts: &Hosts, agent: &ureq::Agent, want: &Want, buffer: &mut [u8]) -> Result<(u64, String), String> {
     let gone = |status: u16| format!("The file is no longer there ({status}).");
     let explain = |failed: Failed| match failed {
         Failed::Gone(status) => gone(status),
@@ -564,10 +417,7 @@ fn fetch(
         sealed: None,
     };
     match hosts.trust(want.network, want.url) {
-        None => Err(format!(
-            "{} does not serve files from that address.",
-            want.network.label()
-        )),
+        None => Err(format!("{} does not serve files from that address.", want.network.label())),
         // Only the adapter holds the session, so it says how.
         Some(Trust::Session) => {
             let from = ask(want.adapter, &want.file.id, want.url)?;
@@ -615,42 +465,15 @@ mod tests {
         assert_eq!(sniff(b"#!/bin/sh"), Sniffed::Program);
         assert_eq!(sniff(b"%PDF-1.7"), Sniffed::Other);
         assert!(what_it_says(MediaKind::Image, "image/png", "a.png", png).is_ok());
-        assert!(
-            what_it_says(MediaKind::Image, "image/png", "a.png", &jpeg).is_err(),
-            "a JPEG called a PNG is refused as a picture"
-        );
-        assert!(
-            what_it_says(MediaKind::Image, "image/jpeg", "a.jpg", b"<svg").is_err(),
-            "nothing else decodes as a picture"
-        );
-        assert!(
-            what_it_says(MediaKind::File, "application/pdf", "report.pdf", b"MZ\x90").is_err(),
-            "a program dressed as a document"
-        );
-        assert!(
-            what_it_says(
-                MediaKind::File,
-                "application/octet-stream",
-                "setup.exe",
-                b"MZ\x90"
-            )
-            .is_ok(),
-            "a program that says it is one is the OS's to check"
-        );
-        assert!(what_it_says(
-            MediaKind::File,
-            "application/pdf",
-            "report.pdf",
-            b"%PDF-1.7"
-        )
-        .is_ok());
+        assert!(what_it_says(MediaKind::Image, "image/png", "a.png", &jpeg).is_err(), "a JPEG called a PNG is refused as a picture");
+        assert!(what_it_says(MediaKind::Image, "image/jpeg", "a.jpg", b"<svg").is_err(), "nothing else decodes as a picture");
+        assert!(what_it_says(MediaKind::File, "application/pdf", "report.pdf", b"MZ\x90").is_err(), "a program dressed as a document");
+        assert!(what_it_says(MediaKind::File, "application/octet-stream", "setup.exe", b"MZ\x90").is_ok(), "a program that says it is one is the OS's to check");
+        assert!(what_it_says(MediaKind::File, "application/pdf", "report.pdf", b"%PDF-1.7").is_ok());
     }
 
     fn trust(network: Network, url: &str) -> Option<Trust> {
-        Hosts {
-            local: vec![("127.0.0.1".to_owned(), Trust::Open)],
-        }
-        .trust(network, url)
+        Hosts { local: vec![("127.0.0.1".to_owned(), Trust::Open)] }.trust(network, url)
     }
 
     /// A file host on localhost. Answers 404 under `/old` and four bytes anywhere else, and
@@ -668,9 +491,7 @@ mod tests {
                     if path.is_empty() {
                         path = line.split_whitespace().nth(1).unwrap_or("").to_owned();
                     }
-                    session |= line
-                        .to_ascii_lowercase()
-                        .starts_with("authorization: bearer xoxc-1");
+                    session |= line.to_ascii_lowercase().starts_with("authorization: bearer xoxc-1");
                     line.clear();
                 }
                 let gone = path.starts_with("/old");
@@ -705,18 +526,10 @@ mod tests {
         (commands, asked)
     }
 
-    fn fetched(
-        hosts: &Hosts,
-        network: Network,
-        url: &str,
-        adapter: Option<&Sender<Command>>,
-    ) -> Result<Vec<u8>, String> {
+    fn fetched(hosts: &Hosts, network: Network, url: &str, adapter: Option<&Sender<Command>>) -> Result<Vec<u8>, String> {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let part = std::env::temp_dir().join(format!(
-            "tinyclient-fetch-{}-{next}.part",
-            std::process::id()
-        ));
+        let part = std::env::temp_dir().join(format!("tinyclient-fetch-{}-{next}.part", std::process::id()));
         let file = MediaFile::new("F1", MediaKind::Image);
         let want = Want {
             network,
@@ -727,13 +540,8 @@ mod tests {
             cap: MB,
             also: &Vec::new,
         };
-        let done = download(hosts, &agent(), &want, &mut vec![0u8; BUFFER])
-            .map(|_| std::fs::read(&part).unwrap());
-        assert_eq!(
-            done.is_err(),
-            !part.exists(),
-            "a failure leaves no part file"
-        );
+        let done = download(hosts, &agent(), &want, &mut vec![0u8; BUFFER]).map(|_| std::fs::read(&part).unwrap());
+        assert_eq!(done.is_err(), !part.exists(), "a failure leaves no part file");
         let _ = std::fs::remove_file(&part);
         done
     }
@@ -743,22 +551,13 @@ mod tests {
         let (port, asked) = file_host();
         // `localhost` stands for the host a network keeps files on, `127.0.0.1` for its CDN.
         let hosts = Hosts {
-            local: vec![
-                ("localhost".to_owned(), Trust::Session),
-                ("127.0.0.1".to_owned(), Trust::Open),
-            ],
+            local: vec![("localhost".to_owned(), Trust::Session), ("127.0.0.1".to_owned(), Trust::Open)],
         };
         let private = format!("http://localhost:{port}/files-pri/a.png");
         let (commands, downloads) = adapter(private.clone());
-        assert_eq!(
-            fetched(&hosts, Network::Slack, &private, Some(&commands)).unwrap(),
-            b"file"
-        );
+        assert_eq!(fetched(&hosts, Network::Slack, &private, Some(&commands)).unwrap(), b"file");
         assert_eq!(downloads.try_recv().unwrap(), private);
-        assert_eq!(
-            asked.try_recv().unwrap(),
-            ("/files-pri/a.png".to_owned(), true)
-        );
+        assert_eq!(asked.try_recv().unwrap(), ("/files-pri/a.png".to_owned(), true));
 
         // Not connected: nobody holds the session, so nothing is asked of the host at all.
         assert!(fetched(&hosts, Network::Slack, &private, None).is_err());
@@ -770,10 +569,7 @@ mod tests {
         assert!(fetched(&hosts, Network::Slack, &private, Some(&elsewhere)).is_err());
         assert!(asked.try_recv().is_err());
         let (to_cdn, _) = adapter(format!("http://127.0.0.1:{port}/cdn/a.png"));
-        assert_eq!(
-            fetched(&hosts, Network::Slack, &private, Some(&to_cdn)).unwrap(),
-            b"file"
-        );
+        assert_eq!(fetched(&hosts, Network::Slack, &private, Some(&to_cdn)).unwrap(), b"file");
         assert_eq!(asked.try_recv().unwrap(), ("/cdn/a.png".to_owned(), false));
     }
 
@@ -785,30 +581,20 @@ mod tests {
         };
         // Refused by the host with nothing in the address to say so: asked, then renewed.
         let old = format!("http://127.0.0.1:{port}/old/a.png");
-        let (commands, downloads) =
-            adapter(format!("http://127.0.0.1:{port}/new/a.png?ex=7fffffff"));
-        assert_eq!(
-            fetched(&hosts, Network::Discord, &old, Some(&commands)).unwrap(),
-            b"file"
-        );
+        let (commands, downloads) = adapter(format!("http://127.0.0.1:{port}/new/a.png?ex=7fffffff"));
+        assert_eq!(fetched(&hosts, Network::Discord, &old, Some(&commands)).unwrap(), b"file");
         assert_eq!(downloads.try_recv().unwrap(), old);
         let paths: Vec<String> = asked.try_iter().map(|(path, _)| path).collect();
         assert_eq!(paths, ["/old/a.png", "/new/a.png?ex=7fffffff"]);
 
         // An address that says itself it ran out (`ex`, the hex time) is not asked at all.
         let signed = format!("http://127.0.0.1:{port}/old/b.png?ex=1&is=1&hm=2");
-        assert_eq!(
-            fetched(&hosts, Network::Discord, &signed, Some(&commands)).unwrap(),
-            b"file"
-        );
+        assert_eq!(fetched(&hosts, Network::Discord, &signed, Some(&commands)).unwrap(), b"file");
         let paths: Vec<String> = asked.try_iter().map(|(path, _)| path).collect();
         assert_eq!(paths, ["/new/a.png?ex=7fffffff"]);
         // That is Discord's way of signing: another network's address is simply asked.
         assert!(!run_out(Network::Slack, &signed) && run_out(Network::Discord, &signed));
-        assert!(!run_out(
-            Network::Discord,
-            "https://cdn.discordapp.com/a.png?ex=7fffffff&is=1"
-        ));
+        assert!(!run_out(Network::Discord, "https://cdn.discordapp.com/a.png?ex=7fffffff&is=1"));
 
         // The adapter has nothing newer, or there is no adapter: it failed, and is not asked twice.
         let (same, _) = adapter(old.clone());
@@ -823,20 +609,12 @@ mod tests {
         let hosts = Hosts {
             local: vec![("127.0.0.1".to_owned(), Trust::Open)],
         };
-        let address = |name: &str, ends: &str| {
-            format!("http://127.0.0.1:{port}/old/{name}.png?ex={ends}&is=1")
-        };
-        let (commands, downloads) =
-            adapter(format!("http://127.0.0.1:{port}/new/a.png?ex=7fffffff"));
-        let part =
-            std::env::temp_dir().join(format!("tinyclient-fetch-{}-also.part", std::process::id()));
+        let address = |name: &str, ends: &str| format!("http://127.0.0.1:{port}/old/{name}.png?ex={ends}&is=1");
+        let (commands, downloads) = adapter(format!("http://127.0.0.1:{port}/new/a.png?ex=7fffffff"));
+        let part = std::env::temp_dir().join(format!("tinyclient-fetch-{}-also.part", std::process::id()));
         let file = MediaFile::new("F1", MediaKind::Image);
         let url = address("a", "1");
-        let waiting = vec![
-            ("F2".to_owned(), address("b", "1")),
-            ("F3".to_owned(), address("c", "7fffffff")),
-            ("F1".to_owned(), url.clone()),
-        ];
+        let waiting = vec![("F2".to_owned(), address("b", "1")), ("F3".to_owned(), address("c", "7fffffff")), ("F1".to_owned(), url.clone())];
         let want = Want {
             network: Network::Discord,
             file: &file,
@@ -857,87 +635,30 @@ mod tests {
     #[test]
     fn only_a_networks_own_hosts_are_trusted_and_only_its_file_host_gets_the_session() {
         use Network::{Discord, Slack, Teams};
-        assert_eq!(
-            trust(
-                Discord,
-                "https://cdn.discordapp.com/avatars/1/a.webp?size=80"
-            ),
-            Some(Trust::Open)
-        );
-        assert_eq!(
-            trust(
-                Discord,
-                "https://media.discordapp.net/attachments/1/2/a.png?ex=1&is=2&hm=3"
-            ),
-            Some(Trust::Open)
-        );
-        assert_eq!(
-            trust(Slack, "https://files.slack.com/files-tmb/T1-F1/a_480.png"),
-            Some(Trust::Session)
-        );
-        assert_eq!(
-            trust(Slack, "https://avatars.slack-edge.com/2024/a_72.png"),
-            Some(Trust::Open)
-        );
+        assert_eq!(trust(Discord, "https://cdn.discordapp.com/avatars/1/a.webp?size=80"), Some(Trust::Open));
+        assert_eq!(trust(Discord, "https://media.discordapp.net/attachments/1/2/a.png?ex=1&is=2&hm=3"), Some(Trust::Open));
+        assert_eq!(trust(Slack, "https://files.slack.com/files-tmb/T1-F1/a_480.png"), Some(Trust::Session));
+        assert_eq!(trust(Slack, "https://avatars.slack-edge.com/2024/a_72.png"), Some(Trust::Open));
         // One network's hosts are not another's.
-        assert_eq!(
-            trust(Discord, "https://files.slack.com/files-pri/T1-F1/a.png"),
-            None
-        );
-        assert_eq!(
-            trust(Slack, "https://cdn.discordapp.com/avatars/1/a.webp"),
-            None
-        );
-        assert_eq!(
-            trust(Teams, "https://cdn.discordapp.com/avatars/1/a.webp"),
-            None
-        );
+        assert_eq!(trust(Discord, "https://files.slack.com/files-pri/T1-F1/a.png"), None);
+        assert_eq!(trust(Slack, "https://cdn.discordapp.com/avatars/1/a.webp"), None);
+        assert_eq!(trust(Teams, "https://cdn.discordapp.com/avatars/1/a.webp"), None);
         // Not HTTPS, a look-alike, a user part, a link from a message.
-        assert_eq!(
-            trust(Discord, "http://cdn.discordapp.com/avatars/1/a.webp"),
-            None
-        );
-        assert_eq!(
-            trust(Discord, "https://cdn.discordapp.com.example.org/a.png"),
-            None
-        );
+        assert_eq!(trust(Discord, "http://cdn.discordapp.com/avatars/1/a.webp"), None);
+        assert_eq!(trust(Discord, "https://cdn.discordapp.com.example.org/a.png"), None);
         assert_eq!(trust(Discord, "https://evilcdn.discordapp.com/a.png"), None);
         assert_eq!(trust(Slack, "https://notslack-edge.com/a.png"), None);
-        assert_eq!(
-            trust(Slack, "https://files.slack.com@example.org/a.png"),
-            None
-        );
-        assert_eq!(
-            trust(Slack, "https://example.org\\@files.slack.com/a.png"),
-            None
-        );
-        assert_eq!(
-            trust(Discord, "https://example.org/cdn.discordapp.com/a.png"),
-            None
-        );
+        assert_eq!(trust(Slack, "https://files.slack.com@example.org/a.png"), None);
+        assert_eq!(trust(Slack, "https://example.org\\@files.slack.com/a.png"), None);
+        assert_eq!(trust(Discord, "https://example.org/cdn.discordapp.com/a.png"), None);
         assert_eq!(trust(Discord, "file:///etc/passwd"), None);
         // A test's own server, and nothing else on plain HTTP.
-        assert_eq!(
-            trust(Discord, "http://127.0.0.1:4000/a.png"),
-            Some(Trust::Open)
-        );
+        assert_eq!(trust(Discord, "http://127.0.0.1:4000/a.png"), Some(Trust::Open));
         assert_eq!(trust(Discord, "http://localhost:4000/a.png"), None);
         // A Tiny file asks Download even on a local test server. A user part is not a host.
-        assert_eq!(
-            trust(Network::Tiny, "https://chat.example/v1/media/a"),
-            Some(Trust::Session)
-        );
-        assert_eq!(
-            trust(Network::Tiny, "http://127.0.0.1:9/v1/media/a"),
-            Some(Trust::Session)
-        );
-        assert_eq!(
-            trust(
-                Network::Tiny,
-                "https://chat.example@evil.example/v1/media/a"
-            ),
-            None
-        );
+        assert_eq!(trust(Network::Tiny, "https://chat.example/v1/media/a"), Some(Trust::Session));
+        assert_eq!(trust(Network::Tiny, "http://127.0.0.1:9/v1/media/a"), Some(Trust::Session));
+        assert_eq!(trust(Network::Tiny, "https://chat.example@evil.example/v1/media/a"), None);
     }
 
     #[test]
@@ -969,49 +690,24 @@ mod tests {
 
         // To the picture, on a host that is trusted: fetched.
         let picture = format!("http://127.0.0.1:{port}/avatars/a_72.png");
-        assert_eq!(
-            fetched(&hosts, Network::Slack, &via(&picture), None).unwrap(),
-            b"file"
-        );
+        assert_eq!(fetched(&hosts, Network::Slack, &via(&picture), None).unwrap(), b"file");
         assert_eq!(asked.try_recv().unwrap().0, "/avatars/a_72.png");
         // To anywhere else: refused, and that host never hears of it.
-        assert!(fetched(
-            &hosts,
-            Network::Slack,
-            &via(&format!("http://localhost:{port}/a.png")),
-            None
-        )
-        .is_err());
-        assert!(fetched(
-            &hosts,
-            Network::Slack,
-            &via("https://example.org/a.png"),
-            None
-        )
-        .is_err());
+        assert!(fetched(&hosts, Network::Slack, &via(&format!("http://localhost:{port}/a.png")), None).is_err());
+        assert!(fetched(&hosts, Network::Slack, &via("https://example.org/a.png"), None).is_err());
         assert!(asked.try_recv().is_err());
         // Round and round: given up on.
         let itself = via(&via(&via(&via(&picture))));
         assert!(fetched(&hosts, Network::Slack, &itself, None).is_err());
-        assert_eq!(
-            redirected("https://ca.slack-edge.com/T1-U1-72", "/avatars/a.png").as_deref(),
-            Some("https://ca.slack-edge.com/avatars/a.png")
-        );
-        assert_eq!(
-            redirected("https://ca.slack-edge.com/T1-U1-72", "a.png"),
-            None
-        );
+        assert_eq!(redirected("https://ca.slack-edge.com/T1-U1-72", "/avatars/a.png").as_deref(), Some("https://ca.slack-edge.com/avatars/a.png"));
+        assert_eq!(redirected("https://ca.slack-edge.com/T1-U1-72", "a.png"), None);
     }
 
     #[test]
     fn a_failure_of_the_line_passes_and_one_about_the_file_stands() {
         // What a host that is down, or a certificate that could not be checked, looks like.
-        assert!(passing(
-            "The download failed: io: Connection refused (os error 10061)."
-        ));
-        assert!(passing(
-            "The download failed: tls: invalid peer certificate: UnknownIssuer."
-        ));
+        assert!(passing("The download failed: io: Connection refused (os error 10061)."));
+        assert!(passing("The download failed: tls: invalid peer certificate: UnknownIssuer."));
         assert!(passing("The network did not answer."));
         assert!(passing("The account is not connected."));
         assert!(passing("The server answered 503."));
@@ -1027,25 +723,14 @@ mod tests {
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = closed.local_addr().unwrap().port();
         drop(closed);
-        let hosts = Hosts {
-            local: vec![("127.0.0.1".to_owned(), Trust::Open)],
-        };
-        let why = fetched(
-            &hosts,
-            Network::Discord,
-            &format!("http://127.0.0.1:{port}/a.png"),
-            None,
-        )
-        .unwrap_err();
+        let hosts = Hosts { local: vec![("127.0.0.1".to_owned(), Trust::Open)] };
+        let why = fetched(&hosts, Network::Discord, &format!("http://127.0.0.1:{port}/a.png"), None).unwrap_err();
         assert!(passing(&why), "{why}");
     }
 
     #[test]
     fn caps_follow_the_kind_and_what_the_network_said() {
-        let file = |kind, bytes| MediaFile {
-            bytes,
-            ..MediaFile::new("f", kind)
-        };
+        let file = |kind, bytes| MediaFile { bytes, ..MediaFile::new("f", kind) };
         let cache = 500 * MB;
         assert_eq!(cap(&file(MediaKind::Avatar, 0), cache), MB);
         assert_eq!(cap(&file(MediaKind::Avatar, 30 * MB), cache), MB);

@@ -29,9 +29,7 @@ const PREVIEWS_ASKED: usize = 4_000;
 pub const ANSWER_TTL: Duration = Duration::from_secs(300);
 
 pub fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
 /// A lock that a panic elsewhere left poisoned is still the data it guards: every write here is
@@ -42,13 +40,7 @@ pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// A catalog page as asked: account, kind, Space, query, cursor.
-pub type CatalogAsked = (
-    AccountKey,
-    protocol::CatalogKind,
-    Option<Key>,
-    String,
-    Option<String>,
-);
+pub type CatalogAsked = (AccountKey, protocol::CatalogKind, Option<Key>, String, Option<String>);
 
 /// Answers asked of a network, kept a few minutes so a card opened twice asks once. Bounded:
 /// the oldest goes when it is full.
@@ -59,18 +51,13 @@ pub struct Recent<K, V> {
 
 impl<K: Eq + Hash + Clone, V: Clone> Recent<K, V> {
     pub fn new(limit: usize) -> Recent<K, V> {
-        Recent {
-            held: Mutex::new(Vec::new()),
-            limit,
-        }
+        Recent { held: Mutex::new(Vec::new()), limit }
     }
 
     pub fn get(&self, key: &K) -> Option<V> {
         let mut held = lock(&self.held);
         held.retain(|(_, at, _)| at.elapsed() < ANSWER_TTL);
-        held.iter()
-            .find(|(held, _, _)| held == key)
-            .map(|(_, _, value)| value.clone())
+        held.iter().find(|(held, _, _)| held == key).map(|(_, _, value)| value.clone())
     }
 
     pub fn keep(&self, key: K, value: V) {
@@ -195,9 +182,7 @@ impl Hub {
         let settings = Values::new(store.settings().unwrap_or_default());
         // Starting from the clock makes a `seq` from an earlier run older than `floor`, so a
         // shell that outlived a restart is told to read everything again.
-        let start = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(1, |d| d.as_micros() as u64);
+        let start = SystemTime::now().duration_since(UNIX_EPOCH).map_or(1, |d| d.as_micros() as u64);
         Hub {
             store: Mutex::new(store),
             links: Mutex::new(Vec::new()),
@@ -247,12 +232,7 @@ impl Hub {
     }
 
     /// Stores one setting and keeps the copy here in step. Tells every window.
-    pub fn set_setting(
-        &self,
-        scope: &str,
-        key: &str,
-        value: Option<String>,
-    ) -> rusqlite::Result<()> {
+    pub fn set_setting(&self, scope: &str, key: &str, value: Option<String>) -> rusqlite::Result<()> {
         // The store first, held until the copy matches it: the copy never holds what was not
         // saved, and two writers cannot leave the two in a different order.
         let mut store = self.store();
@@ -295,10 +275,7 @@ impl Hub {
     /// Waits until retention is due: `every`, or sooner when asked.
     pub fn prune_due(&self, every: Duration) {
         let asked = lock(&self.prune_now);
-        let (mut asked, _) = self
-            .prune_wake
-            .wait_timeout_while(asked, every, |asked| !*asked)
-            .unwrap_or_else(PoisonError::into_inner);
+        let (mut asked, _) = self.prune_wake.wait_timeout_while(asked, every, |asked| !*asked).unwrap_or_else(PoisonError::into_inner);
         *asked = false;
     }
 
@@ -351,10 +328,7 @@ impl Hub {
         let reading = lock(&self.reading);
         Keychain {
             reading: !reading.pending.is_empty(),
-            waiting: reading
-                .now
-                .filter(|(_, since)| since.elapsed() >= KEYCHAIN_PROMPT)
-                .map(|(network, _)| network),
+            waiting: reading.now.filter(|(_, since)| since.elapsed() >= KEYCHAIN_PROMPT).map(|(network, _)| network),
             denied: reading.denied.clone(),
         }
     }
@@ -363,10 +337,7 @@ impl Hub {
 
     pub fn link(&self, account: &AccountKey) -> Link {
         let links = lock(&self.links);
-        links
-            .iter()
-            .find(|linked| linked.account == *account)
-            .map_or(Link::SignedOut, |linked| linked.link)
+        links.iter().find(|linked| linked.account == *account).map_or(Link::SignedOut, |linked| linked.link)
     }
 
     /// Every account that has a session, with its link and the network's reason for it.
@@ -383,13 +354,8 @@ impl Hub {
             Link::Connected => 3,
         };
         let links = lock(&self.links);
-        let of_network = links
-            .iter()
-            .filter(|linked| linked.account.network == network);
-        of_network
-            .map(|linked| linked.link)
-            .max_by_key(|link| rank(*link))
-            .unwrap_or(Link::SignedOut)
+        let of_network = links.iter().filter(|linked| linked.account.network == network);
+        of_network.map(|linked| linked.link).max_by_key(|link| rank(*link)).unwrap_or(Link::SignedOut)
     }
 
     /// `SignedOut` removes the account from the list.
@@ -414,9 +380,7 @@ impl Hub {
                 (None, Link::SignedOut) => return,
                 (Some(at), _) => {
                     let linked = &mut links[at];
-                    if (linked.link, linked.detail.as_str(), linked.reconnecting)
-                        == (link, detail, reconnecting)
-                    {
+                    if (linked.link, linked.detail.as_str(), linked.reconnecting) == (link, detail, reconnecting) {
                         return;
                     }
                     linked.link = link;
@@ -469,10 +433,7 @@ impl Hub {
     }
 
     pub fn capabilities(&self, account: &AccountKey) -> Capabilities {
-        lock(&self.links)
-            .iter()
-            .find(|linked| linked.account == *account)
-            .map_or_else(Capabilities::default, |linked| linked.can)
+        lock(&self.links).iter().find(|linked| linked.account == *account).map_or_else(Capabilities::default, |linked| linked.can)
     }
 
     // Notifications.
@@ -498,9 +459,7 @@ impl Hub {
     /// Call after anything the shell draws has changed, naming what.
     pub fn changed(&self, change: Change) {
         match &change {
-            Change::Conversation { conversation } => {
-                self.notify(crate::notify::Event::Row(conversation.clone()))
-            }
+            Change::Conversation { conversation } => self.notify(crate::notify::Event::Row(conversation.clone())),
             Change::Call { call } => self.notify(crate::notify::Event::Call(call.clone())),
             _ => {}
         }
@@ -545,11 +504,7 @@ impl Hub {
             return (changes.seq, true, Vec::new());
         }
         let newer = changes.entries.iter().filter(|(seq, _)| *seq > since);
-        (
-            changes.seq,
-            false,
-            newer.map(|(_, change)| change.clone()).collect(),
-        )
+        (changes.seq, false, newer.map(|(_, change)| change.clone()).collect())
     }
 
     // What the shell has on screen.
@@ -561,11 +516,7 @@ impl Hub {
         if *live.watching == watching {
             return false;
         }
-        let Live {
-            presence,
-            watching: held,
-            ..
-        } = &mut *live;
+        let Live { presence, watching: held, .. } = &mut *live;
         presence.retain(|person, shown| shown.owned || watching.people.contains(person));
         *held = Arc::new(watching);
         true
@@ -644,32 +595,24 @@ impl Hub {
 
     pub fn presence(&self, person: &Key) -> Presence {
         let live = lock(&self.live);
-        live.presence
-            .get(person)
-            .map_or(Presence::Unknown, |shown| shown.presence)
+        live.presence.get(person).map_or(Presence::Unknown, |shown| shown.presence)
     }
 
     /// The same, with the status text that came with it.
     pub fn shown(&self, person: &Key) -> (Presence, String) {
         let live = lock(&self.live);
-        live.presence
-            .get(person)
-            .map_or((Presence::Unknown, String::new()), |shown| {
-                (shown.presence, shown.status.clone())
-            })
+        live.presence.get(person).map_or((Presence::Unknown, String::new()), |shown| (shown.presence, shown.status.clone()))
     }
 
     /// Everything held about what they are doing now.
     pub fn doing(&self, person: &Key) -> Doing {
         let live = lock(&self.live);
-        live.presence
-            .get(person)
-            .map_or_else(Doing::default, |shown| Doing {
-                presence: shown.presence,
-                status: shown.status.clone(),
-                emoji: shown.emoji.clone(),
-                activity: shown.activity.as_deref().cloned(),
-            })
+        live.presence.get(person).map_or_else(Doing::default, |shown| Doing {
+            presence: shown.presence,
+            status: shown.status.clone(),
+            emoji: shown.emoji.clone(),
+            activity: shown.activity.as_deref().cloned(),
+        })
     }
 
     // Uploads and previews.
@@ -681,28 +624,17 @@ impl Hub {
             let mut live = lock(&self.live);
             let id = (conversation.clone(), client_id.to_owned());
             let done = sent >= total;
-            if !done
-                && live
-                    .uploads
-                    .get(&id)
-                    .is_some_and(|at| at.elapsed() < UPLOAD_EVERY)
-            {
+            if !done && live.uploads.get(&id).is_some_and(|at| at.elapsed() < UPLOAD_EVERY) {
                 return;
             }
             if done {
                 live.uploads.remove(&id);
             } else {
-                live.uploads
-                    .retain(|_, at| at.elapsed() < Duration::from_secs(600));
+                live.uploads.retain(|_, at| at.elapsed() < Duration::from_secs(600));
                 live.uploads.insert(id, Instant::now());
             }
         }
-        self.changed(Change::Upload {
-            conversation,
-            client_id: client_id.to_owned(),
-            sent,
-            total,
-        });
+        self.changed(Change::Upload { conversation, client_id: client_id.to_owned(), sent, total });
     }
 
     /// Of these rows, the ones whose preview has not been asked of the network before. They
@@ -712,18 +644,13 @@ impl Hub {
         if live.previews.len() > PREVIEWS_ASKED {
             live.previews.clear();
         }
-        rows.into_iter()
-            .filter(|row| live.previews.insert(row.clone()))
-            .collect()
+        rows.into_iter().filter(|row| live.previews.insert(row.clone())).collect()
     }
 
     /// Voice channels with someone in them now, and who.
     pub fn occupied(&self) -> Vec<(Key, Occupants)> {
         let live = lock(&self.live);
-        live.occupants
-            .iter()
-            .map(|(conversation, occupants)| (conversation.clone(), occupants.clone()))
-            .collect()
+        live.occupants.iter().map(|(conversation, occupants)| (conversation.clone(), occupants.clone())).collect()
     }
 
     // Voice channels.
@@ -740,22 +667,16 @@ impl Hub {
             let mut live = lock(&self.live);
             let known = live.occupants.get(&conversation);
             let empty = occupants.total == 0;
-            if known == Some(&occupants)
-                || (known.is_none() && (empty || live.occupants.len() >= OCCUPIED))
-            {
+            if known == Some(&occupants) || (known.is_none() && (empty || live.occupants.len() >= OCCUPIED)) {
                 return;
             }
             if empty {
                 live.occupants.remove(&conversation);
             } else {
-                live.occupants
-                    .insert(conversation.clone(), occupants.clone());
+                live.occupants.insert(conversation.clone(), occupants.clone());
             }
         }
-        self.changed(Change::Occupants {
-            conversation,
-            occupants,
-        });
+        self.changed(Change::Occupants { conversation, occupants });
     }
 
     pub fn occupants(&self, conversation: &Key) -> Option<Occupants> {
@@ -782,20 +703,14 @@ impl Hub {
             live.typing.retain(|_, typists| !typists.is_empty());
             typists
         };
-        self.changed(Change::Typing {
-            conversation,
-            typists,
-        });
+        self.changed(Change::Typing { conversation, typists });
     }
 
     pub fn typists(&self, conversation: &Key) -> Vec<Typist> {
         let live = lock(&self.live);
         let now = now();
         let typists = live.typing.get(conversation).into_iter().flatten();
-        typists
-            .filter(|typist| typist.until > now)
-            .cloned()
-            .collect()
+        typists.filter(|typist| typist.until > now).cloned().collect()
     }
 
     /// Drops what is known live about an account when its socket drops. Our own presence is
@@ -804,16 +719,8 @@ impl Hub {
     /// channel that was shown as occupied is told to the shell as empty: nothing else would
     /// ever take the people off its row.
     pub fn forget_live(&self, account: &AccountKey) {
-        let me = self
-            .store()
-            .accounts()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|row| row.key == *account)
-            .map(|row| row.me);
-        let own = me
-            .filter(|me| !me.is_empty())
-            .map(|me| Key::new(account, me));
+        let me = self.store().accounts().unwrap_or_default().into_iter().find(|row| row.key == *account).map(|row| row.me);
+        let own = me.filter(|me| !me.is_empty()).map(|me| Key::new(account, me));
         self.drop_live(account, own.as_ref());
     }
 
@@ -825,25 +732,14 @@ impl Hub {
     fn drop_live(&self, account: &AccountKey, keep: Option<&Key>) {
         let emptied: Vec<Key> = {
             let mut live = lock(&self.live);
-            live.presence
-                .retain(|person, _| person.account() != *account || Some(person) == keep);
-            live.typing
-                .retain(|conversation, _| conversation.account() != *account);
-            let emptied = live
-                .occupants
-                .keys()
-                .filter(|conversation| conversation.account() == *account)
-                .cloned()
-                .collect();
-            live.occupants
-                .retain(|conversation, _| conversation.account() != *account);
+            live.presence.retain(|person, _| person.account() != *account || Some(person) == keep);
+            live.typing.retain(|conversation, _| conversation.account() != *account);
+            let emptied = live.occupants.keys().filter(|conversation| conversation.account() == *account).cloned().collect();
+            live.occupants.retain(|conversation, _| conversation.account() != *account);
             emptied
         };
         for conversation in emptied {
-            self.changed(Change::Occupants {
-                conversation,
-                occupants: Occupants::default(),
-            });
+            self.changed(Change::Occupants { conversation, occupants: Occupants::default() });
         }
     }
 }

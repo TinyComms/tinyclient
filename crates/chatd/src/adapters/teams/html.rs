@@ -118,9 +118,7 @@ fn attributes(mut rest: &str) -> Vec<(String, String)> {
         if rest.is_empty() {
             return found;
         }
-        let end = rest
-            .find(|c: char| c.is_whitespace() || c == '=' || c == '/')
-            .unwrap_or(rest.len());
+        let end = rest.find(|c: char| c.is_whitespace() || c == '=' || c == '/').unwrap_or(rest.len());
         let name = rest[..end].to_ascii_lowercase();
         rest = rest[end..].trim_start();
         let Some(after) = rest.strip_prefix('=') else {
@@ -166,17 +164,13 @@ fn next(rest: &str) -> Option<(Token<'_>, &str)> {
         let end = comment.find("-->").map_or(comment.len(), |end| end + 3);
         return Some((Token::Text(""), &comment[end..]));
     }
-    let tag = rest
-        .strip_prefix('<')
-        .filter(|inside| inside.starts_with(|c: char| c == '/' || c.is_ascii_alphabetic()));
+    let tag = rest.strip_prefix('<').filter(|inside| inside.starts_with(|c: char| c == '/' || c.is_ascii_alphabetic()));
     if let Some(end) = tag.and_then(|_| tag_end(rest)) {
         let (inside, after) = (&rest[1..end], &rest[end + 1..]);
         if let Some(name) = inside.strip_prefix('/') {
             return Some((Token::Close(name.trim().to_ascii_lowercase()), after));
         }
-        let cut = inside
-            .find(|c: char| c.is_whitespace() || c == '/')
-            .unwrap_or(inside.len());
+        let cut = inside.find(|c: char| c.is_whitespace() || c == '/').unwrap_or(inside.len());
         let token = Token::Open {
             name: inside[..cut].to_ascii_lowercase(),
             attrs: attributes(&inside[cut..]),
@@ -185,11 +179,7 @@ fn next(rest: &str) -> Option<(Token<'_>, &str)> {
         return Some((token, after));
     }
     // A `<` that opens no tag is a character like any other.
-    let end = rest
-        .char_indices()
-        .skip(1)
-        .find(|(_, c)| *c == '<')
-        .map_or(rest.len(), |(end, _)| end);
+    let end = rest.char_indices().skip(1).find(|(_, c)| *c == '<').map_or(rest.len(), |(end, _)| end);
     Some((Token::Text(&rest[..end]), &rest[end..]))
 }
 
@@ -228,54 +218,26 @@ struct Builder<'a> {
 }
 
 const BLOCKS: &[&str] = &[
-    "p",
-    "div",
-    "ul",
-    "ol",
-    "li",
-    "blockquote",
-    "pre",
-    "codeblock",
-    "table",
-    "tr",
-    "hr",
-    "h1",
-    "h2",
-    "h3",
-    "h4",
-    "h5",
-    "h6",
+    "p", "div", "ul", "ol", "li", "blockquote", "pre", "codeblock", "table", "tr", "hr", "h1", "h2",
+    "h3", "h4", "h5", "h6",
 ];
 /// Elements that never have an inside.
 const VOID: &[&str] = &["br", "img", "hr", "input", "meta", "link"];
 
 fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> &'a str {
-    attrs
-        .iter()
-        .find(|(known, _)| known == name)
-        .map_or("", |(_, value)| value.as_str())
+    attrs.iter().find(|(known, _)| known == name).map_or("", |(_, value)| value.as_str())
 }
 
 /// A length from `width="250"`, or from `style="width:250px"` when the attribute is missing.
 fn pixels(attrs: &[(String, String)], name: &str) -> u32 {
     let number = |text: &str| {
-        let digits: String = text
-            .trim()
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.')
-            .collect();
-        digits
-            .parse::<f64>()
-            .ok()
-            .filter(|size| *size >= 1.)
-            .map(|size| size.min(65_535.) as u32)
+        let digits: String = text.trim().chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        digits.parse::<f64>().ok().filter(|size| *size >= 1.).map(|size| size.min(65_535.) as u32)
     };
     let styled = || {
         attr(attrs, "style").split(';').find_map(|rule| {
             let (property, value) = rule.split_once(':')?;
-            (property.trim().eq_ignore_ascii_case(name))
-                .then(|| number(value))
-                .flatten()
+            (property.trim().eq_ignore_ascii_case(name)).then(|| number(value)).flatten()
         })
     };
     number(attr(attrs, name)).or_else(styled).unwrap_or(0)
@@ -287,21 +249,14 @@ pub(super) fn giphy(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
     };
-    let host = rest
-        .split(['/', '?', '#', ':'])
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let host = rest.split(['/', '?', '#', ':']).next().unwrap_or("").to_ascii_lowercase();
     host == "giphy.com" || host.ends_with(".giphy.com")
 }
 
 fn linkable(url: &str) -> bool {
-    ["https://", "http://", "mailto:", "msteams:"]
-        .iter()
-        .any(|scheme| {
-            url.get(..scheme.len())
-                .is_some_and(|start| start.eq_ignore_ascii_case(scheme))
-        })
+    ["https://", "http://", "mailto:", "msteams:"].iter().any(|scheme| {
+        url.get(..scheme.len()).is_some_and(|start| start.eq_ignore_ascii_case(scheme))
+    })
 }
 
 impl Builder<'_> {
@@ -315,10 +270,7 @@ impl Builder<'_> {
 
     /// Puts the owed line break in, unless the text is already at the start of a line.
     fn settle(&mut self) {
-        if std::mem::take(&mut self.due)
-            && !self.out.text.is_empty()
-            && !self.out.text.ends_with('\n')
-        {
+        if std::mem::take(&mut self.due) && !self.out.text.is_empty() && !self.out.text.ends_with('\n') {
             self.out.text.push('\n');
         }
     }
@@ -366,21 +318,14 @@ impl Builder<'_> {
     }
 
     fn image(&mut self, attrs: &[(String, String)]) {
-        let (kind, src, alt) = (
-            attr(attrs, "itemtype"),
-            attr(attrs, "src"),
-            attr(attrs, "alt"),
-        );
+        let (kind, src, alt) = (attr(attrs, "itemtype"), attr(attrs, "src"), attr(attrs, "alt"));
         if kind == EMOJI {
             self.say(alt);
             return;
         }
         if kind == CUSTOM_EMOJI {
             let name = format!(":{}:", alt.trim_matches(':'));
-            let file = self
-                .lookup
-                .emoji(attr(attrs, "itemid"), src)
-                .filter(|_| self.quote.is_none() && self.hidden == 0);
+            let file = self.lookup.emoji(attr(attrs, "itemid"), src).filter(|_| self.quote.is_none() && self.hidden == 0);
             self.settle();
             let start = self.at();
             self.say(&name);
@@ -418,21 +363,12 @@ impl Builder<'_> {
         let start = self.at();
         self.say(if alt.trim().is_empty() { "Image" } else { alt });
         if linkable(src) {
-            self.span(
-                start,
-                Style::Link {
-                    url: src.to_owned(),
-                },
-            );
+            self.span(start, Style::Link { url: src.to_owned() });
         }
     }
 
     fn list_item(&self) -> Style {
-        let lists = || {
-            self.open
-                .iter()
-                .filter(|element| matches!(element.tag.as_str(), "ul" | "ol"))
-        };
+        let lists = || self.open.iter().filter(|element| matches!(element.tag.as_str(), "ul" | "ol"));
         Style::ListItem {
             ordered: lists().next_back().is_some_and(|list| list.tag == "ol"),
             depth: lists().count().saturating_sub(1).min(8) as u8,
@@ -452,11 +388,7 @@ impl Builder<'_> {
             }
             "img" => self.image(attrs),
             // A cell after the first on its row.
-            "td" | "th"
-                if !(self.due || self.out.text.is_empty() || self.out.text.ends_with('\n')) =>
-            {
-                self.say("\u{a0}|\u{a0}")
-            }
+            "td" | "th" if !(self.due || self.out.text.is_empty() || self.out.text.ends_with('\n')) => self.say("\u{a0}|\u{a0}"),
             _ => {}
         }
         if closed || VOID.contains(&name.as_str()) {
@@ -513,21 +445,11 @@ impl Builder<'_> {
             }
             "blockquote" => Some(Style::Quote),
             "li" => Some(self.list_item()),
-            "a" => Some(attr(attrs, "href"))
-                .filter(|url| linkable(url))
-                .map(|url| Style::Link {
-                    url: url.to_owned(),
-                }),
+            "a" => Some(attr(attrs, "href")).filter(|url| linkable(url)).map(|url| Style::Link { url: url.to_owned() }),
             "span" | "at" if kind == MENTION || element.tag == "at" => {
                 element.mention = true;
-                let item = if element.tag == "at" {
-                    attr(attrs, "id")
-                } else {
-                    attr(attrs, "itemid")
-                };
-                self.lookup
-                    .mention(item)
-                    .map(|(kind, id)| Style::Mention { kind, id })
+                let item = if element.tag == "at" { attr(attrs, "id") } else { attr(attrs, "itemid") };
+                self.lookup.mention(item).map(|(kind, id)| Style::Mention { kind, id })
             }
             "uriobject" | "swift" | "script" | "style" | "title" | "head" => {
                 self.out.card |= matches!(element.tag.as_str(), "uriobject" | "swift");
@@ -604,9 +526,7 @@ impl Builder<'_> {
         }
         self.out.spans.retain(|span| span.start < span.end);
         let names_me = |span: &Span| match &span.style {
-            Style::Mention { kind, id } => {
-                *kind == MentionKind::Everyone || (!me.is_empty() && id == me)
-            }
+            Style::Mention { kind, id } => *kind == MentionKind::Everyone || (!me.is_empty() && id == me),
             _ => false,
         };
         self.out.mentioned = self.out.spans.iter().any(names_me);
@@ -639,11 +559,7 @@ pub(super) fn parse(html: &str, lookup: &dyn Lookup, me: &str) -> Parsed {
                 decode(raw, &mut text);
                 builder.say(&text);
             }
-            Token::Open {
-                name,
-                attrs,
-                closed,
-            } => builder.opened(name, &attrs, closed),
+            Token::Open { name, attrs, closed } => builder.opened(name, &attrs, closed),
             Token::Close(name) => builder.closed(&name),
         }
     }
@@ -690,10 +606,7 @@ mod tests {
         }
 
         fn emoji(&self, id: &str, _url: &str) -> Option<MediaFile> {
-            Some(MediaFile::new(
-                format!("emoji:{id}"),
-                protocol::MediaKind::Emoji,
-            ))
+            Some(MediaFile::new(format!("emoji:{id}"), protocol::MediaKind::Emoji))
         }
     }
 
@@ -702,16 +615,7 @@ mod tests {
     }
 
     fn ranges(parsed: &Parsed) -> Vec<(&str, &Style)> {
-        parsed
-            .spans
-            .iter()
-            .map(|span| {
-                (
-                    &parsed.text[span.start as usize..span.end as usize],
-                    &span.style,
-                )
-            })
-            .collect()
+        parsed.spans.iter().map(|span| (&parsed.text[span.start as usize..span.end as usize], &span.style)).collect()
     }
 
     fn has(parsed: &Parsed, text: &str, style: Style) -> bool {
@@ -728,13 +632,7 @@ mod tests {
         assert!(has(&parsed, "today", Style::Bold) && has(&parsed, "day", Style::Italic));
         assert!(has(&parsed, "not", Style::Strike) && has(&parsed, "now", Style::Underline));
         assert!(has(&parsed, "cargo test", Style::Code));
-        assert!(has(
-            &parsed,
-            "the plan",
-            Style::Link {
-                url: "https://ex.com/a?b=1&c=2".into()
-            }
-        ));
+        assert!(has(&parsed, "the plan", Style::Link { url: "https://ex.com/a?b=1&c=2".into() }));
         assert!(!parsed.card && !parsed.mentioned && parsed.images.is_empty());
     }
 
@@ -745,34 +643,11 @@ mod tests {
              <blockquote><p>looks good</p></blockquote>\
              <pre class=\"language-rust\"><code>let a = 1;\n  let b = 2;</code></pre><p>&nbsp;</p><div>done<br>really</div>",
         );
-        assert_eq!(
-            parsed.text,
-            "Steps\nbuild\ndeploy\neu\nlooks good\nlet a = 1;\n  let b = 2;\n \ndone\nreally"
-        );
-        assert!(has(
-            &parsed,
-            "build",
-            Style::ListItem {
-                ordered: true,
-                depth: 0
-            }
-        ));
-        assert!(has(
-            &parsed,
-            "eu",
-            Style::ListItem {
-                ordered: false,
-                depth: 1
-            }
-        ));
+        assert_eq!(parsed.text, "Steps\nbuild\ndeploy\neu\nlooks good\nlet a = 1;\n  let b = 2;\n \ndone\nreally");
+        assert!(has(&parsed, "build", Style::ListItem { ordered: true, depth: 0 }));
+        assert!(has(&parsed, "eu", Style::ListItem { ordered: false, depth: 1 }));
         assert!(has(&parsed, "looks good", Style::Quote));
-        assert!(has(
-            &parsed,
-            "let a = 1;\n  let b = 2;",
-            Style::CodeBlock {
-                language: "rust".into()
-            }
-        ));
+        assert!(has(&parsed, "let a = 1;\n  let b = 2;", Style::CodeBlock { language: "rust".into() }));
         // Inside a code block, `code` is not a second style.
         assert!(!parsed.spans.iter().any(|span| span.style == Style::Code));
     }
@@ -785,34 +660,10 @@ mod tests {
              <span itemtype=\"http://schema.skype.com/Mention\" itemid=\"2\">General</span></p>",
         );
         assert_eq!(parsed.text, "@Ana Ruiz and @Me in @General");
-        assert!(has(
-            &parsed,
-            "@Ana Ruiz",
-            Style::Mention {
-                kind: MentionKind::User,
-                id: "8:orgid:ana".into()
-            }
-        ));
-        assert!(has(
-            &parsed,
-            "@Me",
-            Style::Mention {
-                kind: MentionKind::User,
-                id: "8:orgid:me".into()
-            }
-        ));
-        assert!(
-            has(&parsed, "Me", Style::Bold),
-            "what was inside the mention moved over with it"
-        );
-        assert!(has(
-            &parsed,
-            "@General",
-            Style::Mention {
-                kind: MentionKind::Channel,
-                id: "19:general@thread.tacv2".into()
-            }
-        ));
+        assert!(has(&parsed, "@Ana Ruiz", Style::Mention { kind: MentionKind::User, id: "8:orgid:ana".into() }));
+        assert!(has(&parsed, "@Me", Style::Mention { kind: MentionKind::User, id: "8:orgid:me".into() }));
+        assert!(has(&parsed, "Me", Style::Bold), "what was inside the mention moved over with it");
+        assert!(has(&parsed, "@General", Style::Mention { kind: MentionKind::Channel, id: "19:general@thread.tacv2".into() }));
         assert!(parsed.mentioned);
         assert!(!read("<p><at id=\"0\">Ana</at> hi</p>").mentioned);
     }
@@ -840,29 +691,11 @@ mod tests {
         assert_eq!(parsed.images, [image]);
         // A GIF from Teams' Giphy button is a picture of its own; Giphy's host is the only one
         // outside Teams that is ever fetched, and only for that.
-        let gif = Image {
-            src: "https://media4.giphy.com/media/x/giphy.gif".into(),
-            width: 200,
-            height: 100,
-            name: "Cat GIF".into(),
-        };
+        let gif = Image { src: "https://media4.giphy.com/media/x/giphy.gif".into(), width: 200, height: 100, name: "Cat GIF".into() };
         assert_eq!(parsed.gifs, [gif]);
-        assert!(
-            giphy("https://i.giphy.com/x.gif")
-                && !giphy("http://media.giphy.com/x.gif")
-                && !giphy("https://giphy.com.evil.example/x.gif")
-        );
+        assert!(giphy("https://i.giphy.com/x.gif") && !giphy("http://media.giphy.com/x.gif") && !giphy("https://giphy.com.evil.example/x.gif"));
         let elsewhere = read("<p><img itemtype=\"http://schema.skype.com/Giphy\" alt=\"Not Giphy\" src=\"https://example.org/x.gif\"></p>");
-        assert!(
-            elsewhere.gifs.is_empty()
-                && has(
-                    &elsewhere,
-                    "Not Giphy",
-                    Style::Link {
-                        url: "https://example.org/x.gif".into()
-                    }
-                )
-        );
+        assert!(elsewhere.gifs.is_empty() && has(&elsewhere, "Not Giphy", Style::Link { url: "https://example.org/x.gif".into() }));
         assert!(parsed.spans.iter().any(|span| matches!(&span.style, Style::Emoji { file } if file.id == "emoji:0-weu-d2-partyparrot")));
 
         let card = read("<URIObject type=\"SWIFT.1\" url_thumbnail=\"https://x\"><Swift b64=\"eyJ0eXBlIjoibWVzc2FnZSJ9\"></Swift>Card - access it on https://go.skype.com/cards.unsupported</URIObject>");
@@ -893,29 +726,16 @@ mod tests {
         assert_eq!(read("a < b and c > d").text, "a < b and c > d");
         assert_eq!(read("<p>unclosed <b>bold").text, "unclosed bold");
         assert!(has(&read("<p>unclosed <b>bold"), "bold", Style::Bold));
-        assert_eq!(
-            read("</div>stray &bogus; &#128512; &#x1F600;<!-- gone --><script>alert(1)</script>")
-                .text,
-            "stray &bogus; 😀 😀"
-        );
+        assert_eq!(read("</div>stray &bogus; &#128512; &#x1F600;<!-- gone --><script>alert(1)</script>").text, "stray &bogus; 😀 😀");
         assert_eq!(read("<a href=\"javascript:alert(1)\">x</a>").spans, []);
         assert_eq!(read("plain   text\n  on lines").text, "plain text on lines");
-        assert_eq!(
-            read("<table><tr><td>a</td><td>b</td></tr><tr><td>c</td></tr></table>").text,
-            "a | b\nc"
-        );
+        assert_eq!(read("<table><tr><td>a</td><td>b</td></tr><tr><td>c</td></tr></table>").text, "a | b\nc");
         assert_eq!(read("").text, "");
     }
 
     #[test]
     fn typed_text_is_escaped_on_the_way_out() {
-        assert_eq!(
-            compose("a < b & \"c\"\nnext"),
-            "<p>a &lt; b &amp; &quot;c&quot;<br>next</p>"
-        );
-        assert_eq!(
-            read(&compose("1 < 2 && <b>not bold</b>\nline")).text,
-            "1 < 2 && <b>not bold</b>\nline"
-        );
+        assert_eq!(compose("a < b & \"c\"\nnext"), "<p>a &lt; b &amp; &quot;c&quot;<br>next</p>");
+        assert_eq!(read(&compose("1 < 2 && <b>not bold</b>\nline")).text, "1 < 2 && <b>not bold</b>\nline");
     }
 }

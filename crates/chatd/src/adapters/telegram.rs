@@ -95,10 +95,7 @@ const PLACED: usize = 4_096;
 
 /// The registered app id, when this build was given one.
 pub fn credentials() -> Option<(i32, &'static str)> {
-    let id = option_env!("TINYCLIENT_TELEGRAM_API_ID")?
-        .trim()
-        .parse()
-        .ok()?;
+    let id = option_env!("TINYCLIENT_TELEGRAM_API_ID")?.trim().parse().ok()?;
     let hash = option_env!("TINYCLIENT_TELEGRAM_API_HASH")?.trim();
     (id > 0 && !hash.is_empty()).then_some((id, hash))
 }
@@ -114,8 +111,7 @@ pub fn supported() -> bool {
 
 /// Why Telegram cannot be used in this build, for the sign-in sheet.
 pub fn unsupported_reason() -> String {
-    "This build of tinyclient was made without a Telegram app id, so it cannot sign in to Telegram."
-        .to_owned()
+    "This build of tinyclient was made without a Telegram app id, so it cannot sign in to Telegram.".to_owned()
 }
 
 /// What the keychain holds for Telegram. Not `Debug`: it is the account's keys.
@@ -146,11 +142,7 @@ pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
     let saved = parse(session)?;
     Ok(vec![Signed {
         account: saved.user.to_string(),
-        name: if saved.name.is_empty() {
-            "Telegram".to_owned()
-        } else {
-            saved.name
-        },
+        name: if saved.name.is_empty() { "Telegram".to_owned() } else { saved.name },
         session: session.to_owned(),
     }])
 }
@@ -227,15 +219,11 @@ pub(super) struct Account {
 
 impl Account {
     fn dir(&self) -> MutexGuard<'_, Directory> {
-        self.dir
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.dir.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn live(&self) -> MutexGuard<'_, Live> {
-        self.live
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// One request, with Telegram's flood waits honored.
@@ -270,20 +258,12 @@ impl Account {
                 dir.recall(who, &note);
             }
         }
-        dir.input_peer(who).ok_or_else(|| Fault::Rpc {
-            code: 400,
-            name: "PEER_ID_INVALID".to_owned(),
-            value: None,
-        })
+        dir.input_peer(who).ok_or_else(|| Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None })
     }
 
     fn input_channel(&self, who: Who) -> Result<tl::enums::InputChannel, Fault> {
         self.input(who)?;
-        self.dir().input_channel(who).ok_or_else(|| Fault::Rpc {
-            code: 400,
-            name: "CHANNEL_INVALID".to_owned(),
-            value: None,
-        })
+        self.dir().input_channel(who).ok_or_else(|| Fault::Rpc { code: 400, name: "CHANNEL_INVALID".to_owned(), value: None })
     }
 
     /// Remembers where a message is.
@@ -296,18 +276,14 @@ impl Account {
         if live.placed.len() >= PLACED {
             live.placed.pop_front();
         }
-        live.placed
-            .push_back(((who, message), conversation.to_owned()));
+        live.placed.push_back(((who, message), conversation.to_owned()));
     }
 
     fn placed(&self, who: Option<Who>, message: i32) -> Option<String> {
         let live = self.live();
-        let found = live.placed.iter().rev().find(|((peer, id), _)| {
-            *id == message
-                && match who {
-                    Some(who) => *peer == who,
-                    None => !matches!(peer, Who::Channel(_)),
-                }
+        let found = live.placed.iter().rev().find(|((peer, id), _)| *id == message && match who {
+            Some(who) => *peer == who,
+            None => !matches!(peer, Who::Channel(_)),
         });
         found.map(|(_, conversation)| conversation.clone())
     }
@@ -330,10 +306,7 @@ impl Account {
             }
             live.here = Some(Instant::now());
         }
-        let _ = wire::call(
-            self.wire.as_ref(),
-            &tl::functions::account::UpdateStatus { offline: false },
-        );
+        let _ = wire::call(self.wire.as_ref(), &tl::functions::account::UpdateStatus { offline: false });
     }
 }
 
@@ -367,20 +340,13 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         .name("telegram-events".into())
         .spawn(move || {
             keep_connected(&socket_ctx, || connect(&socket_ctx, &saved, &held));
-            held.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
+            held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
         })
         .map_err(|err| err.to_string())?;
     std::thread::Builder::new()
         .name("telegram-commands".into())
         .spawn(move || {
-            let account = || {
-                current
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-            };
+            let account = || current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
             serve_commands(
                 &ctx,
                 inbox,
@@ -447,9 +413,7 @@ fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) 
         };
     }
     account.files.attach(&account);
-    *current
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(account.clone());
+    *current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(account.clone());
     // Dropped while signing on: the command thread has gone and will not close this wire.
     if ctx.stopped() {
         return Failure::Dropped("stopped".to_owned());
@@ -470,11 +434,7 @@ fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) 
     let ended = loop {
         let wait = HERE_EVERY.saturating_sub(said.elapsed());
         match events.recv_timeout(wait) {
-            Ok(Event::Update {
-                update,
-                users,
-                chats,
-            }) => {
+            Ok(Event::Update { update, users, chats }) => {
                 account.learn(&users, &chats);
                 live::apply(&account, &update);
             }
@@ -489,16 +449,11 @@ fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) 
             break "stopped".to_owned();
         }
     };
-    current
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
+    current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
     // Whether the session is over is asked of the wire that just failed: a revoked session
     // closes the connection first and says why only when asked.
     match wire::call(account.wire.as_ref(), &tl::functions::updates::GetState {}) {
-        Err(fault) if fault.signed_out() => {
-            Failure::SignedOut("Telegram ended this session.".to_owned())
-        }
+        Err(fault) if fault.signed_out() => Failure::SignedOut("Telegram ended this session.".to_owned()),
         _ => Failure::Dropped(ended),
     }
 }
@@ -513,9 +468,7 @@ struct Held {
 /// connect: the conversation the user opened, whose store answer remains until then. One
 /// ask once, at most this many, and gone the moment the session ends (a sign-out), so
 /// nothing held outlives the account it was asked for.
-static HELD: Mutex<Held> = Mutex::new(Held {
-    backs: VecDeque::new(),
-});
+static HELD: Mutex<Held> = Mutex::new(Held { backs: VecDeque::new() });
 
 const HELD_BACKS: usize = 32;
 
@@ -529,54 +482,25 @@ fn held_back(id: String) {
 }
 
 fn held_take() -> VecDeque<String> {
-    std::mem::take(
-        &mut HELD
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .backs,
-    )
+    std::mem::take(&mut HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).backs)
 }
 
 /// Answers a command while there is no connection.
 fn offline(ctx: &Context, command: Command) {
     let down = || Refusal::Refused("Telegram is offline.".to_owned());
     match command {
-        Command::Send {
-            conversation_id,
-            client_id,
-            ..
-        } => ctx.sent(
-            &conversation_id,
-            &client_id,
-            Err("Telegram is offline.".to_owned()),
-        ),
-        Command::React { reply, .. }
-        | Command::Edit { reply, .. }
-        | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Send { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
+        Command::React { reply, .. } | Command::Edit { reply, .. } | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
         Command::Members { reply, .. } => drop(reply.send(Err(down()))),
-        Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => {
-            drop(reply.send(Err(down())))
-        }
+        Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(down()))),
         Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
-        Command::SetMute { reply, .. } | Command::Leave { reply, .. } => {
-            drop(reply.send(Err(down())))
-        }
+        Command::SetMute { reply, .. } | Command::Leave { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchShared { reply, .. } => drop(reply.send(Err(down()))),
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
-        Command::SendWith {
-            conversation_id,
-            client_id,
-            ..
-        } => ctx.sent(
-            &conversation_id,
-            &client_id,
-            Err("Telegram is offline.".to_owned()),
-        ),
-        Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => {
-            drop(reply.send(Err(down())))
-        }
+        Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
+        Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         other => other.unsupported(ctx),
     }
@@ -585,30 +509,9 @@ fn offline(ctx: &Context, command: Command) {
 fn serve(account: &Arc<Account>, command: Command) {
     let ctx = &account.ctx;
     match command {
-        Command::History {
-            conversation_id,
-            before,
-        } => drop(sync::history(
-            account,
-            &conversation_id,
-            sync::Around::Before(&before),
-        )),
-        Command::HistoryAfter {
-            conversation_id,
-            after,
-        } => drop(sync::history(
-            account,
-            &conversation_id,
-            sync::Around::After(&after),
-        )),
-        Command::HistoryAround {
-            conversation_id,
-            around,
-        } => drop(sync::history(
-            account,
-            &conversation_id,
-            sync::Around::At(&around),
-        )),
+        Command::History { conversation_id, before } => drop(sync::history(account, &conversation_id, sync::Around::Before(&before))),
+        Command::HistoryAfter { conversation_id, after } => drop(sync::history(account, &conversation_id, sync::Around::After(&after))),
+        Command::HistoryAround { conversation_id, around } => drop(sync::history(account, &conversation_id, sync::Around::At(&around))),
         // The chat list is current from updates; only a default mute changing needs it read
         // again, and then only when the user opens it.
         Command::OpenHome => {
@@ -621,216 +524,93 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Watch(watching) => sync::on_screen(account, &watching),
         Command::Wanted(ids) => drop(account.files.asked(&ids)),
         Command::Previews(ids) => sync::previews(account, &ids),
-        Command::MarkRead {
-            conversation_id,
-            message_id,
-        } => mark_read(account, &conversation_id, &message_id),
-        Command::Send {
-            conversation_id,
-            client_id,
-            text,
-            reply_to,
-        } => {
+        Command::MarkRead { conversation_id, message_id } => mark_read(account, &conversation_id, &message_id),
+        Command::Send { conversation_id, client_id, text, reply_to } => {
             account.here();
-            let outcome = send_text(
-                account,
-                &conversation_id,
-                &client_id,
-                &text,
-                reply_to.as_deref(),
-                Options::default(),
-            );
-            ctx.sent(
-                &conversation_id,
-                &client_id,
-                outcome.map_err(|fault| fault.words()),
-            );
+            let outcome = send_text(account, &conversation_id, &client_id, &text, reply_to.as_deref(), Options::default());
+            ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
         }
-        Command::SendWith {
-            conversation_id,
-            client_id,
-            text,
-            reply_to,
-            with,
-        } => {
-            send::send_with(
-                account,
-                &conversation_id,
-                &client_id,
-                &text,
-                reply_to.as_deref(),
-                *with,
-            );
+        Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+            send::send_with(account, &conversation_id, &client_id, &text, reply_to.as_deref(), *with);
         }
         Command::CancelSend { client_id, .. } => send::cancel(account, &client_id),
-        Command::React {
-            conversation_id,
-            message_id,
-            emoji,
-            on,
-            reply,
-        } => {
-            let _ = reply.send(
-                react::react(account, &conversation_id, &message_id, &emoji, on).map_err(refused),
-            );
+        Command::React { conversation_id, message_id, emoji, on, reply } => {
+            let _ = reply.send(react::react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
         }
-        Command::ReactionRules {
-            conversation_id,
-            reply,
-        } => {
+        Command::ReactionRules { conversation_id, reply } => {
             let _ = reply.send(react::rules(account, &conversation_id).map_err(refused));
         }
-        Command::Edit {
-            conversation_id,
-            message_id,
-            text,
-            reply,
-        } => {
-            let _ =
-                reply.send(edit(account, &conversation_id, &message_id, &text).map_err(refused));
+        Command::Edit { conversation_id, message_id, text, reply } => {
+            let _ = reply.send(edit(account, &conversation_id, &message_id, &text).map_err(refused));
         }
-        Command::Delete {
-            conversation_id,
-            message_id,
-            reply,
-        } => {
+        Command::Delete { conversation_id, message_id, reply } => {
             let _ = reply.send(delete(account, &conversation_id, &message_id).map_err(refused));
         }
         Command::Typing(conversation_id) => typing(account, &conversation_id),
-        Command::Draft {
-            conversation_id,
-            text,
-        } => save_draft(account, &conversation_id, &text),
+        Command::Draft { conversation_id, text } => save_draft(account, &conversation_id, &text),
         Command::SearchPeople(query) => {
-            let request = tl::functions::contacts::Search {
-                broadcasts: false,
-                bots: false,
-                q: query.clone(),
-                limit: 25,
-            };
+            let request = tl::functions::contacts::Search { broadcasts: false, bots: false, q: query.clone(), limit: 25 };
             if let Ok(tl::enums::contacts::Found::Found(found)) = account.ask(&request) {
                 account.learn(&found.users, &[]);
             }
             // Resolving is tightly flood-limited: only an explicit, complete @username asks
             // for it, after ranked search. Never hold queued sends up waiting out a flood.
             if let Some(username) = query.trim().strip_prefix('@').filter(|name| {
-                (5..=32).contains(&name.len())
-                    && name.as_bytes()[0].is_ascii_alphabetic()
+                (5..=32).contains(&name.len()) && name.as_bytes()[0].is_ascii_alphabetic()
                     && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
             }) {
-                let request = tl::functions::contacts::ResolveUsername {
-                    username: username.to_owned(),
-                    referer: None,
-                };
-                if let Ok(tl::enums::contacts::ResolvedPeer::Peer(found)) =
-                    wire::call(account.wire.as_ref(), &request)
-                {
+                let request = tl::functions::contacts::ResolveUsername { username: username.to_owned(), referer: None };
+                if let Ok(tl::enums::contacts::ResolvedPeer::Peer(found)) = wire::call(account.wire.as_ref(), &request) {
                     account.learn(&found.users, &[]);
                 }
             }
             ctx.searched(&query);
         }
-        Command::Members {
-            conversation_id,
-            offset,
-            limit,
-            reply,
-        } => {
+        Command::Members { conversation_id, offset, limit, reply } => {
             let _ = reply.send(members(account, &conversation_id, offset, limit).map_err(refused));
         }
         Command::StartDirect { person_id, reply } => {
             // Nothing reaches the other person: the chat exists on Telegram once a message does.
             let started = match Who::parse(&person_id) {
-                Some((who @ Who::User(_), None)) => {
-                    sync::ensure_row(account, who, None).then_some(person_id)
-                }
+                Some((who @ Who::User(_), None)) => sync::ensure_row(account, who, None).then_some(person_id),
                 _ => None,
             };
-            let _ = reply.send(started.ok_or_else(|| {
-                Refusal::Refused("That person can't be messaged from here.".to_owned())
-            }));
+            let _ = reply.send(started.ok_or_else(|| Refusal::Refused("That person can't be messaged from here.".to_owned())));
         }
         Command::Profile { person_id, reply } => {
             let _ = reply.send(info::profile(account, &person_id).map_err(refused));
         }
-        Command::ProfileIn {
-            person_id,
-            space_id,
-            reply,
-        } => {
+        Command::ProfileIn { person_id, space_id, reply } => {
             let _ = reply.send(info::profile_in(account, &person_id, &space_id).map_err(refused));
         }
-        Command::ConversationInfo {
-            conversation_id,
-            reply,
-        } => {
+        Command::ConversationInfo { conversation_id, reply } => {
             let _ = reply.send(info::conversation(account, &conversation_id).map_err(refused));
         }
-        Command::SetMute {
-            conversation_id,
-            notify,
-            reply,
-        } => {
+        Command::SetMute { conversation_id, notify, reply } => {
             let _ = reply.send(info::set_mute(account, &conversation_id, notify).map_err(refused));
         }
-        Command::Leave {
-            conversation_id,
-            reply,
-        } => {
+        Command::Leave { conversation_id, reply } => {
             let _ = reply.send(info::leave(account, &conversation_id).map_err(refused));
         }
-        Command::Pinned {
-            conversation_id,
-            reply,
-        } => {
+        Command::Pinned { conversation_id, reply } => {
             let _ = reply.send(info::pinned(account, &conversation_id).map_err(refused));
         }
-        Command::Search {
-            query,
-            scope,
-            reply,
-            ..
-        } => {
+        Command::Search { query, scope, reply, .. } => {
             let result = match scope {
-                super::SearchScope::Conversation(id) => {
-                    info::search_messages(account, &id, &query).map_err(refused)
-                }
+                super::SearchScope::Conversation(id) => info::search_messages(account, &id, &query).map_err(refused),
                 super::SearchScope::Space(_) => Err(Refusal::Unsupported),
             };
             let _ = reply.send(result);
         }
-        Command::SearchShared {
-            conversation_id,
-            kind,
-            before,
-            limit,
-            reply,
-        } => {
-            let _ = reply.send(
-                info::shared(account, &conversation_id, kind, before.as_deref(), limit)
-                    .map_err(refused),
-            );
+        Command::SearchShared { conversation_id, kind, before, limit, reply } => {
+            let _ = reply.send(info::shared(account, &conversation_id, kind, before.as_deref(), limit).map_err(refused));
         }
-        Command::Catalog {
-            kind,
-            query,
-            cursor,
-            reply,
-            ..
-        } => {
-            let _ = reply
-                .send(catalog::catalog(account, kind, &query, cursor.as_deref()).map_err(refused));
+        Command::Catalog { kind, query, cursor, reply, .. } => {
+            let _ = reply.send(catalog::catalog(account, kind, &query, cursor.as_deref()).map_err(refused));
         }
-        Command::Handoff {
-            conversation_id,
-            reply,
-        } => {
+        Command::Handoff { conversation_id, reply } => {
             let link = Who::parse(&conversation_id).map(|(who, _)| {
-                let handle = account
-                    .dir()
-                    .get(who)
-                    .map(|known| known.handle.clone())
-                    .unwrap_or_default();
+                let handle = account.dir().get(who).map(|known| known.handle.clone()).unwrap_or_default();
                 match (who, handle.as_str()) {
                     (_, handle) if !handle.is_empty() => format!("tg://resolve?domain={handle}"),
                     (Who::User(id), _) => format!("tg://user?id={id}"),
@@ -857,32 +637,21 @@ fn serve(account: &Arc<Account>, command: Command) {
 }
 
 fn mark_read(account: &Account, conversation: &str, message: &str) {
-    let (Some((who, topic)), Ok(max_id)) = (Who::parse(conversation), message.parse::<i32>())
-    else {
+    let (Some((who, topic)), Ok(max_id)) = (Who::parse(conversation), message.parse::<i32>()) else {
         return;
     };
     account.here();
     // Told exactly as Telegram's own apps tell it: reading is never withheld (the terms).
     let told = match (who, topic) {
         (who, Some(topic)) => account.input(who).and_then(|peer| {
-            account
-                .ask(&tl::functions::messages::ReadDiscussion {
-                    peer,
-                    msg_id: topic,
-                    read_max_id: max_id,
-                })
-                .map(drop)
+            account.ask(&tl::functions::messages::ReadDiscussion { peer, msg_id: topic, read_max_id: max_id }).map(drop)
         }),
-        (who @ Who::Channel(_), None) => account.input_channel(who).and_then(|channel| {
-            account
-                .ask(&tl::functions::channels::ReadHistory { channel, max_id })
-                .map(drop)
-        }),
-        (who, None) => account.input(who).and_then(|peer| {
-            account
-                .ask(&tl::functions::messages::ReadHistory { peer, max_id })
-                .map(drop)
-        }),
+        (who @ Who::Channel(_), None) => account
+            .input_channel(who)
+            .and_then(|channel| account.ask(&tl::functions::channels::ReadHistory { channel, max_id }).map(drop)),
+        (who, None) => {
+            account.input(who).and_then(|peer| account.ask(&tl::functions::messages::ReadHistory { peer, max_id }).map(drop))
+        }
     };
     if let Err(fault) = told {
         tracing::warn!("chatd: Telegram: read: {fault}");
@@ -892,11 +661,7 @@ fn mark_read(account: &Account, conversation: &str, message: &str) {
 /// The nonce Telegram dedupes a send by, from the shell's client id.
 fn random_id(client_id: &str) -> i64 {
     client_id.parse().unwrap_or_else(|_| {
-        client_id
-            .bytes()
-            .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
-                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-            }) as i64
+        client_id.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)) as i64
     })
 }
 
@@ -933,19 +698,8 @@ fn remember_random(account: &Account, random: i64, client_id: &str) {
     live.random.push_back((random, client_id.to_owned()));
 }
 
-fn send_text(
-    account: &Account,
-    conversation: &str,
-    client_id: &str,
-    text: &str,
-    reply_to: Option<&str>,
-    opts: Options,
-) -> Result<protocol::Message, Fault> {
-    let invalid = || Fault::Rpc {
-        code: 400,
-        name: "PEER_ID_INVALID".to_owned(),
-        value: None,
-    };
+fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, opts: Options) -> Result<protocol::Message, Fault> {
+    let invalid = || Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None };
     let (who, topic) = Who::parse(conversation).ok_or_else(invalid)?;
     let peer = account.input(who)?;
     let reply = reply_to.and_then(|id| id.parse::<i32>().ok());
@@ -982,15 +736,8 @@ fn send_text(
 }
 
 fn edit(account: &Account, conversation: &str, message: &str, text: &str) -> Result<(), Fault> {
-    let invalid = || Fault::Rpc {
-        code: 400,
-        name: "MESSAGE_ID_INVALID".to_owned(),
-        value: None,
-    };
-    let ((who, _), id) = (
-        Who::parse(conversation).ok_or_else(invalid)?,
-        message.parse::<i32>().map_err(|_| invalid())?,
-    );
+    let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
+    let ((who, _), id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
     let request = tl::functions::messages::EditMessage {
         no_webpage: false,
         invert_media: false,
@@ -1012,29 +759,16 @@ fn edit(account: &Account, conversation: &str, message: &str, text: &str) -> Res
 }
 
 fn delete(account: &Account, conversation: &str, message: &str) -> Result<(), Fault> {
-    let invalid = || Fault::Rpc {
-        code: 400,
-        name: "MESSAGE_ID_INVALID".to_owned(),
-        value: None,
-    };
-    let ((who, _), id) = (
-        Who::parse(conversation).ok_or_else(invalid)?,
-        message.parse::<i32>().map_err(|_| invalid())?,
-    );
+    let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
+    let ((who, _), id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
     match who {
         Who::Channel(_) => {
             let channel = account.input_channel(who)?;
-            account.ask(&tl::functions::channels::DeleteMessages {
-                channel,
-                id: vec![id],
-            })?;
+            account.ask(&tl::functions::channels::DeleteMessages { channel, id: vec![id] })?;
         }
         // For everyone, which is what `Delete` means.
         _ => {
-            account.ask(&tl::functions::messages::DeleteMessages {
-                revoke: true,
-                id: vec![id],
-            })?;
+            account.ask(&tl::functions::messages::DeleteMessages { revoke: true, id: vec![id] })?;
         }
     }
     let _ = account.ctx.deleted(conversation, message);
@@ -1047,11 +781,7 @@ fn typing(account: &Account, conversation: &str) {
     };
     {
         let mut live = account.live();
-        if live
-            .typed
-            .get(conversation)
-            .is_some_and(|told| told.elapsed() < TYPING_EVERY)
-        {
+        if live.typed.get(conversation).is_some_and(|told| told.elapsed() < TYPING_EVERY) {
             return;
         }
         live.typed.retain(|_, told| told.elapsed() < TYPING_EVERY);
@@ -1106,9 +836,7 @@ fn person(account: &Account, who: Who, relation: Relation) -> Person {
         presence: account.ctx.presence_of(&row.id),
         name: row.name,
         handle: row.handle,
-        avatar: row
-            .avatar
-            .map(|id| protocol::MediaFile::new(id, protocol::MediaKind::Avatar)),
+        avatar: row.avatar.map(|id| protocol::MediaFile::new(id, protocol::MediaKind::Avatar)),
         bot: row.bot,
         relation,
         status: String::new(),
@@ -1117,63 +845,31 @@ fn person(account: &Account, who: Who, relation: Relation) -> Person {
     }
 }
 
-fn members(
-    account: &Account,
-    conversation: &str,
-    offset: u32,
-    limit: u32,
-) -> Result<Members, Fault> {
-    let invalid = || Fault::Rpc {
-        code: 400,
-        name: "PEER_ID_INVALID".to_owned(),
-        value: None,
-    };
+fn members(account: &Account, conversation: &str, offset: u32, limit: u32) -> Result<Members, Fault> {
+    let invalid = || Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None };
     let (who, _) = Who::parse(conversation).ok_or_else(invalid)?;
-    let relation = |account: &Account, id: i64| match account
-        .dir()
-        .get(Who::User(id))
-        .is_some_and(|known| known.contact)
-    {
+    let relation = |account: &Account, id: i64| match account.dir().get(Who::User(id)).is_some_and(|known| known.contact) {
         true => Relation::Contact,
         false => Relation::None,
     };
     let (total, ids): (u32, Vec<i64>) = match who {
-        Who::User(id) => (
-            2,
-            [account.me, id]
-                .into_iter()
-                .skip(offset as usize)
-                .take(limit as usize)
-                .collect(),
-        ),
+        Who::User(id) => (2, [account.me, id].into_iter().skip(offset as usize).take(limit as usize).collect()),
         Who::Group(chat_id) => {
-            let tl::enums::messages::ChatFull::Full(full) =
-                account.ask(&tl::functions::messages::GetFullChat { chat_id })?;
+            let tl::enums::messages::ChatFull::Full(full) = account.ask(&tl::functions::messages::GetFullChat { chat_id })?;
             account.learn(&full.users, &full.chats);
             let listed = match &full.full_chat {
                 tl::enums::ChatFull::Full(chat) => match &chat.participants {
-                    tl::enums::ChatParticipants::Participants(list) => list
-                        .participants
-                        .iter()
-                        .map(|one| match one {
-                            tl::enums::ChatParticipant::Participant(one) => one.user_id,
-                            tl::enums::ChatParticipant::Creator(one) => one.user_id,
-                            tl::enums::ChatParticipant::Admin(one) => one.user_id,
-                        })
-                        .collect(),
+                    tl::enums::ChatParticipants::Participants(list) => list.participants.iter().map(|one| match one {
+                        tl::enums::ChatParticipant::Participant(one) => one.user_id,
+                        tl::enums::ChatParticipant::Creator(one) => one.user_id,
+                        tl::enums::ChatParticipant::Admin(one) => one.user_id,
+                    }).collect(),
                     tl::enums::ChatParticipants::Forbidden(_) => Vec::new(),
                 },
                 tl::enums::ChatFull::ChannelFull(_) => Vec::new(),
             };
             let listed: Vec<i64> = listed;
-            (
-                listed.len() as u32,
-                listed
-                    .into_iter()
-                    .skip(offset as usize)
-                    .take(limit as usize)
-                    .collect(),
-            )
+            (listed.len() as u32, listed.into_iter().skip(offset as usize).take(limit as usize).collect())
         }
         Who::Channel(_) => {
             let request = tl::functions::channels::GetParticipants {
@@ -1201,13 +897,7 @@ fn members(
     };
     Ok(Members {
         pending: false,
-        sections: vec![MemberSection {
-            name: "Members".to_owned(),
-            count: total,
-        }],
-        members: ids
-            .into_iter()
-            .map(|id| person(account, Who::User(id), relation(account, id)))
-            .collect(),
+        sections: vec![MemberSection { name: "Members".to_owned(), count: total }],
+        members: ids.into_iter().map(|id| person(account, Who::User(id), relation(account, id))).collect(),
     })
 }

@@ -101,28 +101,10 @@ fn digits(text: &str) -> bool {
 /// `<t:1618953630:f>` as words, in the machine's own time zone.
 fn timestamp(unix: i64, style: &str) -> String {
     const MONTHS: [&str; 12] = [
-        "January",
-        "February",
-        "March",
-        "April",
-        "May",
-        "June",
-        "July",
-        "August",
-        "September",
-        "October",
-        "November",
-        "December",
+        "January", "February", "March", "April", "May", "June", "July", "August", "September",
+        "October", "November", "December",
     ];
-    const DAYS: [&str; 7] = [
-        "Sunday",
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-    ];
+    const DAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
     let mut local: libc::tm = unsafe { std::mem::zeroed() };
     let unix = unix as libc::time_t;
     // SAFETY: platform localtime helpers fill the struct we hand them.
@@ -160,22 +142,12 @@ fn angle(rich: &mut Rich, text: &str, names: &dyn Names) -> Option<usize> {
     let start = rich.text.len();
     let mention = |rich: &mut Rich, shown: String, kind: MentionKind, id: &str| {
         rich.text.push_str(&shown);
-        rich.span(
-            start,
-            Style::Mention {
-                kind,
-                id: id.to_owned(),
-            },
-        );
+        rich.span(start, Style::Mention { kind, id: id.to_owned() });
     };
     if let Some(id) = inner.strip_prefix("@&").filter(|id| digits(id)) {
         let name = names.role(id).unwrap_or_else(|| "role".to_owned());
         mention(rich, format!("@{name}"), MentionKind::Role, id);
-    } else if let Some(id) = inner
-        .strip_prefix('@')
-        .map(|id| id.trim_start_matches('!'))
-        .filter(|id| digits(id))
-    {
+    } else if let Some(id) = inner.strip_prefix('@').map(|id| id.trim_start_matches('!')).filter(|id| digits(id)) {
         let name = names.user(id).unwrap_or_else(|| "someone".to_owned());
         mention(rich, format!("@{name}"), MentionKind::User, id);
     } else if let Some(id) = inner.strip_prefix('#').filter(|id| digits(id)) {
@@ -201,12 +173,7 @@ fn angle(rich: &mut Rich, text: &str, names: &dyn Names) -> Option<usize> {
         rich.text.push_str(&format!("/{name}"));
     } else if inner.starts_with("https://") || inner.starts_with("http://") {
         rich.text.push_str(inner);
-        rich.span(
-            start,
-            Style::Link {
-                url: inner.to_owned(),
-            },
-        );
+        rich.span(start, Style::Link { url: inner.to_owned() });
     } else {
         return None;
     }
@@ -215,17 +182,11 @@ fn angle(rich: &mut Rich, text: &str, names: &dyn Names) -> Option<usize> {
 
 /// The length of the bare link `text` starts with.
 fn bare_link(text: &str) -> usize {
-    let mut end = text
-        .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '|'))
-        .unwrap_or(text.len());
+    let mut end = text.find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '|')).unwrap_or(text.len());
     // Punctuation after a link belongs to the sentence, and so does an unmatched bracket.
     while let Some(last) = text[..end].chars().next_back() {
         let unmatched = last == ')' && !text[..end].contains('(');
-        if matches!(
-            last,
-            '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | '*' | '_' | '~'
-        ) || unmatched
-        {
+        if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | '*' | '_' | '~') || unmatched {
             end -= last.len_utf8();
         } else {
             break;
@@ -249,10 +210,7 @@ fn inline(rich: &mut Rich, text: &str, names: &dyn Names) {
         let start = rich.text.len();
         let first = rest.chars().next().unwrap_or(' ');
         // What comes before decides whether `_` and a link start here.
-        let after_word = text[..at]
-            .chars()
-            .next_back()
-            .is_some_and(char::is_alphanumeric);
+        let after_word = text[..at].chars().next_back().is_some_and(char::is_alphanumeric);
 
         if first == '\\' {
             if let Some(escaped) = rest[1..].chars().next().filter(char::is_ascii_punctuation) {
@@ -294,10 +252,7 @@ fn inline(rich: &mut Rich, text: &str, names: &dyn Names) {
                 let delimiter = &rest[..1];
                 let close = closing(rest, 1, delimiter).filter(|close| {
                     let inner = &rest[1..*close];
-                    let word_follows = rest[close + 1..]
-                        .chars()
-                        .next()
-                        .is_some_and(char::is_alphanumeric);
+                    let word_follows = rest[close + 1..].chars().next().is_some_and(char::is_alphanumeric);
                     !inner.starts_with(char::is_whitespace)
                         && !inner.ends_with(char::is_whitespace)
                         && !(first == '_' && word_follows)
@@ -333,19 +288,11 @@ fn inline(rich: &mut Rich, text: &str, names: &dyn Names) {
                 }
             }
             '@' => {
-                let everyone = ["@everyone", "@here"]
-                    .into_iter()
-                    .find(|word| rest.starts_with(word));
+                let everyone = ["@everyone", "@here"].into_iter().find(|word| rest.starts_with(word));
                 if let Some(word) = everyone {
                     rich.text.push_str(word);
                     let id = word[1..].to_owned();
-                    rich.span(
-                        start,
-                        Style::Mention {
-                            kind: MentionKind::Everyone,
-                            id,
-                        },
-                    );
+                    rich.span(start, Style::Mention { kind: MentionKind::Everyone, id });
                     at += word.len();
                     continue;
                 }
@@ -354,12 +301,7 @@ fn inline(rich: &mut Rich, text: &str, names: &dyn Names) {
                 let end = bare_link(rest);
                 if end > "https://".len() {
                     rich.text.push_str(&rest[..end]);
-                    rich.span(
-                        start,
-                        Style::Link {
-                            url: rest[..end].to_owned(),
-                        },
-                    );
+                    rich.span(start, Style::Link { url: rest[..end].to_owned() });
                     at += end;
                     continue;
                 }
@@ -379,12 +321,8 @@ fn list_item(line: &str) -> Option<(u8, bool, usize)> {
     if rest.starts_with("- ") || rest.starts_with("* ") {
         return Some((depth, false, indent + 2));
     }
-    let number = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .filter(|end| *end > 0)?;
-    rest[number..]
-        .starts_with(". ")
-        .then_some((depth, true, indent + number + 2))
+    let number = rest.find(|c: char| !c.is_ascii_digit()).filter(|end| *end > 0)?;
+    rest[number..].starts_with(". ").then_some((depth, true, indent + number + 2))
 }
 
 /// The lines outside code blocks: quotes, headings, lists, then inline markdown.
@@ -405,9 +343,7 @@ fn lines(rich: &mut Rich, text: &str, names: &dyn Names) {
                 (quoted, line) = (true, rest);
             }
         }
-        let heading = ["### ", "## ", "# "]
-            .into_iter()
-            .find_map(|mark| line.strip_prefix(mark));
+        let heading = ["### ", "## ", "# "].into_iter().find_map(|mark| line.strip_prefix(mark));
         if let Some(heading) = heading {
             // The model has no heading; bold is the nearest.
             inline(rich, heading, names);
@@ -448,10 +384,7 @@ pub fn markdown(rich: &mut Rich, text: &str, names: &dyn Names) {
         // A first line of letters alone names the language.
         let (language, code) = match code.split_once('\n') {
             Some((first, body))
-                if !first.is_empty()
-                    && first
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || "+-#_.".contains(c)) =>
+                if !first.is_empty() && first.chars().all(|c| c.is_ascii_alphanumeric() || "+-#_.".contains(c)) =>
             {
                 (first, body)
             }
@@ -459,12 +392,7 @@ pub fn markdown(rich: &mut Rich, text: &str, names: &dyn Names) {
         };
         let start = rich.text.len();
         rich.text.push_str(code.strip_suffix('\n').unwrap_or(code));
-        rich.span(
-            start,
-            Style::CodeBlock {
-                language: language.to_owned(),
-            },
-        );
+        rich.span(start, Style::CodeBlock { language: language.to_owned() });
         rest = &rest[close + 3..];
         if let Some(after) = rest.strip_prefix('\n') {
             rest = after;
@@ -486,12 +414,7 @@ fn media_kind(mime: &str, name: &str) -> MediaKind {
         mime if mime.starts_with("video/") => MediaKind::Video,
         mime if mime.starts_with("audio/") => MediaKind::Audio,
         "" if lower.ends_with(".gif") => MediaKind::Gif,
-        "" if [".png", ".jpg", ".jpeg", ".webp"]
-            .iter()
-            .any(|end| lower.ends_with(end)) =>
-        {
-            MediaKind::Image
-        }
+        "" if [".png", ".jpg", ".jpeg", ".webp"].iter().any(|end| lower.ends_with(end)) => MediaKind::Image,
         _ => MediaKind::File,
     }
 }
@@ -504,15 +427,9 @@ fn fitted(width: u32, height: u32) -> (u32, u32) {
     }
     // Whichever side is further over its limit decides.
     if u64::from(width) * 300 >= u64::from(height) * 400 {
-        (
-            400,
-            ((u64::from(height) * 400) / u64::from(width)).max(1) as u32,
-        )
+        (400, ((u64::from(height) * 400) / u64::from(width)).max(1) as u32)
     } else {
-        (
-            ((u64::from(width) * 300) / u64::from(height)).max(1) as u32,
-            300,
-        )
+        (((u64::from(width) * 300) / u64::from(height)).max(1) as u32, 300)
     }
 }
 
@@ -531,11 +448,7 @@ fn resized(proxy: &str, width: u32, height: u32, animated: bool) -> String {
 
 /// Whether a proxied picture may move: a GIF, or a WebP, which can.
 fn may_move(address: &str) -> bool {
-    let path = address
-        .split(['?', '#'])
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let path = address.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
     path.ends_with(".gif") || path.ends_with(".webp")
 }
 
@@ -543,21 +456,13 @@ fn may_move(address: &str) -> bool {
 /// it, for a 2x screen and for a grid tile, which crops and so draws the whole picture larger
 /// than its box. Never larger than the picture is; the picture itself is the last size when
 /// it is smaller than the next step.
-fn larger(
-    proxy: &str,
-    (width, height): (u32, u32),
-    (full_width, full_height): (u32, u32),
-    animated: bool,
-) -> Vec<(u32, String)> {
+fn larger(proxy: &str, (width, height): (u32, u32), (full_width, full_height): (u32, u32), animated: bool) -> Vec<(u32, String)> {
     let mut sizes = Vec::new();
     for (times, over) in [(3, 2), (2, 1), (3, 1)] {
         let (wide, high) = (width * times / over, height * times / over);
         if wide >= full_width || high >= full_height {
             if full_width > width {
-                sizes.push((
-                    full_width.max(full_height),
-                    resized(proxy, full_width, full_height, animated),
-                ));
+                sizes.push((full_width.max(full_height), resized(proxy, full_width, full_height, animated)));
             }
             break;
         }
@@ -568,11 +473,7 @@ fn larger(
 
 /// A voice message's bars: base64 of one byte each.
 fn waveform(encoded: Option<&str>) -> Vec<u8> {
-    let decoded = encoded.and_then(|encoded| {
-        base64::engine::general_purpose::STANDARD
-            .decode(encoded.trim())
-            .ok()
-    });
+    let decoded = encoded.and_then(|encoded| base64::engine::general_purpose::STANDARD.decode(encoded.trim()).ok());
     let mut bars = decoded.unwrap_or_default();
     bars.truncate(protocol::WAVEFORM_LIMIT);
     bars
@@ -590,31 +491,21 @@ fn attachment(rich: &mut Rich, attached: &Attached) -> Attachment {
     };
     rich.files.push((file.clone(), attached.url.clone()));
     let drawn = matches!(kind, MediaKind::Image | MediaKind::Gif | MediaKind::Video);
-    let thumb = attached
-        .proxy_url
-        .as_deref()
-        .filter(|_| drawn && attached.width > 0)
-        .map(|proxy| {
-            let (width, height) = fitted(attached.width, attached.height);
-            let thumb = MediaFile {
-                width,
-                height,
-                ..MediaFile::new(format!("att:{}:thumb", attached.id), MediaKind::Image)
-            };
-            let animated = kind == MediaKind::Gif || mime == "image/webp";
-            rich.files
-                .push((thumb.clone(), resized(proxy, width, height, animated)));
-            let sizes = larger(
-                proxy,
-                (width, height),
-                (attached.width, attached.height),
-                animated,
-            );
-            if !sizes.is_empty() {
-                rich.files.sizes.push((thumb.id.clone(), sizes));
-            }
-            thumb
-        });
+    let thumb = attached.proxy_url.as_deref().filter(|_| drawn && attached.width > 0).map(|proxy| {
+        let (width, height) = fitted(attached.width, attached.height);
+        let thumb = MediaFile {
+            width,
+            height,
+            ..MediaFile::new(format!("att:{}:thumb", attached.id), MediaKind::Image)
+        };
+        let animated = kind == MediaKind::Gif || mime == "image/webp";
+        rich.files.push((thumb.clone(), resized(proxy, width, height, animated)));
+        let sizes = larger(proxy, (width, height), (attached.width, attached.height), animated);
+        if !sizes.is_empty() {
+            rich.files.sizes.push((thumb.id.clone(), sizes));
+        }
+        thumb
+    });
     Attachment {
         spoiler: attached.spoiler(),
         sticker: false,
@@ -631,26 +522,10 @@ fn attachment(rich: &mut Rich, attached: &Attached) -> Attachment {
 /// A sticker is drawn like an attached picture; the shell renders Lottie JSON with tlottie.
 fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
     let (kind, url, mime) = match sticker.format_type {
-        3 => (
-            MediaKind::File,
-            format!("{}/stickers/{}.json", model::cdn(), sticker.id),
-            "application/json",
-        ),
-        4 => (
-            MediaKind::Gif,
-            format!("{}/stickers/{}.gif", model::media(), sticker.id),
-            "image/gif",
-        ),
-        2 => (
-            MediaKind::Image,
-            model::apng_sticker(&sticker.id),
-            "image/png",
-        ),
-        _ => (
-            MediaKind::Image,
-            format!("{}/stickers/{}.png?size=160", model::media(), sticker.id),
-            "image/png",
-        ),
+        3 => (MediaKind::File, format!("{}/stickers/{}.json", model::cdn(), sticker.id), "application/json"),
+        4 => (MediaKind::Gif, format!("{}/stickers/{}.gif", model::media(), sticker.id), "image/gif"),
+        2 => (MediaKind::Image, model::apng_sticker(&sticker.id), "image/png"),
+        _ => (MediaKind::Image, format!("{}/stickers/{}.png?size=160", model::media(), sticker.id), "image/png"),
     };
     let file = MediaFile {
         width: 160,
@@ -680,20 +555,10 @@ fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
 fn embed_still(rich: &mut Rich, id: String, picture: &EmbedImage) -> Option<MediaFile> {
     let proxy = picture.proxy_url.as_deref()?;
     let (width, height) = fitted(picture.width, picture.height);
-    let file = MediaFile {
-        width,
-        height,
-        ..MediaFile::new(id, MediaKind::Image)
-    };
+    let file = MediaFile { width, height, ..MediaFile::new(id, MediaKind::Image) };
     let animated = may_move(proxy);
-    rich.files
-        .push((file.clone(), resized(proxy, width, height, animated)));
-    let sizes = larger(
-        proxy,
-        (width, height),
-        (picture.width, picture.height),
-        animated,
-    );
+    rich.files.push((file.clone(), resized(proxy, width, height, animated)));
+    let sizes = larger(proxy, (width, height), (picture.width, picture.height), animated);
     if !sizes.is_empty() {
         rich.files.sizes.push((file.id.clone(), sizes));
     }
@@ -721,11 +586,7 @@ fn moving(rich: &mut Rich, message: &str, index: usize, embed: &Embed) -> Option
     rich.files.push((file.clone(), proxy.to_owned()));
     let name = match kind {
         MediaKind::Gif => "GIF".to_owned(),
-        _ => embed
-            .title
-            .clone()
-            .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| "Video".to_owned()),
+        _ => embed.title.clone().filter(|title| !title.is_empty()).unwrap_or_else(|| "Video".to_owned()),
     };
     let mut attachment = Attachment::new(name, file);
     attachment.thumb = Some(thumb);
@@ -743,8 +604,7 @@ fn preview(rich: &mut Rich, message: &str, index: usize, embed: &Embed) -> Previ
         description.push_str(&format!("{}: {}", field.name, field.value));
     }
     let picture = embed.image.as_ref().or(embed.thumbnail.as_ref());
-    let image =
-        picture.and_then(|picture| embed_still(rich, format!("embed:{message}:{index}"), picture));
+    let image = picture.and_then(|picture| embed_still(rich, format!("embed:{message}:{index}"), picture));
     let site = embed.provider.as_ref().or(embed.author.as_ref());
     Preview {
         url: embed.url.clone().unwrap_or_default(),
@@ -763,48 +623,31 @@ fn card(embed: &Embed, names: &dyn Names) -> Card {
         markdown(&mut rich, text, names);
         rich.text
     };
-    let author = embed
-        .author
-        .as_ref()
-        .map_or("", |author| author.name.as_str());
-    let title = embed
-        .title
-        .as_deref()
-        .filter(|title| !title.is_empty())
-        .unwrap_or(author);
+    let author = embed.author.as_ref().map_or("", |author| author.name.as_str());
+    let title = embed.title.as_deref().filter(|title| !title.is_empty()).unwrap_or(author);
     Card {
         title: plain(title),
         text: plain(embed.description.as_deref().unwrap_or("")),
-        fields: embed
-            .fields
-            .iter()
-            .map(|field| (plain(&field.name), plain(&field.value)))
-            .collect(),
-        footer: embed
-            .footer
-            .as_ref()
-            .map_or_else(String::new, |footer| footer.text.clone()),
+        fields: embed.fields.iter().map(|field| (plain(&field.name), plain(&field.value))).collect(),
+        footer: embed.footer.as_ref().map_or_else(String::new, |footer| footer.text.clone()),
         color: embed.color,
     }
 }
 
 fn reactions(rich: &mut Rich, reacted: &[model::Reacted]) -> Vec<Reaction> {
-    let mapped = reacted
-        .iter()
-        .filter(|reaction| reaction.count > 0)
-        .map(|reaction| {
-            let (emoji, file) = reaction.emoji.spelled();
-            let file = file.map(|(file, url)| {
-                rich.files.push((file.clone(), url));
-                file
-            });
-            Reaction {
-                emoji,
-                file,
-                count: reaction.count,
-                mine: reaction.me,
-            }
+    let mapped = reacted.iter().filter(|reaction| reaction.count > 0).map(|reaction| {
+        let (emoji, file) = reaction.emoji.spelled();
+        let file = file.map(|(file, url)| {
+            rich.files.push((file.clone(), url));
+            file
         });
+        Reaction {
+            emoji,
+            file,
+            count: reaction.count,
+            mine: reaction.me,
+        }
+    });
     mapped.collect()
 }
 
@@ -816,19 +659,12 @@ fn snippet(posted: &Posted, names: &dyn Names) -> String {
     if !line.is_empty() {
         return line.chars().take(120).collect();
     }
-    let attached = posted
-        .attachments
-        .as_deref()
-        .and_then(|attached| attached.first());
+    let attached = posted.attachments.as_deref().and_then(|attached| attached.first());
     attached.map_or_else(String::new, |attached| attached.filename.clone())
 }
 
 pub fn sender_name(posted: &Posted) -> String {
-    let nick = posted
-        .member
-        .as_ref()
-        .and_then(|member| member.nick.as_deref())
-        .filter(|nick| !nick.is_empty());
+    let nick = posted.member.as_ref().and_then(|member| member.nick.as_deref()).filter(|nick| !nick.is_empty());
     let own = posted.author.as_ref().map_or("", |author| author.name());
     nick.unwrap_or(own).to_owned()
 }
@@ -860,10 +696,7 @@ fn system_line(kind: u8, who: &str, content: &str, mentioned: &str) -> Option<St
 
 /// Where the official app shows this message.
 pub fn jump_link(guild: Option<&str>, channel: &str, message: &str) -> String {
-    format!(
-        "https://discord.com/channels/{}/{channel}/{message}",
-        guild.unwrap_or("@me")
-    )
+    format!("https://discord.com/channels/{}/{channel}/{message}", guild.unwrap_or("@me"))
 }
 
 /// Whose message this is and where, which the payload alone does not always say.
@@ -886,10 +719,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     let kind = posted.kind.unwrap_or(0);
     let link = jump_link(place.guild, &posted.channel_id, &posted.id);
 
-    let forwarded = posted
-        .message_snapshots
-        .first()
-        .map(|snapshot| &*snapshot.message);
+    let forwarded = posted.message_snapshots.first().map(|snapshot| &*snapshot.message);
     let mut message_kind = MessageKind::Normal;
     let mentioned = posted.mentions.first().map_or("", |user| user.name());
     match system_line(kind, &who, content, mentioned) {
@@ -897,19 +727,11 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
             markdown(&mut rich, content, place.names);
             // What was forwarded is the message's own text; a forward has none of its own.
             if let Some(forwarded) = forwarded {
-                markdown(
-                    &mut rich,
-                    forwarded.content.as_deref().unwrap_or(""),
-                    place.names,
-                );
+                markdown(&mut rich, forwarded.content.as_deref().unwrap_or(""), place.names);
             }
         }
         Some(line) if line.is_empty() => {
-            rich.text = if content.is_empty() {
-                "A message tinyclient cannot show.".to_owned()
-            } else {
-                content.to_owned()
-            };
+            rich.text = if content.is_empty() { "A message tinyclient cannot show.".to_owned() } else { content.to_owned() };
             message_kind = MessageKind::Unsupported { link: link.clone() };
         }
         Some(line) => {
@@ -920,56 +742,29 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
 
     let carried = forwarded.unwrap_or(posted);
     let attached = carried.attachments.as_deref().unwrap_or(&[]);
-    let mut attachments: Vec<Attachment> = attached
-        .iter()
-        .map(|attached| attachment(&mut rich, attached))
-        .collect();
-    attachments.extend(
-        carried
-            .sticker_items
-            .iter()
-            .map(|item| sticker(&mut rich, item)),
-    );
+    let mut attachments: Vec<Attachment> = attached.iter().map(|attached| attachment(&mut rich, attached)).collect();
+    attachments.extend(carried.sticker_items.iter().map(|item| sticker(&mut rich, item)));
     let embeds = carried.embeds.as_deref().unwrap_or(&[]);
-    let composed =
-        carried.author.as_ref().is_some_and(|author| author.bot) || carried.webhook_id.is_some();
-    let (card, previews, moving_pictures) =
-        cards(&mut rich, &posted.id, embeds, place.names, composed);
+    let composed = carried.author.as_ref().is_some_and(|author| author.bot) || carried.webhook_id.is_some();
+    let (card, previews, moving_pictures) = cards(&mut rich, &posted.id, embeds, place.names, composed);
     attachments.extend(moving_pictures);
     let reactions = reactions(&mut rich, posted.reactions.as_deref().unwrap_or(&[]));
-    let origin = posted
-        .message_reference
-        .as_ref()
-        .filter(|reference| reference.kind == 1 && forwarded.is_some());
+    let origin = posted.message_reference.as_ref().filter(|reference| reference.kind == 1 && forwarded.is_some());
     let forwarded_from = origin.map(|origin| {
         let channel = origin.channel_id.as_deref().unwrap_or("");
-        let elsewhere = origin
-            .guild_id
-            .as_deref()
-            .filter(|guild| Some(*guild) != place.guild);
+        let elsewhere = origin.guild_id.as_deref().filter(|guild| Some(*guild) != place.guild);
         Box::new(Forwarded {
-            from_title: place
-                .names
-                .channel(channel)
-                .map_or_else(String::new, |name| format!("#{name}")),
-            from_space: elsewhere
-                .and_then(|guild| place.names.space(guild))
-                .unwrap_or_default(),
+            from_title: place.names.channel(channel).map_or_else(String::new, |name| format!("#{name}")),
+            from_space: elsewhere.and_then(|guild| place.names.space(guild)).unwrap_or_default(),
             link: match &origin.message_id {
-                Some(message) if !channel.is_empty() => {
-                    jump_link(origin.guild_id.as_deref(), channel, message)
-                }
+                Some(message) if !channel.is_empty() => jump_link(origin.guild_id.as_deref(), channel, message),
                 _ => String::new(),
             },
         })
     });
 
     if let Some(poll) = &posted.poll {
-        let question = poll
-            .question
-            .as_ref()
-            .and_then(|question| question.text.as_deref())
-            .unwrap_or("");
+        let question = poll.question.as_ref().and_then(|question| question.text.as_deref()).unwrap_or("");
         rich.text = format!("Poll: {question}");
         rich.spans.clear();
         message_kind = MessageKind::Unsupported { link: link.clone() };
@@ -992,25 +787,19 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         (Some(reference), Some(original)) if reference.kind == 0 => Some(ReplyTo {
             deleted: false,
             // A webhook's author id names the webhook, not a person.
-            person: original
-                .author
-                .as_ref()
-                .filter(|_| original.webhook_id.is_none())
-                .map(|author| Key::new(place.account, &author.id)),
+            person: original.author.as_ref().filter(|_| original.webhook_id.is_none()).map(|author| Key::new(place.account, &author.id)),
             id: original.id.clone(),
             sender: sender_name(original),
             snippet: snippet(original, place.names),
         }),
         // The original was deleted, or Discord did not include it.
-        (Some(reference), None) if reference.kind == 0 && kind == 19 => {
-            reference.message_id.as_ref().map(|id| ReplyTo {
-                deleted: true,
-                person: None,
-                id: id.clone(),
-                sender: String::new(),
-                snippet: String::new(),
-            })
-        }
+        (Some(reference), None) if reference.kind == 0 && kind == 19 => reference.message_id.as_ref().map(|id| ReplyTo {
+            deleted: true,
+            person: None,
+            id: id.clone(),
+            sender: String::new(),
+            snippet: String::new(),
+        }),
         _ => None,
     };
     // Discord does not say who replied in a thread or how much of it we read, short of
@@ -1027,10 +816,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     rich.files.push((avatar.clone(), avatar_url));
     let outgoing = !author.id.is_empty() && author.id == place.me;
     // Our own client's nonce is the shell's client id: digits, at most 25.
-    let client_id = posted
-        .nonce
-        .clone()
-        .filter(|nonce| outgoing && digits(nonce) && nonce.len() <= 25);
+    let client_id = posted.nonce.clone().filter(|nonce| outgoing && digits(nonce) && nonce.len() <= 25);
     let message = Message {
         seal: protocol::Seal::Plain,
         card,
@@ -1039,11 +825,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         id: posted.id.clone(),
         sender: Sender {
             // A webhook's author id names the webhook, not a person.
-            id: if posted.webhook_id.is_some() {
-                String::new()
-            } else {
-                author.id.clone()
-            },
+            id: if posted.webhook_id.is_some() { String::new() } else { author.id.clone() },
             name: who,
             avatar: Some(avatar),
             bot: author.bot || posted.webhook_id.is_some(),
@@ -1125,30 +907,17 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
         let stickers: Vec<Attachment> = stored
             .attachments
             .iter()
-            .filter(|kept| {
-                kept.file.id.starts_with("sticker:") || kept.file.id.starts_with("embed:")
-            })
+            .filter(|kept| kept.file.id.starts_with("sticker:") || kept.file.id.starts_with("embed:"))
             .cloned()
             .collect();
-        stored.attachments = attached
-            .iter()
-            .map(|attached| attachment(&mut rich, attached))
-            .collect();
+        stored.attachments = attached.iter().map(|attached| attachment(&mut rich, attached)).collect();
         stored.attachments.extend(stickers);
     }
     if let Some(embeds) = &update.embeds {
-        let (card, previews, moving_pictures) = cards(
-            &mut rich,
-            &stored.id,
-            embeds,
-            place.names,
-            stored.sender.bot,
-        );
+        let (card, previews, moving_pictures) = cards(&mut rich, &stored.id, embeds, place.names, stored.sender.bot);
         stored.card = card;
         stored.previews = previews;
-        stored
-            .attachments
-            .retain(|kept| !kept.file.id.starts_with("embed:"));
+        stored.attachments.retain(|kept| !kept.file.id.starts_with("embed:"));
         stored.attachments.extend(moving_pictures);
     }
     if let Some(reacted) = &update.reactions {
@@ -1192,20 +961,13 @@ mod tests {
 
     fn styled<'a>(rich: &'a Rich, style: &Style) -> Vec<&'a str> {
         let matching = rich.spans.iter().filter(|span| span.style == *style);
-        matching
-            .map(|span| &rich.text[span.start as usize..span.end as usize])
-            .collect()
+        matching.map(|span| &rich.text[span.start as usize..span.end as usize]).collect()
     }
 
     #[test]
     fn inline_styles_leave_no_markup_and_cover_their_words() {
-        let rich = parsed(
-            "a **bold _both_** ~~gone~~ __under__ ||secret|| `x*y` snake_case_name 2 * 3 * 4",
-        );
-        assert_eq!(
-            rich.text,
-            "a bold both gone under secret x*y snake_case_name 2 * 3 * 4"
-        );
+        let rich = parsed("a **bold _both_** ~~gone~~ __under__ ||secret|| `x*y` snake_case_name 2 * 3 * 4");
+        assert_eq!(rich.text, "a bold both gone under secret x*y snake_case_name 2 * 3 * 4");
         assert_eq!(styled(&rich, &Style::Bold), ["bold both"]);
         assert_eq!(styled(&rich, &Style::Italic), ["both"]);
         assert_eq!(styled(&rich, &Style::Strike), ["gone"]);
@@ -1217,93 +979,35 @@ mod tests {
     #[test]
     fn mentions_read_as_names_and_emoji_as_their_name() {
         let rich = parsed("<@7> <@!9> in <#5> cc <@&3> @everyone <:party:42> <a:spin:43>");
-        assert_eq!(
-            rich.text,
-            "@Priya @someone in #deploys cc @mods @everyone :party: :spin:"
-        );
-        let user = Style::Mention {
-            kind: MentionKind::User,
-            id: "7".into(),
-        };
+        assert_eq!(rich.text, "@Priya @someone in #deploys cc @mods @everyone :party: :spin:");
+        let user = Style::Mention { kind: MentionKind::User, id: "7".into() };
         assert_eq!(styled(&rich, &user), ["@Priya"]);
-        let everyone = Style::Mention {
-            kind: MentionKind::Everyone,
-            id: "everyone".into(),
-        };
+        let everyone = Style::Mention { kind: MentionKind::Everyone, id: "everyone".into() };
         assert_eq!(styled(&rich, &everyone), ["@everyone"]);
-        let emoji: Vec<&str> = rich
-            .files
-            .files
-            .iter()
-            .map(|(file, _)| file.id.as_str())
-            .collect();
+        let emoji: Vec<&str> = rich.files.files.iter().map(|(file, _)| file.id.as_str()).collect();
         assert_eq!(emoji, ["emoji:42", "emoji:43"]);
     }
 
     #[test]
     fn links_bare_masked_and_bracketed() {
-        let rich = parsed(
-            "see https://a.example/x?y=1. and [the docs](https://b.example) or <https://c.example>",
-        );
-        assert_eq!(
-            rich.text,
-            "see https://a.example/x?y=1. and the docs or https://c.example"
-        );
+        let rich = parsed("see https://a.example/x?y=1. and [the docs](https://b.example) or <https://c.example>");
+        assert_eq!(rich.text, "see https://a.example/x?y=1. and the docs or https://c.example");
         let link = |url: &str| Style::Link { url: url.into() };
-        assert_eq!(
-            styled(&rich, &link("https://a.example/x?y=1")),
-            ["https://a.example/x?y=1"]
-        );
+        assert_eq!(styled(&rich, &link("https://a.example/x?y=1")), ["https://a.example/x?y=1"]);
         assert_eq!(styled(&rich, &link("https://b.example")), ["the docs"]);
-        assert_eq!(
-            styled(&rich, &link("https://c.example")),
-            ["https://c.example"]
-        );
+        assert_eq!(styled(&rich, &link("https://c.example")), ["https://c.example"]);
     }
 
     #[test]
     fn blocks_code_quotes_and_lists() {
-        let rich =
-            parsed("before\n```rust\nlet a = *b;\n```\n> quoted **line**\n- one\n1. two\nénd");
-        assert_eq!(
-            rich.text,
-            "before\nlet a = *b;\nquoted line\none\n1. two\nénd"
-        );
-        assert_eq!(
-            styled(
-                &rich,
-                &Style::CodeBlock {
-                    language: "rust".into()
-                }
-            ),
-            ["let a = *b;"]
-        );
+        let rich = parsed("before\n```rust\nlet a = *b;\n```\n> quoted **line**\n- one\n1. two\nénd");
+        assert_eq!(rich.text, "before\nlet a = *b;\nquoted line\none\n1. two\nénd");
+        assert_eq!(styled(&rich, &Style::CodeBlock { language: "rust".into() }), ["let a = *b;"]);
         assert_eq!(styled(&rich, &Style::Quote), ["quoted line"]);
-        assert_eq!(
-            styled(
-                &rich,
-                &Style::ListItem {
-                    ordered: false,
-                    depth: 0
-                }
-            ),
-            ["one"]
-        );
-        assert_eq!(
-            styled(
-                &rich,
-                &Style::ListItem {
-                    ordered: true,
-                    depth: 0
-                }
-            ),
-            ["1. two"]
-        );
+        assert_eq!(styled(&rich, &Style::ListItem { ordered: false, depth: 0 }), ["one"]);
+        assert_eq!(styled(&rich, &Style::ListItem { ordered: true, depth: 0 }), ["1. two"]);
         for span in &rich.spans {
-            assert!(
-                rich.text.is_char_boundary(span.start as usize)
-                    && rich.text.is_char_boundary(span.end as usize)
-            );
+            assert!(rich.text.is_char_boundary(span.start as usize) && rich.text.is_char_boundary(span.end as usize));
         }
     }
 
@@ -1313,51 +1017,24 @@ mod tests {
         assert_eq!(fitted(1600, 900), (400, 225));
         assert_eq!(fitted(900, 1600), (168, 300));
         assert_eq!(fitted(320, 200), (320, 200));
-        let sides =
-            |sizes: Vec<(u32, String)>| sizes.into_iter().map(|(side, _)| side).collect::<Vec<_>>();
+        let sides = |sizes: Vec<(u32, String)>| sizes.into_iter().map(|(side, _)| side).collect::<Vec<_>>();
         let proxy = "https://media.discordapp.net/attachments/1/2/a.png?ex=1";
         // A 2x screen showing the 400 pt picture asks for 800: there is a size that large.
-        assert_eq!(
-            sides(larger(proxy, (400, 225), (1600, 900), false)),
-            [600, 800, 1200]
-        );
+        assert_eq!(sides(larger(proxy, (400, 225), (1600, 900), false)), [600, 800, 1200]);
         // Never a size the picture does not have: its own is the last one.
         let small = larger(proxy, (400, 225), (700, 394), false);
         assert_eq!(sides(small.clone()), [600, 700]);
-        assert!(
-            small[1].1.ends_with("&format=webp&width=700&height=394"),
-            "{}",
-            small[1].1
-        );
-        assert_eq!(
-            sides(larger(proxy, (320, 200), (320, 200), false)),
-            Vec::<u32>::new()
-        );
+        assert!(small[1].1.ends_with("&format=webp&width=700&height=394"), "{}", small[1].1);
+        assert_eq!(sides(larger(proxy, (320, 200), (320, 200), false)), Vec::<u32>::new());
         // A GIF is asked for moving at every size, never as its whole original.
-        let gif = larger(
-            "https://media.discordapp.net/attachments/1/2/hop.gif?ex=1",
-            (400, 225),
-            (800, 450),
-            true,
-        );
-        assert!(
-            gif.iter()
-                .all(|(_, url)| url.ends_with("&animated=true") && url.contains("format=webp")),
-            "{gif:?}"
-        );
-        assert!(
-            may_move(
-                "https://images-ext-1.discordapp.net/external/x/https/example.org/a.GIF?width=1"
-            ) && !may_move("https://x/a.png")
-        );
+        let gif = larger("https://media.discordapp.net/attachments/1/2/hop.gif?ex=1", (400, 225), (800, 450), true);
+        assert!(gif.iter().all(|(_, url)| url.ends_with("&animated=true") && url.contains("format=webp")), "{gif:?}");
+        assert!(may_move("https://images-ext-1.discordapp.net/external/x/https/example.org/a.GIF?width=1") && !may_move("https://x/a.png"));
     }
 
     #[test]
     fn unclosed_markup_stays_as_typed() {
-        assert_eq!(
-            parsed("2 ** 3 and a_b and `open").text,
-            "2 ** 3 and a_b and `open"
-        );
+        assert_eq!(parsed("2 ** 3 and a_b and `open").text, "2 ** 3 and a_b and `open");
         assert_eq!(parsed("\\*not italic\\*").text, "*not italic*");
     }
 }

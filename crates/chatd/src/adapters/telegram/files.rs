@@ -64,72 +64,55 @@ impl Files {
         let (jobs, inbox) = channel::<Job>();
         let waiting = Arc::new(AtomicUsize::new(0));
         let (ctx, counted) = (ctx.clone(), waiting.clone());
-        let spawned = std::thread::Builder::new()
-            .name("telegram-files".into())
-            .spawn(move || {
-                let mut account = Weak::new();
-                // Datacenters this connection's sign-in has been carried to.
-                let mut carried = HashSet::new();
-                let mut queue: VecDeque<Box<Want>> = VecDeque::new();
-                loop {
-                    // Everything sent so far is read before the next fetch, so an original the
-                    // viewer asked for does not wait behind the rows' pictures.
-                    let next = if queue.is_empty() {
-                        inbox.recv().ok()
-                    } else {
-                        inbox.try_recv().ok()
-                    };
-                    if let Some(job) = next {
-                        match job {
-                            Job::Attach(to) => {
-                                account = to;
-                                carried.clear();
-                            }
-                            Job::Fetch(want) => queue.push_back(want),
-                            Job::First(want) => queue.push_front(want),
+        let spawned = std::thread::Builder::new().name("telegram-files".into()).spawn(move || {
+            let mut account = Weak::new();
+            // Datacenters this connection's sign-in has been carried to.
+            let mut carried = HashSet::new();
+            let mut queue: VecDeque<Box<Want>> = VecDeque::new();
+            loop {
+                // Everything sent so far is read before the next fetch, so an original the
+                // viewer asked for does not wait behind the rows' pictures.
+                let next = if queue.is_empty() { inbox.recv().ok() } else { inbox.try_recv().ok() };
+                if let Some(job) = next {
+                    match job {
+                        Job::Attach(to) => {
+                            account = to;
+                            carried.clear();
                         }
-                        continue;
+                        Job::Fetch(want) => queue.push_back(want),
+                        Job::First(want) => queue.push_front(want),
                     }
-                    let Some(want) = queue.pop_front() else {
-                        return;
-                    };
-                    counted.fetch_sub(1, Ordering::Relaxed);
-                    let Some(account) = account.upgrade() else {
-                        continue;
-                    };
-                    if ctx.stopped() {
-                        return;
+                    continue;
+                }
+                let Some(want) = queue.pop_front() else {
+                    return;
+                };
+                counted.fetch_sub(1, Ordering::Relaxed);
+                let Some(account) = account.upgrade() else {
+                    continue;
+                };
+                if ctx.stopped() {
+                    return;
+                }
+                if let Err(fault) = fetch(&account, &want, &mut carried) {
+                    // A reference that ran out is renewed by the next page that names the file.
+                    if !fault.is("FILE_REFERENCE_EXPIRED") {
+                        tracing::warn!("chatd: Telegram: file {}: {fault}", want.file.id);
                     }
-                    if let Err(fault) = fetch(&account, &want, &mut carried) {
-                        // A reference that ran out is renewed by the next page that names the file.
-                        if !fault.is("FILE_REFERENCE_EXPIRED") {
-                            tracing::warn!("chatd: Telegram: file {}: {fault}", want.file.id);
-                        }
-                        // The viewer is waiting on an original: it is told, and keeps the still.
-                        if want.original {
-                            let mut file = want.file.clone();
-                            let what = if want.file.kind == MediaKind::Image {
-                                "the full picture"
-                            } else {
-                                "the file"
-                            };
-                            file.failed = Some(format!("Telegram did not send {what}."));
-                            ctx.hub.changed(Change::Media {
-                                account: ctx.account.clone(),
-                                file,
-                            });
-                        }
+                    // The viewer is waiting on an original: it is told, and keeps the still.
+                    if want.original {
+                        let mut file = want.file.clone();
+                        let what = if want.file.kind == MediaKind::Image { "the full picture" } else { "the file" };
+                        file.failed = Some(format!("Telegram did not send {what}."));
+                        ctx.hub.changed(Change::Media { account: ctx.account.clone(), file });
                     }
                 }
-            });
+            }
+        });
         if let Err(err) = spawned {
             tracing::warn!("chatd: Telegram: files: {err}");
         }
-        Files {
-            jobs,
-            waiting,
-            held: Mutex::default(),
-        }
+        Files { jobs, waiting, held: Mutex::default() }
     }
 
     pub fn attach(&self, account: &Arc<Account>) {
@@ -139,18 +122,13 @@ impl Files {
     /// Queues what rows on screen show, and keeps the originals' places for [`Files::asked`].
     /// Nothing is fetched twice: a file already on disk is passed over when its turn comes.
     pub fn want(&self, wants: Vec<Want>) {
-        let (originals, wants): (Vec<Want>, Vec<Want>) =
-            wants.into_iter().partition(|want| want.original);
+        let (originals, wants): (Vec<Want>, Vec<Want>) = wants.into_iter().partition(|want| want.original);
         if !originals.is_empty() {
             let mut held = crate::hub::lock(&self.held);
             if held.len() + originals.len() > HELD {
                 held.clear();
             }
-            held.extend(
-                originals
-                    .into_iter()
-                    .map(|want| (want.file.id.clone(), want)),
-            );
+            held.extend(originals.into_iter().map(|want| (want.file.id.clone(), want)));
         }
         for want in wants {
             if self.waiting.fetch_add(1, Ordering::Relaxed) >= WAITING {
@@ -187,26 +165,13 @@ fn fetch(account: &Account, want: &Want, carried: &mut HashSet<i32>) -> Result<(
     let id = std::slice::from_ref(&want.file.id);
     let on_disk = |ctx: &Context| {
         let known = ctx.hub.store().media(&ctx.account, id).unwrap_or_default();
-        known
-            .first()
-            .and_then(|(file, _)| file.path.clone())
-            .is_some_and(|path| std::path::Path::new(&path).exists())
+        known.first().and_then(|(file, _)| file.path.clone()).is_some_and(|path| std::path::Path::new(&path).exists())
     };
     // What an older fetch kept as its gzip container is not what a shell reads: thrown
     // away, so the fetch of this turn keeps the file inside.
     if want.file.kind == MediaKind::Emoji {
-        if let Some(held) = ctx
-            .hub
-            .store()
-            .media(&ctx.account, id)
-            .unwrap_or_default()
-            .first()
-            .and_then(|(file, _)| file.path.clone())
-            .map(std::path::PathBuf::from)
-        {
-            if std::fs::read(&held)
-                .is_ok_and(|bytes| bytes.len() >= 2 && bytes[..2] == [0x1f, 0x8b])
-            {
+        if let Some(held) = ctx.hub.store().media(&ctx.account, id).unwrap_or_default().first().and_then(|(file, _)| file.path.clone()).map(std::path::PathBuf::from) {
+            if std::fs::read(&held).is_ok_and(|bytes| bytes.len() >= 2 && bytes[..2] == [0x1f, 0x8b]) {
                 let _ = std::fs::remove_file(&held);
             }
         }
@@ -220,10 +185,7 @@ fn fetch(account: &Account, want: &Want, carried: &mut HashSet<i32>) -> Result<(
     std::fs::create_dir_all(blobs::dir_under(&media_dir(), &ctx.account)).map_err(local)?;
     let mut out = std::fs::File::create(&part).map_err(local)?;
     let written = match &want.inline {
-        Some(bytes) => out
-            .write_all(bytes)
-            .map(|()| bytes.len() as u64)
-            .map_err(local),
+        Some(bytes) => out.write_all(bytes).map(|()| bytes.len() as u64).map_err(local),
         None => download(account, want, carried, &mut out),
     };
     drop(out);
@@ -238,9 +200,7 @@ fn fetch(account: &Account, want: &Want, carried: &mut HashSet<i32>) -> Result<(
     // is the file inside, the picture or animation a shell knows how to draw.
     let bytes = match want.file.kind {
         MediaKind::Emoji => {
-            let unpacked = std::fs::read(&part)
-                .ok()
-                .and_then(|held| net::gunzip(&held, LARGEST as usize));
+            let unpacked = std::fs::read(&part).ok().and_then(|held| net::gunzip(&held, LARGEST as usize));
             match unpacked {
                 Some(unpacked) => {
                     let _ = std::fs::write(&part, &unpacked);
@@ -260,35 +220,18 @@ fn fetch(account: &Account, want: &Want, carried: &mut HashSet<i32>) -> Result<(
     let address = format!("tg://file/{}", want.file.id);
     let landed = {
         let mut store = ctx.hub.store();
-        store
-            .register_media(&ctx.account, &[(want.file.clone(), address)])
-            .map_err(stored)?;
-        store
-            .media_landed(
-                &ctx.account,
-                &want.file.id,
-                &path.to_string_lossy(),
-                bytes,
-                now(),
-            )
-            .map_err(stored)?
+        store.register_media(&ctx.account, &[(want.file.clone(), address)]).map_err(stored)?;
+        store.media_landed(&ctx.account, &want.file.id, &path.to_string_lossy(), bytes, now()).map_err(stored)?
     };
     if let Some(file) = landed {
-        ctx.hub.changed(Change::Media {
-            account: ctx.account.clone(),
-            file,
-        });
+        ctx.hub.changed(Change::Media { account: ctx.account.clone(), file });
         // A picture is part of a row, which named no file while there was none: the row and
         // the people list are read again.
         if want.file.kind == MediaKind::Avatar {
-            ctx.hub.changed(Change::People {
-                account: ctx.account.clone(),
-            });
+            ctx.hub.changed(Change::People { account: ctx.account.clone() });
         }
         if let Some(row) = &want.row {
-            ctx.hub.changed(Change::Conversation {
-                conversation: ctx.key(row),
-            });
+            ctx.hub.changed(Change::Conversation { conversation: ctx.key(row) });
         }
     }
     account.keep_session();
@@ -296,12 +239,7 @@ fn fetch(account: &Account, want: &Want, carried: &mut HashSet<i32>) -> Result<(
 }
 
 /// The pieces of one file, in order, from the datacenter that holds it.
-fn download(
-    account: &Account,
-    want: &Want,
-    carried: &mut HashSet<i32>,
-    out: &mut std::fs::File,
-) -> Result<u64, Fault> {
+fn download(account: &Account, want: &Want, carried: &mut HashSet<i32>, out: &mut std::fs::File) -> Result<u64, Fault> {
     let wire = account.wire.as_ref();
     let home = wire.home();
     let dc = (want.dc != 0 && want.dc != home).then_some(want.dc);
@@ -311,27 +249,14 @@ fn download(
         if !carried.contains(&dc) {
             let tl::enums::auth::ExportedAuthorization::Authorization(pass) =
                 account.ask(&tl::functions::auth::ExportAuthorization { dc_id: dc })?;
-            wire::call_in(
-                wire,
-                Some(dc),
-                &tl::functions::auth::ImportAuthorization {
-                    id: pass.id,
-                    bytes: pass.bytes,
-                },
-            )?;
+            wire::call_in(wire, Some(dc), &tl::functions::auth::ImportAuthorization { id: pass.id, bytes: pass.bytes })?;
             carried.insert(dc);
         }
     }
     // A picture's pieces stay small; a file the user pressed play on comes in the largest.
     let (limit, most) = match (want.original, want.file.kind) {
-        (true, MediaKind::Image) => (
-            PIECE,
-            (want.file.bytes + want.file.bytes / 8).clamp(LARGEST, LARGEST_ORIGINAL),
-        ),
-        (true, _) => (
-            FILE_PIECE,
-            (want.file.bytes + want.file.bytes / 8).clamp(LARGEST, LARGEST_FILE),
-        ),
+        (true, MediaKind::Image) => (PIECE, (want.file.bytes + want.file.bytes / 8).clamp(LARGEST, LARGEST_ORIGINAL)),
+        (true, _) => (FILE_PIECE, (want.file.bytes + want.file.bytes / 8).clamp(LARGEST, LARGEST_FILE)),
         (false, _) => (PIECE, LARGEST),
     };
     let mut offset = 0i64;
@@ -352,10 +277,7 @@ fn download(
         let piece = match wire::call_in(wire, dc, &request) {
             // A flood wait is honored in full here as everywhere.
             Err(fault) => match fault.flood() {
-                Some(seconds)
-                    if seconds <= wire::PATIENCE
-                        && !pause(std::time::Duration::from_secs(seconds)) =>
-                {
+                Some(seconds) if seconds <= wire::PATIENCE && !pause(std::time::Duration::from_secs(seconds)) => {
                     wire::call_in(wire, dc, &request)?
                 }
                 _ => return Err(fault),
@@ -363,21 +285,16 @@ fn download(
             Ok(piece) => piece,
         };
         let tl::enums::upload::File::File(piece) = piece else {
-            return Err(Fault::Net(
-                "Telegram keeps this file where tinyclient cannot fetch it yet".to_owned(),
-            ));
+            return Err(Fault::Net("Telegram keeps this file where tinyclient cannot fetch it yet".to_owned()));
         };
-        out.write_all(&piece.bytes)
-            .map_err(|err| Fault::Net(err.to_string()))?;
+        out.write_all(&piece.bytes).map_err(|err| Fault::Net(err.to_string()))?;
         offset += piece.bytes.len() as i64;
         if (piece.bytes.len() as i32) < limit {
             return Ok(offset as u64);
         }
         // An original may be as large as Telegram says it is; a row's picture never needs more.
         if offset as u64 > most {
-            return Err(Fault::Net(
-                "the picture is larger than it should be".to_owned(),
-            ));
+            return Err(Fault::Net("the picture is larger than it should be".to_owned()));
         }
     }
 }

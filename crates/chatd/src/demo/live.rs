@@ -45,10 +45,7 @@ impl Plan {
             conversation: discord.live.clone(),
             voice: discord.voice.clone(),
             yusuf: discord.cast[YUSUF].clone(),
-            friends: discord.cast[..8]
-                .iter()
-                .map(|who| Key::new(&discord.account, who.id.clone()))
-                .collect(),
+            friends: discord.cast[..8].iter().map(|who| Key::new(&discord.account, who.id.clone())).collect(),
             media,
             origin,
             latest: None,
@@ -59,12 +56,8 @@ impl Plan {
     fn heard(&self, hub: &Hub, message: &Message, live: bool) {
         let stored = hub.store().ingest(&self.conversation, message, live);
         if matches!(stored, Ok(Stored::New | Stored::Updated)) {
-            hub.changed(Change::Messages {
-                conversation: self.conversation.clone(),
-            });
-            hub.changed(Change::Conversation {
-                conversation: self.conversation.clone(),
-            });
+            hub.changed(Change::Messages { conversation: self.conversation.clone() });
+            hub.changed(Change::Conversation { conversation: self.conversation.clone() });
             hub.changed(Change::Status);
         }
     }
@@ -88,15 +81,8 @@ impl Plan {
             height: 400,
             ..MediaFile::new(format!("live-{round}-thumb"), MediaKind::Image)
         };
-        let url = format!(
-            "{}/art/{}/{}/640/400?wait=900",
-            self.origin,
-            Art::Scene.letter(),
-            round % 360
-        );
-        hub.store()
-            .register_media(&self.account, &[(file.clone(), url)])
-            .ok()?;
+        let url = format!("{}/art/{}/{}/640/400?wait=900", self.origin, Art::Scene.letter(), round % 360);
+        hub.store().register_media(&self.account, &[(file.clone(), url)]).ok()?;
         Some(Attachment {
             thumb: Some(file.clone()),
             mime: "image/png".to_owned(),
@@ -106,16 +92,10 @@ impl Plan {
 
     /// Puts the round's picture on disk, unless the shell's own `Fetch` already did.
     fn land(&self, hub: &Hub, round: u64) {
-        let Some(file) = self
-            .latest
-            .as_ref()
-            .and_then(|message| message.files().next())
-        else {
+        let Some(file) = self.latest.as_ref().and_then(|message| message.files().next()) else {
             return;
         };
-        let known = hub
-            .store()
-            .media(&self.account, std::slice::from_ref(&file.id));
+        let known = hub.store().media(&self.account, std::slice::from_ref(&file.id));
         if !matches!(known.as_deref(), Ok([(MediaFile { path: None, .. }, _)])) {
             return;
         }
@@ -125,14 +105,9 @@ impl Plan {
             return;
         }
         let path = path.to_string_lossy();
-        let landed =
-            hub.store()
-                .media_landed(&self.account, &file.id, &path, bytes.len() as u64, now());
+        let landed = hub.store().media_landed(&self.account, &file.id, &path, bytes.len() as u64, now());
         if let Ok(Some(file)) = landed {
-            hub.changed(Change::Media {
-                account: self.account.clone(),
-                file,
-            });
+            hub.changed(Change::Media { account: self.account.clone(), file });
         }
     }
 
@@ -158,35 +133,22 @@ impl Plan {
                     count: 1,
                     mine: false,
                 };
-                let reacted = hub
-                    .store()
-                    .react(&self.conversation, &message.id, &reaction, true);
+                let reacted = hub.store().react(&self.conversation, &message.id, &reaction, true);
                 if matches!(reacted, Ok(true)) {
-                    hub.changed(Change::Messages {
-                        conversation: self.conversation.clone(),
-                    });
+                    hub.changed(Change::Messages { conversation: self.conversation.clone() });
                 }
             }
             3 => {
                 // The stored message has the reaction; the edit must keep it.
-                let Some(id) = self.latest.as_ref().map(|message| message.id.clone()) else {
-                    return;
-                };
-                let Ok(Some(mut message)) = hub.store().message(&self.conversation, &id) else {
-                    return;
-                };
+                let Some(id) = self.latest.as_ref().map(|message| message.id.clone()) else { return };
+                let Ok(Some(mut message)) = hub.store().message(&self.conversation, &id) else { return };
                 message.text.push_str(" (I checked twice.)");
                 message.edited = true;
                 self.heard(hub, &message, false);
             }
             4 => {
                 let person = self.friends[round as usize % self.friends.len()].clone();
-                let presence = [
-                    Presence::Idle,
-                    Presence::Dnd,
-                    Presence::Offline,
-                    Presence::Online,
-                ][round as usize % 4];
+                let presence = [Presence::Idle, Presence::Dnd, Presence::Offline, Presence::Online][round as usize % 4];
                 let status = ["", "back soon", "", "at the bench"][round as usize % 4];
                 hub.set_presence(person, presence, status, true);
                 // And whoever is first in a voice channel mutes, or unmutes.

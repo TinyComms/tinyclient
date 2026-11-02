@@ -80,8 +80,8 @@ use crate::hub::Hub;
 use crate::store::{ConversationRow, PersonRow, Store, Stored};
 use png::Art;
 use protocol::{
-    AccountKey, Activity, Capabilities, Key, Link, MediaFile, MediaKind, MentionKind, Message,
-    Network, Occupants, Presence, Relation, SendState, Sender, Span, Style,
+    AccountKey, Activity, Capabilities, Key, Link, MediaFile, MediaKind, MentionKind, Message, Network, Occupants,
+    Presence, Relation, SendState, Sender, Span, Style,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -202,8 +202,7 @@ impl Rich {
         let start = self.text.len() as u32;
         self.text.push_str(text);
         let end = self.text.len() as u32;
-        self.spans
-            .extend(styles.into_iter().map(|style| Span { start, end, style }));
+        self.spans.extend(styles.into_iter().map(|style| Span { start, end, style }));
         self
     }
 
@@ -296,25 +295,13 @@ impl Seeder<'_> {
 
     /// The same picture at twice and three times its size, as a network's image proxy would
     /// serve it: what a 2x screen, or a row drawn larger than the thumbnail, asks for.
-    fn larger(
-        &mut self,
-        account: &AccountKey,
-        id: &str,
-        look: (Art, u32),
-        width: u32,
-        height: u32,
-    ) -> Fallible<()> {
+    fn larger(&mut self, account: &AccountKey, id: &str, look: (Art, u32), width: u32, height: u32) -> Fallible<()> {
         let (art, seed) = look;
-        let sizes = [2, 3]
-            .into_iter()
-            .filter(|times| width.max(height) * times <= 2_400);
+        let sizes = [2, 3].into_iter().filter(|times| width.max(height) * times <= 2_400);
         let variants: Vec<(u32, String)> = sizes
             .map(|times| {
                 let route = Self::art_route(art, seed, width * times, height * times);
-                (
-                    width.max(height) * times,
-                    format!("{}/{route}?wait=300", self.origin),
-                )
+                (width.max(height) * times, format!("{}/{route}?wait=300", self.origin))
             })
             .collect();
         Ok(self.store.register_variants(account, id, &variants)?)
@@ -322,26 +309,13 @@ impl Seeder<'_> {
 
     /// We ourselves, recorded as a person so the account can show our own picture, and present.
     pub fn myself(&mut self, account: &AccountKey, me: &Who) -> Fallible<()> {
-        self.store
-            .upsert_people(account, &[person_row(account, me, "robin.vale", "")])?;
-        self.presence.push((
-            Key::new(account, me.id.clone()),
-            Presence::Online,
-            String::new(),
-        ));
+        self.store.upsert_people(account, &[person_row(account, me, "robin.vale", "")])?;
+        self.presence.push((Key::new(account, me.id.clone()), Presence::Online, String::new()));
         Ok(())
     }
 
     /// A picture that is already on disk.
-    pub fn picture(
-        &mut self,
-        account: &AccountKey,
-        id: &str,
-        kind: MediaKind,
-        look: (Art, u32),
-        width: u32,
-        height: u32,
-    ) -> Fallible<MediaFile> {
+    pub fn picture(&mut self, account: &AccountKey, id: &str, kind: MediaKind, look: (Art, u32), width: u32, height: u32) -> Fallible<MediaFile> {
         let (art, seed) = look;
         let mut file = Self::drawn(id, kind, width, height);
         self.register(account, &file, &Self::art_route(art, seed, width, height))?;
@@ -351,24 +325,14 @@ impl Seeder<'_> {
         let bytes = png::encode(art, seed, width, height);
         std::fs::write(&path, &bytes)?;
         let path = path.to_string_lossy().into_owned();
-        self.store
-            .media_landed(account, id, &path, bytes.len() as u64, self.now)?;
+        self.store.media_landed(account, id, &path, bytes.len() as u64, self.now)?;
         file.bytes = bytes.len() as u64;
         Ok(file)
     }
 
     /// A photograph from `photos/` (see [`photos`]), on disk as if fetched, at the size the
     /// network reports it. `look` is drawn instead when the file is not there.
-    pub fn photo(
-        &mut self,
-        account: &AccountKey,
-        id: &str,
-        kind: MediaKind,
-        name: &str,
-        look: (Art, u32),
-        width: u32,
-        height: u32,
-    ) -> Fallible<MediaFile> {
+    pub fn photo(&mut self, account: &AccountKey, id: &str, kind: MediaKind, name: &str, look: (Art, u32), width: u32, height: u32) -> Fallible<MediaFile> {
         let Some(bytes) = photos::bytes(name) else {
             return self.picture(account, id, kind, look, width, height);
         };
@@ -378,23 +342,13 @@ impl Seeder<'_> {
         std::fs::create_dir_all(path.parent().unwrap_or(Path::new("/")))?;
         std::fs::write(&path, &bytes)?;
         let path = path.to_string_lossy().into_owned();
-        self.store
-            .media_landed(account, id, &path, bytes.len() as u64, self.now)?;
+        self.store.media_landed(account, id, &path, bytes.len() as u64, self.now)?;
         file.bytes = bytes.len() as u64;
         Ok(file)
     }
 
     /// A photograph from `photos/` nobody has fetched, as [`Seeder::waiting`] is a drawn one.
-    pub fn photo_waiting(
-        &mut self,
-        account: &AccountKey,
-        id: &str,
-        kind: MediaKind,
-        name: &str,
-        look: (Art, u32),
-        width: u32,
-        height: u32,
-    ) -> Fallible<MediaFile> {
+    pub fn photo_waiting(&mut self, account: &AccountKey, id: &str, kind: MediaKind, name: &str, look: (Art, u32), width: u32, height: u32) -> Fallible<MediaFile> {
         if photos::bytes(name).is_none() {
             return self.waiting(account, id, kind, look, width, height);
         }
@@ -405,31 +359,12 @@ impl Seeder<'_> {
 
     /// A group's or channel's own picture from `photos/`, as its row's `avatar`. None without
     /// the file: such a row shows its initials, as it would on the network.
-    pub fn cover(
-        &mut self,
-        account: &AccountKey,
-        conversation: &str,
-        name: &str,
-    ) -> Fallible<Option<String>> {
+    pub fn cover(&mut self, account: &AccountKey, conversation: &str, name: &str) -> Fallible<Option<String>> {
         if photos::bytes(name).is_none() {
             return Ok(None);
         }
-        let id: String = conversation
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect();
-        Ok(Some(
-            self.photo(
-                account,
-                &format!("cover-{id}"),
-                MediaKind::Avatar,
-                name,
-                (Art::Badge, 0),
-                192,
-                192,
-            )?
-            .id,
-        ))
+        let id: String = conversation.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+        Ok(Some(self.photo(account, &format!("cover-{id}"), MediaKind::Avatar, name, (Art::Badge, 0), 192, 192)?.id))
     }
 
     /// The picture of someone called `name`: their portrait from `photos/`, or one drawn.
@@ -442,36 +377,16 @@ impl Seeder<'_> {
     }
 
     /// A picture nobody has fetched. It lands, after a visible wait, when the shell asks.
-    pub fn waiting(
-        &mut self,
-        account: &AccountKey,
-        id: &str,
-        kind: MediaKind,
-        look: (Art, u32),
-        width: u32,
-        height: u32,
-    ) -> Fallible<MediaFile> {
+    pub fn waiting(&mut self, account: &AccountKey, id: &str, kind: MediaKind, look: (Art, u32), width: u32, height: u32) -> Fallible<MediaFile> {
         let (art, seed) = look;
         let file = Self::drawn(id, kind, width, height);
-        self.register(
-            account,
-            &file,
-            &format!("{}?wait=900", Self::art_route(art, seed, width, height)),
-        )?;
+        self.register(account, &file, &format!("{}?wait=900", Self::art_route(art, seed, width, height)))?;
         self.larger(account, id, look, width, height)?;
         Ok(file)
     }
 
     /// A file whose address answers 404, so asking for it fails.
-    pub fn broken(
-        &mut self,
-        account: &AccountKey,
-        id: &str,
-        kind: MediaKind,
-        width: u32,
-        height: u32,
-        bytes: u64,
-    ) -> Fallible<MediaFile> {
+    pub fn broken(&mut self, account: &AccountKey, id: &str, kind: MediaKind, width: u32, height: u32, bytes: u64) -> Fallible<MediaFile> {
         let mut file = Self::drawn(id, kind, width, height);
         file.bytes = bytes;
         self.register(account, &file, "gone?wait=900")?;
@@ -479,14 +394,7 @@ impl Seeder<'_> {
     }
 
     /// A file that is not a picture, served by `route` when the user asks for it.
-    pub fn file(
-        &mut self,
-        account: &AccountKey,
-        id: &str,
-        kind: MediaKind,
-        bytes: u64,
-        route: &str,
-    ) -> Fallible<MediaFile> {
+    pub fn file(&mut self, account: &AccountKey, id: &str, kind: MediaKind, bytes: u64, route: &str) -> Fallible<MediaFile> {
         let mut file = MediaFile::new(id, kind);
         file.bytes = bytes;
         self.register(account, &file, route)?;
@@ -496,12 +404,7 @@ impl Seeder<'_> {
     /// Records the people of a table and their relationships, and answers them as speakers.
     /// Everyone with a portrait in `photos/` has it, as people on a network mostly do. Without
     /// one, every fifth has no picture, a few have one not yet fetched and one has one that fails.
-    pub fn people(
-        &mut self,
-        account: &AccountKey,
-        prefix: &str,
-        listed: &[Listed],
-    ) -> Fallible<Vec<Who>> {
+    pub fn people(&mut self, account: &AccountKey, prefix: &str, listed: &[Listed]) -> Fallible<Vec<Who>> {
         let mut rows = Vec::new();
         let mut cast = Vec::new();
         let mut relations = Vec::new();
@@ -510,25 +413,11 @@ impl Seeder<'_> {
             let avatar_id = format!("avatar-{id}-{:08x}", self.roll(u32::MAX as u64));
             let look = self.look(Art::Person);
             let avatar = match (photos::portrait(name), at % 10) {
-                (Some(file), _) => Some(self.photo(
-                    account,
-                    &avatar_id,
-                    MediaKind::Avatar,
-                    &file,
-                    look,
-                    192,
-                    192,
-                )?),
+                (Some(file), _) => Some(self.photo(account, &avatar_id, MediaKind::Avatar, &file, look, 192, 192)?),
                 (None, 4) => None,
-                (None, 8) => {
-                    Some(self.waiting(account, &avatar_id, MediaKind::Avatar, look, 80, 80)?)
-                }
-                (None, 9) if at == 19 => {
-                    Some(self.broken(account, &avatar_id, MediaKind::Avatar, 80, 80, 0)?)
-                }
-                (None, _) => {
-                    Some(self.picture(account, &avatar_id, MediaKind::Avatar, look, 80, 80)?)
-                }
+                (None, 8) => Some(self.waiting(account, &avatar_id, MediaKind::Avatar, look, 80, 80)?),
+                (None, 9) if at == 19 => Some(self.broken(account, &avatar_id, MediaKind::Avatar, 80, 80, 0)?),
+                (None, _) => Some(self.picture(account, &avatar_id, MediaKind::Avatar, look, 80, 80)?),
             };
             let who = Who {
                 id: id.clone(),
@@ -540,11 +429,7 @@ impl Seeder<'_> {
             rows.push(person_row(account, &who, handle, status));
             if *relation != Relation::None {
                 relations.push((id, *relation));
-                self.presence.push((
-                    Key::new(account, who.id.clone()),
-                    *presence,
-                    (*status).to_owned(),
-                ));
+                self.presence.push((Key::new(account, who.id.clone()), *presence, (*status).to_owned()));
             }
             cast.push(who);
         }
@@ -554,21 +439,9 @@ impl Seeder<'_> {
     }
 
     /// A message from `who`, `minutes` ago, not yet recorded.
-    pub fn message(
-        &mut self,
-        account: &AccountKey,
-        who: &Who,
-        minutes: i64,
-        text: &str,
-    ) -> Message {
+    pub fn message(&mut self, account: &AccountKey, who: &Who, minutes: i64, text: &str) -> Message {
         let sent = self.now - minutes * 60;
-        let mut message = Message::plain(
-            self.message_id(account.network, sent),
-            "",
-            text,
-            sent,
-            who.me,
-        );
+        let mut message = Message::plain(self.message_id(account.network, sent), "", text, sent, who.me);
         message.sender = who.sender();
         // Naming us is a mention of us, as the networks' own rules would have it.
         if let (Some(at), false) = (text.find(MENTION), who.me) {
@@ -591,13 +464,7 @@ impl Seeder<'_> {
     }
 
     /// Records one plain message and answers its id.
-    pub fn say(
-        &mut self,
-        conversation: &Key,
-        who: &Who,
-        minutes: i64,
-        text: &str,
-    ) -> Fallible<String> {
+    pub fn say(&mut self, conversation: &Key, who: &Who, minutes: i64, text: &str) -> Fallible<String> {
         let message = self.message(&conversation.account(), who, minutes, text);
         self.post(conversation, &message)?;
         Ok(message.id)
@@ -605,35 +472,17 @@ impl Seeder<'_> {
 
     /// Records a run of plain messages, each `(speaker, minutes ago, text)`, and answers their
     /// ids. The speaker indexes `cast`; anything past its end is us.
-    pub fn script(
-        &mut self,
-        conversation: &Key,
-        cast: &[Who],
-        me: &Who,
-        lines: &[(usize, i64, &str)],
-    ) -> Fallible<Vec<String>> {
+    pub fn script(&mut self, conversation: &Key, cast: &[Who], me: &Who, lines: &[(usize, i64, &str)]) -> Fallible<Vec<String>> {
         let mut ids = Vec::with_capacity(lines.len());
         for (speaker, minutes, text) in lines {
-            ids.push(self.say(
-                conversation,
-                cast.get(*speaker).unwrap_or(me),
-                *minutes,
-                text,
-            )?);
+            ids.push(self.say(conversation, cast.get(*speaker).unwrap_or(me), *minutes, text)?);
         }
         Ok(ids)
     }
 
     /// The unread state as a network would report it at connect.
-    pub fn counts(
-        &mut self,
-        conversation: &Key,
-        unread: u32,
-        mentions: u32,
-        read: Option<&str>,
-    ) -> Fallible<()> {
-        self.store
-            .set_counts(conversation, unread, mentions, read, 0)?;
+    pub fn counts(&mut self, conversation: &Key, unread: u32, mentions: u32, read: Option<&str>) -> Fallible<()> {
+        self.store.set_counts(conversation, unread, mentions, read, 0)?;
         Ok(())
     }
 
@@ -662,15 +511,7 @@ pub fn seed(store: &mut Store, dir: &Path, mode: Mode) -> Fallible<()> {
         occupants: Vec::new(),
     };
     // Whatever an earlier run seeded goes first, files included, so ids never collide.
-    for account in [
-        discord::account(),
-        slack::harbor(),
-        slack::fernhill(),
-        telegram::account(),
-        teams::account(),
-        signal::account(),
-        tiny::account(),
-    ] {
+    for account in [discord::account(), slack::harbor(), slack::fernhill(), telegram::account(), teams::account(), signal::account(), tiny::account()] {
         seeder.store.forget(&account)?;
         let _ = std::fs::remove_dir_all(crate::blobs::dir_under(&media, &account));
     }
@@ -686,10 +527,7 @@ pub fn seed(store: &mut Store, dir: &Path, mode: Mode) -> Fallible<()> {
     me.push((tiny::account(), tiny::seed(&mut seeder)?));
 
     let fernhill = match (mode.expired, mode.reconnecting) {
-        (true, _) => (
-            Link::Expired,
-            "Slack ended this session. Sign in again to send and receive.",
-        ),
+        (true, _) => (Link::Expired, "Slack ended this session. Sign in again to send and receive."),
         (false, true) => (Link::Offline, ""),
         (false, false) => (Link::Connected, ""),
     };
@@ -739,11 +577,7 @@ pub fn attach(hub: &Arc<Hub>) -> Vec<(AccountKey, Adapter)> {
             (Link::Offline, true) => hub.set_offline(account, true),
             _ => hub.set_link(account, *link, detail),
         }
-        let me = stage
-            .me
-            .iter()
-            .find(|(of, _)| of == account)
-            .map(|(_, me)| me.clone());
+        let me = stage.me.iter().find(|(of, _)| of == account).map(|(_, me)| me.clone());
         if let (Link::Connected, Some(me)) = (link, me) {
             match adapter::start(account.clone(), hub.clone(), me) {
                 Ok(adapter) => adapters.push((account.clone(), adapter)),
@@ -767,52 +601,41 @@ pub fn attach(hub: &Arc<Hub>) -> Vec<(AccountKey, Adapter)> {
         hub.set_occupants(conversation, occupants);
     }
     let hub = hub.clone();
-    let spawned = std::thread::Builder::new()
-        .name("demo".into())
-        .spawn(move || {
-            // `Chat::new` fails whatever is pending when it starts, so the message that is still
-            // being sent goes in after it, and is kept young so it never times out.
-            std::thread::sleep(Duration::from_millis(500));
-            let showcase::Pending {
-                conversation,
-                mut message,
-                unread,
-                mentions,
-            } = stage.pending;
-            let mut live = stage.mode.live.then_some(stage.live);
-            let mut tick = 0u64;
-            loop {
-                if tick.is_multiple_of(10) {
-                    message.sent = crate::hub::now();
-                    message.state = SendState::Pending;
-                    let mut store = hub.store();
-                    let stored = store.ingest(&conversation, &message, false);
-                    if matches!(stored, Ok(Stored::New)) {
-                        // Our own new message reads the conversation; put its unread state back.
-                        let _ = store.set_counts(&conversation, unread, mentions, None, 0);
-                        drop(store);
-                        hub.changed(protocol::Change::Messages {
-                            conversation: conversation.clone(),
-                        });
-                        hub.changed(protocol::Change::Conversation {
-                            conversation: conversation.clone(),
-                        });
-                        hub.changed(protocol::Change::Status);
-                    }
+    let spawned = std::thread::Builder::new().name("demo".into()).spawn(move || {
+        // `Chat::new` fails whatever is pending when it starts, so the message that is still
+        // being sent goes in after it, and is kept young so it never times out.
+        std::thread::sleep(Duration::from_millis(500));
+        let showcase::Pending { conversation, mut message, unread, mentions } = stage.pending;
+        let mut live = stage.mode.live.then_some(stage.live);
+        let mut tick = 0u64;
+        loop {
+            if tick.is_multiple_of(10) {
+                message.sent = crate::hub::now();
+                message.state = SendState::Pending;
+                let mut store = hub.store();
+                let stored = store.ingest(&conversation, &message, false);
+                if matches!(stored, Ok(Stored::New)) {
+                    // Our own new message reads the conversation; put its unread state back.
+                    let _ = store.set_counts(&conversation, unread, mentions, None, 0);
+                    drop(store);
+                    hub.changed(protocol::Change::Messages { conversation: conversation.clone() });
+                    hub.changed(protocol::Change::Conversation { conversation: conversation.clone() });
+                    hub.changed(protocol::Change::Status);
                 }
-                // With nothing live to do, only the pending message needs this thread: it wakes
-                // for that alone.
-                let steps: u32 = match &mut live {
-                    Some(live) => {
-                        live.step(&hub, tick);
-                        1
-                    }
-                    None => 10,
-                };
-                tick += u64::from(steps);
-                std::thread::sleep(live::STEP * steps);
             }
-        });
+            // With nothing live to do, only the pending message needs this thread: it wakes
+            // for that alone.
+            let steps: u32 = match &mut live {
+                Some(live) => {
+                    live.step(&hub, tick);
+                    1
+                }
+                None => 10,
+            };
+            tick += u64::from(steps);
+            std::thread::sleep(live::STEP * steps);
+        }
+    });
     if let Err(err) = spawned {
         tracing::warn!("chatd: demo: {err}");
     }

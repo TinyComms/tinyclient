@@ -4,8 +4,7 @@
 use super::super::{Command, Failure};
 use super::model::{
     self, number, seconds, Channel, Guild, GuildSettings, Kept, Member, MuteConfig, PresenceUpdate,
-    ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, SEND_MESSAGES,
-    VIEW_CHANNEL,
+    ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, SEND_MESSAGES, VIEW_CHANNEL,
 };
 use super::{proto, Discord, GuildInfo, Quiet, Resumable, RoleInfo, WARM};
 use crate::hub::now;
@@ -97,31 +96,18 @@ fn until(config: Option<&MuteConfig>) -> i64 {
 pub(super) fn quiet(settings: &GuildSettings) -> Quiet {
     let overrides = &settings.channel_overrides;
     let muted = overrides.iter().filter(|channel| channel.muted);
-    let opted = overrides
-        .iter()
-        .filter(|channel| channel.flags & model::OPT_IN_ENABLED != 0);
-    let levels = overrides
-        .iter()
-        .filter(|channel| channel.message_notifications < 3);
+    let opted = overrides.iter().filter(|channel| channel.flags & model::OPT_IN_ENABLED != 0);
+    let levels = overrides.iter().filter(|channel| channel.message_notifications < 3);
     Quiet {
         muted_until: settings.muted.then(|| until(settings.mute_config.as_ref())),
         suppress_everyone: settings.suppress_everyone,
         suppress_roles: settings.suppress_roles,
-        channels: muted
-            .map(|channel| {
-                (
-                    channel.channel_id.clone(),
-                    until(channel.mute_config.as_ref()),
-                )
-            })
-            .collect(),
+        channels: muted.map(|channel| (channel.channel_id.clone(), until(channel.mute_config.as_ref()))).collect(),
         hide_muted: settings.hide_muted_channels,
         opt_in: settings.flags & model::OPT_IN_CHANNELS_ON != 0,
         opted_in: opted.map(|channel| channel.channel_id.clone()).collect(),
         level: settings.message_notifications,
-        levels: levels
-            .map(|channel| (channel.channel_id.clone(), channel.message_notifications))
-            .collect(),
+        levels: levels.map(|channel| (channel.channel_id.clone(), channel.message_notifications)).collect(),
     }
 }
 
@@ -129,9 +115,7 @@ impl Quiet {
     /// Muted now: the server, the channel, or the category it is in.
     pub(super) fn mutes(&self, channel: &str, parent: Option<&str>, now: i64) -> bool {
         let on = |until: Option<&i64>| until.is_some_and(|until| *until > now);
-        on(self.muted_until.as_ref())
-            || on(self.channels.get(channel))
-            || on(parent.and_then(|parent| self.channels.get(parent)))
+        on(self.muted_until.as_ref()) || on(self.channels.get(channel)) || on(parent.and_then(|parent| self.channels.get(parent)))
     }
 
     /// The server as a whole is muted now.
@@ -144,9 +128,7 @@ impl Quiet {
     /// community's, and the channels a server's onboarding always shows are not known here, so
     /// such a server may show fewer channels than Discord does until they are opted in.
     pub(super) fn opted_out(&self, channel: &str, parent: Option<&str>) -> bool {
-        self.opt_in
-            && !self.opted_in.contains(channel)
-            && !parent.is_some_and(|parent| self.opted_in.contains(parent))
+        self.opt_in && !self.opted_in.contains(channel) && !parent.is_some_and(|parent| self.opted_in.contains(parent))
     }
 
     /// The network's notification setting for one conversation, mute first.
@@ -154,11 +136,7 @@ impl Quiet {
         if self.mutes(channel, parent, now) {
             return protocol::Notify::Nothing;
         }
-        let level = self
-            .levels
-            .get(channel)
-            .or_else(|| parent.and_then(|parent| self.levels.get(parent)))
-            .copied();
+        let level = self.levels.get(channel).or_else(|| parent.and_then(|parent| self.levels.get(parent))).copied();
         match level.unwrap_or(self.level) {
             1 => protocol::Notify::Mentions,
             2 => protocol::Notify::Nothing,
@@ -169,9 +147,7 @@ impl Quiet {
     /// The next time one of its mutes runs out.
     fn next_end(&self, now: i64) -> Option<i64> {
         let ends = self.muted_until.iter().chain(self.channels.values());
-        ends.copied()
-            .filter(|end| *end > now && *end != i64::MAX)
-            .min()
+        ends.copied().filter(|end| *end > now && *end != i64::MAX).min()
     }
 }
 
@@ -190,9 +166,7 @@ fn kind_of(channel: &Channel) -> Option<ConversationKind> {
         model::NEWS => ConversationKind::Announcement,
         model::VOICE | model::STAGE => ConversationKind::Voice,
         model::FORUM | model::MEDIA_FORUM => ConversationKind::Forum,
-        model::NEWS_THREAD | model::PUBLIC_THREAD | model::PRIVATE_THREAD => {
-            ConversationKind::Thread
-        }
+        model::NEWS_THREAD | model::PUBLIC_THREAD | model::PRIVATE_THREAD => ConversationKind::Thread,
         _ => return None,
     })
 }
@@ -204,11 +178,7 @@ fn header(id: &str, name: &str, position: i32) -> Group {
 
 /// A topic as one line.
 fn one_line(topic: Option<&str>) -> String {
-    topic
-        .unwrap_or("")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    topic.unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 impl GuildInfo {
@@ -220,26 +190,16 @@ impl GuildInfo {
         }
         let everyone = number(guild);
         let of = |role: &u64| self.roles.get(role).map_or(0, |role| role.permissions);
-        let mut allowed = self
-            .my_roles
-            .iter()
-            .fold(of(&everyone), |all, role| all | of(role));
+        let mut allowed = self.my_roles.iter().fold(of(&everyone), |all, role| all | of(role));
         if allowed & ADMINISTRATOR != 0 {
             return u64::MAX;
         }
         let overwrites = &channel.permission_overwrites;
-        if let Some(all) = overwrites
-            .iter()
-            .find(|over| !over.member && number(&over.id) == everyone)
-        {
+        if let Some(all) = overwrites.iter().find(|over| !over.member && number(&over.id) == everyone) {
             allowed = (allowed & !all.deny) | all.allow;
         }
-        let mine = overwrites
-            .iter()
-            .filter(|over| !over.member && self.my_roles.contains(&number(&over.id)));
-        let (allow, deny) = mine.fold((0, 0), |(allow, deny), over| {
-            (allow | over.allow, deny | over.deny)
-        });
+        let mine = overwrites.iter().filter(|over| !over.member && self.my_roles.contains(&number(&over.id)));
+        let (allow, deny) = mine.fold((0, 0), |(allow, deny), over| (allow | over.allow, deny | over.deny));
         allowed = (allowed & !deny) | allow;
         if let Some(own) = overwrites.iter().find(|over| over.member && over.id == me) {
             allowed = (allowed & !own.deny) | own.allow;
@@ -256,10 +216,7 @@ impl GuildInfo {
         let everyone = number(guild);
         let mut allowed = self.roles.get(&everyone).map_or(0, |role| role.permissions);
         let overwrites = &channel.permission_overwrites;
-        if let Some(all) = overwrites
-            .iter()
-            .find(|over| !over.member && number(&over.id) == everyone)
-        {
+        if let Some(all) = overwrites.iter().find(|over| !over.member && number(&over.id) == everyone) {
             allowed = (allowed & !all.deny) | all.allow;
         }
         allowed & (VIEW_CHANNEL | ADMINISTRATOR) == 0
@@ -269,22 +226,15 @@ impl GuildInfo {
     fn row(&self, guild: &str, me: &str, channel: &Channel) -> Option<ConversationRow> {
         let kind = kind_of(channel)?;
         let parent = channel.parent_id.as_deref();
-        let category = parent
-            .and_then(|parent| self.categories.get(parent))
-            .map(|(position, _)| *position);
+        let category = parent.and_then(|parent| self.categories.get(parent)).map(|(position, _)| *position);
         let name = channel.name.clone().unwrap_or_else(|| "channel".to_owned());
-        let written = matches!(
-            kind,
-            ConversationKind::Channel | ConversationKind::Announcement
-        );
+        let written = matches!(kind, ConversationKind::Channel | ConversationKind::Announcement);
         Some(ConversationRow {
             group: parent.filter(|_| category.is_some()).map(str::to_owned),
             position: place(category, channel.is_voice(), channel.position),
             call: super::voice::support(channel.kind),
             // A voice channel's occupant limit, for the tree's `4/12`.
-            limit: (channel.kind == model::VOICE)
-                .then_some(channel.user_limit)
-                .unwrap_or(0),
+            limit: (channel.kind == model::VOICE).then_some(channel.user_limit).unwrap_or(0),
             topic: one_line(channel.topic.as_deref()),
             read_only: written && self.permissions(guild, me, channel) & SEND_MESSAGES == 0,
             private: self.private(guild, channel),
@@ -311,14 +261,7 @@ struct Tree {
 }
 
 impl Discord {
-    fn guild_info(
-        &self,
-        guild: &Guild,
-        member: Option<&Member>,
-        me: &str,
-        position: i32,
-        quiet: Quiet,
-    ) -> GuildInfo {
+    fn guild_info(&self, guild: &Guild, member: Option<&Member>, me: &str, position: i32, quiet: Quiet) -> GuildInfo {
         let roles = guild.roles.iter().map(|role| {
             let info = RoleInfo {
                 name: role.name.clone(),
@@ -326,74 +269,42 @@ impl Discord {
             };
             (number(&role.id), info)
         });
-        let categories = guild
-            .channels
-            .iter()
-            .filter(|channel| channel.kind == model::CATEGORY);
-        let categories = categories.map(|category| {
-            (
-                category.id.clone(),
-                (category.position, category.name.clone().unwrap_or_default()),
-            )
-        });
+        let categories = guild.channels.iter().filter(|channel| channel.kind == model::CATEGORY);
+        let categories = categories.map(|category| (category.id.clone(), (category.position, category.name.clone().unwrap_or_default())));
         GuildInfo {
             name: guild.name().to_owned(),
             icon: guild.icon().map(str::to_owned),
             owner: guild.owner() == me,
             position,
-            joined: guild
-                .joined_at
-                .as_deref()
-                .and_then(model::iso_seconds)
-                .unwrap_or(0),
+            joined: guild.joined_at.as_deref().and_then(model::iso_seconds).unwrap_or(0),
             roles: roles.collect(),
-            my_roles: member.map_or_else(Vec::new, |member| {
-                member.roles.iter().map(|role| number(role)).collect()
-            }),
+            my_roles: member.map_or_else(Vec::new, |member| member.roles.iter().map(|role| number(role)).collect()),
             categories: categories.collect(),
             channels: Vec::new(),
             quiet,
-            nick: member
-                .and_then(|member| member.nick.clone())
-                .unwrap_or_default(),
-            emojis: guild
-                .emojis
-                .iter()
-                .filter(|emoji| emoji.available)
-                .filter_map(|emoji| {
-                    Some(super::Pickable {
-                        id: emoji.id.clone()?,
-                        name: emoji.name.clone(),
-                        animated: emoji.animated,
-                        format: 0,
-                        roles: emoji.roles.iter().map(|role| number(role)).collect(),
-                    })
+            nick: member.and_then(|member| member.nick.clone()).unwrap_or_default(),
+            emojis: guild.emojis.iter().filter(|emoji| emoji.available).filter_map(|emoji| {
+                Some(super::Pickable {
+                    id: emoji.id.clone()?,
+                    name: emoji.name.clone(),
+                    animated: emoji.animated,
+                    format: 0,
+                    roles: emoji.roles.iter().map(|role| number(role)).collect(),
                 })
-                .collect(),
-            stickers: guild
-                .stickers
-                .iter()
-                .filter(|sticker| sticker.available)
-                .map(|sticker| super::Pickable {
-                    id: sticker.id.clone(),
-                    name: sticker.name.clone(),
-                    animated: sticker.format_type != 1,
-                    format: sticker.format_type,
-                    roles: Box::default(),
-                })
-                .collect(),
+            }).collect(),
+            stickers: guild.stickers.iter().filter(|sticker| sticker.available).map(|sticker| super::Pickable {
+                id: sticker.id.clone(),
+                name: sticker.name.clone(),
+                animated: sticker.format_type != 1,
+                format: sticker.format_type,
+                roles: Box::default(),
+            }).collect(),
         }
     }
 
     /// A server's tree: only what we may see, with empty categories left out and the threads we
     /// are in under their channel.
-    fn tree(
-        &self,
-        guild: &Guild,
-        info: &mut GuildInfo,
-        me: &str,
-        read: &HashMap<String, ReadState>,
-    ) -> Tree {
+    fn tree(&self, guild: &Guild, info: &mut GuildInfo, me: &str, read: &HashMap<String, ReadState>) -> Tree {
         let mut rows = Vec::new();
         let mut counts = Vec::new();
         let mut placed: HashMap<&str, (Option<String>, i32)> = HashMap::new();
@@ -429,33 +340,21 @@ impl Discord {
             placed.insert(&channel.id, (row.group.clone(), row.position));
             info.remember(&channel.id, channel.parent_id.as_deref());
             // A voice channel's chat and a forum's newest post are not "unread" in the tree.
-            if matches!(
-                row.kind,
-                ConversationKind::Channel | ConversationKind::Announcement
-            ) {
+            if matches!(row.kind, ConversationKind::Channel | ConversationKind::Announcement) {
                 counts.push(standing(channel, Some(info.joined)));
             }
             rows.push(row);
         }
         let mut under: HashMap<&str, i32> = HashMap::new();
         for thread in &guild.threads {
-            let archived = thread
-                .thread_metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.archived);
-            let Some((group, position)) = thread
-                .parent_id
-                .as_deref()
-                .and_then(|parent| placed.get(parent))
-            else {
+            let archived = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.archived);
+            let Some((group, position)) = thread.parent_id.as_deref().and_then(|parent| placed.get(parent)) else {
                 continue;
             };
             if archived || !thread.is_thread() {
                 continue;
             }
-            let nth = under
-                .entry(thread.parent_id.as_deref().unwrap_or(""))
-                .or_insert(0);
+            let nth = under.entry(thread.parent_id.as_deref().unwrap_or("")).or_insert(0);
             *nth = (*nth + 1).min(99);
             let name = thread.name.clone().unwrap_or_else(|| "Thread".to_owned());
             rows.push(ConversationRow {
@@ -475,26 +374,13 @@ impl Discord {
             counts.push(standing(thread, None));
         }
         let used: HashSet<&str> = rows.iter().filter_map(|row| row.group.as_deref()).collect();
-        let categories = guild
-            .channels
-            .iter()
-            .filter(|channel| channel.kind == model::CATEGORY);
+        let categories = guild.channels.iter().filter(|channel| channel.kind == model::CATEGORY);
         let now = now();
-        let groups = categories
-            .filter(|category| used.contains(category.id.as_str()))
-            .map(|category| Group {
-                // A muted category starts collapsed. The server's own mute is on the Space.
-                muted: info
-                    .quiet
-                    .channels
-                    .get(&category.id)
-                    .is_some_and(|until| *until > now),
-                ..header(
-                    &category.id,
-                    category.name.as_deref().unwrap_or(""),
-                    category.position,
-                )
-            });
+        let groups = categories.filter(|category| used.contains(category.id.as_str())).map(|category| Group {
+            // A muted category starts collapsed. The server's own mute is on the Space.
+            muted: info.quiet.channels.get(&category.id).is_some_and(|until| *until > now),
+            ..header(&category.id, category.name.as_deref().unwrap_or(""), category.position)
+        });
         Tree {
             groups: groups.collect(),
             rows,
@@ -504,13 +390,7 @@ impl Discord {
 
     /// Writes one server's tree, with each row's unread state and mute, and keeps what is needed
     /// to work the tree out again when a role or our own membership changes.
-    fn plant(
-        &self,
-        guild: &Guild,
-        info: &mut GuildInfo,
-        me: &str,
-        read: &HashMap<String, ReadState>,
-    ) -> rusqlite::Result<()> {
+    fn plant(&self, guild: &Guild, info: &mut GuildInfo, me: &str, read: &HashMap<String, ReadState>) -> rusqlite::Result<()> {
         let tree = self.tree(guild, info, me, read);
         self.ctx.tree(&guild.id, &tree.groups, &tree.rows)?;
         let now = now();
@@ -529,20 +409,13 @@ impl Discord {
             } else {
                 (*unread, *mentions, read_to.clone())
             };
-            self.ctx
-                .counts(id, unread, mentions, read_to.as_deref(), *updated)?;
+            self.ctx.counts(id, unread, mentions, read_to.as_deref(), *updated)?;
         }
         for row in &tree.rows {
-            self.ctx.muted(
-                &row.id,
-                info.quiet.mutes(&row.id, row.group.as_deref(), now),
-            )?;
+            self.ctx.muted(&row.id, info.quiet.mutes(&row.id, row.group.as_deref(), now))?;
         }
         let kept: Vec<Kept> = guild.channels.iter().map(Kept::of).collect();
-        self.ctx.set_note(
-            &format!("kept:{}", guild.id),
-            &serde_json::to_string(&kept).unwrap_or_default(),
-        );
+        self.ctx.set_note(&format!("kept:{}", guild.id), &serde_json::to_string(&kept).unwrap_or_default());
         self.unlist_threads(&guild.id, &tree.rows)
     }
 
@@ -552,16 +425,9 @@ impl Discord {
     /// and loses its place.
     fn unlist_threads(&self, guild: &str, rows: &[ConversationRow]) -> rusqlite::Result<()> {
         let note = format!("threads:{guild}");
-        let listed: Vec<&str> = rows
-            .iter()
-            .filter(|row| row.kind == ConversationKind::Thread)
-            .map(|row| row.id.as_str())
-            .collect();
+        let listed: Vec<&str> = rows.iter().filter(|row| row.kind == ConversationKind::Thread).map(|row| row.id.as_str()).collect();
         let before = self.ctx.note(&note).unwrap_or_default();
-        for gone in before
-            .split(',')
-            .filter(|id| !id.is_empty() && !listed.contains(id))
-        {
+        for gone in before.split(',').filter(|id| !id.is_empty() && !listed.contains(id)) {
             let Some(known) = self.ctx.known(gone)?.filter(|known| known.space.is_some()) else {
                 continue;
             };
@@ -582,25 +448,16 @@ impl Discord {
     /// Changes what is kept of a server's channels.
     fn keep(&self, guild: &str, change: impl FnOnce(&mut Vec<Kept>)) {
         let note = format!("kept:{guild}");
-        let mut kept: Vec<Kept> = self
-            .ctx
-            .note(&note)
-            .and_then(|kept| serde_json::from_str(&kept).ok())
-            .unwrap_or_default();
+        let mut kept: Vec<Kept> = self.ctx.note(&note).and_then(|kept| serde_json::from_str(&kept).ok()).unwrap_or_default();
         change(&mut kept);
-        self.ctx
-            .set_note(&note, &serde_json::to_string(&kept).unwrap_or_default());
+        self.ctx.set_note(&note, &serde_json::to_string(&kept).unwrap_or_default());
     }
 
     /// Works out a server's visible channels again from what is kept of them, after a role's
     /// permissions or our own roles changed. Unread state and threads stay as they are: the
     /// store keeps both through a tree replacement.
     fn replant(&self, guild_id: &str) -> rusqlite::Result<()> {
-        let kept: Vec<Kept> = match self
-            .ctx
-            .note(&format!("kept:{guild_id}"))
-            .map(|kept| serde_json::from_str(&kept))
-        {
+        let kept: Vec<Kept> = match self.ctx.note(&format!("kept:{guild_id}")).map(|kept| serde_json::from_str(&kept)) {
             Some(Ok(kept)) => kept,
             _ => return Ok(()),
         };
@@ -619,29 +476,17 @@ impl Discord {
             let tree = self.tree(&guild, info, &me, &HashMap::new());
             // Threads are not in what is kept; those under a channel still visible stay known.
             let visible: HashSet<u64> = info.channels.iter().map(|(id, _)| *id).collect();
-            let threads = threads
-                .into_iter()
-                .filter(|(id, parent)| !visible.contains(id) && visible.contains(parent));
+            let threads = threads.into_iter().filter(|(id, parent)| !visible.contains(id) && visible.contains(parent));
             info.channels.extend(threads);
             let now = now();
-            let muted: Vec<bool> = tree
-                .rows
-                .iter()
-                .map(|row| info.quiet.mutes(&row.id, row.group.as_deref(), now))
-                .collect();
+            let muted: Vec<bool> = tree.rows.iter().map(|row| info.quiet.mutes(&row.id, row.group.as_deref(), now)).collect();
             (tree, muted)
         };
         self.ctx.tree(guild_id, &tree.groups, &tree.rows)?;
         for (row, muted) in tree.rows.iter().zip(muted) {
             self.ctx.muted(&row.id, muted)?;
         }
-        let flags = self
-            .state
-            .lock()
-            .unwrap()
-            .guilds
-            .get(guild_id)
-            .map(|info| (info.quiet.server_muted(now()), info.quiet.hide_muted));
+        let flags = self.state.lock().unwrap().guilds.get(guild_id).map(|info| (info.quiet.server_muted(now()), info.quiet.hide_muted));
         if let Some((muted, hide)) = flags {
             self.ctx.space_flags(guild_id, muted, hide)?;
         }
@@ -649,12 +494,7 @@ impl Discord {
     }
 
     /// A role was created, changed or deleted. Only a change to what it permits moves the tree.
-    pub(super) fn role_changed(
-        &self,
-        guild: &str,
-        role: Option<Role>,
-        deleted: Option<&str>,
-    ) -> Result<(), Failure> {
+    pub(super) fn role_changed(&self, guild: &str, role: Option<Role>, deleted: Option<&str>) -> Result<(), Failure> {
         let moved = {
             let mut state = self.state.lock().unwrap();
             let Some(info) = state.guilds.get_mut(guild) else {
@@ -671,9 +511,7 @@ impl Discord {
                     let ours = role.id == guild || info.my_roles.contains(&number(&role.id));
                     ours && before.is_none_or(|before| before.permissions != role.permissions)
                 }
-                (None, Some(id)) => {
-                    info.roles.remove(&number(id)).is_some() && info.my_roles.contains(&number(id))
-                }
+                (None, Some(id)) => info.roles.remove(&number(id)).is_some() && info.my_roles.contains(&number(id)),
                 (None, None) => false,
             }
         };
@@ -711,13 +549,7 @@ impl Discord {
         let mut flags = Vec::new();
         let (rows, files): (Vec<SpaceRow>, Vec<(MediaFile, String)>) = {
             let state = self.state.lock().unwrap();
-            flags.extend(state.guilds.iter().map(|(id, info)| {
-                (
-                    id.clone(),
-                    info.quiet.server_muted(now),
-                    info.quiet.hide_muted,
-                )
-            }));
+            flags.extend(state.guilds.iter().map(|(id, info)| (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted)));
             let listed = state.guilds.iter().map(|(id, info)| {
                 let icon = info.icon.as_deref().map(|hash| model::guild_icon(id, hash));
                 let row = SpaceRow {
@@ -760,11 +592,7 @@ impl Discord {
         let mut names = Vec::with_capacity(recipients.len());
         for user in &recipients {
             // A friend's nickname, recorded with the relationships, stays.
-            let name = state
-                .users
-                .get(&user.id)
-                .cloned()
-                .unwrap_or_else(|| user.name().to_owned());
+            let name = state.users.get(&user.id).cloned().unwrap_or_else(|| user.name().to_owned());
             files.push(user.avatar());
             people.push(user.person(Some(&name)));
             state.users.insert(user.id.clone(), name.clone());
@@ -807,11 +635,7 @@ impl Discord {
     }
 
     /// Records one direct or group conversation: created, renamed, or just started by us.
-    pub(super) fn direct(
-        &self,
-        channel: &Channel,
-        known: &HashMap<String, User>,
-    ) -> rusqlite::Result<()> {
+    pub(super) fn direct(&self, channel: &Channel, known: &HashMap<String, User>) -> rusqlite::Result<()> {
         let (mut files, mut people) = (Vec::new(), Vec::new());
         let Some(row) = self.direct_row(channel, known, &mut files, &mut people) else {
             return Ok(());
@@ -834,23 +658,15 @@ impl Discord {
     /// an id is one; a server alone in a nameless one is simply not in a folder.
     fn folders(ready: &Ready) -> Option<Vec<proto::GuildFolder>> {
         let legacy = ready.user_settings.as_ref().map(|settings| {
-            let folders = settings
-                .guild_folders
-                .iter()
-                .map(|folder| proto::GuildFolder {
-                    id: folder.id,
-                    name: folder.name.clone().unwrap_or_default(),
-                    color: folder.color,
-                    guild_ids: folder.guild_ids.clone(),
-                });
+            let folders = settings.guild_folders.iter().map(|folder| proto::GuildFolder {
+                id: folder.id,
+                name: folder.name.clone().unwrap_or_default(),
+                color: folder.color,
+                guild_ids: folder.guild_ids.clone(),
+            });
             folders.collect::<Vec<_>>()
         });
-        legacy.filter(|folders| !folders.is_empty()).or_else(|| {
-            ready
-                .user_settings_proto
-                .as_deref()
-                .and_then(proto::guild_folders)
-        })
+        legacy.filter(|folders| !folders.is_empty()).or_else(|| ready.user_settings_proto.as_deref().and_then(proto::guild_folders))
     }
 
     /// Records the server folders. One with no id holds a server that is in no folder.
@@ -905,36 +721,15 @@ impl Discord {
     /// top, newest first, which is where Discord puts a server just joined.
     fn order(ready: &Ready) -> Vec<String> {
         let legacy = ready.user_settings.as_ref().map(|settings| {
-            let folders: Vec<String> = settings
-                .guild_folders
-                .iter()
-                .flat_map(|folder| folder.guild_ids.clone())
-                .collect();
-            if folders.is_empty() {
-                settings.guild_positions.clone()
-            } else {
-                folders
-            }
+            let folders: Vec<String> = settings.guild_folders.iter().flat_map(|folder| folder.guild_ids.clone()).collect();
+            if folders.is_empty() { settings.guild_positions.clone() } else { folders }
         });
         let stated = legacy.filter(|order| !order.is_empty());
-        let stated = stated.or_else(|| {
-            ready
-                .user_settings_proto
-                .as_deref()
-                .and_then(proto::guild_order)
-        });
+        let stated = stated.or_else(|| ready.user_settings_proto.as_deref().and_then(proto::guild_order));
         let stated = stated.unwrap_or_default();
-        let mut unplaced: Vec<&Guild> = ready
-            .guilds
-            .iter()
-            .filter(|guild| !stated.contains(&guild.id))
-            .collect();
+        let mut unplaced: Vec<&Guild> = ready.guilds.iter().filter(|guild| !stated.contains(&guild.id)).collect();
         unplaced.sort_by(|a, b| b.joined_at.cmp(&a.joined_at));
-        unplaced
-            .into_iter()
-            .map(|guild| guild.id.clone())
-            .chain(stated)
-            .collect()
+        unplaced.into_iter().map(|guild| guild.id.clone()).chain(stated).collect()
     }
 
     /// Takes READY apart into the store. Only [`super::State`] outlives this call.
@@ -944,19 +739,10 @@ impl Discord {
         self.capabilities(ready.user.premium_type);
         let order = Self::order(&ready);
         let folders = Self::folders(&ready);
-        let known: HashMap<String, User> = ready
-            .users
-            .into_iter()
-            .map(|user| (user.id.clone(), user))
-            .collect();
-        let read = ready
-            .read_state
-            .map_or_else(Vec::new, Versioned::into_entries);
-        let read: HashMap<String, ReadState> = read
-            .into_iter()
-            .filter(|state| state.read_state_type == 0)
-            .map(|state| (state.id.clone(), state))
-            .collect();
+        let known: HashMap<String, User> = ready.users.into_iter().map(|user| (user.id.clone(), user)).collect();
+        let read = ready.read_state.map_or_else(Vec::new, Versioned::into_entries);
+        let read: HashMap<String, ReadState> =
+            read.into_iter().filter(|state| state.read_state_type == 0).map(|state| (state.id.clone(), state)).collect();
         let mut settings: HashMap<Option<String>, Quiet> = ready
             .user_guild_settings
             .map_or_else(Vec::new, Versioned::into_entries)
@@ -981,10 +767,7 @@ impl Discord {
         }
         {
             let mut state = self.state.lock().unwrap();
-            let resume = ready
-                .resume_gateway_url
-                .as_deref()
-                .map(|url| format!("{}/?encoding=json&v=9", url.trim_end_matches('/')));
+            let resume = ready.resume_gateway_url.as_deref().map(|url| format!("{}/?encoding=json&v=9", url.trim_end_matches('/')));
             state.session = resume.map(|url| Resumable {
                 id: ready.session_id.clone(),
                 url,
@@ -1025,25 +808,15 @@ impl Discord {
             let marker = state.map_or(0, |state| state.last_message_id);
             // Discord counts every unread message of a direct conversation as a mention of us.
             let behind = state.is_some() && last.is_some_and(|last| number(last) > marker);
-            let unread = if behind {
-                state.map_or(1, |state| state.mention_count.max(1))
-            } else {
-                0
-            };
+            let unread = if behind { state.map_or(1, |state| state.mention_count.max(1)) } else { 0 };
             let read_to = (marker > 0).then(|| marker.to_string());
             let updated = last.map_or(0, seconds);
             if let Some(last) = last.filter(|id| !id.is_empty()) {
                 self.ctx.note_newest(&row.id, last)?;
             }
             let (unread, _, read_to) = self.settled(&row.id, *last, unread, 0, read_to);
-            self.ctx
-                .counts(&row.id, unread, 0, read_to.as_deref(), updated)?;
-            let muted = self
-                .state
-                .lock()
-                .unwrap()
-                .quiet_directs
-                .mutes(&row.id, None, now);
+            self.ctx.counts(&row.id, unread, 0, read_to.as_deref(), updated)?;
+            let muted = self.state.lock().unwrap().quiet_directs.mutes(&row.id, None, now);
             self.ctx.muted(&row.id, muted)?;
             // A request is never warmed: opening one must not look read to its sender.
             if unread > 0 && !muted && row.special != Special::Request {
@@ -1057,29 +830,15 @@ impl Discord {
             if guild.unavailable == Some(true) {
                 continue;
             }
-            let merged = ready
-                .merged_members
-                .get(index)
-                .and_then(|members| members.iter().find(|member| member.id() == me));
+            let merged = ready.merged_members.get(index).and_then(|members| members.iter().find(|member| member.id() == me));
             let member = merged.or_else(|| guild.members.iter().find(|member| member.id() == me));
-            let position = order
-                .iter()
-                .position(|id| *id == guild.id)
-                .unwrap_or(order.len()) as i32;
+            let position = order.iter().position(|id| *id == guild.id).unwrap_or(order.len()) as i32;
             let quiet = settings.remove(&Some(guild.id.clone())).unwrap_or_default();
             let mut info = self.guild_info(guild, member, &me, position, quiet);
             self.plant(guild, &mut info, &me, &read)?;
-            icons.extend(
-                info.icon
-                    .as_deref()
-                    .map(|hash| model::guild_icon(&guild.id, hash)),
-            );
+            icons.extend(info.icon.as_deref().map(|hash| model::guild_icon(&guild.id, hash)));
             self.voice_states(Some(&guild.id), &guild.voice_states);
-            self.state
-                .lock()
-                .unwrap()
-                .guilds
-                .insert(guild.id.clone(), info);
+            self.state.lock().unwrap().guilds.insert(guild.id.clone(), info);
         }
         self.spaces()?;
         if let Some(folders) = &folders {
@@ -1089,11 +848,7 @@ impl Discord {
         for presence in &ready.presences {
             self.presence(presence);
         }
-        if let Some(status) = ready
-            .user_settings_proto
-            .as_deref()
-            .and_then(proto::status_settings)
-        {
+        if let Some(status) = ready.user_settings_proto.as_deref().and_then(proto::status_settings) {
             self.own_status(status);
         }
 
@@ -1103,9 +858,7 @@ impl Discord {
             let first = !std::mem::replace(&mut state.warmed, true);
             unread_directs.sort_by_key(|(updated, _)| std::cmp::Reverse(*updated));
             unread_directs.truncate(if first { WARM } else { 0 });
-            state
-                .warming
-                .extend(unread_directs.iter().map(|(_, id)| id.clone()));
+            state.warming.extend(unread_directs.iter().map(|(_, id)| id.clone()));
             unread_directs
         };
         for (_, id) in warm {
@@ -1156,16 +909,10 @@ impl Discord {
             let mut state = self.state.lock().unwrap();
             let owned = state.relations.get(id) == Some(&Relation::Friend);
             if owned {
-                state.presence.insert(
-                    id.to_owned(),
-                    (update.presence(), update.status().to_owned()),
-                );
+                state.presence.insert(id.to_owned(), (update.presence(), update.status().to_owned()));
             }
             // The status line is stored with the person, so People shows it as last seen.
-            let row = state
-                .rows
-                .get_mut(id)
-                .filter(|row| owned && row.status != update.status());
+            let row = state.rows.get_mut(id).filter(|row| owned && row.status != update.status());
             let restated = row.map(|row| {
                 row.status = update.status().to_owned();
                 row.clone()
@@ -1177,15 +924,10 @@ impl Discord {
                 self.log("status", err);
             }
         }
-        self.ctx
-            .presence(id, update.presence(), update.status(), owned);
+        self.ctx.presence(id, update.presence(), update.status(), owned);
         let (emoji, doing) = (update.emoji().to_owned(), update.doing());
         if owned {
-            self.state
-                .lock()
-                .unwrap()
-                .doing
-                .insert(id.to_owned(), (emoji.clone(), doing.clone()));
+            self.state.lock().unwrap().doing.insert(id.to_owned(), (emoji.clone(), doing.clone()));
             self.tell_activity(id);
         } else {
             self.ctx.activity(id, &emoji, doing, false);
@@ -1198,35 +940,18 @@ impl Discord {
         let (emoji, doing, voice) = {
             let state = self.state.lock().unwrap();
             let (emoji, doing) = state.doing.get(person).cloned().unwrap_or_default();
-            let voice = state
-                .voice
-                .states
-                .get(person)
-                .map(|heard| (heard.channel().to_owned(), heard.guild.clone()));
+            let voice = state.voice.states.get(person).map(|heard| (heard.channel().to_owned(), heard.guild.clone()));
             let voice = voice.map(|(channel, guild)| {
-                let place = guild
-                    .as_ref()
-                    .and_then(|guild| state.guilds.get(guild))
-                    .map(|info| info.name.clone());
+                let place = guild.as_ref().and_then(|guild| state.guilds.get(guild)).map(|info| info.name.clone());
                 (channel, guild, place.unwrap_or_default())
             });
             (emoji, doing, voice)
         };
         let doing = match voice {
             Some((channel, guild, place)) => {
-                let name = self
-                    .ctx
-                    .known(&channel)
-                    .ok()
-                    .flatten()
-                    .map(|row| row.title)
-                    .unwrap_or_default();
+                let name = self.ctx.known(&channel).ok().flatten().map(|row| row.title).unwrap_or_default();
                 let mut voice = protocol::Activity {
-                    kind: if guild.is_some() {
-                        protocol::ActivityKind::InVoice
-                    } else {
-                        protocol::ActivityKind::InCall
-                    },
+                    kind: if guild.is_some() { protocol::ActivityKind::InVoice } else { protocol::ActivityKind::InCall },
                     name,
                     place,
                     conversation: Some(self.ctx.key(&channel)),
@@ -1244,11 +969,7 @@ impl Discord {
     pub(super) fn resumed(&self) {
         let known: Vec<_> = {
             let state = self.state.lock().unwrap();
-            state
-                .presence
-                .iter()
-                .map(|(id, (presence, status))| (id.clone(), *presence, status.clone()))
-                .collect()
+            state.presence.iter().map(|(id, (presence, status))| (id.clone(), *presence, status.clone())).collect()
         };
         for (id, presence, status) in known {
             self.ctx.presence(&id, presence, &status, true);
@@ -1266,16 +987,7 @@ impl Discord {
             match state.guilds.remove(&guild.id) {
                 Some(old) => (old.position, old.quiet),
                 // New servers go on top, as in Discord.
-                None => (
-                    state
-                        .guilds
-                        .values()
-                        .map(|info| info.position)
-                        .min()
-                        .unwrap_or(0)
-                        - 1,
-                    Quiet::default(),
-                ),
+                None => (state.guilds.values().map(|info| info.position).min().unwrap_or(0) - 1, Quiet::default()),
             }
         };
         let member = guild.members.iter().find(|member| member.id() == me);
@@ -1284,11 +996,7 @@ impl Discord {
         // stage is known from the rows the tree just planted.
         self.plant(&guild, &mut info, &me, &HashMap::new())?;
         self.voice_states(Some(&guild.id), &guild.voice_states);
-        self.state
-            .lock()
-            .unwrap()
-            .guilds
-            .insert(guild.id.clone(), info);
+        self.state.lock().unwrap().guilds.insert(guild.id.clone(), info);
         Ok(self.spaces()?)
     }
 
@@ -1299,12 +1007,7 @@ impl Discord {
             let Some(info) = state.guilds.get_mut(&guild.id) else {
                 return Ok(());
             };
-            if guild.name.is_some()
-                || guild
-                    .properties
-                    .as_ref()
-                    .is_some_and(|properties| properties.name.is_some())
-            {
+            if guild.name.is_some() || guild.properties.as_ref().is_some_and(|properties| properties.name.is_some()) {
                 info.name = guild.name().to_owned();
             }
             info.icon = guild.icon().map(str::to_owned);
@@ -1319,10 +1022,7 @@ impl Discord {
         }
         let left = {
             let mut state = self.state.lock().unwrap();
-            state
-                .voice
-                .states
-                .retain(|_, voice| voice.guild.as_deref() != Some(guild.id.as_str()));
+            state.voice.states.retain(|_, voice| voice.guild.as_deref() != Some(guild.id.as_str()));
             if state.members.on_screen.as_deref() == Some(guild.id.as_str()) {
                 state.members = Default::default();
             }
@@ -1342,11 +1042,9 @@ impl Discord {
         if !self.state.lock().unwrap().guilds.contains_key(&guild) {
             return Ok(());
         }
-        self.keep(&guild, |kept| {
-            match kept.iter_mut().find(|known| known.id == channel.id) {
-                Some(known) => *known = Kept::of(&channel),
-                None => kept.push(Kept::of(&channel)),
-            }
+        self.keep(&guild, |kept| match kept.iter_mut().find(|known| known.id == channel.id) {
+            Some(known) => *known = Kept::of(&channel),
+            None => kept.push(Kept::of(&channel)),
         });
         if channel.kind == model::CATEGORY {
             return self.category_changed(&guild, &channel);
@@ -1359,33 +1057,17 @@ impl Discord {
             };
             // Who may see a channel is worked out when the channel itself arrives, here and at
             // connect, and again for the whole server when a role or our membership changes.
-            let row = info
-                .can_view(&guild, &me, &channel)
-                .then(|| info.row(&guild, &me, &channel))
-                .flatten();
+            let row = info.can_view(&guild, &me, &channel).then(|| info.row(&guild, &me, &channel)).flatten();
             // The first channel we may see under a category brings the category's header.
-            let headed = |group: &String| {
-                info.channels
-                    .iter()
-                    .any(|(_, parent)| *parent == number(group))
-            };
-            let heads = row
-                .as_ref()
-                .and_then(|row| row.group.clone())
-                .filter(|group| !headed(group));
-            let heads = heads.and_then(|group| {
-                info.categories
-                    .get(&group)
-                    .map(|(position, name)| header(&group, name, *position))
-            });
+            let headed = |group: &String| info.channels.iter().any(|(_, parent)| *parent == number(group));
+            let heads = row.as_ref().and_then(|row| row.group.clone()).filter(|group| !headed(group));
+            let heads = heads.and_then(|group| info.categories.get(&group).map(|(position, name)| header(&group, name, *position)));
             if row.is_some() {
                 info.remember(&channel.id, channel.parent_id.as_deref());
             } else {
                 info.channels.retain(|(id, _)| *id != number(&channel.id));
             }
-            let muted = info
-                .quiet
-                .mutes(&channel.id, channel.parent_id.as_deref(), now());
+            let muted = info.quiet.mutes(&channel.id, channel.parent_id.as_deref(), now());
             (row, muted, heads)
         };
         if let Some(head) = heads {
@@ -1398,9 +1080,7 @@ impl Discord {
                 self.ctx.muted(&row.id, muted)?;
             }
             // It was visible and no longer is.
-            None if self.ctx.known(&channel.id)?.is_some() => {
-                self.ctx.conversation_gone(&channel.id)?
-            }
+            None if self.ctx.known(&channel.id)?.is_some() => self.ctx.conversation_gone(&channel.id)?,
             None => {}
         }
         Ok(())
@@ -1416,23 +1096,14 @@ impl Discord {
             let Some(info) = state.guilds.get_mut(guild) else {
                 return Ok(());
             };
-            let before = info
-                .categories
-                .insert(category.id.clone(), (category.position, name.clone()));
-            (
-                before,
-                info.channels
-                    .iter()
-                    .any(|(_, parent)| *parent == number(&category.id)),
-            )
+            let before = info.categories.insert(category.id.clone(), (category.position, name.clone()));
+            (before, info.channels.iter().any(|(_, parent)| *parent == number(&category.id)))
         };
         match before {
             _ if !used => {}
             Some((position, _)) if position != category.position => self.replant(guild)?,
             Some((_, known)) if known == name => {}
-            _ => self
-                .ctx
-                .group(guild, &header(&category.id, &name, category.position))?,
+            _ => self.ctx.group(guild, &header(&category.id, &name, category.position))?,
         }
         Ok(())
     }
@@ -1443,10 +1114,7 @@ impl Discord {
             state.privates.remove(&channel.id);
             state.directs.retain(|_, id| *id != channel.id);
             state.covered.remove(&channel.id);
-            let info = channel
-                .guild_id
-                .as_ref()
-                .and_then(|guild| state.guilds.get_mut(guild));
+            let info = channel.guild_id.as_ref().and_then(|guild| state.guilds.get_mut(guild));
             info.is_some_and(|info| {
                 info.channels.retain(|(id, _)| *id != number(&channel.id));
                 info.categories.remove(&channel.id).is_some()
@@ -1490,10 +1158,7 @@ impl Discord {
             }),
             ..ConversationRow::new(&thread.id, ConversationKind::Thread, name)
         };
-        let archived = thread
-            .thread_metadata
-            .as_ref()
-            .is_some_and(|metadata| metadata.archived);
+        let archived = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.archived);
         if let Some(guild) = &parent.space {
             self.ctx.set_note(&format!("guild:{}", thread.id), guild);
         }
@@ -1502,11 +1167,7 @@ impl Discord {
             row.group = parent.group.clone();
             row.position = parent.position + 1;
             let mut state = self.state.lock().unwrap();
-            if let Some(info) = parent
-                .space
-                .as_ref()
-                .and_then(|guild| state.guilds.get_mut(guild))
-            {
+            if let Some(info) = parent.space.as_ref().and_then(|guild| state.guilds.get_mut(guild)) {
                 info.remember(&thread.id, thread.parent_id.as_deref());
             }
         }
@@ -1514,10 +1175,7 @@ impl Discord {
         if let Some(guild) = &parent.space {
             let note = format!("threads:{guild}");
             let before = self.ctx.note(&note).unwrap_or_default();
-            let mut listed: Vec<&str> = before
-                .split(',')
-                .filter(|id| !id.is_empty() && *id != thread.id)
-                .collect();
+            let mut listed: Vec<&str> = before.split(',').filter(|id| !id.is_empty() && *id != thread.id).collect();
             if !archived {
                 listed.push(&thread.id);
             }
@@ -1557,11 +1215,7 @@ impl Discord {
         let rows: Vec<(String, bool)> = {
             let state = self.state.lock().unwrap();
             match guild.map(|guild| state.guilds.get(guild)) {
-                None => state
-                    .privates
-                    .iter()
-                    .map(|id| (id.clone(), state.quiet_directs.mutes(id, None, now)))
-                    .collect(),
+                None => state.privates.iter().map(|id| (id.clone(), state.quiet_directs.mutes(id, None, now))).collect(),
                 Some(None) => Vec::new(),
                 Some(Some(info)) => {
                     let each = info.channels.iter().map(|(channel, parent)| {
@@ -1582,31 +1236,19 @@ impl Discord {
     fn reschedule_unmute(&self) {
         let now = now();
         let mut state = self.state.lock().unwrap();
-        let ends = state
-            .guilds
-            .values()
-            .filter_map(|info| info.quiet.next_end(now));
+        let ends = state.guilds.values().filter_map(|info| info.quiet.next_end(now));
         let next = ends.chain(state.quiet_directs.next_end(now)).min();
         state.next_unmute = next;
     }
 
     /// A timed mute ran out: the rows it covered are no longer dimmed.
     pub(super) fn unmute_tick(&self) {
-        let due = self
-            .state
-            .lock()
-            .unwrap()
-            .next_unmute
-            .is_some_and(|at| at <= now());
+        let due = self.state.lock().unwrap().next_unmute.is_some_and(|at| at <= now());
         if !due {
             return;
         }
         let guilds: Vec<String> = self.state.lock().unwrap().guilds.keys().cloned().collect();
-        for guild in guilds
-            .iter()
-            .map(|guild| Some(guild.as_str()))
-            .chain([None])
-        {
+        for guild in guilds.iter().map(|guild| Some(guild.as_str())).chain([None]) {
             if let Err(err) = self.apply_quiet(guild) {
                 self.log("mute", err);
             }
@@ -1625,14 +1267,8 @@ mod tests {
         let first_text = place(Some(0), false, 9);
         let first_voice = place(Some(0), true, 0);
         let second = place(Some(1), false, 0);
-        assert!(
-            loose < place(Some(0), false, 0) - 1,
-            "uncategorised channels come before the first header"
-        );
+        assert!(loose < place(Some(0), false, 0) - 1, "uncategorised channels come before the first header");
         assert!(first_text < first_voice && first_voice < second - 1);
-        assert!(
-            place(Some(5000), true, 50_000) > 0,
-            "absurd positions do not overflow"
-        );
+        assert!(place(Some(5000), true, 50_000) > 0, "absurd positions do not overflow");
     }
 }

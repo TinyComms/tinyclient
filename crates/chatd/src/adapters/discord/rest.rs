@@ -39,10 +39,7 @@ fn build(user_agent: &str) -> Option<u64> {
         .user_agent(user_agent)
         .build()
         .into();
-    let mut response = agent
-        .get(address("TINYCLIENT_DISCORD_LOGIN", LOGIN))
-        .call()
-        .ok()?;
+    let mut response = agent.get(address("TINYCLIENT_DISCORD_LOGIN", LOGIN)).call().ok()?;
     let page = response.body_mut().read_to_string().ok()?;
     let rest = page.split_once("\"BUILD_NUMBER\":\"")?.1;
     rest.split_once('"')?.0.parse::<u64>().ok()
@@ -64,30 +61,17 @@ fn timezone() -> Option<String> {
 fn client_fields(user_agent: &str) -> (&'static str, &'static str, &'static str, String) {
     #[cfg(target_os = "macos")]
     {
-        let version = user_agent
-            .split_once("Version/")
-            .map_or("26.0", |(_, rest)| rest.split(' ').next().unwrap_or("26.0"))
-            .to_owned();
+        let version = user_agent.split_once("Version/").map_or("26.0", |(_, rest)| rest.split(' ').next().unwrap_or("26.0")).to_owned();
         ("Mac OS X", "Safari", "10.15.7", version)
     }
     #[cfg(target_os = "windows")]
     {
-        let version = user_agent
-            .split_once("Chrome/")
-            .map_or("131.0.0.0", |(_, rest)| {
-                rest.split(' ').next().unwrap_or("131.0.0.0")
-            })
-            .to_owned();
+        let version = user_agent.split_once("Chrome/").map_or("131.0.0.0", |(_, rest)| rest.split(' ').next().unwrap_or("131.0.0.0")).to_owned();
         ("Windows", "Chrome", "10", version)
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let version = user_agent
-            .split_once("Chrome/")
-            .map_or("131.0.0.0", |(_, rest)| {
-                rest.split(' ').next().unwrap_or("131.0.0.0")
-            })
-            .to_owned();
+        let version = user_agent.split_once("Chrome/").map_or("131.0.0.0", |(_, rest)| rest.split(' ').next().unwrap_or("131.0.0.0")).to_owned();
         ("Linux", "Chrome", "", version)
     }
 }
@@ -125,8 +109,7 @@ impl Identity {
             "client_build_number": build,
             "client_event_source": null,
         });
-        let super_properties =
-            base64::engine::general_purpose::STANDARD.encode(properties.to_string());
+        let super_properties = base64::engine::general_purpose::STANDARD.encode(properties.to_string());
         Identity {
             user_agent,
             properties,
@@ -226,11 +209,7 @@ fn route(method: &str, path: &str) -> String {
         route.push('/');
         let numeric = part.bytes().all(|byte| byte.is_ascii_digit());
         // Every reaction to any message of a channel is one route, whatever the emoji.
-        route.push_str(if (after_messages && numeric) || reactions {
-            ":id"
-        } else {
-            part
-        });
+        route.push_str(if (after_messages && numeric) || reactions { ":id" } else { part });
         after_messages = part == "messages";
         reactions |= part == "reactions";
     }
@@ -250,20 +229,12 @@ struct Limit {
 /// A header's seconds. "NaN" and "inf" parse as numbers; neither is a wait, and NaN would reach
 /// `Duration::from_secs_f64` through `clamp` and panic.
 fn seconds_of(value: &str) -> Option<f64> {
-    value
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|seconds| seconds.is_finite())
+    value.trim().parse::<f64>().ok().filter(|seconds| seconds.is_finite())
 }
 
 fn limit(problem: &Value, header: impl Fn(&str) -> Option<String>) -> Limit {
     let seconds = |name: &str| header(name).as_deref().and_then(seconds_of);
-    let stated = problem["retry_after"]
-        .as_f64()
-        .filter(|seconds| seconds.is_finite())
-        .or_else(|| seconds("retry-after"))
-        .or_else(|| seconds("x-ratelimit-reset-after"));
+    let stated = problem["retry_after"].as_f64().filter(|seconds| seconds.is_finite()).or_else(|| seconds("retry-after")).or_else(|| seconds("x-ratelimit-reset-after"));
     let scope = header("x-ratelimit-scope").unwrap_or_default();
     let flagged = header("x-ratelimit-global").is_some_and(|value| value == "true");
     // A 429 that is not Discord's own (no JSON, no scope) is the edge refusing the address:
@@ -271,10 +242,7 @@ fn limit(problem: &Value, header: impl Fn(&str) -> Option<String>) -> Limit {
     let unexplained = problem.is_null() && scope.is_empty();
     Limit {
         wait: stated.unwrap_or(if unexplained { 5. } else { 1. }).max(0.),
-        global: problem["global"].as_bool() == Some(true)
-            || flagged
-            || scope == "global"
-            || unexplained,
+        global: problem["global"].as_bool() == Some(true) || flagged || scope == "global" || unexplained,
         shared: scope == "shared",
     }
 }
@@ -299,10 +267,7 @@ impl Rest {
     /// from an adapter thread only.
     pub fn identity(&self) -> &Identity {
         self.identity.get_or_init(|| {
-            let remembered = self
-                .ctx
-                .note("build")
-                .and_then(|build| build.parse::<u64>().ok());
+            let remembered = self.ctx.note("build").and_then(|build| build.parse::<u64>().ok());
             let read = build(browser()).filter(|build| *build >= BUILD);
             if let Some(read) = read.filter(|read| Some(*read) != remembered) {
                 self.ctx.set_note("build", &read.to_string());
@@ -319,17 +284,10 @@ impl Rest {
             if windows.len() > 64 {
                 windows.retain(|_, window| window.resets > now);
             }
-            windows
-                .get(route)
-                .filter(|window| window.remaining == 0)
-                .map(|window| window.resets)
+            windows.get(route).filter(|window| window.remaining == 0).map(|window| window.resets)
         };
         let everything = *crate::hub::lock(&self.everything_waits);
-        let until = window
-            .into_iter()
-            .chain(everything)
-            .max()
-            .filter(|until| *until > now);
+        let until = window.into_iter().chain(everything).max().filter(|until| *until > now);
         if let Some(until) = until {
             let wait = until - now;
             if wait.as_secs_f64() > PATIENCE {
@@ -347,10 +305,7 @@ impl Rest {
         let mut refusals = crate::hub::lock(&self.refusals);
         let (recent, paused) = &mut *refusals;
         recent.push_back(now);
-        while recent
-            .front()
-            .is_some_and(|at| now.duration_since(*at) > REFUSALS_WITHIN)
-        {
+        while recent.front().is_some_and(|at| now.duration_since(*at) > REFUSALS_WITHIN) {
             recent.pop_front();
         }
         if recent.len() >= REFUSALS && paused.is_none() {
@@ -431,13 +386,7 @@ impl Rest {
     /// One call, with headers of its own beside the session's. The answer is the body as text,
     /// so a caller parses it straight into what it needs. A 429 is waited out in full and
     /// tried once more, then reported.
-    pub fn call_with(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<Value>,
-        extra: &[(&str, &str)],
-    ) -> Result<String, Refused> {
+    pub fn call_with(&self, method: &str, path: &str, body: Option<Value>, extra: &[(&str, &str)]) -> Result<String, Refused> {
         if self.challenged.load(Ordering::Relaxed) {
             return Err(Refused::Challenge);
         }
@@ -452,21 +401,12 @@ impl Rest {
         let mut waited = false;
         loop {
             self.pace(&route)?;
-            let mut response = self
-                .request(method, &url, body.as_ref(), extra)
-                .map_err(|err| Refused::Network(err.to_string()))?;
+            let mut response =
+                self.request(method, &url, body.as_ref(), extra).map_err(|err| Refused::Network(err.to_string()))?;
             let headers = response.headers().clone();
-            let header = |name: &str| {
-                headers
-                    .get(name)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned)
-            };
-            let remaining =
-                header("x-ratelimit-remaining").and_then(|value| value.parse::<u32>().ok());
-            let reset = header("x-ratelimit-reset-after")
-                .as_deref()
-                .and_then(seconds_of);
+            let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok()).map(str::to_owned);
+            let remaining = header("x-ratelimit-remaining").and_then(|value| value.parse::<u32>().ok());
+            let reset = header("x-ratelimit-reset-after").as_deref().and_then(seconds_of);
             if let (Some(remaining), Some(reset)) = (remaining, reset) {
                 let window = Window {
                     remaining,
@@ -483,9 +423,7 @@ impl Rest {
             let code = problem["code"].as_u64().unwrap_or(0);
             let retry_after = problem["retry_after"].as_f64();
             if problem.get("captcha_key").is_some() || problem.get("captcha_sitekey").is_some() {
-                self.challenge(
-                    "Discord asked for a captcha. Finish it in Discord, then sign in here again.",
-                );
+                self.challenge("Discord asked for a captcha. Finish it in Discord, then sign in here again.");
                 return Err(Refused::Challenge);
             }
             match status {
@@ -503,10 +441,7 @@ impl Rest {
                     if limit.global {
                         *crate::hub::lock(&self.everything_waits) = Some(until);
                     }
-                    let window = Window {
-                        remaining: 0,
-                        resets: until,
-                    };
+                    let window = Window { remaining: 0, resets: until };
                     crate::hub::lock(&self.windows).insert(route.clone(), window);
                     if waited || limit.wait > PATIENCE || self.paused().is_some() {
                         return Err(Refused::Limited(limit.wait));
@@ -535,59 +470,31 @@ mod tests {
 
     #[test]
     fn every_message_of_a_channel_shares_its_channels_window() {
-        assert_eq!(
-            route("POST", "/channels/5/messages/77/ack"),
-            route("POST", "/channels/5/messages/78/ack")
-        );
-        assert_ne!(
-            route("GET", "/channels/5/messages?limit=50"),
-            route("GET", "/channels/6/messages?limit=50")
-        );
-        assert_ne!(
-            route("GET", "/channels/5/messages"),
-            route("POST", "/channels/5/messages")
-        );
+        assert_eq!(route("POST", "/channels/5/messages/77/ack"), route("POST", "/channels/5/messages/78/ack"));
+        assert_ne!(route("GET", "/channels/5/messages?limit=50"), route("GET", "/channels/6/messages?limit=50"));
+        assert_ne!(route("GET", "/channels/5/messages"), route("POST", "/channels/5/messages"));
     }
 
     #[test]
     fn a_429_that_is_not_discords_json_is_read_from_its_headers() {
         let headers = |pairs: &'static [(&'static str, &'static str)]| {
-            move |name: &str| {
-                pairs
-                    .iter()
-                    .find(|(known, _)| *known == name)
-                    .map(|(_, value)| (*value).to_owned())
-            }
+            move |name: &str| pairs.iter().find(|(known, _)| *known == name).map(|(_, value)| (*value).to_owned())
         };
         // Cloudflare: a page, a Retry-After, nothing else. Every route waits.
         let edge = limit(&Value::Null, headers(&[("retry-after", "64")]));
         assert_eq!((edge.wait, edge.global, edge.shared), (64., true, false));
         // Discord's own, with the body lost: the scope says whose limit it is.
-        let user = limit(
-            &Value::Null,
-            headers(&[("retry-after", "2"), ("x-ratelimit-scope", "user")]),
-        );
+        let user = limit(&Value::Null, headers(&[("retry-after", "2"), ("x-ratelimit-scope", "user")]));
         assert_eq!((user.wait, user.global), (2., false));
-        let global = limit(
-            &Value::Null,
-            headers(&[("retry-after", "3"), ("x-ratelimit-scope", "global")]),
-        );
+        let global = limit(&Value::Null, headers(&[("retry-after", "3"), ("x-ratelimit-scope", "global")]));
         assert!(global.global);
-        let shared = limit(
-            &json!({"retry_after": 0.5, "global": false}),
-            headers(&[("x-ratelimit-scope", "shared")]),
-        );
-        assert_eq!(
-            (shared.wait, shared.global, shared.shared),
-            (0.5, false, true)
-        );
+        let shared = limit(&json!({"retry_after": 0.5, "global": false}), headers(&[("x-ratelimit-scope", "shared")]));
+        assert_eq!((shared.wait, shared.global, shared.shared), (0.5, false, true));
         assert!(limit(&json!({"retry_after": 1.0, "global": true}), headers(&[])).global);
         // A header that is not a number of seconds is no wait at all, and never panics.
         for odd in ["NaN", "inf", "-inf", " nan "] {
             assert_eq!(seconds_of(odd), None, "{odd}");
-            let odd = limit(&Value::Null, move |name: &str| {
-                (name == "retry-after").then(|| odd.to_owned())
-            });
+            let odd = limit(&Value::Null, move |name: &str| (name == "retry-after").then(|| odd.to_owned()));
             assert!(odd.wait.is_finite());
             let _ = Duration::from_secs_f64(odd.wait.min(3600.));
         }
@@ -598,33 +505,16 @@ mod tests {
     fn every_reaction_in_a_channel_shares_one_window() {
         assert_eq!(
             route("PUT", "/channels/5/messages/77/reactions/%F0%9F%91%8D/@me"),
-            route("DELETE", "/channels/5/messages/78/reactions/party:9/@me")
-                .replace("DELETE", "PUT"),
+            route("DELETE", "/channels/5/messages/78/reactions/party:9/@me").replace("DELETE", "PUT"),
         );
     }
 
     #[test]
     fn a_refusal_reads_as_words_with_the_wait_in_seconds() {
-        let slow = Refused::Status {
-            status: 429,
-            code: 20016,
-            message: String::new(),
-            retry_after: Some(7.2),
-        };
+        let slow = Refused::Status { status: 429, code: 20016, message: String::new(), retry_after: Some(7.2) };
         assert_eq!(slow.reason(), "Slow mode: wait 8 s.");
-        assert_eq!(
-            Refused::Limited(2.5).reason(),
-            "Rate limited: try again in 3 s."
-        );
-        let forbidden = Refused::Status {
-            status: 403,
-            code: 50013,
-            message: "Missing Permissions".into(),
-            retry_after: None,
-        };
-        assert_eq!(
-            forbidden.reason(),
-            "You do not have permission to do this here."
-        );
+        assert_eq!(Refused::Limited(2.5).reason(), "Rate limited: try again in 3 s.");
+        let forbidden = Refused::Status { status: 403, code: 50013, message: "Missing Permissions".into(), retry_after: None };
+        assert_eq!(forbidden.reason(), "You do not have permission to do this here.");
     }
 }

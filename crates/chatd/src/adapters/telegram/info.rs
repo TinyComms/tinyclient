@@ -8,16 +8,10 @@ use super::wire::Fault;
 use super::Account;
 use crate::adapters::{About, ConversationAbout, SharedPage};
 use grammers_tl_types as tl;
-use protocol::{
-    Contact, ContactKind, Mark, Message, Notify, SharedItem, SharedKind, Style, Warning,
-};
+use protocol::{Contact, ContactKind, Mark, Message, Notify, SharedItem, SharedKind, Style, Warning};
 
 fn invalid(name: &str) -> Fault {
-    Fault::Rpc {
-        code: 400,
-        name: name.to_owned(),
-        value: None,
-    }
+    Fault::Rpc { code: 400, name: name.to_owned(), value: None }
 }
 
 /// A person's card: what `users.getFullUser` says, with what is already known of them.
@@ -26,19 +20,11 @@ pub(super) fn profile(account: &Account, person_id: &str) -> Result<About, Fault
         return Err(invalid("USER_ID_INVALID"));
     };
     account.input(who)?;
-    let id = account
-        .dir()
-        .input_user(who)
-        .ok_or_else(|| invalid("USER_ID_INVALID"))?;
-    let tl::enums::users::UserFull::Full(full) =
-        account.ask(&tl::functions::users::GetFullUser { id })?;
+    let id = account.dir().input_user(who).ok_or_else(|| invalid("USER_ID_INVALID"))?;
+    let tl::enums::users::UserFull::Full(full) = account.ask(&tl::functions::users::GetFullUser { id })?;
     account.learn(&full.users, &full.chats);
     let tl::enums::UserFull::Full(user) = full.full_user;
-    let mut about = About {
-        bio: user.about.unwrap_or_default(),
-        mutual_total: user.common_chats_count.max(0) as u32,
-        ..About::default()
-    };
+    let mut about = About { bio: user.about.unwrap_or_default(), mutual_total: user.common_chats_count.max(0) as u32, ..About::default() };
     let this = full.users.iter().find_map(|found| match found {
         tl::enums::User::User(found) if found.id == user_id => Some(found),
         _ => None,
@@ -46,11 +32,7 @@ pub(super) fn profile(account: &Account, person_id: &str) -> Result<About, Fault
     if let Some(this) = this {
         // Shown only where Telegram returns it; chatd masks it until clicked.
         if let Some(phone) = this.phone.as_ref().filter(|phone| !phone.is_empty()) {
-            about.contacts.push(Contact {
-                kind: ContactKind::Phone,
-                value: format!("+{phone}"),
-                masked: true,
-            });
+            about.contacts.push(Contact { kind: ContactKind::Phone, value: format!("+{phone}"), masked: true });
         }
         if let Some(tl::enums::UserStatus::Offline(offline)) = &this.status {
             about.last_seen = Some(i64::from(offline.was_online));
@@ -58,9 +40,7 @@ pub(super) fn profile(account: &Account, person_id: &str) -> Result<About, Fault
     }
     let known = account.dir().get(who).cloned().unwrap_or_default();
     if !known.handle.is_empty() {
-        about
-            .fields
-            .push(("Username".to_owned(), format!("@{}", known.handle)));
+        about.fields.push(("Username".to_owned(), format!("@{}", known.handle)));
     }
     about.warning = match known.mark {
         Some(Mark::Scam) => Some(Warning::Scam),
@@ -74,15 +54,10 @@ pub(super) fn profile(account: &Account, person_id: &str) -> Result<About, Fault
 /// joined, from one more request. A basic group keeps no titles.
 pub(super) fn profile_in(account: &Account, person_id: &str, place: &str) -> Result<About, Fault> {
     let mut about = profile(account, person_id)?;
-    let (Some((who, None)), Some((chat @ Who::Channel(_), _))) =
-        (Who::parse(person_id), Who::parse(place))
-    else {
+    let (Some((who, None)), Some((chat @ Who::Channel(_), _))) = (Who::parse(person_id), Who::parse(place)) else {
         return Ok(about);
     };
-    let request = tl::functions::channels::GetParticipant {
-        channel: account.input_channel(chat)?,
-        participant: account.input(who)?,
-    };
+    let request = tl::functions::channels::GetParticipant { channel: account.input_channel(chat)?, participant: account.input(who)? };
     let tl::enums::channels::ChannelParticipant::Participant(found) = match account.ask(&request) {
         Ok(found) => found,
         // Not a member there (any more): the card without it.
@@ -103,10 +78,7 @@ pub(super) fn profile_in(account: &Account, person_id: &str, place: &str) -> Res
 }
 
 /// A chat's info pane.
-pub(super) fn conversation(
-    account: &Account,
-    conversation: &str,
-) -> Result<ConversationAbout, Fault> {
+pub(super) fn conversation(account: &Account, conversation: &str) -> Result<ConversationAbout, Fault> {
     let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
     let known = account.dir().get(who).cloned().unwrap_or_default();
     let notify = match account.ctx.known(conversation) {
@@ -115,30 +87,21 @@ pub(super) fn conversation(
     };
     let mut about = ConversationAbout {
         notify,
-        link: if known.handle.is_empty() {
-            String::new()
-        } else {
-            format!("https://t.me/{}", known.handle)
-        },
+        link: if known.handle.is_empty() { String::new() } else { format!("https://t.me/{}", known.handle) },
         ..ConversationAbout::default()
     };
     match who {
         Who::User(id) if id == account.me || id == SERVICE => {}
         Who::User(_) => {
-            let id = account
-                .dir()
-                .input_user(who)
-                .ok_or_else(|| invalid("USER_ID_INVALID"))?;
-            let tl::enums::users::UserFull::Full(full) =
-                account.ask(&tl::functions::users::GetFullUser { id })?;
+            let id = account.dir().input_user(who).ok_or_else(|| invalid("USER_ID_INVALID"))?;
+            let tl::enums::users::UserFull::Full(full) = account.ask(&tl::functions::users::GetFullUser { id })?;
             account.learn(&full.users, &full.chats);
             let tl::enums::UserFull::Full(user) = full.full_user;
             about.description = user.about.unwrap_or_default();
             about.members = Some(2);
         }
         Who::Group(chat_id) => {
-            let tl::enums::messages::ChatFull::Full(full) =
-                account.ask(&tl::functions::messages::GetFullChat { chat_id })?;
+            let tl::enums::messages::ChatFull::Full(full) = account.ask(&tl::functions::messages::GetFullChat { chat_id })?;
             account.learn(&full.users, &full.chats);
             if let tl::enums::ChatFull::Full(chat) = full.full_chat {
                 about.description = chat.about;
@@ -148,9 +111,7 @@ pub(super) fn conversation(
                         .participants
                         .iter()
                         .find_map(|one| match one {
-                            tl::enums::ChatParticipant::Creator(one) => {
-                                Some(account.dir().name(Who::User(one.user_id)))
-                            }
+                            tl::enums::ChatParticipant::Creator(one) => Some(account.dir().name(Who::User(one.user_id))),
                             _ => None,
                         })
                         .unwrap_or_default();
@@ -159,8 +120,7 @@ pub(super) fn conversation(
         }
         Who::Channel(_) => {
             let channel = account.input_channel(who)?;
-            let tl::enums::messages::ChatFull::Full(full) =
-                account.ask(&tl::functions::channels::GetFullChannel { channel })?;
+            let tl::enums::messages::ChatFull::Full(full) = account.ask(&tl::functions::channels::GetFullChannel { channel })?;
             account.learn(&full.users, &full.chats);
             if let tl::enums::ChatFull::ChannelFull(channel) = full.full_chat {
                 about.description = channel.about;
@@ -177,11 +137,7 @@ pub(super) fn conversation(
 pub(super) fn set_mute(account: &Account, conversation: &str, notify: Notify) -> Result<(), Fault> {
     let (who, topic) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
     if who == Who::User(SERVICE) {
-        return Err(Fault::Rpc {
-            code: 400,
-            name: "SERVICE_NEVER_MUTED".to_owned(),
-            value: None,
-        });
+        return Err(Fault::Rpc { code: 400, name: "SERVICE_NEVER_MUTED".to_owned(), value: None });
     }
     let peer = account.input(who)?;
     let muted = notify != Notify::All;
@@ -198,10 +154,7 @@ pub(super) fn set_mute(account: &Account, conversation: &str, notify: Notify) ->
         Some(top_msg_id) => tl::types::InputNotifyForumTopic { peer, top_msg_id }.into(),
         None => tl::types::InputNotifyPeer { peer }.into(),
     };
-    account.ask(&tl::functions::account::UpdateNotifySettings {
-        peer,
-        settings: settings.into(),
-    })?;
+    account.ask(&tl::functions::account::UpdateNotifySettings { peer, settings: settings.into() })?;
     let _ = account.ctx.muted(conversation, muted);
     super::filing::facts_changed(account, who, |facts| facts.muted = muted);
     Ok(())
@@ -210,18 +163,12 @@ pub(super) fn set_mute(account: &Account, conversation: &str, notify: Notify) ->
 /// Leaves a group or a channel; history stays on Telegram for the others.
 pub(super) fn leave(account: &Account, conversation: &str) -> Result<(), Fault> {
     let answer = match Who::parse(conversation) {
-        Some((Who::Group(chat_id), None)) => {
-            account.ask(&tl::functions::messages::DeleteChatUser {
-                revoke_history: false,
-                chat_id,
-                user_id: tl::enums::InputUser::UserSelf,
-            })?
-        }
-        Some((who @ Who::Channel(_), None)) => {
-            account.ask(&tl::functions::channels::LeaveChannel {
-                channel: account.input_channel(who)?,
-            })?
-        }
+        Some((Who::Group(chat_id), None)) => account.ask(&tl::functions::messages::DeleteChatUser {
+            revoke_history: false,
+            chat_id,
+            user_id: tl::enums::InputUser::UserSelf,
+        })?,
+        Some((who @ Who::Channel(_), None)) => account.ask(&tl::functions::channels::LeaveChannel { channel: account.input_channel(who)? })?,
         _ => return Err(invalid("PEER_NOT_A_GROUP")),
     };
     super::live::answered(account, &answer);
@@ -229,14 +176,7 @@ pub(super) fn leave(account: &Account, conversation: &str) -> Result<(), Fault> 
     Ok(())
 }
 
-fn search(
-    account: &Account,
-    conversation: &str,
-    query: &str,
-    filter: tl::enums::MessagesFilter,
-    offset_id: i32,
-    limit: i32,
-) -> Result<(Vec<Message>, Option<u32>), Fault> {
+fn search(account: &Account, conversation: &str, query: &str, filter: tl::enums::MessagesFilter, offset_id: i32, limit: i32) -> Result<(Vec<Message>, Option<u32>), Fault> {
     let (who, topic) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
     let request = tl::functions::messages::Search {
         peer: account.input(who)?,
@@ -262,63 +202,28 @@ fn search(
 }
 
 /// Text matches from Telegram, bounded to one page and mapped like cached search hits.
-pub(super) fn search_messages(
-    account: &Account,
-    conversation: &str,
-    query: &str,
-) -> Result<Vec<protocol::MessageHit>, Fault> {
-    let (messages, _) = search(
-        account,
-        conversation,
-        query,
-        tl::enums::MessagesFilter::InputMessagesFilterEmpty,
-        0,
-        100,
-    )?;
+pub(super) fn search_messages(account: &Account, conversation: &str, query: &str) -> Result<Vec<protocol::MessageHit>, Fault> {
+    let (messages, _) = search(account, conversation, query, tl::enums::MessagesFilter::InputMessagesFilterEmpty, 0, 100)?;
     let known = account.ctx.known(conversation).ok().flatten();
-    Ok(messages
-        .into_iter()
-        .take(100)
-        .map(|message| protocol::MessageHit {
-            conversation: account.ctx.key(conversation),
-            message_id: message.id,
-            sent: message.sent,
-            sender: message.sender.name,
-            snippet: crate::store::snippet(&message.text, query),
-            title: known
-                .as_ref()
-                .map(|row| row.title.clone())
-                .unwrap_or_default(),
-            space_title: known
-                .as_ref()
-                .map(|row| row.space_title.clone())
-                .unwrap_or_default(),
-            outgoing: message.outgoing,
-        })
-        .collect())
+    Ok(messages.into_iter().take(100).map(|message| protocol::MessageHit {
+        conversation: account.ctx.key(conversation),
+        message_id: message.id,
+        sent: message.sent,
+        sender: message.sender.name,
+        snippet: crate::store::snippet(&message.text, query),
+        title: known.as_ref().map(|row| row.title.clone()).unwrap_or_default(),
+        space_title: known.as_ref().map(|row| row.space_title.clone()).unwrap_or_default(),
+        outgoing: message.outgoing,
+    }).collect())
 }
 
 /// The pinned messages, newest first.
 pub(super) fn pinned(account: &Account, conversation: &str) -> Result<Vec<Message>, Fault> {
-    Ok(search(
-        account,
-        conversation,
-        "",
-        tl::enums::MessagesFilter::InputMessagesFilterPinned,
-        0,
-        protocol::PINNED_LIMIT as i32,
-    )?
-    .0)
+    Ok(search(account, conversation, "", tl::enums::MessagesFilter::InputMessagesFilterPinned, 0, protocol::PINNED_LIMIT as i32)?.0)
 }
 
 /// What was shared, from Telegram's own search, with Telegram's count of it as the total.
-pub(super) fn shared(
-    account: &Account,
-    conversation: &str,
-    kind: SharedKind,
-    before: Option<&str>,
-    limit: u32,
-) -> Result<SharedPage, Fault> {
+pub(super) fn shared(account: &Account, conversation: &str, kind: SharedKind, before: Option<&str>, limit: u32) -> Result<SharedPage, Fault> {
     let filter = match kind {
         SharedKind::Media => tl::enums::MessagesFilter::InputMessagesFilterPhotoVideo,
         SharedKind::Files => tl::enums::MessagesFilter::InputMessagesFilterDocument,
@@ -340,16 +245,10 @@ pub(super) fn shared(
         };
         match kind {
             SharedKind::Media | SharedKind::Files => {
-                items.extend(message.attachments.iter().map(|attachment| {
-                    item(Some(attachment.clone()), String::new(), String::new())
-                }));
+                items.extend(message.attachments.iter().map(|attachment| item(Some(attachment.clone()), String::new(), String::new())));
             }
             SharedKind::Links => {
-                let mut urls: Vec<(String, String)> = message
-                    .previews
-                    .iter()
-                    .map(|preview| (preview.url.clone(), preview.title.clone()))
-                    .collect();
+                let mut urls: Vec<(String, String)> = message.previews.iter().map(|preview| (preview.url.clone(), preview.title.clone())).collect();
                 for span in &message.spans {
                     if let Style::Link { url } = &span.style {
                         if !urls.iter().any(|(known, _)| known == url) {

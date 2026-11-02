@@ -52,8 +52,8 @@ use crate::session;
 use protocol::{AccountKey, Change, Link, MediaFile, Network, Watching};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -108,10 +108,7 @@ fn is_pick(id: &str) -> bool {
 
 /// Where an account's picker previews go: `media/<network>/pick/<account>`.
 fn pick_dir(media: &Path, account: &AccountKey) -> PathBuf {
-    media
-        .join(account.network.label().to_lowercase())
-        .join("pick")
-        .join(&account.account)
+    media.join(account.network.label().to_lowercase()).join("pick").join(&account.account)
 }
 
 /// The directory a file of the account lands in.
@@ -124,9 +121,7 @@ fn dir_for(media: &Path, account: &AccountKey, id: &str) -> PathBuf {
 
 /// Where an account's files go under the `media` directory.
 pub fn dir_under(media: &Path, account: &AccountKey) -> PathBuf {
-    media
-        .join(account.network.label().to_lowercase())
-        .join(&account.account)
+    media.join(account.network.label().to_lowercase()).join(&account.account)
 }
 
 fn fnv(text: &str) -> u64 {
@@ -136,9 +131,7 @@ fn fnv(text: &str) -> u64 {
 /// FNV-1a of some bytes: what an adapter names a picture it fetched itself by, so a changed
 /// picture is a new id.
 pub fn fnv_bytes(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
-        (hash ^ *byte as u64).wrapping_mul(0x0100_0000_01b3)
-    })
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ *byte as u64).wrapping_mul(0x0100_0000_01b3))
 }
 
 /// JPEG, PNG, WebP or GIF, by their first bytes: a picture an adapter fetched itself is kept
@@ -234,9 +227,7 @@ struct Rest {
 
 /// How long a file rests after its `tries`th failure in a row.
 fn rest_for(tries: u32) -> Duration {
-    RETRY_FIRST
-        .saturating_mul(1 << tries.saturating_sub(1).min(16))
-        .min(RETRY_MOST)
+    RETRY_FIRST.saturating_mul(1 << tries.saturating_sub(1).min(16)).min(RETRY_MOST)
 }
 
 /// A picker session: the ask that opened it, and the generation its close will end.
@@ -283,12 +274,7 @@ impl Blobs {
     pub fn new(hub: Arc<Hub>, dir: PathBuf) -> Blobs {
         // `TINYCLIENT_MEDIA_HOSTS`: hosts a test serves files from, separated by commas.
         let mut local: Vec<(String, fetch::Trust)> = scratch("TINYCLIENT_MEDIA_HOSTS")
-            .map(|hosts| {
-                hosts
-                    .split(',')
-                    .map(|host| (host.to_owned(), fetch::Trust::Open))
-                    .collect()
-            })
+            .map(|hosts| hosts.split(',').map(|host| (host.to_owned(), fetch::Trust::Open)).collect())
             .unwrap_or_default();
         // The demo's files come from its own server on localhost.
         if crate::demo::seeded() {
@@ -310,16 +296,10 @@ impl Blobs {
             evicting: Mutex::new(()),
         });
         type Helper = fn(&Cache);
-        let helpers: [(&str, Helper); 2] = [
-            ("media-pick", Cache::sweep_picks),
-            ("media-own", Cache::own_pictures),
-        ];
+        let helpers: [(&str, Helper); 2] = [("media-pick", Cache::sweep_picks), ("media-own", Cache::own_pictures)];
         for (name, helper) in helpers {
             let cache = cache.clone();
-            let spawned = std::thread::Builder::new()
-                .name(name.into())
-                .stack_size(256 * 1024)
-                .spawn(move || helper(&cache));
+            let spawned = std::thread::Builder::new().name(name.into()).stack_size(256 * 1024).spawn(move || helper(&cache));
             if let Err(err) = spawned {
                 tracing::warn!("chatd: media: {err}");
             }
@@ -328,17 +308,15 @@ impl Blobs {
             let cache = cache.clone();
             // The first worker checks the directory before either fetches anything, so a file
             // on its way is never mistaken for one nobody knows.
-            let spawned = std::thread::Builder::new()
-                .name("media".into())
-                .spawn(move || {
-                    if worker == 0 {
-                        cache.reconcile();
-                        cache.evict();
-                        crate::hub::lock(&cache.queue).ready = true;
-                        cache.wake.notify_all();
-                    }
-                    cache.work(worker == 0);
-                });
+            let spawned = std::thread::Builder::new().name("media".into()).spawn(move || {
+                if worker == 0 {
+                    cache.reconcile();
+                    cache.evict();
+                    crate::hub::lock(&cache.queue).ready = true;
+                    cache.wake.notify_all();
+                }
+                cache.work(worker == 0);
+            });
             if let Err(err) = spawned {
                 tracing::warn!("chatd: media: {err}");
             }
@@ -395,14 +373,9 @@ impl Blobs {
         if self.cache.cap_fixed {
             return;
         }
-        self.cache
-            .cap
-            .store(cap_of(&self.cache.hub), Ordering::Relaxed);
+        self.cache.cap.store(cap_of(&self.cache.hub), Ordering::Relaxed);
         let cache = self.cache.clone();
-        let spawned = std::thread::Builder::new()
-            .name("media-evict".into())
-            .stack_size(256 * 1024)
-            .spawn(move || cache.evict());
+        let spawned = std::thread::Builder::new().name("media-evict".into()).stack_size(256 * 1024).spawn(move || cache.evict());
         if let Err(err) = spawned {
             tracing::warn!("chatd: media: {err}");
         }
@@ -417,14 +390,8 @@ impl Blobs {
             for epoch in queue.epochs.values_mut() {
                 *epoch += 1;
             }
-            let queued = queue
-                .waiting
-                .iter()
-                .chain(queue.parked.iter())
-                .map(|job| job.file.0.clone());
-            let accounts: Vec<AccountKey> = queued
-                .chain(queue.fetching.iter().map(|file| file.0.clone()))
-                .collect();
+            let queued = queue.waiting.iter().chain(queue.parked.iter()).map(|job| job.file.0.clone());
+            let accounts: Vec<AccountKey> = queued.chain(queue.fetching.iter().map(|file| file.0.clone())).collect();
             for account in accounts {
                 *queue.epochs.entry(account).or_default() += 1;
             }
@@ -474,23 +441,14 @@ impl Cache {
     }
 
     /// [`Blobs::request`].
-    fn request(
-        &self,
-        account: &AccountKey,
-        ids: &[String],
-        adapter: Option<Sender<Command>>,
-    ) -> rusqlite::Result<Vec<MediaFile>> {
+    fn request(&self, account: &AccountKey, ids: &[String], adapter: Option<Sender<Command>>) -> rusqlite::Result<Vec<MediaFile>> {
         let mut files: Vec<MediaFile> = {
             let mut store = self.hub.store();
             store.media_used(account, ids, now())?;
             let mut files = Vec::with_capacity(ids.len());
             for (mut file, _) in store.media(account, ids)? {
                 // Something else deleted it: it is simply not fetched yet.
-                if file
-                    .path
-                    .as_ref()
-                    .is_some_and(|path| !Path::new(path).exists())
-                {
+                if file.path.as_ref().is_some_and(|path| !Path::new(path).exists()) {
                     store.media_evicted(account, &file.id)?;
                     file.path = None;
                 }
@@ -504,9 +462,7 @@ impl Cache {
         {
             let mut queue = crate::hub::lock(&self.queue);
             let at = Instant::now();
-            queue
-                .asked
-                .retain(|_, asked| at.duration_since(*asked) < self.on_screen);
+            queue.asked.retain(|_, asked| at.duration_since(*asked) < self.on_screen);
             let epoch = queue.epochs.get(account).copied().unwrap_or(0);
             for file in &mut files {
                 let key = (account.clone(), file.id.clone());
@@ -520,13 +476,7 @@ impl Cache {
                         queue.picker_closed.get(account).copied().unwrap_or(0),
                         queue.picked.get(account).map(|picker| picker.generation),
                     );
-                    queue.picked.insert(
-                        account.clone(),
-                        Picker {
-                            asked: at,
-                            generation: picker_generation,
-                        },
-                    );
+                    queue.picked.insert(account.clone(), Picker { asked: at, generation: picker_generation });
                     picking = true;
                 }
                 // A failure stands until `Fetch` says `retry` (the server clears it before
@@ -585,39 +535,17 @@ impl Cache {
         };
         {
             let store = self.hub.store();
-            let avatar_of = |key: &protocol::Key| {
-                store
-                    .conversation(key)
-                    .ok()
-                    .flatten()
-                    .and_then(|row| row.avatar)
-                    .map(|file| (key.account(), file.id))
-            };
-            screen
-                .rows
-                .extend(watching.rows.iter().filter_map(avatar_of));
-            screen
-                .kept
-                .extend(watching.conversation.iter().filter_map(avatar_of));
-            let person = |key: &protocol::Key| {
-                store
-                    .person(key)
-                    .ok()
-                    .flatten()
-                    .and_then(|person| person.avatar)
-                    .map(|file| (key.account(), file.id))
-            };
-            screen
-                .kept
-                .extend(watching.people.iter().filter_map(person));
+            let avatar_of = |key: &protocol::Key| store.conversation(key).ok().flatten().and_then(|row| row.avatar).map(|file| (key.account(), file.id));
+            screen.rows.extend(watching.rows.iter().filter_map(avatar_of));
+            screen.kept.extend(watching.conversation.iter().filter_map(avatar_of));
+            let person = |key: &protocol::Key| store.person(key).ok().flatten().and_then(|person| person.avatar).map(|file| (key.account(), file.id));
+            screen.kept.extend(watching.people.iter().filter_map(person));
         }
         let screen = Arc::new(screen);
         *crate::hub::lock(&self.screen) = screen.clone();
         let back = {
             let mut queue = crate::hub::lock(&self.queue);
-            let (back, still): (Vec<Job>, Vec<Job>) = std::mem::take(&mut queue.parked)
-                .into_iter()
-                .partition(|job| !screen.scrolled_away(&job.file));
+            let (back, still): (Vec<Job>, Vec<Job>) = std::mem::take(&mut queue.parked).into_iter().partition(|job| !screen.scrolled_away(&job.file));
             queue.parked = still;
             let any = !back.is_empty();
             queue.waiting.extend(back);
@@ -646,20 +574,11 @@ impl Cache {
             let next = queue
                 .picked
                 .values()
-                .map(|picker| {
-                    self.pick_idle
-                        .saturating_sub(at.duration_since(picker.asked))
-                })
+                .map(|picker| self.pick_idle.saturating_sub(at.duration_since(picker.asked)))
                 .min();
             queue = match next {
-                Some(wait) => self
-                    .picks
-                    .wait_timeout(queue, wait)
-                    .map_or_else(|err| err.into_inner().0, |(queue, _)| queue),
-                None => self
-                    .picks
-                    .wait(queue)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                Some(wait) => self.picks.wait_timeout(queue, wait).map_or_else(|err| err.into_inner().0, |(queue, _)| queue),
+                None => self.picks.wait(queue).unwrap_or_else(std::sync::PoisonError::into_inner),
             };
         }
     }
@@ -671,12 +590,7 @@ impl Cache {
     fn close_picker(&self, account: &AccountKey, only_if_idle: bool) {
         {
             let mut queue = crate::hub::lock(&self.queue);
-            if only_if_idle
-                && !queue
-                    .picked
-                    .get(account)
-                    .is_none_or(|picker| picker.asked.elapsed() >= self.pick_idle)
-            {
+            if only_if_idle && !queue.picked.get(account).is_none_or(|picker| picker.asked.elapsed() >= self.pick_idle) {
                 return;
             }
             // The close ends this session's generation: a job of it is dropped unless a new
@@ -693,15 +607,8 @@ impl Cache {
         }
         let dir = pick_dir(&self.dir, account);
         // Read first: the store is locked again for each row.
-        let rows = self
-            .hub
-            .store()
-            .media_on_disk(Some(account), u32::MAX)
-            .unwrap_or_default();
-        for row in rows
-            .iter()
-            .filter(|row| is_pick(&row.id) || Path::new(&row.path).starts_with(&dir))
-        {
+        let rows = self.hub.store().media_on_disk(Some(account), u32::MAX).unwrap_or_default();
+        for row in rows.iter().filter(|row| is_pick(&row.id) || Path::new(&row.path).starts_with(&dir)) {
             let _ = self.hub.store().media_evicted(account, &row.id);
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -735,16 +642,11 @@ impl Cache {
             for linked in &links {
                 let connected = linked.link == Link::Connected;
                 // New here: signed in, or chatd started with it.
-                let own = seen.entry(linked.account.clone()).or_insert(Own {
-                    connected,
-                    until: Some(at + OWN_FOR),
-                });
+                let own = seen.entry(linked.account.clone()).or_insert(Own { connected, until: Some(at + OWN_FOR) });
                 if connected && !own.connected {
                     own.until = Some(at + OWN_FOR);
                     // What failed while the line was down is worth asking for at once.
-                    crate::hub::lock(&self.queue)
-                        .resting
-                        .retain(|(of, _), _| *of != linked.account);
+                    crate::hub::lock(&self.queue).resting.retain(|(of, _), _| *of != linked.account);
                 }
                 own.connected = connected;
                 if own.until.is_some_and(|until| until < at) {
@@ -758,35 +660,19 @@ impl Cache {
                 continue;
             };
             for (account, own) in seen.iter_mut().filter(|(_, own)| own.until.is_some()) {
-                let Some(avatar) = accounts
-                    .iter()
-                    .find(|row| row.key == *account)
-                    .and_then(|row| row.avatar.clone())
-                else {
+                let Some(avatar) = accounts.iter().find(|row| row.key == *account).and_then(|row| row.avatar.clone()) else {
                     continue;
                 };
                 own.until = None;
-                if avatar
-                    .path
-                    .as_ref()
-                    .is_some_and(|path| Path::new(path).exists())
-                {
+                if avatar.path.as_ref().is_some_and(|path| Path::new(path).exists()) {
                     continue;
                 }
                 // CONTRACT: the server holds the adapters, so this thread asks without one: a
                 // picture behind the session (Teams, Telegram) waits for the shell's `Fetch`,
                 // which the server sends with the adapter. `Blobs::new` taking a way to reach
                 // the adapters would let it come here too.
-                let url = self
-                    .hub
-                    .store()
-                    .media(account, std::slice::from_ref(&avatar.id))
-                    .ok()
-                    .and_then(|mut known| known.pop())
-                    .map(|(_, url)| url);
-                if url.is_none_or(|url| {
-                    self.hosts.trust(account.network, &url) != Some(fetch::Trust::Open)
-                }) {
+                let url = self.hub.store().media(account, std::slice::from_ref(&avatar.id)).ok().and_then(|mut known| known.pop()).map(|(_, url)| url);
+                if url.is_none_or(|url| self.hosts.trust(account.network, &url) != Some(fetch::Trust::Open)) {
                     continue;
                 }
                 if let Err(err) = self.request(account, &[avatar.id], None) {
@@ -805,8 +691,7 @@ impl Cache {
             Err(err) => tracing::warn!("chatd: media: {err}"),
         }
         for network in Network::ALL {
-            let Ok(accounts) = std::fs::read_dir(self.dir.join(network.label().to_lowercase()))
-            else {
+            let Ok(accounts) = std::fs::read_dir(self.dir.join(network.label().to_lowercase())) else {
                 continue;
             };
             for entry in accounts.flatten() {
@@ -822,10 +707,7 @@ impl Cache {
                 let Ok(rows) = self.hub.store().media_on_disk(Some(&account), u32::MAX) else {
                     continue;
                 };
-                let known: HashSet<&std::ffi::OsStr> = rows
-                    .iter()
-                    .filter_map(|row| Path::new(&row.path).file_name())
-                    .collect();
+                let known: HashSet<&std::ffi::OsStr> = rows.iter().filter_map(|row| Path::new(&row.path).file_name()).collect();
                 let Ok(files) = std::fs::read_dir(entry.path()) else {
                     continue;
                 };
@@ -868,10 +750,7 @@ impl Cache {
             }
             let on_screen: HashSet<FileKey> = {
                 let queue = crate::hub::lock(&self.queue);
-                let recent = queue
-                    .asked
-                    .iter()
-                    .filter(|(_, asked)| asked.elapsed() < self.on_screen);
+                let recent = queue.asked.iter().filter(|(_, asked)| asked.elapsed() < self.on_screen);
                 recent.map(|(key, _)| key.clone()).collect()
             };
             let listed = oldest.len();
@@ -913,11 +792,7 @@ impl Cache {
             let job = {
                 let mut queue = crate::hub::lock(&self.queue);
                 loop {
-                    let next = if queue.ready {
-                        queue.waiting.pop()
-                    } else {
-                        None
-                    };
+                    let next = if queue.ready { queue.waiting.pop() } else { None };
                     match next {
                         Some(job) => {
                             queue.fetching.push(job.file.clone());
@@ -925,21 +800,13 @@ impl Cache {
                         }
                         None if first && !queue.parked.is_empty() => {
                             queue.parked.retain(|job| job.at.elapsed() < PARKED_FOR);
-                            let (waited, _) = self
-                                .wake
-                                .wait_timeout(queue, PARKED_LOOK)
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let (waited, _) = self.wake.wait_timeout(queue, PARKED_LOOK).unwrap_or_else(std::sync::PoisonError::into_inner);
                             drop(waited);
                             // Rows that came back put their pictures in line.
                             self.screen();
                             queue = crate::hub::lock(&self.queue);
                         }
-                        None => {
-                            queue = self
-                                .wake
-                                .wait(queue)
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        }
+                        None => queue = self.wake.wait(queue).unwrap_or_else(std::sync::PoisonError::into_inner),
                     }
                 }
             };
@@ -955,9 +822,7 @@ impl Cache {
             }
             let outcome = self.fetch(&agent, &job, &mut buffer);
             let (account, id) = &job.file;
-            crate::hub::lock(&self.queue)
-                .fetching
-                .retain(|file| file != &job.file);
+            crate::hub::lock(&self.queue).fetching.retain(|file| file != &job.file);
             match outcome {
                 Some(Ok(file)) => {
                     crate::hub::lock(&self.queue).resting.remove(&job.file);
@@ -965,22 +830,14 @@ impl Cache {
                     self.evict();
                 }
                 Some(Err((mut file, reason))) if fetch::passing(&reason) => {
-                    tracing::warn!(
-                        "chatd: {}: media {id}: {}",
-                        account.network.label(),
-                        crate::adapters::net::redact(&reason)
-                    );
+                    tracing::warn!("chatd: {}: media {id}: {}", account.network.label(), crate::adapters::net::redact(&reason));
                     // Not recorded: it rests, and is fetched again when asked for after that.
                     self.rest(&job.file, &reason);
                     file.failed = Some(reason);
                     self.announce(account, file);
                 }
                 Some(Err((mut file, reason))) => {
-                    tracing::warn!(
-                        "chatd: {}: media {id}: {}",
-                        account.network.label(),
-                        crate::adapters::net::redact(&reason)
-                    );
+                    tracing::warn!("chatd: {}: media {id}: {}", account.network.label(), crate::adapters::net::redact(&reason));
                     crate::hub::lock(&self.queue).resting.remove(&job.file);
                     // Recorded, so asking again answers with the reason and fetches nothing.
                     match self.hub.store().media_failed(account, id, &reason) {
@@ -1007,14 +864,7 @@ impl Cache {
             }
         }
         let tries = queue.resting.get(file).map_or(0, |rest| rest.tries) + 1;
-        queue.resting.insert(
-            file.clone(),
-            Rest {
-                until: at + rest_for(tries),
-                tries,
-                why: why.to_owned(),
-            },
-        );
+        queue.resting.insert(file.clone(), Rest { until: at + rest_for(tries), tries, why: why.to_owned() });
     }
 
     fn signed_out_since(&self, job: &Job) -> bool {
@@ -1028,33 +878,15 @@ impl Cache {
     fn waiting_with(&self, job: &Job) -> Vec<(String, String)> {
         let ids: Vec<String> = {
             let queue = crate::hub::lock(&self.queue);
-            let same = queue
-                .waiting
-                .iter()
-                .rev()
-                .filter(|other| other.file.0 == job.file.0);
-            same.take(RENEWED_TOGETHER - 1)
-                .map(|other| other.file.1.clone())
-                .collect()
+            let same = queue.waiting.iter().rev().filter(|other| other.file.0 == job.file.0);
+            same.take(RENEWED_TOGETHER - 1).map(|other| other.file.1.clone()).collect()
         };
-        let known = self
-            .hub
-            .store()
-            .media(&job.file.0, &ids)
-            .unwrap_or_default();
-        known
-            .into_iter()
-            .map(|(file, url)| (file.id, url))
-            .collect()
+        let known = self.hub.store().media(&job.file.0, &ids).unwrap_or_default();
+        known.into_iter().map(|(file, url)| (file.id, url)).collect()
     }
 
     /// Fetches one file. `Ok` carries it with its path; `Err` carries it without one and why.
-    fn fetch(
-        &self,
-        agent: &ureq::Agent,
-        job: &Job,
-        buffer: &mut [u8],
-    ) -> Option<Result<MediaFile, (MediaFile, String)>> {
+    fn fetch(&self, agent: &ureq::Agent, job: &Job, buffer: &mut [u8]) -> Option<Result<MediaFile, (MediaFile, String)>> {
         let (account, id) = &job.file;
         let failed = |file: &MediaFile, why: String| Some(Err((file.clone(), why)));
         let dir = dir_for(&self.dir, account, id);
@@ -1064,12 +896,7 @@ impl Cache {
         for last in [false, true] {
             // Read the row now, not when it was queued: the adapter may have registered a fresh
             // address since, and the account may be gone.
-            let (file, url) = self
-                .hub
-                .store()
-                .media(account, std::slice::from_ref(id))
-                .ok()?
-                .pop()?;
+            let (file, url) = self.hub.store().media(account, std::slice::from_ref(id)).ok()?.pop()?;
             if self.signed_out_since(job) {
                 return None;
             }
@@ -1082,10 +909,7 @@ impl Cache {
                 return Some(Ok(file));
             }
             if let Err(err) = protocol::private::dir(&dir) {
-                return failed(
-                    &file,
-                    format!("The cache directory could not be made: {err}."),
-                );
+                return failed(&file, format!("The cache directory could not be made: {err}."));
             }
             let want = fetch::Want {
                 network: account.network,
@@ -1108,21 +932,13 @@ impl Cache {
                     return failed(&file, why);
                 }
             };
-            if self.signed_out_since(job)
-                || (is_pick(id) && self.closed_since(account, job.picker_generation))
-            {
+            if self.signed_out_since(job) || (is_pick(id) && self.closed_since(account, job.picker_generation)) {
                 let _ = std::fs::remove_file(&part);
                 return None;
             }
             // The row may name another size by now. A renewed address for the same picture
             // (`from`, which the adapter recorded) is not that.
-            let now_at = self
-                .hub
-                .store()
-                .media(account, std::slice::from_ref(id))
-                .ok()?
-                .pop()?
-                .1;
+            let now_at = self.hub.store().media(account, std::slice::from_ref(id)).ok()?.pop()?.1;
             if now_at != url && now_at != from && !last {
                 let _ = std::fs::remove_file(&part);
                 continue;
@@ -1141,10 +957,7 @@ impl Cache {
                 }
                 return failed(&file, format!("The file could not be kept: {err}."));
             }
-            let landed =
-                self.hub
-                    .store()
-                    .media_landed(account, id, &path.to_string_lossy(), bytes, now());
+            let landed = self.hub.store().media_landed(account, id, &path.to_string_lossy(), bytes, now());
             return match landed {
                 Ok(Some(file)) => {
                     self.replaced(job, path);
@@ -1220,31 +1033,16 @@ mod tests {
 
     #[test]
     fn the_sweep_closes_only_what_stood_idle_and_a_reopened_picker_is_never_stale() {
-        let account = AccountKey {
-            network: Network::Discord,
-            account: "1".into(),
-        };
+        let account = AccountKey { network: Network::Discord, account: "1".into() };
         let at = Instant::now();
         let idle = Duration::from_secs(2);
         let mut picked = HashMap::new();
         // Open long enough: the sweep closes it.
-        picked.insert(
-            account.clone(),
-            Picker {
-                asked: at - Duration::from_secs(3),
-                generation: 1,
-            },
-        );
+        picked.insert(account.clone(), Picker { asked: at - Duration::from_secs(3), generation: 1 });
         assert_eq!(stale(&picked, at, idle), std::slice::from_ref(&account));
         // Re-asked a moment ago — the next session's generation: never stale, whatever the
         // generation's number.
-        picked.insert(
-            account.clone(),
-            Picker {
-                asked: at,
-                generation: next_generation(1, Some(1)),
-            },
-        );
+        picked.insert(account.clone(), Picker { asked: at, generation: next_generation(1, Some(1)) });
         assert!(stale(&picked, at, idle).is_empty());
         // With no picker open, nothing is closed.
         picked.clear();

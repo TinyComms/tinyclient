@@ -23,44 +23,22 @@ const CHUNK: u64 = 10 * 320 * 1024;
 const FOLDER: &str = "Microsoft Teams Chat Files";
 
 impl Teams {
-    pub(super) fn send_with(
-        self: &Arc<Self>,
-        conversation: &str,
-        client_id: &str,
-        text: &str,
-        reply_to: Option<&str>,
-        with: Outgoing,
-    ) {
+    pub(super) fn send_with(self: &Arc<Self>, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: Outgoing) {
         if with.files.is_empty() {
             // Teams has no silent or scheduled send, and the shell offers none; a pick has no
             // catalog here. What is left is the text.
             self.post(conversation, client_id, text, reply_to);
             return;
         }
-        let (teams, conversation_id, client, text, reply) = (
-            self.clone(),
-            conversation.to_owned(),
-            client_id.to_owned(),
-            text.to_owned(),
-            reply_to.map(str::to_owned),
-        );
-        upload::spawn(&self.ctx, conversation, client_id, &with.files, move |up| {
-            teams.with_files(&conversation_id, &client, &text, reply.as_deref(), up)
-        });
+        let (teams, conversation_id, client, text, reply) = (self.clone(), conversation.to_owned(), client_id.to_owned(), text.to_owned(), reply_to.map(str::to_owned));
+        upload::spawn(&self.ctx, conversation, client_id, &with.files, move |up| teams.with_files(&conversation_id, &client, &text, reply.as_deref(), up));
     }
 
     pub(super) fn cancel_send(&self, client_id: &str) {
         upload::cancel(&self.ctx.account, client_id);
     }
 
-    fn with_files(
-        &self,
-        conversation: &str,
-        client_id: &str,
-        text: &str,
-        reply_to: Option<&str>,
-        up: &mut Upload,
-    ) -> Result<Message, String> {
+    fn with_files(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, up: &mut Upload) -> Result<Message, String> {
         let mut named = Vec::new();
         let mut attachments = Vec::new();
         for at in 0..up.files().len() {
@@ -70,9 +48,7 @@ impl Teams {
         }
         up.check()?;
         let properties = json!({"files": Value::Array(named).to_string()});
-        let mut message = self
-            .posted_with(conversation, client_id, text, reply_to, Some(properties))
-            .map_err(super::reason)?;
+        let mut message = self.posted_with(conversation, client_id, text, reply_to, Some(properties)).map_err(super::reason)?;
         message.attachments = attachments;
         Ok(message)
     }
@@ -84,25 +60,10 @@ impl Teams {
         if bytes == 0 {
             return Err(format!("{name} is empty."));
         }
-        let path = format!(
-            "{}/v1.0/me/drive/root:/{}/{}:/createUploadSession",
-            self.graph,
-            escaped(FOLDER),
-            escaped(&name)
-        );
-        let session = self
-            .call(
-                "POST",
-                &path,
-                Auth::Bearer(GRAPH),
-                Body::Json(&json!({"item": {"@microsoft.graph.conflictBehavior": "rename"}})),
-                true,
-            )
-            .map_err(failed)?;
+        let path = format!("{}/v1.0/me/drive/root:/{}/{}:/createUploadSession", self.graph, escaped(FOLDER), escaped(&name));
+        let session = self.call("POST", &path, Auth::Bearer(GRAPH), Body::Json(&json!({"item": {"@microsoft.graph.conflictBehavior": "rename"}})), true).map_err(failed)?;
         let Some(url) = session.body["uploadUrl"].as_str().map(str::to_owned) else {
-            return Err(format!(
-                "{name} could not be sent: OneDrive gave no place to put it."
-            ));
+            return Err(format!("{name} could not be sent: OneDrive gave no place to put it."));
         };
         // The session's address is signed: it takes no token, and goes nowhere but OneDrive.
         let target = Target::put(url);
@@ -117,32 +78,12 @@ impl Teams {
             }
         }
         let (Some(id), Some(web)) = (item["id"].as_str(), item["webUrl"].as_str()) else {
-            return Err(format!(
-                "{name} could not be sent: OneDrive did not say where it put it."
-            ));
+            return Err(format!("{name} could not be sent: OneDrive did not say where it put it."));
         };
-        let shared = format!(
-            "{}/v1.0/me/drive/items/{}/createLink",
-            self.graph,
-            escaped(id)
-        );
-        let link = self
-            .call(
-                "POST",
-                &shared,
-                Auth::Bearer(GRAPH),
-                Body::Json(&json!({"type": "view", "scope": "organization"})),
-                true,
-            )
-            .map_err(failed)?;
-        let share = link.body["link"]["webUrl"]
-            .as_str()
-            .unwrap_or(web)
-            .to_owned();
-        let kind = name
-            .rsplit_once('.')
-            .map_or("", |(_, ext)| ext)
-            .to_ascii_lowercase();
+        let shared = format!("{}/v1.0/me/drive/items/{}/createLink", self.graph, escaped(id));
+        let link = self.call("POST", &shared, Auth::Bearer(GRAPH), Body::Json(&json!({"type": "view", "scope": "organization"})), true).map_err(failed)?;
+        let share = link.body["link"]["webUrl"].as_str().unwrap_or(web).to_owned();
+        let kind = name.rsplit_once('.').map_or("", |(_, ext)| ext).to_ascii_lowercase();
         let site = web.split("/Documents/").next().unwrap_or(web);
         let entry = json!({
             "@type": "http://schema.skype.com/File", "version": 2, "id": id, "baseUrl": format!("{site}/"),
@@ -152,10 +93,7 @@ impl Teams {
             "botFileProperties": {}, "permissionScope": "users", "filePreview": {},
             "fileChicletState": {"serviceName": "p2p", "state": "active"},
         });
-        let file = MediaFile {
-            bytes,
-            ..MediaFile::new(format!("file:sent:{}", escaped(id)), MediaKind::File)
-        };
+        let file = MediaFile { bytes, ..MediaFile::new(format!("file:sent:{}", escaped(id)), MediaKind::File) };
         if let Err(err) = self.ctx.media(&[(file.clone(), share)]) {
             tracing::warn!("chatd: Teams: {err}");
         }

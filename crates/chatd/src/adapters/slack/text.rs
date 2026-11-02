@@ -89,13 +89,7 @@ impl<'a> Rich<'a> {
         }
         self.mentioned |= id == self.names.me();
         let kind = MentionKind::User;
-        self.span(
-            start,
-            Style::Mention {
-                kind,
-                id: id.to_owned(),
-            },
-        );
+        self.span(start, Style::Mention { kind, id: id.to_owned() });
     }
 
     fn channel(&mut self, id: &str, label: Option<&str>) {
@@ -112,13 +106,7 @@ impl<'a> Rich<'a> {
             },
         }
         let kind = MentionKind::Channel;
-        self.span(
-            start,
-            Style::Mention {
-                kind,
-                id: id.to_owned(),
-            },
-        );
+        self.span(start, Style::Mention { kind, id: id.to_owned() });
     }
 
     fn usergroup(&mut self, id: &str, label: Option<&str>) {
@@ -126,21 +114,10 @@ impl<'a> Rich<'a> {
         self.text.push('@');
         match label {
             Some(label) => self.text.push_str(label.trim_start_matches('@')),
-            None => self.text.push_str(
-                &self
-                    .names
-                    .usergroup(id)
-                    .unwrap_or_else(|| "group".to_owned()),
-            ),
+            None => self.text.push_str(&self.names.usergroup(id).unwrap_or_else(|| "group".to_owned())),
         }
         let kind = MentionKind::Role;
-        self.span(
-            start,
-            Style::Mention {
-                kind,
-                id: id.to_owned(),
-            },
-        );
+        self.span(start, Style::Mention { kind, id: id.to_owned() });
     }
 
     fn everyone(&mut self, range: &str) {
@@ -149,25 +126,13 @@ impl<'a> Rich<'a> {
         self.text.push_str(range);
         self.broadcast = true;
         let kind = MentionKind::Everyone;
-        self.span(
-            start,
-            Style::Mention {
-                kind,
-                id: range.to_owned(),
-            },
-        );
+        self.span(start, Style::Mention { kind, id: range.to_owned() });
     }
 
     pub fn link(&mut self, url: &str, label: Option<&str>) {
         let start = self.at();
-        self.text
-            .push_str(label.filter(|label| !label.is_empty()).unwrap_or(url));
-        self.span(
-            start,
-            Style::Link {
-                url: url.to_owned(),
-            },
-        );
+        self.text.push_str(label.filter(|label| !label.is_empty()).unwrap_or(url));
+        self.span(start, Style::Link { url: url.to_owned() });
     }
 
     /// A standard emoji as itself, a custom one as `:name:` with its picture, and a name nobody
@@ -214,12 +179,7 @@ impl<'a> Rich<'a> {
                     self.span(start, Style::Bold);
                 }
                 "context" => {
-                    for (at, element) in block["elements"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .enumerate()
-                    {
+                    for (at, element) in block["elements"].as_array().into_iter().flatten().enumerate() {
                         if element["type"] == "image" {
                             continue;
                         }
@@ -233,12 +193,8 @@ impl<'a> Rich<'a> {
                     // The picture is at an address Slack does not serve, so it is named, not
                     // fetched.
                     let label = [&block["title"]["text"], &block["alt_text"]];
-                    let label = label
-                        .into_iter()
-                        .filter_map(Value::as_str)
-                        .find(|label| !label.is_empty());
-                    self.text
-                        .push_str(&format!("[image: {}]", label.unwrap_or("untitled")));
+                    let label = label.into_iter().filter_map(Value::as_str).find(|label| !label.is_empty());
+                    self.text.push_str(&format!("[image: {}]", label.unwrap_or("untitled")));
                 }
                 "divider" => {}
                 _ => self.undrawn = true,
@@ -261,9 +217,7 @@ impl<'a> Rich<'a> {
 
     fn rich_block(&mut self, element: &Value) {
         self.line();
-        let children = element["elements"]
-            .as_array()
-            .map_or(&[][..], Vec::as_slice);
+        let children = element["elements"].as_array().map_or(&[][..], Vec::as_slice);
         match element["type"].as_str().unwrap_or("") {
             "rich_text_list" => {
                 let style = Style::ListItem {
@@ -307,17 +261,12 @@ impl<'a> Rich<'a> {
                 "broadcast" => self.everyone(element["range"].as_str().unwrap_or("here")),
                 "emoji" => {
                     let name = element["name"].as_str().unwrap_or("");
-                    match element["unicode"]
-                        .as_str()
-                        .and_then(emoji::from_code_points)
-                    {
+                    match element["unicode"].as_str().and_then(emoji::from_code_points) {
                         Some(emoji) => self.text.push_str(&emoji),
                         None => self.emoji(name),
                     }
                 }
-                "date" => self
-                    .text
-                    .push_str(element["fallback"].as_str().unwrap_or("")),
+                "date" => self.text.push_str(element["fallback"].as_str().unwrap_or("")),
                 "color" => self.text.push_str(element["value"].as_str().unwrap_or("")),
                 _ => self.text.push_str(element["text"].as_str().unwrap_or("")),
             }
@@ -347,21 +296,12 @@ impl<'a> Rich<'a> {
                 self.line();
                 let start = self.at();
                 self.plain(part.trim_matches('\n'));
-                self.span(
-                    start,
-                    Style::CodeBlock {
-                        language: String::new(),
-                    },
-                );
+                self.span(start, Style::CodeBlock { language: String::new() });
                 self.line();
                 continue;
             }
             // The line break after a closing fence belongs to the fence.
-            let part = if at > 0 {
-                part.strip_prefix('\n').unwrap_or(part)
-            } else {
-                part
-            };
+            let part = if at > 0 { part.strip_prefix('\n').unwrap_or(part) } else { part };
             for (line_at, line) in part.split('\n').enumerate() {
                 if line_at > 0 {
                     self.text.push('\n');
@@ -380,12 +320,7 @@ impl<'a> Rich<'a> {
 
     /// Text with Slack's three escapes undone and nothing else read into it.
     fn plain(&mut self, text: &str) {
-        self.text.push_str(
-            &text
-                .replace("&lt;", "<")
-                .replace("&gt;", ">")
-                .replace("&amp;", "&"),
-        );
+        self.text.push_str(&text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&"));
     }
 
     /// One line of mrkdwn. Every character that starts something is ASCII, so the byte offsets
@@ -396,13 +331,8 @@ impl<'a> Rich<'a> {
         while at < bytes.len() {
             let found = match bytes[at] {
                 b'<' => line[at..].find('>').map(|close| (at + close + 1, 0u8)),
-                b'`' => line[at + 1..]
-                    .find('`')
-                    .filter(|len| *len > 0)
-                    .map(|len| (at + len + 2, b'`')),
-                mark @ (b'*' | b'_' | b'~') => {
-                    closer(line, at, mark).map(|close| (close + 1, mark))
-                }
+                b'`' => line[at + 1..].find('`').filter(|len| *len > 0).map(|len| (at + len + 2, b'`')),
+                mark @ (b'*' | b'_' | b'~') => closer(line, at, mark).map(|close| (close + 1, mark)),
                 b':' => emoji_end(line, at).map(|close| (close + 1, b':')),
                 _ => None,
             };
@@ -450,11 +380,7 @@ impl<'a> Rich<'a> {
                 if let Some(group) = command.strip_prefix("subteam^") {
                     self.usergroup(group, label);
                 } else if matches!(command, "here" | "channel" | "everyone" | "group") {
-                    self.everyone(if command == "group" {
-                        "channel"
-                    } else {
-                        command
-                    });
+                    self.everyone(if command == "group" { "channel" } else { command });
                 } else {
                     // `<!date^…|fallback>` and anything newer: the label is what to read.
                     self.plain(label.unwrap_or(command));
@@ -462,12 +388,7 @@ impl<'a> Rich<'a> {
             }
             _ => {
                 let url = target.replace("&amp;", "&");
-                let label = label.map(|label| {
-                    label
-                        .replace("&lt;", "<")
-                        .replace("&gt;", ">")
-                        .replace("&amp;", "&")
-                });
+                let label = label.map(|label| label.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&"));
                 self.link(&url, label.as_deref());
             }
         }
@@ -493,8 +414,7 @@ fn closer(line: &str, open: usize, mark: u8) -> Option<usize> {
 /// The closing colon of an emoji name opened at `open`.
 fn emoji_end(line: &str, open: usize) -> Option<usize> {
     let rest = &line[open + 1..];
-    let len =
-        rest.find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || "_+-'".contains(c)))?;
+    let len = rest.find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || "_+-'".contains(c)))?;
     let mut close = open + 1 + len;
     if len == 0 || line.as_bytes()[close] != b':' {
         return None;
@@ -530,17 +450,13 @@ mod tests {
             (id == "S1").then(|| "oncall".to_owned())
         }
         fn custom(&self, name: &str) -> Option<Custom> {
-            (name == "partyparrot")
-                .then(|| Custom::File(MediaFile::new("emoji:partyparrot", MediaKind::Emoji)))
+            (name == "partyparrot").then(|| Custom::File(MediaFile::new("emoji:partyparrot", MediaKind::Emoji)))
         }
     }
 
     fn ranges(rich: &Rich) -> Vec<(String, Style)> {
         let cut = |span: &Span| rich.text[span.start as usize..span.end as usize].to_owned();
-        rich.spans
-            .iter()
-            .map(|span| (cut(span), span.style.clone()))
-            .collect()
+        rich.spans.iter().map(|span| (cut(span), span.style.clone())).collect()
     }
 
     #[test]
@@ -558,69 +474,31 @@ mod tests {
         );
         let found = ranges(&rich);
         let has = |text: &str, style: Style| found.contains(&(text.to_owned(), style));
-        assert!(has(
-            "@name-of-U1",
-            Style::Mention {
-                kind: MentionKind::User,
-                id: "U1".into()
-            }
-        ));
-        assert!(has(
-            "the doc",
-            Style::Link {
-                url: "https://ex.com/a?b=1&c=2".into()
-            }
-        ));
-        assert!(has(
-            "#platform",
-            Style::Mention {
-                kind: MentionKind::Channel,
-                id: "C9".into()
-            }
-        ));
-        assert!(has(
-            "@here",
-            Style::Mention {
-                kind: MentionKind::Everyone,
-                id: "here".into()
-            }
-        ));
+        assert!(has("@name-of-U1", Style::Mention { kind: MentionKind::User, id: "U1".into() }));
+        assert!(has("the doc", Style::Link { url: "https://ex.com/a?b=1&c=2".into() }));
+        assert!(has("#platform", Style::Mention { kind: MentionKind::Channel, id: "C9".into() }));
+        assert!(has("@here", Style::Mention { kind: MentionKind::Everyone, id: "here".into() }));
         assert!(has("bold both", Style::Bold));
         assert!(has("both", Style::Italic));
         assert!(has("gone", Style::Strike));
         assert!(has("x*y", Style::Code));
-        assert!(found
-            .iter()
-            .any(|(text, style)| text == ":partyparrot:" && matches!(style, Style::Emoji { .. })));
+        assert!(found.iter().any(|(text, style)| text == ":partyparrot:" && matches!(style, Style::Emoji { .. })));
         assert!(rich.broadcast && !rich.mentioned);
         // Every range sits on character boundaries of the text it describes.
         for span in &rich.spans {
-            assert!(
-                rich.text.is_char_boundary(span.start as usize)
-                    && rich.text.is_char_boundary(span.end as usize)
-            );
+            assert!(rich.text.is_char_boundary(span.start as usize) && rich.text.is_char_boundary(span.end as usize));
         }
     }
 
     #[test]
     fn quotes_code_blocks_and_my_own_mention() {
         let mut rich = Rich::new(&Book);
-        rich.mrkdwn(
-            "&gt; said <@UME>\nthen\n```let a = 1 &lt; 2;\n*not bold*```\nafter :+1::skin-tone-3:",
-        );
+        rich.mrkdwn("&gt; said <@UME>\nthen\n```let a = 1 &lt; 2;\n*not bold*```\nafter :+1::skin-tone-3:");
         rich.finish();
-        assert_eq!(
-            rich.text,
-            "said @name-of-UME\nthen\nlet a = 1 < 2;\n*not bold*\nafter 👍🏼"
-        );
+        assert_eq!(rich.text, "said @name-of-UME\nthen\nlet a = 1 < 2;\n*not bold*\nafter 👍🏼");
         let found = ranges(&rich);
         assert!(found.contains(&("said @name-of-UME".into(), Style::Quote)));
-        assert!(found.contains(&(
-            "let a = 1 < 2;\n*not bold*".into(),
-            Style::CodeBlock {
-                language: String::new()
-            }
-        )));
+        assert!(found.contains(&("let a = 1 < 2;\n*not bold*".into(), Style::CodeBlock { language: String::new() })));
         assert!(rich.mentioned);
     }
 
@@ -657,39 +535,11 @@ mod tests {
         let found = ranges(&rich);
         let has = |text: &str, style: Style| found.contains(&(text.to_owned(), style));
         assert!(has("today", Style::Bold) && has("today", Style::Italic));
-        assert!(has(
-            "@oncall",
-            Style::Mention {
-                kind: MentionKind::Role,
-                id: "S1".into()
-            }
-        ));
-        assert!(has(
-            "plan",
-            Style::Link {
-                url: "https://ex.com".into()
-            }
-        ));
-        assert!(has(
-            "build",
-            Style::ListItem {
-                ordered: true,
-                depth: 1
-            }
-        ));
-        assert!(has(
-            "deploy",
-            Style::ListItem {
-                ordered: true,
-                depth: 1
-            }
-        ));
-        assert!(has(
-            "cargo test",
-            Style::CodeBlock {
-                language: String::new()
-            }
-        ));
+        assert!(has("@oncall", Style::Mention { kind: MentionKind::Role, id: "S1".into() }));
+        assert!(has("plan", Style::Link { url: "https://ex.com".into() }));
+        assert!(has("build", Style::ListItem { ordered: true, depth: 1 }));
+        assert!(has("deploy", Style::ListItem { ordered: true, depth: 1 }));
+        assert!(has("cargo test", Style::CodeBlock { language: String::new() }));
         assert!(has("looks good", Style::Quote));
         assert!(rich.mentioned && !rich.undrawn);
     }

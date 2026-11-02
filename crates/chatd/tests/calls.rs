@@ -7,14 +7,14 @@
 use chatd::hub::Hub;
 use chatd::media::CallError;
 use chatd::store::Store;
-use protocol::ChatStream;
 use protocol::{
-    read_frame, write_frame, Call, CallFailure, CallState, Change, Dave, Key, MediaRequest,
-    Network, Participant, Request, Response, VoiceJoin,
+    read_frame, write_frame, Call, CallFailure, CallState, Change, Dave, Key, MediaRequest, Network,
+    Participant, Request, Response, VoiceJoin,
 };
 use serde_json::{json, Value};
 use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream, UdpSocket};
+use protocol::ChatStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -31,15 +31,9 @@ fn environment() {
     READY.call_once(|| {
         let chatd = Path::new(env!("CARGO_BIN_EXE_chatd"));
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let built = Command::new(cargo)
-            .args(["build", "-p", "mediad", "--bin", "mediad"])
-            .status()
-            .unwrap();
+        let built = Command::new(cargo).args(["build", "-p", "mediad", "--bin", "mediad"]).status().unwrap();
         assert!(built.success(), "could not build mediad");
-        std::env::set_var(
-            "TINYCLIENT_MEDIAD",
-            chatd.with_file_name(format!("mediad{}", std::env::consts::EXE_SUFFIX)),
-        );
+        std::env::set_var("TINYCLIENT_MEDIAD", chatd.with_file_name(format!("mediad{}", std::env::consts::EXE_SUFFIX)));
         std::env::set_var("TINYCLIENT_MEDIAD_AUDIO", "tone");
         std::env::set_var("TINYCLIENT_VOICE_PLAIN", "1");
     });
@@ -55,12 +49,7 @@ fn hub() -> (Arc<Hub>, PathBuf) {
     environment();
     static NEXT: AtomicU32 = AtomicU32::new(0);
     // On Windows "/tmp" has no drive; chatd takes only absolute paths.
-    let dir = std::path::absolute(format!(
-        "/tmp/tinyclient-calls-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
-    .unwrap();
+    let dir = std::path::absolute(format!("/tmp/tinyclient-calls-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
     let store = Store::open(&dir.join("chat.sqlite")).unwrap();
     (Arc::new(Hub::new(store)), dir)
@@ -81,10 +70,7 @@ fn mediads() -> usize {
 
 /// The one mediad this test process runs.
 fn mediad_pid() -> String {
-    child_pids(std::process::id(), "mediad")
-        .first()
-        .map(|pid| pid.to_string())
-        .unwrap_or_default()
+    child_pids(std::process::id(), "mediad").first().map(|pid| pid.to_string()).unwrap_or_default()
 }
 
 fn child_pids(parent: u32, name: &str) -> Vec<u32> {
@@ -93,10 +79,7 @@ fn child_pids(parent: u32, name: &str) -> Vec<u32> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-            TH32CS_SNAPPROCESS,
-        };
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
         let program = format!("{name}.exe");
         let mut found = Vec::new();
         // SAFETY: the snapshot is checked before use and closed after; the entry is sized for the
@@ -110,18 +93,10 @@ fn child_pids(parent: u32, name: &str) -> Vec<u32> {
             entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
             let mut more = Process32FirstW(snapshot, &mut entry) != 0;
             while more {
-                let end = entry
-                    .szExeFile
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(entry.szExeFile.len());
+                let end = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
                 // A process with no threads has exited and is only held open by a handle.
                 let alive = entry.cntThreads > 0;
-                if alive
-                    && entry.th32ParentProcessID == parent
-                    && String::from_utf16_lossy(&entry.szExeFile[..end])
-                        .eq_ignore_ascii_case(&program)
-                {
+                if alive && entry.th32ParentProcessID == parent && String::from_utf16_lossy(&entry.szExeFile[..end]).eq_ignore_ascii_case(&program) {
                     found.push(entry.th32ProcessID);
                 }
                 more = Process32NextW(snapshot, &mut entry) != 0;
@@ -132,34 +107,19 @@ fn child_pids(parent: u32, name: &str) -> Vec<u32> {
     }
     #[cfg(not(windows))]
     {
-        let out = Command::new("pgrep")
-            .args(["-P", &parent.to_string(), name])
-            .output()
-            .unwrap();
-        String::from_utf8(out.stdout)
-            .unwrap()
-            .lines()
-            .filter_map(|pid| pid.trim().parse().ok())
-            .collect()
+        let out = Command::new("pgrep").args(["-P", &parent.to_string(), name]).output().unwrap();
+        String::from_utf8(out.stdout).unwrap().lines().filter_map(|pid| pid.trim().parse().ok()).collect()
     }
 }
 
 fn kill_pid(pid: &str) -> bool {
     #[cfg(windows)]
     {
-        Command::new("taskkill")
-            .args(["/F", "/PID", pid])
-            .status()
-            .unwrap()
-            .success()
+        Command::new("taskkill").args(["/F", "/PID", pid]).status().unwrap().success()
     }
     #[cfg(not(windows))]
     {
-        Command::new("kill")
-            .args(["-9", pid])
-            .status()
-            .unwrap()
-            .success()
+        Command::new("kill").args(["-9", pid]).status().unwrap().success()
     }
 }
 
@@ -209,18 +169,14 @@ impl Peer {
                     }
                 }
                 Ok(_) => {}
-                Err(tungstenite::Error::Io(err))
-                    if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(tungstenite::Error::Io(err)) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
                 Err(err) => panic!("the voice server's socket: {err}"),
             }
         }
     }
 
     fn close(mut self, code: u16) {
-        let frame = tungstenite::protocol::CloseFrame {
-            code: code.into(),
-            reason: "".into(),
-        };
+        let frame = tungstenite::protocol::CloseFrame { code: code.into(), reason: "".into() };
         let _ = self.ws.close(Some(frame));
         let _ = self.ws.flush();
         let until = Instant::now() + Duration::from_millis(300);
@@ -232,10 +188,7 @@ impl Voice {
     fn new() -> Voice {
         let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
         udp.set_read_timeout(Some(PATIENCE)).unwrap();
-        Voice {
-            listener: TcpListener::bind("127.0.0.1:0").unwrap(),
-            udp,
-        }
+        Voice { listener: TcpListener::bind("127.0.0.1:0").unwrap(), udp }
     }
 
     fn join(&self) -> VoiceJoin {
@@ -247,10 +200,7 @@ impl Voice {
             user_id: "111".into(),
             server_id: "900".into(),
             channel_id: "900".into(),
-            dave: Dave {
-                max_version: 1,
-                required: false,
-            },
+            dave: Dave { max_version: 1, required: false },
             // The adapter's view of our mute is older than chatd's; chatd's wins.
             muted: false,
             deafened: false,
@@ -260,13 +210,9 @@ impl Voice {
     /// Accepts mediad and stops after reading its identify.
     fn identified(&self) -> (Peer, Value) {
         let (stream, _) = self.listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let ws = tungstenite::accept(stream).unwrap();
-        ws.get_ref()
-            .set_read_timeout(Some(Duration::from_millis(20)))
-            .unwrap();
+        ws.get_ref().set_read_timeout(Some(Duration::from_millis(20))).unwrap();
         let mut peer = Peer { ws, seq: 0 };
         let identify = peer.expect(0);
         (peer, identify)
@@ -278,17 +224,10 @@ impl Voice {
         peer.send(8, json!({ "v": 8, "heartbeat_interval": 30_000 }));
         let port = self.udp.local_addr().unwrap().port();
         let modes = ["aead_aes256_gcm_rtpsize", "aead_xchacha20_poly1305_rtpsize"];
-        peer.send(
-            2,
-            json!({ "ssrc": 1111, "ip": "127.0.0.1", "port": port, "modes": modes }),
-        );
+        peer.send(2, json!({ "ssrc": 1111, "ip": "127.0.0.1", "port": port, "modes": modes }));
         let mut request = [0u8; 128];
         let (len, from) = self.udp.recv_from(&mut request).unwrap();
-        assert_eq!(
-            (len, &request[..4]),
-            (74, &[0u8, 1, 0, 70][..]),
-            "address discovery"
-        );
+        assert_eq!((len, &request[..4]), (74, &[0u8, 1, 0, 70][..]), "address discovery");
         let mut answer = [0u8; 74];
         answer[..4].copy_from_slice(&[0, 2, 0, 70]);
         answer[8..17].copy_from_slice(b"127.0.0.1");
@@ -309,19 +248,12 @@ fn a_join_is_drawn_as_a_call_only_once_the_voice_server_admits_us_and_a_refusal_
     let seq = hub.seq();
 
     assert!(hub.calls.start(&hub, lounge()).is_ok());
-    assert!(
-        matches!(hub.calls.start(&hub, lounge()), Err(CallError::Active)),
-        "one call at a time"
-    );
+    assert!(matches!(hub.calls.start(&hub, lounge()), Err(CallError::Active)), "one call at a time");
     assert!(hub.calls.describe().1, "mediad runs from connecting");
     assert_eq!(mediads(), 1);
     // Muted before the network has answered: it must survive the join.
     assert!(hub.calls.set_audio(&hub, true, false).is_ok());
-    let alice = Participant {
-        id: "222".into(),
-        name: "Alice".into(),
-        ..Participant::default()
-    };
+    let alice = Participant { id: "222".into(), name: "Alice".into(), ..Participant::default() };
     hub.calls.set_participants(&hub, &lounge(), vec![alice]);
 
     // The adapter has both gateway events and hands the session over.
@@ -330,11 +262,7 @@ fn a_join_is_drawn_as_a_call_only_once_the_voice_server_admits_us_and_a_refusal_
     assert_eq!(identify["token"], "voice-token");
     assert_eq!(identify["max_dave_protocol_version"], 1);
     let call = hub.calls.describe().0.unwrap();
-    assert_eq!(
-        call.state,
-        CallState::Connecting,
-        "identified is not joined"
-    );
+    assert_eq!(call.state, CallState::Connecting, "identified is not joined");
     assert_eq!(call.joined, 0);
     assert!(call.engine_linked, "a voice engine took the session");
 
@@ -344,18 +272,9 @@ fn a_join_is_drawn_as_a_call_only_once_the_voice_server_admits_us_and_a_refusal_
     assert!(call.joined > 0);
     assert!(call.muted, "mute set while connecting is kept");
     assert_eq!(call.participants[0].name, "Alice");
-    until("devices", || {
-        hub.calls
-            .describe()
-            .0
-            .is_some_and(|call| call.input == "tone")
-    });
+    until("devices", || hub.calls.describe().0.is_some_and(|call| call.input == "tone"));
     // Muted from the start: the gateway is never told we speak, though the tone is loud.
-    assert_eq!(
-        peer.expect(5)["speaking"],
-        0,
-        "only the announcement of our SSRC"
-    );
+    assert_eq!(peer.expect(5)["speaking"], 0, "only the announcement of our SSRC");
 
     // The shell was told, with the whole call, without asking.
     let (_, _, changes) = hub.wait(seq, Duration::from_millis(10));
@@ -365,35 +284,13 @@ fn a_join_is_drawn_as_a_call_only_once_the_voice_server_admits_us_and_a_refusal_
     // Requests reach mediad and each gets its one reply.
     assert!(hub.calls.set_audio(&hub, false, false).is_ok());
     assert_eq!(peer.expect(5)["speaking"], 1, "unmuted, the tone is speech");
-    assert!(hub
-        .calls
-        .request(
-            &hub,
-            &MediaRequest::Devices {
-                input: None,
-                output: None
-            }
-        )
-        .is_ok());
+    assert!(hub.calls.request(&hub, &MediaRequest::Devices { input: None, output: None }).is_ok());
 
     // Discord ends it: DAVE required. The reason is shown and mediad is gone.
     peer.close(4017);
-    until("failed", || {
-        matches!(
-            state(&hub),
-            Some(CallState::Failed {
-                reason: CallFailure::Encryption,
-                ..
-            })
-        )
-    });
-    until("mediad to exit", || {
-        mediads() == 0 && !hub.calls.describe().1
-    });
-    assert!(matches!(
-        hub.calls.set_audio(&hub, true, false),
-        Err(CallError::NoCall)
-    ));
+    until("failed", || matches!(state(&hub), Some(CallState::Failed { reason: CallFailure::Encryption, .. })));
+    until("mediad to exit", || mediads() == 0 && !hub.calls.describe().1);
+    assert!(matches!(hub.calls.set_audio(&hub, true, false), Err(CallError::NoCall)));
     // It stays until dismissed.
     sleep(Duration::from_millis(300));
     assert!(matches!(state(&hub), Some(CallState::Failed { .. })));
@@ -409,10 +306,7 @@ fn a_failure_from_the_adapter_stops_mediad_stays_on_screen_and_gives_way_to_a_ne
     assert!(hub.calls.start(&hub, lounge()).is_ok());
     assert_eq!(mediads(), 1);
     // What `Context::call_failed` does.
-    let full = CallState::Failed {
-        reason: CallFailure::Refused,
-        detail: "Lounge is full.".into(),
-    };
+    let full = CallState::Failed { reason: CallFailure::Refused, detail: "Lounge is full.".into() };
     hub.calls.set_state(&hub, &lounge(), full.clone());
     assert!(!hub.calls.describe().1, "a failed call has no mediad");
     assert_eq!(mediads(), 0);
@@ -432,20 +326,11 @@ fn a_failure_from_the_adapter_stops_mediad_stays_on_screen_and_gives_way_to_a_ne
 /// wedged before its first word.
 fn silent_helper(dir: &Path) -> PathBuf {
     let source = dir.join("silent.rs");
-    std::fs::write(
-        &source,
-        "fn main() { loop { std::thread::sleep(std::time::Duration::from_secs(3600)); } }",
-    )
-    .unwrap();
+    std::fs::write(&source, "fn main() { loop { std::thread::sleep(std::time::Duration::from_secs(3600)); } }").unwrap();
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let rustc = Path::new(&cargo).with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX));
     let out = dir.join(format!("silent{}", std::env::consts::EXE_SUFFIX));
-    let built = Command::new(rustc)
-        .args(["--edition", "2021", "-o"])
-        .arg(&out)
-        .arg(&source)
-        .status()
-        .unwrap();
+    let built = Command::new(rustc).args(["--edition", "2021", "-o"]).arg(&out).arg(&source).status().unwrap();
     assert!(built.success(), "could not build the silent helper");
     out
 }
@@ -470,29 +355,18 @@ fn a_mediad_that_never_says_it_is_ready_fails_in_words_and_chatd_answers_on() {
         let _ = kill_pid(&pid.to_string());
     }
     let failed = matches!(&outcome, Ok(Err(CallError::Media(err))) if err.to_string() == "The call engine stopped answering. Try again.");
-    assert!(
-        failed,
-        "the start did not fail in words: {}",
-        match &outcome {
-            Ok(Err(CallError::Media(err))) => format!("the engine said: {err}"),
-            Ok(Err(_)) => "the engine refused".to_owned(),
-            Ok(Ok(())) => "the start succeeded".to_owned(),
-            Err(_) => "the ask did not come back in time".to_owned(),
-        }
-    );
-    assert!(
-        began.elapsed() >= chatd::media::READY,
-        "the engine had its time: {:?}",
-        began.elapsed()
-    );
+    assert!(failed, "the start did not fail in words: {}", match &outcome {
+        Ok(Err(CallError::Media(err))) => format!("the engine said: {err}"),
+        Ok(Err(_)) => "the engine refused".to_owned(),
+        Ok(Ok(())) => "the start succeeded".to_owned(),
+        Err(_) => "the ask did not come back in time".to_owned(),
+    });
+    assert!(began.elapsed() >= chatd::media::READY, "the engine had its time: {:?}", began.elapsed());
 
     // The one call slot is free again: the state answers, and a real engine starts.
     assert_eq!(hub.calls.describe(), (None, false));
     assert!(hub.calls.start(&hub, lounge()).is_ok());
-    assert!(
-        hub.calls.describe().1,
-        "the real engine runs from connecting"
-    );
+    assert!(hub.calls.describe().1, "the real engine runs from connecting");
     assert_eq!(hub.calls.end(&hub), Some(lounge()));
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -507,9 +381,7 @@ fn a_mediad_that_dies_holding_a_voice_session_is_a_failure_in_words_not_a_vanish
     let (_peer, _) = voice.identified();
     let pid = mediad_pid();
     assert!(kill_pid(&pid));
-    until("the failure", || {
-        matches!(state(&hub), Some(CallState::Failed { .. }))
-    });
+    until("the failure", || matches!(state(&hub), Some(CallState::Failed { .. })));
     let expected = CallState::Failed {
         reason: CallFailure::Engine,
         detail: "The call engine stopped.".into(),
@@ -531,11 +403,7 @@ fn a_call_the_network_never_answers_fails_in_ten_seconds_and_leaves_no_mediad() 
         assert!(Instant::now() < deadline, "still {:?}", state(&hub));
         sleep(Duration::from_millis(50));
     }
-    assert!(
-        began.elapsed() >= Duration::from_secs(10),
-        "{:?}",
-        began.elapsed()
-    );
+    assert!(began.elapsed() >= Duration::from_secs(10), "{:?}", began.elapsed());
     let expected = CallState::Failed {
         reason: CallFailure::Lost,
         detail: "No reply from Discord after 10 seconds.".into(),
@@ -553,11 +421,7 @@ fn a_second_voice_session_for_a_call_that_is_up_moves_the_call_and_keeps_it() {
     let (hub, dir) = hub();
     let (old, new) = (Voice::new(), Voice::new());
     assert!(hub.calls.start(&hub, lounge()).is_ok());
-    let alice = Participant {
-        id: "222".into(),
-        name: "Alice".into(),
-        ..Participant::default()
-    };
+    let alice = Participant { id: "222".into(), name: "Alice".into(), ..Participant::default() };
     hub.calls.set_participants(&hub, &lounge(), vec![alice]);
     hub.calls.join(&hub, &lounge(), old.join());
     let (mut first, _) = old.identified();
@@ -570,51 +434,27 @@ fn a_second_voice_session_for_a_call_that_is_up_moves_the_call_and_keeps_it() {
 
     // The voice server moved (a region change): the adapter hands over a new session for the
     // same call. chatd sends it as `Rejoin`; mediad drops the old connection and takes it.
-    let moved = VoiceJoin {
-        session_id: "session-2".into(),
-        token: "voice-token-2".into(),
-        ..new.join()
-    };
+    let moved = VoiceJoin { session_id: "session-2".into(), token: "voice-token-2".into(), ..new.join() };
     hub.calls.join(&hub, &lounge(), moved);
     let (mut second, identify) = new.identified();
-    assert_eq!(
-        (&identify["session_id"], &identify["token"]),
-        (&json!("session-2"), &json!("voice-token-2"))
-    );
-    assert_eq!(
-        state(&hub),
-        Some(CallState::Reconnecting),
-        "between the two servers the call is reconnecting, not gone"
-    );
+    assert_eq!((&identify["session_id"], &identify["token"]), (&json!("session-2"), &json!("voice-token-2")));
+    assert_eq!(state(&hub), Some(CallState::Reconnecting), "between the two servers the call is reconnecting, not gone");
     new.admit(&mut second);
     until("joined again", || state(&hub) == Some(CallState::Joined));
 
     let after = hub.calls.describe().0.unwrap();
-    assert_eq!(
-        after.joined, before.joined,
-        "the same call: its clock did not restart"
-    );
+    assert_eq!(after.joined, before.joined, "the same call: its clock did not restart");
     assert_eq!(after.participants[0].name, "Alice");
     assert!(after.muted, "mute is kept across the move");
-    assert_eq!(
-        (mediads(), mediad_pid()),
-        (1, pid),
-        "the same mediad carried it over"
-    );
+    assert_eq!((mediads(), mediad_pid()), (1, pid), "the same mediad carried it over");
     let (_, _, changes) = hub.wait(seq, Duration::from_millis(10));
-    assert!(
-        changes
-            .iter()
-            .all(|change| !matches!(change, Change::Call { call: None })),
-        "the call never left the screen"
-    );
+    assert!(changes.iter().all(|change| !matches!(change, Change::Call { call: None })), "the call never left the screen");
     // The old voice server heard a goodbye, not a dropped socket.
     let goodbye = loop {
         match first.ws.read() {
             Ok(Message::Close(frame)) => break frame.map(|frame| u16::from(frame.code)),
             Ok(_) => {}
-            Err(tungstenite::Error::Io(err))
-                if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(tungstenite::Error::Io(err)) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(_) => break None,
         }
     };
@@ -635,23 +475,17 @@ impl Daemon {
     fn start(voice: &Voice, answer_ms: &str) -> Daemon {
         environment();
         // On Windows "/tmp" has no drive; chatd takes only absolute paths.
-        let dir =
-            std::path::absolute(format!("/tmp/tinyclient-ring-{}", std::process::id())).unwrap();
+        let dir = std::path::absolute(format!("/tmp/tinyclient-ring-{}", std::process::id())).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_chatd"))
             .arg("--seed-demo")
             .env("TINYCLIENT_DIR", &dir)
-            .env(
-                "TINYCLIENT_DEMO_VOICE",
-                voice.listener.local_addr().unwrap().to_string(),
-            )
+            .env("TINYCLIENT_DEMO_VOICE", voice.listener.local_addr().unwrap().to_string())
             .env("TINYCLIENT_DEMO_ANSWER_MS", answer_ms)
             .spawn()
             .unwrap();
         let daemon = Daemon { child, dir };
-        until("chatd's socket", || {
-            ChatStream::connect(&daemon.dir.join("chat.sock")).is_ok()
-        });
+        until("chatd's socket", || ChatStream::connect(&daemon.dir.join("chat.sock")).is_ok());
         daemon
     }
 
@@ -691,65 +525,32 @@ fn a_ring_we_placed_is_not_a_call_until_the_other_side_answers_whatever_our_medi
         id: "500000000000000001".into(),
     };
     let rang = Instant::now();
-    assert!(matches!(
-        chatd.ask(Request::CallStart {
-            conversation: ines.clone()
-        }),
-        Response::Status { call: Some(_), .. }
-    ));
+    assert!(matches!(chatd.ask(Request::CallStart { conversation: ines.clone() }), Response::Status { call: Some(_), .. }));
 
     // Our own side connects first: the voice server admits us and media flows.
     let (mut peer, identify) = voice.identified();
     assert_eq!(identify["token"], "demo-voice-token");
     voice.admit(&mut peer);
     peer.expect(5);
-    until("our devices", || {
-        chatd.call().is_some_and(|call| call.input == "tone")
-    });
-    assert!(
-        rang.elapsed() < Duration::from_millis(ANSWER_MS - 1_000),
-        "the answer was not outrun: {:?}",
-        rang.elapsed()
-    );
+    until("our devices", || chatd.call().is_some_and(|call| call.input == "tone"));
+    assert!(rang.elapsed() < Duration::from_millis(ANSWER_MS - 1_000), "the answer was not outrun: {:?}", rang.elapsed());
     let call = chatd.call().expect("the ring");
-    assert_eq!(
-        (call.state, call.joined),
-        (CallState::RingingOut, 0),
-        "media being up is not an answer"
-    );
+    assert_eq!((call.state, call.joined), (CallState::RingingOut, 0), "media being up is not an answer");
     assert!(call.participants.is_empty());
 
     // They pick up: now it is a call, with them in it.
-    until("the answer", || {
-        chatd
-            .call()
-            .is_some_and(|call| call.state == CallState::Joined)
-    });
-    assert!(
-        rang.elapsed() >= Duration::from_millis(ANSWER_MS - 600),
-        "joined before anyone answered: {:?}",
-        rang.elapsed()
-    );
+    until("the answer", || chatd.call().is_some_and(|call| call.state == CallState::Joined));
+    assert!(rang.elapsed() >= Duration::from_millis(ANSWER_MS - 600), "joined before anyone answered: {:?}", rang.elapsed());
     let call = chatd.call().unwrap();
     assert!(call.joined > 0);
-    until("the roster", || {
-        chatd.call().is_some_and(|call| {
-            call.participants
-                .iter()
-                .any(|who| who.name == "Ines Marchetti")
-        })
-    });
+    until("the roster", || chatd.call().is_some_and(|call| call.participants.iter().any(|who| who.name == "Ines Marchetti")));
     assert_eq!(call.conversation, ines);
 
-    assert!(matches!(
-        chatd.ask(Request::CallEnd),
-        Response::Status { call: None, .. }
-    ));
+    assert!(matches!(chatd.ask(Request::CallEnd), Response::Status { call: None, .. }));
 }
 
 #[test]
-fn the_microphone_test_outside_a_call_meters_ten_times_a_second_and_its_mediad_leaves_when_it_stops(
-) {
+fn the_microphone_test_outside_a_call_meters_ten_times_a_second_and_its_mediad_leaves_when_it_stops() {
     let _turn = alone();
     let (hub, dir) = hub();
     assert!(hub.calls.test_microphone(&hub, true, false).is_ok());
@@ -768,32 +569,16 @@ fn the_microphone_test_outside_a_call_meters_ten_times_a_second_and_its_mediad_l
             _ => None,
         }));
     }
-    assert!(
-        levels.iter().all(|level| (60..90).contains(level)),
-        "the tone's level: {levels:?}"
-    );
+    assert!(levels.iter().all(|level| (60..90).contains(level)), "the tone's level: {levels:?}");
     // Ten a second: five took about half a second, not less.
-    assert!(
-        began.elapsed() >= Duration::from_millis(350),
-        "{:?} for five",
-        began.elapsed()
-    );
+    assert!(began.elapsed() >= Duration::from_millis(350), "{:?} for five", began.elapsed());
 
     let stopped = Instant::now();
     assert!(hub.calls.test_microphone(&hub, false, false).is_ok());
     until("the test mediad to exit", || mediads() == 0);
-    assert!(
-        stopped.elapsed() < Duration::from_secs(3),
-        "gone {:?} after the test ended",
-        stopped.elapsed()
-    );
+    assert!(stopped.elapsed() < Duration::from_secs(3), "gone {:?} after the test ended", stopped.elapsed());
     let (_, _, changes) = hub.wait(since, Duration::from_millis(10));
-    assert!(
-        changes
-            .iter()
-            .any(|change| matches!(change, Change::Meter { level: None })),
-        "the meter is told it is over"
-    );
+    assert!(changes.iter().any(|change| matches!(change, Change::Meter { level: None })), "the meter is told it is over");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -803,8 +588,7 @@ fn the_test_sound_outside_a_call_plays_on_a_mediad_of_its_own_that_then_exits() 
     let (hub, dir) = hub();
     let played = dir.join("played.pcm");
     std::env::set_var("TINYCLIENT_MEDIAD_SINK", &played);
-    hub.set_setting("", protocol::settings::CUE_VOLUME, Some("100".into()))
-        .unwrap();
+    hub.set_setting("", protocol::settings::CUE_VOLUME, Some("100".into())).unwrap();
     assert_eq!(hub.settings().number(protocol::settings::CUE_VOLUME), 100);
 
     let pressed = Instant::now();
@@ -812,24 +596,11 @@ fn the_test_sound_outside_a_call_plays_on_a_mediad_of_its_own_that_then_exits() 
     assert_eq!(mediads(), 1);
     until("the test mediad to exit", || mediads() == 0);
     std::env::remove_var("TINYCLIENT_MEDIAD_SINK");
-    assert!(
-        pressed.elapsed() < Duration::from_secs(3),
-        "{:?}",
-        pressed.elapsed()
-    );
+    assert!(pressed.elapsed() < Duration::from_secs(3), "{:?}", pressed.elapsed());
     let bytes = std::fs::read(&played).unwrap();
-    let peak = bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|&pair| i16::from_le_bytes(pair).saturating_abs())
-        .max()
-        .unwrap_or(0);
+    let peak = bytes.as_chunks::<2>().0.iter().map(|&pair| i16::from_le_bytes(pair).saturating_abs()).max().unwrap_or(0);
     let db = 20. * (f64::from(peak) / 32767.).log10();
-    assert!(
-        (db + 20.).abs() < 1.,
-        "the join cue at 100 % peaks at -20 dBFS, not {db}"
-    );
+    assert!((db + 20.).abs() < 1., "the join cue at 100 % peaks at -20 dBFS, not {db}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -837,8 +608,7 @@ fn the_test_sound_outside_a_call_plays_on_a_mediad_of_its_own_that_then_exits() 
 fn a_call_starts_muted_when_the_user_joins_muted_and_a_test_gives_way_to_it() {
     let _turn = alone();
     let (hub, dir) = hub();
-    hub.set_setting("", protocol::settings::JOIN_MUTED, Some("on".into()))
-        .unwrap();
+    hub.set_setting("", protocol::settings::JOIN_MUTED, Some("on".into())).unwrap();
     assert!(hub.calls.test_microphone(&hub, true, false).is_ok());
     assert_eq!(mediads(), 1);
     assert!(hub.calls.start(&hub, lounge()).is_ok());

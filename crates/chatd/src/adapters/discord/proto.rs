@@ -76,12 +76,10 @@ fn fields(message: &[u8]) -> Vec<(u64, Field<'_>, &[u8])> {
 }
 
 fn bytes_of(message: &[u8], wanted: u64) -> Option<&[u8]> {
-    fields(message)
-        .into_iter()
-        .find_map(|(number, field, _)| match field {
-            Field::Bytes(bytes) if number == wanted => Some(bytes),
-            _ => None,
-        })
+    fields(message).into_iter().find_map(|(number, field, _)| match field {
+        Field::Bytes(bytes) if number == wanted => Some(bytes),
+        _ => None,
+    })
 }
 
 /// A length-delimited field: its tag, its length, its bytes.
@@ -103,9 +101,7 @@ fn write(into: &mut Vec<u8>, number: u64, bytes: &[u8]) {
 /// Our status settings as Discord sent them, out of the whole settings (or out of an update
 /// that carries them). `None` when they are not in it.
 pub fn status_settings(settings: &str) -> Option<Vec<u8>> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(settings.trim())
-        .ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(settings.trim()).ok()?;
     bytes_of(&bytes, 11).map(<[u8]>::to_vec)
 }
 
@@ -113,9 +109,7 @@ pub fn status_settings(settings: &str) -> Option<Vec<u8>> {
 pub fn own_status(status: &[u8]) -> (String, String) {
     let text = |bytes: Option<&[u8]>| {
         let inner = bytes.and_then(|bytes| bytes_of(bytes, 1));
-        inner.map_or_else(String::new, |inner| {
-            String::from_utf8_lossy(inner).into_owned()
-        })
+        inner.map_or_else(String::new, |inner| String::from_utf8_lossy(inner).into_owned())
     };
     (text(bytes_of(status, 1)), text(bytes_of(status, 2)))
 }
@@ -188,9 +182,7 @@ fn wrapped_varint(message: &[u8]) -> Option<u64> {
 /// numbers are the community's (`GuildFolder`: 1 `guild_ids` packed fixed64, 2 `id` Int64Value,
 /// 3 `name` StringValue, 4 `color` UInt64Value). `None` when the settings do not say.
 pub fn guild_folders(settings: &str) -> Option<Vec<GuildFolder>> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(settings.trim())
-        .ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(settings.trim()).ok()?;
     let folders = bytes_of(&bytes, 14)?;
     let mut found = Vec::new();
     let mut reader = Reader(folders);
@@ -204,13 +196,9 @@ pub fn guild_folders(settings: &str) -> Option<Vec<GuildFolder>> {
             match (number, field) {
                 (2, Field::Bytes(id)) => parsed.id = wrapped_varint(id).map(|id| id as i64),
                 (3, Field::Bytes(name)) => {
-                    parsed.name = bytes_of(name, 1)
-                        .map(|name| String::from_utf8_lossy(name).into_owned())
-                        .unwrap_or_default();
+                    parsed.name = bytes_of(name, 1).map(|name| String::from_utf8_lossy(name).into_owned()).unwrap_or_default();
                 }
-                (4, Field::Bytes(color)) => {
-                    parsed.color = wrapped_varint(color).map(|color| (color & 0xff_ffff) as u32)
-                }
+                (4, Field::Bytes(color)) => parsed.color = wrapped_varint(color).map(|color| (color & 0xff_ffff) as u32),
                 _ => {}
             }
         }
@@ -222,9 +210,7 @@ pub fn guild_folders(settings: &str) -> Option<Vec<GuildFolder>> {
 /// The server ids in the user's own order, folders flattened. `None` when the settings do not
 /// say (or are not what this expects).
 pub fn guild_order(settings: &str) -> Option<Vec<String>> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(settings.trim())
-        .ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(settings.trim()).ok()?;
     let mut reader = Reader(&bytes);
     let mut order = Vec::new();
     while let Some((number, field)) = reader.field() {
@@ -255,11 +241,7 @@ mod tests {
 
     #[test]
     fn folders_flatten_into_one_order() {
-        let packed = |ids: &[u64]| {
-            ids.iter()
-                .flat_map(|id| id.to_le_bytes())
-                .collect::<Vec<u8>>()
-        };
+        let packed = |ids: &[u64]| ids.iter().flat_map(|id| id.to_le_bytes()).collect::<Vec<u8>>();
         // Two folders: [30, 10] and [20].
         let mut folders = Vec::new();
         for ids in [&[30u64, 10][..], &[20][..]] {
@@ -279,14 +261,7 @@ mod tests {
         let mut folders = Vec::new();
         // A named, coloured folder of [30, 10], then a loose server 20.
         let mut folder = Vec::new();
-        write(
-            &mut folder,
-            1,
-            &[30u64, 10]
-                .iter()
-                .flat_map(|id| id.to_le_bytes())
-                .collect::<Vec<u8>>(),
-        );
+        write(&mut folder, 1, &[30u64, 10].iter().flat_map(|id| id.to_le_bytes()).collect::<Vec<u8>>());
         write(&mut folder, 2, &[0x08, 0x07]);
         let mut name = Vec::new();
         write(&mut name, 1, b"Games");
@@ -300,24 +275,8 @@ mod tests {
         write(&mut settings, 14, &folders);
         let encoded = base64::engine::general_purpose::STANDARD.encode(&settings);
         let parsed = guild_folders(&encoded).unwrap();
-        assert_eq!(
-            parsed[0],
-            GuildFolder {
-                id: Some(7),
-                name: "Games".into(),
-                color: Some(255),
-                guild_ids: vec!["30".into(), "10".into()]
-            }
-        );
-        assert_eq!(
-            parsed[1],
-            GuildFolder {
-                id: None,
-                name: String::new(),
-                color: None,
-                guild_ids: vec!["20".into()]
-            }
-        );
+        assert_eq!(parsed[0], GuildFolder { id: Some(7), name: "Games".into(), color: Some(255), guild_ids: vec!["30".into(), "10".into()] });
+        assert_eq!(parsed[1], GuildFolder { id: None, name: String::new(), color: None, guild_ids: vec!["20".into()] });
         assert_eq!(guild_order(&encoded).unwrap(), ["30", "10", "20"]);
     }
 
@@ -326,13 +285,7 @@ mod tests {
         // Status settings: `dnd`, a custom line, and a field this does not know (3, a varint).
         let mut status = Vec::new();
         write(&mut status, 1, &[0x0a, 3, b'd', b'n', b'd']);
-        write(
-            &mut status,
-            2,
-            &[
-                0x0a, 5, b'l', b'u', b'n', b'c', b'h', 0x21, 9, 9, 9, 9, 9, 9, 9, 9,
-            ],
-        );
+        write(&mut status, 2, &[0x0a, 5, b'l', b'u', b'n', b'c', b'h', 0x21, 9, 9, 9, 9, 9, 9, 9, 9]);
         status.extend([0x18, 0x01]);
         let sent = status_settings(&settings(&status)).unwrap();
         assert_eq!(own_status(&sent), ("dnd".to_owned(), "lunch".to_owned()));
@@ -340,21 +293,12 @@ mod tests {
         // Presence alone: the line stays, with its other fields.
         let idle = with_status(&status, "idle", None);
         assert_eq!(own_status(&idle), ("idle".to_owned(), "lunch".to_owned()));
-        assert!(
-            idle.windows(2).any(|pair| pair == [0x18, 0x01]),
-            "the unknown field was dropped"
-        );
+        assert!(idle.windows(2).any(|pair| pair == [0x18, 0x01]), "the unknown field was dropped");
         assert_eq!(bytes_of(&idle, 2), bytes_of(&status, 2));
         // A new line, then none.
-        assert_eq!(
-            own_status(&with_status(&idle, "online", Some("back"))),
-            ("online".to_owned(), "back".to_owned())
-        );
+        assert_eq!(own_status(&with_status(&idle, "online", Some("back"))), ("online".to_owned(), "back".to_owned()));
         let cleared = with_status(&idle, "online", Some(""));
-        assert_eq!(
-            (own_status(&cleared).1.as_str(), bytes_of(&cleared, 2)),
-            ("", None)
-        );
+        assert_eq!((own_status(&cleared).1.as_str(), bytes_of(&cleared, 2)), ("", None));
         assert_eq!(status_settings("AAAA"), None);
     }
 }

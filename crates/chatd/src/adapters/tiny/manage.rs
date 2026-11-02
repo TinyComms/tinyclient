@@ -14,19 +14,14 @@
 // The refusal is the answer to the shell, as everywhere in `tiny`: boxing it buys nothing here.
 #![allow(clippy::result_large_err)]
 
-use super::{
-    asked, endpoint, explain, open, refused, rows, safe_id, tiny_name, Missing, Saved, CHECK,
-    NOT_YOURS, UNREACHABLE, UNREADABLE,
-};
+use super::{asked, endpoint, explain, open, refused, rows, safe_id, tiny_name, Missing, Saved, CHECK, NOT_YOURS, UNREACHABLE, UNREADABLE};
 use protocol::{
-    tiny_allowed, AccountKey, Response, TinyAccess, TinyAuditFilter, TinyBan, TinyBot,
-    TinyCapabilities, TinyCategory, TinyCode, TinyInviteOptions, TinyLayoutGroup, TinyRole,
-    TinyRoleEdit, TinyRoom, TinyRoomEdit, TinySeat, TinyServerEdit, TinyServerInfo, TinySetup,
-    TinySetupApplied, TinySetupApply, TinySetupRefusal, TINY_ALL, TINY_BITRATE_MAX,
-    TINY_BITRATE_MIN, TINY_DESCRIPTION_MAX, TINY_FEATURE_AUDIT_QUERY, TINY_FEATURE_BANS,
-    TINY_FEATURE_CATEGORIES, TINY_FEATURE_FILE_SCAN, TINY_FEATURE_FIRST_RUN_SETUP,
-    TINY_FEATURE_INVITE_OPTIONS, TINY_FEATURE_ROLES, TINY_FEATURE_SERVER, TINY_FEATURE_TIMEOUTS,
-    TINY_FEATURE_UPLOAD_LIMITS, TINY_ICON_MAX, TINY_SERVER_NAME_MAX, TINY_UPLOAD_MAX,
+    tiny_allowed, AccountKey, Response, TinyAccess, TinyAuditFilter, TinyBan, TinyCapabilities, TinyCategory, TinyCode,
+    TinyBot, TinyInviteOptions, TinyLayoutGroup, TinyRole, TinyRoleEdit, TinyRoom, TinyRoomEdit, TinySeat, TinyServerEdit, TinyServerInfo,
+    TinySetup, TinySetupApplied, TinySetupApply, TinySetupRefusal,
+    TINY_ALL, TINY_BITRATE_MAX, TINY_BITRATE_MIN, TINY_DESCRIPTION_MAX, TINY_FEATURE_AUDIT_QUERY, TINY_FEATURE_BANS,
+    TINY_FEATURE_CATEGORIES, TINY_FEATURE_INVITE_OPTIONS, TINY_FEATURE_ROLES, TINY_FEATURE_SERVER, TINY_FEATURE_TIMEOUTS,
+    TINY_FEATURE_FILE_SCAN, TINY_FEATURE_FIRST_RUN_SETUP, TINY_FEATURE_UPLOAD_LIMITS, TINY_ICON_MAX, TINY_SERVER_NAME_MAX, TINY_UPLOAD_MAX,
     TINY_WELCOME_MAX,
 };
 use serde_json::{json, Map, Value};
@@ -86,10 +81,7 @@ fn key(saved: &Saved) -> String {
 }
 
 pub(crate) fn known(saved: &Saved) -> Known {
-    crate::hub::lock(&KNOWN)
-        .get(&key(saved))
-        .cloned()
-        .unwrap_or_default()
+    crate::hub::lock(&KNOWN).get(&key(saved)).cloned().unwrap_or_default()
 }
 
 pub(crate) fn remember(saved: &Saved, change: impl FnOnce(&mut Known)) {
@@ -104,19 +96,13 @@ pub(crate) fn room_audio(saved: &Saved, room_id: &str) -> (u32, bool) {
     let Some(room) = was.rooms.iter().find(|room| room.id == room_id) else {
         return (protocol::TINY_BITRATE_DEFAULT, false);
     };
-    let no_voice_activity = was
-        .access
-        .as_ref()
-        .is_some_and(|access| !access.has_in(room, protocol::TINY_VOICE_ACTIVITY));
+    let no_voice_activity = was.access.as_ref().is_some_and(|access| !access.has_in(room, protocol::TINY_VOICE_ACTIVITY));
     (room.bitrate(), room.ptt_only || no_voice_activity)
 }
 
 /// The room only takes end-to-end encrypted calls (`e2ee_required`), as the server last said.
 pub(crate) fn room_e2ee_required(saved: &Saved, room_id: &str) -> bool {
-    known(saved)
-        .rooms
-        .iter()
-        .any(|room| room.id == room_id && room.e2ee_required)
+    known(saved).rooms.iter().any(|room| room.id == room_id && room.e2ee_required)
 }
 
 /// `GET /v1/capabilities`. Anything but a readable 200 is an older server: no features.
@@ -130,9 +116,7 @@ pub(crate) fn capabilities_of(saved: &Saved) -> TinyCapabilities {
 /// What this account may do, from `GET /v1/me` on a server with roles.
 pub(crate) fn access_of(saved: &Saved) -> Option<TinyAccess> {
     match asked("GET", saved, "/v1/me", None) {
-        Ok((200, body)) if body.get("permissions").is_some() || body.get("owner").is_some() => {
-            serde_json::from_value(body).ok()
-        }
+        Ok((200, body)) if body.get("permissions").is_some() || body.get("owner").is_some() => serde_json::from_value(body).ok(),
         _ => None,
     }
 }
@@ -140,11 +124,7 @@ pub(crate) fn access_of(saved: &Saved) -> Option<TinyAccess> {
 /// The capabilities and access, read now and kept. The page refreshes them on each load.
 pub(crate) fn learn(saved: &Saved) -> Known {
     let capabilities = capabilities_of(saved);
-    let access = if capabilities.features.is_empty() {
-        None
-    } else {
-        access_of(saved)
-    };
+    let access = if capabilities.features.is_empty() { None } else { access_of(saved) };
     remember(saved, |known| {
         known.checked = true;
         known.capabilities = capabilities;
@@ -174,15 +154,7 @@ fn allowed(account: &AccountKey, feature: Option<&str>, id: &str) -> Result<Save
 
 /// One change: allowed, then sent, then any 2xx is done.
 #[allow(clippy::too_many_arguments)]
-fn change(
-    account: &AccountKey,
-    feature: Option<&str>,
-    id: &str,
-    method: &str,
-    path: &str,
-    body: Option<Value>,
-    missing: Missing,
-) -> Response {
+fn change(account: &AccountKey, feature: Option<&str>, id: &str, method: &str, path: &str, body: Option<Value>, missing: Missing) -> Response {
     let saved = match allowed(account, feature, id) {
         Ok(saved) => saved,
         Err(answer) => return answer,
@@ -190,13 +162,7 @@ fn change(
     sent(&saved, method, path, body, missing)
 }
 
-fn sent(
-    saved: &Saved,
-    method: &str,
-    path: &str,
-    body: Option<Value>,
-    missing: Missing,
-) -> Response {
+fn sent(saved: &Saved, method: &str, path: &str, body: Option<Value>, missing: Missing) -> Response {
     match asked(method, saved, path, body) {
         Err(detail) => refused(detail),
         Ok((200..=299, _)) => Response::Ok,
@@ -220,18 +186,14 @@ fn reason(text: &str) -> Result<&str, Response> {
 
 /// `#RRGGBB`.
 fn color_ok(color: &str) -> bool {
-    color.len() == 7
-        && color.starts_with('#')
-        && color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    color.len() == 7 && color.starts_with('#') && color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// For a query string: everything but unreserved characters as `%XX`.
 fn escape(text: &str) -> String {
     text.bytes()
         .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (byte as char).to_string(),
             _ => format!("%{byte:02X}"),
         })
         .collect()
@@ -254,21 +216,13 @@ pub(crate) fn server_of(saved: &Saved, account: &AccountKey) -> Option<TinyServe
         Ok((200, body)) => serde_json::from_value(body).ok()?,
         _ => return None,
     };
-    info.icon = info.icon.filter(|hash| {
-        !hash.is_empty() && hash.len() <= 128 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-    });
-    for word in [
-        &mut info.provider_profile,
-        &mut info.activity_visibility,
-        &mut info.sign_in_methods,
-    ] {
+    info.icon = info.icon.filter(|hash| !hash.is_empty() && hash.len() <= 128 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    for word in [&mut info.provider_profile, &mut info.activity_visibility, &mut info.sign_in_methods] {
         protocol::clip(word, SETUP_WORD_MAX);
     }
     protocol::clip(&mut info.setup_completed_at, SETUP_WORD_MAX);
     if let Some(hash) = info.icon.clone() {
-        info.icon_path = icon_file(saved, account, &hash)
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        info.icon_path = icon_file(saved, account, &hash).map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
     }
     Some(info)
 }
@@ -276,11 +230,7 @@ pub(crate) fn server_of(saved: &Saved, account: &AccountKey) -> Option<TinyServe
 /// The icon with this hash on disk, fetched when it is not there yet. A new icon is a new hash
 /// and so a new file; the shell never draws a stale one.
 fn icon_file(saved: &Saved, account: &AccountKey, hash: &str) -> Option<PathBuf> {
-    let path = crate::blobs::path_of(
-        &protocol::support_dir().join("media"),
-        account,
-        &format!("tiny-icon-{hash}"),
-    );
+    let path = crate::blobs::path_of(&protocol::support_dir().join("media"), account, &format!("tiny-icon-{hash}"));
     if path.is_file() {
         return Some(path);
     }
@@ -303,26 +253,15 @@ fn fetch_icon(saved: &Saved) -> Option<Vec<u8>> {
     }
     let mut bytes = Vec::new();
     let mut body = response.into_body();
-    body.as_reader()
-        .take(TINY_ICON_MAX as u64 + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
+    body.as_reader().take(TINY_ICON_MAX as u64 + 1).read_to_end(&mut bytes).ok()?;
     (bytes.len() <= TINY_ICON_MAX && image_kind(&bytes).is_some()).then_some(bytes)
 }
 
 /// Fetches each member's picture once per hash, beside the server icon, and names the file on
 /// the member. A hash already on disk is not fetched again.
-pub(crate) fn remember_avatars(
-    saved: &Saved,
-    account: &AccountKey,
-    members: &mut [protocol::TinyMember],
-) {
+pub(crate) fn remember_avatars(saved: &Saved, account: &AccountKey, members: &mut [protocol::TinyMember]) {
     for member in members {
-        let Some(hash) = member
-            .avatar
-            .as_deref()
-            .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        else {
+        let Some(hash) = member.avatar.as_deref().filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())) else {
             member.avatar_path.clear();
             continue;
         };
@@ -336,11 +275,7 @@ pub(crate) fn remember_avatars(
 }
 
 fn avatar_file(saved: &Saved, account: &AccountKey, user_id: &str, hash: &str) -> Option<PathBuf> {
-    let path = crate::blobs::path_of(
-        &protocol::support_dir().join("media"),
-        account,
-        &format!("tiny-avatar-{user_id}-{hash}"),
-    );
+    let path = crate::blobs::path_of(&protocol::support_dir().join("media"), account, &format!("tiny-avatar-{user_id}-{hash}"));
     if path.is_file() {
         return Some(path);
     }
@@ -354,10 +289,7 @@ fn avatar_file(saved: &Saved, account: &AccountKey, user_id: &str, hash: &str) -
 
 fn fetch_avatar(saved: &Saved, user_id: &str) -> Option<Vec<u8>> {
     let response = super::agent()
-        .get(&endpoint(
-            &saved.base_url,
-            &format!("/v1/users/{user_id}/avatar"),
-        ))
+        .get(&endpoint(&saved.base_url, &format!("/v1/users/{user_id}/avatar")))
         .header("Authorization", &format!("Bearer {}", saved.token))
         .call()
         .ok()?;
@@ -366,10 +298,7 @@ fn fetch_avatar(saved: &Saved, user_id: &str) -> Option<Vec<u8>> {
     }
     let mut bytes = Vec::new();
     let mut body = response.into_body();
-    body.as_reader()
-        .take(TINY_ICON_MAX as u64 + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
+    body.as_reader().take(TINY_ICON_MAX as u64 + 1).read_to_end(&mut bytes).ok()?;
     (bytes.len() <= TINY_ICON_MAX && image_kind(&bytes).is_some()).then_some(bytes)
 }
 
@@ -428,24 +357,10 @@ pub(crate) fn extras(saved: &Saved, account: &AccountKey, was: &Known) -> Extras
     let has = |feature| was.capabilities.has(feature);
     let may = |id| tiny_allowed(was.access.as_ref(), &saved.role, id);
     Extras {
-        server: has(TINY_FEATURE_SERVER)
-            .then(|| server_of(saved, account))
-            .flatten(),
-        roles: if has(TINY_FEATURE_ROLES) {
-            roles_of(saved)
-        } else {
-            Vec::new()
-        },
-        categories: if has(TINY_FEATURE_CATEGORIES) {
-            categories_of(saved)
-        } else {
-            Vec::new()
-        },
-        bans: if has(TINY_FEATURE_BANS) && may("community.bans.read") {
-            bans_of(saved)
-        } else {
-            Vec::new()
-        },
+        server: has(TINY_FEATURE_SERVER).then(|| server_of(saved, account)).flatten(),
+        roles: if has(TINY_FEATURE_ROLES) { roles_of(saved) } else { Vec::new() },
+        categories: if has(TINY_FEATURE_CATEGORIES) { categories_of(saved) } else { Vec::new() },
+        bans: if has(TINY_FEATURE_BANS) && may("community.bans.read") { bans_of(saved) } else { Vec::new() },
     }
 }
 
@@ -455,9 +370,7 @@ pub(crate) fn server_update(account: AccountKey, edit: TinyServerEdit) -> Respon
     let mut body = Map::new();
     if let Some(name) = &edit.name {
         match name.trim() {
-            name if name.is_empty() || name.chars().count() > TINY_SERVER_NAME_MAX => {
-                return refused(SERVER_NAME_SIZE)
-            }
+            name if name.is_empty() || name.chars().count() > TINY_SERVER_NAME_MAX => return refused(SERVER_NAME_SIZE),
             name => body.insert("name".into(), json!(name)),
         };
     }
@@ -473,10 +386,7 @@ pub(crate) fn server_update(account: AccountKey, edit: TinyServerEdit) -> Respon
         };
         body.insert("welcome".into(), json!(welcome));
     }
-    for (field, room) in [
-        ("default_room_id", &edit.default_room_id),
-        ("afk_room_id", &edit.afk_room_id),
-    ] {
+    for (field, room) in [("default_room_id", &edit.default_room_id), ("afk_room_id", &edit.afk_room_id)] {
         if let Some(room) = room {
             if !room.is_empty() && !safe_id(room) {
                 return refused(CHECK);
@@ -491,18 +401,11 @@ pub(crate) fn server_update(account: AccountKey, edit: TinyServerEdit) -> Respon
         body.insert("afk_timeout_secs".into(), json!(secs));
     }
     if edit.image_max_bytes.is_some() || edit.file_max_bytes.is_some() {
-        if let Err(answer) = allowed(
-            &account,
-            Some(TINY_FEATURE_UPLOAD_LIMITS),
-            "community.server.edit",
-        ) {
+        if let Err(answer) = allowed(&account, Some(TINY_FEATURE_UPLOAD_LIMITS), "community.server.edit") {
             return answer;
         }
     }
-    for (field, bytes) in [
-        ("image_max_bytes", edit.image_max_bytes),
-        ("file_max_bytes", edit.file_max_bytes),
-    ] {
+    for (field, bytes) in [("image_max_bytes", edit.image_max_bytes), ("file_max_bytes", edit.file_max_bytes)] {
         if let Some(bytes) = bytes {
             if !(1..=TINY_UPLOAD_MAX).contains(&bytes) {
                 return refused(UPLOAD_LIMIT);
@@ -511,11 +414,7 @@ pub(crate) fn server_update(account: AccountKey, edit: TinyServerEdit) -> Respon
         }
     }
     if let Some(allow) = edit.allow_archives {
-        if let Err(answer) = allowed(
-            &account,
-            Some(TINY_FEATURE_FILE_SCAN),
-            "community.server.edit",
-        ) {
+        if let Err(answer) = allowed(&account, Some(TINY_FEATURE_FILE_SCAN), "community.server.edit") {
             return answer;
         }
         body.insert("allow_archives".into(), json!(allow));
@@ -523,15 +422,7 @@ pub(crate) fn server_update(account: AccountKey, edit: TinyServerEdit) -> Respon
     if body.is_empty() {
         return Response::Ok;
     }
-    change(
-        &account,
-        Some(TINY_FEATURE_SERVER),
-        "community.server.edit",
-        "PATCH",
-        "/v1/server",
-        Some(Value::Object(body)),
-        Missing::Plain,
-    )
+    change(&account, Some(TINY_FEATURE_SERVER), "community.server.edit", "PATCH", "/v1/server", Some(Value::Object(body)), Missing::Plain)
 }
 
 /// The picture at `path` as the icon, or with `None` no icon. The file is read here, checked,
@@ -549,8 +440,7 @@ pub(crate) fn server_icon(account: AccountKey, path: Option<String>) -> Response
         Err(why) => return refused(&format!("That picture {why}")),
     };
     let mut bytes = Vec::new();
-    let read = std::fs::File::open(&real)
-        .and_then(|file| file.take(TINY_ICON_MAX as u64 + 1).read_to_end(&mut bytes));
+    let read = std::fs::File::open(&real).and_then(|file| file.take(TINY_ICON_MAX as u64 + 1).read_to_end(&mut bytes));
     if read.is_err() {
         return refused("That picture couldn't be read.");
     }
@@ -587,8 +477,7 @@ pub(crate) fn user_avatar(account: AccountKey, path: Option<String>) -> Response
         Err(why) => return refused(&format!("That picture {why}")),
     };
     let mut bytes = Vec::new();
-    let read = std::fs::File::open(&real)
-        .and_then(|file| file.take(TINY_ICON_MAX as u64 + 1).read_to_end(&mut bytes));
+    let read = std::fs::File::open(&real).and_then(|file| file.take(TINY_ICON_MAX as u64 + 1).read_to_end(&mut bytes));
     if read.is_err() {
         return refused("That picture couldn't be read.");
     }
@@ -606,12 +495,7 @@ pub(crate) fn user_avatar(account: AccountKey, path: Option<String>) -> Response
     }
 }
 
-fn put_bytes(
-    saved: &Saved,
-    path: &str,
-    kind: &str,
-    bytes: &[u8],
-) -> Result<(u16, Value), &'static str> {
+fn put_bytes(saved: &Saved, path: &str, kind: &str, bytes: &[u8]) -> Result<(u16, Value), &'static str> {
     let sent = super::agent()
         .put(&endpoint(&saved.base_url, path))
         .header("Authorization", &format!("Bearer {}", saved.token))
@@ -622,11 +506,7 @@ fn put_bytes(
     if (300..400).contains(&status) {
         return Err(UNREACHABLE);
     }
-    let body = if status == 204 {
-        Value::Null
-    } else {
-        response.body_mut().read_json().unwrap_or(Value::Null)
-    };
+    let body = if status == 204 { Value::Null } else { response.body_mut().read_json().unwrap_or(Value::Null) };
     Ok((status, body))
 }
 
@@ -661,24 +541,13 @@ fn setup_bounded(mut setup: TinySetup) -> TinySetup {
     setup.always.truncate(SETUP_ROWS_MAX);
     setup.always.iter_mut().for_each(words);
     for preset in &mut setup.presets {
-        [
-            &mut preset.id,
-            &mut preset.title,
-            &mut preset.summary,
-            &mut preset.unavailable,
-        ]
-        .into_iter()
-        .for_each(words);
+        [&mut preset.id, &mut preset.title, &mut preset.summary, &mut preset.unavailable].into_iter().for_each(words);
     }
     for choice in &mut setup.choices {
-        [&mut choice.id, &mut choice.title, &mut choice.question]
-            .into_iter()
-            .for_each(words);
+        [&mut choice.id, &mut choice.title, &mut choice.question].into_iter().for_each(words);
         choice.options.truncate(SETUP_ROWS_MAX);
         for option in &mut choice.options {
-            [&mut option.id, &mut option.title, &mut option.effect]
-                .into_iter()
-                .for_each(words);
+            [&mut option.id, &mut option.title, &mut option.effect].into_iter().for_each(words);
             option.needs.truncate(SETUP_ROWS_MAX);
             option.needs.iter_mut().for_each(words);
         }
@@ -695,9 +564,7 @@ pub(crate) fn setup_read(account: AccountKey) -> Response {
     match asked("GET", &saved, "/v1/setup", None) {
         Err(detail) => refused(detail),
         Ok((200, body)) => match serde_json::from_value::<TinySetup>(body) {
-            Ok(setup) => Response::TinySetup {
-                setup: setup_bounded(setup),
-            },
+            Ok(setup) => Response::TinySetup { setup: setup_bounded(setup) },
             Err(_) => refused(UNREADABLE),
         },
         Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
@@ -707,11 +574,7 @@ pub(crate) fn setup_read(account: AccountKey) -> Response {
 /// A value the server names a preset or a choice's option by: short, lower case and underscores.
 /// The server checks it again and refuses one it does not know.
 fn setup_word(word: &str) -> bool {
-    !word.is_empty()
-        && word.len() <= SETUP_WORD_MAX
-        && word
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+    !word.is_empty() && word.len() <= SETUP_WORD_MAX && word.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_')
 }
 
 fn setup_body(apply: &TinySetupApply) -> Result<Value, Response> {
@@ -730,10 +593,7 @@ fn setup_body(apply: &TinySetupApply) -> Result<Value, Response> {
         }
     }
     // Left off unless asked for: the server reads a missing flag as no.
-    for (field, on) in [
-        ("erase_emails", apply.erase_emails),
-        ("allow_lockout", apply.allow_lockout),
-    ] {
+    for (field, on) in [("erase_emails", apply.erase_emails), ("allow_lockout", apply.allow_lockout)] {
         if on {
             body.insert(field.into(), json!(true));
         }
@@ -747,10 +607,7 @@ fn setup_refusal(body: &Value) -> Option<TinySetupRefusal> {
         "passkeys_unavailable" => Some(TinySetupRefusal::PasskeysUnavailable),
         "owner_needs_passkey" => Some(TinySetupRefusal::OwnerNeedsPasskey),
         "members_without_passkey" => {
-            let count = body
-                .get("count")
-                .and_then(Value::as_u64)
-                .map_or(0, |count| u32::try_from(count).unwrap_or(u32::MAX));
+            let count = body.get("count").and_then(Value::as_u64).map_or(0, |count| u32::try_from(count).unwrap_or(u32::MAX));
             Some(TinySetupRefusal::MembersWithoutPasskey { count })
         }
         _ => None,
@@ -805,11 +662,7 @@ pub(crate) fn passkey_link_with(account: AccountKey, browser: &super::browser::O
         },
         // Making a link wants a sign-in within the last ten minutes, so a stolen old session
         // cannot plant a passkey of its own.
-        Ok((403, body))
-            if body.get("error").and_then(Value::as_str) == Some("recent_sign_in_required") =>
-        {
-            refused(SIGN_IN_AGAIN)
-        }
+        Ok((403, body)) if body.get("error").and_then(Value::as_str) == Some("recent_sign_in_required") => refused(SIGN_IN_AGAIN),
         Ok((404, _)) => refused(OLDER),
         Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
     }
@@ -849,15 +702,7 @@ fn role_body(role: &TinyRoleEdit, creating: bool) -> Result<Value, Response> {
 
 pub(crate) fn role_create(account: AccountKey, role: TinyRoleEdit) -> Response {
     match role_body(&role, true) {
-        Ok(body) => change(
-            &account,
-            Some(TINY_FEATURE_ROLES),
-            "community.roles.manage",
-            "POST",
-            "/v1/roles",
-            Some(body),
-            Missing::Role,
-        ),
+        Ok(body) => change(&account, Some(TINY_FEATURE_ROLES), "community.roles.manage", "POST", "/v1/roles", Some(body), Missing::Role),
         Err(answer) => answer,
     }
 }
@@ -867,15 +712,7 @@ pub(crate) fn role_update(account: AccountKey, role_id: String, role: TinyRoleEd
         return refused(CHECK);
     }
     match role_body(&role, false) {
-        Ok(body) => change(
-            &account,
-            Some(TINY_FEATURE_ROLES),
-            "community.roles.manage",
-            "PATCH",
-            &format!("/v1/roles/{role_id}"),
-            Some(body),
-            Missing::Role,
-        ),
+        Ok(body) => change(&account, Some(TINY_FEATURE_ROLES), "community.roles.manage", "PATCH", &format!("/v1/roles/{role_id}"), Some(body), Missing::Role),
         Err(answer) => answer,
     }
 }
@@ -884,52 +721,24 @@ pub(crate) fn role_delete(account: AccountKey, role_id: String) -> Response {
     if !safe_id(&role_id) {
         return refused(CHECK);
     }
-    change(
-        &account,
-        Some(TINY_FEATURE_ROLES),
-        "community.roles.manage",
-        "DELETE",
-        &format!("/v1/roles/{role_id}"),
-        None,
-        Missing::Role,
-    )
+    change(&account, Some(TINY_FEATURE_ROLES), "community.roles.manage", "DELETE", &format!("/v1/roles/{role_id}"), None, Missing::Role)
 }
 
 pub(crate) fn role_order(account: AccountKey, role_ids: Vec<String>) -> Response {
     if role_ids.len() > LIST_MAX || !role_ids.iter().all(|id| safe_id(id)) {
         return refused(CHECK);
     }
-    change(
-        &account,
-        Some(TINY_FEATURE_ROLES),
-        "community.roles.manage",
-        "PUT",
-        "/v1/roles/order",
-        Some(json!({ "ids": role_ids })),
-        Missing::Role,
-    )
+    change(&account, Some(TINY_FEATURE_ROLES), "community.roles.manage", "PUT", "/v1/roles/order", Some(json!({ "ids": role_ids })), Missing::Role)
 }
 
 // Members.
 
-pub(crate) fn member_roles(
-    account: AccountKey,
-    user_id: String,
-    role_ids: Vec<String>,
-) -> Response {
+pub(crate) fn member_roles(account: AccountKey, user_id: String, role_ids: Vec<String>) -> Response {
     if !safe_id(&user_id) || role_ids.len() > LIST_MAX || !role_ids.iter().all(|id| safe_id(id)) {
         return refused(CHECK);
     }
     let path = format!("/v1/members/{user_id}/roles");
-    change(
-        &account,
-        Some(TINY_FEATURE_ROLES),
-        "community.members.role",
-        "PUT",
-        &path,
-        Some(json!({ "role_ids": role_ids })),
-        Missing::Member,
-    )
+    change(&account, Some(TINY_FEATURE_ROLES), "community.members.role", "PUT", &path, Some(json!({ "role_ids": role_ids })), Missing::Member)
 }
 
 pub(crate) fn member_owner(account: AccountKey, user_id: String, owner: bool) -> Response {
@@ -937,28 +746,11 @@ pub(crate) fn member_owner(account: AccountKey, user_id: String, owner: bool) ->
         return refused(CHECK);
     }
     let path = format!("/v1/members/{user_id}/owner");
-    change(
-        &account,
-        Some(TINY_FEATURE_ROLES),
-        "community.members.owner",
-        "PUT",
-        &path,
-        Some(json!({ "owner": owner })),
-        Missing::Member,
-    )
+    change(&account, Some(TINY_FEATURE_ROLES), "community.members.owner", "PUT", &path, Some(json!({ "owner": owner })), Missing::Member)
 }
 
-pub(crate) fn timeout(
-    account: AccountKey,
-    user_id: String,
-    until: Option<String>,
-    why: String,
-) -> Response {
-    if !safe_id(&user_id)
-        || until
-            .as_ref()
-            .is_some_and(|until| until.is_empty() || until.len() > 64)
-    {
+pub(crate) fn timeout(account: AccountKey, user_id: String, until: Option<String>, why: String) -> Response {
+    if !safe_id(&user_id) || until.as_ref().is_some_and(|until| until.is_empty() || until.len() > 64) {
         return refused(CHECK);
     }
     let why = match reason(&why) {
@@ -970,15 +762,7 @@ pub(crate) fn timeout(
         body["reason"] = json!(why);
     }
     let path = format!("/v1/members/{user_id}/timeout");
-    change(
-        &account,
-        Some(TINY_FEATURE_TIMEOUTS),
-        "community.members.timeout",
-        "PUT",
-        &path,
-        Some(body),
-        Missing::Member,
-    )
+    change(&account, Some(TINY_FEATURE_TIMEOUTS), "community.members.timeout", "PUT", &path, Some(body), Missing::Member)
 }
 
 /// `TinyRemove` with a reason. An older server takes the removal and ignores the reason.
@@ -990,35 +774,14 @@ pub(crate) fn kick(account: AccountKey, user_id: String, why: String) -> Respons
         Ok(why) => why,
         Err(answer) => return answer,
     };
-    let path = if why.is_empty() {
-        format!("/v1/members/{user_id}")
-    } else {
-        format!("/v1/members/{user_id}?reason={}", escape(why))
-    };
-    change(
-        &account,
-        None,
-        "community.members.remove",
-        "DELETE",
-        &path,
-        None,
-        Missing::Member,
-    )
+    let path = if why.is_empty() { format!("/v1/members/{user_id}") } else { format!("/v1/members/{user_id}?reason={}", escape(why)) };
+    change(&account, None, "community.members.remove", "DELETE", &path, None, Missing::Member)
 }
 
 // Bans.
 
-pub(crate) fn ban(
-    account: AccountKey,
-    user_id: String,
-    why: String,
-    expires_at: Option<String>,
-) -> Response {
-    if !safe_id(&user_id)
-        || expires_at
-            .as_ref()
-            .is_some_and(|at| at.is_empty() || at.len() > 64)
-    {
+pub(crate) fn ban(account: AccountKey, user_id: String, why: String, expires_at: Option<String>) -> Response {
+    if !safe_id(&user_id) || expires_at.as_ref().is_some_and(|at| at.is_empty() || at.len() > 64) {
         return refused(CHECK);
     }
     let why = match reason(&why) {
@@ -1032,30 +795,14 @@ pub(crate) fn ban(
     if let Some(at) = expires_at {
         body["expires_at"] = json!(at);
     }
-    change(
-        &account,
-        Some(TINY_FEATURE_BANS),
-        "community.members.ban",
-        "POST",
-        "/v1/bans",
-        Some(body),
-        Missing::Member,
-    )
+    change(&account, Some(TINY_FEATURE_BANS), "community.members.ban", "POST", "/v1/bans", Some(body), Missing::Member)
 }
 
 pub(crate) fn unban(account: AccountKey, user_id: String) -> Response {
     if !safe_id(&user_id) {
         return refused(CHECK);
     }
-    change(
-        &account,
-        Some(TINY_FEATURE_BANS),
-        "community.members.ban",
-        "DELETE",
-        &format!("/v1/bans/{user_id}"),
-        None,
-        Missing::Ban,
-    )
+    change(&account, Some(TINY_FEATURE_BANS), "community.members.ban", "DELETE", &format!("/v1/bans/{user_id}"), None, Missing::Ban)
 }
 
 // Categories and layout.
@@ -1064,15 +811,7 @@ pub(crate) fn category_create(account: AccountKey, name: String) -> Response {
     let Some(name) = tiny_name(&name) else {
         return refused(CATEGORY_NAME_SIZE);
     };
-    change(
-        &account,
-        Some(TINY_FEATURE_CATEGORIES),
-        "community.categories.manage",
-        "POST",
-        "/v1/categories",
-        Some(json!({ "name": name })),
-        Missing::Category,
-    )
+    change(&account, Some(TINY_FEATURE_CATEGORIES), "community.categories.manage", "POST", "/v1/categories", Some(json!({ "name": name })), Missing::Category)
 }
 
 pub(crate) fn category_rename(account: AccountKey, category_id: String, name: String) -> Response {
@@ -1083,15 +822,7 @@ pub(crate) fn category_rename(account: AccountKey, category_id: String, name: St
         return refused(CATEGORY_NAME_SIZE);
     };
     let path = format!("/v1/categories/{category_id}");
-    change(
-        &account,
-        Some(TINY_FEATURE_CATEGORIES),
-        "community.categories.manage",
-        "PATCH",
-        &path,
-        Some(json!({ "name": name })),
-        Missing::Category,
-    )
+    change(&account, Some(TINY_FEATURE_CATEGORIES), "community.categories.manage", "PATCH", &path, Some(json!({ "name": name })), Missing::Category)
 }
 
 pub(crate) fn category_delete(account: AccountKey, category_id: String) -> Response {
@@ -1099,39 +830,17 @@ pub(crate) fn category_delete(account: AccountKey, category_id: String) -> Respo
         return refused(CHECK);
     }
     let path = format!("/v1/categories/{category_id}");
-    change(
-        &account,
-        Some(TINY_FEATURE_CATEGORIES),
-        "community.categories.manage",
-        "DELETE",
-        &path,
-        None,
-        Missing::Category,
-    )
+    change(&account, Some(TINY_FEATURE_CATEGORIES), "community.categories.manage", "DELETE", &path, None, Missing::Category)
 }
 
 pub(crate) fn layout(account: AccountKey, groups: Vec<TinyLayoutGroup>) -> Response {
     let rooms: usize = groups.iter().map(|group| group.room_ids.len()).sum();
-    let ids_fine = groups.iter().all(|group| {
-        group.category_id.as_deref().is_none_or(safe_id)
-            && group.room_ids.iter().all(|id| safe_id(id))
-    });
+    let ids_fine = groups.iter().all(|group| group.category_id.as_deref().is_none_or(safe_id) && group.room_ids.iter().all(|id| safe_id(id)));
     if groups.len() > LIST_MAX || rooms > LIST_MAX || !ids_fine {
         return refused(CHECK);
     }
-    let categories: Vec<Value> = groups
-        .iter()
-        .map(|group| json!({ "id": group.category_id, "room_ids": group.room_ids }))
-        .collect();
-    change(
-        &account,
-        Some(TINY_FEATURE_CATEGORIES),
-        "community.categories.manage",
-        "PUT",
-        "/v1/layout",
-        Some(json!({ "categories": categories })),
-        Missing::Room,
-    )
+    let categories: Vec<Value> = groups.iter().map(|group| json!({ "id": group.category_id, "room_ids": group.room_ids })).collect();
+    change(&account, Some(TINY_FEATURE_CATEGORIES), "community.categories.manage", "PUT", "/v1/layout", Some(json!({ "categories": categories })), Missing::Room)
 }
 
 // Rooms.
@@ -1209,46 +918,18 @@ pub(crate) fn room_update(account: AccountKey, room_id: String, room: TinyRoomEd
         Ok(body) => body,
         Err(answer) => return answer,
     };
-    let only_name = body
-        .as_object()
-        .is_some_and(|body| body.keys().all(|key| key == "name"));
+    let only_name = body.as_object().is_some_and(|body| body.keys().all(|key| key == "name"));
     // A rename alone is what an older server takes, under its own name.
-    let (feature, id) = if only_name {
-        (None, "community.rooms.rename")
-    } else {
-        (Some(TINY_FEATURE_CATEGORIES), "community.rooms.edit")
-    };
-    change(
-        &account,
-        feature,
-        id,
-        "PATCH",
-        &format!("/v1/rooms/{room_id}"),
-        Some(body),
-        Missing::Room,
-    )
+    let (feature, id) = if only_name { (None, "community.rooms.rename") } else { (Some(TINY_FEATURE_CATEGORIES), "community.rooms.edit") };
+    change(&account, feature, id, "PATCH", &format!("/v1/rooms/{room_id}"), Some(body), Missing::Room)
 }
 
-pub(crate) fn override_set(
-    account: AccountKey,
-    room_id: String,
-    role_id: String,
-    allow: u64,
-    deny: u64,
-) -> Response {
+pub(crate) fn override_set(account: AccountKey, room_id: String, role_id: String, allow: u64, deny: u64) -> Response {
     if !ids_ok(&[&room_id, &role_id]) || (allow | deny) & !TINY_ALL != 0 || allow & deny != 0 {
         return refused(CHECK);
     }
     let path = format!("/v1/rooms/{room_id}/overrides/{role_id}");
-    change(
-        &account,
-        Some(TINY_FEATURE_ROLES),
-        "community.rooms.overrides",
-        "PUT",
-        &path,
-        Some(json!({ "allow": allow, "deny": deny })),
-        Missing::Room,
-    )
+    change(&account, Some(TINY_FEATURE_ROLES), "community.rooms.overrides", "PUT", &path, Some(json!({ "allow": allow, "deny": deny })), Missing::Room)
 }
 
 pub(crate) fn override_clear(account: AccountKey, room_id: String, role_id: String) -> Response {
@@ -1256,25 +937,13 @@ pub(crate) fn override_clear(account: AccountKey, room_id: String, role_id: Stri
         return refused(CHECK);
     }
     let path = format!("/v1/rooms/{room_id}/overrides/{role_id}");
-    change(
-        &account,
-        Some(TINY_FEATURE_ROLES),
-        "community.rooms.overrides",
-        "DELETE",
-        &path,
-        None,
-        Missing::Room,
-    )
+    change(&account, Some(TINY_FEATURE_ROLES), "community.rooms.overrides", "DELETE", &path, None, Missing::Room)
 }
 
 // Invites and the audit.
 
 pub(crate) fn invite_with(account: AccountKey, options: TinyInviteOptions) -> Response {
-    let id = if options.role_ids.is_empty() {
-        "community.invites.create"
-    } else {
-        "community.invites.roles"
-    };
+    let id = if options.role_ids.is_empty() { "community.invites.create" } else { "community.invites.roles" };
     let saved = match allowed(&account, Some(TINY_FEATURE_INVITE_OPTIONS), id) {
         Ok(saved) => saved,
         Err(answer) => return answer,
@@ -1299,10 +968,7 @@ pub(crate) fn invite_with(account: AccountKey, options: TinyInviteOptions) -> Re
         body["max_uses"] = json!(uses);
     }
     if !options.default_expiry {
-        if options
-            .expires_in_secs
-            .is_some_and(|secs| !(60..=2_592_000).contains(&secs))
-        {
+        if options.expires_in_secs.is_some_and(|secs| !(60..=2_592_000).contains(&secs)) {
             return refused(EXPIRY);
         }
         // `null` is never, which the server allows only owners and server managers.
@@ -1387,11 +1053,7 @@ pub(crate) fn bots_create(account: AccountKey, name: String, scopes: Vec<String>
     let Some(name) = text_within(&name, 80).filter(|name| !name.is_empty()) else {
         return refused(BOT_NAME);
     };
-    if scopes.len() > BOT_SCOPE.len()
-        || scopes
-            .iter()
-            .any(|scope| !BOT_SCOPE.contains(&scope.as_str()))
-    {
+    if scopes.len() > BOT_SCOPE.len() || scopes.iter().any(|scope| !BOT_SCOPE.contains(&scope.as_str())) {
         return refused(BOT_SCOPES);
     }
     let mut granted = Vec::new();
@@ -1400,12 +1062,7 @@ pub(crate) fn bots_create(account: AccountKey, name: String, scopes: Vec<String>
             granted.push(scope);
         }
     }
-    match asked(
-        "POST",
-        &saved,
-        "/v1/bots",
-        Some(json!({ "name": name, "scopes": granted })),
-    ) {
+    match asked("POST", &saved, "/v1/bots", Some(json!({ "name": name, "scopes": granted }))) {
         Err(detail) => refused(detail),
         Ok((201, body)) => match created_bot(body) {
             Some((bot, token)) => Response::TinyBotCreated { bot, token },
@@ -1424,34 +1081,19 @@ pub(crate) fn bots_revoke(account: AccountKey, bot_id: String) -> Response {
         Ok(saved) => saved,
         Err(answer) => return answer,
     };
-    sent(
-        &saved,
-        "DELETE",
-        &format!("/v1/bots/{bot_id}"),
-        None,
-        Missing::Plain,
-    )
+    sent(&saved, "DELETE", &format!("/v1/bots/{bot_id}"), None, Missing::Plain)
 }
 
 /// `POST /v1/bots` returns the bot and its one-time token. The token is not logged.
 fn created_bot(body: Value) -> Option<(TinyBot, String)> {
-    let token = body
-        .get("token")
-        .and_then(Value::as_str)
-        .filter(|token| !token.is_empty())?
-        .to_owned();
+    let token = body.get("token").and_then(Value::as_str).filter(|token| !token.is_empty())?.to_owned();
     let bot = serde_json::from_value(body).ok()?;
     Some((bot, token))
 }
 
 /// The checks before a call request goes to the live socket: the server has the feature, this
 /// account may, and the ids are ids.
-pub(crate) fn call_allowed(
-    account: &AccountKey,
-    feature: &str,
-    needs: &[&str],
-    ids: &[&str],
-) -> Result<(), Response> {
+pub(crate) fn call_allowed(account: &AccountKey, feature: &str, needs: &[&str], ids: &[&str]) -> Result<(), Response> {
     for id in needs {
         allowed(account, Some(feature), id)?;
     }

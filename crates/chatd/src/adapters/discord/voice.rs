@@ -6,8 +6,7 @@ use super::model::{self, VoiceState};
 use super::rest::Refused;
 use super::Discord;
 use protocol::{
-    CallFailure, CallSupport, ConversationKind, Dave, Network, Occupant, Participant, Relation,
-    VoiceJoin, Watching,
+    CallFailure, CallSupport, ConversationKind, Dave, Network, Occupant, Participant, Relation, VoiceJoin, Watching,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -62,7 +61,7 @@ fn app_installed() -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        app_installed_macos()
+    app_installed_macos()
     }
 }
 
@@ -78,11 +77,7 @@ fn app_installed_macos() -> bool {
             encoding: u32,
             base: *const c_void,
         ) -> *const c_void;
-        fn LSCopyDefaultApplicationURLForURL(
-            url: *const c_void,
-            roles: u32,
-            error: *mut *const c_void,
-        ) -> *const c_void;
+        fn LSCopyDefaultApplicationURLForURL(url: *const c_void, roles: u32, error: *mut *const c_void) -> *const c_void;
         fn CFRelease(object: *const c_void);
     }
     const UTF8: u32 = 0x0800_0100;
@@ -91,13 +86,7 @@ fn app_installed_macos() -> bool {
     // SAFETY: the bytes outlive the call that copies them; every object made or copied here is
     // released once, and a null answer is not released.
     unsafe {
-        let url = CFURLCreateWithBytes(
-            std::ptr::null(),
-            scheme.as_ptr(),
-            scheme.len() as isize,
-            UTF8,
-            std::ptr::null(),
-        );
+        let url = CFURLCreateWithBytes(std::ptr::null(), scheme.as_ptr(), scheme.len() as isize, UTF8, std::ptr::null());
         if url.is_null() {
             return false;
         }
@@ -115,25 +104,14 @@ fn app_installed_macos() -> bool {
 /// what the network stack said stay in the log.
 fn ring_refused(refused: &Refused) -> String {
     match refused {
-        Refused::Network(_) => {
-            "Discord couldn't be reached to place the call. Check your connection, then try again."
-                .to_owned()
-        }
-        Refused::Status {
-            code: 50013 | 50001 | 50007,
-            ..
-        }
-        | Refused::Status { status: 403, .. } => {
+        Refused::Network(_) => "Discord couldn't be reached to place the call. Check your connection, then try again.".to_owned(),
+        Refused::Status { code: 50013 | 50001 | 50007, .. } | Refused::Status { status: 403, .. } => {
             "Discord didn't let you call here. They may not accept calls from you.".to_owned()
         }
-        Refused::Status { code: 40002, .. }
-        | Refused::Expired
-        | Refused::Challenge
-        | Refused::Limited(_)
-        | Refused::Paused(_) => refused.reason(),
-        Refused::Status { .. } => {
-            "Discord didn't place the call. Try again, or call from Discord.".to_owned()
+        Refused::Status { code: 40002, .. } | Refused::Expired | Refused::Challenge | Refused::Limited(_) | Refused::Paused(_) => {
+            refused.reason()
         }
+        Refused::Status { .. } => "Discord didn't place the call. Try again, or call from Discord.".to_owned(),
     }
 }
 
@@ -208,10 +186,7 @@ impl Voice {
     /// True for a channel whose occupants chatd is to know: one of the server on screen, the
     /// call we are in, or a direct call in progress.
     fn watched(&self, channel: &str, guild: Option<&str>) -> bool {
-        let ours = self
-            .call
-            .as_ref()
-            .is_some_and(|call| call.conversation == channel);
+        let ours = self.call.as_ref().is_some_and(|call| call.conversation == channel);
         ours || match guild {
             Some(guild) => self.shown.as_deref() == Some(guild),
             None => true,
@@ -261,11 +236,7 @@ impl Discord {
             let Some(call) = &mut state.voice.call else {
                 return;
             };
-            let there = state
-                .voice
-                .states
-                .iter()
-                .filter(|(id, heard)| heard.channel == call.conversation && **id != state.me);
+            let there = state.voice.states.iter().filter(|(id, heard)| heard.channel == call.conversation && **id != state.me);
             let participants: Vec<Participant> = there
                 .map(|(id, heard)| Participant {
                     id: id.clone(),
@@ -296,16 +267,8 @@ impl Discord {
             let mut state = self.state.lock().unwrap();
             let state = &mut *state;
             for channel in channels {
-                let mut there: Vec<(&String, &Heard)> = state
-                    .voice
-                    .states
-                    .iter()
-                    .filter(|(_, heard)| heard.channel == channel)
-                    .collect();
-                let guild = there
-                    .first()
-                    .map(|(_, heard)| heard.guild.clone())
-                    .or_else(|| state.voice.told.get(&channel).cloned());
+                let mut there: Vec<(&String, &Heard)> = state.voice.states.iter().filter(|(_, heard)| heard.channel == channel).collect();
+                let guild = there.first().map(|(_, heard)| heard.guild.clone()).or_else(|| state.voice.told.get(&channel).cloned());
                 let Some(guild) = guild else {
                     continue;
                 };
@@ -316,9 +279,7 @@ impl Discord {
                     continue;
                 }
                 // A channel with a friend in it is told wherever it is: the home's "In voice".
-                let friend = there
-                    .iter()
-                    .any(|(id, _)| state.relations.get(*id) == Some(&Relation::Friend));
+                let friend = there.iter().any(|(id, _)| state.relations.get(*id) == Some(&Relation::Friend));
                 if !friend && !state.voice.watched(&channel, guild.as_deref()) {
                     // No longer on screen and not our call any more: chatd lets it go.
                     if state.voice.told.remove(&channel).is_some() {
@@ -329,26 +290,17 @@ impl Discord {
                 // On-stage (live) people first, then friends, then by name, so the capped
                 // list never hides a speaker or a friend behind a crowd whose names sort earlier.
                 there.sort_by_cached_key(|(id, heard)| {
-                    (
-                        !heard.live,
-                        state.relations.get(*id) != Some(&Relation::Friend),
-                        heard.name.to_lowercase(),
-                        (*id).clone(),
-                    )
+                    (!heard.live, state.relations.get(*id) != Some(&Relation::Friend), heard.name.to_lowercase(), (*id).clone())
                 });
                 let total = there.len() as u32;
-                let people =
-                    there
-                        .into_iter()
-                        .take(protocol::OCCUPANTS_LIMIT)
-                        .map(|(id, heard)| Occupant {
-                            person: self.ctx.key(id),
-                            name: heard.name.clone(),
-                            muted: heard.muted,
-                            deafened: heard.deafened,
-                            streaming: heard.streaming,
-                            speaking: heard.live,
-                        });
+                let people = there.into_iter().take(protocol::OCCUPANTS_LIMIT).map(|(id, heard)| Occupant {
+                    person: self.ctx.key(id),
+                    name: heard.name.clone(),
+                    muted: heard.muted,
+                    deafened: heard.deafened,
+                    streaming: heard.streaming,
+                    speaking: heard.live,
+                });
                 let people: Vec<Occupant> = people.collect();
                 state.voice.told.insert(channel.clone(), guild);
                 reports.push((channel, people, total));
@@ -363,9 +315,7 @@ impl Discord {
     /// told whole; those of the server it left are let go, so chatd holds occupants only for
     /// what can be seen (and for the call we are in, wherever it is).
     pub(super) fn voice_watch(&self, watching: &Watching) {
-        let shown = watching.space.as_ref().filter(|space| {
-            space.network == Network::Discord && space.account == self.ctx.account.account
-        });
+        let shown = watching.space.as_ref().filter(|space| space.network == Network::Discord && space.account == self.ctx.account.account);
         let shown = shown.map(|space| space.id.clone());
         let (leave, enter) = {
             let mut state = self.state.lock().unwrap();
@@ -384,19 +334,13 @@ impl Discord {
                 .map(|(_, heard)| &heard.channel)
                 .collect();
             let left = voice.told.iter().filter(|(channel, guild)| {
-                guild.is_some()
-                    && **guild == before
-                    && Some(*channel) != ours.as_ref()
-                    && !friended.contains(channel)
+                guild.is_some() && **guild == before && Some(*channel) != ours.as_ref() && !friended.contains(channel)
             });
             let leave: Vec<String> = left.map(|(channel, _)| channel.clone()).collect();
             for channel in &leave {
                 voice.told.remove(channel);
             }
-            let entered = voice
-                .states
-                .values()
-                .filter(|heard| shown.is_some() && heard.guild == shown);
+            let entered = voice.states.values().filter(|heard| shown.is_some() && heard.guild == shown);
             let enter: BTreeSet<String> = entered.map(|heard| heard.channel.clone()).collect();
             (leave, enter)
         };
@@ -414,19 +358,10 @@ impl Discord {
         // The stages among the channels touched: `suppress` there picks the audience from the
         // platform. In a voice channel it is Discord's server mute instead, and nobody in one
         // is ever counted as on stage.
-        let touched: HashSet<&str> = states
-            .iter()
-            .filter_map(|voice| voice.channel_id.as_deref())
-            .collect();
+        let touched: HashSet<&str> = states.iter().filter_map(|voice| voice.channel_id.as_deref()).collect();
         let stages: HashSet<&str> = touched
             .into_iter()
-            .filter(|channel| {
-                self.ctx
-                    .known(channel)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|row| row.call == CallSupport::Handoff)
-            })
+            .filter(|channel| self.ctx.known(channel).ok().flatten().is_some_and(|row| row.call == CallSupport::Handoff))
             .collect();
         let mut changed = BTreeSet::new();
         {
@@ -438,29 +373,18 @@ impl Discord {
                 let Some(channel) = &voice.channel_id else {
                     continue;
                 };
-                let in_call = state
-                    .voice
-                    .call
-                    .as_ref()
-                    .is_some_and(|call| call.conversation == *channel);
+                let in_call = state.voice.call.as_ref().is_some_and(|call| call.conversation == *channel);
                 let kept = before.is_some() || in_call || voice.user_id == state.me;
                 if state.voice.states.len() >= HEARD && !kept {
                     continue;
                 }
-                let named = voice
-                    .member
-                    .as_ref()
-                    .map(|member| member.name().to_owned())
-                    .filter(|name| !name.is_empty());
+                let named = voice.member.as_ref().map(|member| member.name().to_owned()).filter(|name| !name.is_empty());
                 let named = named.or_else(|| state.users.get(&voice.user_id).cloned());
                 let me = (voice.user_id == state.me).then_some("You".to_owned());
                 let heard = Heard {
                     guild: voice.guild_id.clone().or_else(|| guild.map(str::to_owned)),
                     channel: channel.clone(),
-                    name: named
-                        .or(before.map(|before| before.name))
-                        .or(me)
-                        .unwrap_or_default(),
+                    name: named.or(before.map(|before| before.name)).or(me).unwrap_or_default(),
                     muted: voice.self_mute || voice.mute,
                     deafened: voice.self_deaf || voice.deaf,
                     streaming: voice.self_stream || voice.self_video,
@@ -519,10 +443,7 @@ impl Discord {
                 session_id: session.clone(),
                 user_id: me,
                 // A direct call's voice server is named by its channel.
-                server_id: call
-                    .guild
-                    .clone()
-                    .unwrap_or_else(|| call.conversation.clone()),
+                server_id: call.guild.clone().unwrap_or_else(|| call.conversation.clone()),
                 channel_id: call.conversation.clone(),
                 // Discord requires its end-to-end protocol on every call; version 1 is the one
                 // it has published. mediad offers what it speaks, up to this.
@@ -565,10 +486,7 @@ impl Discord {
             }
         };
         match dropped {
-            Some(conversation) => {
-                self.ctx
-                    .call_failed(&conversation, CallFailure::Refused, REMOVED)
-            }
+            Some(conversation) => self.ctx.call_failed(&conversation, CallFailure::Refused, REMOVED),
             None => self.report(),
         }
     }
@@ -581,10 +499,7 @@ impl Discord {
             };
             let ours = match (&update.guild_id, &call.guild) {
                 (Some(theirs), Some(ours)) => theirs == ours,
-                (None, None) => update
-                    .channel_id
-                    .as_ref()
-                    .is_none_or(|channel| *channel == call.conversation),
+                (None, None) => update.channel_id.as_ref().is_none_or(|channel| *channel == call.conversation),
                 _ => false,
             };
             let Some(endpoint) = update.endpoint.filter(|_| ours) else {
@@ -599,17 +514,12 @@ impl Discord {
     /// Joins a voice channel, or a direct conversation's call. Starting a direct call also rings
     /// the other side, once Discord has us in it.
     pub(super) fn call_join(&self, conversation_id: &str) {
-        let refuse = |why: &str| {
-            self.ctx
-                .call_failed(conversation_id, CallFailure::Refused, why)
-        };
+        let refuse = |why: &str| self.ctx.call_failed(conversation_id, CallFailure::Refused, why);
         let Ok(Some(conversation)) = self.ctx.known(conversation_id) else {
             return refuse("This conversation is gone.");
         };
         let direct = conversation.kind.is_direct();
-        if conversation.call != CallSupport::Native
-            || (!direct && conversation.kind != ConversationKind::Voice)
-        {
+        if conversation.call != CallSupport::Native || (!direct && conversation.kind != ConversationKind::Voice) {
             return refuse("This conversation has no call tinyclient can join.");
         }
         let guild = conversation.space.clone();
@@ -636,10 +546,7 @@ impl Discord {
         if ring {
             self.ctx.ringing_out(conversation_id);
         }
-        self.tell(
-            4,
-            voice_state(guild.as_deref(), Some(conversation_id), false, false),
-        );
+        self.tell(4, voice_state(guild.as_deref(), Some(conversation_id), false, false));
         // Whoever is already there, before anyone's state changes.
         self.roster();
         self.occupancy(BTreeSet::from([conversation_id.to_owned()]));
@@ -649,12 +556,7 @@ impl Discord {
         // The call exists once our own voice state is in it; ringing before that is refused.
         let joined = || {
             let state = self.state.lock().unwrap();
-            state
-                .voice
-                .call
-                .as_ref()
-                .filter(|call| call.conversation == conversation_id)
-                .map(|call| call.session.is_some())
+            state.voice.call.as_ref().filter(|call| call.conversation == conversation_id).map(|call| call.session.is_some())
         };
         let deadline = Instant::now() + RING_AFTER;
         while joined() == Some(false) && Instant::now() < deadline {
@@ -665,11 +567,7 @@ impl Discord {
         if joined() != Some(true) {
             return;
         }
-        let rung = self.call(
-            "POST",
-            &format!("/channels/{conversation_id}/call/ring"),
-            Some(json!({"recipients": null})),
-        );
+        let rung = self.call("POST", &format!("/channels/{conversation_id}/call/ring"), Some(json!({"recipients": null})));
         if let Err(refused) = rung {
             self.log("ring", &refused);
             self.call_leave(conversation_id);
@@ -682,11 +580,7 @@ impl Discord {
     pub(super) fn call_leave(&self, conversation_id: &str) {
         let (was, ringing) = {
             let mut state = self.state.lock().unwrap();
-            let ours = state
-                .voice
-                .call
-                .as_ref()
-                .is_some_and(|call| call.conversation == conversation_id);
+            let ours = state.voice.call.as_ref().is_some_and(|call| call.conversation == conversation_id);
             let was = if ours { state.voice.call.take() } else { None };
             (was, state.voice.ringing.remove(conversation_id))
         };
@@ -709,24 +603,14 @@ impl Discord {
                 return;
             };
             (call.muted, call.deafened) = (muted, deafened);
-            voice_state(
-                call.guild.as_deref(),
-                Some(&call.conversation),
-                muted,
-                deafened,
-            )
+            voice_state(call.guild.as_deref(), Some(&call.conversation), muted, deafened)
         };
         self.tell(4, frame);
     }
 
     /// A direct call began or its ringing changed.
     pub(super) fn call_changed(&self, event: CallEvent) {
-        self.state
-            .lock()
-            .unwrap()
-            .voice
-            .calls
-            .insert(event.channel_id.clone());
+        self.state.lock().unwrap().voice.calls.insert(event.channel_id.clone());
         // Whoever joined is the answer to a ring we placed (see `roster`).
         self.voice_states(None, &event.voice_states);
         enum Now {
@@ -739,17 +623,8 @@ impl Discord {
             let mut state = self.state.lock().unwrap();
             let state = &mut *state;
             let rings_me = event.ringing.contains(&state.me);
-            let others = state
-                .voice
-                .states
-                .iter()
-                .any(|(id, heard)| heard.channel == event.channel_id && *id != state.me);
-            match state
-                .voice
-                .call
-                .as_mut()
-                .filter(|call| call.conversation == event.channel_id)
-            {
+            let others = state.voice.states.iter().any(|(id, heard)| heard.channel == event.channel_id && *id != state.me);
+            match state.voice.call.as_mut().filter(|call| call.conversation == event.channel_id) {
                 Some(call) if call.ring => {
                     call.saw_ringing |= !event.ringing.is_empty();
                     if call.saw_ringing && event.ringing.is_empty() && !others && !call.answered {
@@ -761,10 +636,7 @@ impl Discord {
                 Some(_) => Now::Nothing,
                 None if rings_me => {
                     state.voice.ringing.insert(event.channel_id.clone());
-                    let caller = event
-                        .voice_states
-                        .first()
-                        .map(|voice| voice.user_id.as_str());
+                    let caller = event.voice_states.first().map(|voice| voice.user_id.as_str());
                     let named = caller.and_then(|caller| state.users.get(caller)).cloned();
                     Now::Ring(named.unwrap_or_default())
                 }
@@ -776,18 +648,8 @@ impl Discord {
         };
         match now {
             Now::Ring(from) => {
-                let title = || {
-                    self.ctx
-                        .known(&event.channel_id)
-                        .ok()
-                        .flatten()
-                        .map(|row| row.title)
-                };
-                let from = if from.is_empty() {
-                    title().unwrap_or_default()
-                } else {
-                    from
-                };
+                let title = || self.ctx.known(&event.channel_id).ok().flatten().map(|row| row.title);
+                let from = if from.is_empty() { title().unwrap_or_default() } else { from };
                 // CONTRACT: chatd shows one call. A ring that arrives while we are in another
                 // call is dropped there, so the dock cannot offer it.
                 self.ctx.ring(&event.channel_id, &from);
@@ -799,15 +661,9 @@ impl Discord {
                 // nobody touches goes on until we give up (chatd does, after a minute). With one
                 // person on the other side that makes this a decline. Unconfirmed against a
                 // real account; in a group it only says that nobody is left to answer.
-                let one = self
-                    .ctx
-                    .known(&event.channel_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|row| row.kind == ConversationKind::Direct);
+                let one = self.ctx.known(&event.channel_id).ok().flatten().is_some_and(|row| row.kind == ConversationKind::Direct);
                 let words = if one { DECLINED } else { NO_ANSWER };
-                self.ctx
-                    .call_failed(&event.channel_id, CallFailure::NoAnswer, words);
+                self.ctx.call_failed(&event.channel_id, CallFailure::NoAnswer, words);
             }
             Now::Nothing => {}
         }
@@ -818,10 +674,7 @@ impl Discord {
             let mut state = self.state.lock().unwrap();
             state.voice.calls.remove(&event.channel_id);
             state.voice.ringing.remove(&event.channel_id);
-            state
-                .voice
-                .states
-                .retain(|_, heard| heard.channel != event.channel_id);
+            state.voice.states.retain(|_, heard| heard.channel != event.channel_id);
         }
         self.ctx.ring_stopped(&event.channel_id);
         self.roster();
@@ -845,8 +698,7 @@ impl Discord {
         };
         if let Some(call) = late {
             self.tell(4, voice_state(call.guild.as_deref(), None, false, false));
-            self.ctx
-                .call_failed(&call.conversation, CallFailure::Lost, NO_SESSION);
+            self.ctx.call_failed(&call.conversation, CallFailure::Lost, NO_SESSION);
         }
         false
     }
@@ -859,11 +711,7 @@ mod tests {
     #[test]
     fn a_stage_is_never_joined_here_and_a_voice_channel_is() {
         assert_eq!(support(model::VOICE), CallSupport::Native);
-        assert_eq!(
-            support(model::STAGE),
-            CallSupport::Handoff,
-            "a stage opens in Discord"
-        );
+        assert_eq!(support(model::STAGE), CallSupport::Handoff, "a stage opens in Discord");
         assert_eq!(support(model::TEXT), CallSupport::None);
         assert_eq!(support(model::FORUM), CallSupport::None);
     }
@@ -872,33 +720,18 @@ mod tests {
     fn the_hand_off_opens_the_app_on_the_channel_and_the_web_without_one() {
         assert_eq!(link(Some("81"), "900", true), "discord://-/channels/81/900");
         assert_eq!(link(None, "3001", true), "discord://-/channels/@me/3001");
-        assert_eq!(
-            link(Some("81"), "900", false),
-            "https://discord.com/channels/81/900"
-        );
-        assert_eq!(
-            link(None, "3001", false),
-            "https://discord.com/channels/@me/3001"
-        );
+        assert_eq!(link(Some("81"), "900", false), "https://discord.com/channels/81/900");
+        assert_eq!(link(None, "3001", false), "https://discord.com/channels/@me/3001");
         // Whatever this Mac has installed, asking is safe and says one or the other.
         let found = handoff_link(None, "3001");
-        assert!(
-            found.ends_with("channels/@me/3001")
-                && (found.starts_with("discord://-/") || found.starts_with("https://discord.com/"))
-        );
+        assert!(found.ends_with("channels/@me/3001") && (found.starts_with("discord://-/") || found.starts_with("https://discord.com/")));
     }
 
     #[test]
     fn occupants_are_wanted_for_the_server_on_screen_the_call_and_direct_calls_only() {
-        let mut voice = Voice {
-            shown: Some("81".into()),
-            ..Voice::default()
-        };
+        let mut voice = Voice { shown: Some("81".into()), ..Voice::default() };
         assert!(voice.watched("900", Some("81")));
-        assert!(
-            !voice.watched("901", Some("82")),
-            "a server that is not on screen"
-        );
+        assert!(!voice.watched("901", Some("82")), "a server that is not on screen");
         assert!(voice.watched("3001", None), "a direct call in progress");
         voice.call = Some(Joining {
             conversation: "901".into(),
@@ -913,9 +746,6 @@ mod tests {
             saw_ringing: false,
             answered: false,
         });
-        assert!(
-            voice.watched("901", Some("82")),
-            "the call we are in, wherever it is"
-        );
+        assert!(voice.watched("901", Some("82")), "the call we are in, wherever it is");
     }
 }
