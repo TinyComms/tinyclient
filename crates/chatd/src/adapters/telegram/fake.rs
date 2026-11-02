@@ -232,6 +232,17 @@ fn file_piece(offset: i64, limit: i32) -> Vec<u8> {
     (from..to).map(|at| (at % 251) as u8).collect()
 }
 
+/// A gzip member: what Telegram serves many emoji files (a topic's icon among them) as,
+/// of the file that is inside it. The checks of the container's own trailer are left for
+/// whoever reads it whole: what matters here is the packed body.
+fn packed(member: &[u8]) -> Vec<u8> {
+    let mut held = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    held.extend(miniz_oxide::deflate::compress_to_vec(member, 6));
+    held.extend(0u32.to_le_bytes());
+    held.extend((member.len() as u32).to_le_bytes());
+    held
+}
+
 struct World {
     signed_in: bool,
     /// Messages by conversation, oldest first by id.
@@ -1203,7 +1214,13 @@ impl World {
                 _ => "other".to_owned(),
             };
             self.log(&format!("GetFile {what} at {}", request.offset));
-            let piece = tl::types::upload::File { r#type: tl::enums::storage::FileType::FileJpeg, mtime: T0, bytes: file_piece(request.offset, request.limit) };
+            let held = match &request.location {
+                tl::enums::InputFileLocation::InputDocumentFileLocation(document) if document.id == 5001 => {
+                    packed(br#"{"tg":"the topic's icon"}"#)
+                }
+                _ => file_piece(request.offset, request.limit),
+            };
+            let piece = tl::types::upload::File { r#type: tl::enums::storage::FileType::FileJpeg, mtime: T0, bytes: held };
             return answer(tl::enums::upload::File::File(piece));
         }
         if let Some(request) = asked::<f::auth::ExportAuthorization>(body) {
