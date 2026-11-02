@@ -22,14 +22,12 @@ fn main() {
         }
     }
     // Debug and test builds may omit the id: the Telegram tests assert the "without an app id"
-    // message. A release is what gets installed, and it cannot sign in without these.
+    // message, and the adapter says the same thing at run time. A release without them builds
+    // too — Telegram is then the network this copy cannot carry until its builder supplies
+    // their own two values, which is a packaging decision, not a build error.
     let id_ok = id.trim().parse::<i32>().ok().is_some_and(|id| id > 0);
     if !id_ok || hash.trim().is_empty() {
-        if std::env::var("PROFILE").as_deref() == Ok("release") {
-            panic!(
-                "refusing to build a release of chatd without TINYCLIENT_TELEGRAM_API_ID and TINYCLIENT_TELEGRAM_API_HASH"
-            );
-        }
+        eprintln!("cargo: (chatd ships without a Telegram app id: nothing will sign in to Telegram)");
         return;
     }
     // `rustc-env` is what `option_env!` reads, so the build script is what brings a file's
