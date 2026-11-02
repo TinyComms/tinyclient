@@ -139,6 +139,13 @@ pub fn tint_from(key: &Key, icon: Option<i32>) -> usize {
     icon.filter(|icon| *icon >= 0 && *icon < 8).map(|icon| icon as usize).unwrap_or_else(|| tint_of(key))
 }
 
+/// The color a Telegram topic packs in `icon_color` itself: the low 24 bits are the RGB its
+/// own list paints, and the larger the value the more certainly it is a color and not the
+/// older build's palette id. A palette id (0–7) stays a palette: the caller keeps `tint_from`.
+pub fn topic_fill(icon: Option<i32>) -> Option<u32> {
+    icon.filter(|icon| *icon > 7).map(|color| color as u32 & 0xffffff)
+}
+
 pub struct Avatar {
     name: String,
     tint: usize,
@@ -146,6 +153,9 @@ pub struct Avatar {
     shape: Shape,
     image: Option<PathBuf>,
     glyph: Option<&'static str>,
+    /// A tile where the network packs its own color in, drawing it exactly as the official list
+    /// does instead of the palette's hue next door.
+    fill: Option<u32>,
     /// A glyph plate takes the tint rather than the neutral fill.
     tinted: bool,
     presence: Option<(Presence, Rgba)>,
@@ -164,6 +174,7 @@ impl Avatar {
             shape: Shape::Person,
             image: None,
             glyph: None,
+            fill: None,
             tinted: false,
             presence: None,
             letters: None,
@@ -180,6 +191,7 @@ impl Avatar {
             shape: Shape::Person,
             image: None,
             glyph: None,
+            fill: None,
             tinted: false,
             presence: None,
             letters: None,
@@ -190,6 +202,13 @@ impl Avatar {
     /// A tint the conversation names itself, over the id's hash.
     pub fn tint(mut self, tint: usize) -> Avatar {
         self.tint = tint;
+        self
+    }
+
+    /// A color the network packed itself: the topic's tile draws it directly, over the
+    /// palette's hue.
+    pub fn fill(mut self, fill: u32) -> Avatar {
+        self.fill = Some(fill);
         self
     }
 
@@ -250,7 +269,12 @@ impl Avatar {
             Shape::Person => size / 2.,
             Shape::Place => (size * 0.25).round(),
         };
-        let (fill, letters) = theme::tint(self.tint);
+        let (fill, letters) = match self.fill {
+            // The network's own color: its tile draws it, letters white over it, as the
+            // official list does (a Telegram topic's own color, packed in `icon_color`).
+            Some(color) => theme::tint_pack(color),
+            None => theme::tint(self.tint),
+        };
         let plate = div().size(px(size)).rounded(px(radius)).flex().items_center().justify_center();
         let plate = match self.glyph {
             Some(icon) if self.tinted => plate.bg(fill).child(glyph(icon, if size >= 32. { 16. } else { 14. }, letters)),
@@ -385,5 +409,17 @@ mod tests {
         assert_eq!(group_faces("Ana, +3"), None);
         assert_eq!(initials("Foraging Lisbon", 2), "FL");
         assert_eq!(initials("Family", 2), "F");
+    }
+
+    #[test]
+    fn a_topic_color_packs_the_fill_it_draws_and_a_palette_id_stays_a_palette() {
+        // Telegram packs the tile's own RGB in the low 24 bits: drawn exactly, not the hue
+        // next door.
+        let packed = 0x6fb4f0;
+        assert_eq!(topic_fill(Some(0x6fb4f0)), Some(packed));
+        assert_eq!(topic_fill(Some(-1)), None);
+        // The older build's palette ids (0–7) are a palette still.
+        assert_eq!(topic_fill(Some(3)), None);
+        assert_eq!(topic_fill(None), None);
     }
 }

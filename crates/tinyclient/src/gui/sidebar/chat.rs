@@ -3,7 +3,7 @@
 //! one the name, its context and the time, line two what happened last and one badge.
 
 use super::row_id;
-use crate::gui::components::{glyph, list_row, pair_or, row_badge, row_tone, tint_from, Avatar, Shape};
+use crate::gui::components::{glyph, list_row, pair_or, row_badge, row_tone, tint_from, topic_fill, Avatar, Shape};
 use crate::gui::layout::Menu;
 use crate::gui::people::presence;
 use crate::gui::state::Shell;
@@ -231,8 +231,12 @@ impl Shell {
                     Avatar::new(&space.key, &space.name, size).shape(Shape::Place).image_at(icon).build()
                 }
                 None if c.key.network == Network::Telegram => {
-                    // A forum topic draws its own icon color where Telegram says so.
-                    Avatar::new(&c.key, &c.title, size).tint(tint_from(&c.key, c.topic_icon)).shape(Shape::Place).build()
+                    // A topic's own tile: the color Telegram packs in `icon_color`, exactly
+                    // the one its own list paints, else the palette's hue for that row.
+                    match topic_fill(c.topic_icon) {
+                        Some(color) => Avatar::new(&c.key, &c.title, size).shape(Shape::Place).fill(color).build(),
+                        None => Avatar::new(&c.key, &c.title, size).tint(tint_from(&c.key, c.topic_icon)).shape(Shape::Place).build(),
+                    }
                 }
                 None => Avatar::channel(super::kind_glyph(kind, c.private, c.call), size).build(),
             },
