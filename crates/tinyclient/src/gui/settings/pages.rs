@@ -16,15 +16,16 @@ use gpui::{canvas, div, prelude::*, px, AnyElement, ClipboardItem, Context, Div,
 use crate::gui::hotkeys::{self, Action, Reach};
 use protocol::settings::{
     self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, CACHE_MB, CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME,
-    ECHO_CANCELLATION, GLOBAL, INPUT, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_SUPPRESSION, OUTPUT, PTT_RELEASE_CHOICES,
-    PTT_RELEASE_MS, PUSH_TO_TALK, RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, TYPING, VOICE_VOLUME,
+    ECHO_CANCELLATION, GLOBAL, INPUT, INPUT_VOLUME, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_CHOICES, NOISE_SUPPRESSION, OUTPUT,
+    PTT_RELEASE_CHOICES, PTT_RELEASE_MS, PUSH_TO_TALK, QUALITY_CHOICES, RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, TYPING, VOICE_QUALITY,
+    VOICE_VOLUME,
 };
 use protocol::{AccountStatus, Link, Network, Request, Response};
 use std::rc::Rc;
 
 /// Choice sets whose pills do not fit beside their label. Short pairs stay pills.
 pub(super) fn menu_choice(id: &str) -> bool {
-    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "M5" | "P4" | "D2" | "V8")
+    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "M5" | "P4" | "D2" | "V8" | "V11" | "V21")
 }
 
 /// `--settings-choice` names one of these.
@@ -42,6 +43,8 @@ pub(super) fn choice_id(name: &str) -> Option<&'static str> {
         "P4" => "P4",
         "D2" => "D2",
         "V8" => "V8",
+        "V11" => "V11",
+        "V21" => "V21",
         _ => return None,
     })
 }
@@ -61,6 +64,8 @@ fn choice_slot(id: &str) -> usize {
         "P4" => 34,
         "D2" => 42,
         "V8" => 48,
+        "V11" => 49,
+        "V21" => 50,
         _ => 0,
     }
 }
@@ -96,6 +101,14 @@ fn choice_list(id: &str) -> Option<(Vec<(String, String)>, usize, usize)> {
             (pairs(&["250 MB", "500 MB", "1 GB", "2 GB"]), at, 1)
         }
         "V8" => (pairs(&["Voice activation", "Push to talk"]), usize::from(values.on(PUSH_TO_TALK)), 0),
+        "V11" => {
+            let at = NOISE_CHOICES.iter().position(|w| *w == values.word(GLOBAL, NOISE_SUPPRESSION)).unwrap_or(1);
+            (NOISE_CHOICES.iter().zip(["Off", "Standard", "High", "Enhanced"]).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 1)
+        }
+        "V21" => {
+            let at = QUALITY_CHOICES.iter().position(|w| *w == values.word(GLOBAL, VOICE_QUALITY)).unwrap_or(1);
+            (QUALITY_CHOICES.iter().zip(["Data saver", "Standard", "High"]).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 1)
+        }
         "N7" => (pairs(&["1 hour", "Until tomorrow", "Until I resume"]), 0, 0),
         _ => return None,
     })
@@ -155,6 +168,7 @@ pub fn slider(id: &str) -> Slider {
         // Narrower than the others: its row also carries the test sound's button.
         "S10" => Slider { range: (0, 100), default: 50, read: || prefs::values().number(CUE_VOLUME), stops: None, width: 160., words: percent },
         "V5" => Slider { range: (0, 100), default: 100, read: || prefs::values().number(VOICE_VOLUME), stops: None, width: controls::TRACK, words: percent },
+        "V20" => Slider { range: (0, 100), default: 100, read: || prefs::values().number(INPUT_VOLUME), stops: None, width: controls::TRACK, words: percent },
         // Release delay: one stop for each of the six choices.
         "V14" => Slider { range: (0, 5), default: 2, read: release_stop, stops: Some(6), width: controls::TRACK, words: release_words },
         _ => Slider { range: (0, 100), default: 25, read: || prefs::values().number(SENSITIVITY), stops: None, width: controls::METER, words: |v| v.to_string() },
@@ -167,6 +181,7 @@ pub fn store_slider(window: &mut SettingsWindow, id: &'static str, value: u32, c
         "S10" => CUE_VOLUME,
         "SV" => keys::ALERT_VOLUME,
         "V5" => VOICE_VOLUME,
+        "V20" => INPUT_VOLUME,
         "V14" => {
             let ms = PTT_RELEASE_CHOICES[(value as usize).min(PTT_RELEASE_CHOICES.len() - 1)];
             let stored = (ms != Values::default_number(PTT_RELEASE_MS)).then(|| ms.to_string());
@@ -365,7 +380,7 @@ impl SettingsWindow {
             Section::Voice => {
                 let values = prefs::values();
                 let push = values.on(PUSH_TO_TALK);
-                let mut input = vec!["V8", "V3", "V18"];
+                let mut input = vec!["V8", "V3", "V20", "V21", "V18"];
                 let mode = if push {
                     input.push("V14");
                     if values.hotkey(keys::PTT_KEY).is_none() {
@@ -381,7 +396,7 @@ impl SettingsWindow {
                     self.group(&input, None, window, cx).child(caption(mode)),
                     self.group(&["V13", "V15", "V16", "V17"], Some("Keys"), window, cx).child(caption(keys_caption())),
                     self.group(&["V10", "V11", "V12"], Some("Processing"), window, cx)
-                        .child(caption("Echo cancellation takes out what your speakers play, so others don't hear themselves when you talk without headphones.")),
+                        .child(caption("Echo cancellation takes out what your speakers play. Noise: Standard and High use WebRTC; Enhanced uses RNNoise for keyboards and steady noise.")),
                     self.group(&["S7", "S8", "S9", "S10"], Some("Call sounds"), window, cx)
                         .child(caption("Call sounds play on your call speaker, quieter than voices. Voice volume is in Audio & video.")),
                 ]
@@ -620,24 +635,37 @@ impl SettingsWindow {
                 let second = Some("Plays your microphone back as others would hear it. Not during a call.".to_owned());
                 self.switch_row(id, self.loopback, false, second, |this, on, cx| this.set_loopback(on, cx), cx)
             }
-            "V10" | "V11" | "V12" => {
+            "V10" | "V12" => {
                 let key = match id {
                     "V10" => ECHO_CANCELLATION,
-                    "V11" => NOISE_SUPPRESSION,
                     _ => AUTO_GAIN,
                 };
                 let on = values.on(key);
                 let second = match (id, on) {
                     ("V10", false) => Some("Wear headphones, or others hear themselves when you talk."),
-                    ("V11", false) => Some("Fans, typing and traffic go through as they are."),
-                    ("V12", false) => Some("Your voice is sent at the level your microphone gives."),
+                    ("V12", false) => Some("Your voice is sent at the level your microphone gives. Use Mic volume to raise or lower it."),
                     _ => None,
                 };
                 self.switch_row(id, on, true, second.map(str::to_owned), move |this, on, cx| this.set_switch(id, key, on, true, cx), cx)
             }
+            "V11" => {
+                let at = NOISE_CHOICES.iter().position(|w| *w == values.word(GLOBAL, NOISE_SUPPRESSION)).unwrap_or(1);
+                let second = Some(match NOISE_CHOICES.get(at).copied().unwrap_or("standard") {
+                    "off" => "Fans, typing and traffic go through as they are.".to_owned(),
+                    "enhanced" => "RNNoise: stronger on keyboards and steady noise.".to_owned(),
+                    "high" => "WebRTC at its strongest.".to_owned(),
+                    _ => "WebRTC noise suppression for everyday background noise.".to_owned(),
+                });
+                self.menu_choice_row(id, &["Off", "Standard", "High", "Enhanced"], at, 1, second, None, cx)
+            }
+            "V21" => {
+                let at = QUALITY_CHOICES.iter().position(|w| *w == values.word(GLOBAL, VOICE_QUALITY)).unwrap_or(1);
+                let second = Some("On Tiny calls only. High prefers a clearer Opus mode; Data saver caps around 32 kb/s. The room's bitrate is still the ceiling.".to_owned());
+                self.menu_choice_row(id, &["Data saver", "Standard", "High"], at, 1, second, None, cx)
+            }
             "V13" | "V15" | "V16" | "V17" => return self.key_row(id, cx),
             "V6" => wide_row(label, None, self.slider_control(id, cx)),
-            "V5" => wide_row(label, None, self.slider_control(id, cx)),
+            "V5" | "V20" => wide_row(label, None, self.slider_control(id, cx)),
             "V4" => {
                 let on = values.on(JOIN_MUTED);
                 self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, JOIN_MUTED, on, false, cx), cx)
@@ -959,6 +987,16 @@ impl SettingsWindow {
                 self.set("D2", GLOBAL.into(), CACHE_MB, stored, cx);
             }
             "V8" => self.set_switch(id, PUSH_TO_TALK, ix == 1, false, cx),
+            "V11" => {
+                let word = NOISE_CHOICES[ix.min(NOISE_CHOICES.len() - 1)];
+                let stored = (word != "standard").then(|| word.to_owned());
+                self.set(id, GLOBAL.into(), NOISE_SUPPRESSION, stored, cx);
+            }
+            "V21" => {
+                let word = QUALITY_CHOICES[ix.min(QUALITY_CHOICES.len() - 1)];
+                let stored = (word != "standard").then(|| word.to_owned());
+                self.set(id, GLOBAL.into(), VOICE_QUALITY, stored, cx);
+            }
             "N7" => {
                 let now = crate::view::now();
                 let until = match ix {
@@ -1392,9 +1430,9 @@ impl SettingsWindow {
             }));
         let push = prefs::values().on(PUSH_TO_TALK);
         let second = match (testing, push) {
-            (true, false) => "Speak normally. Green is what others would hear.",
-            (true, true) => "Speak normally. In push to talk the key opens your microphone, not the line.",
-            (false, false) => "Below the line nothing is sent and your speaking ring stays off.",
+            (true, false) => "Yellow is below your sensitivity. Green is what others would hear. Red means you're clipping.",
+            (true, true) => "Speak normally. In push to talk the key opens your microphone, not the line. Red means you're clipping.",
+            (false, false) => "Yellow is below the line (nothing sent). Green would open the mic. Red is clipping.",
             (false, true) => "In push to talk the line does nothing; it is used when you go back to voice activation.",
         };
         let label = |words: &'static str| div().flex_none().type_ui().text_color(theme::text()).child(words);
@@ -1953,7 +1991,7 @@ mod tests {
 
     #[test]
     fn long_choice_sets_are_menus_and_the_button_stays_in_the_column() {
-        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "M5", "P4", "D2", "V8"] {
+        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "M5", "P4", "D2", "V8", "V11", "V21"] {
             assert!(menu_choice(id), "{id}");
         }
         for id in ["A3", "M1", "M2", "N5", "N7"] {

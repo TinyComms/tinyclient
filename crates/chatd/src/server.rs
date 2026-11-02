@@ -418,7 +418,9 @@ impl Chat {
             | settings::PTT_RELEASE_MS
             | settings::ECHO_CANCELLATION
             | settings::NOISE_SUPPRESSION
-            | settings::AUTO_GAIN => self.hub.calls.retune(&self.hub),
+            | settings::AUTO_GAIN
+            | settings::INPUT_VOLUME
+            | settings::VOICE_QUALITY => self.hub.calls.retune(&self.hub),
             settings::INPUT | settings::OUTPUT => self.hub.calls.redevice(&self.hub),
             _ => {}
         }

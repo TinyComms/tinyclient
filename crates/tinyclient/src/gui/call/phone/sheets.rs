@@ -105,7 +105,8 @@ impl Shell {
     /// Everything that is not in the bar.
     fn call_phone_more(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
         let values = crate::gui::app::prefs::values();
-        let (push, noise, echo) = (values.on(PUSH_TO_TALK), values.on(NOISE_SUPPRESSION), values.on(ECHO_CANCELLATION));
+        let noise_on = values.noise_mode() != protocol::NoiseMode::Off;
+        let (push, echo) = (values.on(PUSH_TO_TALK), values.on(ECHO_CANCELLATION));
         let group = subject.kind != ConversationKind::Direct && in_call(call);
         let route = hooks::route(if sending(call, Content::Camera) { hooks::Route::Speaker } else { hooks::Route::Earpiece });
         let mic = if call.input.is_empty() { "Microphone".to_owned() } else { call.input.clone() };
@@ -134,8 +135,16 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, _, cx| this.call_phone_switch(PUSH_TO_TALK, !push, cx))),
             )
             .child(
-                row("call-phone-more-noise", "icons/audio-lines.svg", "Noise suppression", Some("Quiets fans, traffic and keyboards".into()), Some(switch(noise)))
-                    .on_click(cx.listener(move |this, _, _, cx| this.call_phone_switch(NOISE_SUPPRESSION, !noise, cx))),
+                row("call-phone-more-noise", "icons/audio-lines.svg", "Noise suppression", Some("Quiets fans, traffic and keyboards".into()), Some(switch(noise_on)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let value = Some(if noise_on { "off" } else { "standard" }.to_owned());
+                        let mut values = crate::gui::app::prefs::values();
+                        values.set(GLOBAL, NOISE_SUPPRESSION, value.clone());
+                        crate::gui::app::prefs::set_values(values);
+                        crate::gui::settings::redraw(cx);
+                        this.call_ask(Request::Set { scope: GLOBAL.to_owned(), key: NOISE_SUPPRESSION.to_owned(), value }, cx);
+                        cx.notify();
+                    })),
             )
             .child(
                 row("call-phone-more-echo", "icons/volume-2.svg", "Echo cancellation", Some(if echo { "On: no headphones needed".into() } else { "Off: wear headphones".into() }), Some(switch(echo)))

@@ -67,10 +67,16 @@ pub const SENSITIVITY: &str = "sensitivity";
 pub const PUSH_TO_TALK: &str = "push_to_talk";
 /// V8. How long the microphone stays open after push-to-talk is let go, in milliseconds.
 pub const PTT_RELEASE_MS: &str = "ptt_release_ms";
-/// V10, V11, V12. The microphone's processing.
+/// V10, V11, V12. The microphone's processing. V11 is [`NOISE_CHOICES`]: off, standard, high, enhanced.
 pub const ECHO_CANCELLATION: &str = "echo_cancellation";
 pub const NOISE_SUPPRESSION: &str = "noise_suppression";
 pub const AUTO_GAIN: &str = "auto_gain";
+/// Mic soft gain before processing, 0 to 100. 100 is as captured.
+pub const INPUT_VOLUME: &str = "input_volume";
+/// Opus encode quality within a Tiny room's bitrate: [`QUALITY_CHOICES`].
+pub const VOICE_QUALITY: &str = "voice_quality";
+pub const NOISE_CHOICES: [&str; 4] = ["off", "standard", "high", "enhanced"];
+pub const QUALITY_CHOICES: [&str; 3] = ["data_saver", "standard", "high"];
 /// V8, V13, V14, V15. The shell's global keys, as [`crate::hotkey::Binding`] writes them:
 /// push-to-talk, push-to-talk with priority, toggle mute, toggle deafen. Absent is no key.
 /// Read by the shell; chatd only keeps them.
@@ -202,12 +208,15 @@ fn kind(key: &str) -> Option<Kind> {
         // outside the global scope.
         NOTIFY_ABOUT => Kind::Word(&ABOUT_CHOICES, "mentions"),
         SOUND => Kind::Word(&SOUND_CHOICES, "pebble"),
-        ECHO_CANCELLATION | NOISE_SUPPRESSION | AUTO_GAIN => Kind::Switch(true),
+        ECHO_CANCELLATION | AUTO_GAIN => Kind::Switch(true),
+        NOISE_SUPPRESSION => Kind::Word(&NOISE_CHOICES, "standard"),
+        VOICE_QUALITY => Kind::Word(&QUALITY_CHOICES, "standard"),
         JOIN_MUTED | PUSH_TO_TALK | REQUIRE_CALL_E2EE => Kind::Switch(false),
         MUTED_TALK => Kind::Switch(true),
         PTT_RELEASE_MS => Kind::Choice(&PTT_RELEASE_CHOICES, 200),
         CUE_VOLUME => Kind::Percent(50),
         VOICE_VOLUME => Kind::Percent(100),
+        INPUT_VOLUME => Kind::Percent(100),
         SENSITIVITY => Kind::Percent(25),
         INPUT | OUTPUT => Kind::Device,
         PTT_KEY | PRIORITY_KEY | MUTE_KEY | DEAFEN_KEY => Kind::Hotkey,
@@ -283,6 +292,8 @@ pub fn valid(scope: &str, key: &str, value: &str) -> bool {
         Some(Kind::Word(words, _)) if matches!(key, MESSAGE_SOUND | MENTION_SOUND | RING_SOUND | SOUND) => {
             words.contains(&value) || value.strip_prefix("custom:").is_some_and(sound_id) || value == "same"
         }
+        // Older builds stored V11 as on/off; still readable so an upgrade keeps the choice.
+        Some(Kind::Word(words, _)) if key == NOISE_SUPPRESSION => words.contains(&value) || matches!(value, "on" | "off"),
         Some(Kind::Word(words, _)) => words.contains(&value),
         Some(Kind::Minute(_)) => value.parse::<u32>().is_ok_and(|n| n < 24 * 60),
         Some(Kind::Until) => value == "resume" || value.parse::<u64>().is_ok(),
@@ -536,10 +547,21 @@ impl Values {
             voice: self.number(VOICE_VOLUME).min(100) as u8,
             gate: self.number(SENSITIVITY).min(100) as u8,
             cues: self.number(CUE_VOLUME).min(100) as u8,
+            input: self.number(INPUT_VOLUME).min(100) as u8,
             joins: sounds && self.on(CUE_JOINS),
             mine: sounds && self.on(CUE_MINE),
             connection: sounds && self.on(CUE_CONNECTION),
         }
+    }
+
+    /// V11: off, standard (WebRTC), high (WebRTC strongest), or enhanced (RNNoise).
+    pub fn noise_mode(&self) -> crate::NoiseMode {
+        crate::NoiseMode::parse(self.word(GLOBAL, NOISE_SUPPRESSION)).unwrap_or_default()
+    }
+
+    /// How clearly to encode on a Tiny call, within the room's bitrate.
+    pub fn voice_quality(&self) -> crate::VoiceQuality {
+        crate::VoiceQuality::parse(self.word(GLOBAL, VOICE_QUALITY)).unwrap_or_default()
     }
 
     /// How the microphone opens, as the user chose. A room that requires push-to-talk asks
@@ -560,8 +582,8 @@ impl Values {
     pub fn processing(&self) -> crate::AudioProcessing {
         crate::AudioProcessing {
             echo_cancellation: self.on(ECHO_CANCELLATION),
-            noise_suppression: self.on(NOISE_SUPPRESSION),
             auto_gain: self.on(AUTO_GAIN),
+            noise: self.noise_mode(),
         }
     }
 
@@ -754,7 +776,17 @@ mod tests {
         values.set(GLOBAL, PTT_RELEASE_MS, Some("0".into()));
         values.set(GLOBAL, NOISE_SUPPRESSION, Some("off".into()));
         assert_eq!(values.input_mode(), crate::InputMode::PushToTalk { release_ms: 0 });
-        assert!(!values.processing().noise_suppression && values.processing().echo_cancellation);
+        assert!(!values.processing().noise_suppression() && values.processing().echo_cancellation);
+        values.set(GLOBAL, NOISE_SUPPRESSION, Some("enhanced".into()));
+        assert_eq!(values.noise_mode(), crate::NoiseMode::Enhanced);
+        values.set(GLOBAL, NOISE_SUPPRESSION, Some("on".into()));
+        assert_eq!(values.noise_mode(), crate::NoiseMode::Standard);
+        assert_eq!(values.voice_quality(), crate::VoiceQuality::Standard);
+        values.set(GLOBAL, VOICE_QUALITY, Some("high".into()));
+        assert_eq!(values.voice_quality(), crate::VoiceQuality::High);
+        assert_eq!(values.tuning().input, 100);
+        values.set(GLOBAL, INPUT_VOLUME, Some("70".into()));
+        assert_eq!(values.tuning().input, 70);
     }
 
     #[test]
