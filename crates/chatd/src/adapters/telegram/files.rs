@@ -11,6 +11,7 @@
 use super::content::Want;
 use super::wire::{self, Fault};
 use super::{Account, Context};
+use crate::adapters::net;
 use crate::blobs;
 use crate::hub::now;
 use grammers_tl_types as tl;
@@ -185,6 +186,21 @@ fn fetch(account: &Account, want: &Want, carried: &mut HashSet<i32>) -> Result<(
             let _ = std::fs::remove_file(&part);
             return Err(fault);
         }
+    };
+    // Many emoji files (a topic's icon among them) are served gzipped: what is kept
+    // is the file inside, the picture or animation a shell knows how to draw.
+    let bytes = match want.file.kind {
+        MediaKind::Emoji => {
+            let unpacked = std::fs::read(&part).ok().and_then(|held| net::gunzip(&held, LARGEST as usize));
+            match unpacked {
+                Some(unpacked) => {
+                    let _ = std::fs::write(&part, &unpacked);
+                    unpacked.len() as u64
+                }
+                None => bytes,
+            }
+        }
+        _ => bytes,
     };
     if let Err(err) = std::fs::rename(&part, &path) {
         let _ = std::fs::remove_file(&part);

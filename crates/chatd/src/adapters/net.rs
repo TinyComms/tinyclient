@@ -114,3 +114,26 @@ mod tests {
         assert_eq!(redact("410 Gone"), "410 Gone");
     }
 }
+
+/// A gzip member unpacked, at most `limit` bytes of it. Documents that arrive packed
+/// (Telegram's emoji files, Teams' push bodies) hold what a shell draws or reads.
+pub fn gunzip(data: &[u8], limit: usize) -> Option<Vec<u8>> {
+    if data.len() < 18 || data[..3] != [0x1f, 0x8b, 8] {
+        return None;
+    }
+    let flags = data[3];
+    let mut at = 10;
+    if flags & 4 != 0 {
+        at += 2 + usize::from(u16::from_le_bytes([*data.get(at)?, *data.get(at + 1)?]));
+    }
+    // The file name, then the comment: each runs to a zero byte.
+    for flag in [8, 16] {
+        if flags & flag != 0 {
+            at += data.get(at..)?.iter().position(|byte| *byte == 0)? + 1;
+        }
+    }
+    if flags & 2 != 0 {
+        at += 2;
+    }
+    miniz_oxide::inflate::decompress_to_vec_with_limit(data.get(at..)?, limit).ok()
+}
