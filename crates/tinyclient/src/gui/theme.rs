@@ -251,7 +251,7 @@ pub fn row_avatar() -> f32 {
     }
 }
 
-fn sized(size: f32) -> gpui::Pixels {
+pub fn sized(size: f32) -> gpui::Pixels {
     let base = size + text_step() as f32;
     if phone() {
         px((base * phone_tokens::type_factor() * 2.).round() / 2.)

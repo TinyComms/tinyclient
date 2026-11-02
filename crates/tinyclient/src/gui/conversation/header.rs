@@ -38,7 +38,7 @@ impl Shell {
     }
 
     /// The strip above the messages (07 §1): panel, back and forward, picture, title and the
-    /// line after it on one center, the call, then the pane's buttons with Details last.
+    /// line after it on one center, the call, then search and the pane's buttons, Details last.
     /// The encryption chip carries an icon, so the row centers instead of sharing a text
     /// baseline: a baseline puts that chip below the name and the presence word.
     pub(super) fn strip(&self, open: &Conversation, link: Link, window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -82,11 +82,10 @@ impl Shell {
         // of conversation it keeps only its glyph, and the tooltip keeps the words (07 §1).
         let room = self.conversation_room();
         let compact = room > 0. && room < 600.;
-        let search = matches!(open.key.network, protocol::Network::Discord | protocol::Network::Telegram).then(|| {
-            self.conversation_search_box(&open.key, window, cx)
-                .w(px(if compact { 120. } else { 200. }))
-                .ml(px(8.))
-        });
+        let search = icon_button("search", "icons/search.svg", self.pane_shows(|layer| matches!(layer, Layer::Search)))
+            .tooltip(tip("Search in conversation", Some("⌘F")))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_conversation_search(window, cx)));
         let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, cx)).map(|call| {
             let call = call.h(px(28.)).rounded(px(theme::R_CONTROL)).whitespace_nowrap();
             if compact {
@@ -125,13 +124,13 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)))
         });
-        // The title keeps 96 before the line after it gives up anything; that line truncates first.
-        // The title truncates before anything to its right moves; the line after it goes first.
+        // The title keeps 96, or its whole width when shorter, so a short name is not padded
+        // away from what follows. The line after it truncates first, then the title.
         let title_tip = if direct { "Open profile".to_owned() } else { open.title.clone() };
         let title = div()
             .id("conversation-title")
             .flex_initial()
-            .min_w(px(96.))
+            .min_w(title_floor(&open.title, window))
             .truncate()
             .type_title()
             .tooltip(tip(title_tip, direct.then_some("⌘.")))
@@ -179,7 +178,15 @@ impl Shell {
             .border_color(theme::hairline())
             .children(panel)
             .child(travel)
-            .child(div().flex_none().ml(px(12.)).mr(px(8.)).child(face))
+            .child(
+                div()
+                    .id("conversation-face")
+                    .flex_none()
+                    .ml(px(12.))
+                    .mr(px(8.))
+                    .when_some(self.presence_words(open), |face, words| face.tooltip(tip(words, None)))
+                    .child(face),
+            )
             .child(
                 div()
                     .flex_1()
@@ -197,9 +204,8 @@ impl Shell {
                     .children(line)
                     .children(trouble.map(|words| div().flex_none().type_small().text_color(theme::text_faint()).child(words))),
             )
-            .children(search)
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
-            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(members).children(details))
+            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).child(search).children(members).children(details))
     }
 
     /// Whether the conversation is end-to-end encrypted, where its network says: a lock and the
@@ -239,13 +245,27 @@ impl Shell {
     /// presence; elsewhere where it is (`Space › group`) and its topic.
     fn beside(&self, open: &Conversation) -> Option<Beside> {
         if open.kind == ConversationKind::Direct {
-            if let Some(line) = self.peer_line(&open.key) {
-                return Some(Beside::Person(line));
+            if let Some(mut line) = self.peer_line(&open.key) {
+                // The avatar's dot says it; the word is its tooltip. A call and Telegram's
+                // "last seen" have no dot of their own here, so they keep their words.
+                if self.presence_dot(open).is_some_and(|shape| shape != crate::gui::people::presence::Shape::InCall) {
+                    line.word = "";
+                }
+                return (!line.word.is_empty() || !line.extra.is_empty()).then_some(Beside::Person(line));
             }
         }
         let path = path_line(&open.subtitle());
         (!path.is_empty()).then(|| Beside::Path(path))
     }
+}
+
+/// The most a title holds on to as the row narrows: 96, or all of it when it is shorter.
+fn title_floor(title: &str, window: &Window) -> gpui::Pixels {
+    let mut style = window.text_style();
+    style.font_weight = theme::SEMIBOLD;
+    let run = style.to_run(title.len());
+    let width = window.text_system().shape_line(title.to_owned().into(), theme::sized(16.), &[run]).width;
+    width.ceil().min(px(96.))
 }
 
 /// What follows the title. A person's presence is not a place, so it does not reveal the sidebar.

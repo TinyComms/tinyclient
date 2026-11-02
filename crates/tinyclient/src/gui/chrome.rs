@@ -2,7 +2,8 @@
 //!
 //! The 52 pt strips stand in for a title bar. macOS draws the traffic lights over them. Windows
 //! draws nothing once its caption is hidden, so the window draws minimize, maximize and close
-//! at the right end of the top strip and tells Windows where they are: Windows then presses
+//! at the right end of the top strip, as tall as it, so their glyphs share its center line. It
+//! tells Windows where they are: Windows then presses
 //! them, snaps from maximize and drags from the strips itself. Linux asks the compositor for its
 //! own title bar (KDE, Sway, X11 window managers draw one); one that leaves decorations to the
 //! window, GNOME on Wayland, gets the same three buttons and edges that resize.
@@ -16,8 +17,8 @@ use gpui::{
 };
 use std::cell::Cell;
 
-/// Windows' caption buttons: 46 wide, 32 tall, flush with the corner.
-const CAPTION: (f32, f32) = (46., 32.);
+/// Windows' caption buttons: 46 wide, the strip's height, flush with the corner.
+const CAPTION: f32 = 46.;
 /// Windows' close button under the pointer.
 const CLOSE_RED: u32 = 0xc42b1c;
 /// GNOME's round buttons, centered in the strip.
@@ -78,7 +79,7 @@ pub fn width(window: &Window) -> f32 {
     let count = buttons_of(window).len() as f32;
     match style(window) {
         Style::Platform => 0.,
-        Style::Windows => count * CAPTION.0,
+        Style::Windows => count * CAPTION,
         Style::Linux => count * ROUND + (count - 1.) * ROUND_GAP + ROUND_MARGIN,
     }
 }
@@ -137,9 +138,10 @@ pub fn buttons(window: &Window, close: impl Fn(&ClickEvent, &mut Window, &mut Ap
     }
     let maximized = window.is_maximized();
     let row = div().absolute().top_0().right_0().flex().occlude();
+    let row = row.h(px(TOP_BAR));
     let row = match style {
-        Style::Linux => row.h(px(TOP_BAR)).pr(px(ROUND_MARGIN)).items_center().gap(px(ROUND_GAP)),
-        _ => row.h(px(CAPTION.1)),
+        Style::Linux => row.pr(px(ROUND_MARGIN)).items_center().gap(px(ROUND_GAP)),
+        _ => row,
     };
     let mut close = Some(close);
     let row = row.children(buttons_of(window).into_iter().map(|button| {
@@ -176,7 +178,7 @@ fn windows_button(face: Stateful<Div>, button: Button, icon: &'static str) -> St
         Button::Close => (rgb(CLOSE_RED), Rgba { alpha: 0.8, ..rgb(CLOSE_RED) }),
         _ => (theme::hover(), theme::pressed()),
     };
-    face.w(px(CAPTION.0))
+    face.w(px(CAPTION))
         .h_full()
         .window_control_area(area)
         .hover(|style| style.bg(hover))

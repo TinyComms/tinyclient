@@ -36,7 +36,6 @@ pub struct Side {
     /// The search pane's field and its wiring, alive while the pane is.
     search_input: Option<SearchField>,
     /// The search box in the conversation header, replaced when its key changes.
-    conversation_search: std::cell::RefCell<Option<(Key, SearchField)>>,
     /// How often the cache was asked for the search pane, counted across pages: a page remade
     /// starts at nothing, and its number must never meet an older ask's.
     search_asks: u32,
@@ -627,57 +626,12 @@ impl Shell {
         cx.notify();
     }
 
-    /// A discoverable entry point into the same scoped cache and network search as Find.
-    pub(super) fn conversation_search_box(&self, key: &Key, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
-        let mut field = self.conversation_state.side.conversation_search.borrow_mut();
-        if field.as_ref().map(|(held, _)| held) != Some(key) {
-            let input = cx.new(|cx| TextInput::new("Search conversation", cx));
-            let changed = cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| {
-                let words = input.read(cx).text().to_owned();
-                this.conversation_search_typed(&words, window, cx);
-                if matches!(event, InputEvent::Submit) {
-                    this.enter_search(cx);
-                }
-                window.focus(&input.focus_handle(cx), cx);
-            });
-            let keys = cx.subscribe_in(&input, window, |this, input, event: &InputKey, window, cx| match event {
-                InputKey::Escape => {
-                    input.update(cx, |input, cx| input.set_text("", cx));
-                    this.close_search(window, cx);
-                    this.composer_focus(window, cx);
-                }
-                InputKey::Up => this.move_search_pick(false, cx),
-                InputKey::Down => this.move_search_pick(true, cx),
-            });
-            *field = Some((key.clone(), SearchField {
-                input, _subscriptions: vec![changed, keys],
-            }));
-        }
-        let input = field.as_ref().unwrap().1.input.clone();
-        let focused = input.focus_handle(cx).is_focused(window);
-        div()
-            .flex_initial()
-            .min_w(px(100.))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(crate::gui::components::search_field(focused)
-                .h(px(28.))
-                .child(div().flex_1().min_w_0().child(input)))
-    }
-
-    fn conversation_search_typed(&mut self, words: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if words.trim().is_empty() {
-            if matches!(self.conversation_state.side.stack.top(), Some(Layer::Search)) {
-                self.close_search(window, cx);
-            }
-            return;
-        }
-        let active = matches!(self.conversation_state.side.stack.top(), Some(Layer::Search))
-            && self.conversation_state.side.search.as_ref().is_some_and(|page| page.scope == Scope::Conversation);
-        if !active {
-            self.new_search_with(Scope::Conversation, words, window, cx);
-        } else if let Some(field) = &self.conversation_state.side.search_input {
-            field.input.update(cx, |input, cx| input.set_text(words, cx));
-            self.search_typed(cx);
+    /// The strip's search button: Find in this conversation, or back out of it.
+    pub(super) fn toggle_conversation_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.conversation_state.side.stack.top(), Some(Layer::Search)) {
+            self.close_search(window, cx);
+        } else {
+            self.open_search(Scope::Conversation, window, cx);
         }
     }
 
