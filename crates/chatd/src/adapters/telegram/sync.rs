@@ -694,9 +694,10 @@ fn fetch_icons(account: &Account, forum: Who, topics: &[tl::enums::ForumTopic]) 
             return;
         }
     };
-    // What is fetched is a picture, never the animated file: Telegram names the still
-    // thumbnails the icon document carries ("m" first). A document without one is only an
-    // icon when it is itself a still picture ("image/…"), else nothing can be drawn.
+    // What is fetched is whatever the icon can be drawn from: the still thumbnail Telegram
+    // names in the document ("m" first) when it names one, and the document whole otherwise —
+    // an animated icon is its Lottie JSON the same play the messages render, gzip unpacked
+    // where the file lands.
     let wants = icons.into_iter().filter_map(|(icon, topic_row)| {
         // The picture's row: the topic whose row hung it, so the list refreshes on its turn.
         let document = documents.iter().find(|document| match document {
@@ -715,13 +716,7 @@ fn fetch_icons(account: &Account, forum: Who, topics: &[tl::enums::ForumTopic]) 
                 _ => None,
             }))
         });
-        let mime = document.mime_type.as_str();
-        let thumb_size = match &still {
-            Some(still) => still.clone(),
-            None if mime.starts_with("image/") => String::new(),
-            // An animated icon files nothing a still list can draw: skip until it does.
-            None => return None,
-        };
+        let thumb_size = still.unwrap_or_default();
         Some(Want {
             file: MediaFile::new(format!("e{}", icon), MediaKind::Emoji),
             dc: document.dc_id,

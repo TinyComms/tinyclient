@@ -1136,14 +1136,17 @@ impl World {
         }
         if let Some(request) = asked::<f::messages::GetCustomEmojiDocuments>(body) {
             // A topic's icon picture: the documents the emoji ids name, stills at list size.
+            // The animated icon's own id (5002) is what Telegram names an animated emoji:
+            // no still thumbnail, and the file itself is its Lottie play.
             let documents: Vec<tl::enums::Document> = request.document_id.iter().map(|&id| {
+                let animated = id == 5002;
                 tl::enums::Document::Document(tl::types::Document {
                     id,
                     access_hash: i64::from(id) + 7,
                     file_reference: vec![1u8, 2u8, 3u8],
                     date: T0 - 90,
-                    mime_type: "image/webp".to_owned(),
-                    size: 4_096 + 9,
+                    mime_type: if animated { "application/x-tgsticker".to_owned() } else { "image/webp".to_owned() },
+                    size: if animated { 20_000 } else { 4_096 + 9 },
                     thumbs: None,
                     video_thumbs: None,
                     dc_id: 2,
@@ -1156,7 +1159,7 @@ impl World {
         if let Some(request) = asked::<f::messages::GetForumTopics>(body) {
             let forum = input_who(&request.peer);
             self.log(&format!("GetForumTopics {}", forum.text()));
-            let topic = |id: i32, title: &str, top: i32, unread: i32| {
+            let topic = |id: i32, title: &str, top: i32, unread: i32, icon: i64| {
                 let mut topic: tl::types::ForumTopic = blank(&[
                     &put(1u32),
                     &put(id),
@@ -1164,7 +1167,7 @@ impl World {
                     &put(forum.peer()),
                     &put(title.to_owned()),
                     &put(3i32),
-                    &put(5001i64),
+                    &put(icon),
                     &put(top),
                     &put(0i32),
                     &put(0i32),
@@ -1186,7 +1189,7 @@ impl World {
             let found = tl::types::messages::ForumTopics {
                 order_by_create_date: false,
                 count: 2,
-                topics: vec![topic(TOOLS, "Tools", top, 1), topic(1, "General", 1, 0)],
+                topics: vec![topic(TOOLS, "Tools", top, 1, 5001), topic(1, "General", 1, 0, 5002)],
                 messages: newest.into_iter().collect(),
                 chats: chats(),
                 users: users(),
@@ -1337,7 +1340,7 @@ impl World {
             };
             self.log(&format!("GetFile {what} at {}", request.offset));
             let held = match &request.location {
-                tl::enums::InputFileLocation::InputDocumentFileLocation(document) if document.id == 5001 => {
+                tl::enums::InputFileLocation::InputDocumentFileLocation(document) if document.id == 5001 || document.id == 5002 => {
                     packed(br#"{"tg":"the topic's icon"}"#)
                 }
                 _ => file_piece(request.offset, request.limit),

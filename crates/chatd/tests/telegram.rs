@@ -545,6 +545,13 @@ fn a_forum_topic_is_a_thread_under_the_forum() {
     // inside, which the shell can read as its picture or animation.
     let kept = std::fs::read(&path).expect("the topic's picture is on disk");
     assert!(kept.starts_with(b"{"), "the gzip member is unpacked to what is inside: {:02x?}", &kept[..kept.len().min(8)]);
+
+    // General's own icon is an animated emoji — no still thumbnail named in its document.
+    // It is asked whole: its file lands, and what lands is the Lottie JSON it is drawn as,
+    // the same still the official list shows before the frames play.
+    world.until("General's animated icon to land", || world.conversation("c9002_1").filter(|row| row.avatar.as_ref().and_then(|file| file.path.as_ref()).is_some()).map(|_| ()));
+    let moved = world.conversation("c9002_1").unwrap().avatar.as_ref().and_then(|file| file.path.as_ref()).and_then(|path| std::fs::read(path).ok()).expect("General's animated icon is on disk");
+    assert!(moved.starts_with(b"{"), "the animated emoji's file is what is drawn: {:02x?}", &moved[..moved.len().min(8)]);
 }
 
 #[test]
