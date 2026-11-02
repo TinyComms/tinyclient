@@ -535,10 +535,12 @@ fn a_forum_topic_is_a_thread_under_the_forum() {
     // Read in a topic is told for the topic.
     world.ask(Request::MarkRead { conversation: key("c9002_31"), message_id: "42".into() });
     world.until("the topic to be read", || world.calls().contains(&"ReadDiscussion c9002_31 42".to_owned()).then_some(()));
-    // The topic's own color, the tile the list draws its icon with.
+    // The topic's own color, the tile the list draws its icon with, and its picture: the
+    // icon's thumbnail lands on disk and the row shows it.
     let topic = world.conversation("c9002_31").unwrap();
     assert_eq!(topic.topic_icon, Some(3), "the topic's own icon color");
->>>>>>> 13722e1 (Telegram's forum topics stand with their own icon color: the topic's color rides the row from the chats table (a cache with one more column, the schema asked once) into the list, where the tile draws with it like Telegram's own list does)
+    world.until("the topic's picture to land", || world.conversation("c9002_31").filter(|row| row.avatar.as_ref().and_then(|file| file.path.as_ref()).is_some()).map(|_| ()));
+    assert!(world.conversation("c9002_31").unwrap().avatar.as_ref().and_then(|file| file.path.as_ref()).is_some(), "the topic's picture is on disk");
 }
 
 #[test]
