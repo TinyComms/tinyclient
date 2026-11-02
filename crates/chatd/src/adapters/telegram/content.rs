@@ -2,11 +2,11 @@
 //! service messages to one grey line, and whatever tinyclient cannot draw to a named line with a
 //! link into Telegram's own app. Nothing here asks the network anything.
 
-use super::peers::{message_link, Directory, Who};
+use super::peers::{message_link, thread_id, Directory, Who};
 use grammers_tl_types as tl;
 use protocol::{
     Attachment, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview, Reaction, Sender, Span,
-    Style,
+    Style, ThreadSummary,
 };
 use tl::enums::{DocumentAttribute, MessageAction, MessageEntity, MessageMedia, PhotoSize};
 
@@ -470,6 +470,20 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             message.pinned = raw.pinned;
             message.mentions_me = raw.mentioned;
             message.reactions = raw.reactions.as_ref().map(reactions).unwrap_or_default();
+            // A channel post's comment section rides the post: the count alone comes with it,
+            // the linked group is named but never reached, and the comments are read under the
+            // post's own id (`messages.getReplies`, which takes the channel and the post).
+            if let Some(tl::enums::MessageReplies::Replies(info)) = &raw.replies {
+                if info.channel_id.is_some() {
+                    message.thread = Some(ThreadSummary {
+                        id: thread_id(peer, raw.id),
+                        replies: info.replies.max(0) as u32,
+                        last: 0,
+                        participants: Vec::new(),
+                        unread: 0,
+                    });
+                }
+            }
             message.forwarded = raw.fwd_from.as_ref().map(|header| Box::new(forwarded(dir, header)));
             let mut wants = Vec::new();
             match &raw.media {

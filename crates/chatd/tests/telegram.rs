@@ -548,6 +548,55 @@ fn a_forum_topic_is_a_thread_under_the_forum() {
 }
 
 #[test]
+fn a_channel_posts_comments_count_rides_the_post() {
+    let world = World::signed_in();
+    world.connected();
+    // The channel is opened: its post is stored, with nothing said of comments yet.
+    world.until("the channel's page", || world.message("c9001", "5"));
+    world.steer("comments");
+    // Telegram says the section on the post itself, as an edit: the count is its own, and the
+    // id it names is the one the footer opens the comments under.
+    let post = world.arrived("c9001", "5");
+    let section = post.thread.as_ref().expect("the post carries its comment count");
+    assert_eq!((section.replies, section.id.as_str(), section.last), (2, "c9001_5", 0));
+    let thread = world.conversation("c9001_5").unwrap();
+    assert_eq!(
+        (thread.kind, thread.title.as_str(), thread.parent.as_deref(), thread.root.as_deref(), thread.read_only),
+        (ConversationKind::Thread, "Comments", Some("c9001"), Some("5"), true),
+    );
+}
+
+#[test]
+fn asking_a_channel_posts_comments_reads_the_discussion_group_under_the_post() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments");
+    world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+
+    // The thread opens on its own id: Telegram is asked once for the replies to the post, and
+    // the comments are its answer, the discussion group's people and messages.
+    world.until("the comments", || {
+        let page = world.messages("c9001_5");
+        (page.len() == 2).then_some(page)
+    });
+    // The comments as the shell reads a page: oldest first.
+    let comments: Vec<(String, String, String)> =
+        world.messages("c9001_5").into_iter().map(|comment| (comment.id, comment.sender.name, comment.text)).collect();
+    let said: Vec<(&str, &str, &str)> = comments.iter().map(|comment| (comment.0.as_str(), comment.1.as_str(), comment.2.as_str())).collect();
+    assert_eq!(said, [("50", "Tobin Reyes", "On my way up front?"), ("51", "Odalys Brandt", "Yes, at the hut now.")]);
+    assert_eq!(world.called("GetReplies c9001_5"), 1, "{:#?}", world.calls());
+    assert_eq!(world.called("GetHistory c9001_5"), 0);
+
+    // The newest comment's time rides the post's footer, as "last reply", once the page was
+    // read: the section itself names no date. Comment 51 went at 2026-10-13 11:59:20 UTC.
+    let fresh = world.until("the footer's last reply", || {
+        world.message("c9001", "5").filter(|post| post.thread.as_ref().is_some_and(|section| section.last == 1_791_892_760))
+    });
+    let section = fresh.thread.as_ref().unwrap();
+    assert_eq!(section.replies, 2, "{section:?}");
+}
+
+#[test]
 fn a_chat_pinned_by_a_folder_beyond_the_pages_gets_its_row() {
     // The Work folder pins a chat that no dialog page the sign-on read carries: only the
     // folder rule speaks of it, and what nothing stored says of is asked for alone.

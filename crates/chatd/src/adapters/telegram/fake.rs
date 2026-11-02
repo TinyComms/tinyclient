@@ -3,18 +3,20 @@
 //! can be driven through chatd's real socket (`tests/telegram.rs`); it is reachable only in a
 //! scratch directory with `TINYCLIENT_TELEGRAM_FAKE` set, never from a real session.
 //!
-//! A test steers it by appending lines to a file in the scratch directory (`adapters/script.rs`):
-//! `telegram.signin.ctl` while signing in (`scan`, `scan-password`), `telegram.ctl` once signed in (`incoming`,
-//! `photo`, `react`, `edit`, `delete`, `topic`, `typing`, `typing-stop`, `read`, `status`,
-//! `poll`, `voice`, `forward`, `flood-send N`, `revoke`). Every request it is sent is appended
+//! scratch directory (`adapters/script.rs`): `telegram.signin.ctl` while signing in (`scan`,
+//! `scan-password`), `telegram.ctl` once signed in (`incoming`, `photo`, `react`, `edit`,
+//! `delete`, `topic`, `comments`, `typing`, `typing-stop`, `read`, `status`, `poll`, `voice`,
+//! `forward`, `flood-send N`, `revoke`). Every request it is sent is appended
 //! to `telegram.calls`, one line each, so a test can see what the network would have heard.
 //!
 //! The account: Mira Kessler (7001); Odalys Brandt (7002, a contact, with a second password on
 //! her own number); Tobin Reyes (7003); a group "Trail crew" (8001); a channel "Field Notes"
-//! (9001, muted, with a sponsored message); a forum "Workshop" (9002) with topics General and
-//! "Tools" (31). The phone +1 555 010 0142 signs in with the code 24680; +1 555 010 0199 also
-//! wants the password "correct horse". Username resolution serves only `gif` and `forest_wren`;
-//! `flood_wait` returns a flood wait, and every other name returns USERNAME_NOT_OCCUPIED.
+//! (9001, muted, with a sponsored message) with a linked discussion group "Field Notes chat"
+//! (9003, which the comments on its post come from); a forum "Workshop" (9002) with topics
+//! General and "Tools" (31). The phone +1 555 010 0142 signs in with the code 24680; +1 555 010
+//! 0199 also wants the password "correct horse". Username resolution serves only `gif` and
+//! `forest_wren`; `flood_wait` returns a flood wait, and every other name returns
+//! USERNAME_NOT_OCCUPIED.
 
 use super::peers::Who;
 use super::wire::{Event, Fault, Wire};
@@ -35,6 +37,8 @@ const TOBIN: i64 = 7003;
 const CREW: i64 = 8001;
 const NOTES: i64 = 9001;
 const WORKSHOP: i64 = 9002;
+/// "Field Notes chat", the channel's linked discussion group: where its post's comments live.
+const CHATTERS: i64 = 9003;
 const TOOLS: i32 = 31;
 /// Telegram's own account, a bot, and an account Telegram flags as a scam.
 const SERVICE: i64 = 777_000;
@@ -809,6 +813,20 @@ impl World {
                 message.reply_to = Some(reply.into());
                 self.store(None, message.clone());
                 vec![new(message)]
+            }
+            // The channel's post gains a section of comments: the post says its count and the
+            // linked group it is answered in, and two comments stand in the thread.
+            "comments" => {
+                let mut post = message(Who::Channel(NOTES), 5, 0, T0 - 7_200, "Snow line is at 1,900 m this week.");
+                post.replies = Some(blank::<tl::types::MessageReplies>(&[&put(1u32), &put(2i32), &put(0i32), &put(CHATTERS)]).into());
+                self.store(None, post.clone());
+                // A comment is a message of the discussion group, which `getReplies` answers
+                // for the post itself, so it is kept under the post's thread here.
+                let thread = self.messages.entry(key(Who::Channel(NOTES), Some(5))).or_default();
+                for (id, from, date, text) in [(50, TOBIN, T0 - 100, "On my way up front?"), (51, ODALYS, T0 - 40, "Yes, at the hut now.")] {
+                    thread.insert(id, message(Who::Channel(CHATTERS), id, from, date, text).into());
+                }
+                vec![update(tl::types::UpdateEditChannelMessage { message: post.into(), pts: 0, pts_count: 0 }.into())]
             }
             // A service line and a kicked typing signal in the group.
             "service" => {

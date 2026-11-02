@@ -783,6 +783,49 @@ pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped,
         mapped.message.reply_to = Some(quote(account, conversation, page, reply));
     }
     account.place(mapped.peer, mapped.id, conversation);
+    comment_thread(account, conversation, mapped);
+}
+
+/// The thread a channel post's comments hang off. The post carries the count; the row it opens
+/// under is written with it, so the footer's ask never lands on a conversation that is not
+/// there. The newest comment's time only comes with the page of comments, so the value a stored
+/// post keeps is kept on its way in again.
+fn comment_thread(account: &Account, conversation: &str, mapped: &mut Mapped) {
+    let Some(thread) = &mut mapped.message.thread else {
+        return;
+    };
+    if let Ok(Some(stored)) = account.ctx.stored_message(conversation, &mapped.message.id) {
+        if let Some(old) = &stored.thread {
+            if old.id == thread.id && old.last > thread.last {
+                thread.last = old.last;
+            }
+        }
+    }
+    let id = thread.id.clone();
+    if matches!(account.ctx.known(&id), Ok(Some(_))) {
+        return;
+    }
+    let mut row = ConversationRow::new(id, ConversationKind::Thread, "Comments");
+    row.parent = Some(mapped.peer.text());
+    row.root = Some(mapped.message.id.clone());
+    // Reading is what this client opens the comments for: writing into the discussion group
+    // behind them, with the post's echo there, is its own step, so the composer stays shut.
+    row.read_only = true;
+    let _ = account.ctx.conversation(&row);
+}
+
+/// The footer's "last reply": the newest comment's time, written onto the post it hangs off
+/// once its comments were read. A page of the channel read later would otherwise stamp the
+/// post anew without one (`comment_thread` keeps the value on its way in).
+fn comment_time(account: &Account, post_at: Who, root: i32, sent: i64) {
+    let Ok(Some(mut post)) = account.ctx.stored_message(&post_at.text(), &root.to_string()) else {
+        return;
+    };
+    let Some(section) = post.thread.as_mut().filter(|section| section.last < sent) else {
+        return;
+    };
+    section.last = sent;
+    let _ = account.ctx.history(&post_at.text(), std::slice::from_ref(&post));
 }
 
 /// One request for a page of a conversation's messages, newest first as Telegram answers.
@@ -878,6 +921,16 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
         }
     }
     let _ = account.ctx.history(conversation, &messages);
+    // A thread of comments read: its newest time is the post's footer's "last reply", and the
+    // post carries the count but not the time. A forum's topics are asked the same way, but
+    // they carry no comment section and stand as rows of their own.
+    if let Some((parent, Some(root))) = Who::parse(conversation) {
+        if account.dir().get(parent).is_some_and(|known| known.broadcast) {
+            if let Some(newest) = messages.first().map(|message| message.sent) {
+                comment_time(account, parent, root, newest);
+            }
+        }
+    }
     wants.extend(avatar(account, who));
     wants.extend(authors.into_iter().take(20).filter_map(|author| avatar(account, author)));
     account.files.want(wants);
@@ -903,7 +956,9 @@ pub(super) fn backfill(account: &Account, conversation: &str) {
         return;
     }
     let newest = history(account, conversation, Around::Newest);
-    if broadcast {
+    // The sponsored post belongs at the foot of the channel's own page; a comments thread
+    // under one of its posts is read the same way but is not that page.
+    if broadcast && topic.is_none() {
         sponsored(account, who, conversation, newest);
     }
 }
