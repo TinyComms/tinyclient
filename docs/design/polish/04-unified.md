@@ -8,7 +8,7 @@ Requirements: `docs/product/polish/05-unified-views.md`, settled by `00-rulings.
 ## 1. Sidebar frame (Inbox and People share it)
 
 `title strip 52 · jump strip 44 · list`. List inset 8 from the sidebar edges; rows radius 6, padding 8.
-- **Inbox title strip:** `Inbox` 16/600 at x 16; segmented `All · Unread n · Mentions n` right, 12 from the edge. Counts are 11/500 tabular numerals, 5 after the label (`text_faint`, `text` when the segment is on), not pills, and hidden at 0. Under a 300 sidebar the numerals drop. Mentions counts conversations; its tooltip says "4 conversations mention you".
+- **Inbox title strip:** `Inbox` 16/600 at x 16 (fixed, never truncated); segmented `All · Unread n · Mentions n` right, 12 from the edge. Counts are 11/500 tabular numerals, 5 after the label (`text_faint`, `text` when the segment is on), not pills, and hidden at 0. Squeeze by sidebar width: counts need ≥360 on one line (or ≥270 when stacked); mark-all hides under 300 on one line; under 280 the segments move under the title with mark-all on the title row. Mentions counts conversations; its tooltip says "4 conversations mention you".
 - **Jump strip:** 28 field `Jump to… ⌘K` (opens the switcher) and a 28 compose button 8 to its right.
 - **People:** title `People`, nothing on the right; the jump strip is a real `Find people` field, full width. No network toggles, no chips (the rail is the per-network view).
 

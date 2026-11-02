@@ -1328,19 +1328,19 @@ impl Shell {
             .collect()
     }
 
-    /// `All · Unread n · Mentions n`: counts in faint numerals after the label, hidden at 0.
-    fn segments(&self, choices: &[(&'static str, &'static str, u32, bool)], cx: &mut Context<Self>, pick: impl Fn(&mut Shell, usize, &mut Context<Shell>) + Clone + 'static) -> Div {
-        // A phone's 326 (a 390 screen) holds the counts too, at its baseline type: its title and
-        // segment are the strip's only content. A 360 screen's 296 keeps the title whole instead.
-        let roomy = if super::phone::active() {
-            self.sidebar_state.width.get() >= 310. && super::phone::tokens::text_scale() <= 1.25
-        } else {
-            self.sidebar_state.width.get() >= 300.
-        };
+    /// `All · Unread n · Mentions n`: counts in faint numerals after the label, hidden at 0
+    /// or when `show_counts` is false (narrow strip).
+    fn segments(
+        &self,
+        choices: &[(&'static str, &'static str, u32, bool)],
+        show_counts: bool,
+        cx: &mut Context<Self>,
+        pick: impl Fn(&mut Shell, usize, &mut Context<Shell>) + Clone + 'static,
+    ) -> Div {
         let mut out = segmented();
         for (ix, (id, label, count, on)) in choices.iter().copied().enumerate() {
             let pick = pick.clone();
-            let counted = (count > 0 && roomy).then(|| {
+            let counted = (count > 0 && show_counts).then(|| {
                 let words = if count > 99 { "99+".to_owned() } else { count.to_string() };
                 div().ml(px(5.)).text_size(px(11.)).font_weight(theme::MEDIUM).text_color(if on { theme::text() } else { theme::text_faint() }).child(words)
             });
@@ -1395,26 +1395,30 @@ impl Shell {
                 let pick = |this: &mut Shell, ix: usize, cx: &mut Context<Shell>| {
                     this.set_filter([InboxFilter::All, InboxFilter::Unread, InboxFilter::Mentions][ix], cx);
                 };
-                // Mark all as read sits at the strip's end; on a phone it waits in the row menu
-                // and Details, where a thumb finds it, so the title and segment keep their room.
-                let marked = (counts.unread > 0 || counts.mentions > 0) && !super::phone::active();
-                // A phone's larger text has no room for both on one line: the segment takes a
-                // row of its own under the title.
-                if super::phone::active() && super::phone::tokens::text_scale() > 1.25 {
-                    let segments = self.segments(&choices, cx, pick);
-                    return div().flex_none().flex().flex_col().child(strip.child(pane_title("Inbox"))).child(div().flex_none().px(px(theme::PANE_PAD)).pb(px(8.)).flex().child(segments));
+                let has_unread = counts.unread > 0 || counts.mentions > 0;
+                let fit = inbox_strip_fit(
+                    self.sidebar_state.width.get(),
+                    super::phone::active(),
+                    if super::phone::active() { super::phone::tokens::text_scale() } else { 1. },
+                    has_unread,
+                );
+                // Fixed label: never use pane_title (flex_1 + truncate) for "Inbox".
+                let title = div().flex_none().type_title().text_color(theme::text()).child("Inbox");
+                let mark = fit.mark_all.then(|| {
+                    quiet(icon_button("mark-all", "icons/check-check.svg", false))
+                        .tooltip(tip("Mark all as read", None))
+                        .on_click(cx.listener(|this, _, _, cx| this.mark_all_read(cx)))
+                });
+                let segments = self.segments(&choices, fit.counts, cx, pick);
+                if fit.stacked {
+                    return div()
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .child(strip.child(title).child(div().flex_1()).children(mark))
+                        .child(div().flex_none().px(px(theme::PANE_PAD)).pb(px(8.)).flex().child(segments));
                 }
-                strip
-                    .child(pane_title("Inbox"))
-                    .child(self.segments(&choices, cx, pick))
-                    .child(div().flex_1())
-                    .when(marked, |strip| {
-                        strip.child(
-                            quiet(icon_button("mark-all", "icons/check-check.svg", false))
-                                .tooltip(tip("Mark all as read", None))
-                                .on_click(cx.listener(|this, _, _, cx| this.mark_all_read(cx))),
-                        )
-                    })
+                strip.child(title).child(segments).child(div().flex_1()).children(mark)
             }
             Mode::People => strip.child(pane_title("People")),
             Mode::Network(Network::Slack) => self.slack_title(strip, cx),
@@ -1466,7 +1470,7 @@ impl Shell {
                                 .child(div().min_w_0().truncate().type_title().text_color(theme::text()).child(network.label()))
                                 .child(glyph("icons/chevron-down.svg", 12., theme::text_faint())),
                         );
-                        strip.child(self.segments(&choices, cx, |this, ix, cx| this.set_home_unread(ix == 1, cx)))
+                        strip.child(self.segments(&choices, self.sidebar_state.width.get() >= 300., cx, |this, ix, cx| this.set_home_unread(ix == 1, cx)))
                     }
                     _ => strip.child(pane_title(network.label())).child(
                         quiet(icon_button("network-menu", "icons/ellipsis.svg", false))
@@ -1545,7 +1549,7 @@ impl Shell {
                     .child(glyph("icons/chevron-down.svg", 12., theme::text_faint()))
                     .children(elsewhere),
             )
-            .child(self.segments(&choices, cx, |this, ix, cx| this.set_home_unread(ix == 1, cx)))
+            .child(self.segments(&choices, self.sidebar_state.width.get() >= 300., cx, |this, ix, cx| this.set_home_unread(ix == 1, cx)))
     }
 
     /// The mentions of me in these workspaces, from the rows the shell holds: their trees where
@@ -1892,6 +1896,32 @@ fn refused(answer: &std::io::Result<Response>) -> Option<String> {
     }
 }
 
+/// How the Inbox title strip fits at this sidebar width
+/// (`docs/superpowers/specs/2026-11-02-inbox-strip-fit-design.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InboxStripFit {
+    stacked: bool,
+    counts: bool,
+    mark_all: bool,
+}
+
+/// Squeeze ladder for the Inbox strip: fixed title never truncates; counts, mark-all, then stack.
+fn inbox_strip_fit(width: f32, phone: bool, text_scale: f32, has_unread: bool) -> InboxStripFit {
+    // Phone large type always stacks. Desktop stacks below 280 so All/Unread/Mentions stay whole.
+    let stacked = (phone && text_scale > 1.25) || (!phone && width < 280.);
+    // Phone keeps its ≥310 one-line count rule. Desktop: counts at ≥360 one-line, or ≥270 when stacked.
+    let counts = if phone {
+        !stacked && width >= 310.
+    } else if stacked {
+        width >= 270.
+    } else {
+        width >= 360.
+    };
+    // Mark-all stays out of the phone strip; on desktop it yields before the title or filters.
+    let mark_all = has_unread && !phone && (stacked || width >= 300.);
+    InboxStripFit { stacked, counts, mark_all }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2041,5 +2071,31 @@ pub(crate) mod tests {
         assert!(!empty_voice_row(ConversationKind::Voice, true, true, true, false));
         // Non-voice rows are untouched.
         assert!(!empty_voice_row(ConversationKind::Channel, true, false, true, false));
+    }
+
+    #[test]
+    fn inbox_strip_fit_squeezes_by_width_without_truncating_the_title() {
+        let full = inbox_strip_fit(400., false, 1., true);
+        assert_eq!(full, InboxStripFit { stacked: false, counts: true, mark_all: true });
+
+        // Default 316: counts drop so Inbox + segments + mark-all fit on one line.
+        let mid = inbox_strip_fit(316., false, 1., true);
+        assert_eq!(mid, InboxStripFit { stacked: false, counts: false, mark_all: true });
+
+        let lean = inbox_strip_fit(290., false, 1., true);
+        assert_eq!(lean, InboxStripFit { stacked: false, counts: false, mark_all: false });
+
+        // Minimum sidebar: stack; mark-all on the title row; counts when the second row has room.
+        let narrow = inbox_strip_fit(260., false, 1., true);
+        assert_eq!(narrow, InboxStripFit { stacked: true, counts: false, mark_all: true });
+        let stacked_roomy = inbox_strip_fit(270., false, 1., true);
+        assert_eq!(stacked_roomy, InboxStripFit { stacked: true, counts: true, mark_all: true });
+
+        assert!(!inbox_strip_fit(400., false, 1., false).mark_all);
+
+        // Phone: no mark-all; large type stacks; baseline keeps the ≥310 count rule.
+        assert_eq!(inbox_strip_fit(326., true, 1.3, true), InboxStripFit { stacked: true, counts: false, mark_all: false });
+        assert_eq!(inbox_strip_fit(326., true, 1., true), InboxStripFit { stacked: false, counts: true, mark_all: false });
+        assert_eq!(inbox_strip_fit(296., true, 1., true), InboxStripFit { stacked: false, counts: false, mark_all: false });
     }
 }
