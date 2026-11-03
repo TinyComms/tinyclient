@@ -51,11 +51,12 @@ jobs:
           RELEASE_URL: https://github.com/${{ github.repository }}/releases/tag/v${{ inputs.announce }}
         run: packaging/release-note.sh
 
-  # One job waits for CI, so the four build jobs do not each poll for it.
+  # One job waits for CI, so the four build jobs do not each poll for it. The waits are long
+  # because macOS runners can queue for over an hour: a dispatched Mobile run took 2h24m.
   wait-for-ci:
     if: github.event_name == 'push' || inputs.announce == ''
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 240
     outputs:
       run: ${{ steps.ci.outputs.run }}
     steps:
@@ -70,7 +71,7 @@ jobs:
   phones:
     if: github.event_name == 'push' || inputs.announce == ''
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     permissions:
       contents: read
       # To start the Mobile workflow when main never ran it for this commit.
