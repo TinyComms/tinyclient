@@ -811,6 +811,21 @@ impl Calls {
         }
     }
 
+    /// Verbose logging changed: the call's mediad, or the test's, logs at the new ceiling from
+    /// its next line. A mediad started later reads it from its environment (`share_session`).
+    pub fn relevel(&self) {
+        let Some(guard) = protocol::log_policy::current() else {
+            return;
+        };
+        let level = MediaRequest::LogLevel { level: guard.policy().level_word().to_owned() };
+        if let Some(active) = crate::hub::lock(&self.slot).running() {
+            let _ = active.request(&level);
+        }
+        if let Some(tester) = crate::hub::lock(&self.tester).as_mut() {
+            let _ = tester.send(&level);
+        }
+    }
+
     /// V1 or V2 changed: the call's mediad, or the test's, opens the new choice at once, and
     /// the next call starts with it too.
     pub fn redevice(&self, hub: &Hub) {

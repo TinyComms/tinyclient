@@ -99,6 +99,7 @@ pub const ROWS: &[Row] = &[
     row("D3", Storage, "", "Clear saved messages and files", &[], &["clear", "delete", "cache", "free space"]),
     row("B1", About, "", "Copy diagnostics", &[], &["support", "bug", "report", "version", "log"]),
     row("B2", About, "", "Logs", &[], &["log", "debug", "support"]),
+    row("B4", About, "", "Verbose logging", &[], &["log", "debug", "verbose", "trace", "support"]),
     row("B3", About, "", "Reset all settings", &[], &["reset", "defaults", "factory"]),
 ];
 
@@ -271,6 +272,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     key("Conversation", "Open in App", "⌥⌘O"),
     key("Window", "Minimize", "⌘M"),
     key("Help", "Keyboard Shortcuts", "⌘/"),
+    key("Help", "Logs", "⇧⌘L"),
     key("Calls", "Mute or unmute", "⇧⌘M"),
     key("Calls", "Deafen or undeafen", "⇧⌘D"),
     key("Calls", "Leave the call", "⇧⌘H"),
@@ -422,7 +424,7 @@ mod tests {
             assert!(found, "{} is not in {}", shortcut.command, shortcut.menu);
         }
         // The menu items bound in `menubar::bind_keys` and `gui::bind_keys`.
-        for (menu, command) in [("tinyclient", "Settings…"), ("File", "New Message"), ("File", "Close Window"), ("View", "Bigger Text"), ("Help", "Keyboard Shortcuts"), ("Conversation", "Start Call")] {
+        for (menu, command) in [("tinyclient", "Settings…"), ("File", "New Message"), ("File", "Close Window"), ("View", "Bigger Text"), ("Help", "Keyboard Shortcuts"), ("Help", "Logs"), ("Conversation", "Start Call")] {
             assert!(SHORTCUTS.iter().any(|s| s.menu == menu && s.command == command), "{command} is missing");
         }
     }

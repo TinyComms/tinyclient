@@ -213,7 +213,10 @@ fn a_pause_lets_the_process_go_and_play_goes_on_from_there() {
     sleep(Duration::from_millis(400));
     world.ask(PlayRequest::Pause).unwrap();
     let paused = world.until_state(PlayState::Paused);
-    assert!((250..=600).contains(&paused.at), "paused at {}", paused.at);
+    // 400 ms asleep, plus where mediad already was, plus a little scheduler slack. 600 was two
+    // milliseconds short on a loaded macOS runner (paused at 602). Still well before the end of
+    // the one-second file.
+    assert!((250..=750).contains(&paused.at), "paused at {}", paused.at);
     until_no_mediad();
     let at = world.shown().unwrap().at;
     assert_eq!(world.shown().unwrap().position(u64::MAX), at, "a paused position does not move");

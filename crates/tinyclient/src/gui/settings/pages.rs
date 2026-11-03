@@ -697,11 +697,9 @@ impl SettingsWindow {
                 div()
                     .flex()
                     .gap(px(8.))
-                    .child(
-                        button("B1-log", ButtonKind::Secondary, "Save debug log")
-                            .w(px(controls::ABOUT_ACTION))
-                            .on_click(cx.listener(|this, _, _, cx| this.save_debug_log(cx))),
-                    )
+                    .child(button("B2-view", ButtonKind::Secondary, "View logs").on_click(cx.listener(|_, _, _, cx| crate::gui::logs::open(cx))))
+                    // Three buttons do not fit at the column's width; the one under Copy keeps it.
+                    .child(button("B1-log", ButtonKind::Secondary, "Save debug log").on_click(cx.listener(|this, _, _, cx| this.save_debug_log(cx))))
                     .child(button("B2", ButtonKind::Secondary, crate::host::REVEAL).w(px(controls::ABOUT_ACTION)).on_click(cx.listener(
                         |_, _, _, cx| {
                             let logs = protocol::log_policy::logs_dir();
@@ -713,6 +711,12 @@ impl SettingsWindow {
                         },
                     ))),
             ),
+            "B4" => {
+                let second = Some(crate::gui::logs::VERBOSE_NOTE.to_owned());
+                self.switch_row(id, crate::gui::logs::verbose(), false, second, |this, on, cx| {
+                    this.set("B4", GLOBAL.into(), protocol::settings::LOG_LEVEL, crate::gui::logs::verbose_value(on), cx)
+                }, cx)
+            }
             "B3" => row(
                 label,
                 None,
@@ -1692,24 +1696,8 @@ impl SettingsWindow {
     }
 
     fn save_debug_log(&mut self, cx: &mut Context<Self>) {
-        self.off_thread(cx, || {
-            let mut paths = Vec::new();
-            if let Some(guard) = protocol::log_policy::current() {
-                if let Ok(Some(path)) = guard.export_bundle() {
-                    paths.push(path.display().to_string());
-                }
-            }
-            if let Ok(Response::LogsSaved { paths: more }) = crate::client::ask(&Request::SaveLogs) {
-                paths.extend(more);
-            }
-            paths
-        }, |this, paths, cx| {
-            let note = if paths.is_empty() {
-                "Debug logs are turned off.".to_owned()
-            } else {
-                protocol::log_policy::logs_dir().join("bundles").display().to_string()
-            };
-            this.log_note = Some((std::time::Instant::now(), note));
+        self.off_thread(cx, crate::gui::logs::save_bundles, |this, paths, cx| {
+            this.log_note = Some((std::time::Instant::now(), crate::gui::logs::saved_note(&paths)));
             cx.notify();
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(std::time::Duration::from_secs(4)).await;
@@ -1867,7 +1855,7 @@ impl SettingsWindow {
         let plate = crate::gui::components::brand_mark(if phone::active() { 80. } else { 96. });
         let credit = |words: &'static str| div().px(px(controls::side())).py(px(6.)).type_small().when(phone::active(), |line| line.py(px(12.)).phone_preview()).text_color(theme::text_soft()).child(words);
         // A phone has no folder to show, nor a debug log to save into one (B2).
-        let tools = if phone::active() { self.group(&["B1", "B3"], None, window, cx) } else { self.group(&["B1", "B2", "B3"], None, window, cx) };
+        let tools = if phone::active() { self.group(&["B1", "B3"], None, window, cx) } else { self.group(&["B1", "B2", "B4", "B3"], None, window, cx) };
         div()
             .flex()
             .flex_col()

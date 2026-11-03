@@ -58,3 +58,11 @@ pub const CHANNELS: usize = 2;
 pub const FRAME: usize = 960;
 /// Interleaved samples in one frame.
 pub const FRAME_SAMPLES: usize = FRAME * CHANNELS;
+
+/// chatd's Verbose logging changed while this mediad runs (`MediaRequest::LogLevel`): the file
+/// takes the new ceiling from the next line. An unknown word leaves it as it was.
+pub fn relevel(level: &str) {
+    if let Some(guard) = protocol::log_policy::current() {
+        guard.apply(guard.policy().overlay_stored(Some(level), None, None));
+    }
+}

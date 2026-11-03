@@ -273,7 +273,8 @@ The tag line should name Discord, Slack, Telegram, Teams, Signal, Messages, and 
 | # | Control | What it does |
 | --- | --- | --- |
 | B1 | Copy diagnostics | Version, OS, service state, and account connection states. No message text, names, tokens, or log lines. Save debug log writes the in-memory ring under `logs/bundles/` and shows that directory |
-| B2 | Show logs in Finder | Opens `logs/` (`tinyclient.log`, `chatd.log`, `mediad.log`, `login.log`, and `bundles/`) |
+| B2 | Show logs in Finder | View logs opens the Logs window (`docs/logging.md`). Show in Finder opens `logs/` (`tinyclient.log`, `chatd.log`, `mediad.log`, `login.log`, and `bundles/`) |
+| B4 | Verbose logging | Stores `log_level` `debug`. tinyclient, chatd and a running call's mediad log debug lines at once, and after a restart |
 | B3 | Reset all settings… | Confirm: "Reset every setting to its default? Accounts, messages and files are not touched." Deletes every row in `settings` with global or account scope and the settings lines in `shell.prefs`. Per-conversation sounds go too |
 
 ### Count

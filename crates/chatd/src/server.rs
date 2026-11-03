@@ -422,6 +422,8 @@ impl Chat {
             | settings::INPUT_VOLUME
             | settings::VOICE_QUALITY => self.hub.calls.retune(&self.hub),
             settings::INPUT | settings::OUTPUT => self.hub.calls.redevice(&self.hub),
+            // `set_setting` has already moved chatd's own ceiling.
+            settings::LOG_LEVEL => self.hub.calls.relevel(),
             _ => {}
         }
         Response::Ok
@@ -436,6 +438,7 @@ impl Chat {
         self.hub.prune_soon();
         self.hub.calls.retune(&self.hub);
         self.hub.calls.redevice(&self.hub);
+        self.hub.calls.relevel();
         Response::Ok
     }
 

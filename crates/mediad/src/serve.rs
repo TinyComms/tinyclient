@@ -322,6 +322,10 @@ impl Call {
                     .unwrap_or_default();
                 return MediaResponse::LogsSaved { path };
             }
+            MediaRequest::LogLevel { level } => {
+                crate::relevel(&level);
+                return MediaResponse::Done;
+            }
         }
         MediaResponse::Streams { video: self.video.streams() }
     }

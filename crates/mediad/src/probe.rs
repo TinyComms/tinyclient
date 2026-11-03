@@ -90,6 +90,7 @@ pub fn run() {
                             out::send(&MediaResponse::LogsSaved { path });
                             continue;
                         }
+                        MediaRequest::LogLevel { level } => crate::relevel(&level),
                         _ => {
                             out::send(&MediaResponse::Refused { detail: "There is no call.".to_owned() });
                             continue;

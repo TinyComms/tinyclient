@@ -149,6 +149,16 @@ impl LogPolicy {
         self.operator
     }
 
+    /// The operator ceiling as a stored setting would name it: `debug`, `info`, ...
+    pub fn level_word(&self) -> &'static str {
+        level_name(self.operator)
+    }
+
+    /// Whether the files carry debug lines: Verbose logging, or `TINYCLIENT_LOG_LEVEL=debug`.
+    pub fn verbose(&self) -> bool {
+        self.operator >= Level::DEBUG
+    }
+
     pub fn ring_enabled(&self) -> bool {
         self.ring
     }
@@ -297,9 +307,14 @@ pub fn adopt_session(id: &str) {
 }
 
 /// Puts this process's session on a child. chatd generates the id in memory when nothing
-/// set the variable, so inheritance alone would give mediad and login a different one.
+/// set the variable, so inheritance alone would give mediad and login a different one. The
+/// ceiling goes too: a stored Verbose logging lives in chatd's settings, which a helper never
+/// reads, so a mediad started after it was turned on starts at debug.
 pub fn share_session(command: &mut std::process::Command) {
     command.env("TINYCLIENT_SESSION", session_id());
+    if let Some(guard) = current() {
+        command.env("TINYCLIENT_LOG_LEVEL", guard.policy().level_word());
+    }
 }
 
 fn load_session() -> String {
@@ -623,8 +638,19 @@ pub struct LogGuard {
 
 impl LogGuard {
     /// Replaces the ceilings and the export flag. The open file stays open.
+    /// A new operator ceiling is written to the file, so the Logs window shows Verbose logging
+    /// taking hold in each process.
     pub fn apply(&self, policy: LogPolicy) {
-        *self.policy.lock().unwrap_or_else(|err| err.into_inner()) = policy;
+        let before = std::mem::replace(&mut *self.policy.lock().unwrap_or_else(|err| err.into_inner()), policy);
+        if before.operator != policy.operator {
+            // Under the new ceiling, so at warn when that is quieter than info.
+            let line = format!("{}: log level is now {}", self.process, policy.level_word());
+            if policy.operator >= Level::INFO {
+                tracing::info!("{line}");
+            } else {
+                tracing::warn!("{line}");
+            }
+        }
     }
 
     pub fn policy(&self) -> LogPolicy {
@@ -885,6 +911,26 @@ mod tests {
         let off = LogPolicy::policy_from_values(Some("info"), Some("off"), Some("off"));
         assert!(!off.ring_enabled());
         assert!(!off.export_enabled());
+    }
+
+    #[test]
+    fn verbose_is_debug_or_more_and_the_word_round_trips() {
+        for (word, verbose) in [("error", false), ("warn", false), ("info", false), ("debug", true), ("trace", true)] {
+            let policy = LogPolicy::policy_from_values(Some(word), None, None);
+            assert_eq!(policy.verbose(), verbose, "{word}");
+            assert_eq!(policy.level_word(), word);
+        }
+        let raised = LogPolicy::default().overlay_stored(Some("debug"), None, None);
+        assert!(raised.verbose() && raised.ring_enabled());
+    }
+
+    #[test]
+    fn a_log_level_request_reads_and_an_older_frame_still_does() {
+        let request = crate::MediaRequest::LogLevel { level: "debug".to_owned() };
+        let text = serde_json::to_string(&request).unwrap_or_default();
+        assert_eq!(text, r#"{"media":"log_level","level":"debug"}"#);
+        assert_eq!(serde_json::from_str::<crate::MediaRequest>(&text).ok(), Some(request));
+        assert_eq!(serde_json::from_str::<crate::MediaRequest>(r#"{"media":"save_logs"}"#).ok(), Some(crate::MediaRequest::SaveLogs));
     }
 
     #[test]
