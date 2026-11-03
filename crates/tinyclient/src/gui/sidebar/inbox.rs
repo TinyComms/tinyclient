@@ -213,6 +213,23 @@ pub fn hold(drawn: &[Rc<Conversation>], fresh: &[Rc<Conversation>], read_missing
     (kept, waiting)
 }
 
+/// Whether a Space's badge can have moved. A preview, a receipt, or a reorder that
+/// leaves unread, mentions, and mute alone does not. Direct chats have no Space.
+pub fn attention_moved(before: &[Rc<Conversation>], after: &[Rc<Conversation>]) -> bool {
+    fn badge(c: &Conversation) -> (u32, u32, bool) {
+        (c.unread, c.mentions, c.muted)
+    }
+    let mut prev = HashMap::new();
+    for c in before.iter().filter(|c| c.space.is_some()) {
+        prev.insert(&c.key, badge(c));
+    }
+    let mut next = HashMap::new();
+    for c in after.iter().filter(|c| c.space.is_some()) {
+        next.insert(&c.key, badge(c));
+    }
+    prev != next
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +344,25 @@ mod tests {
         assert_eq!((kept[0].unread, kept[0].mentions), (0, 0));
         let (kept, _) = hold(&drawn, &fresh, false);
         assert_eq!(kept[0].unread, 1);
+    }
+
+    #[test]
+    fn a_preview_does_not_move_a_space_badge_and_an_unread_does() {
+        let channel = |id: &str, unread: u32, preview: &str| {
+            with(&row(id, NOW), |c| {
+                c.kind = ConversationKind::Channel;
+                c.space = Some("srv".into());
+                c.unread = unread;
+                c.preview = preview.into();
+            })
+        };
+        let before = vec![channel("general", 1, "earlier"), row("mara", NOW)];
+        let preview = vec![channel("general", 1, "just now"), row("mara", NOW)];
+        assert!(!attention_moved(&before, &preview));
+        let unread = vec![channel("general", 2, "just now"), row("mara", NOW)];
+        assert!(attention_moved(&before, &unread));
+        // A direct chat arriving or leaving is not a Space.
+        assert!(!attention_moved(&before, &[before[0].clone()]));
+        assert!(attention_moved(&before, &[]));
     }
 }

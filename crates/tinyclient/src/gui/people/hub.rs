@@ -170,6 +170,11 @@ impl WatchSet {
         self.sources.values().flatten().any(|watched| watched == person)
     }
 
+    /// A conversation row on screen, or the one open in the composer.
+    pub fn shows_row(&self, key: &Key) -> bool {
+        self.conversation.as_ref() == Some(key) || self.rows.values().flatten().any(|row| row == key)
+    }
+
     /// chatd forgot what it was told (it restarted): the next `due` sends it again.
     pub fn forget(&mut self, now: Instant) {
         if self.sent.take().is_some() {
@@ -217,6 +222,7 @@ impl WatchSet {
 }
 
 #[derive(Clone)]
+#[derive(PartialEq)]
 struct Seen {
     presence: Presence,
     status: String,
@@ -382,8 +388,10 @@ impl Hub {
     pub fn changed(&self, change: &Change, cx: &mut App) {
         match change {
             Change::Presence { person, presence, status, .. } => {
-                self.set_presence(person, *presence, status);
-                self.notify(cx);
+                // Stored either way. Only someone on screen repaints the window.
+                if self.set_presence(person, *presence, status) && self.0.borrow().watch.is_watching(person) {
+                    self.notify(cx);
+                }
             }
             Change::Typing { conversation, typists } => {
                 let mut inner = self.0.borrow_mut();
@@ -395,8 +403,11 @@ impl Hub {
                 // Other conversations' lines have had their time by now.
                 let now = now();
                 inner.typing.retain(|_, (typists, heard)| live(typists, *heard, now).next().is_some());
+                let visible = inner.watch.shows_row(conversation);
                 drop(inner);
-                self.notify(cx);
+                if visible {
+                    self.notify(cx);
+                }
             }
             Change::Occupants { conversation, occupants } => {
                 if self.set_occupants(conversation, occupants) {
@@ -417,8 +428,13 @@ impl Hub {
         }
     }
 
-    fn set_presence(&self, person: &Key, presence: Presence, status: &str) {
+    /// True when this person's presence or status text changed.
+    fn set_presence(&self, person: &Key, presence: Presence, status: &str) -> bool {
         let mut inner = self.0.borrow_mut();
+        let seen = Seen { presence, status: status.to_owned() };
+        if inner.presence.get(person) == Some(&seen) {
+            return false;
+        }
         if inner.presence.len() >= PRESENCE_LIMIT && !inner.presence.contains_key(person) {
             let Inner { watch, presence, .. } = &mut *inner;
             presence.retain(|person, _| watch.is_watching(person));
@@ -426,10 +442,12 @@ impl Hub {
                 presence.clear();
             }
         }
-        let seen = Seen { presence, status: status.to_owned() };
-        if inner.presence.insert(person.clone(), seen).is_none_or(|before| before.presence != presence) {
+        let presence_changed = inner.presence.get(person).is_none_or(|before| before.presence != presence);
+        inner.presence.insert(person.clone(), seen);
+        if presence_changed {
             inner.presence_rev += 1;
         }
+        true
     }
 
     /// Who is in a voice channel now, from a change or from a row just read. True when that
@@ -685,6 +703,17 @@ mod tests {
         watch.people("sidebar", keys(&["a"]), start + QUIET * 8);
         watch.people("sidebar", keys(&["a", "b"]), start + QUIET * 8);
         assert_eq!(watch.due(start + QUIET * 10), Due::Nothing);
+    }
+
+    #[test]
+    fn a_row_on_screen_or_the_open_conversation_is_shown() {
+        let mut watch = WatchSet::default();
+        assert!(!watch.shows_row(&key("a")));
+        watch.rows("sidebar", keys(&["a"]), Instant::now());
+        assert!(watch.shows_row(&key("a")));
+        assert!(!watch.shows_row(&key("z")));
+        watch.conversation(Some(key("z")), Instant::now());
+        assert!(watch.shows_row(&key("z")));
     }
 
     #[test]

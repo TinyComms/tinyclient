@@ -496,7 +496,7 @@ impl PeopleList {
         let items = self.build();
         if *self.items != items {
             let old = self.items.clone();
-            crate::gui::sidebar::respliced(&self.list, &old, &items, Item::anchor);
+            crate::gui::sidebar::respliced(&self.list, &old, &items, Item::anchor, |item| item.height());
             self.items = Rc::new(items);
         }
         self.presence_seen = self.hub.presence_rev();
