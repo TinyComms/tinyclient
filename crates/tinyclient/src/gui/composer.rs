@@ -1247,12 +1247,22 @@ impl Composer {
             self.refuse_files(cx);
             return;
         }
-        let extension = image.format.extension();
+        let format = image.format;
         let key = target.key.clone();
         cx.spawn(async move |this, cx| {
             let written = cx
                 .background_executor()
-                .spawn(async move { attach::write_pasted(&attach::outbox(), &image.bytes, extension, SystemTime::now()) })
+                .spawn(async move {
+                    // Windows pastes a screenshot as a BMP, and the server takes no BMP: it goes up as PNG.
+                    let (bytes, extension) = match format {
+                        gpui::ImageFormat::Bmp => match attach::bmp_as_png(&image.bytes) {
+                            Some(png) => (png, "png"),
+                            None => return Err(std::io::Error::other("the bitmap can't be read")),
+                        },
+                        _ => (image.bytes, format.extension()),
+                    };
+                    attach::write_pasted(&attach::outbox(), &bytes, extension, SystemTime::now())
+                })
                 .await;
             let _ = this.update(cx, |this, cx| match written {
                 Ok(path) => this.stage_files_for(target, vec![path], true, cx),

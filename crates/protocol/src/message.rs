@@ -369,6 +369,16 @@ pub struct Message {
 }
 
 impl Message {
+    /// The name a row shows for its sender. Mine carry my name from the network once it has
+    /// settled; "You" stands in only while a send has no name yet.
+    pub fn shown_sender(&self) -> &str {
+        if self.outgoing && self.sender.name.is_empty() {
+            "You"
+        } else {
+            &self.sender.name
+        }
+    }
+
     /// A message that is only text, which is what an adapter has before it maps anything richer.
     pub fn plain(
         id: impl Into<String>,

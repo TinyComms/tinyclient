@@ -783,7 +783,7 @@ impl Pane {
 
     /// The head line: who, when, and the marks a message carries.
     fn header(&self, message: &Message, receipt: Option<Receipt>) -> Div {
-        let name = if message.outgoing { "You".to_owned() } else { message.sender.name.clone() };
+        let name = message.shown_sender().to_owned();
         let phone = self.metrics == Metrics::PHONE;
         let tag = |words: &'static str| {
             div()
