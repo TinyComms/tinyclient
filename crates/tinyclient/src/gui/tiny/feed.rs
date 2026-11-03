@@ -101,36 +101,55 @@ fn frame(path: &Path) -> Option<Arc<RenderImage>> {
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])))
 }
 
+/// Which of the two feeds: the picture being watched, or my own camera.
+#[derive(Clone, Copy)]
+pub(in crate::gui) enum Which {
+    Watched,
+    Mine,
+}
+
 impl Shell {
-    /// The call changed: the frame it names is read, and one no longer named is let go.
-    pub(in crate::gui) fn feed_follow(&mut self, call: Option<&Call>, cx: &mut Context<Self>) {
-        let picture = call
-            .and_then(|call| call.picture.as_ref())
-            .map(|picture| (picture.generation, picture.path.clone()));
-        let (read, gone) = self.call_state.feed.offer(picture);
-        if let Some(gone) = gone {
-            cx.drop_image(gone, None);
-            cx.notify();
-        }
-        if let Some(read) = read {
-            self.feed_read(read, cx);
+    fn feed_of(&mut self, which: Which) -> &mut Feed<Arc<RenderImage>> {
+        match which {
+            Which::Watched => &mut self.call_state.feed,
+            Which::Mine => &mut self.call_state.self_feed,
         }
     }
 
-    fn feed_read(&mut self, (generation, path): (u64, String), cx: &mut Context<Self>) {
+    /// The call changed: the frames it names are read, and ones no longer named are let go.
+    pub(in crate::gui) fn feed_follow(&mut self, call: Option<&Call>, cx: &mut Context<Self>) {
+        let watched = call
+            .and_then(|call| call.picture.as_ref())
+            .map(|picture| (picture.generation, picture.path.clone()));
+        let mine = call
+            .and_then(|call| call.self_view.as_ref())
+            .map(|picture| (picture.generation, picture.path.clone()));
+        for (which, picture) in [(Which::Watched, watched), (Which::Mine, mine)] {
+            let (read, gone) = self.feed_of(which).offer(picture);
+            if let Some(gone) = gone {
+                cx.drop_image(gone, None);
+                cx.notify();
+            }
+            if let Some(read) = read {
+                self.feed_read(which, read, cx);
+            }
+        }
+    }
+
+    fn feed_read(&mut self, which: Which, (generation, path): (u64, String), cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let image = cx
                 .background_executor()
                 .spawn(async move { frame(Path::new(&path)) })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                let (gone, next) = this.call_state.feed.landed(generation, image);
+                let (gone, next) = this.feed_of(which).landed(generation, image);
                 if let Some(gone) = gone {
                     cx.drop_image(gone, None);
                 }
                 cx.notify();
                 if let Some(next) = next {
-                    this.feed_read(next, cx);
+                    this.feed_read(which, next, cx);
                 }
             });
         })

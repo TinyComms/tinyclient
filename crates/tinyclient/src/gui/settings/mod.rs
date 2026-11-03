@@ -165,6 +165,7 @@ pub(super) enum Confirm {
 pub(super) enum Picker {
     Input,
     Output,
+    Camera,
 }
 
 /// What `mediad --devices` said: every device with its id, the defaults, the microphone
@@ -183,6 +184,8 @@ impl Devices {
         match picker {
             Picker::Input => &self.inputs,
             Picker::Output => &self.outputs,
+            // Cameras are listed apart (`SettingsWindow::cameras`).
+            Picker::Camera => &[],
         }
     }
 
@@ -356,7 +359,7 @@ pub struct SettingsWindow {
     pub(super) choice: Option<&'static str>,
     /// The device pickers' buttons, by `Picker`, so closing a menu gives the key back to its
     /// button; and the open menu, which takes ↑ ↓ Return Space and letters.
-    pub(super) picker_focus: [FocusHandle; 2],
+    pub(super) picker_focus: [FocusHandle; 3],
     pub(super) menu_focus: FocusHandle,
     /// The menu item the keys are on.
     pub(super) menu_cursor: usize,
@@ -377,6 +380,10 @@ pub struct SettingsWindow {
     pub(super) level: Option<u8>,
     test_timer: Option<Task<()>>,
     pub(super) devices: Option<Devices>,
+    /// What `mediad --cameras` said, with a picture from each; `None` until asked.
+    pub(super) cameras: Option<Vec<protocol::CameraSource>>,
+    /// The camera list is being read: each camera opens for a frame, which takes a moment.
+    pub(super) cameras_reading: bool,
     /// Bytes on this Mac: messages, files.
     pub(super) storage: Option<(u64, u64)>,
     /// The row whose value could not be stored, or whose action did not happen.
@@ -453,7 +460,7 @@ impl SettingsWindow {
             confirm: None,
             picker: None,
             choice: None,
-            picker_focus: [cx.focus_handle().tab_index(0).tab_stop(true), cx.focus_handle().tab_index(0).tab_stop(true)],
+            picker_focus: [cx.focus_handle().tab_index(0).tab_stop(true), cx.focus_handle().tab_index(0).tab_stop(true), cx.focus_handle().tab_index(0).tab_stop(true)],
             menu_focus: cx.focus_handle(),
             menu_cursor: 0,
             list_focus: cx.focus_handle().tab_index(0).tab_stop(true),
@@ -468,6 +475,8 @@ impl SettingsWindow {
             level: None,
             test_timer: None,
             devices: None,
+            cameras: None,
+            cameras_reading: false,
             storage: None,
             failed: None,
             sound_error: None,
@@ -814,8 +823,25 @@ impl SettingsWindow {
         self.picker = Some(picker);
         window.focus(&self.menu_focus, cx);
         // The list is read again as the menu opens: a device may have come or gone.
-        self.list_devices(cx);
+        if picker == Picker::Camera {
+            self.list_cameras(cx);
+        } else {
+            self.list_devices(cx);
+        }
         cx.notify();
+    }
+
+    /// Every camera, with a picture from each, read off the main thread: each opens for a frame.
+    pub(super) fn list_cameras(&mut self, cx: &mut Context<Self>) {
+        if self.cameras_reading {
+            return;
+        }
+        self.cameras_reading = true;
+        self.off_thread(cx, read_cameras, |this, cameras, cx| {
+            this.cameras_reading = false;
+            this.cameras = Some(cameras);
+            cx.notify();
+        });
     }
 
     /// Closes the device menu and gives the keys back to its button.
@@ -850,6 +876,7 @@ impl SettingsWindow {
         let (row, key) = match picker {
             Picker::Input => ("V1", protocol::settings::INPUT),
             Picker::Output => ("V2", protocol::settings::OUTPUT),
+            Picker::Camera => ("V22", protocol::settings::CAMERA),
         };
         self.set(row, protocol::settings::GLOBAL.into(), key, name, cx);
     }
@@ -1074,6 +1101,13 @@ pub(in crate::gui) fn mediad_path() -> std::path::PathBuf {
     }
     let exe = std::env::current_exe().unwrap_or_default();
     exe.with_file_name(format!("mediad{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// The system's cameras, each with a small picture in the support directory's `cameras` folder.
+fn read_cameras() -> Vec<protocol::CameraSource> {
+    let folder = protocol::support_dir().join("cameras");
+    let stdout = protocol::media_host::output(protocol::launch::no_console(std::process::Command::new(mediad_path()).arg("--cameras").arg(&folder)).stderr(std::process::Stdio::null())).unwrap_or_default();
+    serde_json::from_slice::<Vec<protocol::CameraSource>>(&stdout).unwrap_or_default().into_iter().take(protocol::DEVICES_LIMIT).collect()
 }
 
 /// The system's devices, by the names a call takes. `None` when mediad could not say.

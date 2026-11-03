@@ -55,7 +55,7 @@ pub fn screens(folder: Option<&Path>) -> Vec<ScreenSource> {
 }
 
 /// A small JPEG of one capture, sampled to its nearest pixel: the picker draws it at this size.
-fn thumbnail(grab: &Rgba, path: &Path) -> Result<(), String> {
+pub(super) fn thumbnail(grab: &Rgba, path: &Path) -> Result<(), String> {
     let (width, height) = fit(grab.width, grab.height, THUMB.0, THUMB.1);
     let rgb = shrink(grab, width, height);
     let file = std::fs::File::create(path).map_err(|err| err.to_string())?;
@@ -64,7 +64,7 @@ fn thumbnail(grab: &Rgba, path: &Path) -> Result<(), String> {
 }
 
 /// RGB at `width` × `height`, each pixel the nearest of the capture's.
-fn shrink(grab: &Rgba, width: u32, height: u32) -> Vec<u8> {
+pub(super) fn shrink(grab: &Rgba, width: u32, height: u32) -> Vec<u8> {
     let mut rgb = Vec::with_capacity((width * height * 3) as usize);
     for y in 0..height {
         let sy = (y as u64 * grab.height as u64 / height.max(1) as u64) as u32;

@@ -13,6 +13,7 @@ use protocol::{PictureKind, ShareQuality};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// Said while the binary is on its way, so a call does not treat the wait as a failure.
@@ -31,6 +32,24 @@ pub use screens::{choose_screen, screens};
 /// A screen through Desktop Duplication, which is what a share at 60 frames a second needs.
 #[cfg(windows)]
 mod duplicate;
+
+/// The camera the next camera frame comes from, as `settings::CAMERA` stores it (a name, then a
+/// tab and the system's id); `None` is the first one listed. One choice per process.
+static CAMERA: Mutex<Option<String>> = Mutex::new(None);
+
+/// What the camera opens from its next frame on. One already open is closed and opened again.
+pub fn choose_camera(choice: Option<String>) {
+    *CAMERA.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = choice;
+}
+
+pub(crate) fn camera_chosen() -> Option<String> {
+    CAMERA.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+}
+
+/// The size my own camera is shown to me at. Smaller than what is sent: it is a corner.
+pub const SELF_VIEW: (u32, u32) = (640, 360);
+/// How often my own camera is painted for me.
+pub const SELF_VIEW_EVERY: Duration = Duration::from_millis(100);
 pub mod convert;
 /// Built everywhere, so host tests drive it with `platform::fake`.
 pub mod phone;

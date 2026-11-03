@@ -441,6 +441,12 @@ impl Shell {
         self.call_state.feed.shown().cloned()
     }
 
+    /// My own camera as it is sent, while it is on.
+    fn tiny_self_frame(&self, call: Option<&Call>) -> Option<Arc<RenderImage>> {
+        call?.self_view.as_ref().filter(|picture| !picture.path.is_empty())?;
+        self.call_state.self_feed.shown().cloned()
+    }
+
     /// What a stream shows: its picture; mine, which is never sent back to me, said in words with
     /// Stop; anyone else's, "Watch stream" until its first picture arrives.
     fn tiny_stream_body(&self, page: &Page, stream: &Stream, call: Option<&Call>, size: Size, cx: &mut Context<Self>) -> AnyElement {
@@ -450,6 +456,23 @@ impl Shell {
         let small = size == Size::Strip;
         let large = size == Size::Big;
         let body = div().size_full().relative().flex().flex_col().items_center().justify_center().gap(px(if small { 4. } else { 10. })).p(px(8.));
+        if stream.mine && !stream.share {
+            // My camera as everyone sees it, with Stop over it.
+            if let Some(frame) = self.tiny_self_frame(call) {
+                let stop = button_with_icon("tiny-stream-camera-off", ButtonKind::Danger, "icons/video-off.svg", "Turn camera off").on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_ask(Request::Media(MediaRequest::Camera { on: false }), cx);
+                }));
+                return div()
+                    .size_full()
+                    .relative()
+                    .child(img(frame).size_full().object_fit(ObjectFit::Contain))
+                    .when(!small, |tile| {
+                        tile.child(div().absolute().bottom(px(10.)).left_0().right_0().flex().justify_center().child(stop.h(px(28.)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())))
+                    })
+                    .into_any_element();
+            }
+        }
         if stream.mine {
             let thumbnail = self.tiny_state.shared.as_ref().filter(|_| stream.share).map(|screen| screen.thumbnail.clone()).filter(|path| !path.is_empty());
             let words = if stream.share { "You're sharing your screen" } else { "Your camera is on" };
@@ -1095,6 +1118,7 @@ mod tests {
             device_stuck: false,
             security: None,
             picture: None,
+            self_view: None,
         }
     }
 
