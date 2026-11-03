@@ -827,7 +827,9 @@ fn a_row_says_where_it_is_and_a_thread_lives_and_dies_with_its_parent() {
 
     let kept = chatd.row(&key(Network::Discord, "T-kept"));
     assert_eq!((kept.parent.as_deref(), kept.root.as_deref()), (Some("C1"), Some("100")));
-    // Retention runs behind the socket at start.
+    // Retention runs behind the socket, a minute after the boot: a setting change wakes the
+    // first pass early, and the same value written back is exactly that wake.
+    chatd.ask(Request::Set { scope: String::new(), key: "keep_days".into(), value: Some("90".into()) });
     for gone in ["T-aged", "T-orphan"] {
         let request = Request::Conversation { conversation: key(Network::Discord, gone) };
         chatd.until(gone, request, |answer| matches!(answer, Response::Error { code: ErrorCode::NotFound, .. }));
