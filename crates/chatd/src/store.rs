@@ -1918,9 +1918,9 @@ impl Store {
     ///
     /// `unread` says whether a new incoming message counts: live ones do, history does not,
     /// because the network already said how much of it is unread. A live outgoing message that is
-    /// the newest clears the count: replying now means it was read. History of our own past posts
-    /// must not: the network still owns how far we have read (Slack threads, Tiny lists). A
-    /// message that carries the `client_id` of one still pending here replaces it.
+    /// the newest clears the count: replying now (pending or echoed) means it was read. History of
+    /// our own past posts must not: the network still owns how far we have read (Slack threads,
+    /// Tiny lists). A message that carries the `client_id` of one still pending here replaces it.
     pub fn ingest(&mut self, conversation: &Key, message: &Message, unread: bool) -> rusqlite::Result<Stored> {
         let tx = self.db.transaction()?;
         let (network, account, id) = (word(&conversation.network), &conversation.account, &conversation.id);
@@ -1963,8 +1963,9 @@ impl Store {
             )?;
         }
         let counts = unread && !message.outgoing;
-        // Only a live send clears the badge and advances the marker; history of ours must not.
-        let clear_read = message.outgoing && unread;
+        // A live send clears the badge: pending from the shell, or the network's echo (`unread`).
+        // History of a past post of ours must not.
+        let clear_read = message.outgoing && (unread || matches!(message.state, SendState::Pending));
         match outcome {
             Stored::New => {
                 tx.execute(
@@ -3065,11 +3066,21 @@ mod tests {
         assert_eq!(row.last_read.as_deref(), None);
         assert_eq!(row.preview.as_str(), "mine");
 
-        let mut live = said("3", "sending now", 30);
-        live.outgoing = true;
-        store.ingest(&key, &live, true).unwrap();
+        let mut pending = said("3", "sending now", 30);
+        pending.outgoing = true;
+        pending.state = SendState::Pending;
+        store.ingest(&key, &pending, false).unwrap();
         let row = store.conversation(&key).unwrap().unwrap();
-        assert_eq!((row.unread, row.last_read.as_deref()), (0, Some("3")));
+        assert_eq!(row.unread, 0, "a pending send still reads the chat");
+        assert_eq!(row.last_read.as_deref(), None, "the marker waits for the network's id");
+
+        let mut echoed = said("3", "sending now", 30);
+        echoed.outgoing = true;
+        echoed.client_id = Some("3".into());
+        echoed.id = "99".into();
+        store.ingest(&key, &echoed, true).unwrap();
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.unread, row.last_read.as_deref()), (0, Some("99")));
     }
 
     /// Tiny OpenSpace refresh (and any late network count) must not put the badge back after
