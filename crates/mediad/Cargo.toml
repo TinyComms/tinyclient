@@ -83,6 +83,9 @@ webpki-roots = "1"
 # call's 20 ms tick needs (`rt`), and the screens and windows a share can send (`picture/screens`).
 # Already in the tree through cpal and mio.
 windows-sys = { version = "0.61", features = ["Win32_Media", "Win32_System_Threading", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Storage_Xps", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
+# A screen share through DXGI Desktop Duplication (`picture/duplicate`): Direct3D 11 and DXGI are
+# COM, which the `windows` crate wraps. The version notifier already builds.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi"] }
 # The first camera, through Media Foundation. Pure Rust bindings. A machine with no camera
 # says so, and the call stays a voice call.
 nokhwa = { version = "0.10.10", default-features = false, features = ["input-native"] }

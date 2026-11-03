@@ -86,10 +86,12 @@ impl Call {
             {
                 return MediaResponse::Refused { detail: NO_VIDEO.to_owned() };
             }
-            MediaRequest::ShareSend { on, screen } => {
-                // What the share captures, chosen before the probe so the probe tries that one.
+            MediaRequest::ShareSend { on, screen, quality } => {
+                // What the share captures, chosen before the probe so the probe tries that one,
+                // and what it spends.
                 if on {
                     picture::choose_screen(screen);
+                    picture::choose_quality(quality);
                 }
                 if self.tiny.is_some() && on {
                     if let Err(words) = picture::probe_screen() {

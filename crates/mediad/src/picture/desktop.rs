@@ -3,15 +3,18 @@
 //! `picture.rs`, which keeps what phones share.
 
 use super::*;
+use crate::rt;
 use openh264::decoder::{Decoder, DecoderConfig};
-use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, Level, Profile, RateControlMode, UsageType};
+use openh264::encoder::{BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, Level, Profile, RateControlMode, UsageType};
 use openh264::formats::YUVSource;
 use openh264::{OpenH264API, Timestamp};
 use openh264_sys2::{SBitrateInfo, ENCODER_OPTION_BITRATE, ENCODER_OPTION_FRAME_RATE, SPATIAL_LAYER_ALL};
 use std::io::Read;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 
 impl YUVSource for Planes {
@@ -48,18 +51,25 @@ struct Coded {
 }
 
 impl Coded {
-    /// `bps` is also the most this encoder ever spends: [`Coded::tune`] only goes under it.
-    fn open(width: u32, height: u32, bps: u32, screen: bool) -> Result<Coded, String> {
+    /// `bps` is also the most this encoder ever spends: [`Coded::tune`] only goes under it, and
+    /// so is `fps`. A share's encoder is level 5.1, which holds 1440p at 60, and spreads its work
+    /// over threads: one thread could not encode 1080p inside a frame at 60.
+    fn open(width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Result<Coded, String> {
         let api = load_api()?;
+        let threads = if screen { std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8) as u16 } else { 1 };
         let config = EncoderConfig::new()
             .bitrate(BitRate::from_bps(bps))
             .rate_control_mode(RateControlMode::Bitrate)
-            .max_frame_rate(FrameRate::from_hz(FULL_FPS))
+            .max_frame_rate(FrameRate::from_hz(fps))
             .usage_type(if screen { UsageType::ScreenContentRealTime } else { UsageType::CameraVideoRealTime })
             .profile(Profile::Baseline)
-            .level(Level::Level_3_1);
+            .level(if screen { Level::Level_5_1 } else { Level::Level_3_1 })
+            // Above 30 a share trades some compression for the time: at medium complexity
+            // eight threads took 14 ms on a 1080p frame, inside a frame at 30 but not at 60.
+            .complexity(if screen && fps > 30. { Complexity::Low } else { Complexity::Medium })
+            .num_threads(threads);
         let encoder = Encoder::with_api_config(api, config).map_err(|err| err.to_string())?;
-        Ok(Coded { encoder, width, height, bps, fps: FULL_FPS, begun: false })
+        Ok(Coded { encoder, width, height, bps, fps, begun: false })
     }
 
     /// The rate and frame rate asked for, if they moved and the encoder can take them.
@@ -104,9 +114,9 @@ impl Coded {
 
 /// The encoder for one track at this size: the one it has, or a new one, which starts with a
 /// keyframe.
-fn coded(slot: &mut Option<Coded>, width: u32, height: u32, nominal: u32, screen: bool) -> Result<&mut Coded, String> {
+fn coded(slot: &mut Option<Coded>, width: u32, height: u32, nominal: u32, fps: f32, screen: bool) -> Result<&mut Coded, String> {
     if !slot.as_ref().is_some_and(|coded| coded.width == width && coded.height == height) {
-        *slot = Some(Coded::open(width, height, nominal, screen)?);
+        *slot = Some(Coded::open(width, height, nominal, fps, screen)?);
     }
     slot.as_mut().ok_or_else(|| "No encoder.".to_owned())
 }
@@ -118,6 +128,41 @@ pub struct Outgoing {
     high: Option<Coded>,
     low: Option<Coded>,
     camera: Camera,
+    cost: Cost,
+}
+
+/// What a share frame costs, in the log once a second or so: where the time goes when the rate
+/// cannot be kept.
+#[derive(Default)]
+struct Cost {
+    frames: u32,
+    capture: Duration,
+    convert: Duration,
+    encode: Duration,
+    since: Option<Instant>,
+}
+
+impl Cost {
+    fn note(&mut self, began: Instant, captured: Instant, converted: Instant, encoded: Instant, grabbed: (u32, u32), sent: (u32, u32)) {
+        self.frames += 1;
+        self.capture += captured - began;
+        self.convert += converted - captured;
+        self.encode += encoded - converted;
+        let since = *self.since.get_or_insert(began);
+        if encoded - since >= Duration::from_secs(1) {
+            let each = |total: Duration| total.as_secs_f32() * 1000. / self.frames as f32;
+            tracing::debug!(
+                frames = self.frames,
+                capture_ms = each(self.capture),
+                convert_ms = each(self.convert),
+                encode_ms = each(self.encode),
+                grabbed = ?grabbed,
+                sent = ?sent,
+                "share frame cost"
+            );
+            *self = Cost { since: Some(encoded), ..Cost::default() };
+        }
+    }
 }
 
 impl Outgoing {
@@ -127,10 +172,16 @@ impl Outgoing {
         if self.share.is_none() {
             load_api()?;
         }
+        let quality = super::share_quality();
+        let began = Instant::now();
         let grabbed = capture_screen()?;
-        let (width, height) = fit(grabbed.width, grabbed.height, SHARE_MAX.0, SHARE_MAX.1);
+        let captured = Instant::now();
+        let (width, height) = fit(grabbed.width, grabbed.height, quality.max.0, quality.max.1);
         let planes = i420(&grabbed.pixels, grabbed.width, grabbed.height, width, height, grabbed.bgra);
-        coded(&mut self.share, width, height, SHARE_BPS, true)?.encode(&planes, &ask)
+        let converted = Instant::now();
+        let encoded = coded(&mut self.share, width, height, quality.bps, quality.fps as f32, true)?.encode(&planes, &ask);
+        self.cost.note(began, captured, converted, Instant::now(), (grabbed.width, grabbed.height), (width, height));
+        encoded
     }
 
     /// The camera's two layers, high then low, or why the camera could not be read. A layer with
@@ -144,7 +195,7 @@ impl Outgoing {
             Some(ask) => {
                 let (width, height) = fit(grabbed.width, grabbed.height, most.0, most.1);
                 let planes = i420(&grabbed.pixels, grabbed.width, grabbed.height, width, height, grabbed.bgra);
-                coded(slot, width, height, nominal, false)?.encode(&planes, &ask)
+                coded(slot, width, height, nominal, FULL_FPS, false)?.encode(&planes, &ask)
             }
             None => Ok(Encoded::default()),
         };
@@ -158,11 +209,11 @@ impl Outgoing {
     }
 }
 
-/// The one decoder a call holds, and the picture it last painted.
+/// The one decoder a call holds, and the painters that write what it decodes for the window.
 #[derive(Default)]
 pub struct Incoming {
     decoder: Option<Decoder>,
-    canvas: Canvas,
+    painters: Painters,
 }
 
 impl Incoming {
@@ -171,35 +222,144 @@ impl Incoming {
         self.decoder = None;
     }
 
-    /// Decodes one received Annex B frame, and paints it if `paint`. Every frame goes through the
-    /// decoder, painted or not: the next one is built on it. `Err` means it did not decode;
-    /// `Ok(None)` that there is nothing to paint.
+    /// Decodes one received Annex B frame, and has it painted for `paint` if given. Every frame
+    /// goes through the decoder, painted or not: the next one is built on it. `Err` means it did
+    /// not decode. What was painted comes back from [`Incoming::painted`].
     #[allow(clippy::result_unit_err)]
-    pub fn decode(&mut self, annex_b: &[u8], paint: bool) -> Result<Option<Painted>, ()> {
+    pub fn decode(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
         if self.decoder.is_none() {
             let api = load_api().map_err(|_| ())?;
             self.decoder = Decoder::with_api_config(api, DecoderConfig::new()).ok();
         }
         let decoder = self.decoder.as_mut().ok_or(())?;
         let Some(decoded) = decoder.decode(annex_b).map_err(|_| ())? else {
-            return Ok(None);
+            return Ok(());
         };
-        if !paint {
-            return Ok(None);
-        }
+        let Some(tag) = paint else {
+            return Ok(());
+        };
         let (width, height) = decoded.dimensions();
         if width == 0 || height == 0 {
-            return Ok(None);
+            return Ok(());
         }
         let mut colors = vec![0u8; width * height * 3];
         // This honours the decoder's strides, which are wider than the picture.
         decoded.write_rgb8(&mut colors);
-        Ok(self.canvas.paint(&colors, width as u32, height as u32))
+        self.painters.paint(colors, width as u32, height as u32, tag);
+        Ok(())
     }
 
-    /// The file on disk goes.
+    /// The pictures painted since this was last asked.
+    pub fn painted(&mut self) -> Vec<(Tag, Painted)> {
+        self.painters.painted()
+    }
+
+    /// The files on disk go, and so does anything still being painted.
     pub fn forget(&mut self) {
-        self.canvas.forget();
+        self.painters.forget();
+    }
+}
+
+/// The threads that write each decoded picture as a JPEG for the window, each with a file of
+/// its own. One took 60 ms on a 1080p picture, two frames of a share at 30, so two or three of
+/// them keep up with it; a picture that finds every painter busy is not painted, and the next
+/// one is. Started at the first picture, not at join.
+#[derive(Default)]
+struct Painters {
+    workers: Vec<Worker>,
+    /// The painter to try first, so they take turns.
+    next: usize,
+    done: Option<(Sender<Done>, Receiver<Done>)>,
+    /// Pictures from before the last `forget` are not shown.
+    epoch: u64,
+    generation: u64,
+}
+
+struct Worker {
+    jobs: Sender<Job>,
+    /// Painting now: a job sent to it would wait.
+    busy: Arc<AtomicBool>,
+}
+
+enum Job {
+    Paint { colors: Vec<u8>, width: u32, height: u32, generation: u64, epoch: u64, tag: Tag },
+    /// The file goes.
+    Forget,
+}
+
+struct Done {
+    epoch: u64,
+    tag: Tag,
+    painted: Painted,
+}
+
+impl Painters {
+    fn start(&mut self) {
+        if !self.workers.is_empty() {
+            return;
+        }
+        let (done_tx, done_rx) = channel();
+        let count = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 3);
+        for _ in 0..count {
+            let (jobs, work) = channel::<Job>();
+            let busy = Arc::new(AtomicBool::new(false));
+            let (done, mine) = (done_tx.clone(), busy.clone());
+            // A thread that could not start takes no jobs: a send to it fails, and the picture
+            // is not painted.
+            let _ = std::thread::Builder::new().name("mediad-paint".into()).spawn(move || {
+                rt::worker_thread();
+                let mut canvas = Canvas::default();
+                for job in work {
+                    match job {
+                        Job::Paint { colors, width, height, generation, epoch, tag } => {
+                            if let Some(painted) = canvas.paint(&colors, width, height, generation) {
+                                let _ = done.send(Done { epoch, tag, painted });
+                            }
+                            mine.store(false, Ordering::Release);
+                        }
+                        Job::Forget => canvas.forget(),
+                    }
+                }
+                canvas.forget();
+            });
+            self.workers.push(Worker { jobs, busy });
+        }
+        self.done = Some((done_tx, done_rx));
+    }
+
+    /// Hands the picture to a painter that is free, if any is.
+    fn paint(&mut self, colors: Vec<u8>, width: u32, height: u32, tag: Tag) {
+        self.start();
+        let count = self.workers.len();
+        for turn in 0..count {
+            let at = (self.next + turn) % count;
+            let worker = &self.workers[at];
+            if worker.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                continue;
+            }
+            self.next = (at + 1) % count;
+            self.generation = self.generation.wrapping_add(1);
+            let job = Job::Paint { colors, width, height, generation: self.generation, epoch: self.epoch, tag };
+            if worker.jobs.send(job).is_err() {
+                worker.busy.store(false, Ordering::Release);
+            }
+            return;
+        }
+    }
+
+    fn painted(&mut self) -> Vec<(Tag, Painted)> {
+        let epoch = self.epoch;
+        self.done.as_ref().map_or_else(Vec::new, |(_, done)| done.try_iter().filter(|done| done.epoch == epoch).map(|done| (done.tag, done.painted)).collect())
+    }
+
+    fn forget(&mut self) {
+        self.epoch += 1;
+        for worker in &self.workers {
+            let _ = worker.jobs.send(Job::Forget);
+        }
+        if let Some((_, done)) = &self.done {
+            for _ in done.try_iter() {}
+        }
     }
 }
 
@@ -505,7 +665,7 @@ mod tests {
     #[ignore = "needs the OpenH264 binary, which is not in the tree"]
     fn frames_survive_the_real_codec_in_bitrate_mode_and_the_rate_moves() {
         let (width, height) = (640usize, 360usize);
-        let mut outgoing = Coded::open(width as u32, height as u32, CAMERA_HIGH_BPS, false).unwrap();
+        let mut outgoing = Coded::open(width as u32, height as u32, CAMERA_HIGH_BPS, FULL_FPS, false).unwrap();
         let mut incoming = Incoming::default();
         let (mut key, mut bytes_high, mut bytes_low) = (false, 0usize, 0usize);
         for n in 0..90usize {
@@ -533,8 +693,15 @@ mod tests {
                 bytes_low += encoded.bytes.len();
             }
             if !encoded.bytes.is_empty() {
-                let painted = incoming.decode(&encoded.bytes, n == 0).expect("every frame decodes");
-                assert_eq!(painted.is_some(), n == 0, "only what was asked is painted, at frame {n}");
+                let tag = (n == 0).then(|| Tag { user: "ada".into(), kind: protocol::PictureKind::Share });
+                incoming.decode(&encoded.bytes, tag).expect("every frame decodes");
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut painted = incoming.painted();
+                while n == 0 && painted.is_empty() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                    painted = incoming.painted();
+                }
+                assert_eq!(!painted.is_empty(), n == 0, "only what was asked is painted, at frame {n}");
             }
         }
         incoming.forget();
