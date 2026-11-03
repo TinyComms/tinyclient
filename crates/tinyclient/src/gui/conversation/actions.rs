@@ -811,7 +811,7 @@ impl Pane {
         };
         let mut rows: Vec<AnyElement> = Vec::new();
         // What it is about: who said it, when, and its first words.
-        let who = if message.outgoing { "You".to_owned() } else { message.sender.name.clone() };
+        let who = message.shown_sender().to_owned();
         let said = if message.text.trim().is_empty() { "Attachment".to_owned() } else { message.text.replace('\n', " ") };
         let about = div()
             .flex_none()
@@ -1168,7 +1168,7 @@ impl Pane {
                     .flex()
                     .items_baseline()
                     .gap(px(8.))
-                    .child(div().type_ui().font_weight(theme::SEMIBOLD).child(if message.outgoing { "You".to_owned() } else { message.sender.name.clone() }))
+                    .child(div().type_ui().font_weight(theme::SEMIBOLD).child(message.shown_sender().to_owned()))
                     .child(div().type_micro().text_color(theme::text_faint()).child(time::clock(message.sent))),
             )
             .child(div().line_clamp(2).type_ui().text_color(theme::text_soft()).child(words));
