@@ -896,7 +896,7 @@ impl Shell {
         self.tiny_state.applied = call;
         #[cfg(feature = "gui-shot")]
         if let Some(stats) = crate::gui::call::shot_stats() {
-            self.tiny_state.stats_chart = health::seed_chart(&stats);
+            self.tiny_state.stats_chart = health::seed_chart(&stats, Instant::now());
             self.tiny_state.stats = Some(stats);
             return;
         }
@@ -910,7 +910,7 @@ impl Shell {
                 match answer {
                     Ok(Response::CallStats { stats }) => {
                         this.tiny_state.steady.feed(&stats, Instant::now());
-                        health::push_chart(&mut this.tiny_state.stats_chart, &stats);
+                        health::push_chart(&mut this.tiny_state.stats_chart, &stats, Instant::now());
                         this.tiny_state.stats_before = this.tiny_state.stats.replace(stats);
                         this.tiny_state.stats_note = None;
                     }

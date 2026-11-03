@@ -95,7 +95,7 @@ fn meta_row(label: &'static str, value: impl IntoElement) -> Div {
         .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(value))
 }
 
-fn kpi(label: &'static str, value: String, unit: &'static str) -> Div {
+fn kpi(label: &'static str, value: String, unit: &'static str, color: Rgba) -> Div {
     div()
         .flex_1()
         .min_w_0()
@@ -112,14 +112,18 @@ fn kpi(label: &'static str, value: String, unit: &'static str) -> Div {
                 .flex()
                 .items_baseline()
                 .gap(px(2.))
-                .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::positive()).child(value))
+                .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(color).child(value))
                 .child(div().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child(unit)),
         )
 }
 
-/// Ping (filled) and receive bitrate over the last minute.
-fn health_chart(samples: Vec<ChartSample>) -> Div {
-    let (now_rtt, now_recv) = samples.last().map(|sample| (sample.rtt_ms, sample.recv_kbps)).unwrap_or((0, 0));
+/// Ping (filled) and receive bitrate over the last minute. `now_*` are the same numbers the
+/// KPI strip shows (smoothed ping, current receive), so the footer does not disagree with them.
+fn health_chart(samples: Vec<ChartSample>, now_rtt: Option<u32>, now_recv: u32) -> Div {
+    let foot = match now_rtt {
+        Some(rtt) => format!("Now · {rtt} ms · {now_recv} kb/s"),
+        None => format!("Now · — · {now_recv} kb/s"),
+    };
     let chart = canvas(
         |_, _, _| (),
         move |bounds, (), window, _| {
@@ -134,11 +138,12 @@ fn health_chart(samples: Vec<ChartSample>) -> Div {
                 let y = origin_y + height * frac;
                 window.paint_quad(fill(Bounds::new(point(px(origin_x), px(y)), size(px(width), px(1.))), theme::hairline()));
             }
-            let count = samples.len();
-            let span = (count.saturating_sub(1)).max(1) as f32;
+            let first = samples.first().map(|sample| sample.at).unwrap_or_else(std::time::Instant::now);
+            let last_at = samples.last().map(|sample| sample.at).unwrap_or(first);
+            let span = last_at.duration_since(first).as_secs_f32().max(0.001);
             let max_rtt = samples.iter().map(|sample| sample.rtt_ms).max().unwrap_or(1).max(1) as f32;
             let max_recv = samples.iter().map(|sample| sample.recv_kbps).max().unwrap_or(1).max(1) as f32;
-            let x_at = |index: usize| origin_x + width * (index as f32) / span;
+            let x_at = |sample: &ChartSample| origin_x + width * sample.at.duration_since(first).as_secs_f32() / span;
             let ping_y = |rtt: u32| {
                 let t = (rtt as f32 / (max_rtt * 1.2)).clamp(0., 1.);
                 origin_y + height * (0.42 + 0.5 * (1. - t))
@@ -149,11 +154,11 @@ fn health_chart(samples: Vec<ChartSample>) -> Div {
             };
 
             let mut area = PathBuilder::fill();
-            area.move_to(point(px(x_at(0)), px(origin_y + height)));
-            for (index, sample) in samples.iter().enumerate() {
-                area.line_to(point(px(x_at(index)), px(ping_y(sample.rtt_ms))));
+            area.move_to(point(px(x_at(&samples[0])), px(origin_y + height)));
+            for sample in &samples {
+                area.line_to(point(px(x_at(sample)), px(ping_y(sample.rtt_ms))));
             }
-            area.line_to(point(px(x_at(count - 1)), px(origin_y + height)));
+            area.line_to(point(px(x_at(samples.last().unwrap())), px(origin_y + height)));
             area.close();
             if let Ok(path) = area.build() {
                 window.paint_path(path, theme::positive_soft());
@@ -161,7 +166,7 @@ fn health_chart(samples: Vec<ChartSample>) -> Div {
 
             let mut ping = PathBuilder::stroke(px(2.));
             for (index, sample) in samples.iter().enumerate() {
-                let at = point(px(x_at(index)), px(ping_y(sample.rtt_ms)));
+                let at = point(px(x_at(sample)), px(ping_y(sample.rtt_ms)));
                 if index == 0 {
                     ping.move_to(at);
                 } else {
@@ -174,7 +179,7 @@ fn health_chart(samples: Vec<ChartSample>) -> Div {
 
             let mut recv = PathBuilder::stroke(px(1.75)).dash_array(&[px(3.), px(3.)]);
             for (index, sample) in samples.iter().enumerate() {
-                let at = point(px(x_at(index)), px(recv_y(sample.recv_kbps)));
+                let at = point(px(x_at(sample)), px(recv_y(sample.recv_kbps)));
                 if index == 0 {
                     recv.move_to(at);
                 } else {
@@ -186,7 +191,7 @@ fn health_chart(samples: Vec<ChartSample>) -> Div {
             }
 
             if let Some(last) = samples.last() {
-                let cx = x_at(count - 1);
+                let cx = x_at(last);
                 let cy = ping_y(last.rtt_ms);
                 window.paint_quad(fill(
                     Bounds::new(point(px(cx - 5.), px(cy - 5.)), size(px(10.), px(10.))),
@@ -248,7 +253,7 @@ fn health_chart(samples: Vec<ChartSample>) -> Div {
                 .type_micro()
                 .text_color(theme::text_soft())
                 .child("−60s")
-                .child(format!("Now · {now_rtt} ms · {now_recv} kb/s")),
+                .child(foot),
         )
 }
 
@@ -358,6 +363,7 @@ impl Shell {
         let room = self.tiny_page_facts().and_then(|page| page.mine.and_then(|id| page.community.rooms.iter().find(|room| room.id == id)).map(|room| (room.name.clone(), room.bitrate())));
         let health = self.tiny_health().unwrap_or_default();
         let grade = health.grade();
+        let hints = health.hints();
         let mut card = div().w(px(320.)).flex().flex_col().child(
             div()
                 .pb(px(10.))
@@ -377,14 +383,14 @@ impl Shell {
                                 .child(health::bars(grade, 14.))
                                 .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("Call health")),
                         )
-                        .children(health.hints().into_iter().take(1).map(|hint| {
+                        .children(hints.iter().take(1).map(|hint| {
                             div()
                                 .mt(px(6.))
                                 .flex()
                                 .items_start()
                                 .gap(px(6.))
                                 .child(div().pt(px(1.)).child(glyph(hint.level.icon(), 12., hint.level.color())))
-                                .child(div().flex_1().min_w_0().whitespace_normal().type_small().text_color(hint.level.color()).child(hint.words))
+                                .child(div().flex_1().min_w_0().whitespace_normal().type_small().text_color(hint.level.color()).child(hint.words.clone()))
                         })),
                 )
                 .child(
@@ -406,7 +412,6 @@ impl Shell {
                 ),
         );
 
-        let hints = health.hints();
         if hints.len() > 1 {
             card = card.child(
                 div().pb(px(8.)).mb(px(4.)).border_b_1().border_color(theme::hairline()).flex().flex_col().gap(px(6.)).children(hints.into_iter().skip(1).take(2).map(|hint| {
@@ -424,17 +429,33 @@ impl Shell {
             Some(stats) => {
                 let samples: Vec<_> = self.tiny_state.stats_chart.iter().copied().collect();
                 if !samples.is_empty() {
-                    card = card.child(health_chart(samples));
+                    card = card.child(health_chart(samples, health.rtt_ms, stats.receive_kbps));
                 }
+                let known = |measured: bool| if measured { theme::positive() } else { theme::text_soft() };
                 card = card
                     .child(
                         div()
                             .mb(px(10.))
                             .flex()
                             .gap(px(8.))
-                            .child(kpi("Ping", format!("{}", health.rtt_ms.unwrap_or(0)), "ms"))
-                            .child(kpi("Jitter", format!("{}", health.jitter_ms.unwrap_or(0)), "ms"))
-                            .child(kpi("Loss", format!("{:.1}", f32::from(health.loss_permille.unwrap_or(0)) / 10.), "%")),
+                            .child(kpi(
+                                "Ping",
+                                health.rtt_ms.map_or_else(|| "—".to_owned(), |ms| ms.to_string()),
+                                "ms",
+                                known(health.rtt_ms.is_some()),
+                            ))
+                            .child(kpi(
+                                "Jitter",
+                                health.jitter_ms.map_or_else(|| "—".to_owned(), |ms| ms.to_string()),
+                                "ms",
+                                known(health.jitter_ms.is_some()),
+                            ))
+                            .child(kpi(
+                                "Loss",
+                                health.loss_permille.map_or_else(|| "—".to_owned(), |n| format!("{:.1}", f32::from(n) / 10.)),
+                                "%",
+                                known(health.loss_permille.is_some()),
+                            )),
                     )
                     .when_some(room.as_ref(), |card, (name, kbps)| {
                         card.child(meta_row("Channel", name.clone())).child(meta_row("Channel bitrate", format!("{kbps} kb/s")))
