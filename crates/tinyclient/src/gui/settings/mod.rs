@@ -412,8 +412,7 @@ pub struct SettingsWindow {
     pub(super) clash: Option<(&'static str, String)>,
     /// V18: the microphone test also plays the microphone back. The window's alone.
     pub(super) loopback: bool,
-    /// The section's pane, so a shot can draw it scrolled (`--settings-scroll`).
-    #[cfg(feature = "gui-shot")]
+    /// Shared by the page, scrollbar, and screenshot harness.
     pane_scroll: gpui::ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -486,7 +485,6 @@ impl SettingsWindow {
             held_modifiers: gpui::Modifiers::default(),
             clash: None,
             loopback: false,
-            #[cfg(feature = "gui-shot")]
             pane_scroll: gpui::ScrollHandle::new(),
             _subscriptions: subscriptions,
         };
@@ -501,6 +499,7 @@ impl SettingsWindow {
         if self.section != section {
             self.stop_test(cx);
             self.stop_recording(cx);
+            self.pane_scroll.set_offset(gpui::point(px(0.), px(0.)));
         }
         self.section = section;
         self.close_modal(cx);
@@ -1043,8 +1042,7 @@ impl SettingsWindow {
         let heading = if searching { "Results" } else { self.section.name() };
         let body = if searching { self.results(window, cx) } else { self.page(window, cx) };
         let scroller = div().id(SharedString::from(format!("pane-{}", self.section.name()))).flex_1().min_h_0().overflow_y_scroll();
-        #[cfg(feature = "gui-shot")]
-        let scroller = scroller.track_scroll(&self.pane_scroll);
+        let scroller = scroller.size_full().track_scroll(&self.pane_scroll);
         div()
             .flex_1()
             .min_w_0()
@@ -1063,7 +1061,7 @@ impl SettingsWindow {
                     .text_color(theme::text())
                     .child(heading),
             )
-            .child(scroller.child(div().w(px(controls::COLUMN + 56.)).px(px(28.)).pb(px(28.)).child(body)))
+            .child(div().flex_1().min_h_0().child(crate::gui::components::scroll_frame("settings-scroll-frame", self.pane_scroll.clone(), scroller.child(div().w(px(controls::COLUMN + 56.)).px(px(28.)).pb(px(28.)).child(body)))))
     }
 }
 

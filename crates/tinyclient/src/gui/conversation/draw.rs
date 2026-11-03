@@ -1118,13 +1118,13 @@ impl Pane {
                             })),
                     ),
             )
-            .child(body.child(
+            .child(crate::gui::components::scroll::scroll_content(("code-scroll-frame", block), body.pb(px(18.)).child(
                 div()
                     .type_code()
                     .when(phone, |code| code.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(20.))))
                     .whitespace_nowrap()
                     .child(shown),
-            ))
+            )))
             .children(folded.then(|| {
                 div()
                     .id(("more", block))

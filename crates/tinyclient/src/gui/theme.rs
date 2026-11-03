@@ -55,6 +55,10 @@ pub fn text_soft() -> Rgba { rgb(0xa8abb3) }
 pub fn text_faint() -> Rgba { rgb(0x858993) }
 pub fn text_disabled() -> Rgba { rgb(0x53565e) }
 
+// Scrollbars stay visible while content overflows, without competing with text.
+pub fn scrollbar() -> Rgba { rgba(0xffffff33) }
+pub fn scrollbar_hover() -> Rgba { rgba(0xffffff5c) }
+
 // Accent: "for you" or "this will act". Never plain unread. On a phone it is the one amber
 // of "Paper Signal"; the desktop keeps its blue.
 pub fn accent() -> Rgba {

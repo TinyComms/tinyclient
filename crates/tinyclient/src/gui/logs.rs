@@ -445,11 +445,11 @@ impl Render for LogsWindow {
                 .min_h_0()
                 .py(px(4.))
                 .child(
-                    uniform_list("log-lines", self.visible.len(), cx.processor(Self::rows))
+                    crate::gui::components::scroll_frame("logs-scroll-frame", self.scroll.clone(), uniform_list("log-lines", self.visible.len(), cx.processor(Self::rows))
                         .with_width_from_item(Some(self.longest))
                         .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
                         .track_scroll(&self.scroll)
-                        .size_full(),
+                        .size_full()),
                 )
                 .into_any_element()
         };

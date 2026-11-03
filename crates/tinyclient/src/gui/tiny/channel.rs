@@ -354,7 +354,7 @@ impl Shell {
         let focus = stage::still(self.tiny_state.focus.as_ref(), room, &streams);
         let base = div().id("tiny-stage").flex_1().min_h_0();
         match focus {
-            None => base
+            None => crate::gui::components::scroll::scroll_page("tiny-stage-grid-scroll-frame", base
                 .overflow_y_scroll()
                 .p(px(24.))
                 .flex()
@@ -363,12 +363,12 @@ impl Shell {
                 .items_center()
                 .justify_center()
                 .gap(px(12.))
-                .children(self.tiny_tiles(page, room, &streams, call, None, Size::Grid, cx))
+                .children(self.tiny_tiles(page, room, &streams, call, None, Size::Grid, cx)))
                 .into_any_element(),
             Some(Focus::Person(focus)) => {
                 let big = room.participants.iter().find(|seat| seat.user_id == *focus).map(|seat| self.tiny_tile(page, seat, call, Size::Big, cx));
                 let rest = self.tiny_tiles(page, room, &streams, call, Some(&Focus::Person(focus.clone())), Size::Grid, cx);
-                base.overflow_y_scroll()
+                crate::gui::components::scroll::scroll_page("tiny-stage-person-scroll-frame", base.overflow_y_scroll()
                     .p(px(24.))
                     .flex()
                     .flex_col()
@@ -376,7 +376,7 @@ impl Shell {
                     .justify_center()
                     .gap(px(16.))
                     .children(big)
-                    .child(div().flex().flex_wrap().justify_center().gap(px(12.)).children(rest))
+                    .child(div().flex().flex_wrap().justify_center().gap(px(12.)).children(rest)))
                     .into_any_element()
             }
             Some(Focus::Stream(user_id)) => {

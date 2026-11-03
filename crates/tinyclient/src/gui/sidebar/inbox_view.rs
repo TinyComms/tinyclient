@@ -239,7 +239,7 @@ impl Shell {
                     return empty_state("icons/check.svg", "You're all caught up", last.as_deref().unwrap_or("")).px(px(24.)).into_any_element();
                 }
                 if self.sidebar_state.muted_open {
-                    return self.muted_news(cx).into_any_element();
+                    return crate::gui::components::scroll::scroll_page("muted-news-scroll-frame", self.muted_news(cx)).into_any_element();
                 }
                 let words = if muted == 1 { "1 muted conversation has new messages".to_owned() } else { format!("{muted} muted conversations have new messages") };
                 let open = button("muted-news", ButtonKind::Secondary, words).h(px(28.)).on_click(cx.listener(|this, _, _, cx| {
@@ -324,7 +324,7 @@ impl Shell {
                     }
                 }
             }))
-            .child(list(state.inbox_list.clone(), cx.processor(|this: &mut Shell, ix: usize, window, cx| this.inbox_item(ix, window, cx))).size_full())
+            .child(crate::gui::components::scroll_frame("inbox-scroll-frame", state.inbox_list.clone(), list(state.inbox_list.clone(), cx.processor(|this: &mut Shell, ix: usize, window, cx| this.inbox_item(ix, window, cx))).size_full()).keyboard(false))
             .children(pill)
             .into_any_element()
     }

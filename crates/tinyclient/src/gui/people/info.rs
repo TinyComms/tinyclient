@@ -852,7 +852,7 @@ impl Render for InfoPane {
             Some(Subject::Conversation(_)) => self.row.clone().map(|row| profile::details::conversation(self, &row, window, cx)),
             Some(Subject::Space(key)) => Some(profile::details::space(self, &key, cx)),
         };
-        div().size_full().child(div().id("info-scroll").size_full().overflow_y_scroll().children(body))
+        div().size_full().child(crate::gui::components::scroll::scroll_page("info-scroll-frame", div().id("info-scroll").size_full().overflow_y_scroll().children(body)))
     }
 }
 

@@ -73,14 +73,14 @@ Easing is ease-out for entering, linear for leaving. Reduce Motion sets every du
 | Menu, popover | opacity 0 to 1 and 4 pt toward its anchor, 120 ms. Leaves in 80 ms |
 | Modal and scrim | opacity and 8 pt rise, 160 ms. Leaves in 100 ms |
 | Toast | opacity and 8 pt rise, 160 ms. Leaves in 100 ms |
-| Scrollbar thumb | fades out over 150 ms, 800 ms after scrolling stops |
+| Scrollbar thumb | stays visible while content overflows; hover and drag feedback is instant |
 
 Never animates: hover, press, selection, focus, tab and segment changes, tooltips (appear whole after 500 ms), a message arriving, badges, presence, typing ("Wren is typing…" is static text), skeletons, progress (the bar moves only when the value does), connection state. No spinner exists. Reason: the idle budget, and instant state change is what reads as fast. The one thing that breathes is a server page's loading mark (§3, Loading), because a screen with nothing on it yet has no other way to say it is working.
 
 ### Focus, targets, scrollbars
 - **Focus ring:** 2 pt `focus`, drawn outside the edge, on keyboard focus only. On a filled button, a 2 pt gap of the surface color comes first. A focused text field shows it always, as a `focus` border plus a 3 pt halo of accent 35%.
 - **Hit target:** 28 × 28 minimum. Anything drawn smaller (14 pt clear ×, 16 pt badge, reaction chip) pads its clickable box to 28, or to 24 inside a toolbar where targets touch.
-- **Scrollbar:** overlay, no track, takes no layout width. Thumb 6 wide, radius 3, 3 from the edge, white 20%, minimum length 32; 8 wide and white 36% under the pointer.
+- **Scrollbar:** overlay, takes no layout width, visible whenever content overflows. Thumb 6 wide, radius 3, minimum length 32; 8 wide with stronger contrast under the pointer or during a drag. A 14 pt hit area supports dragging and clicking above or below the thumb to move one page. Focused scroll regions support Page Up/Down, Home/End, and arrow keys; text inputs keep their editing keys. Navigation lists keep arrow keys for row selection. Conversation panes retain their existing paging and jump-to-latest keyboard behavior.
 
 ## 3. Components
 States are rest / hover / pressed / focus / disabled unless listed. Every hover is instant.
@@ -146,7 +146,7 @@ States are rest / hover / pressed / focus / disabled unless listed. Every hover 
 - **Tabular numerals:** `FontFeatures` `tnum` on SF Pro. Verify it applies; if not, give times a fixed-width box.
 - **Icon stroke:** GPUI cannot restyle an SVG's stroke, so export `name-14.svg`, `-16`, `-20`.
 - **Motion:** `with_animation` on opacity and a top offset, only on elements that have just mounted. Nothing holds an `Animation` with `.repeat()`. Tooltip delay and toast expiry are one-shot timers.
-- **Scrollbar:** an absolutely positioned div read from the `ScrollHandle` / `ListState` offset; no built-in.
+- **Scrollbar:** shared `components/scroll.rs` wrapper, painted after content layout from `ScrollHandle`, `UniformListScrollHandle`, or `ListState`. Variable-height lists freeze their scrollbar geometry during dragging. Conversation thumbs describe the loaded history.
 - **Rows stay fixed height** (28 and 48) so both lists remain `uniform_list`.
 
 ## 6. Removed

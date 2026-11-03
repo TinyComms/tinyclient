@@ -597,7 +597,7 @@ impl Shell {
         let items = state.home_items.clone();
         let visible = on_screen(&state.home_list, items.len(), |ix| items[ix].height());
         self.watch_rows(items[visible].iter().filter_map(Item::conversation), cx);
-        list(state.home_list.clone(), cx.processor(|this: &mut Shell, ix: usize, window, cx| this.home_item(ix, window, cx))).size_full().into_any_element()
+        crate::gui::components::scroll_frame("home-scroll-frame", state.home_list.clone(), list(state.home_list.clone(), cx.processor(|this: &mut Shell, ix: usize, window, cx| this.home_item(ix, window, cx))).size_full()).keyboard(false).into_any_element()
     }
 }
 

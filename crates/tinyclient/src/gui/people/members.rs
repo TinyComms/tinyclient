@@ -517,7 +517,7 @@ impl Render for MemberList {
             div().flex_none().px(px(12.)).flex().items_center().gap(px(8.))
                 .child(div().flex_1().type_small().text_color(theme::text_soft()).child("Some members couldn’t load"))
                 .child(button("retry-member-pages", ButtonKind::Ghost, "Retry").on_click(cx.listener(|this, _, _, cx| this.retry(cx))))
-        )).child(div().flex_1().min_h_0().child(uniform_list("members", rows, cx.processor(Self::rows)).track_scroll(&self.scroll).size_full()))
+        )).child(div().flex_1().min_h_0().child(crate::gui::components::scroll_frame("members-scroll-frame", self.scroll.clone(), uniform_list("members", rows, cx.processor(Self::rows)).track_scroll(&self.scroll).size_full())))
     }
 }
 
