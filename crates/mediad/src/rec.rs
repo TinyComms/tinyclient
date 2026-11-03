@@ -163,6 +163,29 @@ fn run_with(path: PathBuf, told: Receiver<()>) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// The tone's pitch as the file carries it: rising zero crossings over the samples heard.
+    fn pitch(mono: &[f32]) -> f64 {
+        let rising = mono.windows(2).filter(|pair| pair[0] < 0. && pair[1] >= 0.).count();
+        rising as f64 * crate::RATE as f64 / (mono.len() as f64).max(1.)
+    }
+
+    /// A runner that dripped frames keeps a tenth of a second where a quiet one keeps a whole
+    /// one, and both files have to read 440 Hz: the early reading counted only one crossing per
+    /// pair of samples and doubled it, which a long file survived and a short one did not.
+    #[test]
+    fn a_short_sliver_of_a_tone_reads_the_pitch_a_whole_second_does() {
+        let tone = |samples: usize| -> Vec<f32> {
+            (0..samples)
+                .map(|n| (n as f64 * std::f64::consts::TAU * 440. / f64::from(crate::RATE)).sin() as f32)
+                .collect()
+        };
+        for samples in [crate::RATE as usize / 10, crate::RATE as usize, crate::RATE as usize * 2] {
+            let read = pitch(&tone(samples));
+            // A tenth of a second holds 44 crossings, so one at the edge is 10 Hz.
+            assert!((415. ..465.).contains(&read), "{samples} samples read {read} Hz");
+        }
+    }
+
     /// A recording off the stand-in microphone (the tone) leaves a file the player's own
     /// reader opens: as long as the recording ran, and carrying the tone that was heard. This
     /// is the whole trip a voice note needs, with no microphone required.
@@ -194,12 +217,8 @@ mod tests {
         assert!((0.05..1.3).contains(&seconds), "{seconds} s heard");
         // The reader hands stereo; the test hears one ear to a mono line.
         let mono: Vec<f32> = heard.chunks_exact(2).map(|pair| (pair[0] + pair[1]) / 2.).collect();
-        eprintln!("mono: {} first {:?} loudest {:?}", mono.len(), mono[..3.min(mono.len())].to_vec(), mono.iter().fold(0f32, |a, b| a.max(*b)));
-        // Rising zero crossings of what was heard a second: the 440 Hz the stand-in makes.
-        // A crossing between two samples is half-seen by a pair window, so twice as many go
-        // by as are counted here.
-        let rising = mono.chunks_exact(2).filter(|pair| pair[0] < 0. && pair[1] >= 0.).count();
-        let pitch = rising as f64 * 2. * crate::RATE as f64 / (mono.len() as f64).max(1.);
+        // The 440 Hz the stand-in makes, read off any length the runner left the file.
+        let pitch = pitch(&mono);
         assert!((380. ..500.).contains(&pitch), "{pitch} Hz");
         // Mono is the same in both ears, as a voice note is.
         assert!(heard.chunks_exact(2).all(|pair| (pair[0] - pair[1]).abs() < 0.001));
