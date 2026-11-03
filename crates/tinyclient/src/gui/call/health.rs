@@ -158,6 +158,42 @@ const WORSE_AFTER: Duration = Duration::from_secs(3);
 /// And better: a call that went bad has to prove itself for longer.
 const BETTER_AFTER: Duration = Duration::from_secs(10);
 
+/// Seconds of ping and receive bitrate kept for Call health's time graph.
+pub(in crate::gui) const CHART_SECONDS: usize = 60;
+
+/// One poll on the Call health chart: when it was read, round trip, and what we were receiving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::gui) struct ChartSample {
+    pub at: Instant,
+    pub rtt_ms: u32,
+    pub recv_kbps: u32,
+}
+
+/// Append one poll to the chart, dropping the oldest past [`CHART_SECONDS`].
+pub(in crate::gui) fn push_chart(samples: &mut VecDeque<ChartSample>, stats: &CallStats, at: Instant) {
+    if samples.len() >= CHART_SECONDS {
+        samples.pop_front();
+    }
+    samples.push_back(ChartSample { at, rtt_ms: stats.rtt_ms, recv_kbps: stats.receive_kbps });
+}
+
+/// A full minute of made-up samples around `stats`, for `--shot` so the graph is not empty.
+pub(in crate::gui) fn seed_chart(stats: &CallStats, now: Instant) -> VecDeque<ChartSample> {
+    let base_rtt = stats.rtt_ms.max(1);
+    let base_recv = stats.receive_kbps.max(1);
+    (0..CHART_SECONDS)
+        .map(|i| {
+            let rtt_wobble = ((i * 37) % 11) as i32 - 5;
+            let recv_wobble = ((i * 53) % 21) as i32 - 10;
+            ChartSample {
+                at: now - Duration::from_secs((CHART_SECONDS - 1 - i) as u64),
+                rtt_ms: (base_rtt as i32 + rtt_wobble).max(1) as u32,
+                recv_kbps: (base_recv as i32 + recv_wobble * 2).max(1) as u32,
+            }
+        })
+        .collect()
+}
+
 /// The link over the last several seconds, fed each poll, and the grade it has earned. While
 /// nothing flows nothing is known about loss or jitter, so they and the grade stay as they were.
 #[derive(Debug, Default)]
@@ -461,6 +497,27 @@ mod tests {
 
     fn second(rtt_ms: u32, loss_permille: u16, jitter_ms: u32) -> CallStats {
         CallStats { rtt_ms, loss_permille, jitter_ms, link_measured: true, ..CallStats::default() }
+    }
+
+    #[test]
+    fn the_chart_keeps_a_minute_and_shot_seed_fills_it() {
+        let start = Instant::now();
+        let mut samples = VecDeque::new();
+        for n in 0..70 {
+            push_chart(
+                &mut samples,
+                &CallStats { rtt_ms: n, receive_kbps: n * 2, ..CallStats::default() },
+                start + Duration::from_secs(n as u64),
+            );
+        }
+        assert_eq!(samples.len(), CHART_SECONDS);
+        assert_eq!(samples.front().map(|sample| sample.rtt_ms), Some(10));
+        assert_eq!(samples.back().map(|sample| sample.rtt_ms), Some(69));
+        assert!(samples.back().unwrap().at > samples.front().unwrap().at);
+        let seeded = seed_chart(&CallStats { rtt_ms: 38, receive_kbps: 182, ..CallStats::default() }, start);
+        assert_eq!(seeded.len(), CHART_SECONDS);
+        assert!(seeded.iter().all(|sample| sample.rtt_ms > 0 && sample.recv_kbps > 0));
+        assert_eq!(seeded.back().map(|sample| sample.at), Some(start));
     }
 
     #[test]
