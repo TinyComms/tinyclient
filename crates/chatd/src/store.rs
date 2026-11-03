@@ -1707,9 +1707,13 @@ impl Store {
     }
 
     /// The unread state the network reported: at connect, or when another device read it. The
-    /// preview is left alone; it comes from messages.
-    /// The network's counts. Mentions going up are noticed: the Inbox keeps a channel a day
-    /// after it mentioned me.
+    /// preview is left alone; it comes from messages. Mentions going up are noticed: the Inbox
+    /// keeps a channel a day after it mentioned me.
+    ///
+    /// A count older than what this install already marked read is a lost tell (ack still in
+    /// flight, or a Tiny channel list with unread and no cursor at the same `updated`), not the
+    /// truth: the badge stays cleared and `last_read` never moves backwards. A newer `updated`
+    /// with no cursor is real activity (Discord's unread push) and may raise the badge again.
     pub fn set_counts(
         &mut self,
         conversation: &Key,
@@ -1718,6 +1722,33 @@ impl Store {
         last_read: Option<&str>,
         updated: i64,
     ) -> rusqlite::Result<bool> {
+        let current: Option<(u32, u32, String, String, i64)> = self
+            .db
+            .query_row(
+                "SELECT unread, mentions, last_read, preview_id, updated FROM conversation
+                  WHERE network = ?1 AND account = ?2 AND id = ?3",
+                params![word(&conversation.network), conversation.account, conversation.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()?;
+        let Some((have_unread, have_mentions, have_read, preview, have_updated)) = current else {
+            return Ok(false);
+        };
+        let net_read = last_read.filter(|id| !id.is_empty());
+        // Local marker newer than the network's: keep ours, ignore its badge.
+        let local_ahead = !have_read.is_empty() && net_read.is_some_and(|net| id_is_ahead(&have_read, net));
+        // Caught up, no cursor, and nothing newer than we already know: Tiny's list refresh.
+        let caught_up = !have_read.is_empty() && (preview.is_empty() || !id_is_ahead(&preview, &have_read));
+        let stale_list = net_read.is_none() && caught_up && updated <= have_updated;
+
+        let (unread, mentions, marker) = if local_ahead {
+            (have_unread, have_mentions, None)
+        } else if stale_list {
+            (unread.min(have_unread), mentions.min(have_mentions), None)
+        } else {
+            (unread, mentions, net_read)
+        };
+
         let changed = self.db.execute(
             "UPDATE conversation SET
                  noticed = CASE WHEN ?5 > mentions THEN CAST(strftime('%s', 'now') AS INTEGER) ELSE noticed END,
@@ -1732,7 +1763,7 @@ impl Store {
                 conversation.id,
                 unread,
                 mentions,
-                last_read,
+                marker,
                 updated
             ],
         )?;
@@ -1886,9 +1917,10 @@ impl Store {
     /// link preview arriving). The conversation must exist.
     ///
     /// `unread` says whether a new incoming message counts: live ones do, history does not,
-    /// because the network already said how much of it is unread. A new outgoing message that is
-    /// the newest clears the count: replying from any device means it was read. A message that
-    /// carries the `client_id` of one still pending here replaces it.
+    /// because the network already said how much of it is unread. A live outgoing message that is
+    /// the newest clears the count: replying now (pending or echoed) means it was read. History of
+    /// our own past posts must not: the network still owns how far we have read (Slack threads,
+    /// Tiny lists). A message that carries the `client_id` of one still pending here replaces it.
     pub fn ingest(&mut self, conversation: &Key, message: &Message, unread: bool) -> rusqlite::Result<Stored> {
         let tx = self.db.transaction()?;
         let (network, account, id) = (word(&conversation.network), &conversation.account, &conversation.id);
@@ -1931,6 +1963,9 @@ impl Store {
             )?;
         }
         let counts = unread && !message.outgoing;
+        // A live send clears the badge: pending from the shell, or the network's echo (`unread`).
+        // History of a past post of ours must not.
+        let clear_read = message.outgoing && (unread || matches!(message.state, SendState::Pending));
         match outcome {
             Stored::New => {
                 tx.execute(
@@ -1940,7 +1975,7 @@ impl Store {
                          last_read = CASE WHEN ?7 AND ?5 >= updated AND ?10 = 0 THEN ?6 ELSE last_read END,
                          noticed = CASE WHEN ?9 > 0 THEN max(noticed, ?5) ELSE noticed END,
                          preview_from = CASE WHEN ?5 >= updated THEN ?11 ELSE preview_from END,
-                         preview_mine = CASE WHEN ?5 >= updated THEN ?7 ELSE preview_mine END,
+                         preview_mine = CASE WHEN ?5 >= updated THEN ?13 ELSE preview_mine END,
                          preview_id = CASE WHEN ?5 >= updated THEN ?6 ELSE preview_id END,
                          preview = CASE WHEN ?5 >= updated THEN ?4 ELSE preview END,
                          updated = max(updated, ?5),
@@ -1954,12 +1989,13 @@ impl Store {
                         preview_of(message),
                         message.sent,
                         message.id,
-                        message.outgoing,
+                        clear_read,
                         u32::from(counts),
                         u32::from(counts && message.mentions_me),
                         pending,
                         if message.outgoing { "" } else { message.sender.name.as_str() },
                         unread,
+                        message.outgoing,
                     ],
                 )?;
             }
@@ -3014,6 +3050,72 @@ mod tests {
         assert_eq!((row.unread, row.mentions, row.last_read.as_deref()), (0, 0, Some("2")));
     }
 
+    /// History of a reply we already sent must not pretend we just read the chat: Slack's thread
+    /// unread and Tiny's list still own that. A live send still clears.
+    #[test]
+    fn history_of_our_own_messages_does_not_clear_unread() {
+        let (mut store, key) = store();
+        store.ingest(&key, &said("1", "hello", 10), true).unwrap();
+        assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 1);
+
+        let mut mine = said("2", "mine", 20);
+        mine.outgoing = true;
+        store.ingest(&key, &mine, false).unwrap();
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!(row.unread, 1, "loading our past reply is not reading");
+        assert_eq!(row.last_read.as_deref(), None);
+        assert_eq!(row.preview.as_str(), "mine");
+
+        let mut pending = said("3", "sending now", 30);
+        pending.outgoing = true;
+        pending.state = SendState::Pending;
+        store.ingest(&key, &pending, false).unwrap();
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!(row.unread, 0, "a pending send still reads the chat");
+        assert_eq!(row.last_read.as_deref(), None, "the marker waits for the network's id");
+
+        let mut echoed = said("3", "sending now", 30);
+        echoed.outgoing = true;
+        echoed.client_id = Some("3".into());
+        echoed.id = "99".into();
+        store.ingest(&key, &echoed, true).unwrap();
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.unread, row.last_read.as_deref()), (0, Some("99")));
+    }
+
+    /// Tiny OpenSpace refresh (and any late network count) must not put the badge back after
+    /// this install already marked the chat read further than the network still reports.
+    #[test]
+    fn a_stale_network_count_does_not_undo_a_local_read() {
+        let (mut store, key) = store();
+        store.ingest(&key, &said("1", "hello", 10), true).unwrap();
+        store.ingest(&key, &said("2", "there", 20), true).unwrap();
+        assert!(store.mark_read(&key, "2").unwrap());
+        assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 0);
+
+        // Channel-style list: unread only, no last_read, same updated — the Tiny refresh path.
+        assert!(!store.set_counts(&key, 2, 0, None, 20).unwrap());
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.unread, row.last_read.as_deref()), (0, Some("2")));
+
+        // Newer activity with no cursor still raises the badge (Discord's unread push).
+        assert!(store.set_counts(&key, 1, 0, None, 30).unwrap());
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.unread, row.last_read.as_deref()), (1, Some("2")));
+        assert!(store.mark_read(&key, "2").unwrap());
+
+        // Direct-style list: an older cursor and a badge must not rewind what we already read.
+        assert!(!store.set_counts(&key, 1, 0, Some("1"), 20).unwrap());
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.unread, row.last_read.as_deref()), (0, Some("2")));
+
+        // A network that read further than we did is still the truth.
+        store.ingest(&key, &said("3", "later", 30), true).unwrap();
+        assert!(store.set_counts(&key, 0, 0, Some("3"), 30).unwrap());
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.unread, row.last_read.as_deref()), (0, Some("3")));
+    }
+
     #[test]
     fn a_read_does_not_rewind_and_forgetting_a_direct_hides_it_until_a_newer_message() {
         let (mut store, key) = store();
@@ -3029,18 +3131,19 @@ mod tests {
         assert!(!store.mark_read(&dm, "10").unwrap(), "an older marker does not rewind a caught-up chat");
         assert_eq!(store.conversation(&dm).unwrap().unwrap().last_read.as_deref(), Some("20"));
 
-        store.set_counts(&dm, 1, 0, None, 10).unwrap();
+        // A newer live message is unread again; a stale network count must not invent that.
+        store.ingest(&dm, &said("30", "again", 30), true).unwrap();
         let marks = store.unread_marks(Some(Network::Discord)).unwrap();
-        assert!(marks.iter().any(|(found, marker, request)| found == &dm && marker == "20" && !request));
+        assert!(marks.iter().any(|(found, marker, request)| found == &dm && marker == "30" && !request));
         assert!(store.forget_conversation(&dm).unwrap());
         let row = store.conversation(&dm).unwrap().unwrap();
         assert!(row.hidden);
-        assert_eq!((row.unread, row.preview.as_str(), row.last_read.as_deref()), (0, "", Some("20")));
+        assert_eq!((row.unread, row.preview.as_str(), row.last_read.as_deref()), (0, "", Some("30")));
         assert!(store.messages(&dm, &Page::Newest, 10, NOW).unwrap().unwrap().messages.is_empty());
         // A message that is not newer leaves it hidden, as a history fill of what was deleted would.
         store.ingest(&dm, &said("20", "hello", 20), false).unwrap();
         assert!(store.conversation(&dm).unwrap().unwrap().hidden);
-        store.ingest(&dm, &said("30", "again", 30), true).unwrap();
+        store.ingest(&dm, &said("40", "again", 40), true).unwrap();
         let row = store.conversation(&dm).unwrap().unwrap();
         assert!(!row.hidden);
         assert_eq!(row.unread, 1);
