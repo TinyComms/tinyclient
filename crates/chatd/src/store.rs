@@ -2823,8 +2823,9 @@ impl Store {
     // Retention.
 
     /// Keeps the newest [`KEEP_MESSAGES`] of every conversation, and nothing older than `days`
-    /// (P4, [`KEEP_DAYS`] by default) unless the conversation was opened in that time. Run at
-    /// start, daily, and when P4 changes. Unsent messages are the user's and are never pruned.
+    /// (P4, [`KEEP_DAYS`] by default) unless the conversation was opened in that time. Runs
+    /// shortly after the boot, never inside it (the sign-in has the store busy), then daily,
+    /// and when P4 changes. Unsent messages are the user's and are never pruned.
     /// Returns how many rows went.
     pub fn prune(&mut self, now: i64, days: u32) -> rusqlite::Result<usize> {
         let cutoff = now - i64::from(days) * 86_400;

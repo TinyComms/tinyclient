@@ -66,4 +66,12 @@ gpui_ce_wgpu = { path = "vendor/gpui_ce_wgpu" }
 # the Objective-C boundary and an abort at launch. The parameters are optional now and nil is "no
 # range". Drop this when a gpui_ce_ios release takes nil there.
 gpui_ce_ios = { path = "vendor/gpui_ce_ios" }
+# gpui_ce_windows 0.3.0 with one fix (vendor/gpui_ce_windows, `DirectWriteTextSystem::new_inner`,
+# marked "tinyclient patch"): the shaping fallback list ends at Lilex, IBM Plex Sans and Arial,
+# so a run with glyphs none of them carries (Telegram's mathematical-bold-script sender name
+# U+1D4D0 and friends, the kind any user display name may hold) painted tofu boxes where
+# Telegram's own app draws them, through "Segoe UI Symbol", the one Windows face that covers the
+# plane. It is first in the list. Drop this when a gpui_ce_windows release takes the plane fonts
+# there or exposes the list for the app to fill.
+gpui_ce_windows = { path = "vendor/gpui_ce_windows" }
 curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }

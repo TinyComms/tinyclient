@@ -48,17 +48,53 @@ impl World {
         World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_MANY", &many.to_string())])
     }
 
+    /// `many` more chats, with every chats page after the first held at the wire until the test
+    /// lets them go: the pages then land apart, as they do on a real network.
+    fn held(many: u32) -> World {
+        World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_MANY", &many.to_string()), ("TINYCLIENT_TELEGRAM_HOLD", "1")])
+    }
+
+    /// `many` more chats, and the group's dialog ask held. The store here already read the
+    /// group further than Telegram now says, so the writing of that row asks for its dialog
+    /// again and stalls mid-page until the test lets the ask through.
+    fn stalled(many: u32) -> World {
+        World::seed(
+            Some(SESSION),
+            "30",
+            &[("TINYCLIENT_TELEGRAM_MANY", &many.to_string()), ("TINYCLIENT_TELEGRAM_PEER_HOLD", "1")],
+            |store| {
+                let far = key("g8001");
+                let row = chatd::store::ConversationRow::new("g8001", ConversationKind::Group, "Trail crew");
+                store.upsert_conversation(&far.account(), &row).unwrap();
+                // The read has to be written fresh: a count that changes nothing is no write.
+                store.set_counts(&far, 0, 0, Some("25"), 1).unwrap();
+            },
+        )
+    }
+
     /// `session` is the stored sign-in, if any; `qr_seconds` how long the fake's QR codes last.
     fn start(session: Option<&str>, qr_seconds: &str) -> World {
         World::with(session, qr_seconds, &[])
     }
 
     fn with(session: Option<&str>, qr_seconds: &str, env: &[(&str, &str)]) -> World {
+        World::seed(session, qr_seconds, env, |_| {})
+    }
+
+    /// `seed` writes the store of a run that is not the first, as the boot of an account
+    /// already signed in carries one.
+    fn seed(
+        session: Option<&str>,
+        qr_seconds: &str,
+        env: &[(&str, &str)],
+        seed: impl FnOnce(&mut chatd::store::Store),
+    ) -> World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         // On Windows "/tmp" has no drive; chatd takes only absolute paths.
         let dir = std::path::absolute(format!("/tmp/tinyclient-tg-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        seed(&mut chatd::store::Store::open(&dir.join("chat.sqlite")).unwrap());
         let log = std::fs::File::create(dir.join("stderr.log")).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_chatd"));
         command
@@ -362,6 +398,70 @@ fn chats_past_the_newest_500_load_as_the_list_scrolls_with_their_pictures() {
 }
 
 #[test]
+fn a_chats_list_paints_what_it_has_while_the_pages_arrive() {
+    // Five pages of the main list at sign-on; every page after the first is held at the wire.
+    let world = World::held(650);
+    let (_, seq) = world.status();
+    // Nothing waits for the whole list: what the first page landed is on the list already.
+    world.until("the chats of the first page", || world.conversation("u100091").map(drop));
+    // And it was told as it landed: the change feed carries the row before the list is whole.
+    world.changed(seq, "the change of a first-page chat", |change| match change {
+        Change::Conversation { conversation } if conversation.id == "u100091" => Some(()),
+        _ => None,
+    });
+    assert!(world.conversation("u100050").is_some(), "{:#?}", world.calls());
+    // The sign-on is still inside the chats: nothing past them was asked while a page waits.
+    assert_eq!(world.called("GetContacts"), 0, "{:#?}", world.calls());
+    // Let through, the rest of the chats and the archive are read and the sign-on finishes.
+    world.steer("dialogs-go");
+    world.connected();
+    let known = |at: u32| world.conversation(&format!("u{}", 100_000 + at)).is_some();
+    world.until("the newest 500", || known(491).then_some(()));
+    assert_eq!((world.called("GetDialogs 0"), world.called("GetDialogs 1")), (5, 1), "{:#?}", world.calls());
+}
+
+#[test]
+fn the_next_page_is_asked_while_the_current_one_is_written() {
+    // The group's row is written only after its dialog was asked again (the store's read is
+    // ahead of what the page says), and that ask is held at the wire: the writing of the page
+    // sits on it the way any page's writing can on a slower network or a busy database.
+    let world = World::stalled(650);
+    world.until("the group's read to be told again", || (world.called("ReadHistory g8001 25") == 1).then_some(()));
+    // While the page is still being written, the one after it is already at the wire.
+    world.within(Duration::from_secs(3), "the page after to be asked", || {
+        world.calls().iter().any(|call| call.starts_with("GetDialogs 0 u100091")).then_some(())
+    });
+    // When the ask goes through, the writing carries on and the sign-on finishes, one chat's
+    // dialog asked only once.
+    world.steer("peer-go");
+    world.connected();
+    assert_eq!(world.called("GetDialogs 0"), 5, "{:#?}", world.calls());
+    assert_eq!(world.called("GetPeerDialogs g8001"), 1, "{:#?}", world.calls());
+}
+
+#[test]
+fn the_prune_runs_after_the_chats_are_served() {
+    // A message older than retention ever keeps here: Telegram's pages carry no conversation
+    // for it, and a prune at boot would carry it off while the sign-on is still writing chats.
+    let world = World::seed(Some(SESSION), "30", &[], |store| {
+        let long_ago = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - 200 * 86_400;
+        let message = Message::plain("old-letter", "Long gone", "Wrote this before tinyclient.", long_ago, false);
+        store.ingest(&key("u6543"), &message, false).unwrap();
+    });
+    world.connected();
+    // The chats of the boot are on the list and the old message stands: retention did not run
+    // inside the boot that served them.
+    let prunable = |days: u32| match world.ask(Request::Prunable { days }) {
+        Response::Prunable { messages, .. } => messages,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(prunable(90), 1, "{:#?}", world.calls());
+    // And retention still runs, at once when its setting asks it to.
+    world.ask(Request::Set { scope: String::new(), key: "keep_days".to_owned(), value: Some("7".to_owned()) });
+    world.until("the old message to be pruned", || (prunable(90) == 0).then_some(()));
+}
+
+#[test]
 fn a_pin_or_a_folder_change_is_told_row_by_row_and_never_rereads_the_chats() {
     let world = World::signed_in();
     world.connected();
@@ -555,6 +655,35 @@ fn a_forum_topic_is_a_thread_under_the_forum() {
 }
 
 #[test]
+fn a_custom_emoji_reactions_document_is_asked_and_its_file_lands_for_the_chip() {
+    let world = World::signed_in();
+    world.connected();
+    // The conversation is on screen, so the reaction's picture is asked for as it arrives.
+    world.ask(Request::Watch(Watching { conversation: Some(key("u7002")), ..Watching::default() }));
+    world.until("history", || world.message("u7002", "12"));
+    let before = world.called("GetCustomEmojiDocuments");
+    // A reaction that is a custom emoji arrives: its document is named in one batch, and the
+    // reaction carries the media the chip draws (`e<document id>`), stills keep their text.
+    world.steer("custom-react");
+    let reacted = world.until("the custom reaction", || {
+        world.message("u7002", "12").filter(|message| message.reactions.iter().any(|have| have.file.is_some()))
+    });
+    let seen: Vec<(&str, &str)> = reacted.reactions.iter().map(|reaction| (reaction.emoji.as_str(), reaction.file.as_ref().map_or("", |file| file.id.as_str()))).collect();
+    assert_eq!(seen, vec![("👍", ""), (":emoji:", "e5002")]);
+    world.until("the emoji document asked for", || (world.called("GetCustomEmojiDocuments") > before).then_some(()));
+    // The file is fetched whole (the animated document) and kept under the name the
+    // reaction carries, unpacked from the gzip Telegram serves it in.
+    let landed = world.until("the reaction picture on disk", || {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["e5002".into()], size: None, retry: false }) {
+            Response::Media { mut files } => files.pop().and_then(|file| file.path),
+            other => panic!("{other:?}"),
+        }
+    });
+    let kept = std::fs::read(&landed).expect("the reaction picture is on disk");
+    assert!(kept.starts_with(b"{"), "what a chip draws is the file inside: {:02x?}", &kept[..kept.len().min(8)]);
+}
+
+#[test]
 fn a_channel_posts_comments_count_rides_the_post() {
     let world = World::signed_in();
     world.connected();
@@ -604,6 +733,83 @@ fn asking_a_channel_posts_comments_reads_the_discussion_group_under_the_post() {
     });
     let section = fresh.thread.as_ref().unwrap();
     assert_eq!(section.replies, 2, "{section:?}");
+}
+
+#[test]
+fn opening_a_comments_thread_asks_telegram_once_where_its_comments_live_and_lets_it_post() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments");
+    world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+
+    // Opened: Telegram is asked for the discussion group behind the post and the echo of it
+    // to answer, once, and the row stops saying read-only once it did as much. Reading the
+    // comments themselves goes on under the post's own id, as before.
+    world.messages("c9001_5");
+    world.until("the replies to be read", || {
+        (world.called("GetDiscussionMessage c9001_5") == 1 && world.called("GetReplies c9001_5") == 1).then_some(())
+    });
+    let open = world.until("the row to let a comment in", || {
+        world.conversation("c9001_5").filter(|row| !row.read_only)
+    });
+    assert_eq!((open.kind, open.title.as_str()), (ConversationKind::Thread, "Comments"));
+
+    // Opened again: the answer stands for the connection and nothing is asked again.
+    world.messages("c9001_5");
+    sleep(Duration::from_millis(400));
+    assert_eq!(world.called("GetDiscussionMessage c9001_5"), 1, "{:#?}", world.calls());
+}
+
+#[test]
+fn a_comment_posted_in_the_thread_is_told_as_a_reply_to_the_posts_echo_in_the_discussion_group() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments");
+    world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+    world.messages("c9001_5");
+    world.until("the discussion to be asked", || (world.called("GetDiscussionMessage c9001_5") == 1).then_some(()));
+
+    // The send is Telegram's own for the discussion group: not the channel, and under the
+    // echo of the post itself, the way the phone's apps write a comment.
+    world.send("c9001_5", "9002", "Sunset push", None);
+    world.until("the comment to be told", || {
+        world.calls().contains(&"SendMessage c9003_60 Sunset push".to_owned()).then_some(())
+    });
+    // The echo was learned with the thread's open: the send asked Telegram nothing of it again.
+    sleep(Duration::from_millis(400));
+    assert_eq!(world.called("GetDiscussionMessage c9001_5"), 1, "{:#?}", world.calls());
+}
+
+#[test]
+fn a_sent_comment_lands_in_the_thread_and_the_posts_count_rises_under_its_own_id() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments");
+    world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+    world.messages("c9001_5");
+    world.until("the discussion to be asked", || (world.called("GetDiscussionMessage c9001_5") == 1).then_some(()));
+    // The resolve answered: the flip of the row's own read-only word follows it onto the
+    // store. A send that asked before it would be refused, and rightly so - the test waits
+    // for the row the way a window does.
+    world.until("the thread to be postable", || world.conversation("c9001_5").filter(|row| !row.read_only).map(|_| ()));
+
+    // The echo Telegram sends lands as the thread's comment, not as a message of the
+    // discussion group's own list; the quote line a comment answers in the post's echo is
+    // the thread's own anchor and names nobody.
+    world.send("c9001_5", "8001", "Sunset push", None);
+    let sent = world.until("the comment in the thread", || {
+        world.messages("c9001_5").into_iter().find(|comment| comment.text == "Sunset push" && comment.state == SendState::Sent)
+    });
+    assert_eq!((sent.outgoing, sent.reply_to.is_none()), (true, true), "{sent:?}");
+
+    // Telegram raised the count on the post itself, without moving the id the footer
+    // opens the thread under.
+    let post = world.until("the count to rise", || {
+        world.message("c9001", "5").filter(|post| post.thread.as_ref().is_some_and(|section| section.replies == 3))
+    });
+    let section = post.thread.as_ref().unwrap();
+    assert_eq!(section.id.as_str(), "c9001_5");
+    assert_eq!(world.conversation("c9001_5").unwrap().root.as_deref(), Some("5"));
 }
 
 #[test]
@@ -1072,6 +1278,42 @@ fn pickers_and_sending_with_files_options_and_picks() {
     let big = file("track.gpx", 10 * 1024 * 1024 + 5);
     assert_eq!(send("8107", "", protocol::Outgoing { files: vec![one(big, false, false)], ..Default::default() }).state, SendState::Sent);
     assert_eq!((world.called("SaveBigFilePart 0/21 524288"), world.called("SaveBigFilePart 20/21 5")), (1, 1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A send whose file is a voice message this client recorded: uploaded as any file, sent as a
+/// voice note whose audio attribute carries the facts the recorder read, and the way the
+/// message comes back shows the row as it would on Telegram.
+#[test]
+fn a_recorded_voice_message_is_sent_as_a_telegram_voice_note() {
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+    let send = |client_id: &str, text: &str, with: protocol::Outgoing| {
+        let asked = Request::Send { conversation: key("u7002"), client_id: client_id.into(), text: text.into(), reply_to: None, with };
+        assert!(matches!(world.ask(asked), Response::Sent { .. }));
+        world.until(&format!("send {client_id}"), || {
+            world.messages("u7002").into_iter().find(|message| message.client_id.as_deref() == Some(client_id) && message.state != SendState::Pending)
+        })
+    };
+    let dir = std::path::absolute(format!("/tmp/tinyclient-tg-voice-{}", std::process::id())).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("voice-1234.opus");
+    std::fs::write(&path, vec![7u8; 2048]).unwrap();
+    let one = protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false };
+    // Bars at the widest and shut: both are exact through Telegram's five bits a bar.
+    let voice = protocol::VoiceNote { duration: 7_500, waveform: vec![255, 0, 255, 0, 255, 0, 255, 0] };
+    let sent = send("8201", "", protocol::Outgoing { files: vec![one], voice: Some(voice), ..Default::default() });
+    assert_eq!(sent.state, SendState::Sent, "{:?}", world.calls());
+    assert_eq!(world.called("SaveFilePart 0 2048"), 1, "{:?}", world.calls());
+    assert_eq!(world.called("SendMedia u7002 voice-note:7"), 1, "the audio attribute, and no file name: {:?}", world.calls());
+    let attachment = sent.attachments.first().unwrap();
+    assert_eq!((attachment.name.as_str(), attachment.mime.as_str()), ("Voice message", "audio/ogg"));
+    assert_eq!(attachment.file.kind, protocol::MediaKind::Audio);
+    assert_eq!(attachment.duration, 7);
+    assert_eq!(attachment.waveform, vec![255, 0, 255, 0, 255, 0, 255, 0]);
+    // The file's own name is not sent, and not shown either.
+    assert!(!attachment.name.contains("opus"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

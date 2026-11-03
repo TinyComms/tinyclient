@@ -351,6 +351,19 @@ pub fn reactions_of(update: &tl::enums::MessageReactions) -> Vec<Reaction> {
     reactions(update)
 }
 
+/// The custom-emoji documents a message's reactions name, their ids parsed from the media
+/// they carry (`e<document id>`): Telegram keeps access hash and bytes apart from the
+/// reaction, so chatd has to ask `messages.getCustomEmojiDocuments` for those first.
+pub fn reaction_emoji_ids(reactions: &[Reaction]) -> Vec<i64> {
+    reactions.iter().filter_map(|reaction| {
+        reaction
+            .file
+            .as_ref()
+            .filter(|file| file.kind == MediaKind::Emoji)
+            .and_then(|file| file.id[1..].parse().ok())
+    }).collect()
+}
+
 fn sender(dir: &Directory, who: Who) -> Sender {
     let known = dir.get(who);
     Sender {
@@ -471,8 +484,10 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             message.mentions_me = raw.mentioned;
             message.reactions = raw.reactions.as_ref().map(reactions).unwrap_or_default();
             // A channel post's comment section rides the post: the count alone comes with it,
-            // the linked group is named but never reached, and the comments are read under the
-            // post's own id (`messages.getReplies`, which takes the channel and the post).
+            // the linked group named on the wire but not used here. The comments are read
+            // under the post's own id (`messages.getReplies`, which takes the channel and
+            // the post) and written into the discussion group behind it: the sends' ask of
+            // them is `sync::discussion`'s.
             if let Some(tl::enums::MessageReplies::Replies(info)) = &raw.replies {
                 if info.channel_id.is_some() {
                     message.thread = Some(ThreadSummary {

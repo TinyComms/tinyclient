@@ -16,6 +16,9 @@
 //!
 //! `mediad --play` is the other mode: one voice message or audio file (`play`, reading it with
 //! `decode` and speeding it up with `stretch`), the speaker only, until playing stops.
+//!
+//! `mediad --rec <path>` is the newest: one voice note recorded off the microphone (`rec`),
+//! the microphone only, until its stop, and left as an Ogg Opus file as the network's own.
 
 pub mod alert;
 pub mod audio;
@@ -31,6 +34,7 @@ pub mod hear;
 pub mod inproc;
 pub mod jitter;
 pub mod media;
+pub mod ogg;
 pub mod opus;
 pub mod picture;
 pub mod platform;
@@ -40,6 +44,7 @@ pub mod pick;
 pub mod play;
 pub mod process;
 pub mod probe;
+pub mod rec;
 pub mod ring;
 pub mod rt;
 pub mod rtp;

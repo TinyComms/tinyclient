@@ -24,6 +24,7 @@ pub mod ipc;
 pub mod launch;
 mod message;
 mod play;
+mod record;
 pub mod quarantine;
 mod react;
 pub mod settings;
@@ -39,6 +40,7 @@ pub use ipc::{ChatListener, ChatStream};
 pub use message::*;
 pub use play::*;
 pub use react::*;
+pub use record::*;
 pub use signin::*;
 pub use tiny::*;
 
@@ -1408,6 +1410,9 @@ pub enum Request {
     /// A voice message or audio file: play, pause, seek, speed, stop. Answers `Ok`; the rest is
     /// `Change::Playback`.
     Play(PlayRequest),
+    /// One recorded voice message: start, stop, forget. Answers `Ok`; the rest is
+    /// `Change::Recording`.
+    Record(RecordRequest),
 
     /// Every stored setting (`settings`). Missing ones are at their defaults.
     Settings,
@@ -1814,6 +1819,9 @@ pub enum Change {
     /// Ephemeral. The voice message or audio file playing, paused or just ended; `None` once
     /// stopped.
     Playback { playback: Option<Playback> },
+    /// Ephemeral. The one recording: started, recorded (with its facts) or failed; `None` once
+    /// forgotten.
+    Recording { recording: Option<Recording> },
     /// A setting was stored or reset: ask `Settings`.
     Settings,
     /// Ephemeral. A notification was clicked: bring the window forward on this conversation.
@@ -1832,6 +1840,7 @@ impl Change {
             (Change::Status, Change::Status)
             | (Change::Call { .. }, Change::Call { .. })
             | (Change::Playback { .. }, Change::Playback { .. })
+            | (Change::Recording { .. }, Change::Recording { .. })
             | (Change::Settings, Change::Settings)
             | (Change::Open { .. }, Change::Open { .. })
             | (Change::Meter { .. }, Change::Meter { .. }) => true,
@@ -1871,6 +1880,7 @@ impl Change {
                 | Change::SignIn { .. }
                 | Change::Upload { .. }
                 | Change::Playback { .. }
+                | Change::Recording { .. }
                 | Change::Meter { .. }
                 | Change::Open { .. }
         )

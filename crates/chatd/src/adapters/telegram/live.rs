@@ -22,8 +22,17 @@ fn place(account: &Account, who: Who, topic: Option<i32>) -> String {
 fn placed(account: &Account, raw: &tl::enums::Message) -> Option<(String, Mapped)> {
     let mut mapped = content::map(&account.dir(), raw)?;
     let conversation = conversation_of(account, &mapped);
-    let topic = conversation.contains('_').then(|| mapped.topic.unwrap_or(1));
-    if !ensure_row(account, mapped.peer, topic) {
+    // A topic's first message has the forum's row made for it (`ensure_row`); a comment of
+    // the discussion group is mapped under the row the post already wrote, and the group's
+    // own row is not what this message calls for.
+    let ensure = if conversation == mapped.peer.text() {
+        Some((mapped.peer, None))
+    } else if account.dir().get(mapped.peer).is_some_and(|known| known.forum) {
+        Some((mapped.peer, Some(mapped.topic.unwrap_or(1))))
+    } else {
+        None
+    };
+    if !ensure.is_none_or(|(who, topic)| ensure_row(account, who, topic)) {
         return None;
     }
     finish(account, &conversation, &mut mapped, &HashMap::new());
@@ -51,6 +60,7 @@ fn message(account: &Account, raw: &tl::enums::Message, edit: bool) {
     // opening it fetches the page it is on.
     let watching = account.ctx.watching();
     if watching.conversation.as_ref().is_some_and(|open| open.account() == account.ctx.account && open.id == conversation) {
+        sync::reaction_emoji(account, &conversation, std::slice::from_ref(&mapped.message));
         account.files.want(mapped.wants);
     }
 }
@@ -87,6 +97,11 @@ fn reactions(account: &Account, conversation: &str, message: i32, update: &tl::e
     };
     stored.reactions = content::reactions_of(update);
     let _ = account.ctx.history(conversation, std::slice::from_ref(&stored));
+    // The custom ones' pictures are asked for only while they are on screen; a page read
+    // later covers a reaction that arrives to a conversation nobody is in.
+    if account.ctx.watching().conversation.as_ref().is_some_and(|open| open.account() == account.ctx.account && open.id == conversation) {
+        sync::reaction_emoji(account, conversation, std::slice::from_ref(&stored));
+    }
 }
 
 pub(super) fn apply(account: &Account, update: &Update) {
