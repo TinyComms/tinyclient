@@ -230,12 +230,15 @@ impl Shell {
         let mine = page.mine == Some(room.id.as_str());
         let call = self.tiny_call_here(room);
         let banner = call.as_ref().and_then(|call| self.tiny_call_banner(room, call, cx));
-        let stage: AnyElement = if room.participants.is_empty() {
+        let up = call.as_ref().is_some_and(|call| !matches!(call.state, CallState::Failed { .. }));
+        // Under a call that is up here the stage is never "nobody is here": chatd lists my seat
+        // while the server's word catches up, and the grid shows it.
+        let seated_here = call.as_ref().is_some_and(|call| matches!(call.state, CallState::Joined | CallState::Reconnecting));
+        let stage: AnyElement = if room.participants.is_empty() && !seated_here {
             self.tiny_empty_stage(page, room, cx)
         } else {
             self.tiny_stage(page, room, call.as_ref(), cx)
         };
-        let up = call.as_ref().is_some_and(|call| !matches!(call.state, CallState::Failed { .. }));
         let bar = if room.participants.is_empty() && !mine && !up { None } else { Some(self.tiny_call_bar(page, room, mine || up, call.as_ref(), cx)) };
         div().size_full().flex().flex_col().children(banner).child(stage).children(bar).into_any_element()
     }

@@ -4,7 +4,7 @@ states that cannot share a screen). Requirements: `product/03-message-content.md
 px at 1x. Token names are from `theme.rs`; new ones are listed at the end.
 
 ## Decisions
-- **No bubbles, for anyone.** Every message, mine included, is a left-aligned row: avatar, name, time, body. Slack, Discord, Teams, and a Tiny server are channel-first. Telegram, Signal, and Messages are chat-first. A 2,000-character post, a code block, a 400 px image grid and a bot card all fit a full-width column and fight a bubble. A bubble layout would also need a second layout for channels, which breaks "one visual system". My own messages are marked by the name "You" and nothing else.
+- **No bubbles, for anyone.** Every message, mine included, is a left-aligned row: avatar, name, time, body. Slack, Discord, Teams, and a Tiny server are channel-first. Telegram, Signal, and Messages are chat-first. A 2,000-character post, a code block, a 400 px image grid and a bot card all fit a full-width column and fight a bubble. A bubble layout would also need a second layout for channels, which breaks "one visual system". My own messages carry my name, as the network has it, and nothing else marks them. "You" is only the stand-in while a send has no name yet.
 - **One density.** No compact mode. Rows are measured by a virtual list; a second set of metrics doubles every state here for a setting few people
   touch. The thread pane uses one fixed dense variant because it is 380 px wide, not because the user chose it.
 - **Names are `text`.** No Discord role colors: the only brand or per-network color is the icon.
