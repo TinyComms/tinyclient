@@ -21,8 +21,10 @@ fail-fast = false
 # well (`cargo test -p chatd --lib a_media_drop_finds`). nextest gives each test its own process,
 # so it is left out here until the test stands on its own.
 default-filter = 'not (binary_id(chatd) & test(=adapters::tiny::live::tests::a_media_drop_finds_a_dead_socket_at_once))'
-# A test that fails and then passes is reported as FLAKY in the summary, not dropped.
-retries = 1
+# A test that fails and then passes is reported as FLAKY in the summary, not dropped. The
+# retries wait first: a Windows runner sometimes stalls for a minute or two (a 20 MB download
+# test went from 5 to 131 seconds), and every test retried straight away failed again inside it.
+retries = { backoff = "exponential", count = 2, delay = "15s" }
 # A few call and MLS tests legitimately take a minute or more. Ten minutes is a hang.
 slow-timeout = { period = "60s", terminate-after = 10 }
 failure-output = "immediate-final"
