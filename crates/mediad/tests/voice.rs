@@ -1397,14 +1397,14 @@ fn video_is_refused_in_words_on_a_voice_call_and_reports_no_stream() {
     let mut fake = Fake::new();
     let mut mediad = Mediad::start("null", None);
     // Before a join there is no engine in the call and the request is only noted.
-    assert!(matches!(mediad.ask(MediaRequest::ShareSend { on: true, screen: None }), MediaResponse::Streams { video } if video.len() == 1));
+    assert!(matches!(mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: None }), MediaResponse::Streams { video } if video.len() == 1));
     mediad.join(&fake.endpoint(), NO_DAVE);
     let mut peer = fake.accept();
     fake.handshake(&mut peer, &[AES], 0, 30_000);
     mediad.connected();
     assert_eq!(mediad.ask(MediaRequest::Streams), MediaResponse::Streams { video: vec![] }, "a voice call holds no encode");
     for request in [
-        MediaRequest::ShareSend { on: true, screen: None },
+        MediaRequest::ShareSend { on: true, screen: None, quality: None },
         MediaRequest::ShareWatch { source: Some(THEM.into()) },
         MediaRequest::Speaker { source: Some(THEM.into()) },
         MediaRequest::Camera { on: true },
@@ -1414,7 +1414,7 @@ fn video_is_refused_in_words_on_a_voice_call_and_reports_no_stream() {
         };
         assert!(detail.contains("voice only"), "{detail}");
     }
-    assert_eq!(mediad.ask(MediaRequest::ShareSend { on: false, screen: None }), MediaResponse::Streams { video: vec![] });
+    assert_eq!(mediad.ask(MediaRequest::ShareSend { on: false, screen: None, quality: None }), MediaResponse::Streams { video: vec![] });
     assert_eq!(mediad.hang_up().0.code(), Some(0));
 }
 

@@ -1165,7 +1165,7 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
                     who.heard(frame);
                     let reread = who.reread(&before);
                     if user == seat.me && before.sharing && !who.sharing {
-                        ctx.tell_media(room, MediaRequest::ShareSend { on: false, screen: None });
+                        ctx.tell_media(room, MediaRequest::ShareSend { on: false, screen: None, quality: None });
                     }
                     if user == seat.me && before.camera && !who.camera {
                         ctx.tell_media(room, MediaRequest::Camera { on: false });

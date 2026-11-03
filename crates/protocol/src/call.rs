@@ -36,6 +36,20 @@ pub enum PictureKind {
     Share,
 }
 
+/// How much of the screen a share spends: its size, its frame rate and its bitrate. The sharer
+/// picks it; a watcher gets the one layer the sharer sends.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShareQuality {
+    /// The screen as it is, up to 2560×1440, at its own refresh rate up to 60 frames a second.
+    #[default]
+    Best,
+    /// 1080p at 30 frames a second.
+    Balanced,
+    /// 720p at 15 frames a second: what every share was before there was a choice.
+    Low,
+}
+
 /// The picture on screen: a JPEG written by mediad, and removed once the next one is written.
 /// The window reads it into an image of its own (`gui/tiny/feed.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,6 +392,9 @@ pub enum MediaRequest {
         /// `None` is the primary screen, as older shells asked for.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         screen: Option<String>,
+        /// How much to spend on it. `None` is [`ShareQuality::Best`], as older shells asked for.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quality: Option<ShareQuality>,
     },
     /// Watch one participant's share. Replaces any share already being watched.
     ShareWatch { source: Option<String> },
@@ -878,10 +895,11 @@ mod tests {
     #[test]
     fn a_share_without_a_screen_is_the_frame_an_older_build_sends() {
         let older: MediaRequest = serde_json::from_str(r#"{"media":"share_send","on":true}"#).unwrap();
-        assert_eq!(older, MediaRequest::ShareSend { on: true, screen: None });
+        assert_eq!(older, MediaRequest::ShareSend { on: true, screen: None, quality: None });
         assert_eq!(serde_json::to_string(&older).unwrap(), r#"{"media":"share_send","on":true}"#);
-        let chosen = MediaRequest::ShareSend { on: true, screen: Some("display:\\\\.\\DISPLAY2".into()) };
+        let chosen = MediaRequest::ShareSend { on: true, screen: Some("display:\\\\.\\DISPLAY2".into()), quality: Some(ShareQuality::Balanced) };
         let json = serde_json::to_string(&chosen).unwrap();
+        assert!(json.contains(r#""quality":"balanced""#));
         assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), chosen);
     }
 

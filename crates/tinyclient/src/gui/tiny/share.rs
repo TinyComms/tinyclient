@@ -10,17 +10,24 @@ use crate::gui::components::{button, button_disabled, glyph, modal, segment, seg
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, img, prelude::*, px, Context, Div, ObjectFit, SharedString, Window};
-use protocol::{MediaRequest, Request, ScreenSource, SCREENS_LIMIT};
+use protocol::{MediaRequest, Request, ScreenSource, ShareQuality, SCREENS_LIMIT};
 
 /// A picture in the picker, 16:9.
 const THUMB_W: f32 = 184.;
 const THUMB_H: f32 = 104.;
 
+/// The picker's qualities, with what each costs in words.
+const QUALITIES: [(ShareQuality, &str, &str); 3] = [
+    (ShareQuality::Best, "Best", "Your screen as it is, up to 1440p at 60 fps. About 8 Mb/s."),
+    (ShareQuality::Balanced, "Balanced", "1080p at 30 fps. About 4 Mb/s."),
+    (ShareQuality::Low, "Low", "720p at 15 fps. About 1.5 Mb/s, for a slow connection."),
+];
+
 impl Shell {
     /// Share pressed while not sharing: the picker.
     pub(super) fn tiny_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if crate::gui::phone::active() {
-            self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None }), cx);
+            self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None }), cx);
             return;
         }
         self.tiny_state.screens = None;
@@ -40,12 +47,13 @@ impl Shell {
         let screen = picked.as_ref().map(|screen| screen.id.clone());
         self.tiny_state.shared = picked;
         self.close_modal(cx);
-        self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen }), cx);
+        let quality = Some(self.tiny_state.share_quality);
+        self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen, quality }), cx);
     }
 
     pub(super) fn tiny_stop_share(&mut self, cx: &mut Context<Self>) {
         self.tiny_state.shared = None;
-        self.call_ask(Request::Media(MediaRequest::ShareSend { on: false, screen: None }), cx);
+        self.call_ask(Request::Media(MediaRequest::ShareSend { on: false, screen: None, quality: None }), cx);
     }
 
     /// A click on a stream: watched, and filling the stage; when it already fills it, the grid.
@@ -140,6 +148,22 @@ impl Shell {
                 .children(screens.iter().filter(|screen| screen.window == windows).map(|screen| self.tiny_share_card(screen, cx)))
                 .into_any_element(),
         };
+        // How much the share spends. Best is the screen as it is; the others for a slow link
+        // or a busy machine.
+        let quality = div()
+            .mt(px(14.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .child(div().type_ui().text_color(theme::text_soft()).child("Quality"))
+            .child(segmented().children(QUALITIES.iter().map(|&(quality, label, hint)| {
+                segment(SharedString::from(format!("tiny-share-quality-{label}")), label, state.share_quality == quality)
+                    .tooltip(crate::gui::components::tip(hint, None))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tiny_state.share_quality = quality;
+                        cx.notify();
+                    }))
+            })));
         let ready = state.screens.is_some();
         let go = if ready && !self.tiny_state.busy {
             button("tiny-share-go", ButtonKind::Primary, "Share").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.tiny_share_picked(cx))).into_any_element()
@@ -152,6 +176,7 @@ impl Shell {
             .child(div().mt(px(6.)).whitespace_normal().type_ui().text_color(theme::text_soft()).child("Pick what everyone in the call can watch."))
             .children(tabs)
             .child(body)
+            .child(quality)
             .child(
                 div()
                     .mt(px(20.))

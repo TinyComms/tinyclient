@@ -7,13 +7,13 @@
 //!
 //! A compressed frame cannot be skipped the way a sample of the screen can: the next one is
 //! built on it. So capture is latest by construction (a late round captures now, not what was
-//! missed), and it is the painted picture in, not the frames, that is limited to ten a second.
+//! missed), and it is the painted picture in, not the frames, that is limited, by the painters.
 //! Every received frame is decoded, through a bounded queue; a queue that overflows is thrown out
 //! whole and restarts from a keyframe. Likewise an encoded frame that cannot be sealed asks for
 //! a keyframe, and a stalled tick holds the encoder back rather than losing a frame.
 
 use crate::picture::{
-    self, Ask, Encoded, Incoming, Outgoing, Painted, CAMERA_HIGH_BPS, CAMERA_LOW_BPS, SHARE_BPS,
+    self, share_quality, Ask, Encoded, Incoming, Outgoing, Painted, Tag, CAMERA_HIGH_BPS, CAMERA_LOW_BPS,
 };
 use crate::session::Controls;
 use crate::{out, rt};
@@ -24,9 +24,10 @@ use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender,
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Frames a second, when encoding keeps up.
+/// A camera's frames a second, when encoding keeps up. A share goes at what the sharer chose
+/// ([`picture::share_fps`]), and a camera on beside it at no more than this many times two.
 const FPS: u32 = 15;
-/// Half the rate at most this many times: 15, 7.5, 3.75.
+/// Divide the rate by at most this: 15, 7.5, 5, 3.75 for a camera; 60, 30, 20, 15 for a share.
 const SLOWEST: u32 = 4;
 /// Rounds in a row over their deadline before the rate halves.
 const OVERRUN: u32 = 5;
@@ -39,8 +40,11 @@ const KEY_EVERY: Duration = Duration::from_secs(1);
 const ENCODED: usize = 4;
 /// Received frames waiting to be decoded: three seconds at the rate anyone sends.
 const RECEIVED: usize = 45;
-/// The picture on screen is replaced at most this often.
-const PAINT_EVERY: Duration = Duration::from_millis(100);
+/// The picture on screen is replaced at most this often: sixty a second. Each one is a JPEG
+/// written for the window to read by one of a few painter threads; when every painter is busy
+/// the frame is decoded and not painted, which is the real bound (about 20 to 30 a second at
+/// 1080p on a desktop).
+const PAINT_EVERY: Duration = Duration::from_millis(16);
 /// How long a hang-up waits for each thread to finish what it is doing. A camera read is the
 /// longest of it. The process is exiting anyway: this is so a file is not left behind.
 const STOP_WITHIN: Duration = Duration::from_millis(300);
@@ -64,7 +68,7 @@ pub struct Rates {
 impl Default for Rates {
     fn default() -> Self {
         Rates {
-            share: SHARE_BPS,
+            share: share_quality().bps,
             high: CAMERA_HIGH_BPS,
             low: CAMERA_LOW_BPS,
         }
@@ -109,7 +113,7 @@ pub fn allocate(estimate: u64, share: bool, camera: bool, was: Rates) -> Rates {
     } else {
         0
     };
-    let share = take(share, SHARE_BPS, SHARE_FLOOR, was.share);
+    let share = take(share, share_quality().bps, SHARE_FLOOR, was.share);
     let high = take(camera, CAMERA_HIGH_BPS, HIGH_FLOOR, was.high);
     Rates { share, high, low }
 }
@@ -206,7 +210,7 @@ impl Uplink {
 
 /// What to have the estimator look for: what these tracks would spend, with the voice.
 pub fn desired(share: bool, camera: bool) -> u64 {
-    let share = if share { u64::from(SHARE_BPS) } else { 0 };
+    let share = if share { u64::from(share_quality().bps) } else { 0 };
     let camera = if camera {
         u64::from(CAMERA_HIGH_BPS + CAMERA_LOW_BPS)
     } else {
@@ -255,11 +259,13 @@ fn rtp_time(since: Duration) -> u64 {
 }
 
 /// When the next capture is due. A fixed deadline: the period does not stretch by what the work
-/// cost. Encoding that cannot make its deadline halves the rate, and gets it back once it
-/// plainly could.
+/// cost. Encoding that cannot make its deadline slows the rate a step (the full rate over two,
+/// then three, then four), and gets it back a step at a time once it plainly could.
 struct Schedule {
     next: Instant,
-    /// How many times the rate was halved, as a divisor.
+    /// Frames a second when encoding keeps up: what is wanted now runs at.
+    full: u32,
+    /// What the full rate is divided by now.
     slower: u32,
     over: u32,
     easy: u32,
@@ -269,18 +275,35 @@ impl Schedule {
     fn new(now: Instant) -> Schedule {
         Schedule {
             next: now,
+            full: FPS,
             slower: 1,
             over: 0,
             easy: 0,
         }
     }
 
+    /// The rate for what `wants` now: the share's own, a camera's, or for both the share's
+    /// held to twice a camera's, which is as fast as a webcam gives frames.
+    fn rate(&mut self, wants: &Wants) {
+        let full = match (wants.share, wants.camera) {
+            (true, false) => picture::share_fps(),
+            (true, true) => picture::share_fps().min(FPS * 2),
+            _ => FPS,
+        };
+        if full != self.full {
+            self.full = full;
+            self.slower = 1;
+            self.over = 0;
+            self.easy = 0;
+        }
+    }
+
     fn period(&self) -> Duration {
-        Duration::from_secs(1) * self.slower / FPS
+        Duration::from_secs(1) * self.slower / self.full.max(1)
     }
 
     fn fps(&self) -> f32 {
-        FPS as f32 / self.slower as f32
+        self.full as f32 / self.slower as f32
     }
 
     /// Starts again from now, after nothing was wanted for a while.
@@ -297,11 +320,11 @@ impl Schedule {
         self.over = if work > period { self.over + 1 } else { 0 };
         self.easy = if work * 3 < period { self.easy + 1 } else { 0 };
         if self.over >= OVERRUN && self.slower < SLOWEST {
-            self.slower *= 2;
+            self.slower += 1;
             self.over = 0;
             self.easy = 0;
         } else if self.easy >= RELAXED && self.slower > 1 {
-            self.slower /= 2;
+            self.slower -= 1;
             self.easy = 0;
         }
         self.next += self.period();
@@ -461,9 +484,13 @@ impl<S: Source> Capture<S> {
         }
         let Some(payload) = self.controls.e2ee(|e2ee| e2ee.seal_video(&coded.bytes)) else {
             // Held back: nobody will have this frame, so whoever is watching needs a fresh start.
+            tracing::debug!(?track, key = coded.key, bytes = coded.bytes.len(), "a frame was held back unsealed");
             self.gate(track).ask();
             return true;
         };
+        if coded.key {
+            tracing::debug!(?track, wanted_key, bytes = coded.bytes.len(), "keyframe handed to the tick");
+        }
         self.tell
             .send(Word::Frame {
                 track,
@@ -592,6 +619,7 @@ fn capture<S: Source>(mut work: Capture<S>, orders: &Orders) {
             if seen.share && !wants.share {
                 work.source.close_share();
             }
+            schedule.rate(&wants);
             seen = wants;
             continue;
         }
@@ -658,6 +686,7 @@ impl Inbox {
         if fits {
             queue.frames.push_back(In::Frame(frame));
         } else {
+            tracing::debug!(waiting = queue.frames.len(), "received frames overflowed: the decoder is behind, and starts again from a keyframe");
             queue.replace(In::Reset);
         }
         self.arrived.notify_one();
@@ -670,33 +699,54 @@ impl Inbox {
         self.arrived.notify_one();
     }
 
-    fn take(&self) -> Option<In> {
+    /// The next thing in, waiting up to `wait` for one.
+    fn take(&self, wait: Duration) -> Take {
         let mut queue = self.queue.lock().unwrap();
+        let deadline = Instant::now() + wait;
         loop {
             if queue.stop {
-                return None;
+                return Take::Stop;
             }
             if let Some(next) = queue.frames.pop_front() {
-                return Some(next);
+                return Take::Next(next);
             }
-            queue = self.arrived.wait(queue).unwrap();
+            let now = Instant::now();
+            if now >= deadline {
+                return Take::Nothing;
+            }
+            queue = self.arrived.wait_timeout(queue, deadline - now).unwrap().0;
         }
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum Take {
+    Stop,
+    Next(In),
+    /// Nothing came in the time given.
+    Nothing,
+}
+
 /// The decoder and what it paints. `Incoming`, or a stand-in for a test.
 pub trait Screen {
-    /// Decodes one frame, always, and paints it if `paint`. `Err` when it did not decode.
+    /// Decodes one frame, always, and has it painted for `paint` if given. `Err` when it did
+    /// not decode. What was painted comes back from [`Screen::painted`], later.
     #[allow(clippy::result_unit_err)]
-    fn decode(&mut self, annex_b: &[u8], paint: bool) -> Result<Option<Painted>, ()>;
+    fn decode(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()>;
+    /// The pictures painted since this was last asked.
+    fn painted(&mut self) -> Vec<(Tag, Painted)>;
     fn reset(&mut self);
-    /// The painted file goes.
+    /// The painted files go, and so does anything still being painted.
     fn forget(&mut self);
 }
 
 impl Screen for Incoming {
-    fn decode(&mut self, annex_b: &[u8], paint: bool) -> Result<Option<Painted>, ()> {
+    fn decode(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
         Incoming::decode(self, annex_b, paint)
+    }
+
+    fn painted(&mut self) -> Vec<(Tag, Painted)> {
+        Incoming::painted(self)
     }
 
     fn reset(&mut self) {
@@ -716,57 +766,116 @@ struct Decode<P, F> {
     show: F,
     wait_key: bool,
     painted: Option<Instant>,
+    cost: DecodeCost,
+}
+
+/// What received frames cost to decode and hand to a painter, in the log once a second or so.
+#[derive(Default)]
+struct DecodeCost {
+    frames: u32,
+    painted: u32,
+    /// Decoding alone, over the frames that were not painted.
+    decode: Duration,
+    /// Decoding and the hand-over to a painter, over the frames that were. The painting
+    /// itself is on the painter's thread.
+    paint: Duration,
+    since: Option<Instant>,
+}
+
+impl DecodeCost {
+    fn note(&mut self, began: Instant, ended: Instant, painted: bool) {
+        self.frames += 1;
+        if painted {
+            self.painted += 1;
+            self.paint += ended - began;
+        } else {
+            self.decode += ended - began;
+        }
+        let since = *self.since.get_or_insert(began);
+        if ended - since >= Duration::from_secs(1) {
+            let each = |total: Duration, n: u32| total.as_secs_f32() * 1000. / n.max(1) as f32;
+            tracing::debug!(
+                frames = self.frames,
+                painted = self.painted,
+                decode_ms = each(self.decode, self.frames - self.painted),
+                paint_ms = each(self.paint, self.painted),
+                "received frame cost"
+            );
+            *self = DecodeCost { since: Some(ended), ..DecodeCost::default() };
+        }
+    }
 }
 
 impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
-    fn lost(&mut self) {
+    fn lost(&mut self, reason: &'static str, frame: &Received) {
+        tracing::debug!(reason, key = frame.key, contiguous = frame.contiguous, bytes = frame.data.len(), "a received frame was not painted");
         self.wait_key = true;
         self.inbox.want_key.store(true, Ordering::Relaxed);
     }
 
     fn frame(&mut self, frame: Received) {
-        if !frame.contiguous || (self.wait_key && !frame.key) {
-            self.lost();
+        if !frame.contiguous {
+            self.lost("gap", &frame);
+            return;
+        }
+        if self.wait_key && !frame.key {
+            self.lost("waiting for a keyframe", &frame);
             return;
         }
         let Some(opened) = self
             .controls
             .e2ee(|e2ee| e2ee.open_video(&frame.user, &frame.data))
         else {
-            self.lost();
+            self.lost("not opened", &frame);
             return;
         };
         if frame.key {
             self.wait_key = false;
         }
-        let paint = self.painted.is_none_or(|at| at.elapsed() >= PAINT_EVERY);
-        match self.screen.decode(&opened, paint) {
-            Ok(Some(painted)) => {
-                self.painted = Some(Instant::now());
-                (self.show)(MediaResponse::Picture {
-                    path: painted.path.display().to_string(),
-                    width: painted.width,
-                    height: painted.height,
-                    generation: painted.generation,
-                    user_id: frame.user,
-                    kind: frame.kind,
-                });
+        let paint = self.painted.is_none_or(|at| at.elapsed() >= PAINT_EVERY).then(|| Tag { user: frame.user.clone(), kind: frame.kind });
+        let painting = paint.is_some();
+        let began = Instant::now();
+        let decoded = self.screen.decode(&opened, paint);
+        self.cost.note(began, Instant::now(), painting && decoded.is_ok());
+        match decoded {
+            Ok(()) => {
+                if painting {
+                    self.painted = Some(began);
+                }
             }
-            Ok(None) => {}
-            Err(()) => self.lost(),
+            Err(()) => self.lost("did not decode", &frame),
+        }
+        self.flush();
+    }
+
+    /// Every picture painted since last asked goes to the window.
+    fn flush(&mut self) {
+        for (tag, painted) in self.screen.painted() {
+            (self.show)(MediaResponse::Picture {
+                path: painted.path.display().to_string(),
+                width: painted.width,
+                height: painted.height,
+                generation: painted.generation,
+                user_id: tag.user,
+                kind: tag.kind,
+            });
         }
     }
 
     fn run(&mut self) {
-        while let Some(next) = self.inbox.take() {
-            match next {
-                In::Frame(frame) => self.frame(frame),
-                In::Reset => {
+        loop {
+            match self.inbox.take(PAINT_EVERY) {
+                Take::Stop => break,
+                // The painters finish after the frame that fed them: what they finished is
+                // shown as soon as there is a lull.
+                Take::Nothing => self.flush(),
+                Take::Next(In::Frame(frame)) => self.frame(frame),
+                Take::Next(In::Reset) => {
                     self.screen.reset();
                     self.wait_key = true;
                     self.inbox.want_key.store(true, Ordering::Relaxed);
                 }
-                In::Clear => {
+                Take::Next(In::Clear) => {
                     self.screen.reset();
                     self.screen.forget();
                     self.wait_key = true;
@@ -846,6 +955,7 @@ fn start_decode<P: Screen>(
                 show,
                 wait_key: true,
                 painted: None,
+                cost: DecodeCost::default(),
             }
             .run();
     })?;
@@ -1039,7 +1149,7 @@ mod tests {
         let rows: Vec<_> = [3730, 2493, 1349, 640, 300, 144].iter().map(|&estimate| (100, 20, estimate, 0., 5)).collect();
         let now = seconds(&mut uplink, start, 0, &rows, &mut (0, 0));
         let spend = uplink.usable(144_000, wanted, now);
-        assert_eq!(allocate(spend, true, false, Rates::default()).share, SHARE_BPS);
+        assert_eq!(allocate(spend, true, false, Rates::default()).share, share_quality().bps);
     }
 
     #[test]
@@ -1098,9 +1208,10 @@ mod tests {
 
     #[test]
     fn a_good_path_gets_everything() {
-        let rates = allocate(5_000_000, true, true, Rates::default());
+        // A share at its best is 8 Mb/s; with the cameras and the voice, inside 85% of this.
+        let rates = allocate(12_000_000, true, true, Rates::default());
         assert_eq!(rates, Rates::default());
-        assert!(desired(true, true) > 2_150_000);
+        assert!(desired(true, true) > 8_000_000);
     }
 
     #[test]
@@ -1193,7 +1304,7 @@ mod tests {
     }
 
     #[test]
-    fn encoding_that_overruns_halves_the_rate_and_it_comes_back() {
+    fn encoding_that_overruns_slows_the_rate_a_step_at_a_time_and_it_comes_back() {
         let mut now = Instant::now();
         let mut schedule = Schedule::new(now);
         let period = schedule.period();
@@ -1204,17 +1315,19 @@ mod tests {
         }
         assert_eq!(schedule.slower, 2);
         assert_eq!(schedule.fps(), 7.5);
+        // Work longer than even the slowest period: a step each OVERRUN rounds, to the slowest.
         for _ in 0..OVERRUN * 3 {
-            let ended = now + period * 3;
+            let ended = now + period * 5;
             schedule.done(now, ended);
             now = ended;
         }
-        assert_eq!(schedule.slower, SLOWEST, "and it stops halving");
-        for _ in 0..RELAXED * 2 {
+        assert_eq!(schedule.slower, SLOWEST, "and it stops slowing");
+        assert_eq!(schedule.fps(), 3.75);
+        for _ in 0..RELAXED * 3 {
             schedule.done(now, now + period / 4);
             now += period * 2;
         }
-        assert_eq!(schedule.slower, 1);
+        assert_eq!(schedule.slower, 1, "a step back each RELAXED rounds");
     }
 
     #[test]
@@ -1533,20 +1646,25 @@ mod tests {
         fails: Vec<u8>,
         resets: Arc<Mutex<u32>>,
         forgotten: Arc<Mutex<u32>>,
+        /// Painted at once, taken by `painted`.
+        pending: Vec<(Tag, Painted)>,
     }
 
     impl Screen for Glass {
-        fn decode(&mut self, annex_b: &[u8], paint: bool) -> Result<Option<Painted>, ()> {
-            self.decoded.lock().unwrap().push((annex_b[0], paint));
+        fn decode(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
+            self.decoded.lock().unwrap().push((annex_b[0], paint.is_some()));
             if self.fails.contains(&annex_b[0]) {
                 return Err(());
             }
-            Ok(paint.then(|| Painted {
-                path: PathBuf::from("frame.jpg"),
-                width: 2,
-                height: 2,
-                generation: annex_b[0] as u64,
-            }))
+            if let Some(tag) = paint {
+                let painted = Painted { path: PathBuf::from("frame.jpg"), width: 2, height: 2, generation: annex_b[0] as u64 };
+                self.pending.push((tag, painted));
+            }
+            Ok(())
+        }
+
+        fn painted(&mut self) -> Vec<(Tag, Painted)> {
+            std::mem::take(&mut self.pending)
         }
 
         fn reset(&mut self) {
@@ -1584,6 +1702,7 @@ mod tests {
             show: move |frame| sink.lock().unwrap().push(frame),
             wait_key: true,
             painted: None,
+            cost: DecodeCost::default(),
         };
         (decode, shown)
     }
@@ -1656,9 +1775,9 @@ mod tests {
             assert!(inbox.put(frame(n as u8, false)));
         }
         assert!(!inbox.put(frame(0, false)), "the tick is told");
-        assert_eq!(inbox.take(), Some(In::Reset), "what was queued is gone");
+        assert_eq!(inbox.take(Duration::ZERO), Take::Next(In::Reset), "what was queued is gone");
         inbox.queue.lock().unwrap().stop = true;
-        assert_eq!(inbox.take(), None);
+        assert_eq!(inbox.take(Duration::ZERO), Take::Stop);
     }
 
     /// The picture must come off the screen whatever the decoder is busy with when it is told.
@@ -1667,8 +1786,8 @@ mod tests {
         let inbox = Inbox::default();
         inbox.replace(In::Clear);
         inbox.replace(In::Reset);
-        assert_eq!(inbox.take(), Some(In::Clear));
-        assert_eq!(inbox.take(), Some(In::Reset), "the next picture still starts from a keyframe");
+        assert_eq!(inbox.take(Duration::ZERO), Take::Next(In::Clear));
+        assert_eq!(inbox.take(Duration::ZERO), Take::Next(In::Reset), "the next picture still starts from a keyframe");
     }
 
     #[test]
@@ -1678,8 +1797,8 @@ mod tests {
         for n in 0..RECEIVED {
             inbox.put(frame(n as u8, false));
         }
-        assert_eq!(inbox.take(), Some(In::Clear));
-        assert_eq!(inbox.take(), Some(In::Reset));
+        assert_eq!(inbox.take(Duration::ZERO), Take::Next(In::Clear));
+        assert_eq!(inbox.take(Duration::ZERO), Take::Next(In::Reset));
     }
 
     #[test]
@@ -1687,7 +1806,7 @@ mod tests {
         let inbox = Inbox::default();
         inbox.replace(In::Clear);
         inbox.replace(In::Clear);
-        assert_eq!(inbox.take(), Some(In::Clear));
+        assert_eq!(inbox.take(Duration::ZERO), Take::Next(In::Clear));
         assert_eq!(inbox.queue.lock().unwrap().frames.len(), 0);
     }
 
@@ -1696,7 +1815,7 @@ mod tests {
         let inbox = Inbox::default();
         inbox.put(frame(1, false));
         inbox.replace(In::Clear);
-        assert_eq!(inbox.take(), Some(In::Clear));
+        assert_eq!(inbox.take(Duration::ZERO), Take::Next(In::Clear));
     }
 
     #[test]
