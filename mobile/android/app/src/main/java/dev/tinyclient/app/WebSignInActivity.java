@@ -168,6 +168,16 @@ public class WebSignInActivity extends Activity {
                 view.loadUrl(go);
                 return true;
             }
+            // Returning false lets the WebView hand a URL to whatever app claims it, so only web
+            // pages load here. A discord:// or intent:// page belongs to the installed app, and the
+            // sign-in would finish there, out of reach of the token probe.
+            String scheme = request.getUrl().getScheme();
+            if (!"http".equals(scheme) && !"https".equals(scheme) && !"about".equals(scheme)
+                    && !"blob".equals(scheme) && !"data".equals(scheme)) {
+                Log.i(TinyPlatform.TAG, "sign-in navigation to another app dropped: " + scheme);
+                return true;
+            }
+            Log.i(TinyPlatform.TAG, "sign-in navigation: " + request.getUrl().getHost());
             return false;
         }
 
