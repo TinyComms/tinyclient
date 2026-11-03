@@ -192,6 +192,24 @@ fn in_topic(mut message: tl::types::Message, topic: i32) -> tl::types::Message {
     message
 }
 
+/// One plain and one custom reaction, the way a comment's carry them.
+fn comment_reactions() -> tl::types::MessageReactions {
+    let count = |reaction: tl::enums::Reaction, count, mine: bool| {
+        tl::enums::ReactionCount::Count(tl::types::ReactionCount { chosen_order: mine.then_some(0), reaction, count })
+    };
+    tl::types::MessageReactions {
+        min: false,
+        can_see_list: true,
+        reactions_as_tags: false,
+        results: vec![
+            count(tl::enums::Reaction::Emoji(tl::types::ReactionEmoji { emoticon: "👍".to_owned() }), 2, false),
+            count(tl::enums::Reaction::CustomEmoji(tl::types::ReactionCustomEmoji { document_id: 5002 }), 1, false),
+        ],
+        recent_reactions: None,
+        top_reactors: None,
+    }
+}
+
 fn settings(mute_until: Option<i32>) -> tl::enums::PeerNotifySettings {
     let mut settings: tl::types::PeerNotifySettings = blank(&[&put(0u32)]);
     settings.mute_until = mute_until;
@@ -848,6 +866,26 @@ impl World {
                 };
                 vec![update(tl::types::UpdateMessageReactions { peer: odalys.peer(), msg_id: 12, top_msg_id: None, saved_peer_id: None, reactions: reactions.into() }.into())]
             }
+            // A comment gains reactions, as the thread's next page carries them: the page
+            // answer is all that changes, nothing is told on the update stream.
+            "comment-react" => {
+                let mut comment = message(Who::Channel(CHATTERS), 51, ODALYS, T0 - 40, "Yes, at the hut now.");
+                comment.reactions = Some(comment_reactions().into());
+                // The thread's page is kept under the post's id, as `getReplies` counts it.
+                self.messages.entry(key(Who::Channel(NOTES), Some(5))).or_default().insert(51, comment.into());
+                Vec::new()
+            }
+            // The same while the thread is open: Telegram says the reaction of a comment on
+            // the discussion group's stream, naming the echo the comment answers.
+            "comment-react-live" => {
+                vec![update(tl::types::UpdateMessageReactions {
+                    peer: Who::Channel(CHATTERS).peer(),
+                    msg_id: 51,
+                    top_msg_id: Some(ECHO),
+                    saved_peer_id: None,
+                    reactions: comment_reactions().into(),
+                }.into())]
+            }
             "edit" => {
                 let mut message = message(odalys, 13, ODALYS, T0 + 10, "Café at the dock, seven sharp");
                 message.edit_date = Some(T0 + 30);
@@ -885,6 +923,13 @@ impl World {
                 vec![update(
                     tl::types::UpdateDraftMessage { peer: odalys.peer(), top_msg_id: None, saved_peer_id: None, draft: tl::enums::DraftMessage::Empty(blank(&[&put(0u32)])) }.into(),
                 )]
+            }
+            // A draft typed on the phone in the comments thread: Telegram keeps it in the
+            // discussion group, under the echo of the post, as its own apps save one.
+            "thread-draft" => {
+                let text = "Ropes at the hut, then.".to_owned();
+                self.drafts.insert((Who::Channel(CHATTERS), Some(ECHO)), text.clone());
+                vec![update(tl::types::UpdateDraftMessage { peer: Who::Channel(CHATTERS).peer(), top_msg_id: Some(ECHO), saved_peer_id: None, draft: draft_message(&text) }.into())]
             }
             // Odalys goes offline; Tobin's last-seen stays hidden.
             "status" => vec![

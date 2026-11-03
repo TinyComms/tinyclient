@@ -818,9 +818,22 @@ fn typing(account: &Account, conversation: &str) {
 /// types; the same draft arriving back is written nowhere, being what the store already says.
 /// Not `ask`: a draft is not worth waiting out a flood for.
 fn save_draft(account: &Account, conversation: &str, text: &str) {
-    let Some((who, topic)) = Who::parse(conversation) else {
+    let Some((mut who, mut topic)) = Who::parse(conversation) else {
         return;
     };
+    // A comments thread's draft is kept where its sends go: in the discussion group behind
+    // the post, under the echo of it — not against the channel post itself.
+    match sync::comment_target(account, conversation) {
+        Ok(Some((group, echo))) => {
+            who = group;
+            topic = Some(echo);
+        }
+        Ok(None) => {}
+        Err(fault) => {
+            tracing::warn!("chatd: Telegram: draft: {fault}");
+            return;
+        }
+    }
     let Ok(peer) = account.input(who) else {
         return;
     };

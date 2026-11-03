@@ -886,6 +886,84 @@ fn a_sent_comment_lands_in_the_thread_and_the_posts_count_rises_under_its_own_id
 }
 
 #[test]
+fn a_comments_reactions_document_is_asked_and_its_file_lands_for_the_chip_like_a_normal_messages() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments");
+    world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+    // A comment carries a reaction that is a custom emoji, before the thread is opened.
+    world.steer("comment-react");
+    let before = world.called("GetCustomEmojiDocuments");
+
+    // Opening the thread reads the comments as one page: the reaction's document is asked
+    // for the way a normal message's reaction does, and the stored comment names the media
+    // the chip draws (`e<document id>`), the plain one keeping its glyph.
+    world.messages("c9001_5");
+    let reacted = world.until("the comment's reactions", || {
+        world.message("c9001_5", "51").filter(|comment| !comment.reactions.is_empty())
+    });
+    let seen: Vec<(&str, &str)> = reacted.reactions.iter().map(|reaction| (reaction.emoji.as_str(), reaction.file.as_ref().map_or("", |file| file.id.as_str()))).collect();
+    assert_eq!(seen, vec![("👍", ""), (":emoji:", "e5002")]);
+    assert!(world.called("GetCustomEmojiDocuments 5002") > before, "{:#?}", world.calls());
+
+    // The file lands whole under the name the reaction carries, as any reaction's does.
+    let landed = world.until("the comment's reaction picture on disk", || {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["e5002".into()], size: None, retry: false }) {
+            Response::Media { mut files } => files.pop().and_then(|file| file.path),
+            other => panic!("{other:?}"),
+        }
+    });
+    let kept = std::fs::read(&landed).expect("the comment's reaction picture is on disk");
+    assert!(kept.starts_with(b"{"), "what a chip draws is the file inside: {:02x?}", &kept[..kept.len().min(8)]);
+}
+
+#[test]
+fn a_reaction_told_for_a_comment_lands_on_the_thread_while_it_is_open() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments");
+    world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+    world.messages("c9001_5");
+    // The thread is open and on screen: the open learned where its comments go, as the
+    // window's own open does before a reaction could arrive there.
+    world.until("the discussion to be asked", || (world.called("GetDiscussionMessage c9001_5") == 1).then_some(()));
+    world.watch(Watching { conversation: Some(key("c9001_5")), ..Watching::default() });
+
+    // Telegram says the reaction on the discussion group's stream, naming the echo the
+    // comment answers: it lands on the stored comment in the thread, and its document is
+    // asked for the chip, as a normal message's reaction is.
+    world.steer("comment-react-live");
+    let reacted = world.until("the reaction on the comment", || {
+        world.message("c9001_5", "51").filter(|comment| !comment.reactions.is_empty())
+    });
+    let seen: Vec<(&str, u32)> = reacted.reactions.iter().map(|reaction| (reaction.emoji.as_str(), reaction.count)).collect();
+    assert_eq!(seen, vec![("👍", 2), (":emoji:", 1)]);
+    assert!(world.called("GetCustomEmojiDocuments 5002") > 0, "{:#?}", world.calls());
+}
+
+#[test]
+fn a_draft_in_the_comments_thread_is_kept_on_the_thread_not_the_channel() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments");
+    world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+    world.messages("c9001_5");
+    world.until("the discussion to be asked", || (world.called("GetDiscussionMessage c9001_5") == 1).then_some(()));
+
+    // A draft typed on the thread is kept where Telegram's own apps keep one: in the
+    // discussion group, under the echo of the post — not against the channel post itself.
+    world.ask(Request::SetDraft { conversation: key("c9001_5"), text: "Bringing the rope.".into() });
+    world.until("the thread's draft to be told", || (world.called("SaveDraft c9003_60 Bringing the rope.") == 1).then_some(()));
+    assert!(!world.calls().iter().any(|call| call.starts_with("SaveDraft c9001 ")), "{:#?}", world.calls());
+
+    // And a draft the phone typed in the thread comes back on the thread's row.
+    world.steer("thread-draft");
+    world.until("the draft typed in the thread", || {
+        world.conversation("c9001_5").filter(|row| row.draft == "Ropes at the hut, then.").map(|_| ())
+    });
+}
+
+#[test]
 fn a_chat_pinned_by_a_folder_beyond_the_pages_gets_its_row() {
     // The Work folder pins a chat that no dialog page the sign-on read carries: only the
     // folder rule speaks of it, and what nothing stored says of is asked for alone.

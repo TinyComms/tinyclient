@@ -975,11 +975,15 @@ fn comment_row(account: &Account, thread: &str, channel: Who, post: i32) {
 /// names the echo its reply answers. `None` leaves the message with the group's own id,
 /// for a conversation of the group itself.
 fn comments_thread(account: &Account, mapped: &Mapped) -> Option<String> {
-    let Some(echo) = mapped.reply else {
-        return None;
-    };
-    let live = account.live();
-    live.discussion.iter().find(|(_, held, at)| *held == mapped.peer && *at == echo).map(|(thread, _, _)| thread.clone())
+    echo_thread(account, mapped.peer, mapped.reply)
+}
+
+/// The comments thread of the discussion group an update belongs to: the thread that was
+/// opened names the echo its post says again there, and the update carries it as its `top`.
+/// `None` for the group's own messages.
+pub(super) fn echo_thread(account: &Account, group: Who, top: Option<i32>) -> Option<String> {
+    let echo = top?;
+    account.live().discussion.iter().find(|(_, held, at)| *held == group && *at == echo).map(|(thread, _, _)| thread.clone())
 }
 
 /// The footer's "last reply": the newest comment's time, written onto the post it hangs off

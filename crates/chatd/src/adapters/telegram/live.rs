@@ -9,10 +9,12 @@ use protocol::Message;
 use std::collections::HashMap;
 use tl::enums::Update;
 
-/// The conversation a peer's update is about; in a forum, the thread of the topic it names.
+/// The conversation a peer's update is about; in a forum, the thread of the topic it names,
+/// and in a discussion group the comments thread when the update names the echo it answers.
 fn place(account: &Account, who: Who, topic: Option<i32>) -> String {
     match who {
         Who::Channel(_) if account.dir().get(who).is_some_and(|known| known.forum) => thread_id(who, topic.unwrap_or(1)),
+        Who::Channel(_) => sync::echo_thread(account, who, topic).unwrap_or_else(|| who.text()),
         who => who.text(),
     }
 }
@@ -207,7 +209,9 @@ pub(super) fn apply(account: &Account, update: &Update) {
                 // Telegram's naming of General.
                 thread_id(who, drafted.top_msg_id.unwrap_or(1))
             } else {
-                who.text()
+                // A comments thread's draft rides the discussion group, kept under the
+                // echo of its post: the thread's own id is where this row's draft belongs.
+                sync::echo_thread(account, who, drafted.top_msg_id).unwrap_or_else(|| who.text())
             };
             let text = match &drafted.draft {
                 tl::enums::DraftMessage::Message(draft) => draft.message.as_str(),
