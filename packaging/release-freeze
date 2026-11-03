@@ -1,0 +1,4 @@
+# Release freeze for tinyclient, read by packaging/release-cut.sh.
+# One inclusive date range per line: YYYY-MM-DD YYYY-MM-DD.
+# Dates are the local date of the Windows machine the release is cut on (Zeppelin).
+# No release while today falls inside a range, unless Justin says "ship through the freeze".
