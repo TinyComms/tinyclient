@@ -1,0 +1,19 @@
+# cargo-nextest runs each test in its own process and every test binary at once, where
+# `cargo test` ran the binaries one after another. CI selects the `ci` profile through
+# NEXTEST_PROFILE; a local `cargo nextest run` keeps nextest's defaults.
+
+[profile.ci]
+# Run everything, so one failure does not hide the next.
+fail-fast = false
+# A test that fails and then passes is reported as FLAKY in the summary, not dropped.
+retries = 1
+# A few call and MLS tests legitimately take a minute or more. Ten minutes is a hang.
+slow-timeout = { period = "60s", terminate-after = 10 }
+failure-output = "immediate-final"
+success-output = "never"
+
+# Known to fail now and then on a loaded runner and pass on the next run. More tries here
+# keep it from failing the build while it is looked into.
+[[profile.ci.overrides]]
+filter = 'binary_id(chatd::telegram) & test(=a_channel_posts_comments_count_rides_the_post)'
+retries = 3

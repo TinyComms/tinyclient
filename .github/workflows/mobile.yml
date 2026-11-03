@@ -1,8 +1,9 @@
 name: Mobile
 
-# The desktop workflow (ci.yml) already builds and tests the host. This one proves the two
-# things it cannot: that the crate still compiles for the phones, and that the native shells
-# package. Nothing here is signed or uploaded to a store.
+# The desktop workflow (ci.yml) already builds and tests the host, and checks the window with
+# the mobile feature on. This one proves the two things it cannot: that the crate still compiles
+# for the phones, and that the native shells package. One job per phone, android-app and
+# ios-app. Nothing here is signed or uploaded to a store.
 #
 # Versions are the ones checked against vendor docs on 2026-10-31
 # (research_notes/mobile/build-ci-release.md, rust-core-native-shells.md):
@@ -46,26 +47,16 @@ env:
   GRADLE_VERSION: "9.6.0"
 
 jobs:
-  # The cheap one: does `mobile` break the desktop build? This is the check that catches a
-  # feature-graph mistake before either expensive job runs.
-  host-check:
-    name: host check (gui + mobile)
+  # Each phone builds its Rust library and packages the app in one job. They used to be two jobs
+  # apiece, and the app job waited in a second runner queue and then downloaded the library.
+  # A pull request builds the libraries with the ci-mobile profile (no LTO, Cargo.toml), from
+  # scratch: main's cache holds the release profile, which a pull request cannot reuse. Main and
+  # tags build release, which is what ships, and main saves that cache.
+  android-app:
+    name: android (libs + assembleDebug)
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-rust
-        with:
-          cache-key: mobile-host
-      - name: Window
-        run: cargo check -p tinyclient --features gui
-      - name: Window with the mobile feature enabled
-        # The cfg(target_os = "ios"|"android") arms are not type-checked on this host; this
-        # proves the feature does not disturb the desktop arms.
-        run: cargo check -p tinyclient --features "gui mobile"
-
-  android-libs:
-    name: android libs
-    runs-on: ubuntu-latest
+    env:
+      PROFILE: ${{ github.event_name == 'pull_request' && 'ci-mobile' || 'release' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -74,6 +65,7 @@ jobs:
           targets: aarch64-linux-android,x86_64-linux-android
 
       - uses: swatinem/rust-cache@v2
+        if: github.event_name != 'pull_request'
         with:
           prefix-key: v1-rust
           shared-key: mobile-android
@@ -99,10 +91,12 @@ jobs:
           TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
         # Output is the layout AGP packages automatically: jniLibs/<abi>/libtinyclient.so.
         # `--platform 29` matches minSdk: below it the NDK has no libnativewindow to link.
+        # The app loads only the shared library, so `--crate-type cdylib` builds that one instead
+        # of every type in [lib] crate-type.
         run: |
           cargo ndk -t arm64-v8a -t x86_64 --platform 29 \
             -o mobile/android/app/src/main/jniLibs \
-            build --release -p tinyclient --lib --features mobile
+            rustc --profile "$PROFILE" -p tinyclient --lib --features mobile --crate-type cdylib
 
       - name: 16 KB page check
         # Play blocks updates without 16 KB support from 2027-02-01, and a misaligned ELF
@@ -117,19 +111,6 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/upload-artifact@v6
-        with:
-          name: android-jniLibs
-          path: mobile/android/app/src/main/jniLibs
-          if-no-files-found: error
-
-  android-app:
-    name: android app (assembleDebug)
-    needs: android-libs
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -139,11 +120,6 @@ jobs:
       - uses: gradle/actions/setup-gradle@v5
         with:
           gradle-version: ${{ env.GRADLE_VERSION }}
-
-      - uses: actions/download-artifact@v6
-        with:
-          name: android-jniLibs
-          path: mobile/android/app/src/main/jniLibs
 
       - name: assembleDebug
         working-directory: mobile/android
@@ -162,50 +138,36 @@ jobs:
           path: mobile/android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
 
-  ios-libs:
-    name: ios libs (xcframework)
+  ios-app:
+    name: ios (libs + unsigned archive)
     # Xcode is macOS-only. macos-26 carries Xcode 26.6 / iOS 26.5 SDK, which satisfies the
     # current mandate; move to the xcode-27 preview image before April 2027.
     runs-on: macos-26
+    env:
+      PROFILE: ${{ github.event_name == 'pull_request' && 'ci-mobile' || 'release' }}
     steps:
       - uses: actions/checkout@v5
 
+      # The archive below is for a device, so the simulator slices are not built here.
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+          targets: aarch64-apple-ios
 
       - uses: swatinem/rust-cache@v2
+        if: github.event_name != 'pull_request'
         with:
           prefix-key: v1-rust
           shared-key: mobile-ios
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build device + simulator and make the xcframework
+      - name: Build the device library and make the xcframework
         env:
           # chatd runs in the app, and its build script refuses a release without these.
           TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
           TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
         run: |
           chmod +x scripts/mobile/build-ios.sh
-          scripts/mobile/build-ios.sh
-
-      - uses: actions/upload-artifact@v6
-        with:
-          name: TinyCore.xcframework
-          path: mobile/ios/TinyCore.xcframework
-          if-no-files-found: error
-
-  ios-app:
-    name: ios app (unsigned archive)
-    needs: ios-libs
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: actions/download-artifact@v6
-        with:
-          name: TinyCore.xcframework
-          path: mobile/ios/TinyCore.xcframework
+          scripts/mobile/build-ios.sh --device-only --profile "$PROFILE"
 
       - name: XcodeGen
         run: brew install xcodegen

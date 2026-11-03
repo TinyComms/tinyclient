@@ -20,9 +20,9 @@ parts were not. Nothing here was built for a phone.
 | `mobile/ios/` | XcodeGen project, `Info.plist`, Swift `AppDelegate`/`SceneDelegate`, bridging header |
 | `scripts/mobile/build-android.ps1` | Windows: NDK check → `cargo ndk` → `gradlew assembleDebug` |
 | `scripts/mobile/build-android.sh` | Linux/macOS: the same |
-| `scripts/mobile/build-ios.sh` | macOS: Rust device + simulator → `lipo` → `xcodebuild -create-xcframework` |
+| `scripts/mobile/build-ios.sh` | macOS: Rust device + simulator → `lipo` → `xcodebuild -create-xcframework` (`--device-only` for CI's archive) |
 | `scripts/mobile/seed-demo.ps1` | `chatd --seed-demo` in a scratch `TINYCLIENT_DIR`, prints the env |
-| `.github/workflows/mobile.yml` | `host-check`, `android-libs`, `android-app`, `ios-libs`, `ios-app` |
+| `.github/workflows/mobile.yml` | `android-app`, `ios-app`: each builds its library and packages the app (the host check is in `ci.yml`) |
 
 `src/main.rs` is unchanged: the desktop binary keeps its own module tree and its own entry point.
 
@@ -124,8 +124,8 @@ xcodebuild -project Tiny.xcodeproj -scheme Tiny \
   CODE_SIGNING_ALLOWED=NO build
 ```
 
-`build-ios.sh` runs three `cargo build --lib --features mobile` (device, arm64 sim, x86_64 sim),
-`lipo`s the two simulator slices into one, and calls `xcodebuild -create-xcframework` into
+`build-ios.sh` builds the static library three times with `cargo rustc --lib --features mobile
+--crate-type staticlib` (device, arm64 sim, x86_64 sim), `lipo`s the two simulator slices into one, and calls `xcodebuild -create-xcframework` into
 `mobile/ios/TinyCore.xcframework`. Two simulator slices cannot be passed to
 `-create-xcframework` separately: it refuses two libraries with the same platform+variant.
 

@@ -3,7 +3,7 @@ description: Toolchain, protoc, system libraries, linker, and the cargo cache sh
 
 inputs:
   cache-key:
-    description: test or release. One cache per profile, shared by every job that builds it.
+    description: test or release. One cache per profile, shared by every job that builds it. none builds without a cache.
     required: true
 
 runs:
@@ -37,8 +37,11 @@ runs:
     # each save is about a gigabyte, the repository holds 10 GB, and pull-request copies were
     # evicting the cache before the next build could use it. shared-key drops the job name so
     # CI and the release workflow restore the same entry. The v1 prefix starts clean of the
-    # caches from before the linker flags and the line-table profile.
+    # caches from before the linker flags and the line-table profile. The key also carries the
+    # runner's OS and CPU, so each platform keeps its own entry; a job off the critical path can
+    # pass none and leave the room to the ones that are on it.
     - uses: swatinem/rust-cache@v2
+      if: inputs.cache-key != 'none'
       with:
         prefix-key: v1-rust
         shared-key: ${{ inputs.cache-key }}

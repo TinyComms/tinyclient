@@ -6,13 +6,15 @@
 #   scripts/mobile/build-ios.sh --debug
 #   scripts/mobile/build-ios.sh --debug --demo   # proof build: made-up chats from launch (`demo`)
 #   scripts/mobile/build-ios.sh --debug --sim-only   # Apple-silicon simulator slice only (fast loop)
+#   scripts/mobile/build-ios.sh --device-only        # device slice only, for a device archive (CI)
+#   scripts/mobile/build-ios.sh --profile ci-mobile  # any Cargo profile; output is target/<triple>/<profile>
 #
 # Nothing here needs UniFFI: the shell calls one C symbol (`tinyclient_ios_main`). See
 # docs/mobile-build.md. This script does NOT build the .app — that is xcodebuild's job, and the
 # exact command is printed at the end.
 #
 # macOS only: lipo and xcodebuild ship with Xcode. On Windows there is no equivalent; use the
-# `ios-libs` / `ios-app` jobs in .github/workflows/mobile.yml.
+# `ios-app` job in .github/workflows/mobile.yml.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -24,14 +26,22 @@ profile_dir="release"
 extra_args=(--release)
 features="mobile"
 sim_only=0
+device_only=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --debug) profile="debug"; profile_dir="debug"; extra_args=() ;;
         --release) profile="release"; profile_dir="release"; extra_args=(--release) ;;
+        --profile)
+            [ $# -ge 2 ] || { echo "build-ios: --profile needs a name" >&2; exit 2; }
+            profile="$2"; extra_args=(--profile "$2")
+            # Cargo writes the dev profile to target/<triple>/debug and every other one to its own name.
+            if [ "$2" = "dev" ]; then profile_dir="debug"; else profile_dir="$2"; fi
+            shift ;;
         --demo) features="mobile demo" ;;
         --sim-only) sim_only=1 ;;
-        -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --device-only) device_only=1 ;;
+        -h|--help) sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "build-ios: unknown argument: $1 (try --help)" >&2; exit 2 ;;
     esac
     shift
@@ -43,7 +53,8 @@ fail() {
 }
 
 # The made-up chatd shows invented data and never reaches the real core: never in a release.
-[ "$features" = "mobile" ] || [ "$profile" = "debug" ] || fail "--demo is for debug proof builds only, never a release."
+[ "$features" = "mobile" ] || [ "$profile" = "debug" ] || [ "$profile" = "dev" ] || fail "--demo is for debug proof builds only, never a release."
+[ "$sim_only" = 0 ] || [ "$device_only" = 0 ] || fail "--sim-only and --device-only leave nothing to build together; pick one."
 
 note() {
     printf 'build-ios: %s\n' "$1"
@@ -51,7 +62,7 @@ note() {
 
 # --- host and tools --------------------------------------------------------
 
-[ "$(uname -s)" = "Darwin" ] || fail "this script needs macOS: lipo and xcodebuild ship with Xcode, and the iOS SDK is macOS-only. On Windows use the ios-libs job in .github/workflows/mobile.yml (a macos-26 runner)."
+[ "$(uname -s)" = "Darwin" ] || fail "this script needs macOS: lipo and xcodebuild ship with Xcode, and the iOS SDK is macOS-only. On Windows use the ios-app job in .github/workflows/mobile.yml (a macos-26 runner)."
 
 if ! command -v cargo >/dev/null 2>&1; then
     if [ -x "$HOME/.cargo/bin/cargo" ]; then
@@ -71,6 +82,8 @@ command -v lipo >/dev/null 2>&1 || fail "lipo is not on PATH. It ships with Xcod
 # platform+variant, so both simulator architectures must be lipo'd into one first.
 targets=(aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios)
 [ "$sim_only" = 1 ] && targets=(aarch64-apple-ios-sim)
+# A device archive (`-destination 'generic/platform=iOS'`) links only the device slice.
+[ "$device_only" = 1 ] && targets=(aarch64-apple-ios)
 installed="$(rustup target list --installed)"
 for triple in "${targets[@]}"; do
     if ! printf '%s\n' "$installed" | grep -qx "$triple"; then
@@ -81,15 +94,17 @@ done
 
 # --- Build -----------------------------------------------------------------
 
-# The app's floor (project.yml). Unset, rustc links the library's cdylib for iOS 10, where
-# the C dependencies built against the current SDK find no ___chkstk_darwin.
+# The app's floor (project.yml). Unset, the C dependencies and any dylib rustc links target
+# iOS 10, where code built against the current SDK finds no ___chkstk_darwin.
 export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-16.0}"
 
 # `--lib` because the package also has the desktop binary; `mobile` is the entry point + gui.
+# Xcode links only the static library, so `cargo rustc --crate-type staticlib` builds that one
+# instead of every type in [lib] crate-type. Under release LTO each type is a separate link.
 build() {
     local triple="$1"
-    note "cargo build $profile --target $triple"
-    (cd "$root" && cargo build "${extra_args[@]}" -p tinyclient --lib --features "$features" --target "$triple")
+    note "cargo rustc $profile --target $triple (staticlib)"
+    (cd "$root" && cargo rustc "${extra_args[@]}" -p tinyclient --lib --features "$features" --target "$triple" --crate-type staticlib)
 }
 
 for triple in "${targets[@]}"; do
@@ -104,11 +119,21 @@ if [ "$sim_only" = 1 ]; then
 fi
 
 device_lib="$root/target/aarch64-apple-ios/$profile_dir/libtinyclient.a"
+
+if [ "$device_only" = 1 ]; then
+    [ -f "$device_lib" ] || fail "expected $device_lib after the staticlib build."
+    rm -rf "$xcframework"
+    note "xcodebuild -create-xcframework (device slice only) -> $xcframework"
+    xcodebuild -create-xcframework -library "$device_lib" -output "$xcframework"
+    note "done: $(du -sh "$xcframework" | cut -f1) $xcframework"
+    exit 0
+fi
+
 sim_arm_lib="$root/target/aarch64-apple-ios-sim/$profile_dir/libtinyclient.a"
 sim_intel_lib="$root/target/x86_64-apple-ios/$profile_dir/libtinyclient.a"
 
 for lib in "$device_lib" "$sim_arm_lib" "$sim_intel_lib"; do
-    [ -f "$lib" ] || fail "expected $lib; does [lib] crate-type include staticlib?"
+    [ -f "$lib" ] || fail "expected $lib after the staticlib build."
 done
 
 mkdir -p "$root/target/universal-ios-sim"
