@@ -49,14 +49,12 @@ env:
 jobs:
   # Each phone builds its Rust library and packages the app in one job. They used to be two jobs
   # apiece, and the app job waited in a second runner queue and then downloaded the library.
-  # A pull request builds the libraries with the ci-mobile profile (no LTO, Cargo.toml), from
-  # scratch: main's cache holds the release profile, which a pull request cannot reuse. Main and
-  # tags build release, which is what ships, and main saves that cache.
+  # Every build is release, so a pull request reuses the dependencies in main's cache. A cheaper
+  # profile was tried for pull requests: with nothing cached for it, it was slower (Android 19.7
+  # minutes against about 11).
   android-app:
     name: android (libs + assembleDebug)
     runs-on: ubuntu-latest
-    env:
-      PROFILE: ${{ github.event_name == 'pull_request' && 'ci-mobile' || 'release' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -65,7 +63,6 @@ jobs:
           targets: aarch64-linux-android,x86_64-linux-android
 
       - uses: swatinem/rust-cache@v2
-        if: github.event_name != 'pull_request'
         with:
           prefix-key: v1-rust
           shared-key: mobile-android
@@ -96,7 +93,7 @@ jobs:
         run: |
           cargo ndk -t arm64-v8a -t x86_64 --platform 29 \
             -o mobile/android/app/src/main/jniLibs \
-            rustc --profile "$PROFILE" -p tinyclient --lib --features mobile --crate-type cdylib
+            rustc --release -p tinyclient --lib --features mobile --crate-type cdylib
 
       - name: 16 KB page check
         # Play blocks updates without 16 KB support from 2027-02-01, and a misaligned ELF
@@ -143,8 +140,6 @@ jobs:
     # Xcode is macOS-only. macos-26 carries Xcode 26.6 / iOS 26.5 SDK, which satisfies the
     # current mandate; move to the xcode-27 preview image before April 2027.
     runs-on: macos-26
-    env:
-      PROFILE: ${{ github.event_name == 'pull_request' && 'ci-mobile' || 'release' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -154,7 +149,6 @@ jobs:
           targets: aarch64-apple-ios
 
       - uses: swatinem/rust-cache@v2
-        if: github.event_name != 'pull_request'
         with:
           prefix-key: v1-rust
           shared-key: mobile-ios
@@ -167,7 +161,7 @@ jobs:
           TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
         run: |
           chmod +x scripts/mobile/build-ios.sh
-          scripts/mobile/build-ios.sh --device-only --profile "$PROFILE"
+          scripts/mobile/build-ios.sh --device-only
 
       - name: XcodeGen
         run: brew install xcodegen

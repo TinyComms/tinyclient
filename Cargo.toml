@@ -36,14 +36,6 @@ opt-level = 2
 lto = "thin"
 codegen-units = 1
 
-# The phone libraries a pull request builds (.github/workflows/mobile.yml). They prove the crate
-# compiles and links for the phones and are never shipped, so they skip LTO and spread codegen
-# across the runner's cores. Pushes to main build the release profile.
-[profile.ci-mobile]
-inherits = "release"
-lto = false
-codegen-units = 16
-
 # `wgpu::InstanceFlags::default()` (what gpui_ce_wgpu asks for) turns on the Vulkan debug-utils and
 # validation layers when wgpu-types is built with debug_assertions. On the Android emulator's
 # Vulkan driver that segfaults in `vk_common_SetDebugUtilsObjectNameEXT` on the first labelled

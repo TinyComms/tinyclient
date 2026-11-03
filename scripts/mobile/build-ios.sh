@@ -7,7 +7,7 @@
 #   scripts/mobile/build-ios.sh --debug --demo   # proof build: made-up chats from launch (`demo`)
 #   scripts/mobile/build-ios.sh --debug --sim-only   # Apple-silicon simulator slice only (fast loop)
 #   scripts/mobile/build-ios.sh --device-only        # device slice only, for a device archive (CI)
-#   scripts/mobile/build-ios.sh --profile ci-mobile  # any Cargo profile; output is target/<triple>/<profile>
+#   scripts/mobile/build-ios.sh --profile NAME       # any Cargo profile; output is target/<triple>/<NAME>
 #
 # Nothing here needs UniFFI: the shell calls one C symbol (`tinyclient_ios_main`). See
 # docs/mobile-build.md. This script does NOT build the .app — that is xcodebuild's job, and the
