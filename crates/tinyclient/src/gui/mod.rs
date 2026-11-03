@@ -19,6 +19,7 @@ pub(crate) mod debug_launch;
 mod hotkeys;
 mod input;
 mod layout;
+mod logs;
 mod pane;
 mod people;
 mod phone;
@@ -54,7 +55,7 @@ gpui::actions!(
         AttachFile, CloseWindow, SearchConversation, SearchEverywhere, BiggerText, SmallerText,
         ActualSize, FullScreen, MarkUnread, MarkSpaceRead, ShowDetails, Star, Mute, StartCall,
         OpenInNetwork, CopyLink, Minimize, Zoom, ShowWindow, KeyboardShortcuts, ReleaseNotes,
-        CopyDiagnostics, ReportProblem
+        CopyDiagnostics, ReportProblem, ShowLogs
     ]
 );
 

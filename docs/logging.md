@@ -14,6 +14,8 @@ Environment, read at process start:
 
 The same three are settings `log_level`, `log_ring`, and `log_export`. A stored row replaces that one environment value after chatd opens its database, and again in the window when settings load. A missing row leaves the environment value. Garbage reads as the default. The subscriber admits our own crates up to `trace` from the start, and the render ceiling is what drops events, so raising the level takes effect for events after that change. `reqwest`, `hyper`, `h2`, `sqlx`, `tower`, and `str0m` stay at `warn` in the subscriber.
 
+Verbose logging (Settings › About, and the Logs window) stores `log_level` as `debug`, and clears it when turned off (or stores `info` when `TINYCLIENT_LOG_LEVEL` alone would keep debug). chatd moves its own ceiling when the row is stored, and sends a running call's or microphone test's mediad `MediaRequest::LogLevel`; the window moves when its settings load again. A mediad or login helper started later gets the ceiling in `TINYCLIENT_LOG_LEVEL` beside `TINYCLIENT_SESSION`. Nothing needs a restart, and the row is kept for the next start.
+
 `TINYCLIENT_SESSION` is 32 hex characters shared by the window, chatd, and mediad. The window adopts chatd's id from `Status.session` when that field is set.
 
 ## Files
@@ -32,6 +34,8 @@ Under the support directory (`TINYCLIENT_DIR`, otherwise the platform data dir):
 The old `chatd.log` at the top of the support directory is not opened, copied, or deleted.
 
 Save debug log in Settings › About writes the window ring and asks chatd, which also asks a live mediad. Export off writes nothing and the window says "Debug logs are turned off." Bundles older than 24 hours are removed on the next save. On Unix the log directory is mode `0700`, and the operator files and the bundle are mode `0600`.
+
+The Logs window (Help › Logs, ⇧⌘L / Ctrl+Shift+L, or View logs in Settings › About) reads `tinyclient.log`, `chatd.log`, and `mediad.log` while it is open, every half second, and keeps the last 5000 lines of each in memory. It filters by process, level, and words, and its Hide noise switch (on by default) drops GPUI's "RefCell already borrowed" and "No monitor detected!" lines. Copy visible puts the lines it shows on the clipboard. It shows only what the files already hold, so nothing it shows has skipped the redaction below.
 
 Stderr gets the same operator line when it is a terminal or `JOURNAL_STREAM` is set. chatd's stderr is otherwise discarded.
 

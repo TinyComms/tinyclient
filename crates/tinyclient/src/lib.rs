@@ -29,6 +29,9 @@ mod gui;
 #[cfg(all(feature = "gui", any(target_os = "ios", target_os = "android")))]
 mod host;
 #[cfg(all(feature = "gui", any(target_os = "ios", target_os = "android")))]
+#[allow(dead_code)]
+mod log_tail;
+#[cfg(all(feature = "gui", any(target_os = "ios", target_os = "android")))]
 mod lottie;
 #[cfg(all(feature = "gui", any(target_os = "ios", target_os = "android")))]
 mod tiny_attach;

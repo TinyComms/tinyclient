@@ -128,6 +128,7 @@ pub fn menus(places: &[(String, usize)], open_network: Option<Network>, update_i
         Menu::new("Help").items([
             MenuItem::action("Keyboard Shortcuts", KeyboardShortcuts),
             MenuItem::action("Copy Diagnostics", CopyDiagnostics),
+            MenuItem::action("Logs", ShowLogs),
         ]),
     ]
 }
@@ -152,7 +153,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-secondary-o", OpenInNetwork, None),
         KeyBinding::new("secondary-m", Minimize, None),
         KeyBinding::new("secondary-/", KeyboardShortcuts, None),
+        KeyBinding::new("secondary-shift-l", ShowLogs, None),
     ]);
+    super::super::logs::bind_keys(cx);
     // Hiding is macOS's. Linux ignores it, and GPUI on Windows panics at Hide Others.
     if cfg!(target_os = "macos") {
         cx.bind_keys([KeyBinding::new("secondary-h", Hide, None), KeyBinding::new("alt-secondary-h", HideOthers, None)]);
@@ -222,6 +225,7 @@ pub fn app_actions(cx: &mut App) {
         .detach();
     });
     cx.on_action(|_: &KeyboardShortcuts, cx| settings::open(settings::Section::Shortcuts, cx));
+    cx.on_action(|_: &ShowLogs, cx| super::super::logs::open(cx));
 }
 
 impl Shell {

@@ -429,6 +429,10 @@ pub enum MediaRequest {
     Loopback { on: bool },
     /// Write mediad's debug ring. Answered `LogsSaved`.
     SaveLogs,
+    /// The log ceiling changed in chatd's settings (Verbose logging): `error`, `warn`, `info`,
+    /// `debug` or `trace`, as `settings::LOG_LEVEL` holds it. Answered `Done`; an unknown word
+    /// changes nothing.
+    LogLevel { level: String },
 }
 
 /// The loudest one participant may be set, in percent.
