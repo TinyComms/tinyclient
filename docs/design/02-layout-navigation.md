@@ -48,7 +48,7 @@ Three parts, the same in every mode, 96 px above the list:
 
 | Mode | Title strip | List |
 | --- | --- | --- |
-| Inbox | `Inbox` · segmented `All · Unread n · Mentions n` (counts dropped under 300 px) | 48 px rows by recency; pinned first |
+| Inbox | `Inbox` · segmented `All · Unread n · Mentions n` (counts / mark-all / stack by width; see polish/04) | 48 px rows by recency; pinned first |
 | Network home | network icon 20, name · `…` · link state in words when not connected | 28 px tree: `Direct messages` (six newest, then `Show 76 more`, which expands in place), then Spaces in the network's order. Discord folders and Telegram folders are Groups. |
 | Space | `‹` 26, squared avatar 24, name · `…` (Mark all read, Pin to rail, Open in Discord) | 28 px tree: Groups › conversations › sub-rows, network order |
 | People | `People` · 24 px toggles, one per signed-in network | Frame for the people area: 316 × (height − 96), 48 px rows (40 when compact), optional 36 px tab row |
