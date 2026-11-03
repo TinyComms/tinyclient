@@ -819,6 +819,7 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                         seat.echo = false;
                         if !spend_resume(seat) {
                             ctx.call_failed(room, CallFailure::Lost, DROPPED);
+                            tell(ctx, seat, room);
                         }
                     }
                 }
@@ -909,6 +910,7 @@ fn move_with(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, wire: &
         Err(words) => {
             seat.wanted = None;
             ctx.call_failed(&room, CallFailure::Lost, &words);
+            tell(ctx, seat, &room);
             Ok(())
         }
     }
@@ -1000,6 +1002,7 @@ fn rejoin_with(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, wire:
         Err(words) => {
             seat.wanted = None;
             ctx.call_failed(&room, CallFailure::Lost, &words);
+            tell(ctx, seat, &room);
             Ok(())
         }
     }
@@ -1240,11 +1243,13 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
         })
         .filter(|(_, people)| !people.is_empty())
         .collect();
-    for room in before.iter().filter(|room| !seat.calls.contains_key(*room)) {
-        ctx.occupants(room, Vec::new(), 0);
-    }
     super::manage::remember(saved, |known| known.seats.clear());
-    for room in seat.calls.keys() {
+    // A room `ready` no longer lists is told as empty, or as ours alone while our call is up in
+    // it: the seat is taken again below, and the page does not say nobody is here meanwhile.
+    let mut told: Vec<&str> = before.iter().map(String::as_str).chain(seat.calls.keys().map(String::as_str)).chain(seat.wanted.as_deref()).collect();
+    told.sort_unstable();
+    told.dedup();
+    for room in told {
         tell(ctx, seat, room);
     }
     let ours: Vec<String> = seat.calls.keys().filter(|room| ctx.in_call(room)).cloned().collect();
@@ -1263,8 +1268,22 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
 /// Who is in one room's call, with their names, as a voice channel's occupants. A call chatd
 /// holds in that room gets everyone but us as its roster.
 fn tell(ctx: &Context, seat: &Seat, room: &str) {
-    let people = seat.calls.get(room).map(Vec::as_slice).unwrap_or_default();
-    let name = |user: &str| seat.names.get(user).filter(|name| !name.is_empty()).cloned().unwrap_or_else(|| "Someone".to_owned());
+    let listed = seat.calls.get(room).map(Vec::as_slice).unwrap_or_default();
+    // While a call of ours is up here, we stay seated on the page even when the server does not
+    // list us for a moment: a `media_lost` the call is taking again, or a `ready` after a drop
+    // whose rejoin has not been answered. The stage would otherwise say nobody is here under a
+    // connected call. `seat.calls` stays the server's word, so the rejoin still sees no seat.
+    let mine = (may_resume(ctx, room) && !listed.iter().any(|who| who.user == seat.me))
+        .then(|| Sitting { muted: seat.muted, deafened: seat.deafened, priority: seat.priority, ..Sitting::new(&seat.me) });
+    let people: Vec<Sitting> = listed.iter().cloned().chain(mine).collect();
+    let name = |user: &str| {
+        seat.names
+            .get(user)
+            .filter(|name| !name.is_empty())
+            .cloned()
+            .or_else(|| (user == seat.me && !seat.saved.display_name.is_empty()).then(|| seat.saved.display_name.clone()))
+            .unwrap_or_else(|| "Someone".to_owned())
+    };
     if ctx.in_call(room) {
         let others = people.iter().filter(|who| who.user != seat.me);
         let roster = others.map(|who| Participant {
@@ -1500,6 +1519,7 @@ fn call_gone(ctx: &Context, seat: &mut Seat, reason: CallFailure, words: &str) {
     forget_resume(seat);
     if let Some(room) = seat.wanted.take().filter(|room| ctx.in_call(room)) {
         ctx.call_failed(&room, reason, words);
+        tell(ctx, seat, &room);
     }
 }
 
@@ -1561,6 +1581,7 @@ fn resume_media(ctx: &Context, seat: &mut Seat, pending: &[Pending]) {
     }
     if !spend_resume(seat) {
         ctx.call_failed(&room, CallFailure::Lost, DROPPED);
+        tell(ctx, seat, &room);
     }
 }
 
@@ -1650,6 +1671,7 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
             // shown as the end of the call; the user asked for the first join, and is told.
             if pending.reply.is_none() {
                 ctx.call_failed(room, CallFailure::Refused, said);
+                tell(ctx, seat, room);
             } else {
                 ctx.call_over(room);
             }
