@@ -62,10 +62,12 @@ fi
 
 url=$(gh run view "$run" --json url --jq .url)
 echo "wait-for-run.sh: waiting for $workflow run $run ($url)"
-# The job's timeout bounds this wait. A watch that drops out early (a network error) is resumed,
-# and the conclusion is read back from the finished run rather than taken from gh's exit status.
+# The job's timeout bounds this wait, and a minute between looks keeps two waiting jobs well
+# inside the token's hourly API allowance. A watch that drops out early (a network error) is
+# resumed, and the conclusion is read back from the finished run rather than taken from gh's
+# exit status.
 until [ "$(gh run view "$run" --json status --jq .status)" = completed ]; do
-    gh run watch "$run" --interval 30 >/dev/null || sleep 30
+    gh run watch "$run" --interval 60 >/dev/null || sleep 60
 done
 conclusion=$(gh run view "$run" --json conclusion --jq .conclusion)
 if [ "$conclusion" != success ]; then
