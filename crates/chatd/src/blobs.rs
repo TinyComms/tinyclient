@@ -9,8 +9,8 @@
 //!   shell sends for what is on screen; nothing is fetched ahead.
 //! - A picture asked for as a row's (its avatar, while the row is in `Watching.rows`) waits,
 //!   unfetched, once the row has scrolled away, and goes back in line when it is on screen again.
-//! - Each account's own picture (the rail's) is fetched when the account is signed in or starts,
-//!   and again on each connect if it is not on disk, without the shell asking.
+//! - Each account's own picture (the rail's) is fetched once the link is up, and again on each
+//!   connect if it is not on disk, without the shell asking. Not while the link is still down.
 //! - A picker's previews (stickers, GIF stills: ids made with [`pick`]) go to
 //!   `media/<network>/pick/<account>/`, are fetched only while the picker asks for them, and are
 //!   deleted when it closes ([`Blobs::picker_closed`], or [`PICK_IDLE`] without a request).
@@ -623,10 +623,11 @@ impl Cache {
         generation <= closed && !queue.picked.contains_key(account)
     }
 
-    /// Fetches each account's own picture (the rail's) when the account signs in or starts,
-    /// and on each connect if it is not on disk. Looks at the links every [`OWN_EVERY`] (one
-    /// lock); the store only while an account that just started or connected has not had its
-    /// picture asked for, for at most [`OWN_FOR`], since the adapter records us a little after.
+    /// Fetches each account's own picture (the rail's) once the link is up, and on each connect
+    /// if it is not on disk. Not while the link is still down: the adapter records who we are as
+    /// it connects and can replace the id the store already had. Looks at the links every
+    /// [`OWN_EVERY`] (one lock); the store only while an account that just connected has not had
+    /// its picture asked for, for at most [`OWN_FOR`], since the adapter records us a little after.
     fn own_pictures(&self) {
         struct Own {
             connected: bool,
@@ -660,6 +661,14 @@ impl Cache {
                 continue;
             };
             for (account, own) in seen.iter_mut().filter(|(_, own)| own.until.is_some()) {
+                // Offline, the store can still hold the picture from the last session, or from a
+                // test that seeded one. The adapter replaces that id as it connects (Discord's
+                // READY does). Fetching now takes the stale picture, and the connect that follows
+                // takes the real one: two downloads of "the" picture. Wait until the link is up,
+                // which is also when that id is the one the rail will show.
+                if !own.connected {
+                    continue;
+                }
                 let Some(avatar) = accounts.iter().find(|row| row.key == *account).and_then(|row| row.avatar.clone()) else {
                     continue;
                 };
