@@ -789,21 +789,39 @@ fn fetch_icons(account: &Account, forum: Who, topics: &[tl::enums::ForumTopic]) 
     account.files.want(wants);
 }
 
-/// A reaction's custom emoji: its document asked for and the file fetched into the media
-/// cache under the same name the reaction carries, whole, the way a topic's icon is. The
-/// rows read again when the pictures land, and the chips draw them instead of `:emoji:`.
-pub(super) fn reaction_emoji(account: &Account, conversation: &str, messages: &[Message]) {
-    let mut ids = messages.iter().flat_map(|message| content::reaction_emoji_ids(&message.reactions)).collect::<Vec<i64>>();
+/// The custom emoji a set of document ids names, fetched whole into the media cache under the
+/// name each id carries, so the rows that show them draw the picture instead of their text.
+/// The rows named by `conversation` read again when the files land.
+fn fetch_emoji(account: &Account, mut ids: Vec<i64>, conversation: &str, why: &str) {
     ids.sort_unstable();
     ids.dedup();
     if ids.is_empty() {
         return;
     }
-    let documents = emoji_documents(account, &ids, "reaction emoji");
+    let documents = emoji_documents(account, &ids, why);
     let wants = ids.iter().filter_map(|id| {
         documents_of(&documents, *id).map(|document| emoji_want(document, Some(conversation.to_owned())))
     }).collect();
     account.files.want(wants);
+}
+
+/// A reaction's custom emoji: its document asked for and the file fetched into the media
+/// cache under the same name the reaction carries, whole, the way a topic's icon is. The
+/// rows read again when the pictures land, and the chips draw them instead of `:emoji:`.
+pub(super) fn reaction_emoji(account: &Account, conversation: &str, messages: &[Message]) {
+    fetch_emoji(
+        account,
+        messages.iter().flat_map(|message| content::reaction_emoji_ids(&message.reactions)).collect(),
+        conversation,
+        "reaction emoji",
+    );
+}
+
+/// A message's own custom emoji: the premium emoji its text names, fetched whole under the
+/// name its span carries (`e<document id>`). The text is the alt glyph Telegram chose; the row
+/// draws the picture in its place once the file lands, and the glyph until then.
+pub(super) fn text_emoji(account: &Account, conversation: &str, messages: &[Message]) {
+    fetch_emoji(account, messages.iter().flat_map(content::text_emoji_ids).collect(), conversation, "message emoji");
 }
 
 /// Where in a conversation a page of history is wanted.
@@ -1081,6 +1099,9 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
     // The reactions' custom emoji on this page: their files land for the chips while the
     // user is looking at the conversation.
     reaction_emoji(account, conversation, &messages);
+    // The premium emoji in the page's own text: their files land for the rows the same way,
+    // and the alt glyph stands only until they do.
+    text_emoji(account, conversation, &messages);
     account.files.want(wants);
     messages.into_iter().next()
 }

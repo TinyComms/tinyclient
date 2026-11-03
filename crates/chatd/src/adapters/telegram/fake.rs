@@ -778,6 +778,27 @@ impl World {
                 self.store(None, message.clone());
                 vec![new(message)]
             }
+            // A premium emoji in the text: the entity names a document, and the text under it
+            // is the plain emoji Telegram chose as the alt glyph.
+            "emoji-text" => {
+                let text = "Cast off 🦀 at dawn";
+                let mut message = message(odalys, 22, ODALYS, T0 + 90, text);
+                message.entities = Some(vec![
+                    tl::types::MessageEntityCustomEmoji { offset: 9, length: 2, document_id: 5002 }.into(),
+                ]);
+                self.store(None, message.clone());
+                vec![new(message)]
+            }
+            // The same while its conversation is on screen, with a still emoji's document.
+            "emoji-text-live" => {
+                let text = "Back at the 🔥 bench";
+                let mut message = message(odalys, 23, ODALYS, T0 + 100, text);
+                message.entities = Some(vec![
+                    tl::types::MessageEntityCustomEmoji { offset: 12, length: 2, document_id: 5001 }.into(),
+                ]);
+                self.store(None, message.clone());
+                vec![new(message)]
+            }
             "photo" => {
                 let mut message = message(odalys, 14, ODALYS, T0 + 20, "The view from the ridge");
                 message.media = Some(tl::types::MessageMediaPhoto { spoiler: false, live_photo: false, photo: Some(photo(6_014)), ttl_seconds: None, video: None }.into());
@@ -1289,7 +1310,10 @@ impl World {
                     attributes: Vec::new(),
                 })
             }).collect();
-            self.log(&format!("GetCustomEmojiDocuments {}", documents.len()));
+            self.log(&format!(
+                "GetCustomEmojiDocuments {}",
+                request.document_id.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+            ));
             return answer(documents);
         }
         if let Some(request) = asked::<f::messages::GetForumTopics>(body) {

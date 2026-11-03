@@ -61,6 +61,7 @@ fn message(account: &Account, raw: &tl::enums::Message, edit: bool) {
     let watching = account.ctx.watching();
     if watching.conversation.as_ref().is_some_and(|open| open.account() == account.ctx.account && open.id == conversation) {
         sync::reaction_emoji(account, &conversation, std::slice::from_ref(&mapped.message));
+        sync::text_emoji(account, &conversation, std::slice::from_ref(&mapped.message));
         account.files.want(mapped.wants);
     }
 }

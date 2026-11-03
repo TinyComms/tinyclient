@@ -684,6 +684,49 @@ fn a_custom_emoji_reactions_document_is_asked_and_its_file_lands_for_the_chip() 
 }
 
 #[test]
+fn a_premium_emoji_in_message_text_is_asked_and_its_file_lands_for_the_row() {
+    let world = World::signed_in();
+    world.connected();
+    // It arrives in a chat nobody is looking at: stored, but its document is not asked for
+    // until the page is read, as a reaction's is not.
+    world.steer("emoji-text");
+    world.until("the message to be stored", || world.message("u7002", "22"));
+    assert_eq!(world.called("GetCustomEmojiDocuments"), 0, "{:#?}", world.calls());
+
+    // The page read names the emoji document in its spans (`e<document id>`), one batch asks
+    // for it, and the file lands whole under that name. The text keeps the alt glyph.
+    world.ask(Request::Watch(Watching { conversation: Some(key("u7002")), ..Watching::default() }));
+    let read = world.until("the page with a premium emoji", || world.message("u7002", "22"));
+    let named = |message: &Message| {
+        let span = message.spans.iter().find(|span| matches!(span.style, Style::Emoji { .. })).expect("the run names an emoji");
+        let Style::Emoji { file } = &span.style else { unreachable!() };
+        (message.text[span.start as usize..span.end as usize].to_owned(), file.id.clone())
+    };
+    assert_eq!(named(&read), ("🦀".to_owned(), "e5002".to_owned()));
+    world.until("the emoji document asked for", || (world.called("GetCustomEmojiDocuments 5002") > 0).then_some(()));
+    let landed = world.until("the message emoji on disk", || {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["e5002".into()], size: None, retry: false }) {
+            Response::Media { mut files } => files.pop().and_then(|file| file.path),
+            other => panic!("{other:?}"),
+        }
+    });
+    let kept = std::fs::read(&landed).expect("the message emoji is on disk");
+    assert!(kept.starts_with(b"{"), "what the row draws is the file inside: {:02x?}", &kept[..kept.len().min(8)]);
+
+    // One that arrives while the conversation is on screen is fetched as it lands.
+    world.steer("emoji-text-live");
+    let live = world.until("the premium emoji to arrive", || world.message("u7002", "23"));
+    assert_eq!(named(&live), ("🔥".to_owned(), "e5001".to_owned()));
+    world.until("the still emoji asked for", || (world.called("GetCustomEmojiDocuments 5001") > 0).then_some(()));
+    world.until("the still emoji on disk", || {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["e5001".into()], size: None, retry: false }) {
+            Response::Media { files } => files.first().and_then(|file| file.path.clone()),
+            other => panic!("{other:?}"),
+        }
+    });
+}
+
+#[test]
 fn a_channel_posts_comments_count_rides_the_post() {
     let world = World::signed_in();
     world.connected();
