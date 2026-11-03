@@ -29,6 +29,11 @@ pub use desktop::*;
 mod screens;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use screens::{choose_screen, screens};
+/// A phone offers Settings no camera list: its own picker chooses, and `--cameras` prints none.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub fn cameras(_folder: Option<&std::path::Path>) -> Vec<protocol::CameraSource> {
+    Vec::new()
+}
 /// A screen through Desktop Duplication, which is what a share at 60 frames a second needs.
 #[cfg(windows)]
 mod duplicate;
