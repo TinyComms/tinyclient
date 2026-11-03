@@ -13,6 +13,7 @@ mod emoji;
 mod info;
 mod message;
 mod people;
+mod search;
 mod send;
 mod text;
 mod tree;
@@ -42,6 +43,8 @@ const GAP: Duration = Duration::from_millis(200);
 /// The longest `Retry-After` that is waited out before the one retry. A longer one is told to
 /// the user at once and nothing is retried: the wait is never cut short.
 const PATIENCE: u64 = 60;
+/// A search queued this long past the shell's ask is not sent: the pane has moved on.
+const SEARCH_PATIENCE: Duration = Duration::from_secs(25);
 /// A history this adapter fetched itself this recently is not fetched again when opened.
 const FRESH: Duration = Duration::from_secs(60);
 /// The wait before each conversation warmed after connecting: more than twice the 1.2 s that
@@ -174,6 +177,9 @@ fn reason(fault: Fault) -> String {
             "no_text" => "Slack does not take an empty message.",
             "thread_not_found" | "cannot_reply_to_message" => "That message can no longer be replied to.",
             "user_not_found" | "user_disabled" | "cannot_dm_bot" => "Slack cannot open a conversation with them.",
+            // The documented answer when the session's kind of token is not the one a method
+            // takes. Slack's own search is one such: its web client may use an internal call.
+            "not_allowed_token_type" => "Slack's own search isn't reachable with this session.",
             error if error.starts_with("restricted_action") => "This workspace does not let you post here.",
             error => return format!("Slack refused ({error})."),
         },
@@ -1316,6 +1322,13 @@ impl Slack {
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
             Command::SetMute { conversation_id, notify, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
+            Command::Search { query, scope, at, reply } => {
+                if at.elapsed() >= SEARCH_PATIENCE {
+                    drop(reply);
+                } else {
+                    answer(reply, self.search_messages(&query, &scope));
+                }
+            }
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 match self.search_shared(&conversation_id, kind, before.as_deref(), limit) {
                     Some(found) => answer(reply, found),

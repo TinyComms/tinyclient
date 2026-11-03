@@ -2220,14 +2220,47 @@ fn info_mute_pins_files_emoji_threads_and_a_scheduled_send_ask_slack_once_each()
 }
 
 #[test]
-fn search_asks_the_network_only_where_it_can() {
+fn a_search_asks_slacks_own_search_once_and_maps_hits_to_their_conversations() {
     let world = World::start();
     world.ready();
-    // A Space on Slack: the adapter cannot search messages yet, and says so in words. Nothing
-    // is asked of the fake.
-    let refused = world.ask(Request::SearchNetwork { conversation: None, space: Some(alpha("T01ALPHA")), query: "x".into() });
-    assert!(matches!(&refused, Response::Error { detail, .. } if detail.contains("cannot do this yet")), "{refused:?}");
-    assert!(world.fake.calls(ALPHA, "search.all").is_empty() && world.fake.calls(ALPHA, "search.messages").is_empty());
+    world.general();
+
+    // One conversation: Slack's own search, narrowed to it, and the hit mapped like the
+    // cache's. A channel the sidebar does not know is not a hit we can open.
+    let asked = world.ask(Request::SearchNetwork { conversation: Some(alpha("C0GEN")), space: None, query: "deploy".into() });
+    let Response::MessageHits { hits } = asked else { panic!("{asked:?}") };
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    let hit = &hits[0];
+    assert_eq!(hit.conversation, alpha("C0GEN"));
+    assert_eq!((hit.message_id.as_str(), hit.sent), ("1760000330.000330", 1760000330));
+    assert_eq!((hit.sender.as_str(), hit.title.as_str(), hit.space_title.as_str()), ("Ana", "#general", "Acme"));
+    assert!(hit.snippet.contains("deploy") && !hit.snippet.contains('`'), "{}", hit.snippet);
+    assert!(!hit.outgoing);
+
+    let calls = world.fake.calls(ALPHA, "search.messages");
+    assert_eq!(calls.len(), 1, "one press of Enter, one search");
+    assert_eq!((calls[0].params["query"].as_str(), calls[0].params["sort"].as_str()), ("deploy in:#general", "timestamp"));
+    assert!(world.fake.calls(BETA, "search.messages").is_empty(), "the other workspace is not asked");
+
+    // The workspace's own search: no channel filter, and every hit in a conversation the
+    // sidebar knows, newest first.
+    let asked = world.ask(Request::SearchNetwork { conversation: None, space: Some(alpha("T01ALPHA")), query: "deploy".into() });
+    let Response::MessageHits { hits } = asked else { panic!("{asked:?}") };
+    let mapped: Vec<(&str, &str)> = hits.iter().map(|hit| (hit.conversation.id.as_str(), hit.title.as_str())).collect();
+    assert_eq!(mapped, [("C0GEN", "#general"), ("C0DEP", "#deploys")]);
+    let calls = world.fake.calls(ALPHA, "search.messages");
+    assert_eq!((calls.len(), calls[1].params["query"].as_str()), (2, "deploy"));
+}
+
+#[test]
+fn a_search_slack_will_not_do_is_refused_in_words_rather_than_faked() {
+    let world = World::start_with(|fake| {
+        fake.refusing.lock().unwrap().insert("search.messages".into(), "not_allowed_token_type".into());
+    });
+    world.ready();
+    // The web session cannot reach Slack's search: the user is told, and no hit is invented.
+    let refused = world.ask(Request::SearchNetwork { conversation: Some(alpha("C0GEN")), space: None, query: "deploy".into() });
+    assert!(matches!(&refused, Response::Error { detail, .. } if detail == "Slack's own search isn't reachable with this session."), "{refused:?}");
 }
 
 #[test]

@@ -1,0 +1,15 @@
+{"ok": true, "query": "deploy",
+ "messages": {
+   "total": 3,
+   "paging": {"count": 20, "total": 3, "page": 1, "pages": 1},
+   "matches": [
+     {"iid": "1", "team_id": "T01ALPHA", "channel_id": "C0GEN", "type": "message", "user": "U0ANA",
+      "ts": "1760000330.000330", "text": "The *deploy* is on `main` now",
+      "permalink": "https://acme.slack.com/archives/C0GEN/p1760000330000330"},
+     {"iid": "2", "team_id": "T01ALPHA", "channel_id": "C0DEP", "type": "message", "user": "U0BEN",
+      "ts": "1760000320.000320", "text": "deploy to prod finished",
+      "permalink": "https://acme.slack.com/archives/C0DEP/p1760000320000320"},
+     {"iid": "3", "team_id": "T01ALPHA", "channel_id": "C0ELSEWHERE", "type": "message", "user": "U0ZOE",
+      "ts": "1760000310.000310", "text": "deploy notes in a channel I am not in",
+      "permalink": "https://acme.slack.com/archives/C0ELSEWHERE/p1760000310000310"}
+   ]}}
