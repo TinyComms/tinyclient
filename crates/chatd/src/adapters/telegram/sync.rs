@@ -1205,11 +1205,10 @@ pub(super) fn backfill(account: &Account, conversation: &str) {
 
 /// A channel's sponsored message, which the terms require a client that shows channels to show.
 /// Asked when the channel is opened, at most once in five minutes as Telegram asks; told to
-/// Telegram as viewed once it is on screen (`ads_on_screen`), once for each.
+/// Telegram as viewed once it is on screen (`ads_on_screen`), once for each, and told of a
+/// follow when its link is followed (`followed`).
 // CONTRACT: there is no kind for an advertisement, so it is a message at the foot of the
-// channel with a card that says "Sponsored". And nothing tells chatd that the user followed its
-// link (the shell opens the address itself), so `messages.clickSponsoredMessage` is never sent:
-// the terms want it sent on a click. A `Request` naming a clicked message would carry it.
+// channel with a card marked `sponsored` that says "Sponsored".
 fn sponsored(account: &Account, channel: Who, conversation: &str, newest: Option<Message>) {
     let Ok(peer) = account.input(channel) else {
         return;
@@ -1257,6 +1256,7 @@ fn sponsored(account: &Account, channel: Who, conversation: &str, newest: Option
     message.card = Some(Box::new(Card {
         title: if ad.recommended { "Recommended".to_owned() } else { "Sponsored".to_owned() },
         footer: ad.sponsor_info.clone().or_else(|| ad.additional_info.clone()).unwrap_or_default(),
+        sponsored: true,
         ..Card::default()
     }));
     if account.ctx.history(conversation, std::slice::from_ref(&message)).is_ok() {
@@ -1302,6 +1302,32 @@ fn ads_on_screen(account: &Account, watching: &Watching) {
     for random_id in due {
         let _ = account.ask(&tl::functions::messages::ViewSponsoredMessage { random_id });
     }
+}
+
+/// The user followed a link out of a message (the shell is opening it). Only a broadcast
+/// channel's ad names a `random_id` (`random_of`): a post's id or anything else decodes to
+/// nothing, and Telegram hears nothing, though the link opens all the same.
+pub(super) fn followed(account: &Account, conversation: &str, message_id: &str) {
+    let Some((who, _)) = Who::parse(conversation) else {
+        return;
+    };
+    if !account.dir().get(who).is_some_and(|known| known.broadcast) {
+        return;
+    }
+    let Some(random_id) = random_of(message_id) else {
+        return;
+    };
+    let _ = account.ask(&tl::functions::messages::ClickSponsoredMessage { media: false, fullscreen: false, random_id });
+}
+
+/// The ad id the store knows the ad by is its `random_id` in hex behind "ad" (`sponsored`);
+/// the bytes come back.
+fn random_of(message_id: &str) -> Option<Vec<u8>> {
+    let hex = message_id.strip_prefix("ad")?;
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return None;
+    }
+    (0..hex.len()).step_by(2).map(|at| u8::from_str_radix(&hex[at..at + 2], 16).ok()).collect()
 }
 
 /// A list of Telegram's messages as the contract's, for the conversation they are in, and the
@@ -1354,5 +1380,14 @@ mod tests {
         assert_eq!(contacts_hash(2, &[30, 10]), contacts_hash(2, &[10, 30]));
         assert_ne!(contacts_hash(2, &[10, 30]), contacts_hash(3, &[10, 30]));
         assert_ne!(contacts_hash(1, &[10]), 0);
+    }
+
+    #[test]
+    fn an_ad_id_decodes_to_its_random_id_and_any_other_id_decodes_to_nothing() {
+        assert_eq!(random_of("adad01"), Some(vec![0xad, 0x01]));
+        assert_eq!(random_of("adc0ffee"), Some(vec![0xc0, 0xff, 0xee]));
+        assert_eq!(random_of("5"), None);
+        assert_eq!(random_of("adlemon"), None);
+        assert_eq!(random_of("ad"), None);
     }
 }

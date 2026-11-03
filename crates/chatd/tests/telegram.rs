@@ -1215,6 +1215,26 @@ fn a_channel_shows_its_sponsored_message_and_tells_telegram_once_it_is_on_screen
 }
 
 #[test]
+fn following_a_sponsored_message_tells_telegram_of_the_click_but_a_post_does_not() {
+    let world = World::signed_in();
+    world.connected();
+    let ad = world.until("the sponsored message", || world.messages("c9001").into_iter().find(|message| message.id == "adad01"));
+    assert_eq!(ad.card.as_ref().map(|card| (card.title.as_str(), card.sponsored)), Some(("Sponsored", true)));
+    // The link is followed: Telegram hears of the click.
+    assert_eq!(world.ask(Request::FollowLink { conversation: key("c9001"), message_id: "adad01".into() }), Response::Ok);
+    world.until("Telegram to be told of the click", || (world.called("ClickSponsoredMessage") == 1).then_some(()));
+    // A post's id names no ad: the follow opens but Telegram does not hear of it.
+    assert_eq!(world.ask(Request::FollowLink { conversation: key("c9001"), message_id: "5".into() }), Response::Ok);
+    // Nor one outside a broadcast channel, ad-shaped as it is.
+    assert_eq!(world.ask(Request::FollowLink { conversation: key("u7002"), message_id: "adad01".into() }), Response::Ok);
+    sleep(Duration::from_millis(300));
+    assert_eq!(world.called("ClickSponsoredMessage"), 1);
+    // Every follow is told as its own click.
+    assert_eq!(world.ask(Request::FollowLink { conversation: key("c9001"), message_id: "adad01".into() }), Response::Ok);
+    world.until("the second click told", || (world.called("ClickSponsoredMessage") == 2).then_some(()));
+}
+
+#[test]
 fn the_panes_ask_telegram_once_each_and_counts_are_telegrams_own() {
     let world = World::signed_in();
     world.connected();

@@ -1408,6 +1408,10 @@ impl World {
             self.log("ViewSponsoredMessage");
             return answer(true);
         }
+        if asked::<f::messages::ClickSponsoredMessage>(body).is_some() {
+            self.log("ClickSponsoredMessage");
+            return answer(true);
+        }
         if let Some(request) = asked::<f::messages::SendMessage>(body) {
             let peer = input_who(&request.peer);
             if let Some(seconds) = self.flood_send.take() {

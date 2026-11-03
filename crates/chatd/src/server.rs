@@ -2050,6 +2050,13 @@ impl Chat {
                 }
                 Response::Ok
             }
+            Request::FollowLink { conversation, message_id } => {
+                let account = conversation.account();
+                if self.hub.link(&account) == Link::Connected {
+                    self.command(&account, Command::FollowLink { conversation_id: conversation.id, message_id });
+                }
+                Response::Ok
+            }
 
             Request::React { conversation, message_id, emoji, on } => self.react(conversation, message_id, emoji, on),
             Request::Reactions { conversation } => self.reactions(conversation),

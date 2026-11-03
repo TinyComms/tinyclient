@@ -387,6 +387,7 @@ impl Slack {
             fields: fields.map(|field| (words(&field["title"]), words(&field["value"]))).collect(),
             footer: words(&card["footer"]),
             color: colour(&card["color"]),
+            sponsored: false,
         };
         if framed.title.is_empty() && framed.text.is_empty() && framed.fields.is_empty() {
             framed.text = words(&card["fallback"]);

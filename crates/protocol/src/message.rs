@@ -249,6 +249,7 @@ pub struct Forwarded {
 
 /// What a bot or app posts instead of plain text: an embed, a block of fields. Drawn as one
 /// framed card under the message's text. Every string is cut to a fixed length on its way in.
+/// A channel's sponsored message is one too, marked `sponsored`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Card {
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -263,6 +264,9 @@ pub struct Card {
     /// The accent the network gave it, `0xRRGGBB`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<u32>,
+    /// A channel's sponsored message: the shell tells chatd when the user follows it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sponsored: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

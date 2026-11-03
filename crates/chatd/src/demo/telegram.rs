@@ -217,7 +217,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
     ];
     let newest = s.store.message(&channel, &said[1])?.map_or(s.now, |message| message.sent);
     let mut ad = protocol::Message::plain("adad01", "Larch Boots", "Resoled by hand in Innsbruck.", newest, false);
-    ad.card = Some(Box::new(Card { title: "Sponsored".to_owned(), footer: "Larch Boots GmbH".to_owned(), ..Card::default() }));
+    ad.card = Some(Box::new(Card { title: "Sponsored".to_owned(), footer: "Larch Boots GmbH".to_owned(), sponsored: true, ..Card::default() }));
     s.post(&channel, &ad)?;
     // The channel's own post is the preview, not the advertisement.
     if let Some(post) = s.store.message(&channel, &said[1])? {

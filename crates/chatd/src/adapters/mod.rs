@@ -264,6 +264,9 @@ pub enum Command {
     },
     /// The user's draft is changing. Pace it: at most one signal per 8 s per conversation.
     Typing(String),
+    /// The user followed a link out of this message (the shell is opening it). Telegram's terms
+    /// want a sponsored message's follow told; nothing waits on it.
+    FollowLink { conversation_id: String, message_id: String },
     /// A conversation's cloud draft here changed to `text` (empty clears it). The shell has
     /// already waited out the pauses between the keys, so this is one settled draft and there
     /// is nothing to answer.

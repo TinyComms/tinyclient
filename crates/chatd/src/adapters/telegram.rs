@@ -550,6 +550,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(delete(account, &conversation_id, &message_id).map_err(refused));
         }
         Command::Typing(conversation_id) => typing(account, &conversation_id),
+        Command::FollowLink { conversation_id, message_id } => sync::followed(account, &conversation_id, &message_id),
         Command::Draft { conversation_id, text } => save_draft(account, &conversation_id, &text),
         Command::SearchPeople(query) => {
             let request = tl::functions::contacts::Search { broadcasts: false, bots: false, q: query.clone(), limit: 25 };

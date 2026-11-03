@@ -1297,6 +1297,12 @@ pub enum Request {
     Typing {
         conversation: Key,
     },
+    /// The user followed a link out of this message (the shell is opening it). Telegram's terms
+    /// want a sponsored message's follow told to it; other networks have nothing to do.
+    FollowLink {
+        conversation: Key,
+        message_id: String,
+    },
     /// Adds (`on`) or takes back our reaction. `emoji` is the emoji itself, or a custom one's
     /// `:name:` as `Reaction::emoji` spells it. Shown at once; what the network then says is
     /// what stays.
