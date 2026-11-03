@@ -299,6 +299,10 @@ impl Call {
                 self.controls.set_bitrate(kbps);
                 return MediaResponse::Done;
             }
+            MediaRequest::Quality(quality) => {
+                self.controls.set_quality(quality);
+                return MediaResponse::Done;
+            }
             // Measured once a second by the call's loop (`stats`).
             MediaRequest::Stats => {
                 return match self.controls.stats() {

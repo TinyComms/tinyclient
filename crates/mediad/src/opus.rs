@@ -107,7 +107,13 @@ impl Encoder {
     /// frames inside a talk spurt (the pauses between words) reach the far end as losses it has
     /// to make up.
     pub fn voice() -> Option<Encoder> {
-        Encoder::made(1, OPUS_APPLICATION_VOIP, VOICE_BITRATE, false)
+        Encoder::voice_quality(protocol::VoiceQuality::Standard)
+    }
+
+    /// Like [`Encoder::voice`], but High quality uses Opus's Audio application for clearer speech.
+    pub fn voice_quality(quality: protocol::VoiceQuality) -> Option<Encoder> {
+        let application = if quality.prefer_audio_application() { OPUS_APPLICATION_AUDIO } else { OPUS_APPLICATION_VOIP };
+        Encoder::made(1, application, VOICE_BITRATE, false)
     }
 
     fn made(channels: usize, application: i32, bitrate: i32, dtx: bool) -> Option<Encoder> {

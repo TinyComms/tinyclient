@@ -286,19 +286,25 @@ pub fn lit(level: Option<u8>) -> usize {
     }
 }
 
-/// The level meter: 20 segments, lit `text_faint` under the sensitivity line and `positive`
-/// from it, so it shows what would be sent. The line is drawn whether or not a test runs.
+/// Level at which the meter tip turns red (clipping / overload), on the same 0–100 scale.
+pub const CLIP_LEVEL: u8 = 95;
+
+/// The level meter: 20 segments. Yellow under the sensitivity line (would not open), green
+/// from it (would send), red tip near clip. The line is drawn whether or not a test runs.
 pub fn meter(level: Option<u8>, gate: u32) -> Div {
     let lit = lit(level);
     let line = position(gate, (0, 100), METER);
     let first_sent = (gate as usize * SEGMENTS).div_ceil(100);
+    let clip_from = (usize::from(CLIP_LEVEL) * SEGMENTS).div_ceil(100);
     let segment = |ix: usize| {
         let color: Hsla = if ix >= lit {
             switch_off().into_color()
+        } else if ix >= clip_from {
+            theme::danger().into_color()
         } else if ix >= first_sent {
             theme::positive().into_color()
         } else {
-            theme::text_faint().into_color()
+            theme::warning().into_color()
         };
         div().flex_none().w(px(10.)).h(px(8.)).rounded(px(2.)).bg(color)
     };
@@ -345,5 +351,6 @@ mod tests {
         assert_eq!(lit(Some(1)), 1);
         assert_eq!(lit(Some(50)), 10);
         assert_eq!(lit(Some(100)), 20);
+        assert_eq!((usize::from(CLIP_LEVEL) * SEGMENTS).div_ceil(100), 19);
     }
 }

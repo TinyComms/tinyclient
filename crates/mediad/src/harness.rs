@@ -325,7 +325,7 @@ pub fn realtime(mic: (u32, usize), speaker: (u32, usize), seconds: f64) -> (crat
 
     crate::rt::tick_thread();
     let mut processor = Processor::new();
-    processor.set(Some(AudioProcessing { echo_cancellation: true, noise_suppression: true, auto_gain: true }));
+    processor.set(Some(AudioProcessing { echo_cancellation: true, auto_gain: true, noise: protocol::NoiseMode::Standard }));
     let (mut encoder, mut decoder) = (Encoder::voice().unwrap(), Decoder::new().unwrap());
     let mut limiter = Limiter::default();
     let mut warm = None;

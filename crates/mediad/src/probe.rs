@@ -122,6 +122,7 @@ pub fn run() {
             };
             let mut frame = [0i16; FRAME_SAMPLES];
             if audio.capture(&mut frame) {
+                crate::process::apply_input_gain(&mut frame, controls.tuning().input);
                 processor.capture(&mut frame);
                 loudest = loudest.max(level(&frame));
                 if loopback {

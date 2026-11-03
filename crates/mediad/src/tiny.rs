@@ -470,6 +470,8 @@ struct Call {
     devices: Option<Devices>,
     microphone_unasked: bool,
     encoder: Encoder,
+    /// Whether the encoder was made with Opus Audio (High quality) vs Voip.
+    encoder_audio_app: bool,
     gate: Gate,
     slots: HashMap<String, Slot>,
     ticks: u64,
@@ -1102,6 +1104,13 @@ impl Call {
     /// silence trail have gone, a muted microphone sends nothing.
     fn capture(&mut self, audio: &mut Audio) -> u8 {
         let controls = self.controls.clone();
+        let quality = controls.quality();
+        if quality.prefer_audio_application() != self.encoder_audio_app {
+            if let Some(encoder) = Encoder::voice_quality(quality) {
+                self.encoder = encoder;
+                self.encoder_audio_app = quality.prefer_audio_application();
+            }
+        }
         self.encoder.set_bitrate(controls.bitrate());
         let muted = controls.muted.load(Ordering::Relaxed);
         let mut frame = [0i16; FRAME_SAMPLES];
@@ -1297,7 +1306,8 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
     // The tick is woken by the system timer: at 1 ms, not Windows' default 15.6 ms.
     let _timer = rt::FineTimer::hold();
     rt::tick_thread();
-    let (Some(encoder), Ok(poll)) = (Encoder::voice(), Poll::new()) else {
+    let quality = controls.quality();
+    let (Some(encoder), Ok(poll)) = (Encoder::voice_quality(quality), Poll::new()) else {
         tracing::warn!("mediad: the Opus encoder or the poller could not be made");
         out::fail(CallFailure::Engine, ENGINE);
     };
@@ -1319,6 +1329,7 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         devices: None,
         microphone_unasked,
         encoder,
+        encoder_audio_app: quality.prefer_audio_application(),
         gate: Gate::default(),
         slots: HashMap::new(),
         ticks: 0,

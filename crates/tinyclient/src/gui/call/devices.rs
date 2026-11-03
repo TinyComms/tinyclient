@@ -259,13 +259,20 @@ impl Shell {
             }
         };
         let lit = lit(level);
+        let gate = prefs::values().number(protocol::settings::SENSITIVITY) as u8;
+        let first_sent = (u16::from(gate.min(100)) * u16::from(SEGMENTS)).div_ceil(100) as u8;
+        let clip_from = (u16::from(95u8) * u16::from(SEGMENTS)).div_ceil(100) as u8;
         let segment = |ix: u8| {
-            div()
-                .flex_none()
-                .w(px(4.))
-                .h(px(12.))
-                .rounded(px(1.))
-                .bg(if ix < lit { theme::positive() } else { theme::selected() })
+            let color = if ix >= lit {
+                theme::selected()
+            } else if side == Side::Input && ix >= clip_from {
+                theme::danger()
+            } else if side == Side::Input && ix < first_sent {
+                theme::warning()
+            } else {
+                theme::positive()
+            };
+            div().flex_none().w(px(4.)).h(px(12.)).rounded(px(1.)).bg(color)
         };
         div()
             .h(px(26.))

@@ -14,7 +14,7 @@ use crate::media::{self, FromMedia, MICROPHONE_DENIED};
 use crate::permission::{microphone, Microphone};
 use crate::rtp::{self, Cipher, Sender};
 use crate::out;
-use protocol::{AudioProcessing, CallFailure, CallStats, Cue, InputMode, MediaResponse, TinyPicture, TinySlot, Tuning, VoiceJoin};
+use protocol::{AudioProcessing, CallFailure, CallStats, Cue, InputMode, MediaResponse, TinyPicture, TinySlot, Tuning, VoiceJoin, VoiceQuality};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::net::UdpSocket;
@@ -100,6 +100,8 @@ pub struct Controls {
     ear: Mutex<crate::hear::Ear>,
     /// Echo cancellation, noise suppression, automatic gain. `None` until chatd says: off.
     processing: Mutex<Option<AudioProcessing>>,
+    /// How clearly to encode (Tiny). Standard until chatd says.
+    quality: Mutex<VoiceQuality>,
     /// What our voice is encoded at, in kb/s. 0: the call's own default.
     bitrate: AtomicU32,
     /// The connection over the last second, from the loop that carries the call.
@@ -274,6 +276,14 @@ impl Controls {
 
     pub fn processing(&self) -> Option<AudioProcessing> {
         *self.processing.lock().unwrap()
+    }
+
+    pub fn set_quality(&self, quality: VoiceQuality) {
+        *self.quality.lock().unwrap() = quality;
+    }
+
+    pub fn quality(&self) -> VoiceQuality {
+        *self.quality.lock().unwrap()
     }
 
     pub fn set_bitrate(&self, kbps: u32) {

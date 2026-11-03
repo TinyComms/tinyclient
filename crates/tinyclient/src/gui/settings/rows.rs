@@ -78,6 +78,8 @@ pub const ROWS: &[Row] = &[
     row("V8", Voice, "", "Microphone opens by", &["Voice activation", "Push to talk"], &["ptt", "push to talk", "voice activity", "vad", "open mic"]),
     row("V3", Voice, "", "Input level", &[], &["test", "meter", "mic", "level"]),
     row("V6", Voice, "", "Sensitivity", &[], &["gate", "threshold", "noise", "voice activity", "vad"]),
+    row("V20", Voice, "", "Mic volume", &[], &["input", "gain", "loud", "quiet", "volume", "microphone"]),
+    row("V21", Voice, "", "Voice quality", &["Data saver", "Standard", "High"], &["codec", "bitrate", "opus", "quality", "clear"]),
     row("V18", Voice, "", "Hear yourself while testing", &[], &["loopback", "test", "listen", "monitor", "echo test"]),
     row("V19", Voice, "", "Tell me when I talk while muted", &[], &["muted", "talking", "warning", "mute", "speak"]),
     row("V14", Voice, "", "Release delay", &["0 ms", "100 ms", "200 ms", "300 ms", "500 ms", "1 s"], &["ptt", "push to talk", "delay", "hold", "cut off"]),
@@ -86,7 +88,7 @@ pub const ROWS: &[Row] = &[
     row("V16", Voice, "Keys", "Toggle mute", &[], &["mute", "hotkey", "shortcut", "global"]),
     row("V17", Voice, "Keys", "Toggle deafen", &[], &["deafen", "hotkey", "shortcut", "global"]),
     row("V10", Voice, "Processing", "Echo cancellation", &[], &["echo", "aec", "speakers", "feedback"]),
-    row("V11", Voice, "Processing", "Noise suppression", &[], &["noise", "background", "fan", "keyboard", "denoise"]),
+    row("V11", Voice, "Processing", "Noise suppression", &["Off", "Standard", "High", "Enhanced"], &["noise", "background", "fan", "keyboard", "denoise", "rnnoise"]),
     row("V12", Voice, "Processing", "Automatic gain", &[], &["agc", "gain", "loudness", "quiet", "volume"]),
     row("S7", Voice, "Call sounds", "Someone joins, leaves or I'm moved", &[], &["sound", "chime", "ding", "join", "leave", "move", "cue"]),
     row("S8", Voice, "Call sounds", "I mute, unmute or deafen", &[], &["sound", "ding", "tick", "cue", "deafen"]),
@@ -210,7 +212,7 @@ pub fn kept_by_chatd(id: &str) -> bool {
     matches!(
         id,
         "N1" | "N2" | "ND" | "NG" | "NM" | "NT" | "N4" | "NL" | "N5" | "N6" | "N7" | "N8" | "N9" | "N10" | "N11" | "N13" | "S2" | "S3" | "S4" | "SV" | "S13" | "S14"
-            | "G2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "D1" | "D2" | "D3"
+            | "G2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "V20" | "V21" | "D1" | "D2" | "D3"
     )
 }
 

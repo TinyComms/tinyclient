@@ -422,6 +422,8 @@ pub enum MediaRequest {
     Processing(AudioProcessing),
     /// What our voice is encoded at, in kb/s (a Tiny room's bitrate, 16 to 128).
     Bitrate { kbps: u32 },
+    /// How clearly to encode within that bitrate (Tiny calls).
+    Quality(VoiceQuality),
     /// How the connection is doing. Answered `Stats`, or `Refused` before media flows.
     Stats,
     /// Settings' microphone test plays the microphone back on the speaker, through the same
@@ -454,17 +456,131 @@ impl Default for InputMode {
     }
 }
 
-/// The microphone's processing. All on unless the user turned one off.
+/// How noise is taken out of the microphone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoiseMode {
+    /// Nothing: fans, typing and traffic go through as captured.
+    Off,
+    /// WebRTC noise suppression at a strong everyday level.
+    #[default]
+    Standard,
+    /// WebRTC noise suppression at its strongest.
+    High,
+    /// RNNoise (neural): better on keyboards and steady noise than Standard/High.
+    Enhanced,
+}
+
+impl NoiseMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NoiseMode::Off => "off",
+            NoiseMode::Standard => "standard",
+            NoiseMode::High => "high",
+            NoiseMode::Enhanced => "enhanced",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<NoiseMode> {
+        Some(match value {
+            "off" => NoiseMode::Off,
+            // Older builds stored a switch: "on" meant WebRTC NS at its then-default.
+            "on" | "standard" => NoiseMode::Standard,
+            "high" => NoiseMode::High,
+            "enhanced" => NoiseMode::Enhanced,
+            _ => return None,
+        })
+    }
+}
+
+/// How clearly our voice is encoded, within a Tiny room's bitrate ceiling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceQuality {
+    /// Save bandwidth: about 32 kb/s.
+    DataSaver,
+    /// The room's bitrate as set (default).
+    #[default]
+    Standard,
+    /// Prefer the top of the room's range; clearer Opus Audio mode.
+    High,
+}
+
+impl VoiceQuality {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VoiceQuality::DataSaver => "data_saver",
+            VoiceQuality::Standard => "standard",
+            VoiceQuality::High => "high",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<VoiceQuality> {
+        Some(match value {
+            "data_saver" => VoiceQuality::DataSaver,
+            "standard" => VoiceQuality::Standard,
+            "high" => VoiceQuality::High,
+            _ => return None,
+        })
+    }
+
+    /// The encode target in kb/s for a Tiny room whose ceiling is `room_kbps` (16 to 128).
+    /// Data saver caps at 32; High uses the room's full rate (admins set 96–128 for clarity).
+    pub fn apply_room(self, room_kbps: u32) -> u32 {
+        let room = room_kbps.clamp(16, 128);
+        match self {
+            VoiceQuality::DataSaver => room.min(32),
+            VoiceQuality::Standard | VoiceQuality::High => room,
+        }
+    }
+
+    /// Whether the encoder should prefer Opus's Audio application (clearer than Voip).
+    pub fn prefer_audio_application(self) -> bool {
+        matches!(self, VoiceQuality::High)
+    }
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+
+    #[test]
+    fn voice_quality_caps_data_saver_and_keeps_room_for_high() {
+        assert_eq!(VoiceQuality::DataSaver.apply_room(128), 32);
+        assert_eq!(VoiceQuality::DataSaver.apply_room(24), 24);
+        assert_eq!(VoiceQuality::Standard.apply_room(64), 64);
+        assert_eq!(VoiceQuality::High.apply_room(128), 128);
+        assert!(VoiceQuality::High.prefer_audio_application());
+        assert!(!VoiceQuality::Standard.prefer_audio_application());
+    }
+
+    #[test]
+    fn noise_mode_reads_legacy_on_off() {
+        assert_eq!(NoiseMode::parse("on"), Some(NoiseMode::Standard));
+        assert_eq!(NoiseMode::parse("off"), Some(NoiseMode::Off));
+        assert_eq!(NoiseMode::parse("enhanced"), Some(NoiseMode::Enhanced));
+    }
+}
+
+/// The microphone's processing. Echo and gain are on unless turned off; noise has modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioProcessing {
     pub echo_cancellation: bool,
-    pub noise_suppression: bool,
     pub auto_gain: bool,
+    #[serde(default)]
+    pub noise: NoiseMode,
 }
 
 impl Default for AudioProcessing {
     fn default() -> AudioProcessing {
-        AudioProcessing { echo_cancellation: true, noise_suppression: true, auto_gain: true }
+        AudioProcessing { echo_cancellation: true, auto_gain: true, noise: NoiseMode::Standard }
+    }
+}
+
+impl AudioProcessing {
+    /// Whether any noise suppression runs.
+    pub fn noise_suppression(self) -> bool {
+        self.noise != NoiseMode::Off
     }
 }
 
@@ -548,6 +664,9 @@ pub struct Tuning {
     pub gate: u8,
     /// The cues' volume. At 100 a cue peaks at -20 dBFS.
     pub cues: u8,
+    /// Our microphone's soft gain before processing. 100 is as captured; 0 is silence.
+    #[serde(default = "tuning_input_default")]
+    pub input: u8,
     /// Someone joins or leaves (S7).
     pub joins: bool,
     /// I mute, unmute, deafen or undeafen (S8).
@@ -556,9 +675,13 @@ pub struct Tuning {
     pub connection: bool,
 }
 
+fn tuning_input_default() -> u8 {
+    100
+}
+
 impl Default for Tuning {
     fn default() -> Tuning {
-        Tuning { voice: 100, gate: 25, cues: 50, joins: true, mine: true, connection: true }
+        Tuning { voice: 100, gate: 25, cues: 50, input: 100, joins: true, mine: true, connection: true }
     }
 }
 

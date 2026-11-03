@@ -396,6 +396,8 @@ pub(crate) fn listen(controls: &Controls, audio: &mut Audio, processor: &mut Pro
     let captured = audio.capture(frame);
     processor.set(controls.processing());
     if captured {
+        // Mic volume before DSP so AGC/NS see the level the user chose, and the meter matches.
+        crate::process::apply_input_gain(frame, controls.tuning().input);
         processor.capture(frame);
     }
     let heard = if captured { level(frame) } else { 0 };

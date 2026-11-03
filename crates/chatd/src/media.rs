@@ -83,6 +83,8 @@ struct Live {
     /// The room requires push-to-talk (a Tiny room's `ptt_only`, or no voice activation
     /// there), whatever the user chose.
     push_to_talk: bool,
+    /// A Tiny room's bitrate ceiling in kb/s, when known. Quality presets are applied against it.
+    room_bitrate: Option<u32>,
     /// How mediad last said the call is protected, before whom the user verified is applied.
     secured: Option<protocol::CallSecurity>,
 }
@@ -229,6 +231,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         metering: false,
         me: String::new(),
         push_to_talk: false,
+        room_bitrate: None,
         secured: None,
     }
 }
@@ -743,10 +746,10 @@ impl Calls {
             drop(tester);
             hub.changed(Change::Meter { level: None });
         }
-        let (tuning, input, output, muted, mode, processing) = {
+        let (tuning, input, output, muted, mode, processing, quality) = {
             let settings = hub.settings();
             let mode = input_mode(&settings, false);
-            (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT), settings.on(JOIN_MUTED), mode, settings.processing())
+            (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT), settings.on(JOIN_MUTED), mode, settings.processing(), settings.voice_quality())
         };
         {
             let mut slot = crate::hub::lock(&self.slot);
@@ -763,6 +766,7 @@ impl Calls {
             let _ = active.request(&MediaRequest::Tune(tuning));
             let _ = active.request(&MediaRequest::Input(mode));
             let _ = active.request(&MediaRequest::Processing(processing));
+            let _ = active.request(&MediaRequest::Quality(quality));
             // V9: everyone on this account whose volume for me is not the default.
             let gains = hub.settings().gains(&conversation.account());
             for (user_id, percent, muted) in gains {
@@ -793,6 +797,13 @@ impl Calls {
             let _ = active.request(&MediaRequest::Tune(tuning));
             let _ = active.request(&MediaRequest::Input(input_mode(&settings, push_to_talk)));
             let _ = active.request(&MediaRequest::Processing(settings.processing()));
+            let quality = settings.voice_quality();
+            let _ = active.request(&MediaRequest::Quality(quality));
+            // Re-apply the room bitrate under the new quality cap when we know the room's.
+            let room_bitrate = crate::hub::lock(&active.live).room_bitrate;
+            if let Some(kbps) = room_bitrate {
+                let _ = active.request(&MediaRequest::Bitrate { kbps: quality.apply_room(kbps) });
+            }
         }
         if let Some(tester) = crate::hub::lock(&self.tester).as_mut() {
             let _ = tester.send(&MediaRequest::Tune(tuning));
@@ -1254,10 +1265,13 @@ impl Calls {
         if !self.update(hub, conversation, |live| {
             changed = live.push_to_talk != push_to_talk;
             live.push_to_talk = push_to_talk;
+            live.room_bitrate = Some(kbps);
         }) {
             return;
         }
-        let _ = self.request(hub, &MediaRequest::Bitrate { kbps });
+        let quality = hub.settings().voice_quality();
+        let _ = self.request(hub, &MediaRequest::Bitrate { kbps: quality.apply_room(kbps) });
+        let _ = self.request(hub, &MediaRequest::Quality(quality));
         if changed {
             let mode = input_mode(&hub.settings(), push_to_talk);
             let _ = self.request(hub, &MediaRequest::Input(mode));
