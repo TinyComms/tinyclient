@@ -31,6 +31,8 @@ mod pane;
 mod panel;
 pub(super) mod settings;
 mod setup;
+mod share;
+mod stage;
 
 use super::input::{InputEvent, InputKey, TextInput};
 use super::sidebar::Mode;
@@ -99,6 +101,8 @@ pub(super) enum Modal {
     /// Ownership to this member, the server's name typed first.
     Transfer(String),
     SignOutEverywhere,
+    /// What to share in a call: a screen or a window.
+    Share,
 }
 
 /// The invite being made.
@@ -163,8 +167,21 @@ pub struct State {
 
     /// The channel on show. None is the server's home.
     channel: Option<String>,
-    /// The person drawn large on the stage, pinned by a click on their tile.
-    focus: Option<String>,
+    /// The person drawn large, or the stream filling the stage, pinned by a click on its tile.
+    focus: Option<stage::Focus>,
+    /// Where the people go while a stream fills the stage.
+    strip: stage::Strip,
+    /// The focused stream has the whole window. True when the window was made full screen for
+    /// it, and so goes back when it ends.
+    full: Option<bool>,
+    /// The share picker's screens and windows, `None` while `mediad --screens` looks.
+    screens: Option<Vec<protocol::ScreenSource>>,
+    /// The picker shows windows, not screens.
+    screen_windows: bool,
+    /// The one picked in the picker, by id.
+    screen_pick: Option<String>,
+    /// What my share sends, as the picker listed it, for my own stream's tile.
+    shared: Option<protocol::ScreenSource>,
     /// Categories folded, by key ([`model::LOOSE`] for the rooms in none).
     folded: HashSet<String>,
     members_open: bool,
@@ -261,6 +278,12 @@ impl State {
             call_error: None,
             channel: None,
             focus: None,
+            strip: stage::Strip::default(),
+            full: None,
+            screens: None,
+            screen_windows: false,
+            screen_pick: None,
+            shared: None,
             folded: HashSet::new(),
             members_open: true,
             float: None,
@@ -1018,7 +1041,7 @@ impl Shell {
     /// The member hover card is not a page, so back passes it by. False when none was up.
     pub(in crate::gui) fn tiny_back(&mut self, cx: &mut Context<Self>) -> bool {
         let state = &self.tiny_state;
-        if state.sub.is_none() && state.float.is_none() && state.modal.is_none() && state.settings.is_none() {
+        if state.sub.is_none() && state.float.is_none() && state.modal.is_none() && state.settings.is_none() && state.focus.is_none() {
             return false;
         }
         self.tiny_escape(cx)
@@ -1039,6 +1062,9 @@ impl Shell {
             self.tiny_close_settings(cx);
         } else if self.tiny_state.card.is_some() {
             self.tiny_state.card = None;
+        } else if self.tiny_state.focus.is_some() && self.tiny_state.channel.is_some() && matches!(self.sidebar_state.mode, Mode::Network(Network::Tiny)) {
+            // A focused tile is the grid again.
+            self.tiny_state.focus = None;
         } else {
             return false;
         }
@@ -1436,7 +1462,7 @@ impl Shell {
         }
         if let Some(ix) = flag("--tiny-focus").and_then(|n| n.parse::<usize>().ok()) {
             let room = self.tiny_state.channel.as_ref().and_then(|id| community.rooms.iter().find(|room| room.id == *id));
-            self.tiny_state.focus = room.and_then(|room| room.participants.get(ix)).map(|seat| seat.user_id.clone());
+            self.tiny_state.focus = room.and_then(|room| room.participants.get(ix)).map(|seat| stage::Focus::Person(seat.user_id.clone()));
         }
         match flag("--tiny-menu").as_deref() {
             Some("header") => self.tiny_open_float(Float::Header, cx),

@@ -1068,7 +1068,7 @@ impl SettingsWindow {
 }
 
 /// `TINYCLIENT_MEDIAD`, or the `mediad` beside this window, as chatd finds it.
-fn mediad_path() -> std::path::PathBuf {
+pub(in crate::gui) fn mediad_path() -> std::path::PathBuf {
     if let Some(path) = std::env::var_os("TINYCLIENT_MEDIAD") {
         return path.into();
     }

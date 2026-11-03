@@ -78,7 +78,7 @@ impl Call {
             // on a joined voice call is refused in words. Turning one off is never refused.
             // Before a join there is no engine in the call and the bookkeeping below stands,
             // which is what chatd's own lifecycle tests drive.
-            MediaRequest::ShareSend { on: true }
+            MediaRequest::ShareSend { on: true, .. }
             | MediaRequest::ShareWatch { source: Some(_) }
             | MediaRequest::Speaker { source: Some(_) }
             | MediaRequest::Camera { on: true }
@@ -86,7 +86,11 @@ impl Call {
             {
                 return MediaResponse::Refused { detail: NO_VIDEO.to_owned() };
             }
-            MediaRequest::ShareSend { on } => {
+            MediaRequest::ShareSend { on, screen } => {
+                // What the share captures, chosen before the probe so the probe tries that one.
+                if on {
+                    picture::choose_screen(screen);
+                }
                 if self.tiny.is_some() && on {
                     if let Err(words) = picture::probe_screen() {
                         return MediaResponse::Refused { detail: words };
@@ -406,6 +410,14 @@ pub fn run(args: &[String]) -> u8 {
             return 0;
         }
         // Who macOS would name in the microphone prompt. Touches no audio and no permission.
+        // The share picker's list: every screen and window, with a small picture of each in the
+        // folder named.
+        Some("--screens") => {
+            let folder = args.get(1).map(std::path::PathBuf::from);
+            let screens = picture::screens(folder.as_deref());
+            out::print_line(&serde_json::to_string(&screens).unwrap_or_else(|_| "[]".to_owned()));
+            return 0;
+        }
         Some("--responsible") => {
             out::print_line(&permission::responsible().unwrap_or_default());
             return 0;

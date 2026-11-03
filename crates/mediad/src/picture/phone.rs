@@ -183,6 +183,14 @@ impl Incoming {
     }
 }
 
+/// A phone's share is the system's own picker's: nothing here to choose.
+pub fn choose_screen(_id: Option<String>) {}
+
+/// A phone lists nothing: the system asks what to share.
+pub fn screens(_folder: Option<&std::path::Path>) -> Vec<protocol::ScreenSource> {
+    Vec::new()
+}
+
 /// Whether the screen can be shared, before the button claims it: a platform that shares.
 pub fn probe_screen() -> Result<(), String> {
     platform::required().map(|_| ())

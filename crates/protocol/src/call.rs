@@ -122,6 +122,26 @@ pub struct Participant {
     pub sharing: bool,
 }
 
+/// The most screens and windows `mediad --screens` lists.
+pub const SCREENS_LIMIT: usize = 24;
+
+/// One screen or window a share can send, as `mediad --screens` lists it for the share picker.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenSource {
+    /// What [`MediaRequest::ShareSend`] names it by: `display:<device>` or `window:<handle>`.
+    pub id: String,
+    /// "Screen 1", or the window's title.
+    pub name: String,
+    /// A window, not a whole screen.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub window: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub primary: bool,
+    /// A small picture of it, as a file, when one could be taken.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thumbnail: String,
+}
+
 /// One microphone or speaker the system lists.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioDevice {
@@ -352,7 +372,13 @@ pub struct TinyPicture {
 pub enum MediaRequest {
     Streams,
     /// Send our screen, or stop sending it.
-    ShareSend { on: bool },
+    ShareSend {
+        on: bool,
+        /// Which screen or window, as `mediad --screens` lists it ([`ScreenSource::id`]).
+        /// `None` is the primary screen, as older shells asked for.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        screen: Option<String>,
+    },
     /// Watch one participant's share. Replaces any share already being watched.
     ShareWatch { source: Option<String> },
     /// The active speaker changed. Replaces the previous speaker's decode.
@@ -843,6 +869,16 @@ mod tests {
         let json = serde_json::to_string(&on).unwrap();
         assert_eq!(json, r#"{"room_id":"r","identity":"/keys/ada","required":true}"#);
         assert_eq!(serde_json::from_str::<TinyE2ee>(&json).unwrap(), on);
+    }
+
+    #[test]
+    fn a_share_without_a_screen_is_the_frame_an_older_build_sends() {
+        let older: MediaRequest = serde_json::from_str(r#"{"media":"share_send","on":true}"#).unwrap();
+        assert_eq!(older, MediaRequest::ShareSend { on: true, screen: None });
+        assert_eq!(serde_json::to_string(&older).unwrap(), r#"{"media":"share_send","on":true}"#);
+        let chosen = MediaRequest::ShareSend { on: true, screen: Some("display:\\\\.\\DISPLAY2".into()) };
+        let json = serde_json::to_string(&chosen).unwrap();
+        assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), chosen);
     }
 
     #[test]

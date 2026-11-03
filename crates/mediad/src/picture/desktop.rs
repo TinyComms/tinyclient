@@ -261,12 +261,21 @@ impl Camera {
     }
 }
 
-/// The primary screen as RGBA or BGRA. The whole screen, which the share then fits.
+/// The screen or window chosen for the share ([`super::choose_screen`]), else the primary
+/// screen, as RGBA or BGRA. The whole of it, which the share then fits.
 pub fn capture_screen() -> Result<Rgba, String> {
+    capture_source(super::screens::chosen().as_deref())
+}
+
+/// One screen or window by its `--screens` id. Only Windows tells them apart; elsewhere every id
+/// is the primary screen.
+pub(super) fn capture_source(id: Option<&str>) -> Result<Rgba, String> {
     #[cfg(windows)]
     {
-        return capture_screen_windows();
+        return super::screens::capture(id);
     }
+    #[cfg(not(windows))]
+    let _ = id;
     #[cfg(target_os = "macos")]
     {
         return capture_screen_macos();
@@ -278,54 +287,6 @@ pub fn capture_screen() -> Result<Rgba, String> {
     #[cfg(not(any(windows, target_os = "macos", all(target_os = "linux", not(target_env = "ohos")))))]
     {
         Err("Screen sharing isn't available on this system.".to_owned())
-    }
-}
-
-#[cfg(windows)]
-fn capture_screen_windows() -> Result<Rgba, String> {
-    use std::mem::size_of;
-    use windows_sys::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SelectObject, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetDesktopWindow, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
-    unsafe {
-        let width = GetSystemMetrics(SM_CXSCREEN);
-        let height = GetSystemMetrics(SM_CYSCREEN);
-        if width <= 0 || height <= 0 {
-            return Err("The screen has no size.".to_owned());
-        }
-        let desktop = GetDesktopWindow();
-        let dc = GetDC(desktop);
-        if dc.is_null() {
-            return Err("tinyclient can't record the screen.".to_owned());
-        }
-        let memory = CreateCompatibleDC(dc);
-        let bitmap = CreateCompatibleBitmap(dc, width, height);
-        let previous = SelectObject(memory, bitmap as _);
-        let copied = BitBlt(memory, 0, 0, width, height, dc, 0, 0, SRCCOPY);
-        let mut header = BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width,
-            biHeight: -height,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB,
-            biSizeImage: 0,
-            biXPelsPerMeter: 0,
-            biYPelsPerMeter: 0,
-            biClrUsed: 0,
-            biClrImportant: 0,
-        };
-        let mut pixels = vec![0u8; (width * height * 4) as usize];
-        let rows = GetDIBits(memory, bitmap, 0, height as u32, pixels.as_mut_ptr().cast(), (&mut header as *mut BITMAPINFOHEADER).cast(), DIB_RGB_COLORS);
-        SelectObject(memory, previous);
-        DeleteObject(bitmap as _);
-        DeleteDC(memory);
-        ReleaseDC(desktop, dc);
-        if copied == 0 || rows == 0 {
-            return Err("tinyclient can't record the screen.".to_owned());
-        }
-        Ok(Rgba { width: width as u32, height: height as u32, pixels, bgra: true })
     }
 }
 
