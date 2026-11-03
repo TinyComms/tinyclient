@@ -82,6 +82,35 @@ pub fn grouped_safety(digits: &str) -> String {
         .join(" ")
 }
 
+/// Concrete glyphs for a digit code (call code or safety number), Telegram-style: no skin
+/// tones, no lookalike pairs. Same digits always map to the same four.
+const SAFETY_EMOJIS: &[&str] = &[
+    "🦊", "🎩", "🌙", "🎸", "🍎", "⚡", "🎯", "🌵", "🎲", "🌈", "🚀", "🍀", "🎧", "🦄", "🍕", "🔑",
+    "🌊", "🎨", "🐸", "🍩", "🔥", "🎈", "🐣", "🌹", "🐯", "🎵", "🌻", "🪐", "🫐", "🪼", "🍉", "🧿",
+    "🚲", "🍋", "🦋", "🍄", "🪁", "🐙", "🌽", "💎", "🦉", "🥐", "🧲", "🐝", "🍇", "🧭", "🦜", "🍓",
+    "🥁", "🐨", "🌶", "🧊", "🦚", "🧀", "🐢", "🦩", "🥯", "🦞", "🌼", "🧶", "🫖", "🛵", "🧈", "🪺",
+];
+
+/// Four emojis from a digit string (call code or pairwise safety number). Empty or non-digit
+/// input yields none. Everyone who holds the same digits sees the same four.
+pub fn safety_emojis(digits: &str) -> Vec<&'static str> {
+    let digits: Vec<u8> = digits.bytes().filter(u8::is_ascii_digit).map(|b| b - b'0').collect();
+    if digits.is_empty() {
+        return Vec::new();
+    }
+    (0..4)
+        .map(|i| {
+            let mut n = 0u32;
+            for (j, d) in digits.iter().enumerate() {
+                n = n.wrapping_mul(10).wrapping_add(u32::from(*d));
+                n = n.wrapping_add(((i as u32) + 1).wrapping_mul((j as u32) + 1).wrapping_mul(17));
+            }
+            n = n.wrapping_mul(0x9E37_79B1).wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
+            SAFETY_EMOJIS[(n as usize) % SAFETY_EMOJIS.len()]
+        })
+        .collect()
+}
+
 /// What `Request::TinyE2ee` asks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -202,6 +231,19 @@ mod tests {
         let grouped = grouped_safety(&digits);
         assert_eq!(grouped.split(' ').count(), 12);
         assert!(grouped.starts_with("01234 56789 "));
+    }
+
+    #[test]
+    fn safety_emojis_are_four_stable_glyphs_from_the_digits() {
+        assert!(safety_emojis("").is_empty());
+        assert!(safety_emojis("abc").is_empty());
+        let one = safety_emojis("686286309597067940951489038115");
+        assert_eq!(one.len(), 4);
+        assert_eq!(one, safety_emojis("686286309597067940951489038115"));
+        assert_ne!(one, safety_emojis("686286309597067940951489038116"));
+        for glyph in &one {
+            assert!(SAFETY_EMOJIS.contains(glyph));
+        }
     }
 
     #[test]

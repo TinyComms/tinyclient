@@ -242,6 +242,8 @@ pub struct State {
     menu: Option<Menu>,
     /// Which security indicator opened `Menu::Security`: the panel opens beside it.
     security_at: security::Place,
+    /// Whether the security panel's "More about this call" disclosure is open.
+    security_more: bool,
     /// When a click outside closed the menu, so the same click on its button does not reopen it.
     menu_closed: Option<Instant>,
     /// What mediad last said is not as chosen (`Call::device_notice`), so a new one is shown.

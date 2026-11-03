@@ -11,9 +11,10 @@
 //! about its protection (every network but a Tiny server). The panel opens beside the indicator
 //! that was clicked: over the dock's card, over the compact bar, or under the top bar.
 //!
-//! The panel says in plain words what the server can and cannot see, shows
-//! the call code everyone in the call compares, and each other member's safety number with
-//! "Mark as verified".
+//! The panel leads with four emojis derived from the call code (Telegram-style): everyone in
+//! the call sees the same four, so reading them out loud checks that you share one encrypted
+//! group. Pairwise safety numbers and what the server can still see sit under "More about this
+//! call". Each other member can be marked verified.
 //!
 //! It never says more than holds. "End-to-end encrypted" and the green lock appear while mediad
 //! says the group has keys, and also when you are the only person in the call: there is nobody
@@ -27,7 +28,7 @@ use super::{in_call, Menu};
 use crate::gui::components::{glyph, tip};
 use crate::gui::state::Shell;
 use crate::gui::theme;
-use gpui::{deferred, div, prelude::*, px, AnyElement, Context, Div, FontWeight, Rgba, Stateful};
+use gpui::{deferred, div, prelude::*, px, AnyElement, Context, Div, FontWeight, MouseButton, Rgba, Stateful};
 use protocol::{Call, CallSecurity, Request, SecureMember, SecurityMode, Trust};
 
 /// Where the indicator is drawn: the panel it opens is placed by it.
@@ -120,6 +121,11 @@ pub(super) fn grouped_lines(digits: &str, size: usize, per_line: usize) -> Vec<S
     groups.chunks(per_line.max(1)).map(|line| line.join(" ")).collect()
 }
 
+/// Four emojis from the call code (`protocol::safety_emojis`).
+pub(super) fn call_emojis(code: &str) -> Vec<&'static str> {
+    protocol::safety_emojis(code)
+}
+
 /// A member's name as the call's roster has it. Someone the server does not list in the call
 /// is said to be exactly that.
 pub(super) fn member_name(call: &Call, user_id: &str) -> String {
@@ -141,7 +147,7 @@ fn first_name(name: &str) -> &str {
 /// The headline and the sentence under it.
 pub(super) fn summary(security: &CallSecurity, alone: bool) -> (&'static str, &'static str) {
     match badge(security, alone) {
-        Badge::EndToEnd => ("End-to-end encrypted", "Only the people in this call can hear it. The server passes along audio it cannot unlock."),
+        Badge::EndToEnd => ("End-to-end encrypted", "Only people in this call can hear it."),
         Badge::Alone => ("End-to-end encrypted", "You're the only one in this call. Your microphone stays off until someone joins, so nothing you say reaches the server unlocked."),
         Badge::Check => ("Check who is in this call", "The call is end-to-end encrypted, but something about who holds its keys changed. Read below before you trust it."),
         Badge::Pending => ("Setting up end-to-end encryption", "Your microphone waits until it's done, so nothing you say reaches the server unlocked."),
@@ -261,8 +267,10 @@ impl Shell {
             .focus_visible(|style| style.shadow(theme::focus_ring()))
             .child(glyph(icon, 14., color))
             .tooltip(tip(badge_words(shown), None))
+            // Stop the dock title's click (open conversation) on press, not only on click: a
+            // parent that sees mouse_down first steals the gesture and the lock looks dead.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, _, cx| {
-                // The title row opens the conversation; this opens the panel alone.
                 cx.stop_propagation();
                 this.call_state.security_at = place;
                 this.call_menu_toggle(Menu::Security, cx);
@@ -374,6 +382,138 @@ impl Shell {
         if security.mode != SecurityMode::EndToEnd {
             return panel;
         }
+        let emojis = call_emojis(&security.code);
+        if !emojis.is_empty() {
+            panel = panel
+                .child(
+                    div()
+                        .flex()
+                        .justify_center()
+                        .gap(px(8.))
+                        .rounded(px(10.))
+                        .bg(theme::hover())
+                        .px(px(10.))
+                        .py(px(12.))
+                        .children(emojis.into_iter().enumerate().map(|(ix, glyph)| {
+                            div()
+                                .id(("call-emoji", ix))
+                                .size(px(44.))
+                                .rounded(px(10.))
+                                .bg(theme::selected())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(26.))
+                                .line_height(px(32.))
+                                .child(glyph)
+                        })),
+                )
+                .child(words(
+                    "Same four on everyone's screen? You're in one encrypted call.".to_owned(),
+                    theme::text_faint(),
+                ));
+        }
+        let in_it = in_call(call);
+        if !security.members.is_empty() {
+            let mut people = div().flex().flex_col().gap(px(6.));
+            for (ix, member) in security.members.iter().enumerate() {
+                let name = member_name(call, &member.user_id);
+                let ghost = member.user_id.is_empty();
+                let loud = suspect(&security, member);
+                let verified = member.trust == Trust::Verified;
+                let button = (!ghost && in_it).then(|| {
+                    let (call, member) = (call.clone(), member.clone());
+                    div()
+                        .id(("call-verify", ix))
+                        .flex_none()
+                        .h(px(22.))
+                        .px(px(8.))
+                        .rounded(px(6.))
+                        .bg(theme::hover())
+                        .flex()
+                        .items_center()
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::text())
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::selected()))
+                        .child(if verified { "Unmark" } else { "Mark as verified" })
+                        .on_click(cx.listener(move |this, _, _, cx| this.call_verify(&call, &member, !verified, cx)))
+                });
+                let mut row = div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(if ghost { theme::warning() } else { theme::text() })
+                                    .child(name),
+                            )
+                            .when(verified && !loud, |row| {
+                                row.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(4.))
+                                        .child(glyph("icons/badge-check.svg", 13., theme::positive()))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(theme::positive())
+                                                .child("Verified"),
+                                        ),
+                                )
+                            })
+                            .children(button),
+                    );
+                if loud {
+                    row = row.child(words(trust_words(member).to_owned(), theme::warning()));
+                }
+                if let Some(warning) = changed_warning(call, member) {
+                    row = row.child(words(warning, theme::warning()));
+                }
+                people = people.child(row);
+            }
+            panel = panel.child(people);
+        }
+        let more_open = self.call_state.security_more;
+        let more_label = if more_open { "Less about this call" } else { "More about this call" };
+        panel = panel.child(
+            div()
+                .id("call-security-more")
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .pt(px(2.))
+                .cursor_pointer()
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::text_faint())
+                        .child(more_label),
+                )
+                .child(glyph(if more_open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" }, 12., theme::text_faint()))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_state.security_more = !this.call_state.security_more;
+                    cx.notify();
+                })),
+        );
+        if !more_open {
+            return panel;
+        }
         panel = panel.child(
             div()
                 .flex()
@@ -383,87 +523,29 @@ impl Shell {
                 .children(SERVER_SEES.iter().map(|seen| words(format!("· {seen}"), theme::text_soft())))
                 .child(words("It cannot hear what is said.".to_owned(), theme::text_soft())),
         );
-        if !security.code.is_empty() {
-            panel = panel.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(label("CALL CODE"))
-                    .child(digits(grouped_lines(&security.code, 5, 3)))
-                    .child(words(
-                        "Everyone in the call sees the same code. Read it out loud: the same code means you are all in one encrypted group, not split by the server. Check the list below for anyone you don't expect. It changes whenever someone joins or leaves."
-                            .to_owned(),
-                        theme::text_faint(),
-                    )),
-            );
-        }
         if security.members.is_empty() {
             return panel;
         }
-        let in_it = in_call(call);
-        let mut people = div().flex().flex_col().gap(px(8.)).child(label("SAFETY NUMBERS"));
-        for (ix, member) in security.members.iter().enumerate() {
+        let mut detail = div().flex().flex_col().gap(px(8.)).child(label("SAFETY NUMBERS"));
+        for member in &security.members {
             let name = member_name(call, &member.user_id);
-            let ghost = member.user_id.is_empty();
-            let loud = suspect(&security, member);
-            let state_color = match member.trust {
-                _ if loud => theme::warning(),
-                Trust::Verified => theme::positive(),
-                _ => theme::text_faint(),
-            };
-            let verified = member.trust == Trust::Verified;
-            let button = (!ghost && in_it).then(|| {
-                let (call, member) = (call.clone(), member.clone());
-                div()
-                    .id(("call-verify", ix))
-                    .flex_none()
-                    .h(px(22.))
-                    .px(px(8.))
-                    .rounded(px(6.))
-                    .bg(theme::hover())
-                    .flex()
-                    .items_center()
-                    .text_size(px(11.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme::text())
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme::selected()))
-                    .child(if verified { "Unmark" } else { "Mark as verified" })
-                    .on_click(cx.listener(move |this, _, _, cx| this.call_verify(&call, &member, !verified, cx)))
-            });
             let mut row = div()
                 .flex()
                 .flex_col()
                 .gap(px(3.))
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(12.5))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(if ghost { theme::warning() } else { theme::text() })
-                                .child(name),
-                        )
-                        .when(verified && !loud, |row| row.child(glyph("icons/badge-check.svg", 13., theme::positive())))
-                        .children(button),
-                )
-                .child(words(trust_words(member).to_owned(), state_color));
-            if let Some(warning) = changed_warning(call, member) {
-                row = row.child(words(warning, theme::warning()));
-            }
+                        .text_size(px(12.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::text())
+                        .child(name),
+                );
             if !member.safety.is_empty() {
                 row = row.child(digits(grouped_lines(&member.safety, 5, 3)));
             }
-            people = people.child(row);
+            detail = detail.child(row);
         }
-        panel.child(people).child(words(
+        panel.child(detail).child(words(
             "Compare a safety number with that person, in person or on another channel you trust. Both of you see the same number."
                 .to_owned(),
             theme::text_faint(),
@@ -554,6 +636,16 @@ mod tests {
         assert_eq!(grouped_lines("123456789012345678901234567890", 5, 3), ["12345 67890 12345", "67890 12345 67890"]);
         assert_eq!(grouped_lines(&"9".repeat(45), 5, 3).len(), 3, "a safety number is three lines");
         assert_eq!(grouped("", 5), "");
+    }
+
+    #[test]
+    fn call_emojis_are_four_stable_glyphs_from_the_code() {
+        assert!(call_emojis("").is_empty());
+        assert!(call_emojis("abc").is_empty());
+        let one = call_emojis("686286309597067940951489038115");
+        assert_eq!(one.len(), 4);
+        assert_eq!(one, call_emojis("686286309597067940951489038115"));
+        assert_ne!(one, call_emojis("686286309597067940951489038116"));
     }
 
     #[test]
