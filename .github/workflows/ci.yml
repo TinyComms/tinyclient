@@ -2,7 +2,8 @@ name: CI
 
 # Pull requests, and pushes to main. A branch that also has a pull request used to run this
 # twice. Tests and the release build run together: each used to wait for the other, and the
-# release programs are what a later tag packages instead of compiling again.
+# release programs are what a later tag packages instead of compiling again. A pull request
+# packages Linux x86_64 only; main builds every release program, Linux aarch64 included.
 on:
   push:
     branches: [main]
@@ -25,6 +26,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # .config/nextest.toml: no fail-fast, a retry that reports flaky tests, and a hang timeout.
+  NEXTEST_PROFILE: ci
 
 jobs:
   test:
@@ -33,40 +36,48 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, macos-latest, windows-latest]
+        include:
+          - os: macos-latest
+            features: --features tinyclient/gui
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: test
-      - name: Test
-        run: cargo test --workspace
+      - uses: taiki-e/install-action@nextest
+      # nextest runs the test binaries side by side, where `cargo test` ran them one at a time.
       # The window's own tests (prefs, search, shortcuts against the menus, the controls) build
-      # only with the gui feature.
-      - name: Test the window
-        if: runner.os == 'macOS'
-        run: cargo test -p tinyclient --features gui
+      # only with the gui feature, so macOS turns it on for the one pass over the workspace.
+      - name: Test
+        run: cargo nextest run --workspace ${{ matrix.features }}
+      # nextest does not run doc tests.
+      - name: Doc tests
+        run: cargo test --workspace --doc ${{ matrix.features }}
+      # The cfg(target_os = "ios"|"android") arms are not type-checked on this host; this proves
+      # the mobile feature does not disturb the desktop arms. It shares this job's cache.
+      - name: Window with the mobile feature enabled
+        if: runner.os == 'Linux'
+        run: cargo check -p tinyclient --features "gui mobile"
 
   package:
     name: package (${{ matrix.artifact }})
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Ubuntu 22.04 is the oldest glibc the release packages promise. Building here is
-          # what lets a tag reuse these binaries.
-          - os: ubuntu-22.04
-            artifact: linux-x86_64
-          - os: macos-latest
-            artifact: macos
-          - os: windows-latest
-            artifact: windows
-    runs-on: ${{ matrix.os }}
+        # A pull request packages Linux x86_64, which proves the release build and the packaging.
+        # The others build only on main, which is what a tag reuses. On a pull request the macOS
+        # build took a second macOS runner beside the tests and queued behind the phone jobs.
+        artifact: ${{ fromJSON(github.event_name == 'push' && '["linux-x86_64","linux-aarch64","macos","windows"]' || '["linux-x86_64"]') }}
+    # Ubuntu 22.04 is the oldest glibc the release packages promise.
+    runs-on: ${{ fromJSON('{"linux-x86_64":"ubuntu-22.04","linux-aarch64":"ubuntu-22.04-arm","macos":"macos-latest","windows":"windows-latest"}')[matrix.artifact] }}
     steps:
       - uses: actions/checkout@v5
+      # Linux aarch64 builds without a cache. It runs only on main, beside the longer macOS
+      # tests, and its entry would be another few gigabytes in a cache already at its 10 GB cap.
       - uses: ./.github/actions/setup-rust
         with:
-          cache-key: release
+          cache-key: ${{ matrix.artifact == 'linux-aarch64' && 'none' || 'release' }}
       - name: Build release
         shell: bash
         env:
@@ -87,17 +98,17 @@ jobs:
 
       # The release's packaging, so a change that breaks it shows here rather than at the next tag.
       - name: Package .deb, .rpm, AppImage and .tar.gz
-        if: matrix.artifact == 'linux-x86_64'
+        if: startsWith(matrix.artifact, 'linux-')
         run: |
           eval "$(packaging/linux/tools.sh)"
           packaging/linux.sh --no-build ci
           desktop-file-validate packaging/linux/dev.tinyclient.app.desktop
-          dpkg-deb --info dist/tinyclient-ci-linux-x86_64.deb
-          dpkg-deb --contents dist/tinyclient-ci-linux-x86_64.deb
+          dpkg-deb --info "dist/tinyclient-ci-linux-$(uname -m).deb"
+          dpkg-deb --contents "dist/tinyclient-ci-linux-$(uname -m).deb"
       - uses: actions/upload-artifact@v6
-        if: matrix.artifact == 'linux-x86_64'
+        if: startsWith(matrix.artifact, 'linux-')
         with:
-          name: tinyclient-linux-x86_64
+          name: tinyclient-${{ matrix.artifact }}
           path: dist/*
 
       - name: Pack binaries
