@@ -584,17 +584,17 @@ fn mediad_exits_when_chatd_is_killed_mid_call() {
 fn a_share_is_one_encode_and_one_subscribed_decode() {
     let chatd = Daemon::start(standup);
 
-    let no_call = chatd.ask(Request::Media(MediaRequest::ShareSend { on: true }));
+    let no_call = chatd.ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None }));
     assert!(matches!(no_call, Response::Error { code: ErrorCode::NoCall, .. }), "{no_call:?}");
     assert_eq!(chatd.mediad_pids(), Vec::<u32>::new());
 
     chatd.ask(call_start());
     let watch = |source: &str| Request::Media(MediaRequest::ShareWatch { source: Some(source.into()) });
     let speaker = |source: &str| Request::Media(MediaRequest::Speaker { source: Some(source.into()) });
-    chatd.ask(Request::Media(MediaRequest::ShareSend { on: true }));
+    chatd.ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None }));
     chatd.ask(watch("alice"));
     chatd.ask(speaker("carol"));
-    chatd.ask(Request::Media(MediaRequest::ShareSend { on: true }));
+    chatd.ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None }));
     chatd.ask(speaker("dave"));
     let last = chatd.ask(watch("bob"));
 

@@ -383,6 +383,8 @@ impl Shell {
             self.close_switcher(window, cx);
         } else if self.layout_state.menu.is_some() {
             self.layout_state.menu = None;
+        } else if self.tiny_unfull(window, cx) {
+            return true;
         } else if self.tiny_escape(cx) {
             return true;
         } else if self.layout_state.floating {

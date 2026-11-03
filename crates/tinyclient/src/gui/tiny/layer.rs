@@ -1,7 +1,7 @@
 //! Everything the server page floats over the window, drawn from the window's root so it sits
-//! above every pane: Server Settings, a menu with its submenu, the hover card, the connection
-//! numbers, and a modal. A menu has a catcher behind it that closes it on a click anywhere else,
-//! and that also carries a volume drag that wanders off the slider.
+//! above every pane: a stream in full screen, Server Settings, a menu with its submenu, the hover
+//! card, the connection numbers, and a modal. A menu has a catcher behind it that closes it on a
+//! click anywhere else, and that also carries a volume drag that wanders off the slider.
 
 use super::members::MEMBERS_WIDTH;
 use super::panel::PANEL;
@@ -15,11 +15,13 @@ use gpui::{div, prelude::*, px, AnyElement, Context, MouseButton, MouseMoveEvent
 impl Shell {
     pub(in crate::gui) fn tiny_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let state = &self.tiny_state;
-        if state.float.is_none() && state.modal.is_none() && state.settings.is_none() && state.card.is_none() && !state.setup.prompt {
+        if state.float.is_none() && state.modal.is_none() && state.settings.is_none() && state.card.is_none() && !state.setup.prompt && state.full.is_none() {
             return None;
         }
         let page = self.tiny_page_facts()?;
         let mut layer = div().absolute().top_0().left_0().size_full();
+        // A stream with the whole window, under any menu or modal.
+        layer = layer.children(self.tiny_full_stage(&page, cx));
         if state.settings.is_some() {
             layer = layer.child(self.tiny_settings_overlay(&page, window, cx));
         }

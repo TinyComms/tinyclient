@@ -216,7 +216,7 @@ pub fn answer(request: &Request) -> Option<Response> {
         }),
         Request::CallTalk { held, .. } => on_call(&|call| call.speaking = *held && !call.muted),
         Request::Media(MediaRequest::Camera { on }) => on_call(&|call| stream(call, Content::Camera, *on)),
-        Request::Media(MediaRequest::ShareSend { on }) => on_call(&|call| stream(call, Content::Share, *on)),
+        Request::Media(MediaRequest::ShareSend { on, .. }) => on_call(&|call| stream(call, Content::Share, *on)),
         Request::Media(_) => Response::Ok,
         _ => return None,
     })

@@ -19,6 +19,11 @@ pub const CODEC_LATER: &str = "OpenH264 is still downloading.";
 mod desktop;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use desktop::*;
+/// What a share sends: the picker's list and the one chosen.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod screens;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub use screens::{choose_screen, screens};
 pub mod convert;
 /// Built everywhere, so host tests drive it with `platform::fake`.
 pub mod phone;

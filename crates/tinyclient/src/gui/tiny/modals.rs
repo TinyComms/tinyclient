@@ -70,6 +70,7 @@ impl Shell {
 
     pub(super) fn tiny_modal(&self, page: &Page, modal_on_show: &Modal, window: &Window, cx: &mut Context<Self>) -> Div {
         match modal_on_show {
+            Modal::Share => self.tiny_share_modal(cx),
             Modal::Invite => self.invite_modal(page, window, cx),
             Modal::Code { paste, origin, terms, role } => self.code_modal(page, paste, origin, terms, role, cx),
             Modal::Kick(user_id) => {
