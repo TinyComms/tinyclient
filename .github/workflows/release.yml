@@ -5,8 +5,17 @@ name: Release
 # same files without publishing (`gh workflow run release.yml --ref BRANCH`); they are kept as the
 # run's `release-all` artifact.
 #
-# macOS, Windows, and Linux x86_64 skip compilation when CI already built that commit. The
-# programs are packaged and signed here. Linux aarch64 is built here; CI does not cover it.
+# A release is promoted from the commit's run on main rather than built from scratch. The tag
+# and the main push of a commit start together, so the first job finds the CI run (ci.yml) that
+# main's push started and waits for it. If that run fails, nothing is published. If it passes,
+# each platform takes its programs from that run's packages and only packages and signs them
+# here; a platform whose package the run lacks compiles as before. A commit main's CI never
+# looked at (only docs changed, or a branch run by hand) has no run to wait for, and every
+# platform compiles.
+#
+# The phones come from the Mobile run (mobile.yml) of the same commit in the same way. Mobile
+# only runs on main when the app's code changed, so when there is no such run this workflow
+# starts one on the tag and waits for it. A phone build that fails fails the release.
 on:
   push:
     tags:
@@ -42,8 +51,59 @@ jobs:
           RELEASE_URL: https://github.com/${{ github.repository }}/releases/tag/v${{ inputs.announce }}
         run: packaging/release-note.sh
 
+  # One job waits for CI, so the four build jobs do not each poll for it. The waits are long
+  # because macOS runners can queue for over an hour: a dispatched Mobile run took 2h24m.
+  wait-for-ci:
+    if: github.event_name == 'push' || inputs.announce == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    outputs:
+      run: ${{ steps.ci.outputs.run }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Wait for main's CI run of this commit
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: packaging/ci/wait-for-run.sh ci.yml
+
+  # The APK is a debug build; the iOS app is unsigned and only runs once re-signed.
+  phones:
+    if: github.event_name == 'push' || inputs.announce == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      # To start the Mobile workflow when main never ran it for this commit.
+      actions: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Name the files
+        run: packaging/ci-label.sh >> "$GITHUB_ENV"
+      - name: Wait for the Mobile run of this commit
+        id: mobile
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: packaging/ci/wait-for-run.sh mobile.yml --dispatch
+      - name: Take, name and zip the files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ steps.mobile.outputs.run }}
+        run: |
+          gh run download "$RUN" -n tinyclient-android-debug -D phone
+          gh run download "$RUN" -n tinyclient-ios-unsigned -D phone/Tiny.app
+          mkdir -p dist
+          mv phone/app-debug.apk "dist/tinyclient-$LABEL-android-debug.apk"
+          (cd phone && zip -qr "../dist/tinyclient-$LABEL-ios-unsigned.zip" Tiny.app)
+          ls -l dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-phones
+          path: dist/*
+          if-no-files-found: error
 
   macos:
+    needs: wait-for-ci
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -53,7 +113,8 @@ jobs:
         id: reuse
         env:
           GH_TOKEN: ${{ github.token }}
-        run: packaging/ci/reuse-binaries.sh macos
+          CI_RUN: ${{ needs.wait-for-ci.outputs.run }}
+        run: packaging/ci/reuse-binaries.sh macos "$CI_RUN"
       - uses: ./.github/actions/setup-rust
         if: steps.reuse.outputs.found != 'true'
         with:
@@ -95,6 +156,7 @@ jobs:
           path: dist/*
 
   linux:
+    needs: wait-for-ci
     strategy:
       fail-fast: false
       matrix:
@@ -115,7 +177,8 @@ jobs:
         id: reuse
         env:
           GH_TOKEN: ${{ github.token }}
-        run: packaging/ci/reuse-binaries.sh ${{ matrix.artifact }}
+          CI_RUN: ${{ needs.wait-for-ci.outputs.run }}
+        run: packaging/ci/reuse-binaries.sh ${{ matrix.artifact }} "$CI_RUN"
       # Packaging reads the linked libraries even when the programs themselves came from CI.
       - name: Install packaging dependencies
         if: steps.reuse.outputs.found == 'true'
@@ -195,6 +258,7 @@ jobs:
         run: docker run --rm -v "$PWD:/w" -w /w -e LABEL -e VERSION -e ARCH=${{ matrix.arch }} ${{ matrix.image }} packaging/linux/smoke.sh ${{ matrix.kind }}
 
   windows:
+    needs: wait-for-ci
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -206,7 +270,8 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: packaging/ci/reuse-binaries.sh windows
+          CI_RUN: ${{ needs.wait-for-ci.outputs.run }}
+        run: packaging/ci/reuse-binaries.sh windows "$CI_RUN"
       - uses: ./.github/actions/setup-rust
         if: steps.reuse.outputs.found != 'true'
         with:
@@ -238,7 +303,7 @@ jobs:
           path: dist/*
 
   publish:
-    needs: [macos, linux, linux-smoke, windows]
+    needs: [macos, linux, linux-smoke, windows, phones]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -253,7 +318,8 @@ jobs:
           merge-multiple: true
       # Each package also goes up without the version in its name, so a fixed address
       # (releases/latest/download/tinyclient-macos.dmg, which tinyclient.io/download/macos points
-      # at) always serves the newest one. SHA256SUMS covers both names.
+      # at) always serves the newest one. The phone files get one too, such as
+      # tinyclient-android-debug.apk. SHA256SUMS covers both names.
       - name: Unversioned copies and checksums
         working-directory: dist
         run: |

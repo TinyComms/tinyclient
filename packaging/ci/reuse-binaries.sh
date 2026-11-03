@@ -1,13 +1,16 @@
 #!/bin/sh
-# Copies the release programs out of the packages CI already uploaded for this commit.
+# Copies the release programs out of the packages a CI run already uploaded for this commit.
+# The run is the one wait-for-run.sh found and waited for; release.yml passes its id.
 # found=true means target/release holds tinyclient, chatd, mediad and tinyclient-login.
-# A commit CI did not build (or whose CI failed) leaves found=false, and the caller compiles.
+# With no run id, or a run without this platform's package, found=false and the caller compiles.
 set -eu
 
-kind=${1:?usage: reuse-binaries.sh macos|linux-x86_64|windows}
+kind=${1:?usage: reuse-binaries.sh macos|linux-x86_64|linux-aarch64|windows [CI run id]}
+run=${2:-}
 case "$kind" in
     macos) artifact=tinyclient-macos ;;
     linux-x86_64) artifact=tinyclient-linux-x86_64 ;;
+    linux-aarch64) artifact=tinyclient-linux-aarch64 ;;
     windows) artifact=tinyclient-windows-x86_64 ;;
     *)
         echo "reuse-binaries.sh: nothing to reuse for $kind"
@@ -31,7 +34,7 @@ take() {
                 chmod +x "target/release/$program"
             done
             ;;
-        linux-x86_64)
+        linux-x86_64 | linux-aarch64)
             archive=$(find "$stage" -name 'tinyclient-*-linux-*.tar.gz' | head -1)
             [ -n "$archive" ] || return 1
             unpack=$(mktemp -d)
@@ -64,9 +67,6 @@ take() {
 }
 
 found=false
-run=$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --status success --limit 1 \
-    --json databaseId --jq '.[0].databaseId // empty' || true)
-
 if [ -n "$run" ]; then
     stage=$(mktemp -d)
     if gh run download "$run" -n "$artifact" -D "$stage" && take "$stage"; then
@@ -77,7 +77,7 @@ if [ -n "$run" ]; then
     fi
     rm -rf "$stage"
 else
-    echo "reuse-binaries.sh: no successful CI run for $GITHUB_SHA; compiling"
+    echo "reuse-binaries.sh: no CI run for $GITHUB_SHA to reuse; compiling"
 fi
 
 echo "found=$found" >> "${GITHUB_OUTPUT:?reuse-binaries.sh is for GitHub Actions}"
