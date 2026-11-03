@@ -749,6 +749,36 @@ fn a_channel_posts_comments_count_rides_the_post() {
 }
 
 #[test]
+fn a_channel_posts_views_ride_the_post_from_one_ask_for_the_page() {
+    let world = World::signed_in();
+    world.connected();
+    // Opening the channel reads the page once, and the views come with it: the count rides the
+    // post its footer draws, not the channel's row.
+    let post = world.until("the post's views", || world.message("c9001", "5").filter(|post| post.views.is_some()));
+    assert_eq!(post.views, Some(12_400), "{:#?}", world.calls());
+    assert!(world.called("GetMessagesViews c9001 5") >= 1, "{:#?}", world.calls());
+    // A direct chat has no views, and none is asked for.
+    world.until("history", || world.message("u7002", "12"));
+    assert_eq!(world.called("GetMessagesViews u7002"), 0, "{:#?}", world.calls());
+}
+
+#[test]
+fn a_posts_unread_comments_ride_its_footer_until_they_are_read() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments 3");
+    world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+    // The discussion says three comments are unread: opening it puts them on the post, whose
+    // footer shows them, and a page of the channel read later does not stamp them away.
+    world.messages("c9001_5");
+    let post = world.until("the post's unread comments", || {
+        world.message("c9001", "5").filter(|post| post.thread.as_ref().is_some_and(|section| section.unread == 3))
+    });
+    let section = post.thread.as_ref().unwrap();
+    assert_eq!(section.replies, 2, "{section:?}");
+}
+
+#[test]
 fn asking_a_channel_posts_comments_reads_the_discussion_group_under_the_post() {
     let world = World::signed_in();
     world.connected();

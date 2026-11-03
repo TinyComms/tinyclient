@@ -656,8 +656,15 @@ fn mark_read(account: &Account, conversation: &str, message: &str) {
             account.input(who).and_then(|peer| account.ask(&tl::functions::messages::ReadHistory { peer, max_id }).map(drop))
         }
     };
+    let read = told.is_ok();
     if let Err(fault) = told {
         tracing::warn!("chatd: Telegram: read: {fault}");
+    }
+    // The comments were read: the badge on the post they hang off goes with them.
+    if let (true, who @ Who::Channel(_), Some(root)) = (read, who, topic) {
+        if account.dir().get(who).is_some_and(|known| known.broadcast) {
+            sync::comment_unread(account, who, root, 0);
+        }
     }
 }
 

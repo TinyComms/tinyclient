@@ -301,6 +301,8 @@ struct World {
     /// The cloud drafts Telegram keeps, by their conversation: some typed on the phone, some
     /// told by `saveDraft` from here. The key is whose, and in a forum which topic.
     drafts: HashMap<(Who, Option<i32>), String>,
+    /// Comments under the channel's post that the test says are unread.
+    comments_unread: i32,
     calls: PathBuf,
     /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
     dialogs_go: bool,
@@ -329,6 +331,7 @@ impl World {
             family_grew: false,
             lost_reads: false,
             drafts: HashMap::new(),
+            comments_unread: 0,
             calls: protocol::support_dir().join("telegram.calls"),
             dialogs_go: false,
             peer_go: false,
@@ -590,9 +593,10 @@ fn all_drafts(world: &World) -> Result<Vec<u8>, Fault> {
 
 /// What `getDiscussionMessage` answers for a channel post: the echo of the post, spoken in
 /// the discussion group as Telegram forwards it there, leading the thread — the id a send
-/// answers, learned when the thread is opened.
+/// answers, learned when the thread is opened. `unread` is how many of its comments the
+/// account has not read, as the test steers that.
 #[inline(never)]
-fn discussion_answer(place: &str) -> Result<Vec<u8>, Fault> {
+fn discussion_answer(place: &str, unread: i32) -> Result<Vec<u8>, Fault> {
     if place != key(Who::Channel(NOTES), Some(5)) {
         return Err(rpc(400, "MESSAGE_ID_INVALID", None));
     }
@@ -610,7 +614,7 @@ fn discussion_answer(place: &str) -> Result<Vec<u8>, Fault> {
         max_id: Some(51),
         read_inbox_max_id: Some(0),
         read_outbox_max_id: None,
-        unread_count: 0,
+        unread_count: unread,
         chats: chats(),
         users: users(),
     };
@@ -967,8 +971,10 @@ impl World {
                 vec![new(message)]
             }
             // The channel's post gains a section of comments: the post says its count and the
-            // linked group it is answered in, and two comments stand in the thread.
+            // linked group it is answered in, and two comments stand in the thread. A number
+            // after the word says how many of them the user has not read.
             "comments" => {
+                self.comments_unread = words.next().and_then(|count| count.parse().ok()).unwrap_or(0);
                 let mut post = message(Who::Channel(NOTES), 5, 0, T0 - 7_200, "Snow line is at 1,900 m this week.");
                 post.replies = Some(blank::<tl::types::MessageReplies>(&[&put(1u32), &put(2i32), &put(0i32), &put(CHATTERS)]).into());
                 self.store(None, post.clone());
@@ -1289,7 +1295,19 @@ impl World {
         if let Some(request) = asked::<f::messages::GetDiscussionMessage>(body) {
             let place = key(input_who(&request.peer), Some(request.msg_id));
             self.log(&format!("GetDiscussionMessage {place}"));
-            return discussion_answer(&place);
+            return discussion_answer(&place, self.comments_unread);
+        }
+        // A channel's posts and how many saw each: Telegram answers one entry for every id it
+        // was asked, in the order it was asked, and the post here has its count.
+        if let Some(request) = asked::<f::messages::GetMessagesViews>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("GetMessagesViews {} {}", peer.text(), request.id.iter().map(i32::to_string).collect::<Vec<_>>().join(" ")));
+            let views: Vec<tl::enums::MessageViews> = request.id.iter().map(|id| {
+                let seen = (*id == 5 && peer == Who::Channel(NOTES)).then_some(12_400);
+                tl::enums::MessageViews::Views(tl::types::MessageViews { views: seen, forwards: None, replies: None })
+            }).collect();
+            let found = tl::types::messages::MessageViews { views, chats: chats(), users: users() };
+            return answer(tl::enums::messages::MessageViews::Views(found));
         }
         if let Some(request) = asked::<f::messages::GetCustomEmojiDocuments>(body) {
             // A topic's icon picture: the documents the emoji ids name, stills at list size.

@@ -881,16 +881,19 @@ pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped,
 
 /// The thread a channel post's comments hang off. The post carries the count; the row it opens
 /// under is written with it, so the footer's ask never lands on a conversation that is not
-/// there. The newest comment's time only comes with the page of comments, so the value a stored
-/// post keeps is kept on its way in again.
+/// there. The newest comment's time and the comments' unread only come with the pages that
+/// read them, so the values a stored post keeps are kept on its way in again.
 fn comment_thread(account: &Account, conversation: &str, mapped: &mut Mapped) {
     let Some(thread) = &mut mapped.message.thread else {
         return;
     };
     if let Ok(Some(stored)) = account.ctx.stored_message(conversation, &mapped.message.id) {
         if let Some(old) = &stored.thread {
-            if old.id == thread.id && old.last > thread.last {
-                thread.last = old.last;
+            if old.id == thread.id {
+                if old.last > thread.last {
+                    thread.last = old.last;
+                }
+                thread.unread = old.unread;
             }
         }
     }
@@ -919,6 +922,8 @@ fn discussion(account: &Account, channel: Who, post: i32) -> Result<(Who, i32), 
     let request = tl::functions::messages::GetDiscussionMessage { peer: account.input(channel)?, msg_id: post };
     let tl::enums::messages::DiscussionMessage::Message(found) = account.ask(&request)?;
     account.learn(&found.users, &found.chats);
+    // How many comments the user has not read comes with the discussion, not with the post.
+    comment_unread(account, channel, post, found.unread_count);
     // The answer leads with the post itself, standing in the group: the id in it is what
     // a send answers, and the group it stands in is where a send goes.
     let Some((group, echo)) = found.messages.iter().find_map(|message| match message {
@@ -989,6 +994,23 @@ fn comment_time(account: &Account, post_at: Who, root: i32, sent: i64) {
     };
     section.last = sent;
     let _ = account.ctx.history(&post_at.text(), std::slice::from_ref(&post));
+}
+
+/// The comments' unread count, which comes with where the discussion is, onto the post whose
+/// footer shows it. A count that did not change writes nothing.
+pub(super) fn comment_unread(account: &Account, channel: Who, root: i32, unread: i32) {
+    let Ok(Some(mut post)) = account.ctx.stored_message(&channel.text(), &root.to_string()) else {
+        return;
+    };
+    let Some(section) = post.thread.as_mut() else {
+        return;
+    };
+    let unread = unread.max(0) as u32;
+    if section.unread == unread {
+        return;
+    }
+    section.unread = unread;
+    let _ = account.ctx.history(&channel.text(), std::slice::from_ref(&post));
 }
 
 /// One request for a page of a conversation's messages, newest first as Telegram answers.
@@ -1074,7 +1096,12 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
             authors.insert(author);
         }
     }
-    let messages: Vec<Message> = mapped.into_iter().map(|one| one.message).collect();
+    let mut messages: Vec<Message> = mapped.into_iter().map(|one| one.message).collect();
+    // A broadcast channel's posts show how many saw them. One ask covers the page, and the
+    // count is written with the posts below rather than fetched again for each.
+    if topic.is_none() && account.dir().get(who).is_some_and(|known| known.broadcast) {
+        views(account, who, &mut messages);
+    }
     // The newest page is whole: a stored message inside its range that Telegram no longer
     // lists was deleted while we were away.
     if let (Around::Newest, Some(newest), Some(oldest)) = (&around, messages.first(), messages.last()) {
@@ -1104,6 +1131,39 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
     text_emoji(account, conversation, &messages);
     account.files.want(wants);
     messages.into_iter().next()
+}
+
+/// The views of a channel's posts, in one ask for the page. Telegram counts a view when the
+/// app tells it to (`increment`), and reading a page is not the same as each post having been
+/// on screen, so nothing is added to the count here: what Telegram says stands.
+fn views(account: &Account, channel: Who, messages: &mut [Message]) {
+    let ids: Vec<i32> = messages.iter().filter_map(|message| message.id.parse().ok()).collect();
+    if ids.is_empty() {
+        return;
+    }
+    let Ok(peer) = account.input(channel) else {
+        return;
+    };
+    let request = tl::functions::messages::GetMessagesViews { peer, id: ids, increment: false };
+    let Ok(tl::enums::messages::MessageViews::Views(found)) = account.ask(&request) else {
+        return;
+    };
+    account.learn(&found.users, &found.chats);
+    // Telegram answers in the order it was asked: no id comes back with a count.
+    let counts: HashMap<i32, u32> = request
+        .id
+        .iter()
+        .zip(found.views.iter())
+        .filter_map(|(id, one)| {
+            let tl::enums::MessageViews::Views(counts) = one;
+            Some((*id, counts.views?.max(0) as u32))
+        })
+        .collect();
+    for message in messages {
+        if let Some(count) = message.id.parse().ok().and_then(|id| counts.get(&id)) {
+            message.views = Some(*count);
+        }
+    }
 }
 
 /// The user opened a conversation.

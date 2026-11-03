@@ -55,6 +55,12 @@ fn message(account: &Account, raw: &tl::enums::Message, edit: bool) {
             mapped.message.client_id = live.sent.remove(at).map(|(_, client_id)| client_id);
         }
     }
+    // An edit says nothing of a channel post's views: the count the page read kept stands.
+    if edit && mapped.message.views.is_none() {
+        if let Ok(Some(stored)) = account.ctx.stored_message(&conversation, &mapped.message.id) {
+            mapped.message.views = stored.views;
+        }
+    }
     let _ = account.ctx.message(&conversation, &mapped.message);
     // What it shows is fetched only when the user is looking at the conversation; otherwise
     // opening it fetches the page it is on.
