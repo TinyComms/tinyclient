@@ -436,8 +436,8 @@ pub struct Conversation {
     /// Only invited people see it: drawn with a lock.
     #[serde(default, skip_serializing_if = "is_false")]
     pub private: bool,
-    /// End-to-end encrypted or not, where the network says (a Tiny server). Fixed when it was
-    /// made: a plaintext conversation never becomes an encrypted one.
+    /// End-to-end encrypted or not, where the network says (a Tiny server). A plaintext
+    /// conversation can be upgraded once; messages from before that stay readable by the server.
     #[serde(default, skip_serializing_if = "Encryption::is_unknown")]
     pub encryption: Encryption,
     /// What the user had typed and not sent, kept by chatd across restarts (`SetDraft`).

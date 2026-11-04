@@ -28,7 +28,7 @@ pub fn phone_words(encryption: protocol::Encryption) -> &'static str {
     match encryption {
         protocol::Encryption::Unknown => "",
         protocol::Encryption::Plain => "Server can read",
-        protocol::Encryption::EndToEnd => "Encrypted",
+        protocol::Encryption::EndToEnd | protocol::Encryption::EndToEndAfterPlain => "Encrypted",
     }
 }
 
@@ -50,7 +50,7 @@ impl Shell {
         // as the subtitle's line here (a lock and the words, or that the server can read it).
         // A tap opens Encryption, where the safety numbers are.
         let encryption = (!open.encryption.is_unknown()).then(|| {
-            let sealed = open.encryption == protocol::Encryption::EndToEnd;
+            let sealed = open.encryption.is_sealed();
             let (icon, tone) = if sealed { ("icons/lock.svg", theme::text_soft()) } else { ("icons/triangle-alert.svg", theme::text_faint()) };
             let account = open.key.account();
             div()

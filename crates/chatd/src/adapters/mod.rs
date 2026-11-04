@@ -619,6 +619,20 @@ impl Context {
         Ok(())
     }
 
+    /// A conversation this client already has was upgraded to end-to-end encryption. Only the
+    /// label changes; the row is not rebuilt.
+    pub fn mark_encryption(
+        &self,
+        conversation_id: &str,
+        encryption: protocol::Encryption,
+    ) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_encryption(&conversation, encryption)? {
+            self.hub.changed(Change::Conversation { conversation });
+        }
+        Ok(())
+    }
+
     /// How far this user has read one conversation here, as far as the store says. It stays what
     /// they did, and a network count older than it is a lost tell of it, not the truth.
     pub fn read_up_to(&self, conversation_id: &str) -> Option<String> {

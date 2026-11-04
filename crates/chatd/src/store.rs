@@ -1706,6 +1706,26 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// The encryption label of one conversation, after a live upgrade. The rest of the row stays.
+    /// False when there is no such conversation, or the label was already this.
+    pub fn set_encryption(
+        &mut self,
+        conversation: &Key,
+        encryption: protocol::Encryption,
+    ) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE conversation SET encryption = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3 AND encryption != ?4",
+            params![
+                word(&conversation.network),
+                conversation.account,
+                conversation.id,
+                word(&encryption)
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// The unread state the network reported: at connect, or when another device read it. The
     /// preview is left alone; it comes from messages. Mentions going up are noticed: the Inbox
     /// keeps a channel a day after it mentioned me.

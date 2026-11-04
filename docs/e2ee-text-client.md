@@ -42,8 +42,10 @@ server and deletes the directory.
 - **Reading.** Rows of an encrypted conversation are opened (or read from the cache) oldest epoch
   first; an edit is folded into its target if the target's author sent it. The server's `body` is
   never read for such a row. What does not open reads "Can't be decrypted on this device" with
-  `Seal::Undecryptable`. A plaintext conversation is `Encryption::Plain` and says "Not end-to-end
-  encrypted"; it never becomes encrypted.
+  `Seal::Undecryptable`. A plaintext conversation is `Encryption::Plain` until this device is
+  ready and the server allows encryption: it then asks `POST /v1/conversations/{id}/e2ee`. Older
+  messages stay in the clear and the header says they can still be read by the server. A
+  conversation that was encrypted from the start does not say that.
 - **Files out.** PNG, JPEG and WebP are decoded with limits (16,384 px a side, 100 MP, 512 MiB) and
   turned upright, then written again (JPEG stays JPEG at quality 88, the others become PNG), which
   drops EXIF, XMP, IPTC and GPS. "Send as file" and originals skip it. The file is sealed under a
