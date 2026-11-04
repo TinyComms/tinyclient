@@ -63,14 +63,39 @@ that passes on the base proves nothing new, so the lab reports `failure` and say
 A refactor, perf change or chore has no new scenario: step 3 is skipped, and the lab runs the
 existing `smoke` scenarios on the branch only.
 
+### What can certify a change
+
+Only a run of the **whole** required plan, with its evidence published, posts `e2e-proof` or
+`e2e-release`. The lab refuses everything that would let a smaller run speak for a bigger one:
+
+- `--platforms a,b` runs those platforms and posts their own `e2e-lab/<platform>` results. It posts
+  no aggregate. It exits non-zero if a platform it ran was red.
+- Posting needs the upload. `--no-upload` without `--no-post` is refused before anything runs. A
+  platform is green only if its recording, steps and `proof.json` are in the proof release; a lost
+  upload turns it red.
+- The release suite is the `"release": true` scenarios **in the commit being certified**, not in
+  the checkout the lab runs from. A commit with none fails; it does not pass an empty suite.
+- A `feature` or `fix` with no named scenario, a `docs` pull request that changes code, and a pull
+  request with no single type are failures, not "nothing to record".
+- Each scenario keeps its own folder, steps and recording, so two scenarios on one platform cannot
+  overwrite each other's evidence.
+- A silent Mac does not hang the lab: the deadline is enforced apart from reading its output.
+
+`e2e/lab/test_orchestration.py` drives `main()` with git, hosts, uploads and GitHub replaced, and
+holds each of these.
+
 ### A valid recording
 
 The lab checks these with `ffprobe` and `ffmpeg`, and fails the platform if any is false.
 
 - Started before the first step and stopped after the last, so no step happens off camera.
-- At least the length of the step log, at least 640x480, and playable.
-- Not black and not frozen: the frame difference (`signalstats` `YDIF`) is above zero across the
-  run, and no gap of more than 5 seconds is identical.
+- Playable, with a short side of at least 360 px, and no step later than the end of the run: no step
+  happens off camera. A recorder that writes frames only when the screen changes (`screenrecord`,
+  `simctl`) ends its file at the last change; the adapter says `vfr=True` and the lab pads the clip.
+- Not black, and it moves: at least a second of change in the run, and no single still stretch longer
+  than the scenario's `max_still_seconds` (default 20). A screen holding still is normal for a UI.
+  A run that was meant to fail (the base) is checked only for playing and showing its steps: a
+  failing app may sit still or go dark, and that is the evidence.
 - The SHA and the step name are burned into the picture (`drawtext` from `steps.jsonl`), so a
   clip cannot be moved to another pull request.
 - Audio scenarios also keep the received audio and run `scripts/e2e/tone-check.py` on it.
@@ -103,12 +128,41 @@ to 2 GB each and cost nothing. The `target_url` of each status is that release.
 | Android | the emulator | `adb shell screenrecord --time-limit 180 /sdcard/n.mp4`, one after another, joined with `ffmpeg -f concat` | until the run ends |
 | Windows | `winbuild` | `ffmpeg -f gdigrab -framerate 10 -i desktop …` in the console session | `q` on stdin |
 
-Not working yet, from the 2026-11-04 check: Windows has no ffmpeg; the Mac's Screen Recording
-permission for ffmpeg over `ssh` is unchecked; the Android emulator has not run a recording.
+macOS is recorded as the tinyclient window only, never the whole display: the Mac is a laptop in
+daily use and the recordings are public.
 
 ## Not built yet
 
-Built: `pr-gate`, the pull request template, `gate.json`, and the `e2e:` line in
-`release-cut.sh`. Everything under "A lab run" is a contract, not code yet. The lab driver, the
-first scenario (the call, from `scripts/e2e/local-tiny-call.ps1`, which already records Linux) and
-the recording checks come in the rollout order in `docs/quality-gate.md`.
+Built: `pr-gate`, the pull request template, `gate.json`, the `e2e:` line in `release-cut.sh`, and
+the lab (`e2e/lab/lab.py`, `common.py`, `platforms/`), with one scenario, `smoke`.
+
+```
+python e2e/lab/lab.py try smoke --platforms linux     # branch build only, posts nothing
+python e2e/lab/lab.py pr 170                          # base then branch, posts the statuses
+python e2e/lab/lab.py release                         # the release suite on origin/main
+python -m unittest discover -s e2e/lab -p "test_*.py"  # needs ffmpeg and ffprobe on PATH
+```
+
+`try` reads the scenario from the working tree; `pr` and `release` read it from the commit. The
+lab needs `gh` signed in as the account in `gate.json` `lab_actors`, `ssh` to the hosts, and
+ffmpeg/ffprobe here (`E2E_FFMPEG`).
+
+### Status of each platform (2026-11-04)
+
+| Platform | State | Evidence |
+| --- | --- | --- |
+| Linux | works | `lab.py try smoke`: validated, captioned recording; sabotage run fails on the inbox step; warm run 22 s |
+| Windows | works | the same on `winbuild`; ffmpeg 9.0.2 and protoc 29.3 installed in `C:\lab\tools` (no admin) |
+| Android | works | the same on a headless `Pixel_7`; builds the `demo` APK |
+| macOS | **blocked** | needs Screen Recording and Accessibility for `~/Development/tiny-lab/bin/TinyLabHelper.app` (System Settings > Privacy & Security). Not granted, so the recorder, key presses and driver are untested. |
+| iOS | **blocked** | build, install and the conversation tap work; no passing `try` run yet. The first inbox check failed on a white screenshot while the recording showed the inbox, cause not found. |
+| Mac host | **blocked** | `~/Development` is on an external drive that stalled (`ls` fails). The internal disk is at 97%, so the build cannot move there without a decision. |
+
+Nothing in this table is a pass for macOS or iOS. Until both have a recording, `release_proof` stays
+`report` and `e2e-proof` is not made a required check, or every change under `crates/` would be
+unmergeable.
+
+Known departures from the shipped app: the Android and iOS clips are a `demo` build (invented data
+compiled in), and at `origin/main` 957aaae the Android `demo` build does not compile
+(`mobile/android/loopback.rs` uses the old `mediad::picture::phone::Pictures`), so the adapter drops
+those two lines. `smoke` never opens the call screen, which is the only place they are used.

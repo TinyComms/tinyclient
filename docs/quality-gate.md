@@ -71,11 +71,14 @@ The lab is the machines that already exist, driven over `ssh`. Nothing in GitHub
 
 | Platform | Host | Recorder | Checked 2026-11-04 |
 | --- | --- | --- | --- |
-| Linux | `tiny-linux` VM (X11, 1280x800) | ffmpeg `x11grab` | works; `vm-desktop.sh` already does it |
-| iOS | `mbp` simulator (iPhone 18 Pro) | `xcrun simctl io <udid> recordVideo` | works: recorded h264 |
-| macOS | `mbp` | ffmpeg `avfoundation` ("Capture screen 0") | device is there; Screen Recording permission for ffmpeg over ssh **not yet checked** |
-| Android | Zeppelin AVD `Pixel_7` (WHPX) | `adb shell screenrecord`, chained (3 minute limit) | AVD exists; **not yet run** |
-| Windows | `winbuild` VM (console session active) | ffmpeg `gdigrab` | session fine; **ffmpeg is not installed there** |
+| Linux | `tiny-linux` VM (X11, 1280x800) | ffmpeg `x11grab` | **works**: recorded `smoke`, validated |
+| Windows | `winbuild` VM, in its console session through a one-shot task | ffmpeg `gdigrab` | **works**: recorded `smoke`, validated |
+| Android | headless `Pixel_7` on Zeppelin (WHPX) | `adb shell screenrecord`, chained past its 3 minute limit | **works**: recorded `smoke`, validated |
+| iOS | `mbp` simulator (iPhone 18 Pro) | `xcrun simctl io <udid> recordVideo` | **blocked**: builds and installs, no passing run yet |
+| macOS | `mbp`, the tinyclient window only | `TinyLabHelper.app` (ScreenCaptureKit) | **blocked**: Screen Recording and Accessibility not granted |
+
+The Mac host is also blocked: its external drive stalled and its internal disk is at 97%. Details
+and the exact steps are in [`e2e/README.md`](../e2e/README.md#status-of-each-platform-2026-11-04).
 
 Why push and not a self-hosted runner: both repositories are public. A self-hosted runner on this
 network runs whatever a fork pull request sends it. The lab only builds and runs a pull request
@@ -108,11 +111,14 @@ Each step is a line in `e2e/gate.json` or one branch-protection setting, so it c
 platform at a time and come off if it stalls the work.
 
 1. **Now**: template, `pr-gate` with `template` and `scenario` enforced. Nothing needs a lab.
-2. Linux + Android lab (the local call test already records Linux; add the Android recording).
-   First scenario: the call, from `scripts/e2e/local-tiny-call.ps1`.
-3. iOS (simulator, on the Mac) and macOS.
-4. Windows (install ffmpeg on `winbuild`).
-5. Require `e2e-proof` on `main`. Release suite on. `"release_proof": "enforce"`.
+2. **Done**: the lab, and Linux, Windows and Android recording `smoke`.
+3. **Blocked, needs Justin at the Mac**: macOS and iOS (permissions, the stalled drive, disk space).
+4. Require `e2e-proof` on `main`, and set `"release_proof": "enforce"`. Not before step 3: the plan
+   for a change under `crates/` includes macOS and iOS, so the check could never go green. The
+   call scenario from `scripts/e2e/local-tiny-call.ps1` is not ported yet either; that script is
+   broken at present because the server now refuses a bare-IP `TINYSERVER_PUBLIC_URL`.
 
-Before step 5, `ci` has to be reliable. The latest run on `main` is red only because
-`test (macos-latest)` was cancelled; a required check that flakes stalls every pull request.
+Before step 4, `ci` has to be reliable. The red runs on `main` on 2026-11-03 and 2026-11-04 were
+`test (macos-latest)` never getting a hosted runner ("not acquired ... capacity constraints"), not a
+failing test. A required check that can fail that way stalls every pull request, so decide first
+whether `test (macos-latest)` is required or only the other jobs are.

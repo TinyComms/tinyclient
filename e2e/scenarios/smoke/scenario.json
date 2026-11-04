@@ -1,0 +1,8 @@
+{
+  "id": "smoke",
+  "title": "The app starts on invented demo data, shows its inbox, opens a conversation, and quits cleanly",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": true,
+  "max_still_seconds": 30
+}
