@@ -2,6 +2,8 @@
 //! could fetch: so the pictures a row shows (thumbnails, stills, avatars) are fetched here, one
 //! at a time, into the media cache's own directory, and recorded as the cache records a file
 //! that landed. From then on they are the cache's: counted, evicted and deleted like any other.
+//! A picture asked for as a row's (`Watch` says which rows are on screen) waits, unfetched,
+//! once the row has scrolled away, and goes back in line when it is on screen again.
 //!
 // CONTRACT: an adapter has no way to hand the media cache a file. This does what the cache does
 // when one lands (`Store::register_media`, `Store::media_landed`, `Change::Media`) and nothing
@@ -15,13 +17,14 @@ use crate::adapters::net;
 use crate::blobs;
 use crate::hub::now;
 use grammers_tl_types as tl;
-use protocol::{Change, MediaKind};
+use protocol::{Change, Key, MediaKind};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{RecvTimeoutError, channel, Sender};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 /// Files waiting their turn. Past this, new ones are let go: they are asked for again when
 /// their conversation is next opened.
@@ -30,6 +33,11 @@ const WAITING: usize = 256;
 const PIECE: i32 = 256 * 1024;
 /// The least time between two file requests.
 const PACE: std::time::Duration = std::time::Duration::from_millis(250);
+/// While a row's picture waits for its row to come back, the screen is looked at this
+/// often; the watch's `Look` wakes this sooner.
+const PARKED_LOOK: Duration = Duration::from_secs(1);
+/// A row's picture whose row has been away this long is no longer waited for.
+const PARKED_FOR: Duration = Duration::from_secs(600);
 /// The largest picture fetched for a row.
 const LARGEST: u64 = 2 * 1024 * 1024;
 /// The largest original fetched for the viewer, whatever Telegram says it is.
@@ -49,6 +57,8 @@ enum Job {
     Fetch(Box<Want>),
     /// The viewer is waiting on it: it goes before every row's picture.
     First(Box<Want>),
+    /// What is on screen changed: rows that came back put their pictures back in line.
+    Look,
 }
 
 pub struct Files {
@@ -69,10 +79,34 @@ impl Files {
             // Datacenters this connection's sign-in has been carried to.
             let mut carried = HashSet::new();
             let mut queue: VecDeque<Box<Want>> = VecDeque::new();
+            // Rows' pictures asked for and since scrolled away, with when each was parked.
+            let mut parked: Vec<(Instant, Box<Want>)> = Vec::new();
+            let mut gone = false;
             loop {
                 // Everything sent so far is read before the next fetch, so an original the
                 // viewer asked for does not wait behind the rows' pictures.
-                let next = if queue.is_empty() { inbox.recv().ok() } else { inbox.try_recv().ok() };
+                let next = if !queue.is_empty() {
+                    inbox.try_recv().ok()
+                } else if parked.is_empty() {
+                    match inbox.recv() {
+                        Ok(job) => Some(job),
+                        Err(_) => {
+                            gone = true;
+                            None
+                        }
+                    }
+                } else {
+                    // Nothing to fetch while rows' pictures wait for their rows: the screen
+                    // is looked at this often, and a `Look` wakes this at once.
+                    match inbox.recv_timeout(PARKED_LOOK) {
+                        Ok(job) => Some(job),
+                        Err(RecvTimeoutError::Timeout) => None,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            gone = true;
+                            None
+                        }
+                    }
+                };
                 if let Some(job) = next {
                     match job {
                         Job::Attach(to) => {
@@ -81,11 +115,19 @@ impl Files {
                         }
                         Job::Fetch(want) => queue.push_back(want),
                         Job::First(want) => queue.push_front(want),
+                        Job::Look => rows_back(&account, &mut parked, &mut queue),
                     }
                     continue;
                 }
+                // Nothing new at the wire: rows that came back go first, then the queue.
+                rows_back(&account, &mut parked, &mut queue);
                 let Some(want) = queue.pop_front() else {
-                    return;
+                    // The wire is gone and nothing is left to fetch: the thread ends,
+                    // whatever still waits for a row.
+                    if gone {
+                        return;
+                    }
+                    continue;
                 };
                 counted.fetch_sub(1, Ordering::Relaxed);
                 let Some(account) = account.upgrade() else {
@@ -93,6 +135,12 @@ impl Files {
                 };
                 if ctx.stopped() {
                     return;
+                }
+                // A row's picture whose row scrolled away waits for it to come back,
+                // unfetched.
+                if want.watched && want.row.as_deref().is_none_or(|row| !row_shown(&account, row)) {
+                    parked.push((Instant::now(), want));
+                    continue;
                 }
                 if let Err(fault) = fetch(&account, &want, &mut carried) {
                     // A reference that ran out is renewed by the next page that names the file.
@@ -117,6 +165,12 @@ impl Files {
 
     pub fn attach(&self, account: &Arc<Account>) {
         let _ = self.jobs.send(Job::Attach(Arc::downgrade(account)));
+    }
+
+    /// What is on screen changed (`Watch`): rows whose pictures wait for their rows are
+    /// looked at again, so one scrolled back goes first in line.
+    pub fn look(&self) {
+        let _ = self.jobs.send(Job::Look);
     }
 
     /// Queues what rows on screen show, and keeps the originals' places for [`Files::asked`].
@@ -157,6 +211,31 @@ impl Files {
 
 fn media_dir() -> PathBuf {
     protocol::support_dir().join("media")
+}
+
+/// Whether the row this picture hangs on is on screen now. The shell says (`Watch`); the
+/// open conversation is on screen whatever the list shows.
+fn row_shown(account: &Account, row: &str) -> bool {
+    let watching = account.ctx.watching();
+    let shown = |key: &Key| key.account() == account.ctx.account && key.id == row;
+    watching.rows.iter().any(shown) || watching.conversation.as_ref().is_some_and(|open| shown(open))
+}
+
+/// Rows that came back put their pictures back in line, at its front, in the order they
+/// were parked; what is still away stays parked, and what has waited too long goes: the
+/// shell asks again if the row is still there.
+fn rows_back(account: &Weak<Account>, parked: &mut Vec<(Instant, Box<Want>)>, queue: &mut VecDeque<Box<Want>>) {
+    let Some(account) = account.upgrade() else {
+        return;
+    };
+    let (back, kept): (Vec<_>, Vec<_>) = std::mem::take(parked).into_iter().partition(|(at, want)| {
+        at.elapsed() < PARKED_FOR && want.row.as_deref().is_some_and(|row| row_shown(&account, row))
+    });
+    // What waited too long for its row is let go, whatever the screen says now.
+    *parked = kept.into_iter().filter(|(at, _)| at.elapsed() < PARKED_FOR).collect();
+    for (_, want) in back.into_iter().rev() {
+        queue.push_front(want);
+    }
 }
 
 /// One file, from Telegram to the cache's directory.

@@ -609,9 +609,11 @@ pub(super) fn on_screen(account: &Account, watching: &Watching) {
         .collect();
     let mut pictures = Vec::new();
     for who in &rows {
-        let Some(want) = avatar(account, *who) else {
+        let Some(mut want) = avatar(account, *who) else {
             continue;
         };
+        // A row the shell lists: its picture waits while the row is scrolled away.
+        want.watched = true;
         let mut live = account.live();
         if live.pictured.len() >= 4_096 {
             live.pictured.clear();
@@ -620,6 +622,9 @@ pub(super) fn on_screen(account: &Account, watching: &Watching) {
             pictures.push(want);
         }
     }
+    // The screen changed with this `Watch`: rows that scrolled back go first, in line,
+    // then what is on it now is asked for.
+    account.files.look();
     account.files.want(pictures);
     for list in 0..2 {
         let next = {
@@ -682,6 +687,7 @@ pub(super) fn avatar(account: &Account, who: Who) -> Option<Want> {
         location: tl::types::InputPeerPhotoFileLocation { big: false, peer: dir.input_peer(who)?, photo_id: known.photo }.into(),
         inline: None,
         row: Some(who.text()),
+        watched: false,
         original: false,
     })
 }
@@ -759,6 +765,7 @@ fn emoji_want(document: &tl::types::Document, row: Option<String>) -> Want {
         }),
         inline: None,
         row,
+        watched: false,
         original: false,
     }
 }
