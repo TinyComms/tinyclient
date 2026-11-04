@@ -18,7 +18,7 @@ use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use crate::view::{age, now};
 use gpui::{div, prelude::*, px, AnyElement, Context, Entity, Focusable, FontWeight, HighlightStyle, MouseButton, SharedString, StyledText, Window};
-use protocol::{ConversationKind, Key, Link, Message, MessageHit, Network, Request, Response, ThreadSummary};
+use protocol::{Capabilities, ConversationKind, Key, Link, Message, MessageHit, Network, Request, Response, ThreadSummary};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -98,9 +98,13 @@ pub enum Scope {
     Space,
 }
 
-/// Whether the pane's Enter asks this network itself: Slack and Discord search a Space or one
-/// conversation, Telegram only one conversation. Everywhere is the cache alone.
-fn network_searches(network: Network, scope: Scope) -> bool {
+/// Whether the pane's Enter asks this account's network itself: the account's capabilities say
+/// it searches, and the scope is one the network takes. Slack and Discord search a Space or
+/// one conversation, Telegram only one conversation. Everywhere is the cache alone.
+fn network_searches(can: &Capabilities, network: Network, scope: Scope) -> bool {
+    if !can.search {
+        return false;
+    }
     match network {
         Network::Discord | Network::Slack => scope != Scope::Everywhere,
         Network::Telegram => scope == Scope::Conversation,
@@ -806,7 +810,10 @@ impl Shell {
             self.open_search_hit(&hit, cx);
             return;
         }
-        let can_ask_network = self.open_key().is_some_and(|key| network_searches(key.network, scope));
+        let can_ask_network = self.open_key().is_some_and(|key| {
+            let can = self.snapshot.as_ref().and_then(|snapshot| snapshot.account(&key.account())).map(|account| account.can).unwrap_or_default();
+            network_searches(&can, key.network, scope)
+        });
         if !can_ask_network {
             if let Some(hit) = first {
                 self.open_search_hit(&hit, cx);
@@ -1450,14 +1457,19 @@ mod tests {
     }
 
     #[test]
-    fn enter_asks_a_network_only_for_a_scope_it_can_search() {
-        assert!(network_searches(Network::Slack, Scope::Conversation));
-        assert!(network_searches(Network::Slack, Scope::Space));
-        assert!(network_searches(Network::Discord, Scope::Space));
-        assert!(network_searches(Network::Telegram, Scope::Conversation));
-        assert!(!network_searches(Network::Telegram, Scope::Space), "Telegram searches one conversation at a time");
-        assert!(!network_searches(Network::Teams, Scope::Space), "Teams is not asked yet");
-        assert!(!network_searches(Network::Slack, Scope::Everywhere), "Everywhere is the cache alone");
+    fn enter_asks_a_network_only_where_the_account_says_it_searches_and_for_a_scope_it_takes() {
+        let searching = Capabilities { search: true, ..Capabilities::default() };
+        assert!(network_searches(&searching, Network::Slack, Scope::Conversation));
+        assert!(network_searches(&searching, Network::Slack, Scope::Space));
+        assert!(network_searches(&searching, Network::Discord, Scope::Space));
+        assert!(network_searches(&searching, Network::Telegram, Scope::Conversation));
+        assert!(!network_searches(&searching, Network::Telegram, Scope::Space), "Telegram searches one conversation at a time");
+        assert!(!network_searches(&searching, Network::Teams, Scope::Space), "Teams is not asked yet");
+        assert!(!network_searches(&searching, Network::Slack, Scope::Everywhere), "Everywhere is the cache alone");
+        // A network that has not said it searches is never asked, whatever the scope.
+        let quiet = Capabilities::default();
+        assert!(!network_searches(&quiet, Network::Slack, Scope::Conversation));
+        assert!(!network_searches(&quiet, Network::Telegram, Scope::Conversation), "the demo answers no network search");
     }
 
     #[test]
