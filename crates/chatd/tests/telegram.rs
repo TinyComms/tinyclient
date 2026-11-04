@@ -379,6 +379,77 @@ fn the_chats_are_one_list_with_no_space_each_filed_in_every_folder_it_matches() 
 }
 
 #[test]
+fn a_chip_counts_the_unread_unmuted_chats_of_its_folder_and_one_in_two_folders_counts_in_both() {
+    let world = World::signed_in();
+    world.connected();
+    let Response::Folders { folders } = world.ask(Request::Folders { network: Network::Telegram }) else {
+        panic!("no folders");
+    };
+    let count = |id: &str| folders.iter().find(|folder| folder.key.id == id).map(|folder| (folder.unread, folder.mentions));
+    // Work holds the forum (one unread) and the group (read); Family holds Odalys (one unread)
+    // and the group. A read chat counts on no chip.
+    assert_eq!(count("2"), Some((1, 0)), "{folders:?}");
+    assert_eq!(count("3"), Some((1, 0)), "{folders:?}");
+    // A message that names me in the group, which sits in both folders, counts on both chips.
+    world.steer("mention group");
+    let folders = world.until("the mention on both chips", || {
+        let Response::Folders { folders } = world.ask(Request::Folders { network: Network::Telegram }) else {
+            panic!("no folders");
+        };
+        let count = |id: &str| folders.iter().find(|folder| folder.key.id == id).map(|folder| (folder.unread, folder.mentions));
+        (count("2") == Some((2, 1)) && count("3") == Some((2, 1))).then_some(folders)
+    });
+    assert_eq!(folders.iter().map(|folder| folder.key.id.as_str()).collect::<Vec<_>>(), ["2", "3"], "{folders:?}");
+}
+
+#[test]
+fn an_archived_chat_stays_out_of_the_home_and_inbox_until_it_mentions_me() {
+    let world = World::signed_in();
+    world.connected();
+    let home_ids = || -> Vec<String> { world.home(None, Shelf::Main).into_iter().map(|row| row.key.id).collect() };
+    let inbox_ids = || -> Vec<String> {
+        match world.ask(Request::Inbox { network: Some(Network::Telegram), filter: Default::default(), offset: 0, limit: 50 }) {
+            Response::Conversations { conversations, .. } => conversations.into_iter().map(|row| row.key.id).collect(),
+            other => panic!("{other:?}"),
+        }
+    };
+    // Tobin is archived: not in the home list, not in the Inbox, not on the rail's count.
+    assert!(!home_ids().contains(&"u7003".to_owned()));
+    assert!(!inbox_ids().contains(&"u7003".to_owned()), "{:?}", inbox_ids());
+    assert_eq!(world.status().0[0].attention, 1, "{:#?}", world.status().0);
+    // His message names me: the archived chat reaches the Inbox and raises the count,
+    // and the home list still keeps the archive out.
+    world.steer("mention");
+    world.until("the mention on the archived row", || world.conversation("u7003").filter(|row| row.mentions > 0).map(drop));
+    assert!(inbox_ids().contains(&"u7003".to_owned()), "{:?}", inbox_ids());
+    assert!(!home_ids().contains(&"u7003".to_owned()), "{:?}", home_ids());
+    assert_eq!(world.status().0[0].attention, 2, "{:#?}", world.status().0);
+}
+
+#[test]
+fn a_folder_that_excludes_read_chats_keeps_the_open_one_until_it_is_left() {
+    let world = World::signed_in();
+    world.connected();
+    let ids = |rows: Vec<Conversation>| rows.into_iter().map(|row| row.key.id).collect::<Vec<_>>();
+    // The Work folder now takes its chats by kind and leaves read ones out: the read group
+    // goes, the unread forum stays.
+    world.steer("exclude-read");
+    world.until("the read group out of Work", || {
+        (ids(world.home(Some("2"), Shelf::Main)) == ["c9002".to_owned()]).then_some(())
+    });
+    // The forum is open while it is read: it keeps its place in Work.
+    world.watch(Watching { conversation: Some(key("c9002")), ..Watching::default() });
+    world.steer("read-forum");
+    world.until("the forum read", || world.conversation("c9002").filter(|row| row.unread == 0).map(drop));
+    assert_eq!(ids(world.home(Some("2"), Shelf::Main)), ["c9002".to_owned()], "the open chat stays put while it is read");
+    // Leaving it files it again by the live facts: a read chat is out of Work.
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.until("the forum out of Work once left", || {
+        ids(world.home(Some("2"), Shelf::Main)).is_empty().then_some(())
+    });
+}
+
+#[test]
 fn chats_past_the_newest_500_load_as_the_list_scrolls_with_their_pictures() {
     let world = World::crowded(650);
     world.connected();

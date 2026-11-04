@@ -316,6 +316,8 @@ struct World {
     revoked: bool,
     /// Tobin was added to the Family folder (`folder`).
     family_grew: bool,
+    /// The Work folder now takes its chats by kind and leaves read ones out (`exclude-read`).
+    exclude_read: bool,
     /// A read of the group that no longer counts here, as one told during a dropped link. It
     /// stays lost until that read is told again, and then it is heard.
     lost_reads: bool,
@@ -351,6 +353,7 @@ impl World {
             revoked: false,
             family_grew: false,
             lost_reads: false,
+            exclude_read: false,
             drafts: HashMap::new(),
             comments_unread: 0,
             calls: protocol::support_dir().join("telegram.calls"),
@@ -403,14 +406,21 @@ impl World {
         match id {
             WORK => {
                 filter.title = named("Work");
-                let channel: tl::enums::InputPeer =
-                    tl::types::InputPeerChannel { channel_id: WORKSHOP, access_hash: 0 }.into();
-                if lost_pin() {
-                    // A pin whose chat lies past the pages the test's dialogs pass carries.
-                    filter.pinned_peers = vec![crew.clone()];
-                    filter.include_peers = vec![channel];
+                if self.exclude_read {
+                    // The same folder with "exclude read chats" on: it takes groups by kind,
+                    // naming none, so a read chat leaves it.
+                    filter.groups = true;
+                    filter.exclude_read = true;
                 } else {
-                    filter.include_peers = vec![channel, crew];
+                    let channel: tl::enums::InputPeer =
+                        tl::types::InputPeerChannel { channel_id: WORKSHOP, access_hash: 0 }.into();
+                    if lost_pin() {
+                        // A pin whose chat lies past the pages the test's dialogs pass carries.
+                        filter.pinned_peers = vec![crew.clone()];
+                        filter.include_peers = vec![channel];
+                    } else {
+                        filter.include_peers = vec![channel, crew];
+                    }
                 }
             }
             _ => {
@@ -1089,6 +1099,32 @@ impl World {
             "folder" => {
                 self.family_grew = true;
                 vec![update(tl::types::UpdateDialogFilter { id: FAMILY, filter: Some(self.folder(FAMILY)) }.into())]
+            }
+            // The Work folder's rules changed: it takes groups by kind and leaves read ones out.
+            "exclude-read" => {
+                self.exclude_read = true;
+                vec![update(tl::types::UpdateDialogFilter { id: WORK, filter: Some(self.folder(WORK)) }.into())]
+            }
+            // The forum was read, here or on the phone: nothing in it is unread.
+            "read-forum" => vec![update(tl::types::UpdateReadChannelInbox {
+                folder_id: None,
+                channel_id: WORKSHOP,
+                max_id: 41,
+                still_unread_count: 0,
+                pts: 0,
+            }
+            .into())],
+            // A message that names me: in the group ("mention group") or, none named, in the
+            // archived chat, which then reaches the Inbox and the rail's count for it.
+            "mention" => {
+                let (who, id) = match words.next() {
+                    Some("group") => (Who::Group(CREW), 21),
+                    _ => (Who::User(TOBIN), 32),
+                };
+                let mut said = message(who, id, TOBIN, T0 + 90, "Are you seeing this?");
+                said.mentioned = true;
+                self.store(None, said.clone());
+                vec![new(said)]
             }
             // Odalys (or the chat the line names) read my messages up to this one.
             "outbox" => {

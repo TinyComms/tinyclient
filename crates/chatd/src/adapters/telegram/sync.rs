@@ -571,6 +571,34 @@ fn peer_dialog(account: &Account, who: Who) -> Option<tl::types::Dialog> {
 /// What the shell has on screen changed: the pictures of the rows on it are fetched, each once,
 /// and a list scrolled near the end of what is loaded reads its next page.
 pub(super) fn on_screen(account: &Account, watching: &Watching) {
+    // The open chat's read fact freezes while it is open, so a folder that excludes read
+    // chats keeps it until another conversation takes its place.
+    let open = watching
+        .conversation
+        .as_ref()
+        .filter(|open| open.account() == account.ctx.account)
+        .and_then(|open| Who::parse(&open.id))
+        .and_then(|(who, topic)| topic.is_none().then_some(who));
+    let left = {
+        let mut live = account.live();
+        match (live.filed.open.take(), open) {
+            // The same chat stays open: its read fact stays as it was when it opened.
+            (Some((held, read)), Some(who)) if held == who => {
+                live.filed.open = Some((held, read));
+                None
+            }
+            // Another chat takes its place: the one that left is filed by the live facts.
+            (left, Some(who)) => {
+                let read = live.filed.facts.get(&who).copied().unwrap_or_default().read;
+                live.filed.open = Some((who, read));
+                left
+            }
+            (left, None) => left,
+        }
+    };
+    if let Some((held, _)) = left {
+        filing::refile(account, [held]);
+    }
     let rows: Vec<Who> = watching
         .rows
         .iter()

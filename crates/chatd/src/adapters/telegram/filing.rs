@@ -50,6 +50,9 @@ pub(super) type Cursor = (i32, i32, Who);
 pub(super) struct Filed {
     pub rules: Vec<Rule>,
     pub facts: HashMap<Who, Facts>,
+    /// The chat on screen and its read state when it opened. A folder that excludes read
+    /// chats keeps it until it is left: while it is open, its read fact stands as it was.
+    pub open: Option<(Who, bool)>,
     /// The pins of the main list and of the archive, in Telegram's order.
     pub pins: [Vec<Who>; 2],
     /// The chats of each list in the order they were read, for knowing when the user has
@@ -69,7 +72,10 @@ impl Filed {
 
     /// Where a chat is filed now.
     pub fn filing(&self, who: Who, known: &Known) -> Filing {
-        let facts = self.facts.get(&who).copied().unwrap_or_default();
+        let mut facts = self.facts.get(&who).copied().unwrap_or_default();
+        if let Some((_, read)) = self.open.filter(|(held, _)| *held == who) {
+            facts.read = read;
+        }
         let list = usize::from(facts.archived);
         Filing {
             folders: self.rules.iter().filter(|rule| rule.holds(who, known, facts)).map(|rule| rule.id.to_string()).collect(),
