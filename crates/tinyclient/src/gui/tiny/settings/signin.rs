@@ -1,7 +1,7 @@
 //! Sign-in: how people sign in to this server — the provider it sends their browser to (from its
 //! `/v1/auth/config`), how many came in through the provider's groups — and who this account is
 //! signed in as. "Sign out everywhere" ends every session of this account on the server, this
-//! one too (asked first).
+//! one too (asked first). Between them, this account's own passkeys (`passkeys.rs`).
 
 use super::kit::{card, note};
 use super::{page_head, section};
@@ -34,7 +34,6 @@ pub(in crate::gui) fn provider_words(provider: &str) -> (String, bool) {
 }
 
 pub(in crate::gui::tiny) fn signin(shell: &Shell, facts: &Facts, window: &mut Window, cx: &mut Context<Shell>) -> AnyElement {
-    let _ = (shell, window);
     let community = facts.community;
     let mut page = div().flex().flex_col().gap(px(28.)).child(page_head("Sign-in", "How people sign in to this server, and who you are signed in as."));
     let (provider, unknown) = provider_words(&community.provider);
@@ -110,6 +109,7 @@ pub(in crate::gui::tiny) fn signin(shell: &Shell, facts: &Facts, window: &mut Wi
                 ),
         ),
     );
+    page = page.children(super::passkeys::passkeys(shell, &community.provider, window, cx));
     page = page.child(
         section("Sessions").child(
             card()

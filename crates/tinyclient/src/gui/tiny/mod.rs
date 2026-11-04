@@ -103,6 +103,26 @@ pub(super) enum Modal {
     SignOutEverywhere,
     /// What to share in a call: a screen or a window.
     Share,
+    /// Passkey links for members, made from setup: who is ticked, then the links the server
+    /// made, shown once. They are dropped when it closes and never written anywhere.
+    PasskeyLinks { picked: Vec<String>, links: Vec<protocol::TinyClaimLink>, busy: bool, error: Option<String> },
+    /// A fresh set of this account's recovery codes, shown once. They live only here, go when it
+    /// closes, and are never written anywhere.
+    RecoveryCodes(Vec<String>),
+    /// One of this account's passkeys, to remove, by id, with its name for the words.
+    RemovePasskey { id: String, label: String },
+}
+
+impl Modal {
+    /// It shows something that is gone once it closes (recovery codes, passkey links made), so a
+    /// stray click on the scrim does not close it: only its own Done or Close does, or Escape.
+    pub(super) fn holds_secrets(&self) -> bool {
+        match self {
+            Modal::RecoveryCodes(_) => true,
+            Modal::PasskeyLinks { links, .. } => !links.is_empty(),
+            _ => false,
+        }
+    }
 }
 
 /// The invite being made.
@@ -233,6 +253,9 @@ pub struct State {
     settings_fields: settings::Fields,
     /// First-run setup, for owners, and the form Server Settings › Privacy shares with it.
     setup: setup::State,
+
+    /// This account's own passkeys, for Server Settings › Sign-in.
+    passkeys: settings::Passkeys,
 }
 
 impl State {
@@ -316,6 +339,7 @@ impl State {
             settings: None,
             settings_fields,
             setup: setup::State::default(),
+            passkeys: settings::Passkeys::default(),
         }
     }
 
@@ -333,6 +357,7 @@ impl State {
         self.card = None;
         self.settings = None;
         self.setup = setup::State::default();
+        self.passkeys = settings::Passkeys::default();
     }
 
     /// The volume and mute for me kept for someone, else 100 % and heard: what was just set
@@ -1053,7 +1078,10 @@ impl Shell {
     /// Escape, from the window's keys: the top layer here closes first. False when nothing here
     /// was open.
     pub(super) fn tiny_escape(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.tiny_state.setup.prompt {
+        if matches!(self.tiny_state.modal, Some(Modal::PasskeyLinks { .. })) {
+            // Opened from the first-run screen, and drawn over it: it closes before the screen goes.
+            self.close_modal(cx);
+        } else if self.tiny_state.setup.prompt {
             self.tiny_setup_later(cx);
         } else if self.tiny_state.sub.is_some() {
             self.tiny_state.sub = None;
@@ -1509,10 +1537,13 @@ impl Shell {
         }
         if let Some(how) = flag("--tiny-setup") {
             self.tiny_shot_setup(&how, window, cx);
+            if let Some(down) = flag("--tiny-scroll").and_then(|n| n.parse::<f32>().ok()) {
+                self.tiny_state.setup.scroll.set_offset(Point::new(gpui::px(0.), gpui::px(-down)));
+            }
         }
         if std::env::args().any(|arg| arg == "--tiny-settings") {
             let asked = flag("--tiny-settings").unwrap_or_default();
-            let page = settings::Page::ALL.into_iter().find(|page| page.label().to_lowercase().starts_with(&asked)).filter(|_| !asked.is_empty() && asked != "dirty");
+            let page = settings::Page::ALL.into_iter().find(|page| page.label().to_lowercase().replace('-', "").starts_with(&asked)).filter(|_| !asked.is_empty() && asked != "dirty");
             self.tiny_open_settings(page.unwrap_or(settings::Page::Overview), None, window, cx);
             if asked == "dirty" {
                 let name = self.tiny_state.settings_fields.name.clone();
@@ -1530,6 +1561,11 @@ impl Shell {
                     }
                     _ => {}
                 }
+            }
+            // A made-up set of recovery codes over Sign-in, as "New recovery codes" shows them.
+            if flag("--tiny-confirm").as_deref() == Some("codes") {
+                let codes = ["7KQM-2XPD", "R4TW-9HCN", "B8LF-3VZJ", "M2YE-6QSA", "W9GD-4KTR", "H3PX-8NMB", "C6UJ-1FWL", "T5RA-7DYQ", "N1ZS-5GEH", "F8VK-2BCU"];
+                self.tiny_show_codes(codes.iter().map(|code| (*code).to_owned()).collect(), cx);
             }
             if flag("--tiny-confirm").as_deref() == Some("transfer") {
                 let heir = community.members.iter().find(|member| member.user_id != community.me && !model::is_owner(member)).map(|member| member.user_id.clone());

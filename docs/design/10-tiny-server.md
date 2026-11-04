@@ -292,6 +292,14 @@ server is the only place the answer is kept. It shows, in this order:
    `members_without_passkey` says how many cannot sign in until given a passkey link and offers
    "Do it anyway" (`allow_lockout`); `passkeys_unavailable` says the server has none.
 
+Under the sign-in choice sits a checklist of what switching to passkeys needs: the provider is
+named, the owner's own passkey is ticked or not, and members without one are counted from the
+total. Each line with something to do has its button. "Make passkey links" asks chatd for a link
+per member; they come back in a modal with a copy button each, to be handed out by hand. The
+Sign-in page in Settings has a Passkeys section for the signed-in member: list, add, rename and
+remove their own passkeys (`settings/passkeys.rs`), and make new recovery codes. Removing the last
+one is refused, in words, while no recovery code is left.
+
 The foot holds Later, Keep what I have (an empty answer, `{}`, and a complete one) and Apply
 (or "Use Privacy" with a preset picked). What it shows and sends is `tiny_setup.rs`, tested
 without a window. It is shown to no one but an owner of a server with the feature: not an admin
@@ -301,6 +309,8 @@ with every permission, not a bot, and not on an older server.
 sit in, `--tiny-menu stats` opens Call health and `--tiny-focus n` focuses the nth tile.
 `--tiny-settings <page>` opens a page for a screenshot, with `--tiny-pick n` (the nth role,
 channel, or n members ticked), `--tiny-override <role>`, `--tiny-scroll <px>`, `--tiny-owner`
-and `--tiny-confirm transfer`. `--tiny-setup first|custom|refused|privacy|member` draws first-run
-setup (with Privacy picked and the choices open, or after a refusal) or the Privacy page, over a
-made-up outline. The demo's Night Shift has data for every page.
+and `--tiny-confirm transfer|codes`. `--tiny-setup first|custom|refused|checklist|links|privacy|change|change-anyway|member`
+draws first-run setup (with Privacy picked and the choices open, after a refusal, with the sign-in
+checklist, or with passkey links handed out) or the Privacy page (`change-anyway` with Privacy
+picked, so Save reads "Switch anyway"), over a made-up outline. `--tiny-settings signin` draws
+the Sign-in page with its Passkeys section. The demo's Night Shift has data for every page.

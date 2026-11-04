@@ -794,11 +794,23 @@ pub struct TinyServerEdit {
 /// The server lists this when it has setup. Without it, nothing about setup is shown.
 pub const TINY_FEATURE_FIRST_RUN_SETUP: &str = "first_run_setup";
 
+/// Words chatd answers a Tiny request with that a client also acts on, so both read one copy: the
+/// client hides what an older server can't do, and says why the last passkey stays before it asks.
+pub mod tiny_words {
+    /// The server has no such route: it is older than the request.
+    pub const OLDER: &str = "This server can't do that yet. Ask its owner to update tinyserver.";
+    /// The server wants a sign-in from the last ten minutes before it changes a passkey or the
+    /// recovery codes.
+    pub const SIGN_IN_AGAIN: &str = "That needs a sign-in from the last ten minutes. Sign out of this server, sign in again, then try once more.";
+    /// The server keeps the last passkey while no recovery code is left.
+    pub const LAST_PASSKEY: &str = "This is your last passkey and you have no recovery codes left, so it stays.";
+}
+
 /// The values each choice takes, as the server names them. A value is kept as text so one from a
 /// newer server still reads; these are the ones this build has words for.
 pub const TINY_PROVIDER_PROFILES: [&str; 3] = ["full", "name", "none"];
 pub const TINY_ACTIVITY_VISIBILITIES: [&str; 3] = ["everyone", "admins", "nobody"];
-pub const TINY_SIGN_IN_METHODS: [&str; 2] = ["any", "passkey"];
+pub const TINY_SIGN_IN_METHODS: [&str; 3] = ["provider", "any", "passkey"];
 
 /// The three choices, each as the server names its value. Empty is "not said".
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -809,7 +821,7 @@ pub struct TinyPosture {
     /// Who sees last-online and how a member joined: `everyone`, `admins` or `nobody`.
     #[serde(default, deserialize_with = "text_or_null")]
     pub activity_visibility: String,
-    /// How members sign in: `any` or `passkey`.
+    /// How members sign in: `provider`, `any` or `passkey`.
     #[serde(default, deserialize_with = "text_or_null")]
     pub sign_in_methods: String,
 }
@@ -861,6 +873,24 @@ pub struct TinySetupCounts {
     pub emails_stored: u32,
     #[serde(default, deserialize_with = "or_default")]
     pub owner_has_passkey: bool,
+    /// Members who have not signed in through a provider, so could not if only that were allowed.
+    #[serde(default, deserialize_with = "or_default")]
+    pub members_without_provider: u32,
+    #[serde(default, deserialize_with = "or_default")]
+    pub owner_has_provider: bool,
+}
+
+/// One member as setup lists them: who they are, and which ways of signing in they have.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinySetupMember {
+    pub user_id: String,
+    pub display_name: String,
+    /// Has at least one passkey.
+    #[serde(default, deserialize_with = "or_default")]
+    pub passkey: bool,
+    /// Has signed in through a provider.
+    #[serde(default, deserialize_with = "or_default")]
+    pub provider: bool,
 }
 
 /// One way to settle all three choices at once, with the server's own words for it.
@@ -925,6 +955,10 @@ pub struct TinySetup {
     pub deployment: TinyDeployment,
     #[serde(default, deserialize_with = "or_default")]
     pub counts: TinySetupCounts,
+    /// Everyone on the server, for choosing who gets a link to add a passkey. An older server
+    /// sends none.
+    #[serde(default, deserialize_with = "readable_rows")]
+    pub members: Vec<TinySetupMember>,
     #[serde(default, deserialize_with = "readable_rows")]
     pub presets: Vec<TinyPreset>,
     #[serde(default, deserialize_with = "readable_rows")]
@@ -976,6 +1010,48 @@ pub enum TinySetupRefusal {
     OwnerNeedsPasskey,
     /// Passkeys only, while this many members have none: they could not sign in.
     MembersWithoutPasskey { count: u32 },
+    /// Provider only, while the owner has not signed in through a provider.
+    OwnerNeedsProvider,
+    /// Provider only, while this many members have not signed in through one: they could not
+    /// sign in.
+    MembersWithoutProvider { count: u32 },
+}
+
+/// A link for one member to add a passkey, made by `POST /v1/setup/claim-links`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyClaimLink {
+    pub user_id: String,
+    pub display_name: String,
+    /// Open it in a browser to add the passkey. Whoever holds it can, so it is for that member.
+    pub url: String,
+}
+
+/// One of a member's own passkeys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyPasskey {
+    pub id: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub label: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub created_at: String,
+    /// When it last signed in; `None` when it never has.
+    #[serde(default, deserialize_with = "or_default")]
+    pub last_used_at: Option<String>,
+    /// Kept in a password manager or cloud account, so it follows the person to other devices.
+    #[serde(default, deserialize_with = "or_default")]
+    pub synced: bool,
+    /// The server has doubts about it and says to look at it.
+    #[serde(default, deserialize_with = "or_default")]
+    pub flagged: bool,
+}
+
+/// `GET /v1/me/passkeys`: a member's own passkeys and how many recovery codes are still unused.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyPasskeys {
+    #[serde(default, deserialize_with = "readable_rows")]
+    pub passkeys: Vec<TinyPasskey>,
+    #[serde(default, deserialize_with = "or_default")]
+    pub recovery_codes_left: u32,
 }
 
 /// A list where a row that cannot be read is left out, so one odd row never empties the rest.
@@ -1732,7 +1808,11 @@ mod tests {
         "completed_at": null,
         "current": {"provider_profile": "full", "activity_visibility": "everyone", "sign_in_methods": "any"},
         "deployment": {"passkeys": true, "sso": false},
-        "counts": {"members": 1, "members_without_passkey": 1, "emails_stored": 1, "owner_has_passkey": false},
+        "counts": {"members": 2, "members_without_passkey": 1, "members_without_provider": 1, "emails_stored": 1, "owner_has_passkey": false, "owner_has_provider": true},
+        "members": [
+          {"user_id": "u1", "display_name": "Justin", "passkey": false, "provider": true},
+          {"user_id": "u2", "display_name": "Dayo", "passkey": false, "provider": false}
+        ],
         "presets": [
           {"id": "convenience", "title": "Convenience", "summary": "Easiest to run.",
            "choices": {"provider_profile": "full", "activity_visibility": "everyone", "sign_in_methods": "any"}, "available": true},
@@ -1744,7 +1824,8 @@ mod tests {
           {"id": "provider_profile", "title": "What to keep from a sign-in provider", "question": "What should the server keep?", "relevant": false,
            "options": [{"id": "full", "title": "Name and email address", "effect": "Keeps both."}, {"id": "name", "title": "Name only", "effect": "Keeps the name."}]},
           {"id": "sign_in_methods", "title": "How members sign in", "question": "Which?", "relevant": true,
-           "options": [{"id": "any", "title": "Whatever this server offers", "effect": "Passkey."},
+           "options": [{"id": "provider", "title": "Sign-in provider only", "effect": "Only the provider.", "needs": ["sso", "owner_has_provider"]},
+                       {"id": "any", "title": "Whatever this server offers", "effect": "Passkey."},
                        {"id": "passkey", "title": "Passkeys only", "effect": "Nothing else.", "needs": ["passkeys", "owner_has_passkey"]}]}
         ],
         "always": ["There are no usernames.", "The server sends no analytics or crash reports anywhere."]
@@ -1757,14 +1838,19 @@ mod tests {
         assert_eq!(setup.completed_at, "", "null until an owner answers");
         assert_eq!(setup.current, TinyPosture { provider_profile: "full".into(), activity_visibility: "everyone".into(), sign_in_methods: "any".into() });
         assert_eq!(setup.deployment, TinyDeployment { passkeys: true, sso: false });
-        assert_eq!(setup.counts, TinySetupCounts { members: 1, members_without_passkey: 1, emails_stored: 1, owner_has_passkey: false });
+        assert_eq!(setup.counts, TinySetupCounts { members: 2, members_without_passkey: 1, members_without_provider: 1, emails_stored: 1, owner_has_passkey: false, owner_has_provider: true });
+        assert!(setup.counts.owner_has_provider);
+        assert_eq!(setup.members.len(), 2);
+        assert_eq!((setup.members[0].user_id.as_str(), setup.members[0].display_name.as_str()), ("u1", "Justin"));
+        assert!(!setup.members[1].passkey && !setup.members[1].provider && setup.members[0].provider);
         assert_eq!(setup.presets.iter().map(|preset| (preset.id.as_str(), preset.available)).collect::<Vec<_>>(), [("convenience", true), ("privacy", false)]);
         assert_eq!(setup.presets[0].unavailable, "", "an available preset has no reason");
         assert_eq!(setup.presets[1].unavailable, "This server was started without passkey sign-in.");
         assert_eq!(setup.presets[1].choices.value("sign_in_methods"), Some("passkey"));
         assert!(!setup.choices[0].relevant && setup.choices[1].relevant);
         assert_eq!(setup.choices[0].question, "What should the server keep?");
-        assert_eq!(setup.choices[1].options[1].needs, ["passkeys", "owner_has_passkey"]);
+        assert_eq!(setup.choices[1].options[0].id, "provider");
+        assert_eq!(setup.choices[1].options[2].needs, ["passkeys", "owner_has_passkey"]);
         assert!(setup.choices[0].options[0].needs.is_empty());
         assert_eq!(setup.always.len(), 2);
         // The convenience preset in the contract sets exactly what a server did before setup.
@@ -1781,7 +1867,7 @@ mod tests {
         let odd: TinySetup = serde_json::from_str(
             r#"{"needed":true,"presets":[{"id":"convenience","available":null,"future":1},{"title":"no id"},"nope"],
                 "choices":[{"id":"sign_in_methods","relevant":null,"options":[{"id":"any"},{"effect":"no id"},7]}],
-                "always":["one",null,"two"],"counts":null,"deployment":null,"current":null,"extra":{"a":1}}"#,
+                "always":["one",null,"two"],"members":[{"user_id":"u1","display_name":"A","passkey":true},{"user_id":"u2"},"nope"],"counts":null,"deployment":null,"current":null,"extra":{"a":1}}"#,
         )
         .unwrap();
         assert_eq!(odd.presets.len(), 1);
@@ -1789,7 +1875,11 @@ mod tests {
         assert_eq!(odd.choices[0].options.iter().map(|option| option.id.as_str()).collect::<Vec<_>>(), ["any"]);
         assert!(odd.choices[0].relevant);
         assert_eq!(odd.always, ["one", "two"]);
+        assert_eq!(odd.members.len(), 1, "a member row without a name is dropped");
+        assert!(odd.members[0].passkey && !odd.members[0].provider);
         assert_eq!((odd.counts, odd.deployment, odd.current), (TinySetupCounts::default(), TinyDeployment::default(), TinyPosture::default()));
+        // An older server sends no members at all.
+        assert!(serde_json::from_str::<TinySetup>(r#"{"needed":true}"#).unwrap().members.is_empty());
         // Not a list at all: no rows.
         let none: TinySetup = serde_json::from_str(r#"{"needed":true,"presets":"x","choices":null}"#).unwrap();
         assert!(none.presets.is_empty() && none.choices.is_empty());
@@ -1832,6 +1922,34 @@ mod tests {
         let json = serde_json::to_string(&refusals).unwrap();
         assert_eq!(json, r#"[{"why":"passkeys_unavailable"},{"why":"owner_needs_passkey"},{"why":"members_without_passkey","count":4}]"#);
         assert_eq!(serde_json::from_str::<Vec<TinySetupRefusal>>(&json).unwrap(), refusals);
+    }
+
+    #[test]
+    fn a_refusal_about_the_provider_reads_and_an_unknown_one_does_not() {
+        let refusals: Vec<TinySetupRefusal> =
+            serde_json::from_str(r#"[{"why":"owner_needs_provider"},{"why":"members_without_provider","count":2}]"#).unwrap();
+        assert_eq!(refusals, [TinySetupRefusal::OwnerNeedsProvider, TinySetupRefusal::MembersWithoutProvider { count: 2 }]);
+        assert_eq!(serde_json::to_string(&refusals).unwrap(), r#"[{"why":"owner_needs_provider"},{"why":"members_without_provider","count":2}]"#);
+        assert!(serde_json::from_str::<TinySetupRefusal>(r#"{"why":"something_new"}"#).is_err());
+    }
+
+    #[test]
+    fn a_passkey_list_reads_with_nulls_where_a_key_was_never_used() {
+        let list: TinyPasskeys = serde_json::from_str(
+            r#"{"passkeys":[{"id":"p1","label":"Laptop","created_at":"2026-10-01T00:00:00Z","last_used_at":null,"synced":true,"flagged":false},
+                            {"id":"p2","label":"Phone","created_at":"2026-10-02T00:00:00Z","last_used_at":"2026-11-01T09:00:00Z","synced":false,"flagged":true},
+                            {"label":"no id"}],
+                "recovery_codes_left":null}"#,
+        )
+        .unwrap();
+        assert_eq!(list.passkeys.len(), 2);
+        assert_eq!(list.passkeys[0].last_used_at, None);
+        assert_eq!(list.passkeys[1].last_used_at.as_deref(), Some("2026-11-01T09:00:00Z"));
+        assert!(list.passkeys[0].synced && !list.passkeys[0].flagged && list.passkeys[1].flagged);
+        assert_eq!(list.recovery_codes_left, 0);
+        let link: TinyClaimLink = serde_json::from_str(r#"{"user_id":"u2","display_name":"Dayo","url":"https://x/claim/abc"}"#).unwrap();
+        assert_eq!((link.user_id.as_str(), link.url.as_str()), ("u2", "https://x/claim/abc"));
+        assert_eq!(TINY_SIGN_IN_METHODS, ["provider", "any", "passkey"]);
     }
 
     #[test]

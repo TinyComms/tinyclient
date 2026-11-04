@@ -18,19 +18,19 @@ use super::{asked, endpoint, explain, open, refused, rows, safe_id, tiny_name, M
 use protocol::{
     tiny_allowed, AccountKey, Response, TinyAccess, TinyAuditFilter, TinyBan, TinyCapabilities, TinyCategory, TinyCode,
     TinyBot, TinyInviteOptions, TinyLayoutGroup, TinyRole, TinyRoleEdit, TinyRoom, TinyRoomEdit, TinySeat, TinyServerEdit, TinyServerInfo,
-    TinySetup, TinySetupApplied, TinySetupApply, TinySetupRefusal,
+    TinyClaimLink, TinyPasskeys, TinySetup, TinySetupApplied, TinySetupApply, TinySetupRefusal,
     TINY_ALL, TINY_BITRATE_MAX, TINY_BITRATE_MIN, TINY_DESCRIPTION_MAX, TINY_FEATURE_AUDIT_QUERY, TINY_FEATURE_BANS,
     TINY_FEATURE_CATEGORIES, TINY_FEATURE_INVITE_OPTIONS, TINY_FEATURE_ROLES, TINY_FEATURE_SERVER, TINY_FEATURE_TIMEOUTS,
     TINY_FEATURE_FILE_SCAN, TINY_FEATURE_FIRST_RUN_SETUP, TINY_FEATURE_UPLOAD_LIMITS, TINY_ICON_MAX, TINY_SERVER_NAME_MAX, TINY_UPLOAD_MAX,
     TINY_WELCOME_MAX,
 };
+use protocol::tiny_words::{LAST_PASSKEY, OLDER, SIGN_IN_AGAIN};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const OLDER: &str = "This server can't do that yet. Ask its owner to update tinyserver.";
 const BOT_NAME: &str = "A bot name is 1 to 80 characters.";
 const BOT_SCOPES: &str = "A bot can be granted rooms.read, rooms.write, and members.read.";
 const CATEGORY_NAME_SIZE: &str = "A category name is 1 to 80 characters.";
@@ -47,7 +47,8 @@ const UPLOAD_LIMIT: &str = "An upload limit is 1 byte to 100 MiB.";
 const REASON_SIZE: &str = "A reason is at most 500 characters.";
 const ICON_SIZE: &str = "That picture is too big. The most is 256 KB.";
 const ICON_KIND: &str = "That picture isn't a PNG, JPEG or WebP.";
-const SIGN_IN_AGAIN: &str = "Adding a passkey needs a sign-in from the last ten minutes. Sign out of this server, sign in again, then try once more.";
+const PASSKEY_LABEL_MAX: usize = 60;
+const PASSKEY_GONE: &str = "That passkey is gone.";
 /// The longest reason the audit keeps from here.
 const REASON_MAX: usize = 500;
 /// The longest value of a setup choice, such as `activity_visibility`'s `everyone`, and the longest
@@ -539,6 +540,10 @@ fn setup_bounded(mut setup: TinySetup) -> TinySetup {
     setup.presets.truncate(SETUP_ROWS_MAX);
     setup.choices.truncate(SETUP_ROWS_MAX);
     setup.always.truncate(SETUP_ROWS_MAX);
+    setup.members.truncate(SETUP_ROWS_MAX * 8);
+    for member in &mut setup.members {
+        [&mut member.user_id, &mut member.display_name].into_iter().for_each(words);
+    }
     setup.always.iter_mut().for_each(words);
     for preset in &mut setup.presets {
         [&mut preset.id, &mut preset.title, &mut preset.summary, &mut preset.unavailable].into_iter().for_each(words);
@@ -603,12 +608,14 @@ fn setup_body(apply: &TinySetupApply) -> Result<Value, Response> {
 
 /// A 409 from setup that the owner can do something about.
 fn setup_refusal(body: &Value) -> Option<TinySetupRefusal> {
-    match body.get("error").and_then(Value::as_str)? {
+    let error = body.get("error").and_then(Value::as_str)?;
+    match error {
         "passkeys_unavailable" => Some(TinySetupRefusal::PasskeysUnavailable),
         "owner_needs_passkey" => Some(TinySetupRefusal::OwnerNeedsPasskey),
-        "members_without_passkey" => {
+        "owner_needs_provider" => Some(TinySetupRefusal::OwnerNeedsProvider),
+        "members_without_passkey" | "members_without_provider" => {
             let count = body.get("count").and_then(Value::as_u64).map_or(0, |count| u32::try_from(count).unwrap_or(u32::MAX));
-            Some(TinySetupRefusal::MembersWithoutPasskey { count })
+            Some(if error == "members_without_passkey" { TinySetupRefusal::MembersWithoutPasskey { count } } else { TinySetupRefusal::MembersWithoutProvider { count } })
         }
         _ => None,
     }
@@ -666,6 +673,109 @@ pub(crate) fn passkey_link_with(account: AccountKey, browser: &super::browser::O
         Ok((404, _)) => refused(OLDER),
         Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
     }
+}
+
+/// `POST /v1/setup/claim-links`: a link for each member asked for, to add a passkey. Owners only.
+/// The links are bearers: they go back to the window that asked and are never logged.
+pub(crate) fn setup_claim_links(account: AccountKey, user_ids: Vec<String>) -> Response {
+    if user_ids.is_empty() || !user_ids.iter().all(|id| safe_id(id)) {
+        return refused(CHECK);
+    }
+    let saved = match owner_only(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    match asked("POST", &saved, "/v1/setup/claim-links", Some(json!({ "user_ids": user_ids }))) {
+        Err(detail) => refused(detail),
+        Ok((200, body)) => match body.get("links").cloned().map(serde_json::from_value::<Vec<TinyClaimLink>>) {
+            Some(Ok(links)) => Response::TinyClaimLinks { links },
+            _ => refused(UNREADABLE),
+        },
+        Ok((404, _)) => refused(OLDER),
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+/// `GET /v1/me/passkeys`: this account's own passkeys and how many recovery codes are left.
+pub(crate) fn passkeys_read(account: AccountKey) -> Response {
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    match asked("GET", &saved, "/v1/me/passkeys", None) {
+        Err(detail) => refused(detail),
+        Ok((200, body)) => match serde_json::from_value::<TinyPasskeys>(body) {
+            Ok(mut passkeys) => {
+                passkeys.passkeys.truncate(LIST_MAX);
+                for passkey in &mut passkeys.passkeys {
+                    protocol::clip(&mut passkey.label, PASSKEY_LABEL_MAX);
+                }
+                Response::TinyPasskeys { passkeys }
+            }
+            Err(_) => refused(UNREADABLE),
+        },
+        Ok((404, _)) => refused(OLDER),
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+/// `PATCH /v1/me/passkeys/{id}`: a name for one of this account's passkeys, 1 to 60 characters.
+pub(crate) fn passkey_rename(account: AccountKey, id: String, label: String) -> Response {
+    let label = label.trim();
+    if !safe_id(&id) || label.is_empty() || label.chars().count() > PASSKEY_LABEL_MAX {
+        return refused(CHECK);
+    }
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    match asked("PATCH", &saved, &format!("/v1/me/passkeys/{id}"), Some(json!({ "label": label }))) {
+        Err(detail) => refused(detail),
+        Ok((200..=299, _)) => Response::Ok,
+        Ok((404, _)) => refused(PASSKEY_GONE),
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+/// `DELETE /v1/me/passkeys/{id}`. The server keeps the last passkey when no recovery code is left.
+pub(crate) fn passkey_remove(account: AccountKey, id: String) -> Response {
+    if !safe_id(&id) {
+        return refused(CHECK);
+    }
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    match asked("DELETE", &saved, &format!("/v1/me/passkeys/{id}"), None) {
+        Err(detail) => refused(detail),
+        Ok((200..=299, _)) => Response::Ok,
+        Ok((403, body)) if recent_sign_in_needed(&body) => refused(SIGN_IN_AGAIN),
+        Ok((403, _)) => refused(LAST_PASSKEY),
+        Ok((404, _)) => refused(PASSKEY_GONE),
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+/// `POST /v1/me/recovery-codes`: a fresh set, shown once and never logged.
+pub(crate) fn recovery_codes(account: AccountKey) -> Response {
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    match asked("POST", &saved, "/v1/me/recovery-codes", None) {
+        Err(detail) => refused(detail),
+        Ok((200 | 201, body)) => match body.get("codes").cloned().map(serde_json::from_value::<Vec<String>>) {
+            Some(Ok(codes)) => Response::TinyRecoveryCodes { codes },
+            _ => refused(UNREADABLE),
+        },
+        Ok((403, _)) => refused(SIGN_IN_AGAIN),
+        Ok((404, _)) => refused(OLDER),
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+fn recent_sign_in_needed(body: &Value) -> bool {
+    body.get("error").and_then(Value::as_str) == Some("recent_sign_in_required")
 }
 
 // Roles.

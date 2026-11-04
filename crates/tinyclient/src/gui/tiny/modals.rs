@@ -3,7 +3,9 @@
 //! profile, and signing out of the server; and Server Settings' confirmations: deleting a role,
 //! kicking several people, unbanning, revoking invites, handing over the server and signing out
 //! everywhere. The most dangerous ask for the server's name to be typed. Each is the system's modal (`components::modal`):
-//! a title, what it does in words, Cancel and the action last.
+//! a title, what it does in words, Cancel and the action last. And setup's passkey links for
+//! members, shown once; Sign-in's removal of one of your passkeys, and your new recovery codes,
+//! shown once.
 
 use super::{model, Modal, Page};
 use crate::gui::components::{button, button_disabled, field, glyph, modal, segment, segmented, ButtonKind};
@@ -229,6 +231,33 @@ impl Shell {
                 }));
                 self.tiny_typed_confirm(panel, page, "Transfer ownership", window, cx, |this, cx| this.tiny_transfer(cx))
             }
+            Modal::PasskeyLinks { picked, links, busy, error } => self.passkey_links_modal(page, picked, links, *busy, error.as_deref(), cx),
+            Modal::RecoveryCodes(codes) => self.recovery_codes_modal(codes, cx),
+            Modal::RemovePasskey { id, label } => {
+                let id = id.clone();
+                let last = self.tiny_state.passkeys.list.as_ref().is_some_and(|list| list.passkeys.len() == 1);
+                let action = if self.tiny_state.passkeys.busy {
+                    button_disabled("Remove passkey").h(px(32.)).into_any_element()
+                } else {
+                    button("tiny-signin-passkey-remove-do", ButtonKind::Danger, "Remove passkey").h(px(32.)).on_click(cx.listener(move |this, _, _, cx| this.tiny_passkey_remove(id.clone(), cx))).into_any_element()
+                };
+                modal(format!("Remove {label}?"))
+                    .child(words(if last {
+                        "It is your last passkey. After this you sign in with a recovery code, or another way this server allows, until you add a new one."
+                    } else {
+                        "You can't sign in with it any more. Your other passkeys keep working."
+                    }))
+                    .children(self.modal_error())
+                    .child(
+                        div()
+                            .mt(px(20.))
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(button("tiny-signin-passkey-remove-cancel", ButtonKind::Secondary, "Cancel").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))))
+                            .child(action),
+                    )
+            }
             Modal::SignOutEverywhere => modal("Sign out everywhere?")
                 .child(words(format!("Every session of yours on {} ends, on every computer, this one too. Sign in again with your provider when you want back in.", page.name)))
                 .children(self.modal_error())
@@ -257,6 +286,123 @@ impl Shell {
                     .gap(px(8.))
                     .child(button("tiny-modal-cancel", ButtonKind::Secondary, "Cancel").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))))
                     .child(action),
+            )
+    }
+
+    /// Passkey links for members who have none: who to make them for, then each link to copy and
+    /// send. They are shown once and go when this closes. A server that can't make them (an older
+    /// one) is said in a note where the list was.
+    fn passkey_links_modal(&self, page: &Page, picked: &[String], links: &[protocol::TinyClaimLink], busy: bool, error: Option<&str>, cx: &mut Context<Self>) -> Div {
+        let panel = modal("Passkey links").w(px(520.));
+        let close = |label: &'static str, kind: ButtonKind| button("tiny-setup-links-done", kind, label).h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)));
+        if let Some(detail) = error {
+            return panel
+                .child(div().mt(px(16.)).child(super::settings::note("icons/triangle-alert.svg", theme::warning(), detail.to_owned())))
+                .child(div().mt(px(20.)).flex().justify_end().child(close("Close", ButtonKind::Secondary)));
+        }
+        let rows = div().id("tiny-setup-links-list").mt(px(16.)).max_h(px(320.)).overflow_y_scroll();
+        let mut list = super::settings::card();
+        if links.is_empty() {
+            let me = page.me;
+            let members = self.tiny_state.setup.data.as_ref().map(|setup| setup.members.as_slice()).unwrap_or_default();
+            for (ix, member) in members.iter().filter(|member| member.user_id != me).enumerate() {
+                let on = picked.contains(&member.user_id);
+                let id = member.user_id.clone();
+                list = list.child(
+                    div()
+                        .id(("tiny-setup-links-member", ix))
+                        .px(px(14.))
+                        .py(px(10.))
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .when(ix > 0, |row| row.border_t_1().border_color(theme::hairline()))
+                        .when(!busy, |row| row.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| this.tiny_setup_tick_link(&id, cx))))
+                        .child(super::settings::check_box(("tiny-setup-links-tick", ix), Some(on), !busy))
+                        .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(member.display_name.clone()))
+                        .when(member.passkey, |row| row.child(div().flex_none().type_small().text_color(theme::text_faint()).child("Has a passkey"))),
+                );
+            }
+            let make = if busy {
+                button_disabled("Making links…").h(px(32.)).into_any_element()
+            } else if picked.is_empty() {
+                button_disabled("Make links").h(px(32.)).into_any_element()
+            } else {
+                button("tiny-setup-links-make", ButtonKind::Primary, "Make links").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.tiny_setup_make_links(cx))).into_any_element()
+            };
+            return panel
+                .child(words("Make a link for each member ticked. They open it in a browser to add a passkey, then sign in with it."))
+                .child(rows.child(list))
+                .child(div().mt(px(20.)).flex().justify_end().gap(px(8.)).child(close("Cancel", ButtonKind::Secondary)).child(make));
+        }
+        for (ix, link) in links.iter().enumerate() {
+            let url = link.url.clone();
+            list = list.child(
+                div()
+                    .px(px(14.))
+                    .py(px(10.))
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .when(ix > 0, |row| row.border_t_1().border_color(theme::hairline()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().truncate().type_ui().text_color(theme::text()).child(link.display_name.clone()))
+                            .child(div().truncate().type_small().text_color(theme::text_faint()).child(link.url.clone())),
+                    )
+                    .child(button(("tiny-setup-links-copy", ix), ButtonKind::Secondary, "Copy").on_click(cx.listener(move |_, _, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()))))),
+            );
+        }
+        let all = links.iter().map(|link| format!("{}\t{}", link.display_name, link.url)).collect::<Vec<_>>().join("\n");
+        let copied = self.tiny_state.copied;
+        panel
+            .child(words("Each link works once, for that person only, for 14 days. Send it to them yourself; the server does not."))
+            .child(rows.child(list))
+            .child(
+                div()
+                    .mt(px(20.))
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(close("Done", ButtonKind::Ghost))
+                    .child(button("tiny-setup-links-copy-all", ButtonKind::Secondary, if copied { "Copied" } else { "Copy all" }).h(px(32.)).on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(all.clone()));
+                        this.tiny_state.copied = true;
+                        cx.notify();
+                    }))),
+            )
+    }
+
+    /// A fresh set of recovery codes, shown once: in two columns of monospace, with Copy and Done.
+    /// They go when this closes.
+    fn recovery_codes_modal(&self, codes: &[String], cx: &mut Context<Self>) -> Div {
+        let half = codes.len().div_ceil(2);
+        let column = |part: &[String]| div().flex_1().flex().flex_col().gap(px(4.)).children(part.iter().map(|code| div().type_code().text_color(theme::text()).child(code.clone())));
+        let (left, right) = codes.split_at(half.min(codes.len()));
+        let all = codes.join("\n");
+        let copied = self.tiny_state.copied;
+        modal("New recovery codes")
+            .w(px(440.))
+            .child(words("Each code works once. Keep them somewhere that is not this computer."))
+            .child(words("The codes you had before no longer work."))
+            .child(div().id("tiny-codes").mt(px(16.)).px(px(16.)).py(px(12.)).rounded(px(theme::R_CARD)).bg(theme::raised()).border_1().border_color(theme::hairline()).flex().gap(px(16.)).child(column(left)).child(column(right)))
+            .child(
+                div()
+                    .mt(px(20.))
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(button("tiny-signin-codes-copy", ButtonKind::Secondary, if copied { "Copied" } else { "Copy" }).h(px(32.)).on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(all.clone()));
+                        this.tiny_state.copied = true;
+                        cx.notify();
+                    })))
+                    .child(button("tiny-signin-codes-done", ButtonKind::Primary, "Done").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))),
             )
     }
 
@@ -438,8 +584,9 @@ fn handoff_facts(origin: &str, role: &str, legacy: bool) -> (String, Option<&'st
     (opens, makes)
 }
 
-/// A modal panel, centered over a scrim that closes it.
-pub(super) fn layer(panel: Div, cx: &mut Context<Shell>) -> AnyElement {
+/// A modal panel, centered over a scrim that closes it when `scrim_closes` (not for one that
+/// holds secrets shown once: see [`super::Modal::holds_secrets`]).
+pub(super) fn layer(panel: Div, scrim_closes: bool, cx: &mut Context<Shell>) -> AnyElement {
     div()
         .absolute()
         .top_0()
@@ -454,7 +601,7 @@ pub(super) fn layer(panel: Div, cx: &mut Context<Shell>) -> AnyElement {
                 .size_full()
                 .bg(theme::scrim())
                 .occlude()
-                .on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))),
+                .when(scrim_closes, |scrim| scrim.on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))),
         )
         .child(
             div()
@@ -473,7 +620,17 @@ pub(super) fn layer(panel: Div, cx: &mut Context<Shell>) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{handoff_facts, list_names};
+    use super::{handoff_facts, list_names, Modal};
+
+    #[test]
+    fn a_stray_click_does_not_close_what_is_shown_once() {
+        assert!(Modal::RecoveryCodes(vec!["a1b2-c3d4".into()]).holds_secrets());
+        let links = |links: Vec<protocol::TinyClaimLink>| Modal::PasskeyLinks { picked: Vec::new(), links, busy: false, error: None };
+        assert!(!links(Vec::new()).holds_secrets(), "nothing made yet: the scrim closes it");
+        let made = protocol::TinyClaimLink { user_id: "ana".into(), display_name: "Ana".into(), url: "https://premier.example/claim/x".into() };
+        assert!(links(vec![made]).holds_secrets());
+        assert!(!Modal::SignOut.holds_secrets());
+    }
 
     #[test]
     fn several_names_read_as_a_sentence() {
