@@ -584,6 +584,7 @@ mod tests {
             device_stuck: false,
             security: Some(security),
             picture: None,
+            self_view: None,
         }
     }
 

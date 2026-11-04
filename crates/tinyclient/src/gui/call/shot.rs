@@ -260,6 +260,7 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         video: Vec::new(),
         security: None,
         picture: None,
+        self_view: None,
     })
 }
 
@@ -382,6 +383,7 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joi
         outputs: Vec::new(),
         security: None,
         picture: None,
+        self_view: None,
     }
 }
 

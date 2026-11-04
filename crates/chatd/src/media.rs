@@ -9,8 +9,9 @@
 //! server has the adapter leave on the network, so nobody is left ringing or shown in a channel.
 
 use crate::hub::{now, Hub};
-use protocol::settings::{GLOBAL, INPUT, JOIN_MUTED, OUTPUT, REQUIRE_CALL_E2EE};
+use protocol::settings::{CAMERA, GLOBAL, INPUT, JOIN_MUTED, OUTPUT, REQUIRE_CALL_E2EE};
 use protocol::{
+    PictureKind,
     clip, read_frame, write_frame, AudioDevice, Call, CallFailure, CallPicture, CallState, Change, Content, Cue, Direction, Key, MediaRequest,
     MediaResponse, Participant, TinyOffer, TinySlot, VideoStream, VoiceJoin, DEVICES_LIMIT, OCCUPANTS_LIMIT,
 };
@@ -220,6 +221,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         outputs: Vec::new(),
         security: None,
         picture: None,
+        self_view: None,
     };
     Live {
         call,
@@ -403,6 +405,13 @@ impl Live {
                     return false;
                 }
                 self.call.picture = picture;
+            }
+            MediaResponse::SelfView { path, width, height, generation } => {
+                let picture = (!path.is_empty()).then(|| CallPicture { path, width, height, generation, user_id: String::new(), kind: PictureKind::Camera });
+                if self.call.self_view == picture {
+                    return false;
+                }
+                self.call.self_view = picture;
             }
             MediaResponse::Sending { share, camera } => {
                 let mut video: Vec<VideoStream> = self.call.video.iter().filter(|stream| stream.direction != Direction::Encode).cloned().collect();
@@ -746,10 +755,10 @@ impl Calls {
             drop(tester);
             hub.changed(Change::Meter { level: None });
         }
-        let (tuning, input, output, muted, mode, processing, quality) = {
+        let (tuning, input, output, camera, muted, mode, processing, quality) = {
             let settings = hub.settings();
             let mode = input_mode(&settings, false);
-            (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT), settings.on(JOIN_MUTED), mode, settings.processing(), settings.voice_quality())
+            (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT), settings.device(CAMERA), settings.on(JOIN_MUTED), mode, settings.processing(), settings.voice_quality())
         };
         {
             let mut slot = crate::hub::lock(&self.slot);
@@ -772,8 +781,8 @@ impl Calls {
             for (user_id, percent, muted) in gains {
                 let _ = active.request(&MediaRequest::Gain { user_id, percent, muted });
             }
-            if input.is_some() || output.is_some() {
-                let _ = active.request(&MediaRequest::Devices { input, output });
+            if input.is_some() || output.is_some() || camera.is_some() {
+                let _ = active.request(&MediaRequest::Devices { input, output, camera });
             }
             *slot = Slot::Active(active);
         }
@@ -829,11 +838,11 @@ impl Calls {
     /// V1 or V2 changed: the call's mediad, or the test's, opens the new choice at once, and
     /// the next call starts with it too.
     pub fn redevice(&self, hub: &Hub) {
-        let (input, output) = {
+        let (input, output, camera) = {
             let settings = hub.settings();
-            (settings.device(INPUT), settings.device(OUTPUT))
+            (settings.device(INPUT), settings.device(OUTPUT), settings.device(CAMERA))
         };
-        let devices = MediaRequest::Devices { input, output };
+        let devices = MediaRequest::Devices { input, output, camera };
         if let Some(active) = crate::hub::lock(&self.slot).running() {
             let _ = active.request(&devices);
         }
@@ -865,7 +874,7 @@ impl Calls {
             // The meter is of the microphone as a call would send it: processed.
             let told = tester
                 .send(&MediaRequest::Tune(tuning))
-                .and_then(|()| tester.send(&MediaRequest::Devices { input, output }))
+                .and_then(|()| tester.send(&MediaRequest::Devices { input, output, camera: None }))
                 .and_then(|()| tester.send(&MediaRequest::Processing(processing)));
             told.map_err(CallError::Media)?;
             *held = Some(tester);

@@ -156,6 +156,17 @@ pub struct ScreenSource {
     pub thumbnail: String,
 }
 
+/// One camera the system lists, for Settings › Audio & video.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CameraSource {
+    /// The system's id for it, which `settings::CAMERA` stores with the name.
+    pub id: String,
+    pub name: String,
+    /// A small picture from it, as a file, when one could be taken.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thumbnail: String,
+}
+
 /// One microphone or speaker the system lists.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioDevice {
@@ -231,6 +242,9 @@ pub struct Call {
     /// The one picture being watched. `None` while nothing is on screen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub picture: Option<CallPicture>,
+    /// My own camera as it is sent, for my tile. `None` while it is off. Its `user_id` is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_view: Option<CallPicture>,
 }
 
 /// A Tiny server call's protection (tinyserver's `docs/calls.md`, "End-to-end encryption").
@@ -412,8 +426,14 @@ pub enum MediaRequest {
     /// Muted: capture nothing and send nothing. Deafened: play nothing.
     Audio { muted: bool, deafened: bool },
     /// The microphone and speaker to use, as V1 and V2 store them (`settings::DeviceChoice`):
-    /// `None` is the automatic choice. Sent at start and whenever either setting changes.
-    Devices { input: Option<String>, output: Option<String> },
+    /// `None` is the automatic choice. Sent at start and whenever either setting changes. The
+    /// camera the same way (V22); `None` is the first the system lists.
+    Devices {
+        input: Option<String>,
+        output: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        camera: Option<String>,
+    },
     /// Gains, the speech gate and which cues play (Settings › Sounds and Audio & video). Sent
     /// at start and whenever one changes.
     Tune(Tuning),
@@ -827,6 +847,9 @@ pub enum MediaResponse {
     },
     /// What our camera and share are actually sending, after an answer or a refusal.
     Sending { share: bool, camera: bool },
+    /// Our own camera as it is being sent, a few times a second, so the person sees what
+    /// everyone else sees; an empty path when the camera went off.
+    SelfView { path: String, width: u32, height: u32, generation: u64 },
     /// A picture that could not be captured, in words. The voice call stays.
     Notice { detail: String },
 }
@@ -856,6 +879,7 @@ impl MediaResponse {
             MediaResponse::TinyRenegotiate { .. } => "TinyRenegotiate",
             MediaResponse::Picture { .. } => "Picture",
             MediaResponse::Sending { .. } => "Sending",
+            MediaResponse::SelfView { .. } => "SelfView",
             MediaResponse::Notice { .. } => "Notice",
         }
     }

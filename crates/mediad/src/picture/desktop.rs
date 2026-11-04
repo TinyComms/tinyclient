@@ -11,6 +11,7 @@ use openh264::{OpenH264API, Timestamp};
 use openh264_sys2::{SBitrateInfo, ENCODER_OPTION_BITRATE, ENCODER_OPTION_FRAME_RATE, SPATIAL_LAYER_ALL};
 use std::io::Read;
 use std::path::Path;
+use protocol::CameraSource;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -129,6 +130,35 @@ pub struct Outgoing {
     low: Option<Coded>,
     camera: Camera,
     cost: Cost,
+    camera_cost: GrabCost,
+    /// My own camera, painted for me (`selfie`).
+    selfie_canvas: Canvas,
+    selfie_at: Option<Instant>,
+    selfie_generation: u64,
+    selfie_painted: Option<Painted>,
+}
+
+/// What a camera frame costs to read, in the log once a second or so, with the rate the camera
+/// gave them at: `camera.frame()` waits for the next one, so its time is the camera's period.
+#[derive(Default)]
+struct GrabCost {
+    frames: u32,
+    waited: Duration,
+    since: Option<Instant>,
+}
+
+impl GrabCost {
+    fn note(&mut self, waited: Duration, size: (u32, u32)) {
+        self.frames += 1;
+        self.waited += waited;
+        let now = Instant::now();
+        let since = *self.since.get_or_insert(now);
+        if now - since >= Duration::from_secs(1) {
+            let seconds = (now - since).as_secs_f32();
+            tracing::debug!(frames = self.frames, fps = self.frames as f32 / seconds, wait_ms = self.waited.as_secs_f32() * 1000. / self.frames as f32, ?size, "camera frames");
+            *self = GrabCost { since: Some(now), ..GrabCost::default() };
+        }
+    }
 }
 
 /// What a share frame costs, in the log once a second or so: where the time goes when the rate
@@ -184,13 +214,36 @@ impl Outgoing {
         encoded
     }
 
+    /// My own camera for my own tile, a few times a second: the grab shrunk and written as a
+    /// JPEG, taken by [`Outgoing::self_view`].
+    fn selfie(&mut self, grabbed: &Rgba) {
+        if self.selfie_at.is_some_and(|at| at.elapsed() < super::SELF_VIEW_EVERY) {
+            return;
+        }
+        self.selfie_at = Some(Instant::now());
+        let (width, height) = fit(grabbed.width, grabbed.height, super::SELF_VIEW.0, super::SELF_VIEW.1);
+        let rgb = super::screens::shrink(grabbed, width, height);
+        self.selfie_generation = self.selfie_generation.wrapping_add(1);
+        if let Some(painted) = self.selfie_canvas.paint(&rgb, width, height, self.selfie_generation) {
+            self.selfie_painted = Some(painted);
+        }
+    }
+
+    /// The last self view painted and not yet taken.
+    pub fn self_view(&mut self) -> Option<Painted> {
+        self.selfie_painted.take()
+    }
+
     /// The camera's two layers, high then low, or why the camera could not be read. A layer with
     /// no `Ask` is stopped: nothing is spent on it and it comes back empty.
     pub fn camera(&mut self, high: Option<Ask>, low: Option<Ask>) -> Result<(Encoded, Encoded), String> {
         if self.high.is_none() || self.low.is_none() {
             load_api()?;
         }
+        let began = Instant::now();
         let grabbed = self.camera.frame()?;
+        self.camera_cost.note(began.elapsed(), (grabbed.width, grabbed.height));
+        self.selfie(&grabbed);
         let layer = |slot: &mut Option<Coded>, ask: Option<Ask>, most: (u32, u32), nominal: u32| match ask {
             Some(ask) => {
                 let (width, height) = fit(grabbed.width, grabbed.height, most.0, most.1);
@@ -206,6 +259,9 @@ impl Outgoing {
 
     pub fn close_camera(&mut self) {
         self.camera.close();
+        self.selfie_canvas.forget();
+        self.selfie_painted = None;
+        self.selfie_at = None;
     }
 }
 
@@ -368,57 +424,172 @@ pub fn probe_screen() -> Result<(), String> {
     capture_screen().map(|_| ())
 }
 
+/// The camera, through the system's own API (Media Foundation, AVFoundation, V4L2).
 #[derive(Default)]
 struct Camera {
-    #[cfg(windows)]
     inner: Option<nokhwa::Camera>,
+    /// The choice it was opened with. A new choice closes it, and the next frame opens that.
+    opened: Option<String>,
 }
 
 impl Camera {
     fn frame(&mut self) -> Result<Rgba, String> {
-        #[cfg(windows)]
-        {
-            self.open()?;
-            let camera = self.inner.as_mut().ok_or_else(|| "No camera was opened.".to_owned())?;
-            let frame = camera.frame().map_err(|err| err.to_string())?;
-            let image = frame.decode_image::<nokhwa::pixel_format::RgbFormat>().map_err(|err| err.to_string())?;
-            let width = image.width();
-            let height = image.height();
-            let mut pixels = Vec::with_capacity((width * height * 4) as usize);
-            for pixel in image.pixels() {
-                pixels.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
-            }
-            return Ok(Rgba { width, height, pixels, bgra: false });
+        if self.inner.is_some() && self.opened != super::camera_chosen() {
+            self.close();
         }
-        #[cfg(not(windows))]
-        {
-            Err("A camera isn't available on this system yet. You can still share your screen.".to_owned())
-        }
+        self.open()?;
+        let camera = self.inner.as_mut().ok_or_else(|| "No camera was opened.".to_owned())?;
+        let frame = camera.frame().map_err(|err| err.to_string())?;
+        rgba_of(&frame)
     }
 
-    #[cfg(windows)]
     fn open(&mut self) -> Result<(), String> {
         if self.inner.is_some() {
             return Ok(());
         }
-        use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
-        use nokhwa::pixel_format::RgbFormat;
-        let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
-        let mut camera = nokhwa::Camera::new(CameraIndex::Index(0), format).map_err(|err| err.to_string())?;
+        let chosen = super::camera_chosen();
+        let index = camera_index(chosen.as_deref())?;
+        let mut camera = open_camera(index)?;
         camera.open_stream().map_err(|err| err.to_string())?;
+        tracing::debug!(format = ?camera.camera_format(), "camera opened");
         self.inner = Some(camera);
+        self.opened = chosen;
         Ok(())
     }
 
     fn close(&mut self) {
-        #[cfg(windows)]
-        {
-            if let Some(camera) = self.inner.as_mut() {
-                let _ = camera.stop_stream();
+        if let Some(camera) = self.inner.as_mut() {
+            let _ = camera.stop_stream();
+        }
+        self.inner = None;
+        self.opened = None;
+    }
+}
+
+/// Every camera the system lists, by id and name, with a small picture from each in `folder`
+/// when one is given: Settings shows them. Each is opened for one frame.
+pub fn cameras(folder: Option<&Path>) -> Vec<CameraSource> {
+    {
+        use nokhwa::utils::ApiBackend;
+        let Ok(listed) = nokhwa::query(ApiBackend::Auto) else {
+            return Vec::new();
+        };
+        let folder = folder.filter(|folder| std::fs::create_dir_all(folder).is_ok());
+        if let Some(folder) = folder {
+            for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+                if entry.path().extension().is_some_and(|ext| ext == "jpg") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
             }
-            self.inner = None;
+        }
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|at| at.as_millis()).unwrap_or_default();
+        listed
+            .iter()
+            .enumerate()
+            .map(|(n, info)| {
+                let mut source = CameraSource { id: camera_id(info), name: info.human_name(), thumbnail: String::new() };
+                let Some(folder) = folder else {
+                    return source;
+                };
+                let path = folder.join(format!("camera-{stamp}-{n}.jpg"));
+                let picture = open_camera(info.index().clone())
+                    .and_then(|mut camera| {
+                        camera.open_stream().map_err(|err| err.to_string())?;
+                        // The first frames of a camera that just woke are often dark.
+                        let mut frame = camera.frame();
+                        for _ in 0..4 {
+                            frame = camera.frame();
+                        }
+                        let _ = camera.stop_stream();
+                        frame.map_err(|err| err.to_string())
+                    })
+                    .and_then(|frame| rgba_of(&frame))
+                    .and_then(|grabbed| super::screens::thumbnail(&grabbed, &path));
+                match picture {
+                    Ok(()) => source.thumbnail = path.to_string_lossy().into_owned(),
+                    Err(err) => tracing::debug!("mediad: no picture of camera {}: {err}", source.name),
+                }
+                source
+            })
+            .collect()
+    }
+}
+
+/// The camera `index`, at 720p at its fastest if it has 720p (more than the 640×360 that is
+/// sent, and far less to decode than 4K), else at whatever it runs fastest at. The format is
+/// nokhwa's to pick from those two asks: a format set by hand (`Exact`) on Windows came out as
+/// black frames, and the frame rate Media Foundation reports back is a range minimum, not the
+/// rate, so neither is trusted here; the rate is measured instead (`Outgoing::camera`).
+fn open_camera(index: nokhwa::utils::CameraIndex) -> Result<nokhwa::Camera, String> {
+    use nokhwa::pixel_format::RgbFormat;
+    use nokhwa::utils::{RequestedFormat, RequestedFormatType, Resolution};
+    let asks = [RequestedFormatType::HighestFrameRate(60), RequestedFormatType::HighestFrameRate(30), RequestedFormatType::HighestResolution(Resolution::new(1280, 720)), RequestedFormatType::AbsoluteHighestFrameRate];
+    let mut last = String::new();
+    for ask in asks {
+        match nokhwa::Camera::new(index.clone(), RequestedFormat::new::<RgbFormat>(ask)) {
+            Ok(mut camera) => {
+                if let Ok(formats) = camera.compatible_camera_formats() {
+                    tracing::debug!(count = formats.len(), formats = ?formats.iter().map(|f| format!("{}x{} {:?} {}fps", f.width(), f.height(), f.format(), f.frame_rate())).collect::<Vec<_>>(), "camera formats");
+                }
+                return Ok(camera);
+            }
+            Err(err) => last = err.to_string(),
         }
     }
+    Err(last)
+}
+
+/// One camera frame as RGBA. An MJPEG frame is decoded here with the JPEG decoder this crate
+/// already has: nokhwa's own needs a C build, which this crate does without, and without it
+/// every MJPEG frame failed, which is what most webcams send at 720p and above.
+fn rgba_of(frame: &nokhwa::Buffer) -> Result<Rgba, String> {
+    use nokhwa::utils::FrameFormat;
+    if frame.source_frame_format() == FrameFormat::MJPEG {
+        let image = image::load_from_memory_with_format(frame.buffer(), image::ImageFormat::Jpeg).map_err(|err| err.to_string())?.into_rgba8();
+        let (width, height) = (image.width(), image.height());
+        return Ok(Rgba { width, height, pixels: image.into_raw(), bgra: false });
+    }
+    let image = frame.decode_image::<nokhwa::pixel_format::RgbFormat>().map_err(|err| err.to_string())?;
+    let (width, height) = (image.width(), image.height());
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for pixel in image.pixels() {
+        pixels.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+    }
+    Ok(Rgba { width, height, pixels, bgra: false })
+}
+
+/// The system's id of a listed camera: Media Foundation's symbolic link on Windows, else the
+/// index. With the name, what `settings::CAMERA` stores.
+fn camera_id(info: &nokhwa::utils::CameraInfo) -> String {
+    let misc = info.misc();
+    if misc.is_empty() {
+        info.index().to_string()
+    } else {
+        misc
+    }
+}
+
+/// Which camera `choice` means now: the one whose id matches, else whose name does, else the
+/// first listed; with nothing listed, index 0, which says why it fails.
+fn camera_index(choice: Option<&str>) -> Result<nokhwa::utils::CameraIndex, String> {
+    use nokhwa::utils::{ApiBackend, CameraIndex};
+    let listed = nokhwa::query(ApiBackend::Auto).map_err(|err| err.to_string())?;
+    if listed.is_empty() {
+        return Err("No camera was found.".to_owned());
+    }
+    let (name, id) = match choice.and_then(|choice| choice.split_once('\t')) {
+        Some((name, id)) => (name, Some(id)),
+        None => (choice.unwrap_or_default(), None),
+    };
+    let found = listed
+        .iter()
+        .find(|info| id.is_some_and(|id| camera_id(info) == id))
+        .or_else(|| listed.iter().find(|info| !name.is_empty() && info.human_name() == name))
+        .unwrap_or(&listed[0]);
+    Ok(match found.index() {
+        CameraIndex::Index(n) => CameraIndex::Index(*n),
+        CameraIndex::String(s) => CameraIndex::String(s.clone()),
+    })
 }
 
 /// The screen or window chosen for the share ([`super::choose_screen`]), else the primary

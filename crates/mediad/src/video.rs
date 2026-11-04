@@ -251,6 +251,8 @@ pub enum Word {
     },
     /// The share or the camera cannot go on, in words.
     Failed { share: bool, words: String },
+    /// My own camera, painted for my tile; `None` when the camera went off.
+    SelfView(Option<Painted>),
 }
 
 /// The RTP time at 90 kHz of a capture `since` the first one.
@@ -376,9 +378,17 @@ pub trait Source {
     fn close_camera(&mut self);
     /// The share went off. A desktop's screen has nothing to close.
     fn close_share(&mut self) {}
+    /// My own camera painted for me since last asked, where the source does that.
+    fn self_view(&mut self) -> Option<Painted> {
+        None
+    }
 }
 
 impl Source for Outgoing {
+    fn self_view(&mut self) -> Option<Painted> {
+        Outgoing::self_view(self)
+    }
+
     fn share(&mut self, ask: Ask) -> Result<Encoded, String> {
         Outgoing::share(self, ask)
     }
@@ -528,6 +538,13 @@ impl<S: Source> Capture<S> {
                     {
                         return false;
                     }
+        if wants.camera {
+            if let Some(painted) = self.source.self_view() {
+                if self.tell.send(Word::SelfView(Some(painted))).is_err() {
+                    return false;
+                }
+            }
+        }
                 }
                 Err(words) => {
                     if let Some(ask) = high {
@@ -615,6 +632,9 @@ fn capture<S: Source>(mut work: Capture<S>, orders: &Orders) {
             }
             if seen.keep_camera && !wants.keep_camera {
                 work.source.close_camera();
+            }
+            if seen.camera && !wants.camera {
+                let _ = work.tell.send(Word::SelfView(None));
             }
             if seen.share && !wants.share {
                 work.source.close_share();
@@ -1878,6 +1898,7 @@ mod tests {
                     bytes += payload.len();
                 }
                 Some(Word::Failed { words, .. }) => panic!("{words}"),
+                Some(Word::SelfView(_)) => {}
                 None => std::thread::yield_now(),
             }
         }

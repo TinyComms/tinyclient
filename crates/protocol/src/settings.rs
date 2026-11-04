@@ -45,6 +45,9 @@ pub const CUE_VOLUME: &str = "cue_volume";
 /// ([`DeviceChoice::upgrade`]).
 pub const INPUT: &str = "input";
 pub const OUTPUT: &str = "output";
+/// V22. The camera, stored as V1 and V2 store theirs: absent is the first camera the system
+/// lists, else one by name, then a tab and the system's id for it.
+pub const CAMERA: &str = "camera";
 /// The stored value of "System default" in V1 and V2.
 pub const SYSTEM_DEFAULT: &str = "@system";
 /// V4. Every join and every Accept starts muted.

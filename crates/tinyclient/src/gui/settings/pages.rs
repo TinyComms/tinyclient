@@ -12,10 +12,10 @@ use crate::gui::components::{button, glyph, keycap, menu, menu_item, menu_item_c
 use crate::gui::layout::NETWORK_ORDER;
 use crate::gui::phone::{self, tokens::PhoneType};
 use crate::gui::theme::{self, Type};
-use gpui::{canvas, div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, MouseButton, SharedString, Window};
+use gpui::{canvas, div, img, prelude::*, px, AnyElement, ClipboardItem, Context, Div, MouseButton, ObjectFit, SharedString, Window};
 use crate::gui::hotkeys::{self, Action, Reach};
 use protocol::settings::{
-    self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, CACHE_MB, CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME,
+    self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, CACHE_MB, CAMERA, CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME,
     ECHO_CANCELLATION, GLOBAL, INPUT, INPUT_VOLUME, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_CHOICES, NOISE_SUPPRESSION, OUTPUT,
     PTT_RELEASE_CHOICES, PTT_RELEASE_MS, PUSH_TO_TALK, QUALITY_CHOICES, RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, TYPING, VOICE_QUALITY,
     VOICE_VOLUME,
@@ -251,6 +251,22 @@ pub(super) fn label_of(id: &str) -> &'static str {
     rows::find(id).map_or("", |row| row.label)
 }
 
+/// Whether `choice` names this camera: by the system's id first, then by name.
+fn camera_is(choice: &DeviceChoice, camera: &protocol::CameraSource) -> bool {
+    match choice {
+        DeviceChoice::Device { name, id } => id.as_deref().is_some_and(|id| id == camera.id) || name == &camera.name,
+        _ => false,
+    }
+}
+
+/// The camera `choice` means now: the one it names, else the first listed.
+fn camera_means<'a>(choice: &DeviceChoice, listed: &'a [protocol::CameraSource]) -> Option<&'a protocol::CameraSource> {
+    match choice {
+        DeviceChoice::Device { .. } => listed.iter().find(|camera| camera_is(choice, camera)),
+        _ => listed.first(),
+    }
+}
+
 /// The accounts that have rows of their own, in the rail's order.
 fn accounts(window: &SettingsWindow, cx: &gpui::App) -> Vec<AccountStatus> {
     let Some(shell) = window.shell.upgrade() else {
@@ -375,6 +391,7 @@ impl SettingsWindow {
                 self.group(&["V1"], Some("Microphone"), window, cx).child(caption("How your microphone opens, its level and its processing are in Voice.")),
                 self.group(&["V2", "V5"], Some("Speaker"), window, cx)
                     .child(caption("Picking a device in a call's menu changes that call only. These are the defaults.")),
+                self.group(&["V22"], Some("Camera"), window, cx).child(self.camera_preview(cx)),
                 self.group(&["V4"], Some("Joining"), window, cx),
             ],
             Section::Voice => {
@@ -620,6 +637,7 @@ impl SettingsWindow {
             }
             "P1" | "P2" => return self.per_account_rows(id, cx).unwrap_or_else(div),
             "V1" | "V2" => self.device_row(id, cx),
+            "V22" => self.camera_row(cx),
             "V3" => self.meter_row(cx),
             "V8" => {
                 let push = values.on(PUSH_TO_TALK);
@@ -1334,10 +1352,127 @@ impl SettingsWindow {
         row(label, second, div().flex().items_center().child(reset_slot(reset)).child(picker_button))
     }
 
+    /// The camera picker (V22): the same menu button as the microphone's, over
+    /// `mediad --cameras`. Nothing chosen is the first camera the system lists.
+    fn camera_row(&mut self, cx: &mut Context<Self>) -> Div {
+        let id = "V22";
+        let picker = Picker::Camera;
+        let choice = prefs::values().device_choice(CAMERA);
+        let stored = (choice != DeviceChoice::Auto).then_some(());
+        let listed = self.cameras.clone().unwrap_or_default();
+        let means = camera_means(&choice, &listed).map(|camera| camera.name.clone());
+        let gone = matches!(choice, DeviceChoice::Device { .. }) && self.cameras.is_some() && means.is_none();
+        let (shown, whole) = match &choice {
+            DeviceChoice::Device { name, .. } if gone => (format!("{name} (not connected)"), format!("{name} (not connected)")),
+            DeviceChoice::Device { name, .. } => {
+                let name = means.clone().unwrap_or_else(|| name.clone());
+                (name.clone(), name)
+            }
+            _ if listed.is_empty() && self.cameras.is_some() => ("No camera found".to_owned(), "No camera found".to_owned()),
+            _ if self.cameras.is_none() => ("Automatic".to_owned(), "Automatic: looking for cameras".to_owned()),
+            _ => ("Automatic".to_owned(), means.map_or("Automatic".to_owned(), |name| format!("Automatic: {name}"))),
+        };
+        let second = gone.then(|| "Calls use the first camera found until it is back.".into());
+        if self.cameras.is_none() {
+            self.list_cameras(cx);
+        }
+        let anchors = self.anchors.clone();
+        let anchor: &'static str = "V22-menu";
+        let label = label_of(id);
+        let picker_button = div()
+            .id(SharedString::from(format!("{id}-picker")))
+            .track_focus(&self.picker_focus[picker as usize])
+            .w(px(controls::POPUP_WIDTH))
+            .h(px(theme::CONTROL))
+            .pl(px(10.))
+            .pr(px(8.))
+            .rounded(px(theme::R_CONTROL))
+            .bg(theme::hover())
+            .border_1()
+            .border_color(theme::border())
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .cursor_pointer()
+            .role(gpui::Role::ComboBox)
+            .aria_label(label)
+            .aria_value(SharedString::from(whole.clone()))
+            .tooltip(crate::gui::components::tip(whole, None))
+            .hover(|style| style.bg(theme::selected()).border_color(theme::border_strong()))
+            .focus_visible(|style| style.shadow(theme::focus_ring()))
+            .child(div().flex_1().min_w_0().truncate().type_ui().font_weight(theme::MEDIUM).text_color(if stored.is_some() && !gone { theme::text() } else { theme::text_soft() }).child(shown))
+            .child(glyph("icons/chevron-down.svg", 14., theme::text_soft()))
+            .child(canvas(move |bounds, _, _| { anchors.borrow_mut().insert(anchor, bounds); }, |_, _, _, _| {}).absolute().top_0().left_0().size_full())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.picker == Some(picker) {
+                    this.close_picker(window, cx);
+                } else {
+                    this.open_picker(picker, window, cx);
+                }
+            }));
+        let reset = stored.as_ref().map(|_| {
+            reset_button(SharedString::from(format!("{id}-reset")), format!("Reset {label} to automatic").into())
+                .on_click(cx.listener(move |this, _, _, cx| this.set(id, GLOBAL.into(), CAMERA, None, cx)))
+        });
+        row(label, second, div().flex().items_center().child(reset_slot(reset)).child(picker_button))
+    }
+
+    /// Under the camera row: what the chosen camera sees, as `mediad --cameras` last saw it,
+    /// and a button to look again. A still, not a stream: the picture is one frame.
+    fn camera_preview(&mut self, cx: &mut Context<Self>) -> Div {
+        let choice = prefs::values().device_choice(CAMERA);
+        let listed = self.cameras.clone().unwrap_or_default();
+        let picture = camera_means(&choice, &listed).map(|camera| camera.thumbnail.clone()).filter(|path| !path.is_empty());
+        let words = match (&self.cameras, &picture) {
+            (None, _) => "Looking at your cameras…",
+            (Some(listed), _) if listed.is_empty() => "No camera was found.",
+            (_, None) => "This camera gave no picture.",
+            (_, Some(_)) => "What this camera sees, as of a moment ago. Everyone in a call sees it this way.",
+        };
+        let frame = div()
+            .flex_none()
+            .w(px(320.))
+            .h(px(180.))
+            .rounded(px(8.))
+            .bg(gpui::rgb(0x000000))
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(match picture {
+                Some(path) => img(std::path::PathBuf::from(path)).size_full().object_fit(ObjectFit::Contain).into_any_element(),
+                None => glyph("icons/video.svg", 28., theme::text_faint()).into_any_element(),
+            });
+        let again = button("V22-again", ButtonKind::Secondary, if self.cameras_reading { "Looking…" } else { "Look again" })
+            .h(px(28.))
+            .on_click(cx.listener(|this, _, _, cx| this.list_cameras(cx)));
+        div()
+            .px(px(12.))
+            .py(px(10.))
+            .flex()
+            .gap(px(14.))
+            .items_start()
+            .child(frame)
+            .child(div().flex_1().min_w_0().flex().flex_col().items_start().gap(px(10.)).child(caption(words)).child(again))
+    }
+
     /// A picker's choices in menu order, by the value stored and the words shown: Automatic,
     /// System default, the hardware, the virtual devices, then the chosen one if it is not
-    /// connected.
+    /// connected. A camera's: Automatic, then each camera.
     pub(super) fn picker_choices(&self, picker: Picker) -> Vec<(Option<String>, String)> {
+        if picker == Picker::Camera {
+            let listed = self.cameras.clone().unwrap_or_default();
+            let first = listed.first().map_or("Automatic".to_owned(), |camera| format!("Automatic ({})", camera.name));
+            let mut choices = vec![(None, first)];
+            choices.extend(listed.iter().map(|camera| (DeviceChoice::device(&camera.name, &camera.id).value(), camera.name.clone())));
+            let choice = prefs::values().device_choice(CAMERA);
+            if let DeviceChoice::Device { name, .. } = &choice {
+                if camera_means(&choice, &listed).is_none() {
+                    choices.push((choice.value(), format!("{name} (not connected)")));
+                }
+            }
+            return choices;
+        }
         let devices = self.devices.clone().unwrap_or_default();
         let listed = devices.listed(picker);
         let key = if picker == Picker::Input { INPUT } else { OUTPUT };
@@ -1363,6 +1498,14 @@ impl SettingsWindow {
 
     /// Which of [`Self::picker_choices`] is the one chosen.
     pub(super) fn picker_checked(&self, picker: Picker) -> usize {
+        if picker == Picker::Camera {
+            let choice = prefs::values().device_choice(CAMERA);
+            let listed = self.cameras.clone().unwrap_or_default();
+            return match &choice {
+                DeviceChoice::Device { .. } => 1 + listed.iter().position(|camera| camera_is(&choice, camera)).unwrap_or(listed.len()),
+                _ => 0,
+            };
+        }
         let key = if picker == Picker::Input { INPUT } else { OUTPUT };
         let choice = prefs::values().device_choice(key);
         let devices = self.devices.clone().unwrap_or_default();
@@ -1382,6 +1525,7 @@ impl SettingsWindow {
         let anchor = match picker {
             Picker::Input => "V1-menu",
             Picker::Output => "V2-menu",
+            Picker::Camera => "V22-menu",
         };
         let bounds = self.anchors.borrow().get(anchor).copied()?;
         let checked = self.picker_checked(picker);

@@ -1434,7 +1434,7 @@ fn hang_up_while_still_connecting_exits_cleanly() {
 fn requests_before_and_without_a_join_keep_their_one_reply() {
     let mut mediad = Mediad::start("null", None);
     assert_eq!(mediad.ask(MediaRequest::Audio { muted: true, deafened: false }), MediaResponse::Done);
-    assert_eq!(mediad.ask(MediaRequest::Devices { input: None, output: None }), MediaResponse::Done);
+    assert_eq!(mediad.ask(MediaRequest::Devices { input: None, output: None, camera: None }), MediaResponse::Done);
     assert_eq!(mediad.ask(MediaRequest::Streams), MediaResponse::Streams { video: vec![] });
     let (status, took) = mediad.hang_up();
     assert_eq!(status.code(), Some(0));
