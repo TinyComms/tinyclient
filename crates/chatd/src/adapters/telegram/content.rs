@@ -488,6 +488,10 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             };
             let outgoing = raw.out || (from == Who::User(dir.me) && peer == Who::User(dir.me));
             let mut message = Message::plain(raw.id.to_string(), "", raw.message.clone(), i64::from(raw.date), outgoing);
+            // The message's own timer: Telegram stops serving it at `date + ttl_period`, and
+            // the official apps drop it from their stores whether online or not. The store
+            // does the same.
+            message.expires_at = raw.ttl_period.filter(|ttl| *ttl > 0).map(|ttl| i64::from(raw.date) + i64::from(ttl));
             message.sender = sender(dir, from);
             message.spans = spans(&raw.message, raw.entities.as_deref().unwrap_or(&[]));
             message.edited = raw.edit_date.is_some() && !raw.edit_hide;

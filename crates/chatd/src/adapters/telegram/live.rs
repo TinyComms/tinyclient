@@ -263,6 +263,9 @@ pub(super) fn sent(account: &Account, conversation: &str, who: Who, text: &str, 
     // The short answer names only the id and the time: the rest is what we sent.
     if let tl::enums::Updates::UpdateShortSentMessage(short) = answer {
         let mut message = Message::plain(short.id.to_string(), "", text, i64::from(short.date), true);
+        // A send into a chat that keeps its messages only for a while comes back with the
+        // timer the chat gave it, like any other message there.
+        message.expires_at = short.ttl_period.filter(|ttl| *ttl > 0).map(|ttl| i64::from(short.date) + i64::from(ttl));
         let me = Who::User(account.me);
         message.sender = protocol::Sender { id: me.text(), name: account.dir().name(me), ..protocol::Sender::default() };
         message.spans = content::spans(text, short.entities.as_deref().unwrap_or(&[]));

@@ -5,11 +5,11 @@
 //!
 //! scratch directory (`adapters/script.rs`): `telegram.signin.ctl` while signing in (`scan`,
 //! `scan-password`), `telegram.ctl` once signed in (`incoming`, `photo`, `react`, `edit`,
-//! `delete`, `topic`, `comments`, `typing`, `typing-stop`, `read`, `status`, `poll`, `voice`,
-//! `forward`, `flood-send N`, `revoke`, and the holds of `TINYCLIENT_TELEGRAM_HOLD` and
-//! `TINYCLIENT_TELEGRAM_PEER_HOLD` through `dialogs-go` and `peer-go`). Every request it is
-//! sent is appended to `telegram.calls`, one line each, so a test can see what the network
-//! would have heard.
+//! `delete`, `ttl`, `ttl-gone`, `topic`, `comments`, `typing`, `typing-stop`, `read`, `status`,
+//! `poll`, `voice`, `forward`, `flood-send N`, `revoke`, and the holds of
+//! `TINYCLIENT_TELEGRAM_HOLD` and `TINYCLIENT_TELEGRAM_PEER_HOLD` through `dialogs-go` and
+//! `peer-go`). Every request it is sent is appended to `telegram.calls`, one line each, so a
+//! test can see what the network would have heard.
 //!
 //! The account: Mira Kessler (7001); Odalys Brandt (7002, a contact, with a second password on
 //! her own number); Tobin Reyes (7003); a group "Trail crew" (8001); a channel "Field Notes"
@@ -905,6 +905,27 @@ impl World {
                     held.remove(&13);
                 }
                 vec![update(tl::types::UpdateDeleteMessages { messages: vec![13], pts: 0, pts_count: 1 }.into())]
+            }
+            // One message whose own timer ran out before it arrived, and one with a moment
+            // still to live: the store never shows the first and drops the second at its
+            // moment, whether the account is online or not.
+            "ttl" => {
+                let mut gone = message(odalys, 17, ODALYS, T0 - 3_600, "Gone before it arrived");
+                gone.ttl_period = Some(60);
+                let mut alive = message(odalys, 18, ODALYS, crate::hub::now() as i32, "Vanishes in a moment");
+                alive.ttl_period = Some(10);
+                self.store(None, gone.clone());
+                self.store(None, alive.clone());
+                vec![new(gone), new(alive)]
+            }
+            // Telegram's own word that both are gone after their time, as its server says to
+            // everyone still listening.
+            "ttl-gone" => {
+                if let Some(held) = self.messages.get_mut(&odalys.text()) {
+                    held.remove(&17);
+                    held.remove(&18);
+                }
+                vec![update(tl::types::UpdateDeleteMessages { messages: vec![17, 18], pts: 0, pts_count: 2 }.into())]
             }
             "topic" => {
                 let message = in_topic(message(Who::Channel(WORKSHOP), 42, TOBIN, T0 + 40, "Found it, bottom drawer."), TOOLS);
