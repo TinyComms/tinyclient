@@ -1,6 +1,7 @@
 //! The mic: press to record, press again to stop, and the finished note in the tray until it is
-//! sent. Anything of sound is chatd's and mediad's to do: the composer asks (`Request::Record`)
-//! and reads what came back (`Change::Recording`).
+//! sent — or, with push-to-talk on, hold to record and let go to stop. Anything of sound is
+//! chatd's and mediad's to do: the composer asks (`Request::Record`) and reads what came back
+//! (`Change::Recording`).
 
 use protocol::{Capabilities, Key, OutgoingFile, RecordRequest, RecordState, Recording, VoiceNote};
 use super::{super::playing, Tone};
@@ -22,13 +23,30 @@ pub(in crate::gui) fn on_press(recording: &Option<Recording>, target: &Key) -> R
     }
 }
 
+/// What a held mic is: the down records. Every down is a start, like a press where nothing of
+/// this conversation's runs — chatd ends whatever ran, and what it kept goes with it.
+pub(in crate::gui) fn on_hold_down(target: &Key) -> RecordRequest {
+    RecordRequest::Start { conversation: target.clone() }
+}
+
+/// What letting the mic go asks, once the release grace has run: the stop, while this
+/// conversation's recording still runs. One that never started, failed, or finished is none to
+/// stop, and asking would only end another's.
+pub(in crate::gui) fn on_hold_up(recording: &Option<Recording>, target: &Key) -> Option<RecordRequest> {
+    let runs = recording
+        .as_ref()
+        .is_some_and(|recording| recording.conversation == *target && matches!(recording.state, RecordState::Active));
+    runs.then_some(RecordRequest::Stop)
+}
+
 /// The composer's foot on a recording, for the conversation it belongs to. `now` is unix
-/// milliseconds, as `since` is.
-pub(in crate::gui) fn foot(recording: &Option<Recording>, target: &Key, now: u64) -> Option<(String, Tone)> {
+/// milliseconds, as `since` is; `push` names the way the mic works, for what ends it.
+pub(in crate::gui) fn foot(recording: &Option<Recording>, target: &Key, now: u64, push: bool) -> Option<(String, Tone)> {
     let recording = recording.as_ref().filter(|recording| recording.conversation == *target)?;
     Some(match &recording.state {
         RecordState::Active => {
-            (format!("Recording · {} — press the mic again to stop", clock(now.saturating_sub(recording.since))), Tone::Note)
+            let how = if push { "release the mic to stop" } else { "press the mic again to stop" };
+            (format!("Recording · {} — {}", clock(now.saturating_sub(recording.since)), how), Tone::Note)
         }
         RecordState::Recorded { duration, .. } => {
             (format!("Voice note · {} kept. It goes with your message.", clock(u64::from(*duration))), Tone::Note)
@@ -170,17 +188,39 @@ mod tests {
     #[test]
     fn the_foot_shows_the_clock_while_it_records_and_the_note_when_it_is_kept() {
         let key = target();
-        let (words, tone) = foot(&Some(active()), &key, 79_000).unwrap();
+        let (words, tone) = foot(&Some(active()), &key, 79_000, false).unwrap();
         assert_eq!(words, "Recording · 1:09 — press the mic again to stop");
         assert_eq!(tone, Tone::Note);
-        let (words, tone) = foot(&Some(kept("voice-1.opus")), &key, 80_000).unwrap();
+        let (words, tone) = foot(&Some(active()), &key, 79_000, true).unwrap();
+        assert_eq!(words, "Recording · 1:09 — release the mic to stop");
+        let (words, tone) = foot(&Some(kept("voice-1.opus")), &key, 80_000, false).unwrap();
         assert_eq!(words, "Voice note · 0:12 kept. It goes with your message.");
         assert_eq!(tone, Tone::Note);
-        let (words, tone) = foot(&Some(Recording { since: 10_000, state: RecordState::Failed { detail: "No microphone.".into() }, ..active() }), &key, 80_000).unwrap();
+        let (words, tone) = foot(&Some(Recording { since: 10_000, state: RecordState::Failed { detail: "No microphone.".into() }, ..active() }), &key, 80_000, false).unwrap();
         assert_eq!(words, "No microphone.");
         assert_eq!(tone, Tone::Refused);
         // Another conversation's recording is not this foot's to show.
-        assert!(foot(&Some(active()), &Key { id: "9001".into(), ..key }, 80_000).is_none());
+        assert!(foot(&Some(active()), &Key { id: "9001".into(), ..key }, 80_000, false).is_none());
+    }
+
+    #[test]
+    fn a_hold_down_records_and_its_release_stops_what_still_runs() {
+        let key = target();
+        assert!(matches!(on_hold_down(&key), RecordRequest::Start { .. }), "every down records");
+        assert_eq!(on_hold_up(&Some(active()), &key), Some(RecordRequest::Stop), "the release stops the run");
+    }
+
+    /// A release stops only a recording that still runs here: a note kept, a failure, another
+    /// conversation's recording, and nothing at all are none of its business.
+    #[test]
+    fn the_release_stops_nothing_else() {
+        let key = target();
+        assert_eq!(on_hold_up(&None, &key), None);
+        let elsewhere = Recording { conversation: Key { account: key.account.clone(), network: key.network, id: "9001".into() }, ..active() };
+        assert_eq!(on_hold_up(&Some(elsewhere), &key), None);
+        assert_eq!(on_hold_up(&Some(kept("voice-1.opus")), &key), None, "a finished note is no run");
+        let failed = Recording { state: RecordState::Failed { detail: "No microphone.".into() }, ..active() };
+        assert_eq!(on_hold_up(&Some(failed), &key), None);
     }
 
     #[test]
