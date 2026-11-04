@@ -66,6 +66,12 @@ gpui_ce_wgpu = { path = "vendor/gpui_ce_wgpu" }
 # the Objective-C boundary and an abort at launch. The parameters are optional now and nil is "no
 # range". Drop this when a gpui_ce_ios release takes nil there.
 gpui_ce_ios = { path = "vendor/gpui_ce_ios" }
+# gpui_ce_macos 0.3.0 with one fix (vendor/gpui_ce_macos, `did_finish_launching`, marked
+# "tinyclient patch"): it ran the app's launch code while still holding the platform lock, so
+# the first platform call in it (`cx.set_menus`) waited on that lock forever and no window ever
+# opened on macOS. The gpui-ce repository's main branch already lets go of the lock first; 0.3.0
+# was published from a commit that does not. Drop this when a gpui_ce_macos release does.
+gpui_ce_macos = { path = "vendor/gpui_ce_macos" }
 # gpui_ce_windows 0.3.0 with one fix (vendor/gpui_ce_windows, `DirectWriteTextSystem::new_inner`,
 # marked "tinyclient patch"): the shaping fallback list ends at Lilex, IBM Plex Sans and Arial,
 # so a run with glyphs none of them carries (Telegram's mathematical-bold-script sender name
