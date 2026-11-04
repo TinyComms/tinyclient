@@ -2153,6 +2153,10 @@ impl Chat {
             Request::TinySetupRead { account } => adapters::tiny::manage::setup_read(account),
             Request::TinySetupApply { account, apply } => adapters::tiny::manage::setup_apply(account, apply),
             Request::TinyPasskeyLink { account } => adapters::tiny::manage::passkey_link(account),
+            // Wired up with the passkey screens; until then they are refused in words.
+            Request::TinySetupClaimLinks { .. } | Request::TinyPasskeysRead { .. } | Request::TinyPasskeyRename { .. } | Request::TinyPasskeyRemove { .. } | Request::TinyRecoveryCodes { .. } => {
+                error(ErrorCode::Unsupported, "this build cannot manage passkeys yet")
+            }
             Request::TinyBots { account } => adapters::tiny::manage::bots_list(account),
             Request::TinyBotCreate { account, name, scopes } => adapters::tiny::manage::bots_create(account, name, scopes),
             Request::TinyBotRevoke { account, bot_id } => adapters::tiny::manage::bots_revoke(account, bot_id),

@@ -217,6 +217,8 @@ pub fn remedy(refusal: &TinySetupRefusal) -> Option<Remedy> {
         TinySetupRefusal::PasskeysUnavailable => None,
         TinySetupRefusal::OwnerNeedsPasskey => Some(Remedy::AddPasskey),
         TinySetupRefusal::MembersWithoutPasskey { .. } => Some(Remedy::DoItAnyway),
+        // The GUI's answer to these two comes with the provider-only choice.
+        TinySetupRefusal::OwnerNeedsProvider | TinySetupRefusal::MembersWithoutProvider { .. } => None,
     }
 }
 
@@ -240,6 +242,12 @@ pub fn refusal_words(refusal: &TinySetupRefusal) -> String {
             "{} no passkey yet. If you go on, they can't sign in until you give each of them a passkey link. Anyone already signed in stays signed in until their session ends.",
             people_without(*count)
         ),
+        TinySetupRefusal::OwnerNeedsProvider => {
+            "You have not signed in through a sign-in provider yet. If members were limited to the provider now, you could not sign in again.".to_owned()
+        }
+        TinySetupRefusal::MembersWithoutProvider { count } => {
+            format!("{} not signed in through a sign-in provider yet, so they could not sign in if members were limited to it.", people_without(*count))
+        }
     }
 }
 
@@ -387,7 +395,8 @@ mod tests {
             completed_at: String::new(),
             current: posture("full", "everyone", "any"),
             deployment: TinyDeployment { passkeys: true, sso: true },
-            counts: TinySetupCounts { members: 3, members_without_passkey: 2, emails_stored: 2, owner_has_passkey: false },
+            counts: TinySetupCounts { members: 3, members_without_passkey: 2, emails_stored: 2, owner_has_passkey: false, ..TinySetupCounts::default() },
+            members: Vec::new(),
             presets: vec![
                 TinyPreset { id: "convenience".into(), title: "Convenience".into(), summary: "Easy.".into(), choices: posture("full", "everyone", "any"), available: true, unavailable: String::new() },
                 TinyPreset { id: "privacy".into(), title: "Privacy".into(), summary: "Least.".into(), choices: posture("none", "nobody", "passkey"), available: true, unavailable: String::new() },
@@ -600,9 +609,9 @@ mod tests {
     fn the_counts_that_matter_are_said_before_the_owner_commits() {
         let mut setup = setup();
         assert_eq!(counts_words(&setup), ["2 members have no passkey yet.", "2 email addresses are stored."]);
-        setup.counts = TinySetupCounts { members: 1, members_without_passkey: 1, emails_stored: 1, owner_has_passkey: false };
+        setup.counts = TinySetupCounts { members: 1, members_without_passkey: 1, emails_stored: 1, owner_has_passkey: false, ..TinySetupCounts::default() };
         assert_eq!(counts_words(&setup), ["1 member has no passkey yet.", "1 email address is stored."]);
-        setup.counts = TinySetupCounts { members: 4, members_without_passkey: 0, emails_stored: 0, owner_has_passkey: true };
+        setup.counts = TinySetupCounts { members: 4, members_without_passkey: 0, emails_stored: 0, owner_has_passkey: true, ..TinySetupCounts::default() };
         assert_eq!(counts_words(&setup), ["Every member has a passkey."]);
         setup.deployment.passkeys = false;
         assert!(counts_words(&setup).is_empty(), "no passkeys here: nothing to count");

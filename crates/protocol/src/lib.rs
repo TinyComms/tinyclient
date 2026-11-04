@@ -1700,6 +1700,33 @@ pub enum Request {
     TinyPasskeyLink {
         account: AccountKey,
     },
+    /// The owner asks for a link per chosen member to add a passkey
+    /// (`POST /v1/setup/claim-links`). Answers `TinyClaimLinks`. A member is refused.
+    TinySetupClaimLinks {
+        account: AccountKey,
+        user_ids: Vec<String>,
+    },
+    /// This account's own passkeys (`GET /v1/me/passkeys`). Answers `TinyPasskeys`.
+    TinyPasskeysRead {
+        account: AccountKey,
+    },
+    /// Renames one of this account's passkeys. Answers `Ok`.
+    TinyPasskeyRename {
+        account: AccountKey,
+        id: String,
+        label: String,
+    },
+    /// Removes one of this account's passkeys. Answers `Ok`; the server refuses to remove the
+    /// last way to sign in.
+    TinyPasskeyRemove {
+        account: AccountKey,
+        id: String,
+    },
+    /// Makes a fresh set of recovery codes for this account, which replaces the old ones. Answers
+    /// `TinyRecoveryCodes`. The codes are shown once.
+    TinyRecoveryCodes {
+        account: AccountKey,
+    },
     /// The server's application bots. Answers `TinyBots`. A member is refused.
     TinyBots {
         account: AccountKey,
@@ -2078,6 +2105,18 @@ pub enum Response {
     /// The server would not apply the choices, and said what the owner can do. Nothing changed.
     TinySetupRefused {
         refusal: TinySetupRefusal,
+    },
+    /// One link per member asked for, each to add a passkey.
+    TinyClaimLinks {
+        links: Vec<TinyClaimLink>,
+    },
+    /// This account's own passkeys.
+    TinyPasskeys {
+        passkeys: TinyPasskeys,
+    },
+    /// A fresh set of recovery codes, shown once.
+    TinyRecoveryCodes {
+        codes: Vec<String>,
     },
     /// The server's application bots. None of them carries a token.
     TinyBots {
