@@ -6,14 +6,14 @@
 //! this window holds is the form the owner is filling in, and "Later" only lasts until the server
 //! is opened again. Nothing is applied until the owner says so, and nothing blocks the app.
 
-use super::settings::{check_box, section, Page as SettingsPage};
-use super::Page;
+use super::settings::{card, check_box, provider_words, section, Page as SettingsPage};
+use super::{Modal, Page};
 use crate::client::ask;
 use crate::gui::components::{button, button_disabled, glyph, ButtonKind};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
-use crate::tiny_setup::{self, Form, Hint, Remedy};
-use gpui::{div, prelude::*, px, AnyElement, Context, Div, ElementId, SharedString, Stateful};
+use crate::tiny_setup::{self, Action, Checklist, Form, Hint, Remedy, StepState};
+use gpui::{div, prelude::*, px, AnyElement, Context, Div, ElementId, SharedString, Stateful, Window};
 use protocol::{Request, Response, TinySetup, TinySetupApply, TinySetupRefusal};
 
 /// What the window holds of setup, for the server on show.
@@ -47,6 +47,8 @@ pub(super) struct State {
     linking: bool,
     /// What happened with the link, in words.
     link_note: Option<String>,
+    /// The first-run screen's scroll.
+    pub(super) scroll: gpui::ScrollHandle,
 }
 
 /// What an answer is made of when it is sent.
@@ -270,7 +272,13 @@ impl Shell {
         let Some(account) = self.tiny_state.account.clone() else {
             return;
         };
+        // "Switch anyway" was pressed: the owner has seen who would be locked out, so the server
+        // is not asked to refuse for it first.
+        let anyway = what == Answer::Form && self.tiny_state.setup.data.as_ref().and_then(|setup| self.tiny_setup_steps(setup)).is_some_and(|steps| steps.anyway);
         let state = &mut self.tiny_state.setup;
+        if anyway {
+            state.form.allow_lockout = true;
+        }
         let Some(setup) = state.data.as_ref() else {
             return;
         };
@@ -377,6 +385,67 @@ impl Shell {
         cx.notify();
     }
 
+    /// "Send passkey links…": the modal opens with every member who has no passkey ticked.
+    fn tiny_setup_open_links(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(setup) = self.tiny_state.setup.data.as_ref() else {
+            return;
+        };
+        let me = self.tiny_state.community.as_ref().map(|community| community.me.as_str()).unwrap_or_default();
+        let picked = setup.members.iter().filter(|member| !member.passkey && member.user_id != me).map(|member| member.user_id.clone()).collect();
+        self.tiny_open_modal(Modal::PasskeyLinks { picked, links: Vec::new(), busy: false, error: None }, window, cx);
+    }
+
+    /// A member ticked or not, before the links are made.
+    pub(super) fn tiny_setup_tick_link(&mut self, user_id: &str, cx: &mut Context<Self>) {
+        if let Some(Modal::PasskeyLinks { picked, links, busy: false, error: None }) = self.tiny_state.modal.as_mut() {
+            if links.is_empty() {
+                match picked.iter().position(|id| id == user_id) {
+                    Some(at) => {
+                        picked.remove(at);
+                    }
+                    None => picked.push(user_id.to_owned()),
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// "Make links": one link for each member ticked. They are held only by the modal, which
+    /// drops them when it closes; an answer that comes after it closed is dropped too.
+    pub(super) fn tiny_setup_make_links(&mut self, cx: &mut Context<Self>) {
+        let Some(account) = self.tiny_state.account.clone() else {
+            return;
+        };
+        let Some(Modal::PasskeyLinks { picked, busy, error, .. }) = self.tiny_state.modal.as_mut() else {
+            return;
+        };
+        if *busy || picked.is_empty() {
+            return;
+        }
+        *busy = true;
+        *error = None;
+        let user_ids = picked.clone();
+        let wanted = account.clone();
+        cx.notify();
+        self.off_thread(cx, move || ask(&Request::TinySetupClaimLinks { account, user_ids }), move |this, answer, cx| {
+            if this.tiny_state.account.as_ref() != Some(&wanted) {
+                return;
+            }
+            let Some(Modal::PasskeyLinks { links, busy: busy @ true, error, .. }) = this.tiny_state.modal.as_mut() else {
+                return;
+            };
+            *busy = false;
+            match answer {
+                Ok(Response::TinyClaimLinks { links: made }) if !made.is_empty() => *links = made,
+                Ok(Response::TinyClaimLinks { .. }) => *error = Some("The server made no links.".to_owned()),
+                Ok(Response::Error { detail, .. }) => *error = Some(detail),
+                Ok(_) => *error = Some(crate::client::OTHER_ANSWER.to_owned()),
+                Err(err) => *error = Some(crate::client::trouble_words("tiny", &err)),
+            }
+            cx.notify();
+        });
+    }
+
     // What Server Settings › Privacy asks of it.
 
     /// The page comes on show: an owner's is the server's outline, read if it is not held.
@@ -412,6 +481,82 @@ impl Shell {
 
     // What is drawn.
 
+    /// The community's name for its sign-in provider, for words that name it.
+    fn tiny_setup_provider(&self) -> String {
+        match self.tiny_state.community.as_ref().map(|community| provider_words(&community.provider)) {
+            Some((name, false)) => name,
+            _ => "the sign-in provider".to_owned(),
+        }
+    }
+
+    /// What stands between the owner and the sign-in method the form picked.
+    fn tiny_setup_steps(&self, setup: &TinySetup) -> Option<Checklist> {
+        tiny_setup::checklist(setup, &self.tiny_state.setup.form, &self.tiny_setup_provider())
+    }
+
+    /// The button that sends the form, on the first-run screen and in the Privacy page's
+    /// unsaved-changes bar: "Switch anyway", and dangerous, when members would be locked out.
+    pub(super) fn tiny_setup_apply_button(&self, setup: &TinySetup) -> (SharedString, ButtonKind) {
+        let state = &self.tiny_state.setup;
+        if self.tiny_setup_steps(setup).is_some_and(|steps| steps.anyway) {
+            return ("Switch anyway".into(), ButtonKind::Danger);
+        }
+        if !state.prompt {
+            return ("Save changes".into(), ButtonKind::Primary);
+        }
+        let label = match state.form.preset.as_deref().and_then(|id| setup.presets.iter().find(|preset| preset.id == id)) {
+            Some(preset) if !state.customizing => format!("Use {}", preset.title).into(),
+            _ => "Apply".into(),
+        };
+        (label, ButtonKind::Primary)
+    }
+
+    /// The steps for the sign-in method picked, drawn under it: each done or still open, with
+    /// what the owner can press for it. `None` when it is not a switch, or nothing is in the way.
+    fn tiny_setup_checklist(&self, prefix: &'static str, setup: &TinySetup, cx: &mut Context<Self>) -> Option<Div> {
+        let steps = self.tiny_setup_steps(setup)?;
+        if steps.steps.is_empty() {
+            return None;
+        }
+        let linking = self.tiny_state.setup.linking;
+        let mut list = card();
+        for (ix, step) in steps.steps.iter().enumerate() {
+            let (icon, tone) = match step.state {
+                StepState::Done => ("icons/check.svg", theme::positive()),
+                StepState::Open => ("icons/circle-alert.svg", theme::warning()),
+            };
+            let action = match step.action {
+                Some(Action::AddPasskey) if linking => Some(button_disabled(tiny_setup::remedy_label(Remedy::AddPasskey)).into_any_element()),
+                Some(Action::AddPasskey) => Some(
+                    button(SharedString::from(format!("{prefix}-step-passkey")), ButtonKind::Secondary, tiny_setup::remedy_label(Remedy::AddPasskey))
+                        .on_click(cx.listener(|this, _, _, cx| this.tiny_setup_link(cx)))
+                        .into_any_element(),
+                ),
+                Some(Action::SendLinks) => Some(
+                    button(SharedString::from(format!("{prefix}-step-links")), ButtonKind::Secondary, "Send passkey links…")
+                        .on_click(cx.listener(|this, _, window, cx| this.tiny_setup_open_links(window, cx)))
+                        .into_any_element(),
+                ),
+                // The client cannot sign in through the provider for them: the words say to.
+                Some(Action::SignInWithProvider) | None => None,
+            };
+            list = list.child(
+                div()
+                    .px(px(14.))
+                    .py(px(10.))
+                    .min_h(px(48.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .when(ix > 0, |row| row.border_t_1().border_color(theme::hairline()))
+                    .child(glyph(icon, 16., tone))
+                    .child(div().flex_1().min_w_0().whitespace_normal().type_ui().text_color(theme::text()).child(step.words.clone()))
+                    .children(action),
+            );
+        }
+        Some(list)
+    }
+
     /// The form both the first-run screen and the Privacy page draw: the two presets, Customize
     /// with each choice and option, the facts that always hold, what a choice would touch and the
     /// switch for erasing the addresses on file, and what the server said no to. `prefix` names
@@ -429,14 +574,19 @@ impl Shell {
             let preset_id = preset.id.clone();
             let mut words = div().flex_1().min_w_0().flex().flex_col().gap(px(3.)).child(title(preset.title.clone()));
             // What a preset means is said once it is picked, so the choice stays short to read.
-            if on || !preset.available {
+            if on {
                 words = words.child(about(preset.summary.clone()));
             }
+            // Only an older server says a preset cannot be chosen: one line, in its words.
             if !preset.available && !preset.unavailable.is_empty() {
-                words = words.child(div().whitespace_normal().type_small().text_color(theme::warning()).child(preset.unavailable.clone()));
+                words = words.child(div().truncate().type_small().text_color(theme::warning()).child(preset.unavailable.clone()));
             }
             let card = pick_card(id("preset", ix), on, preset.available).child(radio(on)).child(words);
             presets = presets.child(if preset.available { card.on_click(cx.listener(move |this, _, _, cx| this.tiny_setup_pick_preset(&preset_id, cx))) } else { card });
+            // With the choices folded away, what the preset's sign-in method needs is said under it.
+            if on && !state.customizing {
+                presets = presets.children(self.tiny_setup_checklist(prefix, setup, cx));
+            }
         }
         body = body.child(presets);
 
@@ -464,9 +614,11 @@ impl Shell {
                     if on {
                         words = words.child(about(option.effect.clone()));
                     }
+                    // The sign-in method picked has its steps under it, the owner's passkey among them.
+                    let steps = if on && choice.id == "sign_in_methods" { self.tiny_setup_checklist(prefix, setup, cx) } else { None };
                     if let Some(why) = blocked {
                         words = words.child(div().whitespace_normal().type_small().text_color(theme::warning()).child(why));
-                    } else if on && tiny_setup::hint(setup, &option.needs) == Some(Hint::AddPasskey) {
+                    } else if on && steps.is_none() && tiny_setup::hint(setup, &option.needs) == Some(Hint::AddPasskey) {
                         let hint = div().whitespace_normal().type_small().text_color(theme::warning()).child(tiny_setup::ADD_PASSKEY_WORDS);
                         let add = if state.linking {
                             button_disabled(tiny_setup::remedy_label(Remedy::AddPasskey)).into_any_element()
@@ -479,6 +631,7 @@ impl Shell {
                     }
                     let row = pick_card(id(&format!("choice{cx_ix}"), ix), on, blocked.is_none()).child(radio(on)).child(words);
                     card = card.child(if blocked.is_none() { row.on_click(cx.listener(move |this, _, _, cx| this.tiny_setup_pick_option(&choice_id, &option_id, cx))) } else { row });
+                    card = card.children(steps);
                 }
                 choices = choices.child(card);
             }
@@ -552,7 +705,7 @@ impl Shell {
 
     fn tiny_setup_refusal(&self, prefix: &'static str, refusal: &TinySetupRefusal, cx: &mut Context<Self>) -> Div {
         let state = &self.tiny_state.setup;
-        let panel = div().w_full().flex().flex_col().gap(px(10.)).child(aside("icons/triangle-alert.svg", theme::warning(), tiny_setup::refusal_words(refusal, "the sign-in provider")));
+        let panel = div().w_full().flex().flex_col().gap(px(10.)).child(aside("icons/triangle-alert.svg", theme::warning(), tiny_setup::refusal_words(refusal, &self.tiny_setup_provider())));
         let mut actions = div().flex().gap(px(8.));
         if let Some(remedy) = tiny_setup::remedy(refusal) {
             let label = tiny_setup::remedy_label(remedy);
@@ -575,23 +728,19 @@ impl Shell {
         let Some(setup) = state.data.as_ref() else {
             return div().into_any_element();
         };
-        let form = &state.form;
         let heading = div()
             .flex()
             .flex_col()
             .gap(px(6.))
             .child(div().type_headline().text_color(theme::text()).child(format!("Set up {}", page.name)))
             .child(about("Choose what this server keeps about its members. You can change it later in Server Settings › Privacy."));
-        let apply_label: SharedString = match form.preset.as_deref().and_then(|id| setup.presets.iter().find(|preset| preset.id == id)) {
-            Some(preset) if !state.customizing => format!("Use {}", preset.title).into(),
-            _ => "Apply".into(),
-        };
+        let (apply_label, apply_kind) = self.tiny_setup_apply_button(setup);
         let apply = if state.sending {
             button_disabled("Applying…").into_any_element()
-        } else if !form.answers(setup) {
+        } else if !state.form.answers(setup) {
             button_disabled(apply_label).into_any_element()
         } else {
-            button("tiny-setup-apply", ButtonKind::Primary, apply_label).on_click(cx.listener(|this, _, _, cx| this.tiny_setup_send(Answer::Form, cx))).into_any_element()
+            button("tiny-setup-apply", apply_kind, apply_label).on_click(cx.listener(|this, _, _, cx| this.tiny_setup_send(Answer::Form, cx))).into_any_element()
         };
         let keep = if state.sending {
             button_disabled("Keep what I have").into_any_element()
@@ -633,7 +782,7 @@ impl Shell {
             .font_family(theme::FONT)
             .text_color(theme::text())
             .child(
-                div().id("tiny-setup-scroll").flex_1().min_h_0().w_full().overflow_y_scroll().flex().flex_col().items_center().child(
+                div().id("tiny-setup-scroll").flex_1().min_h_0().w_full().overflow_y_scroll().track_scroll(&state.scroll).flex().flex_col().items_center().child(
                     div().w_full().max_w(px(760.)).px(px(40.)).pt(px(64.)).pb(px(32.)).flex().flex_col().gap(px(28.)).child(heading).child(self.tiny_setup_form("tiny-setup", "Start from", setup, cx)),
                 ),
             )
@@ -643,21 +792,31 @@ impl Shell {
 }
 
 /// The outline a server with passkeys and one sign-in provider would send, with an owner who has
-/// no passkey yet and three members who have none, for `--tiny-setup`.
+/// no passkey yet and three of its eight members who have none, for `--tiny-setup`.
 #[cfg(feature = "gui-shot")]
 const SHOT_OUTLINE: &str = r#"{
   "needed": true, "completed_at": null,
-  "current": {"provider_profile": "full", "activity_visibility": "everyone", "sign_in_methods": "any"},
+  "current": {"provider_profile": "full", "activity_visibility": "everyone", "sign_in_methods": "provider"},
   "deployment": {"passkeys": true, "sso": true},
-  "counts": {"members": 8, "members_without_passkey": 3, "emails_stored": 8, "owner_has_passkey": false},
+  "counts": {"members": 8, "members_without_passkey": 3, "emails_stored": 8, "owner_has_passkey": false, "members_without_provider": 0, "owner_has_provider": true},
+  "members": [
+    {"user_id": "halvard", "display_name": "Halvard Eide", "passkey": true, "provider": true},
+    {"user_id": "ana", "display_name": "Ana Ruiz", "passkey": false, "provider": true},
+    {"user_id": "dayo", "display_name": "Dayo Adeyemi", "passkey": true, "provider": true},
+    {"user_id": "mei", "display_name": "Mei Tanaka", "passkey": false, "provider": true},
+    {"user_id": "jonas", "display_name": "Jonas Berg", "passkey": true, "provider": true},
+    {"user_id": "priya", "display_name": "Priya Nair", "passkey": true, "provider": true},
+    {"user_id": "tomas", "display_name": "Tomás Silva", "passkey": false, "provider": true},
+    {"user_id": "lena", "display_name": "Lena Fischer", "passkey": true, "provider": true}
+  ],
   "presets": [
-    {"id": "convenience", "title": "Convenience", "summary": "Easiest to run, and how the server worked before this setup. Names and email addresses from sign-in are kept, everyone sees when others were last online, and any sign-in method works.",
-     "choices": {"provider_profile": "full", "activity_visibility": "everyone", "sign_in_methods": "any"}, "available": true},
+    {"id": "convenience", "title": "Convenience", "summary": "Easiest to run, and how the server worked before this setup. Names and email addresses from sign-in are kept, everyone sees when others were last online, and members sign in through the provider.",
+     "choices": {"provider_profile": "full", "activity_visibility": "everyone", "sign_in_methods": "provider"}, "available": true},
     {"id": "privacy", "title": "Privacy", "summary": "Keeps the least about members. Nothing is kept from a sign-in provider, nobody's last-online time is recorded, and members sign in with passkeys only.",
      "choices": {"provider_profile": "none", "activity_visibility": "nobody", "sign_in_methods": "passkey"}, "available": true}
   ],
   "choices": [
-    {"id": "provider_profile", "title": "What to keep from a sign-in provider", "question": "When someone first joins through single sign-on, what should the server keep from their account there?", "relevant": true,
+    {"id": "provider_profile", "title": "What to keep from a sign-in provider", "question": "When someone first joins through the sign-in provider, what should the server keep from their account there?", "relevant": true,
      "options": [
        {"id": "full", "title": "Name and email address", "effect": "Keeps the name and email address the provider gives. People who manage the server can see members' email addresses."},
        {"id": "name", "title": "Name only", "effect": "Keeps the name and never an email address."},
@@ -667,63 +826,67 @@ const SHOT_OUTLINE: &str = r#"{
        {"id": "everyone", "title": "Every member", "effect": "Everyone sees when others were last online and how they joined."},
        {"id": "admins", "title": "Admins only", "effect": "Only people who manage the server see it."},
        {"id": "nobody", "title": "Nobody", "effect": "The server stops recording when anyone was last online and clears what it has. No one sees how a member joined."}]},
-    {"id": "sign_in_methods", "title": "How members sign in", "question": "Which sign-in methods should the server accept?", "relevant": true,
+    {"id": "sign_in_methods", "title": "How members sign in", "question": "Which ways of signing in should the server accept?", "relevant": true,
      "options": [
-       {"id": "any", "title": "Whatever this server offers", "effect": "Members sign in with a passkey or with single sign-on."},
-       {"id": "passkey", "title": "Passkeys only", "effect": "Members sign in with a passkey and nothing else. People who only have a single sign-on account cannot sign in until you give them a link to add a passkey. Sessions already open carry on.", "needs": ["passkeys", "owner_has_passkey"]}]}
+       {"id": "provider", "title": "Through Pocket ID only", "effect": "Members sign in through Pocket ID and nothing else. A passkey alone does not get in.", "needs": ["owner_has_provider"]},
+       {"id": "any", "title": "Passkeys, or through Pocket ID", "effect": "Members sign in with a passkey, or through Pocket ID."},
+       {"id": "passkey", "title": "Passkeys only", "effect": "Members sign in with a passkey and nothing else. People who only have a Pocket ID account cannot sign in until you give them a link to add a passkey. Sessions already open carry on.", "needs": ["passkeys", "owner_has_passkey"]}]}
   ],
-  "always": ["There are no usernames. A member has a display name, which is not unique, and signs in with a passkey or a single sign-on account.", "The server sends no analytics or crash reports anywhere."]
+  "always": ["There are no usernames. A member has a display name, which is not unique, and signs in with a passkey or through the sign-in provider.", "The server sends no analytics or crash reports anywhere."]
 }"#;
 
 #[cfg(feature = "gui-shot")]
 impl Shell {
-    /// `--tiny-setup first|custom|refused|nopasskeys|privacy|change|member`: the first-run screen (`custom` with
-    /// Privacy picked and the choices open, `refused` after a refusal), Server Settings › Privacy
-    /// as an owner reads it, or as a member does, over a made-up outline. Nothing is asked of a
-    /// server.
+    /// `--tiny-setup first|custom|refused|checklist|links|privacy|change|member`: the first-run
+    /// screen (`custom` with Privacy picked and the choices open, `refused` after a refusal,
+    /// `checklist` with what switching to passkeys needs under the sign-in choice, `links` with
+    /// two passkey links made over it), Server Settings › Privacy as an owner reads it, or as a
+    /// member does, over a made-up outline. Nothing is asked of a server.
     pub(super) fn tiny_shot_setup(&mut self, how: &str, window: &mut gpui::Window, cx: &mut Context<Self>) {
         let owner = how != "member";
-        let first = matches!(how, "first" | "custom" | "refused" | "nopasskeys");
+        let first = matches!(how, "first" | "custom" | "refused" | "checklist" | "links");
         let Some(community) = self.tiny_state.community.as_mut() else {
             return;
         };
         community.capabilities.features.push(protocol::TINY_FEATURE_FIRST_RUN_SETUP.to_owned());
+        community.provider = "Pocket ID".into();
         if owner {
             community.access = Some(protocol::TinyAccess { owner: true, ..community.access.clone().unwrap_or_default() });
         }
         if let Some(server) = community.server.as_mut() {
             server.provider_profile = if how == "member" { "name".into() } else { "full".into() };
             server.activity_visibility = if how == "member" { "admins".into() } else { "everyone".into() };
-            server.sign_in_methods = if how == "member" { "passkey".into() } else { "any".into() };
+            server.sign_in_methods = if how == "member" { "passkey".into() } else { "provider".into() };
             server.setup_completed_at = if first { String::new() } else { "2026-10-30T09:00:00Z".into() };
         }
         let mut setup: TinySetup = serde_json::from_str(SHOT_OUTLINE).expect("the outline reads");
         setup.needed = first;
-        if how == "nopasskeys" {
-            // A server started without passkey sign-in: Privacy cannot be chosen as it stands.
-            setup.deployment.passkeys = false;
-            setup.counts.members_without_passkey = 0;
-            if let Some(preset) = setup.presets.iter_mut().find(|preset| preset.id == "privacy") {
-                preset.available = false;
-                preset.unavailable = "Needs passkey sign-in, which this server doesn't have turned on. You can still choose the other private options one by one below.".into();
-            }
-            if let Some(choice) = setup.choices.iter_mut().find(|choice| choice.id == "sign_in_methods") {
-                choice.relevant = false;
-            }
-        }
         let state = &mut self.tiny_state.setup;
         state.form = Form::starting(&setup);
-        state.customizing = how == "nopasskeys";
         state.changing = how == "change";
-        if matches!(how, "custom" | "refused") {
+        if matches!(how, "custom" | "refused" | "checklist" | "links") {
             state.form.pick_preset(&setup, "privacy");
-            state.customizing = how == "custom";
+            state.customizing = matches!(how, "custom" | "checklist" | "links");
         }
         if how == "refused" {
             state.refusal = Some(TinySetupRefusal::MembersWithoutPasskey { count: setup.counts.members_without_passkey });
         }
+        let made: Vec<protocol::TinyClaimLink> = setup
+            .members
+            .iter()
+            .filter(|member| !member.passkey)
+            .take(2)
+            .zip(["Hq7tW2mXc9LbR4pZ", "Vn3sK8dYf1QaJ6uE"])
+            .map(|(member, token)| protocol::TinyClaimLink { user_id: member.user_id.clone(), display_name: member.display_name.clone(), url: format!("https://premier.example/claim/{token}") })
+            .collect();
         state.data = Some(setup);
         state.prompt = first;
+        if how == "links" {
+            self.tiny_setup_open_links(window, cx);
+            if let Some(Modal::PasskeyLinks { links, .. }) = self.tiny_state.modal.as_mut() {
+                *links = made;
+            }
+        }
         if !first {
             self.tiny_open_settings(super::settings::Page::Privacy, None, window, cx);
         }

@@ -43,7 +43,8 @@ pub(in crate::gui) use bans::banned_name;
 pub(in crate::gui) use channels::Sel;
 pub(in crate::gui) use danger::confirmed;
 pub(in crate::gui) use invites::revocable;
-pub(in crate::gui::tiny) use kit::check_box;
+pub(in crate::gui::tiny) use kit::{card, check_box, note};
+pub(in crate::gui::tiny) use signin::provider_words;
 #[cfg(feature = "gui-shot")]
 pub(in crate::gui) use members::selectable as tickable;
 
@@ -277,12 +278,12 @@ pub(in crate::gui::tiny) fn section(label: &'static str) -> Div {
     div().flex().flex_col().gap(px(8.)).child(div().type_micro().text_color(theme::text_faint()).child(label.to_uppercase()))
 }
 
-/// The unsaved-changes bar at the foot of an edited page.
-fn unsaved_bar(saving: bool, error: Option<String>, cx: &mut Context<Shell>) -> Div {
+/// The unsaved-changes bar at the foot of an edited page. `save` is the button's label and kind.
+fn unsaved_bar(saving: bool, error: Option<String>, save: (SharedString, ButtonKind), cx: &mut Context<Shell>) -> Div {
     let save = if saving {
         button_disabled("Saving…").into_any_element()
     } else {
-        button("tiny-settings-save", ButtonKind::Primary, "Save changes").on_click(cx.listener(|this, _, _, cx| this.tiny_settings_save(cx))).into_any_element()
+        button("tiny-settings-save", save.1, save.0).on_click(cx.listener(|this, _, _, cx| this.tiny_settings_save(cx))).into_any_element()
     };
     let (words, tone): (SharedString, _) = match error {
         Some(detail) => (detail.into(), theme::danger()),
@@ -375,6 +376,14 @@ impl Shell {
             Page::Channels => self.tiny_channels_dirty(cx),
             Page::Privacy => self.tiny_privacy_dirty(),
             _ => false,
+        }
+    }
+
+    /// What Save says: Privacy's is the setup form's, which may be "Switch anyway".
+    fn tiny_settings_save_button(&self, page: Page) -> (SharedString, ButtonKind) {
+        match self.tiny_state.setup.data.as_ref() {
+            Some(setup) if page == Page::Privacy => self.tiny_setup_apply_button(setup),
+            _ => ("Save changes".into(), ButtonKind::Primary),
         }
     }
 
@@ -549,7 +558,7 @@ impl Shell {
             )
             .child(div().absolute().top(px(44.)).right(px(chrome::corner_pad(window, 28.))).child(close))
             .when(dirty || overlay.error.is_some(), |content| {
-                content.child(div().absolute().bottom(px(20.)).left(px(40.)).right(px(40.)).flex().child(unsaved_bar(overlay.saving, overlay.error.clone(), cx)))
+                content.child(div().absolute().bottom(px(20.)).left(px(40.)).right(px(40.)).flex().child(unsaved_bar(overlay.saving, overlay.error.clone(), self.tiny_settings_save_button(overlay.page), cx)))
             });
         div()
             .id("tiny-settings")
@@ -654,7 +663,7 @@ impl Shell {
                         .left(px(tokens::GUTTER))
                         .right(px(tokens::GUTTER))
                         .flex()
-                        .child(unsaved_bar(overlay.saving, overlay.error.clone(), cx)),
+                        .child(unsaved_bar(overlay.saving, overlay.error.clone(), self.tiny_settings_save_button(overlay.page), cx)),
                 )
             })
             .child(div().flex_none().h(px(tokens::safe_bottom())))

@@ -48,14 +48,16 @@ impl Shell {
                 layer = layer.child(placed("tiny-card-at", Place::Beside(at), Layer::Popover, window, card));
             }
         }
-        if let Some(modal) = state.modal.clone() {
-            let panel = self.tiny_modal(&page, &modal, window, cx);
-            layer = layer.child(super::modals::layer(panel, cx));
-        }
+        // Passkey links are asked for from the first-run screen, so they are drawn over it.
+        let over_setup = matches!(state.modal, Some(super::Modal::PasskeyLinks { .. }));
+        let modal = state.modal.clone().map(|modal| super::modals::layer(self.tiny_modal(&page, &modal, window, cx), cx));
+        let (under, over) = if over_setup { (None, modal) } else { (modal, None) };
+        layer = layer.children(under);
         // Above everything else, until the owner answers or puts it off with Later or Escape.
         if state.setup.prompt {
             layer = layer.child(self.tiny_setup_overlay(&page, cx));
         }
+        layer = layer.children(over);
         Some(layer.into_any_element())
     }
 

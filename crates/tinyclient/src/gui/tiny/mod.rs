@@ -103,6 +103,9 @@ pub(super) enum Modal {
     SignOutEverywhere,
     /// What to share in a call: a screen or a window.
     Share,
+    /// Passkey links for members, made from setup: who is ticked, then the links the server
+    /// made, shown once. They are dropped when it closes and never written anywhere.
+    PasskeyLinks { picked: Vec<String>, links: Vec<protocol::TinyClaimLink>, busy: bool, error: Option<String> },
 }
 
 /// The invite being made.
@@ -1053,7 +1056,10 @@ impl Shell {
     /// Escape, from the window's keys: the top layer here closes first. False when nothing here
     /// was open.
     pub(super) fn tiny_escape(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.tiny_state.setup.prompt {
+        if matches!(self.tiny_state.modal, Some(Modal::PasskeyLinks { .. })) {
+            // Opened from the first-run screen, and drawn over it: it closes before the screen goes.
+            self.close_modal(cx);
+        } else if self.tiny_state.setup.prompt {
             self.tiny_setup_later(cx);
         } else if self.tiny_state.sub.is_some() {
             self.tiny_state.sub = None;
@@ -1509,6 +1515,9 @@ impl Shell {
         }
         if let Some(how) = flag("--tiny-setup") {
             self.tiny_shot_setup(&how, window, cx);
+            if let Some(down) = flag("--tiny-scroll").and_then(|n| n.parse::<f32>().ok()) {
+                self.tiny_state.setup.scroll.set_offset(Point::new(gpui::px(0.), gpui::px(-down)));
+            }
         }
         if std::env::args().any(|arg| arg == "--tiny-settings") {
             let asked = flag("--tiny-settings").unwrap_or_default();
