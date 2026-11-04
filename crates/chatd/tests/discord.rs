@@ -2,6 +2,9 @@
 //! websocket that replay hand-written payloads shaped like the documented ones. Each test runs
 //! the real chatd binary in a scratch directory and asserts on what its socket then answers.
 
+#[path = "support/mediad.rs"]
+mod test_mediad;
+
 use base64::Engine;
 use protocol::{
     read_frame, write_frame, AccountKey, Call, CallState, CallSupport, Change, Conversation, ConversationKind,
@@ -555,14 +558,8 @@ fn serve_gateway(shared: &Shared, stream: TcpStream, control: &Receiver<Control>
 
 /// mediad is another package's binary, so cargo does not build it for these tests.
 fn mediad() -> PathBuf {
-    let chatd = std::path::Path::new(env!("CARGO_BIN_EXE_chatd"));
-    static BUILD: std::sync::Once = std::sync::Once::new();
-    BUILD.call_once(|| {
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let built = Command::new(cargo).args(["build", "-j", "6", "-p", "mediad", "--bin", "mediad"]).status();
-        assert!(built.unwrap().success(), "could not build mediad");
-    });
-    chatd.with_file_name(format!("mediad{}", std::env::consts::EXE_SUFFIX))
+    static ENGINE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ENGINE.get_or_init(test_mediad::path).clone()
 }
 
 /// A child that is over at once, for the `World` field until the real chatd is spawned.

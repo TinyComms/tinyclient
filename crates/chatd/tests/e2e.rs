@@ -1,5 +1,8 @@
 //! Runs the real chatd and mediad binaries and talks to chatd over its local socket.
 
+#[path = "support/mediad.rs"]
+mod test_mediad;
+
 use chatd::store::{ConversationRow, SpaceRow, Store};
 use protocol::{
     read_frame, write_frame, AccountKey, CallFailure, CallState, CallSupport, Change, Content,
@@ -67,7 +70,6 @@ fn process_rss_kb(pid: u32) -> u64 {
     }
 }
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Once;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -77,18 +79,8 @@ const IDLE_BUDGET_KB: u64 = 250 * 1024;
 
 /// mediad is another package's binary, so cargo does not build it for these tests.
 fn mediad() -> PathBuf {
-    let chatd = Path::new(env!("CARGO_BIN_EXE_chatd"));
-    static BUILD: Once = Once::new();
-    BUILD.call_once(|| {
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let mut build = Command::new(cargo);
-        build.args(["build", "-p", "mediad", "--bin", "mediad"]);
-        if chatd.parent().is_some_and(|dir| dir.ends_with("release")) {
-            build.arg("--release");
-        }
-        assert!(build.status().unwrap().success(), "could not build mediad");
-    });
-    chatd.with_file_name(format!("mediad{}", std::env::consts::EXE_SUFFIX))
+    static ENGINE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ENGINE.get_or_init(test_mediad::path).clone()
 }
 
 struct Daemon {

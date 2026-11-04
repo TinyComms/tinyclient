@@ -4,6 +4,9 @@
 //!
 //! mediad hears a generated tone and opens no sound device (`TINYCLIENT_MEDIAD_AUDIO`).
 
+#[path = "support/mediad.rs"]
+mod test_mediad;
+
 use chatd::hub::Hub;
 use chatd::media::CallError;
 use chatd::store::Store;
@@ -29,11 +32,7 @@ const PATIENCE: Duration = Duration::from_secs(8);
 fn environment() {
     static READY: Once = Once::new();
     READY.call_once(|| {
-        let chatd = Path::new(env!("CARGO_BIN_EXE_chatd"));
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let built = Command::new(cargo).args(["build", "-p", "mediad", "--bin", "mediad"]).status().unwrap();
-        assert!(built.success(), "could not build mediad");
-        std::env::set_var("TINYCLIENT_MEDIAD", chatd.with_file_name(format!("mediad{}", std::env::consts::EXE_SUFFIX)));
+        std::env::set_var("TINYCLIENT_MEDIAD", test_mediad::path());
         std::env::set_var("TINYCLIENT_MEDIAD_AUDIO", "tone");
         std::env::set_var("TINYCLIENT_VOICE_PLAIN", "1");
     });

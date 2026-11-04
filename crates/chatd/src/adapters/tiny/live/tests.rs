@@ -752,12 +752,7 @@ fn a_server_with_audio_down_is_sent_no_join() {
 fn with_mediad() {
     static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     BUILT.get_or_init(|| {
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let built = std::process::Command::new(cargo).args(["build", "-p", "mediad", "--bin", "mediad"]).status().expect("cargo runs");
-        assert!(built.success(), "mediad builds");
-        // target/debug/deps/chatd-… is beside target/debug/mediad.
-        let deps = std::env::current_exe().expect("the test's path");
-        let mediad = deps.parent().and_then(|deps| deps.parent()).expect("target/debug").join(format!("mediad{}", std::env::consts::EXE_SUFFIX));
+        let mediad = crate::test_mediad::path();
         std::env::set_var("TINYCLIENT_MEDIAD", mediad);
         std::env::set_var("TINYCLIENT_MEDIAD_AUDIO", "tone");
     });
