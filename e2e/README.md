@@ -63,6 +63,27 @@ that passes on the base proves nothing new, so the lab reports `failure` and say
 A refactor, perf change or chore has no new scenario: step 3 is skipped, and the lab runs the
 existing `smoke` scenarios on the branch only.
 
+### What can certify a change
+
+Only a run of the **whole** required plan, with its evidence published, posts `e2e-proof` or
+`e2e-release`. The lab refuses everything that would let a smaller run speak for a bigger one:
+
+- `--platforms a,b` runs those platforms and posts their own `e2e-lab/<platform>` results. It posts
+  no aggregate. It exits non-zero if a platform it ran was red.
+- Posting needs the upload. `--no-upload` without `--no-post` is refused before anything runs. A
+  platform is green only if its recording, steps and `proof.json` are in the proof release; a lost
+  upload turns it red.
+- The release suite is the `"release": true` scenarios **in the commit being certified**, not in
+  the checkout the lab runs from. A commit with none fails; it does not pass an empty suite.
+- A `feature` or `fix` with no named scenario, a `docs` pull request that changes code, and a pull
+  request with no single type are failures, not "nothing to record".
+- Each scenario keeps its own folder, steps and recording, so two scenarios on one platform cannot
+  overwrite each other's evidence.
+- A silent Mac does not hang the lab: the deadline is enforced apart from reading its output.
+
+`e2e/lab/test_orchestration.py` drives `main()` with git, hosts, uploads and GitHub replaced, and
+holds each of these.
+
 ### A valid recording
 
 The lab checks these with `ffprobe` and `ffmpeg`, and fails the platform if any is false.

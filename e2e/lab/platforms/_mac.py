@@ -11,7 +11,7 @@ import re
 import shlex
 import subprocess
 import tarfile
-import time
+import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAC = os.path.join(HERE, "mac")
@@ -27,26 +27,45 @@ def _ssh(host, remote_command, data=None, timeout=600):
     return subprocess.run([*SSH, host["ssh"], remote_command], input=data, capture_output=True, timeout=timeout)
 
 
+def _stream(argv, data, log, timeout):
+    """Runs `argv`, feeds it `data`, and streams its output to `log` until it ends or `timeout`
+    seconds pass. The deadline is the caller's, not the child's: it holds when the child prints
+    nothing at all (a stalled build, a hung disk, a driver waiting on a screen that never comes)."""
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    lines = []
+
+    def pump():
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", "replace").rstrip()
+            if "can't change option: zle" in line:  # the login shell's noise on a non-terminal
+                continue
+            lines.append(line)
+            log("mac: " + line)
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    try:
+        proc.stdin.write(data)
+        proc.stdin.close()
+    except OSError:
+        pass  # the child is already gone; its exit status says why
+    try:
+        status = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        reader.join(5)
+        raise MacError("the Mac did not finish within %d s" % timeout)
+    reader.join(30)
+    return status, "\n".join(lines)
+
+
 def remote(host, script, env=None, log=print, timeout=3600):
     """Runs a shell script on the Mac (login zsh, then sh) with `env` exported first, streaming its
-    output to `log`. Returns (exit status, output text)."""
+    output to `log`. Returns (exit status, output text). Raises MacError at `timeout` seconds."""
     exports = "".join("export %s=%s\n" % (k, shlex.quote(str(v))) for k, v in (env or {}).items())
     command = 'f=$(mktemp /tmp/lab.XXXXXX); cat > "$f"; zsh -lc "sh $f"; rc=$?; rm -f "$f"; exit $rc'
-    proc = subprocess.Popen([*SSH, host["ssh"], command], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    proc.stdin.write((exports + script).encode("utf-8"))
-    proc.stdin.close()
-    lines = []
-    deadline = time.time() + timeout
-    for raw in proc.stdout:
-        line = raw.decode("utf-8", "replace").rstrip()
-        if "can't change option: zle" in line:  # the login shell's noise on a non-terminal
-            continue
-        lines.append(line)
-        log("mac: " + line)
-        if time.time() > deadline:
-            proc.kill()
-            raise MacError("the Mac did not finish within %d s" % timeout)
-    return proc.wait(), "\n".join(lines)
+    return _stream([*SSH, host["ssh"], command], (exports + script).encode("utf-8"), log, timeout)
 
 
 def _tar_of(folder, rename=None):

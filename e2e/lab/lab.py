@@ -88,7 +88,8 @@ def load_adapter(platform):
 def one_run(platform, label, app_sha, scenario_sha, scenario, scenario_dir, src_tar, out, log):
     """An adapter's run, then the lab's own check of what it brought back. Never raises."""
     adapter = load_adapter(platform)
-    where = os.path.join(out, platform, label)
+    # One folder per scenario: two scenarios on one platform must not overwrite each other's evidence.
+    where = os.path.join(out, platform, label, scenario["id"])
     os.makedirs(where, exist_ok=True)
     if adapter is None:
         return {"passed": False, "problems": ["there is no lab for %s yet (e2e/lab/platforms/%s.py)" % (platform, platform)],
@@ -104,6 +105,11 @@ def one_run(platform, label, app_sha, scenario_sha, scenario, scenario_dir, src_
         log("[%s %s] adapter crashed:\n%s" % (platform, label, trace))
         return {"passed": False, "problems": ["the adapter crashed: " + trace.strip().splitlines()[-1]], "label": label, "app_sha": app_sha}
     steps = common.read_steps(outcome.steps)
+    if outcome.steps and os.path.isfile(outcome.steps):
+        # Taken now, under a name of its own, before the adapter's next run can reuse the path.
+        kept = os.path.join(where, "%s-%s-%s.steps.jsonl" % (platform, label, scenario["id"]))
+        shutil.copyfile(outcome.steps, kept)
+        outcome.steps = kept
     problems = common.validate(outcome.recording, outcome.seconds, steps, scenario,
                                expect_pass=bool(outcome.passed) or label == "branch", vfr=outcome.vfr)
     shown = ""
@@ -126,6 +132,9 @@ def judge(scenario, platform, base, branch):
     for r in (base, branch):
         if r:
             why += ["%s: %s" % (r["label"], p) for p in r["problems"]]
+    for r in (base, branch):
+        if r and not r.get("recording") and not r["problems"]:
+            why.append("%s: there is no captioned recording" % r["label"])
     if branch and not branch["passed"]:
         why.append("it fails on the branch")
     if base is not None and base["passed"]:
@@ -136,6 +145,8 @@ def judge(scenario, platform, base, branch):
 def platform_job(platform, scenarios, shas, src_tars, out, log):
     """Everything for one platform, one scenario after another. Returns (state, description, runs)."""
     runs, verdicts = [], []
+    if not scenarios:
+        return "failure", "no scenario was given to record on %s" % platform, []
     for scenario, sdir in scenarios:
         if platform not in scenario.get("platforms", []):
             reason = scenario.get("not_applicable", {}).get(platform)
@@ -152,19 +163,117 @@ def platform_job(platform, scenarios, shas, src_tars, out, log):
         verdicts.append(judge(scenario, platform, base, branch))
     bad = [d for s, d in verdicts if s != "success"]
     state = "failure" if bad else "success"
-    return state, "; ".join(bad or [d for _, d in verdicts])[:140] or "nothing to record", runs
+    return state, "; ".join(bad or [d for _, d in verdicts])[:140], runs
+
+
+# ---- What may certify a change -------------------------------------------------------------
+# These are pure so the invariants can be tested without a host or a status being posted.
+
+def flag_problem(no_post, no_upload):
+    """A status links published recordings. Posting without uploading would claim evidence nobody can see."""
+    if no_upload and not no_post:
+        return "--no-upload cannot post statuses, because a status must link recordings that are published. Add --no-post, or drop --no-upload."
+    return None
+
+
+def asset_name(out, path):
+    """The name a file has inside the proof release. Unique per file: the path under out/ is in it."""
+    return "upload-" + os.path.relpath(path, out).replace(os.sep, "-")
+
+
+def evidence_files(out, platform, runs):
+    files = [os.path.join(out, platform, "proof.json")]
+    for r in runs:
+        files += [r[key] for key in ("recording", "steps") if r.get(key)]
+    return files
+
+
+def verified(out, platform, result, published):
+    """A green platform stays green only if every file that backs it is in the release."""
+    state, desc, runs = result
+    if state != "success" or not runs:
+        return result
+    lost = [os.path.basename(f) for f in evidence_files(out, platform, runs) if asset_name(out, f) not in published]
+    if lost:
+        return "failure", ("recordings not published: " + ", ".join(lost))[:140], runs
+    return result
+
+
+def aggregate(required, results):
+    """The one status that certifies a change, from the full required plan.
+
+    None when this run did not cover every required platform: a subset run (--platforms) is
+    useful and may post what it saw per platform, but it never speaks for the whole plan."""
+    if not required or set(required) - set(results):
+        return None
+    bad = ["%s: %s" % (p, results[p][1]) for p in required if results[p][0] != "success"]
+    if bad:
+        return "failure", "; ".join(bad)[:140]
+    if not any(results[p][2] for p in required):
+        return "failure", "nothing was recorded on any platform"
+    return "success", ("recorded on %s" % ", ".join(required))[:140]
+
+
+def pre_verdict(cfg, kind, ids, full_plan):
+    """What the type and the plan settle before any host is touched. None means: go and record."""
+    if kind is None:
+        return "failure", "the pull request has no single type"
+    if not full_plan:
+        return "success", "nothing to record (%s, no code changed)" % kind
+    if kind == "docs":
+        return "failure", "it is typed docs but changes code"
+    if kind in cfg["proof_types"] and not ids:
+        return "failure", "a %s needs an e2e scenario named under Proof" % kind
+    return None
+
+
+def scenario_ids_at(sha):
+    """The scenarios that exist in commit `sha`, not in whatever this checkout has."""
+    done = subprocess.run(["git", "-C", ROOT, "ls-tree", "--name-only", "%s:e2e/scenarios" % sha], capture_output=True, text=True)
+    return sorted(done.stdout.split()) if done.returncode == 0 else []
+
+
+def release_suite(ids, load):
+    """The (scenario, dir) pairs marked release among `ids`. `load(id)` reads one from the target commit."""
+    suite = []
+    for sid in ids:
+        scenario, sdir = load(sid)
+        if scenario.get("release"):
+            suite.append((scenario, sdir))
+    return suite
+
+
+def publish(out, results, tag, repo, sha):
+    """Uploads the evidence and returns the names the release really holds afterwards."""
+    proof_repo = HOSTS["proof_repo"]
+    if common.gh("release", "view", tag, "-R", proof_repo, check=False).returncode != 0:
+        common.gh("release", "create", tag, "-R", proof_repo, "--title", "%s %s" % (repo.split("/")[-1], tag),
+                  "--notes", "Recordings of the lab's run of %s at %s. Made by e2e/lab/lab.py; every video has the SHA burned in." % (repo, sha))
+    staged = []
+    for p, (_, _, runs) in results.items():
+        for f in evidence_files(out, p, runs):
+            if os.path.isfile(f):
+                link = os.path.join(out, asset_name(out, f))
+                shutil.copyfile(f, link)
+                staged.append(link)
+    if staged:
+        common.gh("release", "upload", tag, *staged, "-R", proof_repo, "--clobber")
+    listed = common.gh("release", "view", tag, "-R", proof_repo, "--json", "assets", "--jq", ".assets[].name").stdout.split()
+    return set(listed)
 
 
 def execute(plan, scenarios, shas, out, args, log, context_prefix, head_sha, repo):
+    """Runs the plan. With posting on, it has already published the evidence by the time it posts
+    a per-platform result, and a result whose evidence is missing is posted as a failure."""
     os.makedirs(out, exist_ok=True)
     src_tars = {"head": archive(shas["head"], os.path.join(out, "src-%s.tar" % shas["head"][:7]))}
     if shas["need_red"]:
         src_tars["base"] = archive(shas["base"], os.path.join(out, "src-%s.tar" % shas["base"][:7]))
-    tag = args.tag
-    url = "https://github.com/%s/releases/tag/%s" % (HOSTS["proof_repo"], tag)
-    if not args.no_post:
+    url = "https://github.com/%s/releases/tag/%s" % (HOSTS["proof_repo"], args.tag)
+    posting = not args.no_post
+    if posting:
         for p in plan:
-            common.post_status(repo, head_sha, "%s/%s" % (context_prefix, p), "pending", "recording on %s" % p, url if not args.no_upload else None)
+            common.post_status(repo, head_sha, "%s/%s" % (context_prefix, p), "pending", "recording on %s" % p, None)
     groups = {}
     for p in plan:
         groups.setdefault(HOSTS["platforms"][p]["group"], []).append(p)
@@ -173,8 +282,7 @@ def execute(plan, scenarios, shas, out, args, log, context_prefix, head_sha, rep
         done = {}
         for p in groups[group]:
             done[p] = platform_job(p, scenarios, shas, src_tars, out, log)
-            state, desc, runs = done[p]
-            log("%s: %s: %s" % (p, state, desc))
+            log("%s: %s: %s" % (p, done[p][0], done[p][1]))
         return done
 
     results = {}
@@ -188,32 +296,29 @@ def execute(plan, scenarios, shas, out, args, log, context_prefix, head_sha, rep
         with open(os.path.join(out, p, "proof.json"), "w", encoding="utf-8") as f:
             json.dump(proof, f, indent=2)
     if not args.no_upload:
-        upload(out, results, tag, repo, head_sha)
+        try:
+            published = publish(out, results, args.tag, repo, head_sha)
+        except Exception as e:  # an upload that failed is a platform without evidence, not a lab that hangs on pending
+            log("upload failed: %s" % e)
+            published = set()
+        results = {p: verified(out, p, r, published) for p, r in results.items()}
+    if posting:
+        for p, (state, desc, _) in results.items():
+            common.post_status(repo, head_sha, "%s/%s" % (context_prefix, p), state, desc, url)
     return results, url
 
 
-def upload(out, results, tag, repo, sha):
-    proof_repo = HOSTS["proof_repo"]
-    if common.gh("release", "view", tag, "-R", proof_repo, check=False).returncode != 0:
-        common.gh("release", "create", tag, "-R", proof_repo, "--title", "%s %s" % (repo.split("/")[-1], tag),
-                  "--notes", "Recordings of the lab's run of %s at %s. Made by e2e/lab/lab.py; every video has the SHA burned in." % (repo, sha))
-    files = []
-    for p, (_, _, runs) in results.items():
-        files.append(os.path.join(out, p, "proof.json"))
-        for r in runs:
-            for key in ("recording", "steps"):
-                if r.get(key) and os.path.isfile(r[key]):
-                    files.append(r[key])
-    # Names must be unique inside one release.
-    staged = []
-    for f in files:
-        rel = os.path.relpath(f, out).replace(os.sep, "-")
-        link = os.path.join(out, "upload-" + rel)
-        if not os.path.exists(link):
-            shutil.copyfile(f, link)
-        staged.append(link)
-    if staged:
-        common.gh("release", "upload", tag, *staged, "-R", proof_repo, "--clobber")
+def post_aggregate(args, repo, sha, context, full_plan, results, url, log):
+    """Posts the certifying status, or says why it did not. Returns whether the run is green."""
+    verdict = aggregate(full_plan, results)
+    if verdict is None:
+        log("this run covered %s of the required %s, so it certifies nothing; per-platform results only"
+            % (",".join(sorted(results)) or "none", ",".join(full_plan)))
+        return all(s == "success" for s, _, _ in results.values())
+    state, desc = verdict
+    if not args.no_post:
+        common.post_status(repo, sha, context, state, desc, url)
+    return state == "success"
 
 
 def main():
@@ -226,6 +331,12 @@ def main():
     ap.add_argument("--no-upload", action="store_true")
     ap.add_argument("--out")
     args = ap.parse_args()
+    if args.mode == "try":
+        args.no_post = args.no_upload = True
+    problem = flag_problem(args.no_post, args.no_upload)
+    if problem:
+        print("lab: " + problem, file=sys.stderr)
+        return 2
 
     repo = repo_name()
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -233,6 +344,10 @@ def main():
     os.makedirs(out, exist_ok=True)
     log = common.log_to(os.path.join(out, "lab.log"))
     want = args.platforms.split(",") if args.platforms else None
+    unknown = [w for w in (want or []) if w not in ALL]
+    if unknown:
+        print("lab: unknown platform in --platforms: %s (known: %s)" % (",".join(unknown), ",".join(ALL)), file=sys.stderr)
+        return 2
 
     def scenario_of(sha, sid):
         # `try` is for building a scenario, so it reads the working tree; the rest read the commit.
@@ -241,40 +356,41 @@ def main():
             shutil.copytree(os.path.join(ROOT, "e2e", "scenarios", sid), sdir, dirs_exist_ok=True)
         else:
             sdir = extract_scenario(sha, sid, out)
-        return json.load(open(os.path.join(sdir, "scenario.json"), encoding="utf-8")), sdir
+        with open(os.path.join(sdir, "scenario.json"), encoding="utf-8") as f:
+            return json.load(f), sdir
 
     if args.mode == "try":
         sha = git("rev-parse", args.sha or "origin/main")
         ensure(sha)
         scenarios = [scenario_of(sha, args.target)]
         plan = want or scenarios[0][0]["platforms"]
-        args.no_post = args.no_upload = True
         args.tag = "try"
         results, _ = execute(plan, scenarios, {"head": sha, "base": None, "need_red": False}, out, args, log, "e2e-lab", sha, repo)
         for p, (state, desc, runs) in results.items():
             for r in runs:
                 print("%s %s %s %s %s" % (p, state, r.get("recording") or "(no recording)", r["problems"], r.get("note", "")))
-        return 0 if all(s == "success" for s, _, _ in results.values()) else 1
+        return 0 if results and all(s == "success" for s, _, _ in results.values()) else 1
+
+    posting = not args.no_post
 
     if args.mode == "release":
         sha = git("rev-parse", args.sha or "origin/main")
         ensure(sha)
-        ids = sorted(d for d in os.listdir(os.path.join(ROOT, "e2e", "scenarios")) if os.path.isfile(os.path.join(ROOT, "e2e", "scenarios", d, "scenario.json")))
-        scenarios = [scenario_of(sha, i) for i in ids]
-        scenarios = [(s, d) for s, d in scenarios if s.get("release")]
-        plan = want or ALL
+        full_plan = list(ALL)
+        run_plan = [p for p in full_plan if not want or p in want]
+        narrowed = run_plan != full_plan
         args.tag = "main-" + sha[:7]
-        shas = {"head": sha, "base": None, "need_red": False}
-        context, post_sha = "e2e-lab-release", sha
-        if not args.no_post:
+        # The suite is what is in the commit being certified, not what this checkout happens to hold.
+        scenarios = release_suite(scenario_ids_at(sha), lambda sid: scenario_of(sha, sid))
+        if not scenarios:
+            log("no scenario in %s is marked release, so there is no release suite to record" % sha[:7])
+            if posting and not narrowed:
+                common.post_status(repo, sha, CFG["release_context"], "failure", "no scenario is marked release", None)
+            return 1
+        if posting and not narrowed:
             common.post_status(repo, sha, CFG["release_context"], "pending", "recording the release suite", None)
-        results, url = execute(plan, scenarios, shas, out, args, log, context, post_sha, repo)
-        ok = all(s == "success" for s, _, _ in results.values())
-        if not args.no_post:
-            common.post_status(repo, sha, CFG["release_context"], "success" if ok else "failure",
-                               "release suite recorded on %s" % ", ".join(plan) if ok else "; ".join("%s: %s" % (p, d) for p, (s, d, _) in results.items() if s != "success"),
-                               url if not args.no_upload else None)
-        return 0 if ok else 1
+        results, url = execute(run_plan, scenarios, {"head": sha, "base": None, "need_red": False}, out, args, log, "e2e-lab-release", sha, repo)
+        return 0 if post_aggregate(args, repo, sha, CFG["release_context"], full_plan, results, url, log) else 1
 
     number = args.target
     info = json.loads(common.gh("pr", "view", number, "-R", repo, "--json", "headRefOid,baseRefName,body,files").stdout)
@@ -283,36 +399,34 @@ def main():
     git("fetch", "-q", "origin", info["baseRefName"])
     base = git("merge-base", "origin/" + info["baseRefName"], head)
     body, files, statuses, _ = pr_gate.pr_inputs(repo, number, CFG)
-    findings, plan, _, _, kind = pr_gate.evaluate(CFG, body, files, lambda sid: True, statuses)
+    findings, full_plan, _, _, kind = pr_gate.evaluate(CFG, body, files, lambda sid: True, statuses)
     parsed = pr_gate.parse_body(body, CFG)
-    plan = [p for p in plan if not want or p in want]
+    ids = parsed["scenarios"] if kind in CFG["proof_types"] else ["smoke"] if kind in CFG["regression_types"] else []
+    early = pre_verdict(CFG, kind, ids, full_plan)
+    if early:
+        log("%s: %s" % early)
+        if posting:
+            common.post_status(repo, head, CFG["proof_context"], early[0], early[1], None)
+        return 0 if early[0] == "success" else 1
+    run_plan = [p for p in full_plan if not want or p in want]
+    if not run_plan:
+        print("lab: none of --platforms is in this pull request's plan (%s)" % ",".join(full_plan), file=sys.stderr)
+        return 2
+    narrowed = run_plan != full_plan
     args.tag = "pr-%s-%s" % (number, head[:7])
-    url = "https://github.com/%s/releases/tag/%s" % (HOSTS["proof_repo"], args.tag)
-    if kind in CFG["proof_types"]:
-        ids = parsed["scenarios"]
-    elif kind in CFG["regression_types"]:
-        ids = ["smoke"]
-    else:
-        ids = []
-    if not ids or not plan:
-        log("nothing to record for a %s pull request" % kind)
-        if not args.no_post:
-            common.post_status(repo, head, CFG["proof_context"], "success", "nothing to record (%s)" % (kind or "no type"))
-        return 0
-    scenarios = [scenario_of(head, i) for i in ids]
-    shas = {"head": head, "base": base, "need_red": kind in CFG["proof_types"]}
-    if not args.no_post:
-        common.post_status(repo, head, CFG["proof_context"], "pending", "recording on %s" % ", ".join(plan), None)
-    results, url = execute(plan, scenarios, shas, out, args, log, "e2e-lab", head, repo)
-    ok = all(s == "success" for s, _, _ in results.values())
-    if not args.no_post:
-        for p, (state, desc, _) in results.items():
-            common.post_status(repo, head, "e2e-lab/" + p, state, desc, url if not args.no_upload else None)
-        common.post_status(repo, head, CFG["proof_context"], "success" if ok else "failure",
-                           ("recorded on %s: red then green" % ", ".join(plan)) if ok else "; ".join("%s: %s" % (p, d) for p, (s, d, _) in results.items() if s != "success"),
-                           url if not args.no_upload else None)
+    try:
+        scenarios = [scenario_of(head, i) for i in ids]
+    except (OSError, subprocess.CalledProcessError, ValueError) as e:
+        log("cannot read the scenario from the branch: %s" % e)
+        if posting:
+            common.post_status(repo, head, CFG["proof_context"], "failure", "a named scenario is not on the branch", None)
+        return 1
+    if posting and not narrowed:
+        common.post_status(repo, head, CFG["proof_context"], "pending", "recording on %s" % ", ".join(full_plan), None)
+    results, url = execute(run_plan, scenarios, {"head": head, "base": base, "need_red": kind in CFG["proof_types"]}, out, args, log, "e2e-lab", head, repo)
+    green = post_aggregate(args, repo, head, CFG["proof_context"], full_plan, results, url, log)
     print(json.dumps({p: {"state": s, "description": d} for p, (s, d, _) in results.items()}, indent=2))
-    return 0 if ok else 1
+    return 0 if green else 1
 
 
 if __name__ == "__main__":
