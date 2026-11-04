@@ -1330,7 +1330,7 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
                     ),
             );
         }
-        rows.into_any_element()
+        crate::gui::components::scroll::scroll_page("search-scroll-frame", rows).into_any_element()
     };
     div()
         .size_full()
@@ -1397,7 +1397,7 @@ fn draw_pins(shell: &Shell, conversation: &Key, cx: &mut Context<Shell>) -> AnyE
             .child(div().type_ui().text_color(theme::text_soft()).line_clamp(3).child(said))
             .on_click(cx.listener(move |shell, _, _, cx| shell.jump_to_pin(&id, cx)))
     });
-    div().id("pins").size_full().overflow_y_scroll().py(px(4.)).children(rows).into_any_element()
+    crate::gui::components::scroll::scroll_page("pins-scroll-frame", div().id("pins").size_full().overflow_y_scroll().py(px(4.)).children(rows)).into_any_element()
 }
 
 /// Where the message was said, as the spec's result line has it: the Space it sits in and the

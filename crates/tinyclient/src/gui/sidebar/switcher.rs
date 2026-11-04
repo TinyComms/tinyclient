@@ -732,7 +732,7 @@ impl Shell {
                     }),
             )
             .children(said.map(|words| div().h(px(ROW)).flex_none().px(px(16.)).flex().items_center().type_ui().text_color(theme::text_soft()).child(words)))
-            .child(rows)
+            .child(crate::gui::components::scroll_frame("switcher-scroll-frame", switcher.scroll.clone(), rows).fit_content().keyboard(false))
             // The keys it names are a keyboard's; a phone has none.
             .when(!phone, |sheet| sheet.child(
                 div()

@@ -545,7 +545,7 @@ impl Shell {
             .relative()
             .bg(theme::canvas())
             .child(
-                div().id("tiny-settings-scroll").size_full().overflow_y_scroll().track_scroll(&overlay.scroll).child(div().w_full().max_w(px(740.)).px(px(40.)).pt(px(48.)).pb(px(120.)).child(body)),
+                crate::gui::components::scroll_frame("tiny-settings-scroll-frame", overlay.scroll.clone(), div().id("tiny-settings-scroll").size_full().overflow_y_scroll().track_scroll(&overlay.scroll).child(div().w_full().max_w(px(740.)).px(px(40.)).pt(px(48.)).pb(px(120.)).child(body))),
             )
             .child(div().absolute().top(px(44.)).right(px(chrome::corner_pad(window, 28.))).child(close))
             .when(dirty || overlay.error.is_some(), |content| {

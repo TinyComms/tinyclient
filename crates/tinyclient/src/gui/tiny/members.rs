@@ -60,7 +60,7 @@ impl Shell {
                     .pb(px(4.))
                     .child(field(focused).child(glyph("icons/search.svg", 14., theme::text_faint())).child(div().flex_1().min_w_0().child(self.tiny_state.search_input.clone()))),
             )
-            .child(list)
+            .child(div().flex_1().min_h_0().child(crate::gui::components::scroll::scroll_page("tiny-members-scroll-frame", list)))
             .into_any_element()
     }
 

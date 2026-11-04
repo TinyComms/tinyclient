@@ -224,7 +224,7 @@ impl Shell {
             .child(drags_window(div().h(px(if phone { tokens::safe_top() + 4. } else { TOP_BAR })).w_full().flex_none()))
             .child(div().flex().flex_col().items_center().gap(px(8.)).child(inbox).child(people))
             // The networks and pins scroll together; what is above and below never moves.
-            .child(div().id("rail-places").mt(px(8.)).flex_1().min_h_0().w_full().overflow_y_scroll().child(places))
+            .child(div().mt(px(8.)).flex_1().min_h_0().w_full().child(crate::gui::components::scroll::scroll_page("rail-scroll-frame", div().id("rail-places").size_full().overflow_y_scroll().child(places))))
             .child(
                 div()
                     .flex_none()

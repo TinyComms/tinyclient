@@ -126,7 +126,7 @@ impl Composer {
             };
             row = row.child(element);
         }
-        Some(div().child(row))
+        Some(div().child(crate::gui::components::scroll::scroll_content("tray-scroll-frame", row.pb(px(16.)))))
     }
 
     fn chip_controls(&self, chip: &Staged, options: Options, cx: &mut Context<Self>) -> Div {

@@ -1444,18 +1444,16 @@ impl Render for Picker {
         let grid = match self.empty(grid_height, cx) {
             Some(empty) => empty,
             None => match self.tab {
-                Tab::Emoji => uniform_list("picker-emoji", self.rows.len(), cx.processor(Self::emoji_rows))
+                Tab::Emoji => div().h(px(grid_height)).w_full().child(crate::gui::components::scroll_frame("picker-emoji-scroll-frame", self.scroll.clone(), uniform_list("picker-emoji", self.rows.len(), cx.processor(Self::emoji_rows))
                     .track_scroll(&self.scroll)
-                    .h(px(grid_height))
-                    .w_full()
-                    .px(px(self.grid_pad()))
-                    .into_any_element(),
+                    .size_full()
+                    .px(px(self.grid_pad())))).into_any_element(),
                 // The list lays its rows edge to edge: the padding is its holder's.
                 _ => div()
                     .h(px(grid_height))
                     .w_full()
                     .px(px(PAD))
-                    .child(list(self.items_list.clone(), cx.processor(Self::item_row)).size_full())
+                    .child(crate::gui::components::scroll_frame("picker-items-scroll-frame", self.items_list.clone(), list(self.items_list.clone(), cx.processor(Self::item_row)).size_full()))
                     .into_any_element(),
             },
         };
