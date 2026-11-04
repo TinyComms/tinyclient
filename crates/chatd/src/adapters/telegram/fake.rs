@@ -1023,10 +1023,6 @@ impl World {
             // A post in the muted channel names the user. The count rides the dialog, so
             // Telegram marks the chats stale (a default said changed) and the next opening
             // of the list reads it in.
-            "mention" => {
-                self.channel_mention = true;
-                vec![update(tl::types::UpdateNotifySettings { peer: tl::enums::NotifyPeer::NotifyBroadcasts, notify_settings: settings(None) }.into())]
-            }
             // A draft typed on the phone while we are here, and one the phone dropped.
             "draft" => {
                 let text = "Riding up with Tobin.".to_owned();
@@ -1190,17 +1186,29 @@ impl World {
                 pts: 0,
             }
             .into())],
-            // A message that names me: in the group ("mention group") or, none named, in the
-            // archived chat, which then reaches the Inbox and the rail's count for it.
+            // A message that names me: in the group ("mention group"), in the archived chat
+            // (bare "mention", which then reaches the Inbox and the rail's count for it), or
+            // in the muted channel ("mention channel" — the mention count rides the dialog,
+            // and the rail hears nothing of any of it).
             "mention" => {
-                let (who, id) = match words.next() {
-                    Some("group") => (Who::Group(CREW), 21),
-                    _ => (Who::User(TOBIN), 32),
-                };
-                let mut said = message(who, id, TOBIN, T0 + 90, "Are you seeing this?");
-                said.mentioned = true;
-                self.store(None, said.clone());
-                vec![new(said)]
+                match words.next() {
+                    Some("channel") => {
+                        self.channel_mention = true;
+                        vec![update(tl::types::UpdateNotifySettings { peer: tl::enums::NotifyPeer::NotifyBroadcasts, notify_settings: settings(None) }.into())]
+                    }
+                    Some("group") => {
+                        let mut said = message(Who::Group(CREW), 21, TOBIN, T0 + 90, "Are you seeing this?");
+                        said.mentioned = true;
+                        self.store(None, said.clone());
+                        vec![new(said)]
+                    }
+                    _ => {
+                        let mut said = message(Who::User(TOBIN), 32, TOBIN, T0 + 90, "Are you seeing this?");
+                        said.mentioned = true;
+                        self.store(None, said.clone());
+                        vec![new(said)]
+                    }
+                }
             }
             // Odalys (or the chat the line names) read my messages up to this one.
             "outbox" => {
