@@ -296,9 +296,11 @@ own user id reports us), `Gone`, `Levels`, `Devices`, `DeviceList`, `Interrupted
 A Discord call: `CallStart` is refused with `Unsupported`, and no mediad, unless the row's `call`
 is `Native`. Otherwise it spawns mediad (`Connecting`) and sends the adapter `Command::CallJoin`.
 The adapter updates its voice state on the gateway and, when it has both events, calls
-`Context::voice(VoiceJoin {endpoint, token, session_id, user_id, server_id, channel_id, dave})`.
-chatd forwards it as `MediaRequest::Join`; a second one for the same call (the voice server
-moved) goes as `MediaRequest::Rejoin`. `Connected` makes the call `Joined`, the only state drawn
+`Context::voice(VoiceJoin {endpoint, token, session_id, user_id, server_id, channel_id, dave, stream, watch, group_id})`.
+chatd forwards the voice session as `MediaRequest::Join`; a second one for the same call (the voice server
+moved) goes as `MediaRequest::Rejoin`. `stream`, `watch` and `group_id` are empty on that connection.
+A camera is one H.264 layer on it. Go Live is a second connection, `MediaRequest::Stream`, whose
+group id is the stream server id minus one. Watching a share is another receive-only `Stream`. `Connected` makes the call `Joined`, the only state drawn
 as "in a call". A call we rang stays `RingingOut`, whatever our own media does, until the adapter
 says `Context::answered` (or lists someone else in the call). The roster comes from the adapter
 (`Context::participants`); who is speaking comes from mediad and is merged by user id, ours into
@@ -315,8 +317,10 @@ thread has chatd's call start mediad (`Context::tiny_offer`), which answers `Tin
 `Offer {sdp}`: one UDP socket, a host candidate and an active ICE-TCP candidate
 on the same address, one `sendonly` Opus m-line, one `recvonly` Opus m-line per other seat, then
 H.264 constrained baseline video: a simulcast camera and one screen share, both inactive until
-asked, and one `recvonly` picture. Camera send is Windows-only. Screen share is Windows, macOS
-and Linux X11. UDP is preferred; TCP is the path when UDP cannot get through. The offer goes out
+asked, and one `recvonly` picture. The camera is the system's camera on Windows, macOS, and
+Linux, and the phone's camera on Android and iOS. Screen share is a screen or a window on
+Windows, the primary screen on macOS, the X11 root on an X11 Linux session, and the desktop
+portal's picker on Wayland. UDP is preferred; TCP is the path when UDP cannot get through. The offer goes out
 as `call.join` `sdp`; `call.answer` comes back as `TinyAnswer` (from here the call is joining,
 with the 15 s connect deadline), and each `call.slots` for that `call_id` as `TinySlots`.
 `Connected` makes it `Joined` as for Discord. Mute and deafen go out as `call.state`, a hang-up
@@ -334,7 +338,8 @@ the call fails in words and mediad is let go. A drop already on one of these pat
 start the other.
 
 On a server whose capabilities include `e2ee_calls`, the client seals Opus and the H.264
-picture. The one-byte NAL header stays clear. Discord's DAVE seals Opus only.
+picture. The one-byte NAL header stays clear. Discord's DAVE seals Opus, and on a picture the
+H.264 access unit. It does not use the Tiny lock.
 
 The microphone goes through `process` (WebRTC's AEC3, noise suppression and AGC2, ported to Rust
 by `sonora`) when those switches are on. All three default on. Enhanced noise, the default,

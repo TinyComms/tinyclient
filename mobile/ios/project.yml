@@ -71,12 +71,36 @@ targets:
       - sdk: ReplayKit.framework
       - sdk: WebKit.framework
       - sdk: AuthenticationServices.framework
+      - target: Broadcast
+        embed: true
+  Broadcast:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Broadcast
+        excludes:
+          - Info.plist
+          - Broadcast.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.tinyclient.app.broadcast
+        PRODUCT_NAME: Broadcast
+        SKIP_INSTALL: YES
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Broadcast/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Broadcast/Broadcast.entitlements
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      - sdk: ReplayKit.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
 
 schemes:
   Tiny:
     build:
       targets:
         Tiny: all
+        Broadcast: all
     run:
       config: Debug
     archive:

@@ -252,6 +252,9 @@ fn session(endpoint: &str, session_id: &str, token: &str, dave: Dave) -> VoiceJo
         dave,
         muted: false,
         deafened: false,
+        stream: false,
+        watch: false,
+        group_id: String::new(),
     }
 }
 
@@ -452,9 +455,25 @@ impl Fake {
     }
 
     /// Identify, hello, ready, address discovery, select protocol, session description.
-    /// Gives the identify mediad sent.
+    /// Gives the identify mediad sent. A voice call offers a camera layer.
     fn handshake(&mut self, peer: &mut Peer, offered: &[&str], dave_version: u16, heartbeat_ms: u64) -> Value {
+        self.handshake_kind(peer, offered, dave_version, heartbeat_ms, Some("video"))
+    }
+
+    /// `stream` is the identify layer: `"video"` on the call, `"screen"` on Go Live, and none
+    /// when the leg only watches. A watcher does not offer to encode.
+    fn handshake_kind(&mut self, peer: &mut Peer, offered: &[&str], dave_version: u16, heartbeat_ms: u64, stream: Option<&str>) -> Value {
         let identify = peer.expect(0);
+        assert_eq!(identify["video"], true);
+        match stream {
+            Some(kind) => {
+                assert_eq!(identify["streams"][0]["type"], kind);
+                assert_eq!(identify["streams"][0]["rid"], "100");
+                assert_eq!(identify["streams"][0]["quality"], 100);
+            }
+            None => assert!(identify.get("streams").is_none(), "a watcher offered a stream: {identify}"),
+        }
+        assert!(identify.get("max_dave_protocol_version").is_some());
         peer.send(8, json!({ "v": 8, "heartbeat_interval": heartbeat_ms }));
         let port = self.udp.local_addr().unwrap().port();
         peer.send(2, json!({ "ssrc": OUR_SSRC, "ip": "127.0.0.1", "port": port, "modes": offered, "experiments": [] }));
@@ -481,6 +500,13 @@ impl Fake {
 
         let select = peer.expect(1);
         assert_eq!(select["protocol"], "udp");
+        assert_eq!(select["codecs"][0]["name"], "opus");
+        assert_eq!(select["codecs"][0]["payload_type"], 120);
+        assert_eq!(select["codecs"][1]["name"], "H264");
+        assert_eq!(select["codecs"][1]["payload_type"], 103);
+        assert_eq!(select["codecs"][1]["rtx_payload_type"], 104);
+        assert_eq!(select["codecs"][1]["decode"], true);
+        assert_eq!(select["codecs"][1]["encode"], stream.is_some());
         assert_eq!(select["data"]["address"], "127.0.0.1");
         assert_eq!(select["data"]["port"], from.port());
         let mode = select["data"]["mode"].as_str().unwrap();
@@ -1393,28 +1419,31 @@ fn the_start_of_a_word_is_sent_though_it_was_too_quiet_to_open_the_gate() {
 }
 
 #[test]
-fn video_is_refused_in_words_on_a_voice_call_and_reports_no_stream() {
+fn a_picture_on_a_voice_call_is_not_refused_for_being_voice_only() {
     let mut fake = Fake::new();
     let mut mediad = Mediad::start("null", None);
-    // Before a join there is no engine in the call and the request is only noted.
+    // Before a join there is no engine in the call and the request is only noted. Nothing is opened.
     assert!(matches!(mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: None }), MediaResponse::Streams { video } if video.len() == 1));
     mediad.join(&fake.endpoint(), NO_DAVE);
     let mut peer = fake.accept();
     fake.handshake(&mut peer, &[AES], 0, 30_000);
     mediad.connected();
-    assert_eq!(mediad.ask(MediaRequest::Streams), MediaResponse::Streams { video: vec![] }, "a voice call holds no encode");
+    assert_eq!(mediad.ask(MediaRequest::Streams), MediaResponse::Streams { video: vec![] }, "joining clears a picture noted before it");
     for request in [
         MediaRequest::ShareSend { on: true, screen: None, quality: None },
         MediaRequest::ShareWatch { source: Some(THEM.into()) },
         MediaRequest::Speaker { source: Some(THEM.into()) },
         MediaRequest::Camera { on: true },
     ] {
-        let MediaResponse::Refused { detail } = mediad.ask(request) else {
-            panic!("video was accepted on a voice call");
-        };
-        assert!(detail.contains("voice only"), "{detail}");
+        match mediad.ask(request) {
+            MediaResponse::Streams { .. } => {}
+            // A headless machine has no camera or screen. That refusal is the probe's own words.
+            MediaResponse::Refused { detail } => assert!(!detail.contains("voice only"), "{detail}"),
+            other => panic!("a picture request answered {other:?}"),
+        }
     }
-    assert_eq!(mediad.ask(MediaRequest::ShareSend { on: false, screen: None, quality: None }), MediaResponse::Streams { video: vec![] });
+    let off = mediad.ask(MediaRequest::ShareSend { on: false, screen: None, quality: None });
+    assert!(matches!(off, MediaResponse::Streams { .. }), "{off:?}");
     assert_eq!(mediad.hang_up().0.code(), Some(0));
 }
 
@@ -1428,6 +1457,29 @@ fn hang_up_while_still_connecting_exits_cleanly() {
     let (status, took) = mediad.hang_up();
     assert_eq!(status.code(), Some(0));
     assert!(took < Duration::from_secs(2), "{took:?}");
+}
+
+#[test]
+fn a_go_live_leg_offers_a_screen_and_does_not_speak_or_exit() {
+    let mut fake = Fake::new();
+    let mut mediad = Mediad::start("null", None);
+    let mut join = session(&fake.endpoint(), "session-1", "voice-token", NO_DAVE);
+    join.stream = true;
+    join.group_id = "899".into();
+    assert_eq!(mediad.ask(MediaRequest::Stream(join)), MediaResponse::Done);
+    let mut peer = fake.accept();
+    fake.handshake_kind(&mut peer, &[AES], 0, 30_000, Some("screen"));
+    let sink = peer.expect(15);
+    assert_eq!(sink["any"], 100);
+    let until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < until {
+        peer.pump();
+    }
+    assert!(peer.held.iter().all(|(op, _)| *op != 5), "a screen leg spoke: {:?}", peer.held);
+    assert!(mediad.child.try_wait().unwrap().is_none(), "the screen leg ended the process");
+    assert_eq!(mediad.ask(MediaRequest::StreamStop { watch: false }), MediaResponse::Done);
+    assert!(mediad.child.try_wait().unwrap().is_none(), "stopping the screen ended the process");
+    assert_eq!(mediad.hang_up().0.code(), Some(0));
 }
 
 #[test]

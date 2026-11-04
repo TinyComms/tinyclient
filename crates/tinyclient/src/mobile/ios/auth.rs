@@ -48,7 +48,7 @@ define_class!(
     }
 );
 
-fn key_window(mtm: MainThreadMarker) -> Option<Retained<UIWindow>> {
+pub(super) fn key_window(mtm: MainThreadMarker) -> Option<Retained<UIWindow>> {
     let app = UIApplication::sharedApplication(mtm);
     app.connectedScenes().iter().filter_map(|scene| scene.downcast::<UIWindowScene>().ok()).find_map(|scene| {
         let windows = scene.windows();

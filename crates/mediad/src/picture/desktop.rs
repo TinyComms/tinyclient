@@ -1,6 +1,6 @@
-//! The desktop's pictures: OpenH264 (Cisco's binary, fetched at run time), nokhwa's camera on
-//! Windows, and the screen through GDI, CoreGraphics or X11. Moved here unchanged from
-//! `picture.rs`, which keeps what phones share.
+//! The desktop's pictures: OpenH264 (Cisco's binary, fetched at run time), nokhwa's camera
+//! (Media Foundation, AVFoundation, V4L2), and the screen through GDI, Core Graphics, the X11
+//! root, or the Linux desktop portal. Moved here from `picture.rs`, which keeps what phones share.
 
 use super::*;
 use crate::rt;
@@ -263,6 +263,13 @@ impl Outgoing {
         self.selfie_painted = None;
         self.selfie_at = None;
     }
+
+    /// The share is off. Drop the encoder, and on Linux close the portal session so the recording indicator does not stay up.
+    pub fn close_share(&mut self) {
+        self.share = None;
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        super::portal::stop_screen();
+    }
 }
 
 /// The one decoder a call holds, and the painters that write what it decodes for the window.
@@ -424,23 +431,82 @@ pub fn probe_screen() -> Result<(), String> {
     capture_screen().map(|_| ())
 }
 
-/// The camera, through the system's own API (Media Foundation, AVFoundation, V4L2).
+/// The camera, through the system's own API (Media Foundation, AVFoundation, V4L2). On Linux, one failed open is retried through the desktop portal, which is how a PipeWire-held camera is reached on every distro. A cancel or a missing portal is remembered until the camera is closed, so a dark frame does not ask again.
 #[derive(Default)]
 struct Camera {
     inner: Option<nokhwa::Camera>,
     /// The choice it was opened with. A new choice closes it, and the next frame opens that.
     opened: Option<String>,
+    /// The portal camera is the one producing frames.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    portal: bool,
+    /// One portal attempt already failed or was cancelled.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    portal_gave_up: bool,
 }
 
 impl Camera {
     fn frame(&mut self) -> Result<Rgba, String> {
-        if self.inner.is_some() && self.opened != super::camera_chosen() {
+        let chosen = super::camera_chosen();
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        if self.portal {
+            if self.opened != chosen {
+                self.close();
+            } else {
+                return super::portal::capture_camera();
+            }
+        }
+        if self.inner.is_some() && self.opened != chosen {
             self.close();
         }
+        match self.open_and_read() {
+            Ok(frame) => Ok(frame),
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            Err(words) => self.portal_once(words, chosen),
+            #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+            Err(words) => Err(words),
+        }
+    }
+
+    fn open_and_read(&mut self) -> Result<Rgba, String> {
         self.open()?;
         let camera = self.inner.as_mut().ok_or_else(|| "No camera was opened.".to_owned())?;
         let frame = camera.frame().map_err(|err| err.to_string())?;
         rgba_of(&frame)
+    }
+
+    /// V4L2 could not open. Ask the portal once. A cancel is said in the portal's words. Anything else (no bus, no PipeWire, no camera there) keeps the V4L2 words.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn portal_once(&mut self, v4l2: String, chosen: Option<String>) -> Result<Rgba, String> {
+        if self.portal_gave_up {
+            return Err(v4l2);
+        }
+        match super::portal::open_camera() {
+            Ok(()) => match super::portal::capture_camera() {
+                Ok(frame) => {
+                    if let Some(camera) = self.inner.as_mut() {
+                        let _ = camera.stop_stream();
+                    }
+                    self.inner = None;
+                    self.portal = true;
+                    self.opened = chosen;
+                    Ok(frame)
+                }
+                Err(words) => {
+                    self.portal_gave_up = true;
+                    super::portal::stop_camera();
+                    Err(words)
+                }
+            },
+            Err(err) if err.refused => {
+                self.portal_gave_up = true;
+                Err(err.words)
+            }
+            Err(_) => {
+                self.portal_gave_up = true;
+                Err(v4l2)
+            }
+        }
     }
 
     fn open(&mut self) -> Result<(), String> {
@@ -463,6 +529,12 @@ impl Camera {
         }
         self.inner = None;
         self.opened = None;
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        {
+            self.portal = false;
+            self.portal_gave_up = false;
+            super::portal::stop_camera();
+        }
     }
 }
 
@@ -593,30 +665,39 @@ fn camera_index(choice: Option<&str>) -> Result<nokhwa::utils::CameraIndex, Stri
 }
 
 /// The screen or window chosen for the share ([`super::choose_screen`]), else the primary
-/// screen, as RGBA or BGRA. The whole of it, which the share then fits.
+/// screen, as RGBA or BGRA. The whole of it, which the share then fits. On a Wayland session this
+/// is what opens the desktop's picker.
 pub fn capture_screen() -> Result<Rgba, String> {
-    capture_source(super::screens::chosen().as_deref())
+    grab(super::screens::chosen().as_deref(), true)
 }
 
-/// One screen or window by its `--screens` id. Only Windows tells them apart; elsewhere every id
-/// is the primary screen.
+/// One screen or window by its `--screens` id, for a thumbnail. This does not open a portal
+/// dialog. Only Windows tells the ids apart; elsewhere a thumbnail is the primary screen, or the
+/// frame a share that is already recording last produced.
 pub(super) fn capture_source(id: Option<&str>) -> Result<Rgba, String> {
+    grab(id, false)
+}
+
+fn grab(id: Option<&str>, allow_portal: bool) -> Result<Rgba, String> {
     #[cfg(windows)]
     {
+        let _ = allow_portal;
         return super::screens::capture(id);
     }
     #[cfg(not(windows))]
     let _ = id;
     #[cfg(target_os = "macos")]
     {
+        let _ = allow_portal;
         return capture_screen_macos();
     }
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
-        return capture_screen_linux();
+        return capture_screen_linux(allow_portal);
     }
     #[cfg(not(any(windows, target_os = "macos", all(target_os = "linux", not(target_env = "ohos")))))]
     {
+        let _ = allow_portal;
         Err("Screen sharing isn't available on this system.".to_owned())
     }
 }
@@ -641,8 +722,46 @@ fn capture_screen_macos() -> Result<Rgba, String> {
     Ok(Rgba { width, height, pixels, bgra: true })
 }
 
+/// Wayland goes to the portal first, on every compositor that implements it. A cancel stays a
+/// cancel. The portal being absent may fall through to X11, which is XWayland on a Wayland
+/// session and the real root on an X11 session. An X11 session never opens the portal, so XFCE
+/// and the others do not get a dialog on top of a grab that already works. A thumbnail never
+/// opens the portal either.
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-fn capture_screen_linux() -> Result<Rgba, String> {
+fn capture_screen_linux(allow_portal: bool) -> Result<Rgba, String> {
+    use super::session::Kind;
+    if allow_portal && super::session::current() == Kind::Wayland {
+        match super::portal::capture_screen() {
+            Ok(frame) => return Ok(frame),
+            Err(err) if err.refused => return Err(err.words),
+            Err(err) => return x11_or(err.words),
+        }
+    }
+    if !allow_portal {
+        if let Some(frame) = super::portal::latest_screen() {
+            return Ok(frame);
+        }
+        if super::session::current() == Kind::Wayland {
+            return Err("The screen list does not open the share dialog.".to_owned());
+        }
+    }
+    capture_x11()
+}
+
+/// The portal could not start. Use the X11 root when this session has a display.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn x11_or(portal_words: String) -> Result<Rgba, String> {
+    let display = std::env::var("DISPLAY").ok();
+    if display.is_some_and(|value| !value.is_empty()) {
+        if let Ok(frame) = capture_x11() {
+            return Ok(frame);
+        }
+    }
+    Err(portal_words)
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn capture_x11() -> Result<Rgba, String> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
     let (conn, screen_num) = x11rb::connect(None).map_err(|_| "This session has no X11 display, so the screen can't be shared.".to_owned())?;

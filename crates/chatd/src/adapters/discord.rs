@@ -217,6 +217,8 @@ struct Discord {
     /// This account's message searches: one in flight at a time, paced from when the last
     /// finished, with recent answers kept in memory.
     message_search: Mutex<info::MessageSearch>,
+    /// One Go Live request at a time, so a stop cannot land before the start it was meant to end.
+    stream_gate: Mutex<()>,
 }
 
 /// The user id a token starts with (its first part is the id in base64), so the account is named
@@ -261,6 +263,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         refused_sessions: Mutex::new((0, String::new())),
         held: AtomicBool::new(false),
         message_search: Mutex::new(info::MessageSearch::default()),
+        stream_gate: Mutex::new(()),
     });
     let socket = discord.clone();
     std::thread::spawn(move || keep_connected(&socket.ctx, || socket.connect()));
@@ -1150,6 +1153,7 @@ impl Discord {
             Command::CallJoin(conversation_id) => self.call_join(&conversation_id),
             Command::CallLeave(conversation_id) => self.call_leave(&conversation_id),
             Command::CallAudio { muted, deafened } => self.call_audio(muted, deafened),
+            Command::CallPicture(picture) => self.call_picture(picture),
             // The user asked to sign out, so the token should stop working, not just be
             // forgotten: the answer goes once Discord has ended the session, or refused to.
             Command::SignOut(done) => {

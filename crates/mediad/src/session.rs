@@ -9,9 +9,11 @@
 
 use crate::audio::Audio;
 use crate::dave::{self, Dave, Outgoing};
+use crate::discord_video::{self, Remote};
 use crate::gateway::{self, closed, Closed, Incoming, Socket};
 use crate::media::{self, FromMedia, MICROPHONE_DENIED};
 use crate::permission::{microphone, Microphone};
+use crate::picture::{CAMERA_HIGH, CAMERA_HIGH_BPS, SHARE_BPS, SHARE_MAX};
 use crate::rtp::{self, Cipher, Sender};
 use crate::out;
 use protocol::{AudioProcessing, CallFailure, CallStats, Cue, InputMode, MediaResponse, TinyPicture, TinySlot, Tuning, VoiceJoin, VoiceQuality};
@@ -86,6 +88,11 @@ pub struct Controls {
     share: AtomicBool,
     camera: AtomicBool,
     watch: AtomicBool,
+    /// Stops a Go Live leg without hanging up the voice call. The voice loop does not read these.
+    share_leg_stop: AtomicBool,
+    watch_leg_stop: AtomicBool,
+    /// Whose camera to paint, when the shell named one.
+    speaker: Mutex<Option<String>>,
     /// An answer to the renegotiation offer, or an empty SDP when the server refused it.
     picture_answer: Mutex<Option<String>>,
     /// Who the one video slot carries. `None` inside means the server sent no picture.
@@ -169,6 +176,34 @@ impl Controls {
 
     pub fn watch(&self) -> bool {
         self.watch.load(Ordering::Relaxed)
+    }
+
+    pub fn set_speaker(&self, source: Option<String>) {
+        *self.speaker.lock().unwrap() = source;
+    }
+
+    /// Whom to paint, when one person was chosen. `None` keeps whoever is already showing.
+    pub fn speaker(&self) -> Option<String> {
+        self.speaker.lock().unwrap().clone()
+    }
+
+    /// Asks a Go Live leg to return. The voice call stays up.
+    pub fn stop_leg(&self, watch: bool) {
+        self.leg_flag(watch).store(true, Ordering::Relaxed);
+    }
+
+    /// A new leg is about to start, so the stop from the one it replaces is cleared.
+    pub fn clear_leg(&self, watch: bool) {
+        self.leg_flag(watch).store(false, Ordering::Relaxed);
+    }
+
+    /// The leg should return: chatd hung up, or this leg was stopped.
+    pub fn leg_done(&self, watch: bool) -> bool {
+        self.hangup.load(Ordering::Relaxed) || self.leg_flag(watch).load(Ordering::Relaxed)
+    }
+
+    fn leg_flag(&self, watch: bool) -> &AtomicBool {
+        if watch { &self.watch_leg_stop } else { &self.share_leg_stop }
     }
 
     /// The answer to the last renegotiation, taken once by the call's loop.
@@ -361,15 +396,18 @@ enum End {
     Removed,
 }
 
-struct Media {
-    stop: Arc<AtomicBool>,
-    thread: JoinHandle<Audio>,
+enum Running {
+    Voice { stop: Arc<AtomicBool>, thread: JoinHandle<Audio> },
+    /// A Go Live connection. It returns; it does not keep a device.
+    Stream { stop: Arc<AtomicBool>, thread: JoinHandle<()> },
 }
 
 /// What `Ready` gave us, held until the session description completes it.
 struct Transport {
     socket: UdpSocket,
     ssrc: u32,
+    /// The video SSRC and its retransmission, when Ready named a stream.
+    video: Option<(u32, u32)>,
 }
 
 struct Call {
@@ -383,7 +421,13 @@ struct Call {
     users: Arc<Mutex<HashMap<u32, String>>>,
     /// Everyone the gateway says is connected, us included: who DAVE may add to the group.
     connected: BTreeSet<u64>,
-    media: Option<Media>,
+    media: Option<Running>,
+    /// The video SSRCs Ready gave us, once the session description has taken the transport.
+    assigned: Option<(u32, u32)>,
+    /// Video SSRCs of other people, filled from opcode 12 and read by the media thread.
+    videos: Arc<Mutex<HashMap<u32, Remote>>>,
+    /// Set after opcode 12 goes out. The media thread sends picture packets only while it is set.
+    announced: Arc<AtomicBool>,
     /// The devices, kept open between one voice server and the next.
     audio: Option<Audio>,
     reports: Reports<FromMedia>,
@@ -418,12 +462,36 @@ enum Waited {
 impl Call {
     /// Stops the audio loop and keeps the devices it held, open, for the next connection.
     fn stop_media(&mut self) {
-        if let Some(media) = self.media.take() {
-            media.stop.store(true, Ordering::Relaxed);
-            if let Ok(audio) = media.thread.join() {
-                self.audio = Some(audio);
+        let Some(running) = self.media.take() else {
+            return;
+        };
+        match running {
+            Running::Voice { stop, thread } => {
+                stop.store(true, Ordering::Relaxed);
+                if let Ok(audio) = thread.join() {
+                    self.audio = Some(audio);
+                }
+            }
+            Running::Stream { stop, thread } => {
+                stop.store(true, Ordering::Relaxed);
+                let _ = thread.join();
             }
         }
+    }
+
+    /// The voice call ends on hang-up. A Go Live leg also ends when its own flag is set, which
+    /// does not hang up the voice call.
+    fn stopping(&self) -> bool {
+        if self.join.stream {
+            self.controls.leg_done(self.join.watch)
+        } else {
+            self.controls.hangup.load(Ordering::Relaxed)
+        }
+    }
+
+    /// A voice-server move belongs to the voice leg. A stream leg ignores it.
+    fn shifting(&self) -> bool {
+        !self.join.stream && self.controls.moving()
     }
 
     /// Takes up the voice session the call moved to. The old connection's socket, UDP path,
@@ -438,6 +506,9 @@ impl Call {
         self.transport = None;
         self.joined = false;
         self.users.lock().unwrap().clear();
+        self.videos.lock().unwrap().clear();
+        self.assigned = None;
+        self.announced.store(false, Ordering::Relaxed);
         let me = self.join.user_id.parse().ok();
         self.connected = me.into_iter().collect();
         // Reports from the loop that just stopped are about the old connection.
@@ -479,10 +550,10 @@ impl Call {
                     break;
                 }
             }
-            if self.controls.hangup.load(Ordering::Relaxed) {
+            if self.stopping() {
                 return Err(End::Hangup);
             }
-            if self.controls.moving() {
+            if self.shifting() {
                 return Err(End::Moved);
             }
         }
@@ -490,11 +561,11 @@ impl Call {
             return Err(End::Dropped(Why::Udp, format!("no answer over UDP from {ip}:{port}")));
         };
         let data = json!({ "address": address, "port": port, "mode": mode });
-        let codecs = json!([{ "name": "opus", "type": "audio", "priority": 1000, "payload_type": rtp::PAYLOAD_TYPE }]);
+        let codecs = codecs(!self.join.watch);
         socket
             .send(gateway::SELECT_PROTOCOL, json!({ "protocol": "udp", "data": data, "codecs": codecs }))
             .map_err(dropped)?;
-        self.transport = Some(Transport { socket: udp, ssrc });
+        self.transport = Some(Transport { socket: udp, ssrc, video: assigned_stream(d) });
         Ok(())
     }
 
@@ -520,6 +591,9 @@ impl Call {
         if version == 0 && self.join.dave.required {
             return Err(End::Fatal(CallFailure::Encryption, NOT_ENCRYPTED.to_owned()));
         }
+        if self.join.stream {
+            return self.start_stream(socket, transport, seal, open, version);
+        }
 
         // The devices open only now, so a join that fails never lights the microphone indicator.
         // After a move they are open already; a choice made meanwhile is applied by the loop.
@@ -541,7 +615,7 @@ impl Call {
         let stop = Arc::new(AtomicBool::new(false));
         let setup = media::Setup {
             socket: transport.socket,
-            sender: Sender::new(seal, transport.ssrc, rand::random(), rand::random()),
+            sender: Sender::new(seal.clone(), transport.ssrc, rand::random(), rand::random()),
             opener: open,
             ssrc: transport.ssrc,
             user_id: self.join.user_id.clone(),
@@ -552,7 +626,11 @@ impl Call {
             audio,
             stop: stop.clone(),
             microphone_unasked: self.microphone_unasked,
+            pipe: transport.video.map(|(ssrc, rtx)| discord_video::Pipe::new(seal, ssrc, rtx)),
+            videos: self.videos.clone(),
+            announced: self.announced.clone(),
         };
+        self.assigned = transport.video;
         let thread = out::spawn(std::thread::Builder::new()
             .name("media".to_owned()),
             move || media::run(setup))
@@ -560,11 +638,14 @@ impl Call {
                 tracing::warn!("mediad: the media thread did not start: {err}");
                 End::Fatal(CallFailure::Engine, ENGINE.to_owned())
             })?;
-        self.media = Some(Media { stop, thread });
+        self.media = Some(Running::Voice { stop, thread });
 
-        // Announces our SSRC. Speaking itself is told when it starts.
+        // Announces our SSRC. Speaking itself is told when it starts. The sink wants follow,
+        // so a camera already in the channel is forwarded; the fake server matches speaking
+        // by opcode and is not bothered by the extra frame.
         let quiet = json!({ "speaking": 0, "delay": 0, "ssrc": self.ssrc });
         socket.send(gateway::SPEAKING, quiet).map_err(dropped)?;
+        socket.send(gateway::SINK, json!({ "any": 100 })).map_err(dropped)?;
         self.joined = true;
         self.deadline = None;
         out::send(&MediaResponse::Connected { ssrc: self.ssrc, dave_version: version });
@@ -609,7 +690,10 @@ impl Call {
                 out::send(&MediaResponse::Connected { ssrc: self.ssrc, dave_version: self.dave_version });
             }
             gateway::SPEAKING => self.source(&d["user_id"], &d["ssrc"]),
-            gateway::VIDEO => self.source(&d["user_id"], &d["audio_ssrc"]),
+            gateway::VIDEO => {
+                self.source(&d["user_id"], &d["audio_ssrc"]);
+                self.note_video(&d);
+            }
             gateway::CLIENTS_CONNECT => {
                 let ids = d["user_ids"].as_array().into_iter().flatten().filter_map(number);
                 self.connected.extend(ids);
@@ -620,6 +704,7 @@ impl Call {
                         self.connected.remove(&id);
                     }
                     self.users.lock().unwrap().retain(|_, user| *user != user_id);
+                    self.videos.lock().unwrap().retain(|_, remote| remote.user_id != user_id);
                     out::send(&MediaResponse::Gone { user_id });
                 }
             }
@@ -671,10 +756,10 @@ impl Call {
 
     fn converse(&mut self, socket: &mut Socket) -> End {
         loop {
-            if self.controls.hangup.load(Ordering::Relaxed) {
+            if self.stopping() {
                 return End::Hangup;
             }
-            if self.controls.moving() {
+            if self.shifting() {
                 return End::Moved;
             }
             while let Ok(report) = self.from_media.try_recv() {
@@ -685,6 +770,7 @@ impl Call {
                     }
                     FromMedia::Dave(outgoing) => self.deliver(socket, outgoing),
                     FromMedia::Fatal(reason, detail) => Err(End::Fatal(reason, detail)),
+                    FromMedia::Picture { share, on } => self.announce_video(socket, share, on),
                 };
                 if let Err(end) = sent {
                     return end;
@@ -743,14 +829,7 @@ impl Call {
             }
             socket.send(gateway::RESUME, d)
         } else {
-            let d = json!({
-                "server_id": join.server_id,
-                "user_id": join.user_id,
-                "session_id": join.session_id,
-                "token": join.token,
-                "max_dave_protocol_version": join.dave.max_version.min(dave::MAX_VERSION),
-            });
-            socket.send(gateway::IDENTIFY, d)
+            socket.send(gateway::IDENTIFY, identify(join))
         };
         if let Err(err) = hello {
             return dropped(err);
@@ -778,10 +857,10 @@ impl Call {
     fn wait(&self, how_long: Duration, for_move: bool) -> Waited {
         let until = Instant::now() + how_long;
         loop {
-            if self.controls.hangup.load(Ordering::Relaxed) {
+            if self.stopping() {
                 return Waited::Hangup;
             }
-            if self.controls.moving() {
+            if self.shifting() {
                 return Waited::Moved;
             }
             if Instant::now() >= until {
@@ -790,24 +869,206 @@ impl Call {
             std::thread::sleep(Duration::from_millis(if for_move { 5 } else { 20 }));
         }
     }
+
+    /// A Go Live leg: the same gateway, and a picture loop instead of the microphone. It sends
+    /// no speaking indication and no `Connected`. A failure here is a notice, not the end of
+    /// the voice call.
+    fn start_stream(&mut self, socket: &mut Socket, transport: Transport, seal: Cipher, opener: Cipher, version: u16) -> Result<(), End> {
+        let first = self.dave.lock().unwrap().start(version);
+        self.deliver(socket, first)?;
+        self.dave_version = version;
+        self.ssrc = transport.ssrc;
+        self.assigned = transport.video;
+        let pipe = transport.video.map(|(ssrc, rtx)| discord_video::Pipe::new(seal, ssrc, rtx));
+        let stop = Arc::new(AtomicBool::new(false));
+        let leg = discord_video::Leg {
+            socket: transport.socket,
+            opener,
+            dave: self.dave.clone(),
+            controls: self.controls.clone(),
+            report: self.reports.clone(),
+            stop: stop.clone(),
+            videos: self.videos.clone(),
+            announced: self.announced.clone(),
+            user_id: self.join.user_id.clone(),
+            pipe,
+            watch: self.join.watch,
+        };
+        let thread = out::spawn(std::thread::Builder::new().name("stream".to_owned()), move || discord_video::run(leg)).map_err(|err| {
+            tracing::warn!("mediad: the stream thread did not start: {err}");
+            End::Fatal(CallFailure::Engine, ENGINE.to_owned())
+        })?;
+        self.media = Some(Running::Stream { stop, thread });
+        // Viewers and the sender both say what they want. A stream does not speak.
+        socket.send(gateway::SINK, json!({ "any": 100 })).map_err(dropped)?;
+        self.joined = true;
+        self.deadline = None;
+        Ok(())
+    }
+
+    /// Opcode 12 named someone else's video SSRCs. Ours are ignored; the media thread routes
+    /// by this map and must not open a packet we sent.
+    fn note_video(&mut self, d: &Value) {
+        let Some(user_id) = text(&d["user_id"]) else {
+            return;
+        };
+        if user_id == self.join.user_id {
+            return;
+        }
+        let mut videos = self.videos.lock().unwrap();
+        videos.retain(|_, remote| remote.user_id != user_id);
+        let Some(streams) = d["streams"].as_array() else {
+            return;
+        };
+        for stream in streams {
+            let Some(ssrc) = number(&stream["ssrc"]).and_then(|n| u32::try_from(n).ok()).filter(|ssrc| *ssrc != 0) else {
+                continue;
+            };
+            let rtx = number(&stream["rtx_ssrc"]).and_then(|n| u32::try_from(n).ok()).filter(|ssrc| *ssrc != 0);
+            videos.insert(ssrc, Remote { user_id: user_id.clone(), repair_of: None });
+            if let Some(rtx) = rtx {
+                videos.insert(rtx, Remote { user_id: user_id.clone(), repair_of: Some(ssrc) });
+            }
+        }
+    }
+
+    /// The capture thread asked for a picture, or to stop. The announcement goes out before
+    /// any packet: the flag is set only after the send returns. A stream leg ignores a camera
+    /// report, and the voice leg ignores a share.
+    fn announce_video(&mut self, socket: &mut Socket, share: bool, on: bool) -> Result<(), End> {
+        if share != self.join.stream {
+            return Ok(());
+        }
+        if !on {
+            self.announced.store(false, Ordering::Relaxed);
+            if self.assigned.is_some() {
+                socket.send(gateway::VIDEO, self.video_body(false)).map_err(dropped)?;
+            }
+            return Ok(());
+        }
+        if self.assigned.is_none() {
+            if self.join.stream {
+                self.controls.set_share(false);
+            } else {
+                self.controls.set_camera(false);
+            }
+            out::send(&MediaResponse::Notice { detail: discord_video::NO_ASSIGNED.to_owned() });
+            out::send(&MediaResponse::Sending { share: self.controls.share(), camera: self.controls.camera() });
+            return Ok(());
+        }
+        socket.send(gateway::VIDEO, self.video_body(true)).map_err(dropped)?;
+        self.announced.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Opcode 12's body. Off, or never assigned, is a video SSRC of 0 and no streams. The
+    /// negotiated type is `video` on both legs; identify is what said `screen`.
+    fn video_body(&self, active: bool) -> Value {
+        let Some((ssrc, rtx)) = self.assigned.filter(|_| active) else {
+            return json!({ "audio_ssrc": self.ssrc, "video_ssrc": 0, "rtx_ssrc": 0, "streams": [] });
+        };
+        let screen = self.join.stream && !self.join.watch;
+        let ((width, height), bitrate) = if screen { (SHARE_MAX, SHARE_BPS) } else { (CAMERA_HIGH, CAMERA_HIGH_BPS) };
+        json!({
+            "audio_ssrc": self.ssrc,
+            "video_ssrc": ssrc,
+            "rtx_ssrc": rtx,
+            "streams": [{
+                "type": "video",
+                "rid": "100",
+                "ssrc": ssrc,
+                "rtx_ssrc": rtx,
+                "active": true,
+                "quality": 100,
+                "max_bitrate": bitrate,
+                "max_framerate": 15,
+                "max_resolution": { "type": "fixed", "width": width, "height": height },
+            }],
+        })
+    }
+}
+
+/// What we can send and receive. One H.264 layer. A watch leg does not encode.
+fn codecs(encode: bool) -> Value {
+    json!([
+        { "name": "opus", "type": "audio", "priority": 1000, "payload_type": rtp::PAYLOAD_TYPE },
+        {
+            "name": "H264",
+            "type": "video",
+            "priority": 1000,
+            "payload_type": rtp::H264,
+            "rtx_payload_type": rtp::RTX,
+            "encode": encode,
+            "decode": true,
+        },
+    ])
+}
+
+/// The voice identify. A camera offers one video layer. Go Live offers a screen layer. A
+/// viewer offers video and no stream of its own. No channel id: that field is gateway v9.
+fn identify(join: &VoiceJoin) -> Value {
+    let mut d = json!({
+        "server_id": join.server_id,
+        "user_id": join.user_id,
+        "session_id": join.session_id,
+        "token": join.token,
+        "max_dave_protocol_version": join.dave.max_version.min(dave::MAX_VERSION),
+        "video": true,
+    });
+    if !join.watch {
+        let kind = if join.stream { "screen" } else { "video" };
+        d["streams"] = json!([{ "type": kind, "rid": "100", "quality": 100 }]);
+    }
+    d
+}
+
+/// The SSRC Ready assigned to the layer we offered, and its retransmission. A missing
+/// retransmission is the next number. No stream, or a zero SSRC, means this call has no picture.
+fn assigned_stream(d: &Value) -> Option<(u32, u32)> {
+    let streams = d["streams"].as_array()?;
+    let chosen = streams.iter().find(|stream| stream["rid"].as_str() == Some("100")).or(streams.first())?;
+    let ssrc = number(&chosen["ssrc"]).and_then(|n| u32::try_from(n).ok()).filter(|ssrc| *ssrc != 0)?;
+    let rtx = number(&chosen["rtx_ssrc"]).and_then(|n| u32::try_from(n).ok()).filter(|ssrc| *ssrc != 0).unwrap_or(ssrc.saturating_add(1));
+    Some((ssrc, rtx))
 }
 
 /// Runs the call to its end. Returns when chatd hung up or the other side ended it; a failure
-/// does not return (`out::fail` exits).
+/// of the voice call does not return (`out::fail` exits). A Go Live leg returns instead, and
+/// says why with a notice: ending the process would take the voice call with it.
 pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
-    // A phone's audio session, for as long as the call runs. Nothing on a desktop.
-    let _audio_session = crate::platform::call_audio();
-    let (Ok(user), Ok(room)) = (join.user_id.parse::<u64>(), join.channel_id.parse::<u64>()) else {
+    let stream = join.stream;
+    // A phone's audio session, for as long as the voice call runs. A stream leg shares the
+    // voice call's session and must not open another. Nothing on a desktop.
+    let _audio_session = (!stream).then(crate::platform::call_audio);
+    let fail = |reason, detail: &str| -> bool {
+        if stream {
+            out::send(&MediaResponse::Notice { detail: detail.to_owned() });
+            true
+        } else {
+            out::fail(reason, detail);
+        }
+    };
+    let room = if join.group_id.is_empty() { join.channel_id.parse::<u64>() } else { join.group_id.parse::<u64>() };
+    let (Ok(user), Ok(room)) = (join.user_id.parse::<u64>(), room) else {
         tracing::warn!("mediad: the voice session's ids are not numbers ({:?}, {:?})", join.user_id, join.channel_id);
-        out::fail(CallFailure::Refused, UNUSABLE);
+        if fail(CallFailure::Refused, UNUSABLE) {
+            return;
+        }
+        unreachable!();
     };
     if join.dave.required && join.dave.max_version.min(dave::MAX_VERSION) == 0 {
-        out::fail(CallFailure::Encryption, NOT_ENCRYPTED);
+        if fail(CallFailure::Encryption, NOT_ENCRYPTED) {
+            return;
+        }
     }
     let mut microphone_unasked = false;
-    if !Audio::simulated() {
+    if !stream && !Audio::simulated() {
         match microphone() {
-            Some(Microphone::Denied) => out::fail(CallFailure::Audio, MICROPHONE_DENIED),
+            Some(Microphone::Denied) => {
+                if fail(CallFailure::Audio, MICROPHONE_DENIED) {
+                    return;
+                }
+            }
             Some(Microphone::Unasked) => microphone_unasked = true,
             Some(Microphone::Allowed) | None => {}
         }
@@ -824,6 +1085,9 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
         users: Arc::default(),
         connected: BTreeSet::from([user]),
         media: None,
+        assigned: None,
+        videos: Arc::default(),
+        announced: Arc::new(AtomicBool::new(false)),
         audio: None,
         reports,
         from_media,
@@ -839,7 +1103,7 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
     let (mut attempt, mut resumes) = (0, 0);
     let mut why = Why::Silent;
     loop {
-        let next = call.controls.moved.lock().unwrap().take();
+        let next = if call.join.stream { None } else { call.controls.moved.lock().unwrap().take() };
         if let Some(next) = next {
             if call.joined {
                 out::send(&MediaResponse::Interrupted);
@@ -851,11 +1115,15 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
         let pause = if resume {
             if resumes == RESUMES {
                 call.stop_media();
-                out::fail(CallFailure::Lost, DROPPED);
+                if fail(CallFailure::Lost, DROPPED) {
+                    return;
+                }
             }
             resumes += 1;
             tracing::warn!("mediad: resume {resumes} of {RESUMES}");
-            out::send(&MediaResponse::Interrupted);
+            if !call.join.stream {
+                out::send(&MediaResponse::Interrupted);
+            }
             // Heard once per drop, not once per try.
             if resumes == 1 {
                 call.controls.cue(Cue::Lost);
@@ -868,7 +1136,9 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
                     Why::Silent => SILENT,
                     Why::Udp => NO_AUDIO_PATH,
                 };
-                out::fail(CallFailure::Lost, words);
+                if fail(CallFailure::Lost, words) {
+                    return;
+                }
             }
             attempt += 1;
             tracing::warn!("mediad: joining {}, try {attempt} of {ATTEMPTS}", call.join.endpoint);
@@ -885,15 +1155,27 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
         let began = Instant::now();
         match call.connection(resume) {
             End::Hangup | End::Ended => return,
-            End::Fatal(reason, detail) => out::fail(reason, detail),
+            End::Fatal(reason, detail) => {
+                if fail(reason, &detail) {
+                    return;
+                }
+            }
             End::Moved => {}
             End::Removed => {
                 tracing::warn!("mediad: the voice server dropped us; waiting {MOVE:?} to hear where the call moved");
-                out::send(&MediaResponse::Interrupted);
+                if !call.join.stream {
+                    out::send(&MediaResponse::Interrupted);
+                }
                 match call.wait(MOVE, true) {
                     Waited::Moved => {}
                     Waited::Hangup => return,
-                    Waited::Done => out::fail(CallFailure::Refused, gateway::REMOVED),
+                    Waited::Done => {
+                        if call.join.stream {
+                            out::send(&MediaResponse::Notice { detail: gateway::REMOVED.to_owned() });
+                            return;
+                        }
+                        out::fail(CallFailure::Refused, gateway::REMOVED);
+                    }
                 }
             }
             End::Dropped(kind, detail) => {
@@ -941,5 +1223,57 @@ mod tests {
         assert_eq!(controls.take_cue(), Some(Cue::Deafened));
         controls.cue(Cue::Left);
         assert_eq!(controls.take_cue(), None, "deafened, nobody is heard leaving");
+    }
+
+    fn sample_join(stream: bool, watch: bool) -> VoiceJoin {
+        VoiceJoin {
+            network: protocol::Network::Discord,
+            endpoint: "voice.example:443".into(),
+            token: "t".into(),
+            session_id: "s".into(),
+            user_id: "1".into(),
+            server_id: "9".into(),
+            channel_id: "9".into(),
+            dave: protocol::Dave { max_version: 1, required: true },
+            muted: false,
+            deafened: false,
+            stream,
+            watch,
+            group_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn identify_offers_one_camera_layer_a_screen_on_go_live_and_nothing_to_send_when_watching() {
+        let voice = identify(&sample_join(false, false));
+        assert_eq!(voice["video"], json!(true));
+        assert_eq!(voice["streams"][0]["type"], "video");
+        assert_eq!(voice["streams"][0]["rid"], "100");
+        assert_eq!(voice["streams"][0]["quality"], 100);
+        assert!(voice.get("channel_id").is_none());
+        assert_eq!(identify(&sample_join(true, false))["streams"][0]["type"], "screen");
+        assert!(identify(&sample_join(true, true)).get("streams").is_none());
+    }
+
+    #[test]
+    fn codecs_offer_opus_and_one_h264_layer_and_a_viewer_does_not_encode() {
+        let offered = codecs(true);
+        assert_eq!(offered[0]["name"], "opus");
+        assert_eq!(offered[0]["payload_type"], json!(rtp::PAYLOAD_TYPE));
+        assert_eq!(offered[1]["name"], "H264");
+        assert_eq!(offered[1]["payload_type"], json!(rtp::H264));
+        assert_eq!(offered[1]["rtx_payload_type"], json!(rtp::RTX));
+        assert_eq!(offered[1]["encode"], true);
+        assert_eq!(offered[1]["decode"], true);
+        assert_eq!(codecs(false)[1]["encode"], false);
+    }
+
+    #[test]
+    fn ready_names_the_layer_we_send_and_a_missing_retransmission_is_the_next_ssrc() {
+        let ready = json!({ "streams": [{ "rid": "100", "ssrc": 7, "rtx_ssrc": 8 }] });
+        assert_eq!(assigned_stream(&ready), Some((7, 8)));
+        assert_eq!(assigned_stream(&json!({ "streams": [{ "rid": "50", "ssrc": 1 }, { "rid": "100", "ssrc": "4" }] })), Some((4, 5)));
+        assert_eq!(assigned_stream(&json!({})), None);
+        assert_eq!(assigned_stream(&json!({ "streams": [{ "ssrc": 0 }] })), None);
     }
 }

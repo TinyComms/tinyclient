@@ -2,11 +2,12 @@
 //! `davey`, and the transitions the voice gateway steers it through.
 //!
 //! The gateway hands each DAVE opcode's payload to a method here and sends whatever comes back.
-//! The media loop calls `encrypt` and `decrypt` on every Opus frame. Protocol version 0 means the
-//! call is not end-to-end encrypted and frames pass through untouched.
+//! The media loop calls `encrypt` and `decrypt` on every Opus frame, and `encrypt_video` and
+//! `decrypt_video` on every H.264 access unit. Protocol version 0 means the call is not
+//! end-to-end encrypted and frames pass through untouched.
 
 use crate::rtp::SILENCE;
-use davey::{DaveSession, MediaType, ProposalsOperationType};
+use davey::{Codec, DaveSession, MediaType, ProposalsOperationType};
 use serde_json::{json, Value};
 use std::num::NonZeroU16;
 
@@ -286,6 +287,36 @@ impl Dave {
         }
     }
 
+    /// One H.264 access unit, Annex B, as it goes into RTP. The NAL headers stay clear. Unencrypted
+    /// until the group has keys. `None` drops the frame: it could not be sealed.
+    pub fn encrypt_video(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        if !self.encrypting() {
+            return Some(frame.to_vec());
+        }
+        match self.session.as_mut()?.encrypt(MediaType::VIDEO, Codec::H264, frame) {
+            Ok(sealed) => Some(sealed.into_owned()),
+            Err(err) => {
+                tracing::warn!("mediad: dave: a picture was not encrypted, dropped: {err}");
+                None
+            }
+        }
+    }
+
+    /// `user_id`'s picture as the decoder wants it. `None` drops it. A failure here does not
+    /// count against the voice tolerance: a picture that will not open is not a broken group.
+    pub fn decrypt_video(&mut self, user_id: Option<u64>, frame: &[u8]) -> Option<Vec<u8>> {
+        let sealed = frame.ends_with(&MARKER);
+        let session = match &mut self.session {
+            Some(session) if session.is_ready() => session,
+            _ => return (!sealed).then(|| frame.to_vec()),
+        };
+        let user_id = user_id?;
+        if self.version == 0 && !session.can_passthrough(user_id) {
+            return (!sealed).then(|| frame.to_vec());
+        }
+        session.decrypt(user_id, MediaType::VIDEO, frame).ok()
+    }
+
     /// `user_id`'s frame as the Opus decoder wants it. `None` drops the frame: it could not be
     /// decrypted, or it is encrypted and there are no keys for it yet. `again` holds what the
     /// gateway must send when too many frames failed and the group has to be rebuilt.
@@ -396,6 +427,70 @@ mod tests {
         let mut again = Vec::new();
         let sealed = first.encrypt(TONE).unwrap();
         assert_eq!(second.decrypt(Some(111), &sealed, &mut again).as_deref(), Some(TONE));
+    }
+
+    #[test]
+    fn a_picture_keeps_its_nal_headers_and_opens_for_the_other_member() {
+        let (mut first, mut second) = grouped(7);
+        let frame = [
+            0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f, 0, 0, 0, 1, 0x65, 0x88, 0x84, 0x21, 0xff, 0x10, 0x22, 0x33, 0x44, 0x55,
+        ];
+        let sealed = first.encrypt_video(&frame).unwrap();
+        assert_ne!(sealed, frame);
+        assert!(sealed.ends_with(&MARKER));
+        assert_eq!(sealed[4], 0x67, "the SPS NAL header stays clear");
+        let idr = sealed.windows(5).position(|window| window == [0, 0, 0, 1, 0x65]).expect("idr start");
+        assert_eq!(sealed[idr + 4], 0x65, "the IDR NAL header stays clear");
+        assert_ne!(&sealed[idr + 5..idr + 5 + 8], &frame[13..21], "the slice body is not in clear");
+        assert_eq!(second.decrypt_video(Some(111), &sealed).as_deref(), Some(&frame[..]));
+        assert_eq!(second.decrypt_video(Some(333), &sealed), None);
+    }
+
+    /// The path a Discord picture actually takes: DAVE on the access unit, then H.264 packets,
+    /// then the transport cipher with the one-byte extension. The other member gets the same
+    /// access unit back, and a lost packet yields nothing until a keyframe.
+    #[test]
+    fn a_picture_round_trips_through_rtp_and_a_gap_waits_for_a_keyframe() {
+        use crate::h264::{packetize, Assembler};
+        use crate::rtp::{video_extension, Cipher, VideoSender, AES_GCM, H264};
+
+        let (mut first, mut second) = grouped(7);
+        let frame = [
+            0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f, 0, 0, 0, 1, 0x68, 0xce, 0x06, 0xe2, 0, 0, 0, 1, 0x65, 0x88, 0x84, 0x21, 0xff, 0x10, 0x22, 0x33, 0x44,
+            0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+        ];
+        let sealed = first.encrypt_video(&frame).unwrap();
+        let key = [9u8; 32];
+        let mut sender = VideoSender::new(Cipher::new(AES_GCM, &key).unwrap(), 50_000);
+        let opener = Cipher::new(AES_GCM, &key).unwrap();
+        let extension = video_extension(true, false);
+        let pieces = packetize(&sealed, 24);
+        assert!(pieces.len() > 1, "the access unit has to cross more than one packet");
+        let mut assembler = Assembler::default();
+        let mut recovered = None;
+        for piece in &pieces {
+            let (datagram, _) = sender.seal(H264, piece.marker, 9_000, &piece.payload, &extension).unwrap();
+            assert_eq!(datagram[0] & 0x10, 0x10, "the extension bit is set");
+            assert_ne!(datagram[1] & 0x7f, 120, "a picture is not an audio packet");
+            let packet = opener.unseal(&datagram).unwrap();
+            assert_eq!(packet.payload_type, H264);
+            assert_eq!(packet.marker, piece.marker);
+            if let Some(unit) = assembler.push(packet.sequence, packet.timestamp, packet.marker, &packet.payload) {
+                recovered = Some(unit);
+            }
+        }
+        let unit = recovered.expect("the last packet closed the access unit");
+        assert_eq!(second.decrypt_video(Some(111), &unit).as_deref(), Some(&frame[..]));
+
+        let mut broken = Assembler::default();
+        let first_packet = opener.unseal(&{
+            let (datagram, _) = sender.seal(H264, pieces[0].marker, 18_000, &pieces[0].payload, &extension).unwrap();
+            datagram
+        }).unwrap();
+        assert!(broken.push(first_packet.sequence, first_packet.timestamp, first_packet.marker, &first_packet.payload).is_none());
+        let skipped = first_packet.sequence.wrapping_add(2);
+        let later = &pieces[pieces.len() - 1];
+        assert!(broken.push(skipped, 18_000, later.marker, &later.payload).is_none(), "a gap does not invent an access unit");
     }
 
     #[test]

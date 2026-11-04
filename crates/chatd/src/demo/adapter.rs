@@ -549,6 +549,9 @@ impl Demo {
             dave: Dave { max_version: 1, required: false },
             muted: false,
             deafened: false,
+            stream: false,
+            watch: false,
+            group_id: String::new(),
         });
         if !rings {
             return;
@@ -693,6 +696,7 @@ impl Demo {
             }
             Command::CallJoin(conversation_id) => Demo::call_join(demo, &conversation_id),
             Command::CallLeave(conversation_id) => demo.call_leave(&conversation_id),
+            Command::CallPicture(_) => {}
             Command::CallAudio { muted, deafened } => {
                 let call = demo.call.lock().unwrap().clone();
                 if let Some(conversation_id) = call.filter(|id| demo.hub.occupants(&demo.key(id)).is_some()) {

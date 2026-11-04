@@ -22,14 +22,17 @@
 
 pub mod alert;
 pub mod audio;
+pub mod broadcast;
 pub mod cue;
 pub mod dave;
 pub mod decode;
+pub mod discord_video;
 pub mod e2ee;
 pub mod framing;
 pub mod gateway;
 #[cfg(test)]
 mod harness;
+pub mod h264;
 pub mod hear;
 pub mod inproc;
 pub mod jitter;

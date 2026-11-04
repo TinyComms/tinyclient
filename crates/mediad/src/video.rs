@@ -376,7 +376,7 @@ pub trait Source {
     fn camera(&mut self, high: Option<Ask>, low: Option<Ask>)
         -> Result<(Encoded, Encoded), String>;
     fn close_camera(&mut self);
-    /// The share went off. A desktop's screen has nothing to close.
+    /// The share went off. A desktop closes its portal session here; a phone stops its capture.
     fn close_share(&mut self) {}
     /// My own camera painted for me since last asked, where the source does that.
     fn self_view(&mut self) -> Option<Painted> {
@@ -405,7 +405,6 @@ impl Source for Outgoing {
         Outgoing::close_camera(self);
     }
 
-    #[cfg(any(target_os = "android", target_os = "ios"))]
     fn close_share(&mut self) {
         Outgoing::close_share(self);
     }

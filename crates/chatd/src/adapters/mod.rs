@@ -191,6 +191,16 @@ pub struct CatalogPage {
     pub cursor: Option<String>,
 }
 
+/// A picture on the call the user is in. Discord is the network that acts on it.
+pub enum Picture {
+    /// Our camera, on or off.
+    Camera(bool),
+    /// Our screen, on or off.
+    Share(bool),
+    /// Whose share to watch. `None` stops watching.
+    Watch(Option<String>),
+}
+
 /// What chatd asks of an adapter. Ids are the network's own; the account is the adapter's.
 pub enum Command {
     /// Fetch the recent history of a conversation the user opened, and correct what is cached
@@ -376,6 +386,9 @@ pub enum Command {
     CallLeave(String),
     /// Our mute and deafen changed; the network shows them to others.
     CallAudio { muted: bool, deafened: bool },
+    /// A camera, a screen share, or whose share to watch. Nothing answers: the call's own
+    /// events say what the network did.
+    CallPicture(Picture),
     /// A Tiny server's live socket: take or leave a seat in a room's call, remove someone from
     /// one, or hear that the user opened the server.
     Tiny(tiny::live::Ask),

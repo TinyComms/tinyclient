@@ -26,6 +26,8 @@ pub const CLIENTS_CONNECT: u8 = 11;
 /// User sessions are also told each member's SSRCs this way.
 pub const VIDEO: u8 = 12;
 pub const CLIENT_DISCONNECT: u8 = 13;
+/// Asks the server to forward video. The keys are primary SSRCs, or `"any"`.
+pub const SINK: u8 = 15;
 
 /// How long a read waits before the caller gets to do its own work. Over TLS a read that times
 /// out may stop anywhere, inside a record or between the records of one frame: what arrived

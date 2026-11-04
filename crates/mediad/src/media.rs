@@ -13,6 +13,7 @@ use crate::dave::{Dave, Outgoing};
 use crate::jitter::{Jitter, Pop};
 use crate::opus::{Decoder, Encoder, MAX_FRAME};
 use crate::permission::{microphone, Microphone};
+use crate::discord_video;
 use crate::rtp::{Cipher, Sender, PAYLOAD_TYPE, SILENCE};
 use crate::session::Controls;
 use crate::{out, CHANNELS, FRAME, FRAME_SAMPLES};
@@ -51,6 +52,9 @@ pub enum FromMedia {
     Speaking(bool),
     Dave(Vec<Outgoing>),
     Fatal(CallFailure, String),
+    /// The camera (`share` false) or the screen (`share` true) should be announced, or withdrawn.
+    /// Nothing is sent on the same turn: the gateway announces the SSRC first.
+    Picture { share: bool, on: bool },
 }
 
 pub struct Setup {
@@ -68,6 +72,12 @@ pub struct Setup {
     pub stop: Arc<AtomicBool>,
     /// The system has not yet been asked about the microphone: watch for the answer.
     pub microphone_unasked: bool,
+    /// The video SSRCs Ready assigned, when it assigned any. The camera sends on these.
+    pub pipe: Option<discord_video::Pipe>,
+    /// Video SSRCs the gateway has announced for other people.
+    pub videos: Arc<Mutex<HashMap<u32, discord_video::Remote>>>,
+    /// Set by the gateway thread after opcode 12 has gone out. The camera sends only while it is set.
+    pub announced: Arc<AtomicBool>,
 }
 
 /// One sender's audio on its way to the mix.
@@ -444,6 +454,7 @@ struct Loop {
     processor: Processor,
     limiter: Limiter,
     meter: Meter,
+    pictures: discord_video::Drive,
 }
 
 impl Loop {
@@ -452,6 +463,9 @@ impl Loop {
         if let Ok(echo) = <[u8; 8]>::try_from(datagram) {
             // Our keepalive, back from the voice server: the round trip.
             self.meter.echoed(u32::from_be_bytes([echo[0], echo[1], echo[2], echo[3]]));
+            return;
+        }
+        if self.pictures.take(datagram, &self.setup.opener, &self.setup.dave, &self.setup.socket) {
             return;
         }
         if datagram.len() < 2 || datagram[1] & 0x7f != PAYLOAD_TYPE {
@@ -644,6 +658,7 @@ impl Loop {
             self.ticks += 1;
             let input = self.capture();
             let output = self.play();
+            self.pictures.tick(&self.setup.dave, &self.setup.socket, &self.setup.report);
             if self.ticks.is_multiple_of(5)
                 && self.setup.controls.metering()
                 && (input, output) != self.levels
@@ -665,6 +680,7 @@ impl Loop {
             }
             self.say(false);
         }
+        self.pictures.finish();
         finish_cue(&self.setup.controls, &mut self.cue, &mut self.setup.audio);
         for (ssrc, stream) in &self.streams {
             let (jitter, rebuilt) = (&stream.jitter, stream.rebuilt);
@@ -706,7 +722,7 @@ pub(crate) fn announce(audio: &Audio) {
 
 /// Runs until `setup.stop` is set. Gives the devices back, still open, for the connection that
 /// follows a move to another voice server.
-pub fn run(setup: Setup) -> Audio {
+pub fn run(mut setup: Setup) -> Audio {
     // The tick is woken by the system timer: at 1 ms, not Windows' default 15.6 ms.
     let _timer = crate::rt::FineTimer::hold();
     crate::rt::tick_thread();
@@ -720,8 +736,18 @@ pub fn run(setup: Setup) -> Audio {
         return setup.audio;
     };
     let devices = Devices::start(setup.microphone_unasked);
+    let pictures = discord_video::Drive::new(
+        setup.controls.clone(),
+        setup.user_id.clone(),
+        setup.videos.clone(),
+        setup.announced.clone(),
+        setup.pipe.take(),
+        false,
+        true,
+    );
     let mut state = Loop {
         setup,
+        pictures,
         encoder,
         streams: HashMap::new(),
         gate: Gate::default(),

@@ -2,11 +2,12 @@
 //! voice session Discord gives out, and reports who is in which voice channel, who is in the
 //! call, who is ringing, and when the other side picked up.
 
+use super::super::{Failure, Picture};
 use super::model::{self, VoiceState};
 use super::rest::Refused;
 use super::Discord;
 use protocol::{
-    CallFailure, CallSupport, ConversationKind, Dave, Network, Occupant, Participant, Relation, VoiceJoin, Watching,
+    CallFailure, CallSupport, ConversationKind, Dave, MediaRequest, Network, Occupant, Participant, Relation, VoiceJoin, Watching,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -157,6 +158,22 @@ struct Joining {
     saw_ringing: bool,
     /// chatd has been told the other side picked up.
     answered: bool,
+    /// Our camera is on. Discord is told with the voice state, and mediad tells it again on the
+    /// voice gateway once a video SSRC exists.
+    video: bool,
+}
+
+/// A Go Live leg we have asked for and not yet given up. The voice call stays up beside it.
+struct StreamSlot {
+    key: String,
+    rtc_server: Option<String>,
+    rtc_channel: Option<String>,
+    token: Option<String>,
+    endpoint: Option<String>,
+    /// mediad has this session. A new endpoint clears it so the leg connects again.
+    told: bool,
+    /// The user turned it off before Discord named the stream. The create is then deleted.
+    drop: bool,
 }
 
 #[derive(Default)]
@@ -174,6 +191,10 @@ pub struct Voice {
     /// Channels chatd holds occupants for, each with its server, so it can be told when they
     /// empty or leave the screen.
     told: HashMap<String, Option<String>>,
+    /// The screen we are sending, once we asked Discord for it.
+    share: Option<StreamSlot>,
+    /// The share we are watching.
+    watch: Option<StreamSlot>,
 }
 
 impl Voice {
@@ -215,15 +236,27 @@ pub struct CallEvent {
     voice_states: Vec<VoiceState>,
 }
 
-fn voice_state(guild: Option<&str>, channel: Option<&str>, muted: bool, deafened: bool) -> Value {
+fn voice_state(guild: Option<&str>, channel: Option<&str>, muted: bool, deafened: bool, video: bool) -> Value {
     json!({
         "guild_id": guild,
         "channel_id": channel,
         "self_mute": muted,
         "self_deaf": deafened,
-        "self_video": false,
+        "self_video": video,
         "flags": FLAGS,
     })
+}
+
+/// `guild:guild:channel:user` in a server, `call:channel:user` in a direct call.
+fn stream_key(guild: Option<&str>, channel: &str, user: &str) -> String {
+    match guild {
+        Some(guild) => format!("guild:{guild}:{channel}:{user}"),
+        None => format!("call:{channel}:{user}"),
+    }
+}
+
+fn owned_by(key: &str, user: &str) -> bool {
+    key.rsplit(':').next() == Some(user)
 }
 
 impl Discord {
@@ -453,10 +486,16 @@ impl Discord {
                 },
                 muted: call.muted,
                 deafened: call.deafened,
+                stream: false,
+                watch: false,
+                group_id: String::new(),
             };
             (call.conversation.clone(), join)
         };
         self.ctx.voice(&join.0, join.1);
+        // A stream's events can arrive before this session id does.
+        self.flush_stream(false);
+        self.flush_stream(true);
     }
 
     pub(super) fn voice_state(&self, voice: VoiceState) {
@@ -538,6 +577,7 @@ impl Discord {
                 ring,
                 saw_ringing: false,
                 answered: false,
+                video: false,
             });
             ring
         };
@@ -546,7 +586,7 @@ impl Discord {
         if ring {
             self.ctx.ringing_out(conversation_id);
         }
-        self.tell(4, voice_state(guild.as_deref(), Some(conversation_id), false, false));
+        self.tell(4, voice_state(guild.as_deref(), Some(conversation_id), false, false, false));
         // Whoever is already there, before anyone's state changes.
         self.roster();
         self.occupancy(BTreeSet::from([conversation_id.to_owned()]));
@@ -578,14 +618,23 @@ impl Discord {
     /// Leaves the call we are in, or declines the one ringing us. For a call already left (it
     /// failed, and chatd says so too) this is nothing.
     pub(super) fn call_leave(&self, conversation_id: &str) {
-        let (was, ringing) = {
+        let (was, share_key, ringing) = {
             let mut state = self.state.lock().unwrap();
             let ours = state.voice.call.as_ref().is_some_and(|call| call.conversation == conversation_id);
             let was = if ours { state.voice.call.take() } else { None };
-            (was, state.voice.ringing.remove(conversation_id))
+            let share_key = ours.then(|| state.voice.share.take()).flatten().map(|slot| slot.key).filter(|key| !key.is_empty());
+            if ours {
+                state.voice.watch.take();
+            }
+            (was, share_key, state.voice.ringing.remove(conversation_id))
         };
         match was {
-            Some(call) => self.tell(4, voice_state(call.guild.as_deref(), None, false, false)),
+            Some(call) => {
+                self.tell(4, voice_state(call.guild.as_deref(), None, false, false, false));
+                if let Some(key) = share_key {
+                    self.tell(19, json!({ "stream_key": key }));
+                }
+            }
             None if ringing => {
                 let path = format!("/channels/{conversation_id}/call/stop-ringing");
                 if let Err(refused) = self.call("POST", &path, Some(json!({}))) {
@@ -603,7 +652,7 @@ impl Discord {
                 return;
             };
             (call.muted, call.deafened) = (muted, deafened);
-            voice_state(call.guild.as_deref(), Some(&call.conversation), muted, deafened)
+            voice_state(call.guild.as_deref(), Some(&call.conversation), muted, deafened, call.video)
         };
         self.tell(4, frame);
     }
@@ -656,7 +705,7 @@ impl Discord {
             }
             Now::Quiet => self.ctx.ring_stopped(&event.channel_id),
             Now::Unanswered(guild) => {
-                self.tell(4, voice_state(guild.as_deref(), None, false, false));
+                self.tell(4, voice_state(guild.as_deref(), None, false, false, false));
                 // Discord stops the ringing itself only when the other side says no; a ring
                 // nobody touches goes on until we give up (chatd does, after a minute). With one
                 // person on the other side that makes this a decline. Unconfirmed against a
@@ -697,11 +746,361 @@ impl Discord {
             state.voice.call.take()
         };
         if let Some(call) = late {
-            self.tell(4, voice_state(call.guild.as_deref(), None, false, false));
+            self.tell(4, voice_state(call.guild.as_deref(), None, false, false, false));
             self.ctx.call_failed(&call.conversation, CallFailure::Lost, NO_SESSION);
         }
         false
     }
+
+    /// The user asked for a camera, a screen, or to watch someone else's share.
+    pub(super) fn call_picture(&self, picture: Picture) {
+        match picture {
+            Picture::Camera(on) => {
+                let frame = {
+                    let mut state = self.state.lock().unwrap();
+                    let Some(call) = state.voice.call.as_mut() else {
+                        return;
+                    };
+                    call.video = on;
+                    voice_state(call.guild.as_deref(), Some(&call.conversation), call.muted, call.deafened, on)
+                };
+                self.tell(4, frame);
+            }
+            Picture::Share(true) => {
+                let (guild, channel) = {
+                    let mut state = self.state.lock().unwrap();
+                    let Some(call) = state.voice.call.as_ref() else {
+                        return;
+                    };
+                    if state.voice.share.as_ref().is_some_and(|slot| !slot.drop) {
+                        return;
+                    }
+                    let guild = call.guild.clone();
+                    let channel = call.conversation.clone();
+                    state.voice.share = Some(StreamSlot {
+                        key: String::new(),
+                        rtc_server: None,
+                        rtc_channel: None,
+                        token: None,
+                        endpoint: None,
+                        told: false,
+                        drop: false,
+                    });
+                    (guild, channel)
+                };
+                self.tell(18, json!({
+                    "type": if guild.is_some() { "guild" } else { "call" },
+                    "guild_id": guild,
+                    "channel_id": channel,
+                    "preferred_region": Value::Null,
+                }));
+            }
+            Picture::Share(false) => {
+                let _gate = self.stream_gate.lock().unwrap();
+                let (key, conversation) = {
+                    let mut state = self.state.lock().unwrap();
+                    let conversation = state.voice.call.as_ref().map(|call| call.conversation.clone());
+                    let key = match state.voice.share.as_mut() {
+                        Some(slot) if slot.key.is_empty() => {
+                            slot.drop = true;
+                            None
+                        }
+                        Some(_) => state.voice.share.take().map(|slot| slot.key).filter(|key| !key.is_empty()),
+                        None => None,
+                    };
+                    (key, conversation)
+                };
+                if let Some(key) = key {
+                    self.tell(19, json!({ "stream_key": key }));
+                }
+                if let Some(conversation) = conversation {
+                    self.ctx.tell_media(&conversation, MediaRequest::StreamStop { watch: false });
+                }
+            }
+            Picture::Watch(Some(user)) => {
+                let key = {
+                    let mut state = self.state.lock().unwrap();
+                    let Some(call) = state.voice.call.as_ref() else {
+                        return;
+                    };
+                    let key = stream_key(call.guild.as_deref(), &call.conversation, &user);
+                    state.voice.watch = Some(StreamSlot {
+                        key: key.clone(),
+                        rtc_server: None,
+                        rtc_channel: None,
+                        token: None,
+                        endpoint: None,
+                        told: false,
+                        drop: false,
+                    });
+                    key
+                };
+                self.tell(20, json!({ "stream_key": key }));
+            }
+            Picture::Watch(None) => {
+                let _gate = self.stream_gate.lock().unwrap();
+                let conversation = {
+                    let mut state = self.state.lock().unwrap();
+                    state.voice.watch.take();
+                    state.voice.call.as_ref().map(|call| call.conversation.clone())
+                };
+                if let Some(conversation) = conversation {
+                    self.ctx.tell_media(&conversation, MediaRequest::StreamStop { watch: true });
+                }
+            }
+        }
+    }
+
+    pub(super) fn stream_created(&self, data: &str) -> Result<(), Failure> {
+        let made: StreamMade = serde_json::from_str(data)?;
+        let next = {
+            let mut state = self.state.lock().unwrap();
+            let me = state.me.clone();
+            let mine = owned_by(&made.stream_key, &me);
+            if state.voice.call.is_none() {
+                if mine { StreamNext::Delete(made.stream_key) } else { StreamNext::Quiet }
+            } else if mine {
+                let dropping = state.voice.share.as_ref().is_some_and(|slot| slot.drop);
+                let fits = state.voice.share.as_ref().is_some_and(|slot| !slot.drop && (slot.key.is_empty() || slot.key == made.stream_key));
+                if dropping {
+                    state.voice.share = None;
+                    StreamNext::Delete(made.stream_key)
+                } else if fits {
+                    let slot = state.voice.share.as_mut().expect("the share was just found");
+                    note_stream(slot, &made);
+                    StreamNext::Flush(false)
+                } else {
+                    StreamNext::Quiet
+                }
+            } else if state.voice.watch.as_ref().is_some_and(|slot| slot.key == made.stream_key) {
+                let slot = state.voice.watch.as_mut().expect("the watch was just found");
+                note_stream(slot, &made);
+                StreamNext::Flush(true)
+            } else {
+                StreamNext::Quiet
+            }
+        };
+        self.follow(next);
+        Ok(())
+    }
+
+    pub(super) fn stream_server(&self, data: &str) -> Result<(), Failure> {
+        let update: StreamServer = serde_json::from_str(data)?;
+        let next = {
+            let mut state = self.state.lock().unwrap();
+            let me = state.me.clone();
+            let watch = if state.voice.share.as_ref().is_some_and(|slot| slot.key == update.stream_key || (slot.key.is_empty() && owned_by(&update.stream_key, &me))) {
+                Some(false)
+            } else if state.voice.watch.as_ref().is_some_and(|slot| slot.key == update.stream_key) {
+                Some(true)
+            } else {
+                None
+            };
+            let Some(watch) = watch else {
+                return Ok(());
+            };
+            let slot = if watch { state.voice.watch.as_mut() } else { state.voice.share.as_mut() }.expect("the slot was just found");
+            if slot.key.is_empty() {
+                slot.key = update.stream_key;
+            }
+            slot.token = Some(update.token);
+            match update.endpoint {
+                Some(endpoint) => {
+                    if slot.endpoint.as_ref() != Some(&endpoint) {
+                        slot.told = false;
+                    }
+                    slot.endpoint = Some(endpoint);
+                    StreamNext::Flush(watch)
+                }
+                None => {
+                    slot.endpoint = None;
+                    slot.told = false;
+                    StreamNext::Pause(watch)
+                }
+            }
+        };
+        self.follow(next);
+        Ok(())
+    }
+
+    pub(super) fn stream_deleted(&self, data: &str) -> Result<(), Failure> {
+        let gone: StreamGone = serde_json::from_str(data)?;
+        if !gone.reason.is_empty() {
+            tracing::warn!("chatd: discord ended a stream ({})", gone.reason);
+        }
+        let next = {
+            let mut state = self.state.lock().unwrap();
+            let me = state.me.clone();
+            if state.voice.share.as_ref().is_some_and(|slot| slot.key == gone.stream_key || (slot.key.is_empty() && owned_by(&gone.stream_key, &me))) {
+                state.voice.share = None;
+                StreamNext::Stop(false)
+            } else if state.voice.watch.as_ref().is_some_and(|slot| slot.key == gone.stream_key) {
+                state.voice.watch = None;
+                StreamNext::Stop(true)
+            } else {
+                StreamNext::Quiet
+            }
+        };
+        self.follow(next);
+        Ok(())
+    }
+
+    fn follow(&self, next: StreamNext) {
+        match next {
+            StreamNext::Quiet => {}
+            StreamNext::Delete(key) => self.tell(19, json!({ "stream_key": key })),
+            StreamNext::Flush(watch) => self.flush_stream(watch),
+            StreamNext::Pause(watch) => self.stop_leg(watch, false),
+            StreamNext::Stop(watch) => self.stop_leg(watch, true),
+        }
+    }
+
+    /// Gives mediad the stream session once Discord has named the server, the channel, the
+    /// token and the endpoint, and the voice call has a session id. The MLS group is the RTC
+    /// server id minus one.
+    fn flush_stream(&self, watch: bool) {
+        let _gate = self.stream_gate.lock().unwrap();
+        let ready = {
+            let mut state = self.state.lock().unwrap();
+            let me = state.me.clone();
+            let Some(call) = state.voice.call.as_ref() else {
+                return;
+            };
+            let Some(session) = call.session.clone() else {
+                return;
+            };
+            let conversation = call.conversation.clone();
+            let (muted, deafened) = (call.muted, call.deafened);
+            let slot = if watch { state.voice.watch.as_mut() } else { state.voice.share.as_mut() };
+            let Some(slot) = slot else {
+                return;
+            };
+            if slot.drop || slot.told {
+                return;
+            }
+            let Some(rtc_server) = slot.rtc_server.clone() else {
+                return;
+            };
+            let rtc_channel = slot.rtc_channel.clone().unwrap_or_else(|| conversation.clone());
+            let Some(token) = slot.token.clone() else {
+                return;
+            };
+            let Some(endpoint) = slot.endpoint.clone() else {
+                return;
+            };
+            let Ok(server_num) = rtc_server.parse::<u64>() else {
+                tracing::warn!("chatd: discord stream server id {rtc_server} is not a number");
+                return;
+            };
+            slot.told = true;
+            Some((
+                conversation,
+                VoiceJoin {
+                    network: Network::Discord,
+                    endpoint,
+                    token,
+                    session_id: session,
+                    user_id: me,
+                    server_id: rtc_server,
+                    channel_id: rtc_channel,
+                    dave: Dave { max_version: 1, required: true },
+                    muted,
+                    deafened,
+                    stream: true,
+                    watch,
+                    group_id: server_num.saturating_sub(1).to_string(),
+                },
+            ))
+        };
+        if let Some((conversation, join)) = ready {
+            self.ctx.tell_media(&conversation, MediaRequest::Stream(join));
+        }
+    }
+
+    /// Stops the mediad leg. `forget` also turns the button off: the stream is gone, not merely
+    /// between servers.
+    fn stop_leg(&self, watch: bool, forget: bool) {
+        let _gate = self.stream_gate.lock().unwrap();
+        let conversation = {
+            let state = self.state.lock().unwrap();
+            state.voice.call.as_ref().map(|call| call.conversation.clone())
+        };
+        let Some(conversation) = conversation else {
+            return;
+        };
+        self.ctx.tell_media(&conversation, MediaRequest::StreamStop { watch });
+        if forget {
+            let request = if watch {
+                MediaRequest::ShareWatch { source: None }
+            } else {
+                MediaRequest::ShareSend { on: false, screen: None, quality: None }
+            };
+            self.ctx.tell_media(&conversation, request);
+        }
+    }
+}
+
+enum StreamNext {
+    Quiet,
+    Flush(bool),
+    /// The server went away. Disconnect and wait for the next endpoint.
+    Pause(bool),
+    /// The stream ended. Disconnect, and turn the control off.
+    Stop(bool),
+    Delete(String),
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+enum Snowflake {
+    Text(String),
+    Number(u64),
+}
+
+fn snowflake(id: Option<Snowflake>) -> Option<String> {
+    id.map(|id| match id {
+        Snowflake::Text(text) => text,
+        Snowflake::Number(number) => number.to_string(),
+    })
+}
+
+#[derive(Deserialize)]
+struct StreamMade {
+    stream_key: String,
+    #[serde(default)]
+    rtc_server_id: Option<Snowflake>,
+    #[serde(default)]
+    rtc_channel_id: Option<Snowflake>,
+}
+
+fn note_stream(slot: &mut StreamSlot, made: &StreamMade) {
+    if slot.key != made.stream_key {
+        slot.key = made.stream_key.clone();
+    }
+    if let Some(server) = snowflake(made.rtc_server_id.clone()) {
+        if slot.rtc_server.as_ref() != Some(&server) {
+            slot.told = false;
+        }
+        slot.rtc_server = Some(server);
+    }
+    if let Some(channel) = snowflake(made.rtc_channel_id.clone()) {
+        slot.rtc_channel = Some(channel);
+    }
+}
+
+#[derive(Deserialize)]
+struct StreamServer {
+    token: String,
+    stream_key: String,
+    #[serde(default)]
+    endpoint: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StreamGone {
+    stream_key: String,
+    #[serde(default)]
+    reason: String,
 }
 
 #[cfg(test)]
@@ -745,7 +1144,16 @@ mod tests {
             ring: false,
             saw_ringing: false,
             answered: false,
+            video: false,
         });
         assert!(voice.watched("901", Some("82")), "the call we are in, wherever it is");
+    }
+
+    #[test]
+    fn a_guild_stream_is_named_by_the_guild_and_a_direct_call_is_not() {
+        assert_eq!(stream_key(Some("81"), "900", "111"), "guild:81:900:111");
+        assert_eq!(stream_key(None, "3001", "111"), "call:3001:111");
+        assert!(owned_by("guild:81:900:111", "111"));
+        assert!(!owned_by("call:3001:222", "111"));
     }
 }

@@ -106,8 +106,15 @@ core-graphics = "0.24"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # A screen grab over the X11 protocol. Pure Rust, so the release image needs no X11 headers.
-# A Wayland session with no XWayland says so in words and the call stays a voice call.
+# An X11 session (XFCE, MATE, Cinnamon, i3, and the rest) uses this. A Wayland session uses the
+# desktop portal instead (`picture/portal.rs`).
 x11rb = "0.13"
+# The session bus for xdg-desktop-portal. Pure Rust, so this does not link a second libdbus
+# beside the one chatd already vendors.
+zbus = "5"
+# PipeWire is loaded by name when a portal capture starts. The binary still launches where the
+# library is absent, and the package does not depend on it.
+libloading = "0.8"
 
 [dev-dependencies]
 # The fake voice server acts as Discord's MLS external sender. Same version davey links.

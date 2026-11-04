@@ -1,6 +1,6 @@
 //! The bottom bar of the call screen: round buttons a thumb can hit, each with its word under
 //! it, so a state never rests on color alone. The set is the desktop's (07 §2): mute, deafen,
-//! camera and share on a Tiny room only, devices, Leave; plus what only a phone has, the camera's
+//! camera and share on a Tiny room or a Discord call, devices, Leave; plus what only a phone has, the camera's
 //! flip and where the sound plays. A control a network cannot do is absent, as on the desktop;
 //! one that cannot work now says why in its word.
 
@@ -15,13 +15,6 @@ use protocol::{Call, CallState, Content, ConversationKind, MediaRequest, Request
 
 /// The round buttons of the bar.
 const SIZE: f32 = super::BUTTON;
-
-/// Why the camera cannot be turned on here, when it cannot.
-fn camera_unavailable() -> Option<&'static str> {
-    // 06 §Pictures: a camera is sent from Windows, and from a phone once its platform does.
-    let desktop_without = cfg!(any(target_os = "macos", target_os = "linux")) && !cfg!(any(target_os = "android", target_os = "ios"));
-    desktop_without.then_some("A camera isn't available on this system yet. You can still share your screen.")
-}
 
 impl Shell {
     /// How many rows of buttons the bar has: two when the call carries pictures.
@@ -109,12 +102,8 @@ impl Shell {
             let camera_on = sending(call, Content::Camera);
             let share_on = sending(call, Content::Share);
             let denied = hooks::denied(Permission::Camera);
-            let missing = camera_unavailable();
             let camera = if denied {
                 round("call-phone-camera", "icons/video-off.svg", "Not allowed", Look::Unavailable, SIZE).on_click(cx.listener(|this, _, _, cx| this.call_phone_open_sheet(Sheet::Camera, cx)))
-            } else if let Some(why) = missing {
-                round("call-phone-camera", "icons/video-off.svg", "No camera", Look::Unavailable, SIZE)
-                    .on_click(cx.listener(move |this, _, _, cx| this.toast(Some(("icons/video-off.svg", theme::text_soft())), why, cx)))
             } else {
                 round("call-phone-camera", if camera_on { "icons/video.svg" } else { "icons/video-off.svg" }, if camera_on { "Camera" } else { "Camera off" }, if !live { Look::Unavailable } else if camera_on { Look::On } else { Look::Rest }, SIZE)
                     .when(live, |button| button.on_click(cx.listener(move |this, _, _, cx| this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx))))
