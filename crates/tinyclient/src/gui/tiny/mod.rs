@@ -242,18 +242,8 @@ pub struct State {
     /// First-run setup, for owners, and the form Server Settings › Privacy shares with it.
     setup: setup::State,
 
-    /// This account's own passkeys, as Server Settings › Sign-in last read them.
-    passkeys: Option<protocol::TinyPasskeys>,
-    /// What the server said no to about them, in words.
-    passkeys_error: Option<String>,
-    /// The server is older than a member's own passkeys: the Passkeys section is not drawn.
-    passkeys_older: bool,
-    /// A link, a rename, a removal or new codes is with the server.
-    passkeys_busy: bool,
-    /// What came of asking for a link to add a passkey, in words.
-    passkeys_note: Option<String>,
-    /// The passkey being renamed, by id, and the field its new name is typed in.
-    renaming: Option<(String, Entity<TextInput>)>,
+    /// This account's own passkeys, for Server Settings › Sign-in.
+    passkeys: settings::Passkeys,
 }
 
 impl State {
@@ -337,12 +327,7 @@ impl State {
             settings: None,
             settings_fields,
             setup: setup::State::default(),
-            passkeys: None,
-            passkeys_error: None,
-            passkeys_older: false,
-            passkeys_busy: false,
-            passkeys_note: None,
-            renaming: None,
+            passkeys: settings::Passkeys::default(),
         }
     }
 
@@ -360,12 +345,7 @@ impl State {
         self.card = None;
         self.settings = None;
         self.setup = setup::State::default();
-        self.passkeys = None;
-        self.passkeys_error = None;
-        self.passkeys_older = false;
-        self.passkeys_busy = false;
-        self.passkeys_note = None;
-        self.renaming = None;
+        self.passkeys = settings::Passkeys::default();
     }
 
     /// The volume and mute for me kept for someone, else 100 % and heard: what was just set

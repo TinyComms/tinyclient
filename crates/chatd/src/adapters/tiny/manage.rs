@@ -24,13 +24,13 @@ use protocol::{
     TINY_FEATURE_FILE_SCAN, TINY_FEATURE_FIRST_RUN_SETUP, TINY_FEATURE_UPLOAD_LIMITS, TINY_ICON_MAX, TINY_SERVER_NAME_MAX, TINY_UPLOAD_MAX,
     TINY_WELCOME_MAX,
 };
+use protocol::tiny_words::{LAST_PASSKEY, OLDER, SIGN_IN_AGAIN};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const OLDER: &str = "This server can't do that yet. Ask its owner to update tinyserver.";
 const BOT_NAME: &str = "A bot name is 1 to 80 characters.";
 const BOT_SCOPES: &str = "A bot can be granted rooms.read, rooms.write, and members.read.";
 const CATEGORY_NAME_SIZE: &str = "A category name is 1 to 80 characters.";
@@ -47,8 +47,6 @@ const UPLOAD_LIMIT: &str = "An upload limit is 1 byte to 100 MiB.";
 const REASON_SIZE: &str = "A reason is at most 500 characters.";
 const ICON_SIZE: &str = "That picture is too big. The most is 256 KB.";
 const ICON_KIND: &str = "That picture isn't a PNG, JPEG or WebP.";
-const SIGN_IN_AGAIN: &str = "Adding a passkey needs a sign-in from the last ten minutes. Sign out of this server, sign in again, then try once more.";
-pub const LAST_PASSKEY: &str = "This is your last passkey and you have no recovery codes left, so it stays.";
 const PASSKEY_LABEL_MAX: usize = 60;
 const PASSKEY_GONE: &str = "That passkey is gone.";
 /// The longest reason the audit keeps from here.

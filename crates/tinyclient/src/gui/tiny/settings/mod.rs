@@ -25,6 +25,7 @@ mod invites;
 mod kit;
 mod members;
 mod overview;
+mod passkeys;
 mod privacy;
 mod roles;
 mod signin;
@@ -44,7 +45,8 @@ pub(in crate::gui) use channels::Sel;
 pub(in crate::gui) use danger::confirmed;
 pub(in crate::gui) use invites::revocable;
 pub(in crate::gui::tiny) use kit::{card, check_box, note};
-pub(in crate::gui::tiny) use signin::{provider_words, LinkFrom};
+pub(in crate::gui::tiny) use passkeys::{Held as Passkeys, LinkFrom};
+pub(in crate::gui::tiny) use signin::provider_words;
 #[cfg(feature = "gui-shot")]
 pub(in crate::gui) use members::selectable as tickable;
 

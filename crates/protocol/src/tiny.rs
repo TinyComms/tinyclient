@@ -794,6 +794,18 @@ pub struct TinyServerEdit {
 /// The server lists this when it has setup. Without it, nothing about setup is shown.
 pub const TINY_FEATURE_FIRST_RUN_SETUP: &str = "first_run_setup";
 
+/// Words chatd answers a Tiny request with that a client also acts on, so both read one copy: the
+/// client hides what an older server can't do, and says why the last passkey stays before it asks.
+pub mod tiny_words {
+    /// The server has no such route: it is older than the request.
+    pub const OLDER: &str = "This server can't do that yet. Ask its owner to update tinyserver.";
+    /// The server wants a sign-in from the last ten minutes before it changes a passkey or the
+    /// recovery codes.
+    pub const SIGN_IN_AGAIN: &str = "Adding a passkey needs a sign-in from the last ten minutes. Sign out of this server, sign in again, then try once more.";
+    /// The server keeps the last passkey while no recovery code is left.
+    pub const LAST_PASSKEY: &str = "This is your last passkey and you have no recovery codes left, so it stays.";
+}
+
 /// The values each choice takes, as the server names them. A value is kept as text so one from a
 /// newer server still reads; these are the ones this build has words for.
 pub const TINY_PROVIDER_PROFILES: [&str; 3] = ["full", "name", "none"];

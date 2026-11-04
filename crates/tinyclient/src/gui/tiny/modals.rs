@@ -235,8 +235,8 @@ impl Shell {
             Modal::RecoveryCodes(codes) => self.recovery_codes_modal(codes, cx),
             Modal::RemovePasskey { id, label } => {
                 let id = id.clone();
-                let last = self.tiny_state.passkeys.as_ref().is_some_and(|list| list.passkeys.len() == 1);
-                let action = if self.tiny_state.passkeys_busy {
+                let last = self.tiny_state.passkeys.list.as_ref().is_some_and(|list| list.passkeys.len() == 1);
+                let action = if self.tiny_state.passkeys.busy {
                     button_disabled("Remove passkey").h(px(32.)).into_any_element()
                 } else {
                     button("tiny-modal-do", ButtonKind::Danger, "Remove passkey").h(px(32.)).on_click(cx.listener(move |this, _, _, cx| this.tiny_passkey_remove(id.clone(), cx))).into_any_element()
