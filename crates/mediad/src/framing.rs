@@ -92,11 +92,13 @@ impl Conn {
         }
     }
 
-    /// Queues one packet and writes what it can. An error ends the stream.
+    /// Queues one packet and writes what it can. WouldBlock reports a packet dropped
+    /// by the bounded queue; other errors end the stream.
     pub fn send(&mut self, packet: &[u8]) -> io::Result<()> {
         // A full backlog drops the packet, as a full UDP buffer would.
-        encode(packet, &mut self.out);
-        self.flush()
+        let accepted = encode(packet, &mut self.out);
+        self.flush()?;
+        if accepted { Ok(()) } else { Err(ErrorKind::WouldBlock.into()) }
     }
 
     /// Writes what it can of the backlog.
@@ -119,6 +121,21 @@ impl Conn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dropped_packet_is_not_reported_as_accepted_and_the_stream_stays_usable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let mut conn = Conn::new(TcpStream::from_std(socket));
+        conn.out.resize(BACKLOG, 0);
+        assert_eq!(conn.send(b"dropped video").unwrap_err().kind(), ErrorKind::WouldBlock);
+        // The full queue can drain during send, but that does not retroactively accept
+        // the dropped packet. A later packet can still use this same connection.
+        conn.out.clear();
+        assert!(conn.send(b"next video").is_ok());
+    }
 
     #[test]
     fn frames_split_across_reads_come_out_whole() {

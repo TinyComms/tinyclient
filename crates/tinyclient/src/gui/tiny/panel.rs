@@ -488,7 +488,7 @@ impl Shell {
                         .child(meta_row("Video images", format!("{} fps", video.rendered_fps)))
                         .child(meta_row("Received size", if video.width > 0 { format!("{} × {}", video.width, video.height) } else { "Waiting for video".to_owned() }))
                         .child(meta_row("Last video image", video.frame_age_ms.map_or_else(|| "None yet".to_owned(), |age| format!("{age} ms ago"))))
-                        .child(div().whitespace_normal().type_micro().text_color(theme::text_soft()).child("Video images counts completed images prepared for this window. Video codec: H.264."));
+                        .child(div().whitespace_normal().type_micro().text_color(theme::text_soft()).child("Video rates combine screen sharing and camera layers. Sending is measured after pacing; TCP may still buffer it. Video images counts completed images prepared for this window. Video codec: H.264."));
                 }
             }
             None => {

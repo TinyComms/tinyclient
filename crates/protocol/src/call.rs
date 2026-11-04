@@ -671,7 +671,7 @@ pub enum CallPath {
 /// The connection as it is now, over the last few seconds.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallStats {
-    /// Video access units sent/received and completed render images, measured over the last
+    /// Video transport output, received access units and completed render images, over the last
     /// interval. No capture-to-display latency is inferred from these counters or RTT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video: Option<VideoStats>,
@@ -735,8 +735,11 @@ pub struct VideoStats {
     pub receive_expected: bool,
     /// Time this receive slot has been watched, so startup is not called a stall.
     pub watching_ms: u32,
+    /// Video RTP bytes accepted by the transport after pacing, including headers and RTX.
+    /// TCP may still buffer them. Padding is excluded.
     pub send_kbps: u32,
     pub receive_kbps: u32,
+    /// Original frame end markers emitted after pacing, combined across all video tracks.
     pub send_fps: u32,
     pub receive_fps: u32,
     /// Images completed for the GUI, rather than refreshes of the physical display.

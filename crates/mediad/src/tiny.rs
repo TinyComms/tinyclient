@@ -110,6 +110,20 @@ fn is_padding(packet: &[u8]) -> bool {
     matches!(packet, [first, second, ..] if first >> 6 == 2 && second & 0x7f == H264_RTX_PT)
 }
 
+/// Video RTP handed to the transport, and whether it ends an original frame. Padding is
+/// not video; retransmissions spend bandwidth but must not inflate the frame rate.
+fn video_packet(packet: &[u8]) -> Option<bool> {
+    let [first, second, ..] = packet else { return None };
+    if packet.len() < 12 || first >> 6 != 2 || first & 0x20 != 0 {
+        return None;
+    }
+    match second & 0x7f {
+        H264_PT => Some(second & 0x80 != 0),
+        H264_RTX_PT => Some(false),
+        _ => None,
+    }
+}
+
 /// What str0m's `egress_loss_fraction` looks back over, by when packets were sent.
 const EGRESS_LOSS_SPAN: Duration = Duration::from_secs(1);
 
@@ -805,7 +819,7 @@ impl Call {
                 if let Some(udp) = &self.link.udp {
                     // A send that fails is a lost packet; ICE notices a dead path.
                     if udp.send_to(packet, to).is_ok() {
-                        self.meter.sent(packet.len());
+                        self.sent_packet(packet);
                     }
                 }
             }
@@ -822,14 +836,21 @@ impl Call {
                     }
                     self.link.tcp.insert(to, (token, Conn::new(socket)));
                 }
-                let failed = self.link.tcp.get_mut(&to).is_some_and(|(_, conn)| conn.send(packet).is_err());
-                if failed {
-                    self.drop_stream(to);
-                } else {
-                    self.meter.sent(packet.len());
+                match self.link.tcp.get_mut(&to).map(|(_, conn)| conn.send(packet)) {
+                    Some(Ok(())) => self.sent_packet(packet),
+                    Some(Err(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {},
+                    Some(Err(_)) => self.drop_stream(to),
+                    None => {},
                 }
             }
             _ => {}
+        }
+    }
+
+    fn sent_packet(&mut self, packet: &[u8]) {
+        self.meter.sent(packet.len());
+        if let Some(ends_frame) = video_packet(packet) {
+            self.controls.video_stats.lock().unwrap().sent(packet.len(), ends_frame, Instant::now());
         }
     }
 
@@ -1069,7 +1090,6 @@ impl Call {
         let size = payload.len() as u64;
         if writer.write(pt, at, MediaTime::new(rtp, Frequency::NINETY_KHZ), payload).is_ok() {
             self.video_bytes += size;
-            self.controls.video_stats.lock().unwrap().sent(size as usize, Instant::now());
         }
     }
 
@@ -1380,6 +1400,23 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_video_counts_frames_at_markers_and_excludes_padding_and_audio() {
+        let packet = |first, second| {
+            let mut packet = vec![0u8; 20];
+            packet[0] = first;
+            packet[1] = second;
+            packet
+        };
+        assert_eq!(video_packet(&packet(0x80, H264_PT)), Some(false));
+        assert_eq!(video_packet(&packet(0x80, H264_PT | 0x80)), Some(true));
+        assert_eq!(video_packet(&packet(0x80, H264_RTX_PT | 0x80)), Some(false));
+        assert_eq!(video_packet(&packet(0xa0, H264_RTX_PT)), None);
+        assert_eq!(video_packet(&packet(0x80, 111)), None);
+        assert_eq!(video_packet(&packet(0x80, 200)), None);
+        assert_eq!(video_packet(&[0x80, H264_PT]), None);
+    }
 
     fn slot(mid: &str, user: &str) -> TinySlot {
         TinySlot { mid: mid.into(), user_id: user.into() }
