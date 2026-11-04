@@ -2951,6 +2951,17 @@ impl Store {
             return Ok(gone);
         }
         tx.execute("DELETE FROM message WHERE expires IS NOT NULL AND expires <= ?1", params![now])?;
+        {
+            // The expired message's words sat in its conversation row's preview; the row says
+            // nothing rather than what is no longer there (the next message refills it).
+            let mut clear = tx.prepare(
+                "UPDATE conversation SET preview = '', preview_from = '', preview_mine = 0, preview_id = ''
+                  WHERE network = ?1 AND account = ?2 AND id = ?3",
+            )?;
+            for key in &gone {
+                clear.execute(params![word(&key.network), &key.account, &key.id])?;
+            }
+        }
         tx.commit()?;
         Ok(gone)
     }

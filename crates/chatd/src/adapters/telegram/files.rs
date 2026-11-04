@@ -115,12 +115,12 @@ impl Files {
                         }
                         Job::Fetch(want) => queue.push_back(want),
                         Job::First(want) => queue.push_front(want),
-                        Job::Look => rows_back(&account, &mut parked, &mut queue),
+                        Job::Look => rows_back(&account, &mut parked, &mut queue, &counted),
                     }
                     continue;
                 }
                 // Nothing new at the wire: rows that came back go first, then the queue.
-                rows_back(&account, &mut parked, &mut queue);
+                rows_back(&account, &mut parked, &mut queue, &counted);
                 let Some(want) = queue.pop_front() else {
                     // The wire is gone and nothing is left to fetch: the thread ends,
                     // whatever still waits for a row.
@@ -129,7 +129,6 @@ impl Files {
                     }
                     continue;
                 };
-                counted.fetch_sub(1, Ordering::Relaxed);
                 let Some(account) = account.upgrade() else {
                     continue;
                 };
@@ -137,11 +136,12 @@ impl Files {
                     return;
                 }
                 // A row's picture whose row scrolled away waits for it to come back,
-                // unfetched.
+                // unfetched — still counted, so the resume cannot spend the same turn twice.
                 if want.watched && want.row.as_deref().is_none_or(|row| !row_shown(&account, row)) {
                     parked.push((Instant::now(), want));
                     continue;
                 }
+                counted.fetch_sub(1, Ordering::Relaxed);
                 if let Err(fault) = fetch(&account, &want, &mut carried) {
                     // A reference that ran out is renewed by the next page that names the file.
                     if !fault.is("FILE_REFERENCE_EXPIRED") {
@@ -224,14 +224,17 @@ fn row_shown(account: &Account, row: &str) -> bool {
 /// Rows that came back put their pictures back in line, at its front, in the order they
 /// were parked; what is still away stays parked, and what has waited too long goes: the
 /// shell asks again if the row is still there.
-fn rows_back(account: &Weak<Account>, parked: &mut Vec<(Instant, Box<Want>)>, queue: &mut VecDeque<Box<Want>>) {
+fn rows_back(account: &Weak<Account>, parked: &mut Vec<(Instant, Box<Want>)>, queue: &mut VecDeque<Box<Want>>, counted: &AtomicUsize) {
     let Some(account) = account.upgrade() else {
         return;
     };
     let (back, kept): (Vec<_>, Vec<_>) = std::mem::take(parked).into_iter().partition(|(at, want)| {
         at.elapsed() < PARKED_FOR && want.row.as_deref().is_some_and(|row| row_shown(&account, row))
     });
-    // What waited too long for its row is let go, whatever the screen says now.
+    // What waited too long for its row is let go, whatever the screen says now — counted
+    // off, for it was parked before its turn came and never left the count.
+    let expired = kept.iter().filter(|(at, _)| at.elapsed() >= PARKED_FOR).count();
+    counted.fetch_sub(expired, Ordering::Relaxed);
     *parked = kept.into_iter().filter(|(at, _)| at.elapsed() < PARKED_FOR).collect();
     for (_, want) in back.into_iter().rev() {
         queue.push_front(want);
