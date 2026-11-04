@@ -392,6 +392,7 @@ impl Shell {
         // A network that signed out takes its place in the sidebar with it.
         if let Some(network) = self.sidebar_state.mode.network() {
             if self.snapshot.as_ref().is_some_and(|s| s.link(network) == Link::SignedOut) {
+                self.sidebar_state.navigation_changed();
                 self.sidebar_state.mode = Mode::Inbox;
             }
         }
@@ -789,6 +790,7 @@ impl Shell {
 
     /// Opens a conversation in the conversation region. The sidebar does not follow.
     pub(super) fn select(&mut self, key: Key, title: &str, cx: &mut Context<Self>) {
+        self.sidebar_state.navigation_changed();
         if self.open.as_ref() == Some(&key) {
             return;
         }
@@ -798,6 +800,7 @@ impl Shell {
 
     /// Opens without adding to history: what back and forward do.
     pub(super) fn open_now(&mut self, key: Key, title: &str, cx: &mut Context<Self>) {
+        self.sidebar_state.navigation_changed();
         let row = self.sidebar_state.find(&self.trees, &key);
         let catch_up = row.as_ref().and_then(|row| {
             if row.unread == 0 && row.mentions == 0 {

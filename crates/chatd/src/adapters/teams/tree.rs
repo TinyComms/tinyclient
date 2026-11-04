@@ -443,6 +443,7 @@ fn preview_of(chat: &Value, me: &str) -> Option<PreviewLine> {
         sender: text(last, "imDisplayName").to_owned(),
         mine: chat["isLastMessageFromMe"] == true || (!me.is_empty() && from.rsplit('/').next() == Some(me)),
         sent: millis(&id) / 1000,
+        expires_at: None,
     })
 }
 

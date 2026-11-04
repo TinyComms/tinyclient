@@ -573,6 +573,11 @@ fn a_row_scrolled_away_before_its_picture_waits_unfetched_and_is_fetched_once_it
         (world.called("GetFile avatar 5100001") > 0).then_some(())
     });
     assert_eq!(world.called("GetFile avatar 5100001"), 1, "each picture once");
+    // Returning a parked picture must leave room for a picture never queued before.
+    world.rows_on_screen(&["u100003"]);
+    world.until("a new row's picture after the parked one returned", || {
+        (world.called("GetFile avatar 5100003") > 0).then_some(())
+    });
 }
 
 #[test]
@@ -795,12 +800,26 @@ fn a_message_whose_own_time_has_passed_is_nowhere_and_one_still_alive_leaves_the
     // At the live one's moment the store drops what ran out, online or not, and says so to
     // the shell.
     let asked = world.called("GetHistory u7002");
-    let since = world.status().1;
-    world.changed(since, "the messages past their time to leave the store", |change| match change {
-        Change::Messages { conversation } if conversation.id == "u7002" => Some(()),
-        _ => None,
-    });
+    let mut since = world.status().1;
+    let (mut messages_changed, mut preview_changed) = (false, false);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !messages_changed || !preview_changed {
+        assert!(Instant::now() < deadline, "expiry did not announce messages and sidebar preview: {messages_changed}, {preview_changed}");
+        let Response::Changes { seq, changes, .. } = world.ask(Request::Wait { since }) else {
+            panic!("no changes");
+        };
+        since = seq;
+        // Consume the initial arrival's changes before looking for expiry's changes.
+        if world.message("u7002", "18").is_some() {
+            continue;
+        }
+        messages_changed |= changes.iter().any(|change| matches!(change,
+            Change::Messages { conversation } if conversation.id == "u7002"));
+        preview_changed |= changes.iter().any(|change| matches!(change,
+            Change::Conversation { conversation } if conversation.id == "u7002"));
+    }
     assert!(world.message("u7002", "18").is_none());
+    assert_ne!(world.conversation("u7002").unwrap().preview, alive.text);
     assert!(world.messages("u7002").into_iter().all(|message| message.id != "17"));
     assert_eq!(world.called("GetHistory u7002"), asked, "nothing was asked of Telegram about it");
 
@@ -810,6 +829,44 @@ fn a_message_whose_own_time_has_passed_is_nowhere_and_one_still_alive_leaves_the
     let quiet = world.status().1;
     sleep(Duration::from_secs(2));
     assert_eq!(world.status().1, quiet, "{:#?}", world.calls());
+}
+
+#[test]
+fn an_unopened_topics_expiring_forum_preview_leaves_the_sidebar_at_its_own_time() {
+    expiring_forum_preview(false);
+}
+
+#[test]
+fn an_opened_topics_expiring_forum_preview_leaves_the_sidebar_with_its_message() {
+    expiring_forum_preview(true);
+}
+
+fn expiring_forum_preview(open_topic: bool) {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_FORUM_TTL", "1")]);
+    world.connected();
+    world.until("the forum's temporary preview", || world.conversation("c9002")
+        .filter(|row| row.preview == "Who has the torque wrench?"));
+    if open_topic {
+        world.watch(Watching { conversation: Some(key("c9002")), ..Watching::default() });
+        world.messages("c9002");
+        world.until("the topic row", || world.conversation("c9002_31"));
+        world.watch(Watching { conversation: Some(key("c9002_31")), ..Watching::default() });
+        world.arrived("c9002_31", "41");
+    } else {
+        assert_eq!(world.called("GetForumTopics"), 0, "the topic has never been opened");
+        assert_eq!(world.called("GetReplies c9002_31"), 0);
+    }
+    let since = world.status().1;
+    world.changed(since, "the expired forum preview to leave the sidebar", |change| match change {
+        Change::Conversation { conversation } if conversation.id == "c9002"
+            && world.conversation("c9002").is_some_and(|row| row.preview.is_empty()) => Some(()),
+        _ => None,
+    });
+    let row = world.conversation("c9002").unwrap();
+    assert_eq!((row.preview.as_str(), row.preview_from.as_str(), row.preview_mine, row.updated), ("", "", false, 0));
+    let store = chatd::store::Store::open(&world.dir.join("chat.sqlite")).unwrap();
+    assert!(store.message(&key("c9002"), "41").unwrap().is_none(), "no duplicate parent message");
+    assert!(store.message(&key("c9002_31"), "41").unwrap().is_none());
 }
 
 #[test]

@@ -556,7 +556,7 @@ impl Shell {
                 Some((_, mode)) => mode.clone(),
                 None => self.sidebar_state.mode.clone(),
             },
-            telegram_folder: self.sidebar_state.home.folder.clone(),
+            telegram_folder: self.sidebar_state.telegram_folder(),
             details_channels: state.details_channels,
             details_directs: state.details_directs,
             text_step: theme::text_step(),

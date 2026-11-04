@@ -504,6 +504,7 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
                 sender: mapped.message.sender.name.clone(),
                 mine: mapped.message.outgoing,
                 sent: mapped.message.sent,
+                expires_at: mapped.message.expires_at,
             };
             let _ = account.ctx.preview(&id, &line);
         } else {

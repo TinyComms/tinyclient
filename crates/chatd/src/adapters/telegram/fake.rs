@@ -382,7 +382,12 @@ impl World {
         world.store(None, message(odalys, 12, ODALYS, T0 - 60, "Good. Trailhead at seven."));
         world.store(None, message(Who::Group(CREW), 20, TOBIN, T0 - 3_600, "Maps are in the shared folder."));
         world.store(None, message(Who::Channel(NOTES), 5, 0, T0 - 7_200, "Snow line is at 1,900 m this week."));
-        world.store(Some(TOOLS), in_topic(message(Who::Channel(WORKSHOP), 41, TOBIN, T0 - 500, "Who has the torque wrench?"), TOOLS));
+        let mut tools = message(Who::Channel(WORKSHOP), 41, TOBIN, T0 - 500, "Who has the torque wrench?");
+        if held_at_wire("TINYCLIENT_TELEGRAM_FORUM_TTL") {
+            tools.date = crate::hub::now() as i32;
+            tools.ttl_period = Some(10);
+        }
+        world.store(Some(TOOLS), in_topic(tools, TOOLS));
         world.store(Some(JIGS), in_topic(message(Who::Channel(WORKSHOP), JIGS, TOBIN, T0 - 200, "First jig done: the box joints came out clean."), JIGS));
         world.store(None, message(Who::User(TOBIN), 30, TOBIN, T0 - 90_000, "Thanks for the lift."));
         // My newest word to Tobin, which his dialog's read-outbox covers: the row's ✓✓ at boot.

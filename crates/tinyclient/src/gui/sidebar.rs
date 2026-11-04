@@ -108,6 +108,8 @@ pub struct State {
     home_news: u32,
     /// A list the home drilled into (Threads, Archive, Message requests, a forum's topics).
     pub drill: Option<home::Drill>,
+    /// User navigation, independent of background home reads and restored home epochs.
+    navigation: u64,
     /// The Slack workspace on show, and whether its menu is open.
     pub slack: Option<Key>,
     slack_menu: bool,
@@ -148,7 +150,7 @@ pub struct State {
     pub switcher: Option<switcher::Switcher>,
 }
 
-fn list_state(_cx: &mut Context<Shell>) -> ListState {
+fn list_state() -> ListState {
     // One row ahead of the viewport. Scrolling already redraws this view, and that
     // render is what updates who is watched. A content change that keeps the same
     // rows does not splice, so a measured height stays measured (`respliced`).
@@ -156,6 +158,49 @@ fn list_state(_cx: &mut Context<Shell>) -> ListState {
 }
 
 impl State {
+    /// The chosen Telegram chip belongs to its home even while another network is shown.
+    pub fn telegram_folder(&self) -> Option<String> {
+        let home = if self.home.network == Some(Network::Telegram) {
+            Some(&self.home)
+        } else {
+            self.saved_homes.get(&Network::Telegram)
+        };
+        home.and_then(|home| home.folder.clone())
+    }
+
+    fn switch_mode(&mut self, mode: Mode) {
+        self.navigation_changed();
+        let home_network = match &mode {
+            Mode::Space(space) if space.network == Network::Discord => Some(Network::Discord),
+            Mode::Network(network) => Some(*network),
+            _ => None,
+        };
+        self.home.switch_network(home_network, &mut self.saved_homes);
+        self.mode = mode;
+        self.drill = None;
+    }
+
+    pub(super) fn navigation_changed(&mut self) {
+        self.navigation = self.navigation.wrapping_add(1);
+    }
+
+    fn enter_drill(&mut self, drill: home::Drill) {
+        self.navigation_changed();
+        self.drill = Some(drill);
+    }
+
+    fn leave_drill(&mut self) -> bool {
+        self.navigation_changed();
+        self.drill.take().is_some()
+    }
+
+    fn landing_topic<'a>(&self, navigation: u64, forum: &Key, conversations: &'a [Conversation]) -> Option<&'a Conversation> {
+        if self.navigation != navigation || !matches!(&self.drill, Some(home::Drill::Topics(current)) if &current.key == forum) {
+            return None;
+        }
+        conversations.first()
+    }
+
     /// The Telegram folder chip last chosen, from the window's own memory: the home on show
     /// and the one waiting in reserve both start there.
     pub fn remember_telegram_folder(&mut self, folder: Option<String>) {
@@ -167,13 +212,17 @@ impl State {
     pub fn new(cx: &mut Context<Shell>) -> State {
         #[cfg(feature = "gui-shot")]
         shot::schedule(cx);
+        Self::with_focus(cx.focus_handle())
+    }
+
+    fn with_focus(focus: FocusHandle) -> State {
         State {
             mode: Mode::Inbox,
             filter: InboxFilter::All,
             inbox: Pages::default(),
             counts: InboxCounts::default(),
             hold: hold::Hold::default(),
-            inbox_list: list_state(cx),
+            inbox_list: list_state(),
             inbox_items: Rc::new(Vec::new()),
             apps_open: false,
             apps_all: false,
@@ -184,11 +233,12 @@ impl State {
             muted_open: false,
             home: home::Home::default(),
             saved_homes: HashMap::new(),
-            home_list: list_state(cx),
+            home_list: list_state(),
             home_items: Rc::new(Vec::new()),
             home_unread: false,
             home_news: 0,
             drill: None,
+            navigation: 0,
             slack: None,
             slack_menu: false,
             spaces_loaded: false,
@@ -202,7 +252,7 @@ impl State {
             tree_scroll: UniformListScrollHandle::new(),
             folder_tabs_scroll: gpui::ScrollHandle::new(),
             cursor: None,
-            focus: cx.focus_handle(),
+            focus,
             pins: Vec::new(),
             history: History::default(),
             walked: Vec::new(),
@@ -389,7 +439,7 @@ impl Shell {
         if self.sidebar_state.mode == mode {
             let state = &mut self.sidebar_state;
             // Clicking the lit place leaves a drill and scrolls its list to the top.
-            if state.drill.take().is_some() {
+            if state.leave_drill() {
                 self.rebuild_rows(cx);
             }
             let state = &self.sidebar_state;
@@ -437,15 +487,8 @@ impl Shell {
             }
         }
         let keep_discord = state.mode.network() == Some(Network::Discord) && mode.network() == Some(Network::Discord);
-        let home_network = match &mode {
-            Mode::Space(space) if space.network == Network::Discord => Some(Network::Discord),
-            Mode::Network(network) => Some(*network),
-            _ => None,
-        };
-        state.home.switch_network(home_network, &mut state.saved_homes);
-        state.mode = mode;
+        state.switch_mode(mode);
         state.cursor = None;
-        state.drill = None;
         state.slack_menu = false;
         if !keep_discord {
             state.home_unread = false;
@@ -498,7 +541,7 @@ impl Shell {
 
     /// `cmd-up`: out of a drill, a Space's network, a network's Inbox.
     pub(super) fn up_level(&mut self, cx: &mut Context<Self>) {
-        if self.sidebar_state.drill.take().is_some() {
+        if self.sidebar_state.leave_drill() {
             self.rebuild_rows(cx);
             return;
         }
@@ -916,12 +959,16 @@ impl Shell {
             // the newest unread topic, else General (`03` §2), and the network catching up
             // behind a later open cannot loop a change back into a request.
             let forum = row.key.clone();
+            // Only this visit may choose the landing. Opening another forum (including this
+            // same one again), picking a topic, or leaving the drill supersedes its reply.
+            let navigation = self.sidebar_state.navigation;
+            let requested_forum = forum.clone();
             let landing = move || ask(&Request::Topics { forum, offset: 0, limit: 1, landing: true });
-            self.off_thread(cx, landing, |this, answer, cx| {
+            self.off_thread(cx, landing, move |this, answer, cx| {
                 let Ok(Response::Conversations { conversations, .. }) = answer else {
                     return;
                 };
-                if let Some(topic) = conversations.first() {
+                if let Some(topic) = this.sidebar_state.landing_topic(navigation, &requested_forum, &conversations) {
                     this.select(topic.key.clone(), &topic.title, cx);
                 }
             });
@@ -1985,6 +2032,97 @@ fn inbox_strip_fit(width: f32, phone: bool, text_scale: f32, has_unread: bool) -
 pub(crate) mod tests {
     use super::*;
     use protocol::{AccountKey, AccountStatus, Presence};
+
+    #[cfg(feature = "gui-shot")]
+    #[gpui::test]
+    fn telegram_folder_survives_saving_after_leaving_its_network(cx: &mut gpui::TestAppContext) {
+        use crate::gui::app::prefs::{self, Prefs};
+        let mut state = State::with_focus(cx.update(|cx| cx.focus_handle()));
+        state.remember_telegram_folder(Some("2".into()));
+        assert_eq!(state.telegram_folder().as_deref(), Some("2"), "the startup preference survives before a home is shown");
+        for mode in [Mode::Network(Network::Telegram), Mode::Network(Network::Discord), Mode::Inbox] {
+            state.switch_mode(mode);
+            let saved = Prefs { telegram_folder: state.telegram_folder(), ..Prefs::default() };
+            let restored = prefs::parse(&prefs::write(&saved));
+            assert_eq!(restored.telegram_folder.as_deref(), Some("2"), "folder lost in {:?}", state.mode);
+            let mut relaunched = State::with_focus(cx.update(|cx| cx.focus_handle()));
+            relaunched.remember_telegram_folder(restored.telegram_folder);
+            relaunched.switch_mode(Mode::Network(Network::Telegram));
+            assert_eq!(relaunched.home.folder.as_deref(), Some("2"));
+        }
+        state.switch_mode(Mode::Network(Network::Telegram));
+        state.home.folder = None;
+        let saved = Prefs { telegram_folder: state.telegram_folder(), ..Prefs::default() };
+        assert_eq!(prefs::parse(&prefs::write(&saved)).telegram_folder, None, "choosing All replaces the saved chip");
+        state.switch_mode(Mode::Inbox);
+        assert_eq!(state.telegram_folder(), None, "All is remembered after leaving Telegram too");
+    }
+
+    #[cfg(feature = "gui-shot")]
+    fn forum(id: &str) -> Conversation {
+        Conversation::new(Key { network: Network::Telegram, account: "me".into(), id: id.into() }, ConversationKind::Forum, id)
+    }
+
+    #[cfg(feature = "gui-shot")]
+    #[gpui::test]
+    fn telegram_landing_only_opens_for_the_latest_forum_visit(cx: &mut gpui::TestAppContext) {
+        let mut state = State::with_focus(cx.update(|cx| cx.focus_handle()));
+        state.switch_mode(Mode::Network(Network::Telegram));
+        let first = forum("first");
+        let second = forum("second");
+        let first_topics = [Conversation::new(Key { id: "first/topic/1".into(), ..first.key.clone() }, ConversationKind::Thread, "General")];
+        let topics = [Conversation::new(Key { id: "second/topic/1".into(), ..second.key.clone() }, ConversationKind::Thread, "General")];
+        state.enter_drill(home::Drill::Topics(Rc::new(first.clone())));
+        let first_visit = state.navigation;
+        state.enter_drill(home::Drill::Topics(Rc::new(second.clone())));
+        let second_visit = state.navigation;
+        assert_eq!(state.landing_topic(second_visit, &second.key, &topics).map(|c| c.key.id.as_str()), Some("second/topic/1"));
+        assert!(state.landing_topic(first_visit, &first.key, &first_topics).is_none(), "an older forum reply must not replace the new landing");
+        state.enter_drill(home::Drill::Topics(Rc::new(second.clone())));
+        let repeated_visit = state.navigation;
+        assert!(state.landing_topic(second_visit, &second.key, &topics).is_none(), "reopening the same forum supersedes its first request");
+        assert!(state.landing_topic(repeated_visit, &second.key, &topics).is_some());
+        assert!(state.landing_topic(repeated_visit, &second.key, &[]).is_none());
+    }
+
+    #[cfg(feature = "gui-shot")]
+    #[gpui::test]
+    fn telegram_landing_does_not_override_navigation_away_from_the_drill(cx: &mut gpui::TestAppContext) {
+        let mut state = State::with_focus(cx.update(|cx| cx.focus_handle()));
+        state.switch_mode(Mode::Network(Network::Telegram));
+        let forum = forum("forum");
+        let topics = [Conversation::new(Key { id: "forum/topic/1".into(), ..forum.key.clone() }, ConversationKind::Thread, "General")];
+        for destination in [Mode::Inbox, Mode::Network(Network::Discord)] {
+            state.enter_drill(home::Drill::Topics(Rc::new(forum.clone())));
+            let request = state.navigation;
+            state.switch_mode(destination);
+            assert!(state.landing_topic(request, &forum.key, &topics).is_none(), "a forum must not reopen after changing modes");
+            state.switch_mode(Mode::Network(Network::Telegram));
+        }
+        state.enter_drill(home::Drill::Topics(Rc::new(forum.clone())));
+        let request = state.navigation;
+        assert!(state.leave_drill());
+        assert!(state.landing_topic(request, &forum.key, &topics).is_none(), "leaving the drill cancels its landing");
+        state.enter_drill(home::Drill::Topics(Rc::new(forum.clone())));
+        let request = state.navigation;
+        state.enter_drill(home::Drill::Archive);
+        assert!(state.landing_topic(request, &forum.key, &topics).is_none(), "another drill supersedes the landing");
+    }
+
+    #[cfg(feature = "gui-shot")]
+    #[gpui::test]
+    fn telegram_landing_respects_an_explicit_conversation_choice(cx: &mut gpui::TestAppContext) {
+        let mut state = State::with_focus(cx.update(|cx| cx.focus_handle()));
+        state.switch_mode(Mode::Network(Network::Telegram));
+        let forum = forum("forum");
+        let topics = [Conversation::new(Key { id: "forum/topic/1".into(), ..forum.key.clone() }, ConversationKind::Thread, "General")];
+        state.enter_drill(home::Drill::Topics(Rc::new(forum.clone())));
+        let request = state.navigation;
+        state.home.epoch += 1;
+        assert!(state.landing_topic(request, &forum.key, &topics).is_some(), "a background home refresh is not navigation");
+        state.navigation_changed();
+        assert!(state.landing_topic(request, &forum.key, &topics).is_none(), "a chat or topic picked by hand wins, even when the drill stays open");
+    }
 
     pub fn row(id: &str, kind: ConversationKind) -> Conversation {
         Conversation::new(Key { network: Network::Discord, account: "me".into(), id: id.into() }, kind, id)

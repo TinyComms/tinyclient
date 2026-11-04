@@ -680,6 +680,9 @@ impl Context {
         let conversation = self.key(conversation_id);
         if self.hub.store().set_preview(&conversation, line)? {
             self.hub.changed(Change::Conversation { conversation });
+            if line.expires_at.is_some() {
+                self.hub.expiring();
+            }
         }
         Ok(())
     }

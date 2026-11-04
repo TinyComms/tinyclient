@@ -296,7 +296,8 @@ impl Chat {
                 match hub.store().expire(now()) {
                     Ok(gone) => {
                         for conversation in gone {
-                            hub.changed(Change::Messages { conversation });
+                            hub.changed(Change::Messages { conversation: conversation.clone() });
+                            hub.changed(Change::Conversation { conversation });
                         }
                     }
                     Err(err) => tracing::warn!("chatd: messages past their time: {err}"),

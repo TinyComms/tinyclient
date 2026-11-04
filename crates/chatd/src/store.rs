@@ -143,6 +143,8 @@ const TABLES: &str = "
         preview_from TEXT NOT NULL DEFAULT '',
         preview_mine INTEGER NOT NULL DEFAULT 0,
         preview_id   TEXT NOT NULL DEFAULT '',
+        -- A preview may be all that was fetched of its message (a forum's dialog line).
+        preview_expires INTEGER,
         -- The newest of my messages the other side has read, and has received.
         seen_to   TEXT NOT NULL DEFAULT '',
         delivered_to TEXT NOT NULL DEFAULT '',
@@ -156,6 +158,7 @@ const TABLES: &str = "
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
     CREATE INDEX conversation_recent ON conversation (updated DESC);
     CREATE INDEX conversation_tree ON conversation (network, account, space, position);
+    CREATE INDEX conversation_preview_expires ON conversation (preview_expires) WHERE preview_expires IS NOT NULL;
     CREATE TABLE message (
         network      TEXT NOT NULL,
         account      TEXT NOT NULL,
@@ -385,6 +388,8 @@ pub struct PreviewLine {
     pub mine: bool,
     /// Unix seconds.
     pub sent: i64,
+    /// The message's own timer, even when only its sidebar line was fetched.
+    pub expires_at: Option<i64>,
 }
 
 /// As stored: folder and Space ids never hold the comma that separates them.
@@ -1591,9 +1596,10 @@ impl Store {
         clip(&mut sender, 80);
         let changed = self.db.execute(
             "UPDATE conversation SET preview = ?4, preview_from = ?5, preview_mine = ?6, preview_id = ?7,
-                    updated = max(updated, ?8)
+                    updated = max(updated, ?8), preview_expires = ?9
               WHERE network = ?1 AND account = ?2 AND id = ?3 AND ?8 >= updated
-                AND (preview != ?4 OR preview_from != ?5 OR preview_mine != ?6 OR preview_id != ?7 OR updated != ?8)",
+                AND (preview != ?4 OR preview_from != ?5 OR preview_mine != ?6 OR preview_id != ?7 OR updated != ?8
+                     OR preview_expires IS NOT ?9)",
             params![
                 word(&conversation.network),
                 conversation.account,
@@ -1602,7 +1608,8 @@ impl Store {
                 sender,
                 line.mine,
                 line.id,
-                line.sent
+                line.sent,
+                line.expires_at
             ],
         )?;
         Ok(changed == 1)
@@ -2000,6 +2007,7 @@ impl Store {
                          preview_mine = CASE WHEN ?5 >= updated THEN ?13 ELSE preview_mine END,
                          preview_id = CASE WHEN ?5 >= updated THEN ?6 ELSE preview_id END,
                          preview = CASE WHEN ?5 >= updated THEN ?4 ELSE preview END,
+                         preview_expires = CASE WHEN ?5 >= updated THEN ?14 ELSE preview_expires END,
                          updated = max(updated, ?5),
                          hidden = CASE WHEN ?12 AND last_read != ''
                              AND (length(last_read), last_read) < (length(?6), ?6) THEN 0 ELSE hidden END
@@ -2018,13 +2026,15 @@ impl Store {
                         if message.outgoing { "" } else { message.sender.name.as_str() },
                         unread,
                         message.outgoing,
+                        message.expires_at,
                     ],
                 )?;
             }
             // An edit of the newest message is what the row previews.
             Stored::Updated => {
                 tx.execute(
-                    "UPDATE conversation SET preview = ?4, preview_id = ?6, preview_mine = ?7, preview_from = ?8
+                    "UPDATE conversation SET preview = ?4, preview_id = ?6, preview_mine = ?7, preview_from = ?8,
+                         preview_expires = ?9
                       WHERE network = ?1 AND account = ?2 AND id = ?3 AND updated = ?5",
                     params![
                         network,
@@ -2035,6 +2045,7 @@ impl Store {
                         message.id,
                         message.outgoing,
                         if message.outgoing { "" } else { message.sender.name.as_str() },
+                        message.expires_at,
                     ],
                 )?;
             }
@@ -2068,6 +2079,7 @@ impl Store {
                 sender: if mine { String::new() } else { message.sender.name },
                 mine,
                 sent: message.sent,
+                expires_at: message.expires_at,
             }
         }))
     }
@@ -2929,8 +2941,11 @@ impl Store {
         let at: Option<i64> = self
             .db
             .query_row(
-                "SELECT MIN(expires) FROM message WHERE expires IS NOT NULL AND expires > ?1",
-                params![now],
+                "SELECT MIN(at) FROM (
+                    SELECT MIN(expires) AS at FROM message WHERE expires IS NOT NULL
+                    UNION ALL
+                    SELECT MIN(preview_expires) AS at FROM conversation WHERE preview_expires IS NOT NULL)",
+                [],
                 |row| row.get::<_, Option<i64>>(0),
             )?;
         Ok(at.map(|at| Duration::from_secs((at - now).max(0) as u64)))
@@ -2942,7 +2957,8 @@ impl Store {
     pub fn expire(&mut self, now: i64) -> rusqlite::Result<Vec<Key>> {
         let tx = self.db.transaction()?;
         let gone: Vec<Key> = tx
-            .prepare("SELECT DISTINCT network, account, conversation FROM message WHERE expires IS NOT NULL AND expires <= ?1")?
+            .prepare("SELECT network, account, conversation FROM message WHERE expires IS NOT NULL AND expires <= ?1
+                UNION SELECT network, account, id FROM conversation WHERE preview_expires IS NOT NULL AND preview_expires <= ?1")?
             .query_map(params![now], key_at)?
             .collect::<rusqlite::Result<_>>()?;
         // Nothing to expire: no write at all, for the pass runs every minute.
@@ -2950,7 +2966,41 @@ impl Store {
             drop(tx);
             return Ok(gone);
         }
+        // The sidebar keeps its own copy and timer, even when its message belongs to a
+        // different topic or was never fetched. IDs alone cannot identify those messages.
+        let previews: Vec<Key> = tx
+            .prepare("SELECT network, account, id FROM conversation WHERE preview_expires IS NOT NULL AND preview_expires <= ?1")?
+            .query_map(params![now], key_at)?
+            .collect::<rusqlite::Result<_>>()?;
         tx.execute("DELETE FROM message WHERE expires IS NOT NULL AND expires <= ?1", params![now])?;
+        for conversation in previews {
+            let newest = tx
+                .query_row(
+                    &format!("SELECT id, text, body FROM message
+                        WHERE network = ?1 AND account = ?2 AND conversation = ?3
+                        {NEWEST_FIRST} LIMIT 1"),
+                    params![word(&conversation.network), conversation.account, conversation.id],
+                    message_from,
+                )
+                .optional()?;
+            let (text, sender, mine, id, sent, expires) = match newest {
+                Some(message) => (
+                    preview_of(&message),
+                    if message.outgoing { String::new() } else { message.sender.name },
+                    message.outgoing,
+                    message.id,
+                    message.sent,
+                    message.expires_at,
+                ),
+                None => (String::new(), String::new(), false, String::new(), 0, None),
+            };
+            tx.execute(
+                "UPDATE conversation SET preview = ?4, preview_from = ?5, preview_mine = ?6,
+                    preview_id = ?7, updated = ?8, preview_expires = ?9
+                    WHERE network = ?1 AND account = ?2 AND id = ?3",
+                params![word(&conversation.network), conversation.account, conversation.id, text, sender, mine, id, sent, expires],
+            )?;
+        }
         tx.commit()?;
         Ok(gone)
     }
@@ -2979,6 +3029,97 @@ mod tests {
 
     fn ids(page: &MessagePage) -> Vec<&str> {
         page.messages.iter().map(|message| message.id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_preview_without_a_stored_message_expires_on_its_own_timer() {
+        let (mut store, key) = store();
+        let line = PreviewLine {
+            id: "41".into(), text: "temporary forum secret".into(), sender: "mara".into(),
+            mine: false, sent: NOW, expires_at: Some(NOW + 10),
+        };
+        store.set_preview(&key, &line).unwrap();
+        assert_eq!(store.until_expiry(NOW).unwrap(), Some(Duration::from_secs(10)));
+        assert!(store.expire(NOW + 9).unwrap().is_empty());
+        assert_eq!(store.expire(NOW + 10).unwrap(), [key.clone()]);
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.preview.as_str(), row.preview_from.as_str(), row.updated), ("", "", 0));
+        assert_eq!(store.preview_id(&key).unwrap(), "");
+        assert_eq!(store.until_expiry(NOW + 10).unwrap(), None);
+    }
+
+    #[test]
+    fn replacing_a_timed_preview_clears_its_timer_and_rescheduling_the_same_line_is_a_change() {
+        let (mut store, key) = store();
+        let mut line = PreviewLine { id: "41".into(), text: "same words".into(), sent: NOW, ..PreviewLine::default() };
+        assert!(store.set_preview(&key, &line).unwrap());
+        line.expires_at = Some(NOW + 10);
+        assert!(store.set_preview(&key, &line).unwrap(), "adding only a timer changes the stored preview");
+        assert_eq!(store.until_expiry(NOW).unwrap(), Some(Duration::from_secs(10)));
+        line.id = "42".into();
+        line.text = "permanent replacement".into();
+        line.sent += 1;
+        line.expires_at = None;
+        assert!(store.set_preview(&key, &line).unwrap());
+        assert_eq!(store.until_expiry(NOW).unwrap(), None);
+        assert!(store.expire(NOW + 10).unwrap().is_empty());
+        assert_eq!(store.conversation(&key).unwrap().unwrap().preview, "permanent replacement");
+    }
+
+    #[test]
+    fn preview_timers_are_scoped_to_their_conversation_and_overdue_timers_wake_at_once() {
+        let (mut store, key) = store();
+        let other = Key::new(&key.account(), "other");
+        store.upsert_conversation(&key.account(), &ConversationRow::new("other", ConversationKind::Channel, "Other")).unwrap();
+        let mut line = PreviewLine { id: "41".into(), text: "temporary".into(), sent: NOW, expires_at: Some(NOW + 10), ..PreviewLine::default() };
+        store.set_preview(&key, &line).unwrap();
+        line.text = "permanent in another conversation".into();
+        line.expires_at = None;
+        store.set_preview(&other, &line).unwrap();
+        assert_eq!(store.until_expiry(NOW + 11).unwrap(), Some(Duration::ZERO));
+        assert_eq!(store.expire(NOW + 11).unwrap(), [key]);
+        assert_eq!(store.conversation(&other).unwrap().unwrap().preview, "permanent in another conversation");
+    }
+
+    #[test]
+    fn an_edited_message_replaces_its_preview_timer_too() {
+        let (mut store, key) = store();
+        let mut message = said("41", "temporary", NOW);
+        message.expires_at = Some(NOW + 10);
+        store.ingest(&key, &message, false).unwrap();
+        assert_eq!(store.newest_line(&key).unwrap().unwrap().expires_at, Some(NOW + 10));
+        message.text = "permanent edit".into();
+        message.expires_at = None;
+        store.ingest(&key, &message, false).unwrap();
+        assert_eq!(store.until_expiry(NOW).unwrap(), None);
+        assert!(store.expire(NOW + 10).unwrap().is_empty());
+        assert_eq!(store.conversation(&key).unwrap().unwrap().preview, "permanent edit");
+    }
+
+    #[test]
+    fn expiring_the_preview_restores_a_surviving_message_then_clears_the_last_copy() {
+        let (mut store, key) = store();
+        let mut older = said("1", "still here", NOW - 20);
+        older.expires_at = Some(NOW + 2);
+        store.ingest(&key, &older, false).unwrap();
+        let mut newest = Message::plain("2", "me", "temporary secret", NOW - 10, true);
+        newest.expires_at = Some(NOW + 1);
+        store.ingest(&key, &newest, false).unwrap();
+        assert_eq!(store.conversation(&key).unwrap().unwrap().preview, "temporary secret");
+
+        assert_eq!(store.expire(NOW + 1).unwrap(), [key.clone()]);
+        assert!(store.message(&key, "2").unwrap().is_none());
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.preview.as_str(), row.preview_from.as_str(), row.preview_mine, row.updated),
+            ("still here", "mara", false, NOW - 20));
+        assert_eq!(store.preview_id(&key).unwrap(), "1");
+
+        assert_eq!(store.expire(NOW + 2).unwrap(), [key.clone()]);
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.preview.as_str(), row.preview_from.as_str(), row.preview_mine, row.updated),
+            ("", "", false, 0));
+        assert_eq!(store.preview_id(&key).unwrap(), "");
+        assert!(store.expire(NOW + 3).unwrap().is_empty());
     }
 
     #[test]
@@ -3446,7 +3587,7 @@ mod tests {
         assert!(store.conversation(&key).unwrap().unwrap().seen);
 
         // A line from a list that carries only that, never older than what is shown.
-        let line = |id: &str, sent| PreviewLine { id: id.into(), text: "from the list".into(), sender: "Ana".into(), mine: false, sent };
+        let line = |id: &str, sent| PreviewLine { id: id.into(), text: "from the list".into(), sender: "Ana".into(), mine: false, sent, expires_at: None };
         assert!(!store.set_preview(&key, &line("5", 150)).unwrap());
         assert!(store.set_preview(&key, &line("12", 300)).unwrap());
         let row = store.conversation(&key).unwrap().unwrap();
@@ -3723,6 +3864,31 @@ mod tests {
         let names: Vec<String> = info.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         assert!(names.iter().any(|name| name == "voice_limit"), "{names:?}");
         assert!(store.settings().unwrap().iter().any(|setting| setting.key == "keep_days" && setting.value == "14"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn an_installed_schema_8_cache_is_rebuilt_with_independent_preview_timers_and_keeps_settings() {
+        let path = scratch("preview-expiry-shape");
+        let mut store = Store::open(&path).unwrap();
+        store.set_setting("", "keep_days", Some("14")).unwrap();
+        store.db.execute_batch(
+            "DROP INDEX conversation_preview_expires;
+             ALTER TABLE conversation DROP COLUMN preview_expires;
+             DROP INDEX message_expires;
+             ALTER TABLE message DROP COLUMN expires;
+             PRAGMA user_version = 8;"
+        ).unwrap();
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        assert!(store.settings().unwrap().iter().any(|setting| setting.key == "keep_days" && setting.value == "14"));
+        let account = AccountKey { network: Network::Telegram, account: "me".into() };
+        let key = Key::new(&account, "forum");
+        store.upsert_conversation(&account, &ConversationRow::new("forum", ConversationKind::Group, "Forum")).unwrap();
+        store.set_preview(&key, &PreviewLine { id: "41".into(), text: "temporary".into(), sent: NOW, expires_at: Some(NOW + 10), ..PreviewLine::default() }).unwrap();
+        assert_eq!(store.until_expiry(NOW).unwrap(), Some(Duration::from_secs(10)));
+        assert_eq!(store.expire(NOW + 10).unwrap(), [key]);
+        drop(store);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

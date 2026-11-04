@@ -143,7 +143,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
         let avatar = s.cover(&account, id, &format!("group-{}.webp", COVERS.iter().find(|(of, _)| *of == id).map_or("", |(_, name)| *name)))?;
         let key = s.conversation(&account, ConversationRow { avatar, ..chat(id, Group, title) })?;
         let sent = s.now - minutes * 60;
-        let line = PreviewLine { id: format!("{sent}000"), text: text.to_owned(), sender: cast[from].name.clone(), mine: false, sent };
+        let line = PreviewLine { id: format!("{sent}000"), text: text.to_owned(), sender: cast[from].name.clone(), mine: false, sent, expires_at: None };
         s.store.set_preview(&key, &line)?;
         Ok(())
     };

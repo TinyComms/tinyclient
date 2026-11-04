@@ -138,7 +138,7 @@ impl Shell {
     /// Goes into a list of the home: Threads, Archive, Message requests, a forum's topics.
     pub(super) fn drill(&mut self, drill: Drill, cx: &mut Context<Self>) {
         let state = &mut self.sidebar_state;
-        state.drill = Some(drill);
+        state.enter_drill(drill);
         state.cursor = None;
         state.home.drilled.clear();
         state.home.loaded = false;

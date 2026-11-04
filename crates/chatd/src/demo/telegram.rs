@@ -221,7 +221,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
     s.post(&channel, &ad)?;
     // The channel's own post is the preview, not the advertisement.
     if let Some(post) = s.store.message(&channel, &said[1])? {
-        let line = PreviewLine { id: post.id.clone(), text: post.text.clone(), sender: String::new(), mine: false, sent: post.sent };
+        let line = PreviewLine { id: post.id.clone(), text: post.text.clone(), sender: String::new(), mine: false, sent: post.sent, expires_at: post.expires_at };
         s.store.set_preview(&channel, &line)?;
     }
     s.counts(&channel, 4, 0, Some(&said[0]))?;

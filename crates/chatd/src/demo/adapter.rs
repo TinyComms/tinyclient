@@ -419,7 +419,7 @@ impl Demo {
                     line.sent = line.sent.max(sent);
                     line
                 }
-                Ok(None) => PreviewLine { id: String::new(), text: "No messages yet".to_owned(), sender: String::new(), mine: false, sent },
+                Ok(None) => PreviewLine { id: String::new(), text: "No messages yet".to_owned(), sender: String::new(), mine: false, sent, expires_at: None },
                 Err(err) => {
                     tracing::warn!("chatd: demo: preview: {err}");
                     continue;
