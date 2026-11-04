@@ -302,7 +302,7 @@ fn a_network_without_spaces_is_one_list_with_its_pins_folders_archive_and_forum(
     // A channel's sponsored message sits at its foot and is never its preview.
     assert!(chatd.row(&telegram("c9001")).preview.starts_with("Snow line"));
     // A forum's topics: its pin first, then by recency.
-    let (topics, _) = chatd.rows(Request::Topics { forum: telegram("c9100"), offset: 0, limit: 10 });
+    let (topics, _) = chatd.rows(Request::Topics { forum: telegram("c9100"), offset: 0, limit: 10, landing: false });
     assert_eq!(titles(&topics), ["General", "ID requests", "Events"]);
 }
 

@@ -71,7 +71,7 @@ impl Shell {
             let mut read = Read::default();
             match drill {
                 Some((_, Some(space), _)) => read.drilled = conversations(&Request::Threads { space, offset: 0, limit: PAGE_LIMIT })?.0,
-                Some((_, _, Some(forum))) => read.drilled = conversations(&Request::Topics { forum, offset: 0, limit: PAGE_LIMIT })?.0,
+                Some((_, _, Some(forum))) => read.drilled = conversations(&Request::Topics { forum, offset: 0, limit: PAGE_LIMIT, landing: false })?.0,
                 Some((shelf, None, None)) => read.drilled = whole(network, None, shelf)?.0,
                 None => {}
             }

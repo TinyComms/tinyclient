@@ -340,6 +340,9 @@ pub enum Command {
     /// The user opened a Space's Threads list: fetch the network's list of followed threads
     /// once, and record them with `Filing::followed`.
     OpenThreads(String),
+    /// The user opened a forum: fetch its topics once and answer, so the landing topic the
+    /// shell then reads from the store is named on what the network says now.
+    OpenForum { conversation_id: String, reply: Reply<()> },
     /// The user answered, withdrew or ended a friendship, or blocked someone. Report the new
     /// relationship through [`Context::relation`] before answering.
     Relate {
@@ -415,7 +418,8 @@ impl Command {
             | Command::Edit { reply, .. }
             | Command::Delete { reply, .. }
             | Command::Relate { reply, .. }
-            | Command::SetPresence { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::SetPresence { reply, .. }
+            | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

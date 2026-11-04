@@ -463,6 +463,41 @@ fn a_muted_channel_draws_quiet_and_never_raises_the_rail() {
 }
 
 #[test]
+fn a_forum_opens_on_the_newest_unread_topic_else_general() {
+    let world = World::signed_in();
+    world.connected();
+    // Opening the forum reads its topics and lands on the newest unread: Jigs here, active
+    // after the unread Tools, General read all along (polish/03 §2, story T8).
+    let landing = || Request::Topics { forum: key("c9002"), offset: 0, limit: 1, landing: true };
+    let Response::Conversations { conversations, .. } = world.ask(landing()) else {
+        panic!("no landing");
+    };
+    assert_eq!(conversations.len(), 1, "{conversations:?}");
+    assert_eq!((conversations[0].key.id.as_str(), conversations[0].title.as_str(), conversations[0].parent.as_deref()), ("c9002_55", "Jigs", Some("c9002")));
+    // What the topics drill lists: the network's pins first (none is pinned), then the
+    // activity, a count on every row.
+    let drill = Request::Topics { forum: key("c9002"), offset: 0, limit: 10, landing: false };
+    let Response::Conversations { conversations: topics, total, .. } = world.ask(drill) else {
+        panic!("no topics");
+    };
+    assert_eq!((total, topics.len()), (3, 3), "{topics:?}");
+    assert_eq!(topics.iter().map(|topic| topic.key.id.as_str()).collect::<Vec<_>>(), ["c9002_55", "c9002_31", "c9002_1"]);
+    assert_eq!((topics[0].unread, topics[1].unread, topics[2].unread), (2, 1, 0));
+
+    // Read both unread topics, as opening them and reading does: the landing is General.
+    for (topic, read) in [("c9002_55", "55"), ("c9002_31", "41")] {
+        world.ask(Request::MarkRead { conversation: key(topic), message_id: read.into() });
+    }
+    world.until("both reads told to Telegram", || {
+        (world.called("ReadDiscussion c9002_55 55") > 0 && world.called("ReadDiscussion c9002_31 41") > 0).then_some(())
+    });
+    let Response::Conversations { conversations, .. } = world.ask(landing()) else {
+        panic!("no landing");
+    };
+    assert_eq!(conversations[0].key.id, "c9002_1", "with nothing unread the landing is General");
+}
+
+#[test]
 fn chats_past_the_newest_500_load_as_the_list_scrolls_with_their_pictures() {
     let world = World::crowded(650);
     world.connected();

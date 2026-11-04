@@ -15,7 +15,8 @@
 //! her own number); Tobin Reyes (7003); a group "Trail crew" (8001); a channel "Field Notes"
 //! (9001, muted, with a sponsored message) with a linked discussion group "Field Notes chat"
 //! (9003, which the comments on its post come from, heard of at `getDiscussionMessage`); a
-//! forum "Workshop" (9002) with topics General and "Tools" (31). The phone +1 555 010 0142
+//! forum "Workshop" (9002) with topics General, "Tools" (31) and "Jigs" (55, the newest
+//! unread). The phone +1 555 010 0142
 //! signs in with the code 24680; +1 555 010 0199 also wants the password "correct horse".
 //! Username resolution serves only `gif` and `forest_wren`; `flood_wait` returns a flood wait,
 //! and every other name returns USERNAME_NOT_OCCUPIED.
@@ -45,6 +46,8 @@ const CHATTERS: i64 = 9003;
 /// test looks for (`GetDiscussionMessage` names it for the open, the send for its reply).
 const ECHO: i32 = 60;
 const TOOLS: i32 = 31;
+/// The forum's newest topic, active after "Tools": the one opening the forum lands on.
+const JIGS: i32 = 55;
 /// Telegram's own account, a bot, an account Telegram flags as a scam, and one it flags an impostor.
 const SERVICE: i64 = 777_000;
 const BOT: i64 = 7004;
@@ -329,6 +332,8 @@ struct World {
     /// A post in the muted channel that names the user: the mention count rides the dialog,
     /// so it lands with the next reading of the chats.
     channel_mention: bool,
+    /// How far the account read each forum topic, as its last `ReadDiscussion` said.
+    topic_reads: HashMap<(Who, i32), i32>,
     calls: PathBuf,
     /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
     dialogs_go: bool,
@@ -360,6 +365,7 @@ impl World {
             drafts: HashMap::new(),
             comments_unread: 0,
             channel_mention: false,
+            topic_reads: HashMap::new(),
             calls: protocol::support_dir().join("telegram.calls"),
             dialogs_go: false,
             peer_go: false,
@@ -371,6 +377,7 @@ impl World {
         world.store(None, message(Who::Group(CREW), 20, TOBIN, T0 - 3_600, "Maps are in the shared folder."));
         world.store(None, message(Who::Channel(NOTES), 5, 0, T0 - 7_200, "Snow line is at 1,900 m this week."));
         world.store(Some(TOOLS), in_topic(message(Who::Channel(WORKSHOP), 41, TOBIN, T0 - 500, "Who has the torque wrench?"), TOOLS));
+        world.store(Some(JIGS), in_topic(message(Who::Channel(WORKSHOP), JIGS, TOBIN, T0 - 200, "First jig done: the box joints came out clean."), JIGS));
         world.store(None, message(Who::User(TOBIN), 30, TOBIN, T0 - 90_000, "Thanks for the lift."));
         // My newest word to Tobin, which his dialog's read-outbox covers: the row's ✓✓ at boot.
         world.store(None, message(Who::User(TOBIN), 31, ME, T0 - 80_000, "Trailhead at seven, then."));
@@ -659,6 +666,64 @@ fn discussion_answer(place: &str, unread: i32) -> Result<Vec<u8>, Fault> {
         users: users(),
     };
     answer(tl::enums::messages::DiscussionMessage::Message(found))
+}
+
+/// The forum's topics, as Telegram's own list names them: the account has read each topic
+/// up to what its last `ReadDiscussion` said, and a read past its newest post is a read
+/// whole. This runs on its own always-outlined body so the dispatcher above stays under a
+/// debug build's 256 KiB connection stack.
+#[inline(never)]
+fn topics_answer(world: &mut World, forum: Who) -> Result<Vec<u8>, Fault> {
+    // One topic, as Telegram's list carries it: the account has read the topic up to what
+    // its last ReadDiscussion said, and a read past its newest post is a read whole. The
+    // date is the topic's own; the caller reads the activity from the messages the answer
+    // carries.
+    let topic = |world: &World, id: i32, title: &str, top: i32, date: i32, unread: i32, icon: i64| {
+        let read = world.topic_reads.get(&(forum, id)).copied().unwrap_or(0);
+        let unread = if read >= top { 0 } else { unread };
+        let mut topic: tl::types::ForumTopic = blank(&[
+            &put(1u32),
+            &put(id),
+            &put(date),
+            &put(forum.peer()),
+            &put(title.to_owned()),
+            &put(3i32),
+            &put(icon),
+            &put(top),
+            &put(read),
+            &put(0i32),
+            &put(unread),
+            &put(0i32),
+            &put(0i32),
+            &put(0i32),
+            &put(Who::User(TOBIN).peer()),
+            &put(settings(None)),
+        ]);
+        topic.my = false;
+        tl::enums::ForumTopic::Topic(topic)
+    };
+    let held = |world: &World, id: i32| world.messages.get(&key(forum, Some(id))).and_then(|list| list.values().next_back().cloned());
+    let newest = held(world, TOOLS);
+    let top = match &newest {
+        Some(tl::enums::Message::Message(message)) => message.id,
+        _ => 41,
+    };
+    // The topics Telegram lists first, which here is their activity: Jigs newest.
+    let messages: Vec<tl::enums::Message> = held(world, JIGS).into_iter().chain(newest).collect();
+    let found = tl::types::messages::ForumTopics {
+        order_by_create_date: false,
+        count: 3,
+        topics: vec![
+            topic(world, JIGS, "Jigs", JIGS, T0 - 200, 2, 5000),
+            topic(world, TOOLS, "Tools", top, T0 - 40_000, 1, 5001),
+            topic(world, 1, "General", 1, T0 - 90_000, 0, 5002),
+        ],
+        messages,
+        chats: chats(),
+        users: users(),
+        pts: 1,
+    };
+    answer(tl::enums::messages::ForumTopics::Topics(found))
 }
 
 /// A comment went in the discussion group: the count of the post rises on the edit of it
@@ -1481,43 +1546,7 @@ impl World {
         if let Some(request) = asked::<f::messages::GetForumTopics>(body) {
             let forum = input_who(&request.peer);
             self.log(&format!("GetForumTopics {}", forum.text()));
-            let topic = |id: i32, title: &str, top: i32, unread: i32, icon: i64| {
-                let mut topic: tl::types::ForumTopic = blank(&[
-                    &put(1u32),
-                    &put(id),
-                    &put(T0 - 80_000),
-                    &put(forum.peer()),
-                    &put(title.to_owned()),
-                    &put(3i32),
-                    &put(icon),
-                    &put(top),
-                    &put(0i32),
-                    &put(0i32),
-                    &put(unread),
-                    &put(0i32),
-                    &put(0i32),
-                    &put(0i32),
-                    &put(Who::User(TOBIN).peer()),
-                    &put(settings(None)),
-                ]);
-                topic.my = false;
-                tl::enums::ForumTopic::Topic(topic)
-            };
-            let newest = self.messages.get(&key(forum, Some(TOOLS))).and_then(|held| held.values().next_back().cloned());
-            let top = match &newest {
-                Some(tl::enums::Message::Message(message)) => message.id,
-                _ => 41,
-            };
-            let found = tl::types::messages::ForumTopics {
-                order_by_create_date: false,
-                count: 2,
-                topics: vec![topic(TOOLS, "Tools", top, 1, 5001), topic(1, "General", 1, 0, 5002)],
-                messages: newest.into_iter().collect(),
-                chats: chats(),
-                users: users(),
-                pts: 1,
-            };
-            return answer(tl::enums::messages::ForumTopics::Topics(found));
+            return topics_answer(self, forum);
         }
         if let Some(request) = asked::<f::messages::GetSponsoredMessages>(body) {
             self.log(&format!("GetSponsoredMessages {}", input_who(&request.peer).text()));
@@ -1656,7 +1685,13 @@ impl World {
             return answer(true);
         }
         if let Some(request) = asked::<f::messages::ReadDiscussion>(body) {
-            self.log(&format!("ReadDiscussion {} {}", key(input_who(&request.peer), Some(request.msg_id)), request.read_max_id));
+            let forum = input_who(&request.peer);
+            self.log(&format!("ReadDiscussion {} {}", key(forum, Some(request.msg_id)), request.read_max_id));
+            // The read reaches this fake, as Telegram's would: the topic's list says it read
+            // from here on.
+            if request.read_max_id > 0 {
+                self.topic_reads.insert((forum, request.msg_id), request.read_max_id);
+            }
             return answer(true);
         }
         if let Some(request) = asked::<f::messages::SetTyping>(body) {

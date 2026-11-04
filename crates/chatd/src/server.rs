@@ -860,6 +860,24 @@ impl Chat {
         }
     }
 
+    /// The topics of a forum, or, asked as the shell asks when it opens one, the topic that
+    /// open lands on. The landing's topics are asked of the network once first, and the
+    /// answer waits for them, so it is named on what Telegram says now and not on what an
+    /// earlier open left in the cache.
+    fn topics(&self, forum: Key, offset: u32, limit: u32, landing: bool) -> Response {
+        if !self.shows(&forum.account()) {
+            return Response::Conversations { conversations: Vec::new(), total: 0, counts: InboxCounts::default() };
+        }
+        if landing && offset == 0 {
+            let _ = self.ask(&forum.account(), |reply| Command::OpenForum { conversation_id: forum.id.clone(), reply });
+        }
+        let read = if landing { self.hub.store().landing(&forum) } else { self.hub.store().topics(&forum, offset, limit.min(PAGE_LIMIT)) };
+        match read {
+            Ok((conversations, total)) => Response::Conversations { conversations: self.rows(conversations), total, counts: InboxCounts::default() },
+            Err(err) => internal(err),
+        }
+    }
+
     fn messages(&self, conversation: Key, page: Page, limit: u32) -> Response {
         if !self.shows(&conversation.account()) {
             return Response::Messages {
@@ -1830,17 +1848,7 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
-            Request::Topics { forum, offset, limit } => {
-                if !self.shows(&forum.account()) {
-                    return Response::Conversations { conversations: Vec::new(), total: 0, counts: InboxCounts::default() };
-                }
-                match self.hub.store().topics(&forum, offset, limit.min(PAGE_LIMIT)) {
-                    Ok((conversations, total)) => {
-                        Response::Conversations { conversations: self.rows(conversations), total, counts: InboxCounts::default() }
-                    }
-                    Err(err) => internal(err),
-                }
-            }
+            Request::Topics { forum, offset, limit, landing } => self.topics(forum, offset, limit, landing),
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),
             Request::Catalog { account, kind, space, query, cursor } => self.catalog(account, kind, space, query, cursor),

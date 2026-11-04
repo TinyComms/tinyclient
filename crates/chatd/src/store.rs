@@ -1464,6 +1464,21 @@ impl Store {
         Ok((rows, total))
     }
 
+    /// The topic of a forum that opening it lands on, as a page of one: the newest unread
+    /// (a mention counts as unread here, as everywhere), else General, Telegram's own first
+    /// topic (`polish/03` §2). Empty until a read of the topics has left rows.
+    pub fn landing(&self, forum: &Key) -> rusqlite::Result<(Vec<Conversation>, u32)> {
+        let belongs = "c.network = ?1 AND c.account = ?2 AND c.parent = ?3 AND NOT c.hidden";
+        let sql = |where_more: &str| format!("{CONVERSATION} WHERE {belongs} {where_more} LIMIT 1");
+        let key = params![word(&forum.network), forum.account, forum.id];
+        let unread = self.db.query_row(&sql("AND (c.unread > 0 OR c.mentions > 0) ORDER BY c.updated DESC, c.id"), key, conversation_from).optional()?;
+        let topic = match unread {
+            Some(topic) => Some(topic),
+            None => self.db.query_row(&sql("AND c.root = '1'"), key, conversation_from).optional()?,
+        };
+        Ok((topic.iter().cloned().collect(), u32::from(topic.is_some())))
+    }
+
     /// The followed threads of a Space, newest first, and how many there are.
     pub fn threads(&self, space: &Key, offset: u32, limit: u32) -> rusqlite::Result<(Vec<Conversation>, u32)> {
         let belongs = "c.network = ?1 AND c.account = ?2 AND c.kind = 'thread' AND c.followed

@@ -504,6 +504,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
+        Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         other => other.unsupported(ctx),
     }
@@ -525,6 +526,12 @@ fn serve(account: &Arc<Account>, command: Command) {
             }
         }
         Command::Watch(watching) => sync::on_screen(account, &watching),
+        // Opening a forum lists its topics, once per open; the landing the shell then reads
+        // from the store is named by what this read left.
+        Command::OpenForum { conversation_id, reply } => {
+            sync::backfill(account, &conversation_id);
+            let _ = reply.send(Ok(()));
+        }
         Command::Wanted(ids) => drop(account.files.asked(&ids)),
         Command::Previews(ids) => sync::previews(account, &ids),
         Command::MarkRead { conversation_id, message_id } => mark_read(account, &conversation_id, &message_id),
