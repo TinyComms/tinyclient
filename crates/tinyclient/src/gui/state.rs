@@ -321,6 +321,7 @@ impl Shell {
         shell.layout_state.details_channels = prefs.details_channels;
         shell.layout_state.details_directs = prefs.details_directs;
         shell.sidebar_state.pins = prefs.pins;
+        shell.sidebar_state.remember_telegram_folder(prefs.telegram_folder.clone());
         shell.tiny_state.set_members_open(prefs.tiny_members);
         app::prefs::set_me(prefs.me.clone());
         shell.saved_prefs.replace(app::prefs::write(&shell.current_prefs()));

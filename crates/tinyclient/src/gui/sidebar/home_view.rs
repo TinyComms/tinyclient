@@ -272,6 +272,9 @@ impl Shell {
             Item::Chat(c) => {
                 let look = match network {
                     Some(Network::Discord) if self.sidebar_state.drill.is_none() => Look { status: true, ..Look::default() },
+                    // The Telegram home says the network's own pins on its rows; a list drilled
+                    // into (the archive, a forum's topics) is drawn plain.
+                    Some(Network::Telegram) if self.sidebar_state.drill.is_none() => Look { time: true, context: false, pin: true, ..Look::default() },
                     _ => Look { time: true, context: false, ..Look::default() },
                 };
                 self.chat_row("home", &c, look, focused, cx).into_any_element()

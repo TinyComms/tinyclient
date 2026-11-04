@@ -156,6 +156,14 @@ fn list_state(_cx: &mut Context<Shell>) -> ListState {
 }
 
 impl State {
+    /// The Telegram folder chip last chosen, from the window's own memory: the home on show
+    /// and the one waiting in reserve both start there.
+    pub fn remember_telegram_folder(&mut self, folder: Option<String>) {
+        self.home.folder = folder.clone();
+        let saved = self.saved_homes.entry(Network::Telegram).or_insert_with(|| home::Home::for_network(Network::Telegram));
+        saved.folder = folder;
+    }
+
     pub fn new(cx: &mut Context<Shell>) -> State {
         #[cfg(feature = "gui-shot")]
         shot::schedule(cx);
