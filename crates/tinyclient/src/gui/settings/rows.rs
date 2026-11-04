@@ -89,7 +89,7 @@ pub const ROWS: &[Row] = &[
     row("V16", Voice, "Keys", "Toggle mute", &[], &["mute", "hotkey", "shortcut", "global"]),
     row("V17", Voice, "Keys", "Toggle deafen", &[], &["deafen", "hotkey", "shortcut", "global"]),
     row("V10", Voice, "Processing", "Echo cancellation", &[], &["echo", "aec", "speakers", "feedback"]),
-    row("V11", Voice, "Processing", "Noise suppression", &["Off", "Standard", "High", "Enhanced"], &["noise", "background", "fan", "keyboard", "denoise", "rnnoise"]),
+    row("V11", Voice, "Processing", "Noise suppression", &["Off", "Standard", "High", "Enhanced"], &["noise", "background", "fan", "keyboard", "denoise", "voice", "cry", "baby"]),
     row("V12", Voice, "Processing", "Automatic gain", &[], &["agc", "gain", "loudness", "quiet", "volume"]),
     row("S7", Voice, "Call sounds", "Someone joins, leaves or I'm moved", &[], &["sound", "chime", "ding", "join", "leave", "move", "cue"]),
     row("S8", Voice, "Call sounds", "I mute, unmute or deafen", &[], &["sound", "ding", "tick", "cue", "deafen"]),

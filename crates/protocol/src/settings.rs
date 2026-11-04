@@ -212,7 +212,7 @@ fn kind(key: &str) -> Option<Kind> {
         NOTIFY_ABOUT => Kind::Word(&ABOUT_CHOICES, "mentions"),
         SOUND => Kind::Word(&SOUND_CHOICES, "pebble"),
         ECHO_CANCELLATION | AUTO_GAIN => Kind::Switch(true),
-        NOISE_SUPPRESSION => Kind::Word(&NOISE_CHOICES, "standard"),
+        NOISE_SUPPRESSION => Kind::Word(&NOISE_CHOICES, "enhanced"),
         VOICE_QUALITY => Kind::Word(&QUALITY_CHOICES, "standard"),
         JOIN_MUTED | PUSH_TO_TALK | REQUIRE_CALL_E2EE => Kind::Switch(false),
         MUTED_TALK => Kind::Switch(true),
@@ -557,7 +557,7 @@ impl Values {
         }
     }
 
-    /// V11: off, standard (WebRTC), high (WebRTC strongest), or enhanced (RNNoise).
+    /// V11: off, standard (WebRTC), high (WebRTC strongest), or enhanced (voice isolation, the default).
     pub fn noise_mode(&self) -> crate::NoiseMode {
         crate::NoiseMode::parse(self.word(GLOBAL, NOISE_SUPPRESSION)).unwrap_or_default()
     }
@@ -783,6 +783,8 @@ mod tests {
         values.set(GLOBAL, NOISE_SUPPRESSION, Some("enhanced".into()));
         assert_eq!(values.noise_mode(), crate::NoiseMode::Enhanced);
         values.set(GLOBAL, NOISE_SUPPRESSION, Some("on".into()));
+        assert_eq!(values.noise_mode(), crate::NoiseMode::Enhanced);
+        values.set(GLOBAL, NOISE_SUPPRESSION, Some("standard".into()));
         assert_eq!(values.noise_mode(), crate::NoiseMode::Standard);
         assert_eq!(values.voice_quality(), crate::VoiceQuality::Standard);
         values.set(GLOBAL, VOICE_QUALITY, Some("high".into()));

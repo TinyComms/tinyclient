@@ -46,8 +46,10 @@ symphonia = { version = "0.5", default-features = false, features = ["ogg", "mkv
 # (`webrtc-audio-processing`) needs meson and ninja to build, and none of the other pure-Rust
 # echo cancellers is WebRTC's. Pinned: a port moves fast, and a new version must be heard first.
 sonora = "=0.2.0"
-# Neural noise suppression (RNNoise), pure Rust. Used for the Enhanced noise mode.
-nnnoiseless = "0.5.2"
+# Enhanced noise: voice isolation (a DeepFilterNet3-style model) with the weights compiled in,
+# so nothing is downloaded. It turns down other voices and cries, which WebRTC's suppressor
+# keeps. Apache-2.0. The `cli` feature pulls a wav tool this process does not use.
+hush-vani = { version = "0.1.2", default-features = false }
 # The watched picture is a JPEG on disk. The jpeg encoder is pure Rust.
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 

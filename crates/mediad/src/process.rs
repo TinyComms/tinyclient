@@ -1,7 +1,8 @@
 //! The microphone's processing (V10 to V12): echo cancellation, noise suppression and automatic
 //! gain, through `sonora`, WebRTC's audio processing module ported to Rust (AEC3, its noise
-//! suppressor and AGC2, with the high-pass filter in front). Enhanced noise uses RNNoise
-//! (`nnnoiseless`) after AEC instead of sonora's Wiener NS.
+//! suppressor and AGC2, with the high-pass filter in front). Enhanced noise, the default,
+//! isolates the near voice with `hush-vani` (weights compiled in) after echo cancellation and
+//! before automatic gain, so another voice or a cry is turned down instead of being raised.
 //!
 //! The echo canceller needs what the speaker plays: the call's mix goes in as the far end
 //! ([`Processor::render`]) every tick, cues included, and each microphone frame comes out with
@@ -12,28 +13,55 @@
 //! Until chatd says what the user chose (`MediaRequest::Processing`), nothing is processed, and
 //! with everything off the processor is not even built: the microphone is as captured.
 
+use std::sync::{Arc, OnceLock};
+
 use crate::{CHANNELS, FRAME, FRAME_SAMPLES, RATE};
-use nnnoiseless::DenoiseState;
+use hush_vani::{Hush, HushStream};
 use protocol::{AudioProcessing, NoiseMode};
 use sonora::config::{
-    AdaptiveDigital, EchoCanceller, GainController2, HighPassFilter, NoiseSuppression, NoiseSuppressionLevel,
+    AdaptiveDigital, EchoCanceller, GainController2, HighPassFilter, NoiseSuppression,
+    NoiseSuppressionLevel,
 };
 use sonora::{Config, StreamConfig};
 
-/// Samples in one 10 ms block, the module's unit — also RNNoise's frame.
+/// Samples in one 10 ms block, the module's unit.
 const BLOCK: usize = FRAME / 2;
+/// 10 ms at 16 kHz, one voice-isolation frame. A 20 ms mic frame is two of these.
+const LOW: usize = 160;
+/// Low-pass before throwing away two of every three samples. An odd length keeps the delay
+/// an integer number of samples.
+const TAPS: usize = 47;
 
 pub struct Processor {
-    apm: Option<sonora::AudioProcessing>,
-    /// RNNoise, only when Enhanced is chosen.
-    denoise: Option<Box<DenoiseState<'static>>>,
+    /// High-pass, echo cancellation, and WebRTC noise suppression when that is the mode.
+    /// Automatic gain is not here for Enhanced: it runs after voice isolation.
+    front: Option<sonora::AudioProcessing>,
+    /// Automatic gain after voice isolation, so a cry is not turned up first.
+    gain: Option<sonora::AudioProcessing>,
+    hush: Option<HushStream>,
+    band: Band,
     /// What is in force, so a repeat of the same choice changes nothing.
     chosen: Option<AudioProcessing>,
+}
+
+/// The 48 kHz ⟷ 16 kHz bridge for voice isolation, and the last samples it still needs.
+struct Band {
+    hist: [f32; TAPS - 1],
+    prev: f32,
 }
 
 impl Default for Processor {
     fn default() -> Processor {
         Processor::new()
+    }
+}
+
+impl Default for Band {
+    fn default() -> Band {
+        Band {
+            hist: [0.; TAPS - 1],
+            prev: 0.,
+        }
     }
 }
 
@@ -43,34 +71,96 @@ fn ns_level(mode: NoiseMode) -> Option<NoiseSuppression> {
         NoiseMode::Standard => NoiseSuppressionLevel::High,
         NoiseMode::High => NoiseSuppressionLevel::VeryHigh,
     };
-    Some(NoiseSuppression { level, ..NoiseSuppression::default() })
+    Some(NoiseSuppression {
+        level,
+        ..NoiseSuppression::default()
+    })
 }
 
-/// The module's settings for the user's echo / noise / gain choices.
-fn config(chosen: AudioProcessing) -> Config {
+fn agc() -> GainController2 {
+    // Adaptive digital gain only: it brings a quiet microphone up to speech level and never
+    // touches the system's input volume.
+    GainController2 {
+        adaptive_digital: Some(AdaptiveDigital::default()),
+        ..GainController2::default()
+    }
+}
+
+/// WebRTC settings for everything except Enhanced's automatic gain, which is a second pass.
+fn front_config(chosen: AudioProcessing, isolated: bool) -> Config {
+    let enhanced = chosen.noise == NoiseMode::Enhanced && isolated;
     Config {
         high_pass_filter: Some(HighPassFilter::default()),
         echo_canceller: chosen.echo_cancellation.then(EchoCanceller::default),
-        noise_suppression: ns_level(chosen.noise),
-        // Adaptive digital gain only: it brings a quiet microphone up to speech level and never
-        // touches the system's input volume.
-        gain_controller2: chosen.auto_gain.then(|| GainController2 {
-            adaptive_digital: Some(AdaptiveDigital::default()),
-            ..GainController2::default()
-        }),
+        noise_suppression: if enhanced {
+            None
+        } else {
+            // If voice isolation did not start, Enhanced falls back to the strongest WebRTC filter.
+            let mode = if chosen.noise == NoiseMode::Enhanced { NoiseMode::High } else { chosen.noise };
+            ns_level(mode)
+        },
+        gain_controller2: (!enhanced && chosen.auto_gain).then(agc),
         ..Config::default()
     }
 }
 
-fn wants_apm(chosen: AudioProcessing) -> bool {
-    // Enhanced still wants the high-pass (and optional AEC/AGC) before RNNoise.
+fn gain_config() -> Config {
+    Config {
+        gain_controller2: Some(agc()),
+        ..Config::default()
+    }
+}
+
+fn wants_front(chosen: AudioProcessing) -> bool {
     chosen.echo_cancellation || chosen.auto_gain || chosen.noise != NoiseMode::Off
+}
+
+fn apm(config: Config) -> sonora::AudioProcessing {
+    let stream = StreamConfig::new(RATE, 1);
+    sonora::AudioProcessing::builder()
+        .config(config)
+        .capture_config(stream)
+        .render_config(stream)
+        .build()
+}
+
+/// Hamming-windowed low-pass at 7.2 kHz, unity gain at dc, so decimation by 3 does not alias.
+fn lowpass() -> &'static [f32; TAPS] {
+    static COEFFS: OnceLock<[f32; TAPS]> = OnceLock::new();
+    COEFFS.get_or_init(|| {
+        const FC: f32 = 7200. / 48000.;
+        let mid = (TAPS / 2) as f32;
+        let mut coeff = [0f32; TAPS];
+        let mut sum = 0f32;
+        for (i, tap) in coeff.iter_mut().enumerate() {
+            let n = i as f32 - mid;
+            let window =
+                0.54 - 0.46 * (std::f32::consts::TAU * i as f32 / (TAPS as f32 - 1.)).cos();
+            let sinc = if n == 0. {
+                2. * FC
+            } else {
+                (n * FC * std::f32::consts::TAU).sin() / (n * std::f32::consts::PI)
+            };
+            *tap = sinc * window;
+            sum += *tap;
+        }
+        for tap in &mut coeff {
+            *tap /= sum;
+        }
+        coeff
+    })
 }
 
 impl Processor {
     /// Off: frames pass untouched.
     pub fn new() -> Processor {
-        Processor { apm: None, denoise: None, chosen: None }
+        Processor {
+            front: None,
+            gain: None,
+            hush: None,
+            band: Band::default(),
+            chosen: None,
+        }
     }
 
     /// Takes the user's choice. All off, or `None`, turns processing off.
@@ -79,25 +169,35 @@ impl Processor {
             return;
         }
         self.chosen = chosen;
+        self.band = Band::default();
         let Some(chosen) = chosen else {
-            self.apm = None;
-            self.denoise = None;
+            self.front = None;
+            self.gain = None;
+            self.hush = None;
             return;
         };
-        self.apm = wants_apm(chosen).then(|| {
-            let stream = StreamConfig::new(RATE, 1);
-            sonora::AudioProcessing::builder().config(config(chosen)).capture_config(stream).render_config(stream).build()
+        let hush = (chosen.noise == NoiseMode::Enhanced).then(|| match Hush::new() {
+            Ok(model) => Some(HushStream::new(Arc::new(model))),
+            Err(err) => {
+                tracing::warn!("voice isolation did not start: {err}");
+                None
+            }
         });
-        self.denoise = (chosen.noise == NoiseMode::Enhanced).then(DenoiseState::new);
+        let isolated = hush.as_ref().is_some_and(Option::is_some);
+        self.hush = hush.flatten();
+        self.front = wants_front(chosen).then(|| apm(front_config(chosen, isolated)));
+        // Gain after isolation only. Other modes keep it inside `front`, where WebRTC runs it
+        // after its own suppressor.
+        self.gain = (isolated && chosen.auto_gain).then(|| apm(gain_config()));
     }
 
     pub fn active(&self) -> bool {
-        self.apm.is_some() || self.denoise.is_some()
+        self.front.is_some() || self.hush.is_some() || self.gain.is_some()
     }
 
     /// What the speaker is about to play: the echo canceller's reference.
     pub fn render(&mut self, frame: &[i16; FRAME_SAMPLES]) {
-        let Some(apm) = &mut self.apm else {
+        let Some(apm) = &mut self.front else {
             return;
         };
         if self.chosen.is_some_and(|c| !c.echo_cancellation) {
@@ -113,33 +213,35 @@ impl Processor {
 
     /// One microphone frame, processed in place.
     pub fn capture(&mut self, frame: &mut [i16; FRAME_SAMPLES]) {
-        if self.apm.is_none() && self.denoise.is_none() {
+        if !self.active() {
             return;
         }
         let mono = fold(frame);
         let mut done = [0f32; FRAME];
-        if let Some(apm) = &mut self.apm {
-            for (block, out) in mono.as_chunks::<BLOCK>().0.iter().zip(done.as_chunks_mut::<BLOCK>().0) {
-                if apm.process_capture_f32(&[&block[..]], &mut [&mut out[..]]).is_err() {
-                    out.copy_from_slice(block);
-                }
-            }
+        if let Some(apm) = &mut self.front {
+            run_blocks(apm, &mono, &mut done);
         } else {
             done = mono;
         }
-        if let Some(denoise) = &mut self.denoise {
-            // RNNoise wants ±32768-scale floats in 10 ms blocks.
-            let mut scaled = [0f32; FRAME];
-            for (out, sample) in scaled.iter_mut().zip(done) {
-                *out = sample * 32768.;
+        if self.hush.is_some() {
+            let mut low = [0f32; LOW * 2];
+            let mut clean = [0f32; LOW * 2];
+            self.band.down(&done, &mut low);
+            if let Some(hush) = &mut self.hush {
+                for (input, out) in low
+                    .as_chunks::<LOW>()
+                    .0
+                    .iter()
+                    .zip(clean.as_chunks_mut::<LOW>().0)
+                {
+                    hush.process_frame(input, out);
+                }
             }
-            let mut cleaned = [0f32; FRAME];
-            for (block_in, block_out) in scaled.as_chunks::<BLOCK>().0.iter().zip(cleaned.as_chunks_mut::<BLOCK>().0) {
-                let _ = denoise.process_frame(block_out, block_in);
-            }
-            for (out, sample) in done.iter_mut().zip(cleaned) {
-                *out = sample / 32768.;
-            }
+            self.band.up(&clean, &mut done);
+        }
+        if let Some(apm) = &mut self.gain {
+            let source = done;
+            run_blocks(apm, &source, &mut done);
         }
         for (pair, sample) in frame.as_chunks_mut::<CHANNELS>().0.iter_mut().zip(done) {
             pair.fill((sample.clamp(-1., 1.) * 32767.) as i16);
@@ -148,7 +250,61 @@ impl Processor {
 
     /// How much echo the canceller is taking away now, in dB, once it knows.
     pub fn echo_reduction_db(&self) -> Option<f64> {
-        self.apm.as_ref()?.statistics().echo_return_loss_enhancement
+        self.front
+            .as_ref()?
+            .statistics()
+            .echo_return_loss_enhancement
+    }
+}
+
+fn run_blocks(apm: &mut sonora::AudioProcessing, input: &[f32; FRAME], output: &mut [f32; FRAME]) {
+    for (block, out) in input
+        .as_chunks::<BLOCK>()
+        .0
+        .iter()
+        .zip(output.as_chunks_mut::<BLOCK>().0)
+    {
+        if apm
+            .process_capture_f32(&[&block[..]], &mut [&mut out[..]])
+            .is_err()
+        {
+            out.copy_from_slice(block);
+        }
+    }
+}
+
+impl Band {
+    /// 48 kHz mono in, 16 kHz mono out, three samples to one.
+    fn down(&mut self, input: &[f32; FRAME], out: &mut [f32; LOW * 2]) {
+        let coeff = lowpass();
+        let mut window = [0f32; FRAME + TAPS];
+        let keep = TAPS - 1;
+        window[..keep].copy_from_slice(&self.hist);
+        window[keep..keep + FRAME].copy_from_slice(input);
+        for (i, sample) in out.iter_mut().enumerate() {
+            let at = keep + i * 3;
+            let mut acc = 0f32;
+            for (k, tap) in coeff.iter().enumerate() {
+                acc += tap * window[at - k];
+            }
+            *sample = acc;
+        }
+        let end = keep + FRAME;
+        self.hist.copy_from_slice(&window[end - keep..end]);
+    }
+
+    /// 16 kHz mono in, 48 kHz mono out. Linear, one sample late, which is under a tenth of a
+    /// millisecond on top of the model's own 10 ms.
+    fn up(&mut self, input: &[f32; LOW * 2], out: &mut [f32; FRAME]) {
+        let mut last = self.prev;
+        for (i, &sample) in input.iter().enumerate() {
+            let at = i * 3;
+            out[at] = last;
+            out[at + 1] = last + (sample - last) / 3.;
+            out[at + 2] = last + (sample - last) * 2. / 3.;
+            last = sample;
+        }
+        self.prev = last;
     }
 }
 
@@ -181,7 +337,8 @@ mod tests {
     use super::*;
 
     fn rms(samples: &[i16]) -> f64 {
-        (samples.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / samples.len().max(1) as f64).sqrt()
+        (samples.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / samples.len().max(1) as f64)
+            .sqrt()
     }
 
     fn db(ratio: f64) -> f64 {
@@ -199,7 +356,10 @@ mod tests {
                 let noise = (seed >> 8) as f32 / (1 << 24) as f32 * 2. - 1.;
                 low = 0.7 * low + 0.3 * noise;
                 let turn = if (n / 24_000) % 2 == 0 { 1. } else { 0.3 };
-                let syllables = (n as f32 / RATE as f32 * 3. * std::f32::consts::TAU).sin().abs() + 0.2;
+                let syllables = (n as f32 / RATE as f32 * 3. * std::f32::consts::TAU)
+                    .sin()
+                    .abs()
+                    + 0.2;
                 (low * 0.3 * turn * syllables * 32767.) as i16
             })
             .collect()
@@ -214,7 +374,11 @@ mod tests {
     }
 
     fn on(echo_cancellation: bool, noise: NoiseMode, auto_gain: bool) -> Option<AudioProcessing> {
-        Some(AudioProcessing { echo_cancellation, auto_gain, noise })
+        Some(AudioProcessing {
+            echo_cancellation,
+            auto_gain,
+            noise,
+        })
     }
 
     /// The speaker's sound reaches the microphone 60 ms later at 40 %: what was played comes
@@ -229,7 +393,15 @@ mod tests {
         let (mut heard, mut sent) = (Vec::new(), Vec::new());
         for (n, played) in far.as_chunks::<FRAME>().0.iter().enumerate() {
             processor.render(&stereo(played));
-            let echo: Vec<i16> = (n * FRAME..(n + 1) * FRAME).map(|i| if i >= delay { (f64::from(far[i - delay]) * 0.4) as i16 } else { 0 }).collect();
+            let echo: Vec<i16> = (n * FRAME..(n + 1) * FRAME)
+                .map(|i| {
+                    if i >= delay {
+                        (f64::from(far[i - delay]) * 0.4) as i16
+                    } else {
+                        0
+                    }
+                })
+                .collect();
             let mut frame = stereo(&echo);
             processor.capture(&mut frame);
             if n * FRAME >= RATE as usize * 6 {
@@ -239,7 +411,11 @@ mod tests {
         }
         let reduced = db(rms(&heard) / rms(&sent).max(1.));
         assert!(reduced > 20., "the echo is only {reduced:.1} dB quieter");
-        assert!(processor.echo_reduction_db().is_some_and(|db| db > 10.), "{:?}", processor.echo_reduction_db());
+        assert!(
+            processor.echo_reduction_db().is_some_and(|db| db > 10.),
+            "{:?}",
+            processor.echo_reduction_db()
+        );
     }
 
     /// With nothing played, speech goes through the canceller untouched in level.
@@ -288,7 +464,8 @@ mod tests {
         assert!(reduced > 6., "the hiss is only {reduced:.1} dB quieter");
     }
 
-    /// Enhanced (RNNoise) also brings steady hiss down.
+    /// Enhanced (voice isolation) brings steady hiss down hard. The 16 kHz bridge alone is only
+    /// a few dB on white noise, so the bar sits well above that.
     #[test]
     fn enhanced_noise_brings_steady_hiss_down() {
         let mut seed: u32 = 7;
@@ -302,7 +479,7 @@ mod tests {
         let mut processor = Processor::new();
         processor.set(on(false, NoiseMode::Enhanced, false));
         let (mut heard, mut sent) = (Vec::new(), Vec::new());
-        // RNNoise fades in; skip the first second so the measurement is steady state.
+        // The model settles over the first second; measure after that.
         for (n, noise) in hiss.as_chunks::<FRAME>().0.iter().enumerate() {
             let mut frame = stereo(noise);
             processor.capture(&mut frame);
@@ -312,7 +489,40 @@ mod tests {
             }
         }
         let reduced = db(rms(&heard) / rms(&sent).max(1.));
-        assert!(reduced > 3., "enhanced hiss is only {reduced:.1} dB quieter");
+        assert!(
+            reduced > 20.,
+            "enhanced hiss is only {reduced:.1} dB quieter"
+        );
+    }
+
+    /// A low tone survives the 48 kHz to 16 kHz bridge and back at nearly the same level.
+    #[test]
+    fn the_rate_bridge_keeps_a_low_tone() {
+        let mut band = Band::default();
+        let mut phase = 0f32;
+        let (mut heard, mut sent) = (0f64, 0f64);
+        let mut count = 0f64;
+        for n in 0..100 {
+            let mut input = [0f32; FRAME];
+            for sample in &mut input {
+                phase += 200. / RATE as f32;
+                *sample = (phase * std::f32::consts::TAU).sin() * 0.4;
+            }
+            let mut low = [0f32; LOW * 2];
+            let mut out = [0f32; FRAME];
+            band.down(&input, &mut low);
+            band.up(&low, &mut out);
+            if n > 10 {
+                heard += input.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>();
+                sent += out.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>();
+                count += input.len() as f64;
+            }
+        }
+        let reduced = db((heard / count).sqrt() / (sent / count).sqrt().max(1e-9));
+        assert!(
+            reduced.abs() < 3.,
+            "the bridge moved a tone by {reduced:.1} dB"
+        );
     }
 
     /// Automatic gain brings a quiet voice up.

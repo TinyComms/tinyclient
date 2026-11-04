@@ -413,7 +413,7 @@ impl SettingsWindow {
                     self.group(&input, None, window, cx).child(caption(mode)),
                     self.group(&["V13", "V15", "V16", "V17"], Some("Keys"), window, cx).child(caption(keys_caption())),
                     self.group(&["V10", "V11", "V12"], Some("Processing"), window, cx)
-                        .child(caption("Echo cancellation takes out what your speakers play. Noise: Standard and High use WebRTC; Enhanced uses RNNoise for keyboards and steady noise.")),
+                        .child(caption("Echo cancellation takes out what your speakers play. Noise, on Enhanced, turns down other voices and cries as well as fans. Standard and High are lighter filters and leave other voices in.")),
                     self.group(&["S7", "S8", "S9", "S10"], Some("Call sounds"), window, cx)
                         .child(caption("Call sounds play on your call speaker, quieter than voices. Voice volume is in Audio & video.")),
                 ]
@@ -667,14 +667,14 @@ impl SettingsWindow {
                 self.switch_row(id, on, true, second.map(str::to_owned), move |this, on, cx| this.set_switch(id, key, on, true, cx), cx)
             }
             "V11" => {
-                let at = NOISE_CHOICES.iter().position(|w| *w == values.word(GLOBAL, NOISE_SUPPRESSION)).unwrap_or(1);
-                let second = Some(match NOISE_CHOICES.get(at).copied().unwrap_or("standard") {
-                    "off" => "Fans, typing and traffic go through as they are.".to_owned(),
-                    "enhanced" => "RNNoise: stronger on keyboards and steady noise.".to_owned(),
-                    "high" => "WebRTC at its strongest.".to_owned(),
-                    _ => "WebRTC noise suppression for everyday background noise.".to_owned(),
+                let at = NOISE_CHOICES.iter().position(|w| *w == values.word(GLOBAL, NOISE_SUPPRESSION)).unwrap_or(3);
+                let second = Some(match NOISE_CHOICES.get(at).copied().unwrap_or("enhanced") {
+                    "off" => "Fans, typing, traffic and other voices go through as they are.".to_owned(),
+                    "enhanced" => "Turns down other voices and cries, and steady noise. Your voice stays.".to_owned(),
+                    "high" => "A strong filter for fans and steady noise. Other voices still come through.".to_owned(),
+                    _ => "A lighter filter for fans and steady noise. Other voices still come through.".to_owned(),
                 });
-                self.menu_choice_row(id, &["Off", "Standard", "High", "Enhanced"], at, 1, second, None, cx)
+                self.menu_choice_row(id, &["Off", "Standard", "High", "Enhanced"], at, 3, second, None, cx)
             }
             "V21" => {
                 let at = QUALITY_CHOICES.iter().position(|w| *w == values.word(GLOBAL, VOICE_QUALITY)).unwrap_or(1);
@@ -1011,7 +1011,8 @@ impl SettingsWindow {
             "V8" => self.set_switch(id, PUSH_TO_TALK, ix == 1, false, cx),
             "V11" => {
                 let word = NOISE_CHOICES[ix.min(NOISE_CHOICES.len() - 1)];
-                let stored = (word != "standard").then(|| word.to_owned());
+                let default = Values::default().word(GLOBAL, NOISE_SUPPRESSION);
+                let stored = (word != default).then(|| word.to_owned());
                 self.set(id, GLOBAL.into(), NOISE_SUPPRESSION, stored, cx);
             }
             "V21" => {

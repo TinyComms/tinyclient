@@ -105,7 +105,13 @@ impl Shell {
     /// Everything that is not in the bar.
     fn call_phone_more(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
         let values = crate::gui::app::prefs::values();
-        let noise_on = values.noise_mode() != protocol::NoiseMode::Off;
+        let noise = values.noise_mode();
+        let noise_on = noise != protocol::NoiseMode::Off;
+        let noise_words = match noise {
+            protocol::NoiseMode::Off => "Off. Other voices and room noise come through.",
+            protocol::NoiseMode::Enhanced => "On. Other voices and cries are turned down.",
+            _ => "On. Steady noise is turned down. Other voices still come through.",
+        };
         let (push, echo) = (values.on(PUSH_TO_TALK), values.on(ECHO_CANCELLATION));
         let group = subject.kind != ConversationKind::Direct && in_call(call);
         let route = hooks::route(if sending(call, Content::Camera) { hooks::Route::Speaker } else { hooks::Route::Earpiece });
@@ -135,9 +141,9 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, _, cx| this.call_phone_switch(PUSH_TO_TALK, !push, cx))),
             )
             .child(
-                row("call-phone-more-noise", "icons/audio-lines.svg", "Noise suppression", Some("Quiets fans, traffic and keyboards".into()), Some(switch(noise_on)))
+                row("call-phone-more-noise", "icons/audio-lines.svg", "Noise suppression", Some(noise_words.into()), Some(switch(noise_on)))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        let value = Some(if noise_on { "off" } else { "standard" }.to_owned());
+                        let value = Some(if noise_on { "off" } else { "enhanced" }.to_owned());
                         let mut values = crate::gui::app::prefs::values();
                         values.set(GLOBAL, NOISE_SUPPRESSION, value.clone());
                         crate::gui::app::prefs::set_values(values);

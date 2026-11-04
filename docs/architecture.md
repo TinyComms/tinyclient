@@ -337,10 +337,11 @@ On a server whose capabilities include `e2ee_calls`, the client seals Opus and t
 picture. The one-byte NAL header stays clear. Discord's DAVE seals Opus only.
 
 The microphone goes through `process` (WebRTC's AEC3, noise suppression and AGC2, ported to Rust
-by `sonora`) when those switches are on. All three default on. The mix played is the echo
-canceller's reference, then the gate as `Input` and `Talk` say (`talk`); the mix plays each
-voice at its `Gain` and ducks everyone else 12 dB under a `Priority` holder who is speaking
-(`hear`); the encoder takes `Bitrate`.
+by `sonora`) when those switches are on. All three default on. Enhanced noise, the default,
+isolates the near voice with `hush-vani` after echo cancellation and before automatic gain.
+The mix played is the echo canceller's reference, then the gate as `Input` and `Talk` say
+(`talk`); the mix plays each voice at its `Gain` and ducks everyone else 12 dB under a
+`Priority` holder who is speaking (`hear`); the encoder takes `Bitrate`.
 
 The device menu: the shell sends `Media(Meter {on})` when it opens and closes. While on, mediad
 sends `Levels` and chatd passes our input level on as `Call.level`; `Call.inputs` and
