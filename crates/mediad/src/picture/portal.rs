@@ -8,7 +8,9 @@
 //!
 //! A thumbnail or `--screens` must not open the portal. Only a share that is actually starting
 //! does, and a cancel does not fall through to X11 (an XWayland root is black, and would look
-//! like a picture). No session bus fails at once, so a headless build does not sit on a dialog.
+//! like a picture). No session bus fails at once, and so does a seat with neither Wayland nor
+//! X11. A headless runner still has a session bus, and a portal call there waits on a dialog
+//! that nobody can answer.
 
 use super::pipewire_abi::*;
 use super::spa_pod::{self, Fixated};
@@ -341,6 +343,11 @@ fn open_camera_live() -> Result<Live, PortalError> {
 }
 
 fn bus() -> Result<Connection, PortalError> {
+    // No display, no dialog. Do not connect: the socket at `$XDG_RUNTIME_DIR/bus` is up on a
+    // headless runner, and the portal call then sits until the method timeout.
+    if super::session::current() == super::session::Kind::None {
+        return Err(failed(NO_BUS));
+    }
     zbus::blocking::connection::Builder::session()
         .map_err(|err| failed_err(NO_BUS, err))?
         .method_timeout(Duration::from_secs(10))
