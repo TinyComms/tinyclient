@@ -378,6 +378,36 @@ class PullRequestCertification(unittest.TestCase):
         h = Harness({}, body=pr_body("docs")).go("pr", "170")
         self.assertEqual((h.code, h.posted("e2e-proof")), (1, [("failure", None)]))
 
+    def test_unmapped_code_is_still_code_for_docs_and_scenario_rules(self):
+        for kind in ("docs", "feature", "fix"):
+            with self.subTest(kind=kind):
+                h = Harness({}, body=pr_body(kind), files=["e2e/lab/lab.py"]).go("pr", "170")
+                self.assertEqual((h.code, h.posted("e2e-proof")), (1, [("failure", None)]))
+
+    def test_copied_manifest_ids_are_rejected_before_any_recording(self):
+        manifests = {"one": scenario("smoke"), "two": scenario("smoke")}
+        h = Harness(manifests, body=pr_body("fix", ["one", "two"])).go("pr", "170")
+        self.assertEqual((h.code, h.runs, h.posted("e2e-proof")), (1, [], [("failure", None)]))
+
+    def test_release_rejects_a_manifest_id_that_does_not_match_its_directory(self):
+        h = Harness({"one": scenario("smoke")})
+        try:
+            h.go("release")
+        except Exception as error:
+            self.fail("invalid release scenario escaped instead of resolving proof: %s" % error)
+        self.assertEqual((h.code, h.runs, h.posted("e2e-release")), (1, [], [("failure", None)]))
+
+    def test_validation_exception_resolves_platform_and_release_statuses(self):
+        h = Harness({"smoke": scenario("smoke")})
+        with mock.patch.object(lab, "platform_job", side_effect=ValueError("truncated steps JSON")):
+            try:
+                h.go("release")
+            except Exception as error:
+                self.fail("validation exception left proof pending: %s" % error)
+        self.assertEqual((h.code, h.posted("e2e-release")[-1][0]), (1, "failure"))
+        for platform in lab.ALL:
+            self.assertEqual(h.posted("e2e-lab-release/" + platform)[-1][0], "failure")
+
     def test_no_type_fails(self):
         h = Harness({}, body=pr_body(None)).go("pr", "170")
         self.assertEqual((h.code, h.posted("e2e-proof")), (1, [("failure", None)]))
@@ -442,6 +472,23 @@ class PerScenarioEvidence(unittest.TestCase):
 
 
 class NoScenarios(unittest.TestCase):
+    def test_malformed_driver_steps_are_a_failed_run(self):
+        class Adapter:
+            @staticmethod
+            def run(ctx):
+                return lab.common.Outcome(passed=True, steps="broken.jsonl", seconds=5)
+
+        with tempfile.TemporaryDirectory() as out, \
+                mock.patch.object(lab, "repo_name", return_value="TinyComms/tinyclient"), \
+                mock.patch.object(lab, "load_adapter", return_value=Adapter), \
+                mock.patch.object(lab.common, "read_steps", side_effect=ValueError("truncated steps JSON")):
+            try:
+                result = lab.one_run("linux", "branch", SHA, SHA, scenario("smoke"), out, "src.tar", out, lambda line: None)
+            except Exception as error:
+                self.fail("malformed driver evidence escaped the run: %s" % error)
+        self.assertFalse(result["passed"])
+        self.assertTrue(result["problems"])
+
     def test_a_platform_given_no_scenario_fails(self):
         state, why, runs = lab.platform_job("linux", [], {"head": "h", "base": "b", "need_red": True}, {}, "out", print)
         self.assertEqual((state, runs), ("failure", []))

@@ -20,6 +20,7 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -86,6 +87,15 @@ def load_adapter(platform):
 
 
 def one_run(platform, label, app_sha, scenario_sha, scenario, scenario_dir, src_tar, out, log):
+    """Adapter, evidence validation and captioning all belong to the same failed-run boundary."""
+    try:
+        return _one_run(platform, label, app_sha, scenario_sha, scenario, scenario_dir, src_tar, out, log)
+    except Exception as error:
+        log("[%s %s] run failed: %s" % (platform, label, error))
+        return {"passed": False, "problems": ["the run failed: " + str(error)], "label": label, "app_sha": app_sha}
+
+
+def _one_run(platform, label, app_sha, scenario_sha, scenario, scenario_dir, src_tar, out, log):
     """An adapter's run, then the lab's own check of what it brought back. Never raises."""
     adapter = load_adapter(platform)
     # One folder per scenario: two scenarios on one platform must not overwrite each other's evidence.
@@ -214,16 +224,17 @@ def aggregate(required, results):
     return "success", ("recorded on %s" % ", ".join(required))[:140]
 
 
-def pre_verdict(cfg, kind, ids, full_plan):
+def pre_verdict(cfg, kind, ids, full_plan, code_changed=None):
     """What the type and the plan settle before any host is touched. None means: go and record."""
     if kind is None:
         return "failure", "the pull request has no single type"
-    if not full_plan:
-        return "success", "nothing to record (%s, no code changed)" % kind
-    if kind == "docs":
+    code_changed = bool(full_plan) if code_changed is None else code_changed
+    if kind == "docs" and code_changed:
         return "failure", "it is typed docs but changes code"
-    if kind in cfg["proof_types"] and not ids:
+    if kind in cfg["proof_types"] and code_changed and not ids:
         return "failure", "a %s needs an e2e scenario named under Proof" % kind
+    if not full_plan:
+        return "success", "no platform recording required (%s)" % kind
     return None
 
 
@@ -263,6 +274,20 @@ def publish(out, results, tag, repo, sha):
 
 
 def execute(plan, scenarios, shas, out, args, log, context_prefix, head_sha, repo):
+    """Infrastructure and worker failures resolve the requested statuses instead of leaving pending proof."""
+    try:
+        return _execute(plan, scenarios, shas, out, args, log, context_prefix, head_sha, repo)
+    except Exception as error:
+        description = ("lab execution failed: " + str(error))[:140]
+        log(description)
+        results = {platform: ("failure", description, []) for platform in plan}
+        if not args.no_post:
+            for platform in plan:
+                common.post_status(repo, head_sha, "%s/%s" % (context_prefix, platform), "failure", description, None)
+        return results, None
+
+
+def _execute(plan, scenarios, shas, out, args, log, context_prefix, head_sha, repo):
     """Runs the plan. With posting on, it has already published the evidence by the time it posts
     a per-platform result, and a result whose evidence is missing is posted as a failure."""
     os.makedirs(out, exist_ok=True)
@@ -350,6 +375,8 @@ def main():
         return 2
 
     def scenario_of(sha, sid):
+        if not re.fullmatch(pr_gate.ID, sid):
+            raise ValueError("invalid scenario directory ID: %s" % sid)
         # `try` is for building a scenario, so it reads the working tree; the rest read the commit.
         if args.mode == "try":
             sdir = os.path.join(out, "e2e", "scenarios", sid)
@@ -357,7 +384,10 @@ def main():
         else:
             sdir = extract_scenario(sha, sid, out)
         with open(os.path.join(sdir, "scenario.json"), encoding="utf-8") as f:
-            return json.load(f), sdir
+            scenario = json.load(f)
+        if scenario.get("id") != sid:
+            raise ValueError("scenario ID must match directory %s" % sid)
+        return scenario, sdir
 
     if args.mode == "try":
         sha = git("rev-parse", args.sha or "origin/main")
@@ -381,7 +411,13 @@ def main():
         narrowed = run_plan != full_plan
         args.tag = "main-" + sha[:7]
         # The suite is what is in the commit being certified, not what this checkout happens to hold.
-        scenarios = release_suite(scenario_ids_at(sha), lambda sid: scenario_of(sha, sid))
+        try:
+            scenarios = release_suite(scenario_ids_at(sha), lambda sid: scenario_of(sha, sid))
+        except Exception as error:
+            log("release scenarios could not be loaded: %s" % error)
+            if posting and not narrowed:
+                common.post_status(repo, sha, CFG["release_context"], "failure", "release scenarios could not be loaded", None)
+            return 1
         if not scenarios:
             log("no scenario in %s is marked release, so there is no release suite to record" % sha[:7])
             if posting and not narrowed:
@@ -402,7 +438,7 @@ def main():
     findings, full_plan, _, _, kind = pr_gate.evaluate(CFG, body, files, lambda sid: True, statuses)
     parsed = pr_gate.parse_body(body, CFG)
     ids = parsed["scenarios"] if kind in CFG["proof_types"] else ["smoke"] if kind in CFG["regression_types"] else []
-    early = pre_verdict(CFG, kind, ids, full_plan)
+    early = pre_verdict(CFG, kind, ids, full_plan, code_changed=bool(pr_gate.code_files(files, CFG)))
     if early:
         log("%s: %s" % early)
         if posting:
