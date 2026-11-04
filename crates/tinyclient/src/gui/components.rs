@@ -215,13 +215,18 @@ pub fn list_row(
         .rounded(px(theme::R_CONTROL))
         .flex()
         .items_center()
-        .when(!selected && !phone, |row| row.hover(|style| style.bg(theme::hover())))
         .when(selected, |row| row.bg(theme::selected()))
         // Rows abut, so the keyboard's ring is inset, over any fill.
         .when(focused, |row| row.shadow(theme::focus_ring_inset()));
     let row = div().id(id).w_full().h(px(height)).px(px(theme::INSET)).py(px(1.)).cursor_pointer();
+    // The face must be stateful: GPUI only keeps `hover_state` and notifies on enter/leave when
+    // the hovered element has an id. Hover on an anonymous child painted the fill only when
+    // something else happened to redraw, so the highlight lagged and skipped rows (R18).
+    let face = face.id("row-face");
     if phone && !selected {
-        row.child(face.id("row-face").active(|style| style.bg(theme::pressed())))
+        row.child(face.active(|style| style.bg(theme::pressed())))
+    } else if !selected {
+        row.child(face.hover(|style| style.bg(theme::hover())))
     } else {
         row.child(face)
     }
@@ -655,5 +660,57 @@ mod tests {
         assert_eq!(badge_look(&row(ConversationKind::Group, 7, 1, true)), Mention(1));
         assert_eq!(badge_look(&row(ConversationKind::Direct, 3, 1, true)), Mention(1));
         assert_eq!(badge_look(&row(ConversationKind::Channel, 0, 0, false)), None);
+    }
+}
+
+/// Hover fill must notify on enter/leave (`docs/product/polish/07-panes-selection.md` R18).
+/// GPUI only tracks that when the hovered element is stateful.
+#[cfg(all(test, feature = "gui-shot"))]
+mod list_row_hover_tests {
+    use super::*;
+    use gpui::{point, Context, Render, TestApp, Window};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct Rows {
+        paints: Rc<Cell<usize>>,
+    }
+
+    impl Render for Rows {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.paints.set(self.paints.get() + 1);
+            let height = theme::row_height(theme::ROW_TWO);
+            div()
+                .w(px(280.))
+                .h(px(160.))
+                .bg(theme::sidebar())
+                .child(list_row("a", height, false, false, div().child("Alpha")))
+                .child(list_row("b", height, false, false, div().child("Beta")))
+        }
+    }
+
+    #[test]
+    fn list_row_hover_notifies_so_the_fill_keeps_up_with_the_pointer() {
+        let paints = Rc::new(Cell::new(0));
+        let mut app = TestApp::new();
+        let mut window = app.open_window(|_, _| Rows { paints: paints.clone() });
+        window.draw();
+        let after_draw = paints.get();
+        assert!(after_draw >= 1);
+
+        let height = theme::row_height(theme::ROW_TWO);
+        let x = px(40.);
+        window.simulate_mouse_move(point(x, px(height / 2.)));
+        assert!(
+            paints.get() > after_draw,
+            "entering a list row must notify so the hover fill paints this frame"
+        );
+
+        let mid = paints.get();
+        window.simulate_mouse_move(point(x, px(height + height / 2.)));
+        assert!(
+            paints.get() > mid,
+            "moving to the next row must notify so the previous hover clears"
+        );
     }
 }
