@@ -273,8 +273,8 @@ impl Shell {
             return;
         };
         // "Switch anyway" was pressed: the owner has seen who would be locked out, so the server
-        // is not asked to refuse for it first.
-        let anyway = what == Answer::Form && self.tiny_state.setup.data.as_ref().and_then(|setup| self.tiny_setup_steps(setup)).is_some_and(|steps| steps.anyway);
+        // is not asked to refuse for it first. `Form::apply_for` decides it.
+        let steps = self.tiny_state.setup.data.as_ref().and_then(|setup| self.tiny_setup_steps(setup));
         let state = &mut self.tiny_state.setup;
         let Some(setup) = state.data.as_ref() else {
             return;
@@ -285,7 +285,7 @@ impl Shell {
         let apply: TinySetupApply = match what {
             Answer::Keep => tiny_setup::keep(),
             // Only this answer carries it: the form keeps what the owner picked, nothing more.
-            Answer::Form => TinySetupApply { allow_lockout: state.form.allow_lockout || anyway, ..state.form.apply(setup) },
+            Answer::Form => state.form.apply_for(setup, steps.as_ref()),
         };
         state.sending = true;
         state.touched();
@@ -467,7 +467,8 @@ impl Shell {
     }
 
     /// The button that sends the form, on the first-run screen and in the Privacy page's
-    /// unsaved-changes bar: "Switch anyway", and dangerous, when members would be locked out.
+    /// unsaved-changes bar: "Switch anyway", and dangerous, when the owner's own step is done and
+    /// members would be locked out.
     pub(super) fn tiny_setup_apply_button(&self, setup: &TinySetup) -> (SharedString, ButtonKind) {
         let state = &self.tiny_state.setup;
         if self.tiny_setup_steps(setup).is_some_and(|steps| steps.anyway) {
@@ -762,7 +763,8 @@ impl Shell {
 }
 
 /// The outline a server with passkeys and one sign-in provider would send, with an owner who has
-/// no passkey yet and three of its eight members who have none, for `--tiny-setup`.
+/// no passkey yet and three of its eight members who have none, for `--tiny-setup`. As the server
+/// sends it, the owner is not in `members` nor in its counts; their own state is `owner_has_*`.
 #[cfg(feature = "gui-shot")]
 const SHOT_OUTLINE: &str = r#"{
   "needed": true, "completed_at": null,
@@ -811,7 +813,7 @@ impl Shell {
     /// screen (`custom` with Privacy picked and the choices open, `refused` after a refusal,
     /// `checklist` with what switching to passkeys needs under the sign-in choice, `links` with
     /// two passkey links made over it), Server Settings › Privacy as an owner reads it (`change-anyway`
-    /// with Privacy picked, so Save reads "Switch anyway"), or as a
+    /// with Privacy picked by an owner who has a passkey, so Save reads "Switch anyway"), or as a
     /// member does, over a made-up outline. Nothing is asked of a server.
     pub(super) fn tiny_shot_setup(&mut self, how: &str, window: &mut gpui::Window, cx: &mut Context<Self>) {
         let owner = how != "member";
@@ -832,6 +834,11 @@ impl Shell {
         }
         let mut setup: TinySetup = serde_json::from_str(SHOT_OUTLINE).expect("the outline reads");
         setup.needed = first;
+        // Switch anyway is offered only once the owner's own step is done: here they have a
+        // passkey, and three members still have none.
+        if how == "change-anyway" {
+            setup.counts.owner_has_passkey = true;
+        }
         let state = &mut self.tiny_state.setup;
         state.form = Form::starting(&setup);
         state.changing = matches!(how, "change" | "change-anyway");

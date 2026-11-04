@@ -50,7 +50,7 @@ impl Shell {
         }
         // Passkey links are asked for from the first-run screen, so they are drawn over it.
         let over_setup = matches!(state.modal, Some(super::Modal::PasskeyLinks { .. }));
-        let modal = state.modal.clone().map(|modal| super::modals::layer(self.tiny_modal(&page, &modal, window, cx), cx));
+        let modal = state.modal.clone().map(|modal| super::modals::layer(self.tiny_modal(&page, &modal, window, cx), !modal.holds_secrets(), cx));
         let (under, over) = if over_setup { (None, modal) } else { (modal, None) };
         layer = layer.children(under);
         // Above everything else, until the owner answers or puts it off with Later or Escape.

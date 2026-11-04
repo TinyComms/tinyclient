@@ -113,6 +113,18 @@ pub(super) enum Modal {
     RemovePasskey { id: String, label: String },
 }
 
+impl Modal {
+    /// It shows something that is gone once it closes (recovery codes, passkey links made), so a
+    /// stray click on the scrim does not close it: only its own Done or Close does, or Escape.
+    pub(super) fn holds_secrets(&self) -> bool {
+        match self {
+            Modal::RecoveryCodes(_) => true,
+            Modal::PasskeyLinks { links, .. } => !links.is_empty(),
+            _ => false,
+        }
+    }
+}
+
 /// The invite being made.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct InviteDraft {

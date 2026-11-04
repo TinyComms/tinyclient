@@ -801,7 +801,7 @@ pub mod tiny_words {
     pub const OLDER: &str = "This server can't do that yet. Ask its owner to update tinyserver.";
     /// The server wants a sign-in from the last ten minutes before it changes a passkey or the
     /// recovery codes.
-    pub const SIGN_IN_AGAIN: &str = "Adding a passkey needs a sign-in from the last ten minutes. Sign out of this server, sign in again, then try once more.";
+    pub const SIGN_IN_AGAIN: &str = "That needs a sign-in from the last ten minutes. Sign out of this server, sign in again, then try once more.";
     /// The server keeps the last passkey while no recovery code is left.
     pub const LAST_PASSKEY: &str = "This is your last passkey and you have no recovery codes left, so it stays.";
 }

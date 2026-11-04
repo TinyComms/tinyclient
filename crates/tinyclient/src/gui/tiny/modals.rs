@@ -239,7 +239,7 @@ impl Shell {
                 let action = if self.tiny_state.passkeys.busy {
                     button_disabled("Remove passkey").h(px(32.)).into_any_element()
                 } else {
-                    button("tiny-modal-do", ButtonKind::Danger, "Remove passkey").h(px(32.)).on_click(cx.listener(move |this, _, _, cx| this.tiny_passkey_remove(id.clone(), cx))).into_any_element()
+                    button("tiny-signin-passkey-remove-do", ButtonKind::Danger, "Remove passkey").h(px(32.)).on_click(cx.listener(move |this, _, _, cx| this.tiny_passkey_remove(id.clone(), cx))).into_any_element()
                 };
                 modal(format!("Remove {label}?"))
                     .child(words(if last {
@@ -254,7 +254,7 @@ impl Shell {
                             .flex()
                             .justify_end()
                             .gap(px(8.))
-                            .child(button("tiny-modal-cancel", ButtonKind::Secondary, "Cancel").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))))
+                            .child(button("tiny-signin-passkey-remove-cancel", ButtonKind::Secondary, "Cancel").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))))
                             .child(action),
                     )
             }
@@ -294,13 +294,13 @@ impl Shell {
     /// one) is said in a note where the list was.
     fn passkey_links_modal(&self, page: &Page, picked: &[String], links: &[protocol::TinyClaimLink], busy: bool, error: Option<&str>, cx: &mut Context<Self>) -> Div {
         let panel = modal("Passkey links").w(px(520.));
-        let close = |label: &'static str, kind: ButtonKind| button("tiny-links-done", kind, label).h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)));
+        let close = |label: &'static str, kind: ButtonKind| button("tiny-setup-links-done", kind, label).h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)));
         if let Some(detail) = error {
             return panel
                 .child(div().mt(px(16.)).child(super::settings::note("icons/triangle-alert.svg", theme::warning(), detail.to_owned())))
                 .child(div().mt(px(20.)).flex().justify_end().child(close("Close", ButtonKind::Secondary)));
         }
-        let rows = div().id("tiny-links-list").mt(px(16.)).max_h(px(320.)).overflow_y_scroll();
+        let rows = div().id("tiny-setup-links-list").mt(px(16.)).max_h(px(320.)).overflow_y_scroll();
         let mut list = super::settings::card();
         if links.is_empty() {
             let me = page.me;
@@ -310,7 +310,7 @@ impl Shell {
                 let id = member.user_id.clone();
                 list = list.child(
                     div()
-                        .id(("tiny-links-member", ix))
+                        .id(("tiny-setup-links-member", ix))
                         .px(px(14.))
                         .py(px(10.))
                         .flex()
@@ -318,7 +318,7 @@ impl Shell {
                         .gap(px(10.))
                         .when(ix > 0, |row| row.border_t_1().border_color(theme::hairline()))
                         .when(!busy, |row| row.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| this.tiny_setup_tick_link(&id, cx))))
-                        .child(super::settings::check_box(("tiny-links-tick", ix), Some(on), !busy))
+                        .child(super::settings::check_box(("tiny-setup-links-tick", ix), Some(on), !busy))
                         .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(member.display_name.clone()))
                         .when(member.passkey, |row| row.child(div().flex_none().type_small().text_color(theme::text_faint()).child("Has a passkey"))),
                 );
@@ -328,7 +328,7 @@ impl Shell {
             } else if picked.is_empty() {
                 button_disabled("Make links").h(px(32.)).into_any_element()
             } else {
-                button("tiny-links-make", ButtonKind::Primary, "Make links").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.tiny_setup_make_links(cx))).into_any_element()
+                button("tiny-setup-links-make", ButtonKind::Primary, "Make links").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.tiny_setup_make_links(cx))).into_any_element()
             };
             return panel
                 .child(words("Make a link for each member ticked. They open it in a browser to add a passkey, then sign in with it."))
@@ -355,7 +355,7 @@ impl Shell {
                             .child(div().truncate().type_ui().text_color(theme::text()).child(link.display_name.clone()))
                             .child(div().truncate().type_small().text_color(theme::text_faint()).child(link.url.clone())),
                     )
-                    .child(button(("tiny-links-copy", ix), ButtonKind::Secondary, "Copy").on_click(cx.listener(move |_, _, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()))))),
+                    .child(button(("tiny-setup-links-copy", ix), ButtonKind::Secondary, "Copy").on_click(cx.listener(move |_, _, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()))))),
             );
         }
         let all = links.iter().map(|link| format!("{}\t{}", link.display_name, link.url)).collect::<Vec<_>>().join("\n");
@@ -370,7 +370,7 @@ impl Shell {
                     .justify_end()
                     .gap(px(8.))
                     .child(close("Done", ButtonKind::Ghost))
-                    .child(button("tiny-links-copy-all", ButtonKind::Secondary, if copied { "Copied" } else { "Copy all" }).h(px(32.)).on_click(cx.listener(move |this, _, _, cx| {
+                    .child(button("tiny-setup-links-copy-all", ButtonKind::Secondary, if copied { "Copied" } else { "Copy all" }).h(px(32.)).on_click(cx.listener(move |this, _, _, cx| {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(all.clone()));
                         this.tiny_state.copied = true;
                         cx.notify();
@@ -397,12 +397,12 @@ impl Shell {
                     .flex()
                     .justify_end()
                     .gap(px(8.))
-                    .child(button("tiny-codes-copy", ButtonKind::Secondary, if copied { "Copied" } else { "Copy" }).h(px(32.)).on_click(cx.listener(move |this, _, _, cx| {
+                    .child(button("tiny-signin-codes-copy", ButtonKind::Secondary, if copied { "Copied" } else { "Copy" }).h(px(32.)).on_click(cx.listener(move |this, _, _, cx| {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(all.clone()));
                         this.tiny_state.copied = true;
                         cx.notify();
                     })))
-                    .child(button("tiny-codes-done", ButtonKind::Primary, "Done").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))),
+                    .child(button("tiny-signin-codes-done", ButtonKind::Primary, "Done").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))),
             )
     }
 
@@ -584,8 +584,9 @@ fn handoff_facts(origin: &str, role: &str, legacy: bool) -> (String, Option<&'st
     (opens, makes)
 }
 
-/// A modal panel, centered over a scrim that closes it.
-pub(super) fn layer(panel: Div, cx: &mut Context<Shell>) -> AnyElement {
+/// A modal panel, centered over a scrim that closes it when `scrim_closes` (not for one that
+/// holds secrets shown once: see [`super::Modal::holds_secrets`]).
+pub(super) fn layer(panel: Div, scrim_closes: bool, cx: &mut Context<Shell>) -> AnyElement {
     div()
         .absolute()
         .top_0()
@@ -600,7 +601,7 @@ pub(super) fn layer(panel: Div, cx: &mut Context<Shell>) -> AnyElement {
                 .size_full()
                 .bg(theme::scrim())
                 .occlude()
-                .on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))),
+                .when(scrim_closes, |scrim| scrim.on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))),
         )
         .child(
             div()
@@ -619,7 +620,17 @@ pub(super) fn layer(panel: Div, cx: &mut Context<Shell>) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{handoff_facts, list_names};
+    use super::{handoff_facts, list_names, Modal};
+
+    #[test]
+    fn a_stray_click_does_not_close_what_is_shown_once() {
+        assert!(Modal::RecoveryCodes(vec!["a1b2-c3d4".into()]).holds_secrets());
+        let links = |links: Vec<protocol::TinyClaimLink>| Modal::PasskeyLinks { picked: Vec::new(), links, busy: false, error: None };
+        assert!(!links(Vec::new()).holds_secrets(), "nothing made yet: the scrim closes it");
+        let made = protocol::TinyClaimLink { user_id: "ana".into(), display_name: "Ana".into(), url: "https://premier.example/claim/x".into() };
+        assert!(links(vec![made]).holds_secrets());
+        assert!(!Modal::SignOut.holds_secrets());
+    }
 
     #[test]
     fn several_names_read_as_a_sentence() {
