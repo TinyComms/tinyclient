@@ -1181,9 +1181,16 @@ impl World {
             let tl::enums::InputCheckPasswordSrp::Srp(proof) = request.password else {
                 return Err(rpc(400, "PASSWORD_HASH_INVALID", None));
             };
-            // The proof the right password gives, made the way a client makes it.
+            // The proof the right password gives, made the way a client makes it. grammers'
+            // SRP bends a debug build's 256 KiB connection stack past its end, so the
+            // computation runs on its own thread with room to spare.
             let asked = self.password();
-            let (m1, g_a) = calculate_2fa(&[7; 8], &[9; 16], &unhex(PRIME), &3, vec![5; 256], asked.secure_random, PASSWORD.as_bytes());
+            let secure_random = asked.secure_random;
+            let srp = std::thread::Builder::new().name("fake srp".into()).stack_size(4 * 1024 * 1024).spawn(move || {
+                calculate_2fa(&[7; 8], &[9; 16], &unhex(PRIME), &3, vec![5; 256], secure_random, PASSWORD.as_bytes())
+            })
+            .expect("the fake's SRP thread");
+            let (m1, g_a) = srp.join().expect("the fake's SRP thread");
             return match self.password_owed && proof.srp_id == 77 && proof.m1 == m1 && proof.a == g_a {
                 true => {
                     self.signed_in = true;
