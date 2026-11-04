@@ -836,11 +836,11 @@ impl Call {
                     }
                     self.link.tcp.insert(to, (token, Conn::new(socket)));
                 }
-                let failed = self.link.tcp.get_mut(&to).is_some_and(|(_, conn)| conn.send(packet).is_err());
-                if failed {
-                    self.drop_stream(to);
-                } else {
-                    self.sent_packet(packet);
+                match self.link.tcp.get_mut(&to).map(|(_, conn)| conn.send(packet)) {
+                    Some(Ok(())) => self.sent_packet(packet),
+                    Some(Err(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {},
+                    Some(Err(_)) => self.drop_stream(to),
+                    None => {},
                 }
             }
             _ => {}
