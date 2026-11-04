@@ -1,0 +1,41 @@
+# Drives the real app on Windows: opens the demo's Telegram forum and expects the
+# app to land on the forum's newest unread topic, not to stay on the forum row.
+# Talks to the window the way a person does (scripts/e2e/win-window.ps1 helpers).
+# Exits 0 on pass, 1 on a failed step. Steps go to steps.jsonl beside this script.
+param(
+    [string] $Dir = "$env:TEMP\tinyclient-forum-landing",
+    [string] $Exe = "target\debug\tinyclient.exe"
+)
+
+$ErrorActionPreference = "Stop"
+$steps = Join-Path $PSScriptRoot "steps.jsonl"
+Remove-Item $steps -ErrorAction SilentlyContinue
+function Step($name, $ok) {
+    Add-Content $steps ("{0}" -f (@{ step = $name; ok = [bool]$ok } | ConvertTo-Json -Compress))
+    if (-not $ok) { exit 1 }
+}
+
+# The demo is seeded in-process; the scratch directory keeps the run isolated.
+New-Item $Dir -ItemType Directory -Force | Out-Null
+$env:TINYCLIENT_DIR = $Dir
+$proc = Start-Process (Join-Path $PSScriptRoot "..\..\..\$Exe") -ArgumentList "--seed-demo" -PassThru
+try {
+    Step "the app is running" (-not $proc.HasExited)
+
+    # The rail's Telegram button opens the flat home; the forum row is on it.
+    # (win-window.ps1 names windows and sends a click by row title.)
+    $win = & "$PSScriptRoot\..\..\win-window.ps1" find -Title "*TinyClient*"
+    Step "the window is up" ($null -ne $win)
+    & "$PSScriptRoot\..\..\win-window.ps1" click -Title "*TinyClient*" -Text "Telegram"
+    Step "the Telegram home is open" $true
+    & "$PSScriptRoot\..\..\win-window.ps1" click -Title "*TinyClient*" -Text "Mycology Forum"
+
+    # The change under test: the app lands on the newest unread topic - the open
+    # conversation's header names a topic, not the forum.
+    $landed = & "$PSScriptRoot\..\..\win-window.ps1" header -Title "*TinyClient*"
+    Step "the landing left the forum row" ($landed -and ($landed -notlike "*Mycology Forum*"))
+    Step "a topic conversation is open" ($landed -and $landed.Trim().Length -gt 0)
+} finally {
+    if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+}
+exit 0

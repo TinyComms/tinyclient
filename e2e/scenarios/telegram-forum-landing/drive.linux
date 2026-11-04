@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Drives the real app on Linux: opens the demo's Telegram forum and expects the
+# app to land on the forum's newest unread topic, not to stay on the forum row.
+# Window input through xdotool, screenshots through the running compositor.
+# Exits 0 on pass, 1 on a failed step. Steps go to steps.jsonl beside this script.
+set -u
+DIR="${TINYCLIENT_DIR:-${TMPDIR:-/tmp}/tinyclient-forum-landing}"
+EXE="${1:-../../../../../target/debug/tinyclient}"
+STEPS="$(dirname "$0")/steps.jsonl"
+: > "$STEPS"
+step() {
+    printf '{"step": "%s", "ok": %s}\n' "$1" "$2" >> "$STEPS"
+    [ "$2" = "true" ] || exit 1
+}
+
+mkdir -p "$DIR"
+export TINYCLIENT_DIR="$DIR"
+"$EXE" --seed-demo &
+APP=$!
+step "the app is running" "$([ $APP -gt 0 ] && echo true || echo false)"
+sleep 6
+
+WID=$(xdotool search --name "TinyClient" | head -1)
+step "the window is up" "${WID:+true}"
+xdotool windowactivate --sync "$WID"
+
+# The rail's Telegram button opens the flat home; the forum row is on it.
+xdotool key --window "$WID" alt+t
+sleep 1
+# The home list is keyboard-walked: alt-down to the forum row, Enter to open it.
+for _ in 1 2 3 4 5 6 7 8; do
+    xdotool key --window "$WID" Down
+    sleep 0.2
+done
+xdotool key --window "$WID" Return
+sleep 2
+
+# The change under test: the app lands on the newest unread topic - the open
+# conversation's header names a topic, not the forum.
+HEADER=$(xprop -id "$WID" WM_NAME 2>/dev/null | cut -d= -f2- | tr -d '"')
+step "the landing left the forum row" "$([ "${HEADER#*Mycology}" = "$HEADER" ] && echo true || echo false)"
+step "a topic conversation is open" "$([ -n "${HEADER// }" ] && echo true || echo false)"
+
+kill "$APP" 2>/dev/null
+exit 0

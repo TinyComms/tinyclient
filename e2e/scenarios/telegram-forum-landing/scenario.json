@@ -1,0 +1,7 @@
+{
+  "id": "telegram-forum-landing",
+  "title": "Opening a Telegram forum lands on the newest unread topic, else General",
+  "platforms": ["windows", "macos", "linux"],
+  "needs": [],
+  "release": false
+}
