@@ -838,6 +838,12 @@ fn a_message_whose_own_time_has_passed_is_nowhere_and_one_still_alive_leaves_the
     assert_ne!(world.conversation("u7002").unwrap().preview, alive.text);
     assert!(world.messages("u7002").into_iter().all(|message| message.id != "17"));
     assert_eq!(world.called("GetHistory u7002"), asked, "nothing was asked of Telegram about it");
+    // The row said the spent message's words in the list; nothing of it is left there.
+    assert!(
+        world.home(None, Shelf::Main).iter().all(|row| row.key.id != "u7002" || row.preview.is_empty()),
+        "{:#?}",
+        world.home(None, Shelf::Main)
+    );
 
     // Telegram says both are gone after their time. The store let them go already, so its word
     // changes nothing here: no change at all.

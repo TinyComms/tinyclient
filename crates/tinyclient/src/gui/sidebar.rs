@@ -209,7 +209,13 @@ impl State {
         saved.folder = folder;
     }
 
-    pub fn new(cx: &mut Context<Shell>) -> State {
+    /// The Telegram folder chip last chosen: the home on show while it is Telegram's, else
+    /// the one waiting in reserve — a switch to another network must not overwrite it.
+    pub fn telegram_folder_chosen(&self) -> Option<String> {
+        telegram_folder_chosen(&self.home, &self.saved_homes)
+    }
+
+pub fn new(cx: &mut Context<Shell>) -> State {
         #[cfg(feature = "gui-shot")]
         shot::schedule(cx);
         Self::with_focus(cx.focus_handle())
@@ -2033,6 +2039,15 @@ fn inbox_strip_fit(width: f32, phone: bool, text_scale: f32, has_unread: bool) -
     InboxStripFit { stacked, counts, mark_all }
 }
 
+/// The Telegram folder chip last chosen: the home on show while it is Telegram's, else the
+/// one waiting in reserve — a switch to another network must not overwrite it.
+fn telegram_folder_chosen(home: &home::Home, saved: &HashMap<Network, home::Home>) -> Option<String> {
+    match home.network {
+        Some(Network::Telegram) => home.folder.clone(),
+        _ => saved.get(&Network::Telegram).and_then(|saved| saved.folder.clone()),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2313,5 +2328,26 @@ pub(crate) mod tests {
         assert_eq!(inbox_strip_fit(326., true, 1.3, true), InboxStripFit { stacked: true, counts: false, mark_all: false });
         assert_eq!(inbox_strip_fit(326., true, 1., true), InboxStripFit { stacked: false, counts: true, mark_all: false });
         assert_eq!(inbox_strip_fit(296., true, 1., true), InboxStripFit { stacked: false, counts: false, mark_all: false });
+    }
+
+    #[test]
+    fn the_saved_telegram_folder_survives_a_switch_to_another_network() {
+        let mut on_show = home::Home::for_network(Network::Telegram);
+        on_show.folder = Some("2".into());
+        let mut saved_telegram = home::Home::for_network(Network::Telegram);
+        saved_telegram.folder = Some("2".into());
+        let discord = home::Home::for_network(Network::Discord);
+        let discord_on_show = home::Home::for_network(Network::Discord);
+        let mut saved = HashMap::new();
+        saved.insert(Network::Telegram, saved_telegram);
+        saved.insert(Network::Discord, discord);
+        // While Telegram's home is on show, the chip is its own.
+        assert_eq!(telegram_folder_chosen(&on_show, &saved), Some("2".into()));
+        // Switched to Discord: the Discord home shows nothing of the chip — the saved
+        // Telegram choice is what the prefs keep, not the Discord home's absence of one.
+        assert_eq!(telegram_folder_chosen(&discord_on_show, &saved), Some("2".into()));
+        // The chip erased is a choice too: All on the next launch.
+        on_show.folder = None;
+        assert_eq!(telegram_folder_chosen(&on_show, &saved), None);
     }
 }
