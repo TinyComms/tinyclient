@@ -25,7 +25,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use zbus::blocking::Connection;
 use zbus::message::Type as MessageType;
-use zvariant::{Array, OwnedFd, OwnedObjectPath, OwnedValue, Value};
+use zbus::zvariant::{Array, OwnedFd, OwnedObjectPath, OwnedValue, Value};
 
 const DEST: &str = "org.freedesktop.portal.Desktop";
 const PATH: &str = "/org/freedesktop/portal/desktop";
@@ -879,9 +879,9 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
 }
 
 fn copy_frame(buffer: &PwBuffer, format: &Mutex<Option<Fixated>>) -> Option<Rgba> {
-    let fixated = *format
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())?;
+    // Postfix `?` binds tighter than `*`, so this has to copy the `Option` out of the guard first.
+    let guard = format.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixated = (*guard)?;
     if buffer.buffer.is_null() {
         return None;
     }

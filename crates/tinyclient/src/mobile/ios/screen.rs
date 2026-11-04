@@ -328,7 +328,7 @@ fn find_button(view: &UIView) -> Option<Retained<UIButton>> {
         return Some(button.retain());
     }
     for child in view.subviews().iter() {
-        if let Some(found) = find_button(child) {
+        if let Some(found) = find_button(&child) {
             return Some(found);
         }
     }
