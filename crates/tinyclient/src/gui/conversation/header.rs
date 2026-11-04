@@ -8,7 +8,7 @@ use crate::gui::layout::{drags_window, TOP_BAR};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, Context, Div, MouseButton, Window};
-use protocol::{Conversation, ConversationKind, Key, Link, Mark, MediaFile};
+use protocol::{Conversation, ConversationKind, Key, Link, Mark, MediaFile, Network};
 
 impl Shell {
     /// The picture of a conversation: its own, or for a direct one the other person's as the
@@ -198,7 +198,7 @@ impl Shell {
                     .gap(px(8.))
                     .children(mixed.then(|| div().flex_none().self_center().mr(px(-2.)).child(network_icon(open.key.network, 14.))))
                     .child(title)
-                    .children(mark(open.mark))
+                    .children(mark(open))
                     .children(role.map(|role| role_chip(&role.name, role.color)))
                     .children(self.encryption_chip(open, cx))
                     .children(line)
@@ -313,15 +313,18 @@ pub(super) fn path_line(subtitle: &str) -> String {
 }
 
 /// What the network says the other side is, as a tag after the title. A verified account is
-/// a check; the rest are words, red where they warn.
-fn mark(mark: Option<Mark>) -> Option<Div> {
-    let (words, color) = match mark? {
-        Mark::Verified => return Some(div().flex_none().self_center().child(glyph("icons/check.svg", 14., theme::accent_text()))),
-        Mark::Scam => ("Scam", theme::danger()),
-        Mark::Fake => ("Fake", theme::danger()),
-        Mark::Guest => ("Guest", theme::text_soft()),
-        Mark::External => ("External", theme::text_soft()),
-        Mark::Deactivated => ("Deactivated", theme::text_faint()),
+/// a check; the rest are words, red where they warn. A bot with no mark of its own gets the
+/// row's word for one (`chat::name_mark`).
+fn mark(c: &Conversation) -> Option<Div> {
+    let (words, color) = match c.mark {
+        Some(Mark::Verified) => return Some(div().flex_none().self_center().child(glyph("icons/check.svg", 14., theme::accent_text()))),
+        Some(Mark::Scam) => ("Scam", theme::danger()),
+        Some(Mark::Fake) => ("Fake", theme::danger()),
+        Some(Mark::Guest) => ("Guest", theme::text_soft()),
+        Some(Mark::External) => ("External", theme::text_soft()),
+        Some(Mark::Deactivated) => ("Deactivated", theme::text_faint()),
+        None if c.bot => (if c.key.network == Network::Telegram { "bot" } else { "App" }, theme::text_soft()),
+        None => return None,
     };
     Some(
         div()

@@ -320,6 +320,8 @@ fn the_chats_are_one_list_with_no_space_each_filed_in_every_folder_it_matches() 
     assert_eq!((service.special, service.mark, service.read_only, service.call), (Special::Service, Some(Mark::Verified), true, protocol::CallSupport::None));
     // Marks from Telegram's flags; a bot is a bot.
     assert_eq!((row("u7005").mark, row("c9001").mark), (Some(Mark::Scam), Some(Mark::Verified)));
+    // The impostor Telegram flags: the same red word the row and the header draw.
+    assert_eq!(row("u7006").mark, Some(Mark::Fake));
     assert!(row("u7004").bot && row("u7004").call == protocol::CallSupport::None);
     // The channel is muted on Telegram and only its owners post in it.
     assert!(row("c9001").muted && row("c9001").read_only && !row("g8001").muted);
@@ -1332,6 +1334,11 @@ fn the_panes_ask_telegram_once_each_and_counts_are_telegrams_own() {
         panic!("no profile");
     };
     assert_eq!(profile.warning, Some(protocol::Warning::Scam));
+    // An impostor's card warns in Telegram's other word.
+    let Response::Profile { profile } = world.ask(Request::Profile { person: key("u7006"), space: None }) else {
+        panic!("no profile");
+    };
+    assert_eq!(profile.warning, Some(protocol::Warning::Fake));
 
     // A channel's info: its own about text and Telegram's counts.
     let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: key("c9001") }) else {
