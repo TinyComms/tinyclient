@@ -601,6 +601,42 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
 }
 
 #[test]
+fn a_message_whose_own_time_has_passed_is_nowhere_and_one_still_alive_leaves_the_store_offline_too() {
+    let world = World::signed_in();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+
+    // One message long past its own time, one with a moment still to live.
+    world.steer("ttl");
+    let alive = world.arrived("u7002", "18");
+    assert_eq!(alive.expires_at, Some(alive.sent + 10), "the timer Telegram named is kept with the message");
+    // The spent one is in no read, though it was in the same conversation.
+    assert!(world.message("u7002", "17").is_none());
+    assert!(world.messages("u7002").into_iter().all(|message| message.id != "17"));
+    // And the live one stands.
+    assert!(world.message("u7002", "18").is_some());
+
+    // At the live one's moment the store drops what ran out, online or not, and says so to
+    // the shell.
+    let asked = world.called("GetHistory u7002");
+    let since = world.status().1;
+    world.changed(since, "the messages past their time to leave the store", |change| match change {
+        Change::Messages { conversation } if conversation.id == "u7002" => Some(()),
+        _ => None,
+    });
+    assert!(world.message("u7002", "18").is_none());
+    assert!(world.messages("u7002").into_iter().all(|message| message.id != "17"));
+    assert_eq!(world.called("GetHistory u7002"), asked, "nothing was asked of Telegram about it");
+
+    // Telegram says both are gone after their time. The store let them go already, so its word
+    // changes nothing here: no change at all.
+    world.steer("ttl-gone");
+    let quiet = world.status().1;
+    sleep(Duration::from_secs(2));
+    assert_eq!(world.status().1, quiet, "{:#?}", world.calls());
+}
+
+#[test]
 fn a_forum_topic_is_a_thread_under_the_forum() {
     let world = World::signed_in();
     world.connected();
