@@ -360,6 +360,14 @@ fn with_setup(me: &'static str, features: &'static str, log: Arc<Mutex<Vec<Strin
                 }
             }
             "POST /v1/me/passkeys/link" => http(200, "OK", r#"{"url":"http://127.0.0.1:9/v1/auth/passkey/claim#claim-token"}"#),
+            "POST /v1/setup/claim-links" => http(200, "OK", r#"{"links":[{"user_id":"u2","display_name":"Dayo","url":"https://tiny.example/claim/abc"}]}"#),
+            "GET /v1/me/passkeys" => http(
+                200,
+                "OK",
+                r#"{"passkeys":[{"id":"p1","label":"Laptop","created_at":"2026-11-01T10:00:00Z","last_used_at":null,"synced":true,"flagged":false}],"recovery_codes_left":3}"#,
+            ),
+            "PATCH /v1/me/passkeys/p1" | "DELETE /v1/me/passkeys/p1" => http(204, "No Content", ""),
+            "POST /v1/me/recovery-codes" => http(200, "OK", r#"{"codes":["aaaa-bbbb","cccc-dddd"]}"#),
             // What the page reads around it: nobody else, nothing to list.
             "GET /v1/members" | "GET /v1/invites" | "GET /v1/rooms" | "GET /v1/roles" | "GET /v1/categories" | "GET /v1/bans" => http(200, "OK", "[]"),
             _ if first.starts_with("GET /v1/audit") => http(200, "OK", "[]"),
@@ -564,4 +572,127 @@ fn a_passkey_link_the_server_could_not_make_is_said_in_words_and_nothing_is_open
     // A link that is not a web page never reaches the system's opener.
     let base = serve(|_| http(200, "OK", r#"{"url":"file:///etc/passwd"}"#));
     with_session(&base, "owner", |account| assert_eq!(passkey_link(account), said("That isn't a web page.")));
+}
+
+#[test]
+fn the_owner_gets_passkey_links_and_an_older_server_says_so() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let base = with_setup(OWNER, SETUP_FEATURES, log.clone());
+    with_session(&base, "owner", |account| {
+        match setup_claim_links(account.clone(), vec!["u2".into()]) {
+            Response::TinyClaimLinks { links } => {
+                assert_eq!(links.len(), 1);
+                assert_eq!((links[0].user_id.as_str(), links[0].display_name.as_str(), links[0].url.as_str()), ("u2", "Dayo", "https://tiny.example/claim/abc"));
+            }
+            other => panic!("links: {other:?}"),
+        }
+        // An id that is not an id is never sent.
+        let before = log.lock().unwrap().len();
+        assert_eq!(setup_claim_links(account, vec!["../x".into()]), said(CHECK));
+        assert_eq!(log.lock().unwrap().len(), before);
+    });
+    assert_eq!(json_body(&last(&log, "POST /v1/setup/claim-links ")), serde_json::json!({ "user_ids": ["u2"] }));
+    // An admin who is not the owner is refused before anything is asked.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let base = with_setup(NOT_OWNER, SETUP_FEATURES, log.clone());
+    with_session(&base, "admin", |account| assert_eq!(setup_claim_links(account, vec!["u2".into()]), said(NOT_YOURS)));
+    assert!(sent(&log, "POST /v1/setup/claim-links ").is_empty());
+    // A server that has setup but not the links route.
+    let base = serve(|request| {
+        let first = request.lines().next().unwrap_or("");
+        if first.starts_with("GET /v1/capabilities") {
+            http(200, "OK", &format!(r#"{{"version":"0.5.0","features":[{SETUP_FEATURES}]}}"#))
+        } else if first.starts_with("GET /v1/me ") {
+            http(200, "OK", OWNER)
+        } else {
+            http(404, "Not Found", r#"{"error":"not_found"}"#)
+        }
+    });
+    with_session(&base, "owner", |account| assert_eq!(setup_claim_links(account, vec!["u2".into()]), said(OLDER)));
+}
+
+#[test]
+fn a_members_own_passkeys_are_read_renamed_and_removed() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let base = with_setup(NOT_OWNER, SETUP_FEATURES, log.clone());
+    with_session(&base, "member", |account| {
+        match passkeys_read(account.clone()) {
+            Response::TinyPasskeys { passkeys } => {
+                assert_eq!(passkeys.recovery_codes_left, 3);
+                assert_eq!(passkeys.passkeys.len(), 1);
+                assert_eq!(passkeys.passkeys[0].label, "Laptop");
+                assert!(passkeys.passkeys[0].synced);
+            }
+            other => panic!("passkeys: {other:?}"),
+        }
+        assert_eq!(passkey_rename(account.clone(), "p1".into(), "  Phone  ".into()), Response::Ok);
+        assert_eq!(passkey_remove(account.clone(), "p1".into()), Response::Ok);
+        match recovery_codes(account.clone()) {
+            Response::TinyRecoveryCodes { codes } => assert_eq!(codes, ["aaaa-bbbb", "cccc-dddd"]),
+            other => panic!("codes: {other:?}"),
+        }
+        // A label that is empty or too long is never sent.
+        let before = log.lock().unwrap().len();
+        assert_eq!(passkey_rename(account.clone(), "p1".into(), "   ".into()), said(CHECK));
+        assert_eq!(passkey_rename(account.clone(), "p1".into(), "x".repeat(61)), said(CHECK));
+        assert_eq!(passkey_rename(account.clone(), "../p1".into(), "ok".into()), said(CHECK));
+        assert_eq!(passkey_remove(account, "a/b".into()), said(CHECK));
+        assert_eq!(log.lock().unwrap().len(), before);
+    });
+    assert_eq!(json_body(&last(&log, "PATCH /v1/me/passkeys/p1 ")), serde_json::json!({ "label": "Phone" }));
+    assert_eq!(sent(&log, "DELETE /v1/me/passkeys/p1 ").len(), 1);
+    // A server from before passkeys.
+    let base = serve(|_| http(404, "Not Found", r#"{"error":"not_found"}"#));
+    with_session(&base, "member", |account| {
+        assert_eq!(passkeys_read(account), said(OLDER));
+    });
+}
+
+#[test]
+fn removing_the_last_passkey_without_codes_is_said_in_words() {
+    let base = serve(|_| http(403, "Forbidden", r#"{"error":"last_credential"}"#));
+    with_session(&base, "member", |account| {
+        assert_eq!(passkey_remove(account, "p1".into()), said(LAST_PASSKEY));
+    });
+    assert!(LAST_PASSKEY.contains("last passkey"), "{LAST_PASSKEY}");
+    // A sign-in that is too old is a different sentence, for removing and for new codes.
+    let base = serve(|_| http(403, "Forbidden", r#"{"error":"recent_sign_in_required"}"#));
+    with_session(&base, "member", |account| {
+        assert_eq!(passkey_remove(account.clone(), "p1".into()), said(SIGN_IN_AGAIN));
+        assert_eq!(recovery_codes(account), said(SIGN_IN_AGAIN));
+    });
+}
+
+#[test]
+fn a_refusal_about_the_provider_reaches_the_gui_as_a_refusal() {
+    for (body, want) in [
+        (r#"{"error":"owner_needs_provider"}"#, TinySetupRefusal::OwnerNeedsProvider),
+        (r#"{"error":"members_without_provider","count":4}"#, TinySetupRefusal::MembersWithoutProvider { count: 4 }),
+    ] {
+        let base = serve(move |request| {
+            let first = request.lines().next().unwrap_or("");
+            if first.starts_with("GET /v1/capabilities") {
+                http(200, "OK", &format!(r#"{{"version":"0.5.0","features":[{SETUP_FEATURES}]}}"#))
+            } else if first.starts_with("GET /v1/me ") {
+                http(200, "OK", OWNER)
+            } else if first.starts_with("PUT /v1/setup") {
+                http(409, "Conflict", body)
+            } else {
+                http(404, "Not Found", r#"{"error":"not_found"}"#)
+            }
+        });
+        with_session(&base, "owner", |account| {
+            assert_eq!(applied_to(TinySetupApply::default(), &account), Response::TinySetupRefused { refusal: want.clone() });
+        });
+    }
+}
+
+#[test]
+fn the_setup_member_list_is_held_to_what_a_window_can_draw() {
+    let members = (0..SETUP_ROWS_MAX * 8 + 5)
+        .map(|n| protocol::TinySetupMember { user_id: format!("u{n}"), display_name: "n".repeat(SETUP_TEXT_MAX + 10), passkey: false, provider: false })
+        .collect();
+    let setup = setup_bounded(TinySetup { members, ..TinySetup::default() });
+    assert_eq!(setup.members.len(), SETUP_ROWS_MAX * 8);
+    assert_eq!(setup.members[0].display_name.chars().count(), SETUP_TEXT_MAX);
 }

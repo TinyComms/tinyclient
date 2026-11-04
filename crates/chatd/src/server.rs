@@ -2153,10 +2153,11 @@ impl Chat {
             Request::TinySetupRead { account } => adapters::tiny::manage::setup_read(account),
             Request::TinySetupApply { account, apply } => adapters::tiny::manage::setup_apply(account, apply),
             Request::TinyPasskeyLink { account } => adapters::tiny::manage::passkey_link(account),
-            // Wired up with the passkey screens; until then they are refused in words.
-            Request::TinySetupClaimLinks { .. } | Request::TinyPasskeysRead { .. } | Request::TinyPasskeyRename { .. } | Request::TinyPasskeyRemove { .. } | Request::TinyRecoveryCodes { .. } => {
-                error(ErrorCode::Unsupported, "this build cannot manage passkeys yet")
-            }
+            Request::TinySetupClaimLinks { account, user_ids } => adapters::tiny::manage::setup_claim_links(account, user_ids),
+            Request::TinyPasskeysRead { account } => adapters::tiny::manage::passkeys_read(account),
+            Request::TinyPasskeyRename { account, id, label } => adapters::tiny::manage::passkey_rename(account, id, label),
+            Request::TinyPasskeyRemove { account, id } => adapters::tiny::manage::passkey_remove(account, id),
+            Request::TinyRecoveryCodes { account } => adapters::tiny::manage::recovery_codes(account),
             Request::TinyBots { account } => adapters::tiny::manage::bots_list(account),
             Request::TinyBotCreate { account, name, scopes } => adapters::tiny::manage::bots_create(account, name, scopes),
             Request::TinyBotRevoke { account, bot_id } => adapters::tiny::manage::bots_revoke(account, bot_id),
