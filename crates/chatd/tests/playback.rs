@@ -9,6 +9,7 @@ use chatd::hub::Hub;
 use chatd::store::Store;
 use protocol::{AccountKey, Change, Key, Network, PlayRequest, PlayState, Playback};
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once};

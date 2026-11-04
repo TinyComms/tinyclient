@@ -11,7 +11,7 @@ use protocol::{
     Relation, Request, Response, SendState, OCCUPANTS_LIMIT,
 };
 use protocol::ChatStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command};
 
 fn child_pids(parent: u32, name: &str) -> Vec<u32> {
