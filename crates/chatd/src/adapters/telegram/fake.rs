@@ -326,6 +326,9 @@ struct World {
     drafts: HashMap<(Who, Option<i32>), String>,
     /// Comments under the channel's post that the test says are unread.
     comments_unread: i32,
+    /// A post in the muted channel that names the user: the mention count rides the dialog,
+    /// so it lands with the next reading of the chats.
+    channel_mention: bool,
     calls: PathBuf,
     /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
     dialogs_go: bool,
@@ -356,6 +359,7 @@ impl World {
             exclude_read: false,
             drafts: HashMap::new(),
             comments_unread: 0,
+            channel_mention: false,
             calls: protocol::support_dir().join("telegram.calls"),
             dialogs_go: false,
             peer_go: false,
@@ -951,6 +955,13 @@ impl World {
             "read" => vec![update(
                 tl::types::UpdateReadHistoryInbox { folder_id: None, peer: odalys.peer(), top_msg_id: None, max_id: 14, still_unread_count: 0, pts: 0, pts_count: 0 }.into(),
             )],
+            // A post in the muted channel names the user. The count rides the dialog, so
+            // Telegram marks the chats stale (a default said changed) and the next opening
+            // of the list reads it in.
+            "mention" => {
+                self.channel_mention = true;
+                vec![update(tl::types::UpdateNotifySettings { peer: tl::enums::NotifyPeer::NotifyBroadcasts, notify_settings: settings(None) }.into())]
+            }
             // A draft typed on the phone while we are here, and one the phone dropped.
             "draft" => {
                 let text = "Riding up with Tobin.".to_owned();
@@ -1310,6 +1321,13 @@ impl World {
                         (dialog(Who::User(BOT), 5, 5, 4, 0, false, None), Who::User(BOT), Who::User(BOT).text()),
                         (dialog(Who::User(SCAM), 6, 6, 6, 0, false, None), Who::User(SCAM), Who::User(SCAM).text()),
                     ];
+                    if self.channel_mention {
+                        for held in all.iter_mut().filter(|(_, who, _)| *who == Who::Channel(NOTES)) {
+                            if let tl::enums::Dialog::Dialog(plain) = &mut held.0 {
+                                plain.unread_mentions_count = 1;
+                            }
+                        }
+                    }
                     for at in 0..crowd() {
                         let who = Who::User(CROWD + at);
                         all.push((dialog(who, 1, 1, 1, 0, false, None), who, who.text()));

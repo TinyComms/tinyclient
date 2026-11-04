@@ -235,10 +235,10 @@ const TABLES: &str = "
     ) WITHOUT ROWID;";
 
 /// The number a row shows (`Conversation::badge`), as SQL over `conversation c`. A bot, an
-/// archived chat count only mentions; a request and a hidden row, which are never drawn
-/// where the number is, count nothing.
-const ATTENTION: &str = "CASE WHEN c.special = 'request' OR c.hidden THEN 0
-                              WHEN c.kind IN ('direct', 'group') AND NOT c.muted AND NOT c.bot AND NOT c.archived
+/// archived chat count only mentions; a request, a hidden row and a muted row count nothing
+/// here — muted is quiet on the rail, whatever waits inside it (`polish/03` §6).
+const ATTENTION: &str = "CASE WHEN c.special = 'request' OR c.hidden OR c.muted THEN 0
+                              WHEN c.kind IN ('direct', 'group') AND NOT c.bot AND NOT c.archived
                               THEN max(c.unread, c.mentions) ELSE c.mentions END";
 
 const CONVERSATION: &str = "

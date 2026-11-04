@@ -447,6 +447,19 @@ fn a_folder_that_excludes_read_chats_keeps_the_open_one_until_it_is_left() {
     world.until("the forum out of Work once left", || {
         ids(world.home(Some("2"), Shelf::Main)).is_empty().then_some(())
     });
+fn a_muted_channel_draws_quiet_and_never_raises_the_rail() {
+    let world = World::signed_in();
+    world.connected();
+    // The channel is muted on Telegram, and one of its unread posts names me. The row
+    // carries what the list needs to draw it dimmed with a quiet count and the quiet
+    // mention pill (polish/03 §6); the rail hears nothing of any of it.
+    world.steer("mention");
+    world.home(None, Shelf::Main);
+    let row = world.until("the channel's mention to land", || world.conversation("c9001").filter(|row| row.mentions == 1));
+    assert_eq!((row.unread, row.muted, row.read_only), (1, true, true), "{row:?}");
+    let (accounts, _) = world.status();
+    let mira = accounts.iter().find(|account| account.key.network == Network::Telegram).unwrap();
+    assert_eq!(mira.attention, 1, "only Odalys's unread needs me: the muted channel never raises the rail");
 }
 
 #[test]
