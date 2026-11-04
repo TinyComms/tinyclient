@@ -22,6 +22,7 @@
 
 pub mod alert;
 pub mod audio;
+pub mod broadcast;
 pub mod cue;
 pub mod dave;
 pub mod decode;

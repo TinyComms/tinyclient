@@ -99,7 +99,7 @@ Ringing shows who, an elapsed counter and Cancel, in the dock; the header pill b
 
 **Video is a Tiny room or a Discord call.** Share and Camera appear on the dock, and on the channel's call bar, while a Tiny room that allows video is joined, and while a Discord call is joined. Any other joined call leaves them off. They are absent, not greyed.
 
-On a Tiny voice channel the stage is the grid of tiles in `10-tiny-server.md`. The call sends and receives one H.264 picture, drawn in that channel (the share, otherwise the active speaker's camera). It does not follow you into another network's conversation. Sending a camera is Windows only. Elsewhere the engine says "A camera isn't available on this system yet. You can still share your screen." Screen share is Windows, macOS, and Linux X11. A Wayland session with no X11 display cannot share: "This session has no X11 display, so the screen can't be shared."
+On a Tiny voice channel the stage is the grid of tiles in `10-tiny-server.md`. The call sends and receives one H.264 picture, drawn in that channel (the share, otherwise the active speaker's camera). It does not follow you into another network's conversation. The camera is the system's camera on Windows, macOS, and Linux, and the phone's camera on Android and iOS. Screen share is a screen or a window on Windows, the primary screen on macOS, the X11 root on an X11 Linux session, and the desktop portal's picker on Wayland. Android uses MediaProjection. iOS uses a broadcast extension for the whole screen, and the simulator shares this app.
 
 Watch is opt-in for that picture. A share or camera never opens the picture by itself.
 
@@ -111,7 +111,7 @@ Settings has no camera device row (`09`).
 
 A camera is one H.264 layer on the voice connection the call already has. Go Live is a second connection that sends the screen and does not open a microphone. Watching someone else's share is a third connection that only receives. The voice connection stays up. The same buttons as a Tiny room turn these on. A stage still opens in Discord and has no share or camera here.
 
-DAVE seals the picture as well as the voice. The client offers H.264 and does not offer another video codec. There is no simulcast. Sending a camera is Windows only, and screen share is Windows, macOS, and Linux X11, the same as a Tiny room.
+DAVE seals the picture as well as the voice. The client offers H.264 and does not offer another video codec. There is no simulcast. The camera and the screen are the same captures a Tiny room uses.
 
 ## 7. Device menu (frame 7)
 

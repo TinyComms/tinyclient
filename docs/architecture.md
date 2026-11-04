@@ -317,8 +317,10 @@ thread has chatd's call start mediad (`Context::tiny_offer`), which answers `Tin
 `Offer {sdp}`: one UDP socket, a host candidate and an active ICE-TCP candidate
 on the same address, one `sendonly` Opus m-line, one `recvonly` Opus m-line per other seat, then
 H.264 constrained baseline video: a simulcast camera and one screen share, both inactive until
-asked, and one `recvonly` picture. Camera send is Windows-only. Screen share is Windows, macOS
-and Linux X11. UDP is preferred; TCP is the path when UDP cannot get through. The offer goes out
+asked, and one `recvonly` picture. The camera is the system's camera on Windows, macOS, and
+Linux, and the phone's camera on Android and iOS. Screen share is a screen or a window on
+Windows, the primary screen on macOS, the X11 root on an X11 Linux session, and the desktop
+portal's picker on Wayland. UDP is preferred; TCP is the path when UDP cannot get through. The offer goes out
 as `call.join` `sdp`; `call.answer` comes back as `TinyAnswer` (from here the call is joining,
 with the 15 s connect deadline), and each `call.slots` for that `call_id` as `TinySlots`.
 `Connected` makes it `Joined` as for Discord. Mute and deafen go out as `call.state`, a hang-up

@@ -1,8 +1,10 @@
 //! What a share sends. The share picker lists every screen and, on Windows, every window a person
 //! would call one (`--screens`), each with a small JPEG of it; the share then captures the one
 //! chosen with `ShareSend`. Windows reads a screen with GDI from the desktop and a window with
-//! `PrintWindow`, which draws it even when it is covered. macOS and X11 share the primary screen
-//! alone, so they list just that.
+//! `PrintWindow`, which draws it even when it is covered. macOS and an X11 session share the
+//! primary screen alone, so they list just that. A Wayland session lists the same one row; the
+//! picture is the frame a share already recording last produced, and the system's own picker is
+//! what chooses the monitor or the window when the share actually starts.
 
 use super::{fit, Rgba};
 use protocol::{ScreenSource, SCREENS_LIMIT};

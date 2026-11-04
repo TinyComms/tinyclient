@@ -94,9 +94,10 @@ never a platform UI thread.
   size you have, any aspect; mediad fits and scales to 640×360 and 320×180 layers. Android
   CameraX/Camera2 `ImageAnalysis` YUV_420_888; iOS `AVCaptureVideoDataOutput` with
   `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange`. Rotate to upright before delivering.
-* **Screen share.** Android `MediaProjection` + `ImageReader` (RGBA_8888); iOS ReplayKit
-  (`RPScreenRecorder.startCapture` in app, or a Broadcast Upload Extension for system-wide).
-  Any size; mediad fits it inside 1280×720.
+* **Screen share.** Android `MediaProjection` + `ImageReader` (RGBA_8888). iOS records the whole
+  screen with a Broadcast Upload Extension (`mobile/ios/Broadcast`); frames cross the app group
+  in `mediad::broadcast`. The simulator has no system broadcast and uses
+  `RPScreenRecorder.startCapture` for this app only. Any size; mediad fits it inside 1280×720.
 * **H.264.** Constrained baseline, level 3.1, Annex B, no B-frames, SPS/PPS before every IDR,
   one slice per frame preferred, `keyframe == true` forces an IDR now. Sizes and rates mediad
   asks for: share up to 1280×720 at 1.5 Mbit/s (`screen: true`), camera 640×360 at 500 kbit/s
@@ -250,14 +251,14 @@ Registered by `crate::mobile::register` on iOS instead of the stub. All through 
 | Permissions | `audio.rs` | `AVCaptureDevice.authorizationStatus` / `requestAccess(for:)`, the caller's thread waiting on a channel; refusals go to the call screen (`hooks::note_permission`); Settings opens `UIApplication.openSettingsURLString` |
 | Audio session | `audio.rs` | `.playAndRecord`, `.voiceChat`, `.allowBluetooth`, active; `.notifyOthersOnDeactivation` at the end. Routes for the call screen (`hooks::route_audio`): earpiece or wired, speaker, Bluetooth HFP, by `overrideOutputAudioPort` and `setPreferredInput`. A camera that starts moves an unchosen route to the speaker. `UIBackgroundModes` `audio` keeps a call going in the background |
 | Camera | `camera.rs` | `AVCaptureSession` (640×480 preset), front or back wide-angle camera, `AVCaptureVideoDataOutput` in `420v`, portrait, frames copied tight to NV12. Flip (`hooks::route_flip`) restarts on the other camera. No camera (the simulator) is the words "This device has no camera." |
-| Screen share | `screen.rs` | `RPScreenRecorder.startCapture` (this app's screen), at most 5 frames a second to the sink. System-wide sharing needs a Broadcast Upload Extension (not built) |
+| Screen share | `screen.rs`, `mobile/ios/Broadcast` | A device shows `RPSystemBroadcastPickerView` and reads the extension's frames from the app-group mailbox (`mediad::broadcast`), scaled to a 1280 long side. The simulator uses `RPScreenRecorder.startCapture` (this app's screen), at most 5 frames a second. A signature without the app group says so and does not fall back to in-app capture |
 | H.264 | `codec.rs` | `VTCompressionSession` (constrained baseline, real time, no reordering, keyframe on request) with AVCC turned into Annex B and SPS/PPS before each IDR; `VTDecompressionSession` made from the stream's SPS/PPS, decoding synchronously to NV12 |
 | Web pages | `web.rs` | `WKWebView` in a page sheet over the window's top view controller, with a Close button; one `WKWebsiteDataStore(forIdentifier:)` per network (iOS 17+). objc2 binds `WKWebView` for macOS only, so WebKit is messaged dynamically |
 | Tiny server | `auth.rs` | `ASWebAuthenticationSession`, `prefersEphemeralWebBrowserSession = false`, a callback scheme nothing uses; chatd's loopback listener receives the redirect |
 
 Debug builds take two launch arguments for checking the platform on a phone or simulator
 (`selftest.rs`): `-tinySelfTest` (permissions, session, routes, camera, H.264 round trips at
-the three sizes mediad uses, ReplayKit) and `-tinyAuthTest <provider page>` (open_auth with a
+the three sizes mediad uses, screen share) and `-tinyAuthTest <provider page>` (open_auth with a
 loopback listener, as chatd does). Records go to the unified log and to
 `Library/Application Support/tinyclient/ios-platform.log`.
 
@@ -265,8 +266,6 @@ loopback listener, as chatd does). Records go to the unified log and to
 
 * A speaker/earpiece control in the call UI needs a request to mediad (`MediaRequest`); until then
   the platform keeps its own default route (earpiece for voice, speaker for video).
-* Screen share on iOS beyond the app needs a Broadcast Upload Extension, a separate process: its
-  frames must reach the app (App Group shared memory) before the sink.
 * Background audio: Android runs its call under a foreground service (above); iOS sets the `audio`
   background mode, so a call keeps playing when the app is backgrounded.
 * CallKit / ConnectionService integration for incoming rings is not part of this interface.

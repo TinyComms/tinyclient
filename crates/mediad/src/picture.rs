@@ -5,9 +5,12 @@
 //! or less. A camera is two layers, 640×360 and 320×180, sent with the same RTP time, at 15
 //! frames a second.
 //! On a desktop (`desktop`) OpenH264 is Cisco's binary, downloaded from Cisco and loaded when the first picture is
-//! encoded, so this crate still builds with no C toolchain. A capture that fails is said in
-//! words and the voice call stays. A phone captures and codes through its `platform` (`phone`).
-//! All of it is slow, and none of it runs on the call's tick: `video` holds the threads.
+//! encoded, so this crate still builds with no C toolchain. The camera is the system's own
+//! (Media Foundation, AVFoundation, V4L2), and on Linux a camera V4L2 cannot open is asked for
+//! through the desktop portal. The screen is GDI or Desktop Duplication on Windows, Core Graphics
+//! on macOS, the X11 root on an X11 session, and that same portal on Wayland. A capture that fails
+//! is said in words and the voice call stays. A phone captures and codes through its `platform`
+//! (`phone`). All of it is slow, and none of it runs on the call's tick: `video` holds the threads.
 
 use protocol::{PictureKind, ShareQuality};
 use std::io;
@@ -37,6 +40,17 @@ pub fn cameras(_folder: Option<&std::path::Path>) -> Vec<protocol::CameraSource>
 /// A screen through Desktop Duplication, which is what a share at 60 frames a second needs.
 #[cfg(windows)]
 mod duplicate;
+/// PipeWire's SPA pods and the struct layout a `dlopen` has to match, plus which Linux session
+/// this is. Compiled into the tests on every desktop; only a Linux build loads PipeWire.
+#[cfg(any(test, all(target_os = "linux", not(target_env = "ohos"))))]
+mod spa_pod;
+#[cfg(any(test, all(target_os = "linux", not(target_env = "ohos"))))]
+mod pipewire_abi;
+#[cfg(any(test, all(target_os = "linux", not(target_env = "ohos"))))]
+mod session;
+/// xdg-desktop-portal ScreenCast and Camera. One path for every desktop that ships a portal.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+mod portal;
 
 /// The camera the next camera frame comes from, as `settings::CAMERA` stores it (a name, then a
 /// tab and the system's id); `None` is the first one listed. One choice per process.
@@ -164,7 +178,7 @@ pub struct Rgba {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
-    /// Windows, macOS and X11 hand back BGRA. A camera hands back RGBA.
+    /// Windows, macOS, X11 and a portal screen hand back BGRA. A camera hands back RGBA, unless the portal's camera negotiated BGRA.
     pub bgra: bool,
 }
 

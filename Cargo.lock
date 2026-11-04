@@ -6088,6 +6088,7 @@ dependencies = [
  "davey",
  "image",
  "libc",
+ "libloading",
  "mio",
  "native-tls",
  "nnnoiseless",
@@ -6115,6 +6116,7 @@ dependencies = [
  "windows 0.62.2",
  "windows-sys 0.61.2",
  "x11rb",
+ "zbus",
 ]
 
 [[package]]

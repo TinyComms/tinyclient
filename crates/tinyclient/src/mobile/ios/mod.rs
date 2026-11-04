@@ -4,7 +4,8 @@
 //! * `audio`: microphone and camera permission (`AVCaptureDevice`), the call's `AVAudioSession`,
 //!   its routes (earpiece, speaker, Bluetooth, headphones) and the Settings page.
 //! * `camera`: `AVCaptureSession` front or back, NV12 frames to the sink.
-//! * `screen`: ReplayKit's in-app capture (`RPScreenRecorder`).
+//! * `screen`: a Broadcast Upload Extension for the whole screen. The simulator, which has no
+//!   system broadcast, keeps ReplayKit's in-app capture.
 //! * `codec`: VideoToolbox H.264, Annex B in and out.
 //! * `web`: Discord, Slack and Teams in a `WKWebView` presented over the GPUI window.
 //! * `auth`: a Tiny server's OIDC page in `ASWebAuthenticationSession` (passkeys work there).

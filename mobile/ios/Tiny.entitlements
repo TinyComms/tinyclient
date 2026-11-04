@@ -9,5 +9,11 @@
 	<array>
 		<string>$(AppIdentifierPrefix)$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 	</array>
+	<!-- The broadcast extension writes frames here. The same group is in Broadcast.entitlements.
+	     An ad-hoc signature that drops the group is said in words; the share does not pretend. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.dev.tinyclient.app</string>
+	</array>
 </dict>
 </plist>
