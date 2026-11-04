@@ -52,6 +52,7 @@ const JIGS: i32 = 55;
 const SERVICE: i64 = 777_000;
 const BOT: i64 = 7004;
 const SCAM: i64 = 7005;
+const FAKE: i64 = 7006;
 /// The `@gif` bot.
 const GIF_BOT: i64 = 7050;
 /// The folders: Work (the group and the forum) and Family (Odalys pinned, and the group too).
@@ -105,6 +106,7 @@ fn user(id: i64, first: &str, last: &str, username: &str) -> tl::types::User {
     // A bot's flag is shared with its info version, which must then be there.
     user.bot_info_version = user.bot.then_some(1);
     user.scam = id == SCAM;
+    user.fake = id == FAKE;
     user.phone = (id == ODALYS).then(|| "15550100777".to_owned());
     if id >= CROWD {
         user.photo = Some(tl::types::UserProfilePhoto { has_video: false, personal: false, photo_id: id + 5_000_000, stripped_thumb: None, dc_id: 2 }.into());
@@ -130,6 +132,7 @@ fn users() -> Vec<tl::enums::User> {
         user(SERVICE, "Telegram", "", "").into(),
         user(BOT, "Trail Bot", "", "trail_bot").into(),
         user(SCAM, "Prize Desk", "", "").into(),
+        user(FAKE, "Support Desk", "", "").into(),
     ];
     all.extend((0..crowd()).map(|at| user(CROWD + at, "Person", &at.to_string(), "").into()));
     all
@@ -395,6 +398,7 @@ impl World {
         // My newest word to the bot, which its dialog's read-outbox stops below: ✓ without ✓✓.
         world.store(None, message(Who::User(BOT), 5, ME, T0 - 115_000, "Any closures this weekend?"));
         world.store(None, message(Who::User(SCAM), 6, SCAM, T0 - 130_000, "You won a prize!"));
+        world.store(None, message(Who::User(FAKE), 7, FAKE, T0 - 140_000, "Your account needs verification."));
         // A draft typed on the phone before this device signed in: it rides Odalys's dialog at
         // the next reading of it, as any draft typed elsewhere does.
         world.drafts.insert((Who::User(ODALYS), None), "Finished packing. Meet at the ridge?".to_owned());
