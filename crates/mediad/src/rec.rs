@@ -94,9 +94,11 @@ pub fn run(path: PathBuf) -> io::Result<()> {
 fn run_with(path: PathBuf, told: Receiver<()>) -> io::Result<()> {
     // The microphone of a call: the same capture stage, and no speaker, so what we hear never
     // comes back out through our own.
+    // chatd reads `RecEvent` from us, not a call's `MediaResponse`: a microphone that will not
+    // open is said in the event it reads, or the composer keeps on recording nothing.
     let mut audio = Audio::open_sides(None, None, (true, false)).unwrap_or_else(|err| {
-        let (reason, detail) = media::failure(err);
-        out::fail(reason, detail)
+        let (_, detail) = media::failure(err);
+        fail(detail)
     });
     let mut encoder = match Encoder::voice() {
         Some(encoder) => encoder,
@@ -123,13 +125,17 @@ fn run_with(path: PathBuf, told: Receiver<()>) -> io::Result<()> {
     let mut packet = [0u8; 1600];
     let mut frames = 0u64;
     let since = Instant::now();
+    let mut next = since + TICK;
     loop {
-        // A stop is waited for in whole ticks, and the tick is the pacing: the recorder runs
-        // at the microphone's rate, as a call's loop does.
-        match told.recv_timeout(TICK) {
+        // A stop is waited for until the next tick, and the ticks are the pacing: the recorder
+        // runs at the microphone's rate, as a call's loop does. The deadline is absolute, so a
+        // frame that took long to encode shortens the next wait instead of letting the
+        // microphone's ring fill until it drops frames.
+        match told.recv_timeout(next.saturating_duration_since(Instant::now())) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
         }
+        next += TICK;
         let mut frame = [0i16; FRAME_SAMPLES];
         if audio.capture(&mut frame) {
             let bytes = match encoder.encode(&frame, &mut packet) {
