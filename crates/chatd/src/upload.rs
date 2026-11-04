@@ -464,7 +464,7 @@ where
     let (ctx, conversation_id, client_id, files) = (ctx.clone(), conversation_id.to_owned(), client_id.to_owned(), files.to_vec());
     let answer = ctx.clone();
     let (conversation, client) = (conversation_id.clone(), client_id.clone());
-    let spawned = std::thread::Builder::new().name("upload".into()).stack_size(512 * 1024).spawn(move || {
+    let spawned = std::thread::Builder::new().name("upload".into()).stack_size(2 * 1024 * 1024).spawn(move || {
         let outcome = match Upload::new(&ctx, &conversation_id, &client_id, &files) {
             Ok(mut upload) => {
                 let outcome = work(&mut upload);

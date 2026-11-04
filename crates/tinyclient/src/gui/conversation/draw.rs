@@ -623,6 +623,7 @@ impl Pane {
                 self.author_tap(header, "author-name", message, cx)
             }))
             .child(sent)
+            .children(self.views_line(message))
             .children(self.reactions(message, window, cx))
             .children(self.thread_line(message, window, cx))
             .children(self.sending(message, cx))
@@ -1118,13 +1119,13 @@ impl Pane {
                             })),
                     ),
             )
-            .child(body.child(
+            .child(crate::gui::components::scroll::scroll_content(("code-scroll-frame", block), body.pb(px(18.)).child(
                 div()
                     .type_code()
                     .when(phone, |code| code.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(20.))))
                     .whitespace_nowrap()
                     .child(shown),
-            ))
+            )))
             .children(folded.then(|| {
                 div()
                     .id(("more", block))
@@ -1822,6 +1823,20 @@ impl Pane {
             .child(div().min_w_0().truncate().when(gone, |snippet| snippet.italic()).child(snippet))
     }
 
+    /// A channel post's footer: how many people saw it, as Telegram's apps say it. Telegram
+    /// counts views for channel posts only, so a message without a count draws nothing.
+    fn views_line(&self, message: &Message) -> Option<AnyElement> {
+        let views = message.views?;
+        Some(
+            div()
+                .h(px(16.))
+                .type_micro()
+                .text_color(theme::text_faint())
+                .child(format!("{} views", views_short(views)))
+                .into_any_element(),
+        )
+    }
+
     fn thread_line(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         // A thread does not open inside a thread.
         let thread = message.thread.as_ref().filter(|_| !self.is_thread())?;
@@ -2103,6 +2118,21 @@ fn own_face(
     message.sender.avatar.clone().or_else(account).or_else(shown)
 }
 
+/// A view count the way Telegram's apps say it: "987", "12.4K", "1.2M". The number is cut,
+/// not rounded, so a count never reads as more than Telegram said.
+fn views_short(views: u32) -> String {
+    let (divisor, suffix) = match views {
+        0..=999 => return views.to_string(),
+        1_000..=999_999 => (1_000, "K"),
+        _ => (1_000_000, "M"),
+    };
+    let tenths = views / (divisor / 10);
+    match tenths % 10 {
+        0 => format!("{}{suffix}", tenths / 10),
+        part => format!("{}.{part}{suffix}", tenths / 10),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2129,6 +2159,17 @@ mod tests {
 
     fn face(message: &Message, messages: &[Rc<Message>], account: Option<&str>) -> Option<String> {
         own_face(message, None, messages, "me", || account.map(picture)).map(|file| file.id)
+    }
+
+    #[test]
+    fn a_view_count_is_said_the_way_telegrams_apps_say_it() {
+        assert_eq!(views_short(999), "999");
+        assert_eq!(views_short(1_000), "1K");
+        assert_eq!(views_short(1_024), "1K");
+        assert_eq!(views_short(12_400), "12.4K");
+        assert_eq!(views_short(999_999), "999.9K");
+        assert_eq!(views_short(1_000_000), "1M");
+        assert_eq!(views_short(1_200_000), "1.2M");
     }
 
     #[test]

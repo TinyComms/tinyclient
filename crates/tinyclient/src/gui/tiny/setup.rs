@@ -753,9 +753,10 @@ impl Shell {
             .font_family(theme::FONT)
             .text_color(theme::text())
             .child(
-                div().id("tiny-setup-scroll").flex_1().min_h_0().w_full().overflow_y_scroll().track_scroll(&state.scroll).flex().flex_col().items_center().child(
+                // Main's scrollbar frame, on the screen's own handle so a shot can scroll it (`--tiny-scroll`).
+                div().flex_1().min_h_0().child(crate::gui::components::scroll::scroll_frame("tiny-setup-scroll-frame", state.scroll.clone(), div().id("tiny-setup-scroll").size_full().min_h_0().w_full().overflow_y_scroll().track_scroll(&state.scroll).flex().flex_col().items_center().child(
                     div().w_full().max_w(px(760.)).px(px(40.)).pt(px(64.)).pb(px(32.)).flex().flex_col().gap(px(28.)).child(heading).child(self.tiny_setup_form("tiny-setup", "Start from", setup, cx)),
-                ),
+                ))),
             )
             .child(footer)
             .into_any_element()

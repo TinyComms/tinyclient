@@ -9,6 +9,8 @@
 #![allow(dead_code)]
 
 mod avatar;
+pub mod scroll;
+pub use scroll::scroll_frame;
 mod overlay;
 pub mod place;
 

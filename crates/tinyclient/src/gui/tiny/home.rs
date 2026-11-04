@@ -96,7 +96,7 @@ impl Shell {
         }
         column = column.child(self.tiny_voice_now(page, &in_voice, cx));
         column = column.child(self.tiny_online_now(page, cx));
-        div().id("tiny-home").size_full().overflow_y_scroll().flex().flex_col().items_center().child(column).into_any_element()
+        crate::gui::components::scroll::scroll_page("tiny-home-scroll-frame", div().id("tiny-home").size_full().overflow_y_scroll().flex().flex_col().items_center().child(column)).into_any_element()
     }
 
     /// Each call with someone in it: its name and count, the faces in it, Join.

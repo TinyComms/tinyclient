@@ -1747,9 +1747,9 @@ impl Shell {
                 }
             }
             Mode::Space(_) if state.rows.is_empty() => empty("icons/hash.svg", "No channels you can read", "Channels you are allowed to see show up here."),
-            _ => uniform_list("tree", state.rows.len(), cx.processor(Self::tree_rows))
+            _ => crate::gui::components::scroll_frame("tree-scroll-frame", state.tree_scroll.clone(), uniform_list("tree", state.rows.len(), cx.processor(Self::tree_rows))
                 .track_scroll(&state.tree_scroll)
-                .size_full()
+                .size_full()).keyboard(false)
                 .into_any_element(),
         }
     }
@@ -1763,6 +1763,23 @@ impl Shell {
                 .child(self.jump_strip(cx))
                 .child(div().flex_1().min_h_0().child(self.home_list(snapshot, window, cx)))
         )
+    }
+
+    /// Keep row selection on arrows; paging keys scroll the list that already has focus.
+    pub(super) fn page_sidebar(&mut self, event: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.in_lists(window) || self.sidebar_state.switcher.is_some() || self.layout_state.menu.is_some() { return; }
+        let state = &self.sidebar_state;
+        let target: crate::gui::components::scroll::ScrollTarget = match &state.mode {
+            Mode::Inbox if !state.inbox.fresh => state.inbox_list.clone().into(),
+            Mode::Inbox | Mode::People | Mode::Network(Network::Tiny) => return,
+            _ if state.listed() => state.home_list.clone().into(),
+            Mode::Space(_) | Mode::Network(_) if !state.rows.is_empty() => state.tree_scroll.clone().into(),
+            _ => return,
+        };
+        if target.page_key(event) {
+            cx.stop_propagation();
+            cx.notify();
+        }
     }
 
     pub(super) fn sidebar(&self, snapshot: &Snapshot, width: f32, window: &mut Window, cx: &mut Context<Self>) -> Div {

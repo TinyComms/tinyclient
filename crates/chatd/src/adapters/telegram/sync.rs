@@ -10,6 +10,8 @@ use crate::store::{ConversationRow, Filing, PreviewLine};
 use grammers_tl_types as tl;
 use protocol::{CallSupport, Capabilities, Card, ConversationKind, EmojiScope, MediaFile, MediaKind, Message, Relation, ReplyTo, Span, Special, Style, Watching};
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{Receiver, channel};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Pages of the main list read at sign-on, a hundred chats each: the newest 500. The rest are
@@ -22,6 +24,9 @@ const NEAR_END: usize = 30;
 const TOPICS: i32 = 50;
 /// A `HistoryAfter` for the same place is not asked again within this long.
 const AFTER_FRESH: Duration = Duration::from_secs(60);
+/// Where a comments thread writes through, held for the connection: capped, as everything
+/// the account holds while it lives.
+const DISCUSSIONS: usize = 32;
 /// Telegram's own rule: a channel's sponsored messages are asked again at most this often.
 const ADS_FRESH: Duration = Duration::from_secs(300);
 /// Rows whose newest message is fetched for one `Previews`, and the pause between them.
@@ -182,12 +187,13 @@ fn capabilities(premium: bool) -> Capabilities {
         edit_window: 48 * 3_600,
         file_scan: false,
         allow_archives: false,
+        voice_notes: true,
     }
 }
 
 /// The first requests of a connection: are we still signed in, who are we, what is muted by
 /// default, the chats, the contacts.
-pub(super) fn sign_on(account: &Account) -> Result<(), Fault> {
+pub(super) fn sign_on(account: &Arc<Account>) -> Result<(), Fault> {
     account.ask(&tl::functions::updates::GetState {})?;
     let me = account.ask(&tl::functions::users::GetUsers { id: vec![tl::enums::InputUser::UserSelf] })?;
     account.learn(&me, &[]);
@@ -269,6 +275,9 @@ struct Page {
     more: bool,
 }
 
+/// One page of a list, and where the next page starts, if Telegram has one.
+type PageRead = (Page, Option<Cursor>);
+
 fn page(account: &Account, folder: Option<i32>, offset: (i32, i32, tl::enums::InputPeer)) -> Result<Page, Fault> {
     let request = tl::functions::messages::GetDialogs {
         exclude_pinned: false,
@@ -310,8 +319,9 @@ fn page(account: &Account, folder: Option<i32>, offset: (i32, i32, tl::enums::In
 /// Reads the chats at sign-on (and again when a default mute changed): the folders first, so
 /// every row is written once with its filing; then the newest 500 of the main list and the
 /// newest of the archive. Each row names its folders, its pin and whether it is archived;
-/// nothing is grouped.
-pub(super) fn dialogs(account: &Account) -> Result<(), Fault> {
+/// nothing is grouped. A page is written while the one after it is asked for, so the lists
+/// paint what exists as it exists, and the boot does not wait for the writing it need not.
+pub(super) fn dialogs(account: &Arc<Account>) -> Result<(), Fault> {
     let rules = match filing::ask_rules(account) {
         Ok(rules) => rules,
         Err(fault) if fault.flood().is_some() || fault.signed_out() => return Err(fault),
@@ -319,15 +329,26 @@ pub(super) fn dialogs(account: &Account) -> Result<(), Fault> {
     };
     account.live().filed = Filed { rules, ..Filed::default() };
     filing::report(account);
-    for (list, pages) in [(0, DIALOG_PAGES), (1, ARCHIVE_PAGES)] {
+    for (list, most) in [(0usize, DIALOG_PAGES), (1usize, ARCHIVE_PAGES)] {
         let mut offset = None;
-        for _ in 0..pages {
-            match read_page(account, list, offset)? {
-                Some(next) => offset = Some(next),
-                None => break,
+        let mut inflight = Some(ask_page(account, list, offset));
+        let mut caught = 0usize;
+        while caught < most {
+            let read = match inflight.take() {
+                Some(landed) => landed.recv().unwrap_or_else(|_| Err(Fault::Net("the page ask ended".into()))),
+                None => fetch_page(account, list, offset),
+            };
+            let (mut page, next) = read?;
+            caught += 1;
+            // The page after this one is asked while this one is written, so long as more of
+            // the list is due at sign-on.
+            if next.is_some() && caught < most && !account.ctx.stopped() {
+                inflight = Some(ask_page(account, list, next));
             }
-            if account.ctx.stopped() {
-                break;
+            record_page(account, list, &mut page, next);
+            match next {
+                Some(next) if caught < most && !account.ctx.stopped() => offset = Some(next),
+                _ => break,
             }
         }
     }
@@ -383,29 +404,63 @@ fn pinned_missing(account: &Account) {
     }
 }
 
-/// One page of a list (0 the main list, 1 the archive) from `offset`, written row by row.
-/// Answers where the next page starts, if Telegram has one.
+/// One page of a list (0 the main list, 1 the archive) from `offset`, read whole and written
+/// whole, as the scrolling list reads it. Answers where the next page starts, if Telegram has
+/// one.
 fn read_page(account: &Account, list: usize, offset: Option<Cursor>) -> Result<Option<Cursor>, Fault> {
+    let (mut page, next) = fetch_page(account, list, offset)?;
+    record_page(account, list, &mut page, next);
+    Ok(next)
+}
+
+/// One page read (0 the main list, 1 the archive) from `offset`, with nothing written yet:
+/// its dialogs in the order Telegram gave, and where the next page starts, if Telegram has
+/// one. The next page is asked before this one is written, so the sign-on is not chained to
+/// the writing of every page it asked for.
+fn fetch_page(account: &Account, list: usize, offset: Option<Cursor>) -> Result<PageRead, Fault> {
     let start = match offset {
         Some((date, id, who)) => (date, id, account.input(who).unwrap_or(tl::enums::InputPeer::Empty)),
         None => (0, 0, tl::enums::InputPeer::Empty),
     };
-    let mut page = page(account, Some(list as i32), start)?;
-    let mut next = None;
+    let page = page(account, Some(list as i32), start)?;
+    let next = page.dialogs.last().and_then(|dialog| {
+        let who = Who::of(&dialog.peer);
+        let date = match page.newest.get(&(who, dialog.top_message)) {
+            Some(tl::enums::Message::Message(newest)) => newest.date,
+            Some(tl::enums::Message::Service(newest)) => newest.date,
+            _ => 0,
+        };
+        Some((date, dialog.top_message, who))
+    });
+    let next = next.filter(|_| page.more);
+    Ok((page, next))
+}
+
+/// The next page, read on its own so it is at the wire while the page before it is written.
+/// Answers on a channel of its own; where no thread could be had, the page is read where the
+/// caller stands, as the sign-on always did.
+fn ask_page(account: &Arc<Account>, list: usize, offset: Option<Cursor>) -> Receiver<Result<PageRead, Fault>> {
+    let (sent, landed) = channel();
+    let spare = sent.clone();
+    let speak = account.clone();
+    let asked = std::thread::Builder::new().name("telegram-pages".into()).spawn(move || {
+        let _ = sent.send(fetch_page(&speak, list, offset));
+    });
+    if asked.is_err() {
+        let _ = spare.send(fetch_page(account, list, offset));
+    }
+    landed
+}
+
+/// A page of the list, written row by row after it was read: its dialogs in the order Telegram
+/// gave, and then where the list goes on.
+fn record_page(account: &Account, list: usize, page: &mut Page, next: Option<Cursor>) {
     for dialog in std::mem::take(&mut page.dialogs) {
         let who = Who::of(&dialog.peer);
         let newest = page.newest.remove(&(who, dialog.top_message));
-        let date = match &newest {
-            Some(tl::enums::Message::Message(message)) => message.date,
-            Some(tl::enums::Message::Service(message)) => message.date,
-            _ => 0,
-        };
-        next = Some((date, dialog.top_message, who));
         record(account, list, &dialog, newest.as_ref());
     }
-    let next = next.filter(|_| page.more);
     account.live().filed.ends[list] = next;
-    Ok(next)
 }
 
 /// One dialog to the store: its row with its filing, its newest message, counts, mute and
@@ -660,6 +715,46 @@ fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
     Ok(count)
 }
 
+/// An emoji document asked whole: the animated file itself (its Lottie play), so the tile
+/// animates like the official apps', and a still emoji is the same file whole. The still
+/// thumbnail inside the document is neither: it is smaller than the play it belongs to.
+fn emoji_want(document: &tl::types::Document, row: Option<String>) -> Want {
+    Want {
+        file: MediaFile::new(format!("e{}", document.id), MediaKind::Emoji),
+        dc: document.dc_id,
+        location: tl::enums::InputFileLocation::InputDocumentFileLocation(tl::types::InputDocumentFileLocation {
+            id: document.id,
+            access_hash: document.access_hash,
+            file_reference: document.file_reference.clone(),
+            thumb_size: String::new(),
+        }),
+        inline: None,
+        row,
+        original: false,
+    }
+}
+
+/// The custom emoji a set of document ids names, asked in one batch. Telegram answers only
+/// what it knows; an error leaves the caller without documents (the tiles fall back to text).
+fn emoji_documents(account: &Account, ids: &[i64], why: &str) -> Vec<tl::types::Document> {
+    let documents = match account.ask(&tl::functions::messages::GetCustomEmojiDocuments { document_id: ids.to_vec() }) {
+        Ok(documents) => documents,
+        Err(fault) => {
+            eprintln!("chatd: Telegram: {why}: {fault}");
+            return Vec::new();
+        }
+    };
+    documents.into_iter().map(|document| match document {
+        tl::enums::Document::Document(document) => Some(document),
+        tl::enums::Document::Empty(_) => None,
+    }).flatten().collect()
+}
+
+/// The documents an id asks of a set: Telegram answers only the emoji it still keeps.
+fn documents_of<'a>(documents: &'a [tl::types::Document], id: i64) -> Option<&'a tl::types::Document> {
+    documents.iter().find(|document| document.id == id)
+}
+
 /// The topics' own pictures: one request for every icon the pages say, and a fetch for each
 /// that is not on disk yet (the same file may hang off several topics). The pictures are the
 /// emoji documents Telegram names in the topic list, small and shown at list size.
@@ -680,58 +775,53 @@ fn fetch_icons(account: &Account, forum: Who, topics: &[tl::enums::ForumTopic]) 
         }
         icons.push((icon, row));
     }
-    let emoji_ids: Vec<i64> = icons.iter().map(|(icon, _)| *icon).collect();
-    let mut emoji_ids = emoji_ids;
-    emoji_ids.sort_unstable();
-    emoji_ids.dedup();
-    if emoji_ids.is_empty() {
+    let mut ids = icons.iter().map(|(icon, _)| *icon).collect::<Vec<i64>>();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
         return;
     }
-    let documents = match account.ask(&tl::functions::messages::GetCustomEmojiDocuments { document_id: emoji_ids }) {
-        Ok(documents) => documents,
-        Err(fault) => {
-            eprintln!("chatd: Telegram: topic icons: {fault}");
-            return;
-        }
-    };
-    // What is fetched is whatever the icon can be drawn from: the still thumbnail Telegram
-    // names in the document ("m" first) when it names one, and the document whole otherwise —
-    // an animated icon is its Lottie JSON the same play the messages render, gzip unpacked
-    // where the file lands.
-    let wants = icons.into_iter().filter_map(|(icon, topic_row)| {
-        // The picture's row: the topic whose row hung it, so the list refreshes on its turn.
-        let document = documents.iter().find(|document| match document {
-            tl::enums::Document::Document(document) => document.id == icon,
-            _ => false,
-        })?;
-        let tl::enums::Document::Document(document) = document else {
-            return None;
-        };
-        let still = document.thumbs.as_ref().and_then(|thumbs| {
-            thumbs.iter().find_map(|thumb| match thumb {
-                tl::enums::PhotoSize::Size(size) if size.r#type == "m" => Some(size.r#type.clone()),
-                _ => None,
-            }).or_else(|| thumbs.iter().find_map(|thumb| match thumb {
-                tl::enums::PhotoSize::Size(size) => Some(size.r#type.clone()),
-                _ => None,
-            }))
-        });
-        let thumb_size = still.unwrap_or_default();
-        Some(Want {
-            file: MediaFile::new(format!("e{}", icon), MediaKind::Emoji),
-            dc: document.dc_id,
-            location: tl::enums::InputFileLocation::InputDocumentFileLocation(tl::types::InputDocumentFileLocation {
-                id: document.id,
-                access_hash: document.access_hash,
-                file_reference: document.file_reference.clone(),
-                thumb_size,
-            }),
-            inline: None,
-            row: Some(topic_row),
-            original: false,
-        })
+    let documents = emoji_documents(account, &ids, "topic icons");
+    // The picture's row: the topic whose row hung it, so the list refreshes on its turn.
+    let wants = icons.iter().filter_map(|(icon, row)| {
+        documents_of(&documents, *icon).map(|document| emoji_want(document, Some(row.clone())))
     }).collect();
     account.files.want(wants);
+}
+
+/// The custom emoji a set of document ids names, fetched whole into the media cache under the
+/// name each id carries, so the rows that show them draw the picture instead of their text.
+/// The rows named by `conversation` read again when the files land.
+fn fetch_emoji(account: &Account, mut ids: Vec<i64>, conversation: &str, why: &str) {
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return;
+    }
+    let documents = emoji_documents(account, &ids, why);
+    let wants = ids.iter().filter_map(|id| {
+        documents_of(&documents, *id).map(|document| emoji_want(document, Some(conversation.to_owned())))
+    }).collect();
+    account.files.want(wants);
+}
+
+/// A reaction's custom emoji: its document asked for and the file fetched into the media
+/// cache under the same name the reaction carries, whole, the way a topic's icon is. The
+/// rows read again when the pictures land, and the chips draw them instead of `:emoji:`.
+pub(super) fn reaction_emoji(account: &Account, conversation: &str, messages: &[Message]) {
+    fetch_emoji(
+        account,
+        messages.iter().flat_map(|message| content::reaction_emoji_ids(&message.reactions)).collect(),
+        conversation,
+        "reaction emoji",
+    );
+}
+
+/// A message's own custom emoji: the premium emoji its text names, fetched whole under the
+/// name its span carries (`e<document id>`). The text is the alt glyph Telegram chose; the row
+/// draws the picture in its place once the file lands, and the glyph until then.
+pub(super) fn text_emoji(account: &Account, conversation: &str, messages: &[Message]) {
+    fetch_emoji(account, messages.iter().flat_map(content::text_emoji_ids).collect(), conversation, "message emoji");
 }
 
 /// Where in a conversation a page of history is wanted.
@@ -762,12 +852,14 @@ fn quote(account: &Account, conversation: &str, page: &HashMap<i32, (String, Str
     }
 }
 
-/// Where a message belongs: its chat, or in a forum the thread of its topic.
+/// Where a message belongs: its chat, in a forum the thread of its topic, and in a
+/// discussion group the thread of the comments a reply of it answers.
 pub(super) fn conversation_of(account: &Account, mapped: &Mapped) -> String {
     match mapped.peer {
         Who::Channel(_) if account.dir().get(mapped.peer).is_some_and(|known| known.forum) => {
             thread_id(mapped.peer, mapped.topic.unwrap_or(1))
         }
+        Who::Channel(_) => comments_thread(account, mapped).unwrap_or_else(|| mapped.peer.text()),
         peer => peer.text(),
     }
 }
@@ -775,7 +867,13 @@ pub(super) fn conversation_of(account: &Account, mapped: &Mapped) -> String {
 /// Finishes a mapped message for the conversation it goes to: the reply's line.
 pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped, page: &HashMap<i32, (String, String, String)>) {
     if let Some(reply) = mapped.reply {
-        mapped.message.reply_to = Some(quote(account, conversation, page, reply));
+        // The echo of the post is the thread's own anchor, not a message anyone has before
+        // them: a comment that answers the post carries no quote line for it. A comment
+        // answering another comment in the thread names that one.
+        let anchor = account.live().discussion.iter().any(|(held, _, echo)| *held == conversation && *echo == reply);
+        if !anchor {
+            mapped.message.reply_to = Some(quote(account, conversation, page, reply));
+        }
     }
     account.place(mapped.peer, mapped.id, conversation);
     comment_thread(account, conversation, mapped);
@@ -783,16 +881,19 @@ pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped,
 
 /// The thread a channel post's comments hang off. The post carries the count; the row it opens
 /// under is written with it, so the footer's ask never lands on a conversation that is not
-/// there. The newest comment's time only comes with the page of comments, so the value a stored
-/// post keeps is kept on its way in again.
+/// there. The newest comment's time and the comments' unread only come with the pages that
+/// read them, so the values a stored post keeps are kept on its way in again.
 fn comment_thread(account: &Account, conversation: &str, mapped: &mut Mapped) {
     let Some(thread) = &mut mapped.message.thread else {
         return;
     };
     if let Ok(Some(stored)) = account.ctx.stored_message(conversation, &mapped.message.id) {
         if let Some(old) = &stored.thread {
-            if old.id == thread.id && old.last > thread.last {
-                thread.last = old.last;
+            if old.id == thread.id {
+                if old.last > thread.last {
+                    thread.last = old.last;
+                }
+                thread.unread = old.unread;
             }
         }
     }
@@ -803,10 +904,82 @@ fn comment_thread(account: &Account, conversation: &str, mapped: &mut Mapped) {
     let mut row = ConversationRow::new(id, ConversationKind::Thread, "Comments");
     row.parent = Some(mapped.peer.text());
     row.root = Some(mapped.message.id.clone());
-    // Reading is what this client opens the comments for: writing into the discussion group
-    // behind them, with the post's echo there, is its own step, so the composer stays shut.
+    // The row stands shut until the open of it learned where its comments go: without
+    // that, a comment has nowhere to be written in Telegram's own terms.
     row.read_only = true;
     let _ = account.ctx.conversation(&row);
+}
+
+/// The discussion group behind a channel post and the echo of the post there: what
+/// `getDiscussionMessage` names for the thread. Asked once (the cache of the connection
+/// holds the answer), for its sends and for the comments Telegram maps back into it.
+fn discussion(account: &Account, channel: Who, post: i32) -> Result<(Who, i32), Fault> {
+    let thread = thread_id(channel, post);
+    let held = account.live().discussion.iter().find(|(place, _, _)| *place == thread).map(|(_, who, echo)| (*who, *echo));
+    if let Some(held) = held {
+        return Ok(held);
+    }
+    let request = tl::functions::messages::GetDiscussionMessage { peer: account.input(channel)?, msg_id: post };
+    let tl::enums::messages::DiscussionMessage::Message(found) = account.ask(&request)?;
+    account.learn(&found.users, &found.chats);
+    // How many comments the user has not read comes with the discussion, not with the post.
+    comment_unread(account, channel, post, found.unread_count);
+    // The answer leads with the post itself, standing in the group: the id in it is what
+    // a send answers, and the group it stands in is where a send goes.
+    let Some((group, echo)) = found.messages.iter().find_map(|message| match message {
+        tl::enums::Message::Message(echo) => Some((Who::of(&echo.peer_id), echo.id)),
+        _ => None,
+    }) else {
+        return Err(Fault::Net("Telegram said the discussion with nothing in it.".to_owned()));
+    };
+    let mut live = account.live();
+    if live.discussion.len() >= DISCUSSIONS {
+        live.discussion.clear();
+    }
+    live.discussion.push_back((thread, group, echo));
+    Ok((group, echo))
+}
+
+/// Where a send in a comments thread goes: the discussion group behind the post, answering
+/// the echo of the post there, as Telegram's own apps keep them. `None` for any other
+/// conversation, which sends under its own peer and header.
+pub(super) fn comment_target(account: &Account, conversation: &str) -> Result<Option<(Who, i32)>, Fault> {
+    let Some((who @ Who::Channel(_), Some(post))) = Who::parse(conversation) else {
+        return Ok(None);
+    };
+    // A broadcast channel, and not a forum: its threads are the comments of a post, which
+    // are held in the linked discussion group.
+    if !account.dir().get(who).is_some_and(|known| known.broadcast) {
+        return Ok(None);
+    }
+    Ok(Some(discussion(account, who, post)?))
+}
+
+/// The row of a comments thread was written read-only, because a comment had nowhere to
+/// go until Telegram named the discussion group behind the post. It does now: an open
+/// that got its answer says post, once, and keeps everything else the row stood for.
+fn comment_row(account: &Account, thread: &str, channel: Who, post: i32) {
+    let Ok(Some(row)) = account.ctx.known(thread) else {
+        return;
+    };
+    if !row.read_only {
+        return;
+    }
+    let mut fresh = ConversationRow::new(thread, ConversationKind::Thread, row.title.as_str());
+    fresh.parent = Some(channel.text());
+    fresh.root = Some(post.to_string());
+    let _ = account.ctx.conversation(&fresh);
+}
+
+/// The comments thread a message in the discussion group belongs to: one already opened
+/// names the echo its reply answers. `None` leaves the message with the group's own id,
+/// for a conversation of the group itself.
+fn comments_thread(account: &Account, mapped: &Mapped) -> Option<String> {
+    let Some(echo) = mapped.reply else {
+        return None;
+    };
+    let live = account.live();
+    live.discussion.iter().find(|(_, held, at)| *held == mapped.peer && *at == echo).map(|(thread, _, _)| thread.clone())
 }
 
 /// The footer's "last reply": the newest comment's time, written onto the post it hangs off
@@ -821,6 +994,23 @@ fn comment_time(account: &Account, post_at: Who, root: i32, sent: i64) {
     };
     section.last = sent;
     let _ = account.ctx.history(&post_at.text(), std::slice::from_ref(&post));
+}
+
+/// The comments' unread count, which comes with where the discussion is, onto the post whose
+/// footer shows it. A count that did not change writes nothing.
+pub(super) fn comment_unread(account: &Account, channel: Who, root: i32, unread: i32) {
+    let Ok(Some(mut post)) = account.ctx.stored_message(&channel.text(), &root.to_string()) else {
+        return;
+    };
+    let Some(section) = post.thread.as_mut() else {
+        return;
+    };
+    let unread = unread.max(0) as u32;
+    if section.unread == unread {
+        return;
+    }
+    section.unread = unread;
+    let _ = account.ctx.history(&channel.text(), std::slice::from_ref(&post));
 }
 
 /// One request for a page of a conversation's messages, newest first as Telegram answers.
@@ -906,7 +1096,12 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
             authors.insert(author);
         }
     }
-    let messages: Vec<Message> = mapped.into_iter().map(|one| one.message).collect();
+    let mut messages: Vec<Message> = mapped.into_iter().map(|one| one.message).collect();
+    // A broadcast channel's posts show how many saw them. One ask covers the page, and the
+    // count is written with the posts below rather than fetched again for each.
+    if topic.is_none() && account.dir().get(who).is_some_and(|known| known.broadcast) {
+        views(account, who, &mut messages);
+    }
     // The newest page is whole: a stored message inside its range that Telegram no longer
     // lists was deleted while we were away.
     if let (Around::Newest, Some(newest), Some(oldest)) = (&around, messages.first(), messages.last()) {
@@ -928,8 +1123,47 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
     }
     wants.extend(avatar(account, who));
     wants.extend(authors.into_iter().take(20).filter_map(|author| avatar(account, author)));
+    // The reactions' custom emoji on this page: their files land for the chips while the
+    // user is looking at the conversation.
+    reaction_emoji(account, conversation, &messages);
+    // The premium emoji in the page's own text: their files land for the rows the same way,
+    // and the alt glyph stands only until they do.
+    text_emoji(account, conversation, &messages);
     account.files.want(wants);
     messages.into_iter().next()
+}
+
+/// The views of a channel's posts, in one ask for the page. Telegram counts a view when the
+/// app tells it to (`increment`), and reading a page is not the same as each post having been
+/// on screen, so nothing is added to the count here: what Telegram says stands.
+fn views(account: &Account, channel: Who, messages: &mut [Message]) {
+    let ids: Vec<i32> = messages.iter().filter_map(|message| message.id.parse().ok()).collect();
+    if ids.is_empty() {
+        return;
+    }
+    let Ok(peer) = account.input(channel) else {
+        return;
+    };
+    let request = tl::functions::messages::GetMessagesViews { peer, id: ids, increment: false };
+    let Ok(tl::enums::messages::MessageViews::Views(found)) = account.ask(&request) else {
+        return;
+    };
+    account.learn(&found.users, &found.chats);
+    // Telegram answers in the order it was asked: no id comes back with a count.
+    let counts: HashMap<i32, u32> = request
+        .id
+        .iter()
+        .zip(found.views.iter())
+        .filter_map(|(id, one)| {
+            let tl::enums::MessageViews::Views(counts) = one;
+            Some((*id, counts.views?.max(0) as u32))
+        })
+        .collect();
+    for message in messages {
+        if let Some(count) = message.id.parse().ok().and_then(|id| counts.get(&id)) {
+            message.views = Some(*count);
+        }
+    }
 }
 
 /// The user opened a conversation.
@@ -949,6 +1183,17 @@ pub(super) fn backfill(account: &Account, conversation: &str) {
             tracing::warn!("chatd: Telegram: topics: {fault}");
         }
         return;
+    }
+    // A comments thread under a channel post: its open asks Telegram once where the
+    // comments are written — the row said read-only until it did — and with the answer
+    // the page of the thread reads as any other's, under the post's id as before.
+    if broadcast {
+        if let Some(post) = topic {
+            match discussion(account, who, post) {
+                Ok(_) => comment_row(account, conversation, who, post),
+                Err(fault) => tracing::warn!("chatd: Telegram: comments: {fault}"),
+            }
+        }
     }
     let newest = history(account, conversation, Around::Newest);
     // The sponsored post belongs at the foot of the channel's own page; a comments thread

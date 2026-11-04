@@ -179,6 +179,9 @@ struct Live {
     stale: bool,
     /// Conversations a `HistoryAfter` was served for, so reading on does not ask twice.
     after: VecDeque<(String, String, Instant)>,
+    /// The discussion group a comments thread writes through and the echo of its post
+    /// there (`discussion`): what the open learned, for its sends and its mapping back.
+    discussion: VecDeque<(String, Who, i32)>,
     /// How the chats are filed: folders, pins, archive, and where each list continues.
     filed: filing::Filed,
     /// Pictures already queued this connection, so a row on screen is fetched once.
@@ -653,8 +656,15 @@ fn mark_read(account: &Account, conversation: &str, message: &str) {
             account.input(who).and_then(|peer| account.ask(&tl::functions::messages::ReadHistory { peer, max_id }).map(drop))
         }
     };
+    let read = told.is_ok();
     if let Err(fault) = told {
         tracing::warn!("chatd: Telegram: read: {fault}");
+    }
+    // The comments were read: the badge on the post they hang off goes with them.
+    if let (true, who @ Who::Channel(_), Some(root)) = (read, who, topic) {
+        if account.dir().get(who).is_some_and(|known| known.broadcast) {
+            sync::comment_unread(account, who, root, 0);
+        }
     }
 }
 
@@ -701,6 +711,9 @@ fn remember_random(account: &Account, random: i64, client_id: &str) {
 fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, opts: Options) -> Result<protocol::Message, Fault> {
     let invalid = || Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None };
     let (who, topic) = Who::parse(conversation).ok_or_else(invalid)?;
+    // The comments of a channel post are held in the discussion group behind it: the send
+    // names that, under the echo of the post itself, where Telegram's own apps write them.
+    let (who, topic) = sync::comment_target(account, conversation)?.map(|(group, echo)| (group, Some(echo))).unwrap_or((who, topic));
     let peer = account.input(who)?;
     let reply = reply_to.and_then(|id| id.parse::<i32>().ok());
     let random = random_id(client_id);

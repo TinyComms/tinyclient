@@ -205,7 +205,7 @@ impl Shell {
             };
             list = list.child(row);
         }
-        list.into_any_element()
+        crate::gui::components::scroll::scroll_page("tiny-directory-scroll-frame", list).into_any_element()
     }
 
     /// Text channels in this server's space, in the tree's order. Direct messages are kept in

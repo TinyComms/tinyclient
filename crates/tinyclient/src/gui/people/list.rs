@@ -1135,7 +1135,7 @@ impl Render for PeopleList {
         let line = |words: String, color: gpui::Rgba| div().flex_none().px(px(theme::PANE_PAD)).pb(px(4.)).type_small().text_color(color).child(words);
         let body = match self.empty() {
             Some(empty) => empty.into_any_element(),
-            None => list(self.list.clone(), cx.processor(|this: &mut PeopleList, ix: usize, window, cx| this.item(ix, window, cx))).size_full().into_any_element(),
+            None => crate::gui::components::scroll_frame("people-scroll-frame", self.list.clone(), list(self.list.clone(), cx.processor(|this: &mut PeopleList, ix: usize, window, cx| this.item(ix, window, cx))).size_full()).into_any_element(),
         };
         div()
             .size_full()

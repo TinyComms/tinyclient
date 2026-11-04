@@ -1318,7 +1318,7 @@ impl Render for Pane {
                     this.point_at(window.mouse_position(), cx);
                 }
             }))
-            .child(rows)
+            .child(crate::gui::components::scroll_frame("message-scroll-frame", self.list.clone(), rows).keyboard(false))
             .child(after)
             .children(self.history_banner(cx))
             .children(self.away.then(|| self.jump_button(cx)))
