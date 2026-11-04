@@ -1011,7 +1011,10 @@ impl SettingsWindow {
             "V8" => self.set_switch(id, PUSH_TO_TALK, ix == 1, false, cx),
             "V11" => {
                 let word = NOISE_CHOICES[ix.min(NOISE_CHOICES.len() - 1)];
-                let default = Values::default().word(GLOBAL, NOISE_SUPPRESSION);
+                // Values has to outlive the borrow from word(); a temporary is dropped
+                // before the comparison, which stable rustc rejects (E0716).
+                let defaults = Values::default();
+                let default = defaults.word(GLOBAL, NOISE_SUPPRESSION);
                 let stored = (word != default).then(|| word.to_owned());
                 self.set(id, GLOBAL.into(), NOISE_SUPPRESSION, stored, cx);
             }
