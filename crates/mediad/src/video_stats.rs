@@ -21,10 +21,11 @@ impl Meter {
             self.watching = None;
         }
     }
-    pub fn sent(&mut self, bytes: usize, now: Instant) {
+    /// One video packet accepted by UDP or the TCP transport after the WebRTC pacer.
+    pub fn sent(&mut self, bytes: usize, ends_frame: bool, now: Instant) {
         self.since.get_or_insert(now);
         self.sent.0 += bytes as u64;
-        self.sent.1 += 1;
+        self.sent.1 += u32::from(ends_frame);
     }
 
     pub fn received(&mut self, bytes: usize, now: Instant) {
@@ -80,7 +81,8 @@ mod tests {
         let mut meter = Meter::default();
         meter.sample(now);
         for _ in 0..60 {
-            meter.sent(10_000, now);
+            meter.sent(6_000, false, now);
+            meter.sent(4_000, true, now);
             meter.received(5_000, now);
             meter.rendered(1920, 1080, now);
         }
