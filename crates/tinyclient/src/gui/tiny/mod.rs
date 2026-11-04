@@ -106,6 +106,11 @@ pub(super) enum Modal {
     /// Passkey links for members, made from setup: who is ticked, then the links the server
     /// made, shown once. They are dropped when it closes and never written anywhere.
     PasskeyLinks { picked: Vec<String>, links: Vec<protocol::TinyClaimLink>, busy: bool, error: Option<String> },
+    /// A fresh set of this account's recovery codes, shown once. They live only here, go when it
+    /// closes, and are never written anywhere.
+    RecoveryCodes(Vec<String>),
+    /// One of this account's passkeys, to remove, by id, with its name for the words.
+    RemovePasskey { id: String, label: String },
 }
 
 /// The invite being made.
@@ -236,6 +241,19 @@ pub struct State {
     settings_fields: settings::Fields,
     /// First-run setup, for owners, and the form Server Settings › Privacy shares with it.
     setup: setup::State,
+
+    /// This account's own passkeys, as Server Settings › Sign-in last read them.
+    passkeys: Option<protocol::TinyPasskeys>,
+    /// What the server said no to about them, in words.
+    passkeys_error: Option<String>,
+    /// The server is older than a member's own passkeys: the Passkeys section is not drawn.
+    passkeys_older: bool,
+    /// A link, a rename, a removal or new codes is with the server.
+    passkeys_busy: bool,
+    /// What came of asking for a link to add a passkey, in words.
+    passkeys_note: Option<String>,
+    /// The passkey being renamed, by id, and the field its new name is typed in.
+    renaming: Option<(String, Entity<TextInput>)>,
 }
 
 impl State {
@@ -319,6 +337,12 @@ impl State {
             settings: None,
             settings_fields,
             setup: setup::State::default(),
+            passkeys: None,
+            passkeys_error: None,
+            passkeys_older: false,
+            passkeys_busy: false,
+            passkeys_note: None,
+            renaming: None,
         }
     }
 
@@ -336,6 +360,12 @@ impl State {
         self.card = None;
         self.settings = None;
         self.setup = setup::State::default();
+        self.passkeys = None;
+        self.passkeys_error = None;
+        self.passkeys_older = false;
+        self.passkeys_busy = false;
+        self.passkeys_note = None;
+        self.renaming = None;
     }
 
     /// The volume and mute for me kept for someone, else 100 % and heard: what was just set
@@ -1521,7 +1551,7 @@ impl Shell {
         }
         if std::env::args().any(|arg| arg == "--tiny-settings") {
             let asked = flag("--tiny-settings").unwrap_or_default();
-            let page = settings::Page::ALL.into_iter().find(|page| page.label().to_lowercase().starts_with(&asked)).filter(|_| !asked.is_empty() && asked != "dirty");
+            let page = settings::Page::ALL.into_iter().find(|page| page.label().to_lowercase().replace('-', "").starts_with(&asked)).filter(|_| !asked.is_empty() && asked != "dirty");
             self.tiny_open_settings(page.unwrap_or(settings::Page::Overview), None, window, cx);
             if asked == "dirty" {
                 let name = self.tiny_state.settings_fields.name.clone();
@@ -1539,6 +1569,11 @@ impl Shell {
                     }
                     _ => {}
                 }
+            }
+            // A made-up set of recovery codes over Sign-in, as "New recovery codes" shows them.
+            if flag("--tiny-confirm").as_deref() == Some("codes") {
+                let codes = ["7KQM-2XPD", "R4TW-9HCN", "B8LF-3VZJ", "M2YE-6QSA", "W9GD-4KTR", "H3PX-8NMB", "C6UJ-1FWL", "T5RA-7DYQ", "N1ZS-5GEH", "F8VK-2BCU"];
+                self.tiny_show_codes(codes.iter().map(|code| (*code).to_owned()).collect(), cx);
             }
             if flag("--tiny-confirm").as_deref() == Some("transfer") {
                 let heir = community.members.iter().find(|member| member.user_id != community.me && !model::is_owner(member)).map(|member| member.user_id.clone());

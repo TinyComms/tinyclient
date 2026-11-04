@@ -4,7 +4,8 @@
 //! kicking several people, unbanning, revoking invites, handing over the server and signing out
 //! everywhere. The most dangerous ask for the server's name to be typed. Each is the system's modal (`components::modal`):
 //! a title, what it does in words, Cancel and the action last. And setup's passkey links for
-//! members, shown once.
+//! members, shown once; Sign-in's removal of one of your passkeys, and your new recovery codes,
+//! shown once.
 
 use super::{model, Modal, Page};
 use crate::gui::components::{button, button_disabled, field, glyph, modal, segment, segmented, ButtonKind};
@@ -231,6 +232,32 @@ impl Shell {
                 self.tiny_typed_confirm(panel, page, "Transfer ownership", window, cx, |this, cx| this.tiny_transfer(cx))
             }
             Modal::PasskeyLinks { picked, links, busy, error } => self.passkey_links_modal(page, picked, links, *busy, error.as_deref(), cx),
+            Modal::RecoveryCodes(codes) => self.recovery_codes_modal(codes, cx),
+            Modal::RemovePasskey { id, label } => {
+                let id = id.clone();
+                let last = self.tiny_state.passkeys.as_ref().is_some_and(|list| list.passkeys.len() == 1);
+                let action = if self.tiny_state.passkeys_busy {
+                    button_disabled("Remove passkey").h(px(32.)).into_any_element()
+                } else {
+                    button("tiny-modal-do", ButtonKind::Danger, "Remove passkey").h(px(32.)).on_click(cx.listener(move |this, _, _, cx| this.tiny_passkey_remove(id.clone(), cx))).into_any_element()
+                };
+                modal(format!("Remove {label}?"))
+                    .child(words(if last {
+                        "It is your last passkey. After this you sign in with a recovery code, or another way this server allows, until you add a new one."
+                    } else {
+                        "You can't sign in with it any more. Your other passkeys keep working."
+                    }))
+                    .children(self.modal_error())
+                    .child(
+                        div()
+                            .mt(px(20.))
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(button("tiny-modal-cancel", ButtonKind::Secondary, "Cancel").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))))
+                            .child(action),
+                    )
+            }
             Modal::SignOutEverywhere => modal("Sign out everywhere?")
                 .child(words(format!("Every session of yours on {} ends, on every computer, this one too. Sign in again with your provider when you want back in.", page.name)))
                 .children(self.modal_error())
@@ -348,6 +375,34 @@ impl Shell {
                         this.tiny_state.copied = true;
                         cx.notify();
                     }))),
+            )
+    }
+
+    /// A fresh set of recovery codes, shown once: in two columns of monospace, with Copy and Done.
+    /// They go when this closes.
+    fn recovery_codes_modal(&self, codes: &[String], cx: &mut Context<Self>) -> Div {
+        let half = codes.len().div_ceil(2);
+        let column = |part: &[String]| div().flex_1().flex().flex_col().gap(px(4.)).children(part.iter().map(|code| div().type_code().text_color(theme::text()).child(code.clone())));
+        let (left, right) = codes.split_at(half.min(codes.len()));
+        let all = codes.join("\n");
+        let copied = self.tiny_state.copied;
+        modal("New recovery codes")
+            .w(px(440.))
+            .child(words("Each code works once. Keep them somewhere that is not this computer."))
+            .child(words("The codes you had before no longer work."))
+            .child(div().id("tiny-codes").mt(px(16.)).px(px(16.)).py(px(12.)).rounded(px(theme::R_CARD)).bg(theme::raised()).border_1().border_color(theme::hairline()).flex().gap(px(16.)).child(column(left)).child(column(right)))
+            .child(
+                div()
+                    .mt(px(20.))
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(button("tiny-codes-copy", ButtonKind::Secondary, if copied { "Copied" } else { "Copy" }).h(px(32.)).on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(all.clone()));
+                        this.tiny_state.copied = true;
+                        cx.notify();
+                    })))
+                    .child(button("tiny-codes-done", ButtonKind::Primary, "Done").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))),
             )
     }
 

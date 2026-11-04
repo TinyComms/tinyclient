@@ -44,7 +44,7 @@ pub(in crate::gui) use channels::Sel;
 pub(in crate::gui) use danger::confirmed;
 pub(in crate::gui) use invites::revocable;
 pub(in crate::gui::tiny) use kit::{card, check_box, note};
-pub(in crate::gui::tiny) use signin::provider_words;
+pub(in crate::gui::tiny) use signin::{provider_words, LinkFrom};
 #[cfg(feature = "gui-shot")]
 pub(in crate::gui) use members::selectable as tickable;
 
@@ -153,7 +153,9 @@ impl Page {
             Page::Audit => may.read_audit,
             // What the server keeps about everyone in it: every member may read it, an owner changes it.
             Page::Privacy => crate::tiny_setup::offered(community),
-            Page::SignIn => may.edit_server || may.owner,
+            // A member's own sign-in and passkeys, on a server new enough to have them (it has
+            // setup); before that, for those who run the server.
+            Page::SignIn => may.edit_server || may.owner || crate::tiny_setup::offered(community),
             // Everyone's own devices and the people they talk to: not a power over the server.
             Page::Encryption => community.has(protocol::TINY_FEATURE_E2EE_TEXT),
             Page::Danger => may.owner,
@@ -337,6 +339,10 @@ impl Shell {
         // An owner's page is the server's own outline, read once.
         if page == Page::Privacy {
             self.tiny_privacy_enter(cx);
+        }
+        // This account's own passkeys, read each time the page comes on show.
+        if page == Page::SignIn {
+            self.tiny_signin_enter(cx);
         }
     }
 
@@ -695,9 +701,9 @@ mod tests {
         modern.capabilities.features = ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "e2ee_text"].map(String::from).to_vec();
         modern.access = Some(TinyAccess { permissions: TINY_KICK_MEMBERS | TINY_VIEW_AUDIT_LOG, ..TinyAccess::default() });
         assert_eq!(shown(&modern), ["Overview", "Members", "Audit log", "Encryption"], "a moderator sees what they moderate, and everyone sees Encryption where the server has it");
-        // Privacy is for everyone on a server that has setup, and only there.
+        // Privacy, and Sign-in with your own passkeys, are for everyone on a server that has setup.
         modern.capabilities.features.push("first_run_setup".to_owned());
-        assert_eq!(shown(&modern), ["Overview", "Members", "Audit log", "Privacy", "Encryption"]);
+        assert_eq!(shown(&modern), ["Overview", "Members", "Audit log", "Privacy", "Sign-in", "Encryption"]);
         modern.access = Some(TinyAccess { permissions: TINY_ALL, rank: 3, ..TinyAccess::default() });
         assert!(!shown(&modern).contains(&"Danger zone"), "only owners see the danger zone");
         modern.access = Some(TinyAccess { owner: true, ..TinyAccess::default() });

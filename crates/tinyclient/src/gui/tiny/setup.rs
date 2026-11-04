@@ -6,7 +6,7 @@
 //! this window holds is the form the owner is filling in, and "Later" only lasts until the server
 //! is opened again. Nothing is applied until the owner says so, and nothing blocks the app.
 
-use super::settings::{card, check_box, provider_words, section, Page as SettingsPage};
+use super::settings::{card, check_box, provider_words, section, LinkFrom, Page as SettingsPage};
 use super::{Modal, Page};
 use crate::client::ask;
 use crate::gui::components::{button, button_disabled, glyph, ButtonKind};
@@ -44,9 +44,9 @@ pub(super) struct State {
     /// Anything else it said no to, in words.
     error: Option<String>,
     /// A passkey link is being asked for.
-    linking: bool,
+    pub(super) linking: bool,
     /// What happened with the link, in words.
-    link_note: Option<String>,
+    pub(super) link_note: Option<String>,
     /// The first-run screen's scroll.
     pub(super) scroll: gpui::ScrollHandle,
 }
@@ -340,38 +340,12 @@ impl Shell {
 
     fn tiny_setup_remedy(&mut self, remedy: Remedy, cx: &mut Context<Self>) {
         match remedy {
-            Remedy::AddPasskey => self.tiny_setup_link(cx),
+            Remedy::AddPasskey => self.tiny_passkey_link(LinkFrom::Setup, cx),
             Remedy::DoItAnyway => {
                 self.tiny_state.setup.form.allow_lockout = true;
                 self.tiny_setup_send(Answer::Form, cx);
             }
         }
-    }
-
-    /// Asks the server for a link that adds a passkey for this account. chatd opens it in the
-    /// system browser; here the owner is told it did.
-    fn tiny_setup_link(&mut self, cx: &mut Context<Self>) {
-        let Some(account) = self.tiny_state.account.clone() else {
-            return;
-        };
-        let state = &mut self.tiny_state.setup;
-        if state.linking {
-            return;
-        }
-        state.linking = true;
-        state.link_note = None;
-        cx.notify();
-        self.off_thread(cx, move || ask(&Request::TinyPasskeyLink { account }), |this, answer, cx| {
-            let state = &mut this.tiny_state.setup;
-            state.linking = false;
-            state.link_note = Some(match answer {
-                Ok(Response::Ok) => "A page to add a passkey opened in your browser. When you have added one, come back and check again.".to_owned(),
-                Ok(Response::Error { detail, .. }) => detail,
-                Ok(_) => crate::client::OTHER_ANSWER.to_owned(),
-                Err(err) => crate::client::trouble_words("tiny", &err),
-            });
-            cx.notify();
-        });
     }
 
     /// The owner has added a passkey (or says so): what the server counts is read again.
@@ -527,7 +501,7 @@ impl Shell {
                 Some(Action::AddPasskey) if linking => Some(button_disabled(tiny_setup::remedy_label(Remedy::AddPasskey)).into_any_element()),
                 Some(Action::AddPasskey) => Some(
                     button(SharedString::from(format!("{prefix}-step-passkey")), ButtonKind::Secondary, tiny_setup::remedy_label(Remedy::AddPasskey))
-                        .on_click(cx.listener(|this, _, _, cx| this.tiny_setup_link(cx)))
+                        .on_click(cx.listener(|this, _, _, cx| this.tiny_passkey_link(LinkFrom::Setup, cx)))
                         .into_any_element(),
                 ),
                 Some(Action::SendLinks) => Some(
@@ -620,7 +594,7 @@ impl Shell {
                             button_disabled(tiny_setup::remedy_label(Remedy::AddPasskey)).into_any_element()
                         } else {
                             button(SharedString::from(format!("{prefix}-hint-link")), ButtonKind::Secondary, tiny_setup::remedy_label(Remedy::AddPasskey))
-                                .on_click(cx.listener(|this, _, _, cx| this.tiny_setup_link(cx)))
+                                .on_click(cx.listener(|this, _, _, cx| this.tiny_passkey_link(LinkFrom::Setup, cx)))
                                 .into_any_element()
                         };
                         words = words.child(hint).child(div().mt(px(4.)).flex().child(add));

@@ -844,6 +844,23 @@ fn premier() -> protocol::TinyCommunity {
     }
 }
 
+/// My passkeys on Premier: one synced and used this morning, one flagged and never used, with
+/// seven recovery codes left.
+fn my_passkeys() -> protocol::TinyPasskeys {
+    let passkey = |id: &str, label: &str, made: i64, used: Option<i64>, synced: bool, flagged: bool| protocol::TinyPasskey {
+        id: id.into(),
+        label: label.into(),
+        created_at: stamp(on_day(made, 10, 0)),
+        last_used_at: used.map(stamp),
+        synced,
+        flagged,
+    };
+    protocol::TinyPasskeys {
+        passkeys: vec![passkey("pk-laptop", "1Password", 120, Some(now() - 3 * 3_600), true, false), passkey("pk-key", "YubiKey 5C", 30, None, false, true)],
+        recovery_codes_left: 7,
+    }
+}
+
 /// Unix seconds as the server writes them: RFC 3339, UTC.
 fn stamp(unix: i64) -> String {
     let days = unix.div_euclid(86_400);
@@ -1147,6 +1164,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
         Request::Prunable { .. } => Response::Prunable { messages: 0, bytes: 0 },
         Request::SignIn { .. } => Response::Error { code: protocol::ErrorCode::SignIn, detail: "The sign-in window was closed.".into() },
         Request::TinyCommunity { .. } => Response::TinyCommunity { community: premier() },
+        Request::TinyPasskeysRead { .. } => Response::TinyPasskeys { passkeys: my_passkeys() },
         Request::TinyE2ee { ask: protocol::E2eeAsk::Status, .. } => Response::TinyE2ee { status: e2ee_status() },
         Request::TinyE2ee { ask: protocol::E2eeAsk::Person { user_id }, .. } => match e2ee_status().people.into_iter().find(|person| person.user_id == *user_id) {
             Some(person) => Response::TinyE2eePerson { person },
