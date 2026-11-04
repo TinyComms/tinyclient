@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "../tests/support/mediad.rs"]
+mod test_mediad;
+
 pub mod adapters;
 pub mod blobs;
 pub mod demo;

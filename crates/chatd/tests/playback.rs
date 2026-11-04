@@ -2,10 +2,14 @@
 //! sound device here (`TINYCLIENT_MEDIAD_AUDIO`). The file is a second of Ogg Opus, as Telegram
 //! and Discord send voice messages, placed in a scratch media cache.
 
+#[path = "support/mediad.rs"]
+mod test_mediad;
+
 use chatd::hub::Hub;
 use chatd::store::Store;
 use protocol::{AccountKey, Change, Key, Network, PlayRequest, PlayState, Playback};
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once};
@@ -17,11 +21,7 @@ const PATIENCE: Duration = Duration::from_secs(8);
 fn environment() {
     static READY: Once = Once::new();
     READY.call_once(|| {
-        let chatd = Path::new(env!("CARGO_BIN_EXE_chatd"));
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let built = Command::new(cargo).args(["build", "-p", "mediad", "--bin", "mediad"]).status().unwrap();
-        assert!(built.success(), "could not build mediad");
-        std::env::set_var("TINYCLIENT_MEDIAD", chatd.with_file_name(format!("mediad{}", std::env::consts::EXE_SUFFIX)));
+        std::env::set_var("TINYCLIENT_MEDIAD", test_mediad::path());
         std::env::set_var("TINYCLIENT_MEDIAD_AUDIO", "null");
     });
 }

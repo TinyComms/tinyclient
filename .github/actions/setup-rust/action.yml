@@ -46,3 +46,5 @@ runs:
         prefix-key: v1-rust
         shared-key: ${{ inputs.cache-key }}
         save-if: ${{ github.ref == 'refs/heads/main' }}
+        # A failing test must not discard a successful dependency build.
+        cache-on-failure: true

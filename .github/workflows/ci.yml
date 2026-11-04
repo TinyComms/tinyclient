@@ -49,6 +49,14 @@ jobs:
       # nextest runs the test binaries side by side, where `cargo test` ran them one at a time.
       # The window's own tests (prefs, search, shortcuts against the menus, the controls) build
       # only with the gui feature, so macOS turns it on for the one pass over the workspace.
+      # Tests use the real media engine. Building it inside each nextest process repeats
+      # Cargo resolution and serializes tests on its build lock (five minutes on a cold Mac).
+      # Use the whole workspace graph so tests and the engine share dependency features.
+      - name: Build test programs
+        shell: bash
+        run: |
+          cargo build --workspace --all-targets ${{ matrix.features }} --timings
+          echo "TINYCLIENT_TEST_MEDIAD=$GITHUB_WORKSPACE/target/debug/mediad${{ runner.os == 'Windows' && '.exe' || '' }}" >> "$GITHUB_ENV"
       - name: Test
         run: cargo nextest run --workspace ${{ matrix.features }}
       # nextest does not run doc tests.
