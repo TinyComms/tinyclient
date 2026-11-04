@@ -671,6 +671,10 @@ pub enum CallPath {
 /// The connection as it is now, over the last few seconds.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallStats {
+    /// Video access units sent/received and completed render images, measured over the last
+    /// interval. No capture-to-display latency is inferred from these counters or RTT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoStats>,
     /// Round trip, in milliseconds. 0 until measured.
     #[serde(default)]
     pub rtt_ms: u32,
@@ -723,6 +727,24 @@ pub struct CallStats {
     /// Times someone's voice stalled in mid-speech and went on when its packet came.
     #[serde(default)]
     pub playout_gaps: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoStats {
+    /// A remote video slot is selected and being watched.
+    pub receive_expected: bool,
+    /// Time this receive slot has been watched, so startup is not called a stall.
+    pub watching_ms: u32,
+    pub send_kbps: u32,
+    pub receive_kbps: u32,
+    pub send_fps: u32,
+    pub receive_fps: u32,
+    /// Images completed for the GUI, rather than refreshes of the physical display.
+    pub rendered_fps: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Time since the last completed image. None until an image exists.
+    pub frame_age_ms: Option<u32>,
 }
 
 /// What the user chose for a call's sound. Percentages, 0 to 100.

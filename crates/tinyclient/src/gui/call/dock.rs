@@ -916,8 +916,12 @@ impl Shell {
                 .when(enabled, |share| {
                     share
                         .tooltip(tip(if share_on { "Stop sharing" } else { "Share your screen" }, None))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.call_ask(Request::Media(MediaRequest::ShareSend { on: !share_on, screen: None, quality: None }), cx)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if share_on {
+                                this.tiny_stop_share(cx);
+                            } else {
+                                this.tiny_share(window, cx);
+                            }
                         }))
                 })
         });

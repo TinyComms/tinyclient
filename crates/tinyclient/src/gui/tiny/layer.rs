@@ -18,6 +18,11 @@ impl Shell {
         if state.float.is_none() && state.modal.is_none() && state.settings.is_none() && state.card.is_none() && !state.setup.prompt && state.full.is_none() {
             return None;
         }
+        // Sharing belongs to the active call, even while another chat is selected and
+        // no Tiny community page is loaded.
+        if matches!(state.modal, Some(super::Modal::Share)) {
+            return Some(super::modals::layer(self.tiny_share_modal(cx), true, cx));
+        }
         let page = self.tiny_page_facts()?;
         let mut layer = div().absolute().top_0().left_0().size_full();
         // A stream with the whole window, under any menu or modal.

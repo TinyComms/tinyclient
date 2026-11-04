@@ -232,7 +232,7 @@ fn health_chart(samples: Vec<ChartSample>, now_rtt: Option<u32>, now_recv: u32) 
                                 .items_center()
                                 .gap(px(5.))
                                 .child(div().size(px(7.)).rounded_full().bg(theme::positive()))
-                                .child(div().type_micro().text_color(theme::text_soft()).child("Ping")),
+                                .child(div().type_micro().text_color(theme::text_soft()).child("RTT")),
                         )
                         .child(
                             div()
@@ -427,9 +427,13 @@ impl Shell {
 
         match &self.tiny_state.stats {
             Some(stats) => {
+                // The bars smooth recent readings, but the numeric details are this sample.
+                let rtt = (stats.rtt_ms > 0).then_some(stats.rtt_ms);
+                let jitter = stats.link_measured.then_some(stats.jitter_ms);
+                let loss = stats.link_measured.then_some(stats.loss_permille);
                 let samples: Vec<_> = self.tiny_state.stats_chart.iter().copied().collect();
                 if !samples.is_empty() {
-                    card = card.child(health_chart(samples, health.rtt_ms, stats.receive_kbps));
+                    card = card.child(health_chart(samples, rtt, stats.receive_kbps));
                 }
                 let known = |measured: bool| if measured { theme::positive() } else { theme::text_soft() };
                 card = card
@@ -439,26 +443,26 @@ impl Shell {
                             .flex()
                             .gap(px(8.))
                             .child(kpi(
-                                "Ping",
-                                health.rtt_ms.map_or_else(|| "—".to_owned(), |ms| ms.to_string()),
+                                "RTT",
+                                rtt.map_or_else(|| "—".to_owned(), |ms| ms.to_string()),
                                 "ms",
-                                known(health.rtt_ms.is_some()),
+                                known(rtt.is_some()),
                             ))
                             .child(kpi(
                                 "Jitter",
-                                health.jitter_ms.map_or_else(|| "—".to_owned(), |ms| ms.to_string()),
+                                jitter.map_or_else(|| "—".to_owned(), |ms| ms.to_string()),
                                 "ms",
-                                known(health.jitter_ms.is_some()),
+                                known(jitter.is_some()),
                             ))
                             .child(kpi(
                                 "Loss",
-                                health.loss_permille.map_or_else(|| "—".to_owned(), |n| format!("{:.1}", f32::from(n) / 10.)),
+                                loss.map_or_else(|| "—".to_owned(), |n| format!("{:.1}", f32::from(n) / 10.)),
                                 "%",
-                                known(health.loss_permille.is_some()),
+                                known(loss.is_some()),
                             )),
                     )
                     .when_some(room.as_ref(), |card, (name, kbps)| {
-                        card.child(meta_row("Channel", name.clone())).child(meta_row("Channel bitrate", format!("{kbps} kb/s")))
+                        card.child(meta_row("Channel", name.clone())).child(meta_row("Audio target", format!("{kbps} kb/s")))
                     })
                     .child(meta_row("Sending", format!("{} kb/s", stats.send_kbps)))
                     .child(meta_row("Receiving", format!("{} kb/s", stats.receive_kbps)))
@@ -475,7 +479,17 @@ impl Shell {
                             .child(div().size(px(6.)).rounded_full().bg(theme::positive()))
                             .child(div().type_micro().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(path_pill(stats.path))),
                     ))
-                    .when(!stats.codec.is_empty(), |card| card.child(meta_row("Codec", stats.codec.clone())));
+                    .when(!stats.codec.is_empty(), |card| card.child(meta_row("Audio codec", stats.codec.clone())))
+                    .child(div().mt(px(6.)).whitespace_normal().type_micro().text_color(theme::text_soft()).child("RTT is the round trip to the call server, not playback delay. Sending and receiving include the whole call."));
+                if let Some(video) = &stats.video {
+                    card = card
+                        .child(meta_row("Video sending", format!("{} kb/s · {} fps", video.send_kbps, video.send_fps)))
+                        .child(meta_row("Video receiving", format!("{} kb/s · {} fps", video.receive_kbps, video.receive_fps)))
+                        .child(meta_row("Video images", format!("{} fps", video.rendered_fps)))
+                        .child(meta_row("Received size", if video.width > 0 { format!("{} × {}", video.width, video.height) } else { "Waiting for video".to_owned() }))
+                        .child(meta_row("Last video image", video.frame_age_ms.map_or_else(|| "None yet".to_owned(), |age| format!("{age} ms ago"))))
+                        .child(div().whitespace_normal().type_micro().text_color(theme::text_soft()).child("Video images counts completed images prepared for this window. Video codec: H.264."));
+                }
             }
             None => {
                 let words: SharedString = self.tiny_state.stats_note.clone().unwrap_or_else(|| "Measuring…".to_owned()).into();

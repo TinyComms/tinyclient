@@ -7,6 +7,7 @@
 //! Windows only; a window share stays on `PrintWindow`.
 
 use super::Rgba;
+pub(super) const NOT_DRAWN: &str = "The screen has not drawn yet.";
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -78,13 +79,22 @@ impl Duplicator {
         let mut resource: Option<IDXGIResource> = None;
         // SAFETY: as in `open`; the frame is released before this returns, on every path.
         unsafe {
-            match self.duplication.AcquireNextFrame(0, &mut info, &mut resource) {
+            // The first image can arrive after DuplicateOutput returns. A zero timeout here
+            // repeatedly tore down new duplications before they ever produced an image.
+            let timeout = if self.last.is_none() { 100 } else { 0 };
+            match self.duplication.AcquireNextFrame(timeout, &mut info, &mut resource) {
                 Ok(()) => {}
                 Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                    return self.last.clone().ok_or_else(|| "The screen has not drawn yet.".to_owned());
+                    return self.last.clone().ok_or_else(|| NOT_DRAWN.to_owned());
                 }
                 Err(err) if err.code() == DXGI_ERROR_ACCESS_LOST => return Err("The screen's output was lost.".to_owned()),
                 Err(err) => return Err(err.to_string()),
+            }
+            // A successful acquire may contain only a pointer update. Its texture is not
+            // a new desktop image (on first acquire it can be entirely black).
+            if info.LastPresentTime == 0 {
+                let _ = self.duplication.ReleaseFrame();
+                return self.last.clone().ok_or_else(|| NOT_DRAWN.to_owned());
             }
             let read = resource.ok_or("No frame.").and_then(|resource| resource.cast::<ID3D11Texture2D>().map_err(|_| "Not a texture.")).and_then(|texture| self.read(&texture));
             let _ = self.duplication.ReleaseFrame();

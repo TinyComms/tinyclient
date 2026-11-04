@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 /// The link and the sound, as far as `CallStats` says. `None` is "not measured", never zero.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in crate::gui) struct Health {
+    pub video_stalled: bool,
     pub rtt_ms: Option<u32>,
     pub jitter_ms: Option<u32>,
     pub loss_permille: Option<u16>,
@@ -68,6 +69,7 @@ impl Health {
             (u64::from(now.voice_loss_permille) * u64::from(part)).checked_div(lost).map_or(0, |n| n.min(1000) as u16)
         };
         Health {
+            video_stalled: now.video.as_ref().is_some_and(|video| video.receive_expected && video.watching_ms >= 3000 && video.frame_age_ms.is_none_or(|age| age >= 3000)),
             rtt_ms: measured(now.rtt_ms),
             jitter_ms: link.then_some(now.jitter_ms),
             loss_permille: link.then_some(now.loss_permille),
@@ -81,6 +83,9 @@ impl Health {
     }
 
     pub fn grade(&self) -> Grade {
+        if self.video_stalled {
+            return Grade::Poor;
+        }
         self.steady.unwrap_or_else(|| self.reading())
     }
 
@@ -110,6 +115,9 @@ impl Health {
     pub fn hints(&self) -> Vec<Hint> {
         let mut out = Vec::new();
         let mut say = |level, words: String| out.push(Hint { level, words });
+        if self.video_stalled {
+            say(Level::Bad, "The video is stalled: no new image for at least three seconds. Audio may still be working.".to_owned());
+        }
         if self.overruns.is_some_and(|n| n > 0) {
             say(Level::Bad, "Your microphone is dropping audio. Try another microphone, or close other apps using it.".to_owned());
         }
@@ -399,6 +407,24 @@ mod tests {
 
     fn link(rtt_ms: u32, loss_permille: u16, jitter_ms: u32) -> Health {
         Health::from_stats(&CallStats { rtt_ms, loss_permille, jitter_ms, ..CallStats::default() })
+    }
+
+    #[test]
+    fn a_stalled_video_cannot_be_hidden_by_an_excellent_audio_grade() {
+        let mut stats = CallStats { rtt_ms: 30, ..CallStats::default() };
+        stats.video = Some(protocol::VideoStats { receive_expected: true, watching_ms: 4000, ..Default::default() });
+        let mut health = Health::from_stats(&stats);
+        health.steady = Some(Grade::Great);
+        assert_eq!(health.grade(), Grade::Poor);
+        assert!(health.hints().iter().any(|hint| hint.words.contains("video is stalled")));
+        stats.video.as_mut().unwrap().frame_age_ms = Some(15);
+        assert_eq!(Health::from_stats(&stats).grade(), Grade::Great);
+        stats.video.as_mut().unwrap().frame_age_ms = None;
+        stats.video.as_mut().unwrap().watching_ms = 1000;
+        assert!(!Health::from_stats(&stats).video_stalled, "allow startup");
+        stats.video.as_mut().unwrap().watching_ms = 4000;
+        stats.video.as_mut().unwrap().receive_expected = false;
+        assert!(!Health::from_stats(&stats).video_stalled, "sending without watching needs no local video");
     }
 
     #[test]
