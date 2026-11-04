@@ -338,6 +338,10 @@ struct World {
     /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
     dialogs_go: bool,
     peer_go: bool,
+    /// The `upload.GetFile` asks being answered now, and the most at once, which the
+    /// tests of the rows' pictures read (`file-count`).
+    file_in: usize,
+    file_at_once: usize,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -369,6 +373,8 @@ impl World {
             calls: protocol::support_dir().join("telegram.calls"),
             dialogs_go: false,
             peer_go: false,
+            file_in: 0,
+            file_at_once: 0,
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, T0 - 300, "Are you coming to the ridge on Saturday?"));
@@ -871,6 +877,11 @@ impl World {
             }
             "peer-go" => {
                 self.peer_go = true;
+                Vec::new()
+            }
+            // The most file asks the wire held at once, for the tests of the rows' pictures.
+            "file-count" => {
+                self.log(&format!("file at once {}", self.file_at_once));
                 Vec::new()
             }
             // Bold on an accented word, a link on an emoji, a mention by id, code, a spoiler.
@@ -1721,7 +1732,11 @@ impl World {
                 _ => file_piece(request.offset, request.limit),
             };
             let piece = tl::types::upload::File { r#type: tl::enums::storage::FileType::FileJpeg, mtime: T0, bytes: held };
-            return answer(tl::enums::upload::File::File(piece));
+            self.file_in += 1;
+            self.file_at_once = self.file_at_once.max(self.file_in);
+            let answered = answer(tl::enums::upload::File::File(piece));
+            self.file_in -= 1;
+            return answered;
         }
         if let Some(request) = asked::<f::auth::ExportAuthorization>(body) {
             self.log(&format!("ExportAuthorization {}", request.dc_id));

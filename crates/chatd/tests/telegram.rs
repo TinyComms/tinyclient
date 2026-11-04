@@ -524,6 +524,58 @@ fn chats_past_the_newest_500_load_as_the_list_scrolls_with_their_pictures() {
 }
 
 #[test]
+fn rows_past_the_first_page_get_their_pictures_when_watched_one_file_each_at_most_four_in_flight() {
+    let world = World::crowded(650);
+    world.connected();
+    let known = |at: u32| world.conversation(&format!("u{}", 100_000 + at)).is_some();
+    world.until("the newest 500", || known(491).then_some(()));
+    assert_eq!(world.called("GetDialogs 0"), 5, "{:#?}", world.calls());
+    // The shell scrolls to the rows past the first page and says so: their pictures are
+    // asked for, each one file, and no chats are read again for any of them.
+    let rows: Vec<String> = (150..200).map(|at| format!("u{}", 100_000 + at)).collect();
+    let named: Vec<&str> = rows.iter().map(String::as_str).collect();
+    world.rows_on_screen(&named);
+    let last = "GetFile avatar 5100199";
+    world.within(Duration::from_secs(45), "the last row's picture to be asked for", || {
+        (world.called(last) > 0).then_some(())
+    });
+    for at in 150..200 {
+        let asked = format!("GetFile avatar {} at 0", 5_100_000 + at);
+        assert_eq!(world.called(&asked), 1, "row {at}: {:#?}", world.calls());
+    }
+    assert_eq!(world.called("GetDialogs 0"), 5, "an avatar ask is one file, not a dialogs re-read");
+    // However the fetching runs, at most four of them are in flight at once.
+    world.steer("file-count");
+    let at_once = world
+        .calls()
+        .iter()
+        .find_map(|call| call.strip_prefix("file at once ")?.parse::<usize>().ok())
+        .unwrap_or(0);
+    assert!(at_once <= 4, "{at_once} file asks were in flight at once: {:#?}", world.calls());
+}
+
+#[test]
+fn a_row_scrolled_away_before_its_picture_waits_unfetched_and_is_fetched_once_it_is_back() {
+    let world = World::crowded(60);
+    world.connected();
+    // Two rows on screen: both their pictures go in line, and the first is fetched.
+    world.rows_on_screen(&["u100000", "u100001"]);
+    world.until("the first row's picture", || (world.called("GetFile avatar 5100000") > 0).then_some(()));
+    // Scrolled away before its picture's turn came: the third row takes its place, and the
+    // second row's picture waits, unfetched, however long the fetching goes on.
+    world.rows_on_screen(&["u100002"]);
+    world.until("the third row's picture", || (world.called("GetFile avatar 5100002") > 0).then_some(()));
+    sleep(Duration::from_millis(400));
+    assert_eq!(world.called("GetFile avatar 5100001"), 0, "{:#?}", world.calls());
+    // Back on screen: it goes back in line and is fetched now, once.
+    world.rows_on_screen(&["u100001"]);
+    world.until("the second row's picture once its row came back", || {
+        (world.called("GetFile avatar 5100001") > 0).then_some(())
+    });
+    assert_eq!(world.called("GetFile avatar 5100001"), 1, "each picture once");
+}
+
+#[test]
 fn a_chats_list_paints_what_it_has_while_the_pages_arrive() {
     // Five pages of the main list at sign-on; every page after the first is held at the wire.
     let world = World::held(650);
