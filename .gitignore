@@ -11,7 +11,3 @@
 
 # Local build credentials (Telegram's app id and hash) for the release's own builds.
 /telegram.env
-<<<<<<< HEAD
->>>>>>> 74b7629 (Telegram's build credentials may sit in telegram.env next to the tree, so a local build does not silently lose Telegram the way a release build refuses to)
-=======
->>>>>>> 438d804 (The ignore file carries Telegram's credentials line from the rebase without the conflict's leftover)
