@@ -1,0 +1,10 @@
+{
+  "proof_repo": "TinyComms/e2e-proof",
+  "platforms": {
+    "linux":   {"group": "tiny-linux", "ssh": "tiny-linux", "work": "~/tiny-lab"},
+    "android": {"group": "zeppelin",   "avd": "Pixel_7", "serial": "emulator-5554"},
+    "windows": {"group": "winbuild",   "ssh": "winbuild", "work": "C:\\lab"},
+    "macos":   {"group": "mbp",        "ssh": "mbp",      "work": "~/tiny-lab"},
+    "ios":     {"group": "mbp",        "ssh": "mbp",      "work": "~/tiny-lab", "device": "iPhone 18 Pro"}
+  }
+}
