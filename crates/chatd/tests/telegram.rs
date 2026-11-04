@@ -1498,6 +1498,38 @@ fn a_recorded_voice_message_is_sent_as_a_telegram_voice_note() {
 }
 
 #[test]
+fn the_dialog_says_whether_they_read_my_last_word_and_a_groups_read_flips_live() {
+    let world = World::signed_in();
+    world.connected();
+    // Tobin read my newest: his dialog's read-outbox covers it, so the row says ✓✓ at the
+    // boot read, with no send and no open of the chat.
+    let tobin = world.conversation("u7003").unwrap();
+    assert_eq!((tobin.preview_mine, tobin.seen), (true, true), "{tobin:?}");
+    // The bot has my newest unread: its dialog's read-outbox stops below it, so ✓ only.
+    let bot = world.conversation("u7004").unwrap();
+    assert_eq!((bot.preview_mine, bot.seen), (true, false), "{bot:?}");
+    // A group whose newest word is not mine says nothing: ✓✓ rides my own last word.
+    let group = world.conversation("g8001").unwrap();
+    assert_eq!((group.preview_mine, group.seen), (false, false), "{group:?}");
+
+    // My word into the group, then the group reads it while I watch: ✓✓ arrives within
+    // seconds, from the update and not from a reading of the dialogs again.
+    let dialogs_before = world.called("GetDialogs");
+    world.send("g8001", "9001", "Rope is on the truck.", None);
+    let said = world.until("the group's echo", || {
+        world.messages("g8001").into_iter().find(|said| {
+            said.text == "Rope is on the truck." && said.state != SendState::Pending
+        })
+    });
+    assert!(!world.conversation("g8001").unwrap().seen);
+    world.steer(&format!("outbox g8001 {}", said.id));
+    world.until("the group's read", || {
+        world.conversation("g8001").filter(|row| row.seen && row.preview_mine)
+    });
+    assert_eq!(world.called("GetDialogs"), dialogs_before, "the flip came from the update, not a dialogs read");
+}
+
+#[test]
 fn a_session_ended_elsewhere_keeps_what_was_read_and_signing_out_ends_it_on_telegram() {
     let world = World::signed_in();
     world.connected();

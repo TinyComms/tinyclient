@@ -219,7 +219,7 @@ fn settings(mute_until: Option<i32>) -> tl::enums::PeerNotifySettings {
     settings.into()
 }
 
-fn dialog(peer: Who, top: i32, read: i32, unread: i32, pinned: bool, folder: Option<i32>) -> tl::enums::Dialog {
+fn dialog(peer: Who, top: i32, read: i32, outbox: i32, unread: i32, pinned: bool, folder: Option<i32>) -> tl::enums::Dialog {
     tl::types::Dialog {
         pinned,
         unread_mark: false,
@@ -227,7 +227,7 @@ fn dialog(peer: Who, top: i32, read: i32, unread: i32, pinned: bool, folder: Opt
         peer: peer.peer(),
         top_message: top,
         read_inbox_max_id: read,
-        read_outbox_max_id: top,
+        read_outbox_max_id: outbox,
         unread_count: unread,
         unread_mentions_count: 0,
         unread_reactions_count: 0,
@@ -365,9 +365,13 @@ impl World {
         world.store(None, message(Who::Channel(NOTES), 5, 0, T0 - 7_200, "Snow line is at 1,900 m this week."));
         world.store(Some(TOOLS), in_topic(message(Who::Channel(WORKSHOP), 41, TOBIN, T0 - 500, "Who has the torque wrench?"), TOOLS));
         world.store(None, message(Who::User(TOBIN), 30, TOBIN, T0 - 90_000, "Thanks for the lift."));
+        // My newest word to Tobin, which his dialog's read-outbox covers: the row's ✓✓ at boot.
+        world.store(None, message(Who::User(TOBIN), 31, ME, T0 - 80_000, "Trailhead at seven, then."));
         world.store(None, message(Who::User(ME), 2, ME, T0 - 100_000, "Packing list: stove, map, headlamp."));
         world.store(None, message(Who::User(SERVICE), 3, SERVICE, T0 - 110_000, "Login code: 24680. Do not give this code to anyone."));
         world.store(None, message(Who::User(BOT), 4, BOT, T0 - 120_000, "Trail report: all clear."));
+        // My newest word to the bot, which its dialog's read-outbox stops below: ✓ without ✓✓.
+        world.store(None, message(Who::User(BOT), 5, ME, T0 - 115_000, "Any closures this weekend?"));
         world.store(None, message(Who::User(SCAM), 6, SCAM, T0 - 130_000, "You won a prize!"));
         world.store(None, message(Who::User(FAKE), 7, FAKE, T0 - 140_000, "Your account needs verification."));
         // A draft typed on the phone before this device signed in: it rides Odalys's dialog at
@@ -1065,10 +1069,15 @@ impl World {
                 self.family_grew = true;
                 vec![update(tl::types::UpdateDialogFilter { id: FAMILY, filter: Some(self.folder(FAMILY)) }.into())]
             }
-            // Odalys read my messages up to this one.
+            // Odalys (or the chat the line names) read my messages up to this one.
             "outbox" => {
-                let max_id = words.next().and_then(|id| id.parse().ok()).unwrap_or(0);
-                vec![update(tl::types::UpdateReadHistoryOutbox { peer: odalys.peer(), max_id, pts: 0, pts_count: 0 }.into())]
+                let (who, id) = match words.next() {
+                    Some(chat) if chat.parse::<i32>().is_ok() => (odalys.clone(), chat.to_owned()),
+                    Some(chat) => (Who::parse(chat).map(|(who, _)| who).unwrap_or(odalys.clone()), words.next().unwrap_or("0").to_owned()),
+                    None => (odalys.clone(), "0".to_owned()),
+                };
+                let max_id = id.parse().ok().unwrap_or(0);
+                vec![update(tl::types::UpdateReadHistoryOutbox { peer: who.peer(), max_id, pts: 0, pts_count: 0 }.into())]
             }
             "flood-send" => {
                 self.flood_send = words.next().and_then(|seconds| seconds.parse().ok());
@@ -1221,28 +1230,29 @@ impl World {
             };
             self.log(&format!("GetDialogs {} {}", request.folder_id.unwrap_or(0), after.map_or_else(|| "start".to_owned(), Who::text)));
             let all: Vec<(tl::enums::Dialog, Who, String)> = match request.folder_id {
-                Some(1) => vec![(dialog(Who::User(TOBIN), 30, 30, 0, false, Some(1)), Who::User(TOBIN), Who::User(TOBIN).text())],
+                Some(1) => vec![(dialog(Who::User(TOBIN), 31, 31, 31, 0, false, Some(1)), Who::User(TOBIN), Who::User(TOBIN).text())],
                 _ => {
                     let mut all = vec![
-                        (dialog(Who::User(ODALYS), 12, 11, 1, true, None), Who::User(ODALYS), Who::User(ODALYS).text()),
+                        (dialog(Who::User(ODALYS), 12, 11, 12, 1, true, None), Who::User(ODALYS), Who::User(ODALYS).text()),
                         {
                             let (read, unread) = self.crew();
-                            (dialog(Who::Group(CREW), 20, read, unread, false, None), Who::Group(CREW), Who::Group(CREW).text())
+                            (dialog(Who::Group(CREW), 20, read, 20, unread, false, None), Who::Group(CREW), Who::Group(CREW).text())
                         },
-                        (dialog(Who::Channel(NOTES), 5, 0, 1, false, None), Who::Channel(NOTES), Who::Channel(NOTES).text()),
-                        (dialog(Who::Channel(WORKSHOP), 41, 0, 1, false, None), Who::Channel(WORKSHOP), key(Who::Channel(WORKSHOP), Some(TOOLS))),
-                        (dialog(Who::User(ME), 2, 2, 0, false, None), Who::User(ME), Who::User(ME).text()),
-                        (dialog(Who::User(SERVICE), 3, 3, 0, false, None), Who::User(SERVICE), Who::User(SERVICE).text()),
-                        (dialog(Who::User(BOT), 4, 4, 0, false, None), Who::User(BOT), Who::User(BOT).text()),
-                        (dialog(Who::User(SCAM), 6, 6, 0, false, None), Who::User(SCAM), Who::User(SCAM).text()),
+                        (dialog(Who::Channel(NOTES), 5, 0, 5, 1, false, None), Who::Channel(NOTES), Who::Channel(NOTES).text()),
+                        (dialog(Who::Channel(WORKSHOP), 41, 0, 41, 1, false, None), Who::Channel(WORKSHOP), key(Who::Channel(WORKSHOP), Some(TOOLS))),
+                        (dialog(Who::User(ME), 2, 2, 2, 0, false, None), Who::User(ME), Who::User(ME).text()),
+                        (dialog(Who::User(SERVICE), 3, 3, 3, 0, false, None), Who::User(SERVICE), Who::User(SERVICE).text()),
+                        // The bot has not read my last word to it: its read-outbox stops below.
+                        (dialog(Who::User(BOT), 5, 5, 4, 0, false, None), Who::User(BOT), Who::User(BOT).text()),
+                        (dialog(Who::User(SCAM), 6, 6, 6, 0, false, None), Who::User(SCAM), Who::User(SCAM).text()),
                     ];
                     for at in 0..crowd() {
                         let who = Who::User(CROWD + at);
-                        all.push((dialog(who, 1, 1, 0, false, None), who, who.text()));
+                        all.push((dialog(who, 1, 1, 1, 0, false, None), who, who.text()));
                     }
                     // The impostor's chat sits past the crowd, so the paging tests' rows land
                     // where their arithmetic says: five pages end at crowd chat 492 exactly.
-                    all.push((dialog(Who::User(FAKE), 7, 7, 0, false, None), Who::User(FAKE), Who::User(FAKE).text()));
+                    all.push((dialog(Who::User(FAKE), 7, 7, 7, 0, false, None), Who::User(FAKE), Who::User(FAKE).text()));
                     if lost_pin() {
                         // The pinned chat is no longer in the pages at all.
                         all.retain(|held| held.1 != Who::Group(CREW));
@@ -1274,7 +1284,7 @@ impl World {
         if let Some(request) = asked::<f::messages::GetPinnedDialogs>(body) {
             self.log(&format!("GetPinnedDialogs {}", request.folder_id));
             let (read, unread) = self.crew();
-            let dialogs = vec![dialog(Who::Group(CREW), 20, read, unread, true, None), dialog(Who::User(ODALYS), 12, 11, 1, true, None)]
+            let dialogs = vec![dialog(Who::Group(CREW), 20, read, 20, unread, true, None), dialog(Who::User(ODALYS), 12, 11, 12, 1, true, None)]
                 .into_iter()
                 .map(|mut dialog| {
                     let who = Who::of(&dialog.peer());
@@ -1293,10 +1303,10 @@ impl World {
             let (read, unread) = self.crew();
             let found = peers.iter().filter_map(|who| {
                 let dialog = match who {
-                    Who::Group(CREW) => dialog(*who, 20, read, unread, false, None),
-                    Who::User(ODALYS) => dialog(*who, 12, 11, 1, false, None),
-                    Who::User(TOBIN) => dialog(*who, 30, 30, 0, false, None),
-                    Who::Channel(NOTES) => dialog(*who, 5, 0, 1, false, None),
+                    Who::Group(CREW) => dialog(*who, 20, read, 20, unread, false, None),
+                    Who::User(ODALYS) => dialog(*who, 12, 11, 12, 1, false, None),
+                    Who::User(TOBIN) => dialog(*who, 31, 31, 31, 0, false, None),
+                    Who::Channel(NOTES) => dialog(*who, 5, 0, 5, 1, false, None),
                     _ => return None,
                 };
                 Some((who.clone().text(), dialog))
