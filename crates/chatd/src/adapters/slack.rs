@@ -1648,6 +1648,7 @@ fn capabilities() -> protocol::Capabilities {
         custom_emoji: protocol::EmojiScope::All,
         schedule: true,
         suppress_embeds: true,
+        search: true,
         ..protocol::Capabilities::default()
     }
 }

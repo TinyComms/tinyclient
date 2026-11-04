@@ -298,6 +298,8 @@ fn the_chats_are_one_list_with_no_space_each_filed_in_every_folder_it_matches() 
     // What Telegram lets this account send, as its session says.
     assert!(accounts[0].can.spoiler && accounts[0].can.silent && accounts[0].can.schedule && accounts[0].can.gifs);
     assert_eq!((accounts[0].can.max_files, accounts[0].can.caption_limit), (10, 1_024));
+    // Enter asks Telegram itself for the open conversation's words.
+    assert!(accounts[0].can.search, "Telegram searches one conversation on the network");
     // No invented Space: the chats are the Telegram home.
     let Response::Spaces { spaces } = world.ask(Request::Spaces { network: Some(Network::Telegram) }) else {
         panic!("no spaces");

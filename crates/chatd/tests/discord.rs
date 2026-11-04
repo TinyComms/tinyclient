@@ -3036,6 +3036,7 @@ fn the_home_follows_discords_own_folders_mutes_opt_in_requests_threads_and_plan(
     };
     assert_eq!((can.max_file_bytes, can.max_files, can.custom_emoji), (10 << 20, 10, protocol::EmojiScope::Space));
     assert!(can.gifs && can.stickers && can.spoiler && can.silent && can.suppress_embeds && can.reply_ping && !can.schedule);
+    assert!(can.search, "Enter asks Discord itself for a server or channel");
 
     // Friends: in voice (from the voice states) and playing (from presence). The voice channel
     // with a friend in it is told although no server is on screen. Both come in

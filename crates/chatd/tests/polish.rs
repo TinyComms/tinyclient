@@ -500,6 +500,8 @@ fn the_pickers_are_answered_on_demand_by_page_and_what_an_account_may_send_is_in
     assert_eq!(can(Network::Discord).max_file_bytes, 10 << 20);
     assert!(can(Network::Telegram).as_file && can(Network::Telegram).silent);
     assert!(!can(Network::Teams).gifs && can(Network::Teams).max_file_bytes > 0);
+    // The demo serves no search of the network itself: its adapter refuses one.
+    assert!(!can(Network::Telegram).search && !can(Network::Discord).search && !can(Network::Slack).search && !can(Network::Teams).search);
 }
 
 fn with_file(path: &std::path::Path) -> Outgoing {

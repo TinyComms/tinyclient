@@ -178,6 +178,7 @@ fn capabilities(premium: bool) -> Capabilities {
         as_file: true,
         gifs: true,
         stickers: true,
+        search: true,
         custom_emoji: if premium { EmojiScope::All } else { EmojiScope::None },
         silent: true,
         schedule: true,
