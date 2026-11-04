@@ -67,11 +67,11 @@ pub struct Pipe {
 }
 
 impl Pipe {
-    pub fn new(mode: &str, key: &[u8], ssrc: u32, rtx: u32) -> Option<Pipe> {
-        Some(Pipe {
-            media: VideoSender::new(Cipher::new(mode, key)?, ssrc),
-            rtx: VideoSender::new(Cipher::new(mode, key)?, rtx),
-        })
+    pub fn new(cipher: Cipher, ssrc: u32, rtx: u32) -> Pipe {
+        Pipe {
+            media: VideoSender::new(cipher.clone(), ssrc),
+            rtx: VideoSender::new(cipher, rtx),
+        }
     }
 }
 
@@ -371,4 +371,40 @@ pub fn run(leg: Leg) {
         drive.tick(&leg.dave, &leg.socket, &leg.report);
     }
     drive.finish();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn primary_and_repair_packets_never_reuse_a_transport_nonce() {
+        for mode in [rtp::AES_GCM, rtp::XCHACHA] {
+            let key = [42; 32];
+            let cipher = Cipher::new(mode, &key).unwrap();
+            let mut audio = rtp::Sender::new(cipher.clone(), 9, 0, 0);
+            let mut pipe = Pipe::new(cipher.clone(), 10, 11);
+            let opener = Cipher::new(mode, &key).unwrap();
+            let mut nonces = std::collections::HashSet::new();
+            for round in 0..32 {
+                // Starting a new video sender, as after a toggle, must not reset this key.
+                if round % 4 == 0 {
+                    pipe = Pipe::new(cipher.clone(), 10, 11);
+                }
+                for (packet, expected) in [
+                    (audio.seal(b"audio").unwrap(), b"audio".as_slice()),
+                    (pipe.media.seal(H264, true, 9000, b"frame", &[]).unwrap().0, b"frame".as_slice()),
+                    (pipe.rtx.seal(RTX, true, 9000, b"repair", &[]).unwrap().0, b"repair".as_slice()),
+                ] {
+                    let nonce = u32::from_be_bytes(packet[packet.len() - 4..].try_into().unwrap());
+                    assert!(nonces.insert(nonce), "{mode}: nonce {nonce} repeated across audio/video/RTX");
+                    assert_eq!(opener.unseal(&packet).unwrap().payload, expected);
+                }
+            }
+            assert_eq!(nonces.len(), 96);
+            let mut other_transport = Pipe::new(Cipher::new(mode, &[43; 32]).unwrap(), 10, 11);
+            let other = other_transport.media.seal(H264, true, 0, b"other", &[]).unwrap().0;
+            assert_eq!(&other[other.len() - 4..], &[0, 0, 0, 0], "another key has its own allocator");
+        }
+    }
 }

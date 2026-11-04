@@ -157,17 +157,43 @@ typedef struct {
     [self fitWidth:width height:height outWidth:&outW outHeight:&outH];
     uint32_t kind = 0;
     size_t bytes = 0;
+    uint8_t *base = NULL;
+    uint8_t *yBase = NULL;
+    uint8_t *uvBase = NULL;
+    size_t stride = 0;
+    size_t yStride = 0;
+    size_t uvStride = 0;
     if (format == kBGRA) {
         kind = kFormatBGRA;
         bytes = outW * outH * 4u;
         if (bytes > kMaxBytes) {
             return;
         }
-        uint8_t *base = CVPixelBufferGetBaseAddress(image);
-        size_t stride = CVPixelBufferGetBytesPerRow(image);
+        base = CVPixelBufferGetBaseAddress(image);
+        stride = CVPixelBufferGetBytesPerRow(image);
         if (base == NULL) {
             return;
         }
+    } else if (format == kFullRange || format == kVideoRange) {
+        kind = kFormatNV12;
+        bytes = outW * outH + outW * outH / 2u;
+        if (bytes > kMaxBytes || CVPixelBufferGetPlaneCount(image) < 2) {
+            return;
+        }
+        yBase = CVPixelBufferGetBaseAddressOfPlane(image, 0);
+        uvBase = CVPixelBufferGetBaseAddressOfPlane(image, 1);
+        yStride = CVPixelBufferGetBytesPerRowOfPlane(image, 0);
+        uvStride = CVPixelBufferGetBytesPerRowOfPlane(image, 1);
+        if (yBase == NULL || uvBase == NULL) {
+            return;
+        }
+    } else {
+        return;
+    }
+    // Mark busy before any shared payload or metadata write. The acquire half keeps the
+    // following pixel writes after the odd mark; the final release publishes them together.
+    uint32_t seq = atomic_fetch_add_explicit(&_header->seq, 1u, memory_order_acq_rel);
+    if (kind == kFormatBGRA) {
         for (size_t y = 0; y < outH; y++) {
             size_t sy = y * height / outH;
             uint8_t *dst = _pixels + y * outW * 4u;
@@ -181,19 +207,7 @@ typedef struct {
                 dst += 4;
             }
         }
-    } else if (format == kFullRange || format == kVideoRange) {
-        kind = kFormatNV12;
-        bytes = outW * outH + outW * outH / 2u;
-        if (bytes > kMaxBytes || CVPixelBufferGetPlaneCount(image) < 2) {
-            return;
-        }
-        uint8_t *yBase = CVPixelBufferGetBaseAddressOfPlane(image, 0);
-        uint8_t *uvBase = CVPixelBufferGetBaseAddressOfPlane(image, 1);
-        size_t yStride = CVPixelBufferGetBytesPerRowOfPlane(image, 0);
-        size_t uvStride = CVPixelBufferGetBytesPerRowOfPlane(image, 1);
-        if (yBase == NULL || uvBase == NULL) {
-            return;
-        }
+    } else {
         uint8_t *dstY = _pixels;
         for (size_t y = 0; y < outH; y++) {
             size_t sy = y * height / outH;
@@ -216,11 +230,7 @@ typedef struct {
                 dstUV[y * outW + x * 2u + 1] = src[1];
             }
         }
-    } else {
-        return;
     }
-    uint32_t seq = atomic_load_explicit(&_header->seq, memory_order_relaxed);
-    atomic_store_explicit(&_header->seq, seq + 1u, memory_order_release);
     _header->width = (uint32_t)outW;
     _header->height = (uint32_t)outH;
     _header->format = kind;

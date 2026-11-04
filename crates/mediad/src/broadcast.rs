@@ -176,8 +176,8 @@ pub fn publish(
     if magic != MAGIC || pixels.len() > MAX_BYTES || map.len < HEADER + pixels.len() {
         return false;
     }
-    let seq = header.seq.load(Ordering::Relaxed);
-    header.seq.store(seq.wrapping_add(1), Ordering::Release);
+    // The acquire half prevents payload writes moving before the odd sequence is visible.
+    let seq = header.seq.fetch_add(1, Ordering::AcqRel);
     // SAFETY: the payload mapping covers `pixels`, and a reader ignores the bytes while the
     // sequence is odd.
     unsafe {
@@ -267,6 +267,41 @@ mod tests {
         fn drop(&mut self) {
             unsafe { dealloc(self.ptr, self.layout) };
         }
+    }
+
+    // Windows cannot run ReplayKit. Check the actual extension's publication boundaries here,
+    // alongside the reader's behavior while a producer is paused in its pixel copy below.
+    #[test]
+    fn extension_hides_pixel_and_metadata_writes_until_publication() {
+        let source = include_str!("../../../mobile/ios/Broadcast/SampleHandler.m");
+        let producer = source.split("- (void)publish:").nth(1).unwrap()
+            .split("- (void)fitWidth:").next().unwrap();
+        let busy = producer.find("atomic_fetch_add_explicit(&_header->seq").or_else(||
+            producer.find("atomic_store_explicit(&_header->seq, seq + 1u")).expect("marks publication busy");
+        let done = producer.find("atomic_store_explicit(&_header->seq, seq + 2u").expect("publishes stable frame");
+        assert!(producer[busy..].split(';').next().unwrap().contains("memory_order_acq_rel"), "the busy mark must also keep later payload writes after it");
+        assert!(producer[done..].split(';').next().unwrap().contains("memory_order_release"), "publish all writes before marking the frame stable");
+        for payload in ["uint8_t *dst = _pixels", "uint8_t *dstY = _pixels", "_header->width =", "_header->height =", "_header->format =", "_header->data_len =", "atomic_store_explicit(&_header->timestamp_us"] {
+            let write = producer.find(payload).expect(payload);
+            assert!(busy < write && write < done, "{payload} must be inside the odd sequence interval");
+        }
+    }
+
+    #[test]
+    fn a_reader_rejects_a_producer_paused_mid_copy() {
+        let buf = Buf::new();
+        let map = buf.map();
+        prepare(&map);
+        assert!(publish(&map, 2, 2, FORMAT_BGRA, &[1; 16], 10));
+        let seq = map.header().seq.fetch_add(1, Ordering::AcqRel);
+        unsafe { std::ptr::write_bytes(map.pixels(), 2, 8) };
+        assert!(read(&map).is_none(), "a half-copied frame must not escape");
+        unsafe { std::ptr::write_bytes(map.pixels().add(8), 2, 8) };
+        map.header().timestamp_us.store(20, Ordering::Relaxed);
+        map.header().seq.store(seq + 2, Ordering::Release);
+        let frame = read(&map).unwrap();
+        assert_eq!(frame.data, [2; 16]);
+        assert_eq!(frame.timestamp_us, 20);
     }
 
     #[test]

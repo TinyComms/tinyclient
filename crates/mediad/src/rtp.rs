@@ -8,6 +8,8 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::Aes256Gcm;
 use chacha20poly1305::XChaCha20Poly1305;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub const AES_GCM: &str = "aead_aes256_gcm_rtpsize";
 pub const XCHACHA: &str = "aead_xchacha20_poly1305_rtpsize";
@@ -34,10 +36,21 @@ pub fn choose_mode(offered: &[String]) -> Option<&'static str> {
     [AES_GCM, XCHACHA].into_iter().find(|mode| offered.iter().any(|o| o == mode))
 }
 
-pub enum Cipher {
+enum Algorithm {
     Aes(Box<Aes256Gcm>),
     XChaCha(Box<XChaCha20Poly1305>),
 }
+
+struct Key {
+    algorithm: Algorithm,
+    /// u32::MAX + 1 is exhausted. Never wrap the wire's 32-bit nonce back to zero.
+    next: AtomicU64,
+}
+
+/// One negotiated transport key. Clones share its cipher and outbound nonce allocator, across
+/// audio, video, retransmission and sender recreation. A different transport gets a new key.
+#[derive(Clone)]
+pub struct Cipher(Arc<Key>);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RtpError {
@@ -91,26 +104,41 @@ pub fn video_extension(screen: bool, repaired: bool) -> Vec<u8> {
 
 impl Cipher {
     pub fn new(mode: &str, key: &[u8]) -> Option<Cipher> {
-        match mode {
-            AES_GCM => Aes256Gcm::new_from_slice(key).ok().map(|c| Cipher::Aes(Box::new(c))),
-            XCHACHA => XChaCha20Poly1305::new_from_slice(key).ok().map(|c| Cipher::XChaCha(Box::new(c))),
+        let algorithm = match mode {
+            AES_GCM => Aes256Gcm::new_from_slice(key).ok().map(|c| Algorithm::Aes(Box::new(c))),
+            XCHACHA => XChaCha20Poly1305::new_from_slice(key).ok().map(|c| Algorithm::XChaCha(Box::new(c))),
             _ => None,
-        }
+        }?;
+        Some(Cipher(Arc::new(Key { algorithm, next: AtomicU64::new(0) })))
     }
 
-    fn seal(&self, counter: [u8; COUNTER], payload: Payload) -> Option<Vec<u8>> {
-        match self {
-            Cipher::Aes(cipher) => {
+    /// Reserve before encrypting: even a failed encryption consumes its nonce. Only this method
+    /// seals outbound packets, so a sender cannot supply or reset the counter itself.
+    fn seal(&self, payload: Payload) -> Option<(Vec<u8>, [u8; COUNTER])> {
+        let mut next = self.0.next.load(Ordering::Relaxed);
+        let next = loop {
+            if next > u64::from(u32::MAX) {
+                return None;
+            }
+            match self.0.next.compare_exchange_weak(next, next + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(reserved) => break reserved,
+                Err(current) => next = current,
+            }
+        };
+        let counter = (next as u32).to_be_bytes();
+        let sealed = match &self.0.algorithm {
+            Algorithm::Aes(cipher) => {
                 let mut nonce = [0u8; 12];
                 nonce[..COUNTER].copy_from_slice(&counter);
                 cipher.encrypt(&nonce.into(), payload).ok()
             }
-            Cipher::XChaCha(cipher) => {
+            Algorithm::XChaCha(cipher) => {
                 let mut nonce = [0u8; 24];
                 nonce[..COUNTER].copy_from_slice(&counter);
                 cipher.encrypt(&nonce.into(), payload).ok()
             }
-        }
+        }?;
+        Some((sealed, counter))
     }
 
     /// Opens a datagram whose clear prefix is `aad` and whose sealed body is `body`, using the
@@ -120,13 +148,13 @@ impl Cipher {
     }
 
     fn open(&self, counter: [u8; COUNTER], payload: Payload) -> Option<Vec<u8>> {
-        match self {
-            Cipher::Aes(cipher) => {
+        match &self.0.algorithm {
+            Algorithm::Aes(cipher) => {
                 let mut nonce = [0u8; 12];
                 nonce[..COUNTER].copy_from_slice(&counter);
                 cipher.decrypt(&nonce.into(), payload).ok()
             }
-            Cipher::XChaCha(cipher) => {
+            Algorithm::XChaCha(cipher) => {
                 let mut nonce = [0u8; 24];
                 nonce[..COUNTER].copy_from_slice(&counter);
                 cipher.decrypt(&nonce.into(), payload).ok()
@@ -180,12 +208,11 @@ pub struct Sender {
     ssrc: u32,
     sequence: u16,
     timestamp: u32,
-    counter: u32,
 }
 
 impl Sender {
     pub fn new(cipher: Cipher, ssrc: u32, sequence: u16, timestamp: u32) -> Sender {
-        Sender { cipher, ssrc, sequence, timestamp, counter: 0 }
+        Sender { cipher, ssrc, sequence, timestamp }
     }
 
     /// 20 ms passed, whether or not a frame was sent in them.
@@ -206,28 +233,25 @@ impl Sender {
         datagram.extend_from_slice(&self.sequence.to_be_bytes());
         datagram.extend_from_slice(&self.timestamp.to_be_bytes());
         datagram.extend_from_slice(&self.ssrc.to_be_bytes());
-        let counter = self.counter.to_be_bytes();
-        let sealed = self.cipher.seal(counter, Payload { msg: opus, aad: &datagram })?;
+        let (sealed, counter) = self.cipher.seal(Payload { msg: opus, aad: &datagram })?;
         datagram.extend_from_slice(&sealed);
         datagram.extend_from_slice(&counter);
         self.sequence = self.sequence.wrapping_add(1);
-        self.counter = self.counter.wrapping_add(1);
         Some(datagram)
     }
 }
 
-/// One video SSRC. Its sequence and nonce counter are its own, independent of the audio sender
-/// and of every other SSRC. The timestamp is the frame's, at 90 kHz, not a clock this type keeps.
+/// One video SSRC. Its RTP sequence is its own; transport nonces belong to the shared key.
+/// The timestamp is the frame's, at 90 kHz, not a clock this type keeps.
 pub struct VideoSender {
     cipher: Cipher,
     ssrc: u32,
     sequence: u16,
-    counter: u32,
 }
 
 impl VideoSender {
     pub fn new(cipher: Cipher, ssrc: u32) -> VideoSender {
-        VideoSender { cipher, ssrc, sequence: 0, counter: 0 }
+        VideoSender { cipher, ssrc, sequence: 0 }
     }
 
     /// The datagram for one packet. `extension` is the one-byte body, already padded; empty sends
@@ -252,12 +276,10 @@ impl VideoSender {
         }
         plain.extend_from_slice(payload);
         let sequence = self.sequence;
-        let counter = self.counter.to_be_bytes();
-        let sealed = self.cipher.seal(counter, Payload { msg: &plain, aad: &header })?;
+        let (sealed, counter) = self.cipher.seal(Payload { msg: &plain, aad: &header })?;
         header.extend_from_slice(&sealed);
         header.extend_from_slice(&counter);
         self.sequence = self.sequence.wrapping_add(1);
-        self.counter = self.counter.wrapping_add(1);
         Some((header, sequence))
     }
 }
@@ -285,6 +307,58 @@ pub fn discovery_response(packet: &[u8]) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonce_exhaustion_stops_audio_and_video_instead_of_wrapping() {
+        for mode in [AES_GCM, XCHACHA] {
+            let mut audio = Sender::new(Cipher::new(mode, &[3; 32]).unwrap(), 1, 0, 0);
+            audio.cipher.0.next.store(u64::from(u32::MAX), Ordering::Relaxed);
+            assert!(audio.seal(b"last").is_some());
+            assert!(audio.seal(b"must not repeat zero").is_none(), "{mode}: audio nonce exhausted");
+            let mut video = VideoSender::new(Cipher::new(mode, &[4; 32]).unwrap(), 2);
+            video.cipher.0.next.store(u64::from(u32::MAX), Ordering::Relaxed);
+            assert!(video.seal(H264, true, 0, b"last", &[]).is_some());
+            assert!(video.seal(H264, true, 0, b"must not repeat zero", &[]).is_none(), "{mode}: video nonce exhausted");
+        }
+    }
+
+    #[test]
+    fn exhausting_the_key_stops_every_sender_and_recreation_cannot_reset_it() {
+        for mode in [AES_GCM, XCHACHA] {
+            let cipher = Cipher::new(mode, &[3; 32]).unwrap();
+            cipher.0.next.store(u64::from(u32::MAX) - 1, Ordering::Relaxed);
+            let mut audio = Sender::new(cipher.clone(), 1, 0, 0);
+            let mut video = VideoSender::new(cipher.clone(), 2);
+            let mut repair = VideoSender::new(cipher.clone(), 3);
+            let audio_packet = audio.seal(b"penultimate").unwrap();
+            let video_packet = video.seal(H264, true, 0, b"last", &[]).unwrap().0;
+            assert_eq!(&audio_packet[audio_packet.len() - 4..], &[255, 255, 255, 254]);
+            assert_eq!(&video_packet[video_packet.len() - 4..], &[255, 255, 255, 255]);
+            assert!(repair.seal(RTX, true, 0, b"exhausted", &[]).is_none());
+            assert!(audio.seal(b"exhausted").is_none());
+            assert!(video.seal(H264, true, 0, b"exhausted", &[]).is_none());
+            assert!(VideoSender::new(cipher, 4).seal(H264, true, 0, b"exhausted", &[]).is_none());
+        }
+    }
+
+    #[test]
+    fn simultaneous_senders_reserve_distinct_nonces() {
+        for mode in [AES_GCM, XCHACHA] {
+            let cipher = Cipher::new(mode, &[5; 32]).unwrap();
+            let senders = (0..8).map(|ssrc| {
+                let cipher = cipher.clone();
+                std::thread::spawn(move || {
+                    let mut sender = Sender::new(cipher, ssrc, 0, 0);
+                    (0..64).map(|_| {
+                        let packet = sender.seal(b"audio").unwrap();
+                        u32::from_be_bytes(packet[packet.len() - 4..].try_into().unwrap())
+                    }).collect::<Vec<_>>()
+                })
+            }).collect::<Vec<_>>();
+            let nonces = senders.into_iter().flat_map(|sender| sender.join().unwrap()).collect::<std::collections::HashSet<_>>();
+            assert_eq!(nonces.len(), 512, "{mode}");
+        }
+    }
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
@@ -356,8 +430,7 @@ mod tests {
         let mut datagram = vec![0x90, 120, 0, 5, 0, 0, 3, 192, 0, 0, 0, 42, 0xbe, 0xde, 0, 2];
         let mut body = vec![0x10, 0xaa, 0x20, 0xbb, 0, 0, 0, 0];
         body.extend_from_slice(b"frame");
-        let counter = [0, 0, 1, 0];
-        let sealed = cipher.seal(counter, Payload { msg: &body, aad: &datagram }).unwrap();
+        let (sealed, counter) = cipher.seal(Payload { msg: &body, aad: &datagram }).unwrap();
         datagram.extend_from_slice(&sealed);
         datagram.extend_from_slice(&counter);
         let opened = cipher.unseal(&datagram).unwrap();

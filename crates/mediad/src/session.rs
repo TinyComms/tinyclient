@@ -591,7 +591,7 @@ impl Call {
             return Err(End::Fatal(CallFailure::Encryption, NOT_ENCRYPTED.to_owned()));
         }
         if self.join.stream {
-            return self.start_stream(socket, transport, mode, &key, open, version);
+            return self.start_stream(socket, transport, seal, open, version);
         }
 
         // The devices open only now, so a join that fails never lights the microphone indicator.
@@ -614,7 +614,7 @@ impl Call {
         let stop = Arc::new(AtomicBool::new(false));
         let setup = media::Setup {
             socket: transport.socket,
-            sender: Sender::new(seal, transport.ssrc, rand::random(), rand::random()),
+            sender: Sender::new(seal.clone(), transport.ssrc, rand::random(), rand::random()),
             opener: open,
             ssrc: transport.ssrc,
             user_id: self.join.user_id.clone(),
@@ -625,7 +625,7 @@ impl Call {
             audio,
             stop: stop.clone(),
             microphone_unasked: self.microphone_unasked,
-            pipe: transport.video.and_then(|(ssrc, rtx)| discord_video::Pipe::new(mode, &key, ssrc, rtx)),
+            pipe: transport.video.map(|(ssrc, rtx)| discord_video::Pipe::new(seal, ssrc, rtx)),
             videos: self.videos.clone(),
             announced: self.announced.clone(),
         };
@@ -872,13 +872,13 @@ impl Call {
     /// A Go Live leg: the same gateway, and a picture loop instead of the microphone. It sends
     /// no speaking indication and no `Connected`. A failure here is a notice, not the end of
     /// the voice call.
-    fn start_stream(&mut self, socket: &mut Socket, transport: Transport, mode: &str, key: &[u8], opener: Cipher, version: u16) -> Result<(), End> {
+    fn start_stream(&mut self, socket: &mut Socket, transport: Transport, seal: Cipher, opener: Cipher, version: u16) -> Result<(), End> {
         let first = self.dave.lock().unwrap().start(version);
         self.deliver(socket, first)?;
         self.dave_version = version;
         self.ssrc = transport.ssrc;
         self.assigned = transport.video;
-        let pipe = transport.video.and_then(|(ssrc, rtx)| discord_video::Pipe::new(mode, key, ssrc, rtx));
+        let pipe = transport.video.map(|(ssrc, rtx)| discord_video::Pipe::new(seal, ssrc, rtx));
         let stop = Arc::new(AtomicBool::new(false));
         let leg = discord_video::Leg {
             socket: transport.socket,
