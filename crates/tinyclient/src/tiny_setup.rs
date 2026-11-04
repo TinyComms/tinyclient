@@ -340,6 +340,7 @@ pub fn activity_words(value: &str) -> &'static str {
 
 pub fn sign_in_words(value: &str) -> &'static str {
     match value {
+        "provider" => "Members sign in through the sign-in provider and nothing else. A passkey alone does not get in.",
         "any" => "Members can sign in with any method this server offers.",
         "passkey" => "Members sign in with a passkey and nothing else. A single sign-on account alone does not get in.",
         _ => UNKNOWN,
