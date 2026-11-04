@@ -338,7 +338,7 @@ pub fn checklist(setup: &TinySetup, form: &Form, provider: &str) -> Option<Check
             let links = setup.members.iter().any(|member| !member.passkey).then_some(Action::SendLinks);
             Some(Checklist {
                 steps: vec![
-                    step("You have a passkey".to_owned(), counts.owner_has_passkey, Some(Action::AddPasskey).filter(|_| !counts.owner_has_passkey)),
+                    step("You have a passkey".to_owned(), counts.owner_has_passkey, (!counts.owner_has_passkey).then_some(Action::AddPasskey)),
                     step(format!("{} of {total} members have a passkey", total.saturating_sub(without)), without == 0, links.filter(|_| without > 0)),
                 ],
                 anyway: without > 0,
@@ -348,7 +348,7 @@ pub fn checklist(setup: &TinySetup, form: &Form, provider: &str) -> Option<Check
             let without = counts.members_without_provider;
             Some(Checklist {
                 steps: vec![
-                    step(format!("You can sign in through {provider}"), counts.owner_has_provider, Some(Action::SignInWithProvider).filter(|_| !counts.owner_has_provider)),
+                    step(format!("You can sign in through {provider}"), counts.owner_has_provider, (!counts.owner_has_provider).then_some(Action::SignInWithProvider)),
                     step(format!("{} of {total} members can sign in through {provider}", total.saturating_sub(without)), without == 0, None),
                 ],
                 anyway: without > 0,
