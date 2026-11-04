@@ -2930,6 +2930,11 @@ impl Store {
             .prepare("SELECT DISTINCT network, account, conversation FROM message WHERE expires IS NOT NULL AND expires <= ?1")?
             .query_map(params![now], key_at)?
             .collect::<rusqlite::Result<_>>()?;
+        // Nothing to expire: no write at all, for the pass runs every minute.
+        if gone.is_empty() {
+            drop(tx);
+            return Ok(gone);
+        }
         tx.execute("DELETE FROM message WHERE expires IS NOT NULL AND expires <= ?1", params![now])?;
         tx.commit()?;
         Ok(gone)
