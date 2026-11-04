@@ -689,15 +689,17 @@ fn a_custom_emoji_reactions_document_is_asked_and_its_file_lands_for_the_chip() 
 fn a_premium_emoji_in_message_text_is_asked_and_its_file_lands_for_the_row() {
     let world = World::signed_in();
     world.connected();
-    // It arrives in a chat nobody is looking at: stored, but its document is not asked for
-    // until the page is read, as a reaction's is not.
-    world.steer("emoji-text");
-    world.until("the message to be stored", || world.message("u7002", "22"));
-    assert_eq!(world.called("GetCustomEmojiDocuments"), 0, "{:#?}", world.calls());
-
-    // The page read names the emoji document in its spans (`e<document id>`), one batch asks
-    // for it, and the file lands whole under that name. The text keeps the alt glyph.
+    // The boot reads each dialog's first page at its own pace, and a page read asks the
+    // documents its spans name - a global count taken before this test opens the chat races
+    // that paced read. The chat is opened first, and the count is taken settled.
     world.ask(Request::Watch(Watching { conversation: Some(key("u7002")), ..Watching::default() }));
+    world.until("the page's own message", || world.message("u7002", "12"));
+    let before = world.called("GetCustomEmojiDocuments");
+    // A premium emoji arrives in the open chat: one batch asks the document its span names
+    // (`e<document id>`), the file lands whole under that name, and the text keeps the alt
+    // glyph until it is there.
+    world.steer("emoji-text");
+    world.until("the emoji document asked for", || (world.called("GetCustomEmojiDocuments") > before).then_some(()));
     let read = world.until("the page with a premium emoji", || world.message("u7002", "22"));
     let named = |message: &Message| {
         let span = message.spans.iter().find(|span| matches!(span.style, Style::Emoji { .. })).expect("the run names an emoji");
