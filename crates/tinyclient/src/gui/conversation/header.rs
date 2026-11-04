@@ -215,7 +215,7 @@ impl Shell {
         if open.encryption.is_unknown() {
             return None;
         }
-        let sealed = open.encryption == protocol::Encryption::EndToEnd;
+        let sealed = open.encryption.is_sealed();
         // Green when only the members' devices can read it. Amber when the server can.
         // A plaintext conversation is never drawn with the lock.
         let (icon, tone) = if sealed { ("icons/lock.svg", theme::online()) } else { ("icons/triangle-alert.svg", theme::warning()) };

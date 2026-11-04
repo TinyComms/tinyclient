@@ -72,7 +72,8 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         row.space = Some(SPACE.to_owned());
         row.topic = channel.topic.clone();
         row.position = channel.position;
-        row.encryption = encryption_of(saved, &channel.id, channel.e2ee);
+        let (e2ee, history) = sealed_state(saved, &channel.id, channel.e2ee, channel.plaintext_history);
+        row.encryption = encryption_of(saved, &channel.id, e2ee, history);
         if let Some(category) = channel.category_id.as_deref().filter(|id| super::safe_id(id)) {
             row.group = Some(category.to_owned());
             if categories.insert(category.to_owned()) {
@@ -107,7 +108,8 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         row.group = Some("directs".to_owned());
         row.peer = Some(direct.peer.user_id.clone());
         row.position = DIRECTS_AT + index as i32;
-        row.encryption = encryption_of(saved, &direct.id, direct.e2ee);
+        let (e2ee, history) = sealed_state(saved, &direct.id, direct.e2ee, direct.plaintext_history);
+        row.encryption = encryption_of(saved, &direct.id, e2ee, history);
         let mine = direct.last_message.as_ref().is_some_and(|last| last.author_id == saved.user_id);
         noted.push(Note::from_last(
             &direct.id,
@@ -154,6 +156,7 @@ pub(crate) fn on_live(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
             }
         }
         "direct.created" => direct_upsert(ctx, saved, names, frame),
+        "e2ee.upgraded" => upgraded(ctx, saved, frame),
         "message.created" | "message.edited" => {
             if let Some((conversation, wire)) = framed_message(frame) {
                 deliver(ctx, saved, names, &conversation, &wire);
@@ -190,6 +193,7 @@ pub(crate) fn live_kind(kind: &str) -> bool {
             | "channel.updated"
             | "channel.deleted"
             | "direct.created"
+            | "e2ee.upgraded"
             | "message.created"
             | "message.edited"
             | "message.deleted"
@@ -352,7 +356,7 @@ fn channel_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>,
     row.group = channel.category_id.filter(|id| super::safe_id(id));
     row.topic = channel.topic.clone();
     row.position = channel.position;
-    row.encryption = encryption_of(saved, &channel.id, channel.e2ee);
+    row.encryption = encryption_of(saved, &channel.id, channel.e2ee, channel.plaintext_history);
     if ctx.conversation(&row).is_err() {
         return;
     }
@@ -376,7 +380,7 @@ fn direct_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, 
     row.group = Some("directs".to_owned());
     row.peer = Some(direct.peer.user_id.clone());
     row.position = DIRECTS_AT;
-    row.encryption = encryption_of(saved, &direct.id, direct.e2ee);
+    row.encryption = encryption_of(saved, &direct.id, direct.e2ee, direct.plaintext_history);
     if ctx.conversation(&row).is_err() {
         return;
     }
@@ -452,15 +456,104 @@ fn open_rows(saved: &Saved, conversation_id: &str, wires: &[&WireMessage]) -> Ha
     device.read(conversation_id, &rows)
 }
 
-/// The conversation's label: encrypted where the server says it is, and otherwise never.
-fn encryption_of(saved: &Saved, conversation_id: &str, e2ee: bool) -> Encryption {
+/// The conversation's label. An upgrade that left older messages in the clear says so.
+fn encryption_of(saved: &Saved, conversation_id: &str, e2ee: bool, history: bool) -> Encryption {
     if let Some(device) = e2ee::started(saved) {
         device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).note_encrypted(conversation_id, e2ee);
     }
-    if e2ee {
+    if e2ee && history {
+        Encryption::EndToEndAfterPlain
+    } else if e2ee {
         Encryption::EndToEnd
     } else {
         Encryption::Plain
+    }
+}
+
+/// What the list says, after asking the server to encrypt a plaintext conversation this device
+/// can already send in. A server that has encryption off, or a conversation that cannot take
+/// the group, is left as it is.
+fn sealed_state(saved: &Saved, id: &str, e2ee: bool, history: bool) -> (bool, bool) {
+    if e2ee {
+        return (true, history);
+    }
+    upgrade_plaintext(saved, id).unwrap_or((false, false))
+}
+
+fn upgrade_skipped(id: &str) -> bool {
+    skipped_upgrades().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(id)
+}
+
+fn skip_upgrade(id: &str) {
+    skipped_upgrades().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(id.to_owned());
+}
+
+fn skipped_upgrades() -> &'static std::sync::Mutex<HashSet<String>> {
+    static SKIPPED: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    SKIPPED.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// Asks the server to encrypt `id`. `Some` is what it became. `None` leaves the plaintext row.
+fn upgrade_plaintext(saved: &Saved, id: &str) -> Option<(bool, bool)> {
+    if !super::safe_id(id) || upgrade_skipped(id) {
+        return None;
+    }
+    let Some(shared) = e2ee::started(saved) else {
+        return None;
+    };
+    let ready = {
+        let device = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mode = device.mode();
+        device.ready() && !mode.is_empty() && mode != "off"
+    };
+    if !ready {
+        return None;
+    }
+    match super::asked("POST", saved, &format!("/v1/conversations/{id}/e2ee"), None) {
+        Ok((200, body)) => {
+            let e2ee = body.get("e2ee").and_then(Value::as_bool).unwrap_or(false);
+            let history = body.get("plaintext_history").and_then(Value::as_bool).unwrap_or(false);
+            if e2ee {
+                let id = id.to_owned();
+                let _ = std::thread::Builder::new().name("tiny-e2ee".into()).spawn(move || {
+                    if let Err(why) = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).sync(&id) {
+                        tracing::warn!("chatd: Tiny e2ee: {id}: {why}");
+                    }
+                });
+            }
+            Some((e2ee, history))
+        }
+        Ok((status, body)) => {
+            let error = body.get("error").and_then(Value::as_str).unwrap_or("");
+            if error == "e2ee_group_too_large" || error == "e2ee_twin" {
+                skip_upgrade(id);
+            }
+            tracing::warn!("chatd: Tiny server: encrypt {id}: {status} {error}");
+            None
+        }
+        Err(detail) => {
+            tracing::warn!("chatd: Tiny server: encrypt {id}: {detail}");
+            None
+        }
+    }
+}
+
+/// The other people's clients hear that a conversation they already have is encrypted now.
+fn upgraded(ctx: &Context, saved: &Saved, frame: &Value) {
+    let id = field(frame, "conversation_id");
+    if !super::safe_id(id) {
+        return;
+    }
+    let history = frame.get("plaintext_history").and_then(Value::as_bool).unwrap_or(false);
+    let encryption = encryption_of(saved, id, true, history);
+    let _ = ctx.mark_encryption(id, encryption);
+    if let Some(shared) = e2ee::started(saved) {
+        let id = id.to_owned();
+        let _ = std::thread::Builder::new().name("tiny-e2ee".into()).spawn(move || {
+            if let Err(why) = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).sync(&id) {
+                tracing::warn!("chatd: Tiny e2ee: {id}: {why}");
+            }
+        });
     }
 }
 
@@ -592,7 +685,7 @@ const NOT_SET_UP: &str = "This device isn't set up for encrypted messages yet. O
 /// Whether a send to this conversation must be end-to-end encrypted. An encrypted conversation is
 /// never sent plaintext, whatever state this device is in: it is an error instead.
 fn sealed_here(ctx: &Context, saved: &Saved, conversation_id: &str) -> Result<bool, String> {
-    let labelled = ctx.known(conversation_id).ok().flatten().is_some_and(|row| row.encryption == Encryption::EndToEnd);
+    let labelled = ctx.known(conversation_id).ok().flatten().is_some_and(|row| row.encryption.is_sealed());
     let Some(device) = e2ee::started(saved) else {
         return if labelled { Err(NOT_SET_UP.to_owned()) } else { Ok(false) };
     };
@@ -1272,9 +1365,12 @@ struct WireChannel {
     unread: u32,
     #[serde(default)]
     last_message: Option<WireLast>,
-    /// End-to-end encrypted, for good. Absent on a server older than encrypted text.
+    /// End-to-end encrypted, for good once it is. Absent on a server older than encrypted text.
     #[serde(default)]
     e2ee: bool,
+    /// Encrypted now, and some message from before that is still stored in the clear.
+    #[serde(default)]
+    plaintext_history: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1283,6 +1379,9 @@ struct WireDirect {
     peer: WirePeer,
     #[serde(default)]
     e2ee: bool,
+    /// Encrypted now, and some message from before that is still stored in the clear.
+    #[serde(default)]
+    plaintext_history: bool,
     #[serde(default, deserialize_with = "flex_u32")]
     unread: u32,
     #[serde(default)]

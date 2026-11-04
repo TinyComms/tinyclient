@@ -14,11 +14,13 @@ use crate::Trust;
 pub enum Encryption {
     #[default]
     Unknown,
-    /// The server can read it. A conversation that was made this way stays this way: it is never
-    /// relabelled as encrypted.
+    /// The server can read it. It stays this way until a member upgrades it.
     Plain,
-    /// Only the members' devices hold the keys.
+    /// Only the members' devices hold the keys, including everything already in it.
     EndToEnd,
+    /// End-to-end encrypted from an upgrade on. Messages and files from before that stay where
+    /// the server can read them.
+    EndToEndAfterPlain,
 }
 
 impl Encryption {
@@ -26,12 +28,18 @@ impl Encryption {
         *self == Encryption::Unknown
     }
 
+    /// The server cannot read new messages. An upgrade that left older messages in the clear
+    /// still counts: those stay labelled on their own.
+    pub fn is_sealed(self) -> bool {
+        matches!(self, Encryption::EndToEnd | Encryption::EndToEndAfterPlain)
+    }
+
     /// The words the conversation's header says.
     pub fn words(self) -> &'static str {
         match self {
             Encryption::Unknown => "",
             Encryption::Plain => "Not end-to-end encrypted",
-            Encryption::EndToEnd => "End-to-end encrypted",
+            Encryption::EndToEnd | Encryption::EndToEndAfterPlain => "End-to-end encrypted",
         }
     }
 
@@ -42,6 +50,9 @@ impl Encryption {
             Encryption::Plain => "Not end-to-end encrypted: the server can read this conversation.",
             Encryption::EndToEnd => {
                 "End-to-end encrypted: only the members' devices can read it, not the server."
+            }
+            Encryption::EndToEndAfterPlain => {
+                "End-to-end encrypted from now on. Messages and files sent before this chat was encrypted can still be read by the server."
             }
         }
     }
@@ -251,6 +262,11 @@ mod tests {
         assert!(Encryption::default().is_unknown());
         assert!(Seal::default().is_plain());
         assert_eq!(Encryption::Plain.words(), "Not end-to-end encrypted");
+        assert!(Encryption::EndToEnd.is_sealed());
+        assert!(Encryption::EndToEndAfterPlain.is_sealed());
+        assert!(!Encryption::Plain.is_sealed());
+        assert_eq!(Encryption::EndToEndAfterPlain.words(), "End-to-end encrypted");
+        assert!(Encryption::EndToEndAfterPlain.explained().contains("before this chat"));
         let ask: E2eeAsk =
             serde_json::from_str(r#"{"op":"verify","user_id":"u","verified":true}"#).unwrap();
         assert_eq!(
