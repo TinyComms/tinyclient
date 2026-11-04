@@ -832,6 +832,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
             bot: author.bot || posted.webhook_id.is_some(),
         },
         sent: seconds(&posted.id),
+        expires_at: None,
         outgoing,
         text: rich.text,
         spans: rich.spans,

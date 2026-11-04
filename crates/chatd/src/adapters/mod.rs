@@ -752,6 +752,7 @@ impl Context {
             self.hub.notify(crate::notify::Event::Message { conversation: conversation.clone(), message: Box::new(message.clone()) });
         }
         self.stored(&conversation, &[stored], true);
+        self.carries_timer(message);
         Ok(())
     }
 
@@ -764,7 +765,18 @@ impl Context {
             stored.push(self.hub.store().ingest(&conversation, message, false)?);
         }
         self.stored(&conversation, &stored, false);
+        if let Some(message) = messages.iter().find(|message| message.expires_at.is_some()) {
+            self.carries_timer(message);
+        }
         Ok(())
+    }
+
+    /// A message with its own timer joins the retention thread's wait, so it leaves the store
+    /// at its moment rather than up to a minute late.
+    fn carries_timer(&self, message: &Message) {
+        if message.expires_at.is_some() {
+            self.hub.expiring();
+        }
     }
 
     /// The message as stored, for networks whose updates are partial and must be merged.
@@ -800,6 +812,9 @@ impl Context {
     /// The outcome of a `Send`: the message as the network accepted it, or why it did not go.
     pub fn sent(&self, conversation_id: &str, client_id: &str, outcome: Result<Message, String>) {
         let conversation = self.key(conversation_id);
+        // A message with its own timer joins the retention thread's wait, so it leaves the
+        // store at its moment rather than up to a minute late.
+        let timer = matches!(&outcome, Ok(message) if message.expires_at.is_some());
         let stored = match outcome {
             Ok(mut message) => {
                 message.client_id = Some(client_id.to_owned());
@@ -821,6 +836,9 @@ impl Context {
         match stored {
             Ok(stored) => self.stored(&conversation, &[stored], true),
             Err(err) => tracing::warn!("chatd: {}: {}", self.account.network.label(), net::redact(&err.to_string())),
+        }
+        if timer {
+            self.hub.expiring();
         }
     }
 

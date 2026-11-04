@@ -18,11 +18,12 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 /// Raise this when a table changes. `open` then drops the cache and starts over.
 /// 6 rebuilds caches written at 5 before `conversation.voice_limit` existed. That column
 /// was added without a version change, so Win+K died with `no such column: c.voice_limit`.
-const SCHEMA: i32 = 8;
+const SCHEMA: i32 = 9;
 
 /// Retention: the newest messages kept per conversation.
 pub const KEEP_MESSAGES: u32 = 2_000;
@@ -165,6 +166,9 @@ const TABLES: &str = "
         -- 0 on the network, 1 pending, 2 failed.
         pending      INTEGER NOT NULL DEFAULT 0,
         client_id    TEXT,
+        -- Unix seconds when the message's own timer (Telegram's ttl_period) makes it leave the
+        -- store, whether the account is online or not. NULL: it does not run out on its own.
+        expires      INTEGER,
         -- The rest of the message as the protocol's JSON: sender, ranges, attachments, link
         -- previews, reactions, reply, thread summary, flags.
         body         TEXT NOT NULL,
@@ -172,6 +176,7 @@ const TABLES: &str = "
     ) WITHOUT ROWID;
     CREATE INDEX message_by_time ON message (network, account, conversation, sent);
     CREATE INDEX message_unsent ON message (pending) WHERE pending != 0;
+    CREATE INDEX message_expires ON message (expires) WHERE expires IS NOT NULL;
     CREATE TABLE person (
         network  TEXT NOT NULL,
         account  TEXT NOT NULL,
@@ -1650,20 +1655,21 @@ impl Store {
     ) -> rusqlite::Result<Vec<MessageHit>> {
         let pattern = format!("%{}%", like_prefix(query));
         self.db
-            .prepare(
+            .prepare(&format!(
                 "SELECT m.network, m.account, m.conversation, m.id, m.sent, m.text, m.body, c.title,
                         COALESCE(s.name, '')
                    FROM message m
                    JOIN conversation c ON c.network = m.network AND c.account = m.account
                       AND c.id = m.conversation
                    LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
-                  WHERE m.pending = 0 AND m.text LIKE ?8 ESCAPE '\\'
-                    AND (?1 IS NULL OR m.network = ?1)
-                    AND (?2 IS NULL OR (m.network = ?2 AND m.account = ?3 AND m.conversation = ?4))
-                    AND (?5 IS NULL OR (c.network = ?5 AND c.account = ?6 AND c.space = ?7))
-                    AND NOT c.hidden AND c.special != 'request'
-                  ORDER BY m.sent DESC, length(m.id) DESC, m.id DESC LIMIT ?9",
-            )?
+                   WHERE m.pending = 0 AND m.text LIKE ?8 ESCAPE '\\'
+                     AND (?1 IS NULL OR m.network = ?1)
+                     AND (?2 IS NULL OR (m.network = ?2 AND m.account = ?3 AND m.conversation = ?4))
+                     AND (?5 IS NULL OR (c.network = ?5 AND c.account = ?6 AND c.space = ?7))
+                     AND (m.expires IS NULL OR m.expires > ?10)
+                     AND NOT c.hidden AND c.special != 'request'
+                   ORDER BY m.sent DESC, length(m.id) DESC, m.id DESC LIMIT ?9",
+            ))?
             .query_map(
                 params![
                     network.map(|network| word(&network)),
@@ -1675,6 +1681,7 @@ impl Store {
                     space.map(|key| key.id.as_str()),
                     pattern,
                     limit,
+                    crate::hub::now(),
                 ],
                 |row| {
                     let text: String = row.get(5)?;
@@ -1957,9 +1964,9 @@ impl Store {
         if outcome != Stored::Same {
             tx.execute(
                 "INSERT OR REPLACE INTO message
-                     (network, account, conversation, id, sent, text, pending, client_id, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![network, account, id, message.id, message.sent, message.text, pending, message.client_id, body],
+                     (network, account, conversation, id, sent, text, pending, client_id, expires, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![network, account, id, message.id, message.sent, message.text, pending, message.client_id, message.expires_at, body],
             )?;
         }
         let counts = unread && !message.outgoing;
@@ -2030,9 +2037,10 @@ impl Store {
                 &format!(
                     "SELECT id, text, body FROM message
                       WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND pending = 0
+                        AND (expires IS NULL OR expires > ?4)
                       {NEWEST_FIRST} LIMIT 1"
                 ),
-                params![word(&conversation.network), conversation.account, conversation.id],
+                params![word(&conversation.network), conversation.account, conversation.id, crate::hub::now()],
                 message_from,
             )
             .optional()?;
@@ -2049,12 +2057,17 @@ impl Store {
         }))
     }
 
+    /// One message, while its own timer still runs; one that ran out is gone, as if it were
+    /// never stored.
     pub fn message(&self, conversation: &Key, id: &str) -> rusqlite::Result<Option<Message>> {
         self.db
             .query_row(
-                "SELECT id, text, body FROM message
-                  WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
-                params![word(&conversation.network), conversation.account, conversation.id, id],
+                &format!(
+                    "SELECT id, text, body FROM message
+                      WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4
+                        AND (expires IS NULL OR expires > ?5)"
+                ),
+                params![word(&conversation.network), conversation.account, conversation.id, id, crate::hub::now()],
                 message_from,
             )
             .optional()
@@ -2188,9 +2201,10 @@ impl Store {
         let mut query = self.db.prepare(&format!(
             "SELECT id, text, body FROM message
               WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND pending = 0 {below} AND {holds}
+                AND (expires IS NULL OR expires > ?6)
               {NEWEST_FIRST} LIMIT ?5"
         ))?;
-        let key = params![word(&conversation.network), conversation.account, conversation.id, before, KEEP_MESSAGES];
+        let key = params![word(&conversation.network), conversation.account, conversation.id, before, KEEP_MESSAGES, crate::hub::now()];
         let mut items: Vec<SharedItem> = Vec::new();
         let mut more = false;
         for message in query.query_map(key, message_from)? {
@@ -2310,12 +2324,16 @@ impl Store {
                 }
                 None => String::new(),
             };
+            // The read's own moment hides what ran out, even before the minute comes for it:
+            // a message with its own timer is gone at its time, online or not.
+            values.push(Value::Integer(now));
             let mut found: Vec<Message> = self
                 .db
                 .prepare(&format!(
                     "SELECT id, text, body FROM message
                       WHERE network = ?1 AND account = ?2 AND conversation = ?3 {place}
-                      {order} LIMIT {}",
+                        AND (expires IS NULL OR expires > ?{}) {order} LIMIT {}",
+                    values.len(),
                     limit + 1
                 ))?
                 .query_map(params_from_iter(values), message_from)?
@@ -2885,6 +2903,34 @@ impl Store {
             [],
         )?;
         tx.execute(&format!("DELETE FROM conversation AS t WHERE {orphaned}"), [])?;
+        tx.commit()?;
+        Ok(gone)
+    }
+
+    /// How long until the next message's own timer runs out, when one is running: the retention
+    /// thread sleeps no longer than that, so a message leaves at its moment even offline.
+    pub fn until_expiry(&self, now: i64) -> rusqlite::Result<Option<Duration>> {
+        // MIN answers one row even when nothing matches: NULL when no timer is running.
+        let at: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT MIN(expires) FROM message WHERE expires IS NOT NULL AND expires > ?1",
+                params![now],
+                |row| row.get::<_, Option<i64>>(0),
+            )?;
+        Ok(at.map(|at| Duration::from_secs((at - now).max(0) as u64)))
+    }
+
+    /// Drops what ran out, whether the network is up or not — the store's own minute, behind
+    /// the socket, waking sooner when a message with a timer arrived. Returns the conversations
+    /// something went from, to be read again.
+    pub fn expire(&mut self, now: i64) -> rusqlite::Result<Vec<Key>> {
+        let tx = self.db.transaction()?;
+        let gone: Vec<Key> = tx
+            .prepare("SELECT DISTINCT network, account, conversation FROM message WHERE expires IS NOT NULL AND expires <= ?1")?
+            .query_map(params![now], key_at)?
+            .collect::<rusqlite::Result<_>>()?;
+        tx.execute("DELETE FROM message WHERE expires IS NOT NULL AND expires <= ?1", params![now])?;
         tx.commit()?;
         Ok(gone)
     }

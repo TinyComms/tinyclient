@@ -163,8 +163,8 @@ pub struct Hub {
     /// The settings as stored (`protocol::settings`), read once and kept in step with every
     /// `Set`, so a typing signal or a call start asks no query.
     settings: Mutex<Values>,
-    /// Retention runs when this is set, and once a day.
-    prune_now: Mutex<bool>,
+    /// What the retention thread was asked to bring forward.
+    soon: Mutex<Soon>,
     prune_wake: Condvar,
     /// The notification thread (`notify::start`), once it runs. Told of new messages, rows
     /// that may have been read, and the call.
@@ -176,6 +176,15 @@ fn apply_log_policy(values: &Values) {
         return;
     };
     guard.apply(protocol::log_policy::LogPolicy::for_settings(values));
+}
+
+/// What asks are standing for the retention thread, to be taken at its next wake.
+#[derive(Default)]
+struct Soon {
+    /// Retention itself: its setting changed, or an account went.
+    prune: bool,
+    /// A message with a time to leave arrived: the sleep is cut to its moment.
+    expiry: bool,
 }
 
 impl Hub {
@@ -213,7 +222,7 @@ impl Hub {
             player: crate::playback::Player::default(),
             recorder: crate::recorder::Recorder::default(),
             settings: Mutex::new(settings.clone()),
-            prune_now: Mutex::new(false),
+            soon: Mutex::default(),
             prune_wake: Condvar::new(),
             notifier: OnceLock::new(),
         }
@@ -270,15 +279,26 @@ impl Hub {
 
     /// Has retention run now rather than at its daily time.
     pub fn prune_soon(&self) {
-        *lock(&self.prune_now) = true;
+        lock(&self.soon).prune = true;
         self.prune_wake.notify_all();
     }
 
-    /// Waits until retention is due: `every`, or sooner when asked.
-    pub fn prune_due(&self, every: Duration) {
-        let asked = lock(&self.prune_now);
-        let (mut asked, _) = self.prune_wake.wait_timeout_while(asked, every, |asked| !*asked).unwrap_or_else(PoisonError::into_inner);
-        *asked = false;
+    /// A message with a time to leave arrived: the wait until it goes is computed again.
+    pub fn expiring(&self) {
+        lock(&self.soon).expiry = true;
+        self.prune_wake.notify_all();
+    }
+
+    /// Waits until the next pass is due: `every`, or sooner when asked. Says what was asked.
+    pub fn prune_due(&self, every: Duration) -> (bool, bool) {
+        let asked = lock(&self.soon);
+        let (mut asked, _) = self
+            .prune_wake
+            .wait_timeout_while(asked, every, |asked| !asked.prune && !asked.expiry)
+            .unwrap_or_else(PoisonError::into_inner);
+        let due = (asked.prune, asked.expiry);
+        *asked = Soon::default();
+        due
     }
 
     pub fn store(&self) -> MutexGuard<'_, Store> {

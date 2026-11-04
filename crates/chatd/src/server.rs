@@ -265,27 +265,59 @@ impl Chat {
         lock(&chat.adapters).extend(crate::demo::attach(&chat.hub));
         // Whatever was on its way when chatd last stopped did not go.
         let _ = chat.hub.store().fail_pending(i64::MAX, "tinyclient was restarted before this was sent.");
-        // Retention runs behind the socket, about a minute after the boot, then once a day,
-        // and when its setting changes. Never inside the boot: the sign-on writes months of
-        // chats into the store while this would be deleting rows of it. A thread sleeping
+        // Expiry and retention run behind the socket. A message whose own timer ran out goes at
+        // its moment, online or not — the thread sleeps until then, at most a minute, and
+        // wakes sooner when a message with a timer arrived. Retention runs about a minute after
+        // the boot, then once a day, and when its setting changes. Never inside the boot: the
+        // sign-in writes months of chats into the store while this would be deleting rows of
+        // it (a minute's expiry is one indexed delete, and fine even then). A thread sleeping
         // between the runs costs nothing.
         const AFTER_BOOT: Duration = Duration::from_secs(60);
+        const EXPIRY_EVERY: Duration = Duration::from_secs(60);
+        const RETENTION_EVERY: Duration = Duration::from_secs(86_400);
         let hub = chat.hub.clone();
         std::thread::spawn(move || {
-            let mut first = true;
+            let boot = Instant::now();
+            // Retention ran last then; its first run comes at the boot's minute.
+            let mut pruned: Option<Instant> = None;
             loop {
-                // The boot's sign-in has the store busy; the first pass waits it out, and a
-                // setting change wakes an earlier run through the same wait.
-                hub.prune_due(if first { AFTER_BOOT } else { Duration::from_secs(86_400) });
-                first = false;
-                let days = hub.settings().number(settings::KEEP_DAYS);
-                match hub.store().prune(now(), days) {
-                    Ok(0) | Err(_) => {}
+                // Sleep until the next message's own timer runs out, at most a minute — its
+                // time comes whether the account is online or not — and shorter still when a
+                // message with a timer arrived or retention is asked for. Until the boot's
+                // minute the sleep is capped there too: the sign-in has the store busy.
+                let cap = if pruned.is_none() { AFTER_BOOT } else { EXPIRY_EVERY };
+                let wait = match hub.store().until_expiry(now()) {
+                    Ok(at) => at.map_or(cap, |at| at.min(cap)),
+                    Err(_) => cap,
+                };
+                let (asked, _) = hub.prune_due(wait);
+                // Whatever ran out is gone from the store, online or not; the conversations it
+                // was in are read again.
+                match hub.store().expire(now()) {
                     Ok(gone) => {
-                        tracing::warn!("chatd: pruned {gone} old messages");
-                        // What is on screen may be gone.
-                        hub.reset();
+                        for conversation in gone {
+                            hub.changed(Change::Messages { conversation });
+                        }
                     }
+                    Err(err) => tracing::warn!("chatd: messages past their time: {err}"),
+                }
+                // Retention: about a minute after the boot, then once a day, or at once when
+                // asked. Its scans are worth skipping while the boot's sign-in writes months
+                // of chats; a minute's expiry is one indexed delete and waits its turn.
+                if pruned.is_some_and(|at| at.elapsed() >= RETENTION_EVERY)
+                    || asked
+                    || (pruned.is_none() && boot.elapsed() >= AFTER_BOOT)
+                {
+                    let days = hub.settings().number(settings::KEEP_DAYS);
+                    match hub.store().prune(now(), days) {
+                        Ok(0) | Err(_) => {}
+                        Ok(gone) => {
+                            tracing::warn!("chatd: pruned {gone} old messages");
+                            // What is on screen may be gone.
+                            hub.reset();
+                        }
+                    }
+                    pruned = Some(Instant::now());
                 }
             }
         });

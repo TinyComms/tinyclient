@@ -327,6 +327,10 @@ pub struct Message {
     pub sender: Sender,
     /// Unix seconds.
     pub sent: i64,
+    /// Unix seconds when the message's own timer (Telegram's `ttl_period`) makes it leave the
+    /// store, whether the account is online or not. `None`: it does not run out on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub outgoing: bool,
     /// Plain text. Mentions already read as names and no network markup is left in it.
@@ -401,6 +405,7 @@ impl Message {
                 ..Sender::default()
             },
             sent,
+            expires_at: None,
             outgoing,
             text: text.into(),
             spans: Vec::new(),
