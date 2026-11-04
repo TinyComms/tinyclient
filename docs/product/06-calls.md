@@ -4,7 +4,7 @@ What tinyclient carries in a call, and what it still hands to the official app. 
 
 ## Sound
 
-Discord calls and Tiny room calls use the same microphone processing. Echo cancellation, noise suppression, and automatic gain are on unless Settings › Voice turns one off. The canceller hears the mix that is playing, cues included. The Tiny channel bar says to wear headphones only while echo cancellation is off.
+Discord calls and Tiny room calls use the same microphone processing. Echo cancellation, noise suppression, and automatic gain are on unless Settings › Voice turns one off. Noise suppression defaults to Enhanced, which turns down other voices and cries as well as fans. Standard and High leave other voices in. The canceller hears the mix that is playing, cues included. The Tiny channel bar says to wear headphones only while echo cancellation is off.
 
 Discord voice is Opus at 48 kHz stereo: voice gateway v8, UDP, and DAVE. DAVE here seals and opens Opus only. Version 1 is required on every Discord call this client joins. A stage is not joined; it opens in Discord. A voice channel joins from the server list: the hover Join pill, a double-click, or Join voice on the row menu. A single click opens the channel and does not join. The Discord home lists friends who are in a voice channel or a DM call under In voice, and that row joins the same way. A DM can be called and can ring. Screen share, camera, and Go Live are not built. Asking for a picture on a joined Discord call is refused in words, and the call stays voice.
 

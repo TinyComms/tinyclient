@@ -527,14 +527,15 @@ impl Default for InputMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoiseMode {
-    /// Nothing: fans, typing and traffic go through as captured.
+    /// Nothing: fans, typing, traffic and other voices go through as captured.
     Off,
-    /// WebRTC noise suppression at a strong everyday level.
-    #[default]
+    /// WebRTC noise suppression at a strong everyday level. Other voices stay.
     Standard,
-    /// WebRTC noise suppression at its strongest.
+    /// WebRTC noise suppression at its strongest. Other voices stay.
     High,
-    /// RNNoise (neural): better on keyboards and steady noise than Standard/High.
+    /// Voice isolation: other voices and cries are turned down, and so is steady noise.
+    /// This is the default. The voice is band-limited to wideband (16 kHz processing).
+    #[default]
     Enhanced,
 }
 
@@ -551,10 +552,11 @@ impl NoiseMode {
     pub fn parse(value: &str) -> Option<NoiseMode> {
         Some(match value {
             "off" => NoiseMode::Off,
-            // Older builds stored a switch: "on" meant WebRTC NS at its then-default.
-            "on" | "standard" => NoiseMode::Standard,
+            "standard" => NoiseMode::Standard,
             "high" => NoiseMode::High,
-            "enhanced" => NoiseMode::Enhanced,
+            // Older builds stored a switch: "on" meant noise suppression was enabled.
+            // That choice now follows Enhanced, the mode that turns other voices down.
+            "on" | "enhanced" => NoiseMode::Enhanced,
             _ => return None,
         })
     }
@@ -623,8 +625,9 @@ mod quality_tests {
 
     #[test]
     fn noise_mode_reads_legacy_on_off() {
-        assert_eq!(NoiseMode::parse("on"), Some(NoiseMode::Standard));
+        assert_eq!(NoiseMode::parse("on"), Some(NoiseMode::Enhanced));
         assert_eq!(NoiseMode::parse("off"), Some(NoiseMode::Off));
+        assert_eq!(NoiseMode::parse("standard"), Some(NoiseMode::Standard));
         assert_eq!(NoiseMode::parse("enhanced"), Some(NoiseMode::Enhanced));
     }
 }
@@ -640,7 +643,7 @@ pub struct AudioProcessing {
 
 impl Default for AudioProcessing {
     fn default() -> AudioProcessing {
-        AudioProcessing { echo_cancellation: true, auto_gain: true, noise: NoiseMode::Standard }
+        AudioProcessing { echo_cancellation: true, auto_gain: true, noise: NoiseMode::Enhanced }
     }
 }
 

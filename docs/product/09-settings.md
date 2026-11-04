@@ -245,7 +245,7 @@ no control.
 | V20 | Mic volume | Slider | 100 % | G | d | Soft gain before processing. Separate from sensitivity and automatic gain. | in |
 | V21 | Voice quality | Menu: Data saver / Standard / High | Standard | G | d | Tiny calls only. Caps encode bitrate (data saver ≈ 32 kb/s) within the room's ceiling; High uses Opus Audio mode. | in |
 | V8 | Voice activation or push to talk | Switch and key recorder | | G | d | In the window. | in |
-| V10–V19 | Processing, keys, release delay | Switches, menus and recorders | V10/V12 on; V11 Standard | G | d | Echo cancellation, noise suppression (Off / Standard / High WebRTC, or Enhanced RNNoise), automatic gain, key recorders (V13 and V15–V17), and release delay. | in |
+| V10–V19 | Processing, keys, release delay | Switches, menus and recorders | V10/V12 on; V11 Enhanced | G | d | Echo cancellation, noise suppression (Off, Standard or High WebRTC, or Enhanced voice isolation, the default), automatic gain, key recorders (V13 and V15–V17), and release delay. | in |
 | S7–S10 | Call cues and their volume | Switches and a slider | Cues on | G | d | Join, leave, mute, deafen, connection, and their volume. Cue semantics during a call are `06-calls.md`. | in |
 | V7 | Camera device | | | G | d | Not in the window. Search: "tinyclient has no camera yet." A Tiny call dock can toggle the camera. That toggle is `06-calls.md`. | not in 0.2.35 |
 | V9 | Per-person volume | | | C | | `CallGain` on a Tiny participant row, not a Settings row. | not in 0.2.35 |
