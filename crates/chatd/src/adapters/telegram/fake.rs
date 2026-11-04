@@ -1036,9 +1036,6 @@ impl World {
             "read" => vec![update(
                 tl::types::UpdateReadHistoryInbox { folder_id: None, peer: odalys.peer(), top_msg_id: None, max_id: 14, still_unread_count: 0, pts: 0, pts_count: 0 }.into(),
             )],
-            // A post in the muted channel names the user. The count rides the dialog, so
-            // Telegram marks the chats stale (a default said changed) and the next opening
-            // of the list reads it in.
             // A draft typed on the phone while we are here, and one the phone dropped.
             "draft" => {
                 let text = "Riding up with Tobin.".to_owned();
