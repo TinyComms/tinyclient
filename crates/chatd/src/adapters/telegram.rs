@@ -816,7 +816,9 @@ fn typing(account: &Account, conversation: &str) {
 /// Keeps the cloud draft of this conversation on Telegram: the text as it stands here, or an
 /// empty one to clear it on the phone too. Telegram's own apps save a draft as their user
 /// types; the same draft arriving back is written nowhere, being what the store already says.
-/// Not `ask`: a draft is not worth waiting out a flood for.
+/// Not `ask` for the plain paths: a draft is not worth waiting out a flood for. A comment's
+/// thread may have to `ask` where its discussion fell out of the held few — rare, and the
+/// row stays read-only until the thread was open, which is what fills the held few.
 fn save_draft(account: &Account, conversation: &str, text: &str) {
     let Some((mut who, mut topic)) = Who::parse(conversation) else {
         return;

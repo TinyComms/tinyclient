@@ -45,11 +45,10 @@ const CHATTERS: i64 = 9003;
 /// test looks for (`GetDiscussionMessage` names it for the open, the send for its reply).
 const ECHO: i32 = 60;
 const TOOLS: i32 = 31;
-/// Telegram's own account, a bot, an account Telegram flags as a scam, and one it flags an impostor.
+/// Telegram's own account, a bot, and an account Telegram flags as a scam.
 const SERVICE: i64 = 777_000;
 const BOT: i64 = 7004;
 const SCAM: i64 = 7005;
-const FAKE: i64 = 7006;
 /// The `@gif` bot.
 const GIF_BOT: i64 = 7050;
 /// The folders: Work (the group and the forum) and Family (Odalys pinned, and the group too).
@@ -103,7 +102,6 @@ fn user(id: i64, first: &str, last: &str, username: &str) -> tl::types::User {
     // A bot's flag is shared with its info version, which must then be there.
     user.bot_info_version = user.bot.then_some(1);
     user.scam = id == SCAM;
-    user.fake = id == FAKE;
     user.phone = (id == ODALYS).then(|| "15550100777".to_owned());
     if id >= CROWD {
         user.photo = Some(tl::types::UserProfilePhoto { has_video: false, personal: false, photo_id: id + 5_000_000, stripped_thumb: None, dc_id: 2 }.into());
@@ -129,7 +127,6 @@ fn users() -> Vec<tl::enums::User> {
         user(SERVICE, "Telegram", "", "").into(),
         user(BOT, "Trail Bot", "", "trail_bot").into(),
         user(SCAM, "Prize Desk", "", "").into(),
-        user(FAKE, "Support Desk", "", "").into(),
     ];
     all.extend((0..crowd()).map(|at| user(CROWD + at, "Person", &at.to_string(), "").into()));
     all
@@ -369,7 +366,6 @@ impl World {
         world.store(None, message(Who::User(SERVICE), 3, SERVICE, T0 - 110_000, "Login code: 24680. Do not give this code to anyone."));
         world.store(None, message(Who::User(BOT), 4, BOT, T0 - 120_000, "Trail report: all clear."));
         world.store(None, message(Who::User(SCAM), 6, SCAM, T0 - 130_000, "You won a prize!"));
-        world.store(None, message(Who::User(FAKE), 7, FAKE, T0 - 140_000, "Your account needs verification."));
         // A draft typed on the phone before this device signed in: it rides Odalys's dialog at
         // the next reading of it, as any draft typed elsewhere does.
         world.drafts.insert((Who::User(ODALYS), None), "Finished packing. Meet at the ridge?".to_owned());
@@ -1240,9 +1236,6 @@ impl World {
                         let who = Who::User(CROWD + at);
                         all.push((dialog(who, 1, 1, 0, false, None), who, who.text()));
                     }
-                    // The impostor's chat sits past the crowd, so the paging tests' rows land
-                    // where their arithmetic says: five pages end at crowd chat 492 exactly.
-                    all.push((dialog(Who::User(FAKE), 7, 7, 0, false, None), Who::User(FAKE), Who::User(FAKE).text()));
                     if lost_pin() {
                         // The pinned chat is no longer in the pages at all.
                         all.retain(|held| held.1 != Who::Group(CREW));

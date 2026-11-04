@@ -690,7 +690,7 @@ fn a_premium_emoji_in_message_text_is_asked_and_its_file_lands_for_the_row() {
     let world = World::signed_in();
     world.connected();
     // The boot reads each dialog's first page at its own pace, and a page read asks the
-    // documents its spans name - a global count taken before this test opens the chat races
+    // documents its spans name — a global count taken before this test opens the chat races
     // that paced read. The chat is opened first, and the count is taken settled.
     world.ask(Request::Watch(Watching { conversation: Some(key("u7002")), ..Watching::default() }));
     world.until("the page's own message", || world.message("u7002", "12"));
@@ -890,7 +890,7 @@ fn a_sent_comment_lands_in_the_thread_and_the_posts_count_rises_under_its_own_id
 }
 
 #[test]
-fn a_comments_reactions_document_is_asked_and_its_file_lands_for_the_chip_like_a_normal_messages() {
+fn a_comments_reactions_document_is_asked_and_its_file_lands_for_the_chip_like_a_normal_messages_does() {
     let world = World::signed_in();
     world.connected();
     world.steer("comments");
