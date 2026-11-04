@@ -834,7 +834,9 @@ impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
     }
 
     fn frame(&mut self, frame: Received) {
-        if !frame.contiguous {
+        // `contiguous` describes the gap BEFORE this access unit. An IDR is independent
+        // of those missing frames and is how a late watcher or a lossy stream recovers.
+        if !frame.contiguous && !frame.key {
             self.lost("gap", &frame);
             return;
         }
@@ -871,6 +873,7 @@ impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
     /// Every picture painted since last asked goes to the window.
     fn flush(&mut self) {
         for (tag, painted) in self.screen.painted() {
+            self.controls.video_stats.lock().unwrap().rendered(painted.width, painted.height, Instant::now());
             (self.show)(MediaResponse::Picture {
                 path: painted.path.display().to_string(),
                 width: painted.width,
@@ -883,19 +886,31 @@ impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
     }
 
     fn run(&mut self) {
+        let mut last_frame = Instant::now();
+        let mut retry = Instant::now();
         loop {
+            // The first PLI can precede the SFU's receive stream, or get lost. Waiting for
+            // another frame to ask again leaves a late watcher stuck forever on setup.
+            if self.controls.watch() && retry.elapsed() >= KEY_EVERY && (self.wait_key || last_frame.elapsed() >= KEY_EVERY) {
+                self.inbox.want_key.store(true, Ordering::Relaxed);
+                retry = Instant::now();
+            }
             match self.inbox.take(PAINT_EVERY) {
                 Take::Stop => break,
                 // The painters finish after the frame that fed them: what they finished is
                 // shown as soon as there is a lull.
                 Take::Nothing => self.flush(),
-                Take::Next(In::Frame(frame)) => self.frame(frame),
+                Take::Next(In::Frame(frame)) => {
+                    last_frame = Instant::now();
+                    self.frame(frame);
+                }
                 Take::Next(In::Reset) => {
                     self.screen.reset();
                     self.wait_key = true;
                     self.inbox.want_key.store(true, Ordering::Relaxed);
                 }
                 Take::Next(In::Clear) => {
+                    self.controls.video_stats.lock().unwrap().clear();
                     self.screen.reset();
                     self.screen.forget();
                     self.wait_key = true;
@@ -962,6 +977,7 @@ fn start_decode<P: Screen>(
     show: impl FnMut(MediaResponse) + std::marker::Send + 'static,
 ) -> std::io::Result<Watcher> {
     let inbox = Arc::new(Inbox::default());
+    inbox.want_key.store(true, Ordering::Relaxed);
     let (ended, done) = channel::<()>();
     let theirs = inbox.clone();
     out::spawn(std::thread::Builder::new().name("video-in".to_owned()), move || {
@@ -1728,6 +1744,40 @@ mod tests {
     }
 
     #[test]
+    fn a_watcher_without_frames_retries_its_initial_keyframe_request() {
+        let controls = Arc::new(Controls::default());
+        controls.set_watch(true);
+        let watcher = start_decode(Glass::default, controls.clone(), |_| {}).unwrap();
+        assert!(watcher.inbox.want_key.swap(false, Ordering::Relaxed));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !watcher.inbox.want_key.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(PAINT_EVERY);
+        }
+        let retried = watcher.inbox.want_key.load(Ordering::Relaxed);
+        controls.set_watch(false);
+        watcher.inbox.replace(In::Clear);
+        watcher.inbox.want_key.store(false, Ordering::Relaxed);
+        std::thread::sleep(KEY_EVERY + PAINT_EVERY * 3);
+        assert!(!watcher.inbox.want_key.load(Ordering::Relaxed), "stopping watching must stop the retries");
+        watcher.inbox.queue.lock().unwrap().stop = true;
+        watcher.inbox.arrived.notify_all();
+        ended(&watcher.done);
+        assert!(retried, "a lost or premature initial PLI must be retried even without arriving frames");
+    }
+
+    #[test]
+    fn a_complete_keyframe_recovers_after_an_rtp_gap() {
+        let glass = Glass::default();
+        let decoded = glass.decoded.clone();
+        let (mut decode, _) = decode(glass);
+        let mut key = frame(7, true);
+        key.contiguous = false;
+        decode.frame(key);
+        assert_eq!(decoded.lock().unwrap().len(), 1, "a keyframe needs no preceding frame");
+        assert!(!decode.wait_key);
+    }
+
+    #[test]
     fn every_frame_is_decoded_and_only_the_paint_is_held_to_ten_a_second() {
         let glass = Glass::default();
         let decoded = glass.decoded.clone();
@@ -1782,7 +1832,7 @@ mod tests {
             2,
             "the next P-frame is not tried"
         );
-        let mut gap = frame(5, true);
+        let mut gap = frame(5, false);
         gap.contiguous = false;
         decode.frame(gap);
         assert_eq!(decoded.lock().unwrap().len(), 2, "a gap is a loss");

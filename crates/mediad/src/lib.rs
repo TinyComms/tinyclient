@@ -55,6 +55,7 @@ pub mod stretch;
 pub mod talk;
 pub mod tiny;
 pub mod video;
+pub mod video_stats;
 
 /// Samples a second, on the wire and in every buffer between the codec and the devices.
 pub const RATE: u32 = 48_000;

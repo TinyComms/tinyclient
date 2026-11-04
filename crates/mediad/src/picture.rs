@@ -333,7 +333,11 @@ fn picture_dir() -> PathBuf {
 /// read it, and a name someone else made first is not followed.
 fn write_jpeg(rgb: &[u8], width: u32, height: u32, generation: u64) -> io::Result<PathBuf> {
     use std::fs::OpenOptions;
-    let path = picture_dir().join(format!("tinyclient-call-{}-{generation}.jpg", std::process::id()));
+    // A local preview and the receive painters each have their own generation counter.
+    // Their files must never collide: replacing either image deletes its previous file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = picture_dir().join(format!("tinyclient-call-{}-{generation}-{unique}.jpg", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -451,6 +455,19 @@ mod tests {
         assert!(second.path.exists());
         canvas.forget();
         assert!(!second.path.exists());
+    }
+
+    #[test]
+    fn independent_renderers_do_not_delete_each_others_images() {
+        let mut local = Canvas::default();
+        let mut remote = Canvas::default();
+        let colors = [128u8; 2 * 2 * 3];
+        let preview = local.paint(&colors, 2, 2, 1).unwrap();
+        let received = remote.paint(&colors, 2, 2, 1).unwrap();
+        assert_ne!(preview.path, received.path, "generation numbers are local to each renderer");
+        local.forget();
+        assert!(received.path.exists(), "removing a camera preview must not erase remote video");
+        remote.forget();
     }
 
     #[test]

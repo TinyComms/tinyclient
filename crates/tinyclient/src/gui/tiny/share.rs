@@ -25,7 +25,7 @@ const QUALITIES: [(ShareQuality, &str, &str); 3] = [
 
 impl Shell {
     /// Share pressed while not sharing: the picker.
-    pub(super) fn tiny_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn tiny_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if crate::gui::phone::active() {
             self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None }), cx);
             return;
@@ -51,7 +51,7 @@ impl Shell {
         self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen, quality }), cx);
     }
 
-    pub(super) fn tiny_stop_share(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn tiny_stop_share(&mut self, cx: &mut Context<Self>) {
         self.tiny_state.shared = None;
         self.call_ask(Request::Media(MediaRequest::ShareSend { on: false, screen: None, quality: None }), cx);
     }

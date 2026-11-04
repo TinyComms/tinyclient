@@ -966,6 +966,7 @@ impl Call {
             self.video.watch();
         }
         self.watching = watching;
+        self.controls.video_stats.lock().unwrap().expect(watching && self.shown.is_some(), Instant::now());
         if self.offered.is_none() && !self.link.pending() {
             let (want_share, want_camera) = (self.controls.share(), self.controls.camera());
             if want_share != self.sending_share {
@@ -1039,7 +1040,7 @@ impl Call {
                 }
             }
         }
-        if self.video.key_wanted() {
+        if self.video.key_wanted() && watching {
             self.ask_keyframe();
         }
     }
@@ -1068,6 +1069,7 @@ impl Call {
         let size = payload.len() as u64;
         if writer.write(pt, at, MediaTime::new(rtp, Frequency::NINETY_KHZ), payload).is_ok() {
             self.video_bytes += size;
+            self.controls.video_stats.lock().unwrap().sent(size as usize, Instant::now());
         }
     }
 
@@ -1078,6 +1080,7 @@ impl Call {
         let user = self.shown.as_ref().map(|pictured| pictured.user_id.clone()).unwrap_or_default();
         let kind = self.shown.as_ref().map(|pictured| pictured.kind).unwrap_or_default();
         let key = data.is_keyframe();
+        self.controls.video_stats.lock().unwrap().received(data.data.len(), Instant::now());
         let frame = Received { key, contiguous: data.contiguous, data: data.data, user, kind };
         if !self.video.picture(frame) {
             self.ask_keyframe();
@@ -1189,7 +1192,11 @@ impl Call {
             self.meter.troubles = audio.troubles();
         }
         if self.ticks.is_multiple_of(SECOND) && self.connected {
-            let stats = self.meter.second(self.slots.values_mut().map(|slot| slot.stream.counts()));
+            let mut stats = self.meter.second(self.slots.values_mut().map(|slot| slot.stream.counts()));
+            let video = self.controls.video_stats.lock().unwrap().sample(Instant::now());
+            if self.sending_share || self.sending_camera || self.watching {
+                stats.video = Some(video);
+            }
             self.controls.publish_stats(stats);
         }
         if let Some(devices) = &mut self.devices {
@@ -1574,6 +1581,7 @@ mod tests {
         estimates: Vec<u64>,
         /// As [`Call::transmit`] does with no video to send.
         no_padding: bool,
+        pictures: Vec<MediaData>,
     }
 
     impl Wire {
@@ -1602,6 +1610,7 @@ mod tests {
                 match peer.poll_output().unwrap() {
                     Output::Timeout(_) => break,
                     Output::Transmit(transmit) => to_link.push(transmit.contents.to_vec()),
+                    Output::Event(Event::MediaData(data)) if data.mid == link.share_mid() => self.pictures.push(data),
                     Output::Event(_) => {}
                 }
             }
@@ -1640,7 +1649,7 @@ mod tests {
         let incoming = str0m::change::SdpOffer::from_sdp_string(offer.sdp()).unwrap();
         let answer = peer.sdp_api().accept_offer(incoming).unwrap();
         let mut link = offer.accept(&answer.to_sdp_string()).unwrap();
-        let mut wire = Wire { now: Instant::now(), ours, theirs, sent: Vec::new(), events: Vec::new(), estimates: Vec::new(), no_padding: false };
+        let mut wire = Wire { now: Instant::now(), ours, theirs, sent: Vec::new(), events: Vec::new(), estimates: Vec::new(), no_padding: false, pictures: Vec::new() };
         for _ in 0..3000 {
             wire.step(&mut link, &mut peer);
             if wire.events.iter().any(|event| event == "Connected") {
@@ -1665,6 +1674,72 @@ mod tests {
         let mut frame = vec![0, 0, 0, 1, name];
         frame.resize(len, 0x55);
         frame
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "captures the interactive Windows desktop and needs the OpenH264 binary"]
+    fn a_real_windows_screen_survives_webrtc_and_is_painted() {
+        use crate::picture::{Ask, Incoming, Outgoing, Tag};
+        let (mut link, mut peer, mut wire) = sharing();
+        let share = link.share_mid();
+        let pt = link.rtc.writer(share).unwrap().payload_params().next().unwrap().pt();
+        let mut source = Outgoing::default();
+        let mut screen = Incoming::default();
+        let began = Instant::now();
+        let capture = crate::picture::capture_screen().unwrap();
+        eprintln!("capture {}x{} rgb max {}", capture.width, capture.height, capture.pixels.chunks_exact(4).flat_map(|pixel| pixel[..3].iter()).max().unwrap());
+        assert!(capture.pixels.chunks_exact(4).any(|pixel| pixel[..3].iter().any(|value| *value > 32)), "the interactive desktop's first capture must not be black");
+        if let Some(folder) = std::env::var_os("TINYCLIENT_VIDEO_PROOF_FOLDER") {
+            std::fs::create_dir_all(&folder).unwrap();
+            let mut rgba = capture.pixels;
+            for pixel in rgba.chunks_exact_mut(4) {
+                if capture.bgra { pixel.swap(0, 2); }
+                pixel[3] = 255;
+            }
+            let image = image::RgbaImage::from_raw(capture.width, capture.height, rgba).unwrap();
+            image::DynamicImage::ImageRgba8(image).to_rgb8().save(std::path::PathBuf::from(folder).join("captured-screen.jpg")).unwrap();
+        }
+        let mut encoded_bytes = 0;
+        let mut frames = 0;
+        for n in 0..60 {
+            let ask = Ask { key: n == 0 || n == 30, bps: 8_000_000, at: Duration::from_millis(n * 17), fps: 60. };
+            let coded = loop {
+                match source.share(ask) {
+                    Ok(coded) => break coded,
+                    Err(words) if words == crate::picture::CODEC_LATER && began.elapsed() < Duration::from_secs(30) => std::thread::sleep(Duration::from_millis(20)),
+                    Err(words) => panic!("capture/encode: {words}"),
+                }
+            };
+            if !coded.bytes.is_empty() {
+                encoded_bytes += coded.bytes.len();
+                frames += 1;
+                link.rtc.writer(share).unwrap().write(pt, wire.now, MediaTime::new(n * 1530, Frequency::NINETY_KHZ), coded.bytes).unwrap();
+            }
+            wire.run(&mut link, &mut peer, 17);
+        }
+        wire.run(&mut link, &mut peer, 5000);
+        assert!(!wire.pictures.is_empty(), "video must cross DTLS-SRTP and depacketize");
+        let received = wire.pictures.len();
+        let mut images = Vec::new();
+        for data in wire.pictures {
+            screen.decode(&data.data, Some(Tag { user: "proof".into(), kind: protocol::PictureKind::Share })).expect("every received frame decodes");
+            images.extend(screen.painted());
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while images.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            images.extend(screen.painted());
+        }
+        let image = &images.last().expect("a real received image must be produced").1;
+        let decoded = image::ImageReader::open(&image.path).unwrap().decode().unwrap().to_rgb8();
+        if let Some(folder) = std::env::var_os("TINYCLIENT_VIDEO_PROOF_FOLDER") {
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::copy(&image.path, std::path::PathBuf::from(folder).join("received-screen.jpg")).unwrap();
+        }
+        assert!(decoded.pixels().any(|pixel| pixel.0.iter().any(|channel| *channel > 32)), "the received desktop must not be black");
+        eprintln!("screen proof: {frames} encoded, {received} received, {}x{}, {encoded_bytes} encoded bytes, elapsed {:?}", image.width, image.height, began.elapsed());
+        screen.forget();
     }
 
     /// Without the pacer a keyframe left as one burst, every packet in one millisecond, in front

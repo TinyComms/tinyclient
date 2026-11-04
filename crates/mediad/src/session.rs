@@ -57,6 +57,7 @@ pub(crate) type Devices = (Option<String>, Option<String>);
 /// What chatd's requests set, read by the threads of the call.
 #[derive(Default)]
 pub struct Controls {
+    pub(crate) video_stats: Mutex<crate::video_stats::Meter>,
     pub muted: AtomicBool,
     pub deafened: AtomicBool,
     /// chatd closed our stdin.

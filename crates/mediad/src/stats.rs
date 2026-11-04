@@ -198,6 +198,7 @@ impl Meter {
         let elapsed = self.since.elapsed().as_secs_f64().max(0.001);
         let kbps = |bytes: u64| (bytes as f64 * 8. / 1000. / elapsed).round() as u32;
         let stats = CallStats {
+            video: None,
             rtt_ms: self.rtt_ms,
             jitter_ms: jitter,
             loss_permille: loss,

@@ -138,7 +138,9 @@ fn duplicated(device: &str) -> Result<Rgba, String> {
         *open = Some((device.to_owned(), Duplicator::open(device)?));
     }
     let frame = open.as_mut().expect("just opened").1.frame();
-    if frame.is_err() {
+    // No image yet is transient: keep this duplication alive while GDI supplies startup.
+    // Reopening it on every pointer-only event would keep restarting that same wait.
+    if frame.as_ref().is_err_and(|words| words != super::duplicate::NOT_DRAWN) {
         *open = None;
     }
     frame
@@ -329,9 +331,23 @@ mod win {
     unsafe fn grab(dc: HDC, width: i32, height: i32, draw: impl FnOnce(HDC) -> bool) -> Option<Rgba> {
         unsafe {
             let memory = CreateCompatibleDC(dc);
+            if memory.is_null() {
+                return None;
+            }
             let bitmap = CreateCompatibleBitmap(dc, width, height);
+            if bitmap.is_null() {
+                DeleteDC(memory);
+                return None;
+            }
             let previous = SelectObject(memory, bitmap as _);
+            if previous.is_null() || previous as isize == -1 {
+                DeleteObject(bitmap as _);
+                DeleteDC(memory);
+                return None;
+            }
             let drawn = draw(memory);
+            // GetDIBits requires its bitmap NOT to be selected into any DC.
+            SelectObject(memory, previous);
             let mut header = BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: width,
@@ -346,11 +362,25 @@ mod win {
                 biClrImportant: 0,
             };
             let mut pixels = vec![0u8; (width * height * 4) as usize];
-            let rows = GetDIBits(memory, bitmap, 0, height as u32, pixels.as_mut_ptr().cast(), (&mut header as *mut BITMAPINFOHEADER).cast(), DIB_RGB_COLORS);
-            SelectObject(memory, previous);
+            let rows = GetDIBits(dc, bitmap, 0, height as u32, pixels.as_mut_ptr().cast(), (&mut header as *mut BITMAPINFOHEADER).cast(), DIB_RGB_COLORS);
             DeleteObject(bitmap as _);
             DeleteDC(memory);
-            (drawn && rows != 0).then(|| Rgba { width: width as u32, height: height as u32, pixels, bgra: true })
+            (drawn && rows == height).then(|| Rgba { width: width as u32, height: height as u32, pixels, bgra: true })
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn gdi_readback_returns_every_drawn_pixel() {
+        use windows_sys::Win32::Graphics::Gdi::{PatBlt, WHITENESS};
+        unsafe {
+            let dc = GetDC(std::ptr::null_mut());
+            assert!(!dc.is_null());
+            let image = grab(dc, 37, 19, |memory| PatBlt(memory, 0, 0, 37, 19, WHITENESS) != 0);
+            ReleaseDC(std::ptr::null_mut(), dc);
+            let image = image.expect("a complete GDI readback");
+            assert_eq!((image.width, image.height), (37, 19));
+            assert!(image.pixels.chunks_exact(4).all(|pixel| pixel[..3] == [255, 255, 255]));
         }
     }
 }
