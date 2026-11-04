@@ -331,8 +331,7 @@ impl Shell {
                     .child(button(("tiny-links-copy", ix), ButtonKind::Secondary, "Copy").on_click(cx.listener(move |_, _, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()))))),
             );
         }
-        let all = links.iter().map(|link| format!("{}	{}", link.display_name, link.url)).collect::<Vec<_>>().join("
-");
+        let all = links.iter().map(|link| format!("{}\t{}", link.display_name, link.url)).collect::<Vec<_>>().join("\n");
         let copied = self.tiny_state.copied;
         panel
             .child(words("Each link works once, for that person only, for 14 days. Send it to them yourself; the server does not."))

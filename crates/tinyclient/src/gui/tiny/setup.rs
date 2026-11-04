@@ -276,9 +276,6 @@ impl Shell {
         // is not asked to refuse for it first.
         let anyway = what == Answer::Form && self.tiny_state.setup.data.as_ref().and_then(|setup| self.tiny_setup_steps(setup)).is_some_and(|steps| steps.anyway);
         let state = &mut self.tiny_state.setup;
-        if anyway {
-            state.form.allow_lockout = true;
-        }
         let Some(setup) = state.data.as_ref() else {
             return;
         };
@@ -287,7 +284,8 @@ impl Shell {
         }
         let apply: TinySetupApply = match what {
             Answer::Keep => tiny_setup::keep(),
-            Answer::Form => state.form.apply(setup),
+            // Only this answer carries it: the form keeps what the owner picked, nothing more.
+            Answer::Form => TinySetupApply { allow_lockout: state.form.allow_lockout || anyway, ..state.form.apply(setup) },
         };
         state.sending = true;
         state.touched();
@@ -573,10 +571,8 @@ impl Shell {
             let on = form.preset.as_deref() == Some(preset.id.as_str());
             let preset_id = preset.id.clone();
             let mut words = div().flex_1().min_w_0().flex().flex_col().gap(px(3.)).child(title(preset.title.clone()));
-            // What a preset means is said once it is picked, so the choice stays short to read.
-            if on {
-                words = words.child(about(preset.summary.clone()));
-            }
+            // What each preset means is said on its card, so there is something to choose on.
+            words = words.child(about(preset.summary.clone()));
             // Only an older server says a preset cannot be chosen: one line, in its words.
             if !preset.available && !preset.unavailable.is_empty() {
                 words = words.child(div().truncate().type_small().text_color(theme::warning()).child(preset.unavailable.clone()));
@@ -837,10 +833,11 @@ const SHOT_OUTLINE: &str = r#"{
 
 #[cfg(feature = "gui-shot")]
 impl Shell {
-    /// `--tiny-setup first|custom|refused|checklist|links|privacy|change|member`: the first-run
+    /// `--tiny-setup first|custom|refused|checklist|links|privacy|change|change-anyway|member`: the first-run
     /// screen (`custom` with Privacy picked and the choices open, `refused` after a refusal,
     /// `checklist` with what switching to passkeys needs under the sign-in choice, `links` with
-    /// two passkey links made over it), Server Settings › Privacy as an owner reads it, or as a
+    /// two passkey links made over it), Server Settings › Privacy as an owner reads it (`change-anyway`
+    /// with Privacy picked, so Save reads "Switch anyway"), or as a
     /// member does, over a made-up outline. Nothing is asked of a server.
     pub(super) fn tiny_shot_setup(&mut self, how: &str, window: &mut gpui::Window, cx: &mut Context<Self>) {
         let owner = how != "member";
@@ -863,7 +860,7 @@ impl Shell {
         setup.needed = first;
         let state = &mut self.tiny_state.setup;
         state.form = Form::starting(&setup);
-        state.changing = how == "change";
+        state.changing = matches!(how, "change" | "change-anyway");
         if matches!(how, "custom" | "refused" | "checklist" | "links") {
             state.form.pick_preset(&setup, "privacy");
             state.customizing = matches!(how, "custom" | "checklist" | "links");
@@ -889,6 +886,13 @@ impl Shell {
         }
         if !first {
             self.tiny_open_settings(super::settings::Page::Privacy, None, window, cx);
+        }
+        // Opening Server Settings puts the form back, so Privacy is picked after it.
+        if how == "change-anyway" {
+            let state = &mut self.tiny_state.setup;
+            if let Some(setup) = state.data.as_ref() {
+                state.form.pick_preset(setup, "privacy");
+            }
         }
     }
 }
