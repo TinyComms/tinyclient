@@ -12,6 +12,17 @@ An agent doing feature work does not bump the version, tag, or announce. It may 
 
 Nothing tags or releases with no agent in the thread: no scheduler, no GitHub Action, no cron. No release on a day when no one asks for one.
 
+### The quality gate
+
+The whole gate is in `docs/quality-gate.md`; the lab's contract is `e2e/README.md`. For a feature agent:
+
+- Open the pull request from `.github/pull_request_template.md`, with one type checked.
+- A `feature` or `fix` brings an `e2e/scenarios/<id>` in the same pull request. It drives the real app and fails on `main` without the change.
+- Do not paste your own screenshots as proof. The lab records each platform and posts `e2e-proof`.
+- Merging with `--admin` past a missing `e2e-proof` is not allowed once it is required.
+
+The captain's check prints an `e2e:` line: the lab's recorded release suite on the exact `origin/main` SHA. When `e2e/gate.json` has `"release_proof": "enforce"`, a missing one is a `BLOCK`.
+
 ### The check
 
 `packaging/release-cut.sh` prints the cut, the next version, and every reason it may not ship today. It changes nothing unless it is passed `--apply`. Run it before every release and paste its output into the thread.

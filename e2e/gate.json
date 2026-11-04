@@ -1,0 +1,74 @@
+{
+  "_comment": "Read by .github/scripts/pr-gate.py and packaging/release-cut.sh. docs/quality-gate.md says what each line does.",
+
+  "types": ["feature", "fix", "perf", "refactor", "chore", "docs"],
+  "proof_types": ["feature", "fix"],
+  "regression_types": ["perf", "refactor", "chore"],
+
+  "labs": ["windows", "macos", "linux", "android", "ios"],
+
+  "no_proof_paths": [
+    "**/*.md",
+    "docs/**",
+    "site/**",
+    "research_notes/**",
+    ".github/ISSUE_TEMPLATE/**",
+    ".github/pull_request_template.md",
+    "LICENSE",
+    "packaging/AGPL-3.0.txt"
+  ],
+
+  "platforms": {
+    "windows": [
+      "crates/**",
+      "Cargo.toml",
+      "Cargo.lock",
+      "packaging/windows/**",
+      "packaging/windows.ps1"
+    ],
+    "linux": [
+      "crates/**",
+      "Cargo.toml",
+      "Cargo.lock",
+      "packaging/linux/**",
+      "packaging/linux.sh"
+    ],
+    "macos": [
+      "crates/**",
+      "Cargo.toml",
+      "Cargo.lock",
+      "packaging/bundle.sh",
+      "packaging/dmg.sh",
+      "packaging/Info.plist",
+      "packaging/entitlements.plist"
+    ],
+    "android": [
+      "crates/**",
+      "Cargo.toml",
+      "Cargo.lock",
+      "mobile/android/**",
+      "scripts/mobile/build-android.*"
+    ],
+    "ios": [
+      "crates/**",
+      "Cargo.toml",
+      "Cargo.lock",
+      "mobile/ios/**",
+      "scripts/mobile/build-ios.sh"
+    ]
+  },
+
+  "platform_excludes": {
+    "windows": ["crates/tinyclient/src/gui/phone/**", "crates/tinyclient/src/mobile/**"],
+    "linux": ["crates/tinyclient/src/gui/phone/**", "crates/tinyclient/src/mobile/**"],
+    "macos": ["crates/tinyclient/src/gui/phone/**", "crates/tinyclient/src/mobile/**"],
+    "android": ["crates/tinyclient/src/mobile/ios/**"],
+    "ios": ["crates/tinyclient/src/mobile/android/**"]
+  },
+
+  "rules_enforced": ["template", "scenario"],
+  "lab_actors": [],
+  "proof_context": "e2e-proof",
+  "release_context": "e2e-release",
+  "release_proof": "report"
+}
