@@ -1,14 +1,19 @@
 //! One H.264 picture for a Tiny call: a screen or a camera out, and the one picture in.
 //!
-//! The SFU takes constrained baseline. A share is one layer, at most 1280×720. A camera is two
-//! layers, 640×360 and 320×180, sent with the same RTP time. Both run at 15 frames a second.
+//! The SFU takes constrained baseline. A share is one layer, at the size, rate and bitrate the
+//! sharer chose ([`Quality`]): the screen as it is up to 2560×1440 at up to 60 frames a second,
+//! or less. A camera is two layers, 640×360 and 320×180, sent with the same RTP time, at 15
+//! frames a second.
 //! On a desktop (`desktop`) OpenH264 is Cisco's binary, downloaded from Cisco and loaded when the first picture is
 //! encoded, so this crate still builds with no C toolchain. A capture that fails is said in
 //! words and the voice call stays. A phone captures and codes through its `platform` (`phone`).
 //! All of it is slow, and none of it runs on the call's tick: `video` holds the threads.
 
+use protocol::{PictureKind, ShareQuality};
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// Said while the binary is on its way, so a call does not treat the wait as a failure.
@@ -24,25 +29,116 @@ pub use desktop::*;
 mod screens;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use screens::{choose_screen, screens};
+/// A phone offers Settings no camera list: its own picker chooses, and `--cameras` prints none.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub fn cameras(_folder: Option<&std::path::Path>) -> Vec<protocol::CameraSource> {
+    Vec::new()
+}
+/// A screen through Desktop Duplication, which is what a share at 60 frames a second needs.
+#[cfg(windows)]
+mod duplicate;
+
+/// The camera the next camera frame comes from, as `settings::CAMERA` stores it (a name, then a
+/// tab and the system's id); `None` is the first one listed. One choice per process.
+static CAMERA: Mutex<Option<String>> = Mutex::new(None);
+
+/// What the camera opens from its next frame on. One already open is closed and opened again.
+pub fn choose_camera(choice: Option<String>) {
+    *CAMERA.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = choice;
+}
+
+pub(crate) fn camera_chosen() -> Option<String> {
+    CAMERA.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+}
+
+/// The size my own camera is shown to me at. Smaller than what is sent: it is a corner.
+pub const SELF_VIEW: (u32, u32) = (640, 360);
+/// How often my own camera is painted for me.
+pub const SELF_VIEW_EVERY: Duration = Duration::from_millis(100);
 pub mod convert;
 /// Built everywhere, so host tests drive it with `platform::fake`.
 pub mod phone;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub use phone::*;
 
-/// A share is fitted inside this. Even, and inside level 3.1.
+/// A phone's share is fitted inside this, and so is a desktop's at `Low`. Even, and inside
+/// level 3.1, which is what a phone's hardware codec is sure to take.
 pub const SHARE_MAX: (u32, u32) = (1280, 720);
 /// The camera's high layer.
 pub const CAMERA_HIGH: (u32, u32) = (640, 360);
 /// The camera's low layer.
 pub const CAMERA_LOW: (u32, u32) = (320, 180);
 
+/// A phone's share, and a desktop's at `Low`.
 pub const SHARE_BPS: u32 = 1_500_000;
 pub const CAMERA_HIGH_BPS: u32 = 500_000;
 pub const CAMERA_LOW_BPS: u32 = 150_000;
 
-/// What an encoder is opened at. `video` halves it when encoding falls behind.
-const FULL_FPS: f32 = 15.;
+/// What a camera's encoder is opened at. `video` halves it when encoding falls behind.
+pub(crate) const FULL_FPS: f32 = 15.;
+/// The most a share is captured at, whatever the screen refreshes at. The capture, the
+/// conversion and the encoder are all on the CPU; above this they could not keep up anyway.
+pub const SHARE_FPS_MOST: u32 = 60;
+
+/// What a share spends, by the sharer's choice ([`protocol::ShareQuality`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quality {
+    /// The share is fitted inside this.
+    pub max: (u32, u32),
+    /// Frames a second, at most: the screen's own rate caps it too.
+    pub fps: u32,
+    /// Bits a second, at most.
+    pub bps: u32,
+}
+
+impl Quality {
+    pub const fn of(quality: ShareQuality) -> Quality {
+        match quality {
+            ShareQuality::Best => Quality { max: (2560, 1440), fps: SHARE_FPS_MOST, bps: 8_000_000 },
+            ShareQuality::Balanced => Quality { max: (1920, 1080), fps: 30, bps: 4_000_000 },
+            ShareQuality::Low => Quality { max: SHARE_MAX, fps: 15, bps: SHARE_BPS },
+        }
+    }
+}
+
+/// The quality the next share goes at. One call per process, so one choice per process. A
+/// phone has no choice: its hardware codec gets `Low`.
+static QUALITY: AtomicU8 = AtomicU8::new(ShareQuality::Best as u8);
+
+/// What a share spends from its next frame on. On a desktop only: see [`share_quality`].
+pub fn choose_quality(quality: Option<ShareQuality>) {
+    QUALITY.store(quality.unwrap_or_default() as u8, Ordering::Relaxed);
+}
+
+/// Frames a second for the share now: what was chosen, held to the shared screen's own refresh
+/// rate where that is known. Nothing new is on a screen between its refreshes.
+pub fn share_fps() -> u32 {
+    let chosen = share_quality().fps;
+    #[cfg(windows)]
+    {
+        screens::refresh_rate(screens::chosen().as_deref()).map_or(chosen, |hz| chosen.min(hz)).max(1)
+    }
+    #[cfg(not(windows))]
+    {
+        chosen.max(1)
+    }
+}
+
+/// What the share spends now.
+pub fn share_quality() -> Quality {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        Quality::of(ShareQuality::Low)
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        Quality::of(match QUALITY.load(Ordering::Relaxed) {
+            1 => ShareQuality::Balanced,
+            2 => ShareQuality::Low,
+            _ => ShareQuality::Best,
+        })
+    }
+}
 
 /// What one track is asked for, for one frame.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -63,6 +159,7 @@ pub struct Encoded {
 }
 
 /// One captured picture, RGBA, top-down, tightly packed.
+#[derive(Clone)]
 pub struct Rgba {
     pub width: u32,
     pub height: u32,
@@ -110,35 +207,87 @@ pub fn i420(src: &[u8], src_w: u32, src_h: u32, width: u32, height: u32, bgra: b
     let mut u = vec![0u8; (width / 2) * (height / 2)];
     let mut v = vec![0u8; (width / 2) * (height / 2)];
     let (across, down) = (reach(src_w, width), reach(src_h, height));
-    let sample = |row: usize, col: usize| -> (i32, i32, i32) {
-        let at = (row * src_w + col) * 4;
-        match src.get(at..at + 3) {
-            Some(&[first, g, last]) if bgra => (last as i32, g as i32, first as i32),
+    let scale = Scale { src, src_w, src_h, width, height, bgra, across, down };
+    // Bands of rows, an even number each so a band owns whole chroma rows, each converted on a
+    // thread of its own: one thread took longer than a frame at 60 on a 1440p screen.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    let rows_per = (height.div_ceil(threads).max(2) + 1) & !1;
+    let mut bands = Vec::with_capacity(threads);
+    let (mut y_rest, mut u_rest, mut v_rest) = (&mut y[..], &mut u[..], &mut v[..]);
+    let mut first = 0;
+    while first < height {
+        let rows = rows_per.min(height - first);
+        let chroma = (rows.div_ceil(2) * (width / 2)).min(u_rest.len());
+        let (y_band, y_next) = y_rest.split_at_mut(rows * width);
+        let (u_band, u_next) = u_rest.split_at_mut(chroma);
+        let (v_band, v_next) = v_rest.split_at_mut(chroma);
+        bands.push((first, y_band, u_band, v_band));
+        (y_rest, u_rest, v_rest) = (y_next, u_next, v_next);
+        first += rows;
+    }
+    if bands.len() == 1 {
+        let (first, y_band, u_band, v_band) = bands.pop().expect("one band");
+        scale.band(first, y_band, u_band, v_band);
+    } else {
+        std::thread::scope(|scope| {
+            for (first, y_band, u_band, v_band) in bands {
+                let scale = &scale;
+                scope.spawn(move || scale.band(first, y_band, u_band, v_band));
+            }
+        });
+    }
+    Planes { width, height, y, u, v }
+}
+
+/// One scaled conversion, shared by the threads that each do a band of its rows.
+struct Scale<'a> {
+    src: &'a [u8],
+    src_w: usize,
+    src_h: usize,
+    width: usize,
+    height: usize,
+    bgra: bool,
+    across: usize,
+    down: usize,
+}
+
+impl Scale<'_> {
+    fn sample(&self, row: usize, col: usize) -> (i32, i32, i32) {
+        let at = (row * self.src_w + col) * 4;
+        match self.src.get(at..at + 3) {
+            Some(&[first, g, last]) if self.bgra => (last as i32, g as i32, first as i32),
             Some(&[first, g, last]) => (first as i32, g as i32, last as i32),
             _ => (0, 0, 0),
         }
-    };
-    for row in 0..height {
-        let top = row * src_h / height;
-        let bottom = (top + down).min(src_h - 1);
-        for col in 0..width {
-            let left = col * src_w / width;
-            let right = (left + across).min(src_w - 1);
-            let (r, g, b) = if across == 0 && down == 0 {
-                sample(top, left)
-            } else {
-                let (a, b, c, d) = (sample(top, left), sample(top, right), sample(bottom, left), sample(bottom, right));
-                ((a.0 + b.0 + c.0 + d.0 + 2) / 4, (a.1 + b.1 + c.1 + d.1 + 2) / 4, (a.2 + b.2 + c.2 + d.2 + 2) / 4)
-            };
-            y[row * width + col] = clamp(66 * r + 129 * g + 25 * b + 128, 16);
-            if row % 2 == 0 && col % 2 == 0 {
-                let chroma = (row / 2) * (width / 2) + col / 2;
-                u[chroma] = clamp(-38 * r - 74 * g + 112 * b + 128, 128);
-                v[chroma] = clamp(112 * r - 94 * g - 18 * b + 128, 128);
+    }
+
+    /// Rows `first` on, as many as `y` holds, into these slices of the three planes.
+    fn band(&self, first: usize, y: &mut [u8], u: &mut [u8], v: &mut [u8]) {
+        let (width, height, src_w, src_h) = (self.width, self.height, self.src_w, self.src_h);
+        let rows = y.len() / width;
+        for row in first..first + rows {
+            let top = row * src_h / height;
+            let bottom = (top + self.down).min(src_h - 1);
+            for col in 0..width {
+                let left = col * src_w / width;
+                let right = (left + self.across).min(src_w - 1);
+                let (r, g, b) = if self.across == 0 && self.down == 0 {
+                    self.sample(top, left)
+                } else {
+                    let (a, b, c, d) = (self.sample(top, left), self.sample(top, right), self.sample(bottom, left), self.sample(bottom, right));
+                    ((a.0 + b.0 + c.0 + d.0 + 2) / 4, (a.1 + b.1 + c.1 + d.1 + 2) / 4, (a.2 + b.2 + c.2 + d.2 + 2) / 4)
+                };
+                y[(row - first) * width + col] = clamp(66 * r + 129 * g + 25 * b + 128, 16);
+                if row % 2 == 0 && col % 2 == 0 {
+                    let chroma = (row / 2 - first / 2) * (width / 2) + col / 2;
+                    if let (Some(cu), Some(cv)) = (u.get_mut(chroma), v.get_mut(chroma)) {
+                        *cu = clamp(-38 * r - 74 * g + 112 * b + 128, 128);
+                        *cv = clamp(112 * r - 94 * g - 18 * b + 128, 128);
+                    }
+                }
             }
         }
     }
-    Planes { width, height, y, u, v }
 }
 
 fn clamp(sum: i32, bias: i32) -> u8 {
@@ -193,11 +342,14 @@ fn write_jpeg(rgb: &[u8], width: u32, height: u32, generation: u64) -> io::Resul
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let file = options.open(&path)?;
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(file, 70);
-    if let Err(err) = encoder.encode(rgb, width, height, image::ExtendedColorType::Rgb8) {
+    // Buffered: the encoder writes a few bytes at a time, and each write straight to the file
+    // was a system call. That made a 1080p picture cost half a second instead of 15 ms.
+    let mut file = io::BufWriter::with_capacity(1 << 16, options.open(&path)?);
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut file, 70);
+    let written = encoder.encode(rgb, width, height, image::ExtendedColorType::Rgb8).map_err(io::Error::other).and_then(|()| file.into_inner().map_err(|err| err.into_error())).and_then(|mut file| io::Write::flush(&mut file));
+    if let Err(err) = written {
         let _ = std::fs::remove_file(&path);
-        return Err(io::Error::other(err));
+        return Err(err);
     }
     Ok(path)
 }
@@ -211,19 +363,25 @@ pub struct Painted {
     pub generation: u64,
 }
 
-/// The picture the decoder last painted, which is one file at a time.
+/// Whose picture a painted one is: what the window is told with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tag {
+    pub user: String,
+    pub kind: PictureKind,
+}
+
+/// The picture a painter last painted, which is one file at a time.
 #[derive(Default)]
 struct Canvas {
-    generation: u64,
     /// The file on disk now, removed when the next is written or the picture stops.
     last: Option<PathBuf>,
 }
 
 impl Canvas {
-    fn paint(&mut self, colors: &[u8], width: u32, height: u32) -> Option<Painted> {
-        let generation = self.generation.wrapping_add(1);
+    /// Writes the picture as `generation`, which the caller keeps unique: the window tells
+    /// pictures apart by it, and so do the files.
+    fn paint(&mut self, colors: &[u8], width: u32, height: u32, generation: u64) -> Option<Painted> {
         let path = write_jpeg(colors, width, height, generation).ok()?;
-        self.generation = generation;
         self.forget();
         self.last = Some(path.clone());
         Some(Painted { path, width, height, generation })
@@ -282,13 +440,13 @@ mod tests {
 
     #[test]
     fn a_failed_decode_leaves_no_file_behind_and_stopping_takes_the_last_one() {
-        let mut canvas = Canvas { generation: u64::from(std::process::id()) * 1000, ..Canvas::default() };
+        let mut canvas = Canvas::default();
+        let generation = u64::from(std::process::id()) * 1000;
         let colors = [128u8; 2 * 2 * 3];
-        let first = canvas.paint(&colors, 2, 2).unwrap();
+        let first = canvas.paint(&colors, 2, 2, generation + 1).unwrap();
         assert!(first.path.exists());
         // A frame in between decoded to nothing, so its generation never reached the disk.
-        canvas.generation += 1;
-        let second = canvas.paint(&colors, 2, 2).unwrap();
+        let second = canvas.paint(&colors, 2, 2, generation + 3).unwrap();
         assert!(!first.path.exists(), "the file before the gap went too");
         assert!(second.path.exists());
         canvas.forget();

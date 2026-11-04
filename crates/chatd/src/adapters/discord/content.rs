@@ -839,6 +839,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         reactions,
         reply_to,
         thread,
+        views: None,
         edited: posted.edited_timestamp.is_some(),
         pinned: posted.pinned.unwrap_or(false),
         mentions_me: false,

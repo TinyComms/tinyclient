@@ -34,6 +34,7 @@ pub(super) mod edit;
 mod hold;
 mod mention;
 mod niceties;
+mod rec;
 // The picker is the composer's and the reactions'; it lives in `gui/picker`.
 #[path = "picker/mod.rs"]
 pub(in crate::gui) mod picker;
@@ -46,6 +47,7 @@ use super::components::place::{max_height, placed, Layer, Place};
 use super::components::{button, glyph, menu, menu_item, tip, ButtonKind};
 use super::input::{InputEvent, InputKey, InputList, InputPaste, PickEmoji, PickGifs, SubmitSilently, TextInput};
 use super::people::{ask_later, Hub};
+use super::playing;
 use super::state::Shell;
 use super::theme::{self, Type};
 use crate::client::ask;
@@ -64,7 +66,7 @@ use picker::images::Images;
 use picker::{Picker, PickerEvent, Setup, Tab};
 use protocol::{
     AccountKey, Capabilities, CatalogKind, Change, Conversation, ConversationKind, EmojiScope, ErrorCode, Key, Link, Message, MessageKind,
-    Network, Page, Person, Pick, Request, Response, SendState, DRAFT_LIMIT,
+    Network, OutgoingFile, Page, Person, Pick, RecordRequest, RecordState, Request, Response, SendState, DRAFT_LIMIT,
 };
 use std::cell::{Cell, OnceCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -107,6 +109,11 @@ const SETTLE: u32 = 20;
 /// Upload progress kept for pending rows, most recent last.
 const UPLOADS: usize = 32;
 const NOT_ANSWERING: &str = "tinyclient's background process is not answering.";
+/// How often the recording's clock is drawn again while one is under way.
+const REC_TICK: Duration = Duration::from_millis(200);
+
+/// A recorded voice message, as chatd says it (`Change::Recording`).
+type Rec = protocol::Recording;
 
 /// What the composer keeps between frames: the composers themselves, made when first drawn,
 /// and the sends that are not chatd's yet or not settled.
@@ -127,6 +134,10 @@ pub struct State {
     /// A Tiny file send that finished before the composer heard it was stored. The chip hold
     /// reads this once, then it goes.
     tiny_files: Vec<(String, Result<(), String>)>,
+    /// The one recording (`Change::Recording`), as chatd last said it.
+    pub(super) recording: Option<Rec>,
+    /// The clock of a recording under way, as the players' ticking is.
+    ticking: bool,
 }
 
 /// A message sent while its account was offline, for the conversation to draw as a row.
@@ -302,7 +313,7 @@ struct Editing {
     reply: Option<Reply>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Tone {
     Offline,
     Refused,
@@ -323,6 +334,8 @@ struct Outgoing {
     /// The chips that went, and the files the shell made for them.
     chips: Vec<u64>,
     made: Vec<PathBuf>,
+    /// The send carried a voice note, so its facts and file can leave with it.
+    note: bool,
 }
 
 /// A drag of files over the window, while it is over this composer's conversation.
@@ -412,6 +425,11 @@ pub struct Composer {
     counts: HashMap<Key, (Option<u32>, Option<u32>)>,
     send_menu: bool,
     anchors: Rc<Anchors>,
+    /// The recording of this conversation, as chatd said it (`Change::Recording`).
+    recording: Option<Rec>,
+    /// The facts of the note that arrived (`Recorded`): a send is sent with them, and this
+    /// composer answers a removed chip with them.
+    note: Option<Rec>,
     /// Tiny file sends whose chips stay until the upload and the message have both settled.
     /// One hold per client id, so a second channel does not discard the first.
     held_files: crate::tiny_attach::Holds<Outgoing>,
@@ -495,6 +513,8 @@ impl Composer {
             counts: HashMap::new(),
             send_menu: false,
             anchors: Rc::new(Anchors::default()),
+            recording: None,
+            note: None,
             held_files: crate::tiny_attach::Holds::default(),
             pending_file: None,
         }
@@ -765,8 +785,11 @@ impl Composer {
         let controls = self.controls();
         let hosts = niceties::link_hosts(&field);
         let reply_to = self.reply.as_ref().map(|reply| reply.id.clone());
+        let files: Vec<OutgoingFile> = self.tray.iter().filter_map(Staged::outgoing).collect();
+        let voice = rec::sent_as(&self.note, &files);
         let with = protocol::Outgoing {
-            files: self.tray.iter().filter_map(Staged::outgoing).collect(),
+            files,
+            voice: voice.clone(),
             silent: silent && controls.silent,
             suppress_embeds: self.no_preview && controls.link_chip && !hosts.is_empty(),
             ping: reply_to.is_none() || !controls.ping || !self.ping_off.contains(&target.key.account()),
@@ -786,6 +809,7 @@ impl Composer {
             reply_to,
             chips: self.tray.iter().map(|chip| chip.id).collect(),
             made: self.tray.iter().flat_map(Staged::made).collect(),
+            note: voice.is_some(),
         };
         self.dispatch(out, with, cx);
     }
@@ -837,6 +861,7 @@ impl Composer {
             reply_to,
             chips: Vec::new(),
             made: Vec::new(),
+            note: false,
         };
         self.dispatch(out, protocol::Outgoing { pick: Some(pick), ping, ..protocol::Outgoing::default() }, cx);
     }
@@ -889,6 +914,11 @@ impl Composer {
         let refused = match answer {
             Ok(Response::Sent { .. }) => {
                 let (key, client_id, made) = (out.key.clone(), out.client_id.clone(), out.made.clone());
+                // The note went out with the send: chatd's facts and file go with it.
+                if out.note {
+                    self.note = None;
+                    ask_later(cx, Request::Record(RecordRequest::Forget), |_, _| {});
+                }
                 let _ = self.shell.update(cx, |shell, cx| {
                     if !made.is_empty() {
                         shell.composer_state.outbox.push((key.clone(), client_id.clone(), made));
@@ -1247,12 +1277,22 @@ impl Composer {
             self.refuse_files(cx);
             return;
         }
-        let extension = image.format.extension();
+        let format = image.format;
         let key = target.key.clone();
         cx.spawn(async move |this, cx| {
             let written = cx
                 .background_executor()
-                .spawn(async move { attach::write_pasted(&attach::outbox(), &image.bytes, extension, SystemTime::now()) })
+                .spawn(async move {
+                    // Windows pastes a screenshot as a BMP, and the server takes no BMP: it goes up as PNG.
+                    let (bytes, extension) = match format {
+                        gpui::ImageFormat::Bmp => match attach::bmp_as_png(&image.bytes) {
+                            Some(png) => (png, "png"),
+                            None => return Err(std::io::Error::other("the bitmap can't be read")),
+                        },
+                        _ => (image.bytes, format.extension()),
+                    };
+                    attach::write_pasted(&attach::outbox(), &bytes, extension, SystemTime::now())
+                })
                 .await;
             let _ = this.update(cx, |this, cx| match written {
                 Ok(path) => this.stage_files_for(target, vec![path], true, cx),
@@ -1311,6 +1351,11 @@ impl Composer {
     pub(super) fn remove_chip(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(at) = self.tray.iter().position(|chip| chip.id == id) {
             let chip = self.tray.remove(at);
+            // The note is chatd's file: taking the chip back gives the recording in.
+            if rec::holds_the_note(&self.note, &chip) {
+                ask_later(cx, Request::Record(RecordRequest::Forget), |_, _| {});
+                self.note = None;
+            }
             delete_later(chip.made());
         }
         self.chip_menu = None;
@@ -1951,6 +1996,62 @@ impl Composer {
     }
 
     /// A 28 pt icon button on the card, its bounds kept for what it opens.
+    /// The mic on the card. A recording under way shows a red dot in its place, and the next
+    /// press stops it: the gate (`Controls::voice`) decides it is on the card at all.
+    fn mic_button(&self, on: bool, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+        if !on {
+            return None;
+        }
+        let hot = self
+            .recording
+            .as_ref()
+            .is_some_and(|recording| Some(&recording.conversation) == self.target.as_ref().map(|target| &target.key) && matches!(recording.state, RecordState::Active));
+        let (icon, words) = match hot {
+            true => ("icons/record.svg", "Stop recording"),
+            false => ("icons/mic.svg", "Record a voice message"),
+        };
+        Some(
+            self.card_button("mic", Some(icon), false, None)
+                .tooltip(tip(words, None))
+                // A recording's dot is its own: the button says what the next press does.
+                .map(|button| match hot {
+                    true => button.bg(theme::danger_soft()),
+                    false => button,
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.record_pressed(cx))),
+        )
+    }
+
+    /// The mic. The first press on a conversation records, the next stops; everything else is
+    /// chatd's, told back as `Change::Recording`.
+    fn record_pressed(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target.as_ref().filter(|target| target.locked().is_none()).map(|target| target.key.clone()) else {
+            return;
+        };
+        if !live() {
+            return;
+        }
+        ask_later(cx, Request::Record(rec::on_press(&self.recording, &target)), |_, _| {});
+    }
+
+    /// `Change::Recording`: the recording on show here, and a finished note staged as a chip so
+    /// it is sent like any file. The note came from chatd's cache, so a removed chip gives the
+    /// recording in rather than taking the file with it.
+    fn recording_changed(&mut self, recording: &Option<Rec>, cx: &mut Context<Self>) {
+        self.recording = recording.clone();
+        let on = recording.as_ref().filter(|recording| self.target.as_ref().is_some_and(|target| target.key == recording.conversation));
+        cx.notify();
+        let Some(recording) = on else { return };
+        let RecordState::Recorded { path, .. } = &recording.state else { return };
+        self.note = Some(recording.clone());
+        let target = self.target.clone().expect("the conversation matched");
+        let known = self.tray.iter().any(|chip| chip.path.to_string_lossy() == *path)
+            || self.drafts.get(&target.key).is_some_and(|draft| draft.files.iter().any(|chip| chip.path.to_string_lossy() == *path));
+        if !known {
+            self.stage_files_for(target, vec![PathBuf::from(path)], false, cx);
+        }
+    }
+
     fn card_button(&self, id: &'static str, icon: Option<&'static str>, toggled: bool, slot: Option<Trigger>) -> gpui::Stateful<Div> {
         let anchors = self.anchors.clone();
         let content = match icon {
@@ -2027,6 +2128,7 @@ impl Composer {
                 .tooltip(tip("Emoji", Some("⌘E")))
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(Tab::Emoji, window, cx)))
         });
+        let mic = self.mic_button(controls.voice, cx);
         let anchors = self.anchors.clone();
         let phone = crate::gui::phone::active();
         // A phone's send is the desktop's filled square drawn at 36 inside a 44 pt target, so a
@@ -2101,6 +2203,7 @@ impl Composer {
                 .gap(px(2.))
                 .children(attach)
                 .child(field)
+                .children(mic)
                 .children(smile)
                 .child(send)
         } else {
@@ -2114,6 +2217,7 @@ impl Composer {
                 .children(attach.map(|attach| attach.mr(px(4.))))
                 .child(field)
                 .children(gif.map(|gif| gif.mr(px(2.))))
+                .children(mic.map(|mic| mic.mr(px(2.))))
                 .children(smile.map(|smile| smile.mr(px(4.))))
                 .child(send)
         };
@@ -2148,7 +2252,8 @@ impl Composer {
         let unlocked = target.locked().is_none();
         let text = self.input.read(cx).text().to_owned();
         let note = || attach::sending_note(target.key.network, &target.can, &self.tray, &text).map(|words| (words, Tone::Note));
-        let said = self.caption.clone().or_else(note).or_else(|| (unlocked && target.link == Link::Offline).then(offline));
+        let recording = rec::foot(&self.recording, &target.key, playing::now_ms());
+        let said = self.caption.clone().or(recording).or_else(note).or_else(|| (unlocked && target.link == Link::Offline).then(offline));
         let hosts = if self.controls().link_chip && unlocked { niceties::link_hosts(&text) } else { Vec::new() };
         let chip = niceties::preview_words(&hosts, self.no_preview).map(|words| {
             let suppressed = self.no_preview;
@@ -2481,6 +2586,7 @@ impl Composer {
                     reply_to: None,
                     chips: Vec::new(),
                     made: Vec::new(),
+                    note: false,
                 };
                 self.dispatch(out, with, cx);
             }
@@ -2951,6 +3057,35 @@ impl Shell {
         self.composer_state.hold.failed_in(conversation) || self.composer_state.flight.failed_in(conversation)
     }
 
+    /// The recording's clock ticks while one runs, as a playing file's players do. One loop:
+    /// it exists only while a recording is under way.
+    fn recording_ticking(&mut self, cx: &mut Context<Self>) {
+        let active = self.composer_state.recording.as_ref().is_some_and(|recording| matches!(recording.state, RecordState::Active));
+        if !active || self.composer_state.ticking {
+            return;
+        }
+        self.composer_state.ticking = true;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(REC_TICK).await;
+            let going = this.update(cx, |shell, cx| {
+                let active = shell.composer_state.recording.as_ref().is_some_and(|recording| matches!(recording.state, RecordState::Active));
+                if !active {
+                    shell.composer_state.ticking = false;
+                    return false;
+                }
+                for composer in [shell.composer_state.main.get(), shell.composer_state.thread.get()].into_iter().flatten() {
+                    composer.update(cx, |_, cx| cx.notify());
+                }
+                cx.notify();
+                true
+            });
+            if !matches!(going, Ok(true)) {
+                return;
+            }
+        })
+        .detach();
+    }
+
     /// Every change chatd reports. Uploads are kept for the pending rows; a file the picker
     /// asked for goes to it; and where a send is on its way, messages changing is one read of
     /// the newest few, to see whether it went.
@@ -2973,6 +3108,14 @@ impl Shell {
                     cx.defer(move |cx| composer.update(cx, |composer, cx| composer.media_landed(&file, cx)));
                 }
                 return;
+            }
+            Change::Recording { recording } => {
+                self.composer_state.recording = recording.clone();
+                for composer in [self.composer_state.main.get(), self.composer_state.thread.get()].into_iter().flatten() {
+                    let (composer, recording) = (composer.clone(), recording.clone());
+                    cx.defer(move |cx| composer.update(cx, |composer, cx| composer.recording_changed(&recording, cx)));
+                }
+                self.recording_ticking(cx);
             }
             _ => {}
         }

@@ -1397,14 +1397,14 @@ fn video_is_refused_in_words_on_a_voice_call_and_reports_no_stream() {
     let mut fake = Fake::new();
     let mut mediad = Mediad::start("null", None);
     // Before a join there is no engine in the call and the request is only noted.
-    assert!(matches!(mediad.ask(MediaRequest::ShareSend { on: true, screen: None }), MediaResponse::Streams { video } if video.len() == 1));
+    assert!(matches!(mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: None }), MediaResponse::Streams { video } if video.len() == 1));
     mediad.join(&fake.endpoint(), NO_DAVE);
     let mut peer = fake.accept();
     fake.handshake(&mut peer, &[AES], 0, 30_000);
     mediad.connected();
     assert_eq!(mediad.ask(MediaRequest::Streams), MediaResponse::Streams { video: vec![] }, "a voice call holds no encode");
     for request in [
-        MediaRequest::ShareSend { on: true, screen: None },
+        MediaRequest::ShareSend { on: true, screen: None, quality: None },
         MediaRequest::ShareWatch { source: Some(THEM.into()) },
         MediaRequest::Speaker { source: Some(THEM.into()) },
         MediaRequest::Camera { on: true },
@@ -1414,7 +1414,7 @@ fn video_is_refused_in_words_on_a_voice_call_and_reports_no_stream() {
         };
         assert!(detail.contains("voice only"), "{detail}");
     }
-    assert_eq!(mediad.ask(MediaRequest::ShareSend { on: false, screen: None }), MediaResponse::Streams { video: vec![] });
+    assert_eq!(mediad.ask(MediaRequest::ShareSend { on: false, screen: None, quality: None }), MediaResponse::Streams { video: vec![] });
     assert_eq!(mediad.hang_up().0.code(), Some(0));
 }
 
@@ -1434,7 +1434,7 @@ fn hang_up_while_still_connecting_exits_cleanly() {
 fn requests_before_and_without_a_join_keep_their_one_reply() {
     let mut mediad = Mediad::start("null", None);
     assert_eq!(mediad.ask(MediaRequest::Audio { muted: true, deafened: false }), MediaResponse::Done);
-    assert_eq!(mediad.ask(MediaRequest::Devices { input: None, output: None }), MediaResponse::Done);
+    assert_eq!(mediad.ask(MediaRequest::Devices { input: None, output: None, camera: None }), MediaResponse::Done);
     assert_eq!(mediad.ask(MediaRequest::Streams), MediaResponse::Streams { video: vec![] });
     let (status, took) = mediad.hang_up();
     assert_eq!(status.code(), Some(0));

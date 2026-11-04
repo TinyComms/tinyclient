@@ -284,7 +284,7 @@ fn a_join_is_drawn_as_a_call_only_once_the_voice_server_admits_us_and_a_refusal_
     // Requests reach mediad and each gets its one reply.
     assert!(hub.calls.set_audio(&hub, false, false).is_ok());
     assert_eq!(peer.expect(5)["speaking"], 1, "unmuted, the tone is speech");
-    assert!(hub.calls.request(&hub, &MediaRequest::Devices { input: None, output: None }).is_ok());
+    assert!(hub.calls.request(&hub, &MediaRequest::Devices { input: None, output: None, camera: None }).is_ok());
 
     // Discord ends it: DAVE required. The reason is shown and mediad is gone.
     peer.close(4017);

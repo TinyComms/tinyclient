@@ -1104,6 +1104,38 @@ fn media_lost_while_the_socket_was_down_joins_again_on_ready() {
     until("the same call goes on", || the_call(&running).is_some_and(|call| !matches!(call.state, protocol::CallState::Failed { .. })));
 }
 
+/// The server stopped hearing our media and the call takes the seat again by itself. Until the
+/// fresh offer is answered the server lists nobody, but the page still shows us seated: the
+/// stage would otherwise say nobody is here under a connected call.
+#[test]
+fn a_seat_being_taken_again_keeps_us_on_the_page() {
+    with_mediad();
+    let (go, dropped) = channel::<()>();
+    let dropped = std::sync::Mutex::new(dropped);
+    let (said, heard) = channel();
+    let fake = fake_with("up", &[], move |_, mut conn| {
+        conn.send(ready(1, &[ME], json!([])));
+        answer_join(&mut conn, "c-1");
+        let _ = dropped.lock().expect("the drop signal").recv_timeout(Duration::from_secs(5));
+        conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "media_lost"}));
+        let again = conn.next(Duration::from_secs(5)).expect("the fresh offer");
+        assert_eq!(again["type"], "call.join", "{again}");
+        // Left unanswered: the seat is not back while the test looks.
+        let _ = said.send(());
+        conn.idle(Duration::from_secs(5));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    until("the health read", || !running.live.seats_only());
+    assert_eq!(running.join_with_audio(ROOM), Ok(()));
+    until("my seat", || running.in_room(ROOM) == ["Ada"]);
+    running.hub.calls.set_state(&running.hub, &running.key(ROOM), protocol::CallState::Joined);
+    let _ = go.send(());
+    heard.recv_timeout(Duration::from_secs(10)).expect("the rejoin went out");
+    assert_eq!(running.in_room(ROOM), ["Ada"], "still seated on the page while the seat is taken again");
+    assert_eq!(running.hub.occupants(&running.key(ROOM)).map(|inside| inside.total), Some(1));
+}
+
 /// The same, with the resume's own join lost with the socket: it is not forgotten.
 #[test]
 fn a_resume_lost_with_its_socket_is_taken_up_again_on_ready() {

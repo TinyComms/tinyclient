@@ -222,6 +222,7 @@ mod tests {
             outputs: Vec::new(),
             security: None,
             picture: None,
+            self_view: None,
         }
     }
 

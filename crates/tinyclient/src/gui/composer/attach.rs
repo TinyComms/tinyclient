@@ -305,6 +305,15 @@ pub fn write_pasted(dir: &Path, bytes: &[u8], extension: &str, now: SystemTime) 
     Ok(path)
 }
 
+/// Re-encodes a pasted BMP as PNG, the one format a clipboard screenshot arrives in that the
+/// server refuses. `None` when the bytes are not a bitmap the image crate can read.
+pub fn bmp_as_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    let picture = image::load_from_memory_with_format(bytes, image::ImageFormat::Bmp).ok()?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    picture.write_to(&mut png, image::ImageFormat::Png).ok()?;
+    Some(png.into_inner())
+}
+
 /// Turns a HEIC into a JPEG beside the outbox, with the system's own converter (ImageIO, via
 /// `sips`). Called off the main thread. `None` when the system could not read it.
 pub fn heic_to_jpeg(dir: &Path, heic: &Path) -> Option<PathBuf> {
@@ -450,6 +459,15 @@ mod tests {
         let long = "a".repeat(1_100);
         assert_eq!(sending_note(Network::Telegram, &can, &[photo], &long).as_deref(), Some("The text goes as its own message first."));
         assert_eq!(sending_note(Network::Telegram, &can, &[], &long), None);
+    }
+
+    #[test]
+    fn a_pasted_bmp_is_sent_as_png() {
+        let mut bmp = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(2, 2).write_to(&mut bmp, image::ImageFormat::Bmp).expect("bmp");
+        let png = bmp_as_png(bmp.get_ref()).expect("png");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert!(bmp_as_png(b"not a bitmap").is_none());
     }
 
     #[test]

@@ -908,6 +908,7 @@ fn demo_call(conversation: &protocol::Key) -> protocol::Call {
         outputs: Vec::new(),
         security: None,
         picture: None,
+        self_view: None,
     }
 }
 

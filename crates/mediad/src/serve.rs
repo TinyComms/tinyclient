@@ -86,10 +86,12 @@ impl Call {
             {
                 return MediaResponse::Refused { detail: NO_VIDEO.to_owned() };
             }
-            MediaRequest::ShareSend { on, screen } => {
-                // What the share captures, chosen before the probe so the probe tries that one.
+            MediaRequest::ShareSend { on, screen, quality } => {
+                // What the share captures, chosen before the probe so the probe tries that one,
+                // and what it spends.
                 if on {
                     picture::choose_screen(screen);
+                    picture::choose_quality(quality);
                 }
                 if self.tiny.is_some() && on {
                     if let Err(words) = picture::probe_screen() {
@@ -270,8 +272,9 @@ impl Call {
                 self.controls.e2ee_report();
                 return MediaResponse::Done;
             }
-            MediaRequest::Devices { input, output } => {
+            MediaRequest::Devices { input, output, camera } => {
                 self.controls.choose(input, output);
+                picture::choose_camera(camera);
                 return MediaResponse::Done;
             }
             // The sound of the call, as the shell and the room decide it. Each holds until sent
@@ -422,6 +425,14 @@ pub fn run(args: &[String]) -> u8 {
             out::print_line(&serde_json::to_string(&screens).unwrap_or_else(|_| "[]".to_owned()));
             return 0;
         }
+        // Settings' camera list: every camera, with a small picture from each in the folder
+        // named. Each is opened for one frame, so this is not run while a call has one.
+        Some("--cameras") => {
+            let folder = args.get(1).map(std::path::PathBuf::from);
+            let cameras = picture::cameras(folder.as_deref());
+            out::print_line(&serde_json::to_string(&cameras).unwrap_or_else(|_| "[]".to_owned()));
+            return 0;
+        }
         Some("--responsible") => {
             out::print_line(&permission::responsible().unwrap_or_default());
             return 0;
@@ -439,6 +450,21 @@ pub fn run(args: &[String]) -> u8 {
         // One notification sound, for chatd: the word, the volume, the speaker (`alert`).
         Some("--sound") => {
             return match crate::alert::run(&args[1..]) {
+                Ok(()) => 0,
+                Err(err) => {
+                    tracing::warn!("mediad: {err}");
+                    1
+                }
+            };
+        }
+        // One voice note recorded off the microphone, for chatd: into a file it named, until
+        // it closes our stdin (`rec`).
+        Some("--rec") => {
+            let Some(path) = args.get(1).map(std::path::PathBuf::from) else {
+                tracing::warn!("mediad: --rec needs a file to record to");
+                return 2;
+            };
+            return match crate::rec::run(path) {
                 Ok(()) => 0,
                 Err(err) => {
                     tracing::warn!("mediad: {err}");

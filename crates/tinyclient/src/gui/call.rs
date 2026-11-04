@@ -221,6 +221,8 @@ pub(super) struct Confirm {
 pub struct State {
     /// The frames of the picture being watched.
     pub(in crate::gui) feed: super::tiny::feed::Feed<std::sync::Arc<gpui::RenderImage>>,
+    /// The frames of my own camera, for my tile.
+    pub(in crate::gui) self_feed: super::tiny::feed::Feed<std::sync::Arc<gpui::RenderImage>>,
     /// Made the first time the dock is drawn.
     counter: OnceCell<Entity<Counter>>,
     /// The same count, for a Tiny channel's stage: a second text, ticking on its own.
@@ -968,6 +970,7 @@ impl Shell {
                             outputs: Vec::new(),
                             security: None,
                             picture: None,
+                            self_view: None,
                         });
                     }
                 }

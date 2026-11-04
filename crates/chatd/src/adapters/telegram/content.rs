@@ -351,6 +351,30 @@ pub fn reactions_of(update: &tl::enums::MessageReactions) -> Vec<Reaction> {
     reactions(update)
 }
 
+/// The custom-emoji documents a message's reactions name, their ids parsed from the media
+/// they carry (`e<document id>`): Telegram keeps access hash and bytes apart from the
+/// reaction, so chatd has to ask `messages.getCustomEmojiDocuments` for those first.
+pub fn reaction_emoji_ids(reactions: &[Reaction]) -> Vec<i64> {
+    reactions.iter().filter_map(|reaction| {
+        reaction
+            .file
+            .as_ref()
+            .filter(|file| file.kind == MediaKind::Emoji)
+            .and_then(|file| file.id[1..].parse().ok())
+    }).collect()
+}
+
+/// The custom-emoji documents a message's own text names, read from the spans' files
+/// (`e<document id>`, the name a reaction's file carries too). The text under a span is the
+/// alt glyph Telegram chose; Telegram keeps the document's access hash and bytes apart from the
+/// entity, so chatd asks `messages.getCustomEmojiDocuments` for these ids first.
+pub fn text_emoji_ids(message: &Message) -> Vec<i64> {
+    message.spans.iter().filter_map(|span| match &span.style {
+        Style::Emoji { file } if file.kind == MediaKind::Emoji => file.id.strip_prefix('e')?.parse().ok(),
+        _ => None,
+    }).collect()
+}
+
 fn sender(dir: &Directory, who: Who) -> Sender {
     let known = dir.get(who);
     Sender {
@@ -471,8 +495,10 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             message.mentions_me = raw.mentioned;
             message.reactions = raw.reactions.as_ref().map(reactions).unwrap_or_default();
             // A channel post's comment section rides the post: the count alone comes with it,
-            // the linked group is named but never reached, and the comments are read under the
-            // post's own id (`messages.getReplies`, which takes the channel and the post).
+            // the linked group named on the wire but not used here. The comments are read
+            // under the post's own id (`messages.getReplies`, which takes the channel and
+            // the post) and written into the discussion group behind it: the sends' ask of
+            // them is `sync::discussion`'s.
             if let Some(tl::enums::MessageReplies::Replies(info)) = &raw.replies {
                 if info.channel_id.is_some() {
                     message.thread = Some(ThreadSummary {
@@ -617,5 +643,20 @@ mod tests {
         let packed = [0b0001_1111, 0b0111_1100, 0b1111_0000, 0b1100_0001, 0b0000_0111];
         assert_eq!(waveform(&packed), vec![255, 0, 255, 0, 255, 0, 255, 0]);
         assert!(waveform(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_premium_emoji_keeps_its_alt_glyph_and_names_its_document_for_fetching() {
+        let text = "Cast off 🦀 at dawn";
+        let entities = vec![tl::types::MessageEntityCustomEmoji { offset: 9, length: 2, document_id: 5_003 }.into()];
+        let mut message = Message::plain("1".to_string(), "Odalys".to_string(), text.to_owned(), 0, false);
+        message.spans = spans(text, &entities);
+        let span = &message.spans[0];
+        assert_eq!(&text[span.start as usize..span.end as usize], "🦀", "the alt glyph stays in the text");
+        assert_eq!(span.style, Style::Emoji { file: MediaFile::new("e5003", MediaKind::Emoji) });
+        assert_eq!(text_emoji_ids(&message), vec![5_003]);
+        // An emoji of another network is not a Telegram document, so it names no id to ask for.
+        message.spans[0].style = Style::Emoji { file: MediaFile::new("emoji:7001", MediaKind::Emoji) };
+        assert!(text_emoji_ids(&message).is_empty());
     }
 }

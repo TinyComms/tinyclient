@@ -917,7 +917,7 @@ impl Shell {
                     share
                         .tooltip(tip(if share_on { "Stop sharing" } else { "Share your screen" }, None))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.call_ask(Request::Media(MediaRequest::ShareSend { on: !share_on, screen: None }), cx)
+                            this.call_ask(Request::Media(MediaRequest::ShareSend { on: !share_on, screen: None, quality: None }), cx)
                         }))
                 })
         });
@@ -1173,6 +1173,7 @@ mod tests {
             outputs: Vec::new(),
             security: None,
             picture: None,
+            self_view: None,
         }
     }
 

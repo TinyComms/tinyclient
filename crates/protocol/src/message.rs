@@ -353,6 +353,9 @@ pub struct Message {
     pub edited: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub pinned: bool,
+    /// How many people saw a channel's post, when the network counts them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub views: Option<u32>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mentions_me: bool,
     #[serde(default, skip_serializing_if = "MessageKind::is_normal")]
@@ -369,6 +372,16 @@ pub struct Message {
 }
 
 impl Message {
+    /// The name a row shows for its sender. Mine carry my name from the network once it has
+    /// settled; "You" stands in only while a send has no name yet.
+    pub fn shown_sender(&self) -> &str {
+        if self.outgoing && self.sender.name.is_empty() {
+            "You"
+        } else {
+            &self.sender.name
+        }
+    }
+
     /// A message that is only text, which is what an adapter has before it maps anything richer.
     pub fn plain(
         id: impl Into<String>,
@@ -397,6 +410,7 @@ impl Message {
             deleted: false,
             edited: false,
             pinned: false,
+            views: None,
             mentions_me: false,
             kind: MessageKind::Normal,
             state: SendState::Sent,

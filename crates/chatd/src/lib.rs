@@ -5,6 +5,7 @@ pub mod hub;
 pub mod media;
 pub mod notify;
 pub mod playback;
+pub mod recorder;
 pub mod server;
 pub mod session;
 pub mod store;

@@ -59,9 +59,11 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig}
 const TICK: Duration = Duration::from_millis(20);
 const SECOND: u64 = 50;
 
-/// H.264 constrained baseline, level 3.1, packetization mode 1. The SFU accepts this and
-/// nothing else on a video m-line.
-const H264_PROFILE: u32 = 0x42e01f;
+/// H.264 constrained baseline, level 5.1, packetization mode 1. The SFU accepts this profile
+/// and nothing else on a video m-line. Level 5.1 holds 2560×1440 at 60 fps, the most a share
+/// sends; the level is a negotiable parameter (RFC 6184 §8.2.2), so a server that still says
+/// level 3.1 matches all the same.
+const H264_PROFILE: u32 = 0x42e033;
 const H264_PT: u8 = 108;
 const H264_RTX_PT: u8 = 109;
 
@@ -657,7 +659,10 @@ impl Call {
             }
             Event::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }) => self.estimate = Some(estimate.as_u64()),
             Event::MediaData(data) if self.link.is_picture(data.mid) => self.picture_in(data),
-            Event::KeyframeRequest(request) if request.mid == self.link.share_mid() => self.video.ask_key(Track::Share),
+            Event::KeyframeRequest(request) if request.mid == self.link.share_mid() => {
+                tracing::debug!(kind = ?request.kind, sending = self.sending_share, "keyframe asked for the share");
+                self.video.ask_key(Track::Share);
+            }
             Event::KeyframeRequest(request) if request.mid == self.link.camera_mid() => match request.rid {
                 Some(rid) if rid == Rid::from("l") => self.video.ask_key(Track::Low),
                 Some(_) => self.video.ask_key(Track::High),
@@ -1020,6 +1025,10 @@ impl Call {
                         out::send(&MediaResponse::Sending { share: false, camera: self.sending_camera });
                     }
                 }
+                Word::SelfView(painted) => out::send(&match painted {
+                    Some(painted) => MediaResponse::SelfView { path: painted.path.display().to_string(), width: painted.width, height: painted.height, generation: painted.generation },
+                    None => MediaResponse::SelfView { path: String::new(), width: 0, height: 0, generation: 0 },
+                }),
                 Word::Failed { share: false, words } => {
                     if !self.camera_noted {
                         self.camera_noted = true;
@@ -1500,7 +1509,7 @@ mod tests {
         assert!(video[1].contains("a=inactive") && !video[1].contains("a=rid:"), "share is one layer and off: {}", video[1]);
         assert!(video[2].contains("a=recvonly") && !video[2].contains("a=rid:"), "one picture in: {}", video[2]);
         for section in &video {
-            assert!(section.to_ascii_lowercase().contains("profile-level-id=42e01f"), "constrained baseline: {section}");
+            assert!(section.to_ascii_lowercase().contains("profile-level-id=42e033"), "constrained baseline, level 5.1: {section}");
             assert!(section.contains("packetization-mode=1"), "{section}");
             assert!(section.contains("H264/90000"), "{section}");
         }

@@ -91,6 +91,7 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>) -> 
         outputs: Vec::new(),
         security: None,
         picture: None,
+        self_view: None,
     }
 }
 

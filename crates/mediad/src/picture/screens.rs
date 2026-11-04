@@ -55,7 +55,7 @@ pub fn screens(folder: Option<&Path>) -> Vec<ScreenSource> {
 }
 
 /// A small JPEG of one capture, sampled to its nearest pixel: the picker draws it at this size.
-fn thumbnail(grab: &Rgba, path: &Path) -> Result<(), String> {
+pub(super) fn thumbnail(grab: &Rgba, path: &Path) -> Result<(), String> {
     let (width, height) = fit(grab.width, grab.height, THUMB.0, THUMB.1);
     let rgb = shrink(grab, width, height);
     let file = std::fs::File::create(path).map_err(|err| err.to_string())?;
@@ -64,7 +64,7 @@ fn thumbnail(grab: &Rgba, path: &Path) -> Result<(), String> {
 }
 
 /// RGB at `width` × `height`, each pixel the nearest of the capture's.
-fn shrink(grab: &Rgba, width: u32, height: u32) -> Vec<u8> {
+pub(super) fn shrink(grab: &Rgba, width: u32, height: u32) -> Vec<u8> {
     let mut rgb = Vec::with_capacity((width * height * 3) as usize);
     for y in 0..height {
         let sy = (y as u64 * grab.height as u64 / height.max(1) as u64) as u32;
@@ -115,10 +115,41 @@ pub(super) fn capture(id: Option<&str>) -> Result<Rgba, String> {
     let displays = win::displays();
     let device = id.and_then(|id| id.strip_prefix("display:"));
     let display = displays.iter().find(|display| Some(display.device.as_str()) == device).or_else(|| displays.iter().find(|display| display.primary));
-    match display {
-        Some(display) => win::capture_rect(display.rect),
-        None => Err("The screen has no size.".to_owned()),
+    let Some(display) = display else {
+        return Err("The screen has no size.".to_owned());
+    };
+    match duplicated(&display.device) {
+        Ok(frame) => Ok(frame),
+        Err(words) => {
+            tracing::debug!(words, "the screen fell back to GDI for a frame");
+            win::capture_rect(display.rect)
+        }
     }
+}
+
+/// The screen `device` through Desktop Duplication, kept open from frame to frame; opened
+/// again after it was lost. One at a time: the share captures one screen.
+#[cfg(windows)]
+fn duplicated(device: &str) -> Result<Rgba, String> {
+    use super::duplicate::Duplicator;
+    static OPEN: Mutex<Option<(String, Duplicator)>> = Mutex::new(None);
+    let mut open = OPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if open.as_ref().is_none_or(|(name, _)| name != device) {
+        *open = Some((device.to_owned(), Duplicator::open(device)?));
+    }
+    let frame = open.as_mut().expect("just opened").1.frame();
+    if frame.is_err() {
+        *open = None;
+    }
+    frame
+}
+
+/// How many times a second the shared screen refreshes, when Windows says. A window is on
+/// the primary screen as far as this knows.
+#[cfg(windows)]
+pub(super) fn refresh_rate(id: Option<&str>) -> Option<u32> {
+    let device = id.and_then(|id| id.strip_prefix("display:")).map(str::to_owned).or_else(|| win::displays().into_iter().find(|display| display.primary).map(|display| display.device))?;
+    win::refresh_rate(&device)
 }
 
 #[cfg(windows)]
@@ -129,7 +160,7 @@ mod win {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
     use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows_sys::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC, GetDIBits, GetMonitorInfoW, ReleaseDC, SelectObject, BITMAPINFOHEADER, BI_RGB,
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, EnumDisplayMonitors, EnumDisplaySettingsW, GetDC, GetDIBits, GetMonitorInfoW, ReleaseDC, SelectObject, BITMAPINFOHEADER, BI_RGB, DEVMODEW, ENUM_CURRENT_SETTINGS,
         DIB_RGB_COLORS, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, SRCCOPY,
     };
     use windows_sys::Win32::Storage::Xps::PrintWindow;
@@ -225,6 +256,22 @@ mod win {
         // SAFETY: the callback only writes the Vec it is handed.
         unsafe { EnumWindows(Some(each), (&raw mut found) as LPARAM) };
         found
+    }
+
+    /// The refresh rate of the screen `device` names (`\\.\DISPLAY2`), as its current mode has
+    /// it. `None` when Windows does not say, or says 0 or 1, which mean "the default".
+    pub fn refresh_rate(device: &str) -> Option<u32> {
+        let name: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: a zeroed DEVMODEW with its size set, as EnumDisplaySettingsW fills it; the
+        // name is NUL terminated and outlives the call.
+        unsafe {
+            let mut mode: DEVMODEW = std::mem::zeroed();
+            mode.dmSize = size_of::<DEVMODEW>() as u16;
+            if EnumDisplaySettingsW(name.as_ptr(), ENUM_CURRENT_SETTINGS, &mut mode) == 0 {
+                return None;
+            }
+            (mode.dmDisplayFrequency > 1).then_some(mode.dmDisplayFrequency)
+        }
     }
 
     /// One rectangle of the desktop, in physical pixels.

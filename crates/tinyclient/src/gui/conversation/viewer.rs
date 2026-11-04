@@ -460,7 +460,7 @@ impl Pane {
         let pan = clamp_pan(pan, drawn, room);
         let pannable = drawn.0 > room.0 || drawn.1 > room.1;
 
-        let sender = if message.outgoing { "You".to_owned() } else { message.sender.name.clone() };
+        let sender = message.shown_sender().to_owned();
         let place = self.open.as_ref().map(|open| open.title.clone()).unwrap_or_default();
         let mut facts = vec![place, attachment.name.clone()];
         if full.width > 0 && full.height > 0 {

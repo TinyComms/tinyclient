@@ -180,6 +180,8 @@ pub struct State {
     screen_windows: bool,
     /// The one picked in the picker, by id.
     screen_pick: Option<String>,
+    /// How much the share spends, as the picker has it. Kept for the next share.
+    share_quality: protocol::ShareQuality,
     /// What my share sends, as the picker listed it, for my own stream's tile.
     shared: Option<protocol::ScreenSource>,
     /// Categories folded, by key ([`model::LOOSE`] for the rooms in none).
@@ -283,6 +285,7 @@ impl State {
             screens: None,
             screen_windows: false,
             screen_pick: None,
+            share_quality: protocol::ShareQuality::default(),
             shared: None,
             folded: HashSet::new(),
             members_open: true,

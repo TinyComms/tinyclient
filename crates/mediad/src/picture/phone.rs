@@ -8,7 +8,7 @@
 //! whether it runs: it stops or starts as on a desktop, and spends its full rate while it does.
 
 use super::convert::{nv12, planes};
-use super::{fit, rgb, Ask, Canvas, Encoded, Painted, Planes, CAMERA_HIGH, CAMERA_HIGH_BPS, CAMERA_LOW, CAMERA_LOW_BPS, CODEC_LATER, SHARE_BPS, SHARE_MAX};
+use super::{fit, rgb, Ask, Canvas, Encoded, Painted, Planes, Tag, CAMERA_HIGH, CAMERA_HIGH_BPS, CAMERA_LOW, CAMERA_LOW_BPS, CODEC_LATER, SHARE_BPS, SHARE_MAX};
 use crate::platform::{self, CameraRequest, EncoderConfig, Facing, FrameSink, H264Decoder, H264Encoder, Permission, Platform, VideoFrame};
 use std::sync::{Arc, Mutex};
 
@@ -149,6 +149,9 @@ impl Outgoing {
 pub struct Incoming {
     decoder: Option<Box<dyn H264Decoder>>,
     canvas: Canvas,
+    generation: u64,
+    /// Painted at once, taken by `painted`.
+    pending: Vec<(Tag, Painted)>,
 }
 
 impl Incoming {
@@ -161,20 +164,29 @@ impl Incoming {
     /// decoder, painted or not: the next one is built on it. `Err` means it did not decode;
     /// `Ok(None)` that there is nothing to paint.
     #[allow(clippy::result_unit_err)]
-    pub fn decode(&mut self, annex_b: &[u8], paint: bool) -> Result<Option<Painted>, ()> {
+    pub fn decode(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
         if self.decoder.is_none() {
             self.decoder = platform::get().ok_or(())?.h264_decoder().ok();
         }
         let decoder = self.decoder.as_mut().ok_or(())?;
         let Some(decoded) = decoder.decode(annex_b).map_err(|_| ())? else {
-            return Ok(None);
+            return Ok(());
         };
-        if !paint || decoded.width == 0 || decoded.height == 0 {
-            return Ok(None);
-        }
+        let Some(tag) = paint.filter(|_| decoded.width != 0 && decoded.height != 0) else {
+            return Ok(());
+        };
         let (width, height) = (decoded.width & !1, decoded.height & !1);
         let colors = rgb(&planes(&decoded, width, height));
-        Ok(self.canvas.paint(&colors, width, height))
+        self.generation = self.generation.wrapping_add(1);
+        if let Some(painted) = self.canvas.paint(&colors, width, height, self.generation) {
+            self.pending.push((tag, painted));
+        }
+        Ok(())
+    }
+
+    /// The pictures painted since this was last asked.
+    pub fn painted(&mut self) -> Vec<(Tag, Painted)> {
+        std::mem::take(&mut self.pending)
     }
 
     /// The file on disk goes.
@@ -245,10 +257,13 @@ mod tests {
         assert!(fake.camera_on());
 
         // What a peer sends back decodes, through the platform's decoder, into a JPEG.
-        let painted = incoming.decode(&high.bytes, true).expect("the high layer decodes").expect("painted");
+        let tag = Tag { user: "ada".into(), kind: protocol::PictureKind::Camera };
+        incoming.decode(&high.bytes, Some(tag.clone())).expect("the high layer decodes");
+        let (_, painted) = incoming.painted().pop().expect("painted");
         assert_eq!((painted.width, painted.height), (640, 360));
         assert!(std::fs::metadata(&painted.path).unwrap().len() > 0);
-        let smaller = incoming.decode(&low.bytes, true).expect("the low layer decodes").expect("painted");
+        incoming.decode(&low.bytes, Some(tag)).expect("the low layer decodes");
+        let (_, smaller) = incoming.painted().pop().expect("painted");
         assert_eq!((smaller.width, smaller.height), (320, 180));
         incoming.forget();
         assert!(!smaller.path.exists());

@@ -70,7 +70,7 @@ pub fn run() {
                 Ok(request) => {
                     match request {
                         MediaRequest::Tune(tuning) => controls.tune(tuning),
-                        MediaRequest::Devices { input, output } => {
+                        MediaRequest::Devices { input, output, .. } => {
                             // A choice made while a device is open takes effect on the next open.
                             (want_input, want_output) = (input, output);
                         }

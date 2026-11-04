@@ -584,17 +584,17 @@ fn mediad_exits_when_chatd_is_killed_mid_call() {
 fn a_share_is_one_encode_and_one_subscribed_decode() {
     let chatd = Daemon::start(standup);
 
-    let no_call = chatd.ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None }));
+    let no_call = chatd.ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None }));
     assert!(matches!(no_call, Response::Error { code: ErrorCode::NoCall, .. }), "{no_call:?}");
     assert_eq!(chatd.mediad_pids(), Vec::<u32>::new());
 
     chatd.ask(call_start());
     let watch = |source: &str| Request::Media(MediaRequest::ShareWatch { source: Some(source.into()) });
     let speaker = |source: &str| Request::Media(MediaRequest::Speaker { source: Some(source.into()) });
-    chatd.ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None }));
+    chatd.ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None }));
     chatd.ask(watch("alice"));
     chatd.ask(speaker("carol"));
-    chatd.ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None }));
+    chatd.ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None }));
     chatd.ask(speaker("dave"));
     let last = chatd.ask(watch("bob"));
 
@@ -827,7 +827,9 @@ fn a_row_says_where_it_is_and_a_thread_lives_and_dies_with_its_parent() {
 
     let kept = chatd.row(&key(Network::Discord, "T-kept"));
     assert_eq!((kept.parent.as_deref(), kept.root.as_deref()), (Some("C1"), Some("100")));
-    // Retention runs behind the socket at start.
+    // Retention runs behind the socket, a minute after the boot: a setting change wakes the
+    // first pass early, and the same value written back is exactly that wake.
+    chatd.ask(Request::Set { scope: String::new(), key: "keep_days".into(), value: Some("90".into()) });
     for gone in ["T-aged", "T-orphan"] {
         let request = Request::Conversation { conversation: key(Network::Discord, gone) };
         chatd.until(gone, request, |answer| matches!(answer, Response::Error { code: ErrorCode::NotFound, .. }));

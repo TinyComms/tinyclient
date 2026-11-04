@@ -173,6 +173,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
         schedule: true,
         suppress_embeds: true,
         edit_window: 48 * 3_600,
+        voice_notes: true,
         ..Capabilities::default()
     }));
     s.capabilities.push((teams::account(), Capabilities { max_file_bytes: 250 * mb, max_files: 10, ..Capabilities::default() }));

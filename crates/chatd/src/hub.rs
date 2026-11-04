@@ -159,6 +159,7 @@ pub struct Hub {
     pub reactions: Recent<Key, protocol::ReactionRules>,
     pub calls: Calls,
     pub player: crate::playback::Player,
+    pub recorder: crate::recorder::Recorder,
     /// The settings as stored (`protocol::settings`), read once and kept in step with every
     /// `Set`, so a typing signal or a call start asks no query.
     settings: Mutex<Values>,
@@ -210,6 +211,7 @@ impl Hub {
             reactions: Recent::new(64),
             calls: Calls::default(),
             player: crate::playback::Player::default(),
+            recorder: crate::recorder::Recorder::default(),
             settings: Mutex::new(settings.clone()),
             prune_now: Mutex::new(false),
             prune_wake: Condvar::new(),
