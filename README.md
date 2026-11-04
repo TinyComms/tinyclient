@@ -100,7 +100,7 @@ Not built, on `main`:
 | **Teams personal accounts** | Work and school accounts only. |
 | **Telegram secret chats** | Not supported. The library tinyclient uses does not implement them. |
 | **Recording a voice message** | Telegram and Discord voice messages play. Recording one is not built. |
-| **Search on the network** | The cache is searched everywhere. Enter asks Discord (a server or one channel) and Telegram (one conversation). Slack, Teams, Signal, and Messages are not asked. |
+| **Search on the network** | The cache is searched everywhere. Enter asks Discord and Slack (a server or one channel) and Telegram (one conversation). Teams, Signal, and Messages are not asked. |
 
 ## Install
 

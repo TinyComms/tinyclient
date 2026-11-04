@@ -18,6 +18,8 @@ pub struct Controls {
     /// "Preview: example.com ×" under the card.
     pub link_chip: bool,
     pub custom_emoji: bool,
+    /// The mic: the network names a recorded file it is sent a voice note with.
+    pub voice: bool,
 }
 
 /// `editing`: edit mode is text only on every network.
@@ -44,6 +46,7 @@ pub fn controls(network: Network, can: &Capabilities, editing: bool) -> Controls
         // Teams builds the card at the sender; there is nothing to suppress.
         link_chip: can.suppress_embeds && network != Network::Teams && !editing,
         custom_emoji: can.custom_emoji != EmojiScope::None,
+        voice: super::rec::available(can) && !editing,
     }
 }
 
@@ -62,6 +65,7 @@ mod tests {
             silent: true,
             suppress_embeds: true,
             reply_ping: true,
+            voice_notes: true,
             ..Capabilities::default()
         }
     }
@@ -70,6 +74,7 @@ mod tests {
     fn each_network_lays_out_only_what_it_can_do() {
         let d = controls(Network::Discord, &discord(), false);
         assert!(d.attach && d.gif && d.emoji && d.silent && d.ping && d.link_chip && d.custom_emoji);
+        assert!(d.voice, "the account names its files voice notes");
         assert_eq!(d.tabs, [Tab::Emoji, Tab::Gifs, Tab::Stickers]);
 
         let slack = Capabilities { max_file_bytes: 1 << 30, max_files: 10, custom_emoji: EmojiScope::All, suppress_embeds: true, gifs: true, ..Capabilities::default() };
@@ -101,7 +106,8 @@ mod tests {
         let none = controls(Network::Discord, &Capabilities::default(), false);
         assert!(!none.attach && !none.gif && none.emoji && !none.silent && !none.link_chip);
         let edit = controls(Network::Discord, &discord(), true);
-        assert!(!edit.attach && !edit.gif && edit.emoji && !edit.silent);
+        assert!(!edit.attach && !edit.gif && edit.emoji && !edit.silent && !edit.link_chip);
+        assert!(!edit.voice, "edit mode is text only");
         assert_eq!(edit.tabs, [Tab::Emoji]);
     }
 }

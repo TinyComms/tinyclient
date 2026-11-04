@@ -316,6 +316,9 @@ pub struct Capabilities {
     pub suppress_embeds: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub reply_ping: bool,
+    /// This network takes a file sent as a recorded voice note (`Outgoing::voice`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub voice_notes: bool,
     /// Seconds after sending that an edit is still allowed. 0: no limit.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub edit_window: u32,
@@ -369,6 +372,18 @@ pub struct Pick {
     pub id: String,
 }
 
+/// A recorded voice message: the facts the recorder read while making the file, sent with it
+/// so the network labels it a voice note without listening to it again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceNote {
+    /// Milliseconds of sound, as the recorder finished the file.
+    pub duration: u32,
+    /// A voice message's loudness over time, one byte a bar, at most
+    /// [`crate::WAVEFORM_LIMIT`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waveform: Vec<u8>,
+}
+
 /// What a `Send` carries besides its text. All of it is off by default, and a plain text
 /// message leaves it off the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -387,6 +402,10 @@ pub struct Outgoing {
     pub ping: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pick: Option<Pick>,
+    /// The last file is a voice message this client recorded (`files` and `voice` go together;
+    /// `files` of one). The facts name it what it is without a second look at the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<VoiceNote>,
     /// Unix seconds: the network sends it then (Slack, Telegram). tinyclient never runs a timer
     /// that sends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -402,6 +421,7 @@ impl Default for Outgoing {
             ping: true,
             pick: None,
             schedule: None,
+            voice: None,
         }
     }
 }

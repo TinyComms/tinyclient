@@ -457,6 +457,21 @@ pub fn run(args: &[String]) -> u8 {
                 }
             };
         }
+        // One voice note recorded off the microphone, for chatd: into a file it named, until
+        // it closes our stdin (`rec`).
+        Some("--rec") => {
+            let Some(path) = args.get(1).map(std::path::PathBuf::from) else {
+                tracing::warn!("mediad: --rec needs a file to record to");
+                return 2;
+            };
+            return match crate::rec::run(path) {
+                Ok(()) => 0,
+                Err(err) => {
+                    tracing::warn!("mediad: {err}");
+                    1
+                }
+            };
+        }
         // S13: checks a sound file the user chose and saves it beside the database.
         Some("--import-sound") => {
             let (Some(source), Some(id)) = (args.get(1), args.get(2)) else {

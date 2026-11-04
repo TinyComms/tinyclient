@@ -172,6 +172,7 @@ impl Dirty {
             | Change::Call { .. }
             | Change::Upload { .. }
             | Change::Playback { .. }
+            | Change::Recording { .. }
             | Change::Settings
             | Change::Meter { .. }
             | Change::Open { .. }

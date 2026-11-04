@@ -6,17 +6,19 @@
 //! scratch directory (`adapters/script.rs`): `telegram.signin.ctl` while signing in (`scan`,
 //! `scan-password`), `telegram.ctl` once signed in (`incoming`, `photo`, `react`, `edit`,
 //! `delete`, `topic`, `comments`, `typing`, `typing-stop`, `read`, `status`, `poll`, `voice`,
-//! `forward`, `flood-send N`, `revoke`). Every request it is sent is appended
-//! to `telegram.calls`, one line each, so a test can see what the network would have heard.
+//! `forward`, `flood-send N`, `revoke`, and the holds of `TINYCLIENT_TELEGRAM_HOLD` and
+//! `TINYCLIENT_TELEGRAM_PEER_HOLD` through `dialogs-go` and `peer-go`). Every request it is
+//! sent is appended to `telegram.calls`, one line each, so a test can see what the network
+//! would have heard.
 //!
 //! The account: Mira Kessler (7001); Odalys Brandt (7002, a contact, with a second password on
 //! her own number); Tobin Reyes (7003); a group "Trail crew" (8001); a channel "Field Notes"
 //! (9001, muted, with a sponsored message) with a linked discussion group "Field Notes chat"
-//! (9003, which the comments on its post come from); a forum "Workshop" (9002) with topics
-//! General and "Tools" (31). The phone +1 555 010 0142 signs in with the code 24680; +1 555 010
-//! 0199 also wants the password "correct horse". Username resolution serves only `gif` and
-//! `forest_wren`; `flood_wait` returns a flood wait, and every other name returns
-//! USERNAME_NOT_OCCUPIED.
+//! (9003, which the comments on its post come from, heard of at `getDiscussionMessage`); a
+//! forum "Workshop" (9002) with topics General and "Tools" (31). The phone +1 555 010 0142
+//! signs in with the code 24680; +1 555 010 0199 also wants the password "correct horse".
+//! Username resolution serves only `gif` and `forest_wren`; `flood_wait` returns a flood wait,
+//! and every other name returns USERNAME_NOT_OCCUPIED.
 
 use super::peers::Who;
 use super::wire::{Event, Fault, Wire};
@@ -28,7 +30,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, PoisonError, Mutex};
 use tl::{Deserializable, Identifiable, RemoteCall, Serializable};
 
 const ME: i64 = 7001;
@@ -39,6 +41,9 @@ const NOTES: i64 = 9001;
 const WORKSHOP: i64 = 9002;
 /// "Field Notes chat", the channel's linked discussion group: where its post's comments live.
 const CHATTERS: i64 = 9003;
+/// The post's echo in the discussion group: the message a send answers, and the id the echo
+/// test looks for (`GetDiscussionMessage` names it for the open, the send for its reply).
+const ECHO: i32 = 60;
 const TOOLS: i32 = 31;
 /// Telegram's own account, a bot, and an account Telegram flags as a scam.
 const SERVICE: i64 = 777_000;
@@ -109,6 +114,11 @@ fn crowd() -> i64 {
     std::env::var("TINYCLIENT_TELEGRAM_MANY").ok().and_then(|many| many.parse().ok()).unwrap_or(0)
 }
 
+/// The tests say which asks may be held at the wire until they steer them through.
+fn held_at_wire(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|held| held == "1")
+}
+
 fn users() -> Vec<tl::enums::User> {
     let mut all: Vec<tl::enums::User> = vec![
         user(ME, "Mira", "Kessler", "mira_k").into(),
@@ -159,6 +169,9 @@ fn chats() -> Vec<tl::enums::Chat> {
             notes
         }),
         tl::enums::Chat::Channel(a_channel(WORKSHOP, "Workshop", false, true, "")),
+        // The discussion group the channel's post's comments are written into: a megagroup,
+        // learned whole from the answers that name it, so its hash ready for a send.
+        tl::enums::Chat::Channel(a_channel(CHATTERS, "Field Notes chat", false, false, "")),
     ]
 }
 
@@ -288,7 +301,12 @@ struct World {
     /// The cloud drafts Telegram keeps, by their conversation: some typed on the phone, some
     /// told by `saveDraft` from here. The key is whose, and in a forum which topic.
     drafts: HashMap<(Who, Option<i32>), String>,
+    /// Comments under the channel's post that the test says are unread.
+    comments_unread: i32,
     calls: PathBuf,
+    /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
+    dialogs_go: bool,
+    peer_go: bool,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -313,7 +331,10 @@ impl World {
             family_grew: false,
             lost_reads: false,
             drafts: HashMap::new(),
+            comments_unread: 0,
             calls: protocol::support_dir().join("telegram.calls"),
+            dialogs_go: false,
+            peer_go: false,
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, T0 - 300, "Are you coming to the ridge on Saturday?"));
@@ -414,6 +435,9 @@ impl World {
             let _ = events.send(update(new.clone()));
             all.push(named);
             all.push(new);
+        }
+        if peer == Who::Channel(CHATTERS) {
+            count_raised(self, events, &mut all);
         }
         answer(updates(all))
     }
@@ -567,6 +591,55 @@ fn all_drafts(world: &World) -> Result<Vec<u8>, Fault> {
     answer(updates(all))
 }
 
+/// What `getDiscussionMessage` answers for a channel post: the echo of the post, spoken in
+/// the discussion group as Telegram forwards it there, leading the thread — the id a send
+/// answers, learned when the thread is opened. `unread` is how many of its comments the
+/// account has not read, as the test steers that.
+#[inline(never)]
+fn discussion_answer(place: &str, unread: i32) -> Result<Vec<u8>, Fault> {
+    if place != key(Who::Channel(NOTES), Some(5)) {
+        return Err(rpc(400, "MESSAGE_ID_INVALID", None));
+    }
+    let mut echo = message(Who::Channel(CHATTERS), ECHO, ME, T0 - 7_200, "Snow line is at 1,900 m this week.");
+    // The echo is the channel's post standing in the group: no author of its own, and the
+    // forward header names the post it says again.
+    echo.from_id = None;
+    echo.out = false;
+    let mut from: tl::types::MessageFwdHeader = blank(&[&put(0u32), &put(T0 - 7_200)]);
+    from.from_id = Some(Who::Channel(NOTES).peer());
+    from.channel_post = Some(5);
+    echo.fwd_from = Some(from.into());
+    let found = tl::types::messages::DiscussionMessage {
+        messages: vec![echo.into()],
+        max_id: Some(51),
+        read_inbox_max_id: Some(0),
+        read_outbox_max_id: None,
+        unread_count: unread,
+        chats: chats(),
+        users: users(),
+    };
+    answer(tl::enums::messages::DiscussionMessage::Message(found))
+}
+
+/// A comment went in the discussion group: the count of the post rises on the edit of it
+/// Telegram tells then, on the update stream and with the answer, the way the count of any
+/// post's comments keeps current (`comment_thread` keeps the id that opens the thread).
+fn count_raised(world: &mut World, events: &Sender<Event>, all: &mut Vec<tl::enums::Update>) {
+    let Some(tl::enums::Message::Message(mut post)) =
+        world.messages.get(&key(Who::Channel(NOTES), None)).and_then(|held| held.get(&5)).cloned()
+    else {
+        return;
+    };
+    if let Some(tl::enums::MessageReplies::Replies(info)) = &mut post.replies {
+        info.replies += 1;
+    }
+    world.store(None, post.clone());
+    let raised: tl::enums::Update =
+        tl::types::UpdateEditChannelMessage { message: post.into(), pts: 0, pts_count: 0 }.into();
+    let _ = events.send(update(raised.clone()));
+    all.push(raised);
+}
+
 /// `saveDraft` keeps a draft as the phone's do, by its conversation and its topic in a forum,
 /// and says the same back to the device that saved it, as for any other ask.
 #[inline(never)]
@@ -590,6 +663,12 @@ pub struct Fake {
     heard: Mutex<Option<Receiver<Event>>>,
     closed: Arc<AtomicBool>,
     control: PathBuf,
+    /// The tests say a page may be held at the wire (`TINYCLIENT_TELEGRAM_HOLD`,
+    /// `TINYCLIENT_TELEGRAM_PEER_HOLD`), until a line steers it through.
+    hold_pages: bool,
+    hold_peer_dialogs: bool,
+    /// Wakes an answer held at the wire when the test steers.
+    wake: Arc<Condvar>,
 }
 
 impl Fake {
@@ -603,6 +682,9 @@ impl Fake {
             heard: Mutex::new(Some(heard)),
             closed: Arc::default(),
             control,
+            hold_pages: held_at_wire("TINYCLIENT_TELEGRAM_HOLD"),
+            hold_peer_dialogs: held_at_wire("TINYCLIENT_TELEGRAM_PEER_HOLD"),
+            wake: Arc::new(Condvar::new()),
         };
         fake.listen();
         fake
@@ -610,7 +692,8 @@ impl Fake {
 
     /// Reads the test's lines for as long as this wire lives; dropping the wire ends it.
     fn listen(&self) {
-        let (world, events, closed, control) = (self.world.clone(), self.events.clone(), self.closed.clone(), self.control.clone());
+        let (world, events, closed, control, wake) =
+            (self.world.clone(), self.events.clone(), self.closed.clone(), self.control.clone(), self.wake.clone());
         let _ = std::thread::Builder::new().name("telegram-fake".into()).spawn(move || {
             script::follow(&control, |line| {
                 if closed.load(Ordering::Relaxed) {
@@ -621,10 +704,32 @@ impl Fake {
                     for event in world.steer(line.trim()) {
                         let _ = events.send(event);
                     }
+                    drop(world);
+                    wake.notify_all();
                 }
                 true
             });
         });
+    }
+
+    /// Sleeps on the asks whose answers the test holds (`dialogs-go`, `peer-go`), saying what
+    /// Telegram was asked as it is asked, whatever the hold.
+    fn hold_back(&self, body: &[u8]) {
+        if !self.hold_pages && !self.hold_peer_dialogs {
+            return;
+        }
+        let world = self.world.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The guard comes back when the test let the ask through, and its own drop sits here.
+        drop(self.wake.wait_while(world, |world| self.is_held(body, world)).unwrap_or_else(PoisonError::into_inner));
+    }
+
+    /// Whether this ask's answer waits for the test to let it through.
+    fn is_held(&self, body: &[u8], world: &World) -> bool {
+        use tl::functions as f;
+        // The chats' first page, and every later one after the `dialogs-go`; a chat's dialog
+        // asked again until the `peer-go`.
+        (self.hold_pages && asked::<f::messages::GetDialogs>(body).is_some_and(|request| !matches!(request.offset_peer, tl::enums::InputPeer::Empty)) && !world.dialogs_go)
+            || (self.hold_peer_dialogs && asked::<f::messages::GetPeerDialogs>(body).is_some() && !world.peer_go)
     }
 }
 
@@ -654,6 +759,15 @@ impl World {
                 self.scanned = Some(true);
                 vec![update(tl::enums::Update::LoginToken)]
             }
+            // The held answers go through, as the test says (`World::held`, `World::stalled`).
+            "dialogs-go" => {
+                self.dialogs_go = true;
+                Vec::new()
+            }
+            "peer-go" => {
+                self.peer_go = true;
+                Vec::new()
+            }
             // Bold on an accented word, a link on an emoji, a mention by id, code, a spoiler.
             "incoming" => {
                 let text = "Café at 🦀 dock, ask Tobin: stove.fuel() secret";
@@ -664,6 +778,27 @@ impl World {
                     tl::types::MessageEntityMentionName { offset: 21, length: 5, user_id: TOBIN }.into(),
                     tl::types::MessageEntityCode { offset: 28, length: 12 }.into(),
                     tl::types::MessageEntitySpoiler { offset: 41, length: 6 }.into(),
+                ]);
+                self.store(None, message.clone());
+                vec![new(message)]
+            }
+            // A premium emoji in the text: the entity names a document, and the text under it
+            // is the plain emoji Telegram chose as the alt glyph.
+            "emoji-text" => {
+                let text = "Cast off 🦀 at dawn";
+                let mut message = message(odalys, 22, ODALYS, T0 + 90, text);
+                message.entities = Some(vec![
+                    tl::types::MessageEntityCustomEmoji { offset: 9, length: 2, document_id: 5002 }.into(),
+                ]);
+                self.store(None, message.clone());
+                vec![new(message)]
+            }
+            // The same while its conversation is on screen, with a still emoji's document.
+            "emoji-text-live" => {
+                let text = "Back at the 🔥 bench";
+                let mut message = message(odalys, 23, ODALYS, T0 + 100, text);
+                message.entities = Some(vec![
+                    tl::types::MessageEntityCustomEmoji { offset: 12, length: 2, document_id: 5001 }.into(),
                 ]);
                 self.store(None, message.clone());
                 vec![new(message)]
@@ -691,6 +826,27 @@ impl World {
                     top_reactors: None,
                 };
                 vec![update(tl::types::UpdateMessageReactions { peer: odalys.peer(), msg_id: 13, top_msg_id: None, saved_peer_id: None, reactions: reactions.into() }.into())]
+            }
+            "custom-react" => {
+                let count = |reaction: tl::enums::Reaction, count, mine: bool| {
+                    tl::enums::ReactionCount::Count(tl::types::ReactionCount {
+                        chosen_order: mine.then_some(0),
+                        reaction,
+                        count,
+                    })
+                };
+                let reactions = tl::types::MessageReactions {
+                    min: false,
+                    can_see_list: true,
+                    reactions_as_tags: false,
+                    results: vec![
+                        count(tl::enums::Reaction::Emoji(tl::types::ReactionEmoji { emoticon: "👍".to_owned() }), 2, false),
+                        count(tl::enums::Reaction::CustomEmoji(tl::types::ReactionCustomEmoji { document_id: 5002 }), 1, false),
+                    ],
+                    recent_reactions: None,
+                    top_reactors: None,
+                };
+                vec![update(tl::types::UpdateMessageReactions { peer: odalys.peer(), msg_id: 12, top_msg_id: None, saved_peer_id: None, reactions: reactions.into() }.into())]
             }
             "edit" => {
                 let mut message = message(odalys, 13, ODALYS, T0 + 10, "Café at the dock, seven sharp");
@@ -815,8 +971,10 @@ impl World {
                 vec![new(message)]
             }
             // The channel's post gains a section of comments: the post says its count and the
-            // linked group it is answered in, and two comments stand in the thread.
+            // linked group it is answered in, and two comments stand in the thread. A number
+            // after the word says how many of them the user has not read.
             "comments" => {
+                self.comments_unread = words.next().and_then(|count| count.parse().ok()).unwrap_or(0);
                 let mut post = message(Who::Channel(NOTES), 5, 0, T0 - 7_200, "Snow line is at 1,900 m this week.");
                 post.replies = Some(blank::<tl::types::MessageReplies>(&[&put(1u32), &put(2i32), &put(0i32), &put(CHATTERS)]).into());
                 self.store(None, post.clone());
@@ -1134,6 +1292,23 @@ impl World {
             self.log(&format!("GetReplies {place}"));
             return answer(self.page(&place, request.offset_id, request.add_offset, request.limit));
         }
+        if let Some(request) = asked::<f::messages::GetDiscussionMessage>(body) {
+            let place = key(input_who(&request.peer), Some(request.msg_id));
+            self.log(&format!("GetDiscussionMessage {place}"));
+            return discussion_answer(&place, self.comments_unread);
+        }
+        // A channel's posts and how many saw each: Telegram answers one entry for every id it
+        // was asked, in the order it was asked, and the post here has its count.
+        if let Some(request) = asked::<f::messages::GetMessagesViews>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("GetMessagesViews {} {}", peer.text(), request.id.iter().map(i32::to_string).collect::<Vec<_>>().join(" ")));
+            let views: Vec<tl::enums::MessageViews> = request.id.iter().map(|id| {
+                let seen = (*id == 5 && peer == Who::Channel(NOTES)).then_some(12_400);
+                tl::enums::MessageViews::Views(tl::types::MessageViews { views: seen, forwards: None, replies: None })
+            }).collect();
+            let found = tl::types::messages::MessageViews { views, chats: chats(), users: users() };
+            return answer(tl::enums::messages::MessageViews::Views(found));
+        }
         if let Some(request) = asked::<f::messages::GetCustomEmojiDocuments>(body) {
             // A topic's icon picture: the documents the emoji ids name, stills at list size.
             // The animated icon's own id (5002) is what Telegram names an animated emoji:
@@ -1153,7 +1328,10 @@ impl World {
                     attributes: Vec::new(),
                 })
             }).collect();
-            self.log(&format!("GetCustomEmojiDocuments {}", documents.len()));
+            self.log(&format!(
+                "GetCustomEmojiDocuments {}",
+                request.document_id.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+            ));
             return answer(documents);
         }
         if let Some(request) = asked::<f::messages::GetForumTopics>(body) {
@@ -1246,7 +1424,13 @@ impl World {
             };
             let options = [("silent", request.silent), ("no-preview", request.no_webpage), ("scheduled", request.schedule_date.is_some())];
             let options: String = options.iter().filter(|(_, on)| *on).map(|(name, _)| format!(" [{name}]")).collect();
-            self.log(&format!("SendMessage {} {}{options}", key(peer, topic), request.message));
+            // A comment names the echo post it answers in its key, as a forum's send names
+            // its topic: the two are Telegram's own ways to point at a threaded write.
+            let said = match peer == Who::Channel(CHATTERS) {
+                true => key(peer, reply),
+                false => key(peer, topic),
+            };
+            self.log(&format!("SendMessage {said} {}{options}", request.message));
             return self.deliver(events, peer, topic, reply, vec![(request.random_id, request.message, None)], request.schedule_date);
         }
         if let Some(request) = asked::<f::messages::EditMessage>(body) {
@@ -1685,12 +1869,52 @@ fn held_media(media: &tl::enums::InputMedia, id: i32) -> (String, tl::enums::Mes
     match media {
         tl::enums::InputMedia::UploadedPhoto(one) => (if one.spoiler { "photo+spoiler" } else { "photo" }.to_owned(), photo(one.spoiler)),
         tl::enums::InputMedia::UploadedDocument(one) => {
-            let name = one.attributes.iter().find_map(|attribute| match attribute {
-                tl::enums::DocumentAttribute::Filename(name) => Some(name.file_name.clone()),
+            let audio = one.attributes.iter().find_map(|attribute| match attribute {
+                tl::enums::DocumentAttribute::Audio(audio) if audio.voice => Some(audio.clone()),
                 _ => None,
             });
             let kind = if one.force_file { "file" } else { "document" };
-            (format!("{kind}:{}", one.mime_type), file(&name.unwrap_or_default(), &one.mime_type))
+            let (kind, media) = match audio {
+                // A voice note keeps only its audio attribute on the wire, as Telegram's own.
+                Some(audio) => {
+                    let kept = tl::types::Document {
+                        id,
+                        access_hash: id + 1,
+                        file_reference: vec![9],
+                        date: T0,
+                        mime_type: one.mime_type.clone(),
+                        size: 18_000,
+                        thumbs: None,
+                        video_thumbs: None,
+                        dc_id: 2,
+                        attributes: vec![audio.clone().into()],
+                    };
+                    (
+                        format!("voice-note:{}", audio.duration),
+                        tl::types::MessageMediaDocument {
+                            nopremium: false,
+                            spoiler: false,
+                            video: false,
+                            round: false,
+                            voice: true,
+                            document: Some(kept.into()),
+                            alt_documents: None,
+                            video_cover: None,
+                            video_timestamp: None,
+                            ttl_seconds: None,
+                        }
+                        .into(),
+                    )
+                }
+                None => {
+                    let name = one.attributes.iter().find_map(|attribute| match attribute {
+                        tl::enums::DocumentAttribute::Filename(name) => Some(name.file_name.clone()),
+                        _ => None,
+                    });
+                    (format!("{kind}:{}", one.mime_type), file(&name.unwrap_or_default(), &one.mime_type))
+                }
+            };
+            (kind, media)
         }
         tl::enums::InputMedia::Photo(one) => (if one.spoiler { "kept-photo+spoiler" } else { "kept-photo" }.to_owned(), photo(one.spoiler)),
         tl::enums::InputMedia::Document(one) => match &one.id {
@@ -1704,7 +1928,11 @@ fn held_media(media: &tl::enums::InputMedia, id: i32) -> (String, tl::enums::Mes
 
 impl Wire for Fake {
     fn invoke(&self, _dc: Option<i32>, body: Vec<u8>) -> Result<Vec<u8>, Fault> {
-        self.world.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).handle(&body, &self.events)
+        let answer = self.world.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).handle(&body, &self.events);
+        // An answer the test holds sleeps here, with the world's lock left open so the test
+        // can steer and read the calls meanwhile.
+        self.hold_back(&body);
+        answer
     }
 
     fn events(&self) -> Option<Receiver<Event>> {

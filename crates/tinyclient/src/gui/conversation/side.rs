@@ -98,6 +98,16 @@ pub enum Scope {
     Space,
 }
 
+/// Whether the pane's Enter asks this network itself: Slack and Discord search a Space or one
+/// conversation, Telegram only one conversation. Everywhere is the cache alone.
+fn network_searches(network: Network, scope: Scope) -> bool {
+    match network {
+        Network::Discord | Network::Slack => scope != Scope::Everywhere,
+        Network::Telegram => scope == Scope::Conversation,
+        _ => false,
+    }
+}
+
 impl Scope {
     fn label(self, network: Option<Network>) -> &'static str {
         match (self, network) {
@@ -796,9 +806,7 @@ impl Shell {
             self.open_search_hit(&hit, cx);
             return;
         }
-        let can_ask_network = scope != Scope::Everywhere
-            && self.open_key().is_some_and(|key| key.network == Network::Discord
-                || (key.network == Network::Telegram && scope == Scope::Conversation));
+        let can_ask_network = self.open_key().is_some_and(|key| network_searches(key.network, scope));
         if !can_ask_network {
             if let Some(hit) = first {
                 self.open_search_hit(&hit, cx);
@@ -1439,6 +1447,17 @@ mod tests {
         assert!(thread_belongs(&key("C_a"), Some(&key("C_a"))));
         assert!(!thread_belongs(&key("C_a"), Some(&key("C_b"))));
         assert!(!thread_belongs(&key("C_a"), None));
+    }
+
+    #[test]
+    fn enter_asks_a_network_only_for_a_scope_it_can_search() {
+        assert!(network_searches(Network::Slack, Scope::Conversation));
+        assert!(network_searches(Network::Slack, Scope::Space));
+        assert!(network_searches(Network::Discord, Scope::Space));
+        assert!(network_searches(Network::Telegram, Scope::Conversation));
+        assert!(!network_searches(Network::Telegram, Scope::Space), "Telegram searches one conversation at a time");
+        assert!(!network_searches(Network::Teams, Scope::Space), "Teams is not asked yet");
+        assert!(!network_searches(Network::Slack, Scope::Everywhere), "Everywhere is the cache alone");
     }
 
     #[test]

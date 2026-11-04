@@ -20,8 +20,13 @@ API terms), **[U]** from memory of the official apps, confirm on the live accoun
 - **Everything in the Inbox** (`listed = true`): 300 channels and the archive flood the mixed list.
 - Saved Messages shows my own photo and presence; the 777000 chat (login codes) gets a Call button.
 - Avatars fetched for the first 40 chats only; chats past 500 (archive past 100) absent until active.
-- **Dropped:** my ✓✓, unread reactions, cloud drafts, verified/scam/fake, per-folder unread,
-  member counts, post views, signature, comments. A pin or folder change re-reads all 600 dialogs.
+- **Dropped:** my ✓✓, unread reactions, verified/scam/fake, per-folder unread,
+  member counts, post views, signature, comment sending. A pin or folder change re-reads all
+  600 dialogs.
+- **Built since this pass:** cloud drafts both ways (the dialogs carry a chat's draft,
+  `DraftMessage` changes pour them in, sends tell `SaveDraft`); comments open as a thread under
+  the post with the count on it; topics without an emoji of their own draw the color tile with
+  the title's first letter (the official palette), and topics that have one animate it.
 
 ## 2. The model (decisions)
 

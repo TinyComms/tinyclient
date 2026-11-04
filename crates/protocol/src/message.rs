@@ -353,6 +353,9 @@ pub struct Message {
     pub edited: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub pinned: bool,
+    /// How many people saw a channel's post, when the network counts them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub views: Option<u32>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mentions_me: bool,
     #[serde(default, skip_serializing_if = "MessageKind::is_normal")]
@@ -407,6 +410,7 @@ impl Message {
             deleted: false,
             edited: false,
             pinned: false,
+            views: None,
             mentions_me: false,
             kind: MessageKind::Normal,
             state: SendState::Sent,

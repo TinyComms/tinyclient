@@ -9,7 +9,7 @@ use super::wire::Fault;
 use super::{live, random_id, remember_random, reply_header, Account, Options};
 use crate::blobs::upload::{self, Upload};
 use grammers_tl_types as tl;
-use protocol::{Message, Outgoing};
+use protocol::{Message, Outgoing, VoiceNote};
 use std::sync::Arc;
 
 /// Telegram's part size, which every part but the last must be exactly.
@@ -44,8 +44,9 @@ pub(super) fn send_with(account: &Arc<Account>, conversation: &str, client_id: &
     }
     let (account, conversation_id, client, text, reply) =
         (account.clone(), conversation.to_owned(), client_id.to_owned(), text.to_owned(), reply_to.map(str::to_owned));
+    let voice: Option<VoiceNote> = (with.files.len() == 1).then_some(()).and_then(|_| with.voice.clone());
     upload::spawn(&ctx, conversation, client_id, &with.files, move |up| {
-        files(&account, &conversation_id, &client, &text, reply.as_deref(), opts, up)
+        files(&account, &conversation_id, &client, &text, reply.as_deref(), opts, voice.as_ref(), up)
     });
 }
 
@@ -63,6 +64,9 @@ struct Target {
 fn target(account: &Account, conversation: &str, reply_to: Option<&str>) -> Result<Target, Fault> {
     let (who, topic) = Who::parse(conversation).ok_or_else(|| Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None })?;
     let reply = reply_to.and_then(|id| id.parse::<i32>().ok());
+    // The comments of a channel post are held in the discussion group behind it: like a
+    // forum's send names its topic, theirs names the echo of the post there.
+    let (who, topic) = super::sync::comment_target(account, conversation)?.map(|(group, echo)| (group, Some(echo))).unwrap_or((who, topic));
     Ok(Target { who, peer: account.input(who)?, reply_to: reply_header(reply, topic) })
 }
 
@@ -142,7 +146,7 @@ struct Uploaded {
     visual: bool,
 }
 
-fn files(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, opts: Options, up: &mut Upload) -> Result<Message, String> {
+fn files(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, opts: Options, voice: Option<&VoiceNote>, up: &mut Upload) -> Result<Message, String> {
     let words = |fault: Fault| fault.words();
     let target = target(account, conversation, reply_to).map_err(words)?;
     let premium = account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium);
@@ -156,7 +160,8 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
     };
     let mut uploaded = Vec::with_capacity(up.files().len());
     for at in 0..up.files().len() {
-        uploaded.push(file(account, client_id, at, up)?);
+        // `voice` is only set for a send of one file: a voice message is one file.
+        uploaded.push(file(account, client_id, at, voice, up)?);
     }
     up.check()?;
     let random = random_id(client_id);
@@ -233,8 +238,9 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
     first.ok_or_else(|| "Nothing was sent.".to_owned())
 }
 
-/// One file of a send, in parts, as Telegram's `InputMedia`.
-fn file(account: &Account, client_id: &str, at: usize, up: &mut Upload) -> Result<Uploaded, String> {
+/// One file of a send, in parts, as Telegram's `InputMedia`. A voice send carries its facts in
+/// `voice` and is sent as a voice note, as Telegram's apps send one.
+fn file(account: &Account, client_id: &str, at: usize, voice: Option<&VoiceNote>, up: &mut Upload) -> Result<Uploaded, String> {
     let (name, bytes, mime, spoiler, as_file) = {
         let source = &up.files()[at];
         (source.name.clone(), source.bytes, source.mime, source.spoiler, source.as_file)
@@ -265,6 +271,20 @@ fn file(account: &Account, client_id: &str, at: usize, up: &mut Upload) -> Resul
         false => tl::types::InputFile { id: file_id, parts, name: name.clone(), md5_checksum: String::new() }.into(),
     };
     let photo = !as_file && PHOTOS.contains(&mime) && bytes <= BIG;
+    // A voice note is one Ogg Opus file and its own attribute: no file name, which Telegram's
+    // own voice notes carry none of (their rows read "Voice message"). The loudness bars go
+    // from the contract's byte a bar to Telegram's five bits a bar.
+    let attributes: Vec<tl::enums::DocumentAttribute> = match voice {
+        Some(voice) => vec![tl::types::DocumentAttributeAudio {
+            voice: true,
+            duration: (voice.duration / 1000) as i32,
+            title: None,
+            performer: None,
+            waveform: Some(packed(&voice.waveform)),
+        }
+        .into()],
+        None => vec![tl::types::DocumentAttributeFilename { file_name: name }.into()],
+    };
     let media: tl::enums::InputMedia = match photo {
         true => tl::types::InputMediaUploadedPhoto { spoiler, live_photo: false, file: input, stickers: None, ttl_seconds: None, video: None }.into(),
         false => tl::types::InputMediaUploadedDocument {
@@ -274,7 +294,7 @@ fn file(account: &Account, client_id: &str, at: usize, up: &mut Upload) -> Resul
             file: input,
             thumb: None,
             mime_type: mime.to_owned(),
-            attributes: vec![tl::types::DocumentAttributeFilename { file_name: name }.into()],
+            attributes,
             stickers: None,
             video_cover: None,
             video_timestamp: None,
@@ -285,9 +305,28 @@ fn file(account: &Account, client_id: &str, at: usize, up: &mut Upload) -> Resul
     Ok(Uploaded { media, visual: photo || (!as_file && mime.starts_with("video/")) })
 }
 
+/// A voice message's loudness, one byte a bar, as Telegram packs it: five-bit values end to
+/// end, as [`content::waveform`](super::content::waveform) unpacks them.
+fn packed(bars: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bars.len() * 5 / 8 + 1);
+    let (mut bits, mut held) = (0usize, 0u16);
+    for &bar in bars {
+        held |= u16::from(u16::from(bar) * 31 / 255) << bits;
+        bits += 5;
+        while bits >= 8 {
+            out.push((held & 0xff) as u8);
+            held >>= 8;
+            bits -= 8;
+        }
+    }
+    if bits > 0 {
+        out.push((held & 0xff) as u8);
+    }
+    out
+}
+
 /// What `messages.uploadMedia` kept, as media an album can name, with the spoiler kept.
-fn stored(held: tl::enums::MessageMedia, asked: &tl::enums::InputMedia) -> Option<tl::enums::InputMedia> {
-    let spoiler = match asked {
+fn stored(held: tl::enums::MessageMedia, asked: &tl::enums::InputMedia) -> Option<tl::enums::InputMedia> {    let spoiler = match asked {
         tl::enums::InputMedia::UploadedPhoto(photo) => photo.spoiler,
         tl::enums::InputMedia::UploadedDocument(document) => document.spoiler,
         _ => false,
@@ -323,3 +362,20 @@ fn stored(held: tl::enums::MessageMedia, asked: &tl::enums::InputMedia) -> Optio
         _ => None,
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_waveform_is_packed_as_it_is_unpacked() {
+        let bars = vec![255u8, 0, 255, 0, 255, 0, 255, 0];
+        assert_eq!(super::super::content::waveform(&packed(&bars)), bars, "the widest and the shut bar");
+        // Bars between are quantized to five bits, and none louder than the widest.
+        assert_eq!(super::super::content::waveform(&packed(&[10]))[0], (10u16 * 31 / 255) as u8 * 255 / 31);
+        assert_eq!(packed(&[255])[0], 0b11111, "the widest bar is five set bits");
+        assert!(packed(&[]).is_empty());
+    }
+}
+
