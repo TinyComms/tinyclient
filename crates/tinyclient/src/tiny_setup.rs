@@ -128,6 +128,8 @@ impl Form {
         if blocked(setup, &listed.needs).is_some() {
             return false;
         }
+        // What else the option needs (a passkey or a provider sign-in of the owner's own, members
+        // who have them) is not a reason to refuse: the checklist shows it before they commit.
         self.allow_lockout = false;
         self.picked.set(choice, option)
     }
@@ -184,8 +186,8 @@ pub fn keep() -> TinySetupApply {
 }
 
 /// What an option depends on that this server lacks: `None` when it can be chosen. Only a missing
-/// feature of the deployment blocks it; an owner without a passkey yet is told so ([`hint`]) and
-/// the server decides.
+/// feature of the deployment blocks it (passkeys, on a server started without them); who has a
+/// passkey or a provider sign-in is the [`checklist`]'s to say, and the server decides.
 pub fn blocked(setup: &TinySetup, needs: &[String]) -> Option<&'static str> {
     (needs.iter().any(|need| need == "passkeys") && !setup.deployment.passkeys).then_some("This server was started without passkey sign-in.")
 }
@@ -217,8 +219,9 @@ pub fn remedy(refusal: &TinySetupRefusal) -> Option<Remedy> {
         TinySetupRefusal::PasskeysUnavailable => None,
         TinySetupRefusal::OwnerNeedsPasskey => Some(Remedy::AddPasskey),
         TinySetupRefusal::MembersWithoutPasskey { .. } => Some(Remedy::DoItAnyway),
-        // The GUI's answer to these two comes with the provider-only choice.
-        TinySetupRefusal::OwnerNeedsProvider | TinySetupRefusal::MembersWithoutProvider { .. } => None,
+        // The client cannot sign someone in through a provider for them: the owner does it once.
+        TinySetupRefusal::OwnerNeedsProvider => None,
+        TinySetupRefusal::MembersWithoutProvider { .. } => Some(Remedy::DoItAnyway),
     }
 }
 
@@ -243,10 +246,10 @@ pub fn refusal_words(refusal: &TinySetupRefusal) -> String {
             people_without(*count)
         ),
         TinySetupRefusal::OwnerNeedsProvider => {
-            "You have not signed in through a sign-in provider yet. If members were limited to the provider now, you could not sign in again.".to_owned()
+            "You haven't signed in through the sign-in provider yourself yet, so you would be locked out. Sign in through it once, then try again.".to_owned()
         }
         TinySetupRefusal::MembersWithoutProvider { count } => {
-            format!("{} not signed in through a sign-in provider yet, so they could not sign in if members were limited to it.", people_without(*count))
+            format!("{} no sign-in provider account and couldn't sign in until they get one.", people_without(*count))
         }
     }
 }
@@ -270,12 +273,90 @@ pub fn counts_words(setup: &TinySetup) -> Vec<String> {
             n => format!("{} no passkey yet.", people_without(n)),
         });
     }
+    if setup.deployment.sso && counts.members_without_provider > 0 {
+        lines.push(format!("{} no sign-in provider account yet.", people_without(counts.members_without_provider)));
+    }
     match counts.emails_stored {
         0 => {}
         1 => lines.push("1 email address is stored.".to_owned()),
         n => lines.push(format!("{n} email addresses are stored.")),
     }
     lines
+}
+
+/// One thing in the way of a switch of sign-in method, or done already.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepState {
+    Done,
+    Open,
+}
+
+/// What the owner can press on an open step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// Ask the server for a link that adds a passkey for this account, and open it.
+    AddPasskey,
+    /// Make a passkey link for each member who has none.
+    SendLinks,
+    /// Sign in through the community's provider once, so the owner is not locked out.
+    SignInWithProvider,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    pub words: String,
+    pub state: StepState,
+    pub action: Option<Action>,
+}
+
+/// What stands between the owner and the sign-in method they picked, drawn under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checklist {
+    pub steps: Vec<Step>,
+    /// Someone would be locked out as things stand, so Apply reads "Switch anyway" and is Danger.
+    pub anyway: bool,
+}
+
+/// The steps for the sign-in method the form picked, or `None` when it is not a switch or the
+/// choice is not shown. Choosing "any" has nothing in the way: no steps and nobody locked out.
+/// The provider is named generally here; the server's own words for it are not sent to this crate.
+pub fn checklist(setup: &TinySetup, form: &Form) -> Option<Checklist> {
+    let picked = form.picked.sign_in_methods.as_str();
+    if picked == setup.current.sign_in_methods {
+        return None;
+    }
+    if setup.choices.iter().any(|choice| choice.id == "sign_in_methods" && !choice.relevant) {
+        return None;
+    }
+    let counts = &setup.counts;
+    let step = |words: String, done: bool, action: Option<Action>| Step { words, state: if done { StepState::Done } else { StepState::Open }, action };
+    // Members as listed, or as counted by a server that does not list them.
+    let total = if setup.members.is_empty() { counts.members } else { u32::try_from(setup.members.len()).unwrap_or(u32::MAX) };
+    match picked {
+        "passkey" => {
+            let without = counts.members_without_passkey;
+            let links = setup.members.iter().any(|member| !member.passkey).then_some(Action::SendLinks);
+            Some(Checklist {
+                steps: vec![
+                    step("You have a passkey".to_owned(), counts.owner_has_passkey, Some(Action::AddPasskey).filter(|_| !counts.owner_has_passkey)),
+                    step(format!("{} of {total} members have a passkey", total.saturating_sub(without)), without == 0, links.filter(|_| without > 0)),
+                ],
+                anyway: without > 0,
+            })
+        }
+        "provider" => {
+            let without = counts.members_without_provider;
+            Some(Checklist {
+                steps: vec![
+                    step("You can sign in through the sign-in provider".to_owned(), counts.owner_has_provider, Some(Action::SignInWithProvider).filter(|_| !counts.owner_has_provider)),
+                    step(format!("{} of {total} members can sign in through it", total.saturating_sub(without)), without == 0, None),
+                ],
+                anyway: without > 0,
+            })
+        }
+        "any" => Some(Checklist { steps: Vec::new(), anyway: false }),
+        _ => None,
+    }
 }
 
 pub const ERASE_LABEL: &str = "Also remove the email addresses already on file";
@@ -377,11 +458,15 @@ pub fn decided_words(server: &TinyServerInfo) -> &'static str {
 mod tests {
     use super::*;
     use protocol::{
-        TinyAccess, TinyCapabilities, TinyChoice, TinyDeployment, TinyOption, TinyPreset, TinySetupCounts, TINY_ACTIVITY_VISIBILITIES, TINY_PROVIDER_PROFILES, TINY_SIGN_IN_METHODS,
+        TinyAccess, TinyCapabilities, TinyChoice, TinyDeployment, TinyOption, TinyPreset, TinySetupCounts, TinySetupMember, TINY_ACTIVITY_VISIBILITIES, TINY_PROVIDER_PROFILES, TINY_SIGN_IN_METHODS,
     };
 
     fn option(id: &str, needs: &[&str]) -> TinyOption {
         TinyOption { id: id.into(), title: id.into(), effect: format!("{id} does this."), needs: needs.iter().map(|need| (*need).to_owned()).collect() }
+    }
+
+    fn member(name: &str, passkey: bool, provider: bool) -> TinySetupMember {
+        TinySetupMember { user_id: name.to_lowercase(), display_name: name.into(), passkey, provider }
     }
 
     fn posture(profile: &str, activity: &str, sign_in: &str) -> TinyPosture {
@@ -396,8 +481,15 @@ mod tests {
             completed_at: String::new(),
             current: posture("full", "everyone", "any"),
             deployment: TinyDeployment { passkeys: true, sso: true },
-            counts: TinySetupCounts { members: 3, members_without_passkey: 2, emails_stored: 2, owner_has_passkey: false, ..TinySetupCounts::default() },
-            members: Vec::new(),
+            counts: TinySetupCounts {
+                members: 4,
+                members_without_passkey: 2,
+                emails_stored: 2,
+                owner_has_passkey: false,
+                members_without_provider: 1,
+                owner_has_provider: true,
+            },
+            members: vec![member("Justin", true, true), member("Ana", false, true), member("Ben", false, false), member("Cy", true, true)],
             presets: vec![
                 TinyPreset { id: "convenience".into(), title: "Convenience".into(), summary: "Easy.".into(), choices: posture("full", "everyone", "any"), available: true, unavailable: String::new() },
                 TinyPreset { id: "privacy".into(), title: "Privacy".into(), summary: "Least.".into(), choices: posture("none", "nobody", "passkey"), available: true, unavailable: String::new() },
@@ -422,7 +514,7 @@ mod tests {
                     title: "Sign-in".into(),
                     question: "Which?".into(),
                     relevant: true,
-                    options: vec![option("any", &[]), option("passkey", &["passkeys", "owner_has_passkey"])],
+                    options: vec![option("provider", &["sso", "owner_has_provider"]), option("any", &[]), option("passkey", &["passkeys", "owner_has_passkey"])],
                 },
             ],
             always: vec!["There are no usernames.".into()],
@@ -570,11 +662,17 @@ mod tests {
         assert!(!form.pick_preset(&setup, "privacy"));
         assert_eq!((form.preset.clone(), form.picked.clone()), (None, setup.current.clone()));
         assert!(!form.pick_option(&setup, "sign_in_methods", "passkey"), "needs passkeys, which this server does not have");
+        assert!(form.pick_option(&setup, "sign_in_methods", "provider"), "the checklist, not a refusal, says what is in the way");
         assert!(form.pick_option(&setup, "sign_in_methods", "any"));
         assert!(!form.pick_option(&setup, "sign_in_methods", "nothing"), "an option the server does not list");
         assert!(!form.pick_option(&setup, "mystery", "x"), "a choice the server does not list");
         assert_eq!(blocked(&setup, &["passkeys".into()]), Some("This server was started without passkey sign-in."));
         assert_eq!(blocked(&setup, &[]), None);
+        assert_eq!(blocked(&setup, &["owner_has_passkey".into()]), None, "an owner without a passkey is the checklist's to say");
+        setup.deployment.passkeys = true;
+        assert!(form.pick_option(&setup, "sign_in_methods", "passkey"), "picked although the owner has no passkey yet");
+        setup.deployment.passkeys = false;
+        assert!(form.pick_option(&setup, "sign_in_methods", "any"));
         // Privacy with the sign-in choice left alone, as the server's own text suggests, is the
         // owner's: a preset that is unavailable, then each of its other two choices by hand.
         assert!(form.pick_option(&setup, "provider_profile", "none") && form.pick_option(&setup, "activity_visibility", "nobody"));
@@ -603,15 +701,25 @@ mod tests {
         let off = refusal_words(&TinySetupRefusal::PasskeysUnavailable);
         assert!(off.contains("started without passkey sign-in"), "{off}");
         assert_eq!(remedy(&TinySetupRefusal::PasskeysUnavailable), None, "nothing the owner can press fixes a server without passkeys");
+        let owner = refusal_words(&TinySetupRefusal::OwnerNeedsProvider);
+        assert_eq!(owner, "You haven't signed in through the sign-in provider yourself yet, so you would be locked out. Sign in through it once, then try again.");
+        assert_eq!(remedy(&TinySetupRefusal::OwnerNeedsProvider), None, "the client cannot sign someone in through a provider for them");
+        let members = refusal_words(&TinySetupRefusal::MembersWithoutProvider { count: 3 });
+        assert_eq!(members, "3 members have no sign-in provider account and couldn't sign in until they get one.");
+        assert!(refusal_words(&TinySetupRefusal::MembersWithoutProvider { count: 1 }).starts_with("1 member has no sign-in provider account"));
+        assert_eq!(remedy(&TinySetupRefusal::MembersWithoutProvider { count: 3 }), Some(Remedy::DoItAnyway));
         assert_eq!((remedy_label(Remedy::AddPasskey), remedy_label(Remedy::DoItAnyway)), ("Add a passkey for me", "Do it anyway"));
     }
 
     #[test]
     fn the_counts_that_matter_are_said_before_the_owner_commits() {
         let mut setup = setup();
-        assert_eq!(counts_words(&setup), ["2 members have no passkey yet.", "2 email addresses are stored."]);
+        assert_eq!(counts_words(&setup), ["2 members have no passkey yet.", "1 member has no sign-in provider account yet.", "2 email addresses are stored."]);
         setup.counts = TinySetupCounts { members: 1, members_without_passkey: 1, emails_stored: 1, owner_has_passkey: false, ..TinySetupCounts::default() };
         assert_eq!(counts_words(&setup), ["1 member has no passkey yet.", "1 email address is stored."]);
+        setup.counts.members_without_provider = 3;
+        assert_eq!(counts_words(&setup)[1], "3 members have no sign-in provider account yet.");
+        setup.counts.members_without_provider = 0;
         setup.counts = TinySetupCounts { members: 4, members_without_passkey: 0, emails_stored: 0, owner_has_passkey: true, ..TinySetupCounts::default() };
         assert_eq!(counts_words(&setup), ["Every member has a passkey."]);
         setup.deployment.passkeys = false;
@@ -625,6 +733,89 @@ mod tests {
         assert_eq!(applied_words(&applied(1, 1)), "Saved. 1 email address was removed. 1 last-online time was cleared.");
         assert_eq!(applied_words(&applied(3, 0)), "Saved. 3 email addresses were removed.");
         assert_eq!(applied_words(&applied(0, 5)), "Saved. 5 last-online times were cleared.");
+    }
+
+    fn switched(setup: &TinySetup, to: &str) -> Form {
+        let mut form = Form::starting(setup);
+        assert!(form.pick_option(setup, "sign_in_methods", to));
+        form
+    }
+
+    fn states(list: &Checklist) -> Vec<(StepState, Option<Action>)> {
+        list.steps.iter().map(|step| (step.state, step.action)).collect()
+    }
+
+    #[test]
+    fn a_switch_to_passkeys_lists_the_two_steps_and_who_can_act() {
+        let mut setup = setup();
+        let list = checklist(&setup, &switched(&setup, "passkey")).expect("a switch has a checklist");
+        assert_eq!(list.steps[0].words, "You have a passkey");
+        assert_eq!(list.steps[1].words, "2 of 4 members have a passkey");
+        assert_eq!(states(&list), [(StepState::Open, Some(Action::AddPasskey)), (StepState::Open, Some(Action::SendLinks))]);
+        assert!(list.anyway);
+        setup.counts.owner_has_passkey = true;
+        setup.counts.members_without_passkey = 0;
+        setup.members = vec![member("Justin", true, true), member("Ana", true, true)];
+        let list = checklist(&setup, &switched(&setup, "passkey")).unwrap();
+        assert_eq!(list.steps[1].words, "2 of 2 members have a passkey");
+        assert_eq!(states(&list), [(StepState::Done, None), (StepState::Done, None)]);
+        assert!(!list.anyway);
+    }
+
+    #[test]
+    fn a_switch_back_to_the_provider_mirrors_them() {
+        let mut setup = setup();
+        setup.current = posture("full", "everyone", "passkey");
+        let list = checklist(&setup, &switched(&setup, "provider")).expect("a switch has a checklist");
+        assert_eq!(list.steps[0].words, "You can sign in through the sign-in provider");
+        assert_eq!(list.steps[1].words, "3 of 4 members can sign in through it");
+        assert_eq!(states(&list), [(StepState::Done, None), (StepState::Open, None)], "no link: the client cannot make a provider account for someone");
+        assert!(list.anyway);
+        setup.counts.owner_has_provider = false;
+        setup.counts.members_without_provider = 0;
+        let list = checklist(&setup, &switched(&setup, "provider")).unwrap();
+        assert_eq!(states(&list), [(StepState::Open, Some(Action::SignInWithProvider)), (StepState::Done, None)]);
+        assert!(!list.anyway, "an owner who has not signed in is the server's to refuse, not a member locked out");
+    }
+
+    #[test]
+    fn no_switch_or_the_middle_way_needs_no_steps() {
+        let setup = setup();
+        assert_eq!(checklist(&setup, &Form::starting(&setup)), None, "nothing changed");
+        let mut back = Form::starting(&setup);
+        back.pick_option(&setup, "sign_in_methods", "passkey");
+        back.pick_option(&setup, "sign_in_methods", "any");
+        assert_eq!(checklist(&setup, &back), None, "picked back to what the server has");
+        let mut current = setup.clone();
+        current.current = posture("full", "everyone", "passkey");
+        assert_eq!(checklist(&current, &switched(&current, "any")), Some(Checklist { steps: Vec::new(), anyway: false }));
+        let mut irrelevant = setup.clone();
+        irrelevant.choices[2].relevant = false;
+        assert_eq!(checklist(&irrelevant, &switched(&irrelevant, "passkey")), None);
+    }
+
+    #[test]
+    fn an_older_server_with_no_member_list_still_counts_but_offers_no_links() {
+        let mut setup = setup();
+        setup.members.clear();
+        let list = checklist(&setup, &switched(&setup, "passkey")).unwrap();
+        assert_eq!(list.steps[1].words, "2 of 4 members have a passkey");
+        assert_eq!(states(&list), [(StepState::Open, Some(Action::AddPasskey)), (StepState::Open, None)]);
+        assert!(list.anyway);
+    }
+
+    #[test]
+    fn switch_anyway_is_asked_only_when_someone_would_be_locked_out() {
+        let mut setup = setup();
+        assert!(checklist(&setup, &switched(&setup, "passkey")).unwrap().anyway);
+        setup.counts.members_without_passkey = 0;
+        setup.members.iter_mut().for_each(|member| member.passkey = true);
+        assert!(!checklist(&setup, &switched(&setup, "passkey")).unwrap().anyway, "the owner's own passkey is the server's to check");
+        setup.current = posture("full", "everyone", "passkey");
+        assert!(checklist(&setup, &switched(&setup, "provider")).unwrap().anyway);
+        setup.counts.members_without_provider = 0;
+        assert!(!checklist(&setup, &switched(&setup, "provider")).unwrap().anyway);
+        assert!(!checklist(&setup, &switched(&setup, "any")).unwrap().anyway);
     }
 
     /// Everyone who is not an owner is told what the server keeps from these three values, so
