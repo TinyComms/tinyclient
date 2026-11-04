@@ -553,6 +553,9 @@ fn a_ring_we_placed_is_not_a_call_until_the_other_side_answers_whatever_our_medi
 fn the_microphone_test_outside_a_call_meters_ten_times_a_second_and_its_mediad_leaves_when_it_stops() {
     let _turn = alone();
     let (hub, dir) = hub();
+    // The stand-in microphone is a 440 Hz tone. Enhanced, the default, isolates a
+    // voice and takes that tone down, so the meter is read on Standard, which leaves it.
+    hub.set_setting("", protocol::settings::NOISE_SUPPRESSION, Some("standard".into())).unwrap();
     assert!(hub.calls.test_microphone(&hub, true, false).is_ok());
     assert_eq!(mediads(), 1, "one mediad, for the test");
     // Counted from here: looking for mediad can take a second on Windows, and the levels told

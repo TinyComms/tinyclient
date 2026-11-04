@@ -570,4 +570,47 @@ mod tests {
         apply_input_gain(&mut full, 100);
         assert_eq!(full[0], 1000);
     }
+
+    /// The microphone test's stand-in is a 440 Hz tone at the same peak the device
+    /// stand-in uses. Standard leaves it in the meter's band. Enhanced takes it down.
+    #[test]
+    fn standard_keeps_the_test_tone_and_enhanced_takes_it_down() {
+        fn tone() -> Vec<[i16; FRAME_SAMPLES]> {
+            let mut phase = 0f64;
+            let step = 440. * std::f64::consts::TAU / f64::from(RATE);
+            (0..25)
+                .map(|_| {
+                    let mut frame = [0i16; FRAME_SAMPLES];
+                    for pair in frame.as_chunks_mut::<CHANNELS>().0 {
+                        pair.fill((phase.sin() * 8000.) as i16);
+                        phase = (phase + step) % std::f64::consts::TAU;
+                    }
+                    frame
+                })
+                .collect()
+        }
+        // The probe reports the loudest frame of each tenth of a second, and it does
+        // not feed the speaker back while the meter runs without loopback.
+        fn meter(noise: NoiseMode, frames: &[[i16; FRAME_SAMPLES]]) -> Vec<u8> {
+            let mut processor = Processor::new();
+            processor.set(on(true, noise, true));
+            let mut levels = Vec::new();
+            let mut loudest = 0u8;
+            for (n, frame) in frames.iter().enumerate() {
+                let mut frame = *frame;
+                processor.capture(&mut frame);
+                loudest = loudest.max(crate::audio::level(&frame));
+                if (n + 1).is_multiple_of(5) {
+                    levels.push(loudest);
+                    loudest = 0;
+                }
+            }
+            levels
+        }
+        let frames = tone();
+        let standard = meter(NoiseMode::Standard, &frames);
+        let enhanced = meter(NoiseMode::Enhanced, &frames);
+        assert!(standard.iter().all(|level| (60..90).contains(level)), "standard: {standard:?}");
+        assert!(enhanced.iter().any(|level| *level < 50), "enhanced left the tone up: {enhanced:?}");
+    }
 }
