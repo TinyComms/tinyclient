@@ -649,10 +649,17 @@ impl Shell {
         )
     }
 
-    /// Share and camera belong on a joined Tiny call whose room allows video. A room that has
-    /// not loaded yet still shows them: the server's default is that video is allowed.
-    fn tiny_pictures(&self, call: &Call) -> bool {
-        if call.conversation.network != Network::Tiny || call.state != CallState::Joined {
+    /// Share and camera belong on a joined call that can carry a picture: a Discord voice
+    /// channel, or a Tiny room that allows video. A Tiny room that has not loaded yet still
+    /// shows them: the server's default is that video is allowed.
+    fn call_pictures(&self, call: &Call) -> bool {
+        if call.state != CallState::Joined {
+            return false;
+        }
+        if call.conversation.network == Network::Discord {
+            return true;
+        }
+        if call.conversation.network != Network::Tiny {
             return false;
         }
         let Some(page) = self.tiny_page_facts().filter(|page| page.account == &call.conversation.account()) else {
@@ -908,7 +915,7 @@ impl Shell {
                 .tooltip(tip(if call.deafened { "Undeafen" } else { "Deafen" }, Some("⌘⇧D")))
                 .on_click(cx.listener(|this, _, _, cx| this.call_deafen(cx)))
         });
-        let pictures = self.tiny_pictures(call);
+        let pictures = self.call_pictures(call);
         let share_on = encoding(call, Content::Share);
         let camera_on = encoding(call, Content::Camera);
         let share = pictures.then(|| {

@@ -1,4 +1,4 @@
-use crate::adapters::{self, About, Adapter, Command, Refusal, Reply, SearchScope};
+use crate::adapters::{self, About, Adapter, Command, Picture, Refusal, Reply, SearchScope};
 use crate::blobs::Blobs;
 use crate::hub::{lock, now, Hub, KEYCHAIN_PROMPT};
 use crate::media::CallError;
@@ -2271,6 +2271,12 @@ impl Chat {
                 Response::Ok
             }
             Request::Media(request) => {
+                let picture = match &request {
+                    MediaRequest::Camera { on } => Some(Picture::Camera(*on)),
+                    MediaRequest::ShareSend { on, .. } => Some(Picture::Share(*on)),
+                    MediaRequest::ShareWatch { source } => Some(Picture::Watch(source.clone())),
+                    _ => None,
+                };
                 let asked = match request {
                     // Joining is the adapter's to ask for, with what the network handed out.
                     MediaRequest::Join(_) | MediaRequest::Rejoin(_) => {
@@ -2279,6 +2285,16 @@ impl Chat {
                     MediaRequest::Meter { on } => self.hub.calls.meter(&self.hub, on),
                     request => self.hub.calls.request(&self.hub, &request).map(drop),
                 };
+                // A refusal never tells Discord we are sending. Other networks ignore the command.
+                if asked.is_ok() {
+                    if let Some(picture) = picture {
+                        if let (Some(call), true) = self.hub.calls.describe() {
+                            if call.conversation.network == Network::Discord {
+                                self.command(&call.conversation.account(), Command::CallPicture(picture));
+                            }
+                        }
+                    }
+                }
                 match asked {
                     Ok(()) => self.status(),
                     Err(err) => call_error(err),

@@ -139,10 +139,10 @@ pub(super) fn sending(call: &Call, content: Content) -> bool {
     call.video.iter().any(|stream| stream.direction == Direction::Encode && stream.content == content)
 }
 
-/// The call can carry pictures at all: a Tiny room's call (07 §6). Elsewhere camera and share
-/// are absent, not greyed.
+/// The call can carry pictures: a Tiny room, or a Discord voice call. Elsewhere camera and
+/// share are absent, not greyed.
 fn pictures_network(call: &Call) -> bool {
-    call.conversation.network == Network::Tiny
+    matches!(call.conversation.network, Network::Tiny | Network::Discord)
 }
 
 /// One round control: its look, and the colors that go with it.

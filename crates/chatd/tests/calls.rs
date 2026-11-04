@@ -204,6 +204,9 @@ impl Voice {
             // The adapter's view of our mute is older than chatd's; chatd's wins.
             muted: false,
             deafened: false,
+            stream: false,
+            watch: false,
+            group_id: String::new(),
         }
     }
 

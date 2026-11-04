@@ -2,7 +2,7 @@
 
 Mockups: `mockups/07-calls.html` (frame numbers below refer to it). Requirements: `../product/06-calls.md`.
 
-**One idea.** Every call state on every network lives in one place: the **call dock** at the bottom of the sidebar. Ringing out, ringing in, connecting, in a call and failed are five faces of the same 300 px card. A voice call is that card and nothing else; the 212 px "call surface" card in today's shell goes away. **Video is a Tiny call** (§6). Discord voice is audio only and is joined from the server list.
+**One idea.** Every call state on every network lives in one place: the **call dock** at the bottom of the sidebar. Ringing out, ringing in, connecting, in a call and failed are five faces of the same 300 px card. A voice call is that card and nothing else; the 212 px "call surface" card in today's shell goes away. **A picture is a Tiny room (§6) or a Discord call (§6a).** Discord voice is joined from the server list.
 
 **Why the dock is at the bottom of the sidebar, not the top of the conversation.** The conversation pane changes on every navigation and belongs to whatever is open; the sidebar does not. A call in Lounge has nothing to do with the Slack channel I am reading, so it should not sit in that channel's header. The dock is also directly under the voice-channel tree it came from, and it never pushes messages down. Cost: the conversation list loses 112 px while a call exists, and only then.
 
@@ -36,16 +36,16 @@ One pill in the conversation header, 30 px high, radius 15, 12 px side padding, 
 | Hand-off | no fill, 1 px `hairline_strong` border, `text_soft`; the **network's own icon** 14 px, then label, then `arrow-up-right` 12 px `text_faint` | **Open in Teams** · **Open huddle in Slack** · **Open in Telegram** · **Open in Discord** · **Open in Messages** | "Teams calls open in the Teams app. tinyclient doesn't carry them." / "Huddles open in Slack. Press the headphones there to join." |
 | None (a Discord text channel, or Signal, where calls are not built) | no button | | |
 
-The hand-off reads as deliberate because it is a different object: outlined, branded, with an out-arrow and a destination in its name. It never says "Call". If the official app is missing, a 32 px line appears under the header: "Teams isn't installed. **Open in browser ↗**". There is no separate video or share button in the header: camera and share are turned on inside a call. Pressing Call while in another call asks in the dock first ("Leave Lounge and call Mara Okafor?"). A voice channel joins from its header pill, its hover **Join** pill, or a double-click; a single click only opens its chat, because joining is seen by everyone there. Discord voice is audio only and is joined from the server list.
+The hand-off reads as deliberate because it is a different object: outlined, branded, with an out-arrow and a destination in its name. It never says "Call". If the official app is missing, a 32 px line appears under the header: "Teams isn't installed. **Open in browser ↗**". There is no separate video or share button in the header: camera and share are turned on inside a call. Pressing Call while in another call asks in the dock first ("Leave Lounge and call Mara Okafor?"). A voice channel joins from its header pill, its hover **Join** pill, or a double-click; a single click only opens its chat, because joining is seen by everyone there. Discord voice is joined from the server list. Camera and share turn on inside the call, not on this pill.
 
 ## 2. The call dock and bar (frames 2–5, 7)
 
 Dock: full sidebar width (316), 8 px padding, 1 px `hairline` top border, present only when a call state exists. Card: 300 wide, radius 12, `raised` fill, 1 px `hairline` border, 10 px padding, 8 px row gap. **Height 96** (dock 112). Optional 32 px strips stack on top inside the card.
 
 - **Row 1, 36 px, the title row.** 28 px avatar (person: round, in a 4 px speaking-ring slot; voice channel: 28 px square, radius 8, `positive_soft` fill, `volume` glyph in `positive`). Title 13 px semibold. Sub-line 11.5 px `text_soft`: network icon 11 px + context + state. Right side: the peer's `mic-off` glyph (DM), or an avatar stack (group, channel): up to three 20 px avatars overlapping 6 px, then "+N". Click the row: open that conversation ("Go to Lounge"). Click the stack: participant list.
-- **Row 2, the controls.** Joined controls share one row equally and wrap as a set: mute, deafen, share, camera, devices, Leave. Share and camera are included only on a Tiny room that allows video. Each button grows to the same width. The place name wraps on the line under the title. The elapsed clock sits with the signal bars and the security slot, not beside the name. Controls a stage or a network cannot do are absent, not greyed: stage 2 shows mute, deafen, devices, Leave.
+- **Row 2, the controls.** Joined controls share one row equally and wrap as a set: mute, deafen, share, camera, devices, Leave. Share and camera are included on a Tiny room that allows video, and on a joined Discord call. Each button grows to the same width. The place name wraps on the line under the title. The elapsed clock sits with the signal bars and the security slot, not beside the name. Controls a stage or a network cannot do are absent, not greyed: stage 2 shows mute, deafen, devices, Leave.
 
-Sub-line wording: `Ringing… 0:12` · `Connecting…` · `Discord · 12:04` (DM) · `tinyclient-dev · 4:31` (channel: server name) · `Reconnecting…` (`warning`) · `Call ended · 12:04`. A Tiny call does not count down time left. The sub-line's tooltip in a Discord call: "End-to-end encrypted by Discord". Discord DAVE seals Opus only. Left alone in a DM call: `Mara left · 12:40`; tinyclient does not hang up for me.
+Sub-line wording: `Ringing… 0:12` · `Connecting…` · `Discord · 12:04` (DM) · `tinyclient-dev · 4:31` (channel: server name) · `Reconnecting…` (`warning`) · `Call ended · 12:04`. A Tiny call does not count down time left. The sub-line's tooltip in a Discord call: "End-to-end encrypted by Discord". Discord DAVE seals the voice, and the picture when one is on. Left alone in a DM call: `Mara left · 12:40`; tinyclient does not hang up for me.
 
 | Control | Rest | On | Tooltip / shortcut |
 |---|---|---|---|
@@ -97,15 +97,21 @@ Ringing shows who, an elapsed counter and Cancel, in the dock; the header pill b
 
 ## 6. The picture in a Tiny channel
 
-**Video is a Tiny call.** Share and Camera appear on the dock, and on the channel's call bar, only while a Tiny room that allows video is joined. Any other joined call refuses them: "Screen sharing and video are not built yet. This call carries voice only."
+**Video is a Tiny room or a Discord call.** Share and Camera appear on the dock, and on the channel's call bar, while a Tiny room that allows video is joined, and while a Discord call is joined. Any other joined call leaves them off. They are absent, not greyed.
 
 On a Tiny voice channel the stage is the grid of tiles in `10-tiny-server.md`. The call sends and receives one H.264 picture, drawn in that channel (the share, otherwise the active speaker's camera). It does not follow you into another network's conversation. Sending a camera is Windows only. Elsewhere the engine says "A camera isn't available on this system yet. You can still share your screen." Screen share is Windows, macOS, and Linux X11. A Wayland session with no X11 display cannot share: "This session has no X11 display, so the screen can't be shared."
 
 Watch is opt-in for that picture. A share or camera never opens the picture by itself.
 
-When the server offers `e2ee_calls`, the client seals Opus and the H.264 picture and leaves the one-byte NAL header clear. Discord DAVE seals Opus only.
+When the server offers `e2ee_calls`, the client seals Opus and the H.264 picture and leaves the one-byte NAL header clear. Discord DAVE does not use that lock.
 
 Settings has no camera device row (`09`).
+
+## 6a. The picture on a Discord call
+
+A camera is one H.264 layer on the voice connection the call already has. Go Live is a second connection that sends the screen and does not open a microphone. Watching someone else's share is a third connection that only receives. The voice connection stays up. The same buttons as a Tiny room turn these on. A stage still opens in Discord and has no share or camera here.
+
+DAVE seals the picture as well as the voice. The client offers H.264 and does not offer another video codec. There is no simulcast. Sending a camera is Windows only, and screen share is Windows, macOS, and Linux X11, the same as a Tiny room.
 
 ## 7. Device menu (frame 7)
 
@@ -119,7 +125,7 @@ A Tiny call that loses its media resumes three times in two minutes, pausing 1 s
 
 ## 7b. What the call seals
 
-When the server offers `e2ee_calls`, the client seals Opus and the H.264 picture and leaves the one-byte NAL header clear. Discord DAVE seals Opus only. The security slot is the call's one indicator of that protection (`gui/call/security.rs`); a call that says nothing about protection draws none.
+When the server offers `e2ee_calls`, the client seals Opus and the H.264 picture and leaves the one-byte NAL header clear. Discord DAVE seals Opus, and on a picture the H.264 access unit. The security slot is the call's one indicator of that protection (`gui/call/security.rs`); a call that says nothing about protection draws none. The Discord tooltip stays "End-to-end encrypted by Discord". The Tiny lock is not drawn on a Discord call.
 
 ## 8. Ending and what remains (frames 4, 8, 9)
 

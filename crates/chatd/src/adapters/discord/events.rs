@@ -209,6 +209,9 @@ impl Discord {
             "VOICE_STATE_UPDATE" => self.voice_state(from_str(data)?),
             "GUILD_EMOJIS_UPDATE" | "GUILD_STICKERS_UPDATE" => self.pickables_changed(from_str(data)?),
             "VOICE_SERVER_UPDATE" => self.voice_server(from_str(data)?),
+            "STREAM_CREATE" => self.stream_created(data)?,
+            "STREAM_SERVER_UPDATE" => self.stream_server(data)?,
+            "STREAM_DELETE" => self.stream_deleted(data)?,
             "CALL_CREATE" | "CALL_UPDATE" => self.call_changed(from_str(data)?),
             "CALL_DELETE" => self.call_deleted(from_str(data)?),
             _ => {}

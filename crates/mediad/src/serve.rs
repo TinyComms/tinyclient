@@ -19,7 +19,6 @@ const ENGINE_LINKED: bool = true;
 /// How often the system's devices are looked at for one plugged in or removed.
 const DEVICES_EVERY: Duration = Duration::from_secs(2);
 
-const NO_VIDEO: &str = "Screen sharing and video are not built yet. This call carries voice only.";
 const ENGINE: &str = "The call engine could not start. Try again.";
 const ENGINE_STOPPED: &str = "The call engine stopped. Try joining again.";
 const NOT_YET: &str = "The call isn't connected yet, so there's nothing to measure.";
@@ -63,6 +62,9 @@ struct Call {
     video: Video,
     controls: Arc<Controls>,
     voice: Option<JoinHandle<()>>,
+    /// Go Live: one connection that sends the screen, and one that only receives a share.
+    share_leg: Option<JoinHandle<()>>,
+    watch_leg: Option<JoinHandle<()>>,
     /// A Tiny server call's offer, out with the server and not yet answered.
     offer: Option<tiny::Offer>,
     /// Our user id on that server, and whether the call running is one.
@@ -70,61 +72,65 @@ struct Call {
 }
 
 impl Call {
+    /// The Go Live leg this request replaces has to be gone before the next one starts, or the
+    /// stop flag meant for it would end the new one.
+    fn replace_leg(&mut self, watch: bool) {
+        self.controls.stop_leg(watch);
+        let running = if watch { self.watch_leg.take() } else { self.share_leg.take() };
+        if let Some(running) = running {
+            let _ = running.join();
+        }
+        self.controls.clear_leg(watch);
+    }
+
     /// Every request gets exactly one reply.
     fn apply(&mut self, request: MediaRequest) -> MediaResponse {
         match request {
             MediaRequest::Streams => {}
-            // CONTRACT: nothing tells the shell that a call is voice only, so asking for video
-            // on a joined voice call is refused in words. Turning one off is never refused.
-            // Before a join there is no engine in the call and the bookkeeping below stands,
-            // which is what chatd's own lifecycle tests drive.
-            MediaRequest::ShareSend { on: true, .. }
-            | MediaRequest::ShareWatch { source: Some(_) }
-            | MediaRequest::Speaker { source: Some(_) }
-            | MediaRequest::Camera { on: true }
-                if self.voice.is_some() && self.tiny.is_none() =>
-            {
-                return MediaResponse::Refused { detail: NO_VIDEO.to_owned() };
-            }
             MediaRequest::ShareSend { on, screen, quality } => {
                 // What the share captures, chosen before the probe so the probe tries that one,
-                // and what it spends.
+                // and what it spends. Before a call is up the request is only noted: the voice
+                // tests ask then, and a headless run must not open a screen to answer them.
                 if on {
                     picture::choose_screen(screen);
                     picture::choose_quality(quality);
                 }
-                if self.tiny.is_some() && on {
+                if on && (self.voice.is_some() || self.tiny.is_some()) {
                     if let Err(words) = picture::probe_screen() {
                         return MediaResponse::Refused { detail: words };
                     }
                 }
                 self.video.share_encode = on;
-                if self.tiny.is_some() {
+                if self.voice.is_some() || self.tiny.is_some() {
                     self.controls.set_share(on);
                 }
             }
             MediaRequest::Camera { on } => {
-                if self.tiny.is_some() && on {
+                if on && (self.voice.is_some() || self.tiny.is_some()) {
                     if let Err(words) = picture::probe_camera() {
                         return MediaResponse::Refused { detail: words };
                     }
                 }
                 self.video.camera_encode = on;
-                if self.tiny.is_some() {
+                if self.voice.is_some() || self.tiny.is_some() {
                     self.controls.set_camera(on);
                 }
             }
             MediaRequest::ShareWatch { source } => {
                 self.video.share_decode = source.clone();
-                if self.tiny.is_some() {
+                if self.voice.is_some() || self.tiny.is_some() {
                     self.controls.set_watch(source.is_some());
                 }
             }
             // A Tiny room's SFU already follows the active speaker. The bookkeeping stays for a
-            // call that has no engine yet, which is what chatd's lifecycle test drives.
+            // call that has no engine yet, which is what chatd's lifecycle test drives. A
+            // Discord call paints the person named here.
             MediaRequest::Speaker { source } => {
                 if self.tiny.is_none() || self.voice.is_none() {
-                    self.video.speaker_decode = source;
+                    self.video.speaker_decode = source.clone();
+                }
+                if self.voice.is_some() && self.tiny.is_none() {
+                    self.controls.set_speaker(source);
                 }
             }
             MediaRequest::Join(join) => {
@@ -158,6 +164,32 @@ impl Call {
                     return self.apply(MediaRequest::Join(join));
                 }
                 self.controls.rejoin(join);
+                return MediaResponse::Done;
+            }
+            // Beside the voice call. The thread returns; it does not exit the process.
+            MediaRequest::Stream(join) => {
+                let watch = join.watch;
+                self.replace_leg(watch);
+                let controls = self.controls.clone();
+                let name = if watch { "watch" } else { "share" };
+                let spawned = out::spawn(std::thread::Builder::new().name(name.to_owned()), move || session::run(join, controls));
+                match spawned {
+                    Ok(leg) => {
+                        if watch {
+                            self.watch_leg = Some(leg);
+                        } else {
+                            self.share_leg = Some(leg);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!("mediad: the stream thread did not start: {err}");
+                        return MediaResponse::Refused { detail: ENGINE.to_owned() };
+                    }
+                }
+                return MediaResponse::Done;
+            }
+            MediaRequest::StreamStop { watch } => {
+                self.controls.stop_leg(watch);
                 return MediaResponse::Done;
             }
             MediaRequest::Meter { on } => {

@@ -356,6 +356,16 @@ pub struct VoiceJoin {
     pub dave: Dave,
     pub muted: bool,
     pub deafened: bool,
+    /// A Go Live connection, not the call's own voice. Its loop sends pictures and no audio.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub stream: bool,
+    /// This Go Live connection only receives. It sends no picture of its own.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub watch: bool,
+    /// The MLS group for a stream, the stream server id minus one. Empty on the voice
+    /// connection, which uses the channel id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group_id: String,
 }
 
 /// What mediad needs to make an offer to a Tiny server's SFU (tinyserver's `docs/calls.md`).
@@ -420,6 +430,11 @@ pub enum MediaRequest {
     /// drop the old connection and connect this one, keeping devices, mute and the call itself.
     /// Answered `Done`; then `Interrupted` and `Connected` as for any reconnect.
     Rejoin(VoiceJoin),
+    /// A Go Live connection beside the voice call. Answered `Done`. The leg returns on its
+    /// own and does not end the process.
+    Stream(VoiceJoin),
+    /// Stop one Go Live leg. `watch` is the receive-only connection. Answered `Done`.
+    StreamStop { watch: bool },
     /// The device menu opened or closed. While on, `Levels` are wanted and `DeviceList` is sent
     /// once at once and again whenever the system's devices change.
     Meter { on: bool },
@@ -451,7 +466,7 @@ pub enum MediaRequest {
     TinySlots { audio: Vec<TinySlot> },
     /// The answer to a renegotiation, or an empty SDP when the server refused it (`share_taken`).
     TinyRenegotiation { sdp: String },
-    /// Our camera, on or off. A Tiny call only; a voice call refuses it in words.
+    /// Our camera, on or off. A Tiny room and a Discord call.
     Camera { on: bool },
     /// Who the one video slot carries now. `None` when the server sends `video: null`.
     TinyPicture { picture: Option<TinyPicture> },

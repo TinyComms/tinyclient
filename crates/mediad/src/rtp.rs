@@ -13,6 +13,16 @@ pub const AES_GCM: &str = "aead_aes256_gcm_rtpsize";
 pub const XCHACHA: &str = "aead_xchacha20_poly1305_rtpsize";
 /// Opus, as Discord numbers it.
 pub const PAYLOAD_TYPE: u8 = 120;
+/// H.264 constrained baseline, the one picture codec this client sends and decodes.
+pub const H264: u8 = 103;
+/// Retransmission of an H.264 packet. The payload is the original sequence, then the original bytes.
+pub const RTX: u8 = 104;
+/// One-byte RTP extension ids Discord's video uses.
+pub const EXT_PLAYOUT: u8 = 6;
+pub const EXT_CONTENT: u8 = 7;
+pub const EXT_RID: u8 = 11;
+/// The RID of a packet an RTX stream repaired.
+pub const EXT_REPAIRED: u8 = 12;
 /// What a sender emits when it stops talking, so the far decoder does not interpolate into noise.
 pub const SILENCE: [u8; 3] = [0xf8, 0xff, 0xfe];
 const HEADER: usize = 12;
@@ -39,14 +49,44 @@ pub enum RtpError {
     Crypto,
 }
 
-/// One received audio packet, decrypted.
+/// One received packet, transport-decrypted. Audio and video share the layout.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Packet {
     pub sequence: u16,
     pub timestamp: u32,
     pub ssrc: u32,
-    /// The Opus frame, still end-to-end encrypted if the call uses DAVE.
+    pub payload_type: u8,
+    pub marker: bool,
+    /// The media payload, still end-to-end encrypted when the call uses DAVE.
     pub payload: Vec<u8>,
+}
+
+/// A one-byte-header extension body (RFC 5285), padded out to a whole number of 32-bit words.
+/// Each element is `(id, data)` with an id of 1 to 14 and at most 16 bytes. The 4-byte `0xBEDE`
+/// preamble is not part of this: it rides in the clear with the RTP header.
+pub fn one_byte(elements: &[(u8, &[u8])]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for &(id, data) in elements {
+        if id == 0 || id > 14 || data.is_empty() || data.len() > 16 {
+            continue;
+        }
+        body.push((id << 4) | (data.len() as u8 - 1));
+        body.extend_from_slice(data);
+    }
+    while body.len() % 4 != 0 {
+        body.push(0);
+    }
+    body
+}
+
+/// The extensions on one video packet: the layer's RID, whether it is a screen, and a zero
+/// playout delay. An RTX packet names the repaired RID instead of the original.
+pub fn video_extension(screen: bool, repaired: bool) -> Vec<u8> {
+    let rid: &[u8] = b"100";
+    let content = [u8::from(screen)];
+    let delay = [0u8, 0, 0];
+    let id = if repaired { EXT_REPAIRED } else { EXT_RID };
+    one_byte(&[(id, rid), (EXT_CONTENT, &content), (EXT_PLAYOUT, &delay)])
 }
 
 impl Cipher {
@@ -73,6 +113,12 @@ impl Cipher {
         }
     }
 
+    /// Opens a datagram whose clear prefix is `aad` and whose sealed body is `body`, using the
+    /// nonce counter that followed the tag. Video's generic NACKs use an 8-byte RTCP header.
+    pub fn open_aad(&self, counter: [u8; COUNTER], aad: &[u8], body: &[u8]) -> Option<Vec<u8>> {
+        self.open(counter, Payload { msg: body, aad })
+    }
+
     fn open(&self, counter: [u8; COUNTER], payload: Payload) -> Option<Vec<u8>> {
         match self {
             Cipher::Aes(cipher) => {
@@ -93,7 +139,9 @@ impl Cipher {
         if datagram.len() < HEADER + TAG + COUNTER || datagram[0] >> 6 != 2 {
             return Err(RtpError::Malformed);
         }
-        if (200..=204).contains(&datagram[1]) {
+        // RTCP shares the socket. The marker bit is not part of an RTCP payload type, so the
+        // whole second byte is the type. 205 is a generic NACK, which video answers on its own.
+        if (200..=206).contains(&datagram[1]) {
             return Err(RtpError::Control);
         }
         let extended = datagram[0] & 0x10 != 0;
@@ -119,6 +167,8 @@ impl Cipher {
             sequence: u16::from_be_bytes([datagram[2], datagram[3]]),
             timestamp: u32::from_be_bytes(datagram[4..8].try_into().unwrap()),
             ssrc: u32::from_be_bytes(datagram[8..12].try_into().unwrap()),
+            payload_type: datagram[1] & 0x7f,
+            marker: datagram[1] & 0x80 != 0,
             payload,
         })
     }
@@ -163,6 +213,52 @@ impl Sender {
         self.sequence = self.sequence.wrapping_add(1);
         self.counter = self.counter.wrapping_add(1);
         Some(datagram)
+    }
+}
+
+/// One video SSRC. Its sequence and nonce counter are its own, independent of the audio sender
+/// and of every other SSRC. The timestamp is the frame's, at 90 kHz, not a clock this type keeps.
+pub struct VideoSender {
+    cipher: Cipher,
+    ssrc: u32,
+    sequence: u16,
+    counter: u32,
+}
+
+impl VideoSender {
+    pub fn new(cipher: Cipher, ssrc: u32) -> VideoSender {
+        VideoSender { cipher, ssrc, sequence: 0, counter: 0 }
+    }
+
+    /// The datagram for one packet. `extension` is the one-byte body, already padded; empty sends
+    /// none. The preamble is authenticated with the header and the body is encrypted ahead of
+    /// the payload. Gives the datagram and the sequence number it was stamped with.
+    pub fn seal(&mut self, payload_type: u8, marker: bool, timestamp: u32, payload: &[u8], extension: &[u8]) -> Option<(Vec<u8>, u16)> {
+        let extended = !extension.is_empty();
+        let mut header = Vec::with_capacity(HEADER + 4 + payload.len());
+        let first = 0x80 | if extended { 0x10 } else { 0 };
+        let second = (payload_type & 0x7f) | if marker { 0x80 } else { 0 };
+        header.push(first);
+        header.push(second);
+        header.extend_from_slice(&self.sequence.to_be_bytes());
+        header.extend_from_slice(&timestamp.to_be_bytes());
+        header.extend_from_slice(&self.ssrc.to_be_bytes());
+        let mut plain = Vec::with_capacity(extension.len() + payload.len());
+        if extended {
+            let words = u16::try_from(extension.len() / 4).ok()?;
+            header.extend_from_slice(&[0xbe, 0xde]);
+            header.extend_from_slice(&words.to_be_bytes());
+            plain.extend_from_slice(extension);
+        }
+        plain.extend_from_slice(payload);
+        let sequence = self.sequence;
+        let counter = self.counter.to_be_bytes();
+        let sealed = self.cipher.seal(counter, Payload { msg: &plain, aad: &header })?;
+        header.extend_from_slice(&sealed);
+        header.extend_from_slice(&counter);
+        self.sequence = self.sequence.wrapping_add(1);
+        self.counter = self.counter.wrapping_add(1);
+        Some((header, sequence))
     }
 }
 
@@ -267,6 +363,27 @@ mod tests {
         let opened = cipher.unseal(&datagram).unwrap();
         assert_eq!(opened.payload, b"frame");
         assert_eq!((opened.sequence, opened.ssrc), (5, 42));
+    }
+
+    #[test]
+    fn a_video_packet_carries_its_extension_in_the_encrypted_prefix() {
+        let key = [3u8; 32];
+        let mut sender = VideoSender::new(Cipher::new(AES_GCM, &key).unwrap(), 0x51c0_0001);
+        let extension = video_extension(true, false);
+        assert_eq!(extension.len() % 4, 0);
+        let (datagram, sequence) = sender.seal(H264, true, 9_000, b"nal", &extension).unwrap();
+        assert_eq!(sequence, 0);
+        assert_eq!(datagram[0], 0x90, "the extension bit is set");
+        assert_eq!(datagram[1], 0x80 | H264, "the marker is the high bit of the payload type");
+        assert_eq!(&datagram[12..16], &[0xbe, 0xde, 0, (extension.len() / 4) as u8]);
+        let far = Cipher::new(AES_GCM, &key).unwrap();
+        let opened = far.unseal(&datagram).unwrap();
+        assert_eq!(opened.payload, b"nal");
+        assert_eq!((opened.payload_type, opened.marker, opened.ssrc), (H264, true, 0x51c0_0001));
+        // The preamble is authenticated with the header. A changed word count does not open.
+        let mut forged = datagram.clone();
+        forged[15] ^= 1;
+        assert_eq!(far.unseal(&forged), Err(RtpError::Crypto));
     }
 
     #[test]
