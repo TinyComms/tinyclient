@@ -705,6 +705,7 @@ impl Discord {
             as_file: false,
             gifs: true,
             stickers: true,
+            search: true,
             custom_emoji: emoji,
             silent: true,
             schedule: false,

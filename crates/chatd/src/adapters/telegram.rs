@@ -504,6 +504,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
+        Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         other => other.unsupported(ctx),
     }
@@ -525,6 +526,12 @@ fn serve(account: &Arc<Account>, command: Command) {
             }
         }
         Command::Watch(watching) => sync::on_screen(account, &watching),
+        // Opening a forum lists its topics, once per open; the landing the shell then reads
+        // from the store is named by what this read left.
+        Command::OpenForum { conversation_id, reply } => {
+            sync::backfill(account, &conversation_id);
+            let _ = reply.send(Ok(()));
+        }
         Command::Wanted(ids) => drop(account.files.asked(&ids)),
         Command::Previews(ids) => sync::previews(account, &ids),
         Command::MarkRead { conversation_id, message_id } => mark_read(account, &conversation_id, &message_id),
@@ -550,6 +557,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(delete(account, &conversation_id, &message_id).map_err(refused));
         }
         Command::Typing(conversation_id) => typing(account, &conversation_id),
+        Command::FollowLink { conversation_id, message_id } => sync::followed(account, &conversation_id, &message_id),
         Command::Draft { conversation_id, text } => save_draft(account, &conversation_id, &text),
         Command::SearchPeople(query) => {
             let request = tl::functions::contacts::Search { broadcasts: false, bots: false, q: query.clone(), limit: 25 };
@@ -815,11 +823,26 @@ fn typing(account: &Account, conversation: &str) {
 /// Keeps the cloud draft of this conversation on Telegram: the text as it stands here, or an
 /// empty one to clear it on the phone too. Telegram's own apps save a draft as their user
 /// types; the same draft arriving back is written nowhere, being what the store already says.
-/// Not `ask`: a draft is not worth waiting out a flood for.
+/// Not `ask` for the plain paths: a draft is not worth waiting out a flood for. A comment's
+/// thread may have to `ask` where its discussion fell out of the held few — rare, and the
+/// row stays read-only until the thread was open, which is what fills the held few.
 fn save_draft(account: &Account, conversation: &str, text: &str) {
-    let Some((who, topic)) = Who::parse(conversation) else {
+    let Some((mut who, mut topic)) = Who::parse(conversation) else {
         return;
     };
+    // A comments thread's draft is kept where its sends go: in the discussion group behind
+    // the post, under the echo of it — not against the channel post itself.
+    match sync::comment_target(account, conversation) {
+        Ok(Some((group, echo))) => {
+            who = group;
+            topic = Some(echo);
+        }
+        Ok(None) => {}
+        Err(fault) => {
+            tracing::warn!("chatd: Telegram: draft: {fault}");
+            return;
+        }
+    }
     let Ok(peer) = account.input(who) else {
         return;
     };

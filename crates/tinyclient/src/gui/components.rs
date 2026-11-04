@@ -155,6 +155,9 @@ pub enum BadgeLook {
     Mention(u32),
     /// Messages to me in a DM or group DM: the outlined count.
     Count(u32),
+    /// A muted row's own unread, drawn as the quiet outlined count (Telegram's grey count,
+    /// `03` §4; the other networks leave a muted row's plain unread undrawn).
+    Quiet(u32),
     /// Anything else unread.
     Dot,
 }
@@ -164,6 +167,11 @@ pub fn badge_look(conversation: &Conversation) -> BadgeLook {
     let pill = conversation.mentions > 0 && (conversation.kind != ConversationKind::Direct || conversation.muted);
     if pill {
         return BadgeLook::Mention(conversation.mentions);
+    }
+    // Telegram draws a muted row's count, quiet (`03` §4); the other networks draw nothing
+    // for a muted row's plain unread (D7, R8).
+    if conversation.muted && conversation.unread > 0 && conversation.key.network == Network::Telegram {
+        return BadgeLook::Quiet(conversation.unread);
     }
     match (conversation.badge(), conversation.muted) {
         (_, true) | (Badge::None, _) => BadgeLook::None,
@@ -178,6 +186,7 @@ pub fn badge_for(look: BadgeLook) -> Option<Div> {
         BadgeLook::None => None,
         BadgeLook::Mention(count) => Some(badge_mention(count)),
         BadgeLook::Count(count) => Some(badge_count_unread(count)),
+        BadgeLook::Quiet(count) => Some(badge_count(count)),
         BadgeLook::Dot => Some(badge_dot(8., theme::unread())),
     }
 }
@@ -654,12 +663,20 @@ mod tests {
         assert_eq!(badge_look(&row(ConversationKind::Direct, 3, 3, false)), Count(3));
         assert_eq!(badge_look(&row(ConversationKind::Channel, 5, 0, false)), Dot);
         assert_eq!(badge_look(&row(ConversationKind::Channel, 5, 1, false)), Mention(1));
-        // Muted: nothing, except a mention, which keeps the same pill.
-        assert_eq!(badge_look(&row(ConversationKind::Group, 7, 0, true)), None);
-        assert_eq!(badge_look(&row(ConversationKind::Direct, 3, 0, true)), None);
+        // Muted on Telegram: the count draws quiet (`03` §4), a mention keeps the same pill.
+        assert_eq!(badge_look(&row(ConversationKind::Group, 7, 0, true)), Quiet(7));
+        assert_eq!(badge_look(&row(ConversationKind::Direct, 3, 0, true)), Quiet(3));
+        assert_eq!(badge_look(&row(ConversationKind::Channel, 5, 0, true)), Quiet(5));
         assert_eq!(badge_look(&row(ConversationKind::Group, 7, 1, true)), Mention(1));
         assert_eq!(badge_look(&row(ConversationKind::Direct, 3, 1, true)), Mention(1));
         assert_eq!(badge_look(&row(ConversationKind::Channel, 0, 0, false)), None);
+        // Elsewhere a muted row stays blank until it names me (D7, R8).
+        let elsewhere = |kind, unread: u32, mentions: u32, muted: bool| {
+            let key = Key { network: Network::Discord, account: "me".into(), id: "c".into() };
+            Conversation { unread, mentions, muted, ..Conversation::new(key, kind, "Fernhill") }
+        };
+        assert_eq!(badge_look(&elsewhere(ConversationKind::Group, 7, 0, true)), None);
+        assert_eq!(badge_look(&elsewhere(ConversationKind::Channel, 5, 1, true)), Mention(1));
     }
 }
 

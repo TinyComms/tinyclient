@@ -19,11 +19,12 @@ use crate::gui::phone::tokens as tokens_phone;
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use crate::view::{age, now};
+use crate::client::ask;
 use gpui::{
     canvas, div, prelude::*, px, Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, ElementId,
     Hsla, MouseButton, ObjectFit, SharedString, Stateful, Window,
 };
-use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Preview, Receipt, SendState};
+use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Preview, Receipt, Request, SendState};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::time::Duration;
@@ -1033,6 +1034,13 @@ impl Pane {
                     }
                 }
                 if let Some(url) = &run.link {
+                    // A sponsored message's follow is Telegram's to count; the link opens all the same.
+                    if message.card.as_deref().is_some_and(|card| card.sponsored) {
+                        if let Some(conversation) = self.key().cloned() {
+                            let request = Request::FollowLink { conversation, message_id: id.to_owned() };
+                            cx.background_executor().spawn(async move { ask(&request) }).detach();
+                        }
+                    }
                     cx.open_url(url);
                 } else if let Some((MentionKind::User, person)) = &run.mention {
                     let (Some(person), at) = (self.person(person), window.mouse_position()) else {

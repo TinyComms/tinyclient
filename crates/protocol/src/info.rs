@@ -304,6 +304,10 @@ pub struct Capabilities {
     pub gifs: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub stickers: bool,
+    /// The network searches its own messages (`SearchNetwork`), which the search pane's Enter
+    /// asks. Everywhere stays the cache alone.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub search: bool,
     #[serde(default)]
     pub custom_emoji: EmojiScope,
     /// `Outgoing::silent`, `Outgoing::schedule`, `Outgoing::suppress_embeds` and

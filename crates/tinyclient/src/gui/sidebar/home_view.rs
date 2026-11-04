@@ -71,7 +71,7 @@ impl Shell {
             let mut read = Read::default();
             match drill {
                 Some((_, Some(space), _)) => read.drilled = conversations(&Request::Threads { space, offset: 0, limit: PAGE_LIMIT })?.0,
-                Some((_, _, Some(forum))) => read.drilled = conversations(&Request::Topics { forum, offset: 0, limit: PAGE_LIMIT })?.0,
+                Some((_, _, Some(forum))) => read.drilled = conversations(&Request::Topics { forum, offset: 0, limit: PAGE_LIMIT, landing: false })?.0,
                 Some((shelf, None, None)) => read.drilled = whole(network, None, shelf)?.0,
                 None => {}
             }
@@ -138,7 +138,7 @@ impl Shell {
     /// Goes into a list of the home: Threads, Archive, Message requests, a forum's topics.
     pub(super) fn drill(&mut self, drill: Drill, cx: &mut Context<Self>) {
         let state = &mut self.sidebar_state;
-        state.drill = Some(drill);
+        state.enter_drill(drill);
         state.cursor = None;
         state.home.drilled.clear();
         state.home.loaded = false;
@@ -272,6 +272,9 @@ impl Shell {
             Item::Chat(c) => {
                 let look = match network {
                     Some(Network::Discord) if self.sidebar_state.drill.is_none() => Look { status: true, ..Look::default() },
+                    // The Telegram home says the network's own pins on its rows; a list drilled
+                    // into (the archive, a forum's topics) is drawn plain.
+                    Some(Network::Telegram) if self.sidebar_state.drill.is_none() => Look { time: true, context: false, pin: true, ..Look::default() },
                     _ => Look { time: true, context: false, ..Look::default() },
                 };
                 self.chat_row("home", &c, look, focused, cx).into_any_element()

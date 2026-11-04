@@ -404,6 +404,7 @@ impl Shell {
             return true;
         }
         if self.open.is_some() || self.snapshot.as_ref().is_some_and(|snapshot| snapshot.open.is_some()) {
+            self.sidebar_state.navigation_changed();
             self.open = None;
             if let Some(snapshot) = &mut self.snapshot {
                 snapshot.open = None;

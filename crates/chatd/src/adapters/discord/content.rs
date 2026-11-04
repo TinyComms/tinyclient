@@ -631,6 +631,7 @@ fn card(embed: &Embed, names: &dyn Names) -> Card {
         fields: embed.fields.iter().map(|field| (plain(&field.name), plain(&field.value))).collect(),
         footer: embed.footer.as_ref().map_or_else(String::new, |footer| footer.text.clone()),
         color: embed.color,
+        sponsored: false,
     }
 }
 
@@ -831,6 +832,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
             bot: author.bot || posted.webhook_id.is_some(),
         },
         sent: seconds(&posted.id),
+        expires_at: None,
         outgoing,
         text: rich.text,
         spans: rich.spans,

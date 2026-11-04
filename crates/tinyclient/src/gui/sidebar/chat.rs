@@ -25,6 +25,8 @@ pub struct Look {
     pub time: bool,
     /// A DM's line two says what the person is doing before what they said (Discord).
     pub status: bool,
+    /// The network's own pins are said on the row (Telegram's home).
+    pub pin: bool,
 }
 
 /// The time on a row, in the one date table (`polish/01-system.md` §2): the clock today, then
@@ -376,6 +378,7 @@ impl Shell {
             .items_center()
             .gap(px(6.))
             .children(look.mark.then(|| mark(c.key.network, 14., faint)))
+            .children((look.pin && c.pin.is_some()).then(|| glyph("icons/pin.svg", 12., faint)))
             .child(
                 div()
                     .min_w_0()

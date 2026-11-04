@@ -490,6 +490,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
             .to_vec(),
         footer: "Lichen Bot · trail-cams".to_owned(),
         color: Some(0x4c_9a_6a),
+        sponsored: false,
     }));
     feed.push(report);
 

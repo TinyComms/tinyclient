@@ -331,6 +331,7 @@ impl Note {
                     sender: if self.mine { String::new() } else { name_of(names, saved, &last.author_id) },
                     mine: self.mine,
                     sent: rfc3339(&last.created_at).unwrap_or(updated),
+                    expires_at: None,
                 });
             }
         }

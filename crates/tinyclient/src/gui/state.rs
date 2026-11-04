@@ -321,6 +321,7 @@ impl Shell {
         shell.layout_state.details_channels = prefs.details_channels;
         shell.layout_state.details_directs = prefs.details_directs;
         shell.sidebar_state.pins = prefs.pins;
+        shell.sidebar_state.remember_telegram_folder(prefs.telegram_folder.clone());
         shell.tiny_state.set_members_open(prefs.tiny_members);
         app::prefs::set_me(prefs.me.clone());
         shell.saved_prefs.replace(app::prefs::write(&shell.current_prefs()));
@@ -391,6 +392,7 @@ impl Shell {
         // A network that signed out takes its place in the sidebar with it.
         if let Some(network) = self.sidebar_state.mode.network() {
             if self.snapshot.as_ref().is_some_and(|s| s.link(network) == Link::SignedOut) {
+                self.sidebar_state.navigation_changed();
                 self.sidebar_state.mode = Mode::Inbox;
             }
         }
@@ -788,6 +790,7 @@ impl Shell {
 
     /// Opens a conversation in the conversation region. The sidebar does not follow.
     pub(super) fn select(&mut self, key: Key, title: &str, cx: &mut Context<Self>) {
+        self.sidebar_state.navigation_changed();
         if self.open.as_ref() == Some(&key) {
             return;
         }
@@ -797,6 +800,7 @@ impl Shell {
 
     /// Opens without adding to history: what back and forward do.
     pub(super) fn open_now(&mut self, key: Key, title: &str, cx: &mut Context<Self>) {
+        self.sidebar_state.navigation_changed();
         let row = self.sidebar_state.find(&self.trees, &key);
         let catch_up = row.as_ref().and_then(|row| {
             if row.unread == 0 && row.mentions == 0 {

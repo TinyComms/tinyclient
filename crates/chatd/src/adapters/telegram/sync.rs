@@ -178,6 +178,7 @@ fn capabilities(premium: bool) -> Capabilities {
         as_file: true,
         gifs: true,
         stickers: true,
+        search: true,
         custom_emoji: if premium { EmojiScope::All } else { EmojiScope::None },
         silent: true,
         schedule: true,
@@ -503,6 +504,7 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
                 sender: mapped.message.sender.name.clone(),
                 mine: mapped.message.outgoing,
                 sent: mapped.message.sent,
+                expires_at: mapped.message.expires_at,
             };
             let _ = account.ctx.preview(&id, &line);
         } else {
@@ -571,6 +573,34 @@ fn peer_dialog(account: &Account, who: Who) -> Option<tl::types::Dialog> {
 /// What the shell has on screen changed: the pictures of the rows on it are fetched, each once,
 /// and a list scrolled near the end of what is loaded reads its next page.
 pub(super) fn on_screen(account: &Account, watching: &Watching) {
+    // The open chat's read fact freezes while it is open, so a folder that excludes read
+    // chats keeps it until another conversation takes its place.
+    let open = watching
+        .conversation
+        .as_ref()
+        .filter(|open| open.account() == account.ctx.account)
+        .and_then(|open| Who::parse(&open.id))
+        .and_then(|(who, topic)| topic.is_none().then_some(who));
+    let left = {
+        let mut live = account.live();
+        match (live.filed.open.take(), open) {
+            // The same chat stays open: its read fact stays as it was when it opened.
+            (Some((held, read)), Some(who)) if held == who => {
+                live.filed.open = Some((held, read));
+                None
+            }
+            // Another chat takes its place: the one that left is filed by the live facts.
+            (left, Some(who)) => {
+                let read = live.filed.facts.get(&who).copied().unwrap_or_default().read;
+                live.filed.open = Some((who, read));
+                left
+            }
+            (left, None) => left,
+        }
+    };
+    if let Some((held, _)) = left {
+        filing::refile(account, [held]);
+    }
     let rows: Vec<Who> = watching
         .rows
         .iter()
@@ -580,9 +610,11 @@ pub(super) fn on_screen(account: &Account, watching: &Watching) {
         .collect();
     let mut pictures = Vec::new();
     for who in &rows {
-        let Some(want) = avatar(account, *who) else {
+        let Some(mut want) = avatar(account, *who) else {
             continue;
         };
+        // A row the shell lists: its picture waits while the row is scrolled away.
+        want.watched = true;
         let mut live = account.live();
         if live.pictured.len() >= 4_096 {
             live.pictured.clear();
@@ -591,6 +623,9 @@ pub(super) fn on_screen(account: &Account, watching: &Watching) {
             pictures.push(want);
         }
     }
+    // The screen changed with this `Watch`: rows that scrolled back go first, in line,
+    // then what is on it now is asked for.
+    account.files.look();
     account.files.want(pictures);
     for list in 0..2 {
         let next = {
@@ -653,6 +688,7 @@ pub(super) fn avatar(account: &Account, who: Who) -> Option<Want> {
         location: tl::types::InputPeerPhotoFileLocation { big: false, peer: dir.input_peer(who)?, photo_id: known.photo }.into(),
         inline: None,
         row: Some(who.text()),
+        watched: false,
         original: false,
     })
 }
@@ -730,6 +766,7 @@ fn emoji_want(document: &tl::types::Document, row: Option<String>) -> Want {
         }),
         inline: None,
         row,
+        watched: false,
         original: false,
     }
 }
@@ -975,11 +1012,15 @@ fn comment_row(account: &Account, thread: &str, channel: Who, post: i32) {
 /// names the echo its reply answers. `None` leaves the message with the group's own id,
 /// for a conversation of the group itself.
 fn comments_thread(account: &Account, mapped: &Mapped) -> Option<String> {
-    let Some(echo) = mapped.reply else {
-        return None;
-    };
-    let live = account.live();
-    live.discussion.iter().find(|(_, held, at)| *held == mapped.peer && *at == echo).map(|(thread, _, _)| thread.clone())
+    echo_thread(account, mapped.peer, mapped.reply)
+}
+
+/// The comments thread of the discussion group an update belongs to: the thread that was
+/// opened names the echo its post says again there, and the update carries it as its `top`.
+/// `None` for the group's own messages.
+pub(super) fn echo_thread(account: &Account, group: Who, top: Option<i32>) -> Option<String> {
+    let echo = top?;
+    account.live().discussion.iter().find(|(_, held, at)| *held == group && *at == echo).map(|(thread, _, _)| thread.clone())
 }
 
 /// The footer's "last reply": the newest comment's time, written onto the post it hangs off
@@ -1205,11 +1246,10 @@ pub(super) fn backfill(account: &Account, conversation: &str) {
 
 /// A channel's sponsored message, which the terms require a client that shows channels to show.
 /// Asked when the channel is opened, at most once in five minutes as Telegram asks; told to
-/// Telegram as viewed once it is on screen (`ads_on_screen`), once for each.
+/// Telegram as viewed once it is on screen (`ads_on_screen`), once for each, and told of a
+/// follow when its link is followed (`followed`).
 // CONTRACT: there is no kind for an advertisement, so it is a message at the foot of the
-// channel with a card that says "Sponsored". And nothing tells chatd that the user followed its
-// link (the shell opens the address itself), so `messages.clickSponsoredMessage` is never sent:
-// the terms want it sent on a click. A `Request` naming a clicked message would carry it.
+// channel with a card marked `sponsored` that says "Sponsored".
 fn sponsored(account: &Account, channel: Who, conversation: &str, newest: Option<Message>) {
     let Ok(peer) = account.input(channel) else {
         return;
@@ -1257,6 +1297,7 @@ fn sponsored(account: &Account, channel: Who, conversation: &str, newest: Option
     message.card = Some(Box::new(Card {
         title: if ad.recommended { "Recommended".to_owned() } else { "Sponsored".to_owned() },
         footer: ad.sponsor_info.clone().or_else(|| ad.additional_info.clone()).unwrap_or_default(),
+        sponsored: true,
         ..Card::default()
     }));
     if account.ctx.history(conversation, std::slice::from_ref(&message)).is_ok() {
@@ -1302,6 +1343,32 @@ fn ads_on_screen(account: &Account, watching: &Watching) {
     for random_id in due {
         let _ = account.ask(&tl::functions::messages::ViewSponsoredMessage { random_id });
     }
+}
+
+/// The user followed a link out of a message (the shell is opening it). Only a broadcast
+/// channel's ad names a `random_id` (`random_of`): a post's id or anything else decodes to
+/// nothing, and Telegram hears nothing, though the link opens all the same.
+pub(super) fn followed(account: &Account, conversation: &str, message_id: &str) {
+    let Some((who, _)) = Who::parse(conversation) else {
+        return;
+    };
+    if !account.dir().get(who).is_some_and(|known| known.broadcast) {
+        return;
+    }
+    let Some(random_id) = random_of(message_id) else {
+        return;
+    };
+    let _ = account.ask(&tl::functions::messages::ClickSponsoredMessage { media: false, fullscreen: false, random_id });
+}
+
+/// The ad id the store knows the ad by is its `random_id` in hex behind "ad" (`sponsored`);
+/// the bytes come back.
+fn random_of(message_id: &str) -> Option<Vec<u8>> {
+    let hex = message_id.strip_prefix("ad")?;
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return None;
+    }
+    (0..hex.len()).step_by(2).map(|at| u8::from_str_radix(&hex[at..at + 2], 16).ok()).collect()
 }
 
 /// A list of Telegram's messages as the contract's, for the conversation they are in, and the
@@ -1354,5 +1421,14 @@ mod tests {
         assert_eq!(contacts_hash(2, &[30, 10]), contacts_hash(2, &[10, 30]));
         assert_ne!(contacts_hash(2, &[10, 30]), contacts_hash(3, &[10, 30]));
         assert_ne!(contacts_hash(1, &[10]), 0);
+    }
+
+    #[test]
+    fn an_ad_id_decodes_to_its_random_id_and_any_other_id_decodes_to_nothing() {
+        assert_eq!(random_of("adad01"), Some(vec![0xad, 0x01]));
+        assert_eq!(random_of("adc0ffee"), Some(vec![0xc0, 0xff, 0xee]));
+        assert_eq!(random_of("5"), None);
+        assert_eq!(random_of("adlemon"), None);
+        assert_eq!(random_of("ad"), None);
     }
 }

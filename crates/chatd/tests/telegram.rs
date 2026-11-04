@@ -298,6 +298,8 @@ fn the_chats_are_one_list_with_no_space_each_filed_in_every_folder_it_matches() 
     // What Telegram lets this account send, as its session says.
     assert!(accounts[0].can.spoiler && accounts[0].can.silent && accounts[0].can.schedule && accounts[0].can.gifs);
     assert_eq!((accounts[0].can.max_files, accounts[0].can.caption_limit), (10, 1_024));
+    // Enter asks Telegram itself for the open conversation's words.
+    assert!(accounts[0].can.search, "Telegram searches one conversation on the network");
     // No invented Space: the chats are the Telegram home.
     let Response::Spaces { spaces } = world.ask(Request::Spaces { network: Some(Network::Telegram) }) else {
         panic!("no spaces");
@@ -320,6 +322,8 @@ fn the_chats_are_one_list_with_no_space_each_filed_in_every_folder_it_matches() 
     assert_eq!((service.special, service.mark, service.read_only, service.call), (Special::Service, Some(Mark::Verified), true, protocol::CallSupport::None));
     // Marks from Telegram's flags; a bot is a bot.
     assert_eq!((row("u7005").mark, row("c9001").mark), (Some(Mark::Scam), Some(Mark::Verified)));
+    // The impostor Telegram flags: the same red word the row and the header draw.
+    assert_eq!(row("u7006").mark, Some(Mark::Fake));
     assert!(row("u7004").bot && row("u7004").call == protocol::CallSupport::None);
     // The channel is muted on Telegram and only its owners post in it.
     assert!(row("c9001").muted && row("c9001").read_only && !row("g8001").muted);
@@ -377,6 +381,128 @@ fn the_chats_are_one_list_with_no_space_each_filed_in_every_folder_it_matches() 
 }
 
 #[test]
+fn a_chip_counts_the_unread_unmuted_chats_of_its_folder_and_one_in_two_folders_counts_in_both() {
+    let world = World::signed_in();
+    world.connected();
+    let Response::Folders { folders } = world.ask(Request::Folders { network: Network::Telegram }) else {
+        panic!("no folders");
+    };
+    let count = |id: &str| folders.iter().find(|folder| folder.key.id == id).map(|folder| (folder.unread, folder.mentions));
+    // Work holds the forum (one unread) and the group (read); Family holds Odalys (one unread)
+    // and the group. A read chat counts on no chip.
+    assert_eq!(count("2"), Some((1, 0)), "{folders:?}");
+    assert_eq!(count("3"), Some((1, 0)), "{folders:?}");
+    // A message that names me in the group, which sits in both folders, counts on both chips.
+    world.steer("mention group");
+    let folders = world.until("the mention on both chips", || {
+        let Response::Folders { folders } = world.ask(Request::Folders { network: Network::Telegram }) else {
+            panic!("no folders");
+        };
+        let count = |id: &str| folders.iter().find(|folder| folder.key.id == id).map(|folder| (folder.unread, folder.mentions));
+        (count("2") == Some((2, 1)) && count("3") == Some((2, 1))).then_some(folders)
+    });
+    assert_eq!(folders.iter().map(|folder| folder.key.id.as_str()).collect::<Vec<_>>(), ["2", "3"], "{folders:?}");
+}
+
+#[test]
+fn an_archived_chat_stays_out_of_the_home_and_inbox_until_it_mentions_me() {
+    let world = World::signed_in();
+    world.connected();
+    let home_ids = || -> Vec<String> { world.home(None, Shelf::Main).into_iter().map(|row| row.key.id).collect() };
+    let inbox_ids = || -> Vec<String> {
+        match world.ask(Request::Inbox { network: Some(Network::Telegram), filter: Default::default(), offset: 0, limit: 50 }) {
+            Response::Conversations { conversations, .. } => conversations.into_iter().map(|row| row.key.id).collect(),
+            other => panic!("{other:?}"),
+        }
+    };
+    // Tobin is archived: not in the home list, not in the Inbox, not on the rail's count.
+    assert!(!home_ids().contains(&"u7003".to_owned()));
+    assert!(!inbox_ids().contains(&"u7003".to_owned()), "{:?}", inbox_ids());
+    assert_eq!(world.status().0[0].attention, 1, "{:#?}", world.status().0);
+    // His message names me: the archived chat reaches the Inbox and raises the count,
+    // and the home list still keeps the archive out.
+    world.steer("mention");
+    world.until("the mention on the archived row", || world.conversation("u7003").filter(|row| row.mentions > 0).map(drop));
+    assert!(inbox_ids().contains(&"u7003".to_owned()), "{:?}", inbox_ids());
+    assert!(!home_ids().contains(&"u7003".to_owned()), "{:?}", home_ids());
+    assert_eq!(world.status().0[0].attention, 2, "{:#?}", world.status().0);
+}
+
+#[test]
+fn a_folder_that_excludes_read_chats_keeps_the_open_one_until_it_is_left() {
+    let world = World::signed_in();
+    world.connected();
+    let ids = |rows: Vec<Conversation>| rows.into_iter().map(|row| row.key.id).collect::<Vec<_>>();
+    // The Work folder now takes its chats by kind and leaves read ones out: the read group
+    // goes, the unread forum stays.
+    world.steer("exclude-read");
+    world.until("the read group out of Work", || {
+        (ids(world.home(Some("2"), Shelf::Main)) == ["c9002".to_owned()]).then_some(())
+    });
+    // The forum is open while it is read: it keeps its place in Work.
+    world.watch(Watching { conversation: Some(key("c9002")), ..Watching::default() });
+    world.steer("read-forum");
+    world.until("the forum read", || world.conversation("c9002").filter(|row| row.unread == 0).map(drop));
+    assert_eq!(ids(world.home(Some("2"), Shelf::Main)), ["c9002".to_owned()], "the open chat stays put while it is read");
+    // Leaving it files it again by the live facts: a read chat is out of Work.
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.until("the forum out of Work once left", || {
+        ids(world.home(Some("2"), Shelf::Main)).is_empty().then_some(())
+    });
+}
+
+#[test]
+fn a_muted_channel_draws_quiet_and_never_raises_the_rail() {
+    let world = World::signed_in();
+    world.connected();
+    // The channel is muted on Telegram, and one of its unread posts names me. The row
+    // carries what the list needs to draw it dimmed with a quiet count and the quiet
+    // mention pill (polish/03 §6); the rail hears nothing of any of it.
+    world.steer("mention channel");
+    world.home(None, Shelf::Main);
+    let row = world.until("the channel's mention to land", || world.conversation("c9001").filter(|row| row.mentions == 1));
+    assert_eq!((row.unread, row.muted, row.read_only), (1, true, true), "{row:?}");
+    let (accounts, _) = world.status();
+    let mira = accounts.iter().find(|account| account.key.network == Network::Telegram).unwrap();
+    assert_eq!(mira.attention, 1, "only Odalys's unread needs me: the muted channel never raises the rail");
+}
+
+#[test]
+fn a_forum_opens_on_the_newest_unread_topic_else_general() {
+    let world = World::signed_in();
+    world.connected();
+    // Opening the forum reads its topics and lands on the newest unread: Jigs here, active
+    // after the unread Tools, General read all along (polish/03 §2, story T8).
+    let landing = || Request::Topics { forum: key("c9002"), offset: 0, limit: 1, landing: true };
+    let Response::Conversations { conversations, .. } = world.ask(landing()) else {
+        panic!("no landing");
+    };
+    assert_eq!(conversations.len(), 1, "{conversations:?}");
+    assert_eq!((conversations[0].key.id.as_str(), conversations[0].title.as_str(), conversations[0].parent.as_deref()), ("c9002_55", "Jigs", Some("c9002")));
+    // What the topics drill lists: the network's pins first (none is pinned), then the
+    // activity, a count on every row.
+    let drill = Request::Topics { forum: key("c9002"), offset: 0, limit: 10, landing: false };
+    let Response::Conversations { conversations: topics, total, .. } = world.ask(drill) else {
+        panic!("no topics");
+    };
+    assert_eq!((total, topics.len()), (3, 3), "{topics:?}");
+    assert_eq!(topics.iter().map(|topic| topic.key.id.as_str()).collect::<Vec<_>>(), ["c9002_55", "c9002_31", "c9002_1"]);
+    assert_eq!((topics[0].unread, topics[1].unread, topics[2].unread), (2, 1, 0));
+
+    // Read both unread topics, as opening them and reading does: the landing is General.
+    for (topic, read) in [("c9002_55", "55"), ("c9002_31", "41")] {
+        world.ask(Request::MarkRead { conversation: key(topic), message_id: read.into() });
+    }
+    world.until("both reads told to Telegram", || {
+        (world.called("ReadDiscussion c9002_55 55") > 0 && world.called("ReadDiscussion c9002_31 41") > 0).then_some(())
+    });
+    let Response::Conversations { conversations, .. } = world.ask(landing()) else {
+        panic!("no landing");
+    };
+    assert_eq!(conversations[0].key.id, "c9002_1", "with nothing unread the landing is General");
+}
+
+#[test]
 fn chats_past_the_newest_500_load_as_the_list_scrolls_with_their_pictures() {
     let world = World::crowded(650);
     world.connected();
@@ -395,6 +521,63 @@ fn chats_past_the_newest_500_load_as_the_list_scrolls_with_their_pictures() {
     world.rows_on_screen(&["u100300"]);
     sleep(Duration::from_millis(300));
     assert_eq!(world.called("GetDialogs 0"), 6);
+}
+
+#[test]
+fn rows_past_the_first_page_get_their_pictures_when_watched_one_file_each_at_most_four_in_flight() {
+    let world = World::crowded(650);
+    world.connected();
+    let known = |at: u32| world.conversation(&format!("u{}", 100_000 + at)).is_some();
+    world.until("the newest 500", || known(491).then_some(()));
+    assert_eq!(world.called("GetDialogs 0"), 5, "{:#?}", world.calls());
+    // The shell scrolls to the rows past the first page and says so: their pictures are
+    // asked for, each one file, and no chats are read again for any of them.
+    let rows: Vec<String> = (150..200).map(|at| format!("u{}", 100_000 + at)).collect();
+    let named: Vec<&str> = rows.iter().map(String::as_str).collect();
+    world.rows_on_screen(&named);
+    let last = "GetFile avatar 5100199";
+    world.within(Duration::from_secs(45), "the last row's picture to be asked for", || {
+        (world.called(last) > 0).then_some(())
+    });
+    for at in 150..200 {
+        let asked = format!("GetFile avatar {} at 0", 5_100_000 + at);
+        assert_eq!(world.called(&asked), 1, "row {at}: {:#?}", world.calls());
+    }
+    assert_eq!(world.called("GetDialogs 0"), 5, "an avatar ask is one file, not a dialogs re-read");
+    // However the fetching runs, at most four of them are in flight at once.
+    world.steer("file-count");
+    let at_once = world
+        .calls()
+        .iter()
+        .find_map(|call| call.strip_prefix("file at once ")?.parse::<usize>().ok())
+        .unwrap_or(0);
+    assert!(at_once <= 4, "{at_once} file asks were in flight at once: {:#?}", world.calls());
+}
+
+#[test]
+fn a_row_scrolled_away_before_its_picture_waits_unfetched_and_is_fetched_once_it_is_back() {
+    let world = World::crowded(60);
+    world.connected();
+    // Two rows on screen: both their pictures go in line, and the first is fetched.
+    world.rows_on_screen(&["u100000", "u100001"]);
+    world.until("the first row's picture", || (world.called("GetFile avatar 5100000") > 0).then_some(()));
+    // Scrolled away before its picture's turn came: the third row takes its place, and the
+    // second row's picture waits, unfetched, however long the fetching goes on.
+    world.rows_on_screen(&["u100002"]);
+    world.until("the third row's picture", || (world.called("GetFile avatar 5100002") > 0).then_some(()));
+    sleep(Duration::from_millis(400));
+    assert_eq!(world.called("GetFile avatar 5100001"), 0, "{:#?}", world.calls());
+    // Back on screen: it goes back in line and is fetched now, once.
+    world.rows_on_screen(&["u100001"]);
+    world.until("the second row's picture once its row came back", || {
+        (world.called("GetFile avatar 5100001") > 0).then_some(())
+    });
+    assert_eq!(world.called("GetFile avatar 5100001"), 1, "each picture once");
+    // Returning a parked picture must leave room for a picture never queued before.
+    world.rows_on_screen(&["u100003"]);
+    world.until("a new row's picture after the parked one returned", || {
+        (world.called("GetFile avatar 5100003") > 0).then_some(())
+    });
 }
 
 #[test]
@@ -599,6 +782,94 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
 }
 
 #[test]
+fn a_message_whose_own_time_has_passed_is_nowhere_and_one_still_alive_leaves_the_store_offline_too() {
+    let world = World::signed_in();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+
+    // One message long past its own time, one with a moment still to live.
+    world.steer("ttl");
+    let alive = world.arrived("u7002", "18");
+    assert_eq!(alive.expires_at, Some(alive.sent + 10), "the timer Telegram named is kept with the message");
+    // The spent one is in no read, though it was in the same conversation.
+    assert!(world.message("u7002", "17").is_none());
+    assert!(world.messages("u7002").into_iter().all(|message| message.id != "17"));
+    // And the live one stands.
+    assert!(world.message("u7002", "18").is_some());
+
+    // At the live one's moment the store drops what ran out, online or not, and says so to
+    // the shell.
+    let asked = world.called("GetHistory u7002");
+    let mut since = world.status().1;
+    let (mut messages_changed, mut preview_changed) = (false, false);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !messages_changed || !preview_changed {
+        assert!(Instant::now() < deadline, "expiry did not announce messages and sidebar preview: {messages_changed}, {preview_changed}");
+        let Response::Changes { seq, changes, .. } = world.ask(Request::Wait { since }) else {
+            panic!("no changes");
+        };
+        since = seq;
+        // Consume the initial arrival's changes before looking for expiry's changes.
+        if world.message("u7002", "18").is_some() {
+            continue;
+        }
+        messages_changed |= changes.iter().any(|change| matches!(change,
+            Change::Messages { conversation } if conversation.id == "u7002"));
+        preview_changed |= changes.iter().any(|change| matches!(change,
+            Change::Conversation { conversation } if conversation.id == "u7002"));
+    }
+    assert!(world.message("u7002", "18").is_none());
+    assert_ne!(world.conversation("u7002").unwrap().preview, alive.text);
+    assert!(world.messages("u7002").into_iter().all(|message| message.id != "17"));
+    assert_eq!(world.called("GetHistory u7002"), asked, "nothing was asked of Telegram about it");
+
+    // Telegram says both are gone after their time. The store let them go already, so its word
+    // changes nothing here: no change at all.
+    world.steer("ttl-gone");
+    let quiet = world.status().1;
+    sleep(Duration::from_secs(2));
+    assert_eq!(world.status().1, quiet, "{:#?}", world.calls());
+}
+
+#[test]
+fn an_unopened_topics_expiring_forum_preview_leaves_the_sidebar_at_its_own_time() {
+    expiring_forum_preview(false);
+}
+
+#[test]
+fn an_opened_topics_expiring_forum_preview_leaves_the_sidebar_with_its_message() {
+    expiring_forum_preview(true);
+}
+
+fn expiring_forum_preview(open_topic: bool) {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_FORUM_TTL", "1")]);
+    world.connected();
+    world.until("the forum's temporary preview", || world.conversation("c9002")
+        .filter(|row| row.preview == "Who has the torque wrench?"));
+    if open_topic {
+        world.watch(Watching { conversation: Some(key("c9002")), ..Watching::default() });
+        world.messages("c9002");
+        world.until("the topic row", || world.conversation("c9002_31"));
+        world.watch(Watching { conversation: Some(key("c9002_31")), ..Watching::default() });
+        world.arrived("c9002_31", "41");
+    } else {
+        assert_eq!(world.called("GetForumTopics"), 0, "the topic has never been opened");
+        assert_eq!(world.called("GetReplies c9002_31"), 0);
+    }
+    let since = world.status().1;
+    world.changed(since, "the expired forum preview to leave the sidebar", |change| match change {
+        Change::Conversation { conversation } if conversation.id == "c9002"
+            && world.conversation("c9002").is_some_and(|row| row.preview.is_empty()) => Some(()),
+        _ => None,
+    });
+    let row = world.conversation("c9002").unwrap();
+    assert_eq!((row.preview.as_str(), row.preview_from.as_str(), row.preview_mine, row.updated), ("", "", false, 0));
+    let store = chatd::store::Store::open(&world.dir.join("chat.sqlite")).unwrap();
+    assert!(store.message(&key("c9002"), "41").unwrap().is_none(), "no duplicate parent message");
+    assert!(store.message(&key("c9002_31"), "41").unwrap().is_none());
+}
+
+#[test]
 fn a_forum_topic_is_a_thread_under_the_forum() {
     let world = World::signed_in();
     world.connected();
@@ -687,15 +958,17 @@ fn a_custom_emoji_reactions_document_is_asked_and_its_file_lands_for_the_chip() 
 fn a_premium_emoji_in_message_text_is_asked_and_its_file_lands_for_the_row() {
     let world = World::signed_in();
     world.connected();
-    // It arrives in a chat nobody is looking at: stored, but its document is not asked for
-    // until the page is read, as a reaction's is not.
-    world.steer("emoji-text");
-    world.until("the message to be stored", || world.message("u7002", "22"));
-    assert_eq!(world.called("GetCustomEmojiDocuments"), 0, "{:#?}", world.calls());
-
-    // The page read names the emoji document in its spans (`e<document id>`), one batch asks
-    // for it, and the file lands whole under that name. The text keeps the alt glyph.
+    // The boot reads each dialog's first page at its own pace, and a page read asks the
+    // documents its spans name — a global count taken before this test opens the chat races
+    // that paced read. The chat is opened first, and the count is taken settled.
     world.ask(Request::Watch(Watching { conversation: Some(key("u7002")), ..Watching::default() }));
+    world.until("the page's own message", || world.message("u7002", "12"));
+    let before = world.called("GetCustomEmojiDocuments");
+    // A premium emoji arrives in the open chat: one batch asks the document its span names
+    // (`e<document id>`), the file lands whole under that name, and the text keeps the alt
+    // glyph until it is there.
+    world.steer("emoji-text");
+    world.until("the emoji document asked for", || (world.called("GetCustomEmojiDocuments") > before).then_some(()));
     let read = world.until("the page with a premium emoji", || world.message("u7002", "22"));
     let named = |message: &Message| {
         let span = message.spans.iter().find(|span| matches!(span.style, Style::Emoji { .. })).expect("the run names an emoji");
@@ -883,6 +1156,84 @@ fn a_sent_comment_lands_in_the_thread_and_the_posts_count_rises_under_its_own_id
     let section = post.thread.as_ref().unwrap();
     assert_eq!(section.id.as_str(), "c9001_5");
     assert_eq!(world.conversation("c9001_5").unwrap().root.as_deref(), Some("5"));
+}
+
+#[test]
+fn a_comments_reactions_document_is_asked_and_its_file_lands_for_the_chip_like_a_normal_messages_does() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments");
+    world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+    // A comment carries a reaction that is a custom emoji, before the thread is opened.
+    world.steer("comment-react");
+    let before = world.called("GetCustomEmojiDocuments");
+
+    // Opening the thread reads the comments as one page: the reaction's document is asked
+    // for the way a normal message's reaction does, and the stored comment names the media
+    // the chip draws (`e<document id>`), the plain one keeping its glyph.
+    world.messages("c9001_5");
+    let reacted = world.until("the comment's reactions", || {
+        world.message("c9001_5", "51").filter(|comment| !comment.reactions.is_empty())
+    });
+    let seen: Vec<(&str, &str)> = reacted.reactions.iter().map(|reaction| (reaction.emoji.as_str(), reaction.file.as_ref().map_or("", |file| file.id.as_str()))).collect();
+    assert_eq!(seen, vec![("👍", ""), (":emoji:", "e5002")]);
+    assert!(world.called("GetCustomEmojiDocuments 5002") > before, "{:#?}", world.calls());
+
+    // The file lands whole under the name the reaction carries, as any reaction's does.
+    let landed = world.until("the comment's reaction picture on disk", || {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["e5002".into()], size: None, retry: false }) {
+            Response::Media { mut files } => files.pop().and_then(|file| file.path),
+            other => panic!("{other:?}"),
+        }
+    });
+    let kept = std::fs::read(&landed).expect("the comment's reaction picture is on disk");
+    assert!(kept.starts_with(b"{"), "what a chip draws is the file inside: {:02x?}", &kept[..kept.len().min(8)]);
+}
+
+#[test]
+fn a_reaction_told_for_a_comment_lands_on_the_thread_while_it_is_open() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments");
+    world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+    world.messages("c9001_5");
+    // The thread is open and on screen: the open learned where its comments go, as the
+    // window's own open does before a reaction could arrive there.
+    world.until("the discussion to be asked", || (world.called("GetDiscussionMessage c9001_5") == 1).then_some(()));
+    world.watch(Watching { conversation: Some(key("c9001_5")), ..Watching::default() });
+
+    // Telegram says the reaction on the discussion group's stream, naming the echo the
+    // comment answers: it lands on the stored comment in the thread, and its document is
+    // asked for the chip, as a normal message's reaction is.
+    world.steer("comment-react-live");
+    let reacted = world.until("the reaction on the comment", || {
+        world.message("c9001_5", "51").filter(|comment| !comment.reactions.is_empty())
+    });
+    let seen: Vec<(&str, u32)> = reacted.reactions.iter().map(|reaction| (reaction.emoji.as_str(), reaction.count)).collect();
+    assert_eq!(seen, vec![("👍", 2), (":emoji:", 1)]);
+    assert!(world.called("GetCustomEmojiDocuments 5002") > 0, "{:#?}", world.calls());
+}
+
+#[test]
+fn a_draft_in_the_comments_thread_is_kept_on_the_thread_not_the_channel() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments");
+    world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+    world.messages("c9001_5");
+    world.until("the discussion to be asked", || (world.called("GetDiscussionMessage c9001_5") == 1).then_some(()));
+
+    // A draft typed on the thread is kept where Telegram's own apps keep one: in the
+    // discussion group, under the echo of the post — not against the channel post itself.
+    world.ask(Request::SetDraft { conversation: key("c9001_5"), text: "Bringing the rope.".into() });
+    world.until("the thread's draft to be told", || (world.called("SaveDraft c9003_60 Bringing the rope.") == 1).then_some(()));
+    assert!(!world.calls().iter().any(|call| call.starts_with("SaveDraft c9001 ")), "{:#?}", world.calls());
+
+    // And a draft the phone typed in the thread comes back on the thread's row.
+    world.steer("thread-draft");
+    world.until("the draft typed in the thread", || {
+        world.conversation("c9001_5").filter(|row| row.draft == "Ropes at the hut, then.").map(|_| ())
+    });
 }
 
 #[test]
@@ -1215,6 +1566,26 @@ fn a_channel_shows_its_sponsored_message_and_tells_telegram_once_it_is_on_screen
 }
 
 #[test]
+fn following_a_sponsored_message_tells_telegram_of_the_click_but_a_post_does_not() {
+    let world = World::signed_in();
+    world.connected();
+    let ad = world.until("the sponsored message", || world.messages("c9001").into_iter().find(|message| message.id == "adad01"));
+    assert_eq!(ad.card.as_ref().map(|card| (card.title.as_str(), card.sponsored)), Some(("Sponsored", true)));
+    // The link is followed: Telegram hears of the click.
+    assert_eq!(world.ask(Request::FollowLink { conversation: key("c9001"), message_id: "adad01".into() }), Response::Ok);
+    world.until("Telegram to be told of the click", || (world.called("ClickSponsoredMessage") == 1).then_some(()));
+    // A post's id names no ad: the follow opens but Telegram does not hear of it.
+    assert_eq!(world.ask(Request::FollowLink { conversation: key("c9001"), message_id: "5".into() }), Response::Ok);
+    // Nor one outside a broadcast channel, ad-shaped as it is.
+    assert_eq!(world.ask(Request::FollowLink { conversation: key("u7002"), message_id: "adad01".into() }), Response::Ok);
+    sleep(Duration::from_millis(300));
+    assert_eq!(world.called("ClickSponsoredMessage"), 1);
+    // Every follow is told as its own click.
+    assert_eq!(world.ask(Request::FollowLink { conversation: key("c9001"), message_id: "adad01".into() }), Response::Ok);
+    world.until("the second click told", || (world.called("ClickSponsoredMessage") == 2).then_some(()));
+}
+
+#[test]
 fn the_panes_ask_telegram_once_each_and_counts_are_telegrams_own() {
     let world = World::signed_in();
     world.connected();
@@ -1234,6 +1605,11 @@ fn the_panes_ask_telegram_once_each_and_counts_are_telegrams_own() {
         panic!("no profile");
     };
     assert_eq!(profile.warning, Some(protocol::Warning::Scam));
+    // An impostor's card warns in Telegram's other word.
+    let Response::Profile { profile } = world.ask(Request::Profile { person: key("u7006"), space: None }) else {
+        panic!("no profile");
+    };
+    assert_eq!(profile.warning, Some(protocol::Warning::Fake));
 
     // A channel's info: its own about text and Telegram's counts.
     let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: key("c9001") }) else {
@@ -1388,6 +1764,38 @@ fn a_recorded_voice_message_is_sent_as_a_telegram_voice_note() {
     // The file's own name is not sent, and not shown either.
     assert!(!attachment.name.contains("opus"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_dialog_says_whether_they_read_my_last_word_and_a_groups_read_flips_live() {
+    let world = World::signed_in();
+    world.connected();
+    // Tobin read my newest: his dialog's read-outbox covers it, so the row says ✓✓ at the
+    // boot read, with no send and no open of the chat.
+    let tobin = world.conversation("u7003").unwrap();
+    assert_eq!((tobin.preview_mine, tobin.seen), (true, true), "{tobin:?}");
+    // The bot has my newest unread: its dialog's read-outbox stops below it, so ✓ only.
+    let bot = world.conversation("u7004").unwrap();
+    assert_eq!((bot.preview_mine, bot.seen), (true, false), "{bot:?}");
+    // A group whose newest word is not mine says nothing: ✓✓ rides my own last word.
+    let group = world.conversation("g8001").unwrap();
+    assert_eq!((group.preview_mine, group.seen), (false, false), "{group:?}");
+
+    // My word into the group, then the group reads it while I watch: ✓✓ arrives within
+    // seconds, from the update and not from a reading of the dialogs again.
+    let dialogs_before = world.called("GetDialogs");
+    world.send("g8001", "9001", "Rope is on the truck.", None);
+    let said = world.until("the group's echo", || {
+        world.messages("g8001").into_iter().find(|said| {
+            said.text == "Rope is on the truck." && said.state != SendState::Pending
+        })
+    });
+    assert!(!world.conversation("g8001").unwrap().seen);
+    world.steer(&format!("outbox g8001 {}", said.id));
+    world.until("the group's read", || {
+        world.conversation("g8001").filter(|row| row.seen && row.preview_mine)
+    });
+    assert_eq!(world.called("GetDialogs"), dialogs_before, "the flip came from the update, not a dialogs read");
 }
 
 #[test]

@@ -419,7 +419,7 @@ impl Demo {
                     line.sent = line.sent.max(sent);
                     line
                 }
-                Ok(None) => PreviewLine { id: String::new(), text: "No messages yet".to_owned(), sender: String::new(), mine: false, sent },
+                Ok(None) => PreviewLine { id: String::new(), text: "No messages yet".to_owned(), sender: String::new(), mine: false, sent, expires_at: None },
                 Err(err) => {
                     tracing::warn!("chatd: demo: preview: {err}");
                     continue;
@@ -709,6 +709,11 @@ impl Demo {
                 demo.ctx.pause(millis("TINYCLIENT_DEMO_SIGN_OUT_MS", 150));
                 let _ = reply.send(Ok(()));
             }
+            // The demo's topics are what its store holds: nothing to fetch, and the landing
+            // reads it from there.
+            Command::OpenForum { reply, .. } => {
+                let _ = reply.send(Ok(()));
+            }
             // Nothing is behind these: what is stored is all there is.
             Command::Backfill(_)
             | Command::Warm(_)
@@ -721,6 +726,7 @@ impl Demo {
             | Command::MarkRead { .. }
             | Command::AckBulk { .. }
             | Command::Typing(_)
+            | Command::FollowLink { .. }
             | Command::Draft { .. }
             | Command::Watch(_)
             | Command::Wanted(_)

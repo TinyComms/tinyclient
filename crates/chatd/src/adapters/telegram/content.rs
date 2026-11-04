@@ -20,6 +20,10 @@ pub struct Want {
     pub inline: Option<Vec<u8>>,
     /// The conversation whose row shows it, for a chat's picture: the row is read again.
     pub row: Option<String>,
+    /// Asked for as the picture of a row the shell lists as on screen: it waits, unfetched,
+    /// while that row has scrolled away, and goes back in line when the row is on screen
+    /// again. Only what `Watch` named as rows says so; a message's own pictures never wait.
+    pub watched: bool,
     /// A picture itself, for the viewer: kept until the shell asks for it, never fetched for a
     /// row.
     pub original: bool,
@@ -180,14 +184,14 @@ fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>) -> Opti
     let (kind, width, height, bytes, inline) = pick(&photo.sizes, INLINE)?;
     let mut thumb = MediaFile::new(format!("p{}{kind}", photo.id), MediaKind::Image);
     (thumb.width, thumb.height, thumb.bytes) = (width, height, bytes);
-    wants.push(Want { file: thumb.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, original: false });
+    wants.push(Want { file: thumb.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, watched: false, original: false });
     // The picture itself is the largest size Telegram keeps: the viewer fills a screen with
     // it, at the screen's own pixels.
     let mut file = thumb.clone();
     if let Some((kind, width, height, bytes, inline)) = pick(&photo.sizes, u32::MAX).filter(|(largest, ..)| *largest != kind) {
         file.id = format!("p{}{kind}", photo.id);
         (file.width, file.height, file.bytes) = (width, height, bytes);
-        wants.push(Want { file: file.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, original: true });
+        wants.push(Want { file: file.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, watched: false, original: true });
     }
     let mut attachment = Attachment::new("Photo", file);
     attachment.thumb = Some(thumb);
@@ -239,6 +243,7 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
             .into(),
             inline: inline.map(<[u8]>::to_vec),
             row: None,
+            watched: false,
             original: false,
         });
         thumb
@@ -277,7 +282,7 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
             file_reference: document.file_reference.clone(),
             thumb_size: String::new(),
         };
-        wants.push(Want { file: file.clone(), dc: document.dc_id, location: location.into(), inline: None, row: None, original: true });
+        wants.push(Want { file: file.clone(), dc: document.dc_id, location: location.into(), inline: None, row: None, watched: false, original: true });
     }
     let mut attachment = Attachment::new(if name.is_empty() { label.to_owned() } else { name }, file);
     attachment.thumb = still;
@@ -488,6 +493,10 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             };
             let outgoing = raw.out || (from == Who::User(dir.me) && peer == Who::User(dir.me));
             let mut message = Message::plain(raw.id.to_string(), "", raw.message.clone(), i64::from(raw.date), outgoing);
+            // The message's own timer: Telegram stops serving it at `date + ttl_period`, and
+            // the official apps drop it from their stores whether online or not. The store
+            // does the same.
+            message.expires_at = raw.ttl_period.filter(|ttl| *ttl > 0).map(|ttl| i64::from(raw.date) + i64::from(ttl));
             message.sender = sender(dir, from);
             message.spans = spans(&raw.message, raw.entities.as_deref().unwrap_or(&[]));
             message.edited = raw.edit_date.is_some() && !raw.edit_hide;

@@ -120,6 +120,10 @@ pub struct Prefs {
     /// The conversation that was open, and its title for the strip until its row is read.
     pub open: Option<(Key, String)>,
     pub mode: Mode,
+    /// The Telegram folder chip last chosen (T2): the home opens on it again. Folder ids are
+    /// the account's own; the home shows every Telegram account's chips, so one choice stands
+    /// for the window.
+    pub telegram_folder: Option<String>,
     /// The Details switch for channels and groups, and the one for DMs (rule 2).
     pub details_channels: bool,
     pub details_directs: bool,
@@ -144,6 +148,7 @@ impl Default for Prefs {
             frame: None,
             open: None,
             mode: Mode::Inbox,
+            telegram_folder: None,
             details_channels: false,
             details_directs: false,
             text_step: 0,
@@ -221,6 +226,7 @@ pub fn parse(text: &str) -> Prefs {
                     _ => Mode::Inbox,
                 };
             }
+            "telegram_folder" => prefs.telegram_folder = fields.next().filter(|id| !id.is_empty()).map(str::to_owned),
             "details" => {
                 let on = |word: Option<&str>| word == Some("on");
                 prefs.details_channels = on(fields.next());
@@ -275,6 +281,9 @@ pub fn write(prefs: &Prefs) -> String {
         Mode::People => text.push_str("mode\tpeople\n"),
         Mode::Network(network) => text.push_str(&format!("mode\tnetwork\t{}\n", network_word(*network))),
         Mode::Space(space) => text.push_str(&format!("mode\tspace\t{}\n", key(space))),
+    }
+    if let Some(folder) = &prefs.telegram_folder {
+        text.push_str(&format!("telegram_folder\t{}\n", clean(folder)));
     }
     let word = |on: bool| if on { "on" } else { "off" };
     text.push_str(&format!("details\t{}\t{}\n", word(prefs.details_channels), word(prefs.details_directs)));
@@ -351,6 +360,7 @@ mod tests {
             frame: Some((120., 80., 1300., 800.)),
             open: Some((key(Network::Discord, "c1"), "#general\twith a tab".into())),
             mode: Mode::Space(key(Network::Discord, "9")),
+            telegram_folder: Some("2".into()),
             details_channels: true,
             details_directs: false,
             text_step: 2,
@@ -363,6 +373,8 @@ mod tests {
         let read = parse(&write(&saved));
         let me = Me { name: "Justin S".into(), picture: "me-17.png".into() };
         assert_eq!(read, Prefs { open: Some((key(Network::Discord, "c1"), "#general with a tab".into())), me, ..saved.clone() });
+        assert_eq!(read.telegram_folder.as_deref(), Some("2"), "the folder chip last chosen is remembered");
+        assert_eq!(parse(&write(&Prefs { telegram_folder: None, ..Prefs::default() })).telegram_folder, None, "nothing is written for All");
         for mode in [Mode::Inbox, Mode::People, Mode::Network(Network::Telegram)] {
             assert_eq!(parse(&write(&Prefs { mode: mode.clone(), ..Prefs::default() })).mode, mode);
         }

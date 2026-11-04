@@ -9,10 +9,12 @@ use protocol::Message;
 use std::collections::HashMap;
 use tl::enums::Update;
 
-/// The conversation a peer's update is about; in a forum, the thread of the topic it names.
+/// The conversation a peer's update is about; in a forum, the thread of the topic it names,
+/// and in a discussion group the comments thread when the update names the echo it answers.
 fn place(account: &Account, who: Who, topic: Option<i32>) -> String {
     match who {
         Who::Channel(_) if account.dir().get(who).is_some_and(|known| known.forum) => thread_id(who, topic.unwrap_or(1)),
+        Who::Channel(_) => sync::echo_thread(account, who, topic).unwrap_or_else(|| who.text()),
         who => who.text(),
     }
 }
@@ -207,7 +209,9 @@ pub(super) fn apply(account: &Account, update: &Update) {
                 // Telegram's naming of General.
                 thread_id(who, drafted.top_msg_id.unwrap_or(1))
             } else {
-                who.text()
+                // A comments thread's draft rides the discussion group, kept under the
+                // echo of its post: the thread's own id is where this row's draft belongs.
+                sync::echo_thread(account, who, drafted.top_msg_id).unwrap_or_else(|| who.text())
             };
             let text = match &drafted.draft {
                 tl::enums::DraftMessage::Message(draft) => draft.message.as_str(),
@@ -259,6 +263,9 @@ pub(super) fn sent(account: &Account, conversation: &str, who: Who, text: &str, 
     // The short answer names only the id and the time: the rest is what we sent.
     if let tl::enums::Updates::UpdateShortSentMessage(short) = answer {
         let mut message = Message::plain(short.id.to_string(), "", text, i64::from(short.date), true);
+        // A send into a chat that keeps its messages only for a while comes back with the
+        // timer the chat gave it, like any other message there.
+        message.expires_at = short.ttl_period.filter(|ttl| *ttl > 0).map(|ttl| i64::from(short.date) + i64::from(ttl));
         let me = Who::User(account.me);
         message.sender = protocol::Sender { id: me.text(), name: account.dir().name(me), ..protocol::Sender::default() };
         message.spans = content::spans(text, short.entities.as_deref().unwrap_or(&[]));

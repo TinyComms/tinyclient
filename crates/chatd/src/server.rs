@@ -265,27 +265,60 @@ impl Chat {
         lock(&chat.adapters).extend(crate::demo::attach(&chat.hub));
         // Whatever was on its way when chatd last stopped did not go.
         let _ = chat.hub.store().fail_pending(i64::MAX, "tinyclient was restarted before this was sent.");
-        // Retention runs behind the socket, about a minute after the boot, then once a day,
-        // and when its setting changes. Never inside the boot: the sign-on writes months of
-        // chats into the store while this would be deleting rows of it. A thread sleeping
+        // Expiry and retention run behind the socket. A message whose own timer ran out goes at
+        // its moment, online or not — the thread sleeps until then, at most a minute, and
+        // wakes sooner when a message with a timer arrived. Retention runs about a minute after
+        // the boot, then once a day, and when its setting changes. Never inside the boot: the
+        // sign-in writes months of chats into the store while this would be deleting rows of
+        // it (a minute's expiry is one indexed delete, and fine even then). A thread sleeping
         // between the runs costs nothing.
         const AFTER_BOOT: Duration = Duration::from_secs(60);
+        const EXPIRY_EVERY: Duration = Duration::from_secs(60);
+        const RETENTION_EVERY: Duration = Duration::from_secs(86_400);
         let hub = chat.hub.clone();
         std::thread::spawn(move || {
-            let mut first = true;
+            let boot = Instant::now();
+            // Retention ran last then; its first run comes at the boot's minute.
+            let mut pruned: Option<Instant> = None;
             loop {
-                // The boot's sign-in has the store busy; the first pass waits it out, and a
-                // setting change wakes an earlier run through the same wait.
-                hub.prune_due(if first { AFTER_BOOT } else { Duration::from_secs(86_400) });
-                first = false;
-                let days = hub.settings().number(settings::KEEP_DAYS);
-                match hub.store().prune(now(), days) {
-                    Ok(0) | Err(_) => {}
+                // Sleep until the next message's own timer runs out, at most a minute — its
+                // time comes whether the account is online or not — and shorter still when a
+                // message with a timer arrived or retention is asked for. Until the boot's
+                // minute the sleep is capped there too: the sign-in has the store busy.
+                let cap = if pruned.is_none() { AFTER_BOOT } else { EXPIRY_EVERY };
+                let wait = match hub.store().until_expiry(now()) {
+                    Ok(at) => at.map_or(cap, |at| at.min(cap)),
+                    Err(_) => cap,
+                };
+                let (asked, _) = hub.prune_due(wait);
+                // Whatever ran out is gone from the store, online or not; the conversations it
+                // was in are read again.
+                match hub.store().expire(now()) {
                     Ok(gone) => {
-                        tracing::warn!("chatd: pruned {gone} old messages");
-                        // What is on screen may be gone.
-                        hub.reset();
+                        for conversation in gone {
+                            hub.changed(Change::Messages { conversation: conversation.clone() });
+                            hub.changed(Change::Conversation { conversation });
+                        }
                     }
+                    Err(err) => tracing::warn!("chatd: messages past their time: {err}"),
+                }
+                // Retention: about a minute after the boot, then once a day, or at once when
+                // asked. Its scans are worth skipping while the boot's sign-in writes months
+                // of chats; a minute's expiry is one indexed delete and waits its turn.
+                if pruned.is_some_and(|at| at.elapsed() >= RETENTION_EVERY)
+                    || asked
+                    || (pruned.is_none() && boot.elapsed() >= AFTER_BOOT)
+                {
+                    let days = hub.settings().number(settings::KEEP_DAYS);
+                    match hub.store().prune(now(), days) {
+                        Ok(0) | Err(_) => {}
+                        Ok(gone) => {
+                            tracing::warn!("chatd: pruned {gone} old messages");
+                            // What is on screen may be gone.
+                            hub.reset();
+                        }
+                    }
+                    pruned = Some(Instant::now());
                 }
             }
         });
@@ -824,6 +857,24 @@ impl Chat {
         match self.hub.store().conversation(&Key::new(&conversation.account(), id)) {
             Ok(Some(thread)) => Response::Conversation { conversation: self.row(thread) },
             Ok(None) => error(ErrorCode::Internal, "the thread started, but was not recorded"),
+            Err(err) => internal(err),
+        }
+    }
+
+    /// The topics of a forum, or, asked as the shell asks when it opens one, the topic that
+    /// open lands on. The landing's topics are asked of the network once first, and the
+    /// answer waits for them, so it is named on what Telegram says now and not on what an
+    /// earlier open left in the cache.
+    fn topics(&self, forum: Key, offset: u32, limit: u32, landing: bool) -> Response {
+        if !self.shows(&forum.account()) {
+            return Response::Conversations { conversations: Vec::new(), total: 0, counts: InboxCounts::default() };
+        }
+        if landing && offset == 0 {
+            let _ = self.ask(&forum.account(), |reply| Command::OpenForum { conversation_id: forum.id.clone(), reply });
+        }
+        let read = if landing { self.hub.store().landing(&forum) } else { self.hub.store().topics(&forum, offset, limit.min(PAGE_LIMIT)) };
+        match read {
+            Ok((conversations, total)) => Response::Conversations { conversations: self.rows(conversations), total, counts: InboxCounts::default() },
             Err(err) => internal(err),
         }
     }
@@ -1798,17 +1849,7 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
-            Request::Topics { forum, offset, limit } => {
-                if !self.shows(&forum.account()) {
-                    return Response::Conversations { conversations: Vec::new(), total: 0, counts: InboxCounts::default() };
-                }
-                match self.hub.store().topics(&forum, offset, limit.min(PAGE_LIMIT)) {
-                    Ok((conversations, total)) => {
-                        Response::Conversations { conversations: self.rows(conversations), total, counts: InboxCounts::default() }
-                    }
-                    Err(err) => internal(err),
-                }
-            }
+            Request::Topics { forum, offset, limit, landing } => self.topics(forum, offset, limit, landing),
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),
             Request::Catalog { account, kind, space, query, cursor } => self.catalog(account, kind, space, query, cursor),
@@ -2047,6 +2088,13 @@ impl Chat {
                 // P1: off, the network never hears it.
                 if self.hub.link(&account) == Link::Connected && self.hub.settings().typing(&account) {
                     self.command(&account, Command::Typing(conversation.id));
+                }
+                Response::Ok
+            }
+            Request::FollowLink { conversation, message_id } => {
+                let account = conversation.account();
+                if self.hub.link(&account) == Link::Connected {
+                    self.command(&account, Command::FollowLink { conversation_id: conversation.id, message_id });
                 }
                 Response::Ok
             }

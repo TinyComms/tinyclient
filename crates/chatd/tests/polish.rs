@@ -302,7 +302,7 @@ fn a_network_without_spaces_is_one_list_with_its_pins_folders_archive_and_forum(
     // A channel's sponsored message sits at its foot and is never its preview.
     assert!(chatd.row(&telegram("c9001")).preview.starts_with("Snow line"));
     // A forum's topics: its pin first, then by recency.
-    let (topics, _) = chatd.rows(Request::Topics { forum: telegram("c9100"), offset: 0, limit: 10 });
+    let (topics, _) = chatd.rows(Request::Topics { forum: telegram("c9100"), offset: 0, limit: 10, landing: false });
     assert_eq!(titles(&topics), ["General", "ID requests", "Events"]);
 }
 
@@ -500,6 +500,8 @@ fn the_pickers_are_answered_on_demand_by_page_and_what_an_account_may_send_is_in
     assert_eq!(can(Network::Discord).max_file_bytes, 10 << 20);
     assert!(can(Network::Telegram).as_file && can(Network::Telegram).silent);
     assert!(!can(Network::Teams).gifs && can(Network::Teams).max_file_bytes > 0);
+    // The demo serves no search of the network itself: its adapter refuses one.
+    assert!(!can(Network::Telegram).search && !can(Network::Discord).search && !can(Network::Slack).search && !can(Network::Teams).search);
 }
 
 fn with_file(path: &std::path::Path) -> Outgoing {

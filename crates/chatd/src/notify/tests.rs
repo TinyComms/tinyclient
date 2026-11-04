@@ -115,6 +115,15 @@ fn bots_and_the_archive_notify_only_for_mentions() {
 }
 
 #[test]
+fn the_networks_own_login_code_chat_notifies_like_a_direct_message() {
+    let values = Values::default();
+    let now = moment();
+    // Telegram's 777000: neither bot nor muted nor a request, so its code reaches the user.
+    let service = Conversation { special: Special::Service, ..dm() };
+    assert!(posts(&values, &service, &message("Telegram", "Login code: 24680. Do not give this code to anyone."), &now));
+}
+
+#[test]
 fn all_messages_is_global_then_per_account_then_per_conversation() {
     let mut values = Values::default();
     let now = moment();

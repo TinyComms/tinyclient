@@ -5,17 +5,18 @@
 //!
 //! scratch directory (`adapters/script.rs`): `telegram.signin.ctl` while signing in (`scan`,
 //! `scan-password`), `telegram.ctl` once signed in (`incoming`, `photo`, `react`, `edit`,
-//! `delete`, `topic`, `comments`, `typing`, `typing-stop`, `read`, `status`, `poll`, `voice`,
-//! `forward`, `flood-send N`, `revoke`, and the holds of `TINYCLIENT_TELEGRAM_HOLD` and
-//! `TINYCLIENT_TELEGRAM_PEER_HOLD` through `dialogs-go` and `peer-go`). Every request it is
-//! sent is appended to `telegram.calls`, one line each, so a test can see what the network
-//! would have heard.
+//! `delete`, `ttl`, `ttl-gone`, `topic`, `comments`, `typing`, `typing-stop`, `read`, `status`,
+//! `poll`, `voice`, `forward`, `flood-send N`, `revoke`, and the holds of
+//! `TINYCLIENT_TELEGRAM_HOLD` and `TINYCLIENT_TELEGRAM_PEER_HOLD` through `dialogs-go` and
+//! `peer-go`). Every request it is sent is appended to `telegram.calls`, one line each, so a
+//! test can see what the network would have heard.
 //!
 //! The account: Mira Kessler (7001); Odalys Brandt (7002, a contact, with a second password on
 //! her own number); Tobin Reyes (7003); a group "Trail crew" (8001); a channel "Field Notes"
 //! (9001, muted, with a sponsored message) with a linked discussion group "Field Notes chat"
 //! (9003, which the comments on its post come from, heard of at `getDiscussionMessage`); a
-//! forum "Workshop" (9002) with topics General and "Tools" (31). The phone +1 555 010 0142
+//! forum "Workshop" (9002) with topics General, "Tools" (31) and "Jigs" (55, the newest
+//! unread). The phone +1 555 010 0142
 //! signs in with the code 24680; +1 555 010 0199 also wants the password "correct horse".
 //! Username resolution serves only `gif` and `forest_wren`; `flood_wait` returns a flood wait,
 //! and every other name returns USERNAME_NOT_OCCUPIED.
@@ -45,10 +46,13 @@ const CHATTERS: i64 = 9003;
 /// test looks for (`GetDiscussionMessage` names it for the open, the send for its reply).
 const ECHO: i32 = 60;
 const TOOLS: i32 = 31;
-/// Telegram's own account, a bot, and an account Telegram flags as a scam.
+/// The forum's newest topic, active after "Tools": the one opening the forum lands on.
+const JIGS: i32 = 55;
+/// Telegram's own account, a bot, an account Telegram flags as a scam, and one it flags an impostor.
 const SERVICE: i64 = 777_000;
 const BOT: i64 = 7004;
 const SCAM: i64 = 7005;
+const FAKE: i64 = 7006;
 /// The `@gif` bot.
 const GIF_BOT: i64 = 7050;
 /// The folders: Work (the group and the forum) and Family (Odalys pinned, and the group too).
@@ -102,6 +106,7 @@ fn user(id: i64, first: &str, last: &str, username: &str) -> tl::types::User {
     // A bot's flag is shared with its info version, which must then be there.
     user.bot_info_version = user.bot.then_some(1);
     user.scam = id == SCAM;
+    user.fake = id == FAKE;
     user.phone = (id == ODALYS).then(|| "15550100777".to_owned());
     if id >= CROWD {
         user.photo = Some(tl::types::UserProfilePhoto { has_video: false, personal: false, photo_id: id + 5_000_000, stripped_thumb: None, dc_id: 2 }.into());
@@ -127,6 +132,7 @@ fn users() -> Vec<tl::enums::User> {
         user(SERVICE, "Telegram", "", "").into(),
         user(BOT, "Trail Bot", "", "trail_bot").into(),
         user(SCAM, "Prize Desk", "", "").into(),
+        user(FAKE, "Support Desk", "", "").into(),
     ];
     all.extend((0..crowd()).map(|at| user(CROWD + at, "Person", &at.to_string(), "").into()));
     all
@@ -192,13 +198,31 @@ fn in_topic(mut message: tl::types::Message, topic: i32) -> tl::types::Message {
     message
 }
 
+/// One plain and one custom reaction, the way a comment's carry them.
+fn comment_reactions() -> tl::types::MessageReactions {
+    let count = |reaction: tl::enums::Reaction, count, mine: bool| {
+        tl::enums::ReactionCount::Count(tl::types::ReactionCount { chosen_order: mine.then_some(0), reaction, count })
+    };
+    tl::types::MessageReactions {
+        min: false,
+        can_see_list: true,
+        reactions_as_tags: false,
+        results: vec![
+            count(tl::enums::Reaction::Emoji(tl::types::ReactionEmoji { emoticon: "👍".to_owned() }), 2, false),
+            count(tl::enums::Reaction::CustomEmoji(tl::types::ReactionCustomEmoji { document_id: 5002 }), 1, false),
+        ],
+        recent_reactions: None,
+        top_reactors: None,
+    }
+}
+
 fn settings(mute_until: Option<i32>) -> tl::enums::PeerNotifySettings {
     let mut settings: tl::types::PeerNotifySettings = blank(&[&put(0u32)]);
     settings.mute_until = mute_until;
     settings.into()
 }
 
-fn dialog(peer: Who, top: i32, read: i32, unread: i32, pinned: bool, folder: Option<i32>) -> tl::enums::Dialog {
+fn dialog(peer: Who, top: i32, read: i32, outbox: i32, unread: i32, pinned: bool, folder: Option<i32>) -> tl::enums::Dialog {
     tl::types::Dialog {
         pinned,
         unread_mark: false,
@@ -206,7 +230,7 @@ fn dialog(peer: Who, top: i32, read: i32, unread: i32, pinned: bool, folder: Opt
         peer: peer.peer(),
         top_message: top,
         read_inbox_max_id: read,
-        read_outbox_max_id: top,
+        read_outbox_max_id: outbox,
         unread_count: unread,
         unread_mentions_count: 0,
         unread_reactions_count: 0,
@@ -295,6 +319,8 @@ struct World {
     revoked: bool,
     /// Tobin was added to the Family folder (`folder`).
     family_grew: bool,
+    /// The Work folder now takes its chats by kind and leaves read ones out (`exclude-read`).
+    exclude_read: bool,
     /// A read of the group that no longer counts here, as one told during a dropped link. It
     /// stays lost until that read is told again, and then it is heard.
     lost_reads: bool,
@@ -303,10 +329,19 @@ struct World {
     drafts: HashMap<(Who, Option<i32>), String>,
     /// Comments under the channel's post that the test says are unread.
     comments_unread: i32,
+    /// A post in the muted channel that names the user: the mention count rides the dialog,
+    /// so it lands with the next reading of the chats.
+    channel_mention: bool,
+    /// How far the account read each forum topic, as its last `ReadDiscussion` said.
+    topic_reads: HashMap<(Who, i32), i32>,
     calls: PathBuf,
     /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
     dialogs_go: bool,
     peer_go: bool,
+    /// The `upload.GetFile` asks being answered now, and the most at once, which the
+    /// tests of the rows' pictures read (`file-count`).
+    file_in: usize,
+    file_at_once: usize,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -330,11 +365,16 @@ impl World {
             revoked: false,
             family_grew: false,
             lost_reads: false,
+            exclude_read: false,
             drafts: HashMap::new(),
             comments_unread: 0,
+            channel_mention: false,
+            topic_reads: HashMap::new(),
             calls: protocol::support_dir().join("telegram.calls"),
             dialogs_go: false,
             peer_go: false,
+            file_in: 0,
+            file_at_once: 0,
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, T0 - 300, "Are you coming to the ridge on Saturday?"));
@@ -342,12 +382,23 @@ impl World {
         world.store(None, message(odalys, 12, ODALYS, T0 - 60, "Good. Trailhead at seven."));
         world.store(None, message(Who::Group(CREW), 20, TOBIN, T0 - 3_600, "Maps are in the shared folder."));
         world.store(None, message(Who::Channel(NOTES), 5, 0, T0 - 7_200, "Snow line is at 1,900 m this week."));
-        world.store(Some(TOOLS), in_topic(message(Who::Channel(WORKSHOP), 41, TOBIN, T0 - 500, "Who has the torque wrench?"), TOOLS));
+        let mut tools = message(Who::Channel(WORKSHOP), 41, TOBIN, T0 - 500, "Who has the torque wrench?");
+        if held_at_wire("TINYCLIENT_TELEGRAM_FORUM_TTL") {
+            tools.date = crate::hub::now() as i32;
+            tools.ttl_period = Some(10);
+        }
+        world.store(Some(TOOLS), in_topic(tools, TOOLS));
+        world.store(Some(JIGS), in_topic(message(Who::Channel(WORKSHOP), JIGS, TOBIN, T0 - 200, "First jig done: the box joints came out clean."), JIGS));
         world.store(None, message(Who::User(TOBIN), 30, TOBIN, T0 - 90_000, "Thanks for the lift."));
+        // My newest word to Tobin, which his dialog's read-outbox covers: the row's ✓✓ at boot.
+        world.store(None, message(Who::User(TOBIN), 31, ME, T0 - 80_000, "Trailhead at seven, then."));
         world.store(None, message(Who::User(ME), 2, ME, T0 - 100_000, "Packing list: stove, map, headlamp."));
         world.store(None, message(Who::User(SERVICE), 3, SERVICE, T0 - 110_000, "Login code: 24680. Do not give this code to anyone."));
         world.store(None, message(Who::User(BOT), 4, BOT, T0 - 120_000, "Trail report: all clear."));
+        // My newest word to the bot, which its dialog's read-outbox stops below: ✓ without ✓✓.
+        world.store(None, message(Who::User(BOT), 5, ME, T0 - 115_000, "Any closures this weekend?"));
         world.store(None, message(Who::User(SCAM), 6, SCAM, T0 - 130_000, "You won a prize!"));
+        world.store(None, message(Who::User(FAKE), 7, FAKE, T0 - 140_000, "Your account needs verification."));
         // A draft typed on the phone before this device signed in: it rides Odalys's dialog at
         // the next reading of it, as any draft typed elsewhere does.
         world.drafts.insert((Who::User(ODALYS), None), "Finished packing. Meet at the ridge?".to_owned());
@@ -377,14 +428,21 @@ impl World {
         match id {
             WORK => {
                 filter.title = named("Work");
-                let channel: tl::enums::InputPeer =
-                    tl::types::InputPeerChannel { channel_id: WORKSHOP, access_hash: 0 }.into();
-                if lost_pin() {
-                    // A pin whose chat lies past the pages the test's dialogs pass carries.
-                    filter.pinned_peers = vec![crew.clone()];
-                    filter.include_peers = vec![channel];
+                if self.exclude_read {
+                    // The same folder with "exclude read chats" on: it takes groups by kind,
+                    // naming none, so a read chat leaves it.
+                    filter.groups = true;
+                    filter.exclude_read = true;
                 } else {
-                    filter.include_peers = vec![channel, crew];
+                    let channel: tl::enums::InputPeer =
+                        tl::types::InputPeerChannel { channel_id: WORKSHOP, access_hash: 0 }.into();
+                    if lost_pin() {
+                        // A pin whose chat lies past the pages the test's dialogs pass carries.
+                        filter.pinned_peers = vec![crew.clone()];
+                        filter.include_peers = vec![channel];
+                    } else {
+                        filter.include_peers = vec![channel, crew];
+                    }
                 }
             }
             _ => {
@@ -621,6 +679,64 @@ fn discussion_answer(place: &str, unread: i32) -> Result<Vec<u8>, Fault> {
     answer(tl::enums::messages::DiscussionMessage::Message(found))
 }
 
+/// The forum's topics, as Telegram's own list names them: the account has read each topic
+/// up to what its last `ReadDiscussion` said, and a read past its newest post is a read
+/// whole. This runs on its own always-outlined body so the dispatcher above stays under a
+/// debug build's 256 KiB connection stack.
+#[inline(never)]
+fn topics_answer(world: &mut World, forum: Who) -> Result<Vec<u8>, Fault> {
+    // One topic, as Telegram's list carries it: the account has read the topic up to what
+    // its last ReadDiscussion said, and a read past its newest post is a read whole. The
+    // date is the topic's own; the caller reads the activity from the messages the answer
+    // carries.
+    let topic = |world: &World, id: i32, title: &str, top: i32, date: i32, unread: i32, icon: i64| {
+        let read = world.topic_reads.get(&(forum, id)).copied().unwrap_or(0);
+        let unread = if read >= top { 0 } else { unread };
+        let mut topic: tl::types::ForumTopic = blank(&[
+            &put(1u32),
+            &put(id),
+            &put(date),
+            &put(forum.peer()),
+            &put(title.to_owned()),
+            &put(3i32),
+            &put(icon),
+            &put(top),
+            &put(read),
+            &put(0i32),
+            &put(unread),
+            &put(0i32),
+            &put(0i32),
+            &put(0i32),
+            &put(Who::User(TOBIN).peer()),
+            &put(settings(None)),
+        ]);
+        topic.my = false;
+        tl::enums::ForumTopic::Topic(topic)
+    };
+    let held = |world: &World, id: i32| world.messages.get(&key(forum, Some(id))).and_then(|list| list.values().next_back().cloned());
+    let newest = held(world, TOOLS);
+    let top = match &newest {
+        Some(tl::enums::Message::Message(message)) => message.id,
+        _ => 41,
+    };
+    // The topics Telegram lists first, which here is their activity: Jigs newest.
+    let messages: Vec<tl::enums::Message> = held(world, JIGS).into_iter().chain(newest).collect();
+    let found = tl::types::messages::ForumTopics {
+        order_by_create_date: false,
+        count: 3,
+        topics: vec![
+            topic(world, JIGS, "Jigs", JIGS, T0 - 200, 2, 5000),
+            topic(world, TOOLS, "Tools", top, T0 - 40_000, 1, 5001),
+            topic(world, 1, "General", 1, T0 - 90_000, 0, 5002),
+        ],
+        messages,
+        chats: chats(),
+        users: users(),
+        pts: 1,
+    };
+    answer(tl::enums::messages::ForumTopics::Topics(found))
+}
+
 /// A comment went in the discussion group: the count of the post rises on the edit of it
 /// Telegram tells then, on the update stream and with the answer, the way the count of any
 /// post's comments keeps current (`comment_thread` keeps the id that opens the thread).
@@ -768,6 +884,11 @@ impl World {
                 self.peer_go = true;
                 Vec::new()
             }
+            // The most file asks the wire held at once, for the tests of the rows' pictures.
+            "file-count" => {
+                self.log(&format!("file at once {}", self.file_at_once));
+                Vec::new()
+            }
             // Bold on an accented word, a link on an emoji, a mention by id, code, a spoiler.
             "incoming" => {
                 let text = "Café at 🦀 dock, ask Tobin: stove.fuel() secret";
@@ -848,6 +969,26 @@ impl World {
                 };
                 vec![update(tl::types::UpdateMessageReactions { peer: odalys.peer(), msg_id: 12, top_msg_id: None, saved_peer_id: None, reactions: reactions.into() }.into())]
             }
+            // A comment gains reactions, as the thread's next page carries them: the page
+            // answer is all that changes, nothing is told on the update stream.
+            "comment-react" => {
+                let mut comment = message(Who::Channel(CHATTERS), 51, ODALYS, T0 - 40, "Yes, at the hut now.");
+                comment.reactions = Some(comment_reactions().into());
+                // The thread's page is kept under the post's id, as `getReplies` counts it.
+                self.messages.entry(key(Who::Channel(NOTES), Some(5))).or_default().insert(51, comment.into());
+                Vec::new()
+            }
+            // The same while the thread is open: Telegram says the reaction of a comment on
+            // the discussion group's stream, naming the echo the comment answers.
+            "comment-react-live" => {
+                vec![update(tl::types::UpdateMessageReactions {
+                    peer: Who::Channel(CHATTERS).peer(),
+                    msg_id: 51,
+                    top_msg_id: Some(ECHO),
+                    saved_peer_id: None,
+                    reactions: comment_reactions().into(),
+                }.into())]
+            }
             "edit" => {
                 let mut message = message(odalys, 13, ODALYS, T0 + 10, "Café at the dock, seven sharp");
                 message.edit_date = Some(T0 + 30);
@@ -859,6 +1000,27 @@ impl World {
                     held.remove(&13);
                 }
                 vec![update(tl::types::UpdateDeleteMessages { messages: vec![13], pts: 0, pts_count: 1 }.into())]
+            }
+            // One message whose own timer ran out before it arrived, and one with a moment
+            // still to live: the store never shows the first and drops the second at its
+            // moment, whether the account is online or not.
+            "ttl" => {
+                let mut gone = message(odalys, 17, ODALYS, T0 - 3_600, "Gone before it arrived");
+                gone.ttl_period = Some(60);
+                let mut alive = message(odalys, 18, ODALYS, crate::hub::now() as i32, "Vanishes in a moment");
+                alive.ttl_period = Some(10);
+                self.store(None, gone.clone());
+                self.store(None, alive.clone());
+                vec![new(gone), new(alive)]
+            }
+            // Telegram's own word that both are gone after their time, as its server says to
+            // everyone still listening.
+            "ttl-gone" => {
+                if let Some(held) = self.messages.get_mut(&odalys.text()) {
+                    held.remove(&17);
+                    held.remove(&18);
+                }
+                vec![update(tl::types::UpdateDeleteMessages { messages: vec![17, 18], pts: 0, pts_count: 2 }.into())]
             }
             "topic" => {
                 let message = in_topic(message(Who::Channel(WORKSHOP), 42, TOBIN, T0 + 40, "Found it, bottom drawer."), TOOLS);
@@ -885,6 +1047,13 @@ impl World {
                 vec![update(
                     tl::types::UpdateDraftMessage { peer: odalys.peer(), top_msg_id: None, saved_peer_id: None, draft: tl::enums::DraftMessage::Empty(blank(&[&put(0u32)])) }.into(),
                 )]
+            }
+            // A draft typed on the phone in the comments thread: Telegram keeps it in the
+            // discussion group, under the echo of the post, as its own apps save one.
+            "thread-draft" => {
+                let text = "Ropes at the hut, then.".to_owned();
+                self.drafts.insert((Who::Channel(CHATTERS), Some(ECHO)), text.clone());
+                vec![update(tl::types::UpdateDraftMessage { peer: Who::Channel(CHATTERS).peer(), top_msg_id: Some(ECHO), saved_peer_id: None, draft: draft_message(&text) }.into())]
             }
             // Odalys goes offline; Tobin's last-seen stays hidden.
             "status" => vec![
@@ -1016,10 +1185,56 @@ impl World {
                 self.family_grew = true;
                 vec![update(tl::types::UpdateDialogFilter { id: FAMILY, filter: Some(self.folder(FAMILY)) }.into())]
             }
-            // Odalys read my messages up to this one.
+            // The Work folder's rules changed: it takes groups by kind and leaves read ones out.
+            "exclude-read" => {
+                self.exclude_read = true;
+                vec![update(tl::types::UpdateDialogFilter { id: WORK, filter: Some(self.folder(WORK)) }.into())]
+            }
+            // The forum was read, here or on the phone: nothing in it is unread.
+            "read-forum" => vec![update(tl::types::UpdateReadChannelInbox {
+                folder_id: None,
+                channel_id: WORKSHOP,
+                max_id: 41,
+                still_unread_count: 0,
+                pts: 0,
+            }
+            .into())],
+            // A message that names me: in the group ("mention group"), in the archived chat
+            // (bare "mention", which then reaches the Inbox and the rail's count for it), or
+            // in the muted channel ("mention channel" — the mention count rides the dialog,
+            // and the rail hears nothing of any of it).
+            "mention" => {
+                match words.next() {
+                    Some("channel") => {
+                        // A post in the muted channel names the user. The count rides the
+                        // dialog, so Telegram marks the chats stale (a default said changed)
+                        // and the next opening of the list reads it in.
+                        self.channel_mention = true;
+                        vec![update(tl::types::UpdateNotifySettings { peer: tl::enums::NotifyPeer::NotifyBroadcasts, notify_settings: settings(None) }.into())]
+                    }
+                    Some("group") => {
+                        let mut said = message(Who::Group(CREW), 21, TOBIN, T0 + 90, "Are you seeing this?");
+                        said.mentioned = true;
+                        self.store(None, said.clone());
+                        vec![new(said)]
+                    }
+                    _ => {
+                        let mut said = message(Who::User(TOBIN), 32, TOBIN, T0 + 90, "Are you seeing this?");
+                        said.mentioned = true;
+                        self.store(None, said.clone());
+                        vec![new(said)]
+                    }
+                }
+            }
+            // Odalys (or the chat the line names) read my messages up to this one.
             "outbox" => {
-                let max_id = words.next().and_then(|id| id.parse().ok()).unwrap_or(0);
-                vec![update(tl::types::UpdateReadHistoryOutbox { peer: odalys.peer(), max_id, pts: 0, pts_count: 0 }.into())]
+                let (who, id) = match words.next() {
+                    Some(chat) if chat.parse::<i32>().is_ok() => (odalys.clone(), chat.to_owned()),
+                    Some(chat) => (Who::parse(chat).map(|(who, _)| who).unwrap_or(odalys.clone()), words.next().unwrap_or("0").to_owned()),
+                    None => (odalys.clone(), "0".to_owned()),
+                };
+                let max_id = id.parse().ok().unwrap_or(0);
+                vec![update(tl::types::UpdateReadHistoryOutbox { peer: who.peer(), max_id, pts: 0, pts_count: 0 }.into())]
             }
             "flood-send" => {
                 self.flood_send = words.next().and_then(|seconds| seconds.parse().ok());
@@ -1123,9 +1338,16 @@ impl World {
             let tl::enums::InputCheckPasswordSrp::Srp(proof) = request.password else {
                 return Err(rpc(400, "PASSWORD_HASH_INVALID", None));
             };
-            // The proof the right password gives, made the way a client makes it.
+            // The proof the right password gives, made the way a client makes it. grammers'
+            // SRP bends a debug build's 256 KiB connection stack past its end, so the
+            // computation runs on its own thread with room to spare.
             let asked = self.password();
-            let (m1, g_a) = calculate_2fa(&[7; 8], &[9; 16], &unhex(PRIME), &3, vec![5; 256], asked.secure_random, PASSWORD.as_bytes());
+            let secure_random = asked.secure_random;
+            let srp = std::thread::Builder::new().name("fake srp".into()).stack_size(4 * 1024 * 1024).spawn(move || {
+                calculate_2fa(&[7; 8], &[9; 16], &unhex(PRIME), &3, vec![5; 256], secure_random, PASSWORD.as_bytes())
+            })
+            .expect("the fake's SRP thread");
+            let (m1, g_a) = srp.join().expect("the fake's SRP thread");
             return match self.password_owed && proof.srp_id == 77 && proof.m1 == m1 && proof.a == g_a {
                 true => {
                     self.signed_in = true;
@@ -1172,25 +1394,36 @@ impl World {
             };
             self.log(&format!("GetDialogs {} {}", request.folder_id.unwrap_or(0), after.map_or_else(|| "start".to_owned(), Who::text)));
             let all: Vec<(tl::enums::Dialog, Who, String)> = match request.folder_id {
-                Some(1) => vec![(dialog(Who::User(TOBIN), 30, 30, 0, false, Some(1)), Who::User(TOBIN), Who::User(TOBIN).text())],
+                Some(1) => vec![(dialog(Who::User(TOBIN), 31, 31, 31, 0, false, Some(1)), Who::User(TOBIN), Who::User(TOBIN).text())],
                 _ => {
                     let mut all = vec![
-                        (dialog(Who::User(ODALYS), 12, 11, 1, true, None), Who::User(ODALYS), Who::User(ODALYS).text()),
+                        (dialog(Who::User(ODALYS), 12, 11, 12, 1, true, None), Who::User(ODALYS), Who::User(ODALYS).text()),
                         {
                             let (read, unread) = self.crew();
-                            (dialog(Who::Group(CREW), 20, read, unread, false, None), Who::Group(CREW), Who::Group(CREW).text())
+                            (dialog(Who::Group(CREW), 20, read, 20, unread, false, None), Who::Group(CREW), Who::Group(CREW).text())
                         },
-                        (dialog(Who::Channel(NOTES), 5, 0, 1, false, None), Who::Channel(NOTES), Who::Channel(NOTES).text()),
-                        (dialog(Who::Channel(WORKSHOP), 41, 0, 1, false, None), Who::Channel(WORKSHOP), key(Who::Channel(WORKSHOP), Some(TOOLS))),
-                        (dialog(Who::User(ME), 2, 2, 0, false, None), Who::User(ME), Who::User(ME).text()),
-                        (dialog(Who::User(SERVICE), 3, 3, 0, false, None), Who::User(SERVICE), Who::User(SERVICE).text()),
-                        (dialog(Who::User(BOT), 4, 4, 0, false, None), Who::User(BOT), Who::User(BOT).text()),
-                        (dialog(Who::User(SCAM), 6, 6, 0, false, None), Who::User(SCAM), Who::User(SCAM).text()),
+                        (dialog(Who::Channel(NOTES), 5, 0, 5, 1, false, None), Who::Channel(NOTES), Who::Channel(NOTES).text()),
+                        (dialog(Who::Channel(WORKSHOP), 41, 0, 41, 1, false, None), Who::Channel(WORKSHOP), key(Who::Channel(WORKSHOP), Some(TOOLS))),
+                        (dialog(Who::User(ME), 2, 2, 2, 0, false, None), Who::User(ME), Who::User(ME).text()),
+                        (dialog(Who::User(SERVICE), 3, 3, 3, 0, false, None), Who::User(SERVICE), Who::User(SERVICE).text()),
+                        // The bot has not read my last word to it: its read-outbox stops below.
+                        (dialog(Who::User(BOT), 5, 5, 4, 0, false, None), Who::User(BOT), Who::User(BOT).text()),
+                        (dialog(Who::User(SCAM), 6, 6, 6, 0, false, None), Who::User(SCAM), Who::User(SCAM).text()),
                     ];
+                    if self.channel_mention {
+                        for held in all.iter_mut().filter(|(_, who, _)| *who == Who::Channel(NOTES)) {
+                            if let tl::enums::Dialog::Dialog(plain) = &mut held.0 {
+                                plain.unread_mentions_count = 1;
+                            }
+                        }
+                    }
                     for at in 0..crowd() {
                         let who = Who::User(CROWD + at);
-                        all.push((dialog(who, 1, 1, 0, false, None), who, who.text()));
+                        all.push((dialog(who, 1, 1, 1, 0, false, None), who, who.text()));
                     }
+                    // The impostor's chat sits past the crowd, so the paging tests' rows land
+                    // where their arithmetic says: five pages end at crowd chat 492 exactly.
+                    all.push((dialog(Who::User(FAKE), 7, 7, 7, 0, false, None), Who::User(FAKE), Who::User(FAKE).text()));
                     if lost_pin() {
                         // The pinned chat is no longer in the pages at all.
                         all.retain(|held| held.1 != Who::Group(CREW));
@@ -1222,7 +1455,7 @@ impl World {
         if let Some(request) = asked::<f::messages::GetPinnedDialogs>(body) {
             self.log(&format!("GetPinnedDialogs {}", request.folder_id));
             let (read, unread) = self.crew();
-            let dialogs = vec![dialog(Who::Group(CREW), 20, read, unread, true, None), dialog(Who::User(ODALYS), 12, 11, 1, true, None)]
+            let dialogs = vec![dialog(Who::Group(CREW), 20, read, 20, unread, true, None), dialog(Who::User(ODALYS), 12, 11, 12, 1, true, None)]
                 .into_iter()
                 .map(|mut dialog| {
                     let who = Who::of(&dialog.peer());
@@ -1241,10 +1474,10 @@ impl World {
             let (read, unread) = self.crew();
             let found = peers.iter().filter_map(|who| {
                 let dialog = match who {
-                    Who::Group(CREW) => dialog(*who, 20, read, unread, false, None),
-                    Who::User(ODALYS) => dialog(*who, 12, 11, 1, false, None),
-                    Who::User(TOBIN) => dialog(*who, 30, 30, 0, false, None),
-                    Who::Channel(NOTES) => dialog(*who, 5, 0, 1, false, None),
+                    Who::Group(CREW) => dialog(*who, 20, read, 20, unread, false, None),
+                    Who::User(ODALYS) => dialog(*who, 12, 11, 12, 1, false, None),
+                    Who::User(TOBIN) => dialog(*who, 31, 31, 31, 0, false, None),
+                    Who::Channel(NOTES) => dialog(*who, 5, 0, 5, 1, false, None),
                     _ => return None,
                 };
                 Some((who.clone().text(), dialog))
@@ -1337,43 +1570,7 @@ impl World {
         if let Some(request) = asked::<f::messages::GetForumTopics>(body) {
             let forum = input_who(&request.peer);
             self.log(&format!("GetForumTopics {}", forum.text()));
-            let topic = |id: i32, title: &str, top: i32, unread: i32, icon: i64| {
-                let mut topic: tl::types::ForumTopic = blank(&[
-                    &put(1u32),
-                    &put(id),
-                    &put(T0 - 80_000),
-                    &put(forum.peer()),
-                    &put(title.to_owned()),
-                    &put(3i32),
-                    &put(icon),
-                    &put(top),
-                    &put(0i32),
-                    &put(0i32),
-                    &put(unread),
-                    &put(0i32),
-                    &put(0i32),
-                    &put(0i32),
-                    &put(Who::User(TOBIN).peer()),
-                    &put(settings(None)),
-                ]);
-                topic.my = false;
-                tl::enums::ForumTopic::Topic(topic)
-            };
-            let newest = self.messages.get(&key(forum, Some(TOOLS))).and_then(|held| held.values().next_back().cloned());
-            let top = match &newest {
-                Some(tl::enums::Message::Message(message)) => message.id,
-                _ => 41,
-            };
-            let found = tl::types::messages::ForumTopics {
-                order_by_create_date: false,
-                count: 2,
-                topics: vec![topic(TOOLS, "Tools", top, 1, 5001), topic(1, "General", 1, 0, 5002)],
-                messages: newest.into_iter().collect(),
-                chats: chats(),
-                users: users(),
-                pts: 1,
-            };
-            return answer(tl::enums::messages::ForumTopics::Topics(found));
+            return topics_answer(self, forum);
         }
         if let Some(request) = asked::<f::messages::GetSponsoredMessages>(body) {
             self.log(&format!("GetSponsoredMessages {}", input_who(&request.peer).text()));
@@ -1406,6 +1603,10 @@ impl World {
         }
         if asked::<f::messages::ViewSponsoredMessage>(body).is_some() {
             self.log("ViewSponsoredMessage");
+            return answer(true);
+        }
+        if asked::<f::messages::ClickSponsoredMessage>(body).is_some() {
+            self.log("ClickSponsoredMessage");
             return answer(true);
         }
         if let Some(request) = asked::<f::messages::SendMessage>(body) {
@@ -1508,7 +1709,13 @@ impl World {
             return answer(true);
         }
         if let Some(request) = asked::<f::messages::ReadDiscussion>(body) {
-            self.log(&format!("ReadDiscussion {} {}", key(input_who(&request.peer), Some(request.msg_id)), request.read_max_id));
+            let forum = input_who(&request.peer);
+            self.log(&format!("ReadDiscussion {} {}", key(forum, Some(request.msg_id)), request.read_max_id));
+            // The read reaches this fake, as Telegram's would: the topic's list says it read
+            // from here on.
+            if request.read_max_id > 0 {
+                self.topic_reads.insert((forum, request.msg_id), request.read_max_id);
+            }
             return answer(true);
         }
         if let Some(request) = asked::<f::messages::SetTyping>(body) {
@@ -1530,7 +1737,11 @@ impl World {
                 _ => file_piece(request.offset, request.limit),
             };
             let piece = tl::types::upload::File { r#type: tl::enums::storage::FileType::FileJpeg, mtime: T0, bytes: held };
-            return answer(tl::enums::upload::File::File(piece));
+            self.file_in += 1;
+            self.file_at_once = self.file_at_once.max(self.file_in);
+            let answered = answer(tl::enums::upload::File::File(piece));
+            self.file_in -= 1;
+            return answered;
         }
         if let Some(request) = asked::<f::auth::ExportAuthorization>(body) {
             self.log(&format!("ExportAuthorization {}", request.dc_id));

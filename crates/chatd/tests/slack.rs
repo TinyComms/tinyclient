@@ -2127,6 +2127,7 @@ fn rows_on_screen_get_their_newest_message_paced_and_people_carry_what_slack_say
     let can = world.account("T01ALPHA").can;
     assert_eq!((can.max_file_bytes, can.max_files, can.custom_emoji), (1 << 30, 10, protocol::EmojiScope::All));
     assert!(can.schedule && can.suppress_embeds && !can.gifs && !can.stickers && !can.silent);
+    assert!(can.search, "Enter asks Slack itself for a workspace or channel");
 }
 
 #[test]

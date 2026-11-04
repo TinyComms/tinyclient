@@ -482,7 +482,21 @@ impl Flow {
         if !(2..=7).contains(&algo.g) || !check_p_and_g(&algo.p, &algo.g) {
             return self.fail("Telegram sent numbers that cannot be trusted for checking the password.");
         }
-        let (m1, g_a) = calculate_2fa(&algo.salt1, &algo.salt2, &algo.p, &algo.g, g_b, asked.secure_random.clone(), password.as_bytes());
+        // grammers' SRP bends a debug build's 256 KiB connection stack past its end, so the
+        // computation runs on its own thread with room to spare.
+        let srp = std::thread::Builder::new().name("srp".into()).stack_size(4 * 1024 * 1024).spawn({
+            let (salt1, salt2, p, g, secure_random, password) = (
+                algo.salt1.clone(),
+                algo.salt2.clone(),
+                algo.p.clone(),
+                algo.g,
+                asked.secure_random.clone(),
+                password.clone(),
+            );
+            move || calculate_2fa(&salt1, &salt2, &p, &g, g_b, secure_random, password.as_bytes())
+        })
+        .expect("the SRP thread");
+        let (m1, g_a) = srp.join().expect("the SRP thread");
         drop(password);
         let request = tl::functions::auth::CheckPassword {
             password: tl::types::InputCheckPasswordSrp { srp_id, a: g_a.to_vec(), m1: m1.to_vec() }.into(),

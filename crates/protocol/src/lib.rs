@@ -1125,10 +1125,15 @@ pub enum Request {
     },
     /// The topics of a forum (a Telegram forum group, a Discord forum), the network's pins
     /// first, then newest first. From the cache; opening a topic is opening a conversation.
+    /// With `landing`, not a page but the one topic opening the forum lands on: the newest
+    /// unread, else General. Asking for the landing is also what makes chatd read the
+    /// topics from the network first, so the answer names the landing on Telegram's word now.
     Topics {
         forum: Key,
         offset: u32,
         limit: u32,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        landing: bool,
     },
     /// Voice channels and calls with a friend in them now, across Spaces: the Discord home's
     /// "In voice". From what chatd holds live; at most 50.
@@ -1296,6 +1301,12 @@ pub enum Request {
     /// The user's draft is changing. chatd decides how often the network hears of it.
     Typing {
         conversation: Key,
+    },
+    /// The user followed a link out of this message (the shell is opening it). Telegram's terms
+    /// want a sponsored message's follow told to it; other networks have nothing to do.
+    FollowLink {
+        conversation: Key,
+        message_id: String,
     },
     /// Adds (`on`) or takes back our reaction. `emoji` is the emoji itself, or a custom one's
     /// `:name:` as `Reaction::emoji` spells it. Shown at once; what the network then says is
