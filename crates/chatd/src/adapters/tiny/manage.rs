@@ -50,6 +50,7 @@ const ICON_KIND: &str = "That picture isn't a PNG, JPEG or WebP.";
 const SIGN_IN_AGAIN: &str = "Adding a passkey needs a sign-in from the last ten minutes. Sign out of this server, sign in again, then try once more.";
 pub const LAST_PASSKEY: &str = "This is your last passkey and you have no recovery codes left, so it stays.";
 const PASSKEY_LABEL_MAX: usize = 60;
+const PASSKEY_GONE: &str = "That passkey is gone.";
 /// The longest reason the audit keeps from here.
 const REASON_MAX: usize = 500;
 /// The longest value of a setup choice, such as `activity_visibility`'s `everyone`, and the longest
@@ -733,7 +734,7 @@ pub(crate) fn passkey_rename(account: AccountKey, id: String, label: String) -> 
     match asked("PATCH", &saved, &format!("/v1/me/passkeys/{id}"), Some(json!({ "label": label }))) {
         Err(detail) => refused(detail),
         Ok((200..=299, _)) => Response::Ok,
-        Ok((404, _)) => refused(OLDER),
+        Ok((404, _)) => refused(PASSKEY_GONE),
         Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
     }
 }
@@ -752,7 +753,7 @@ pub(crate) fn passkey_remove(account: AccountKey, id: String) -> Response {
         Ok((200..=299, _)) => Response::Ok,
         Ok((403, body)) if recent_sign_in_needed(&body) => refused(SIGN_IN_AGAIN),
         Ok((403, _)) => refused(LAST_PASSKEY),
-        Ok((404, _)) => refused(OLDER),
+        Ok((404, _)) => refused(PASSKEY_GONE),
         Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
     }
 }

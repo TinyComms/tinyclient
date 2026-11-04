@@ -696,3 +696,13 @@ fn the_setup_member_list_is_held_to_what_a_window_can_draw() {
     assert_eq!(setup.members.len(), SETUP_ROWS_MAX * 8);
     assert_eq!(setup.members[0].display_name.chars().count(), SETUP_TEXT_MAX);
 }
+
+#[test]
+fn a_passkey_already_gone_is_said_so_and_not_blamed_on_the_server() {
+    let base = serve(|_| http(404, "Not Found", r#"{"error":"not_found"}"#));
+    with_session(&base, "member", |account| {
+        assert_eq!(passkey_remove(account.clone(), "p1".into()), said(PASSKEY_GONE));
+        assert_eq!(passkey_rename(account, "p1".into(), "Phone".into()), said(PASSKEY_GONE));
+    });
+    assert_eq!(PASSKEY_GONE, "That passkey is gone.");
+}
