@@ -552,7 +552,7 @@ impl Shell {
 
     fn tiny_setup_refusal(&self, prefix: &'static str, refusal: &TinySetupRefusal, cx: &mut Context<Self>) -> Div {
         let state = &self.tiny_state.setup;
-        let panel = div().w_full().flex().flex_col().gap(px(10.)).child(aside("icons/triangle-alert.svg", theme::warning(), tiny_setup::refusal_words(refusal)));
+        let panel = div().w_full().flex().flex_col().gap(px(10.)).child(aside("icons/triangle-alert.svg", theme::warning(), tiny_setup::refusal_words(refusal, "the sign-in provider")));
         let mut actions = div().flex().gap(px(8.));
         if let Some(remedy) = tiny_setup::remedy(refusal) {
             let label = tiny_setup::remedy_label(remedy);
