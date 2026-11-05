@@ -54,6 +54,9 @@ class HandshakeFault:
         target = ctl.get("fail_handshake_once_for")
         request = urlsplit(path)
         device = parse_qs(request.query).get("device_id", [None])[0]
+        conversation = ctl.get("fail_handshake_conversation")
+        if conversation and request.path != f"/v1/e2ee/conversations/{conversation}/handshake":
+            return False
         if (method != "GET" or not request.path.startswith("/v1/e2ee/conversations/")
                 or not request.path.endswith("/handshake") or not target or device != target or target in self.used):
             return False

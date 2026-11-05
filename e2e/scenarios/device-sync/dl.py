@@ -795,10 +795,16 @@ class Scenario:
         data[-1] ^= 1
         with open(damaged, "wb") as file:
             file.write(data)
-        for name, purpose in (("backup", "backup import"), ("gapfill", "same-user gap fill")):
+        for name, purpose in (("backup", "backup import"), ("sync", "fresh sibling initialization"), ("gapfill", "same-user gap fill")):
             bea_id = self.seed["people"]["bea"]["user_id"]
-            if name == "gapfill":
-                A.e2ee({"op": "verify", "user_id": bea_id, "verified": False})
+            self_conversation = None
+            if name == "sync":
+                code, answer = A.e2ee({"op": "verify", "user_id": bea_id, "verified": False})
+                self.L.check("X.sync.unmarked", "Ada clears the verified mark before creating the fresh complete-history device", code == 0)
+                status, own = rest(self.base, self.seed["sessions"]["a_desk_a"]["token"], "POST", "/v1/e2ee/self")
+                self_conversation = own.get("conversation_id") if isinstance(own, dict) else None
+                self.L.check("X.sync.fixture", "the own-device conversation is available for targeted handshake fault injection",
+                             status in (200, 201) and bool(self_conversation))
             spare = dict(self.seed["sessions"]["a_spare"], base_url=f"http://localhost:{self.server['proxy_port']}")
             # Keep the shell from issuing background message reads (and therefore Want) before
             # the backup/sibling-readiness assertion. These extended cases exercise chatd IPC.
@@ -808,14 +814,17 @@ class Scenario:
                 self.L.step("windows", purpose + " device starts", False)
                 continue
             self.grab_windows()
-            handshake_device = (N.e2ee_status() or {}).get("device_id") if name == "gapfill" else None
+            handshake_device = (N.e2ee_status() or {}).get("device_id") if name == "sync" else None
             if handshake_device:
-                self.linker.proxy(fail_handshake_once_for=handshake_device)
-            seen = self.linker.link(A, N, "windows", history="none")
-            self.L.check("X." + name + ".empty-link", "the fresh device links with no history in its archive",
-                         seen.get("new_final", {}).get("stage") == "done" and seen.get("new_final", {}).get("messages", 0) == 0,
+                self.linker.proxy(fail_handshake_once_for=handshake_device, fail_handshake_conversation=self_conversation)
+            scope = "all" if name == "sync" else "none"
+            seen = self.linker.link(A, N, "windows", history=scope)
+            imported = seen.get("new_final", {}).get("messages", 0)
+            expected_archive = imported >= len(self.history) if name == "sync" else imported == 0
+            self.L.check("X." + name + ".archive-link", "the fresh device links with " + scope + " history in its archive",
+                         seen.get("new_final", {}).get("stage") == "done" and expected_archive,
                          new_final=seen.get("new_final"))
-            if name == "gapfill":
+            if name == "sync":
                 injected = N.wait_until("first sibling handshake transiently fails", lambda: any(
                     row.get("injected") == "handshake_once:" + str(handshake_device) for row in self.linker.wire()), 30)
                 self.linker.proxy()

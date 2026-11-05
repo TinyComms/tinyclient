@@ -56,8 +56,11 @@ post `e2e-proof`, claim all-platform coverage, or convert a standalone scratch r
 Android, iOS and macOS are gaps. Add `--extended` to run backup export, wrong-passphrase and
 tampered-file rejection, a nonempty import roundtrip, and same-user gap fill after linking with
 no archive history. Keep `release` false until the whole required platform plan is recorded.
-The extended sync case injects one transient handshake 503 for the fresh device and checks that
+The extended sync case imports complete history, injects one transient self-conversation handshake
+503 for that fresh device, and checks that
 an old device's new verified mark reaches it before it sends any local Want or Verified message.
+It uses a separate profile from the no-history gap-fill test so missing history cannot initialize
+sync first and conceal a readiness bug.
 The fresh profiles in these extended cases run chatd without a window so shell background reads
 cannot initialize sibling sync or fill history before the assertion. These are IPC checks.
 

@@ -18,3 +18,9 @@ class HandshakeFaultTest(unittest.TestCase):
         path = "/v1/e2ee/conversations/self/handshake?device_id=new-device"
         self.assertFalse(fault.take("GET", path, {}))
         self.assertTrue(fault.take("GET", path, {"fail_handshake_once_for": "new-device"}))
+
+    def test_self_handshake_fault_ignores_a_regular_conversation(self):
+        fault = HandshakeFault()
+        control = {"fail_handshake_once_for": "new-device", "fail_handshake_conversation": "self"}
+        self.assertFalse(fault.take("GET", "/v1/e2ee/conversations/dm/handshake?device_id=new-device", control))
+        self.assertTrue(fault.take("GET", "/v1/e2ee/conversations/self/handshake?device_id=new-device", control))
