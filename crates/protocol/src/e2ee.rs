@@ -181,6 +181,8 @@ pub enum LinkStage {
     Waiting,
     /// Both devices show the same six digits. The old one asks the person to confirm.
     Confirm,
+    /// The old device is waiting for native device-owner authentication.
+    OwnerApproval,
     /// The old device is signing the new one and packing up history.
     Sending,
     /// The new device is registering and unpacking history.

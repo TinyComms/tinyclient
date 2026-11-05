@@ -490,7 +490,12 @@ fn from_sibling(ctx: &Context, saved: &Saved, wire: &WireMessage) {
         client_id: wire.client_id.as_deref(),
         created_at: &wire.created_at,
     };
-    let gained = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).sibling_said(&row);
+    let (gained, changed) = {
+        let mut device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let gained = device.sibling_said(&row);
+        (gained, device.sibling_notice())
+    };
+    if changed { ctx.community_changed(); }
     for conversation in gained {
         load_page(ctx, saved, &conversation, None, PAGE_MAX);
     }

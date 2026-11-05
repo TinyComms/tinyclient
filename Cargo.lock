@@ -5707,6 +5707,7 @@ dependencies = [
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "objc2-local-authentication",
  "objc2-web-kit",
  "protocol",
  "serde_json",
@@ -5715,6 +5716,8 @@ dependencies = [
  "tracing",
  "tungstenite 0.28.0",
  "ureq 3.4.2",
+ "windows 0.62.2",
+ "windows-future 0.3.2",
  "wry",
 ]
 
@@ -6884,6 +6887,18 @@ dependencies = [
  "objc2 0.5.3",
  "objc2-app-kit 0.2.2",
  "objc2-foundation 0.2.2",
+]
+
+[[package]]
+name = "objc2-local-authentication"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48e0b8b339e0d9d2ed4416b7f93f9d4daadff7d4dd797f89867cde11aeac607"
+dependencies = [
+ "block2 0.6.2",
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
+ "objc2-security",
 ]
 
 [[package]]
@@ -10653,6 +10668,7 @@ dependencies = [
  "objc2-core-media",
  "objc2-core-video",
  "objc2-foundation 0.3.2",
+ "objc2-local-authentication",
  "objc2-replay-kit",
  "objc2-ui-kit 0.3.2",
  "objc2-video-toolbox",

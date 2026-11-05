@@ -11,11 +11,34 @@ formats.
 | mediad in process | `protocol::media_host` | `crate::mobile::register` (`mediad::inproc::start`, done) | chatd calls, `--play`, `--sound`, `test`; Settings' device list |
 | Call platform | `mediad::platform::Platform` | `crate::mobile::register` (stub `Phone`) | mediad: permissions, audio session, camera, screen, H.264 |
 | Web sign-in | `protocol::web_sign_in::WebSignIn` | `crate::mobile::register` (stub `Phone`) | chatd: Discord, Slack, Teams sign-in; a Tiny server's OIDC page |
+| Device-owner approval | `protocol::device_approval::DeviceApproval` | Android and iOS platform registration | chatd: verify the owner before cross-signing another device |
 
 `crates/tinyclient/src/mobile.rs` registers all three from `android_main` and `ios_main`,
 before chatd starts. The platform agents replace the bodies of its `Phone` stubs (or register
 their own types there) and touch nothing else in the core. Desktop builds register nothing and
 behave exactly as before.
+
+Device approval runs on the linking worker, outside the device and link-state locks. A fresh
+native availability check may establish that no verifier is configured or present. Otherwise
+only successful OS authentication permits signing; cancellation, busy hardware, lockout,
+unknown errors, and a missing provider refuse the operation. Android uses the framework
+BiometricPrompt with credential fallback (API 29 and later); iOS uses LocalAuthentication's
+device-owner policy, including passcode fallback. Neither receives or transfers a device key.
+
+Desktop approval uses the bundled `tinyclient-login --device-approval` helper: Windows uses
+UserConsentVerifier's desktop HWND interop; macOS uses LocalAuthentication. Linux explicitly
+reports unsupported reauthentication because this client has no standard Linux device-owner
+authentication integration. On Linux the out-of-band link code and six-digit confirmation
+remain required; they are not biometric authentication. The helper must be installed beside
+chatd. A missing or incompatible helper is an error, never the unsupported fallback.
+
+Microsoft documents the Windows desktop verification interop API as supported from
+[build 22000 (Windows 11)](https://learn.microsoft.com/en-us/windows/win32/api/userconsentverifierinterop/nn-userconsentverifierinterop-iuserconsentverifierinterop).
+The helper queries that interface on the running system. If Windows reports a configured
+verifier but does not implement the desktop interface, approval refuses with an explicit
+version-support message; it never substitutes the UWP request API or skips authentication.
+A fresh native result that no verifier is present/configured can still use the documented
+unavailable fallback on Windows 10. Busy, policy and unknown API errors always refuse.
 
 ## 1. mediad in process (`protocol::media_host`)
 

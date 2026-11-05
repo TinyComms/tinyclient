@@ -72,6 +72,7 @@ pub(in crate::gui) fn stage_words(link: &E2eeLink) -> String {
         LinkStage::Waiting => "Waiting for the new device…".to_owned(),
         LinkStage::Confirm if new => "Your other device asks for these digits. Type them there.".to_owned(),
         LinkStage::Confirm => "Check that this is your device, then type the six digits it shows.".to_owned(),
+        LinkStage::OwnerApproval => "Use your operating system’s prompt to approve adding this device.".to_owned(),
         LinkStage::Sending => "Approving the new device and sending your messages…".to_owned(),
         LinkStage::Receiving => "Setting this device up and bringing your messages…".to_owned(),
         LinkStage::Done if new => match link.messages {
@@ -123,7 +124,7 @@ impl Shell {
                     return;
                 };
                 let finished = link.as_ref().is_some_and(|link| link.stage == LinkStage::Done);
-                let moving = link.as_ref().is_some_and(|link| matches!(link.stage, LinkStage::Sending | LinkStage::Receiving));
+                let moving = link.as_ref().is_some_and(|link| matches!(link.stage, LinkStage::OwnerApproval | LinkStage::Sending | LinkStage::Receiving));
                 let Some(draft) = this.encryption_draft() else {
                     return;
                 };

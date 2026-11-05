@@ -152,6 +152,8 @@ pub(super) fn answers(conv: &str, rows: Vec<(String, Opened)>) -> Vec<Sync> {
 /// What this device keeps about its siblings while it runs.
 #[derive(Default)]
 pub(super) struct Siblings {
+    /// A synchronized verification mark changed a settings page's data.
+    changed: bool,
     /// Asked for, and when: not asked again for a while.
     asked: HashMap<(String, String), Instant>,
     /// Waiting to be asked: by conversation.
@@ -169,6 +171,9 @@ struct Parts {
 }
 
 impl Device {
+    pub(crate) fn sibling_notice(&mut self) -> bool {
+        std::mem::take(&mut self.siblings.changed)
+    }
     /// The person's own conversation, made the first time. `None` where the server has none.
     pub(super) fn self_conversation(&mut self) -> Option<String> {
         if !self.self_capable || !self.ready() {
@@ -357,10 +362,12 @@ impl Device {
             } => self.take_part(conv, id, hash, part, total, data, from_device),
             Sync::Verified { user, number } => {
                 if super::super::safe_id(&user) && user != self.saved.user_id {
+                    let old = self.notes.verified.get(&user).cloned();
                     match number {
-                        Some(number) => self.notes.verified.insert(user, number),
+                        Some(number) => self.notes.verified.insert(user.clone(), number),
                         None => self.notes.verified.remove(&user),
                     };
+                    self.siblings.changed |= self.notes.verified.get(&user) != old.as_ref();
                     self.save_notes();
                 }
                 Vec::new()
@@ -659,6 +666,104 @@ mod tests {
         assert!(
             device.sibling_said(&row).is_empty(),
             "a successfully handled row is deduplicated"
+        );
+    }
+
+    #[test]
+    fn becoming_ready_initializes_sibling_sync_without_a_local_sync_action() {
+        let mut receiver = device("ready-sibling-sync");
+        let own = receiver.notes.self_conv.take().unwrap();
+        receiver.state = protocol::DeviceState::AwaitingApproval {
+            code: String::new(),
+        };
+        let id = receiver.engine.as_ref().unwrap().device_id().to_string();
+        let key = super::super::b64(&receiver.engine.as_ref().unwrap().signature_key());
+        let mark = Sync::Verified {
+            user: "bea".into(),
+            number: Some("123456".into()),
+        };
+        receiver.remember(&own, "verification-row", opened(&mark.text().unwrap()));
+        let own_route = own.clone();
+        receiver.saved.base_url = super::super::super::tests::serve(move |request| {
+            let body = if request.starts_with("GET /v1/capabilities ") {
+                serde_json::json!({"features":["e2ee_text","e2ee_self","e2ee_device_link"]})
+            } else if request.starts_with("GET /v1/e2ee/users/") {
+                serde_json::json!([{"device_id":id,"signature_key":key}])
+            } else if request.starts_with("GET /v1/e2ee/key_packages/count?") {
+                serde_json::json!({"remaining":100})
+            } else if request.starts_with("POST /v1/e2ee/self ") {
+                serde_json::json!({"conversation_id":own_route})
+            } else if request.starts_with("GET /v1/conversations/") {
+                serde_json::json!({"messages":[{"id":"verification-row","author_id":ME,"device_id":"sibling","ciphertext":"AAAA"}]})
+            } else {
+                return super::super::super::tests::http(404, "Test", "{}");
+            };
+            super::super::super::tests::http(200, "Test", &body.to_string())
+        });
+        receiver.enrol();
+        assert!(receiver.ready());
+        assert_eq!(receiver.notes.self_conv.as_deref(), Some(own.as_str()));
+        assert_eq!(
+            receiver.notes.verified.get("bea").map(String::as_str),
+            Some("123456")
+        );
+    }
+
+    #[test]
+    fn a_successful_handshake_replays_previously_unreadable_sibling_rows() {
+        let mut receiver = device("handshake-sibling-retry");
+        receiver.self_capable = true;
+        receiver.state = protocol::DeviceState::Ready;
+        let own = receiver.notes.self_conv.clone().unwrap();
+        let server_key = e2ee::identity::DeviceKey::generate().unwrap().public_key();
+        receiver
+            .engine
+            .as_mut()
+            .unwrap()
+            .create_group(e2ee::ConversationId::parse(&own).unwrap(), &server_key)
+            .unwrap();
+        let row = Row {
+            id: "verification-row",
+            author_id: ME,
+            kind: "message",
+            ciphertext: Some("AAAA"),
+            epoch: 0,
+            device_id: "sibling",
+            target_id: None,
+            client_id: None,
+            created_at: "",
+        };
+        assert!(receiver.sibling_said(&row).is_empty());
+        let mark = Sync::Verified {
+            user: "bea".into(),
+            number: Some("654321".into()),
+        };
+        receiver.remember(&own, row.id, opened(&mark.text().unwrap()));
+        receiver.saved.base_url = super::super::super::tests::serve(move |request| {
+            let body = if request.starts_with("GET /v1/e2ee/conversations/")
+                && request.contains("/handshake?")
+            {
+                serde_json::json!([])
+            } else if request.starts_with("GET /v1/e2ee/conversations/") {
+                serde_json::json!({"e2ee":true,"epoch":0,"external_sender":super::super::b64(&server_key)})
+            } else if request.starts_with("GET /v1/conversations/") {
+                serde_json::json!({"messages":[{"id":"verification-row","author_id":ME,"device_id":"sibling","ciphertext":"AAAA"}]})
+            } else {
+                return super::super::super::tests::http(404, "Test", "{}");
+            };
+            super::super::super::tests::http(200, "Test", &body.to_string())
+        });
+        let changed = receiver.heard(
+            "e2ee.handshake",
+            &serde_json::json!({"conversation_id":own}),
+        );
+        assert_eq!(
+            receiver.notes.verified.get("bea").map(String::as_str),
+            Some("654321")
+        );
+        assert!(
+            changed,
+            "a synchronized verification mark must notify an already-open settings page"
         );
     }
 
@@ -1067,7 +1172,7 @@ mod live {
             let DeviceState::AwaitingApproval { code } = lock(&second).state.clone() else {
                 panic!("the second device waits to be approved");
             };
-            lock(&first).approve(&code).unwrap();
+            lock(&first).approve(&code, &|| false).unwrap();
             lock(&second).enrol();
             assert_eq!(lock(&second).state, DeviceState::Ready);
 

@@ -141,10 +141,10 @@ fn live_e2ee_text_round_trip() {
         panic!("a second device waits for approval, got {:?}", ada2.state);
     };
     assert!(
-        ada.approve("tiny-device-AAAA").is_err(),
+        ada.approve("tiny-device-AAAA", &|| false).is_err(),
         "a code that is not one is refused"
     );
-    ada.approve(&code).expect("approved");
+    ada.approve(&code, &|| false).expect("approved");
     ada2.enrol();
     assert_eq!(
         ada2.state,
@@ -330,7 +330,7 @@ fn live_e2ee_text_round_trip() {
     let DeviceState::AwaitingApproval { code } = ada3.state.clone() else {
         panic!("waits for approval");
     };
-    ada.approve(&code).unwrap();
+    ada.approve(&code, &|| false).unwrap();
     ada3.enrol();
     ada.sync(&dm).expect("Ada adds her third device");
     ada3.sync(&dm).expect("it joins");

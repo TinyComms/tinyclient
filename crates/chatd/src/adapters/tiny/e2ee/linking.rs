@@ -74,6 +74,14 @@ pub(super) trait Relay: Send + Sync {
         signature_key: &[u8],
         cross_signature: &[u8],
     ) -> Result<(), Failed>;
+    /// Publish only public MLS packages before acknowledging a link, so the approving
+    /// device's immediate group sync can actually add this device.
+    fn publish_keys(
+        &self,
+        device_id: &str,
+        packages: &[Vec<u8>],
+        last_resort: &[u8],
+    ) -> Result<(), Failed>;
     /// The conversations the person is in: an archive's rows for any other are dropped.
     fn conversations(&self) -> Result<BTreeSet<String>, Failed>;
 }
@@ -114,6 +122,8 @@ pub(super) struct Linking {
     state: Mutex<State>,
     wake: Condvar,
     told: Told,
+    approval: Arc<dyn protocol::device_approval::DeviceApproval>,
+    deadline: Instant,
 }
 
 #[derive(Default)]
@@ -138,6 +148,8 @@ impl Linking {
             }),
             wake: Condvar::new(),
             told,
+            approval: super::approval::service(),
+            deadline: Instant::now() + PATIENCE,
         }
     }
 
@@ -522,14 +534,25 @@ fn new_half(
         view.total = archive.as_ref().map_or(0, |archive| archive.bytes);
     });
     let cross_signature = unb64(&cross_signature).ok_or(super::super::UNREADABLE)?;
-    relay.register(&device_id.to_string(), &signature_key, &cross_signature)?;
-
     let mut messages = 0;
     if let Some(archive) = archive {
         messages = take_in(
             job, device, relay, link, link_id, &user, &dir, &archive, most,
         )?;
     }
+    if job.stopped() {
+        return Err(STOPPED.to_owned());
+    }
+    relay.register(&device_id.to_string(), &signature_key, &cross_signature)?;
+    let (packages, last_resort) = {
+        let mut device = lock(device);
+        let engine = device.engine()?;
+        (
+            engine.key_packages(super::KEY_PACKAGES).map_err(words)?,
+            engine.last_resort_key_package().map_err(words)?,
+        )
+    };
+    relay.publish_keys(&device_id.to_string(), &packages, &last_resort)?;
     relay.post(
         link,
         Role::New,
@@ -754,6 +777,24 @@ fn old_half(
     });
 
     let scope = job.confirmed()?;
+    let cancelled = || job.stopped() || Instant::now() >= job.deadline;
+    if cancelled() {
+        return Err(STOPPED.to_owned());
+    }
+    job.show(|view| {
+        view.stage = LinkStage::OwnerApproval;
+        view.check.clear();
+    });
+    // Native approval is a core-side gate, including for direct LinkConfirm IPC callers.
+    // Neither the device lock nor the link state lock is held while the person authenticates.
+    super::approval::verify(
+        job.approval.as_ref(),
+        "Approve adding a device to your Tiny account",
+        &cancelled,
+    )?;
+    if cancelled() {
+        return Err(STOPPED.to_owned());
+    }
     job.show(|view| {
         view.stage = LinkStage::Sending;
         // The digits were typed: they are not shown again.
@@ -761,6 +802,9 @@ fn old_half(
     });
     let cross_signature = {
         let mut device = lock(device);
+        if cancelled() {
+            return Err(STOPPED.to_owned());
+        }
         let signature = device
             .engine()?
             .cross_sign(new_device, &new_key)
@@ -795,6 +839,9 @@ fn old_half(
         history: scope,
         archive,
     };
+    if cancelled() {
+        return Err(STOPPED.to_owned());
+    }
     relay.post(link, Role::Old, &channel.send(&approve).map_err(words)?)?;
     let sealed = next_from(job, relay, link, Role::New, &mut after)?;
     match receive(channel, &sealed)? {
@@ -1027,6 +1074,20 @@ fn refused(status: u16, answer: &Value) -> Failed {
 }
 
 impl Relay for Http {
+    fn publish_keys(
+        &self,
+        device_id: &str,
+        packages: &[Vec<u8>],
+        last_resort: &[u8],
+    ) -> Result<(), Failed> {
+        let body = json!({"device_id":device_id,
+            "key_packages":packages.iter().map(|key| b64(key)).collect::<Vec<_>>(),
+            "last_resort":b64(last_resort)});
+        match self.asked("POST", "/v1/e2ee/key_packages", Some(body))? {
+            (200 | 204, _) => Ok(()),
+            (status, _) => Err(Failed::Words(format!("The device was approved, but its encryption setup did not finish ({status}). Try linking again."))),
+        }
+    }
     fn create(&self) -> Result<(String, String), Failed> {
         match self.asked("POST", "/v1/e2ee/links", None)? {
             (200 | 201, answer) => {

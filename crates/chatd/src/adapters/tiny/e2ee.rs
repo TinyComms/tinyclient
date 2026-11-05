@@ -500,8 +500,6 @@ pub(crate) fn begin(saved: &Saved, commands: std::sync::mpsc::Sender<crate::adap
     let mut device = lock(&shared);
     device.commands = Some(commands);
     device.enrol();
-    // What the person's other devices said while this one was away.
-    let _ = device.catch_up();
 }
 
 /// Signing out: the device is revoked on the server and its state forgotten here. What it opened
@@ -851,6 +849,12 @@ impl Device {
                 tracing::warn!("chatd: Tiny e2ee: {why}");
                 self.state = DeviceState::Failed { why };
             }
+        }
+        if self.ready() {
+            // Startup can run while approval is still pending. Every successful enrollment,
+            // including the one after linking, must initialize the hidden sibling group.
+            let gained = self.catch_up().into_iter().collect();
+            self.reload(&gained);
         }
     }
 
@@ -1838,8 +1842,16 @@ impl Device {
             "e2ee.handshake" => {
                 let conversation_id = field("conversation_id");
                 if super::safe_id(&conversation_id) && self.ready() {
-                    if let Err(why) = self.sync(&conversation_id) {
-                        tracing::warn!("chatd: Tiny e2ee: {conversation_id}: {why}");
+                    match self.sync(&conversation_id) {
+                        Ok(()) => {
+                            if self.is_self(&conversation_id) {
+                                let gained = self.catch_up().into_iter().collect();
+                                self.reload(&gained);
+                            } else {
+                                self.reload(&BTreeSet::from([conversation_id]));
+                            }
+                        }
+                        Err(why) => tracing::warn!("chatd: Tiny e2ee: {conversation_id}: {why}"),
                     }
                 }
             }
@@ -1867,13 +1879,15 @@ impl Device {
                 }
                 if user == self.saved.user_id && self.ready() {
                     if let Ok(rows) = self.list(&user) {
-                        return self.note_devices(&rows);
+                        let devices_changed = self.note_devices(&rows);
+                        let sync_changed = self.sibling_notice();
+                        return devices_changed || sync_changed;
                     }
                 }
             }
             _ => {}
         }
-        false
+        self.sibling_notice()
     }
 
     /// `E2eeAsk::Status`.
@@ -2035,7 +2049,8 @@ impl Device {
     }
 
     /// Signs and registers a new device of this person from its link code.
-    pub(crate) fn approve(&mut self, code: &str) -> Result<(), String> {
+    pub(crate) fn approve(&mut self, code: &str, cancelled: &dyn Fn() -> bool) -> Result<(), String> {
+        if cancelled() { return Err("Device approval timed out.".to_owned()); }
         if !self.ready() {
             return Err("This device has to be set up before it can approve another.".to_owned());
         }
@@ -2046,6 +2061,7 @@ impl Device {
             .cross_sign(device, &key)
             .map_err(|err| format!("It couldn't be approved: {err}"))?;
         let body = json!({ "signature_key": b64(&key), "cross_signature": b64(&signature), "label": "Approved device" });
+        if cancelled() { return Err("Device approval timed out.".to_owned()); }
         match self.ask("PUT", &format!("/v1/e2ee/devices/{device}"), Some(body))? {
             (200 | 201, _) => {
                 let me = self.saved.user_id.clone();
@@ -2157,6 +2173,14 @@ pub(crate) fn answer(
     told: linking::Told,
 ) -> protocol::Response {
     use protocol::{E2eeAsk, ErrorCode, Response};
+    // Owner authentication belongs before the device lock, including the old-server fallback.
+    match &ask {
+        E2eeAsk::Approve { code } => return approval::approve(saved, code),
+        E2eeAsk::LinkJoin { code } if code.trim().starts_with("tiny-device-") => {
+            return approval::approve(saved, code);
+        }
+        _ => {}
+    }
     // A link's own steps never wait for this device's lock, which a link holds now and then.
     match ask {
         E2eeAsk::Link => {
@@ -2234,7 +2258,7 @@ pub(crate) fn answer(
                 detail,
             },
         },
-        E2eeAsk::Approve { code } => done(device.approve(&code)),
+        E2eeAsk::Approve { .. } => unreachable!("approval is handled before taking the device lock"),
         E2eeAsk::Revoke { device_id } => {
             let revoked = device.revoke(&device_id);
             drop(device);
@@ -2264,10 +2288,6 @@ pub(crate) fn answer(
             done(linking::start_new(saved, &shared, linking, told))
         }
         E2eeAsk::LinkJoin { code } => {
-            // A code from a device whose server does not link devices: approved as before.
-            if code.trim().starts_with("tiny-device-") {
-                return done(device.approve(&code));
-            }
             drop(device);
             done(linking::start_old(saved, &shared, &code, told))
         }
@@ -2305,6 +2325,7 @@ pub(crate) fn attachment_key() -> Result<AttachmentKey, String> {
 
 mod backup;
 mod linking;
+mod approval;
 mod export_rows;
 pub(crate) mod siblings;
 
@@ -2403,6 +2424,16 @@ mod tests {
         let cache = device.cache("22222222-2222-2222-2222-222222222222").unwrap();
         assert_eq!(cache.pending.get("pending").unwrap().text, "kept for retry");
         assert!(!cache.rows.contains_key("accepted"));
+    }
+
+    #[test]
+    fn a_handshake_schedules_a_reread_of_messages_that_may_now_open() {
+        let (mut device, _) = posting_device("handshake-reread", 0);
+        let (send, receive) = std::sync::mpsc::channel();
+        device.commands = Some(send);
+        device.heard("e2ee.handshake", &json!({"conversation_id":"22222222-2222-2222-2222-222222222222"}));
+        assert!(matches!(receive.try_recv(), Ok(crate::adapters::Command::Backfill(id))
+            if id == "22222222-2222-2222-2222-222222222222"));
     }
 
     #[test]

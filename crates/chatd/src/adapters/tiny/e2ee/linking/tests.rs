@@ -7,6 +7,7 @@ use crate::adapters::tiny::Saved;
 use e2ee::store::{FileStore, StateKey};
 use e2ee::{Engine, UserId};
 use protocol::DeviceState;
+mod approval_tests;
 use std::collections::BTreeMap;
 
 const USER: &str = "7e57ada0-0000-4000-8000-000000000001";
@@ -28,6 +29,7 @@ struct Fake {
     moved: Condvar,
     /// Each registration: the device, its key, the cross-signature.
     registered: Mutex<Vec<Registered>>,
+    published: Mutex<BTreeSet<String>>,
     deleted: Mutex<Vec<String>>,
     members: BTreeSet<String>,
     /// The server in the middle: rewrites what it relays, by sender.
@@ -37,6 +39,20 @@ struct Fake {
 }
 
 impl Relay for Fake {
+    fn publish_keys(
+        &self,
+        device_id: &str,
+        packages: &[Vec<u8>],
+        last_resort: &[u8],
+    ) -> Result<(), Failed> {
+        assert_eq!(packages.len(), super::super::KEY_PACKAGES);
+        assert!(packages.iter().all(|key| !key.is_empty()) && !last_resort.is_empty());
+        assert!(lock(&self.registered)
+            .iter()
+            .any(|(id, _, _)| id == device_id));
+        lock(&self.published).insert(device_id.to_owned());
+        Ok(())
+    }
     fn create(&self) -> Result<(String, String), Failed> {
         let id = link::LinkCode::parse(&Pending::create([0; 16]).unwrap().code().encode())
             .unwrap()
@@ -346,6 +362,15 @@ fn quiet() -> Told {
     Arc::new(|| {})
 }
 
+/// These tests exercise link cryptography and relay behavior, with owner authentication
+/// supplied per job. Native UI is exercised separately and is never opened by unit tests.
+fn owner_approved_job() -> Linking {
+    let mut job = Linking::new(Role::Old, quiet());
+    job.approval =
+        Arc::new(|_: &str, _: &dyn Fn() -> bool| Ok(protocol::device_approval::Outcome::Verified));
+    job
+}
+
 /// Waits until `job` shows `stage`, or fails the test.
 fn reaches(job: &Linking, stage: LinkStage) -> E2eeLink {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -412,7 +437,7 @@ fn link_through_with(
         );
     }
     let new_job = Arc::new(Linking::new(Role::New, quiet()));
-    let old_job = Arc::new(Linking::new(Role::Old, quiet()));
+    let old_job = Arc::new(owner_approved_job());
     let new_thread = {
         let (job, device, relay) = (new_job.clone(), new.clone(), relay.clone());
         std::thread::spawn(move || run_new(&job, &device, relay.as_ref()))
@@ -555,6 +580,16 @@ fn no_history_sends_no_archive() {
     );
     assert_eq!(run.new_result, Ok(0));
     assert_eq!(lock(&relay.registered).len(), 1);
+    let id = lock(&run.new)
+        .engine
+        .as_ref()
+        .unwrap()
+        .device_id()
+        .to_string();
+    assert!(
+        lock(&relay.published).contains(&id),
+        "link completion must wait until the new device's public key packages are available"
+    );
 }
 
 #[test]
@@ -583,7 +618,7 @@ fn a_server_that_puts_its_own_key_in_the_middle_gets_nothing_and_both_stop() {
     let old = device("mitm-old", DeviceState::Ready);
     lock(&old).remember("c1", "m1", opened("secret", 1));
     let new_job = Arc::new(Linking::new(Role::New, quiet()));
-    let old_job = Arc::new(Linking::new(Role::Old, quiet()));
+    let old_job = Arc::new(owner_approved_job());
     let new_thread = {
         let (job, device, relay) = (new_job.clone(), new.clone(), relay.clone());
         std::thread::spawn(move || run_new(&job, &device, relay.as_ref()))
@@ -613,8 +648,9 @@ fn an_archive_changed_on_the_server_is_not_taken_in() {
         members: ["c1".to_owned()].into(),
         ..Fake::default()
     };
+    let relay = Arc::new(fake);
     let run = link_through(
-        Arc::new(fake),
+        relay.clone(),
         &[("c1", "m1", opened("x", 1))],
         Scope::All,
         |_, _| {},
@@ -634,6 +670,10 @@ fn an_archive_changed_on_the_server_is_not_taken_in() {
     let mut new = lock(&run.new);
     assert!(new.cache("c1").is_none_or(|cache| cache.rows.is_empty()));
     assert!(!new.dir.join(ARCHIVE_FILE).exists());
+    assert!(
+        lock(&relay.registered).is_empty(),
+        "invalid history must be refused before registering the new device"
+    );
 }
 
 #[test]
@@ -882,7 +922,7 @@ fn live_a_real_server_links_a_device_with_its_history() {
     );
 
     let new_job = Arc::new(Linking::new(Role::New, quiet()));
-    let old_job = Arc::new(Linking::new(Role::Old, quiet()));
+    let old_job = Arc::new(owner_approved_job());
     let new_thread = {
         let (job, device, relay) = (new_job.clone(), second.clone(), relay_two.clone());
         std::thread::spawn(move || run_new(&job, &device, relay.as_ref()))

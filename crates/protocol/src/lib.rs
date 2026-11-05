@@ -14,6 +14,7 @@ use std::path::PathBuf;
 pub mod browser;
 mod call;
 pub mod crash;
+pub mod device_approval;
 mod e2ee;
 pub mod hotkey;
 pub mod log_policy;
