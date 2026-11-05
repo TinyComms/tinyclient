@@ -21,6 +21,11 @@ mod messages;
 mod sealing;
 pub mod signin;
 
+/// The lab's sealed-row proof. See `messages::prove_missing_seal`.
+pub fn prove_missing_seal() -> Result<(), String> {
+    messages::prove_missing_seal()
+}
+
 use super::{serve_commands, Command, Context, Signed};
 use crate::hub::Hub;
 use crate::session;
