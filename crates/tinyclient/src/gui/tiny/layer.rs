@@ -109,7 +109,7 @@ impl Shell {
             }
             Float::Stats => {
                 let at = anchor(RAIL_WIDTH + 8., tall - PANEL, sidebar - 16., PANEL);
-                let card = popover().p(px(14.)).child(self.tiny_stats_card());
+                let card = popover().p(px(14.)).child(self.tiny_stats_card(cx));
                 out.push(placed("tiny-stats", Place::Above(at), Layer::Popover, window, fade_in("tiny-stats-fade", 120, card)));
             }
         }

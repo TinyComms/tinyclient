@@ -46,7 +46,7 @@ fn fact(label: &'static str, value: impl Into<SharedString>) -> Div {
 }
 
 pub(in crate::gui::tiny) fn voice(shell: &Shell, facts: &Facts, window: &mut Window, cx: &mut Context<Shell>) -> AnyElement {
-    let _ = (window, cx);
+    let _ = window;
     let community = facts.community;
     let mut page = div().flex().flex_col().gap(px(28.)).child(page_head("Voice & media", "How this server's audio is doing, and what it asks of a connection."));
 
@@ -162,7 +162,7 @@ pub(in crate::gui::tiny) fn voice(shell: &Shell, facts: &Facts, window: &mut Win
 
     // My own call.
     page = page.child(section("Your connection").child(if shell.tiny_call().is_some() {
-        card().p(px(16.)).child(shell.tiny_stats_card())
+        card().p(px(16.)).child(shell.tiny_stats_card(cx))
     } else {
         kit::note("icons/info.svg", theme::text_faint(), "Join a channel here to see your own connection: ping, jitter, loss, bitrate and the path your audio takes.")
     }));

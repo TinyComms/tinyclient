@@ -243,6 +243,7 @@ pub struct State {
     stats_before: Option<CallStats>,
     /// The last minute of ping and receive bitrate for Call health's time graph.
     stats_chart: VecDeque<health::ChartSample>,
+    stats_tab: panel::StatsTab,
     /// The polls over the last several seconds: what the bars and the numbers show.
     steady: health::Steady,
     /// Why there are no numbers, when mediad said.
@@ -336,6 +337,7 @@ impl State {
             stats: None,
             stats_before: None,
             stats_chart: VecDeque::new(),
+            stats_tab: panel::StatsTab::default(),
             steady: health::Steady::default(),
             stats_note: None,
             stats_task: None,
@@ -1573,6 +1575,10 @@ impl Shell {
             }
         }
         match flag("--tiny-menu").as_deref() {
+            Some("stats-video") => {
+                self.tiny_state.stats_tab = panel::StatsTab::Video;
+                self.tiny_open_float(Float::Stats, cx);
+            }
             Some("header") => self.tiny_open_float(Float::Header, cx),
             Some("stats") => self.tiny_open_float(Float::Stats, cx),
             Some("channel") => {

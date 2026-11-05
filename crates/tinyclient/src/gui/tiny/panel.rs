@@ -6,7 +6,7 @@
 
 use super::Float;
 use crate::gui::call::health::{self, ChartSample, Grade, Health};
-use crate::gui::components::{glyph, tip, Avatar};
+use crate::gui::components::{glyph, segment, segmented, tip, Avatar};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{
@@ -15,6 +15,13 @@ use gpui::{
 use protocol::{CallPath, CallState, Presence};
 
 pub(super) const PANEL: f32 = 52.;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum StatsTab {
+    #[default]
+    Connection,
+    Video,
+}
 
 /// One of the panel's three buttons. `off` draws it struck through in `danger`.
 fn panel_button(id: &'static str, icon: &'static str, off: bool) -> Stateful<Div> {
@@ -118,12 +125,22 @@ fn kpi(label: &'static str, value: String, unit: &'static str, color: Rgba) -> D
         )
 }
 
-/// Ping (filled) and receive bitrate over the last minute. `now_*` are the same numbers the
-/// KPI strip shows (smoothed ping, current receive), so the footer does not disagree with them.
-fn health_chart(samples: Vec<ChartSample>, now_rtt: Option<u32>, now_recv: u32) -> Div {
-    let foot = match now_rtt {
-        Some(rtt) => format!("Now · {rtt} ms · {now_recv} kb/s"),
-        None => format!("Now · — · {now_recv} kb/s"),
+/// The selected tab's measured history, with current values in the footer. Video send and
+/// receive share one bitrate scale; connection RTT and receive retain their own scales.
+fn health_chart(mut samples: Vec<ChartSample>, now_rtt: Option<u32>, now_recv: u32, video: bool) -> Div {
+    // One chart slot, with only the selected tab's series. Video's two rates share a scale.
+    if video {
+        for sample in &mut samples {
+            let (sent, received) = sample.video_kbps.unwrap_or_default();
+            sample.rtt_ms = sent;
+            sample.recv_kbps = received;
+        }
+    }
+    let foot = match (video, now_rtt) {
+        (true, Some(sent)) => format!("↑ {sent} · ↓ {now_recv} kb/s"),
+        (true, None) => "—".to_owned(),
+        (false, Some(rtt)) => format!("{rtt} ms · {now_recv} kb/s"),
+        (false, None) => format!("— · {now_recv} kb/s"),
     };
     let chart = canvas(
         |_, _, _| (),
@@ -139,19 +156,18 @@ fn health_chart(samples: Vec<ChartSample>, now_rtt: Option<u32>, now_recv: u32) 
                 let y = origin_y + height * frac;
                 window.paint_quad(fill(Bounds::new(point(px(origin_x), px(y)), size(px(width), px(1.))), theme::hairline()));
             }
-            let first = samples.first().map(|sample| sample.at).unwrap_or_else(std::time::Instant::now);
-            let last_at = samples.last().map(|sample| sample.at).unwrap_or(first);
-            let span = last_at.duration_since(first).as_secs_f32().max(0.001);
+            let last_at = samples.last().map(|sample| sample.at).unwrap_or_else(std::time::Instant::now);
             let max_rtt = samples.iter().map(|sample| sample.rtt_ms).max().unwrap_or(1).max(1) as f32;
             let max_recv = samples.iter().map(|sample| sample.recv_kbps).max().unwrap_or(1).max(1) as f32;
-            let x_at = |sample: &ChartSample| origin_x + width * sample.at.duration_since(first).as_secs_f32() / span;
+            let max_video = max_rtt.max(max_recv);
+            let x_at = |sample: &ChartSample| origin_x + width * (1. - last_at.saturating_duration_since(sample.at).as_secs_f32() / 60.).clamp(0., 1.);
             let ping_y = |rtt: u32| {
-                let t = (rtt as f32 / (max_rtt * 1.2)).clamp(0., 1.);
-                origin_y + height * (0.42 + 0.5 * (1. - t))
+                let t = (rtt as f32 / (if video { max_video } else { max_rtt } * 1.2)).clamp(0., 1.);
+                origin_y + height * if video { 0.06 + 0.86 * (1. - t) } else { 0.42 + 0.5 * (1. - t) }
             };
             let recv_y = |kbps: u32| {
-                let t = (kbps as f32 / (max_recv * 1.2)).clamp(0., 1.);
-                origin_y + height * (0.06 + 0.3 * (1. - t))
+                let t = (kbps as f32 / (if video { max_video } else { max_recv } * 1.2)).clamp(0., 1.);
+                origin_y + height * if video { 0.06 + 0.86 * (1. - t) } else { 0.06 + 0.3 * (1. - t) }
             };
 
             let mut area = PathBuilder::fill();
@@ -233,7 +249,7 @@ fn health_chart(samples: Vec<ChartSample>, now_rtt: Option<u32>, now_recv: u32) 
                                 .items_center()
                                 .gap(px(5.))
                                 .child(div().size(px(7.)).rounded_full().bg(theme::positive()))
-                                .child(div().type_micro().text_color(theme::text_soft()).child("RTT")),
+                                .child(div().type_micro().text_color(theme::text_soft()).child(if video { "Send" } else { "RTT" })),
                         )
                         .child(
                             div()
@@ -358,144 +374,105 @@ impl Shell {
         self.tiny_state.stats.as_ref().map(|stats| self.tiny_state.steady.applied(Health::from_polls(before, stats)))
     }
 
-    /// Call health, over the panel: the link graded, what to do about it in words, the last
-    /// minute on a graph, key numbers, then the connection's details.
-    pub(super) fn tiny_stats_card(&self) -> Div {
-        let room = self.tiny_page_facts().and_then(|page| page.mine.and_then(|id| page.community.rooms.iter().find(|room| room.id == id)).map(|room| (room.name.clone(), room.bitrate())));
+    /// One compact view at a time, with the same chart area in both tabs.
+    pub(super) fn tiny_stats_card(&self, cx: &mut Context<Self>) -> Div {
         let health = self.tiny_health().unwrap_or_default();
         let grade = health.grade();
         let hints = health.hints();
-        let mut card = div().w(px(320.)).flex().flex_col().child(
-            div()
-                .pb(px(10.))
-                .flex()
-                .items_start()
-                .justify_between()
-                .gap(px(8.))
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .child(health::bars(grade, 14.))
-                                .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("Call health")),
-                        )
-                        .children(hints.iter().take(1).map(|hint| {
-                            div()
-                                .mt(px(6.))
-                                .flex()
-                                .items_start()
-                                .gap(px(6.))
-                                .child(div().pt(px(1.)).child(glyph(hint.level.icon(), 12., hint.level.color())))
-                                .child(div().flex_1().min_w_0().whitespace_normal().type_small().text_color(hint.level.color()).child(hint.words.clone()))
-                        })),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .px(px(8.))
-                        .py(px(3.))
-                        .rounded_full()
-                        .bg(match grade {
-                            Grade::Great | Grade::Good => theme::positive_soft(),
-                            Grade::Fair => theme::warning_soft(),
-                            Grade::Poor => theme::danger_soft(),
-                            Grade::Unknown => theme::field(),
-                        })
-                        .type_micro()
-                        .font_weight(theme::SEMIBOLD)
-                        .text_color(grade.color())
-                        .child(grade_badge(grade)),
-                ),
-        );
-
-        if hints.len() > 1 {
-            card = card.child(
-                div().pb(px(8.)).mb(px(4.)).border_b_1().border_color(theme::hairline()).flex().flex_col().gap(px(6.)).children(hints.into_iter().skip(1).take(2).map(|hint| {
-                    div()
-                        .flex()
-                        .items_start()
-                        .gap(px(8.))
-                        .child(div().pt(px(2.)).child(glyph(hint.level.icon(), 13., hint.level.color())))
-                        .child(div().flex_1().min_w_0().whitespace_normal().type_small().text_color(theme::text()).child(hint.words))
-                })),
-            );
+        let details = hints.iter().map(|hint| hint.words.as_str()).collect::<Vec<_>>().join("\n");
+        let video_tab = self.tiny_state.stats_tab == StatsTab::Video;
+        let mut card = div().w(px(320.)).flex().flex_col()
+            .child(div().pb(px(10.)).flex().items_center().justify_between().gap(px(8.))
+                .child(div().flex().items_center().gap(px(8.))
+                    .child(health::bars(grade, 14.))
+                    .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("Call health"))
+                    .child(div().id("call-health-info").flex().items_center()
+                        .tooltip(tip(details, None))
+                        .child(glyph("icons/info.svg", 13., theme::text_faint()))))
+                .child(div().px(px(8.)).py(px(3.)).rounded_full()
+                    .bg(match grade {
+                        Grade::Great | Grade::Good => theme::positive_soft(),
+                        Grade::Fair => theme::warning_soft(),
+                        Grade::Poor => theme::danger_soft(),
+                        Grade::Unknown => theme::field(),
+                    }).type_micro().font_weight(theme::SEMIBOLD).text_color(grade.color()).child(grade_badge(grade))))
+            .child(segmented().mb(px(10.))
+                .child(segment("call-health-connection", "Connection", !video_tab).flex_1().justify_center()
+                    .tab_index(0).focus_visible(|style| style.shadow(theme::focus_ring()))
+                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                        if !event.keystroke.modifiers.modified() && matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.tiny_state.stats_tab = StatsTab::Connection;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.tiny_state.stats_tab = StatsTab::Connection;
+                        cx.notify();
+                    })))
+                .child(segment("call-health-video", "Video", video_tab).flex_1().justify_center()
+                    .tab_index(0).focus_visible(|style| style.shadow(theme::focus_ring()))
+                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                        if !event.keystroke.modifiers.modified() && matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.tiny_state.stats_tab = StatsTab::Video;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.tiny_state.stats_tab = StatsTab::Video;
+                        cx.notify();
+                    }))));
+        // A real problem stays visible whichever tab is selected; its full explanation is on hover.
+        if let Some(hint) = hints.first().filter(|hint| hint.level == health::Level::Bad || hint.level == health::Level::Warn) {
+            card = card.child(div().id("call-health-warning").mb(px(8.)).truncate().type_small()
+                .text_color(hint.level.color()).tooltip(tip(hint.words.clone(), None)).child(hint.words.clone()));
         }
-
-        match &self.tiny_state.stats {
-            Some(stats) => {
-                // The bars smooth recent readings, but the numeric details are this sample.
-                let rtt = (stats.rtt_ms > 0).then_some(stats.rtt_ms);
-                let jitter = stats.link_measured.then_some(stats.jitter_ms);
-                let loss = stats.link_measured.then_some(stats.loss_permille);
-                let samples: Vec<_> = self.tiny_state.stats_chart.iter().copied().collect();
-                if !samples.is_empty() {
-                    card = card.child(health_chart(samples, rtt, stats.receive_kbps));
-                }
-                let known = |measured: bool| if measured { theme::positive() } else { theme::text_soft() };
-                card = card
-                    .child(
-                        div()
-                            .mb(px(10.))
-                            .flex()
-                            .gap(px(8.))
-                            .child(kpi(
-                                "RTT",
-                                rtt.map_or_else(|| "—".to_owned(), |ms| ms.to_string()),
-                                "ms",
-                                known(rtt.is_some()),
-                            ))
-                            .child(kpi(
-                                "Jitter",
-                                jitter.map_or_else(|| "—".to_owned(), |ms| ms.to_string()),
-                                "ms",
-                                known(jitter.is_some()),
-                            ))
-                            .child(kpi(
-                                "Loss",
-                                loss.map_or_else(|| "—".to_owned(), |n| format!("{:.1}", f32::from(n) / 10.)),
-                                "%",
-                                known(loss.is_some()),
-                            )),
-                    )
-                    .when_some(room.as_ref(), |card, (name, kbps)| {
-                        card.child(meta_row("Channel", name.clone())).child(meta_row("Audio target", format!("{kbps} kb/s")))
-                    })
-                    .child(meta_row("Sending", format!("{} kb/s", stats.send_kbps)))
-                    .child(meta_row("Receiving", format!("{} kb/s", stats.receive_kbps)))
-                    .child(meta_row(
-                        "Path",
-                        div()
-                            .px(px(7.))
-                            .py(px(2.))
-                            .rounded_full()
-                            .bg(theme::selected())
-                            .flex()
-                            .items_center()
-                            .gap(px(5.))
-                            .child(div().size(px(6.)).rounded_full().bg(theme::positive()))
-                            .child(div().type_micro().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(path_pill(stats.path))),
-                    ))
-                    .when(!stats.codec.is_empty(), |card| card.child(meta_row("Audio codec", stats.codec.clone())))
-                    .child(div().mt(px(6.)).whitespace_normal().type_micro().text_color(theme::text_soft()).child("RTT is the round trip to the call server, not playback delay. Sending and receiving include the whole call."));
-                if let Some(video) = &stats.video {
-                    card = card
-                        .child(meta_row("Video sending", format!("{} kb/s · {} fps", video.send_kbps, video.send_fps)))
-                        .child(meta_row("Video receiving", format!("{} kb/s · {} fps", video.receive_kbps, video.receive_fps)))
-                        .child(meta_row("Video images", format!("{} fps", video.rendered_fps)))
-                        .child(meta_row("Received size", if video.width > 0 { format!("{} × {}", video.width, video.height) } else { "Waiting for video".to_owned() }))
-                        .child(meta_row("Last video image", video.frame_age_ms.map_or_else(|| "None yet".to_owned(), |age| format!("{age} ms ago"))))
-                        .child(div().whitespace_normal().type_micro().text_color(theme::text_soft()).child("Video rates combine screen sharing and camera layers. Sending is measured after pacing; TCP may still buffer it. Video images counts completed images prepared for this window. Video codec: H.264."));
-                }
+        let Some(stats) = &self.tiny_state.stats else {
+            return card.child(div().h(px(260.)).flex().items_center().justify_center().type_small()
+                .text_color(theme::text_soft()).child(self.tiny_state.stats_note.clone().unwrap_or_else(|| "Measuring…".to_owned())));
+        };
+        let samples: Vec<_> = self.tiny_state.stats_chart.iter().copied().collect();
+        let row = |label, value: String, unit, measured, help| {
+            kpi(label, value, unit, if measured { theme::positive() } else { theme::text_soft() })
+                .id(SharedString::from(format!("call-health-kpi-{label}"))).tooltip(tip(help, None))
+        };
+        if video_tab {
+            let Some(video) = &stats.video else {
+                return card.child(div().h(px(260.)).flex().flex_col().items_center().justify_center().gap(px(10.))
+                    .child(glyph("icons/monitor-up.svg", 26., theme::text_faint()))
+                    .child(div().type_small().text_color(theme::text_soft()).child("No video active")));
+            };
+            let incoming = video.receive_expected;
+            card = card.child(health_chart(samples, Some(video.send_kbps), video.receive_kbps, true))
+                .child(div().mb(px(10.)).flex().gap(px(8.))
+                    .child(row("Sending", video.send_fps.to_string(), "fps", true,
+                        "Original video frames emitted after pacing, across screen sharing and camera layers. Retransmissions are not new frames; TCP may still buffer output."))
+                    .child(row("Receiving", if incoming { video.receive_fps.to_string() } else { "—".to_owned() }, "fps", incoming,
+                        "Complete incoming video frames per second. No value while you are not watching."))
+                    .child(row("Rendered", if incoming { video.rendered_fps.to_string() } else { "—".to_owned() }, "fps", incoming,
+                        "Completed video images prepared for this window, not monitor refreshes.")));
+            if incoming {
+                card = card.child(meta_row("Resolution", if video.width > 0 { format!("{} × {}", video.width, video.height) } else { "Waiting…".to_owned() }))
+                    .child(meta_row("Last image", video.frame_age_ms.map_or_else(|| "None yet".to_owned(), |age| format!("{age} ms ago"))));
+            } else {
+                card = card.child(meta_row("Playback", "Not watching")).child(meta_row("Codec", "H.264"));
             }
-            None => {
-                let words: SharedString = self.tiny_state.stats_note.clone().unwrap_or_else(|| "Measuring…".to_owned()).into();
-                card = card.child(div().pt(px(4.)).whitespace_normal().type_small().text_color(theme::text_soft()).child(words));
-            }
+        } else {
+            let rtt = (stats.rtt_ms > 0).then_some(stats.rtt_ms);
+            let jitter = stats.link_measured.then_some(stats.jitter_ms);
+            let loss = stats.link_measured.then_some(stats.loss_permille);
+            card = card.child(health_chart(samples, rtt, stats.receive_kbps, false))
+                .child(div().mb(px(10.)).flex().gap(px(8.))
+                    .child(row("RTT", rtt.map_or_else(|| "—".to_owned(), |ms| ms.to_string()), "ms", rtt.is_some(),
+                        "Round-trip time to the call server, not one-way playback delay. Numeric values are the current sample; signal bars smooth recent measurements."))
+                    .child(row("Jitter", jitter.map_or_else(|| "—".to_owned(), |ms| ms.to_string()), "ms", jitter.is_some(),
+                        "Variation in packet arrival timing. No value when traffic is insufficient to measure it."))
+                    .child(row("Loss", loss.map_or_else(|| "—".to_owned(), |n| format!("{:.1}", f32::from(n) / 10.)), "%", loss.is_some(),
+                        "Measured packet loss on your connection, after repair.")))
+                .child(meta_row("Traffic", format!("↑ {} · ↓ {} kb/s", stats.send_kbps, stats.receive_kbps))
+                    .id("call-health-traffic").tooltip(tip("Total sending and receiving for the whole call, including video and transport overhead.", None)))
+                .child(meta_row("Transport", format!("{}{}", path_pill(stats.path), if stats.codec.is_empty() { String::new() } else { format!(" · {}", stats.codec.to_uppercase()) })));
         }
         card
     }

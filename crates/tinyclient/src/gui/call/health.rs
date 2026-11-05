@@ -185,6 +185,7 @@ pub(in crate::gui) struct ChartSample {
     pub at: Instant,
     pub rtt_ms: u32,
     pub recv_kbps: u32,
+    pub video_kbps: Option<(u32, u32)>,
 }
 
 /// Append one poll to the chart, dropping the oldest past [`CHART_SECONDS`].
@@ -192,7 +193,7 @@ pub(in crate::gui) fn push_chart(samples: &mut VecDeque<ChartSample>, stats: &Ca
     if samples.len() >= CHART_SECONDS {
         samples.pop_front();
     }
-    samples.push_back(ChartSample { at, rtt_ms: stats.rtt_ms, recv_kbps: stats.receive_kbps });
+    samples.push_back(ChartSample { at, rtt_ms: stats.rtt_ms, recv_kbps: stats.receive_kbps, video_kbps: stats.video.as_ref().map(|video| (video.send_kbps, video.receive_kbps)) });
 }
 
 /// A full minute of made-up samples around `stats`, for `--shot` so the graph is not empty.
@@ -207,6 +208,7 @@ pub(in crate::gui) fn seed_chart(stats: &CallStats, now: Instant) -> VecDeque<Ch
                 at: now - Duration::from_secs((CHART_SECONDS - 1 - i) as u64),
                 rtt_ms: (base_rtt as i32 + rtt_wobble).max(1) as u32,
                 recv_kbps: (base_recv as i32 + recv_wobble * 2).max(1) as u32,
+                video_kbps: stats.video.as_ref().map(|video| (video.send_kbps, video.receive_kbps)),
             }
         })
         .collect()
@@ -564,6 +566,20 @@ mod tests {
         assert_eq!(seeded.len(), CHART_SECONDS);
         assert!(seeded.iter().all(|sample| sample.rtt_ms > 0 && sample.recv_kbps > 0));
         assert_eq!(seeded.back().map(|sample| sample.at), Some(start));
+    }
+
+    #[test]
+    fn video_history_keeps_its_own_rates_and_does_not_invent_them_while_inactive() {
+        let mut samples = VecDeque::new();
+        let mut stats = CallStats { rtt_ms: 40, receive_kbps: 900, ..Default::default() };
+        let now = Instant::now();
+        push_chart(&mut samples, &stats, now);
+        stats.video = Some(protocol::VideoStats { send_kbps: 440, receive_kbps: 800, ..Default::default() });
+        push_chart(&mut samples, &stats, now + Duration::from_secs(1));
+        stats.video = None;
+        push_chart(&mut samples, &stats, now + Duration::from_secs(2));
+        assert_eq!(samples.iter().map(|sample| sample.video_kbps).collect::<Vec<_>>(), [None, Some((440, 800)), None]);
+        assert!(samples.iter().all(|sample| sample.rtt_ms == 40 && sample.recv_kbps == 900));
     }
 
     #[test]

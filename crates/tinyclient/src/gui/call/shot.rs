@@ -21,6 +21,9 @@
 //!
 //! `tiny_sharing` is a call where I share my screen and mediad has painted the first picture of
 //! it for my own tile (a made-up one, the demo's schematic); `--tiny-stream` focuses my stream.
+//!
+//! `TINYCLIENT_SHOT_VIDEO=1` adds sample video metrics; `--tiny-menu stats-video` selects
+//! the compact health card's Video tab. These are design previews, not measured call proof.
 
 use super::phone::{Sheet, Shown};
 use super::security::Place;
@@ -65,6 +68,11 @@ pub(super) fn stats() -> Option<protocol::CallStats> {
     let name = asked().filter(|name| name.starts_with("tiny_"))?;
     let poor = name == "tiny_poor";
     Some(protocol::CallStats {
+        video: std::env::var_os("TINYCLIENT_SHOT_VIDEO").map(|_| protocol::VideoStats {
+            send_kbps: 440, receive_kbps: 2100, send_fps: 30, receive_fps: 60, rendered_fps: 58,
+            receive_expected: true, watching_ms: 30_000, width: 1920, height: 1080, frame_age_ms: Some(16),
+        }),
+        link_measured: true,
         rtt_ms: if poor { 184 } else { 38 },
         jitter_ms: if poor { 41 } else { 4 },
         loss_permille: if poor { 62 } else { 2 },
