@@ -49,6 +49,10 @@ Android, iOS and macOS are gaps. Add `--extended` to run backup export, wrong-pa
 tampered-file rejection, a nonempty import roundtrip, and same-user gap fill after linking with
 no archive history. Keep `release` false until the whole required platform plan is recorded.
 
+The device-sync feature stack requires `--extended`: its evidence must include a nonempty
+backup import and sibling gap fill, as well as the initial linked-device send. The descriptor
+records those requirements; it remains a coordinated IPC scenario pending native lab adapters.
+
 The canary scan reports only whether its chosen needles were found in the chosen files; it is
 not a security audit. Seed sessions and link-code inputs are local test secrets and must not be
 published with public evidence.

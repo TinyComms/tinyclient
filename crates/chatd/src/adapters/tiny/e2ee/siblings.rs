@@ -18,6 +18,7 @@ use super::{lock, Device, Opened, Read, Row, Shared};
 use e2ee::{Envelope, Kind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
@@ -25,9 +26,12 @@ use std::time::{Duration, Instant};
 const PREFIX: &str = "tiny-sync-1 ";
 /// Ids asked at once.
 const ASK_AT_ONCE: usize = 50;
-/// The text of one answer stays under this, so its envelope fits the 16 KiB limit with its JSON
-/// escaping.
-const ANSWER_BYTES: usize = 10 * 1024;
+/// A fragment is base64 inside the sync JSON inside an envelope. Four KiB leaves ample room
+/// for both layers of encoding; ordinary batches are checked with the real envelope codec.
+const FRAGMENT_BYTES: usize = 4 * 1024;
+const MAX_FRAGMENTS: usize = 16;
+const MAX_ROW_BYTES: usize = FRAGMENT_BYTES * MAX_FRAGMENTS;
+const MAX_ASSEMBLIES: usize = 32;
 /// A message asked for is not asked for again sooner.
 const ASK_AGAIN: Duration = Duration::from_secs(10 * 60);
 /// Tries at asking, and the wait between them: past the server's commit batching.
@@ -48,6 +52,15 @@ pub(super) enum Sync {
         conv: String,
         rows: Vec<(String, Opened)>,
     },
+    /// A large opened row, split without losing attachment keys or requiring a larger envelope.
+    HavePart {
+        conv: String,
+        id: String,
+        hash: String,
+        part: u32,
+        total: u32,
+        data: String,
+    },
     /// `number` is the safety number marked as compared; `None` takes the mark back.
     Verified {
         user: String,
@@ -65,27 +78,54 @@ impl Sync {
     pub(super) fn parse(text: &str) -> Option<Sync> {
         serde_json::from_str(text.strip_prefix(PREFIX)?).ok()
     }
+
+    fn fits(&self) -> bool {
+        self.text().is_some_and(|text| Envelope::message(text).encode(Kind::Message).is_ok())
+    }
 }
 
-/// `rows` as answers, each small enough for one message. A row too large on its own is left out.
+/// `rows` as bounded wire envelopes. Large rows use hashed fragments, including rows whose
+/// text grows when the sync JSON is escaped a second time inside the encrypted envelope.
 pub(super) fn answers(conv: &str, rows: Vec<(String, Opened)>) -> Vec<Sync> {
     let mut out = Vec::new();
     let mut batch: Vec<(String, Opened)> = Vec::new();
-    let mut size = 0;
     for (id, opened) in rows {
-        let one = serde_json::to_string(&(&id, &opened)).map_or(usize::MAX, |json| json.len()) + 1;
-        if one + conv.len() + 64 > ANSWER_BYTES {
+        let Ok(bytes) = serde_json::to_vec(&opened) else {
+            continue;
+        };
+        if bytes.len() > MAX_ROW_BYTES {
             continue;
         }
-        if size + one + conv.len() + 64 > ANSWER_BYTES && !batch.is_empty() {
+        let mut candidate = batch.clone();
+        candidate.push((id.clone(), opened.clone()));
+        if (Sync::Have { conv: conv.to_owned(), rows: candidate.clone() }).fits() {
+            batch = candidate;
+            continue;
+        }
+        if !batch.is_empty() {
             out.push(Sync::Have {
                 conv: conv.to_owned(),
                 rows: std::mem::take(&mut batch),
             });
-            size = 0;
         }
-        size += one;
-        batch.push((id, opened));
+        let single = Sync::Have { conv: conv.to_owned(), rows: vec![(id.clone(), opened)] };
+        if single.fits() {
+            if let Sync::Have { rows, .. } = single {
+                batch = rows;
+            }
+            continue;
+        }
+        let hash = super::b64(&Sha256::digest(&bytes));
+        let total = bytes.len().div_ceil(FRAGMENT_BYTES) as u32;
+        for (part, bytes) in bytes.chunks(FRAGMENT_BYTES).enumerate() {
+            let reply = Sync::HavePart {
+                conv: conv.to_owned(), id: id.clone(), hash: hash.clone(),
+                part: part as u32, total, data: super::b64(bytes),
+            };
+            if reply.fits() {
+                out.push(reply);
+            }
+        }
     }
     if !batch.is_empty() {
         out.push(Sync::Have {
@@ -105,6 +145,14 @@ pub(super) struct Siblings {
     wanted: Vec<(String, Vec<String>)>,
     /// Self messages already acted on.
     seen: BTreeSet<String>,
+    /// At most two MiB of partial row data, separated by sending device and digest. Unfinished
+    /// rows expire so retries cannot accumulate plaintext indefinitely.
+    parts: HashMap<(String, String, String, String), Parts>,
+}
+
+struct Parts {
+    at: Instant,
+    chunks: Vec<Option<Vec<u8>>>,
 }
 
 impl Device {
@@ -238,7 +286,7 @@ impl Device {
         // Only the person's own other devices. MLS has checked the sender is who the row says.
         if row.author_id != self.saved.user_id
             || mine.as_deref() == Some(row.device_id)
-            || !self.siblings.seen.insert(row.id.to_owned())
+            || self.siblings.seen.contains(row.id)
         {
             return Vec::new();
         }
@@ -249,6 +297,7 @@ impl Device {
         let Some(sync) = Sync::parse(&opened.text) else {
             return Vec::new();
         };
+        self.siblings.seen.insert(row.id.to_owned());
         self.act(sync, row.device_id)
     }
 
@@ -285,6 +334,9 @@ impl Device {
                     Vec::new()
                 }
             }
+            Sync::HavePart { conv, id, hash, part, total, data } => {
+                self.take_part(conv, id, hash, part, total, data, from_device)
+            }
             Sync::Verified { user, number } => {
                 if super::super::safe_id(&user) && user != self.saved.user_id {
                     match number {
@@ -296,6 +348,54 @@ impl Device {
                 Vec::new()
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn take_part(&mut self, conv: String, id: String, hash: String, part: u32, total: u32, data: String, from: &str) -> Vec<String> {
+        if !super::super::safe_id(&conv) || !super::super::safe_id(&id) || self.is_self(&conv)
+            || total == 0 || total as usize > MAX_FRAGMENTS || part >= total
+            || hash.len() > 44 || data.len() > FRAGMENT_BYTES.div_ceil(3) * 4
+        {
+            return Vec::new();
+        }
+        let Some(expected) = super::unb64(&hash).filter(|hash| hash.len() == 32) else {
+            return Vec::new();
+        };
+        let Some(bytes) = super::unb64(&data).filter(|bytes| bytes.len() <= FRAGMENT_BYTES) else {
+            return Vec::new();
+        };
+        if self.cache(&conv).is_none_or(|cache| cache.rows.contains_key(&id)) {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        self.siblings.parts.retain(|_, held| now.duration_since(held.at) < ASK_AGAIN);
+        let key = (from.to_owned(), conv.clone(), id.clone(), hash);
+        if !self.siblings.parts.contains_key(&key) && self.siblings.parts.len() >= MAX_ASSEMBLIES {
+            return Vec::new();
+        }
+        let held = self.siblings.parts.entry(key.clone()).or_insert_with(|| Parts {
+            at: now, chunks: vec![None; total as usize],
+        });
+        if held.chunks.len() != total as usize {
+            return Vec::new();
+        }
+        if held.chunks[part as usize].as_ref().is_some_and(|before| *before != bytes) {
+            self.siblings.parts.remove(&key);
+            return Vec::new();
+        }
+        held.chunks[part as usize] = Some(bytes);
+        if held.chunks.iter().any(Option::is_none) {
+            return Vec::new();
+        }
+        let held = self.siblings.parts.remove(&key).unwrap();
+        let bytes: Vec<u8> = held.chunks.into_iter().flatten().flatten().collect();
+        if Sha256::digest(&bytes).as_slice() != expected {
+            return Vec::new();
+        }
+        let Ok(opened) = serde_json::from_slice::<Opened>(&bytes) else {
+            return Vec::new();
+        };
+        self.act(Sync::Have { conv, rows: vec![(id, opened)] }, from)
     }
 
     /// What this device can answer to a sibling's `want`: the asked messages its cache holds.
@@ -422,6 +522,83 @@ mod tests {
     }
 
     #[test]
+    fn a_sync_row_that_becomes_readable_is_retried_instead_of_permanently_skipped() {
+        let mut device = device("retry-readable");
+        let own = device.notes.self_conv.clone().unwrap();
+        let row = Row { id: "retry-row", author_id: ME, kind: "message", ciphertext: Some("AAAA"),
+            epoch: 0, device_id: "sibling", target_id: None, client_id: None, created_at: "" };
+        assert!(device.sibling_said(&row).is_empty());
+        // Once a Welcome or another successful read makes this row available, catch-up must
+        // still process its authenticated cached plaintext.
+        let answer = Sync::Have { conv: "c1".into(), rows: vec![("m1".into(), opened("recovered"))] };
+        device.remember(&own, row.id, opened(&answer.text().unwrap()));
+        assert_eq!(device.sibling_said(&row), ["c1"]);
+        assert_eq!(device.cache("c1").unwrap().rows["m1"].text, "recovered");
+        assert!(device.sibling_said(&row).is_empty(), "a successfully handled row is deduplicated");
+    }
+
+    #[test]
+    fn gap_fill_transfers_a_valid_message_larger_than_ten_kibibytes() {
+        let text = "x".repeat(15_000);
+        assert!(Envelope::message(&text).encode(Kind::Message).is_ok());
+        let replies = answers("c1", vec![("large".into(), opened(&text))]);
+        assert!(!replies.is_empty(), "a legal message must not disappear from gap fill");
+        let mut receiver = device("large-answer");
+        for reply in replies.into_iter().rev() {
+            assert!(Envelope::message(reply.text().unwrap()).encode(Kind::Message).is_ok());
+            receiver.act(reply, "sibling");
+        }
+        assert_eq!(receiver.cache("c1").unwrap().rows["large"].text, text);
+    }
+
+    #[test]
+    fn gap_fill_measures_the_outer_envelope_when_text_needs_json_escaping() {
+        let text = "\"".repeat(4_500);
+        assert!(Envelope::message(&text).encode(Kind::Message).is_ok());
+        let replies = answers("c1", vec![("quotes".into(), opened(&text))]);
+        assert!(!replies.is_empty());
+        let mut receiver = device("escaped-answer");
+        for reply in replies {
+            assert!(Envelope::message(reply.text().unwrap()).encode(Kind::Message).is_ok(), "the wire envelope must fit after both layers of escaping");
+            receiver.act(reply, "sibling");
+        }
+        assert_eq!(receiver.cache("c1").unwrap().rows["quotes"].text, text);
+    }
+
+    #[test]
+    fn fragmented_answers_are_authenticated_and_never_mix_devices() {
+        let text = "\"".repeat(7_000);
+        let replies = answers("c1", vec![("large".into(), opened(&text))]);
+        assert!(replies.len() > 1, "large rows use independently bounded fragments");
+        let mut receiver = device("separate-fragments");
+        receiver.act(replies[0].clone(), "first-device");
+        for reply in replies.iter().skip(1) {
+            receiver.act(reply.clone(), "second-device");
+        }
+        assert!(!receiver.cache("c1").unwrap().rows.contains_key("large"));
+        for reply in replies.iter().skip(1) {
+            receiver.act(reply.clone(), "first-device");
+        }
+        assert_eq!(receiver.cache("c1").unwrap().rows["large"].text, text);
+
+        let mut receiver = device("corrupt-fragments");
+        let mut corrupt = serde_json::to_value(&replies[0]).unwrap();
+        corrupt["data"] = serde_json::json!("AAAA");
+        receiver.act(serde_json::from_value(corrupt).unwrap(), "sibling");
+        for reply in replies.iter().skip(1) {
+            receiver.act(reply.clone(), "sibling");
+        }
+        assert!(!receiver.cache("c1").unwrap().rows.contains_key("large"), "a bad assembled hash never persists a partial row");
+        let mut oversized = serde_json::to_value(&replies[0]).unwrap();
+        oversized["total"] = serde_json::json!(u32::MAX);
+        receiver.act(serde_json::from_value(oversized).unwrap(), "sibling");
+        for reply in replies {
+            receiver.act(reply, "sibling");
+        }
+        assert_eq!(receiver.cache("c1").unwrap().rows["large"].text, text, "invalid fragment counts do not prevent a later valid retry");
+    }
+
+    #[test]
     fn a_sibling_answers_what_its_cache_holds_and_the_asker_keeps_it_without_overwriting() {
         let mut had = device("had");
         had.remember("c1", "m1", opened("opened there"));
@@ -523,9 +700,9 @@ mod tests {
             .is_empty());
         let mine: &'static str = Box::leak(mine.into_boxed_str());
         assert!(device.sibling_said(&row("r2", ME, mine)).is_empty());
-        // One that does not open is dropped, and not tried twice.
+        // One that does not open remains retryable after its Welcome arrives.
         assert!(device.sibling_said(&row("r3", ME, "sibling")).is_empty());
-        assert!(device.siblings.seen.contains("r3"));
+        assert!(!device.siblings.seen.contains("r3"));
         assert!(
             !device.has_wants(),
             "a sync message is never itself asked for"
@@ -600,14 +777,14 @@ mod tests {
         let rows: Vec<(String, Opened)> = (0..60)
             .map(|n| (format!("m{n}"), opened(&"x".repeat(900))))
             .collect();
-        let mut too_big = vec![("huge".to_owned(), opened(&"y".repeat(20_000)))];
+        let mut too_big = vec![("huge".to_owned(), opened(&"y".repeat(MAX_ROW_BYTES + 1)))];
         too_big.extend(rows.clone());
         let out = answers("c1", too_big);
         assert!(out.len() > 1);
         let mut kept = 0;
         for answer in &out {
             let text = answer.text().unwrap();
-            assert!(text.len() <= ANSWER_BYTES + PREFIX.len(), "{}", text.len());
+            assert!(Envelope::message(text).encode(Kind::Message).is_ok());
             let Sync::Have { rows, .. } = answer else {
                 panic!()
             };
