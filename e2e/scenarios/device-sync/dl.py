@@ -220,6 +220,11 @@ class Linker:
             rc, ans = ask(old, "old_join", code=code)
             seen["old_join"] = {"rc": rc, "answer": ans}
             self.L.step(platform, f"{old.label} takes the code (pasted, as from a QR)", rc == 0 or expect.startswith("refused"), answer=ans if rc else None)
+            if expect.startswith("refused") and rc != 0:
+                # A refused join has no confirmation stage to wait for. Keep the actual refusal
+                # and current stages instead of waiting for six digits that must never appear.
+                seen.update(refused=True, old_state=state(old), new_state=state(new))
+                return self.finish(seen, wire_from)
             # The new device shows six digits; the old one asks the person to type them.
             check_new = new.wait_until("check (new)", lambda: find(state(new), v1["check_regex"]), 45)
             old_stage = old.wait_until("old at confirm", lambda: (lambda st: st if st.get("stage") in ("confirm", "failed") else None)(state(old)), 45) or state(old)
