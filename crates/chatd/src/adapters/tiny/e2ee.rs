@@ -2121,10 +2121,7 @@ impl Device {
                     .as_ref()
                     .map(|engine| engine.device_id().to_string());
                 if mine.as_deref() == Some(device_id) {
-                    self.state = DeviceState::Failed {
-                        why: "This device was revoked. Sign in again to set it up as a new device."
-                            .to_owned(),
-                    };
+                    self.mark_revoked();
                 }
                 let me = self.saved.user_id.clone();
                 let _ = self.verify_user(&me);
@@ -2450,6 +2447,44 @@ mod tests {
             ciphertext: None, epoch: 0, device_id: "", target_id: None, client_id: None, created_at: "" };
         let mut read = device.read(conversation, &[row]);
         assert!(matches!(read.remove(message), Some(Read::Opened(opened)) if opened.text == "saved before removal"));
+    }
+
+    #[test]
+    fn explicit_self_removal_keeps_saved_history_and_does_not_register_again() {
+        let (mut device, _) = posting_device("explicit-self-removal", 0);
+        let own_id = device.engine.as_ref().unwrap().device_id();
+        let conversation = "22222222-2222-2222-2222-222222222222";
+        let message = "33333333-3333-3333-3333-333333333333";
+        device.remember(conversation, message, Opened { text: "saved before self removal".into(), ..Opened::default() });
+        let registrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = registrations.clone();
+        device.saved.base_url = super::super::tests::serve(move |request| {
+            if request.starts_with("GET /v1/capabilities ") {
+                return super::super::tests::http(200, "OK", r#"{"features":["e2ee_text"],"e2ee_text":"optional"}"#);
+            }
+            if request.starts_with("PUT ") {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return super::super::tests::http(409, "Conflict", r#"{"error":"device_exists"}"#);
+            }
+            super::super::tests::http(200, "OK", "[]")
+        });
+        device.revoke("44444444-4444-4444-4444-444444444444").unwrap();
+        assert!(!device.revoked(), "removing another device must keep this device approved");
+        assert_eq!(device.state, DeviceState::Ready);
+        device.revoke(&own_id.to_string()).unwrap();
+        assert!(device.revoked(), "explicit self removal must persist the same terminal marker as external removal");
+        assert!(matches!(device.try_enrol().unwrap(), DeviceState::Failed { .. }));
+        assert_eq!(registrations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let status = device.status(&HashMap::new());
+        assert!(status.revoked);
+        assert!(matches!(status.device, DeviceState::Failed { ref why } if why == "This device was removed. Saved messages are still available."));
+        assert_eq!(device.engine.as_ref().unwrap().device_id(), own_id);
+        assert!(device.cache_key.is_some());
+        let notes: Value = serde_json::from_slice(&std::fs::read(device.dir.join("notes.json")).unwrap()).unwrap();
+        assert_eq!(notes["revoked_device"], own_id.to_string());
+        let row = Row { id: message, author_id: &device.saved.user_id.clone(), kind: "message",
+            ciphertext: None, epoch: 0, device_id: "", target_id: None, client_id: None, created_at: "" };
+        assert!(matches!(device.read(conversation, &[row]).remove(message), Some(Read::Opened(opened)) if opened.text == "saved before self removal"));
     }
 
     #[test]
