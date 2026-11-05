@@ -3,6 +3,7 @@
 mod test_mediad;
 
 pub mod adapters;
+pub mod leave_prove;
 pub mod blobs;
 pub mod demo;
 pub mod hub;
