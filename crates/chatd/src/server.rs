@@ -2315,7 +2315,7 @@ impl Chat {
             },
             // Answered `Ok` whatever became of it: the recording's own word is `Change::Recording`.
             Request::Record(request) => {
-                self.hub.recorder.request(&self.hub, &support_dir().join("media"), request);
+                self.hub.recorder.request(&self.hub, request);
                 Response::Ok
             }
             Request::Media(request) => {

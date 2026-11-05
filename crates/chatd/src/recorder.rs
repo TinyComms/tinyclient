@@ -3,12 +3,11 @@
 //! starts mediad for a file when the user presses the mic and closes its stdin on stop or forget,
 //! so a recording gone holds no device at all.
 //!
-//! The file is chatd's to name: a `voice-<millis>.opus` beside the account's cache files, so a
-//! recording is sent from inside the media cache like any file. One recording at a time, across
+//! The file is chatd's to name: a `voice-<millis>.opus` in the upload outbox, so a recording
+//! passes the upload path checks and is cleaned up after sending. One recording at a time, across
 //! every network: starting another ends the one before it, whose file is dropped once its mediad
 //! has let go of it.
 
-use crate::blobs::dir_under;
 use crate::hub::{lock, Hub};
 use crate::media::mediad_path;
 use protocol::{read_frame, Change, Key, RecordRequest, Recording, RecordState, RecEvent, WAVEFORM_LIMIT};
@@ -83,21 +82,21 @@ impl Recorder {
     }
 
     /// The shell's request. Every answer is `Ok`: what happened is a `Change::Recording`.
-    pub fn request(&self, hub: &Arc<Hub>, media: &Path, request: RecordRequest) {
+    pub fn request(&self, hub: &Arc<Hub>, request: RecordRequest) {
         match request {
-            RecordRequest::Start { conversation } => self.start(hub, media, conversation),
+            RecordRequest::Start { conversation } => self.start(hub, conversation),
             RecordRequest::Stop => self.stop(hub),
             RecordRequest::Forget => self.forget(hub),
         }
     }
 
     /// Starts a mediad. Whatever was recording ends first: its facts never arrive any more.
-    fn start(&self, hub: &Arc<Hub>, media: &Path, conversation: Key) {
+    fn start(&self, hub: &Arc<Hub>, conversation: Key) {
         let since = now_ms();
-        let path = dir_under(media, &conversation.account()).join(format!("voice-{since}.opus"));
+        let path = crate::blobs::upload::outbox().join(format!("voice-{since}.opus"));
         self.replace(hub, None);
         let recording = Recording { conversation, since, state: RecordState::Active };
-        let _ = std::fs::create_dir_all(path.parent().expect("the cache has a parent"));
+        let _ = std::fs::create_dir_all(path.parent().expect("the outbox has a parent"));
         self.spawn_recording(hub, &recording, &path);
         self.tell(hub);
     }
@@ -143,6 +142,9 @@ impl Recorder {
         };
         let (keep, said) = (active.keep.clone(), active.said.clone());
         *lock(&self.active) = Some(active);
+        // Publish before reading events: even an immediate failure must have a current
+        // recording to update, and the composer needs Active to make its next press Stop.
+        *lock(&self.shown) = Some(recording.clone());
         // Ends when mediad exits, which it does when chatd closes our stdin.
         let hub = hub.clone();
         let recording = recording.clone();
@@ -211,6 +213,46 @@ impl Recorder {
 mod tests {
     use super::*;
     use protocol::Network;
+
+    #[test]
+    fn a_started_recorder_is_visible_and_its_stop_keeps_the_finished_note() {
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("tiny-recorder-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hub = Arc::new(Hub::new(crate::store::Store::open(&dir.join("chat.sqlite")).unwrap()));
+        // A controlled media host waits for the actual stop pipe to close, then reports
+        // completion. This exercises running/reported rather than assuming shown is set.
+        let spawned = protocol::media_host::spawn_with(|mut launch| {
+            std::thread::spawn(move || {
+                let mut input = Vec::new();
+                launch.stdin.read_to_end(&mut input).unwrap();
+                protocol::write_frame(&mut launch.stdout, &RecEvent::Done { duration: 1000, waveform: vec![50] }).unwrap();
+                launch.exit.finish(0);
+            });
+            Ok(())
+        }, &Command::new("mediad")).unwrap();
+        let recording = recording(5_000);
+        let path = dir.join("voice.opus");
+        hub.recorder.running(&hub, &recording, &path, spawned);
+        assert_eq!(hub.recorder.shown(), Some(recording));
+        hub.recorder.stop(&hub);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let shown = hub.recorder.shown().unwrap();
+            if let RecordState::Recorded { path: kept, duration, waveform } = shown.state {
+                assert_eq!(kept, path.to_string_lossy());
+                assert_eq!(duration, 1000);
+                assert_eq!(waveform, vec![50]);
+                break;
+            }
+            assert!(Instant::now() < deadline, "stop did not finish the recording");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(hub);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn recording(since: u64) -> Recording {
         Recording { conversation: Key { network: Network::Telegram, account: "10".into(), id: "7002".into() }, since, state: RecordState::Active }

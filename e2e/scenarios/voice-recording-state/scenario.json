@@ -1,0 +1,7 @@
+{
+  "id": "voice-recording-state",
+  "title": "The microphone starts a visible recording and a second press stages the finished voice note",
+  "platforms": ["linux"],
+  "needs": [],
+  "release": false
+}
