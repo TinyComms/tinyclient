@@ -1105,31 +1105,37 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
             // made, registered, key packages up. Never stops the account.
             e2ee::begin(&saved, ctx.commands.clone());
             messages::refresh(&ctx, &saved);
-            serve_commands(
-                &ctx,
-                inbox,
-                Duration::from_millis(200),
-                |_| {},
-                |command| match command {
-                    Command::Tiny(ask) => live.ask(ask),
-                    // chatd's call in a room ended (hung up, or failed), or its mute changed.
-                    Command::CallLeave(room_id) => live.ask(live::Ask::Hangup { room_id }),
-                    Command::CallAudio { muted, deafened } => live.ask(live::Ask::State { muted, deafened }),
-                    Command::SignOut(reply) => {
-                        // This install stops being a device of the person: revoked on the server
-                        // while the session still works, its keys and cache forgotten here.
-                        e2ee::sign_out(&saved);
-                        delete_session(&saved);
-                        let _ = reply.send(Ok(()));
-                    }
-                    other => messages::serve(&ctx, &saved, &live, other),
-                },
-            );
+            serve_inbox(&ctx, &saved, &live, inbox);
             // The socket thread sleeps on the socket; this is how it hears the adapter stopped.
             live.wake();
         })
         .map_err(|err| err.to_string())?;
     Ok(())
+}
+
+/// The account's commands, until it stops. A conversation opened (`Backfill`) or warmed reads
+/// its newest page from the server, as every other command that reads one does.
+fn serve_inbox(ctx: &Context, saved: &Saved, live: &live::Live, inbox: Receiver<Command>) {
+    serve_commands(
+        ctx,
+        inbox,
+        Duration::from_millis(200),
+        |id| messages::serve(ctx, saved, live, Command::Backfill(id.to_owned())),
+        |command| match command {
+            Command::Tiny(ask) => live.ask(ask),
+            // chatd's call in a room ended (hung up, or failed), or its mute changed.
+            Command::CallLeave(room_id) => live.ask(live::Ask::Hangup { room_id }),
+            Command::CallAudio { muted, deafened } => live.ask(live::Ask::State { muted, deafened }),
+            Command::SignOut(reply) => {
+                // This install stops being a device of the person: revoked on the server
+                // while the session still works, its keys and cache forgotten here.
+                e2ee::sign_out(saved);
+                delete_session(saved);
+                let _ = reply.send(Ok(()));
+            }
+            other => messages::serve(ctx, saved, live, other),
+        },
+    );
 }
 
 #[cfg(test)]

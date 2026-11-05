@@ -2,7 +2,7 @@
 //! the REST routes the socket reads beside it. Timings are shortened through `Timing`.
 
 use super::*;
-use crate::adapters::{local, Adapter};
+use crate::adapters::{local, Adapter, Command};
 use crate::hub::Hub;
 use crate::store::Store;
 use protocol::{AccountKey, Change, Key, Network};
@@ -1804,4 +1804,41 @@ fn an_incognito_host_or_a_requiring_room_never_carries_a_call_on_unencrypted() {
     // A room that requires it, on any server.
     assert_eq!(must_encrypt("chat.example.org", true, true), Ok(true));
     assert_eq!(must_encrypt("chat.example.org", true, false), Err(ROOM_CANNOT_ENCRYPT));
+}
+
+#[test]
+fn opening_a_conversation_reads_its_newest_page_from_the_server() {
+    // A conversation opened on the shell is `Backfill`: before, the Tiny adapter took it and did
+    // nothing, so a conversation showed only what the socket or scrolling up had brought.
+    let fake = fake(&[], |_, _| {});
+    let hub = Arc::new(Hub::new(Store::open(std::path::Path::new(":memory:")).expect("a store in memory")));
+    let (adapter, ctx, inbox) = local(AccountKey { network: Network::Tiny, account: ME.to_owned() }, hub);
+    let saved = Saved {
+        base_url: fake.base.clone(),
+        token: "t".to_owned(),
+        user_id: ME.to_owned(),
+        email: None,
+        display_name: "Ada".to_owned(),
+        role: "owner".to_owned(),
+        plain_http_ok: false,
+        e2ee: None,
+    };
+    let live = Arc::new(Live::new().expect("a wake pair"));
+    let (serving, serving_live) = (ctx.clone(), live.clone());
+    let thread = std::thread::spawn(move || super::super::serve_inbox(&serving, &saved, &serving_live, inbox));
+    let conversation = "c0ffee00-0000-4000-8000-000000000001";
+    ctx.commands.send(Command::Backfill(conversation.to_owned())).expect("the inbox");
+    let wanted = format!("GET /v1/conversations/{conversation}/messages?limit=");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let asked = loop {
+        match fake.seen.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Seen::Rest(line)) if line.starts_with(&wanted) => break true,
+            Ok(_) => {}
+            Err(_) => break false,
+        }
+    };
+    drop(adapter);
+    let _ = ctx.commands.send(Command::Stop);
+    let _ = thread.join();
+    assert!(asked, "the newest page was asked of the server");
 }
