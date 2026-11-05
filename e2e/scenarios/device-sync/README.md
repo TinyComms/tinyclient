@@ -1,5 +1,9 @@
 # Device sync
 
+Catch-up recovery harness preparation and its separate pending real-device proof
+are documented in [RECOVERY.md](RECOVERY.md). The owned handshake gate and public
+binding observer tests do not constitute a runtime recovery pass.
+
 This is the reusable multi-device IPC proof. It drives the same chatd requests as the window,
 records real desktop windows, and keeps one assertion ledger. It is **IPC proof with GUI display**;
 it does not certify clicking through the link screens.

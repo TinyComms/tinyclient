@@ -30,10 +30,12 @@ import asyncio
 import base64
 import itertools
 import json
+import math
 import os
 import re
 import sys
 import time
+import uuid
 from urllib.parse import parse_qs, urlsplit
 
 LINK_RE = re.compile(r"^/v1/e2ee/links(?:/([A-Za-z0-9_-]+))?(/messages|/archive)?(?:\?.*)?$")
@@ -65,6 +67,86 @@ class HandshakeFault:
 
 
 HANDSHAKE_FAULT = HandshakeFault()
+
+
+def handshake_gate(method, path, ctl):
+    """Match only the fixture's two named GET readers; no credential inspection.
+
+    The query device_id is routing scope, not authentication. The real service
+    still authenticates the forwarded request. Keep tokens out of control/logs.
+    Invalid matching controls fail closed before any HTTP bytes go upstream.
+    """
+    gate = ctl.get("handshake_gate")
+    if not isinstance(gate, dict) or method != "GET":
+        return None
+    request = urlsplit(path)
+    if request.path != f"/v1/e2ee/conversations/{gate.get('conversation_id')}/handshake":
+        return None
+    devices = gate.get("device_ids")
+    query_devices = parse_qs(request.query).get("device_id", [])
+    if not isinstance(devices, list) or not any(device in devices for device in query_devices):
+        return None
+    if len(query_devices) != 1 or len(devices) not in (1, 2) or len(set(devices)) != len(devices):
+        raise ValueError("invalid handshake gate device scope")
+    for value in [gate.get("id"), gate.get("conversation_id"), *devices]:
+        if not isinstance(value, str) or str(uuid.UUID(value)) != value:
+            raise ValueError("invalid handshake gate UUID")
+    for key in ("max_wait_seconds", "expires_at"):
+        value = gate.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError("invalid handshake gate deadline")
+    if not 0 < gate["max_wait_seconds"] <= 120 or gate.get("state") not in ("paused", "released"):
+        raise ValueError("invalid handshake gate bounds or state")
+    return gate, query_devices[0]
+
+
+class HandshakeDeliveryGate:
+    """At most one pending GET per gate/device; explicit same-scope release only."""
+    def __init__(self):
+        self.pending = set()
+        self.active = None
+        self.deadline = None
+
+    async def wait(self, method, path, ctl, cid):
+        # Once armed, missing/replaced control cannot make a retry bypass the
+        # hold. Retain its two-device scope until the exact explicit release.
+        if self.active is not None and ctl.get("handshake_gate") == dict(self.active, state="released"):
+            self.active = None
+        match = handshake_gate(method, path, {"handshake_gate": self.active}) if self.active else None
+        if match is None:
+            match = handshake_gate(method, path, ctl)
+        if match is None or match[0]["state"] == "released":
+            return True
+        gate, device = match
+        if self.active is None:
+            self.active = gate
+            self.deadline = time.monotonic() + max(0, min(gate["max_wait_seconds"], gate["expires_at"] - time.time()))
+        elif gate != self.active:
+            raise ValueError("another handshake gate is already armed")
+        key = gate["id"], device
+        record = {"conn": cid, "gate_id": gate["id"], "device_id": device,
+                  "conversation_id": gate["conversation_id"]}
+        if key in self.pending:
+            log(dict(record, event="handshake_gate_capacity"))
+            return False
+        self.pending.add(key)
+        deadline = self.deadline
+        scope = dict(gate, state="released")
+        log(dict(record, event="handshake_gate_held"))
+        try:
+            while time.monotonic() < deadline:
+                current = control().get("handshake_gate")
+                if current == scope:
+                    log(dict(record, event="handshake_gate_released"))
+                    return True
+                await asyncio.sleep(min(.025, max(0, deadline - time.monotonic())))
+            log(dict(record, event="handshake_gate_timeout"))
+            return False
+        finally:
+            self.pending.discard(key)
+
+
+HANDSHAKE_GATE = HandshakeDeliveryGate()
 
 
 def control():
@@ -265,6 +347,15 @@ async def handle(creader, cwriter):
             ctl = control()
             m = LINK_RE.match(path)
             rec = {"conn": cid, "method": method, "path": path.split("?")[0], "query": "?" in path}
+            if not await HANDSHAKE_GATE.wait(method, path, ctl, cid):
+                body = b'{"error":"proof handshake gate not released"}'
+                cwriter.write(head_bytes("HTTP/1.1 503 Service Unavailable", [
+                    ("Content-Type", "application/json"), ("Content-Length", str(len(body))),
+                    ("Connection", "close")]) + body)
+                await cwriter.drain()
+                rec.update(status=503, injected="handshake_gate_refused")
+                log(rec)
+                break
             if HANDSHAKE_FAULT.take(method, path, ctl):
                 await pipe_body(creader, _Sink(), headers)
                 body = b'{"error":"temporary proof handshake failure"}'
