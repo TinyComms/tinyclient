@@ -435,10 +435,16 @@ fn refold(ctx: &Context, saved: &Saved, conversation_id: &str, opened: &HashMap<
     }
 }
 
+/// A row that carries ciphertext is sealed even when the payload omits `e2ee`. Treating it as
+/// plaintext stores the empty body, and the pane draws no words.
+fn row_is_sealed(wire: &WireMessage) -> bool {
+    wire.e2ee || wire.ciphertext.as_ref().is_some_and(|text| !text.is_empty())
+}
+
 /// What the end-to-end encrypted rows of a page say. Empty for a plaintext page, and when this
 /// device has no encryption state (its rows then read "Can't be decrypted on this device").
 fn open_rows(saved: &Saved, conversation_id: &str, wires: &[&WireMessage]) -> HashMap<String, Read> {
-    if !wires.iter().any(|wire| wire.e2ee) {
+    if !wires.iter().any(|wire| row_is_sealed(wire)) {
         return HashMap::new();
     }
     let Some(device) = e2ee::started(saved) else {
@@ -446,7 +452,7 @@ fn open_rows(saved: &Saved, conversation_id: &str, wires: &[&WireMessage]) -> Ha
     };
     let rows: Vec<e2ee::Row> = wires
         .iter()
-        .filter(|wire| wire.e2ee && !present(&wire.deleted_at))
+        .filter(|wire| row_is_sealed(wire) && !present(&wire.deleted_at))
         .map(|wire| e2ee::Row {
             id: &wire.id,
             author_id: &wire.author_id,
@@ -949,7 +955,7 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
     let deleted = present(&wire.deleted_at);
     let sent = rfc3339(&wire.created_at).unwrap_or(0);
     let outgoing = wire.author_id == saved.user_id;
-    if wire.e2ee {
+    if row_is_sealed(wire) {
         return map_sealed(saved, names, wire, opened.get(&wire.id), deleted, sent, outgoing, media);
     }
     let mut message = Message::plain(&wire.id, name_of(names, saved, &wire.author_id), if deleted { "" } else { &wire.body }, sent, outgoing);
@@ -1705,6 +1711,25 @@ mod tests {
         let outcome = post_message(&ctx, &saved, "sealed-1", "client-9", "secret words", None, &[]);
         assert_eq!(outcome.err().as_deref(), Some(NOT_SET_UP));
         assert!(!posted.load(std::sync::atomic::Ordering::SeqCst), "nothing was posted in plain text");
+    }
+
+    /// A current server sets `e2ee`. One that sends ciphertext without that flag must not be
+    /// stored as an empty plaintext row: the pane would draw no words at all.
+    #[test]
+    fn a_sealed_row_without_the_flag_is_not_stored_as_blank_plaintext() {
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            if request.starts_with("GET /v1/conversations/direct-1/messages?") {
+                return Some(http(200, "OK", &format!(
+                    r#"{{"messages":[{{"id":"s-2","author_id":"{PEER}","body":"","ciphertext":"AAAA","epoch":3,"device_id":"d-1","created_at":"{WHEN}"}}]}}"#
+                )));
+            }
+            None
+        });
+        load_page(&ctx, &saved, "direct-1", None, PAGE);
+        let stored = ctx.stored_message("direct-1", "s-2").unwrap().unwrap();
+        assert_eq!(stored.seal, Seal::Undecryptable);
+        assert_ne!(stored.text, "");
+        assert_eq!(stored.text, protocol::UNDECRYPTABLE);
     }
 
     #[test]
