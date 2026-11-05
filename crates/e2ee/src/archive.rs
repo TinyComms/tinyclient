@@ -1,5 +1,5 @@
 //! The history archive one device of a person hands another: what the old device's cache opened,
-//! and the safety numbers the person verified, sealed under a fresh key that only the link channel
+//! public identity pins and the safety numbers the person verified, sealed under a fresh key that only the link channel
 //! carries ([`crate::link::ArchiveRef`]). The server relays the blob and cannot read it.
 //!
 //! ```text
@@ -82,6 +82,10 @@ pub struct Meta {
     pub from_device: String,
     pub created: String,
     pub scope: Scope,
+    /// Public identity pins only. Absent in older cache archives and backups. The enclosing
+    /// metadata record must fit [`MAX_RECORD`]; oversized pin sets are refused, never truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_trust: Option<crate::identity::Trust>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -319,6 +323,9 @@ impl Records {
                 if meta.v != VERSION {
                     return Err(Error::UnsupportedVersion);
                 }
+                if let Some(public) = &meta.public_trust {
+                    public.validate_public()?;
+                }
                 self.seen_meta = true;
             }
             _ if !self.seen_meta => return Err(Error::Malformed("archive: no meta record first")),
@@ -416,13 +423,19 @@ pub fn read<R: Read>(
 
 /// Where an archive is merged: the new device's sealed cache, as the caller keeps it.
 pub trait Target {
+    /// Checks application-specific public metadata during the authentication-only pass.
+    fn validate_meta(&self, _meta: &Meta) -> Result<()> {
+        Ok(())
+    }
     /// Check a message's application schema during the authentication-only pass, before
     /// any target mutation. Implementations must keep this check free of side effects.
     fn validate(&self, _conv: &str, _id: &str, _opened: &Value) -> Result<()> {
         Ok(())
     }
     /// The archive checked out and is about to be merged: its first record.
-    fn start(&mut self, _meta: &Meta) {}
+    fn start(&mut self, _meta: &Meta) -> Result<()> {
+        Ok(())
+    }
     /// Whether the person is in this conversation. Records for any other are dropped.
     fn is_member(&mut self, conv: &str) -> bool;
     /// Whether this device already has the message: it is never overwritten.
@@ -461,6 +474,7 @@ pub fn merge<R: Read>(
                 if found.user != user {
                     return Err(Error::Malformed("archive: another person's"));
                 }
+                target.validate_meta(&found)?;
                 meta = Some(found);
             }
             Record::Msg { conv, id, opened } => target.validate(&conv, &id, &opened)?,
@@ -469,7 +483,7 @@ pub fn merge<R: Read>(
         Ok(())
     })?;
     let meta = meta.ok_or(Error::Malformed("archive: no meta record first"))?;
-    target.start(&meta);
+    target.start(&meta)?;
     let mut merged = Merged::default();
     read(key, link_id, open()?, |record| {
         match record {
@@ -504,6 +518,7 @@ mod tests {
     fn meta() -> Meta {
         Meta {
             v: VERSION,
+            public_trust: None,
             user: "u".into(),
             from_device: "d".into(),
             created: "2026-11-05T00:00:00Z".into(),

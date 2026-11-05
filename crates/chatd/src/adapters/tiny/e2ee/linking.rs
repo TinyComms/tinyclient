@@ -9,7 +9,7 @@
 //! cross-signs the new device, packs what its cache opened (all of it, the last N days, or none)
 //! into an archive under a fresh key, uploads it, and sends the key and the signature over the
 //! channel. The new device registers with the signature, downloads, checks and merges the
-//! archive, and says done. No key of either device, and nothing in the clear, goes to the server.
+//! archive, and says done. No private key of either device, and nothing in the clear, goes to the server.
 //!
 //! One link at a time per account, on a thread of its own: it waits on the relay's long poll, and
 //! takes this device's lock only for a moment at a time. Each step is told to the shell
@@ -19,7 +19,9 @@ use super::{
     b64, device_label, fingerprint, lock, private_dir, unb64, Device, Opened, Saved, Shared,
 };
 use e2ee::archive::{self, ArchiveKey, Meta, Target, Writer};
-use e2ee::link::{self, ArchiveRef, Channel, LinkCode, Message, Pending, Role, Scope};
+use e2ee::link::{
+    self, ApproveSigner, ArchiveRef, Channel, LinkCode, Message, Pending, Role, Scope,
+};
 use e2ee::store::CacheKey;
 use e2ee::DeviceId;
 use protocol::{E2eeHistory, E2eeLink, LinkStage};
@@ -521,6 +523,7 @@ fn new_half(
     let sealed = next_from(job, relay, link, Role::Old, after)?;
     let Message::Approve {
         cross_signature,
+        signer,
         archive,
         ..
     } = receive(channel, &sealed)?
@@ -534,12 +537,30 @@ fn new_half(
         view.total = archive.as_ref().map_or(0, |archive| archive.bytes);
     });
     let cross_signature = unb64(&cross_signature).ok_or(super::super::UNREADABLE)?;
-    let mut messages = 0;
-    if let Some(archive) = archive {
-        messages = take_in(
-            job, device, relay, link, link_id, &user, &dir, &archive, most,
-        )?;
-    }
+    let signer =
+        signer.ok_or("The approving device must be updated before it can link this device.")?;
+    let signer = {
+        let device = lock(device);
+        let engine = device
+            .engine
+            .as_ref()
+            .ok_or("Encryption isn't set up on this device.")?;
+        signer
+            .verify(
+                engine.user_id(),
+                device_id,
+                &signature_key,
+                &cross_signature,
+            )
+            .map_err(words)?
+    };
+    let messages = if let Some(archive) = archive {
+        take_in(
+            job, device, relay, link, link_id, &user, &dir, &archive, most, &signer,
+        )?
+    } else {
+        return Err("The approving device did not send its public identity records.".to_owned());
+    };
     if job.stopped() {
         return Err(STOPPED.to_owned());
     }
@@ -573,6 +594,7 @@ fn take_in(
     dir: &Path,
     archive: &ArchiveRef,
     most: u64,
+    signer: &e2ee::DeviceRef,
 ) -> Result<u64, String> {
     let unreadable = "The history that came couldn't be checked, so none of it was taken in.";
     let key: [u8; 32] = unb64(&archive.key)
@@ -604,6 +626,7 @@ fn take_in(
             members,
             from: String::new(),
             touched: BTreeSet::new(),
+            expected_signer: Some(signer.clone()),
         };
         let open = || std::fs::File::open(&path).map_err(|err| e2ee::Error::Io(err.to_string()));
         let (meta, merged) = archive::merge(&key, link_id, user, open, &mut into)
@@ -631,9 +654,43 @@ pub(super) struct Merging<'a> {
     pub from: String,
     /// Conversations that gained rows: read again once merged.
     pub touched: BTreeSet<String>,
+    /// Present for modern links; backups made before public pin transfer remain readable.
+    pub expected_signer: Option<e2ee::DeviceRef>,
 }
 
 impl Target for Merging<'_> {
+    fn validate_meta(&self, meta: &Meta) -> e2ee::Result<()> {
+        if let Some(public) = &meta.public_trust {
+            let engine = self
+                .device
+                .engine
+                .as_ref()
+                .ok_or(e2ee::Error::Malformed("public trust: no device"))?;
+            engine.validate_public_trust(public)?;
+        }
+        if let Some(signer) = &self.expected_signer {
+            let engine = self
+                .device
+                .engine
+                .as_ref()
+                .ok_or(e2ee::Error::Malformed("public trust: no device"))?;
+            if meta.user != signer.user.to_string()
+                || meta.from_device != signer.device.to_string()
+                || !meta.public_trust.as_ref().is_some_and(|public| {
+                    public.is_trusted(signer.user, signer.device, &signer.signature_key)
+                })
+                || (engine.trust().knows(signer.user)
+                    && !engine.trust().is_trusted(
+                        signer.user,
+                        signer.device,
+                        &signer.signature_key,
+                    ))
+            {
+                return Err(e2ee::Error::IdentityChanged);
+            }
+        }
+        Ok(())
+    }
     fn validate(&self, conv: &str, id: &str, opened: &Value) -> e2ee::Result<()> {
         if !super::super::safe_id(conv) || !super::super::safe_id(id) {
             return Err(e2ee::Error::Malformed("archive message id"));
@@ -643,8 +700,16 @@ impl Target for Merging<'_> {
             .map_err(|_| e2ee::Error::Malformed("archive message"))
     }
 
-    fn start(&mut self, meta: &Meta) {
+    fn start(&mut self, meta: &Meta) -> e2ee::Result<()> {
+        if let Some(public) = &meta.public_trust {
+            self.device
+                .engine
+                .as_mut()
+                .ok_or(e2ee::Error::Malformed("public trust: no device"))?
+                .import_public_trust(public)?;
+        }
         self.from = meta.from_device.chars().take(64).collect();
+        Ok(())
     }
 
     fn is_member(&mut self, conv: &str) -> bool {
@@ -735,8 +800,12 @@ fn old_half(
     let new_key = unb64(&signature_key)
         .filter(|key| key.len() == e2ee::identity::SIGNATURE_KEY_LEN && key[0] == 4)
         .ok_or(super::super::UNREADABLE)?;
-    let (dir, cache_key, verified, from_device, user, most) = {
+    let (dir, cache_key, verified, from_device, user, most, public_trust, signer) = {
         let device = lock(device);
+        let engine = device
+            .engine
+            .as_ref()
+            .ok_or("Encryption isn't set up on this device.")?;
         (
             device.dir.clone(),
             device
@@ -751,6 +820,12 @@ fn old_half(
                 .unwrap_or_default(),
             device.saved.user_id.clone(),
             device.link_max,
+            engine.public_trust().map_err(words)?,
+            ApproveSigner {
+                user: engine.user_id(),
+                device: engine.device_id(),
+                signature_key: engine.signature_key(),
+            },
         )
     };
     let now = now_secs();
@@ -814,28 +889,28 @@ fn old_half(
         device.save_notes();
         signature
     };
-    let archive = match scope {
-        Scope::None => None,
-        scope => Some(send_archive(
-            job,
-            relay,
-            link,
-            &code.link_id,
-            &dir,
-            &cache_key,
-            &verified,
-            most,
-            Meta {
-                v: archive::VERSION,
-                user,
-                from_device,
-                created: now_secs().to_string(),
-                scope,
-            },
-        )?),
-    };
+    // Even without messages, public identity continuity travels in an encrypted metadata archive.
+    let archive = Some(send_archive(
+        job,
+        relay,
+        link,
+        &code.link_id,
+        &dir,
+        &cache_key,
+        &verified,
+        most,
+        Meta {
+            v: archive::VERSION,
+            public_trust: Some(public_trust),
+            user,
+            from_device,
+            created: now_secs().to_string(),
+            scope,
+        },
+    )?);
     let approve = Message::Approve {
         cross_signature: b64(&cross_signature),
+        signer: Some(signer),
         history: scope,
         archive,
     };

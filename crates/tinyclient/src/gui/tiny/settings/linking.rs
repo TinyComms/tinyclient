@@ -422,6 +422,7 @@ pub(in crate::gui::tiny) fn add_device(shell: &Shell, status: &E2eeStatus, draft
         .child(kit::input(&fields.link_check, Some(160.), window, cx))
         .child(div().type_small().text_color(theme::text_faint()).child("Messages to send it"))
         .child(choices)
+        .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child("Verification details are transferred securely even when no messages are selected. Private keys stay on each device."))
         .child(
             div()
                 .flex()

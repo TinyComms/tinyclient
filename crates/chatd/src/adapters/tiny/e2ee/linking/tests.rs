@@ -8,6 +8,7 @@ use e2ee::store::{FileStore, StateKey};
 use e2ee::{Engine, UserId};
 use protocol::DeviceState;
 mod approval_tests;
+mod public_trust;
 use std::collections::BTreeMap;
 
 const USER: &str = "7e57ada0-0000-4000-8000-000000000001";
@@ -209,6 +210,7 @@ fn a_semantically_invalid_archive_imports_no_earlier_messages() {
     let key = ArchiveKey::generate().unwrap();
     let meta = Meta {
         v: archive::VERSION,
+        public_trust: None,
         user: USER.into(),
         from_device: "old".into(),
         created: "now".into(),
@@ -228,6 +230,7 @@ fn a_semantically_invalid_archive_imports_no_earlier_messages() {
         members: BTreeSet::from(["conversation".to_owned()]),
         from: String::new(),
         touched: BTreeSet::new(),
+        expected_signer: None,
     };
     let result = archive::merge(
         &key,
@@ -263,6 +266,7 @@ fn export_keeps_the_latest_valid_cache_record_and_ignores_a_torn_tail() {
     let key = ArchiveKey::generate().unwrap();
     let meta = Meta {
         v: archive::VERSION,
+        public_trust: None,
         user: USER.into(),
         from_device: "old".into(),
         created: "now".into(),
@@ -334,6 +338,7 @@ fn exporting_many_conversations_does_not_hold_all_plaintext_in_memory() {
     let key = ArchiveKey::generate().unwrap();
     let meta = Meta {
         v: archive::VERSION,
+        public_trust: None,
         user: USER.into(),
         from_device: "old".into(),
         created: "now".into(),
@@ -431,6 +436,21 @@ fn link_through_with(
         for (conv, id, opened) in rows {
             old.remember(conv, id, opened.clone());
         }
+        let peer = UserId::parse("b0b00000-0000-4000-8000-000000000002").unwrap();
+        let identity = e2ee::identity::DeviceIdentity::generate(peer).unwrap();
+        old.engine
+            .as_mut()
+            .unwrap()
+            .verify_devices(
+                peer,
+                &[e2ee::identity::DeviceRecord {
+                    device_id: identity.device,
+                    signature_key: identity.key.public_key(),
+                    cross_signature: None,
+                    created_at: 1,
+                }],
+            )
+            .unwrap();
         old.notes.verified.insert(
             "b0b00000-0000-4000-8000-000000000002".into(),
             "12345".into(),
@@ -570,7 +590,7 @@ fn a_new_device_is_signed_and_gets_the_last_month_of_what_it_may_read() {
 }
 
 #[test]
-fn no_history_sends_no_archive() {
+fn no_history_sends_zero_messages_with_public_identity_metadata() {
     let relay = Arc::new(Fake::default());
     let run = link_through(
         relay.clone(),
@@ -796,6 +816,7 @@ fn history_over_the_servers_limit_sends_the_newest_and_says_how_many_stayed() {
     };
     let meta = Meta {
         v: archive::VERSION,
+        public_trust: None,
         user: USER.into(),
         from_device: "d".into(),
         created: "0".into(),

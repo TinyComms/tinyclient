@@ -71,14 +71,22 @@ that account here (a new device) reads them. "Erase" deletes the directory and t
   QR). The person gives it to a device they have, which answers with an ephemeral key; both show
   six digits. The old device shows the new one's label, system and fingerprint and asks the
   person to type the digits and choose the history (none, 7 or 30 days, all, with sizes). Then it
-  cross-signs, packs its cache (and verified marks) into an archive under a fresh key, uploads
-  it, and sends the key and signature on the channel. The new device registers with the
-  signature, downloads, checks the SHA-256 and the archive, merges it (never overwriting, only
-  conversations the person is in, rows marked `imported_from`), says done, and both delete the
+  requests native owner approval where supported, then cross-signs and packs its cache, public
+  identity pins and verified marks into an archive under a fresh key. It uploads the sealed
+  archive and sends its key, signature and public signer on the authenticated channel. The new
+  device checks the cross-signature locally, downloads and validates the archive, and imports
+  it before registering. It publishes its own public MLS key packages before saying done, so
+  the approving device can add it immediately. Both devices then delete the
   link. Any failure, a cancel or wrong digits sends `abort` and deletes the link. A server without
   the feature keeps the paste-the-code approval, and a `tiny-device-` code pasted where a link code
   goes is approved that way. Every device of the person shows "New device added" for a device it
   did not add itself, with Revoke, from the next `e2ee.device`.
+  Choosing no messages still transfers an encrypted metadata-only archive of public pins and
+  verification marks. No private signing key, MLS state, cache key or session token is copied.
+  Existing destination pins, including revocation tombstones, are retained. Public metadata is
+  bounded by the archive's 1 MiB record limit and fails rather than truncating identity pins.
+  Older backup files without public pin metadata remain readable; they cannot restore pins
+  they never stored. Modern links require the authenticated signer and its public pin metadata.
 - **The person's own devices** (servers with `e2ee_self`; `e2ee/siblings.rs`). Each device joins
   the person's own encrypted conversation (`POST /v1/e2ee/self`), whose group is exactly their
   active devices; the server hides it and deletes its messages after `e2ee_self_ttl_secs`. A

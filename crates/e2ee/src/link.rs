@@ -471,6 +471,9 @@ pub enum Message {
     Approve {
         /// Base64 of the old device's cross-signature over the new one.
         cross_signature: String,
+        /// Authenticated public signer; modern links require it before local registration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signer: Option<ApproveSigner>,
         history: Scope,
         archive: Option<ArchiveRef>,
     },
@@ -478,6 +481,36 @@ pub enum Message {
     Abort {
         reason: String,
     },
+}
+
+/// The approving device's public identity, authenticated by the link channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApproveSigner {
+    pub user: crate::UserId,
+    pub device: crate::DeviceId,
+    /// Uncompressed public P-256 point. No signing secret is transferred.
+    pub signature_key: Vec<u8>,
+}
+
+impl ApproveSigner {
+    /// Verifies approval for exactly the new device, public key, and account on this receiver.
+    pub fn verify(
+        &self,
+        user: crate::UserId,
+        device: crate::DeviceId,
+        key: &[u8],
+        signature: &[u8],
+    ) -> Result<crate::DeviceRef> {
+        if self.user != user {
+            return Err(Error::BadSignature);
+        }
+        crate::identity::verify_cross_signature(&self.signature_key, user, device, key, signature)?;
+        Ok(crate::DeviceRef {
+            user: self.user,
+            device: self.device,
+            signature_key: self.signature_key.clone(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -546,6 +579,7 @@ mod tests {
             approve,
             Message::Approve {
                 cross_signature: "c".into(),
+                signer: None,
                 history: Scope::Days(7),
                 archive: None
             }

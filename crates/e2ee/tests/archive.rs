@@ -15,11 +15,62 @@ const LINK: &[u8] = b"0123456789abcdef";
 fn meta(user: &str) -> Meta {
     Meta {
         v: archive::VERSION,
+        public_trust: None,
         user: user.into(),
         from_device: "old-device".into(),
         created: "2026-11-05T12:00:00Z".into(),
         scope: Scope::All,
     }
+}
+
+#[test]
+fn older_metadata_without_public_trust_still_deserializes() {
+    let meta: Meta = serde_json::from_value(json!({
+        "v": 1, "user": "ada", "from_device": "d", "created": "0", "scope": "all"
+    }))
+    .unwrap();
+    assert!(meta.public_trust.is_none());
+}
+
+#[test]
+fn malformed_public_metadata_is_rejected_before_any_message_merges() {
+    let user = e2ee::UserId::random().unwrap();
+    let engine = e2ee::Engine::detached(user).unwrap();
+    let mut public = serde_json::to_value(engine.public_trust().unwrap()).unwrap();
+    public["users"][user.to_string()]["devices"][engine.device_id().to_string()] = json!("AA==");
+    let mut meta = meta("ada");
+    meta.public_trust = Some(serde_json::from_value(public).unwrap());
+    let key = ArchiveKey::generate().unwrap();
+    let mut writer = Writer::new(&key, LINK, &meta, Vec::new()).unwrap();
+    writer
+        .message("conv-0", "m", &json!({"text":"kept out"}))
+        .unwrap();
+    let (blob, _) = writer.finish().unwrap();
+    let mut cache = Cache {
+        member_of: ["conv-0".to_owned()].into(),
+        ..Cache::default()
+    };
+    assert!(archive::merge(&key, LINK, "ada", || Ok(blob.as_slice()), &mut cache).is_err());
+    assert!(cache.rows.is_empty());
+}
+
+#[test]
+fn public_metadata_over_the_archive_record_limit_is_refused_without_truncation() {
+    use base64::Engine as _;
+    let user = e2ee::UserId::random().unwrap();
+    let engine = e2ee::Engine::detached(user).unwrap();
+    let key = base64::engine::general_purpose::STANDARD.encode(engine.signature_key());
+    let devices: serde_json::Map<String, Value> = (0u128..10_000)
+        .map(|n| (e2ee::DeviceId(n.to_be_bytes()).to_string(), json!(key)))
+        .collect();
+    let public = json!({"users": { user.to_string(): {"pinned": true, "devices": devices} }});
+    let mut meta = meta("ada");
+    meta.public_trust = Some(serde_json::from_value(public).unwrap());
+    let archive_key = ArchiveKey::generate().unwrap();
+    assert!(matches!(
+        Writer::new(&archive_key, LINK, &meta, Vec::new()),
+        Err(e2ee::Error::TooLarge("archive record"))
+    ));
 }
 
 type Msg = (String, String, Value);

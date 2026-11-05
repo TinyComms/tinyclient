@@ -97,6 +97,7 @@ fn the_whole_conversation_runs_and_both_screens_show_one_number() {
     assert_eq!(old.receive(&sent).unwrap(), hello);
     let approve = Message::Approve {
         cross_signature: "sig".into(),
+        signer: None,
         history: Scope::Days(30),
         archive: Some(link::ArchiveRef {
             key: "k".into(),

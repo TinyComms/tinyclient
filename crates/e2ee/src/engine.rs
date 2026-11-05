@@ -324,6 +324,45 @@ impl Engine {
         &self.trust
     }
 
+    /// Public verification records for an authenticated link or encrypted backup. This includes
+    /// this device's public signer even before it has fetched its own directory. It never
+    /// exports signing secrets, MLS state, or any state/cache encryption key.
+    pub fn public_trust(&self) -> Result<Trust> {
+        let mut public = self.trust.clone();
+        public.include_own_public(self.device_ref())?;
+        public.validate_public()?;
+        Ok(public)
+    }
+
+    /// Checks imported public records before any state or message-cache mutation.
+    pub fn validate_public_trust(&self, public: &Trust) -> Result<()> {
+        public.validate_public()?;
+        if public.devices(self.user_id()).iter().any(|device| {
+            device.device == self.device_id() && device.signature_key != self.signature_key()
+        }) {
+            return Err(Error::IdentityChanged);
+        }
+        Ok(())
+    }
+
+    /// Persists public pins inherited from an authenticated device or backup, retaining every
+    /// already-pinned person on this device, including their revocation tombstones.
+    pub fn import_public_trust(&mut self, public: &Trust) -> Result<()> {
+        self.validate_public_trust(public)?;
+        let mut candidate = self.trust.clone();
+        candidate.import_public(public)?;
+        let previous = std::mem::replace(&mut self.trust, candidate);
+        let previous_dirty = self.dirty;
+        let previous_error = self.save_error.clone();
+        if let Err(error) = self.persist(true) {
+            self.trust = previous;
+            self.dirty = previous_dirty;
+            self.save_error = previous_error;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Verifies the server's device list for `user` and records the result (see
     /// [`Trust::verify_list`]). Call it for every member whenever the server says their devices
     /// changed (`e2ee.device`) and before a conversation is joined or committed to.

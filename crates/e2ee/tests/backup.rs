@@ -21,6 +21,7 @@ fn file(passphrase: &str, user: &str) -> Vec<u8> {
     let key = header.key(passphrase).unwrap();
     let meta = Meta {
         v: archive::VERSION,
+        public_trust: None,
         user: user.into(),
         from_device: "d".into(),
         created: "0".into(),

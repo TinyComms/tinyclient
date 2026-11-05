@@ -31,7 +31,7 @@ pub(super) fn export_with(
             "Choose a passphrase of at least {SHORTEST} characters."
         ));
     }
-    let (dir, cache_key, verified, user, from_device) = {
+    let (dir, cache_key, verified, user, from_device, public_trust) = {
         let device = lock(device);
         (
             device.dir.clone(),
@@ -46,6 +46,12 @@ pub(super) fn export_with(
                 .as_ref()
                 .map(|engine| engine.device_id().to_string())
                 .unwrap_or_default(),
+            device
+                .engine
+                .as_ref()
+                .map(|engine| engine.public_trust())
+                .transpose()
+                .map_err(|err| err.to_string())?,
         )
     };
     let header = Header::new(params).map_err(|_| "No randomness is available.".to_owned())?;
@@ -54,6 +60,7 @@ pub(super) fn export_with(
         .map_err(|_| "The backup couldn't be locked.".to_owned())?;
     let meta = Meta {
         v: archive::VERSION,
+        public_trust,
         user,
         from_device,
         created: std::time::SystemTime::now()
@@ -125,6 +132,7 @@ pub(super) fn import(
         members,
         from: String::new(),
         touched: std::collections::BTreeSet::new(),
+        expected_signer: None,
     };
     let merged = match archive::merge(&key, &first, &user, open, &mut into) {
         Ok((_, merged)) => merged,
@@ -179,6 +187,55 @@ mod tests {
     }
 
     const ADA: &str = "7e57ada0-0000-4000-8000-0000000000b1";
+
+    #[test]
+    fn a_backup_inherits_public_peer_pins_with_an_independent_device_identity() {
+        let old = device("public-old", ADA);
+        let fresh = device("public-fresh", ADA);
+        let user = e2ee::UserId::parse(ADA).unwrap();
+        let peer = e2ee::UserId::random().unwrap();
+        let peer_device = e2ee::Engine::detached(peer).unwrap();
+        let mut old_engine = e2ee::Engine::detached(user).unwrap();
+        old_engine
+            .verify_devices(
+                peer,
+                &[e2ee::identity::DeviceRecord {
+                    device_id: peer_device.device_id(),
+                    signature_key: peer_device.signature_key(),
+                    cross_signature: None,
+                    created_at: 1,
+                }],
+            )
+            .unwrap();
+        let source_id = old_engine.device_id();
+        let source_key = old_engine.signature_key();
+        lock(&old).engine = Some(old_engine);
+        lock(&fresh).engine = Some(e2ee::Engine::detached(user).unwrap());
+        let path = lock(&old).dir.join("public.tnyb");
+        assert_eq!(
+            export_with(&old, &path, "a public continuity passphrase", cheap()),
+            Ok(0)
+        );
+        assert_eq!(
+            import(
+                &fresh,
+                &path,
+                "a public continuity passphrase",
+                Default::default()
+            ),
+            Ok(0)
+        );
+        let fresh = lock(&fresh);
+        let engine = fresh.engine.as_ref().unwrap();
+        assert_ne!(engine.device_id(), source_id);
+        assert_ne!(engine.signature_key(), source_key);
+        assert!(engine.trust().is_trusted(
+            peer,
+            peer_device.device_id(),
+            &peer_device.signature_key()
+        ));
+        assert!(engine.trust().is_trusted(user, source_id, &source_key));
+    }
 
     #[test]
     fn a_backup_goes_to_a_fresh_device_of_the_same_person_with_its_passphrase() {
