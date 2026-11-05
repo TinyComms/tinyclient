@@ -20,11 +20,11 @@ pub struct Window {
     pub newer: bool,
 }
 
-/// chatd's own order: time, then id as a number would sort.
-type Order = (i64, usize, String);
+/// chatd's own order: [`Message::rank`].
+type Order = (i64, u8, i64, usize, String);
 
 fn order(message: &Message) -> Order {
-    (message.sent, message.id.len(), message.id.clone())
+    message.rank()
 }
 
 /// What an answer says about a stretch of the conversation: everything between `from` and `to`

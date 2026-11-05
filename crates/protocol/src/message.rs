@@ -1,7 +1,7 @@
 //! What a message can hold, the same for every network. Adapters translate into this; the shell
 //! never sees Slack mrkdwn, Discord markdown, Telegram entities or Teams HTML.
 
-use crate::{is_false, is_zero, Key};
+use crate::{is_false, is_zero, is_zero_i64, Key};
 use serde::{Deserialize, Serialize};
 
 /// Most people a [`ThreadSummary`] names, for the pictures beside its reply count.
@@ -327,6 +327,12 @@ pub struct Message {
     pub sender: Sender,
     /// Unix seconds.
     pub sent: i64,
+    /// The network's own order, when the clock is coarser than one message. Tiny stamps an
+    /// encrypted message to the minute and a plaintext message to the second, then numbers
+    /// each post. `0` on a network that has no such number, and on a send that has not been
+    /// given one yet.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub seq: i64,
     /// Unix seconds when the message's own timer (Telegram's `ttl_period`) makes it leave the
     /// store, whether the account is online or not. `None`: it does not run out on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -405,6 +411,7 @@ impl Message {
                 ..Sender::default()
             },
             sent,
+            seq: 0,
             expires_at: None,
             outgoing,
             text: text.into(),
@@ -426,6 +433,15 @@ impl Message {
             client_id: None,
             seal: crate::Seal::Plain,
         }
+    }
+
+    /// Where this message sits among the others in its conversation.
+    ///
+    /// Time first. A server sequence breaks a tie: Tiny's encrypted messages share a minute
+    /// and its plaintext messages share a second, and the id is not the order. A row with no
+    /// sequence sorts after sequenced rows at that same time, then by id, shorter first.
+    pub fn rank(&self) -> (i64, u8, i64, usize, String) {
+        (self.sent, u8::from(self.seq == 0), self.seq, self.id.len(), self.id.clone())
     }
 
     /// Cuts everything a network could make arbitrarily large to its limit. The store does this

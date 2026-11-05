@@ -957,6 +957,7 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
     message.edited = present(&wire.edited_at);
     message.deleted = deleted;
     message.client_id = wire.client_id.clone().filter(|id| !id.is_empty());
+    message.seq = wire.seq;
     message.reply_to = reply_of(wire.reply_to.as_ref());
     if !deleted {
         for file in &wire.attachments {
@@ -994,6 +995,7 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
     message.sender.id = wire.author_id.clone();
     message.deleted = deleted;
     message.client_id = wire.client_id.clone().filter(|id| !id.is_empty());
+    message.seq = wire.seq;
     message.seal = Seal::Encrypted;
     if !deleted {
         match read {
@@ -1451,6 +1453,10 @@ struct WireMessage {
     device_id: Option<String>,
     #[serde(default)]
     target_id: Option<String>,
+    /// Post order. Set on every message a current server sends. Absent on an older one,
+    /// which leaves the clock and the id to break a tie.
+    #[serde(default)]
+    seq: i64,
 }
 
 #[derive(Deserialize)]
@@ -1646,6 +1652,28 @@ mod tests {
         assert_eq!(page.messages[0].text, "first");
         assert!(!page.messages[0].outgoing);
         assert!(page.messages[1].outgoing);
+    }
+
+    #[test]
+    fn messages_that_share_a_stamp_follow_seq_and_not_the_id() {
+        // The id sorts the other way. The stamp is one second for both, which is all an
+        // encrypted message ever has within its minute, and all a plaintext burst shares.
+        let early = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+        let later = "00000000-0000-0000-0000-000000000001";
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            if request.starts_with("GET /v1/conversations/direct-1/messages?") && request.contains("limit=50") {
+                return Some(http(200, "OK", &format!(
+                    r#"{{"messages":[{{"id":"{later}","author_id":"{PEER}","body":"second","seq":2,"created_at":"{WHEN}"}},{{"id":"{early}","author_id":"{ME}","body":"first","seq":1,"created_at":"{WHEN}"}}]}}"#
+                )));
+            }
+            None
+        });
+        load_page(&ctx, &saved, "direct-1", None, PAGE);
+        let page = ctx.hub.store().messages(&ctx.key("direct-1"), &Page::Newest, 10, 1_800_000_000).unwrap().unwrap();
+        let ids: Vec<&str> = page.messages.iter().map(|message| message.id.as_str()).collect();
+        assert_eq!(ids, [early, later]);
+        assert_eq!(page.messages[0].text, "first");
+        assert_eq!(page.messages[1].text, "second");
     }
 
     #[test]

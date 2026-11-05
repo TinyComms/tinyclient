@@ -23,7 +23,7 @@ use std::time::Duration;
 /// Raise this when a table changes. `open` then drops the cache and starts over.
 /// 6 rebuilds caches written at 5 before `conversation.voice_limit` existed. That column
 /// was added without a version change, so Win+K died with `no such column: c.voice_limit`.
-const SCHEMA: i32 = 9;
+const SCHEMA: i32 = 10;
 
 /// Retention: the newest messages kept per conversation.
 pub const KEEP_MESSAGES: u32 = 2_000;
@@ -172,6 +172,10 @@ const TABLES: &str = "
         -- Unix seconds when the message's own timer (Telegram's ttl_period) makes it leave the
         -- store, whether the account is online or not. NULL: it does not run out on its own.
         expires      INTEGER,
+        -- Tiny's post order. 0 where the network has none, and on a send still on its way.
+        -- An encrypted message shares its minute and a plaintext message its second, so this
+        -- is what keeps a burst in the order it was posted. The id is not that order.
+        seq          INTEGER NOT NULL DEFAULT 0,
         -- The rest of the message as the protocol's JSON: sender, ranges, attachments, link
         -- previews, reactions, reply, thread summary, flags.
         body         TEXT NOT NULL,
@@ -287,10 +291,17 @@ const PERSON: &str = "
     FROM person p
     LEFT JOIN media m ON m.network = p.network AND m.account = p.account AND m.id = p.avatar";
 
-/// Messages in the order they are read: by time, then by id, shorter ids first so numeric ids of
-/// different lengths still sort as numbers.
-const NEWEST_FIRST: &str = "ORDER BY sent DESC, length(id) DESC, id DESC";
-const OLDEST_FIRST: &str = "ORDER BY sent, length(id), id";
+/// One message's place. Time, then whether it has no server sequence (those sit after the
+/// sequenced rows at that same time), then the sequence, then id, shorter first so a numeric
+/// id still sorts as a number. [`Message::rank`] is the same order.
+/// Select-list form of the place. The comparison is `{PLACE} < (SELECT {PLACE_TERMS} ...)`.
+/// Selecting `{PLACE}` itself is one column, and SQLite answers "row value misused".
+const PLACE_TERMS: &str = "sent, (seq = 0), seq, length(id), id";
+const PLACE: &str = "(sent, (seq = 0), seq, length(id), id)";
+/// Messages in the order they are read. The newest-first form is the reverse of [`PLACE`],
+/// so a page read that way and then reversed matches the oldest-first form.
+const NEWEST_FIRST: &str = "ORDER BY sent DESC, (seq = 0) DESC, seq DESC, length(id) DESC, id DESC";
+const OLDEST_FIRST: &str = "ORDER BY sent, (seq = 0), seq, length(id), id";
 
 pub struct Store {
     db: Connection,
@@ -2047,19 +2058,46 @@ impl Store {
     pub fn ingest(&mut self, conversation: &Key, message: &Message, unread: bool) -> rusqlite::Result<Stored> {
         let tx = self.db.transaction()?;
         let (network, account, id) = (word(&conversation.network), &conversation.account, &conversation.id);
-        if let Some(client_id) = message.client_id.as_deref().filter(|client_id| *client_id != message.id) {
+        let mut incoming = message.clone();
+        // The echo of a send we are still showing replaces that row. If the list was previewing
+        // it, the preview has to follow, even when the server's stamp is coarser than the clock
+        // we used while it was on its way.
+        let mut replaced_preview = false;
+        if let Some(client_id) = incoming.client_id.as_deref().filter(|client_id| *client_id != incoming.id) {
+            let preview: Option<String> = tx
+                .query_row(
+                    "SELECT preview_id FROM conversation WHERE network = ?1 AND account = ?2 AND id = ?3",
+                    params![network, account, id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            replaced_preview = preview.as_deref() == Some(client_id);
             tx.execute(
                 "DELETE FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3
                     AND id = ?4 AND pending != 0",
                 params![network, account, id, client_id],
             )?;
         }
-        let mut stored = message.clone();
+        // An edit that does not repeat the sequence keeps the one this row already has.
+        if incoming.seq == 0 {
+            if let Some(kept) = tx
+                .query_row(
+                    "SELECT seq FROM message
+                      WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
+                    params![network, account, id, incoming.id],
+                    |row| row.get(0),
+                )
+                .optional()?
+            {
+                incoming.seq = kept;
+            }
+        }
+        let mut stored = incoming.clone();
         stored.bound();
         stored.id.clear();
         stored.text.clear();
         let body = serde_json::to_string(&stored).map_err(broken)?;
-        let pending = match message.state {
+        let pending = match incoming.state {
             SendState::Sent => 0,
             SendState::Pending => 1,
             SendState::Failed { .. } => 2,
@@ -2068,27 +2106,57 @@ impl Store {
             .query_row(
                 "SELECT text, body FROM message
                   WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
-                params![network, account, id, message.id],
+                params![network, account, id, incoming.id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
         let outcome = match before {
-            Some((text, old)) if text == message.text && old == body => Stored::Same,
+            Some((text, old)) if text == incoming.text && old == body => Stored::Same,
             Some(_) => Stored::Updated,
             None => Stored::New,
         };
         if outcome != Stored::Same {
             tx.execute(
                 "INSERT OR REPLACE INTO message
-                     (network, account, conversation, id, sent, text, pending, client_id, expires, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![network, account, id, message.id, message.sent, message.text, pending, message.client_id, message.expires_at, body],
+                     (network, account, conversation, id, sent, text, pending, client_id, expires, body, seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    network,
+                    account,
+                    id,
+                    incoming.id,
+                    incoming.sent,
+                    incoming.text,
+                    pending,
+                    incoming.client_id,
+                    incoming.expires_at,
+                    body,
+                    incoming.seq,
+                ],
             )?;
         }
-        let counts = unread && !message.outgoing;
+        let counts = unread && !incoming.outgoing;
         // A live send clears the badge: pending from the shell, or the network's echo (`unread`).
         // History of a past post of ours must not.
-        let clear_read = message.outgoing && (unread || matches!(message.state, SendState::Pending));
+        let clear_read = incoming.outgoing && (unread || matches!(incoming.state, SendState::Pending));
+        // Same stamp is not the same moment. A later sequence wins; one with no sequence does
+        // not displace a sequenced row, and it does not lose to another unsequenced one.
+        let (updated, preview_seq): (i64, i64) = tx
+            .query_row(
+                "SELECT c.updated,
+                        COALESCE((SELECT m.seq FROM message m
+                                    WHERE m.network = c.network AND m.account = c.account
+                                      AND m.conversation = c.id AND m.id = c.preview_id), 0)
+                   FROM conversation c
+                  WHERE c.network = ?1 AND c.account = ?2 AND c.id = ?3",
+                params![network, account, id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((0, 0));
+        let replace_preview = replaced_preview
+            || incoming.sent > updated
+            || (incoming.sent == updated && if incoming.seq > 0 { incoming.seq > preview_seq } else { preview_seq == 0 });
         match outcome {
             Stored::New => {
                 tx.execute(
@@ -2097,11 +2165,11 @@ impl Store {
                          mentions = CASE WHEN ?7 AND ?5 >= updated THEN 0 ELSE mentions + ?9 END,
                          last_read = CASE WHEN ?7 AND ?5 >= updated AND ?10 = 0 THEN ?6 ELSE last_read END,
                          noticed = CASE WHEN ?9 > 0 THEN max(noticed, ?5) ELSE noticed END,
-                         preview_from = CASE WHEN ?5 >= updated THEN ?11 ELSE preview_from END,
-                         preview_mine = CASE WHEN ?5 >= updated THEN ?13 ELSE preview_mine END,
-                         preview_id = CASE WHEN ?5 >= updated THEN ?6 ELSE preview_id END,
-                         preview = CASE WHEN ?5 >= updated THEN ?4 ELSE preview END,
-                         preview_expires = CASE WHEN ?5 >= updated THEN ?14 ELSE preview_expires END,
+                         preview_from = CASE WHEN ?15 THEN ?11 ELSE preview_from END,
+                         preview_mine = CASE WHEN ?15 THEN ?13 ELSE preview_mine END,
+                         preview_id = CASE WHEN ?15 THEN ?6 ELSE preview_id END,
+                         preview = CASE WHEN ?15 THEN ?4 ELSE preview END,
+                         preview_expires = CASE WHEN ?15 THEN ?14 ELSE preview_expires END,
                          updated = max(updated, ?5),
                          hidden = CASE WHEN ?12 AND last_read != ''
                              AND (length(last_read), last_read) < (length(?6), ?6) THEN 0 ELSE hidden END
@@ -2110,36 +2178,38 @@ impl Store {
                         network,
                         account,
                         id,
-                        preview_of(message),
-                        message.sent,
-                        message.id,
+                        preview_of(&incoming),
+                        incoming.sent,
+                        incoming.id,
                         clear_read,
                         u32::from(counts),
-                        u32::from(counts && message.mentions_me),
+                        u32::from(counts && incoming.mentions_me),
                         pending,
-                        if message.outgoing { "" } else { message.sender.name.as_str() },
+                        if incoming.outgoing { "" } else { incoming.sender.name.as_str() },
                         unread,
-                        message.outgoing,
-                        message.expires_at,
+                        incoming.outgoing,
+                        incoming.expires_at,
+                        replace_preview,
                     ],
                 )?;
             }
-            // An edit of the newest message is what the row previews.
+            // An edit of the message already previewed. Another from the same minute must not
+            // take its place: they share a stamp.
             Stored::Updated => {
                 tx.execute(
-                    "UPDATE conversation SET preview = ?4, preview_id = ?6, preview_mine = ?7, preview_from = ?8,
+                    "UPDATE conversation SET preview = ?4, preview_mine = ?7, preview_from = ?8,
                          preview_expires = ?9
-                      WHERE network = ?1 AND account = ?2 AND id = ?3 AND updated = ?5",
+                      WHERE network = ?1 AND account = ?2 AND id = ?3 AND preview_id = ?6",
                     params![
                         network,
                         account,
                         id,
-                        preview_of(message),
-                        message.sent,
-                        message.id,
-                        message.outgoing,
-                        if message.outgoing { "" } else { message.sender.name.as_str() },
-                        message.expires_at,
+                        preview_of(&incoming),
+                        incoming.sent,
+                        incoming.id,
+                        incoming.outgoing,
+                        if incoming.outgoing { "" } else { incoming.sender.name.as_str() },
+                        incoming.expires_at,
                     ],
                 )?;
             }
@@ -2315,9 +2385,11 @@ impl Store {
             SharedKind::Links => "(instr(body, '\"previews\"') > 0 OR instr(body, '\"style\":\"link\"') > 0)",
         };
         let below = match before {
-            Some(_) => "AND (sent, length(id), id) < (SELECT sent, length(id), id FROM message
-                           WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4)",
-            None => "AND ?4 IS NULL",
+            Some(_) => format!(
+                "AND {PLACE} < (SELECT {PLACE_TERMS} FROM message
+                    WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4)"
+            ),
+            None => "AND ?4 IS NULL".to_owned(),
         };
         let mut query = self.db.prepare(&format!(
             "SELECT id, text, body FROM message
@@ -2439,7 +2511,7 @@ impl Store {
                 Some(anchor) => {
                     values.push(Value::Text(anchor.to_owned()));
                     format!(
-                        "AND (sent, length(id), id) {side} (SELECT sent, length(id), id FROM message
+                        "AND {PLACE} {side} (SELECT {PLACE_TERMS} FROM message
                            WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4)"
                     )
                 }
@@ -3188,6 +3260,45 @@ mod tests {
         assert_eq!(store.until_expiry(NOW).unwrap(), None);
         assert!(store.expire(NOW + 10).unwrap().is_empty());
         assert_eq!(store.conversation(&key).unwrap().unwrap().preview, "permanent edit");
+    }
+
+    #[test]
+    fn a_shared_stamp_follows_the_sequence_and_a_page_does_too() {
+        let (mut store, key) = store();
+        let mut earlier_minute = said("z-earlier", "before", 90);
+        earlier_minute.seq = 9;
+        let mut first = said("ffffffff-ffff-ffff-ffff-ffffffffffff", "first", 100);
+        first.seq = 1;
+        let mut second = said("00000000-0000-0000-0000-000000000002", "second", 100);
+        second.seq = 2;
+        let mut third = said("00000000-0000-0000-0000-000000000001", "third", 100);
+        third.seq = 3;
+        // Arrival order is not the sequence, and the ids sort the other way.
+        for message in [&third, &first, &earlier_minute, &second] {
+            store.ingest(&key, message, false).unwrap();
+        }
+        let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(
+            ids(&page),
+            ["z-earlier", "ffffffff-ffff-ffff-ffff-ffffffffffff", "00000000-0000-0000-0000-000000000002", "00000000-0000-0000-0000-000000000001"]
+        );
+        let older = store.messages(&key, &Page::Before { id: third.id.clone() }, 2, NOW).unwrap().unwrap();
+        assert_eq!(ids(&older), ["ffffffff-ffff-ffff-ffff-ffffffffffff", "00000000-0000-0000-0000-000000000002"]);
+
+        let mut waiting = said("50", "on its way", 100);
+        waiting.state = protocol::SendState::Pending;
+        store.ingest(&key, &waiting, false).unwrap();
+        let with_pending = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(with_pending.messages.last().map(|message| message.id.as_str()), Some("50"));
+
+        let mut edited = first.clone();
+        edited.seq = 0;
+        edited.text = "first, edited".to_owned();
+        store.ingest(&key, &edited, false).unwrap();
+        let after = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(after.messages[1].text, "first, edited");
+        assert_eq!(after.messages[1].seq, 1);
+        assert_eq!(after.messages[1].id, first.id);
     }
 
     #[test]

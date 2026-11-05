@@ -6,7 +6,7 @@ use super::filing::{self, Cursor, Facts, Filed};
 use super::peers::{thread_id, Known, Who};
 use super::wire::Fault;
 use super::{presence, Account, PAGE};
-use crate::store::{ConversationRow, Filing, PreviewLine};
+use crate::store::{ConversationRow, Filing, PreviewLine, preview_text};
 use grammers_tl_types as tl;
 use protocol::{CallSupport, Capabilities, Card, ConversationKind, EmojiScope, MediaFile, MediaKind, Message, Relation, ReplyTo, Span, Special, Style, Watching};
 use std::collections::{HashMap, HashSet};
@@ -1302,12 +1302,19 @@ fn sponsored(account: &Account, channel: Who, conversation: &str, newest: Option
     }));
     if account.ctx.history(conversation, std::slice::from_ref(&message)).is_ok() {
         account.ctx.set_note(&note, &id);
-        // The store previews whatever it recorded last at the newest time. Recording the real
-        // newest message again, marked as its own echo so it counts as changed, puts its words
-        // back on the row: an advertisement is never what the Inbox shows of a channel.
-        if let Some(mut newest) = newest {
-            newest.client_id = Some(newest.id.clone());
-            let _ = account.ctx.history(conversation, std::slice::from_ref(&newest));
+        // The store previews whatever it recorded last at the newest time, and the advertisement
+        // shares that time so it takes the line. The channel's own post is put back on the row:
+        // an advertisement is never what the Inbox shows of a channel.
+        if let Some(newest) = newest {
+            let line = PreviewLine {
+                id: newest.id.clone(),
+                text: preview_text(&newest),
+                sender: newest.sender.name.clone(),
+                mine: newest.outgoing,
+                sent: newest.sent,
+                expires_at: newest.expires_at,
+            };
+            let _ = account.ctx.preview(conversation, &line);
         }
         {
             // The same advertisement asked again later is still told as viewed only once.
