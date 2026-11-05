@@ -572,3 +572,71 @@ fn history_older_than_dates_goes_only_with_all() {
     assert!(!within(&undated, Scope::Days(3650), now_secs()));
     assert!(!within(&opened("x", 0), Scope::None, now_secs()));
 }
+
+#[test]
+fn history_over_the_servers_limit_sends_the_newest_and_says_how_many_stayed() {
+    let old = device("cap-old", DeviceState::Ready);
+    let (dir, cache_key) = {
+        let mut old = lock(&old);
+        for n in 0..200i64 {
+            old.remember("c1", &format!("m{n:03}"), opened(&"x".repeat(200), 200 - n));
+        }
+        (old.dir.clone(), old.cache_key.clone().unwrap())
+    };
+    let meta = Meta {
+        v: archive::VERSION,
+        user: USER.into(),
+        from_device: "d".into(),
+        created: "0".into(),
+        scope: Scope::All,
+    };
+    let key = ArchiveKey::generate().unwrap();
+    let path = dir.join("capped.archive");
+    let most = 8 * 1024;
+    let (summary, left_out) = write_archive(
+        &path,
+        &key,
+        b"link",
+        &dir,
+        &cache_key,
+        &BTreeMap::new(),
+        most,
+        &meta,
+    )
+    .unwrap();
+    assert!(summary.bytes <= most, "{} > {most}", summary.bytes);
+    assert!(left_out > 150 && left_out < 200, "{left_out}");
+    assert_eq!(summary.msgs + left_out, 200);
+    let mut ids = Vec::new();
+    archive::read(
+        &key,
+        b"link",
+        std::fs::File::open(&path).unwrap(),
+        |record| {
+            if let archive::Record::Msg { id, .. } = record {
+                ids.push(id);
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        ids.first().map(String::as_str),
+        Some("m199"),
+        "the newest goes first"
+    );
+    assert!(!ids.contains(&"m000".to_owned()), "the oldest stays");
+    // With room for all of it, nothing stays.
+    let (_, none_left) = write_archive(
+        &path,
+        &key,
+        b"link",
+        &dir,
+        &cache_key,
+        &BTreeMap::new(),
+        ARCHIVE_MAX,
+        &meta,
+    )
+    .unwrap();
+    assert_eq!(none_left, 0);
+}

@@ -435,6 +435,8 @@ pub(crate) struct Device {
     checked: BTreeSet<String>,
     /// The server relays device links (`e2ee_device_link`).
     linking: bool,
+    /// The largest archive one link carries (`e2ee_link_archive_max`).
+    link_max: u64,
 }
 
 type Shared = Arc<Mutex<Device>>;
@@ -742,6 +744,7 @@ impl Device {
             files: HashMap::new(),
             checked: BTreeSet::new(),
             linking: false,
+            link_max: linking::ARCHIVE_MAX,
         }
     }
 
@@ -841,6 +844,11 @@ impl Device {
             self.mode.clear();
             return Ok(DeviceState::Off);
         }
+        self.link_max = body
+            .get("e2ee_link_archive_max")
+            .and_then(Value::as_u64)
+            .filter(|most| *most > 0)
+            .unwrap_or(linking::ARCHIVE_MAX);
         self.linking = body
             .get("features")
             .and_then(Value::as_array)

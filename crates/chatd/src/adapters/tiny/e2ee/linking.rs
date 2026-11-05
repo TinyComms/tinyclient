@@ -39,8 +39,8 @@ pub(crate) type Told = Arc<dyn Fn() + Send + Sync>;
 const PATIENCE: Duration = Duration::from_secs(5 * 60);
 /// One long poll of the relay. Short enough that a cancel is noticed soon.
 const WAIT: u64 = 10;
-/// The most history this device takes in: the server's default `e2ee_link_archive_max`.
-const ARCHIVE_MAX: u64 = 512 * 1024 * 1024;
+/// The most history one link carries when the server does not say (`e2ee_link_archive_max`).
+pub(super) const ARCHIVE_MAX: u64 = 96 * 1024 * 1024;
 /// The archive on its way, in this account's private folder.
 const ARCHIVE_FILE: &str = "link-archive.part";
 /// The choices of history the old device offers, as `Scope`s.
@@ -418,8 +418,10 @@ pub(super) fn run_new(job: &Linking, device: &Shared, relay: &dyn Relay) -> Resu
             // The old device deletes the link once it has read `done`; deleting it first would
             // take `done` with it. Wait for that, a little, then delete it anyway.
             for _ in 0..3 {
-                if matches!(relay.read(&link_text, after, WAIT), Err(Failed::Gone)) {
-                    break;
+                match relay.read(&link_text, after, WAIT) {
+                    // This device's own `done` comes back too: past it, the read waits.
+                    Ok(rows) => after = rows.iter().fold(after, |at, (seq, _, _)| at.max(*seq)),
+                    Err(_) => break,
                 }
             }
             relay.delete(&link_text);
@@ -442,7 +444,7 @@ fn new_half(
 ) -> Result<u64, String> {
     let old_pub = next_from(job, relay, link, Role::Old, after)?;
     let channel = channel_out.insert(pending.accept(&old_pub).map_err(words)?);
-    let (device_id, signature_key, user, dir) = {
+    let (device_id, signature_key, user, dir, most) = {
         let device = lock(device);
         let engine = device
             .engine
@@ -453,6 +455,7 @@ fn new_half(
             engine.signature_key(),
             device.saved.user_id.clone(),
             device.dir.clone(),
+            device.link_max,
         )
     };
     let hello = Message::Hello {
@@ -489,7 +492,9 @@ fn new_half(
 
     let mut messages = 0;
     if let Some(archive) = archive {
-        messages = take_in(job, device, relay, link, link_id, &user, &dir, &archive)?;
+        messages = take_in(
+            job, device, relay, link, link_id, &user, &dir, &archive, most,
+        )?;
     }
     relay.post(
         link,
@@ -510,6 +515,7 @@ fn take_in(
     user: &str,
     dir: &Path,
     archive: &ArchiveRef,
+    most: u64,
 ) -> Result<u64, String> {
     let unreadable = "The history that came couldn't be checked, so none of it was taken in.";
     let key: [u8; 32] = unb64(&archive.key)
@@ -519,7 +525,7 @@ fn take_in(
     let sha256: [u8; 32] = unb64(&archive.sha256)
         .and_then(|sum| sum.try_into().ok())
         .ok_or(unreadable)?;
-    if archive.bytes > ARCHIVE_MAX {
+    if archive.bytes > most {
         return Err("That history is more than this device takes at once.".to_owned());
     }
     private_dir(dir).map_err(|err| format!("The encryption folder could not be made: {err}"))?;
@@ -658,7 +664,7 @@ fn old_half(
     let new_key = unb64(&signature_key)
         .filter(|key| key.len() == e2ee::identity::SIGNATURE_KEY_LEN && key[0] == 4)
         .ok_or(super::super::UNREADABLE)?;
-    let (dir, cache_key, verified, from_device, user) = {
+    let (dir, cache_key, verified, from_device, user, most) = {
         let device = lock(device);
         (
             device.dir.clone(),
@@ -673,6 +679,7 @@ fn old_half(
                 .map(|engine| engine.device_id().to_string())
                 .unwrap_or_default(),
             device.saved.user_id.clone(),
+            device.link_max,
         )
     };
     let now = now_secs();
@@ -725,6 +732,7 @@ fn old_half(
             &dir,
             &cache_key,
             &verified,
+            most,
             Meta {
                 v: archive::VERSION,
                 user,
@@ -817,14 +825,22 @@ fn send_archive(
     dir: &Path,
     cache_key: &CacheKey,
     verified: &std::collections::BTreeMap<String, String>,
+    most: u64,
     meta: Meta,
 ) -> Result<ArchiveRef, String> {
     let key = ArchiveKey::generate().map_err(|_| "No randomness is available.".to_owned())?;
     let path = dir.join(ARCHIVE_FILE);
     let result = (|| {
-        let summary = write_archive(&path, &key, link_id, dir, cache_key, verified, &meta)
-            .map_err(|err| format!("The history couldn't be packed: {err}"))?;
-        job.show(|view| view.total = summary.bytes);
+        let (summary, left_out) =
+            write_archive(&path, &key, link_id, dir, cache_key, verified, most, &meta)
+                .map_err(|err| format!("The history couldn't be packed: {err}"))?;
+        if summary.bytes > most {
+            return Err("The history is more than this server takes. Send fewer days.".to_owned());
+        }
+        job.show(|view| {
+            view.total = summary.bytes;
+            view.left_out = left_out;
+        });
         relay.put_archive(link, &path, summary.bytes)?;
         job.show(|view| view.done = summary.bytes);
         Ok(ArchiveRef {
@@ -838,6 +854,15 @@ fn send_archive(
     result
 }
 
+/// The size of an archive whose records come to `plain` bytes: the header, and a tag per chunk.
+fn sealed_size(plain: u64) -> u64 {
+    archive::HEADER_LEN as u64 + plain + 16 * (plain / archive::CHUNK as u64 + 1)
+}
+
+/// Writes the archive of what `meta.scope` sends, newest first, and stops before it would be
+/// larger than `most` bytes (the server's `e2ee_link_archive_max`). Answers how many messages
+/// were left out for that.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn write_archive(
     path: &Path,
     key: &ArchiveKey,
@@ -845,28 +870,52 @@ pub(super) fn write_archive(
     dir: &Path,
     cache_key: &CacheKey,
     verified: &std::collections::BTreeMap<String, String>,
+    most: u64,
     meta: &Meta,
-) -> e2ee::Result<archive::Summary> {
+) -> e2ee::Result<(archive::Summary, u64)> {
     let file = std::io::BufWriter::new(
         std::fs::File::create(path).map_err(|err| e2ee::Error::Io(err.to_string()))?,
     );
     let mut writer = Writer::new(key, link_id, meta, file)?;
     let now = now_secs();
+    let mut rows: Vec<(String, String, Opened)> = Vec::new();
     for conv in cached_conversations(dir) {
-        let mut rows: Vec<(String, Opened)> = Cache::load(dir, &conv, cache_key)
+        let mut theirs: Vec<(String, String, Opened)> = Cache::load(dir, &conv, cache_key)
             .rows
             .into_iter()
             .filter(|(_, opened)| within(opened, meta.scope, now))
+            .map(|(id, opened)| (conv.clone(), id, opened))
             .collect();
-        // Oldest first, as far as it is known, and never more than one cache holds.
-        rows.sort_by(|a, b| a.1.at.cmp(&b.1.at).then_with(|| a.0.cmp(&b.0)));
-        let skip = rows.len().saturating_sub(CACHED);
-        for (id, mut opened) in rows.into_iter().skip(skip) {
-            opened.imported_from = None;
-            let value =
-                serde_json::to_value(&opened).map_err(|_| e2ee::Error::Malformed("cache"))?;
-            writer.message(&conv, &id, &value)?;
+        // Never more than one cache holds: its newest.
+        theirs.sort_by(|a, b| b.2.at.cmp(&a.2.at).then_with(|| a.1.cmp(&b.1)));
+        theirs.truncate(CACHED);
+        rows.extend(theirs);
+    }
+    // Newest first over every conversation, so what a full archive leaves out is the oldest.
+    rows.sort_by(|a, b| {
+        b.2.at
+            .cmp(&a.2.at)
+            .then_with(|| (&a.0, &a.1).cmp(&(&b.0, &b.1)))
+    });
+    let record = |json: &Value| serde_json::to_vec(json).map_or(0, |bytes| bytes.len() as u64 + 4);
+    let mut tail = record(&json!({ "r": "end", "msgs": u64::MAX }));
+    for (user, number) in verified {
+        tail += record(&json!({ "r": "verified", "user": user, "number": number }));
+    }
+    let mut plain =
+        record(&serde_json::to_value(archive::Record::Meta(meta.clone())).unwrap_or(Value::Null));
+    let total = rows.len() as u64;
+    let mut sent = 0u64;
+    for (conv, id, mut opened) in rows {
+        opened.imported_from = None;
+        let value = serde_json::to_value(&opened).map_err(|_| e2ee::Error::Malformed("cache"))?;
+        let size = record(&json!({ "r": "msg", "conv": conv, "id": id, "opened": value }));
+        if sealed_size(plain + size + tail) > most {
+            break;
         }
+        plain += size;
+        writer.message(&conv, &id, &value)?;
+        sent += 1;
     }
     for (user, number) in verified {
         writer.verified(user, number)?;
@@ -877,7 +926,7 @@ pub(super) fn write_archive(
     file.get_ref()
         .sync_all()
         .map_err(|err| e2ee::Error::Io(err.to_string()))?;
-    Ok(summary)
+    Ok((summary, total - sent))
 }
 
 /// The relay and the device routes over HTTP, as this session.

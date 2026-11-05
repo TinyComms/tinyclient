@@ -217,6 +217,10 @@ pub struct E2eeLink {
     /// Messages the new device took in, at `Done`.
     #[serde(default, skip_serializing_if = "crate::is_zero64")]
     pub messages: u64,
+    /// On the old device: the oldest messages of the choice that did not fit the server's limit
+    /// for one link, and stayed here.
+    #[serde(default, skip_serializing_if = "crate::is_zero64")]
+    pub left_out: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
 }
