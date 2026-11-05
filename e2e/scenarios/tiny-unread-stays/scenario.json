@@ -1,0 +1,12 @@
+{
+  "id": "tiny-unread-stays",
+  "title": "A Tiny unread badge stays when the next channel list has no read cursor",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build uses demo chatd and never opens a Tiny server session, so this list cannot be served to it.",
+    "ios": "The phone proof build uses demo chatd and never opens a Tiny server session, so this list cannot be served to it."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 45
+}

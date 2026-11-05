@@ -419,8 +419,12 @@ pub(in crate::gui::tiny) fn encryption(
     }
     this_device = this_device.child(security_details(draft.details, cx));
     page = page.child(this_device);
-    if status.device == DeviceState::Off || status.revoked {
+    if status.device == DeviceState::Off {
         return page.into_any_element();
+    }
+    if status.revoked {
+        // Saved history stays usable after removal, including its local encrypted backup.
+        return page.child(super::backup::backup(shell, draft.loading, window, cx)).into_any_element();
     }
     if let Some(notice) = super::linking::added_notice("tiny-e2ee-added", &status.added, cx) {
         page = page.child(notice);

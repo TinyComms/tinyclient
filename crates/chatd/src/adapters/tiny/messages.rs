@@ -371,7 +371,13 @@ fn channel_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>,
     if ctx.conversation(&row).is_err() {
         return;
     }
-    Note::from_last(&channel.id, channel.unread, None, None, channel.last_message.as_ref(), false).sealed(channel.e2ee).apply(ctx, saved, names);
+    // The broadcast copies the actor's unread into the channel object. Ours stays until our
+    // own list (`publish`) says otherwise, or a live message moves it.
+    let unread = match ctx.known(&channel.id) {
+        Ok(Some(existing)) => existing.unread,
+        _ => channel.unread,
+    };
+    Note::from_last(&channel.id, unread, None, None, channel.last_message.as_ref(), false).sealed(channel.e2ee).apply(ctx, saved, names);
 }
 
 fn direct_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, frame: &Value) {
@@ -999,6 +1005,7 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
     message.edited = present(&wire.edited_at);
     message.deleted = deleted;
     message.client_id = wire.client_id.clone().filter(|id| !id.is_empty());
+    message.seq = wire.seq;
     message.reply_to = reply_of(wire.reply_to.as_ref());
     if !deleted {
         for file in &wire.attachments {
@@ -1036,6 +1043,7 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
     message.sender.id = wire.author_id.clone();
     message.deleted = deleted;
     message.client_id = wire.client_id.clone().filter(|id| !id.is_empty());
+    message.seq = wire.seq;
     message.seal = Seal::Encrypted;
     if !deleted {
         match read {
@@ -1505,6 +1513,10 @@ struct WireMessage {
     device_id: Option<String>,
     #[serde(default)]
     target_id: Option<String>,
+    /// Post order. Set on every message a current server sends. Absent on an older one,
+    /// which leaves the clock and the id to break a tie.
+    #[serde(default)]
+    seq: i64,
 }
 
 #[derive(Deserialize)]
@@ -1647,6 +1659,36 @@ mod tests {
         assert!(!unicode_emoji(""));
     }
 
+    /// `channel.updated` is broadcast with the actor's own unread baked into `app_channel_json`.
+    /// Applying that count clears everyone else's badge. The viewer's count comes from the list.
+    #[test]
+    fn a_channel_update_does_not_apply_someone_elses_unread() {
+        let (_adapter, ctx, saved) = fixture(|_| None);
+        assert_eq!(ctx.known("channel-1").unwrap().unwrap().unread, 2);
+        let frame = json!({
+            "channel": {
+                "id": "channel-1",
+                "name": "general",
+                "topic": "Moved",
+                "category_id": "cat-1",
+                "category_name": "Text",
+                "position": 1,
+                "unread": 0,
+                "last_message": {
+                    "id": "c-10",
+                    "author_id": PEER,
+                    "body": "later",
+                    "created_at": "2024-01-02T03:05:05Z"
+                }
+            }
+        });
+        on_live(&ctx, &saved, &HashMap::new(), "channel.updated", &frame);
+        let channel = ctx.known("channel-1").unwrap().unwrap();
+        assert_eq!(channel.unread, 2, "a channel update carries the actor's unread, not ours");
+        assert_eq!(channel.topic, "Moved");
+        assert_eq!(channel.preview, "later");
+    }
+
     #[test]
     fn channel_and_direct_rows_keep_voice_rooms() {
         let (_adapter, ctx, _saved) = fixture(|_| None);
@@ -1698,6 +1740,28 @@ mod tests {
         assert_eq!(page.messages[0].text, "first");
         assert!(!page.messages[0].outgoing);
         assert!(page.messages[1].outgoing);
+    }
+
+    #[test]
+    fn messages_that_share_a_stamp_follow_seq_and_not_the_id() {
+        // The id sorts the other way. The stamp is one second for both, which is all an
+        // encrypted message ever has within its minute, and all a plaintext burst shares.
+        let early = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+        let later = "00000000-0000-0000-0000-000000000001";
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            if request.starts_with("GET /v1/conversations/direct-1/messages?") && request.contains("limit=50") {
+                return Some(http(200, "OK", &format!(
+                    r#"{{"messages":[{{"id":"{later}","author_id":"{PEER}","body":"second","seq":2,"created_at":"{WHEN}"}},{{"id":"{early}","author_id":"{ME}","body":"first","seq":1,"created_at":"{WHEN}"}}]}}"#
+                )));
+            }
+            None
+        });
+        load_page(&ctx, &saved, "direct-1", None, PAGE);
+        let page = ctx.hub.store().messages(&ctx.key("direct-1"), &Page::Newest, 10, 1_800_000_000).unwrap().unwrap();
+        let ids: Vec<&str> = page.messages.iter().map(|message| message.id.as_str()).collect();
+        assert_eq!(ids, [early, later]);
+        assert_eq!(page.messages[0].text, "first");
+        assert_eq!(page.messages[1].text, "second");
     }
 
     #[test]

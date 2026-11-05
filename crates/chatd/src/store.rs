@@ -23,7 +23,7 @@ use std::time::Duration;
 /// Raise this when a table changes. `open` then drops the cache and starts over.
 /// 6 rebuilds caches written at 5 before `conversation.voice_limit` existed. That column
 /// was added without a version change, so Win+K died with `no such column: c.voice_limit`.
-const SCHEMA: i32 = 9;
+const SCHEMA: i32 = 10;
 
 /// Retention: the newest messages kept per conversation.
 pub const KEEP_MESSAGES: u32 = 2_000;
@@ -172,6 +172,10 @@ const TABLES: &str = "
         -- Unix seconds when the message's own timer (Telegram's ttl_period) makes it leave the
         -- store, whether the account is online or not. NULL: it does not run out on its own.
         expires      INTEGER,
+        -- Tiny's post order. 0 where the network has none, and on a send still on its way.
+        -- An encrypted message shares its minute and a plaintext message its second, so this
+        -- is what keeps a burst in the order it was posted. The id is not that order.
+        seq          INTEGER NOT NULL DEFAULT 0,
         -- The rest of the message as the protocol's JSON: sender, ranges, attachments, link
         -- previews, reactions, reply, thread summary, flags.
         body         TEXT NOT NULL,
@@ -287,10 +291,17 @@ const PERSON: &str = "
     FROM person p
     LEFT JOIN media m ON m.network = p.network AND m.account = p.account AND m.id = p.avatar";
 
-/// Messages in reading order: seconds, optional subsecond precision, then numeric-looking id.
-/// Subseconds live in the existing JSON body so old caches need no destructive schema rebuild.
-const NEWEST_FIRST: &str = "ORDER BY sent DESC, coalesce(json_extract(body, '$.sent_subsec_millis'), 0) DESC, length(id) DESC, id DESC";
-const OLDEST_FIRST: &str = "ORDER BY sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), length(id), id";
+/// One message's place. Time including private milliseconds, then whether it has no server sequence (those sit after the
+/// sequenced rows at that same time), then the sequence, then id, shorter first so a numeric
+/// id still sorts as a number. [`Message::rank`] is the same order.
+/// Select-list form of the place. The comparison is `{PLACE} < (SELECT {PLACE_TERMS} ...)`.
+/// Selecting `{PLACE}` itself is one column, and SQLite answers "row value misused".
+const PLACE_TERMS: &str = "sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), (seq = 0), seq, length(id), id";
+const PLACE: &str = "(sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), (seq = 0), seq, length(id), id)";
+/// Messages in the order they are read. The newest-first form is the reverse of [`PLACE`],
+/// so a page read that way and then reversed matches the oldest-first form.
+const NEWEST_FIRST: &str = "ORDER BY sent DESC, coalesce(json_extract(body, '$.sent_subsec_millis'), 0) DESC, (seq = 0) DESC, seq DESC, length(id) DESC, id DESC";
+const OLDEST_FIRST: &str = "ORDER BY sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), (seq = 0), seq, length(id), id";
 
 pub struct Store {
     db: Connection,
@@ -530,6 +541,17 @@ fn word<T: Serialize>(value: &T) -> String {
 /// way: a longer id is newer, and equal lengths compare as text.
 pub(crate) fn id_is_ahead(newer: &str, older: &str) -> bool {
     (newer.len(), newer) > (older.len(), older)
+}
+
+/// Tiny message ids are UUIDs. They are all one length, and text order is not time order.
+fn is_uuid(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() == 36
+        && bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+        && id.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
 }
 
 fn from_word<T: DeserializeOwned>(word: String) -> rusqlite::Result<T> {
@@ -1755,13 +1777,59 @@ impl Store {
         Ok(changed == 1)
     }
 
+    fn message_place(&self, conversation: &Key, id: &str) -> Option<(i64, u32, i64)> {
+        self.db
+            .query_row(
+                "SELECT sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), seq FROM message
+                  WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
+                params![word(&conversation.network), conversation.account, conversation.id, id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Whether `newer` is a later message than `older`. Private sender time wins, then the
+    /// server sequence when both rows have one. Otherwise snowflakes, Telegram ids and Slack
+    /// timestamps use [`id_is_ahead`]. UUID text order is not a clock.
+    fn cursor_ahead(&self, conversation: &Key, newer: &str, older: &str) -> bool {
+        if newer.is_empty() || older.is_empty() || newer == older {
+            return false;
+        }
+        if let (Some((left, left_millis, left_seq)), Some((right, right_millis, right_seq))) =
+            (self.message_place(conversation, newer), self.message_place(conversation, older))
+        {
+            if (left, left_millis) != (right, right_millis) {
+                return (left, left_millis) > (right, right_millis);
+            }
+            if left_seq > 0 && right_seq > 0 && left_seq != right_seq {
+                return left_seq > right_seq;
+            }
+        }
+        if is_uuid(newer) || is_uuid(older) {
+            return false;
+        }
+        id_is_ahead(newer, older)
+    }
+
+    /// True when a UUID is involved and neither timestamp nor sequence orders the ids.
+    fn ids_incomparable(&self, conversation: &Key, left: &str, right: &str) -> bool {
+        if left.is_empty() || right.is_empty() || left == right || (!is_uuid(left) && !is_uuid(right)) {
+            return false;
+        }
+        !self.cursor_ahead(conversation, left, right) && !self.cursor_ahead(conversation, right, left)
+    }
+
     /// The unread state the network reported: at connect, or when another device read it. The
     /// preview is left alone; it comes from messages. Mentions going up are noticed: the Inbox
     /// keeps a channel a day after it mentioned me.
     ///
     /// A count older than what this install already marked read is a lost tell (ack still in
     /// flight, or a Tiny channel list with unread and no cursor at the same `updated`), not the
-    /// truth: the badge stays cleared and `last_read` never moves backwards. A newer `updated`
+    /// truth: the badge stays cleared and `last_read` never moves backwards. That same list must
+    /// not clear a badge a live message already raised: Tiny channels have no cursor, and their
+    /// ids are UUIDs, so text order cannot say the preview was already read. A newer `updated`
     /// with no cursor is real activity (Discord's unread push) and may raise the badge again.
     pub fn set_counts(
         &mut self,
@@ -1785,15 +1853,30 @@ impl Store {
         };
         let net_read = last_read.filter(|id| !id.is_empty());
         // Local marker newer than the network's: keep ours, ignore its badge.
-        let local_ahead = !have_read.is_empty() && net_read.is_some_and(|net| id_is_ahead(&have_read, net));
-        // Caught up, no cursor, and nothing newer than we already know: Tiny's list refresh.
-        let caught_up = !have_read.is_empty() && (preview.is_empty() || !id_is_ahead(&preview, &have_read));
-        let stale_list = net_read.is_none() && caught_up && updated <= have_updated;
+        let local_ahead = !have_read.is_empty() && net_read.is_some_and(|net| self.cursor_ahead(conversation, &have_read, net));
+        // A cursor this store cannot order, on a list that is not newer, must not rewind.
+        let cursor_unordered = net_read.is_some_and(|net| {
+            !have_read.is_empty()
+                && have_read != net
+                && !self.cursor_ahead(conversation, &have_read, net)
+                && !self.cursor_ahead(conversation, net, &have_read)
+        });
+        let local_ahead = local_ahead || (cursor_unordered && updated <= have_updated);
+        // Caught up when nothing still unread sits past the marker. A different UUID preview
+        // with a live badge is not caught up: text order would say the older id was newer.
+        let preview_ahead = have_unread > 0
+            && !preview.is_empty()
+            && preview != have_read
+            && (self.cursor_ahead(conversation, &preview, &have_read) || self.ids_incomparable(conversation, &preview, &have_read));
+        let caught_up = !have_read.is_empty() && !preview_ahead;
+        let stale_list = net_read.is_none() && updated <= have_updated;
 
         let (unread, mentions, marker) = if local_ahead {
             (have_unread, have_mentions, None)
-        } else if stale_list {
+        } else if stale_list && caught_up {
             (unread.min(have_unread), mentions.min(have_mentions), None)
+        } else if stale_list {
+            (unread.max(have_unread), mentions.max(have_mentions), None)
         } else {
             (unread, mentions, net_read)
         };
@@ -1856,8 +1939,9 @@ impl Store {
         let Some((unread, mentions, last_read)) = current else {
             return Ok(false);
         };
-        // Never move the marker backwards. An empty target still clears a badge.
-        let marker = if !target.is_empty() && (last_read.is_empty() || !id_is_ahead(&last_read, &target)) {
+        // Never move the marker backwards. An empty target still clears a badge. UUID text
+        // order is not time, so a later Tiny message that sorts first still becomes the cursor.
+        let marker = if !target.is_empty() && (last_read.is_empty() || self.cursor_ahead(conversation, &target, &last_read)) {
             target
         } else {
             last_read.clone()
@@ -1947,17 +2031,22 @@ impl Store {
                 account: row.get(1)?,
                 id: row.get(2)?,
             };
-            let preview: String = row.get(3)?;
-            let last_read: String = row.get(4)?;
-            let request = row.get::<_, String>(5)? == "request";
-            let marker = if !preview.is_empty() && (last_read.is_empty() || id_is_ahead(&preview, &last_read)) {
-                preview
-            } else {
-                last_read
-            };
-            Ok((key, marker, request))
+            Ok((key, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)? == "request"))
         })?;
-        rows.collect()
+        let rows: Vec<_> = rows.collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        // The statement has to finish before cursor checks read message times.
+        Ok(rows
+            .into_iter()
+            .map(|(key, preview, last_read, request)| {
+                let marker = if !preview.is_empty() && (last_read.is_empty() || self.cursor_ahead(&key, &preview, &last_read)) {
+                    preview
+                } else {
+                    last_read
+                };
+                (key, marker, request)
+            })
+            .collect())
     }
 
     // Messages.
@@ -1973,19 +2062,46 @@ impl Store {
     pub fn ingest(&mut self, conversation: &Key, message: &Message, unread: bool) -> rusqlite::Result<Stored> {
         let tx = self.db.transaction()?;
         let (network, account, id) = (word(&conversation.network), &conversation.account, &conversation.id);
-        if let Some(client_id) = message.client_id.as_deref().filter(|client_id| *client_id != message.id) {
+        let mut incoming = message.clone();
+        // The echo of a send we are still showing replaces that row. If the list was previewing
+        // it, the preview has to follow, even when the server's stamp is coarser than the clock
+        // we used while it was on its way.
+        let mut replaced_preview = false;
+        if let Some(client_id) = incoming.client_id.as_deref().filter(|client_id| *client_id != incoming.id) {
+            let preview: Option<String> = tx
+                .query_row(
+                    "SELECT preview_id FROM conversation WHERE network = ?1 AND account = ?2 AND id = ?3",
+                    params![network, account, id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            replaced_preview = preview.as_deref() == Some(client_id);
             tx.execute(
                 "DELETE FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3
                     AND id = ?4 AND pending != 0",
                 params![network, account, id, client_id],
             )?;
         }
-        let mut stored = message.clone();
+        // An edit that does not repeat the sequence keeps the one this row already has.
+        if incoming.seq == 0 {
+            if let Some(kept) = tx
+                .query_row(
+                    "SELECT seq FROM message
+                      WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
+                    params![network, account, id, incoming.id],
+                    |row| row.get(0),
+                )
+                .optional()?
+            {
+                incoming.seq = kept;
+            }
+        }
+        let mut stored = incoming.clone();
         stored.bound();
         stored.id.clear();
         stored.text.clear();
         let body = serde_json::to_string(&stored).map_err(broken)?;
-        let pending = match message.state {
+        let pending = match incoming.state {
             SendState::Sent => 0,
             SendState::Pending => 1,
             SendState::Failed { .. } => 2,
@@ -1994,27 +2110,63 @@ impl Store {
             .query_row(
                 "SELECT text, body FROM message
                   WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
-                params![network, account, id, message.id],
+                params![network, account, id, incoming.id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
         let outcome = match before {
-            Some((text, old)) if text == message.text && old == body => Stored::Same,
+            Some((text, old)) if text == incoming.text && old == body => Stored::Same,
             Some(_) => Stored::Updated,
             None => Stored::New,
         };
         if outcome != Stored::Same {
             tx.execute(
                 "INSERT OR REPLACE INTO message
-                     (network, account, conversation, id, sent, text, pending, client_id, expires, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![network, account, id, message.id, message.sent, message.text, pending, message.client_id, message.expires_at, body],
+                     (network, account, conversation, id, sent, text, pending, client_id, expires, body, seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    network,
+                    account,
+                    id,
+                    incoming.id,
+                    incoming.sent,
+                    incoming.text,
+                    pending,
+                    incoming.client_id,
+                    incoming.expires_at,
+                    body,
+                    incoming.seq,
+                ],
             )?;
         }
-        let counts = unread && !message.outgoing;
+        let counts = unread && !incoming.outgoing;
         // A live send clears the badge: pending from the shell, or the network's echo (`unread`).
         // History of a past post of ours must not.
-        let clear_read = message.outgoing && (unread || matches!(message.state, SendState::Pending));
+        let clear_read = incoming.outgoing && (unread || matches!(incoming.state, SendState::Pending));
+        // Compare private sender milliseconds before the server sequence. With equal time,
+        // one with no sequence does not displace a sequenced row, and does not lose to another
+        // unsequenced one.
+        let (updated, preview_millis, preview_seq): (i64, u32, i64) = tx
+            .query_row(
+                "SELECT c.updated,
+                        COALESCE((SELECT json_extract(m.body, '$.sent_subsec_millis') FROM message m
+                                    WHERE m.network = c.network AND m.account = c.account
+                                      AND m.conversation = c.id AND m.id = c.preview_id), 0),
+                        COALESCE((SELECT m.seq FROM message m
+                                    WHERE m.network = c.network AND m.account = c.account
+                                      AND m.conversation = c.id AND m.id = c.preview_id), 0)
+                   FROM conversation c
+                  WHERE c.network = ?1 AND c.account = ?2 AND c.id = ?3",
+                params![network, account, id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .unwrap_or((0, 0, 0));
+        let incoming_time = (incoming.sent, incoming.sent_subsec_millis);
+        let preview_time = (updated, preview_millis);
+        let replace_preview = replaced_preview
+            || incoming_time > preview_time
+            || (incoming_time == preview_time && if incoming.seq > 0 { incoming.seq > preview_seq } else { preview_seq == 0 });
         match outcome {
             Stored::New => {
                 tx.execute(
@@ -2023,11 +2175,11 @@ impl Store {
                          mentions = CASE WHEN ?7 AND ?5 >= updated THEN 0 ELSE mentions + ?9 END,
                          last_read = CASE WHEN ?7 AND ?5 >= updated AND ?10 = 0 THEN ?6 ELSE last_read END,
                          noticed = CASE WHEN ?9 > 0 THEN max(noticed, ?5) ELSE noticed END,
-                         preview_from = CASE WHEN ?5 >= updated THEN ?11 ELSE preview_from END,
-                         preview_mine = CASE WHEN ?5 >= updated THEN ?13 ELSE preview_mine END,
-                         preview_id = CASE WHEN ?5 >= updated THEN ?6 ELSE preview_id END,
-                         preview = CASE WHEN ?5 >= updated THEN ?4 ELSE preview END,
-                         preview_expires = CASE WHEN ?5 >= updated THEN ?14 ELSE preview_expires END,
+                         preview_from = CASE WHEN ?15 THEN ?11 ELSE preview_from END,
+                         preview_mine = CASE WHEN ?15 THEN ?13 ELSE preview_mine END,
+                         preview_id = CASE WHEN ?15 THEN ?6 ELSE preview_id END,
+                         preview = CASE WHEN ?15 THEN ?4 ELSE preview END,
+                         preview_expires = CASE WHEN ?15 THEN ?14 ELSE preview_expires END,
                          updated = max(updated, ?5),
                          hidden = CASE WHEN ?12 AND last_read != ''
                              AND (length(last_read), last_read) < (length(?6), ?6) THEN 0 ELSE hidden END
@@ -2036,36 +2188,38 @@ impl Store {
                         network,
                         account,
                         id,
-                        preview_of(message),
-                        message.sent,
-                        message.id,
+                        preview_of(&incoming),
+                        incoming.sent,
+                        incoming.id,
                         clear_read,
                         u32::from(counts),
-                        u32::from(counts && message.mentions_me),
+                        u32::from(counts && incoming.mentions_me),
                         pending,
-                        if message.outgoing { "" } else { message.sender.name.as_str() },
+                        if incoming.outgoing { "" } else { incoming.sender.name.as_str() },
                         unread,
-                        message.outgoing,
-                        message.expires_at,
+                        incoming.outgoing,
+                        incoming.expires_at,
+                        replace_preview,
                     ],
                 )?;
             }
-            // An edit of the newest message is what the row previews.
+            // An edit of the message already previewed. Another from the same minute must not
+            // take its place: they share a stamp.
             Stored::Updated => {
                 tx.execute(
-                    "UPDATE conversation SET preview = ?4, preview_id = ?6, preview_mine = ?7, preview_from = ?8,
+                    "UPDATE conversation SET preview = ?4, preview_mine = ?7, preview_from = ?8,
                          preview_expires = ?9
-                      WHERE network = ?1 AND account = ?2 AND id = ?3 AND updated = ?5",
+                      WHERE network = ?1 AND account = ?2 AND id = ?3 AND preview_id = ?6",
                     params![
                         network,
                         account,
                         id,
-                        preview_of(message),
-                        message.sent,
-                        message.id,
-                        message.outgoing,
-                        if message.outgoing { "" } else { message.sender.name.as_str() },
-                        message.expires_at,
+                        preview_of(&incoming),
+                        incoming.sent,
+                        incoming.id,
+                        incoming.outgoing,
+                        if incoming.outgoing { "" } else { incoming.sender.name.as_str() },
+                        incoming.expires_at,
                     ],
                 )?;
             }
@@ -2241,9 +2395,11 @@ impl Store {
             SharedKind::Links => "(instr(body, '\"previews\"') > 0 OR instr(body, '\"style\":\"link\"') > 0)",
         };
         let below = match before {
-            Some(_) => "AND (sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), length(id), id) < (SELECT sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), length(id), id FROM message
-                           WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4)",
-            None => "AND ?4 IS NULL",
+            Some(_) => format!(
+                "AND {PLACE} < (SELECT {PLACE_TERMS} FROM message
+                    WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4)"
+            ),
+            None => "AND ?4 IS NULL".to_owned(),
         };
         let mut query = self.db.prepare(&format!(
             "SELECT id, text, body FROM message
@@ -2365,7 +2521,7 @@ impl Store {
                 Some(anchor) => {
                     values.push(Value::Text(anchor.to_owned()));
                     format!(
-                        "AND (sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), length(id), id) {side} (SELECT sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), length(id), id FROM message
+                        "AND {PLACE} {side} (SELECT {PLACE_TERMS} FROM message
                            WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4)"
                     )
                 }
@@ -3117,6 +3273,45 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_stamp_follows_the_sequence_and_a_page_does_too() {
+        let (mut store, key) = store();
+        let mut earlier_minute = said("z-earlier", "before", 90);
+        earlier_minute.seq = 9;
+        let mut first = said("ffffffff-ffff-ffff-ffff-ffffffffffff", "first", 100);
+        first.seq = 1;
+        let mut second = said("00000000-0000-0000-0000-000000000002", "second", 100);
+        second.seq = 2;
+        let mut third = said("00000000-0000-0000-0000-000000000001", "third", 100);
+        third.seq = 3;
+        // Arrival order is not the sequence, and the ids sort the other way.
+        for message in [&third, &first, &earlier_minute, &second] {
+            store.ingest(&key, message, false).unwrap();
+        }
+        let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(
+            ids(&page),
+            ["z-earlier", "ffffffff-ffff-ffff-ffff-ffffffffffff", "00000000-0000-0000-0000-000000000002", "00000000-0000-0000-0000-000000000001"]
+        );
+        let older = store.messages(&key, &Page::Before { id: third.id.clone() }, 2, NOW).unwrap().unwrap();
+        assert_eq!(ids(&older), ["ffffffff-ffff-ffff-ffff-ffffffffffff", "00000000-0000-0000-0000-000000000002"]);
+
+        let mut waiting = said("50", "on its way", 100);
+        waiting.state = protocol::SendState::Pending;
+        store.ingest(&key, &waiting, false).unwrap();
+        let with_pending = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(with_pending.messages.last().map(|message| message.id.as_str()), Some("50"));
+
+        let mut edited = first.clone();
+        edited.seq = 0;
+        edited.text = "first, edited".to_owned();
+        store.ingest(&key, &edited, false).unwrap();
+        let after = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(after.messages[1].text, "first, edited");
+        assert_eq!(after.messages[1].seq, 1);
+        assert_eq!(after.messages[1].id, first.id);
+    }
+
+    #[test]
     fn expiring_the_preview_restores_a_surviving_message_then_clears_the_last_copy() {
         let (mut store, key) = store();
         let mut older = said("1", "still here", NOW - 20);
@@ -3242,6 +3437,100 @@ mod tests {
     }
 
     #[test]
+    fn merged_order_pages_prefer_precise_time_then_sequence() {
+        let (mut store, key) = store();
+        let mut messages = Vec::new();
+        for (id, millis, seq) in [
+            ("ffffffff-ffff-4fff-8fff-ffffffffffff", 100, 30),
+            ("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", 500, 20),
+            ("dddddddd-dddd-4ddd-8ddd-dddddddddddd", 500, 21),
+            ("00000000-0000-4000-8000-000000000001", 900, 1),
+        ] {
+            let mut message = said(id, id, 20);
+            message.sent_subsec_millis = millis;
+            message.seq = seq;
+            message.previews.push(protocol::Preview {
+                url: format!("https://example.com/{id}"),
+                site: String::new(), title: id.into(), description: String::new(), image: None,
+            });
+            messages.push(message);
+        }
+        // Sender time, post sequence, UUID text and arrival order all differ.
+        for index in [3, 1, 0, 2] {
+            store.ingest(&key, &messages[index], false).unwrap();
+        }
+        let expected: Vec<_> = messages.iter().map(|message| message.id.as_str()).collect();
+        let newest = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(ids(&newest), expected);
+        let mut ranked = newest.messages.clone();
+        ranked.sort_by_key(Message::rank);
+        assert_eq!(ranked, newest.messages, "the shell and SQL use one order");
+        let before = store.messages(&key, &Page::Before { id: messages[2].id.clone() }, 10, NOW).unwrap().unwrap();
+        assert_eq!(ids(&before), expected[..2]);
+        let after = store.messages(&key, &Page::After { id: messages[1].id.clone() }, 10, NOW).unwrap().unwrap();
+        assert_eq!(ids(&after), expected[2..]);
+        let around = store.messages(&key, &Page::Around { id: messages[1].id.clone() }, 2, NOW).unwrap().unwrap();
+        assert_eq!(ids(&around), expected[..3]);
+        let (shared, more) = store.shared(&key, SharedKind::Links, Some(&messages[2].id), 10).unwrap().unwrap();
+        assert!(!more);
+        assert_eq!(shared.iter().map(|item| item.message_id.as_str()).collect::<Vec<_>>(), [expected[1], expected[0]]);
+
+        let mut edited = messages[0].clone();
+        edited.seq = 0;
+        edited.text = "edited older message".into();
+        store.ingest(&key, &edited, false).unwrap();
+        let after_edit = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(ids(&after_edit), expected);
+        assert_eq!((after_edit.messages[0].sent_subsec_millis, after_edit.messages[0].seq), (100, 30));
+        assert_eq!(store.preview_id(&key).unwrap(), messages[3].id);
+    }
+
+    #[test]
+    fn merged_order_preview_follows_private_time_despite_sequence_and_arrival() {
+        for newest_arrives_first in [true, false] {
+            let (mut store, key) = store();
+            let mut earlier = said("ffffffff-ffff-4fff-8fff-ffffffffffff", "earlier", 20);
+            earlier.sent_subsec_millis = 100;
+            earlier.seq = 9;
+            let mut later = said("00000000-0000-4000-8000-000000000001", "later", 20);
+            later.sent_subsec_millis = 900;
+            later.seq = 1;
+            let arrivals = if newest_arrives_first { [&later, &earlier] } else { [&earlier, &later] };
+            for message in arrivals {
+                store.ingest(&key, message, false).unwrap();
+            }
+            assert_eq!(store.preview_id(&key).unwrap(), later.id);
+            assert_eq!(store.conversation(&key).unwrap().unwrap().preview, "later");
+        }
+    }
+
+    #[test]
+    fn merged_order_read_cursor_uses_private_time_and_equal_time_sequence() {
+        for (earlier_millis, later_millis, earlier_seq, later_seq) in [(100, 900, 9, 1), (0, 0, 1, 2)] {
+            let (mut store, key) = store();
+            let mut earlier = said("ffffffff-ffff-4fff-8fff-ffffffffffff", "earlier", 20);
+            earlier.sent_subsec_millis = earlier_millis;
+            earlier.seq = earlier_seq;
+            let mut later = said("00000000-0000-4000-8000-000000000001", "later", 20);
+            later.sent_subsec_millis = later_millis;
+            later.seq = later_seq;
+            store.ingest(&key, &earlier, true).unwrap();
+            assert!(store.mark_read(&key, &earlier.id).unwrap());
+            store.ingest(&key, &later, true).unwrap();
+            let marks = store.unread_marks(Some(Network::Discord)).unwrap();
+            assert!(marks.iter().any(|(found, marker, _)| found == &key && marker == &later.id));
+            store.set_counts(&key, 0, 0, None, 20).unwrap();
+            assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 1);
+            assert!(store.mark_read(&key, &later.id).unwrap());
+            let row = store.conversation(&key).unwrap().unwrap();
+            assert_eq!((row.unread, row.last_read.as_deref()), (0, Some(later.id.as_str())));
+            store.set_counts(&key, 4, 0, Some(&earlier.id), 20).unwrap();
+            let row = store.conversation(&key).unwrap().unwrap();
+            assert_eq!((row.unread, row.last_read.as_deref()), (0, Some(later.id.as_str())));
+        }
+    }
+
+    #[test]
     fn pages_walk_a_conversation_both_ways_and_say_when_there_is_more() {
         let (mut store, key) = store();
         // Ids of two lengths in one second: they must still read in numeric order.
@@ -3358,6 +3647,58 @@ mod tests {
         assert!(store.set_counts(&key, 0, 0, Some("3"), 30).unwrap());
         let row = store.conversation(&key).unwrap().unwrap();
         assert_eq!((row.unread, row.last_read.as_deref()), (0, Some("3")));
+    }
+
+    /// Opening a Tiny server refetches every channel. That list has an unread count and no
+    /// cursor. A fetch that started before a live message, or that repeats the message we
+    /// already counted, must not wipe the badge.
+    #[test]
+    fn a_channel_list_without_a_cursor_does_not_clear_a_live_unread() {
+        let (mut store, key) = store();
+        let later = "00000000-0000-4000-8000-000000000001";
+        store.ingest(&key, &said(later, "hello", 20), true).unwrap();
+        assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 1);
+
+        store.set_counts(&key, 0, 0, None, 10).unwrap();
+        assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 1, "an older list is not a read");
+        store.set_counts(&key, 0, 0, None, 20).unwrap();
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!(row.unread, 1, "a list that has not moved past the live message must not clear it");
+        assert_eq!(row.last_read.as_deref(), None);
+    }
+
+    /// Tiny message ids are UUIDs. Lexicographic order is not time order, so a newer message
+    /// can sort behind the cursor this install already stored. A channel refresh still has no
+    /// cursor and must not treat that as caught up.
+    #[test]
+    fn a_newer_tiny_message_that_sorts_behind_the_cursor_stays_unread() {
+        let (mut store, key) = store();
+        let earlier = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        let later = "00000000-0000-4000-8000-000000000001";
+        assert!(earlier > later, "the fixture is the UUID case: the newer id sorts first");
+
+        store.ingest(&key, &said(earlier, "old", 10), true).unwrap();
+        assert!(store.mark_read(&key, earlier).unwrap());
+        store.ingest(&key, &said(later, "new", 20), true).unwrap();
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.unread, row.last_read.as_deref()), (1, Some(earlier)));
+        assert_eq!(store.preview_id(&key).unwrap(), later);
+        let marks = store.unread_marks(Some(Network::Discord)).unwrap();
+        assert!(
+            marks.iter().any(|(found, marker, request)| found == &key && marker == later && !request),
+            "the ack is the newer message, not the uuid that sorts first"
+        );
+
+        store.set_counts(&key, 0, 0, None, 20).unwrap();
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!(row.unread, 1, "caught up is not 'the preview uuid sorts first'");
+        assert_eq!(row.last_read.as_deref(), Some(earlier));
+
+        assert!(store.mark_read(&key, later).unwrap());
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.unread, row.last_read.as_deref()), (0, Some(later)));
+        assert!(!store.set_counts(&key, 4, 0, None, 20).unwrap(), "a stale count must not bring the badge back");
+        assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 0);
     }
 
     #[test]
