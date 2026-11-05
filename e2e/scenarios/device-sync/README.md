@@ -20,7 +20,8 @@ the lab's existing desktop tools, and plain SSH access through the configured `t
 Supply the client and server commits explicitly. Neither repo is switched or built from dirty files.
 
 1. Build the Windows app from a `git archive` export of the client commit, using
-   `cargo build --release -p tinyclient --features gui -p chatd -p mediad`.
+   `cargo build --release -p tinyclient --features gui -p chatd -p mediad -p login`.
+   Keep `tinyclient-login[.exe]` beside chatd; its approval command must come from the same commit.
 2. Build the IPC helper with `cargo build --release --manifest-path dlctl/Cargo.toml
    --target-dir "$env:LOCALAPPDATA/tiny-e2e/dlctl-target"`.
 3. In Git Bash, run `bash drivers/prepare-linux.sh <client-repo> release <client-sha>`.

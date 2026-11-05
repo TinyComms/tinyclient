@@ -852,7 +852,7 @@ class Scenario:
                 raise RuntimeError("client source marker does not match requested SHA")
         meta["client_sha"] = a.client_sha
         meta["binary_sha256"] = {name: hashlib.sha256(open(os.path.join(a.app_dir, name), "rb").read()).hexdigest()
-                                 for name in ("tinyclient.exe", "chatd.exe", "mediad.exe")}
+                                 for name in ("tinyclient.exe", "chatd.exe", "mediad.exe", "tinyclient-login.exe")}
         print(json.dumps(meta))
         A = self.dev("a_desk_a", "Ada A", gui=not a.no_gui)
         Bea = self.dev("b_desk", "Bea", gui=not a.no_gui)

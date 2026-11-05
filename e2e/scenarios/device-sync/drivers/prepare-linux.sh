@@ -33,13 +33,13 @@ export CARGO_TARGET_DIR=$HOME/tiny-lab/target
 export CARGO_BUILD_JOBS=1
 flag=--release; dir=release
 [ "$profile" = dev ] && { flag=; dir=debug; }
-cargo +stable build $flag -p tinyclient --features gui -p chatd -p mediad
+cargo +stable build $flag -p tinyclient --features gui -p chatd -p mediad -p login
 # dlctl against this checkout's own protocol crate
 sed -i 's#path = "../../../../crates/protocol"#path = "../crates/protocol"#' dlctl/Cargo.toml
 cp Cargo.lock dlctl/Cargo.lock
 (cd dlctl && cargo +stable build --release)
 mkdir -p ~/tiny-dl/bin/app
-cp "$CARGO_TARGET_DIR/$dir/tinyclient" "$CARGO_TARGET_DIR/$dir/chatd" "$CARGO_TARGET_DIR/$dir/mediad" ~/tiny-dl/bin/app/
+cp "$CARGO_TARGET_DIR/$dir/tinyclient" "$CARGO_TARGET_DIR/$dir/chatd" "$CARGO_TARGET_DIR/$dir/mediad" "$CARGO_TARGET_DIR/$dir/tinyclient-login" ~/tiny-dl/bin/app/
 cp "$CARGO_TARGET_DIR/release/dlctl" ~/tiny-dl/bin/dlctl
 cp drivers/linux-host.sh ~/tiny-dl/linux-host.sh
 cp drivers/x11input.py ~/tiny-dl/x11input.py
