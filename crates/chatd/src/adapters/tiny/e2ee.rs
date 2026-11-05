@@ -244,6 +244,9 @@ struct Notes {
     /// The person's own conversation (`POST /v1/e2ee/self`), where their devices talk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     self_conv: Option<String>,
+    /// A confirmed removal applies to this identity, never a later fresh identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revoked_device: Option<String>,
 }
 
 /// One opened message, as the cache keeps it.
@@ -746,6 +749,24 @@ fn words(error: &Error) -> String {
 }
 
 impl Device {
+    fn revoked(&self) -> bool {
+        self.engine.as_ref().is_some_and(|engine| {
+            self.notes.revoked_device.as_deref() == Some(engine.device_id().to_string().as_str())
+        })
+    }
+
+    fn mark_revoked(&mut self) -> bool {
+        let Some(engine) = self.engine.as_ref() else { return false };
+        let id = engine.device_id().to_string();
+        let changed = self.notes.revoked_device.as_ref() != Some(&id) || self.state == DeviceState::Ready;
+        self.notes.revoked_device = Some(id);
+        self.state = DeviceState::Failed {
+            why: "This device was removed. Saved messages are still available.".to_owned(),
+        };
+        if changed { self.save_notes(); }
+        changed
+    }
+
     fn new(saved: &Saved) -> Device {
         Device {
             saved: saved.clone(),
@@ -917,6 +938,10 @@ impl Device {
             self.engine = Some(engine);
             self.cache_key = Some(cache_key);
         }
+        if self.revoked() {
+            self.mark_revoked();
+            return Ok(self.state.clone());
+        }
         self.register()
     }
 
@@ -972,6 +997,11 @@ impl Device {
                 Ok(DeviceState::AwaitingApproval {
                     code: link_code(device_id, &key),
                 })
+            }
+            400 if answer.get("error").and_then(Value::as_str) == Some("bad_device") => {
+                // This identity cannot be registered again after server-side removal.
+                self.mark_revoked();
+                Ok(self.state.clone())
             }
             status => Err(format!("The server refused this device ({status}).")),
         }
@@ -1793,6 +1823,8 @@ impl Device {
             .iter()
             .map(|device| device.device_id.clone())
             .collect();
+        let revoked = self.ready() && this.as_ref().is_some_and(|id| !ids.contains(id));
+        let revoked_changed = revoked && self.mark_revoked();
         let before = self.notes.added.clone();
         let first = self.notes.mine.is_empty();
         self.notes
@@ -1817,7 +1849,7 @@ impl Device {
             self.notes.mine = ids;
             self.save_notes();
         }
-        changed
+        changed || revoked_changed
     }
 
     /// The person saw the notice about this device of theirs.
@@ -1913,6 +1945,8 @@ impl Device {
             }
         }
         status.added = self.notes.added.clone();
+        status.device = self.state.clone();
+        status.revoked = self.revoked();
         let met: Vec<String> = self
             .notes
             .met
@@ -2395,6 +2429,56 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         lock(&shared).state = DeviceState::Failed { why: "test complete".into() };
+    }
+
+    #[test]
+    fn a_removed_device_stops_claiming_ready_without_losing_its_local_keys() {
+        let (mut device, _) = posting_device("status-revoked", 0);
+        let own_id = device.engine.as_ref().unwrap().device_id();
+        let conversation = "22222222-2222-2222-2222-222222222222";
+        let message = "33333333-3333-3333-3333-333333333333";
+        device.remember(conversation, message, Opened { text: "saved before removal".into(), ..Opened::default() });
+        let status = device.status(&HashMap::new());
+        assert_ne!(status.device, DeviceState::Ready, "the confirmed device list no longer contains this device");
+        assert!(status.revoked);
+        assert!(!device.ready());
+        assert_eq!(device.engine.as_ref().unwrap().device_id(), own_id);
+        assert!(device.cache_key.is_some(), "removing future access must keep saved history keys");
+        let notes: Value = serde_json::from_slice(&std::fs::read(device.dir.join("notes.json")).unwrap()).unwrap();
+        assert_eq!(notes["revoked_device"], own_id.to_string());
+        let row = Row { id: message, author_id: &device.saved.user_id.clone(), kind: "message",
+            ciphertext: None, epoch: 0, device_id: "", target_id: None, client_id: None, created_at: "" };
+        let mut read = device.read(conversation, &[row]);
+        assert!(matches!(read.remove(message), Some(Read::Opened(opened)) if opened.text == "saved before removal"));
+    }
+
+    #[test]
+    fn a_failed_device_list_request_does_not_claim_revocation() {
+        let (mut device, _) = posting_device("status-offline", 0);
+        device.saved.base_url = super::super::tests::serve(|_| super::super::tests::http(503, "Unavailable", "{}"));
+        let status = device.status(&HashMap::new());
+        assert_eq!(status.device, DeviceState::Ready);
+        assert!(!status.revoked);
+        assert!(device.ready());
+    }
+
+    #[test]
+    fn a_remembered_removed_identity_is_not_registered_again() {
+        let (mut device, _) = posting_device("revoked-reopen", 0);
+        device.mark_revoked();
+        device.notes = serde_json::from_slice(&std::fs::read(device.dir.join("notes.json")).unwrap()).unwrap();
+        device.state = DeviceState::Off;
+        let registrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = registrations.clone();
+        device.saved.base_url = super::super::tests::serve(move |request| {
+            if request.starts_with("PUT ") { observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+            super::super::tests::http(200, "OK", r#"{"features":["e2ee_text"],"e2ee_text":"optional"}"#)
+        });
+        assert!(matches!(device.try_enrol().unwrap(), DeviceState::Failed { .. }));
+        assert!(device.revoked());
+        assert_eq!(registrations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        device.engine = Some(Engine::detached(UserId::parse(&device.saved.user_id).unwrap()).unwrap());
+        assert!(!device.revoked(), "the remembered removal belongs only to the old identity");
     }
 
     #[test]

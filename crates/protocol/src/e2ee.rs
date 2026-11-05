@@ -310,6 +310,9 @@ pub struct E2eeStatus {
     pub mode: String,
     #[serde(default)]
     pub device: DeviceState,
+    /// The server confirmed this previously approved device was removed. Saved history stays local.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub revoked: bool,
     /// This device's id and fingerprint, once made.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub device_id: String,
