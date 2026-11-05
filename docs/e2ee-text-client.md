@@ -79,6 +79,14 @@ that account here (a new device) reads them. "Erase" deletes the directory and t
   the feature keeps the paste-the-code approval, and a `tiny-device-` code pasted where a link code
   goes is approved that way. Every device of the person shows "New device added" for a device it
   did not add itself, with Revoke, from the next `e2ee.device`.
+- **The person's own devices** (servers with `e2ee_self`; `e2ee/siblings.rs`). Each device joins
+  the person's own encrypted conversation (`POST /v1/e2ee/self`), whose group is exactly their
+  active devices; the server hides it and deletes its messages after `e2ee_self_ttl_secs`. A
+  device that cannot open a message asks there (`want`); a sibling that opened it answers from
+  its cache (`have`), kept here as `imported_from` that device, never overwriting a row. Marking a
+  safety number as verified, or unmarking it, goes there too. Read positions need nothing: they
+  are the server's, per person. On start a device reads what was said while it was away. Messages
+  there count only from the person's own other devices, and never show as a conversation.
 - **Backup file** (`e2ee::backup`, `e2ee/backup.rs`). Encryption's "Save a backup…" writes the
   cache and verified marks as a `TNYB1` file: an `e2ee::archive` under a key from Argon2id
   (64 MiB, 3 passes) over a passphrase of at least 12 characters, with the salt and cost in a

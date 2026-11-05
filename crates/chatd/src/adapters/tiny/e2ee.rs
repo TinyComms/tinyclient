@@ -241,10 +241,13 @@ struct Notes {
     /// The person's devices added since they last looked, for the notice.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     added: Vec<E2eeDevice>,
+    /// The person's own conversation (`POST /v1/e2ee/self`), where their devices talk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    self_conv: Option<String>,
 }
 
 /// One opened message, as the cache keeps it.
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Opened {
     #[serde(default)]
     pub text: String,
@@ -272,7 +275,7 @@ fn is_zero(value: &i64) -> bool {
 }
 
 /// An attachment of an opened message: enough to fetch and open it again.
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct OpenedFile {
     pub id: String,
     /// Base64 of the 32 byte key.
@@ -437,6 +440,10 @@ pub(crate) struct Device {
     linking: bool,
     /// The largest archive one link carries (`e2ee_link_archive_max`).
     link_max: u64,
+    /// The server has the person's own conversation (`e2ee_self`): their devices fill each
+    /// other's gaps there.
+    self_capable: bool,
+    siblings: siblings::Siblings,
 }
 
 type Shared = Arc<Mutex<Device>>;
@@ -484,6 +491,8 @@ pub(crate) fn begin(saved: &Saved) {
     let shared = device(saved);
     let mut device = lock(&shared);
     device.enrol();
+    // What the person's other devices said while this one was away.
+    let _ = device.catch_up();
 }
 
 /// Signing out: the device is revoked on the server and its state forgotten here. What it opened
@@ -745,6 +754,8 @@ impl Device {
             checked: BTreeSet::new(),
             linking: false,
             link_max: linking::ARCHIVE_MAX,
+            self_capable: false,
+            siblings: siblings::Siblings::default(),
         }
     }
 
@@ -844,6 +855,10 @@ impl Device {
             self.mode.clear();
             return Ok(DeviceState::Off);
         }
+        self.self_capable = body
+            .get("features")
+            .and_then(Value::as_array)
+            .is_some_and(|all| all.iter().any(|f| f.as_str() == Some("e2ee_self")));
         self.link_max = body
             .get("e2ee_link_archive_max")
             .and_then(Value::as_u64)
@@ -1510,6 +1525,17 @@ impl Device {
             self.remember(conversation_id, &target, opened);
         }
         let _ = self.engine.as_mut().map(Engine::flush);
+        // What did not open here may have on another device of the person.
+        let missing: Vec<String> = rows
+            .iter()
+            .filter(|row| {
+                row.kind != "edit" && matches!(out.get(row.id), Some(Read::Undecryptable))
+            })
+            .map(|row| row.id.to_owned())
+            .collect();
+        if !missing.is_empty() {
+            self.want(conversation_id, missing);
+        }
         out
     }
 
@@ -1931,11 +1957,14 @@ impl Device {
             }
             self.notes
                 .verified
-                .insert(user_id.to_owned(), person.safety);
+                .insert(user_id.to_owned(), person.safety.clone());
+            self.save_notes();
+            self.tell_verified(user_id, Some(person.safety));
         } else {
             self.notes.verified.remove(user_id);
+            self.save_notes();
+            self.tell_verified(user_id, None);
         }
-        self.save_notes();
         Ok(())
     }
 
@@ -2213,6 +2242,7 @@ pub(crate) fn attachment_key() -> Result<AttachmentKey, String> {
 
 mod backup;
 mod linking;
+pub(crate) mod siblings;
 
 #[cfg(test)]
 mod live;

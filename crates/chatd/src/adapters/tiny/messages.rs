@@ -159,7 +159,13 @@ pub(crate) fn on_live(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         "e2ee.upgraded" => upgraded(ctx, saved, frame),
         "message.created" | "message.edited" => {
             if let Some((conversation, wire)) = framed_message(frame) {
-                deliver(ctx, saved, names, &conversation, &wire);
+                if is_self(saved, &conversation) {
+                    // Off the socket's thread: it may answer, and read conversations again.
+                    let (ctx, saved) = (ctx.clone(), saved.clone());
+                    let _ = std::thread::Builder::new().name("tiny-e2ee-siblings".into()).spawn(move || from_sibling(&ctx, &saved, &wire));
+                } else {
+                    deliver(ctx, saved, names, &conversation, &wire);
+                }
             }
         }
         "message.deleted" => {
@@ -457,9 +463,41 @@ fn open_rows(saved: &Saved, conversation_id: &str, wires: &[&WireMessage]) -> Ha
             created_at: &wire.created_at,
         })
         .collect();
-    let mut device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    device.note_encrypted(conversation_id, true);
-    device.read(conversation_id, &rows)
+    let read = {
+        let mut device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        device.note_encrypted(conversation_id, true);
+        device.read(conversation_id, &rows)
+    };
+    // What did not open is asked of the person's other devices, off this thread.
+    e2ee::siblings::ask_soon(device);
+    read
+}
+
+/// A message of the person's own conversation: what another of their devices said, never a
+/// message to show. Conversations that gained messages from it are read again.
+fn from_sibling(ctx: &Context, saved: &Saved, wire: &WireMessage) {
+    let Some(device) = e2ee::started(saved) else {
+        return;
+    };
+    let row = e2ee::Row {
+        id: &wire.id,
+        author_id: &wire.author_id,
+        kind: wire.kind.as_deref().unwrap_or("message"),
+        ciphertext: wire.ciphertext.as_deref(),
+        epoch: wire.epoch.unwrap_or(0),
+        device_id: wire.device_id.as_deref().unwrap_or(""),
+        target_id: wire.target_id.as_deref(),
+        client_id: wire.client_id.as_deref(),
+        created_at: &wire.created_at,
+    };
+    let gained = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).sibling_said(&row);
+    for conversation in gained {
+        load_page(ctx, saved, &conversation, None, PAGE_MAX);
+    }
+}
+
+fn is_self(saved: &Saved, conversation_id: &str) -> bool {
+    e2ee::started(saved).is_some_and(|device| device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_self(conversation_id))
 }
 
 /// The conversation's label. An upgrade that left older messages in the clear says so.
