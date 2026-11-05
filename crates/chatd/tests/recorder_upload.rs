@@ -3,7 +3,7 @@
 mod test_mediad;
 
 use chatd::{blobs::upload::{self, Upload}, hub::Hub, store::Store};
-use protocol::{Key, Network, OutgoingFile, RecordRequest, RecordState};
+use protocol::{Key, Network, OutgoingFile, PlayRequest, PlayState, RecordRequest, RecordState};
 use std::{path::PathBuf, process::Command, sync::Arc, thread::sleep, time::{Duration, Instant}};
 
 #[test]
@@ -48,6 +48,35 @@ fn a_recorded_opus_note_can_be_uploaded_and_private_cache_files_stay_blocked() {
     let bytes = std::fs::read(&path).unwrap();
     assert!(bytes.starts_with(b"OggS"), "recording is an Ogg container");
     assert!(bytes.windows(8).any(|chunk| chunk == b"OpusHead"));
+    let media = dir.join("media");
+    let play = |path: &std::path::Path, conversation: Key| PlayRequest::Start {
+        account: conversation.account(), file: path.to_string_lossy().into_owned(),
+        path: path.to_string_lossy().into_owned(), conversation, message: String::new(),
+        title: "Voice message preview".into(), at: None, rate: 100, output: None,
+    };
+    // An outbox file is playable only while it is the current finished recording, and
+    // only for that recording's account and conversation.
+    let other = upload::outbox().join("other.opus");
+    std::fs::write(&other, &bytes).unwrap();
+    assert!(hub.player.request(&hub, &media, play(&other, key.clone())).is_err());
+    assert!(hub.player.request(&hub, &media, play(&path, Key { id: "other".into(), ..key.clone() })).is_err());
+    assert!(hub.player.request(&hub, &media, play(&path, Key { account: "other".into(), ..key.clone() })).is_err());
+    hub.player.request(&hub, &media, play(&path, key.clone())).unwrap();
+    wait_playing(&hub);
+    hub.player.request(&hub, &media, PlayRequest::Pause).unwrap();
+    assert_eq!(hub.player.shown().unwrap().state, PlayState::Paused);
+    hub.player.request(&hub, &media, play(&path, key.clone())).unwrap();
+    wait_playing(&hub);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while hub.player.shown().unwrap().state != PlayState::Ended {
+        assert!(Instant::now() < deadline, "preview never ended: {:?}", hub.player.shown());
+        sleep(Duration::from_millis(5));
+    }
+    hub.player.request(&hub, &media, play(&path, key.clone())).unwrap();
+    wait_playing(&hub);
+    hub.recorder.request(&hub, RecordRequest::Forget);
+    assert!(hub.player.shown().is_none(), "removing the note stops its preview");
+    assert!(hub.player.request(&hub, &media, play(&path, key.clone())).is_err());
     let file = OutgoingFile {
         path: path.to_string_lossy().into_owned(),
         name: path.file_name().unwrap().to_string_lossy().into_owned(),
@@ -64,4 +93,15 @@ fn a_recorded_opus_note_can_be_uploaded_and_private_cache_files_stay_blocked() {
     std::fs::create_dir_all(private.parent().unwrap()).unwrap();
     std::fs::write(&private, bytes).unwrap();
     assert!(upload::allowed(&private.to_string_lossy()).is_err());
+}
+
+fn wait_playing(hub: &Hub) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let shown = hub.player.shown().unwrap();
+        if shown.state == PlayState::Playing { return; }
+        assert!(matches!(shown.state, PlayState::Loading), "preview failed: {shown:?}");
+        assert!(Instant::now() < deadline, "preview did not start");
+        sleep(Duration::from_millis(5));
+    }
 }

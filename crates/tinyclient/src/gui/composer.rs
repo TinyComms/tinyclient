@@ -2769,6 +2769,15 @@ impl Render for Composer {
 }
 
 impl Shell {
+    pub(super) fn composer_playback_redraw(&self, cx: &mut Context<Self>) {
+        let ids: Vec<_> = [self.composer_state.main.get(), self.composer_state.thread.get()]
+            .into_iter().flatten().map(Entity::entity_id).collect();
+        let app: &mut gpui::App = cx;
+        for id in ids {
+            app.notify(id);
+        }
+    }
+
     fn composer_in(&self, thread: bool, cx: &mut Context<Self>) -> Entity<Composer> {
         let slot = if thread { &self.composer_state.thread } else { &self.composer_state.main };
         slot.get_or_init(|| {

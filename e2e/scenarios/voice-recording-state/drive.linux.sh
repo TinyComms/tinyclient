@@ -3,6 +3,8 @@ set -eu
 : "${E2E_APP_DIR:?}" "${E2E_OUT:?}" "${E2E_T0:?}"
 : "${E2E_MIC_X:?calibrate the composer microphone X coordinate}"
 : "${E2E_MIC_Y:?calibrate the composer microphone Y coordinate}"
+: "${E2E_PREVIEW_X:?calibrate the staged voice note play button X coordinate}"
+: "${E2E_PREVIEW_Y:?calibrate the staged voice note play button Y coordinate}"
 command -v tesseract >/dev/null
 mkdir -p "$E2E_OUT/shots"
 SCRATCH=$(mktemp -d /tmp/tiny-rec-e2e-XXXXXX)
@@ -62,8 +64,8 @@ for name in [b'Down', b'Return']:
     time.sleep(0.3)
 time.sleep(2)
 
-def click():
-    t.XTestFakeMotionEvent(d, -1, int(os.environ['E2E_MIC_X']), int(os.environ['E2E_MIC_Y']), 0)
+def click(prefix='E2E_MIC'):
+    t.XTestFakeMotionEvent(d, -1, int(os.environ[prefix + '_X']), int(os.environ[prefix + '_Y']), 0)
     for pressed in [1, 0]:
         t.XTestFakeButtonEvent(d, 1, pressed, 0)
         x.XSync(d, 0)
@@ -88,7 +90,13 @@ def expect(label, words):
 
 click()
 expect('recording-is-visible', ['recording', 'stop'])
-time.sleep(2)
+time.sleep(8)
 click()
 expect('finished-note-is-staged', ['voice note', 'kept'])
+click('E2E_PREVIEW')
+expect('staged-note-plays-before-send', ['voice message preview', 'playing'])
+click('E2E_PREVIEW')
+expect('staged-note-preview-pauses', ['paused'])
+click('E2E_PREVIEW')
+expect('staged-note-preview-resumes', ['playing'])
 PY

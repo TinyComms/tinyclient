@@ -5,7 +5,7 @@
 use super::attach::{self, Kind, Options, Staged};
 use super::picker::images::{Loaded, Picture};
 use super::Composer;
-use crate::gui::components::{glyph, menu, menu_item};
+use crate::gui::components::{glyph, menu, menu_item, tip};
 use crate::gui::theme::{self, Type};
 use crate::gui::anim::{self, Play};
 use gpui::{anchored, deferred, Anchor, div, point, prelude::*, px, rgba, AnyElement, Context, Div, MouseButton, ObjectFit, Rgba, Window};
@@ -178,14 +178,28 @@ impl Composer {
 
     fn file_chip(&self, chip: &Staged, options: Options, cx: &mut Context<Self>) -> AnyElement {
         let refused = chip.refused.clone();
-        let second = match (&refused, chip.converting) {
-            (Some(why), _) => why.clone(),
-            (None, true) => "Making a JPEG…".to_owned(),
-            (None, false) if chip.bytes > 0 => format!("{} · {}", Kind::word(&chip.name), attach::size(chip.bytes)),
-            (None, false) => Kind::word(&chip.name),
+        let preview = super::rec::preview(&self.note, chip);
+        let playback = preview.as_ref().and_then(|play| {
+            self.shell.upgrade().and_then(|shell| shell.read(cx).playing_state.of(&play.account, &play.file).cloned())
+        });
+        let playing = playback.as_ref().is_some_and(|shown| matches!(shown.state, protocol::PlayState::Playing | protocol::PlayState::Loading));
+        let second = if preview.is_some() {
+            let duration = match self.note.as_ref().map(|note| &note.state) {
+                Some(protocol::RecordState::Recorded { duration, .. }) => *duration,
+                _ => 0,
+            };
+            super::rec::preview_caption(duration, playback.as_ref(), crate::gui::playing::now_ms())
+        } else {
+            match (&refused, chip.converting) {
+                (Some(why), _) => why.clone(),
+                (None, true) => "Making a JPEG…".to_owned(),
+                (None, false) if chip.bytes > 0 => format!("{} · {}", Kind::word(&chip.name), attach::size(chip.bytes)),
+                (None, false) => Kind::word(&chip.name),
+            }
         };
         let icon = if refused.as_deref() == Some("Folders can't be sent") { "icons/circle-alert.svg" } else { file_icon(chip.kind) };
         let tile = div()
+            .id(("voice-preview", chip.id))
             .size(px(36.))
             .flex_none()
             .rounded(px(theme::R_CONTROL))
@@ -193,7 +207,17 @@ impl Composer {
             .flex()
             .items_center()
             .justify_center()
-            .child(glyph(icon, 16., if refused.is_some() { theme::danger() } else { theme::text_soft() }));
+            .map(|tile| match preview {
+                Some(_) => {
+                    let id = chip.id;
+                    tile.cursor_pointer()
+                        .tooltip(tip(if playing { "Pause preview" } else { "Play voice message" }, None))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| this.preview_pressed(id, cx)))
+                        .child(crate::gui::conversation::player_glyph(playing, 16., theme::accent_text()))
+                }
+                None => tile.child(glyph(icon, 16., if refused.is_some() { theme::danger() } else { theme::text_soft() })),
+            });
         let tags = tags(chip);
         div()
             .id(("chip", chip.id))
@@ -220,13 +244,29 @@ impl Composer {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .child(div().truncate().type_ui().text_color(theme::text()).child(middle(&chip.name, 24)))
+                    .child(div().truncate().type_ui().text_color(theme::text()).child(if super::rec::holds_the_note(&self.note, chip) { "Voice message".to_owned() } else { middle(&chip.name, 24) }))
                     .child(div().truncate().type_small().text_color(if chip.refused.is_some() { theme::danger() } else { theme::text_soft() }).child(second)),
             )
             .when(!tags.is_empty(), |chip| chip.child(div().absolute().left(px(4.)).bottom(px(4.)).flex().gap(px(2.)).children(tags.into_iter().map(tag))))
             .child(self.chip_controls(chip, options, cx))
             .children(self.chip_menu_layer(chip, options, cx))
             .into_any_element()
+    }
+
+    fn preview_pressed(&mut self, id: u64, cx: &mut Context<Self>) {
+        if !super::live() {
+            return;
+        }
+        let Some(play) = self.tray.iter().find(|chip| chip.id == id).and_then(|chip| super::rec::preview(&self.note, chip)) else { return };
+        self.shell_later(cx, move |shell, cx| {
+            let playing = shell.playing_state.of(&play.account, &play.file)
+                .is_some_and(|shown| matches!(shown.state, protocol::PlayState::Playing | protocol::PlayState::Loading));
+            if playing {
+                shell.play_pause(cx);
+            } else {
+                shell.play(play, cx);
+            }
+        });
     }
 
     /// The ⋯ menu: Mark as spoiler, Send as file, Send original, each where it applies, a

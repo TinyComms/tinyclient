@@ -60,6 +60,36 @@ pub(in crate::gui) fn holds_the_note(recording: &Option<Recording>, chip: &super
     }
 }
 
+/// Only the finished note held by this chip is previewable; ordinary attachments stay files.
+pub(super) fn preview(recording: &Option<Recording>, chip: &super::attach::Staged) -> Option<playing::Play> {
+    if chip.refused.is_some() || !holds_the_note(recording, chip) {
+        return None;
+    }
+    let recording = recording.as_ref()?;
+    let RecordState::Recorded { path, .. } = &recording.state else { return None };
+    Some(playing::Play {
+        account: recording.conversation.account(),
+        file: path.clone(),
+        path: path.clone(),
+        conversation: recording.conversation.clone(),
+        message: String::new(),
+        title: "Voice message preview".to_owned(),
+        at: None,
+    })
+}
+
+pub(super) fn preview_caption(duration: u32, playback: Option<&protocol::Playback>, now: u64) -> String {
+    let Some(playback) = playback else { return format!("Voice note · {}", clock(u64::from(duration))) };
+    let label = match &playback.state {
+        protocol::PlayState::Failed { detail } => return detail.clone(),
+        protocol::PlayState::Playing => "Playing",
+        protocol::PlayState::Loading => "Loading",
+        protocol::PlayState::Paused => "Paused",
+        _ => "Voice note",
+    };
+    format!("{label} · {} / {}", clock(u64::from(playback.position(now))), clock(u64::from(duration)))
+}
+
 /// `0:07`, from milliseconds, in the same shape the players show.
 fn clock(ms: u64) -> String {
     playing::clock(ms.min(u32::MAX as u64) as u32)
@@ -84,6 +114,40 @@ mod tests {
             since: 10_000,
             state: RecordState::Recorded { path: path.into(), duration: 12_000, waveform: vec![31, 0] },
         }
+    }
+
+    #[test]
+    fn only_the_staged_recording_has_a_preview_and_preview_keeps_send_metadata() {
+        let path = std::path::PathBuf::from("voice.opus");
+        let mut chip = super::super::attach::Staged::new(1, path, super::super::attach::Found::File(1000),
+            &Capabilities { max_file_bytes: 1_000_000, ..Capabilities::default() }, Network::Telegram);
+        let note = Some(kept("voice.opus"));
+        let play = preview(&note, &chip).unwrap();
+        assert_eq!(play.path, "voice.opus");
+        assert_eq!(play.conversation, target());
+        assert!(play.message.is_empty(), "a draft has no sent message");
+        assert_eq!(sent_as(&note, &[chip.outgoing().unwrap()]).unwrap().duration, 12_000);
+        assert!(preview(&Some(active()), &chip).is_none());
+        assert!(preview(&Some(kept("other.opus")), &chip).is_none());
+        chip.refused = Some("Not on disk anymore".into());
+        assert!(preview(&note, &chip).is_none());
+    }
+
+    #[test]
+    fn a_preview_shows_its_position_and_keeps_the_recorded_duration_while_loading() {
+        let mut playback = protocol::Playback {
+            account: target().account(), file: "voice.opus".into(), conversation: target(),
+            message: String::new(), title: "Voice message preview".into(),
+            state: protocol::PlayState::Loading, at: 0, since: 1000, duration: 0, rate: 100,
+        };
+        assert_eq!(preview_caption(12_000, None, 1000), "Voice note · 0:12");
+        assert_eq!(preview_caption(12_000, Some(&playback), 1000), "Loading · 0:00 / 0:12");
+        playback.state = protocol::PlayState::Paused;
+        playback.at = 3000;
+        playback.duration = 12_000;
+        assert_eq!(preview_caption(12_000, Some(&playback), 9000), "Paused · 0:03 / 0:12");
+        playback.state = protocol::PlayState::Playing;
+        assert_eq!(preview_caption(12_000, Some(&playback), 3000), "Playing · 0:05 / 0:12");
     }
 
     #[test]

@@ -217,6 +217,8 @@ mod tests {
         // as long as the recording got to. The floor is a fraction of the run's own second,
         // so a runner that dripped frames still proves the file opens and sounds.
         assert!((0.05..1.3).contains(&seconds), "{seconds} s");
+        // A preview paused almost immediately must be resumable before the first frame ends.
+        assert_eq!(source.seek(1), Ok(1));
         let mut heard = Vec::new();
         while source.read(&mut heard).unwrap() {}
         let seconds = heard.len() as f64 / 2. / crate::RATE as f64;

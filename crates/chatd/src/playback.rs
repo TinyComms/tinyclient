@@ -3,8 +3,8 @@
 //! starts mediad for a file when the user presses play and closes its stdin on pause, so a
 //! paused or finished file holds no process at all.
 //!
-//! Only a file inside the media cache is handed to mediad: the shell names the path, and a path
-//! anywhere else is refused, so the socket cannot be used to make mediad read other files.
+//! Only a file inside the media cache or the recorder's current finished note is handed to
+//! mediad, so the socket cannot be used to make mediad read other files.
 
 use crate::hub::{lock, Hub};
 use crate::media::mediad_path;
@@ -65,7 +65,12 @@ impl Player {
         match request {
             PlayRequest::Start { account, file, path, conversation, message, title, at, rate, output } => {
                 let path = PathBuf::from(path);
-                if !inside(media, &path) {
+                let preview = hub.recorder.shown().is_some_and(|recording| {
+                    recording.conversation == conversation && recording.conversation.account() == account
+                        && matches!(recording.state, protocol::RecordState::Recorded { path: recorded, .. }
+                            if Path::new(&recorded) == path && inside(&crate::blobs::upload::outbox(), &path))
+                });
+                if !inside(media, &path) && !preview {
                     return Err("That file is not in tinyclient's media cache.".to_owned());
                 }
                 self.start(hub, Start { account, file, path, conversation, message, title, at, rate, output });
@@ -271,6 +276,14 @@ impl Player {
         drop(slot);
         if had {
             self.tell(hub);
+        }
+    }
+
+    /// A staged recording is being sent, removed, or replaced. Release its player first.
+    pub(crate) fn stop_file(&self, hub: &Hub, path: &Path) {
+        let playing = lock(&self.slot).path == path;
+        if playing {
+            self.stop(hub);
         }
     }
 

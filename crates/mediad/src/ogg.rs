@@ -61,12 +61,14 @@ impl Writer {
     /// One audio packet (each takes the one before it out). The samples the packets decode to
     /// so far are `granule`: one packet is one 20 ms frame here.
     pub fn packet(&mut self, packet: &[u8]) -> std::io::Result<()> {
-        self.granule += crate::FRAME as u64;
         match self.held.take() {
             Some(held) => self.write_page(0, &held),
             None => Ok(()),
         }
         .and_then(|()| {
+            // The page just written contains the previous packet. Advance only now,
+            // or its timestamp is one frame ahead and seeking near the start fails.
+            self.granule += crate::FRAME as u64;
             self.held = Some(packet.to_vec());
             Ok(())
         })

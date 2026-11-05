@@ -178,6 +178,9 @@ impl Recorder {
     /// Ends a recording so another can be. A replaced recording's facts never arrive: the running
     /// one alone answers for itself.
     fn replace(&self, hub: &Hub, kept: Option<Recording>) {
+        if let Some(Recording { state: RecordState::Recorded { path, .. }, .. }) = self.shown() {
+            hub.player.stop_file(hub, Path::new(&path));
+        }
         if let Some(mut past) = lock(&self.active).take() {
             past.keep.store(false, Ordering::Relaxed);
             drop(past.stdin.take());

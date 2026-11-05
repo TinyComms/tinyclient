@@ -1,6 +1,6 @@
 {
   "id": "voice-recording-state",
-  "title": "The microphone starts a visible recording and a second press stages the finished voice note",
+  "title": "Record a voice note, stop it, then play and pause the staged note before sending",
   "platforms": ["linux"],
   "needs": [],
   "release": false
