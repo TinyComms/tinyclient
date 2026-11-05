@@ -163,6 +163,13 @@ pub enum E2eeAsk {
     Link,
     /// The person knows a new device of theirs ("New device added"): the notice goes. Answers `Ok`.
     SeenDevice { device_id: String },
+    /// Saves this device's history (what it opened, the safety numbers verified) to `path`, under
+    /// a key from `passphrase` (Argon2id). Nothing goes to the server. Answers `TinyBackup`.
+    /// Never logged: the passphrase is in it.
+    ExportBackup { path: String, passphrase: String },
+    /// Takes a backup file of this person in: only conversations they are in now, nothing this
+    /// device has already. Answers `TinyBackup` with the messages added.
+    ImportBackup { path: String, passphrase: String },
 }
 
 /// Where a device link stands, on either device.

@@ -2507,6 +2507,7 @@ name = "e2ee"
 version = "0.2.57"
 dependencies = [
  "aes-gcm",
+ "argon2",
  "base64 0.22.1",
  "davey",
  "e2ee",

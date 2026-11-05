@@ -564,12 +564,12 @@ fn take_in(
     result
 }
 
-/// The new device's cache, as an archive merges into it.
-struct Merging<'a> {
-    device: &'a mut Device,
-    members: BTreeSet<String>,
-    /// The old device, from the archive's first record.
-    from: String,
+/// A device's cache, as an archive (a link's, or a backup file's) merges into it.
+pub(super) struct Merging<'a> {
+    pub device: &'a mut Device,
+    pub members: BTreeSet<String>,
+    /// The device the archive is from, from its first record.
+    pub from: String,
 }
 
 impl Target for Merging<'_> {
@@ -876,7 +876,29 @@ pub(super) fn write_archive(
     let file = std::io::BufWriter::new(
         std::fs::File::create(path).map_err(|err| e2ee::Error::Io(err.to_string()))?,
     );
-    let mut writer = Writer::new(key, link_id, meta, file)?;
+    let (mut file, summary, left_out) =
+        pack(file, key, link_id, dir, cache_key, verified, most, meta)?;
+    file.flush()
+        .map_err(|err| e2ee::Error::Io(err.to_string()))?;
+    file.get_ref()
+        .sync_all()
+        .map_err(|err| e2ee::Error::Io(err.to_string()))?;
+    Ok((summary, left_out))
+}
+
+/// [`write_archive`] into any writer, which it answers back with the summary.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pack<W: Write>(
+    out: W,
+    key: &ArchiveKey,
+    link_id: &[u8],
+    dir: &Path,
+    cache_key: &CacheKey,
+    verified: &std::collections::BTreeMap<String, String>,
+    most: u64,
+    meta: &Meta,
+) -> e2ee::Result<(W, archive::Summary, u64)> {
+    let mut writer = Writer::new(key, link_id, meta, out)?;
     let now = now_secs();
     let mut rows: Vec<(String, String, Opened)> = Vec::new();
     for conv in cached_conversations(dir) {
@@ -920,13 +942,8 @@ pub(super) fn write_archive(
     for (user, number) in verified {
         writer.verified(user, number)?;
     }
-    let (mut file, summary) = writer.finish()?;
-    file.flush()
-        .map_err(|err| e2ee::Error::Io(err.to_string()))?;
-    file.get_ref()
-        .sync_all()
-        .map_err(|err| e2ee::Error::Io(err.to_string()))?;
-    Ok((summary, total - sent))
+    let (out, summary) = writer.finish()?;
+    Ok((out, summary, total - sent))
 }
 
 /// The relay and the device routes over HTTP, as this session.

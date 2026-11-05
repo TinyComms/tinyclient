@@ -16,6 +16,7 @@
 //! The pieces the pages share are in `kit`.
 
 mod audit;
+mod backup;
 mod bans;
 mod bots;
 mod channels;
@@ -236,6 +237,10 @@ pub(in crate::gui) struct Fields {
     pub link_check: Entity<TextInput>,
     /// A recovery key typed to check it.
     pub recovery_check: Entity<TextInput>,
+    /// A new backup file's passphrase, twice, and the one of a backup to import.
+    pub backup_passphrase: Entity<TextInput>,
+    pub backup_again: Entity<TextInput>,
+    pub backup_open: Entity<TextInput>,
 }
 
 impl Fields {
@@ -257,7 +262,10 @@ impl Fields {
         let link_code = cx.new(|cx| TextInput::new("tiny-link-1.…", cx));
         let link_check = cx.new(|cx| TextInput::new("000 000", cx));
         let recovery_check = cx.new(|cx| TextInput::new("Type your recovery key to check it", cx));
-        for input in [&name, &description, &welcome, &image_max, &file_max, &role_name, &role_color, &member_search, &ban_search, &room_name, &room_topic, &category_name, &bot_name, &confirm, &link_code, &link_check, &recovery_check] {
+        let backup_passphrase = cx.new(|cx| TextInput::new("", cx));
+        let backup_again = cx.new(|cx| TextInput::new("", cx));
+        let backup_open = cx.new(|cx| TextInput::new("", cx));
+        for input in [&name, &description, &welcome, &image_max, &file_max, &role_name, &role_color, &member_search, &ban_search, &room_name, &room_topic, &category_name, &bot_name, &confirm, &link_code, &link_check, &recovery_check, &backup_passphrase, &backup_again, &backup_open] {
             cx.subscribe(input, |_, _, _: &crate::gui::input::InputEvent, cx| cx.notify()).detach();
             // Escape in a field leaves Server Settings, as it does anywhere else in it.
             cx.subscribe(input, |this, _, key: &crate::gui::input::InputKey, cx| {
@@ -267,7 +275,7 @@ impl Fields {
             })
             .detach();
         }
-        Fields { name, description, welcome, image_max, file_max, role_name, role_color, member_search, ban_search, room_name, room_topic, category_name, bot_name, confirm, link_code, link_check, recovery_check }
+        Fields { name, description, welcome, image_max, file_max, role_name, role_color, member_search, ban_search, room_name, room_topic, category_name, bot_name, confirm, link_code, link_check, recovery_check, backup_passphrase, backup_again, backup_open }
     }
 }
 

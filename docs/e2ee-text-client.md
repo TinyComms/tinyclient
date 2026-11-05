@@ -79,6 +79,11 @@ that account here (a new device) reads them. "Erase" deletes the directory and t
   the feature keeps the paste-the-code approval, and a `tiny-device-` code pasted where a link code
   goes is approved that way. Every device of the person shows "New device added" for a device it
   did not add itself, with Revoke, from the next `e2ee.device`.
+- **Backup file** (`e2ee::backup`, `e2ee/backup.rs`). Encryption's "Save a backup…" writes the
+  cache and verified marks as a `TNYB1` file: an `e2ee::archive` under a key from Argon2id
+  (64 MiB, 3 passes) over a passphrase of at least 12 characters, with the salt and cost in a
+  header that is the archive's associated data. "Import a backup…" on a device of the same person
+  merges it like a device link's archive. No server ever keeps a backup.
 - **Recovery key.** 128 bits from the system's random source, shown once as 26 base32 characters
   in six groups; only an HKDF check value is kept, so it can be checked later. There is no key
   backup yet (the crate has none): the page says the key backs nothing up.
@@ -109,7 +114,8 @@ and the recovery key.
 - chatd's message store (SQLite) keeps the opened text of encrypted conversations in plain text,
   as it keeps every network's messages; the media cache keeps opened files. Only the e2ee cache is
   sealed. Sealing the store is follow-up.
-- No key backup and no restore from the recovery key.
+- No key backup to the server and no restore from the recovery key (the backup file is the
+  person's own).
 - Device linking: no OS unlock (Windows Hello, Touch ID, a phone's biometrics) before the old
   device approves; the person types the six digits instead. Messages opened before this release
   carry no date, so "last N days" leaves them out (they go with "all").

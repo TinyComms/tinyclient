@@ -891,6 +891,13 @@ impl Device {
         self.register()
     }
 
+    /// Makes or opens the engine (and with it the cache key) unless it is ready.
+    fn enrol_if_needed(&mut self) {
+        if self.engine.is_none() || self.state != DeviceState::Ready {
+            self.enrol();
+        }
+    }
+
     fn engine(&mut self) -> Result<&mut Engine, String> {
         self.engine
             .as_mut()
@@ -2086,6 +2093,38 @@ pub(crate) fn answer(
             linking::cancel(saved);
             return Response::Ok;
         }
+        // A second of Argon2 and a whole cache: not under the device's lock, which they take
+        // only to read the keys and to merge.
+        E2eeAsk::ExportBackup { path, passphrase } => {
+            let passphrase = e2ee::Zeroizing::new(passphrase);
+            let shared = device(saved);
+            lock(&shared).enrol_if_needed();
+            return match backup::export(&shared, Path::new(&path), &passphrase) {
+                Ok(messages) => Response::TinyBackup { messages },
+                Err(detail) => Response::Error {
+                    code: ErrorCode::Refused,
+                    detail,
+                },
+            };
+        }
+        E2eeAsk::ImportBackup { path, passphrase } => {
+            let passphrase = e2ee::Zeroizing::new(passphrase);
+            let shared = device(saved);
+            lock(&shared).enrol_if_needed();
+            let Some(members) = super::messages::conversation_ids(saved) else {
+                return Response::Error {
+                    code: ErrorCode::Refused,
+                    detail: "Couldn't ask the server which conversations are yours. Check your connection and try again.".to_owned(),
+                };
+            };
+            return match backup::import(&shared, Path::new(&path), &passphrase, members) {
+                Ok(messages) => Response::TinyBackup { messages },
+                Err(detail) => Response::Error {
+                    code: ErrorCode::Refused,
+                    detail,
+                },
+            };
+        }
         _ => {}
     }
     let shared = device(saved);
@@ -2140,7 +2179,11 @@ pub(crate) fn answer(
             drop(device);
             done(linking::start_old(saved, &shared, &code, told))
         }
-        E2eeAsk::Link | E2eeAsk::LinkConfirm { .. } | E2eeAsk::LinkCancel => Response::Ok,
+        E2eeAsk::Link
+        | E2eeAsk::LinkConfirm { .. }
+        | E2eeAsk::LinkCancel
+        | E2eeAsk::ExportBackup { .. }
+        | E2eeAsk::ImportBackup { .. } => Response::Ok,
     }
 }
 
@@ -2168,6 +2211,7 @@ pub(crate) fn attachment_key() -> Result<AttachmentKey, String> {
     AttachmentKey::generate().map_err(|_| "No randomness is available.".to_owned())
 }
 
+mod backup;
 mod linking;
 
 #[cfg(test)]

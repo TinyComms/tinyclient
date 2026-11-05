@@ -14,7 +14,8 @@
 //! * [`store`]: the state store trait, the sealed snapshot's key and the local cache sealing.
 //! * [`safety`]: safety numbers.
 //! * [`link`]: linking a new device of a person from one they have (the code, the channel, the
-//!   messages), and [`archive`]: the history it is given, as a sealed stream.
+//!   messages), and [`archive`]: the history it is given, as a sealed stream. [`backup`]: the
+//!   same archive in a file, under a key from a passphrase (Argon2id).
 //!
 //! # The calls, in the order a client makes them
 //!
@@ -50,6 +51,7 @@
 
 pub mod archive;
 pub mod attachment;
+pub mod backup;
 pub mod engine;
 pub mod envelope;
 pub mod error;
@@ -69,6 +71,8 @@ pub use envelope::{AttachmentRef, Envelope, Kind};
 pub use error::{Error, Result};
 pub use ids::{ConversationId, DeviceId, DeviceRef, UserId};
 pub use messaging::{Claimed, Incoming, Sealed};
+/// For a caller holding a secret it was handed (a passphrase), so it is wiped when dropped.
+pub use zeroize::Zeroizing;
 
 /// Entry points the fuzz targets and property tests feed arbitrary bytes. Each must return, never
 /// panic, whatever the input.
@@ -104,6 +108,11 @@ pub mod parsers {
             }
             let _ = pending.accept(bytes);
         }
+    }
+
+    /// A backup file's header.
+    pub fn backup_header(bytes: &[u8]) {
+        let _ = crate::backup::Header::parse(bytes);
     }
 
     /// A history archive, opened with a fixed key, and merged into nothing.

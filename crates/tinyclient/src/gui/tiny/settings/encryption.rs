@@ -722,6 +722,7 @@ pub(in crate::gui::tiny) fn encryption(
         );
     }
     page.child(super::section("Recovery key").child(recovery))
+        .child(super::backup::backup(shell, draft.loading, window, cx))
         .into_any_element()
 }
 

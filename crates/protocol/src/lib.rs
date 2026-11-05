@@ -2163,6 +2163,10 @@ pub enum Response {
     TinyRecoveryKey {
         key: String,
     },
+    /// What an encrypted backup file holds (`ExportBackup`) or added here (`ImportBackup`).
+    TinyBackup {
+        messages: u64,
+    },
     /// What `E2eeAsk::Link` asked: the device link in progress on this device, if any.
     TinyE2eeLink {
         #[serde(default, skip_serializing_if = "Option::is_none")]
