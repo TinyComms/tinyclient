@@ -119,10 +119,24 @@ Membership changes come only from proposals signed by the pinned key.
 ### 1.9 Messages and commits arrive in two feeds
 
 `GET .../handshake` and the message list are separate. A message of epoch `e` that is read after the
-commit leaving `e` can only be opened within `Config::max_past_epochs` (default 4) epochs, because
+commit leaving `e` can only be opened within `Config::max_past_epochs` (default 8) epochs, because
 MLS discards older epoch secrets. The caller should open messages of epoch `e` before applying the
 commit that leaves it when it reads both from the start. A message from a future epoch is
 `Error::FutureEpoch` (apply handshake first).
+
+Why 8 (it was 4). An epoch here ends only with a membership change: the server's Add and Remove
+proposals, committed; this protocol forbids Updates, so no epoch ends on a timer. A device that was
+off while its conversations gained a phone, lost a revoked laptop and gained a linked device has
+seen three or four commits per conversation before it reads what was said in between, and with
+device linking that is the ordinary case, not the rare one. What keeping an epoch costs in forward
+secrecy: someone who takes this device's state learns the message keys of messages of the kept
+epochs that this device has not opened yet. Keys of messages it opened are already deleted by the
+sender ratchet, and their plaintext is in the local cache anyway, which the same theft opens. A
+removed member gains nothing, since it never had the later epochs. So the window is "unread
+messages of the last 8 membership changes", still bounded by changes, not time. The cost is the
+secret tree kept per epoch (section 5: the per-message cost at 1000 devices grows with it); a caller
+with very large groups can still lower it. It applies to groups made or joined after the change,
+as every `Config` value does.
 
 ### 1.10 A device cannot open its own messages
 

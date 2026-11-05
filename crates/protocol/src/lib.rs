@@ -1379,9 +1379,12 @@ pub enum Request {
     /// again". Answers `Status` at once; the read goes on behind it.
     ReadSessions,
     /// Forgets the account's session and everything stored for it. Waits up to 5 s for the
-    /// network to end the session first.
+    /// network to end the session first. A Tiny server's encrypted history stays on this device
+    /// (sealed, its key in the keychain) for a later sign-in there, unless `erase` is set.
     SignOut {
         account: AccountKey,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        erase: bool,
     },
     /// Begins, or reads again, a sign-in the shell draws itself (`signin.rs`). Answers with the
     /// step to draw. For a network that signs in through a web page this is `Unsupported`.

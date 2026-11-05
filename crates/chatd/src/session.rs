@@ -341,6 +341,62 @@ pub fn forget(network: Network) {
     }
 }
 
+/// An item of the keychain beside the sessions, named `name`, that outlives a sign-out (the keys of
+/// a Tiny server's history kept after signing out). In a scratch directory it is kept in this
+/// process only.
+pub mod item {
+    use super::{enabled, keep, persistent, read_password, Entry, SERVICE};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn scratch() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
+        static ITEMS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+        ITEMS.get_or_init(Mutex::default).lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `Ok(None)` when there is no such item; `Err` when there may be one that could not be read.
+    pub fn read(name: &str) -> Result<Option<String>, String> {
+        if !enabled() {
+            return Ok(scratch().get(name).cloned());
+        }
+        if !persistent() {
+            return Err(super::NO_STORE.to_owned());
+        }
+        let entry = Entry::new(SERVICE, name).map_err(|err| err.to_string())?;
+        match read_password(&entry, false) {
+            Ok(text) => Ok(Some(text)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    pub fn save(name: &str, text: &str) -> Result<(), String> {
+        if !enabled() {
+            scratch().insert(name.to_owned(), text.to_owned());
+            return Ok(());
+        }
+        if !persistent() {
+            return Err(super::NO_STORE.to_owned());
+        }
+        let saved = Entry::new(SERVICE, name)
+            .and_then(|entry| keep(&entry, text))
+            .map_err(|err| format!("keychain: {err}"));
+        #[cfg(target_os = "macos")]
+        if saved.is_ok() {
+            super::apple::trust_account(name);
+        }
+        saved
+    }
+
+    pub fn forget(name: &str) {
+        if !enabled() {
+            scratch().remove(name);
+            return;
+        }
+        let _ = Entry::new(SERVICE, name).and_then(|entry| entry.delete_credential());
+    }
+}
+
 /// macOS keeps one generic password per network in the login keychain. An ad-hoc release's
 /// designated requirement is only its cdhash, so the next release is a different app and macOS
 /// asks for the login password once per network. After this process has read or written an item,

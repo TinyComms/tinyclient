@@ -45,7 +45,9 @@ pub(crate) fn capabilities() -> mls::Capabilities {
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
     /// Past epochs whose message keys are kept so that a message sent just before a commit still
-    /// opens. Each is a window in which an old key could leak; 4 covers a normal reorder.
+    /// opens. Each is a window in which an old key could leak. Epochs move only on membership
+    /// changes, so 8 covers a device that was away while its people added and revoked a few
+    /// devices (`docs/e2ee-core-notes.md` 1.9).
     pub max_past_epochs: usize,
     /// How far out of order, within one epoch and sender, a message may arrive.
     pub out_of_order_tolerance: u32,
@@ -60,7 +62,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
-            max_past_epochs: 4,
+            max_past_epochs: 8,
             out_of_order_tolerance: 64,
             maximum_forward_distance: 2000,
             commits_remembered: 256,

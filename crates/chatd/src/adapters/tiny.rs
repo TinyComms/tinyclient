@@ -196,6 +196,20 @@ pub fn local_servers() -> Response {
     }
 }
 
+/// Signing out of `account` with its encrypted history kept: each of its servers' cache keys moves
+/// from the session, about to be forgotten, to a keychain item of its own (`e2ee::keep_history`).
+pub fn keep_history(session: &str, account: &str) -> Result<(), String> {
+    for saved in saved_rows(session)?.iter().filter(|saved| saved.user_id == account) {
+        e2ee::keep_history(saved)?;
+    }
+    Ok(())
+}
+
+/// Signing out of `account` with its encrypted history erased from this device.
+pub fn erase_history(account: &str) {
+    e2ee::erase_history(account);
+}
+
 /// The session with one server removed. `None` only when that was the last one. An account that
 /// is not in the blob leaves the original string untouched.
 pub fn without(session: &str, account: &str) -> Option<String> {

@@ -107,7 +107,11 @@ pub(crate) fn with_secrets(session: &str, saved: &Saved, secrets: &Secrets) -> O
 
 /// The owner-only directory this account keeps its encrypted text state in.
 fn dir_of(saved: &Saved) -> PathBuf {
-    let safe: String = format!("Tiny-{}", saved.user_id)
+    dir_for(&saved.user_id)
+}
+
+fn dir_for(user_id: &str) -> PathBuf {
+    let safe: String = format!("Tiny-{user_id}")
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' {
@@ -459,22 +463,112 @@ pub(crate) fn begin(saved: &Saved) {
     device.enrol();
 }
 
-/// Signing out: the device is revoked on the server, then forgotten here.
+/// Signing out: the device is revoked on the server and its state forgotten here. What it opened
+/// stays, sealed under the cache key [`keep_history`] keeps in the keychain, unless the person
+/// chose to erase it ([`erase_history`]); a later sign-in here is a new device that reads it.
 pub(crate) fn sign_out(saved: &Saved) {
+    let key = (saved.base_url.clone(), saved.user_id.clone());
     if let Some(shared) = started(saved) {
         let device = lock(&shared);
+        // First, while it is quick: the key, from the keys this device held.
+        if let Err(why) = keep_history(&device.saved) {
+            tracing::warn!("chatd: Tiny e2ee: the history key could not be kept: {why}");
+        }
         if let Some(engine) = device.engine.as_ref() {
             let id = engine.device_id().to_string();
             let _ = device.ask("DELETE", &format!("/v1/e2ee/devices/{id}"), None);
         }
     }
-    forget(saved);
+    lock(devices()).remove(&key);
+    lock(scratch_secrets()).remove(&key);
+    start_over(&dir_of(saved));
 }
 
-/// Forgets the account's device: its state, its cache and its notes.
-pub(crate) fn forget(saved: &Saved) {
-    lock(devices()).remove(&(saved.base_url.clone(), saved.user_id.clone()));
-    let _ = std::fs::remove_dir_all(dir_of(saved));
+/// The keychain item that keeps the cache keys of accounts signed out with their history kept:
+/// `{"<user id> <server>": "<base64 cache key>"}`. Taken back by the next sign-in of that account
+/// on this install, and dropped from here then.
+const KEPT: &str = "Tiny kept history";
+
+fn kept_name(user_id: &str, base_url: &str) -> String {
+    format!("{user_id} {base_url}")
+}
+
+/// What [`KEPT`] holds. An item that could not be read is an error, never taken for empty: it
+/// would be overwritten.
+fn kept() -> Result<BTreeMap<String, String>, String> {
+    Ok(crate::session::item::read(KEPT)?
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default())
+}
+
+fn save_kept(kept: &BTreeMap<String, String>) -> Result<(), String> {
+    if kept.is_empty() {
+        crate::session::item::forget(KEPT);
+        return Ok(());
+    }
+    let text = serde_json::to_string(kept).map_err(|err| err.to_string())?;
+    crate::session::item::save(KEPT, &text)
+}
+
+/// Signing out, keeping the history: the cache key of `saved` goes to [`KEPT`] before its
+/// session, which held it, is forgotten.
+pub(crate) fn keep_history(saved: &Saved) -> Result<(), String> {
+    let Some(secrets) = &saved.e2ee else {
+        return Ok(());
+    };
+    let mut all = kept()?;
+    all.insert(
+        kept_name(&saved.user_id, &saved.base_url),
+        secrets.cache.clone(),
+    );
+    save_kept(&all)
+}
+
+/// Signing out, erasing: this account's folder (what was opened, the notes) and its kept key.
+pub(crate) fn erase_history(user_id: &str) {
+    let _ = std::fs::remove_dir_all(dir_for(user_id));
+    if let Ok(mut all) = kept() {
+        let before = all.len();
+        all.retain(|name, _| !name.starts_with(&format!("{user_id} ")));
+        if all.len() != before {
+            let _ = save_kept(&all);
+        }
+    }
+}
+
+/// Removes everything a device of this folder kept but what it opened and what the person
+/// verified: the next device made here is a new one, and its handshake positions start again.
+fn start_over(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("cache-") && name.ends_with(".log") {
+            continue;
+        }
+        if name == "notes.json" {
+            let notes: Notes = std::fs::read(entry.path())
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+            let kept = Notes {
+                met: notes.met,
+                verified: notes.verified,
+                recovery: notes.recovery,
+                ..Notes::default()
+            };
+            if let Ok(bytes) = serde_json::to_vec(&kept) {
+                let _ = write_private(&entry.path(), &bytes);
+            }
+            continue;
+        }
+        let _ = if entry.path().is_dir() {
+            std::fs::remove_dir_all(entry.path())
+        } else {
+            std::fs::remove_file(entry.path())
+        };
+    }
 }
 
 fn uuid(text: &str) -> Option<[u8; 16]> {
@@ -664,7 +758,21 @@ impl Device {
             self.saved.e2ee = Some(kept.clone());
             return Ok(kept);
         }
-        let secrets = Secrets::generate()?;
+        let mut secrets = Secrets::generate()?;
+        // Signed out here before with the history kept: the cache key comes back, so what was
+        // opened then opens again. A state sealed under a key no session holds any more never
+        // opens: this is a new device.
+        let name = kept_name(&self.saved.user_id, &self.saved.base_url);
+        let mut kept = kept().unwrap_or_default();
+        let reused = kept.remove(&name);
+        if let Some(cache) = &reused {
+            secrets.cache.clone_from(cache);
+        }
+        start_over(&self.dir);
+        self.notes = std::fs::read(self.dir.join("notes.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
         if crate::session::enabled() {
             let saved = self.saved.clone();
             let fresh = secrets.clone();
@@ -676,6 +784,13 @@ impl Device {
             }
         } else {
             lock(scratch_secrets()).insert(key, secrets.clone());
+        }
+        if reused.is_some() {
+            if let Err(why) = save_kept(&kept) {
+                tracing::warn!(
+                    "chatd: Tiny e2ee: the kept history key could not be dropped: {why}"
+                );
+            }
         }
         self.saved.e2ee = Some(secrets.clone());
         Ok(secrets)
@@ -1994,6 +2109,113 @@ mod tests {
         write_private(&dir.join("x"), b"y").unwrap();
         assert_eq!(std::fs::read(dir.join("x")).unwrap(), b"y");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A device of the test session's account that has opened one message, `m1` in `c1`.
+    fn a_device_that_read_something(account: &protocol::AccountKey) -> Saved {
+        let mut saved =
+            super::super::parse(&crate::session::load(protocol::Network::Tiny).unwrap()).unwrap();
+        assert_eq!(saved.user_id, account.account);
+        let _ = std::fs::remove_dir_all(dir_of(&saved));
+        saved.e2ee = Some(Secrets::generate().unwrap());
+        let shared = device(&saved);
+        let mut device = lock(&shared);
+        device.saved.e2ee.clone_from(&saved.e2ee);
+        private_dir(&device.dir).unwrap();
+        device.cache_key = saved
+            .e2ee
+            .as_ref()
+            .and_then(Secrets::keys)
+            .map(|(_, cache)| cache);
+        device.remember(
+            "c1",
+            "m1",
+            Opened {
+                text: "kept".into(),
+                ..Opened::default()
+            },
+        );
+        device.notes.seqs.insert("c1".into(), 7);
+        device.notes.verified.insert("u2".into(), "123".into());
+        device.save_notes();
+        std::fs::write(device.dir.join(STATE), b"a state sealed under the old key").unwrap();
+        saved
+    }
+
+    /// What a new device of the same account, signed in here again, finds of `m1`.
+    fn signed_in_again(saved: &Saved) -> (Device, Option<String>) {
+        let mut again = saved.clone();
+        again.e2ee = None;
+        let mut device = Device::new(&again);
+        let (_, cache) = device.secrets().unwrap().keys().unwrap();
+        let text = Cache::load(&device.dir, "c1", &cache)
+            .rows
+            .get("m1")
+            .map(|opened| opened.text.clone());
+        (device, text)
+    }
+
+    #[test]
+    fn signing_out_keeps_what_was_read_and_signing_in_again_reads_it() {
+        super::super::tests::with_session("http://127.0.0.1:9", "member", |account| {
+            let saved = a_device_that_read_something(&account);
+            sign_out(&saved);
+            let dir = dir_of(&saved);
+            assert!(
+                !dir.join(STATE).exists(),
+                "the device itself is gone: the next one is new"
+            );
+            assert!(started(&saved).is_none());
+            let (device, text) = signed_in_again(&saved);
+            assert_eq!(
+                text.as_deref(),
+                Some("kept"),
+                "the history opens under the kept key"
+            );
+            assert!(
+                device.notes.seqs.is_empty(),
+                "a new device walks the handshakes again"
+            );
+            assert_eq!(
+                device.notes.verified.get("u2").map(String::as_str),
+                Some("123")
+            );
+            assert!(
+                kept().unwrap().is_empty(),
+                "the kept key moved back into the session"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    #[test]
+    fn signing_out_and_erasing_leaves_nothing_to_read() {
+        super::super::tests::with_session("http://127.0.0.1:9", "member", |account| {
+            let saved = a_device_that_read_something(&account);
+            sign_out(&saved);
+            assert!(!kept().unwrap().is_empty());
+            erase_history(&account.account);
+            assert!(!dir_of(&saved).exists());
+            assert!(kept().unwrap().is_empty());
+            let (_, text) = signed_in_again(&saved);
+            assert_eq!(text, None);
+            let _ = std::fs::remove_dir_all(dir_of(&saved));
+        });
+    }
+
+    #[test]
+    fn a_state_whose_key_is_gone_is_started_over_not_a_failure() {
+        super::super::tests::with_session("http://127.0.0.1:9", "member", |account| {
+            let saved = a_device_that_read_something(&account);
+            // The session lost its keys without a sign-out (an older client's, or a keychain
+            // restored from before): the folder is still there.
+            lock(devices()).remove(&(saved.base_url.clone(), saved.user_id.clone()));
+            lock(scratch_secrets()).clear();
+            let (device, text) = signed_in_again(&saved);
+            assert!(!device.dir.join(STATE).exists());
+            assert_eq!(text, None, "without the kept key the old rows stay sealed");
+            let _ = std::fs::remove_dir_all(dir_of(&saved));
+        });
     }
 
     #[test]

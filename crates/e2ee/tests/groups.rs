@@ -1782,3 +1782,32 @@ fn messages_are_padded_to_buckets_so_the_server_sees_short_medium_or_long() {
         .collect();
     assert_eq!(edits[0], edits[1]);
 }
+
+#[test]
+fn a_message_opens_after_as_many_membership_changes_as_are_kept_and_no_more() {
+    let kept = e2ee::Config::default().max_past_epochs;
+    assert_eq!(kept, 8);
+    let mut world = World::new();
+    let (a, b) = (world.person("a"), world.person("b"));
+    let joiners: Vec<usize> = (0..=kept).map(|n| world.person(&format!("p{n}"))).collect();
+    world.sync_trust();
+    world.start(a);
+    world.change(&[a], a, &[b], &[]);
+    let read_late = world.send(a, "read after the changes");
+    let read_too_late = world.send(a, "read after one change more");
+    let mut members = vec![a, b];
+    for (n, joiner) in joiners.iter().enumerate() {
+        world.change(&members.clone(), a, &[*joiner], &[]);
+        members.push(*joiner);
+        if n + 1 == kept {
+            let opened = world
+                .open(b, &read_late, a)
+                .expect("within the kept epochs");
+            assert_eq!(opened.envelope.text, "read after the changes");
+        }
+    }
+    assert!(
+        world.open(b, &read_too_late, a).is_err(),
+        "past the kept epochs the keys are gone"
+    );
+}

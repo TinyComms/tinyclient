@@ -1698,7 +1698,7 @@ impl Shell {
         menu = menu.child(super::components::menu_item_danger("slack-sign-out", Some("icons/log-out.svg"), format!("Sign out of {name}")).on_click(cx.listener(move |this, _, _, cx| {
             this.sidebar_state.slack_menu = false;
             if let Some(account) = account.clone() {
-                this.sign_out(account, cx);
+                this.sign_out(account, false, cx);
             }
         })));
         if phone {

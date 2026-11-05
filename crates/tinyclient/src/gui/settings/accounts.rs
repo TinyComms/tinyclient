@@ -177,7 +177,7 @@ impl SettingsWindow {
     }
 
     pub(super) fn sign_out(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
-        let _ = self.shell.update(cx, |shell, cx| shell.sign_out(account, cx));
+        let _ = self.shell.update(cx, |shell, cx| shell.sign_out(account, false, cx));
         cx.notify();
     }
 

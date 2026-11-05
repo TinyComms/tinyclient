@@ -89,7 +89,11 @@ pub(super) enum Modal {
     RenameRoom(String),
     NewCategory,
     Profile(String),
-    SignOut,
+    /// Signing out of the server: the encrypted history kept on this device (the default) or
+    /// erased.
+    SignOut {
+        erase: bool,
+    },
     /// Server Settings' confirmations.
     DeleteRole(String),
     KickMany(Vec<String>),
@@ -1238,12 +1242,12 @@ impl Shell {
         self.act(Request::TinyLayout { account, groups }, cx);
     }
 
-    pub(super) fn tiny_sign_out(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn tiny_sign_out(&mut self, erase: bool, cx: &mut Context<Self>) {
         let Some(account) = self.with_account() else {
             return;
         };
         self.tiny_state.modal = None;
-        self.sign_out(account, cx);
+        self.sign_out(account, erase, cx);
     }
 
     /// The name field's Return: whichever modal holds it.
