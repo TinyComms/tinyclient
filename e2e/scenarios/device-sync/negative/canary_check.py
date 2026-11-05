@@ -1,4 +1,4 @@
-"""Server-side canary check: the throwaway server holds no plaintext of what was linked.
+"""Search retained throwaway-server files for chosen plaintext and link-secret markers.
 
 Searches, after a run:
   - a pg_dump of the throwaway database (docker exec tiny-dl-pg pg_dump),
@@ -111,7 +111,8 @@ def main():
            "positive_control_in_client_store": ctrl}
     json.dump(res, open(os.path.join(a.out, "canary-check.json"), "w"), indent=1)
     os.remove(dump) if not hits else None   # keep the dump only when it shows a leak
-    print(f"canary check: {'clean' if not hits else str(len(hits)) + ' HITS'} in {files} files / {total} bytes; "
+    outcome = 'chosen markers absent' if res['ok'] is True else (str(len(hits)) + ' HITS' if hits else 'inconclusive')
+    print(f"canary check: {outcome} in {files} files / {total} bytes; "
           f"positive control (canary in Ada A's own store): {ctrl}")
     return 0 if res["ok"] is True else 1
 

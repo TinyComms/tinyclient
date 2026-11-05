@@ -134,8 +134,8 @@ def fill(template, values):
 
 
 def make_picture(path, canary):
-    """A real PNG, 640x400, with the canary drawn in it and in a tEXt chunk: if any byte of the
-    plaintext picture reaches the server, the canary check finds it."""
+    """A real PNG with drawn canary text and a searchable tEXt chunk. The scan can detect the
+    chosen marker in this exact retained plaintext file; it cannot detect every transformation."""
     from PIL import Image, ImageDraw, PngImagePlugin
     img = Image.new("RGB", (640, 400), (32, 96, 160))
     d = ImageDraw.Draw(img)
