@@ -253,6 +253,10 @@ pub(crate) struct Opened {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    /// Sender's Unix milliseconds, authenticated inside the encrypted envelope. Absent in
+    /// older caches; never copied to server-visible message metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<OpenedFile>,
     /// An edit: the message it edits. Its text replaces the target's.
@@ -1646,6 +1650,7 @@ impl Device {
                 let opened = Opened {
                     text: incoming.envelope.text.clone(),
                     reply_to: incoming.envelope.reply_to.clone(),
+                    sent_at: incoming.envelope.sent_at,
                     attachments: incoming
                         .envelope
                         .attachments
@@ -1690,21 +1695,10 @@ impl Device {
             return Err(words(&Error::ServerKeyChanged));
         }
         let conv = ConversationId(uuid(conversation_id).ok_or(super::CHECK)?);
-        // Removals and joins first: a message is never sent to someone already leaving.
-        self.sync(conversation_id)?;
-        let sealed = match self.engine()?.encrypt(conv, kind, target_id, envelope) {
-            Ok(sealed) => sealed,
-            Err(Error::PendingProposals | Error::PendingRemove | Error::CommitInFlight) => {
-                self.sync(conversation_id)?;
-                self.engine()?
-                    .encrypt(conv, kind, target_id, envelope)
-                    .map_err(|err| words(&err))?
-            }
-            Err(err) => return Err(words(&err)),
-        };
         let opened = Opened {
             text: envelope.text.clone(),
             reply_to: envelope.reply_to.clone(),
+            sent_at: envelope.sent_at,
             attachments: envelope.attachments.iter().map(OpenedFile::of).collect(),
             edits: target_id.map(str::to_owned),
             edited_by: None,
@@ -1716,43 +1710,62 @@ impl Device {
         if let Some(cache) = self.cache(conversation_id) {
             cache.pending.insert(client_id.to_owned(), opened.clone());
         }
-        let device_id = self.engine()?.device_id().to_string();
-        let mut body = json!({
-            "ciphertext": b64(&sealed.ciphertext),
-            "epoch": sealed.epoch,
-            "device_id": device_id,
-            "client_id": client_id,
-            "kind": kind.as_str(),
-        });
-        if let Some(target) = target_id {
-            body["target_id"] = Value::String(target.to_owned());
-        }
-        if !attachment_ids.is_empty() {
-            body["attachment_ids"] = json!(attachment_ids);
-        }
-        let (status, answer) = self.ask(
-            "POST",
-            &format!("/v1/conversations/{conversation_id}/messages"),
-            Some(body),
-        )?;
-        match status {
-            200 | 201 => {
-                let id = answer
-                    .get("id")
-                    .or_else(|| answer.pointer("/message/id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                if super::safe_id(&id) {
-                    if let Some(cache) = self.cache(conversation_id) {
-                        cache.pending.remove(client_id);
-                    }
-                    self.remember(conversation_id, &id, opened);
+        for _ in 0..PASSES {
+            // Removals and joins first: a message is never sent to someone already leaving.
+            self.sync(conversation_id)?;
+            let sealed = match self.engine()?.encrypt(conv, kind, target_id, envelope) {
+                Ok(sealed) => sealed,
+                Err(Error::PendingProposals | Error::PendingRemove | Error::CommitInFlight) => {
+                    self.sync(conversation_id)?;
+                    self.engine()?
+                        .encrypt(conv, kind, target_id, envelope)
+                        .map_err(|err| words(&err))?
                 }
-                Ok(answer)
+                Err(err) => return Err(words(&err)),
+            };
+            let device_id = self.engine()?.device_id().to_string();
+            let mut body = json!({
+                "ciphertext": b64(&sealed.ciphertext),
+                "epoch": sealed.epoch,
+                "device_id": device_id,
+                "client_id": client_id,
+                "kind": kind.as_str(),
+            });
+            if let Some(target) = target_id {
+                body["target_id"] = Value::String(target.to_owned());
             }
-            status => Err(super::explain(status, &answer, super::Missing::Plain).to_owned()),
+            if !attachment_ids.is_empty() {
+                body["attachment_ids"] = json!(attachment_ids);
+            }
+            let (status, answer) = self.ask(
+                "POST",
+                &format!("/v1/conversations/{conversation_id}/messages"),
+                Some(body),
+            )?;
+            match status {
+                200 | 201 => {
+                    let id = answer
+                        .get("id")
+                        .or_else(|| answer.pointer("/message/id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    if super::safe_id(&id) {
+                        if let Some(cache) = self.cache(conversation_id) {
+                            cache.pending.remove(client_id);
+                        }
+                        self.remember(conversation_id, &id, opened);
+                    }
+                    return Ok(answer);
+                }
+                409 if matches!(answer.get("error").and_then(Value::as_str), Some("proposals_changed" | "stale_epoch")) => continue,
+                400 if answer.get("error").and_then(Value::as_str) == Some("e2ee_group_too_large") => {
+                    return Err("This encrypted conversation has too many devices to send a message.".to_owned());
+                }
+                status => return Err(super::explain(status, &answer, super::Missing::Plain).to_owned()),
+            }
         }
+        Err("This conversation is still updating its devices. Your message was kept; try sending it again shortly.".to_owned())
     }
 
     /// Opening details for a sealed attachment this device has seen in a message.
@@ -2300,6 +2313,96 @@ mod live;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn posting_device(name: &str, reject: usize) -> (Device, Arc<Mutex<Vec<Value>>>) {
+        let server_key = e2ee::identity::DeviceKey::generate().unwrap().public_key();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let posted = requests.clone();
+        let public = server_key.clone();
+        let base = super::super::tests::serve(move |request| {
+            let (status, body) = if request.starts_with("GET /v1/e2ee/conversations/") && request.contains("/handshake?") {
+                if request.contains("after=0&") {
+                    (200, json!([{"seq":1,"kind":"unknown","epoch":0,"data":""}]))
+                } else {
+                    (200, json!([]))
+                }
+            } else if request.starts_with("GET /v1/e2ee/conversations/") {
+                (200, json!({"e2ee": true, "epoch": 0, "external_sender": b64(&public)}))
+            } else if request.starts_with("POST /v1/conversations/") {
+                let body = request.split_once("\r\n\r\n").unwrap().1;
+                let mut posts = lock(&posted);
+                posts.push(serde_json::from_str(body).unwrap());
+                if posts.len() <= reject {
+                    (409, json!({"error": "proposals_changed"}))
+                } else {
+                    (201, json!({"id": "accepted"}))
+                }
+            } else {
+                (200, json!([]))
+            };
+            super::super::tests::http(status, "Test", &body.to_string())
+        });
+        let saved = Saved {
+            base_url: base, token: "t".into(), user_id: "11111111-1111-1111-1111-111111111111".into(),
+            email: None, display_name: "Ada".into(), role: "member".into(), plain_http_ok: false, e2ee: None,
+        };
+        let mut device = Device::new(&saved);
+        device.dir = std::env::temp_dir().join(format!("chatd-post-{}-{name}", std::process::id()));
+        private_dir(&device.dir).unwrap();
+        let mut engine = Engine::detached(UserId::parse(&saved.user_id).unwrap()).unwrap();
+        engine.create_group(ConversationId::parse("22222222-2222-2222-2222-222222222222").unwrap(), &server_key).unwrap();
+        device.engine = Some(engine);
+        device.cache_key = Some(CacheKey::generate().unwrap());
+        device.state = DeviceState::Ready;
+        (device, requests)
+    }
+
+    #[test]
+    fn device_membership_changes_are_settled_immediately() {
+        let (mut device, _) = posting_device("nudge", 0);
+        let conversation = "22222222-2222-2222-2222-222222222222";
+        device.note_encrypted(conversation, true);
+        let shared = Arc::new(Mutex::new(device));
+        linking::nudge(shared.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if lock(&shared).notes.seqs.get(conversation) == Some(&1) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "a linked device must not wait for the old batching timer to get its Welcome");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        lock(&shared).state = DeviceState::Failed { why: "test complete".into() };
+    }
+
+    #[test]
+    fn a_membership_race_reseals_the_same_outgoing_message_before_retrying() {
+        let (mut device, posts) = posting_device("retry", 1);
+        let mut envelope = Envelope::message("private retry");
+        envelope.sent_at = Some(1_704_164_645_900);
+        let result = device.post("22222222-2222-2222-2222-222222222222", "same-client", Kind::Message, None, &envelope, &[]);
+        assert!(result.is_ok(), "{result:?}");
+        let posts = lock(&posts);
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[0]["client_id"], "same-client");
+        assert_eq!(posts[1]["client_id"], "same-client");
+        assert_ne!(posts[0]["ciphertext"], posts[1]["ciphertext"], "refreshing must re-encrypt rather than resend stale ciphertext");
+        assert!(posts.iter().all(|post| post.get("sent_at").is_none() && post.get("body").is_none()));
+        let opened = device.cache("22222222-2222-2222-2222-222222222222").unwrap().rows.get("accepted").unwrap();
+        assert_eq!(opened.text, "private retry");
+        assert_eq!(opened.sent_at, Some(1_704_164_645_900));
+    }
+
+    #[test]
+    fn an_unsettled_audience_fails_closed_and_keeps_the_outgoing_plaintext() {
+        let (mut device, posts) = posting_device("unsettled", usize::MAX);
+        let result = device.post("22222222-2222-2222-2222-222222222222", "pending", Kind::Message, None, &Envelope::message("kept for retry"), &[]);
+        assert!(result.is_err());
+        assert_eq!(lock(&posts).len(), PASSES, "membership retries are bounded");
+        let cache = device.cache("22222222-2222-2222-2222-222222222222").unwrap();
+        assert_eq!(cache.pending.get("pending").unwrap().text, "kept for retry");
+        assert!(!cache.rows.contains_key("accepted"));
+    }
 
     #[test]
     fn a_recovery_key_is_128_bits_in_six_groups_and_reads_back() {

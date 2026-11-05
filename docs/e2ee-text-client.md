@@ -119,6 +119,10 @@ and the recovery key.
 
 ## Not done
 
+- Encrypted messages now retain the sender's authenticated millisecond date in the sealed cache,
+  device-link archives and the local display order. The server still sees only its rounded date.
+  Older cache rows discarded that sender date and cannot reopen already-consumed MLS ciphertext;
+  they continue to use the rounded server date, including when imported from an older archive.
 - chatd's message store (SQLite) keeps the opened text of encrypted conversations in plain text,
   as it keeps every network's messages; the media cache keeps opened files. Only the e2ee cache is
   sealed. Sealing the store is follow-up.

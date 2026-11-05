@@ -1,0 +1,9 @@
+{
+  "id": "device-sync",
+  "title": "A linked device imports encrypted text, edits, replies and picture keys, receives immediate new messages, sends as the same person, and loses access after revocation",
+  "platforms": ["windows", "linux"],
+  "needs": ["server-device-link", "two-people", "device-sync-coordinator"],
+  "release": false,
+  "max_still_seconds": 120,
+  "execution": "coordinated-ipc"
+}

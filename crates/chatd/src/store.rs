@@ -287,10 +287,10 @@ const PERSON: &str = "
     FROM person p
     LEFT JOIN media m ON m.network = p.network AND m.account = p.account AND m.id = p.avatar";
 
-/// Messages in the order they are read: by time, then by id, shorter ids first so numeric ids of
-/// different lengths still sort as numbers.
-const NEWEST_FIRST: &str = "ORDER BY sent DESC, length(id) DESC, id DESC";
-const OLDEST_FIRST: &str = "ORDER BY sent, length(id), id";
+/// Messages in reading order: seconds, optional subsecond precision, then numeric-looking id.
+/// Subseconds live in the existing JSON body so old caches need no destructive schema rebuild.
+const NEWEST_FIRST: &str = "ORDER BY sent DESC, coalesce(json_extract(body, '$.sent_subsec_millis'), 0) DESC, length(id) DESC, id DESC";
+const OLDEST_FIRST: &str = "ORDER BY sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), length(id), id";
 
 pub struct Store {
     db: Connection,
@@ -2241,7 +2241,7 @@ impl Store {
             SharedKind::Links => "(instr(body, '\"previews\"') > 0 OR instr(body, '\"style\":\"link\"') > 0)",
         };
         let below = match before {
-            Some(_) => "AND (sent, length(id), id) < (SELECT sent, length(id), id FROM message
+            Some(_) => "AND (sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), length(id), id) < (SELECT sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), length(id), id FROM message
                            WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4)",
             None => "AND ?4 IS NULL",
         };
@@ -2365,7 +2365,7 @@ impl Store {
                 Some(anchor) => {
                     values.push(Value::Text(anchor.to_owned()));
                     format!(
-                        "AND (sent, length(id), id) {side} (SELECT sent, length(id), id FROM message
+                        "AND (sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), length(id), id) {side} (SELECT sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), length(id), id FROM message
                            WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4)"
                     )
                 }
@@ -3223,6 +3223,22 @@ mod tests {
         assert!(store.search_messages(None, None, Some(&elsewhere), "world", 10).unwrap().is_empty());
         // With no space named, the cache answers as a whole.
         assert_eq!(store.search_messages(None, None, None, "world", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pages_preserve_subsecond_order_with_random_message_ids() {
+        let (mut store, key) = store();
+        for (id, millis) in [("z-first", 100), ("a-middle", 500), ("b-last", 900)] {
+            let mut value = serde_json::to_value(said(id, id, 20)).unwrap();
+            value["sent_subsec_millis"] = serde_json::json!(millis);
+            store.ingest(&key, &serde_json::from_value(value).unwrap(), false).unwrap();
+        }
+        let newest = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(ids(&newest), ["z-first", "a-middle", "b-last"]);
+        let before = store.messages(&key, &Page::Before { id: "a-middle".into() }, 10, NOW).unwrap().unwrap();
+        assert_eq!(ids(&before), ["z-first"]);
+        let after = store.messages(&key, &Page::After { id: "a-middle".into() }, 10, NOW).unwrap().unwrap();
+        assert_eq!(ids(&after), ["b-last"]);
     }
 
     #[test]

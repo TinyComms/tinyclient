@@ -1035,6 +1035,10 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
     if !deleted {
         match read {
             Some(Read::Opened(opened)) => {
+                if let Some(millis) = opened.sent_at {
+                    message.sent = millis.div_euclid(1000);
+                    message.sent_subsec_millis = millis.rem_euclid(1000) as u32;
+                }
                 message.text = opened.text.clone();
                 message.edited = opened.edited_by.is_some();
                 message.reply_to = reply_of(opened.reply_to.as_ref().map(|id| Value::String(id.clone())).as_ref());
@@ -1594,6 +1598,34 @@ mod tests {
         let (adapter, ctx) = open_ctx();
         refresh(&ctx, &saved);
         (adapter, ctx, saved)
+    }
+
+    #[test]
+    fn encrypted_history_uses_private_sender_time_and_preserves_subsecond_order() {
+        let (_adapter, ctx) = open_ctx();
+        let saved = saved("http://127.0.0.1:9");
+        ctx.conversation(&ConversationRow::new("sealed", ConversationKind::Channel, "Secret")).unwrap();
+        let mut mapped = Vec::new();
+        for (id, millis) in [("z-first", 1_704_164_645_100_i64), ("a-second", 1_704_164_645_900)] {
+            let wire: WireMessage = serde_json::from_value(json!({
+                "id": id, "author_id": PEER, "e2ee": true,
+                "created_at": "2024-01-02T03:04:00Z"
+            })).unwrap();
+            // This is also the representation restored from a linked device's archive.
+            let opened = serde_json::from_value(json!({"text": id, "sent_at": millis})).unwrap();
+            let reads = HashMap::from([(id.to_owned(), Read::Opened(opened))]);
+            mapped.push(map_message(&saved, &HashMap::new(), &wire, &reads, &mut Vec::new()).unwrap());
+        }
+        assert_eq!(mapped[0].sent, 1_704_164_645, "the minute-rounded server date is only a fallback");
+        ctx.history("sealed", &mapped).unwrap();
+        let page = ctx.hub.store().messages(&ctx.key("sealed"), &Page::Newest, 10, 1_800_000_000).unwrap().unwrap();
+        assert_eq!(page.messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["z-first", "a-second"]);
+        let legacy: WireMessage = serde_json::from_value(json!({
+            "id": "legacy", "author_id": PEER, "e2ee": true, "created_at": "2024-01-02T03:04:00Z"
+        })).unwrap();
+        let reads = HashMap::from([("legacy".to_owned(), Read::Opened(e2ee::Opened::default()))]);
+        let legacy = map_message(&saved, &HashMap::new(), &legacy, &reads, &mut Vec::new()).unwrap();
+        assert_eq!((legacy.sent, legacy.sent_subsec_millis), (1_704_164_640, 0), "older envelopes and caches retain their server date");
     }
 
     #[test]

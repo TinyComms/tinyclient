@@ -264,13 +264,10 @@ pub(crate) fn confirm(saved: &Saved, history: &str, check: &str) -> Result<(), S
 
 /// When to ask about the groups after the person's devices changed: past the server's commit
 /// batching (`e2ee_commit_batch_secs`, 30 by default), and once more in case one was busy.
-const NUDGES: [Duration; 2] = [Duration::from_secs(35), Duration::from_secs(40)];
+const NUDGES: [Duration; 3] = [Duration::ZERO, Duration::from_secs(35), Duration::from_secs(40)];
 
-/// The person's devices changed (one added from here, or revoked). The server signs the Add or
-/// Remove for each of their encrypted conversations only after its batching window, and only
-/// when a device next asks about that conversation; until then a new device cannot send there
-/// and a revoked one still reads. So this device asks, past the window, and commits what it is
-/// given.
+/// Settle a device addition or removal immediately, so a linked device gets its Welcome before
+/// its first send. Older servers batch membership changes, so retain the later retries too.
 pub(super) fn nudge(device: Shared) {
     let _ = std::thread::Builder::new()
         .name("tiny-e2ee-nudge".into())
