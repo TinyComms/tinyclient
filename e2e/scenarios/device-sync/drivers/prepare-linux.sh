@@ -3,7 +3,7 @@
 # Run from Git Bash on the coordinator:  bash drivers/prepare-linux.sh [client-checkout] [profile] [ref]
 # (default: this client repository, release, HEAD). Only the committed `ref` is built (git archive). Same build as the lab's (e2e/lab/platforms/linux.py
 # BUILD_SH: stable, -p tinyclient --features gui -p chatd -p mediad) into the lab's own warm target
-# dir ~/tiny-lab/target, so it is incremental; the result is copied to ~/tiny-dl/bin/app, with dlctl.
+# dir ~/tiny-lab/target; immutable results go to ~/tiny-dl/bin/apps/<full-sha>.
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$HERE")
@@ -22,9 +22,9 @@ tar -rf "$TAR" -C "$ROOT" dlctl/Cargo.toml dlctl/src/main.rs drivers/linux-host.
 # would look already built next to a later one's artifacts. Stamp them "now" so cargo rebuilds them.
 ssh "$HOST" "rm -rf ~/tiny-dl/src/$SHORT && mkdir -p ~/tiny-dl/src/$SHORT ~/tiny-dl/bin && tar -x -C ~/tiny-dl/src/$SHORT && find ~/tiny-dl/src/$SHORT -type f -exec touch {} +" < "$TAR"
 rm -f "$TAR"
-ssh "$HOST" bash -s -- "$SHORT" "$PROFILE" <<'REMOTE'
+ssh "$HOST" bash -s -- "$SHORT" "$PROFILE" "$SHA" <<'REMOTE'
 set -eu
-short=$1 profile=$2
+short=$1 profile=$2 sha=$3
 source "$HOME/.cargo/env"
 src=$HOME/tiny-dl/src/$short
 cd "$src"
@@ -38,13 +38,21 @@ cargo +stable build $flag -p tinyclient --features gui -p chatd -p mediad -p log
 sed -i 's#path = "../../../../crates/protocol"#path = "../crates/protocol"#' dlctl/Cargo.toml
 cp Cargo.lock dlctl/Cargo.lock
 (cd dlctl && cargo +stable build --release)
-mkdir -p ~/tiny-dl/bin/app
-cp "$CARGO_TARGET_DIR/$dir/tinyclient" "$CARGO_TARGET_DIR/$dir/chatd" "$CARGO_TARGET_DIR/$dir/mediad" "$CARGO_TARGET_DIR/$dir/tinyclient-login" ~/tiny-dl/bin/app/
+app=$HOME/tiny-dl/bin/apps/$sha
+if [ -e "$app" ]; then
+    [ -f "$app/SOURCE_SHA" ] && [ "$(cat "$app/SOURCE_SHA")" = "$sha" ] || { echo "refusing to replace existing app directory: $app" >&2; exit 1; }
+    for binary in tinyclient chatd mediad tinyclient-login; do
+        [ -x "$app/$binary" ] || { echo "incomplete immutable app directory: $app" >&2; exit 1; }
+    done
+else
+    mkdir -p "$app"
+    cp "$CARGO_TARGET_DIR/$dir/tinyclient" "$CARGO_TARGET_DIR/$dir/chatd" "$CARGO_TARGET_DIR/$dir/mediad" "$CARGO_TARGET_DIR/$dir/tinyclient-login" "$app/"
+    printf '%s\n' "$sha" > "$app/SOURCE_SHA"
+fi
 cp "$CARGO_TARGET_DIR/release/dlctl" ~/tiny-dl/bin/dlctl
 cp drivers/linux-host.sh ~/tiny-dl/linux-host.sh
 cp drivers/linux-processes.py ~/tiny-dl/linux-processes.py
 cp drivers/x11input.py ~/tiny-dl/x11input.py
-echo "$short" > ~/tiny-dl/bin/app/SHA
-~/tiny-dl/bin/app/tinyclient --version
-echo "ready: ~/tiny-dl/bin/app ($short, $profile)"
+"$app/tinyclient" --version
+echo "ready: $app ($sha, $profile); pass this path with --linux-app-dir"
 REMOTE
