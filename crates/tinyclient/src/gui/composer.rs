@@ -3275,21 +3275,21 @@ impl Shell {
             (conversation.clone(), client_id.to_owned()),
             (conversation.clone(), client_id.to_owned()),
         );
-        div()
-            .mt(px(2.))
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .type_small()
-            .text_color(theme::danger())
-            .child(glyph("icons/circle-alert.svg", 14., theme::danger()))
-            .child(div().min_w_0().truncate().child(format!("Not sent. {reason}")))
+        let actions = div().min_w_0().max_w_full().flex().flex_wrap().gap(px(6.))
             .child(small("retry", "Retry").ml(px(2.)).on_click(cx.listener(move |this, _, _, cx| {
                 this.retry_send(retry.0.clone(), retry.1.clone(), cx);
             })))
             .child(small("discard", "Delete").on_click(cx.listener(move |this, _, _, cx| {
                 this.discard_send(discard.0.clone(), discard.1.clone(), cx);
-            })))
+            })));
+        div().mt(px(2.)).w_full().min_w_0().max_w_full().flex().flex_col().gap(px(4.)).type_small()
+            .child(
+                div().min_w_0().max_w_full().flex().items_start().gap(px(6.)).text_color(theme::danger())
+                    .child(div().pt(px(2.)).child(glyph("icons/circle-alert.svg", 14., theme::danger())))
+                    .child(div().flex_1().min_w_0().max_w_full().whitespace_normal().child(format!("Not sent. {reason}"))),
+            )
+            .child(actions)
+
     }
 
     /// `--composer waiting`: the two lines a held row shows, drawn over the dock so they can be

@@ -7,10 +7,10 @@
 //! A safety number marked as compared and since changed says so. The recovery key is shown once;
 //! key backup is not built yet, and the page says that too.
 
-use super::kit::{self, card};
+use super::kit::{self, security_card as card};
 use super::page_head;
 use crate::client::ask;
-use crate::gui::components::{button, glyph, ButtonKind};
+use crate::gui::components::{button, button_with_icon, glyph, ButtonKind};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use crate::gui::tiny::Page as Facts;
@@ -39,16 +39,20 @@ pub(in crate::gui) struct Draft {
     pub qr: Option<(String, std::rc::Rc<crate::gui::signin::qr::Qr>)>,
     /// The history picked to send a new device; empty is `linking::DEFAULT_HISTORY`.
     pub history: String,
+    /// Fingerprints, compatibility codes and recovery information are shown on demand.
+    pub details: bool,
+    /// Only one backup form is open at a time: save (`true`) or import (`false`).
+    pub backup_mode: Option<bool>,
 }
 
 /// The words a device's state reads as.
 pub(in crate::gui) fn state_words(state: &DeviceState) -> (&'static str, String) {
     match state {
         DeviceState::Off => ("icons/lock.svg", "This server doesn't offer end-to-end encrypted messages.".to_owned()),
-        DeviceState::Ready => ("icons/shield.svg", "This device is set up. It can read and send end-to-end encrypted messages from now on.".to_owned()),
+        DeviceState::Ready => ("icons/shield.svg", "This device is ready for encrypted messages.".to_owned()),
         DeviceState::AwaitingApproval { .. } => (
             "icons/key.svg",
-            "You already use another device on this server. Approve this one there: open Encryption on that device and paste the link code below.".to_owned(),
+            "Approve this device from one you already use.".to_owned(),
         ),
         DeviceState::Failed { why } => ("icons/triangle-alert.svg", why.clone()),
     }
@@ -57,7 +61,7 @@ pub(in crate::gui) fn state_words(state: &DeviceState) -> (&'static str, String)
 /// How a person's safety number stands, in words.
 pub(in crate::gui) fn trust_words(person: &E2eePerson) -> &'static str {
     if person.identity_changed {
-        return "New identity: none of their devices chain to the ones you knew. Their new devices are not let into your conversations until you accept it.";
+        return "New identity. Verify with them before accepting it.";
     }
     match person.trust {
         Trust::Verified => "Verified",
@@ -185,7 +189,7 @@ impl Shell {
     pub(in crate::gui::tiny) fn tiny_e2ee_approve_code(&mut self, code: String, cx: &mut Context<Self>) {
         self.tiny_e2ee_do(
             E2eeAsk::Approve { code },
-            "Approved. The new device can read and send from now on.",
+            "Device approved.",
             cx,
         );
     }
@@ -218,6 +222,7 @@ fn device_row(
     id: impl Into<SharedString>,
     device: &E2eeDevice,
     revoke: Option<gpui::Stateful<Div>>,
+    details: bool,
 ) -> gpui::Stateful<Div> {
     let title = if device.this {
         "This device".to_owned()
@@ -234,62 +239,45 @@ fn device_row(
     } else {
         theme::text()
     };
-    kit::table_row(id.into(), false)
-        .child(glyph(
-            if device.untrusted {
-                "icons/triangle-alert.svg"
-            } else {
-                "icons/key.svg"
-            },
-            16.,
-            tone,
+    let mut column = div().flex_1().min_w_0().max_w_full().flex().flex_col().gap(px(4.))
+        .child(kit::security_words(title).when(!details, |title| title.line_clamp(2)).type_ui().font_weight(theme::MEDIUM).text_color(tone))
+        .when(details, |column| column.child(
+            kit::security_words(&device.fingerprint).type_small().font_family(theme::MONO).text_color(theme::text_soft()),
         ))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .truncate()
-                        .type_ui()
-                        .font_weight(theme::MEDIUM)
-                        .text_color(tone)
-                        .child(title),
-                )
-                .child(
-                    div()
-                        // Whole on a phone, where the row is too narrow for it: it is what two
-                        // screens compare.
-                        .when(!crate::gui::phone::active(), |line| line.truncate())
-                        .when(crate::gui::phone::active(), |line| line.whitespace_normal())
-                        .type_small()
-                        .font_family(theme::MONO)
-                        .text_color(theme::text_soft())
-                        .child(device.fingerprint.clone()),
-                )
-                .when(device.untrusted, |column| {
-                    column.child(
-                        div()
-                            .whitespace_normal()
-                            .type_small()
-                            .text_color(theme::danger())
-                            .child(
-                                "Not approved by any of their devices. Nothing is encrypted to it.",
-                            ),
-                    )
-                })
-                .when(!since.is_empty(), |column| {
-                    column.child(
-                        div()
-                            .type_small()
-                            .text_color(theme::text_faint())
-                            .child(format!("Added {since}")),
-                    )
-                }),
-        )
+        .when(device.untrusted, |column| column.child(
+            kit::security_words("Unapproved. Cannot read your messages.").type_small().text_color(theme::danger()),
+        ))
+        .when(details && !since.is_empty(), |column| column.child(
+            kit::security_words(format!("Added {since}")).type_small().text_color(theme::text_faint()),
+        ));
+    let phone = crate::gui::phone::active();
+    let mut revoke = revoke;
+    if phone {
+        column = column.children(revoke.take().map(|action| div().flex().child(action)));
+    }
+    kit::table_row(id.into(), false)
+        .items_start()
+        .child(div().pt(px(2.)).child(glyph(
+            if device.untrusted { "icons/triangle-alert.svg" } else { "icons/smartphone.svg" },
+            16., tone,
+        )))
+        .child(column)
         .children(revoke)
+
+}
+
+fn security_details(open: bool, cx: &mut Context<Shell>) -> Div {
+    div().flex().child(
+        button_with_icon("tiny-e2ee-details", ButtonKind::Ghost,
+            if open { "icons/chevron-up.svg" } else { "icons/chevron-down.svg" },
+            if open { "Hide details" } else { "Security details" })
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let Some(draft) = this.tiny_state.settings.as_mut().map(|overlay| &mut overlay.encryption) {
+                    draft.details = !draft.details;
+                }
+                cx.notify();
+            })),
+    )
 }
 
 pub(in crate::gui::tiny) fn encryption(
@@ -307,22 +295,22 @@ pub(in crate::gui::tiny) fn encryption(
         return div().into_any_element();
     };
     let fields = &shell.tiny_state.settings_fields;
-    let mut page = div().flex().flex_col().gap(px(20.)).child(page_head(
-        "Encryption",
-        "Only people's devices can read end-to-end encrypted conversations. The server stores ciphertext.",
-    ));
+    let mut page = div().min_w_0().max_w_full().flex().flex_col().gap(px(24.))
+        .when(!crate::gui::phone::active(), |page| page.child(page_head(
+            "Encryption", "",
+        )));
     if let Some(error) = &draft.error {
         page = page.child(kit::note(
             "icons/triangle-alert.svg",
             theme::danger(),
-            error.clone(),
+            kit::security_wrap(error),
         ));
     }
     if let Some(note) = &draft.note {
         page = page.child(kit::note(
             "icons/shield.svg",
             theme::positive(),
-            note.clone(),
+            kit::security_wrap(note),
         ));
     }
     let Some(status) = &draft.status else {
@@ -336,14 +324,36 @@ pub(in crate::gui::tiny) fn encryption(
             .into_any_element();
     };
 
+    let owner_link = draft.link.as_ref().is_some_and(|link| link.role == "old" && matches!(
+        link.stage,
+        protocol::LinkStage::Confirm | protocol::LinkStage::OwnerApproval |
+        protocol::LinkStage::Sending | protocol::LinkStage::Receiving,
+    ));
+    if owner_link && status.device == DeviceState::Ready && !status.revoked {
+        return page.child(
+            kit::security_section("icons/smartphone.svg", "Add a device")
+                .child(super::linking::add_device(shell, status, draft, window, cx))
+                .child(security_details(draft.details, cx)),
+        ).into_any_element();
+    }
+
     // This device.
-    let (icon, words) = state_words(&status.device);
+    let (icon, words) = if status.revoked {
+        ("icons/triangle-alert.svg", "This device was removed. Saved messages are still available.".to_owned())
+    } else {
+        state_words(&status.device)
+    };
+    let state_tone = match (&status.device, status.revoked) {
+        (_, true) | (DeviceState::Failed { .. }, _) => theme::danger(),
+        (DeviceState::Ready, _) => theme::positive(),
+        _ => theme::text_soft(),
+    };
     let mut this = card().p(px(12.)).gap(px(10.)).child(
         div()
             .flex()
             .items_start()
             .gap(px(10.))
-            .child(glyph(icon, 16., theme::text_soft()))
+            .child(glyph(icon, 16., state_tone))
             .child(
                 div()
                     .flex_1()
@@ -351,74 +361,81 @@ pub(in crate::gui::tiny) fn encryption(
                     .whitespace_normal()
                     .type_ui()
                     .text_color(theme::text())
-                    .child(words),
+                    .child(kit::security_wrap(&words)),
             ),
     );
-    if !status.fingerprint.is_empty() {
+    if draft.details && !status.fingerprint.is_empty() {
         this = this
             .child(
                 div()
                     .type_small()
                     .text_color(theme::text_faint())
-                    .child("This device's key fingerprint"),
+                    .child("Key fingerprint"),
             )
             .child(
-                div()
-                    .type_ui()
+                kit::security_words(&status.fingerprint)
+                    .type_small()
                     .font_family(theme::MONO)
-                    .text_color(theme::text())
-                    .child(status.fingerprint.clone()),
+                    .text_color(theme::text()),
             );
     }
     let new_device = super::linking::new_device(status, draft, cx);
     if let DeviceState::AwaitingApproval { code } = &status.device {
-        let copied = code.clone();
-        this = this
-            .child(
-                div()
-                    .type_small()
-                    .text_color(theme::text_faint())
-                    .child(if new_device.is_some() {
-                        "Or, on a device that can't add devices yet, paste this link code"
-                    } else {
-                        "Link code"
-                    }),
-            )
-            .child(
-                div()
-                    .whitespace_normal()
-                    .type_small()
-                    .font_family(theme::MONO)
-                    .text_color(theme::text())
-                    .child(code.clone()),
-            )
-            .child(
-                div().flex().child(
-                    button(
-                        "tiny-e2ee-copy-code",
-                        ButtonKind::Secondary,
-                        "Copy link code",
-                    )
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()))
-                    })),
-                ),
-            );
+        if new_device.is_none() || draft.details {
+            let copied = code.clone();
+            this = this
+                .child(
+                    div()
+                        .type_small()
+                        .text_color(theme::text_faint())
+                        .child(if new_device.is_some() {
+                            "For an older device"
+                        } else {
+                            "Link code"
+                        }),
+                )
+
+                .child(
+                    div().flex().child(
+                        button(
+                            "tiny-e2ee-copy-code",
+                            ButtonKind::Secondary,
+                            "Copy link code",
+                        )
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()))
+                        })),
+                    ),
+                );
+        }
     }
-    let mut this_device = super::section("This device");
+    let mut this_device = kit::security_section("icons/shield.svg", "This device");
+    let linking = new_device.is_some();
     if let Some(panel) = new_device {
         this_device = this_device.child(panel);
     }
-    page = page.child(this_device.child(this));
-    if status.device == DeviceState::Off {
+    if !linking || draft.details {
+        this_device = this_device.child(this);
+    }
+    this_device = this_device.child(security_details(draft.details, cx));
+    page = page.child(this_device);
+    if status.device == DeviceState::Off || status.revoked {
         return page.into_any_element();
     }
     if let Some(notice) = super::linking::added_notice("tiny-e2ee-added", &status.added, cx) {
         page = page.child(notice);
     }
+    // Keep setup focused on the current step. Device and backup management remain available
+    // in Security details until this device is approved.
+    if matches!(status.device, DeviceState::AwaitingApproval { .. }) && !draft.details {
+        return page.into_any_element();
+    }
 
     // Your devices.
     let mut mine = card();
+    if status.device == DeviceState::Ready {
+        mine = mine.child(super::linking::add_device(shell, status, draft, window, cx));
+    }
     for (ix, device) in status.devices.iter().enumerate() {
         let id = device.device_id.clone();
         let revoke = button(
@@ -443,6 +460,7 @@ pub(in crate::gui::tiny) fn encryption(
             SharedString::from(format!("tiny-e2ee-mine-{ix}")),
             device,
             Some(revoke),
+            draft.details,
         ));
     }
     if status.devices.is_empty() {
@@ -454,10 +472,7 @@ pub(in crate::gui::tiny) fn encryption(
                 .child("No device is registered yet."),
         );
     }
-    if status.device == DeviceState::Ready {
-        mine = mine.child(super::linking::add_device(shell, status, draft, window, cx));
-    }
-    page = page.child(super::section("Your devices").child(mine));
+    page = page.child(kit::security_section("icons/smartphone.svg", "Your devices").child(mine));
 
     // People.
     let mut people = card();
@@ -560,11 +575,10 @@ pub(in crate::gui::tiny) fn encryption(
         };
         people = people.child(
             kit::table_row(SharedString::from(format!("tiny-e2ee-person-{ix}")), false)
-                // On a phone the buttons go under the key, which keeps the width it needs.
-                .when(crate::gui::phone::active(), |row| row.flex_col().items_start().gap(px(6.)))
+                .flex_col().items_start().gap(px(10.))
                 .child(
                     div()
-                        .flex_1()
+                        .w_full()
                         .min_w_0()
                         .flex()
                         .flex_col()
@@ -589,7 +603,7 @@ pub(in crate::gui::tiny) fn encryption(
                                 }),
                         )
                         .child(emoji_row)
-                        .when(!person.safety.is_empty(), |column| {
+                        .when(draft.details && !person.safety.is_empty(), |column| {
                             column.child(
                                 div()
                                     .whitespace_normal()
@@ -617,6 +631,8 @@ pub(in crate::gui::tiny) fn encryption(
                     div()
                         .flex_none()
                         .flex()
+                        .max_w_full()
+                        .flex_wrap()
                         .gap(px(4.))
                         .children(accept)
                         .child(devices)
@@ -633,12 +649,12 @@ pub(in crate::gui::tiny) fn encryption(
                 .p(px(12.))
                 .type_ui()
                 .text_color(theme::text_soft())
-                .child("Nobody yet. People appear here once you share an encrypted conversation."),
+                .child("People you message will appear here."),
         );
     }
     page = page.child(
-        super::section("People")
-            .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child("Same four emojis on both screens? Nobody, the server included, has put a device between you. Digits stay under the emojis for a precise check."))
+        kit::security_section("icons/users.svg", "People")
+            .when(!status.people.is_empty(), |section| section.child(kit::security_words("Compare these emojis together to verify a conversation.").type_small().text_color(theme::text_soft())))
             .child(people),
     );
     if let Some(person) = &draft.person {
@@ -648,6 +664,7 @@ pub(in crate::gui::tiny) fn encryption(
                 SharedString::from(format!("tiny-e2ee-theirs-{ix}")),
                 device,
                 None,
+                true,
             ));
         }
         let name = if person.name.is_empty() {
@@ -673,17 +690,16 @@ pub(in crate::gui::tiny) fn encryption(
 
     // Recovery.
     let mut recovery = card().p(px(12.)).gap(px(10.)).child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child(
-        "A recovery key is 128 random bits, shown once. Write it down and keep it somewhere safe. Encrypted key backup is not available yet: for now the key backs nothing up, and losing every device still means a new identity.",
+        "Recovery keys do not restore messages yet. Use a backup file below to save your messages.",
     ));
     if let Some(key) = &draft.recovery {
         let copied = key.clone();
         recovery = recovery
             .child(
-                div()
-                    .type_title()
+                kit::security_words(key)
+                    .type_ui()
                     .font_family(theme::MONO)
-                    .text_color(theme::text())
-                    .child(key.clone()),
+                    .text_color(theme::text()),
             )
             .child(div().flex().child(
                 button("tiny-e2ee-copy-recovery", ButtonKind::Secondary, "Copy").on_click(
@@ -714,14 +730,14 @@ pub(in crate::gui::tiny) fn encryption(
             div()
                 .flex()
                 .gap(px(8.))
-                .child(kit::input(&fields.recovery_check, None, window, cx).flex_1())
+                .child(kit::input(&fields.recovery_check, None, window, cx).flex_1().min_w_0().max_w_full())
                 .child(
                     button("tiny-e2ee-check", ButtonKind::Ghost, "Check")
                         .on_click(cx.listener(|this, _, _, cx| this.tiny_e2ee_check(cx))),
                 ),
         );
     }
-    page.child(super::section("Recovery key").child(recovery))
+    page.when(draft.details, |page| page.child(kit::security_section("icons/key.svg", "Recovery key").child(recovery)))
         .child(super::backup::backup(shell, draft.loading, window, cx))
         .into_any_element()
 }
@@ -750,7 +766,7 @@ mod tests {
         assert!(
             state_words(&DeviceState::AwaitingApproval { code: "x".into() })
                 .1
-                .contains("Approve this one there")
+                .contains("Approve this device")
         );
     }
 }

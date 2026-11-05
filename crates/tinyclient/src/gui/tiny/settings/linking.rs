@@ -8,9 +8,9 @@
 //! device of the person, with Revoke.
 
 use super::encryption::Draft;
-use super::kit::{self, card};
+use super::kit::{self, security_card as card};
 use crate::client::ask;
-use crate::gui::components::{button, glyph, ButtonKind};
+use crate::gui::components::{button, button_with_icon, fade_in, glyph, ButtonKind};
 use crate::gui::signin::{code_tile, qr};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
@@ -41,17 +41,17 @@ fn about(bytes: u64) -> String {
 fn history_words(choice: &E2eeHistory) -> String {
     let what = match choice.history.as_str() {
         "none" => "No messages".to_owned(),
-        "all" => "Everything this device has".to_owned(),
+        "all" => "All".to_owned(),
         other => match other.strip_prefix("days:") {
-            Some("1") => "The last day".to_owned(),
-            Some(days) => format!("The last {days} days"),
+            Some("1") => "1 day".to_owned(),
+            Some(days) => format!("{days} days"),
             None => other.to_owned(),
         },
     };
     match (choice.history.as_str(), choice.messages) {
         ("none", _) => what,
-        (_, 1) => format!("{what}: 1 message, about {}", about(choice.bytes)),
-        (_, n) => format!("{what}: {n} messages, about {}", about(choice.bytes)),
+        (_, 1) => format!("{what} · 1 message · {}", about(choice.bytes)),
+        (_, n) => format!("{what} · {n} messages · {}", about(choice.bytes)),
     }
 }
 
@@ -68,22 +68,22 @@ pub(in crate::gui) fn grouped_check(check: &str) -> String {
 pub(in crate::gui) fn stage_words(link: &E2eeLink) -> String {
     let new = link.role == "new";
     match link.stage {
-        LinkStage::Waiting if new => "On a device you already use, open Encryption, choose Add a device, and scan or paste this code. It works for 5 minutes.".to_owned(),
+        LinkStage::Waiting if new => "On your other device, open Encryption and paste this code.".to_owned(),
         LinkStage::Waiting => "Waiting for the new device…".to_owned(),
-        LinkStage::Confirm if new => "Your other device asks for these digits. Type them there.".to_owned(),
-        LinkStage::Confirm => "Check that this is your device, then type the six digits it shows.".to_owned(),
-        LinkStage::OwnerApproval => "Use your operating system’s prompt to approve adding this device.".to_owned(),
-        LinkStage::Sending => "Approving the new device and sending your messages…".to_owned(),
-        LinkStage::Receiving => "Setting this device up and bringing your messages…".to_owned(),
+        LinkStage::Confirm if new => "Enter these six digits on your other device.".to_owned(),
+        LinkStage::Confirm => "Enter the six digits shown on your new device.".to_owned(),
+        LinkStage::OwnerApproval => "Approve the security prompt to continue.".to_owned(),
+        LinkStage::Sending => "Sending your messages…".to_owned(),
+        LinkStage::Receiving => "Receiving your messages…".to_owned(),
         LinkStage::Done if new => match link.messages {
-            0 => "This device is set up. It can read and send end-to-end encrypted messages from now on.".to_owned(),
-            1 => "This device is set up, with 1 message from your other device.".to_owned(),
-            n => format!("This device is set up, with {n} messages from your other device."),
+            0 => "This device is ready.".to_owned(),
+            1 => "Ready. 1 message transferred.".to_owned(),
+            n => format!("Ready. {n} messages transferred."),
         },
         LinkStage::Done => match link.left_out {
-            0 => "Added. The new device can read and send from now on.".to_owned(),
-            1 => "Added. The new device can read and send from now on. The server takes only so much at once, so 1 older message stayed on this device.".to_owned(),
-            n => format!("Added. The new device can read and send from now on. The server takes only so much at once, so {n} older messages stayed on this device."),
+            0 => "Device added.".to_owned(),
+            1 => "Device added. 1 older message remains on this device.".to_owned(),
+            n => format!("Device added. {n} older messages remain on this device."),
         },
         LinkStage::Failed => link.error.clone(),
     }
@@ -258,6 +258,8 @@ fn link_card(link: &E2eeLink, qr_code: Option<&Rc<qr::Qr>>, cx: &mut Context<She
     let (icon, tone) = match link.stage {
         LinkStage::Failed => ("icons/triangle-alert.svg", theme::danger()),
         LinkStage::Done => ("icons/shield.svg", theme::positive()),
+        LinkStage::OwnerApproval => ("icons/shield.svg", theme::accent_text()),
+        LinkStage::Sending | LinkStage::Receiving => ("icons/arrow-right-left.svg", theme::accent_text()),
         _ => ("icons/key.svg", theme::text_soft()),
     };
     let mut body = card().p(px(12.)).gap(px(12.)).child(
@@ -266,25 +268,19 @@ fn link_card(link: &E2eeLink, qr_code: Option<&Rc<qr::Qr>>, cx: &mut Context<She
             .items_start()
             .gap(px(10.))
             .child(glyph(icon, 16., tone))
-            .child(div().flex_1().min_w_0().whitespace_normal().type_ui().text_color(theme::text()).child(stage_words(link))),
+            .child(kit::security_words(stage_words(link)).flex_1().type_ui().text_color(theme::text())),
     );
     if link.role == "new" && link.stage == LinkStage::Waiting && !link.code.is_empty() {
         let copied = link.code.clone();
-        let mut code = div().flex().flex_col().items_center().gap(px(10.));
+        let mut code = div().min_w_0().max_w_full().flex().flex_col().items_center().gap(px(10.));
         if let Some(made) = qr_code {
-            code = code.child(code_tile(made.clone()));
+            code = code.child(code_tile(made.clone()).max_w_full().shadow(theme::shadow_tooltip()));
         }
-        body = body.child(code).child(
-            div()
-                .whitespace_normal()
-                .type_small()
-                .font_family(theme::MONO)
-                .text_color(theme::text_soft())
-                .child(link.code.clone()),
-        );
+        body = body.child(code);
         body = body.child(
             div().flex().gap(px(8.)).child(
-                button("tiny-e2ee-link-copy", ButtonKind::Secondary, "Copy code")
+                button_with_icon("tiny-e2ee-link-copy", ButtonKind::Primary, "icons/copy.svg", "Copy code")
+                    .h(px(40.))
                     .on_click(cx.listener(move |_, _, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied.clone())))),
             ),
         );
@@ -304,7 +300,11 @@ fn link_card(link: &E2eeLink, qr_code: Option<&Rc<qr::Qr>>, cx: &mut Context<She
         );
     }
     if let Some(moved) = progress(link) {
-        body = body.child(div().type_small().text_color(theme::text_faint()).child(moved));
+        let fraction = (link.done as f64 / link.total as f64).clamp(0., 1.) as f32;
+        body = body.child(
+            div().h(px(4.)).w_full().rounded_full().bg(theme::hover()).overflow_hidden()
+                .child(div().h_full().w(gpui::relative(fraction)).rounded_full().bg(theme::accent())),
+        ).child(div().type_small().text_color(theme::text_faint()).child(moved));
     }
     let mut actions = div().flex().flex_wrap().gap(px(8.));
     if failed && link.role == "new" {
@@ -318,24 +318,31 @@ fn link_card(link: &E2eeLink, qr_code: Option<&Rc<qr::Qr>>, cx: &mut Context<She
                 .on_click(cx.listener(|this, _, _, cx| this.tiny_e2ee_link_do(E2eeAsk::LinkCancel, cx))),
         );
     }
-    body.child(actions)
+    div().min_w_0().max_w_full().child(fade_in(
+        SharedString::from(format!("tiny-e2ee-step-{}-{:?}", link.role, link.stage)),
+        160,
+        body.child(actions),
+    ))
 }
 
 /// On a device waiting to be approved, on a server that links devices: the way to add it from a
 /// device the person uses. `None` where the old paste-the-code approval is all there is.
 pub(in crate::gui::tiny) fn new_device(status: &E2eeStatus, draft: &Draft, cx: &mut Context<Shell>) -> Option<Div> {
-    if !status.linking || !matches!(status.device, protocol::DeviceState::AwaitingApproval { .. }) {
+    if status.revoked || !status.linking || !matches!(status.device, protocol::DeviceState::AwaitingApproval { .. }) {
         return None;
     }
     let link = draft.link.as_ref().filter(|link| link.role == "new");
     let panel = match link {
         Some(link) => link_card(link, draft.qr.as_ref().map(|(_, made)| made), cx),
         None => card().p(px(12.)).gap(px(10.)).child(
-            div().whitespace_normal().type_ui().text_color(theme::text()).child("Add this device from a device you already use. It shows a code there; your messages come with it."),
+            div().flex().items_center().gap(px(10.))
+                .child(glyph("icons/smartphone.svg", 24., theme::accent_text()))
+                .child(kit::security_words("Bring your messages to this device.").flex_1().type_ui().font_weight(theme::MEDIUM).text_color(theme::text())),
         )
         .child(
             div().flex().child(
-                button("tiny-e2ee-link-start", ButtonKind::Primary, "Show a code")
+                button_with_icon("tiny-e2ee-link-start", ButtonKind::Primary, "icons/key.svg", "Show a code")
+                    .h(px(40.))
                     .on_click(cx.listener(|this, _, _, cx| this.tiny_e2ee_link_do(E2eeAsk::LinkStart, cx))),
             ),
         ),
@@ -350,39 +357,44 @@ pub(in crate::gui::tiny) fn add_device(shell: &Shell, status: &E2eeStatus, draft
     let paste = |hint: &'static str, window: &mut Window, cx: &mut Context<Shell>| {
         div()
             .p(px(12.))
+            .min_w_0()
+            .max_w_full()
             .flex()
             .flex_col()
-            .gap(px(8.))
-            .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child(hint))
+            .gap(px(10.))
+            .child(kit::security_words(hint).type_small().text_color(theme::text_soft()))
             .child(
                 div()
+                    .min_w_0()
                     .flex()
-                    .gap(px(8.))
-                    .child(kit::input(&fields.link_code, None, window, cx).flex_1())
-                    .child(button("tiny-e2ee-link-join", ButtonKind::Primary, "Continue").on_click(cx.listener(|this, _, _, cx| this.tiny_e2ee_link_join(cx)))),
+                    .flex_col()
+                    .items_start()
+                    .gap(px(10.))
+                    .child(kit::input(&fields.link_code, None, window, cx).min_w_0().max_w_full())
+                    .child(button_with_icon("tiny-e2ee-link-join", ButtonKind::Primary, "icons/arrow-right.svg", "Continue").h(px(40.)).on_click(cx.listener(|this, _, _, cx| this.tiny_e2ee_link_join(cx)))),
             )
     };
     let Some(link) = link else {
         let hint = if status.linking {
-            "Adding a device? On the new device, open Encryption and choose Show a code. Paste that code here."
+            "Paste the code from your new device."
         } else {
-            "Setting up tinyclient on another computer? It shows a link code. Paste it here to approve that device. Check that its fingerprint matches what it shows."
+            "Paste the new device’s link code. Check its fingerprint before approving."
         };
         return paste(hint, window, cx);
     };
     if link.stage != LinkStage::Confirm {
         let mut column = div().p(px(12.)).flex().flex_col().gap(px(8.)).child(link_card(link, None, cx));
         if matches!(link.stage, LinkStage::Done | LinkStage::Failed) {
-            column = column.child(paste("Add another device: paste the code it shows.", window, cx));
+            column = column.child(paste("Paste another device’s code.", window, cx));
         }
         return column;
     }
     // Confirm: who is asking, the digits, how much history.
     let who = match (link.label.is_empty(), link.os.is_empty()) {
-        (false, false) => format!("Add {} ({}) to your account?", link.label, link.os),
-        (false, true) => format!("Add {} to your account?", link.label),
-        (true, false) => format!("Add a {} device to your account?", link.os),
-        (true, true) => "Add this device to your account?".to_owned(),
+        (false, false) => format!("Add {} ({})?", link.label, link.os),
+        (false, true) => format!("Add {}?", link.label),
+        (true, false) => format!("Add a {} device?", link.os),
+        (true, true) => "Add this device?".to_owned(),
     };
     let chosen = if draft.history.is_empty() { DEFAULT_HISTORY } else { draft.history.as_str() };
     let mut choices = div().flex().flex_col().gap(px(6.));
@@ -391,46 +403,36 @@ pub(in crate::gui::tiny) fn add_device(shell: &Shell, status: &E2eeStatus, draft
         let value = choice.history.clone();
         choices = choices.child(
             crate::gui::tiny::setup::pick_card(("tiny-e2ee-link-history", ix), on, true)
+                .min_w_0().p(px(10.)).gap(px(8.))
                 .child(crate::gui::tiny::setup::radio(on))
-                .child(div().flex_1().min_w_0().whitespace_normal().type_ui().text_color(theme::text()).child(history_words(choice)))
+                .child(kit::security_words(history_words(choice)).flex_1().type_ui().text_color(theme::text()))
                 .on_click(cx.listener(move |this, _, _, cx| this.tiny_e2ee_pick_history(value.clone(), cx))),
         );
     }
-    card()
-        .m(px(12.))
-        .p(px(12.))
-        .gap(px(12.))
-        .child(div().whitespace_normal().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child(who))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(2.))
-                .child(div().type_small().text_color(theme::text_faint()).child("Its key fingerprint"))
-                .child(
-                    div()
-                        .when(!crate::gui::phone::active(), |line| line.truncate())
-                        .when(crate::gui::phone::active(), |line| line.whitespace_normal())
-                        .type_small()
-                        .font_family(theme::MONO)
-                        .text_color(theme::text_soft())
-                        .child(link.fingerprint.clone()),
-                ),
-        )
-        .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child("If you didn't just start this on a device of yours, stop: someone may be trying to read your messages."))
-        .child(div().type_small().text_color(theme::text_faint()).child("The six digits the new device shows"))
-        .child(kit::input(&fields.link_check, Some(160.), window, cx))
-        .child(div().type_small().text_color(theme::text_faint()).child("Messages to send it"))
+    let panel = card()
+        .p(px(16.))
+        .gap(px(10.))
+        .child(kit::security_words(who).when(!draft.details, |title| title.line_clamp(2)).type_ui().font_weight(theme::MEDIUM).text_color(theme::text()))
+        .when(draft.details, |panel| panel.child(
+            div().min_w_0().flex().flex_col().gap(px(4.))
+                .child(div().type_small().text_color(theme::text_faint()).child("Key fingerprint"))
+                .child(kit::security_words(&link.fingerprint).type_small().font_family(theme::MONO).text_color(theme::text_soft())),
+        ))
+        .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child("Didn't start this? Stop. Someone may be trying to access your messages."))
+        .child(div().type_small().text_color(theme::text_faint()).child("Six-digit code"))
+        .child(kit::input(&fields.link_check, Some(160.), window, cx).min_w_0().max_w_full())
+        .child(div().type_small().text_color(theme::text_faint()).child("Messages to transfer"))
         .child(choices)
-        .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child("Verification details are transferred securely even when no messages are selected. Private keys stay on each device."))
+        .when(draft.details, |panel| panel.child(kit::security_words("Private keys stay on each device. Verification details transfer even without messages.").type_small().text_color(theme::text_soft())))
         .child(
             div()
                 .flex()
                 .flex_wrap()
                 .gap(px(8.))
-                .child(button("tiny-e2ee-link-confirm", ButtonKind::Primary, "Add device").on_click(cx.listener(|this, _, _, cx| this.tiny_e2ee_link_confirm(cx))))
+                .child(button_with_icon("tiny-e2ee-link-confirm", ButtonKind::Primary, "icons/shield.svg", "Add device").h(px(40.)).on_click(cx.listener(|this, _, _, cx| this.tiny_e2ee_link_confirm(cx))))
                 .child(button("tiny-e2ee-link-stop", ButtonKind::Ghost, "Stop").on_click(cx.listener(|this, _, _, cx| this.tiny_e2ee_link_do(E2eeAsk::LinkCancel, cx)))),
-        )
+        );
+    div().min_w_0().max_w_full().child(fade_in("tiny-e2ee-confirm-step", 160, panel))
 }
 
 /// "New device added": a device of the person that this one did not add, with Revoke.
@@ -464,7 +466,7 @@ pub(in crate::gui) fn added_notice(id: &'static str, added: &[E2eeDevice], cx: &
                         .items_start()
                         .gap(px(10.))
                         .child(glyph("icons/triangle-alert.svg", 16., theme::warning()))
-                        .child(div().flex_1().min_w_0().whitespace_normal().type_ui().text_color(theme::text()).child(words)),
+                        .child(kit::security_words(words).flex_1().type_ui().text_color(theme::text())),
                 )
                 .child(
                     div()
@@ -492,10 +494,10 @@ mod tests {
     #[test]
     fn history_choices_read_with_their_size() {
         let choice = |history: &str, messages, bytes| E2eeHistory { history: history.into(), messages, bytes };
-        assert_eq!(history_words(&choice("days:30", 120, 48_000)), "The last 30 days: 120 messages, about 48 KB");
-        assert_eq!(history_words(&choice("all", 1, 900)), "Everything this device has: 1 message, about 1 KB");
+        assert_eq!(history_words(&choice("days:30", 120, 48_000)), "30 days · 120 messages · 48 KB");
+        assert_eq!(history_words(&choice("all", 1, 900)), "All · 1 message · 1 KB");
         assert_eq!(history_words(&choice("none", 0, 256)), "No messages");
-        assert_eq!(history_words(&choice("days:7", 3, 2_400_000)), "The last 7 days: 3 messages, about 2.4 MB");
+        assert_eq!(history_words(&choice("days:7", 3, 2_400_000)), "7 days · 3 messages · 2.4 MB");
     }
 
     #[test]

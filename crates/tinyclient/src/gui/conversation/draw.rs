@@ -1965,15 +1965,7 @@ impl Pane {
         let key = self.key()?.clone();
         let client_id = message.client_id.clone().unwrap_or_else(|| message.id.clone());
         let (again, drop) = ((key.clone(), client_id.clone()), (key, client_id));
-        let line = div()
-            .h(px(18.))
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .type_small()
-            .text_color(theme::danger())
-            .child(icon(Icon::Alert, 13., theme::danger()))
-            .child(div().min_w_0().truncate().child(format!("Not sent · {reason}")))
+        let actions = div().min_w_0().max_w_full().flex().flex_wrap().items_center().gap(px(10.))
             .child(
                 div()
                     .id("retry")
@@ -2002,6 +1994,13 @@ impl Pane {
                         let _ = this.shell.update(cx, |shell, cx| shell.discard_send(conversation, client_id, cx));
                     })),
             );
+        let line = div().w_full().min_w_0().max_w_full().flex().flex_col().gap(px(4.)).type_small()
+            .child(
+                div().min_w_0().max_w_full().flex().items_start().gap(px(6.)).text_color(theme::danger())
+                    .child(div().pt(px(2.)).child(icon(Icon::Alert, 13., theme::danger())))
+                    .child(div().flex_1().min_w_0().max_w_full().whitespace_normal().child(format!("Not sent · {reason}"))),
+            )
+            .child(actions);
         Some(line.into_any_element())
     }
 }

@@ -2,9 +2,9 @@
 //! and take such a file in on a device of the same person. No server keeps it. The passphrase
 //! fields show dots, never the letters.
 
-use super::kit::{self, card};
+use super::kit::{self, security_card as card};
 use crate::client::ask;
-use crate::gui::components::{button, button_disabled, ButtonKind};
+use crate::gui::components::{button_disabled, button_with_icon, fade_in, ButtonKind};
 use crate::gui::input::TextInput;
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
@@ -30,7 +30,7 @@ fn start_folder() -> PathBuf {
 /// What is wrong with the passphrase typed twice for a new backup, in words.
 pub(in crate::gui) fn passphrase_problem(first: &str, again: &str) -> Option<String> {
     if first.chars().count() < SHORTEST {
-        return Some(format!("Choose a passphrase of at least {SHORTEST} characters. A few words you will remember work well."));
+        return Some(format!("Use at least {SHORTEST} characters."));
     }
     (first != again).then(|| "The two passphrases aren't the same.".to_owned())
 }
@@ -56,8 +56,9 @@ fn secret(input: &Entity<TextInput>, hint: &'static str, window: &mut Window, cx
         .children(focused.then(|| div().flex_none().ml(px(1.)).w(px(2.)).h(px(16.)).bg(theme::accent_text())));
     div()
         .relative()
-        .w(px(280.))
-        .max_w_full()
+        .w_full()
+        .min_w_0()
+        .max_w(px(360.))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |_, _, window, cx| {
@@ -65,7 +66,7 @@ fn secret(input: &Entity<TextInput>, hint: &'static str, window: &mut Window, cx
                 window.prevent_default();
             }),
         )
-        .child(kit::input(input, Some(280.), window, cx))
+        .child(kit::input(input, None, window, cx).min_w_0().max_w_full())
         .child(cover)
 }
 
@@ -162,31 +163,61 @@ impl Shell {
 /// The Backup file section.
 pub(in crate::gui::tiny) fn backup(shell: &Shell, busy: bool, window: &mut Window, cx: &mut Context<Shell>) -> Div {
     let fields = &shell.tiny_state.settings_fields;
-    let words = |text: &'static str| div().whitespace_normal().type_small().text_color(theme::text_soft()).child(text);
-    let save = div()
-        .flex()
-        .flex_col()
-        .gap(px(8.))
-        .child(words("Save the messages this device has read to a file, locked with a passphrase. Keep it somewhere safe. Nobody can open it without the passphrase, and nobody can reset it for you."))
-        .child(secret(&fields.backup_passphrase, "Passphrase", window, cx))
-        .child(secret(&fields.backup_again, "The same passphrase again", window, cx))
-        .child(div().flex().child(if busy {
-            button_disabled("Save a backup…").into_any_element()
+    let mode = shell.tiny_state.settings.as_ref().and_then(|overlay| overlay.encryption.backup_mode);
+    #[cfg(feature = "gui-shot")]
+    let mode = match std::env::var("TINYCLIENT_SHOT_BACKUP").as_deref() {
+        Ok("save") => Some(true),
+        Ok("import") => Some(false),
+        _ => mode,
+    };
+    let pick = |save: bool, cx: &mut Context<Shell>| {
+        button_with_icon(
+            if save { "tiny-e2ee-backup-mode-save" } else { "tiny-e2ee-backup-mode-open" },
+            if mode == Some(save) { ButtonKind::Secondary } else { ButtonKind::Ghost },
+            if save { "icons/download.svg" } else { "icons/upload.svg" },
+            if save { "Save" } else { "Import" },
+        )
+        .h(px(36.))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if let Some(draft) = this.tiny_state.settings.as_mut().map(|overlay| &mut overlay.encryption) {
+                draft.backup_mode = if draft.backup_mode == Some(save) { None } else { Some(save) };
+            }
+            cx.notify();
+        }))
+    };
+    let mut body = card().p(px(12.)).gap(px(14.)).child(
+        div().min_w_0().flex().flex_wrap().gap(px(6.)).child(pick(true, cx)).child(pick(false, cx)),
+    );
+    if let Some(save) = mode {
+        let mut form = div().min_w_0().max_w_full().flex().flex_col().items_start().gap(px(10.));
+        if save {
+            form = form
+                .child(kit::security_words("Keep this passphrase safe. It cannot be reset.").type_small().text_color(theme::text_soft()))
+                .child(secret(&fields.backup_passphrase, "Passphrase · 12+ characters", window, cx))
+                .child(secret(&fields.backup_again, "Confirm passphrase", window, cx))
+                .child(if busy {
+                    button_disabled("Saving…").into_any_element()
+                } else {
+                    button_with_icon("tiny-e2ee-backup-save", ButtonKind::Primary, "icons/download.svg", "Save backup…")
+                        .h(px(36.))
+                        .on_click(cx.listener(|this, _, _, cx| this.tiny_backup_export(cx))).into_any_element()
+                });
         } else {
-            button("tiny-e2ee-backup-save", ButtonKind::Secondary, "Save a backup…").on_click(cx.listener(|this, _, _, cx| this.tiny_backup_export(cx))).into_any_element()
-        }));
-    let open = div()
-        .flex()
-        .flex_col()
-        .gap(px(8.))
-        .child(words("Have a backup from another device of yours? Take its messages in here. Only conversations you are still in come in, and nothing here is replaced."))
-        .child(secret(&fields.backup_open, "The backup's passphrase", window, cx))
-        .child(div().flex().child(if busy {
-            button_disabled("Import a backup…").into_any_element()
-        } else {
-            button("tiny-e2ee-backup-open", ButtonKind::Secondary, "Import a backup…").on_click(cx.listener(|this, _, _, cx| this.tiny_backup_import(cx))).into_any_element()
-        }));
-    super::section("Backup file").child(card().p(px(12.)).gap(px(16.)).child(save).child(div().h(px(1.)).bg(theme::hairline())).child(open))
+            form = form
+                .child(kit::security_words("Restore messages from one of your backups.").type_small().text_color(theme::text_soft()))
+                .child(secret(&fields.backup_open, "Backup passphrase", window, cx))
+                .child(if busy {
+                    button_disabled("Importing…").into_any_element()
+                } else {
+                    button_with_icon("tiny-e2ee-backup-open", ButtonKind::Primary, "icons/upload.svg", "Choose backup…")
+                        .h(px(36.))
+                        .on_click(cx.listener(|this, _, _, cx| this.tiny_backup_import(cx))).into_any_element()
+                });
+        }
+        body = body.child(fade_in(if save { "tiny-backup-save-form" } else { "tiny-backup-open-form" }, 160, form));
+    }
+    kit::security_section("icons/lock.svg", "Message backup").child(body)
+
 }
 
 #[cfg(test)]
