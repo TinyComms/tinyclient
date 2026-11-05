@@ -849,8 +849,9 @@ class Scenario:
         a = self.a
         self.server_up()
         meta = {"run_id": self.run_id, "started": datetime.datetime.now(datetime.timezone.utc).isoformat(), "canary": self.canary,
-                "app_dir": a.app_dir, "app_version": app_version(a.app_dir), "server": {k: self.server.get(k) for k in ("tinyserver_branch", "tinyserver_sha", "e2ee_device_link", "link_ttl_seconds")},
+                "app_dir": a.app_dir, "app_version": app_version(a.app_dir), "server": {k: self.server.get(k) for k in ("tinyserver_branch", "tinyserver_sha", "tinyserver_binary_sha256", "e2ee_device_link", "link_ttl_seconds")},
                 "mode": self.mode, "history_per_conversation": a.history}
+        meta["scenario_tree"] = subprocess.check_output(["git", "-C", CLIENT, "rev-parse", "HEAD:e2e/scenarios/device-sync"], text=True).strip()
         if a.client_sha:
             actual = open(os.path.join(a.app_dir, "SOURCE_SHA"), encoding="utf-8").read().strip()
             if actual != a.client_sha:
