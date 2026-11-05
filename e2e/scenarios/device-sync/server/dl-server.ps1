@@ -42,6 +42,7 @@ param(
     [int]$ProxyPort = 8094,
     [int]$PgPort = 54361,
     [int]$OidcPort = 54362,
+    [ValidateRange(1024,65535)][int]$MediaPort = 50110,
     [string]$PgContainer = 'tiny-device-sync-pg',
     # Short link lifetime for the "expired link" case, in seconds (the server allows 60..3600).
     # 0 = the server's default (300).
@@ -100,20 +101,42 @@ $RuntimeUrl = "postgres://app_runtime:app_runtime@127.0.0.1:$PgPort/tiny_dl?sslm
 function Save-Pid([string]$Name, [int]$Id) {
     $pids = @{}
     if (Test-Path $PidFile) { (Get-Content $PidFile -Raw | ConvertFrom-Json).psobject.Properties | ForEach-Object { $pids[$_.Name] = $_.Value } }
-    $pids[$Name] = $Id
-    $pids | ConvertTo-Json | Set-Content $PidFile
+    $process = Get-Process -Id $Id -ErrorAction Stop
+    $pids[$Name] = @{ pid=$Id; creation_ticks=$process.StartTime.ToUniversalTime().Ticks.ToString(); executable=$process.Path }
+    $pids | ConvertTo-Json -Depth 5 | Set-Content $PidFile
 }
 function Stop-Pids([string[]]$Only = @()) {
     if (-not (Test-Path $PidFile)) { return }
     $keep = @{}
+    $failures = [Collections.Generic.List[string]]::new()
     (Get-Content $PidFile -Raw | ConvertFrom-Json).psobject.Properties | ForEach-Object {
         if ($Only.Count -and $_.Name -notin $Only) { $keep[$_.Name] = $_.Value; return }
-        if (Get-Process -Id $_.Value -ErrorAction SilentlyContinue) {
-            Write-Host "stop $($_.Name) ($($_.Value))"
-            Stop-Process -Id $_.Value -Force -ErrorAction SilentlyContinue
+        $entry = $_.Value
+        if ($entry -is [int] -or $entry -is [long]) {
+            if (Get-Process -Id $entry -ErrorAction SilentlyContinue) {
+                $keep[$_.Name]=$entry
+                $failures.Add("refusing live legacy PID without native ownership: $($_.Name)")
+            }
+            return
+        }
+        $process = Get-Process -Id $entry.pid -ErrorAction SilentlyContinue
+        if (-not $process) { return }
+        if (-not $entry.creation_ticks -or -not $entry.executable -or
+            $process.StartTime.ToUniversalTime().Ticks.ToString() -ne $entry.creation_ticks -or $process.Path -ne $entry.executable) {
+            $keep[$_.Name]=$entry
+            $failures.Add("refusing process identity mismatch: $($_.Name)")
+            return
+        }
+        try {
+            $process.Kill()
+            if (-not $process.WaitForExit(10000)) { throw 'owned process did not exit' }
+        } catch {
+            $keep[$_.Name]=$entry
+            $failures.Add("owned process stop failed: $($_.Name)")
         }
     }
-    if ($keep.Count) { $keep | ConvertTo-Json | Set-Content $PidFile } else { Remove-Item $PidFile }
+    if ($keep.Count) { $keep | ConvertTo-Json -Depth 5 | Set-Content $PidFile } else { Remove-Item $PidFile }
+    if ($failures.Count) { throw ($failures -join '; ') }
 }
 function Wait-Http([string]$Url, [int]$Seconds = 60) {
     $deadline = (Get-Date).AddSeconds($Seconds)
@@ -203,7 +226,7 @@ function Start-Serve {
     # used only by sign-in pages, which this proof never opens: devices use $public (an address).
     $env:TINYSERVER_PUBLIC_URL = "http://localhost:$ProxyPort"
     $env:TINYSERVER_PUBLIC_IP = $adv
-    $env:TINYSERVER_MEDIA_PORT = '50110'
+    $env:TINYSERVER_MEDIA_PORT = $MediaPort.ToString()
     # Match fake-oidc.py's discovery issuer exactly.
     $env:TINYSERVER_OIDC_ISSUER = "http://127.0.0.1:$OidcPort"
     $env:TINYSERVER_OIDC_CLIENT_ID = 'tinyserver'

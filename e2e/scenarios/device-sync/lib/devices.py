@@ -23,6 +23,7 @@ import os
 import shlex
 import subprocess
 import time
+from lib import lifecycle
 
 CREATE_NO_WINDOW = 0x08000000
 TINY = "tiny"
@@ -111,6 +112,7 @@ class WinLocal(Device):
 
     def __init__(self, name, session, app_dir, dlctl, state, label, gui=True, extra_env=None, log=print):
         self.name, self.session, self.app_dir, self.dlctl = name, session, app_dir, dlctl
+        self.state = state
         self.user_id = session["user_id"]
         self.dir = os.path.join(state, "devices", name)
         self.label, self.gui, self.extra_env, self.log = label, gui, extra_env or {}, log
@@ -133,6 +135,7 @@ class WinLocal(Device):
             out = open(os.path.join(self.dir, "chatd.console.log"), "a")
             self.chatd = subprocess.Popen([os.path.join(self.app_dir, "chatd.exe")], env=self.env(), cwd=self.dir,
                                           stdout=out, stderr=subprocess.STDOUT, creationflags=CREATE_NO_WINDOW)
+            lifecycle.register_windows(self.state, self.chatd.pid, os.path.join(self.app_dir, "chatd.exe"))
             time.sleep(2)
             # "Access is denied" at start: a chatd of an earlier run on this dir still held its pipe
             # for a moment after it was stopped. Try again shortly.
@@ -144,6 +147,7 @@ class WinLocal(Device):
             return False
         if self.gui:
             self.window = subprocess.Popen([os.path.join(self.app_dir, "tinyclient.exe")], env=self.env(), cwd=self.dir)
+            lifecycle.register_windows(self.state, self.window.pid, os.path.join(self.app_dir, "tinyclient.exe"))
             placed = self.wait_until("window", lambda: self._win("rect") is not None, 60, 1)
             if placed:
                 i = {"a_desk_a": 0, "a_desk_b": 1, "b_desk": 2}.get(self.name, 3)
@@ -194,16 +198,21 @@ class WinLocal(Device):
         # The window restarts chatd if its chatd goes away first, so the window goes first, and any
         # chatd the window started is found by its parent and stopped too (only those).
         spawned = []
-        if self.window:
+        if self.window and self.window.poll() is None:
             r = subprocess.run(["powershell.exe", "-NoProfile", "-Command",
                                 f"(Get-CimInstance Win32_Process -Filter \"ParentProcessId={self.window.pid}\").ProcessId"],
                                capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
-            spawned = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
+            for value in r.stdout.split():
+                if value.isdigit():
+                    try:
+                        spawned.append(lifecycle.register_windows(self.state, int(value), os.path.join(self.app_dir, "chatd.exe")))
+                    except RuntimeError:
+                        pass  # Gone children and children with another executable are never killed.
         for p in (self.window, self.chatd):
             if p and p.poll() is None:
                 p.kill()
-        for pid in spawned:
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, creationflags=CREATE_NO_WINDOW)
+        for identity in spawned:
+            lifecycle._windows("stop", identity)
         # chatd's mediad child, if a call ever started (it does not in this proof), dies with chatd.
 
     def collect(self, out_dir):
@@ -221,12 +230,19 @@ class LinuxSsh(Device):
     """tiny-linux. The host side is mobile-free bash in linux-host.sh (copied there by prepare)."""
     platform = "linux"
 
-    def __init__(self, name, session, host, work, label, log=print):
+    def __init__(self, name, session, host, work, label, log=print, app_dir=None, state_root=None):
         self.name, self.session, self.host, self.work, self.label, self.log = name, session, host, work, label, log
         self.user_id = session["user_id"]
-        self.dir = f"/tmp/tiny-dl-{name}"   # short: chatd's socket path has a 108-byte limit
+        self.app_dir = app_dir or work.rstrip("/") + "/bin/app"
+        self.state_root = state_root
+        self.dir = state_root.rstrip("/") + "/" + name if state_root else f"/tmp/tiny-dl-{name}"
+        self.record_dir = self.dir + "-rec" if state_root else f"/tmp/tiny-dl-rec-{name}"
 
     def sh(self, cmd, timeout=120):
+        env = "DL_APP_DIR=%s " % lifecycle.remote_path(self.app_dir)
+        if self.state_root:
+            env += "DL_STATE_ROOT=%s " % lifecycle.remote_path(self.state_root)
+        cmd = env + cmd
         r = subprocess.run(["ssh", "-n", self.host, cmd], capture_output=True, text=True, timeout=timeout)
         return r.returncode, r.stdout, r.stderr
 
@@ -247,17 +263,20 @@ class LinuxSsh(Device):
             return code, out.strip()
 
     def shot(self, path):
-        code, _, _ = self.sh(f"bash {self.work}/linux-host.sh shot {self.name} /tmp/tiny-dl-shot.png")
+        remote = self.dir + "-shot.png"
+        code, _, _ = self.sh(f"bash {self.work}/linux-host.sh shot {self.name} {shlex.quote(remote)}")
         if code != 0:
             return False
-        return subprocess.run(["scp", "-q", f"{self.host}:/tmp/tiny-dl-shot.png", path]).returncode == 0
+        return subprocess.run(["scp", "-q", f"{self.host}:{remote}", path]).returncode == 0
 
     def record_start(self):
         return self.sh(f"bash {self.work}/linux-host.sh rec-start {self.name}")[0] == 0
 
     def record_stop(self, local_path):
-        self.sh(f"bash {self.work}/linux-host.sh rec-stop {self.name}")
-        return subprocess.run(["scp", "-q", f"{self.host}:/tmp/tiny-dl-rec-{self.name}/screen.mp4", local_path]).returncode == 0
+        code, _, _ = self.sh(f"bash {self.work}/linux-host.sh rec-stop {self.name}")
+        if code:
+            return False
+        return subprocess.run(["scp", "-q", f"{self.host}:{self.record_dir}/screen.mp4", local_path]).returncode == 0
 
     def outbox(self):
         return f"{self.dir}/data/outbox"
@@ -269,12 +288,15 @@ class LinuxSsh(Device):
         return base64.b64decode(out, validate=True)
 
     def stop(self):
-        self.sh(f"bash {self.work}/linux-host.sh stop {self.name}")
+        code, _, _ = self.sh(f"bash {self.work}/linux-host.sh stop {self.name}")
+        if code:
+            raise RuntimeError("owned Linux device identity/cleanup failed")
 
     def collect(self, out_dir):
         os.makedirs(out_dir, exist_ok=True)
-        self.sh(f"tar czf /tmp/tiny-dl-{self.name}-logs.tgz -C {self.dir} data/logs chatd.log tinyclient.log 2>/dev/null; true")
-        subprocess.run(["scp", "-q", f"{self.host}:/tmp/tiny-dl-{self.name}-logs.tgz", os.path.join(out_dir, "logs.tgz")])
+        remote = self.dir + "-logs.tgz"
+        self.sh(f"tar czf {shlex.quote(remote)} -C {shlex.quote(self.dir)} data/logs chatd.log tinyclient.log 2>/dev/null; true")
+        subprocess.run(["scp", "-q", f"{self.host}:{remote}", os.path.join(out_dir, "logs.tgz")])
 
 
 class WinVmSsh(Device):

@@ -46,18 +46,23 @@ A base failure remains a nonzero process exit and is identified by `base-as-expe
 
 Each database container carries scenario and state-directory ownership labels. The fixture refuses
 to reset or remove a container with other labels. Use `--pg-container`, `--pg-port`, `--http-port`,
-`--proxy-port`, `--oidc-port`, and `DL_STATE` for a separate concurrent fixture; pass the same
+`--proxy-port`, `--oidc-port`, `--media-port`, and `DL_STATE` for a separate concurrent fixture; pass the same
 container and state parameters to `dl-server.ps1 down`. Never use another test run's container.
 `--client-sha` checks the Windows build's `SOURCE_SHA` file and Linux build's source marker, keeps
 binary SHA-256 values, and burns the client/server SHAs into the desktop recording captions.
 
 ## Lab integration boundary
 
-The descriptor travels with feature changes so the PR gate can locate the scenario. The current
-one-app platform adapters do not yet stand up `device-sync-coordinator` or `server-device-link`.
-They must fail until those fixtures and native drivers exist. This scenario therefore does not
-post `e2e-proof`, claim all-platform coverage, or convert a standalone scratch run into a lab pass.
-Android, iOS and macOS are gaps. Add `--extended` to run backup export, wrong-passphrase and
+The descriptor travels with feature changes so the PR gate can locate the scenario. The lab
+dispatches `execution: coordinated-ipc` to `e2e/lab/coordinated.py`, before any single-app adapter
+builds or touches a device. Windows and Linux workers share one fresh coordinator invocation per
+client commit and base/branch label. Each platform still receives its own raw recording and steps
+through the lab's independent motion, duration and caption checks. A scratch run or a passing
+assertion ledger alone cannot supply a lab pass.
+
+Android, iOS and macOS need native coordinator participants and currently fail this boundary;
+their demo smoke adapters cannot certify this scenario. macOS and iOS remain deferred. Keep
+`release` false until the whole required platform plan is recorded. Add `--extended` to run backup export, wrong-passphrase and
 tampered-file rejection, a nonempty import roundtrip, and same-user gap fill after linking with
 no archive history. Keep `release` false until the whole required platform plan is recorded.
 The extended sync case imports complete history, injects one transient self-conversation handshake
@@ -77,3 +82,53 @@ not a security audit. Seed sessions and link-code inputs are local test secrets 
 published with public evidence.
 
 Run harness checks with `python -m unittest discover -s . -p 'test_*.py' -v`.
+
+## Private lab configuration
+
+Set `E2E_DEVICE_SYNC_CONFIG` to a private JSON file outside the repository. It contains
+`server_dir`, `server_sha` (full committed SHA), `app_dirs` (full client SHA to immutable Windows
+binary folder), `linux_app_dirs` (the same SHA to immutable folder on `tiny-linux`),
+`timeout_seconds` (1..14400), `advertise` (the coordinator's IP from private configuration), and
+`ports` with five distinct explicit integers named `pg`, `http`, `proxy`, `oidc`, and `media`.
+The address must be reachable from the remote participant. Both base and branch need pinned
+binary entries before a PR run. Windows folders contain `SOURCE_SHA`; Linux folders contain
+`SHA`. Source markers and native binary digests are retained; an older build is never relabeled.
+
+The lab exports the exact app source archive for its helpers, overlays the branch scenario,
+and supplies `E2E_SCENARIO_SHA`. It runs all negative cases and `--extended`, with a unique
+database container, local `DL_STATE`, and short Linux `/tmp` profile namespace. It never reuses
+an existing fixture. The shared Linux helper must be prepared from this scenario's committed
+driver version before running; preparation is a separate deliberate action, not an implicit
+overwrite of a helper another proof might be using. The IPC helper at the documented local
+`dlctl-target/release` location must already be built against the matching protocol.
+
+From the client repository, after preparing pinned builds and choosing unused private ports:
+
+```powershell
+$env:E2E_DEVICE_SYNC_CONFIG = '<private-config-file>'
+python e2e/lab/lab.py try device-sync --sha <full-client-sha> --platforms windows,linux
+```
+
+This runs the real coordinator and records both desktops; `try` posts and uploads nothing. A PR
+run additionally needs the paired base result to be `base-as-expected`. Infrastructure failures,
+missing recordings, mismatched provenance and cleanup failures cannot count as that regression.
+Existing motion thresholds are unchanged.
+
+The scenario emits `lab-result.json` with `schema: 1`, `execution: coordinated-ipc`, client/server
+SHAs, `completed`, and per-platform `recording`, `steps`, `seconds`, `binary_sha256`, and `vfr`.
+Paths are relative to the fresh evidence root and must remain inside their own platform folder.
+`seconds` comes from probing the raw recording; the consumer still probes and checks the video
+itself. This manifest supplies evidence locations, never an exemption from recording validation.
+The private assertion summary remains local because it contains fixture inputs and local paths.
+
+On completion, interruption or deadline, the lab calls `dl.py cleanup --state <owned-state>` and
+the labeled fixture's `down` action. The device registry checks native Windows process creation
+time and executable; Linux stop checks its native PID/start-time/executable/UID ownership record.
+Identity mismatches are retained and reported without stopping that process. Cleanup errors fail
+the platform result. The deadline stops the exact coordinator process and the registered app,
+recorder, fixture and remote participant processes. It does not guarantee termination of an
+unregistered build or video-conversion descendant. A timeout remains failed evidence and may
+require inspecting those owned jobs before another run; no process-name sweep is performed.
+Native mobile participation must provide the same isolated lifecycle,
+production core, exact build provenance, raw platform recording and assertion ledger before it
+can be registered; substituting desktop evidence or demo data is not a supported integration.

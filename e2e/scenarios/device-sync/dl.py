@@ -36,6 +36,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "lib"))
 from devices import WinLocal, LinuxSsh, WinVmSsh  # noqa: E402
 from attachments import verify_picture, picture_baseline
+from lib import lifecycle
+from lib.lab_result import write_lab_result
 
 CLIENT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 SPACE = os.path.dirname(CLIENT)
@@ -282,6 +284,7 @@ class Scenario:
         self.L = Ledger(self.out, self.t0)
         self.canary = f"DLCANARY-{self.run_id}"
         self.devices = {}
+        self.platform_binary_sha256 = {}
         self.history = []     # (conv, sent_by, msg_id, text, kind)
         self.pics = {}
         self.grabber = None
@@ -295,7 +298,7 @@ class Scenario:
             args = ["pwsh", "-NoProfile", "-File", os.path.join(HERE, "server", "dl-server.ps1"), "up"]
             args += ["-State", STATE, "-PgContainer", self.a.pg_container,
                      "-PgPort", str(self.a.pg_port), "-HttpPort", str(self.a.http_port),
-                     "-ProxyPort", str(self.a.proxy_port), "-OidcPort", str(self.a.oidc_port)]
+                     "-ProxyPort", str(self.a.proxy_port), "-OidcPort", str(self.a.oidc_port), "-MediaPort", str(self.a.media_port)]
             if self.a.server_dir:
                 args += ["-TinyServerDir", self.a.server_dir]
             if self.a.link_ttl:
@@ -333,11 +336,18 @@ class Scenario:
             s = dict(s, base_url=f"http://localhost:{self.server['proxy_port']}")
             d = WinLocal(name, s, self.a.app_dir, DLCTL, STATE, label, gui=gui)
         elif where == "linux":
-            d = LinuxSsh(name, s, "tiny-linux", "~/tiny-dl", label)
+            d = LinuxSsh(name, s, "tiny-linux", "~/tiny-dl", label,
+                         app_dir=self.a.linux_app_dir, state_root=self.a.linux_state_dir)
+            if self.a.linux_state_dir:
+                lifecycle.register_linux(STATE, name, d.host, d.work, d.app_dir, d.state_root)
             if self.a.client_sha:
-                code, marker, _ = d.sh("cat ~/tiny-dl/bin/app/SHA")
+                code, marker, _ = d.sh("cat " + lifecycle.remote_path(d.app_dir + "/SHA"))
                 if code != 0 or not self.a.client_sha.startswith(marker.strip()) or len(marker.strip()) < 12:
                     raise RuntimeError("Linux binary source marker does not match requested SHA")
+            code, digest, _ = d.sh("sha256sum " + lifecycle.remote_path(d.app_dir + "/tinyclient"))
+            if code or not re.fullmatch(r"[0-9a-f]{64}", digest.split()[0] if digest.split() else ""):
+                raise RuntimeError("Linux binary digest could not be recorded")
+            self.platform_binary_sha256["linux"] = digest.split()[0]
         elif where == "winvm":
             d = WinVmSsh(name, s, "winbuild", "C:\\lab", label)
         self.devices[name] = d
@@ -359,6 +369,7 @@ class Scenario:
                                          os.path.join(HERE, "lib", "wingrab.ps1"), "-OutDir", frames,
                                          "-PidFile", os.path.join(self.out, "windows", "grab-pids.txt"), "-Fps", "2"],
                                         creationflags=0x08000000)
+        lifecycle.register_windows(STATE, self.grabber.pid, shutil.which("powershell.exe"))
 
     def open_dm_on_screen(self, d):
         """Clicks the first inbox row (the DM, newest) in a device's window, so the conversation, not
@@ -876,7 +887,9 @@ class Scenario:
         meta = {"run_id": self.run_id, "started": datetime.datetime.now(datetime.timezone.utc).isoformat(), "canary": self.canary,
                 "app_dir": a.app_dir, "app_version": app_version(a.app_dir), "server": {k: self.server.get(k) for k in ("tinyserver_branch", "tinyserver_sha", "tinyserver_binary_sha256", "e2ee_device_link", "link_ttl_seconds")},
                 "mode": self.mode, "history_per_conversation": a.history}
-        meta["scenario_tree"] = subprocess.check_output(["git", "-C", CLIENT, "rev-parse", "HEAD:e2e/scenarios/device-sync"], text=True).strip()
+        meta["scenario_sha"] = os.environ.get("E2E_SCENARIO_SHA", "")
+        meta["scenario_tree"] = (os.environ.get("E2E_SCENARIO_TREE", "") if meta["scenario_sha"] else
+                                 subprocess.check_output(["git", "-C", CLIENT, "rev-parse", "HEAD:e2e/scenarios/device-sync"], text=True).strip())
         if a.client_sha:
             actual = open(os.path.join(a.app_dir, "SOURCE_SHA"), encoding="utf-8").read().strip()
             if actual != a.client_sha:
@@ -965,6 +978,7 @@ class Scenario:
             verdict = "pass" if decided and not failed else ("base-as-expected" if base_like and failed else "fail")
         platforms = sorted({x["platform"] for x in A})
         summary = dict(meta, finished=datetime.datetime.now(datetime.timezone.utc).isoformat(), verdict=verdict,
+                       platform_binary_sha256=self.platform_binary_sha256,
                        failed_steps=self.L.failed_steps,
                        counts={"assertions": len(A), "passed": sum(1 for x in decided if x["ok"]), "failed": len(failed), "skipped": len(A) - len(decided)},
                        platforms={p: {"passed": sum(1 for x in decided if x["platform"] == p and x["ok"]),
@@ -972,6 +986,9 @@ class Scenario:
                        assertions=A)
         with open(os.path.join(self.out, "summary.json"), "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=1)
+        sys.path.insert(0, LAB)
+        import common
+        write_lab_result(self.out, summary, common.probe)
         lines = [f"# device-link proof {self.run_id}: {verdict}", "",
                  f"server `{meta['server']['tinyserver_branch']}@{(meta['server']['tinyserver_sha'] or '')[:9]}`, app {meta['app_version']}, link mode `{self.mode}`", "",
                  "| id | platform | result | title |", "|---|---|---|---|"]
@@ -1025,13 +1042,21 @@ def main():
     r.add_argument("--out", default="")
     r.add_argument("--extended", action="store_true", help="also prove local backup rejection/roundtrip and same-user gap fill")
     r.add_argument("--client-sha", default="", help="exact committed client source marker; also recorded in evidence")
+    r.add_argument("--linux-app-dir", default=None, help="immutable Linux app folder for the requested client commit")
+    r.add_argument("--linux-state-dir", default=None, help="owned short /tmp namespace for isolated Linux profiles")
     r.add_argument("--pg-container", default="tiny-device-sync-pg")
     r.add_argument("--pg-port", type=int, default=54361)
     r.add_argument("--http-port", type=int, default=8093)
     r.add_argument("--proxy-port", type=int, default=8094)
     r.add_argument("--oidc-port", type=int, default=54362)
+    r.add_argument("--media-port", type=int, default=50110)
     sub.add_parser("link-ops")
+    cleanup = sub.add_parser("cleanup", help="stop only devices in this state's guarded ownership registry")
+    cleanup.add_argument("--state", required=True)
     a = p.parse_args()
+    if a.cmd == "cleanup":
+        lifecycle.cleanup(a.state)
+        return 0
     if a.cmd == "link-ops":
         print(open(os.path.join(HERE, "link-ops.json")).read())
         return
