@@ -30,6 +30,9 @@ const ASK_AT_ONCE: usize = 50;
 const ANSWER_BYTES: usize = 10 * 1024;
 /// A message asked for is not asked for again sooner.
 const ASK_AGAIN: Duration = Duration::from_secs(10 * 60);
+/// Tries at asking, and the wait between them: past the server's commit batching.
+const RETRIES: usize = 4;
+const RETRY_AFTER: Duration = Duration::from_secs(35);
 /// Self messages read at once when catching up.
 const CATCH_UP: usize = 100;
 
@@ -140,13 +143,14 @@ impl Device {
         self.notes.self_conv.as_deref() == Some(conversation_id)
     }
 
-    /// Tells the siblings, best effort.
-    fn tell(&mut self, sync: &Sync) {
+    /// Tells the siblings. False when it could not go now (this device is not in its own group
+    /// yet, or the server could not be reached).
+    fn tell(&mut self, sync: &Sync) -> bool {
         let Some(conv) = self.self_conversation() else {
-            return;
+            return false;
         };
         let Some(text) = sync.text() else {
-            return;
+            return true;
         };
         let envelope = Envelope {
             text,
@@ -155,10 +159,14 @@ impl Device {
             sent_at: None,
         };
         let Ok(client_id) = super::attachment_id() else {
-            return;
+            return false;
         };
-        if let Err(why) = self.post(&conv, &client_id, Kind::Message, None, &envelope, &[]) {
-            tracing::warn!("chatd: Tiny e2ee: siblings: {why}");
+        match self.post(&conv, &client_id, Kind::Message, None, &envelope, &[]) {
+            Ok(_) => true,
+            Err(why) => {
+                tracing::warn!("chatd: Tiny e2ee: siblings: {why}");
+                false
+            }
         }
     }
 
@@ -193,16 +201,20 @@ impl Device {
         !self.siblings.wanted.is_empty()
     }
 
-    /// Asks the siblings for what is waiting.
+    /// Asks the siblings for what is waiting. What could not go stays waiting.
     pub(crate) fn ask_siblings(&mut self) {
+        let mut left = Vec::new();
         for (conv, ids) in std::mem::take(&mut self.siblings.wanted) {
             for chunk in ids.chunks(ASK_AT_ONCE) {
-                self.tell(&Sync::Want {
+                if !self.tell(&Sync::Want {
                     conv: conv.clone(),
                     ids: chunk.to_vec(),
-                });
+                }) {
+                    left.push((conv.clone(), chunk.to_vec()));
+                }
             }
         }
+        self.siblings.wanted = left;
     }
 
     /// A safety number marked or unmarked here: the siblings mark it too.
@@ -247,7 +259,7 @@ impl Device {
                     return Vec::new();
                 }
                 for answer in self.answers_for(&conv, &ids) {
-                    self.tell(&answer);
+                    let _ = self.tell(&answer);
                 }
                 Vec::new()
             }
@@ -352,13 +364,30 @@ impl Device {
 }
 
 /// After a page was read: asks the siblings for what did not open, off the reader's thread.
+/// A device not yet in its own group (the server signs a new device's Add only after
+/// `e2ee_commit_batch_secs`, 30 by default, and only when someone next asks) tries again a few
+/// times, asking the server about the group first.
 pub(crate) fn ask_soon(device: Shared) {
     if !lock(&device).has_wants() {
         return;
     }
     let _ = std::thread::Builder::new()
         .name("tiny-e2ee-siblings".into())
-        .spawn(move || lock(&device).ask_siblings());
+        .spawn(move || {
+            for attempt in 0..RETRIES {
+                if attempt > 0 {
+                    std::thread::sleep(RETRY_AFTER);
+                }
+                let mut device = lock(&device);
+                if let Some(own) = device.notes.self_conv.clone() {
+                    let _ = device.sync(&own);
+                }
+                device.ask_siblings();
+                if !device.has_wants() {
+                    return;
+                }
+            }
+        });
 }
 
 #[cfg(test)]
@@ -525,6 +554,9 @@ mod tests {
             2,
             "the person's own conversation is never asked about"
         );
+        // Not in its own group yet (here: no server at all): nothing is lost, it is asked again.
+        device.ask_siblings();
+        assert_eq!(device.siblings.wanted.len(), 2);
         let _ = std::fs::remove_dir_all(&device.dir);
     }
 
@@ -654,10 +686,22 @@ mod live {
                 Some(own.as_str()),
                 "one per person"
             );
-            for _ in 0..3 {
+            // The server signs the second device's Add only after its commit batching (30 s by
+            // default), when someone next asks; the first device then commits it.
+            let joined = (0..20).any(|_| {
                 lock(&first).sync(&own).unwrap();
                 let _ = lock(&second).sync(&own);
-            }
+                let in_group = lock(&second).engine.as_mut().is_some_and(|engine| {
+                    engine
+                        .epoch(e2ee::ConversationId(super::super::uuid(&own).unwrap()))
+                        .is_ok()
+                });
+                if !in_group {
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+                in_group
+            });
+            assert!(joined, "the second device joined the person's own group");
 
             let conv = "00000000-0000-4000-8000-0000000c0de1";
             lock(&first).remember(
