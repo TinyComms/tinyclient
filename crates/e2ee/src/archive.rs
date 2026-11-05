@@ -416,6 +416,11 @@ pub fn read<R: Read>(
 
 /// Where an archive is merged: the new device's sealed cache, as the caller keeps it.
 pub trait Target {
+    /// Check a message's application schema during the authentication-only pass, before
+    /// any target mutation. Implementations must keep this check free of side effects.
+    fn validate(&self, _conv: &str, _id: &str, _opened: &Value) -> Result<()> {
+        Ok(())
+    }
     /// The archive checked out and is about to be merged: its first record.
     fn start(&mut self, _meta: &Meta) {}
     /// Whether the person is in this conversation. Records for any other are dropped.
@@ -439,7 +444,8 @@ pub struct Merged {
 }
 
 /// Merges an archive for `user` into `target`: first a full read that only checks (the whole blob
-/// authenticates, its records are in order, it is for this person), then a second that merges.
+/// authenticates, its records are in order, it is for this person, and the target accepts each
+/// message schema), then a second that merges.
 /// `open` gives the blob from its start each time. Idempotent: a second merge adds nothing.
 pub fn merge<R: Read>(
     key: &ArchiveKey,
@@ -450,11 +456,15 @@ pub fn merge<R: Read>(
 ) -> Result<(Meta, Merged)> {
     let mut meta = None;
     read(key, link_id, open()?, |record| {
-        if let Record::Meta(found) = record {
-            if found.user != user {
-                return Err(Error::Malformed("archive: another person's"));
+        match record {
+            Record::Meta(found) => {
+                if found.user != user {
+                    return Err(Error::Malformed("archive: another person's"));
+                }
+                meta = Some(found);
             }
-            meta = Some(found);
+            Record::Msg { conv, id, opened } => target.validate(&conv, &id, &opened)?,
+            _ => {}
         }
         Ok(())
     })?;

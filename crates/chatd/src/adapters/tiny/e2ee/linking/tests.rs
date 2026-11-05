@@ -1,6 +1,7 @@
 //! Both halves of a device link, run against an in-process relay that plays the server: it relays
 //! what it is given, and in some tests changes it on the way.
 
+use super::super::Cache;
 use super::*;
 use crate::adapters::tiny::Saved;
 use e2ee::store::{FileStore, StateKey};
@@ -184,6 +185,161 @@ fn opened(text: &str, days_ago: i64) -> Opened {
         at: now_secs() - days_ago * 86_400,
         ..Opened::default()
     }
+}
+
+#[test]
+fn a_semantically_invalid_archive_imports_no_earlier_messages() {
+    let shared = device("invalid-archive-row", DeviceState::Ready);
+    let key = ArchiveKey::generate().unwrap();
+    let meta = Meta {
+        v: archive::VERSION,
+        user: USER.into(),
+        from_device: "old".into(),
+        created: "now".into(),
+        scope: Scope::All,
+    };
+    let mut writer = Writer::new(&key, b"semantic-check", &meta, Vec::new()).unwrap();
+    writer
+        .message("conversation", "first", &json!({"text": "valid"}))
+        .unwrap();
+    writer
+        .message("conversation", "second", &json!({"text": 123}))
+        .unwrap();
+    let (blob, _) = writer.finish().unwrap();
+    let mut device = lock(&shared);
+    let mut target = Merging {
+        device: &mut device,
+        members: BTreeSet::from(["conversation".to_owned()]),
+        from: String::new(),
+        touched: BTreeSet::new(),
+    };
+    let result = archive::merge(
+        &key,
+        b"semantic-check",
+        USER,
+        || Ok(blob.as_slice()),
+        &mut target,
+    );
+    assert!(result.is_err());
+    assert!(
+        device.cache("conversation").unwrap().rows.is_empty(),
+        "a rejected archive must not persist earlier valid rows"
+    );
+}
+
+#[test]
+fn export_keeps_the_latest_valid_cache_record_and_ignores_a_torn_tail() {
+    let shared = device("export-cache-versions", DeviceState::Ready);
+    let (dir, cache_key) = {
+        let device = lock(&shared);
+        (device.dir.clone(), device.cache_key.clone().unwrap())
+    };
+    let mut cache = Cache::load(&dir, "conversation", &cache_key);
+    cache.put(&cache_key, "one", opened("old", 2));
+    cache.put(&cache_key, "one", opened("updated", 0));
+    cache.put(&cache_key, "two", opened("other", 1));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&cache.path)
+        .unwrap()
+        .write_all(b"one this-is-not-a-valid-sealed-record\n")
+        .unwrap();
+    let key = ArchiveKey::generate().unwrap();
+    let meta = Meta {
+        v: archive::VERSION,
+        user: USER.into(),
+        from_device: "old".into(),
+        created: "now".into(),
+        scope: Scope::All,
+    };
+    let (blob, summary, omitted) = pack(
+        Vec::new(),
+        &key,
+        b"cache-versions",
+        &dir,
+        &cache_key,
+        &BTreeMap::new(),
+        u64::MAX,
+        &meta,
+    )
+    .unwrap();
+    assert_eq!((summary.msgs, omitted), (2, 0));
+    let mut messages = Vec::new();
+    archive::read(&key, b"cache-versions", blob.as_slice(), |record| {
+        if let archive::Record::Msg { id, opened, .. } = record {
+            messages.push((id, opened["text"].as_str().unwrap().to_owned()));
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        messages,
+        [
+            ("one".to_owned(), "updated".to_owned()),
+            ("two".to_owned(), "other".to_owned())
+        ]
+    );
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "isolated export memory budget; run with --ignored --test-threads=1"]
+fn exporting_many_conversations_does_not_hold_all_plaintext_in_memory() {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    fn peak() -> usize {
+        let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        assert_ne!(
+            unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) },
+            0
+        );
+        counters.PeakWorkingSetSize
+    }
+    let shared = device("archive-memory-budget", DeviceState::Ready);
+    let (dir, cache_key) = {
+        let device = lock(&shared);
+        (device.dir.clone(), device.cache_key.clone().unwrap())
+    };
+    for conv in 0..128 {
+        let mut cache = Cache::load(&dir, &format!("memory-{conv}"), &cache_key);
+        for row in 0..64 {
+            cache.put(
+                &cache_key,
+                &format!("row-{row}"),
+                opened(&"x".repeat(8192), 0),
+            );
+        }
+    }
+    let before = peak();
+    assert_eq!(size_of(&dir, &cache_key, Scope::All, now_secs()).0, 8192);
+    let key = ArchiveKey::generate().unwrap();
+    let meta = Meta {
+        v: archive::VERSION,
+        user: USER.into(),
+        from_device: "old".into(),
+        created: "now".into(),
+        scope: Scope::All,
+    };
+    let (_, summary, omitted) = pack(
+        std::io::sink(),
+        &key,
+        b"memory-budget",
+        &dir,
+        &cache_key,
+        &BTreeMap::new(),
+        u64::MAX,
+        &meta,
+    )
+    .unwrap();
+    assert_eq!((summary.msgs, omitted), (8192, 0));
+    let growth = peak().saturating_sub(before);
+    assert!(
+        growth < 24 * 1024 * 1024,
+        "export retained too much plaintext: peak working set grew by {growth} bytes"
+    );
 }
 
 fn quiet() -> Told {

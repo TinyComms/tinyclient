@@ -92,6 +92,13 @@ that account here (a new device) reads them. "Erase" deletes the directory and t
   (64 MiB, 3 passes) over a passphrase of at least 12 characters, with the salt and cost in a
   header that is the archive's associated data. "Import a backup…" on a device of the same person
   merges it like a device link's archive. No server ever keeps a backup.
+  Export sorts sealed cache values through a temporary SQLite index in the private encryption
+  folder, opening one message at a time. The index contains ids and cache times, but no message
+  plaintext or keys, and is removed when export finishes. Import validates every message schema
+  before writing any rows, so a malformed later record cannot leave an earlier row imported.
+  Sibling replies measure the actual encoded envelope, fragment large rows with a checked hash,
+  and page through missed replies after reconnecting; duplicate sibling publishers cannot fill
+  the partial-row budget with copies of the same requested row.
 - **Recovery key.** 128 bits from the system's random source, shown once as 26 base32 characters
   in six groups; only an HKDF check value is kept, so it can be checked later. There is no key
   backup yet (the crate has none): the page says the key backs nothing up.

@@ -16,8 +16,7 @@
 //! (`Change::Tiny`), which reads `E2eeAsk::Link`.
 
 use super::{
-    b64, device_label, fingerprint, lock, private_dir, unb64, Cache, Device, Opened, Saved, Shared,
-    CACHED,
+    b64, device_label, fingerprint, lock, private_dir, unb64, Device, Opened, Saved, Shared,
 };
 use e2ee::archive::{self, ArchiveKey, Meta, Target, Writer};
 use e2ee::link::{self, ArchiveRef, Channel, LinkCode, Message, Pending, Role, Scope};
@@ -264,7 +263,11 @@ pub(crate) fn confirm(saved: &Saved, history: &str, check: &str) -> Result<(), S
 
 /// When to ask about the groups after the person's devices changed: past the server's commit
 /// batching (`e2ee_commit_batch_secs`, 30 by default), and once more in case one was busy.
-const NUDGES: [Duration; 3] = [Duration::ZERO, Duration::from_secs(35), Duration::from_secs(40)];
+const NUDGES: [Duration; 3] = [
+    Duration::ZERO,
+    Duration::from_secs(35),
+    Duration::from_secs(40),
+];
 
 /// Settle a device addition or removal immediately, so a linked device gets its Welcome before
 /// its first send. Older servers batch membership changes, so retain the later retries too.
@@ -608,6 +611,15 @@ pub(super) struct Merging<'a> {
 }
 
 impl Target for Merging<'_> {
+    fn validate(&self, conv: &str, id: &str, opened: &Value) -> e2ee::Result<()> {
+        if !super::super::safe_id(conv) || !super::super::safe_id(id) {
+            return Err(e2ee::Error::Malformed("archive message id"));
+        }
+        serde_json::from_value::<Opened>(opened.clone())
+            .map(|_| ())
+            .map_err(|_| e2ee::Error::Malformed("archive message"))
+    }
+
     fn start(&mut self, meta: &Meta) {
         self.from = meta.from_device.chars().take(64).collect();
     }
@@ -838,14 +850,21 @@ fn cached_conversations(dir: &Path) -> Vec<String> {
 /// device's lock.
 pub(super) fn size_of(dir: &Path, key: &CacheKey, scope: Scope, now: i64) -> (u64, u64) {
     let (mut messages, mut bytes) = (0u64, 0u64);
-    for conv in cached_conversations(dir) {
-        for (id, opened) in Cache::load(dir, &conv, key).rows {
-            if within(&opened, scope, now) {
-                messages += 1;
-                bytes += serde_json::to_vec(&opened).map_or(0, |json| json.len() as u64)
-                    + (conv.len() + id.len() + 40) as u64;
-            }
-        }
+    let Ok(rows) = super::export_rows::Rows::scan(dir, cached_conversations(dir), key, |opened| {
+        within(opened, scope, now)
+    }) else {
+        return (0, 0);
+    };
+    if rows
+        .visit(key, |conv, id, opened| {
+            messages += 1;
+            bytes += serde_json::to_vec(&opened).map_or(0, |json| json.len() as u64)
+                + (conv.len() + id.len() + 40) as u64;
+            Ok(true)
+        })
+        .is_err()
+    {
+        return (0, 0);
     }
     // The archive's own records and the tags of its chunks.
     (messages, bytes + bytes / 4096 + 256)
@@ -936,25 +955,10 @@ pub(super) fn pack<W: Write>(
 ) -> e2ee::Result<(W, archive::Summary, u64)> {
     let mut writer = Writer::new(key, link_id, meta, out)?;
     let now = now_secs();
-    let mut rows: Vec<(String, String, Opened)> = Vec::new();
-    for conv in cached_conversations(dir) {
-        let mut theirs: Vec<(String, String, Opened)> = Cache::load(dir, &conv, cache_key)
-            .rows
-            .into_iter()
-            .filter(|(_, opened)| within(opened, meta.scope, now))
-            .map(|(id, opened)| (conv.clone(), id, opened))
-            .collect();
-        // Never more than one cache holds: its newest.
-        theirs.sort_by(|a, b| b.2.at.cmp(&a.2.at).then_with(|| a.1.cmp(&b.1)));
-        theirs.truncate(CACHED);
-        rows.extend(theirs);
-    }
-    // Newest first over every conversation, so what a full archive leaves out is the oldest.
-    rows.sort_by(|a, b| {
-        b.2.at
-            .cmp(&a.2.at)
-            .then_with(|| (&a.0, &a.1).cmp(&(&b.0, &b.1)))
-    });
+    let rows =
+        super::export_rows::Rows::scan(dir, cached_conversations(dir), cache_key, |opened| {
+            within(opened, meta.scope, now)
+        })?;
     let record = |json: &Value| serde_json::to_vec(json).map_or(0, |bytes| bytes.len() as u64 + 4);
     let mut tail = record(&json!({ "r": "end", "msgs": u64::MAX }));
     for (user, number) in verified {
@@ -962,19 +966,20 @@ pub(super) fn pack<W: Write>(
     }
     let mut plain =
         record(&serde_json::to_value(archive::Record::Meta(meta.clone())).unwrap_or(Value::Null));
-    let total = rows.len() as u64;
+    let total = rows.total;
     let mut sent = 0u64;
-    for (conv, id, mut opened) in rows {
+    rows.visit(cache_key, |conv, id, mut opened| {
         opened.imported_from = None;
         let value = serde_json::to_value(&opened).map_err(|_| e2ee::Error::Malformed("cache"))?;
         let size = record(&json!({ "r": "msg", "conv": conv, "id": id, "opened": value }));
         if sealed_size(plain + size + tail) > most {
-            break;
+            return Ok(false);
         }
         plain += size;
-        writer.message(&conv, &id, &value)?;
+        writer.message(conv, id, &value)?;
         sent += 1;
-    }
+        Ok(true)
+    })?;
     for (user, number) in verified {
         writer.verified(user, number)?;
     }

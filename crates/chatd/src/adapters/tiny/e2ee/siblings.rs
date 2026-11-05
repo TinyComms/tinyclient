@@ -31,7 +31,7 @@ const ASK_AT_ONCE: usize = 50;
 const FRAGMENT_BYTES: usize = 4 * 1024;
 const MAX_FRAGMENTS: usize = 16;
 const MAX_ROW_BYTES: usize = FRAGMENT_BYTES * MAX_FRAGMENTS;
-const MAX_ASSEMBLIES: usize = 32;
+const MAX_ASSEMBLIES: usize = ASK_AT_ONCE;
 /// A message asked for is not asked for again sooner.
 const ASK_AGAIN: Duration = Duration::from_secs(10 * 60);
 /// Tries at asking, and the wait between them: past the server's commit batching.
@@ -80,7 +80,8 @@ impl Sync {
     }
 
     fn fits(&self) -> bool {
-        self.text().is_some_and(|text| Envelope::message(text).encode(Kind::Message).is_ok())
+        self.text()
+            .is_some_and(|text| Envelope::message(text).encode(Kind::Message).is_ok())
     }
 }
 
@@ -98,7 +99,12 @@ pub(super) fn answers(conv: &str, rows: Vec<(String, Opened)>) -> Vec<Sync> {
         }
         let mut candidate = batch.clone();
         candidate.push((id.clone(), opened.clone()));
-        if (Sync::Have { conv: conv.to_owned(), rows: candidate.clone() }).fits() {
+        if (Sync::Have {
+            conv: conv.to_owned(),
+            rows: candidate.clone(),
+        })
+        .fits()
+        {
             batch = candidate;
             continue;
         }
@@ -108,7 +114,10 @@ pub(super) fn answers(conv: &str, rows: Vec<(String, Opened)>) -> Vec<Sync> {
                 rows: std::mem::take(&mut batch),
             });
         }
-        let single = Sync::Have { conv: conv.to_owned(), rows: vec![(id.clone(), opened)] };
+        let single = Sync::Have {
+            conv: conv.to_owned(),
+            rows: vec![(id.clone(), opened)],
+        };
         if single.fits() {
             if let Sync::Have { rows, .. } = single {
                 batch = rows;
@@ -119,8 +128,12 @@ pub(super) fn answers(conv: &str, rows: Vec<(String, Opened)>) -> Vec<Sync> {
         let total = bytes.len().div_ceil(FRAGMENT_BYTES) as u32;
         for (part, bytes) in bytes.chunks(FRAGMENT_BYTES).enumerate() {
             let reply = Sync::HavePart {
-                conv: conv.to_owned(), id: id.clone(), hash: hash.clone(),
-                part: part as u32, total, data: super::b64(bytes),
+                conv: conv.to_owned(),
+                id: id.clone(),
+                hash: hash.clone(),
+                part: part as u32,
+                total,
+                data: super::b64(bytes),
             };
             if reply.fits() {
                 out.push(reply);
@@ -145,7 +158,7 @@ pub(super) struct Siblings {
     wanted: Vec<(String, Vec<String>)>,
     /// Self messages already acted on.
     seen: BTreeSet<String>,
-    /// At most two MiB of partial row data, separated by sending device and digest. Unfinished
+    /// One request's worth of partial rows (at most 3.2 MiB), separated by sender and digest. Unfinished
     /// rows expire so retries cannot accumulate plaintext indefinitely.
     parts: HashMap<(String, String, String, String), Parts>,
 }
@@ -334,9 +347,14 @@ impl Device {
                     Vec::new()
                 }
             }
-            Sync::HavePart { conv, id, hash, part, total, data } => {
-                self.take_part(conv, id, hash, part, total, data, from_device)
-            }
+            Sync::HavePart {
+                conv,
+                id,
+                hash,
+                part,
+                total,
+                data,
+            } => self.take_part(conv, id, hash, part, total, data, from_device),
             Sync::Verified { user, number } => {
                 if super::super::safe_id(&user) && user != self.saved.user_id {
                     match number {
@@ -351,10 +369,24 @@ impl Device {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn take_part(&mut self, conv: String, id: String, hash: String, part: u32, total: u32, data: String, from: &str) -> Vec<String> {
-        if !super::super::safe_id(&conv) || !super::super::safe_id(&id) || self.is_self(&conv)
-            || total == 0 || total as usize > MAX_FRAGMENTS || part >= total
-            || hash.len() > 44 || data.len() > FRAGMENT_BYTES.div_ceil(3) * 4
+    fn take_part(
+        &mut self,
+        conv: String,
+        id: String,
+        hash: String,
+        part: u32,
+        total: u32,
+        data: String,
+        from: &str,
+    ) -> Vec<String> {
+        if !super::super::safe_id(&conv)
+            || !super::super::safe_id(&id)
+            || self.is_self(&conv)
+            || total == 0
+            || total as usize > MAX_FRAGMENTS
+            || part >= total
+            || hash.len() > 44
+            || data.len() > FRAGMENT_BYTES.div_ceil(3) * 4
         {
             return Vec::new();
         }
@@ -364,22 +396,46 @@ impl Device {
         let Some(bytes) = super::unb64(&data).filter(|bytes| bytes.len() <= FRAGMENT_BYTES) else {
             return Vec::new();
         };
-        if self.cache(&conv).is_none_or(|cache| cache.rows.contains_key(&id)) {
+        if self
+            .cache(&conv)
+            .is_none_or(|cache| cache.rows.contains_key(&id))
+        {
             return Vec::new();
         }
         let now = Instant::now();
-        self.siblings.parts.retain(|_, held| now.duration_since(held.at) < ASK_AGAIN);
+        self.siblings
+            .parts
+            .retain(|_, held| now.duration_since(held.at) < ASK_AGAIN);
         let key = (from.to_owned(), conv.clone(), id.clone(), hash);
+        // Several siblings can answer together. Reserve one publisher per requested row so
+        // duplicate replies cannot crowd other rows of the same 50-message request out.
+        if !self.siblings.parts.contains_key(&key)
+            && self
+                .siblings
+                .parts
+                .keys()
+                .any(|(_, held_conv, held_id, _)| held_conv == &conv && held_id == &id)
+        {
+            return Vec::new();
+        }
         if !self.siblings.parts.contains_key(&key) && self.siblings.parts.len() >= MAX_ASSEMBLIES {
             return Vec::new();
         }
-        let held = self.siblings.parts.entry(key.clone()).or_insert_with(|| Parts {
-            at: now, chunks: vec![None; total as usize],
-        });
+        let held = self
+            .siblings
+            .parts
+            .entry(key.clone())
+            .or_insert_with(|| Parts {
+                at: now,
+                chunks: vec![None; total as usize],
+            });
         if held.chunks.len() != total as usize {
             return Vec::new();
         }
-        if held.chunks[part as usize].as_ref().is_some_and(|before| *before != bytes) {
+        if held.chunks[part as usize]
+            .as_ref()
+            .is_some_and(|before| *before != bytes)
+        {
             self.siblings.parts.remove(&key);
             return Vec::new();
         }
@@ -395,7 +451,13 @@ impl Device {
         let Ok(opened) = serde_json::from_slice::<Opened>(&bytes) else {
             return Vec::new();
         };
-        self.act(Sync::Have { conv, rows: vec![(id, opened)] }, from)
+        self.act(
+            Sync::Have {
+                conv,
+                rows: vec![(id, opened)],
+            },
+            from,
+        )
     }
 
     /// What this device can answer to a sibling's `want`: the asked messages its cache holds.
@@ -416,6 +478,20 @@ impl Device {
         answers(conv, rows)
     }
 
+    fn self_page(&self, conv: &str, before: Option<&str>) -> Option<Vec<Value>> {
+        let path = match before {
+            Some(id) => format!("/v1/conversations/{conv}/messages?before={id}&limit={CATCH_UP}"),
+            None => format!("/v1/conversations/{conv}/messages?limit={CATCH_UP}"),
+        };
+        match self.ask("GET", &path, None) {
+            Ok((200, body)) => {
+                let rows = body.get("messages").unwrap_or(&body).as_array()?;
+                (rows.len() <= CATCH_UP).then(|| rows.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// On start: the person's own conversation is made or joined, and what the siblings said
     /// while this device was away is acted on. Answers the conversations that gained messages.
     pub(crate) fn catch_up(&mut self) -> Vec<String> {
@@ -425,39 +501,73 @@ impl Device {
         if let Err(why) = self.sync(&conv) {
             tracing::warn!("chatd: Tiny e2ee: own conversation: {why}");
         }
-        let rows = match self.ask(
-            "GET",
-            &format!("/v1/conversations/{conv}/messages?limit={CATCH_UP}"),
-            None,
-        ) {
-            Ok((200, body)) => body
-                .get("messages")
-                .cloned()
-                .unwrap_or(body)
-                .as_array()
-                .cloned()
-                .unwrap_or_default(),
-            _ => return Vec::new(),
+        let Some(mut newest) = self.self_page(&conv, None) else {
+            return Vec::new();
         };
+        // Discover older page boundaries without retaining all their ciphertext. Keep the
+        // first page as a snapshot: refetching 'newest' after a busy discovery could skip it.
+        let mut count = newest.len();
+        let mut oldest = newest
+            .first()
+            .and_then(|row| row.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut cursors = Vec::new();
+        let mut discovered = BTreeSet::new();
+        while count == CATCH_UP {
+            let Some(before) = oldest.filter(|id| super::super::safe_id(id)) else {
+                return Vec::new();
+            };
+            if !discovered.insert(before.clone()) {
+                return Vec::new();
+            }
+            let Some(page) = self.self_page(&conv, Some(&before)) else {
+                return Vec::new();
+            };
+            count = page.len();
+            oldest = page
+                .first()
+                .and_then(|row| row.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if !page.is_empty() {
+                cursors.push(before);
+            }
+        }
         let mut gained = BTreeSet::new();
-        // The server gives the newest page oldest first: in the order they were said.
-        for row in &rows {
-            let text = |name: &str| row.get(name).and_then(Value::as_str);
-            let (Some(id), Some(author_id)) = (text("id"), text("author_id")) else {
-                continue;
+        // Process complete pages oldest first so fragmented answers stay bounded, including
+        // when a reply spans a page boundary. Only two pages are ever held in memory.
+        for cursor in cursors
+            .into_iter()
+            .rev()
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
+            let rows = match cursor {
+                Some(before) => match self.self_page(&conv, Some(&before)) {
+                    Some(rows) => rows,
+                    None => break,
+                },
+                None => std::mem::take(&mut newest),
             };
-            let wire = Row {
-                id,
-                author_id,
-                kind: text("kind").unwrap_or("message"),
-                ciphertext: text("ciphertext"),
-                epoch: row.get("epoch").and_then(Value::as_u64).unwrap_or(0),
-                device_id: text("device_id").unwrap_or(""),
-                target_id: text("target_id"),
-                client_id: text("client_id"),
-                created_at: text("created_at").unwrap_or(""),
-            };
-            gained.extend(self.sibling_said(&wire));
+            for row in &rows {
+                let text = |name: &str| row.get(name).and_then(Value::as_str);
+                let (Some(id), Some(author_id)) = (text("id"), text("author_id")) else {
+                    continue;
+                };
+                let wire = Row {
+                    id,
+                    author_id,
+                    kind: text("kind").unwrap_or("message"),
+                    ciphertext: text("ciphertext"),
+                    epoch: row.get("epoch").and_then(Value::as_u64).unwrap_or(0),
+                    device_id: text("device_id").unwrap_or(""),
+                    target_id: text("target_id"),
+                    client_id: text("client_id"),
+                    created_at: text("created_at").unwrap_or(""),
+                };
+                gained.extend(self.sibling_said(&wire));
+            }
         }
         gained.into_iter().collect()
     }
@@ -525,16 +635,78 @@ mod tests {
     fn a_sync_row_that_becomes_readable_is_retried_instead_of_permanently_skipped() {
         let mut device = device("retry-readable");
         let own = device.notes.self_conv.clone().unwrap();
-        let row = Row { id: "retry-row", author_id: ME, kind: "message", ciphertext: Some("AAAA"),
-            epoch: 0, device_id: "sibling", target_id: None, client_id: None, created_at: "" };
+        let row = Row {
+            id: "retry-row",
+            author_id: ME,
+            kind: "message",
+            ciphertext: Some("AAAA"),
+            epoch: 0,
+            device_id: "sibling",
+            target_id: None,
+            client_id: None,
+            created_at: "",
+        };
         assert!(device.sibling_said(&row).is_empty());
         // Once a Welcome or another successful read makes this row available, catch-up must
         // still process its authenticated cached plaintext.
-        let answer = Sync::Have { conv: "c1".into(), rows: vec![("m1".into(), opened("recovered"))] };
+        let answer = Sync::Have {
+            conv: "c1".into(),
+            rows: vec![("m1".into(), opened("recovered"))],
+        };
         device.remember(&own, row.id, opened(&answer.text().unwrap()));
         assert_eq!(device.sibling_said(&row), ["c1"]);
         assert_eq!(device.cache("c1").unwrap().rows["m1"].text, "recovered");
-        assert!(device.sibling_said(&row).is_empty(), "a successfully handled row is deduplicated");
+        assert!(
+            device.sibling_said(&row).is_empty(),
+            "a successfully handled row is deduplicated"
+        );
+    }
+
+    #[test]
+    fn reconnect_catches_up_more_than_one_page_of_fragmented_answers() {
+        let mut receiver = device("paged-fragments");
+        receiver.self_capable = true;
+        receiver.state = protocol::DeviceState::Ready;
+        let own = receiver.notes.self_conv.clone().unwrap();
+        let text = "\"".repeat(7_000);
+        let replies = answers(
+            "c1",
+            (0..50)
+                .map(|n| (format!("message-{n}"), opened(&text)))
+                .collect(),
+        );
+        assert!(replies.len() > CATCH_UP);
+        let mut wire = Vec::new();
+        for (i, reply) in replies.into_iter().enumerate() {
+            let id = format!("self-{i:04}");
+            receiver.remember(&own, &id, opened(&reply.text().unwrap()));
+            wire.push(serde_json::json!({"id":id,"author_id":ME,"device_id":"sibling","epoch":0,"ciphertext":"AAAA"}));
+        }
+        let base = super::super::super::tests::serve(move |request| {
+            if !request.starts_with("GET /v1/conversations/") {
+                return super::super::super::tests::http(404, "Test", "{}");
+            }
+            let end = request
+                .split_once("before=")
+                .and_then(|(_, rest)| rest.split(['&', ' ']).next())
+                .and_then(|id| wire.iter().position(|row| row["id"].as_str() == Some(id)))
+                .unwrap_or(wire.len());
+            let start = end.saturating_sub(CATCH_UP);
+            super::super::super::tests::http(
+                200,
+                "Test",
+                &serde_json::json!({"messages":&wire[start..end]}).to_string(),
+            )
+        });
+        receiver.saved.base_url = base;
+        assert_eq!(receiver.catch_up(), ["c1"]);
+        let rows = &receiver.cache("c1").unwrap().rows;
+        assert_eq!(
+            rows.len(),
+            50,
+            "reconnecting must not lose answers before the newest self-message page"
+        );
+        assert!((0..50).all(|n| rows[&format!("message-{n}")].text == text));
     }
 
     #[test]
@@ -542,10 +714,15 @@ mod tests {
         let text = "x".repeat(15_000);
         assert!(Envelope::message(&text).encode(Kind::Message).is_ok());
         let replies = answers("c1", vec![("large".into(), opened(&text))]);
-        assert!(!replies.is_empty(), "a legal message must not disappear from gap fill");
+        assert!(
+            !replies.is_empty(),
+            "a legal message must not disappear from gap fill"
+        );
         let mut receiver = device("large-answer");
         for reply in replies.into_iter().rev() {
-            assert!(Envelope::message(reply.text().unwrap()).encode(Kind::Message).is_ok());
+            assert!(Envelope::message(reply.text().unwrap())
+                .encode(Kind::Message)
+                .is_ok());
             receiver.act(reply, "sibling");
         }
         assert_eq!(receiver.cache("c1").unwrap().rows["large"].text, text);
@@ -559,7 +736,12 @@ mod tests {
         assert!(!replies.is_empty());
         let mut receiver = device("escaped-answer");
         for reply in replies {
-            assert!(Envelope::message(reply.text().unwrap()).encode(Kind::Message).is_ok(), "the wire envelope must fit after both layers of escaping");
+            assert!(
+                Envelope::message(reply.text().unwrap())
+                    .encode(Kind::Message)
+                    .is_ok(),
+                "the wire envelope must fit after both layers of escaping"
+            );
             receiver.act(reply, "sibling");
         }
         assert_eq!(receiver.cache("c1").unwrap().rows["quotes"].text, text);
@@ -569,7 +751,10 @@ mod tests {
     fn fragmented_answers_are_authenticated_and_never_mix_devices() {
         let text = "\"".repeat(7_000);
         let replies = answers("c1", vec![("large".into(), opened(&text))]);
-        assert!(replies.len() > 1, "large rows use independently bounded fragments");
+        assert!(
+            replies.len() > 1,
+            "large rows use independently bounded fragments"
+        );
         let mut receiver = device("separate-fragments");
         receiver.act(replies[0].clone(), "first-device");
         for reply in replies.iter().skip(1) {
@@ -588,14 +773,47 @@ mod tests {
         for reply in replies.iter().skip(1) {
             receiver.act(reply.clone(), "sibling");
         }
-        assert!(!receiver.cache("c1").unwrap().rows.contains_key("large"), "a bad assembled hash never persists a partial row");
+        assert!(
+            !receiver.cache("c1").unwrap().rows.contains_key("large"),
+            "a bad assembled hash never persists a partial row"
+        );
         let mut oversized = serde_json::to_value(&replies[0]).unwrap();
         oversized["total"] = serde_json::json!(u32::MAX);
         receiver.act(serde_json::from_value(oversized).unwrap(), "sibling");
         for reply in replies {
             receiver.act(reply, "sibling");
         }
-        assert_eq!(receiver.cache("c1").unwrap().rows["large"].text, text, "invalid fragment counts do not prevent a later valid retry");
+        assert_eq!(
+            receiver.cache("c1").unwrap().rows["large"].text,
+            text,
+            "invalid fragment counts do not prevent a later valid retry"
+        );
+    }
+
+    #[test]
+    fn one_full_request_survives_interleaved_fragments_from_two_siblings() {
+        let text = "\"".repeat(7_000);
+        let mut replies = answers(
+            "c1",
+            (0..50)
+                .map(|n| (format!("message-{n}"), opened(&text)))
+                .collect(),
+        );
+        // Minute-rounded server ordering can interleave every first fragment before any
+        // second fragment. Multiple siblings may answer the same request concurrently.
+        replies.sort_by_key(|reply| match reply {
+            Sync::HavePart { part, .. } => *part,
+            _ => 0,
+        });
+        let mut receiver = device("interleaved-fragments");
+        for reply in replies {
+            for from in ["first-device", "second-device"] {
+                receiver.act(reply.clone(), from);
+            }
+        }
+        let rows = &receiver.cache("c1").unwrap().rows;
+        assert_eq!(rows.len(), 50);
+        assert!((0..50).all(|n| rows[&format!("message-{n}")].text == text));
     }
 
     #[test]

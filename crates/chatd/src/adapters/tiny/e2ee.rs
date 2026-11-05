@@ -2305,6 +2305,7 @@ pub(crate) fn attachment_key() -> Result<AttachmentKey, String> {
 
 mod backup;
 mod linking;
+mod export_rows;
 pub(crate) mod siblings;
 
 #[cfg(test)]
