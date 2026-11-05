@@ -232,11 +232,25 @@ async def splice(r, w):
             pass
 
 
+async def connect_upstream(host, port, cid):
+    # Windows ConnectEx can transiently reject a fresh loopback endpoint (ERROR_DUP_NAME).
+    # No HTTP bytes have been sent at this point, so these bounded connection retries cannot
+    # duplicate a message, registration or archive upload. Never retry after forwarding begins.
+    for attempt in range(3):
+        try:
+            return await asyncio.open_connection(host, port)
+        except OSError as error:
+            if getattr(error, "winerror", None) != 52 or attempt == 2:
+                raise
+            log({"conn": cid, "upstream_connect_retry": attempt + 1, "winerror": 52})
+            await asyncio.sleep(0.05 * (attempt + 1))
+
+
 async def handle(creader, cwriter):
     cid = next(conn_ids)
     host, port = ARGS.upstream.rsplit(":", 1)
     try:
-        ureader, uwriter = await asyncio.open_connection(host, int(port))
+        ureader, uwriter = await connect_upstream(host, int(port), cid)
     except OSError as e:
         log({"conn": cid, "error": f"upstream: {e}"})
         cwriter.close()
