@@ -17,13 +17,16 @@ struct Held {
     archive: Option<Vec<u8>>,
 }
 
+type Registered = (String, Vec<u8>, Vec<u8>);
+
 type Rewrite = Box<dyn FnMut(&str, Vec<u8>) -> Vec<u8> + Send>;
 
 #[derive(Default)]
 struct Fake {
     links: Mutex<BTreeMap<String, Held>>,
     moved: Condvar,
-    registered: Mutex<Vec<(String, Vec<u8>, Vec<u8>)>>,
+    /// Each registration: the device, its key, the cross-signature.
+    registered: Mutex<Vec<Registered>>,
     deleted: Mutex<Vec<String>>,
     members: BTreeSet<String>,
     /// The server in the middle: rewrites what it relays, by sender.
@@ -272,9 +275,10 @@ fn link_through(
 
 #[test]
 fn a_new_device_is_signed_and_gets_the_last_month_of_what_it_may_read() {
-    let mut fake = Fake::default();
-    fake.members = ["c1".to_owned(), "c2".to_owned()].into();
-    let relay = Arc::new(fake);
+    let relay = Arc::new(Fake {
+        members: ["c1".to_owned(), "c2".to_owned()].into(),
+        ..Fake::default()
+    });
     let rows = [
         ("c1", "m1", opened("this week", 2)),
         ("c1", "m2", opened("last year", 400)),
