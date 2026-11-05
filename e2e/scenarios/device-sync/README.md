@@ -29,12 +29,16 @@ Supply the client and server commits explicitly. Neither repo is switched or bui
 2. Build the IPC helper with `cargo build --release --manifest-path dlctl/Cargo.toml
    --target-dir "$env:LOCALAPPDATA/tiny-e2e/dlctl-target"`.
 3. In Git Bash, run `bash drivers/prepare-linux.sh <client-repo> release <client-sha>`.
+   It prints the immutable `~/tiny-dl/bin/apps/<client-sha>` path for `--linux-app-dir`.
 4. Set `DL_ADVERTISE` to the coordinator endpoint from private lab configuration when remote
-   devices need it. The default is `localhost`; no private endpoint is committed here.
+   devices need it. Supply a literal address; the local default is `127.0.0.1`.
+   No private endpoint is committed here.
 5. Run:
 
 ```powershell
 python dl.py run --app-dir <pinned-windows-binaries> --server-dir <server-repo> `
+  --client-sha <client-sha> --linux-app-dir "~/tiny-dl/bin/apps/<client-sha>" `
+  --linux-state-dir "/tmp/tiny-dl-<unique-run-id>" `
   --server-ref <server-sha> --devices desk_b,linux --history 6 --link-ttl 60 `
   --cases reject,mitm,tamper,reuse,expired --extended --out <fresh-evidence-directory>
 ```

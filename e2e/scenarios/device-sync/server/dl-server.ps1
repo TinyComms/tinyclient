@@ -47,7 +47,7 @@ param(
     # Short link lifetime for the "expired link" case, in seconds (the server allows 60..3600).
     # 0 = the server's default (300).
     [int]$LinkTtlSeconds = 0,
-    # The endpoint every device uses. Default: localhost (or DL_ADVERTISE from private config;
+    # The endpoint every device uses. Default: 127.0.0.1 (or DL_ADVERTISE from private config;
     # remote devices can reach it). Set explicitly from private lab configuration.
     [string]$Advertise = ''
 )
@@ -154,7 +154,7 @@ function Wait-Http([string]$Url, [int]$Seconds = 60) {
 function Get-Advertise {
     if ($Advertise) { return $Advertise }
     if ($env:DL_ADVERTISE) { return $env:DL_ADVERTISE }
-    return 'localhost'
+    return '127.0.0.1'
 }
 
 function Start-Db {
