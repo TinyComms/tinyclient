@@ -152,7 +152,7 @@ struct Open {
 #[derive(Default)]
 struct ReadMark {
     /// The newest message the network has been told about.
-    sent: Option<(i64, usize, String)>,
+    sent: Option<(i64, u32, usize, String)>,
     at: Option<Instant>,
     /// Seen since, waiting for the second to pass.
     next: Option<String>,
@@ -629,7 +629,7 @@ impl Pane {
             open.marker_known = true;
             // What was read before opening is not told to the network again.
             let read = open.last_read.as_deref().and_then(|id| messages.iter().find(|message| message.id == id));
-            self.read.sent = read.map(|message| (message.sent, message.id.len(), message.id.clone()));
+            self.read.sent = read.map(|message| (message.sent, message.sent_subsec_millis, message.id.len(), message.id.clone()));
         }
         self.older_failed = None;
         self.history_miss = None;
@@ -1129,7 +1129,7 @@ impl Pane {
             .filter(|(_, bounds)| on_screen(bounds))
             .filter_map(|(ix, _)| self.items.get(*ix).and_then(Item::message))
             .filter(|message| message.state == SendState::Sent)
-            .max_by_key(|message| (message.sent, message.id.len(), &message.id))
+            .max_by_key(|message| (message.sent, message.sent_subsec_millis, message.id.len(), &message.id))
             .cloned();
         if let Some(newest) = newest.filter(|_| may_mark_read(SCREENSHOTS, self.active, self.open.is_some(), true)) {
             self.saw(&newest, cx);
@@ -1139,7 +1139,7 @@ impl Pane {
     /// The user has this message on screen in the active window. The network hears of the
     /// newest such message at most once a second.
     fn saw(&mut self, message: &Message, cx: &mut Context<Self>) {
-        let order = (message.sent, message.id.len(), message.id.clone());
+        let order = (message.sent, message.sent_subsec_millis, message.id.len(), message.id.clone());
         if self.read.sent.as_ref().is_some_and(|sent| *sent >= order) {
             return;
         }
@@ -1161,14 +1161,14 @@ impl Pane {
                 let next = this.read.next.take().and_then(|id| this.find(&id));
                 // Only if it is still true: the window may have lost focus meanwhile.
                 if let Some(next) = next.filter(|_| may_mark_read(SCREENSHOTS, this.active, this.open.is_some(), true)) {
-                    this.mark_read((next.sent, next.id.len(), next.id.clone()), cx);
+                    this.mark_read((next.sent, next.sent_subsec_millis, next.id.len(), next.id.clone()), cx);
                 }
             });
         })
         .detach();
     }
 
-    fn mark_read(&mut self, order: (i64, usize, String), cx: &mut Context<Self>) {
+    fn mark_read(&mut self, order: (i64, u32, usize, String), cx: &mut Context<Self>) {
         // The last gate before the socket, whoever called.
         if !may_mark_read(SCREENSHOTS, self.active, self.open.is_some(), true) {
             return;
@@ -1176,7 +1176,7 @@ impl Pane {
         let Some(conversation) = self.key().cloned() else {
             return;
         };
-        let request = Request::MarkRead { conversation, message_id: order.2.clone() };
+        let request = Request::MarkRead { conversation, message_id: order.3.clone() };
         self.read.sent = Some(order);
         self.read.at = Some(Instant::now());
         cx.background_executor().spawn(async move { ask(&request) }).detach();
@@ -1508,7 +1508,7 @@ fn held_in_place(messages: &[Rc<Message>], first: &mut HashMap<String, i64>) -> 
         })
         .collect();
     if moved {
-        held.sort_by_key(|message| message.sent);
+        held.sort_by_key(|message| (message.sent, message.sent_subsec_millis));
     }
     held
 }

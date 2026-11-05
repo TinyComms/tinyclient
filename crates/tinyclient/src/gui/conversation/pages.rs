@@ -21,10 +21,10 @@ pub struct Window {
 }
 
 /// chatd's own order: time, then id as a number would sort.
-type Order = (i64, usize, String);
+type Order = (i64, u32, usize, String);
 
 fn order(message: &Message) -> Order {
-    (message.sent, message.id.len(), message.id.clone())
+    (message.sent, message.sent_subsec_millis, message.id.len(), message.id.clone())
 }
 
 /// What an answer says about a stretch of the conversation: everything between `from` and `to`
@@ -210,6 +210,19 @@ mod tests {
 
     fn before(id: u32) -> Page {
         Page::Before { id: id.to_string() }
+    }
+
+    #[test]
+    fn merging_subsecond_messages_keeps_the_older_end() {
+        let message = |id: &str, millis| {
+            let mut value = serde_json::to_value(Message::plain(id, "Ada", id, 20, false)).unwrap();
+            value["sent_subsec_millis"] = serde_json::json!(millis);
+            serde_json::from_value(value).unwrap()
+        };
+        let mut window = Window::default();
+        window.merge(&Page::Newest, vec![message("z-first", 100), message("a-later", 500)], false, false);
+        window.merge(&Page::Newest, vec![message("a-later", 500), message("b-final", 900)], true, false);
+        assert_eq!(window.messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["z-first", "a-later", "b-final"]);
     }
 
     #[test]

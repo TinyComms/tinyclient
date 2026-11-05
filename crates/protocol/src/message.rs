@@ -327,6 +327,9 @@ pub struct Message {
     pub sender: Sender,
     /// Unix seconds.
     pub sent: i64,
+    /// Milliseconds within `sent`, when the source supplies finer ordering.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sent_subsec_millis: u32,
     /// Unix seconds when the message's own timer (Telegram's `ttl_period`) makes it leave the
     /// store, whether the account is online or not. `None`: it does not run out on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -405,6 +408,7 @@ impl Message {
                 ..Sender::default()
             },
             sent,
+            sent_subsec_millis: 0,
             expires_at: None,
             outgoing,
             text: text.into(),
