@@ -79,6 +79,7 @@ def main():
     server = json.load(open(os.path.join(a.state, "server.json"), encoding="utf-8-sig"))
     dump = os.path.join(a.out, "server-db.sql")
     r = subprocess.run(["docker", "exec", server["pg"], "pg_dump", "-U", "postgres", "--data-only", server["pg_db"]], capture_output=True)
+    dump_ok = r.returncode == 0 and bool(r.stdout)
     open(dump, "wb").write(r.stdout)
     roots = [server["data_dir"], server["logs"], server["wire"], dump]
     ns = needles(inputs, a.probe)
@@ -105,13 +106,14 @@ def main():
         ctrl = inputs["canary"].encode() in blob
     # Clean only counts when the canary is shown to exist where it should (the client's store);
     # otherwise the search proves nothing: inconclusive (None).
-    res = {"ok": (False if hits else (True if ctrl else None)), "hits": hits, "searched": {"files": files, "bytes": total, "needles": sorted({k for k, _ in ns}), "roots": roots},
+    res = {"ok": (False if hits or not dump_ok else (True if ctrl else None)), "database_dump_ok": dump_ok,
+           "hits": hits, "searched": {"files": files, "bytes": total, "needles": sorted({k for k, _ in ns}), "roots": roots},
            "positive_control_in_client_store": ctrl}
     json.dump(res, open(os.path.join(a.out, "canary-check.json"), "w"), indent=1)
     os.remove(dump) if not hits else None   # keep the dump only when it shows a leak
     print(f"canary check: {'clean' if not hits else str(len(hits)) + ' HITS'} in {files} files / {total} bytes; "
           f"positive control (canary in Ada A's own store): {ctrl}")
-    return 0 if not hits else 1
+    return 0 if res["ok"] is True else 1
 
 
 if __name__ == "__main__":

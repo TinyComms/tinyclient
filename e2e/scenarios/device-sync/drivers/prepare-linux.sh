@@ -30,6 +30,7 @@ src=$HOME/tiny-dl/src/$short
 cd "$src"
 [ -e crates/chatd/telegram.env ] || : > crates/chatd/telegram.env
 export CARGO_TARGET_DIR=$HOME/tiny-lab/target
+export CARGO_BUILD_JOBS=1
 flag=--release; dir=release
 [ "$profile" = dev ] && { flag=; dir=debug; }
 cargo +stable build $flag -p tinyclient --features gui -p chatd -p mediad

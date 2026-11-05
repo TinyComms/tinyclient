@@ -34,6 +34,7 @@ import os
 import re
 import sys
 import time
+from urllib.parse import parse_qs, urlsplit
 
 LINK_RE = re.compile(r"^/v1/e2ee/links(?:/([A-Za-z0-9_-]+))?(/messages|/archive)?(?:\?.*)?$")
 HEAD_LIMIT = 64 * 1024
@@ -42,6 +43,25 @@ SMALL_BODY = 64 * 1024  # bodies the proxy may need to read whole (link messages
 conn_ids = itertools.count(1)
 ARGS = None
 observed = {}
+
+
+class HandshakeFault:
+    """One transient failure for a named test device; never delays other devices."""
+    def __init__(self):
+        self.used = set()
+
+    def take(self, method, path, ctl):
+        target = ctl.get("fail_handshake_once_for")
+        request = urlsplit(path)
+        device = parse_qs(request.query).get("device_id", [None])[0]
+        if (method != "GET" or not request.path.startswith("/v1/e2ee/conversations/")
+                or not request.path.endswith("/handshake") or not target or device != target or target in self.used):
+            return False
+        self.used.add(target)
+        return True
+
+
+HANDSHAKE_FAULT = HandshakeFault()
 
 
 def control():
@@ -228,6 +248,14 @@ async def handle(creader, cwriter):
             ctl = control()
             m = LINK_RE.match(path)
             rec = {"conn": cid, "method": method, "path": path.split("?")[0], "query": "?" in path}
+            if HANDSHAKE_FAULT.take(method, path, ctl):
+                await pipe_body(creader, _Sink(), headers)
+                body = b'{"error":"temporary proof handshake failure"}'
+                cwriter.write(head_bytes("HTTP/1.1 503 Service Unavailable", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))]) + body)
+                await cwriter.drain()
+                rec.update(status=503, injected="handshake_once:" + ctl["fail_handshake_once_for"])
+                log(rec)
+                continue
             if m:
                 rec["link"] = m.group(1)
                 rec["route"] = (m.group(2) or "").strip("/") or ("link" if m.group(1) else "links")

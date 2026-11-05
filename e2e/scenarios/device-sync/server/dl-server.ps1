@@ -42,6 +42,7 @@ param(
     [int]$ProxyPort = 8094,
     [int]$PgPort = 54361,
     [int]$OidcPort = 54362,
+    [string]$PgContainer = 'tiny-device-sync-pg',
     # Short link lifetime for the "expired link" case, in seconds (the server allows 60..3600).
     # 0 = the server's default (300).
     [int]$LinkTtlSeconds = 0,
@@ -92,7 +93,7 @@ $Logs = Join-Path $Srv 'logs'
 $PidFile = Join-Path $State 'pids.json'
 $Target = Join-Path $env:LOCALAPPDATA 'tiny-e2e\dl-server-target'
 $SeedDir = Join-Path $env:LOCALAPPDATA 'tiny-e2e\dl-seed'
-$Pg = 'tiny-dl-pg'
+$Pg = $PgContainer
 $MigrateUrl = "postgres://app_owner:app_owner@127.0.0.1:$PgPort/tiny_dl?sslmode=disable"
 $RuntimeUrl = "postgres://app_runtime:app_runtime@127.0.0.1:$PgPort/tiny_dl?sslmode=disable"
 
@@ -128,6 +129,7 @@ function Get-Advertise {
 }
 
 function Start-Db {
+    Assert-DbOwnership
     if (-not (docker ps -q -f "name=^$Pg$")) {
         docker rm -f $Pg 2>$null | Out-Null
         $init = Join-Path $State 'pg-init'
@@ -135,6 +137,7 @@ function Start-Db {
         $roles = (Get-Content -Raw "$TinyServerDir\docker\postgres\init\01-roles.sh") -replace "`r`n", "`n"
         [IO.File]::WriteAllText((Join-Path $init '01-roles.sh'), $roles)
         docker run -d --name $Pg -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres `
+            --label 'tiny.e2e.scenario=device-sync' --label "tiny.e2e.state=$State" `
             -e POSTGRES_DB=tinyserver -e APP_OWNER_PASSWORD=app_owner -e APP_RUNTIME_PASSWORD=app_runtime `
             -p "127.0.0.1:${PgPort}:5432" -v "${init}:/docker-entrypoint-initdb.d:ro" postgres:17-alpine | Out-Null
     }
@@ -148,6 +151,16 @@ function Start-Db {
     docker exec $Pg psql -U postgres -d tinyserver -c 'CREATE DATABASE tiny_dl OWNER app_owner' | Out-Null
     docker exec $Pg psql -U postgres -d tiny_dl -c 'ALTER SCHEMA public OWNER TO app_owner; GRANT USAGE ON SCHEMA public TO app_runtime; GRANT CONNECT ON DATABASE tiny_dl TO app_runtime;' | Out-Null
     docker exec $Pg psql -U postgres -d tiny_dl -c 'ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_runtime; ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO app_runtime; ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO app_runtime;' | Out-Null
+}
+
+function Assert-DbOwnership {
+    $existing = docker container inspect $Pg 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        $record = ($existing | ConvertFrom-Json)[0]
+        if ($record.Config.Labels.'tiny.e2e.scenario' -ne 'device-sync' -or $record.Config.Labels.'tiny.e2e.state' -ne $State) {
+            throw "refusing to change database container not owned by this fixture: $Pg"
+        }
+    }
 }
 
 function Build-All {
@@ -191,7 +204,8 @@ function Start-Serve {
     $env:TINYSERVER_PUBLIC_URL = "http://localhost:$ProxyPort"
     $env:TINYSERVER_PUBLIC_IP = $adv
     $env:TINYSERVER_MEDIA_PORT = '50110'
-    $env:TINYSERVER_OIDC_ISSUER = "http://localhost:$OidcPort"
+    # Match fake-oidc.py's discovery issuer exactly.
+    $env:TINYSERVER_OIDC_ISSUER = "http://127.0.0.1:$OidcPort"
     $env:TINYSERVER_OIDC_CLIENT_ID = 'tinyserver'
     $env:TINYSERVER_OIDC_CLIENT_SECRET = 'dev-only'
     $env:TINYSERVER_ALLOW_FAKE_SCAN = '1'
@@ -229,6 +243,7 @@ function Start-Serve {
     $info = [ordered]@{
         public_url = $public; local_url = "http://localhost:$HttpPort"; proxy_port = $ProxyPort
         tinyserver_dir = $TinyServerDir; tinyserver_sha = $ServerSha
+        tinyserver_binary_sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
         tinyserver_branch = $ServerBranch
         data_dir = $Data; upload_dir = (Join-Path $Data 'uploads'); logs = $Logs; pg = $Pg; pg_db = 'tiny_dl'
         wire = $proxyOut; proxy_control = $ctl; link_ttl_seconds = $LinkTtlSeconds
@@ -260,6 +275,7 @@ function Add-Cy {
 
 switch ($Action) {
     'down' {
+        Assert-DbOwnership
         Stop-Pids
         docker rm -f $Pg 2>$null | Out-Null
         Write-Host 'down'

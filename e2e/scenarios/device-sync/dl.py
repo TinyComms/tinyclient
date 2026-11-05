@@ -40,7 +40,7 @@ from attachments import verify_picture
 CLIENT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 SPACE = os.path.dirname(CLIENT)
 LAB = os.path.join(CLIENT, "e2e", "lab")
-STATE = os.path.join(os.environ.get("LOCALAPPDATA", "/tmp"), "tiny-e2e", "device-sync")
+STATE = os.environ.get("DL_STATE", os.path.join(os.environ.get("LOCALAPPDATA", "/tmp"), "tiny-e2e", "device-sync"))
 DLCTL = os.path.join(os.environ.get("LOCALAPPDATA", "/tmp"), "tiny-e2e", "dlctl-target", "release", "dlctl.exe")
 INSTALLED = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "tinyclient")
 
@@ -54,6 +54,7 @@ class Ledger:
         self.assertions = []
         self.files = {}
         self.failed_steps = []
+        self.platform_t0 = {}
 
     def steps_file(self, platform):
         d = os.path.join(self.out, platform)
@@ -61,7 +62,7 @@ class Ledger:
         return os.path.join(d, "steps.jsonl")
 
     def step(self, platform, words, ok, shot="", **detail):
-        line = {"t": round(time.time() - self.t0, 1), "step": words, "ok": bool(ok)}
+        line = {"t": round(time.time() - self.platform_t0.get(platform, self.t0), 1), "step": words, "ok": bool(ok)}
         if shot:
             line["shot"] = shot
         with open(self.steps_file(platform), "a", encoding="utf-8") as f:
@@ -287,6 +288,9 @@ class Scenario:
     def server_up(self):
         if self.a.reset:
             args = ["pwsh", "-NoProfile", "-File", os.path.join(HERE, "server", "dl-server.ps1"), "up"]
+            args += ["-State", STATE, "-PgContainer", self.a.pg_container,
+                     "-PgPort", str(self.a.pg_port), "-HttpPort", str(self.a.http_port),
+                     "-ProxyPort", str(self.a.proxy_port), "-OidcPort", str(self.a.oidc_port)]
             if self.a.server_dir:
                 args += ["-TinyServerDir", self.a.server_dir]
             if self.a.link_ttl:
@@ -299,6 +303,10 @@ class Scenario:
                 raise SystemExit(f"server up failed, see {log.name}")
         self.seed = json.load(open(os.path.join(STATE, "seed.json"), encoding="utf-8-sig"))
         self.server = json.load(open(os.path.join(STATE, "server.json"), encoding="utf-8-sig"))
+        if not self.a.reset and self.a.server_ref and self.a.server_dir:
+            expected = subprocess.check_output(["git", "-C", self.a.server_dir, "rev-parse", self.a.server_ref + "^{commit}"], text=True).strip()
+            if self.server["tinyserver_sha"] != expected:
+                raise RuntimeError("running fixture server SHA does not match requested ref")
         self.base = self.server["public_url"]
         with open(self.server["proxy_control"], "w") as f:
             f.write("{}")
@@ -321,6 +329,10 @@ class Scenario:
             d = WinLocal(name, s, self.a.app_dir, DLCTL, STATE, label, gui=gui)
         elif where == "linux":
             d = LinuxSsh(name, s, "tiny-linux", "~/tiny-dl", label)
+            if self.a.client_sha:
+                code, marker, _ = d.sh("cat ~/tiny-dl/bin/app/SHA")
+                if code != 0 or not self.a.client_sha.startswith(marker.strip()) or len(marker.strip()) < 12:
+                    raise RuntimeError("Linux binary source marker does not match requested SHA")
         elif where == "winvm":
             d = WinVmSsh(name, s, "winbuild", "C:\\lab", label)
         self.devices[name] = d
@@ -361,7 +373,28 @@ class Scenario:
             self.grabber.kill()
         subprocess.run([sys.executable, os.path.join(HERE, "lib", "frames2mp4.py"), frames,
                         os.path.join(self.out, "windows", "steps.jsonl"), os.path.join(self.out, "windows", "recording.mp4"),
-                        str(self.t0), f"device-link {self.run_id} windows (the coordinator: Ada A, Ada B, Bea)"])
+                        str(self.t0), f"device-sync client {self.a.client_sha[:12]} server {self.server['tinyserver_sha'][:12]} {self.run_id} windows"])
+
+    def stop_linux_recording(self):
+        device = self.devices.get("a_linux")
+        if not device or getattr(device, "recording_stopped", False):
+            return
+        raw = os.path.join(self.out, "linux", "recording-raw.mp4")
+        device.record_stop(raw)
+        device.recording_stopped = True
+        sys.path.insert(0, LAB)
+        import common
+        info = common.probe(raw)
+        if not info:
+            raise RuntimeError("Linux recording did not produce a playable clip")
+        seconds = info["seconds"]
+        steps = common.read_steps(self.L.steps_file("linux"))
+        shown = os.path.join(self.out, "linux", "recording.mp4")
+        header = f"device-sync client {self.a.client_sha[:12]} server {self.server['tinyserver_sha'][:12]} {self.run_id} linux"
+        common.caption(raw, shown, header, steps, seconds)
+        problems = common.validate(shown, seconds, steps, {"max_still_seconds": 120})
+        with open(shown + ".check.json", "w", encoding="utf-8") as file:
+            json.dump({"problems": problems, "seconds": seconds}, file, indent=1)
 
     def shot_all(self, platform, name):
         for d in self.devices.values():
@@ -658,15 +691,24 @@ class Scenario:
         vid = st.get("device_id")
         rc, ans = A.e2ee({"op": "revoke", "device_id": vid})
         self.L.step(platform, f"Ada A revokes {victim.label}", rc == 0, answer=ans if rc else None)
+        revoked_at = time.time()
         sent = {}
+        sent["H10zero"] = self.send(Bea, self.dm, f"{self.canary}-after-revoke-immediate from Bea")
         for tag, delay in (("H10a", 3), ("H10b", 30)):
-            time.sleep(delay if tag == "H10a" else delay - 3)
+            time.sleep(max(0, revoked_at + delay - time.time()))
             sent[tag] = self.send_retrying(Bea, self.dm, f"{self.canary}-after-revoke-{delay}s from Bea", 60)
         for d in others:
+            immediate_ok = d.wait_until("others read immediate revoke message", lambda: any(m.get("id") == sent["H10zero"] and readable(m) for m in (d.messages(self.dm) or [])), 60)
+            self.L.check(f"R0.{d.name}", f"{d.label} reads the message sent immediately after revocation", bool(immediate_ok), d.platform,
+                         expected_on_base=True, message_sent=bool(sent["H10zero"]))
             ok = d.wait_until("others read", lambda: any(m.get("id") == sent["H10b"] and readable(m) for m in (d.messages(self.dm) or [])), 60)
             self.L.check(f"R.{d.name}", f"{d.label} still reads new messages after the revoke", bool(ok), d.platform if d.platform != "windows" else platform, expected_on_base=True)
         time.sleep(8)
         ms = {m.get("id"): m for m in (victim.messages(self.dm) or [])}
+        immediate = ms.get(sent["H10zero"])
+        self.L.check("H10zero", f"the revoked {victim.label} cannot read ciphertext accepted for an immediate post-revoke send",
+                     bool(sent["H10zero"]) and not (immediate and readable(immediate)), platform,
+                     expected_on_base=True, message_sent=bool(sent["H10zero"]), seal=(immediate or {}).get("seal"))
         for tag, delay in (("H10a", 3), ("H10b", 30)):
             m = ms.get(sent[tag])
             self.L.check(tag, f"the revoked {victim.label} cannot read what Bea sends {delay}s after the revoke", not (m and readable(m)), platform,
@@ -685,6 +727,7 @@ class Scenario:
                          waiting_on="server + client v1")
             return
         before = len(((A.e2ee_status() or {}).get("devices") or []))
+        status_before, devices_before = rest(self.base, self.seed["sessions"]["a_desk_a"]["token"], "GET", f"/v1/e2ee/users/{A.user_id}/devices")
         N.start()
         expect = {"mitm": "abort-mismatch", "reject": "abort", "tamper": "abort", "expired": "refused-expired", "reuse": "success"}[case]
         if case == "mitm":
@@ -708,6 +751,12 @@ class Scenario:
             dl = [r for r in seen.get("wire", []) if r.get("route") == "archive" and r.get("method") == "GET"]
             self.L.check("N.tamper", "a tampered archive is rejected: nothing imported, link aborted", bool(dl) and not res["ok"] and res["why"]["unreadable"] + res["why"]["missing"] == len(self.history),
                          platform, expected_on_base=False, archive_gets=dl, state=state)
+            status_after, devices_after = rest(self.base, self.seed["sessions"]["a_desk_a"]["token"], "GET", f"/v1/e2ee/users/{A.user_id}/devices")
+            ids_before = sorted(row["device_id"] for row in devices_before) if status_before == 200 and isinstance(devices_before, list) else None
+            ids_after = sorted(row["device_id"] for row in devices_after) if status_after == 200 and isinstance(devices_after, list) else None
+            self.L.check("N.tamper.no-device", "rejecting corrupt history leaves no newly registered server device",
+                         ids_before is not None and ids_before == ids_after and state != "ready", platform,
+                         expected_on_base=False, device_ids_before=ids_before, device_ids_after=ids_after, new_state=state)
         else:
             title = {"mitm": "a key swapped by the server (MITM) changes the check code and the link aborts",
                      "reject": "the person says the codes differ: the link aborts",
@@ -740,6 +789,9 @@ class Scenario:
         with open(damaged, "wb") as file:
             file.write(data)
         for name, purpose in (("backup", "backup import"), ("gapfill", "same-user gap fill")):
+            bea_id = self.seed["people"]["bea"]["user_id"]
+            if name == "gapfill":
+                A.e2ee({"op": "verify", "user_id": bea_id, "verified": False})
             spare = dict(self.seed["sessions"]["a_spare"], base_url=f"http://localhost:{self.server['proxy_port']}")
             N = WinLocal("a_" + name, spare, self.a.app_dir, DLCTL, STATE, "Ada " + purpose, gui=not self.a.no_gui)
             self.devices[N.name] = N
@@ -747,10 +799,26 @@ class Scenario:
                 self.L.step("windows", purpose + " device starts", False)
                 continue
             self.grab_windows()
+            handshake_device = (N.e2ee_status() or {}).get("device_id") if name == "gapfill" else None
+            if handshake_device:
+                self.linker.proxy(fail_handshake_once_for=handshake_device)
             seen = self.linker.link(A, N, "windows", history="none")
             self.L.check("X." + name + ".empty-link", "the fresh device links with no history in its archive",
                          seen.get("new_final", {}).get("stage") == "done" and seen.get("new_final", {}).get("messages", 0) == 0,
                          new_final=seen.get("new_final"))
+            if name == "gapfill":
+                injected = N.wait_until("first sibling handshake transiently fails", lambda: any(
+                    row.get("injected") == "handshake_once:" + str(handshake_device) for row in self.linker.wire()), 30)
+                self.linker.proxy()
+                self.L.check("X.sync.handshake-503", "one first-sync handshake is transiently refused before the fresh device publishes sync data",
+                             bool(injected), device_id=handshake_device)
+                rc, answer = A.e2ee({"op": "verify", "user_id": bea_id, "verified": True})
+                def verified_on_fresh_device():
+                    code, person = N.e2ee({"op": "person", "user_id": bea_id})
+                    return code == 0 and isinstance(person, dict) and person.get("person", {}).get("trust") == "verified"
+                synced = N.wait_until("verified mark from sibling before local sync activity", verified_on_fresh_device, 90)
+                self.L.check("X.sync.verified", "a fresh linked device receives Ada's new verified mark before it sends any Want or Verified",
+                             rc == 0 and bool(synced), answer=answer)
             if name == "backup":
                 for case, path, phrase in (("wrong-passphrase", original, "wrong " + passphrase), ("tampered", damaged, passphrase)):
                     rc, answer = N.e2ee({"op": "import_backup", "path": path, "passphrase": phrase}, timeout=120)
@@ -774,6 +842,13 @@ class Scenario:
         meta = {"run_id": self.run_id, "started": datetime.datetime.now(datetime.timezone.utc).isoformat(), "canary": self.canary,
                 "app_dir": a.app_dir, "app_version": app_version(a.app_dir), "server": {k: self.server.get(k) for k in ("tinyserver_branch", "tinyserver_sha", "e2ee_device_link", "link_ttl_seconds")},
                 "mode": self.mode, "history_per_conversation": a.history}
+        if a.client_sha:
+            actual = open(os.path.join(a.app_dir, "SOURCE_SHA"), encoding="utf-8").read().strip()
+            if actual != a.client_sha:
+                raise RuntimeError("client source marker does not match requested SHA")
+        meta["client_sha"] = a.client_sha
+        meta["binary_sha256"] = {name: hashlib.sha256(open(os.path.join(a.app_dir, name), "rb").read()).hexdigest()
+                                 for name in ("tinyclient.exe", "chatd.exe", "mediad.exe")}
         print(json.dumps(meta))
         A = self.dev("a_desk_a", "Ada A", gui=not a.no_gui)
         Bea = self.dev("b_desk", "Bea", gui=not a.no_gui)
@@ -798,6 +873,7 @@ class Scenario:
             if "linux" in a.devices:
                 C = self.dev("a_linux", "Ada C (Linux)", where="linux")
                 C.record_start()
+                self.L.platform_t0["linux"] = time.time()
                 self.L.step("linux", "recorder on (x11grab :0)", True)
                 self.link_and_prove(A, Bea, C, "linux", "C-linux")
                 linked.append(C)
@@ -807,17 +883,20 @@ class Scenario:
                 linked.append(W)
             if Bdev and a.revoke:
                 self.revoke(A, Bea, Bdev, [A] + [d for d in linked if d is not Bdev])
+            self.stop_linux_recording()
             for case in a.cases:
                 self.negative(A, case)
             if a.extended:
                 self.extended(A)
-            if "linux" in a.devices:
-                self.devices["a_linux"].record_stop(os.path.join(self.out, "linux", "recording-raw.mp4"))
         except Exception as e:
             import traceback
             traceback.print_exc()
             self.L.step("windows", f"driver error: {type(e).__name__}: {e}", False)
         finally:
+            try:
+                self.stop_linux_recording()
+            except Exception as error:
+                print("Linux recording finalization failed:", error)
             self.stop_grabber()
             for d in self.devices.values():
                 try:
@@ -832,7 +911,7 @@ class Scenario:
                             "--inputs", os.path.join(self.out, "canary-inputs.json"), "--out", self.out], capture_output=True, text=True)
         print(r.stdout[-1500:])
         cc = json.load(open(os.path.join(self.out, "canary-check.json"))) if os.path.exists(os.path.join(self.out, "canary-check.json")) else {}
-        self.L.check("N.canary", "server DB, logs, media dir and wire hold no message plaintext, picture bytes or link secret", cc.get("ok"), "server",
+        self.L.check("N.canary", "chosen canary and link-secret needles are absent from searched server files, with a client positive control", cc.get("ok") is True, "server",
                      expected_on_base=True, hits=cc.get("hits", [])[:5], searched=cc.get("searched"))
         self.summarize(meta)
 
@@ -910,6 +989,12 @@ def main():
     r.add_argument("--no-record", action="store_true")
     r.add_argument("--out", default="")
     r.add_argument("--extended", action="store_true", help="also prove local backup rejection/roundtrip and same-user gap fill")
+    r.add_argument("--client-sha", default="", help="exact committed client source marker; also recorded in evidence")
+    r.add_argument("--pg-container", default="tiny-device-sync-pg")
+    r.add_argument("--pg-port", type=int, default=54361)
+    r.add_argument("--http-port", type=int, default=8093)
+    r.add_argument("--proxy-port", type=int, default=8094)
+    r.add_argument("--oidc-port", type=int, default=54362)
     sub.add_parser("link-ops")
     a = p.parse_args()
     if a.cmd == "link-ops":

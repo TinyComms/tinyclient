@@ -39,6 +39,13 @@ Stop the throwaway fixture with `pwsh -File server/dl-server.ps1 down` after pre
 The paired base run uses the shipped app with `--mode legacy` and its own fresh evidence folder.
 A base failure remains a nonzero process exit and is identified by `base-as-expected` in the ledger.
 
+Each database container carries scenario and state-directory ownership labels. The fixture refuses
+to reset or remove a container with other labels. Use `--pg-container`, `--pg-port`, `--http-port`,
+`--proxy-port`, `--oidc-port`, and `DL_STATE` for a separate concurrent fixture; pass the same
+container and state parameters to `dl-server.ps1 down`. Never use another test run's container.
+`--client-sha` checks the Windows build's `SOURCE_SHA` file and Linux build's source marker, keeps
+binary SHA-256 values, and burns the client/server SHAs into the desktop recording captions.
+
 ## Lab integration boundary
 
 The descriptor travels with feature changes so the PR gate can locate the scenario. The current
@@ -48,6 +55,8 @@ post `e2e-proof`, claim all-platform coverage, or convert a standalone scratch r
 Android, iOS and macOS are gaps. Add `--extended` to run backup export, wrong-passphrase and
 tampered-file rejection, a nonempty import roundtrip, and same-user gap fill after linking with
 no archive history. Keep `release` false until the whole required platform plan is recorded.
+The extended sync case injects one transient handshake 503 for the fresh device and checks that
+an old device's new verified mark reaches it before it sends any local Want or Verified message.
 
 The device-sync feature stack requires `--extended`: its evidence must include a nonempty
 backup import and sibling gap fill, as well as the initial linked-device send. The descriptor
