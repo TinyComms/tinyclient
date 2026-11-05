@@ -86,6 +86,14 @@ class CoordinatorContract(unittest.TestCase):
         (out / "lab-result.json").write_text(json.dumps(manifest))
         return self.returncode
 
+    def test_staged_cleanup_receives_the_pinned_server_checkout(self):
+        session = coordinated.Session(self.config)
+        session.run(self.ctx)
+        self.assertEqual(len(self.cleanups), 1)
+        self.assertTrue(any(isinstance(value, str) and value == self.config["server_dir"]
+                            for value in self.cleanups[0]),
+                        "cleanup would resolve a nonexistent server sibling of the staged export")
+
     def test_two_platforms_share_one_execution_and_keep_separate_evidence(self):
         session = coordinated.Session(self.config)
         windows = session.run(self.ctx)

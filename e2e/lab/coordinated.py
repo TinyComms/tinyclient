@@ -54,9 +54,9 @@ def _invoke(command, env, log, timeout):
             raise
 
 
-def _cleanup(scenario_dir, state, container, env, log):
+def _cleanup(scenario_dir, state, container, env, log, server_dir):
     command = ["pwsh", "-NoProfile", "-File", str(Path(scenario_dir) / "server/dl-server.ps1"),
-               "down", "-State", str(state), "-PgContainer", container]
+               "down", "-State", str(state), "-PgContainer", container, "-TinyServerDir", server_dir]
     with open(log, "a", encoding="utf-8") as output:
         try:
             subprocess.run([sys.executable, str(Path(scenario_dir) / "dl.py"), "cleanup", "--state", str(state)],
@@ -158,7 +158,7 @@ class Session:
         try:
             code = _invoke(command, env, log, self.config["timeout_seconds"])
         finally:
-            _cleanup(str(staged_scenario), state, container, env, str(run_root / "cleanup.log"))
+            _cleanup(str(staged_scenario), state, container, env, str(run_root / "cleanup.log"), self.config["server_dir"])
         return self._outcomes(ctx, evidence, code)
 
     def _outcomes(self, ctx, evidence, code):

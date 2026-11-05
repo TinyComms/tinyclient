@@ -102,7 +102,10 @@ function Save-Pid([string]$Name, [int]$Id) {
     $pids = @{}
     if (Test-Path $PidFile) { (Get-Content $PidFile -Raw | ConvertFrom-Json).psobject.Properties | ForEach-Object { $pids[$_.Name] = $_.Value } }
     $process = Get-Process -Id $Id -ErrorAction Stop
-    $pids[$Name] = @{ pid=$Id; creation_ticks=$process.StartTime.ToUniversalTime().Ticks.ToString(); executable=$process.Path }
+    try {
+        $null = $process.Handle
+        $pids[$Name] = @{ pid=$Id; creation_ticks=$process.StartTime.ToUniversalTime().Ticks.ToString(); executable=$process.Path }
+    } finally { $process.Dispose() }
     $pids | ConvertTo-Json -Depth 5 | Set-Content $PidFile
 }
 function Stop-Pids([string[]]$Only = @()) {
@@ -121,6 +124,8 @@ function Stop-Pids([string[]]$Only = @()) {
         }
         $process = Get-Process -Id $entry.pid -ErrorAction SilentlyContinue
         if (-not $process) { return }
+        try {
+        $null = $process.Handle
         if (-not $entry.creation_ticks -or -not $entry.executable -or
             $process.StartTime.ToUniversalTime().Ticks.ToString() -ne $entry.creation_ticks -or $process.Path -ne $entry.executable) {
             $keep[$_.Name]=$entry
@@ -134,6 +139,7 @@ function Stop-Pids([string[]]$Only = @()) {
             $keep[$_.Name]=$entry
             $failures.Add("owned process stop failed: $($_.Name)")
         }
+        } finally { $process.Dispose() }
     }
     if ($keep.Count) { $keep | ConvertTo-Json -Depth 5 | Set-Content $PidFile } else { Remove-Item $PidFile }
     if ($failures.Count) { throw ($failures -join '; ') }

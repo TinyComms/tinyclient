@@ -38,12 +38,15 @@ $ErrorActionPreference='Stop'
 $r = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $p = Get-Process -Id $r.pid -ErrorAction SilentlyContinue
 if (-not $p) { if ($r.action -eq 'inspect') { throw 'owned process exited before identity capture' }; exit 0 }
+try {
+$null = $p.Handle
 $actual = @{pid=$p.Id; creation_ticks=$p.StartTime.ToUniversalTime().Ticks.ToString(); executable=$p.Path}
 if ($actual.executable -ne $r.executable) { throw 'owned process executable identity mismatch' }
 if ($r.action -eq 'inspect') { $actual | ConvertTo-Json -Compress; exit 0 }
 if ($actual.creation_ticks -ne $r.creation_ticks) { throw 'owned process creation identity mismatch' }
 $p.Kill()
-$p.WaitForExit(10000) | Out-Null
+if (-not $p.WaitForExit(10000)) { throw 'owned process did not exit' }
+} finally { $p.Dispose() }
 '''
     response = subprocess.run(["powershell.exe", "-NoProfile", "-Command", script],
                               input=json.dumps(dict(record, action=action)), capture_output=True,
