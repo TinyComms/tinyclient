@@ -640,3 +640,125 @@ fn history_over_the_servers_limit_sends_the_newest_and_says_how_many_stayed() {
     .unwrap();
     assert_eq!(none_left, 0);
 }
+
+/// The whole link against a real tinyserver with `e2ee_device_link`: two sessions of one person in
+/// `TINY_LINK_SESSIONS` (a JSON array of Tiny sessions), and nobody's device registered for them
+/// yet. The first becomes their first device, reads (here: is given) a message of a conversation
+/// they are in, and links the second, which must come out registered, approved by the first, with
+/// the message. Both are revoked at the end, so the person is left as they were.
+///
+/// `cargo test -p chatd --no-default-features --lib linking::tests::live -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn live_a_real_server_links_a_device_with_its_history() {
+    let Ok(text) = std::env::var("TINY_LINK_SESSIONS") else {
+        eprintln!("TINY_LINK_SESSIONS is not set");
+        return;
+    };
+    let rows: Vec<Value> = serde_json::from_str(&text).expect("a JSON array");
+    let sessions: Vec<Saved> = rows
+        .iter()
+        .map(|row| crate::adapters::tiny::parse(&row.to_string()).expect("a Tiny session"))
+        .collect();
+    let (one, two) = (&sessions[0], &sessions[1]);
+    assert_eq!(one.user_id, two.user_id, "two sessions of one person");
+    let make = |saved: &Saved, name: &str| -> Shared {
+        let mut saved = saved.clone();
+        saved.e2ee = Some(super::super::Secrets::generate().unwrap());
+        let mut device = Device::new(&saved);
+        device.dir = std::env::temp_dir().join(format!(
+            "chatd-e2ee-link-live-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&device.dir);
+        Arc::new(Mutex::new(device))
+    };
+    let first = make(one, "first");
+    let active = lock(&first).list(&one.user_id).unwrap();
+    if !active.is_empty() {
+        eprintln!(
+            "this person already has {} device(s): not touching them",
+            active.len()
+        );
+        return;
+    }
+    lock(&first).enrol();
+    assert_eq!(
+        lock(&first).state,
+        DeviceState::Ready,
+        "the first device is trusted on first use"
+    );
+    assert!(lock(&first).linking, "the server links devices");
+    let second = make(two, "second");
+    lock(&second).enrol();
+    assert!(matches!(
+        lock(&second).state,
+        DeviceState::AwaitingApproval { .. }
+    ));
+
+    let relay_one: Arc<dyn Relay> = Arc::new(Http { saved: one.clone() });
+    let relay_two: Arc<dyn Relay> = Arc::new(Http { saved: two.clone() });
+    let member_of = relay_one.conversations().unwrap();
+    let conv = member_of
+        .iter()
+        .next()
+        .cloned()
+        .expect("the person is in a conversation");
+    lock(&first).remember(
+        &conv,
+        "00000000-0000-4000-8000-00000000c0de",
+        opened("from before the link", 1),
+    );
+
+    let new_job = Arc::new(Linking::new(Role::New, quiet()));
+    let old_job = Arc::new(Linking::new(Role::Old, quiet()));
+    let new_thread = {
+        let (job, device, relay) = (new_job.clone(), second.clone(), relay_two.clone());
+        std::thread::spawn(move || run_new(&job, &device, relay.as_ref()))
+    };
+    let code = loop {
+        let view = lock(&new_job.state).view.clone();
+        assert_ne!(view.stage, LinkStage::Failed, "{}", view.error);
+        if !view.code.is_empty() {
+            break LinkCode::parse(&view.code).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let old_thread = {
+        let (job, device, relay) = (old_job.clone(), first.clone(), relay_one.clone());
+        std::thread::spawn(move || run_old(&job, &device, relay.as_ref(), &code))
+    };
+    let at_old = reaches(&old_job, LinkStage::Confirm);
+    assert_eq!(at_old.check, reaches(&new_job, LinkStage::Confirm).check);
+    say_yes(&old_job, Scope::All);
+    let new_result = new_thread.join().unwrap();
+    let old_result = old_thread.join().unwrap();
+    eprintln!("new: {new_result:?}, old: {old_result:?}");
+
+    let mut second_device = lock(&second);
+    second_device.enrol();
+    let ready = second_device.state == DeviceState::Ready;
+    let read = second_device.cache(&conv).and_then(|cache| {
+        cache
+            .rows
+            .get("00000000-0000-4000-8000-00000000c0de")
+            .map(|o| o.text.clone())
+    });
+    // Leave the person as they were, whatever happened.
+    for device in [&*second_device, &*lock(&first)] {
+        if let Some(engine) = device.engine.as_ref() {
+            let _ = device.ask(
+                "DELETE",
+                &format!("/v1/e2ee/devices/{}", engine.device_id()),
+                None,
+            );
+        }
+    }
+    for dir in [second_device.dir.clone(), lock(&first).dir.clone()] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    assert_eq!(new_result, Ok(1));
+    assert_eq!(old_result, Ok(()));
+    assert!(ready, "the new device is registered and trusted");
+    assert_eq!(read.as_deref(), Some("from before the link"));
+}
