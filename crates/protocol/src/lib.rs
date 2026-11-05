@@ -73,6 +73,10 @@ pub(crate) fn is_zero64(value: &u64) -> bool {
     *value == 0
 }
 
+pub(crate) fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Network {
