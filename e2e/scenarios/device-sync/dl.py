@@ -826,7 +826,9 @@ class Scenario:
                          new_final=seen.get("new_final"))
             if name == "sync":
                 injected = N.wait_until("first sibling handshake transiently fails", lambda: any(
-                    row.get("injected") == "handshake_once:" + str(handshake_device) for row in self.linker.wire()), 30)
+                    row.get("injected") == "handshake_once:" + str(handshake_device)
+                    and row.get("path") == f"/v1/e2ee/conversations/{self_conversation}/handshake"
+                    for row in self.linker.wire()), 30)
                 self.linker.proxy()
                 self.L.check("X.sync.handshake-503", "one first-sync handshake is transiently refused before the fresh device publishes sync data",
                              bool(injected), device_id=handshake_device)
