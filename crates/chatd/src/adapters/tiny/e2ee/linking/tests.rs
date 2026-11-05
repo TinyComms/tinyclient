@@ -226,6 +226,16 @@ fn link_through(
     scope: Scope,
     between: impl FnOnce(&E2eeLink, &E2eeLink),
 ) -> Run {
+    link_through_with(relay, rows, scope, None, between)
+}
+
+fn link_through_with(
+    relay: Arc<Fake>,
+    rows: &[(&str, &str, Opened)],
+    scope: Scope,
+    commands: Option<std::sync::mpsc::Sender<crate::adapters::Command>>,
+    between: impl FnOnce(&E2eeLink, &E2eeLink),
+) -> Run {
     let tag = format!("{:?}{}", scope, rows.len());
     let new = device(
         &format!("new-{tag}"),
@@ -234,6 +244,7 @@ fn link_through(
         },
     );
     let old = device(&format!("old-{tag}"), DeviceState::Ready);
+    lock(&new).commands = commands;
     {
         let mut old = lock(&old);
         for (conv, id, opened) in rows {
@@ -765,4 +776,35 @@ fn live_a_real_server_links_a_device_with_its_history() {
     assert_eq!(old_result, Ok(()));
     assert!(ready, "the new device is registered and trusted");
     assert_eq!(read.as_deref(), Some("from before the link"));
+}
+
+#[test]
+fn what_a_link_brings_in_is_read_again_and_the_groups_it_touches_are_known() {
+    let relay = Arc::new(Fake {
+        members: ["c1".to_owned(), "c2".to_owned()].into(),
+        ..Fake::default()
+    });
+    let rows = [
+        ("c1", "m1", opened("one", 1)),
+        ("c2", "m2", opened("two", 1)),
+    ];
+    let (commands, inbox) = std::sync::mpsc::channel();
+    let run = link_through_with(relay, &rows, Scope::All, Some(commands), |_, _| {});
+    assert_eq!(run.new_result, Ok(2));
+    let mut reloaded: Vec<String> = inbox
+        .try_iter()
+        .filter_map(|command| match command {
+            crate::adapters::Command::Backfill(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    reloaded.sort();
+    assert_eq!(
+        reloaded,
+        vec!["c1".to_owned(), "c2".to_owned()],
+        "each conversation that gained rows"
+    );
+    // What a nudge after the link would ask about on the old device.
+    let known = lock(&run.old).known_encrypted();
+    assert!(known.contains("c1") && known.contains("c2"), "{known:?}");
 }

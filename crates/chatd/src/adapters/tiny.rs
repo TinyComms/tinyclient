@@ -1103,7 +1103,7 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
         .spawn(move || {
             // This install as an encryption device of the person, before any conversation is read:
             // made, registered, key packages up. Never stops the account.
-            e2ee::begin(&saved);
+            e2ee::begin(&saved, ctx.commands.clone());
             messages::refresh(&ctx, &saved);
             serve_commands(
                 &ctx,

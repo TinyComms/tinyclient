@@ -435,6 +435,8 @@ pub(crate) struct Device {
     checked: BTreeSet<String>,
     /// The server relays device links (`e2ee_device_link`).
     linking: bool,
+    /// The adapter's inbox, once the account started.
+    commands: Option<std::sync::mpsc::Sender<crate::adapters::Command>>,
     /// The largest archive one link carries (`e2ee_link_archive_max`).
     link_max: u64,
 }
@@ -480,9 +482,12 @@ pub(crate) fn started(saved: &Saved) -> Option<Shared> {
 }
 
 /// Signs this install in as a device: called when the account starts. Never fails the account.
-pub(crate) fn begin(saved: &Saved) {
+/// `commands` is the adapter's own inbox: what this module took in by itself (a device link's
+/// history) is shown by asking the adapter to read those conversations again.
+pub(crate) fn begin(saved: &Saved, commands: std::sync::mpsc::Sender<crate::adapters::Command>) {
     let shared = device(saved);
     let mut device = lock(&shared);
+    device.commands = Some(commands);
     device.enrol();
 }
 
@@ -744,6 +749,7 @@ impl Device {
             files: HashMap::new(),
             checked: BTreeSet::new(),
             linking: false,
+            commands: None,
             link_max: linking::ARCHIVE_MAX,
         }
     }
@@ -1097,6 +1103,42 @@ impl Device {
 
     /// Brings this device's view of one conversation's group up to date: verifies the members,
     /// starts the group if nobody has, applies the handshake feed, and commits what is pending.
+    /// Has the adapter read these conversations' newest messages again, which now open from the
+    /// cache: they gained rows this device did not open itself.
+    fn reload(&self, conversations: &BTreeSet<String>) {
+        let Some(commands) = &self.commands else {
+            return;
+        };
+        for conversation in conversations {
+            let _ = commands.send(crate::adapters::Command::Backfill(conversation.clone()));
+        }
+    }
+
+    /// The encrypted conversations this device knows of: the ones the server said are, and the
+    /// ones it has opened messages of.
+    fn known_encrypted(&self) -> BTreeSet<String> {
+        let mut out: BTreeSet<String> = self
+            .encrypted
+            .iter()
+            .filter(|(_, encrypted)| **encrypted)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(conv) = name
+                    .strip_prefix("cache-")
+                    .and_then(|rest| rest.strip_suffix(".log"))
+                {
+                    if super::safe_id(conv) {
+                        out.insert(conv.to_owned());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub(crate) fn sync(&mut self, conversation_id: &str) -> Result<(), String> {
         if !self.ready() {
             return Err("This device isn't set up for encrypted messages yet.".to_owned());
@@ -2112,7 +2154,15 @@ pub(crate) fn answer(
             },
         },
         E2eeAsk::Approve { code } => done(device.approve(&code)),
-        E2eeAsk::Revoke { device_id } => done(device.revoke(&device_id)),
+        E2eeAsk::Revoke { device_id } => {
+            let revoked = device.revoke(&device_id);
+            drop(device);
+            if revoked.is_ok() {
+                // Out of every group soon, not when someone next happens to send.
+                linking::nudge(shared.clone());
+            }
+            done(revoked)
+        }
         E2eeAsk::Verify { user_id, verified } => done(device.verify(&user_id, verified)),
         E2eeAsk::AcceptIdentity { user_id } => done(device.accept_identity(&user_id)),
         E2eeAsk::RecoveryKey => match device.recovery_key() {
