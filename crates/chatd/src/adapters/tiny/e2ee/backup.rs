@@ -124,6 +124,7 @@ pub(super) fn import(
         device: &mut device,
         members,
         from: String::new(),
+        touched: std::collections::BTreeSet::new(),
     };
     let merged = match archive::merge(&key, &first, &user, open, &mut into) {
         Ok((_, merged)) => merged,
@@ -137,6 +138,8 @@ pub(super) fn import(
         Err(_) => return Err(unreadable.to_owned()),
     };
     into.device.save_notes();
+    // What came in shows now, not when a newer message next arrives.
+    into.device.reload(&into.touched);
     Ok(merged.added)
 }
 
@@ -217,6 +220,8 @@ mod tests {
         );
 
         let fresh = device("fresh", ADA);
+        let (commands, inbox) = std::sync::mpsc::channel();
+        lock(&fresh).commands = Some(commands);
         let members: std::collections::BTreeSet<String> = ["c1".to_owned()].into();
         assert!(import(&fresh, &path, "a long passphrase?", members.clone())
             .unwrap_err()
@@ -229,6 +234,18 @@ mod tests {
             import(&fresh, &path, "a long passphrase", members),
             Ok(0),
             "a second import adds nothing"
+        );
+        let reloaded: Vec<String> = inbox
+            .try_iter()
+            .filter_map(|command| match command {
+                crate::adapters::Command::Backfill(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reloaded,
+            vec!["c1".to_owned()],
+            "what came in is read again"
         );
         let mut fresh = lock(&fresh);
         assert_eq!(

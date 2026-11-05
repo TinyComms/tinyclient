@@ -262,6 +262,36 @@ pub(crate) fn confirm(saved: &Saved, history: &str, check: &str) -> Result<(), S
     Ok(())
 }
 
+/// When to ask about the groups after the person's devices changed: past the server's commit
+/// batching (`e2ee_commit_batch_secs`, 30 by default), and once more in case one was busy.
+const NUDGES: [Duration; 2] = [Duration::from_secs(35), Duration::from_secs(40)];
+
+/// The person's devices changed (one added from here, or revoked). The server signs the Add or
+/// Remove for each of their encrypted conversations only after its batching window, and only
+/// when a device next asks about that conversation; until then a new device cannot send there
+/// and a revoked one still reads. So this device asks, past the window, and commits what it is
+/// given.
+pub(super) fn nudge(device: Shared) {
+    let _ = std::thread::Builder::new()
+        .name("tiny-e2ee-nudge".into())
+        .spawn(move || {
+            for wait in NUDGES {
+                std::thread::sleep(wait);
+                let conversations = lock(&device).known_encrypted();
+                for conversation in conversations {
+                    // One at a time: reading and sending go on in between.
+                    let mut device = lock(&device);
+                    if !device.ready() {
+                        return;
+                    }
+                    if let Err(why) = device.sync(&conversation) {
+                        tracing::debug!("chatd: Tiny e2ee: {conversation}: {why}");
+                    }
+                }
+            }
+        });
+}
+
 pub(crate) fn cancel(saved: &Saved) {
     if let Some(linking) = lock(links()).get(&key_of(saved)).cloned() {
         lock(&linking.state).stop = true;
@@ -322,6 +352,10 @@ pub(super) fn start_old(
         .spawn(move || {
             let relay = Http { saved };
             let result = run_old(&job, &device, &relay, &code).map(|()| 0);
+            if result.is_ok() {
+                // In every group soon, so it can send at once, not when someone else next does.
+                nudge(device.clone());
+            }
             job.end(result);
         })
         .map_err(|err| err.to_string())?;
@@ -546,6 +580,7 @@ fn take_in(
             device: &mut device,
             members,
             from: String::new(),
+            touched: BTreeSet::new(),
         };
         let open = || std::fs::File::open(&path).map_err(|err| e2ee::Error::Io(err.to_string()));
         let (meta, merged) = archive::merge(&key, link_id, user, open, &mut into)
@@ -558,6 +593,7 @@ fn take_in(
             meta.from_device
         );
         into.device.save_notes();
+        into.device.reload(&into.touched);
         Ok(merged.added)
     })();
     let _ = std::fs::remove_file(&path);
@@ -570,6 +606,8 @@ pub(super) struct Merging<'a> {
     pub members: BTreeSet<String>,
     /// The device the archive is from, from its first record.
     pub from: String,
+    /// Conversations that gained rows: read again once merged.
+    pub touched: BTreeSet<String>,
 }
 
 impl Target for Merging<'_> {
@@ -595,6 +633,7 @@ impl Target for Merging<'_> {
         }
         opened.imported_from = Some(self.from.clone());
         self.device.remember(conv, id, opened);
+        self.touched.insert(conv.to_owned());
         Ok(())
     }
 
