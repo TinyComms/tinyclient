@@ -262,9 +262,9 @@ impl Fields {
         let link_code = cx.new(|cx| TextInput::new("tiny-link-1.…", cx));
         let link_check = cx.new(|cx| TextInput::new("000 000", cx));
         let recovery_check = cx.new(|cx| TextInput::new("Type your recovery key to check it", cx));
-        let backup_passphrase = cx.new(|cx| TextInput::new("", cx));
-        let backup_again = cx.new(|cx| TextInput::new("", cx));
-        let backup_open = cx.new(|cx| TextInput::new("", cx));
+        let backup_passphrase = cx.new(|cx| TextInput::secret("Passphrase · 12+ characters", cx));
+        let backup_again = cx.new(|cx| TextInput::secret("Confirm passphrase", cx));
+        let backup_open = cx.new(|cx| TextInput::secret("Backup passphrase", cx));
         for input in [&name, &description, &welcome, &image_max, &file_max, &role_name, &role_color, &member_search, &ban_search, &room_name, &room_topic, &category_name, &bot_name, &confirm, &link_code, &link_check, &recovery_check, &backup_passphrase, &backup_again, &backup_open] {
             cx.subscribe(input, |_, _, _: &crate::gui::input::InputEvent, cx| cx.notify()).detach();
             // Escape in a field leaves Server Settings, as it does anywhere else in it.
@@ -347,7 +347,7 @@ impl Shell {
         if page == Page::Bots && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.bots.asked) {
             self.tiny_bots_load(cx);
         }
-        if page == Page::Encryption && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.encryption.asked) {
+        if page == Page::Encryption {
             self.tiny_e2ee_load(cx);
         }
         // An owner's page is the server's own outline, read once.
@@ -367,6 +367,9 @@ impl Shell {
 
     fn tiny_settings_page(&mut self, page: Page, cx: &mut Context<Self>) {
         if let Some(overlay) = self.tiny_state.settings.as_mut() {
+            if overlay.page != page {
+                overlay.encryption.invalidate_reads();
+            }
             overlay.page = page;
             overlay.error = None;
             overlay.saved = false;

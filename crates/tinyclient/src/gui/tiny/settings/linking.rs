@@ -113,21 +113,21 @@ impl Shell {
 
     /// Reads the link in progress; while history moves, again a moment later.
     pub(in crate::gui) fn tiny_e2ee_link_load(&mut self, cx: &mut Context<Self>) {
-        let Some(account) = self.tiny_state.account.clone() else {
-            return;
-        };
+        let Some(visit) = self.tiny_e2ee_visit() else { return; };
+        let Some(read) = self.tiny_e2ee_draft_for(&visit).and_then(|draft| draft.begin_link(&visit.account, true)) else { return; };
+        let account = visit.account.clone();
         self.off_thread(
             cx,
             move || ask(&Request::TinyE2ee { account, ask: E2eeAsk::Link }),
             move |this, answer, cx| {
+                let Some(draft) = this.tiny_e2ee_draft_for(&read.visit) else { return; };
+                let Some(again) = draft.complete_link(&read, Some(&read.visit.account), true) else { return; };
                 let Ok(Response::TinyE2eeLink { link }) = answer else {
+                    if again { this.tiny_e2ee_link_load(cx); }
                     return;
                 };
                 let finished = link.as_ref().is_some_and(|link| link.stage == LinkStage::Done);
                 let moving = link.as_ref().is_some_and(|link| matches!(link.stage, LinkStage::OwnerApproval | LinkStage::Sending | LinkStage::Receiving));
-                let Some(draft) = this.encryption_draft() else {
-                    return;
-                };
                 let was_done = draft.link.as_ref().is_some_and(|link| link.stage == LinkStage::Done);
                 // The QR is made once per code.
                 let code = link.as_ref().map(|link| link.code.clone()).unwrap_or_default();
@@ -136,15 +136,20 @@ impl Shell {
                 }
                 draft.link = link;
                 if finished && !was_done {
-                    // The device's own state changed with it.
                     this.tiny_e2ee_load(cx);
                 }
-                if moving {
+                if again {
+                    this.tiny_e2ee_link_load(cx);
+                } else if moving {
+                    let visit = read.visit;
                     cx.spawn(async move |this, cx| {
                         cx.background_executor().timer(PROGRESS).await;
-                        let _ = this.update(cx, |this, cx| this.tiny_e2ee_link_load(cx));
-                    })
-                    .detach();
+                        let _ = this.update(cx, |this, cx| {
+                            if this.tiny_e2ee_draft_for(&visit).is_some() {
+                                this.tiny_e2ee_link_load(cx);
+                            }
+                        });
+                    }).detach();
                 }
                 cx.notify();
             },
@@ -153,9 +158,8 @@ impl Shell {
 
     /// One link ask; what it answers is in the next read of the link.
     fn tiny_e2ee_link_do(&mut self, ask_for: E2eeAsk, cx: &mut Context<Self>) {
-        let Some(account) = self.tiny_state.account.clone() else {
-            return;
-        };
+        let Some(visit) = self.tiny_e2ee_visit() else { return; };
+        let account = visit.account.clone();
         if let Some(draft) = self.encryption_draft() {
             draft.error = None;
             draft.note = None;
@@ -165,7 +169,8 @@ impl Shell {
             cx,
             move || ask(&Request::TinyE2ee { account, ask: ask_for }),
             move |this, answer, cx| {
-                if let Some(draft) = this.encryption_draft() {
+                let Some(draft) = this.tiny_e2ee_draft_for(&visit) else { return; };
+                {
                     match answer {
                         Ok(Response::Ok) => {}
                         Ok(Response::Error { detail, .. }) => draft.error = Some(detail),
@@ -224,6 +229,8 @@ impl Shell {
         let Some(account) = self.tiny_state.account.clone() else {
             return;
         };
+        let visit = self.tiny_e2ee_visit();
+        let expected_account = account.clone();
         self.off_thread(
             cx,
             move || {
@@ -234,15 +241,16 @@ impl Shell {
                 }
             },
             move |this, answer, cx| {
+                if this.tiny_state.account.as_ref() != Some(&expected_account) { return; }
                 if let Ok(Response::Error { detail, .. }) = answer {
-                    if let Some(draft) = this.encryption_draft() {
+                    if let Some(draft) = visit.as_ref().and_then(|visit| this.tiny_e2ee_draft_for(visit)) {
                         draft.error = Some(detail);
                     }
                 }
                 if let Some(account) = this.tiny_state.account.clone() {
                     this.fetch(account, None, cx);
                 }
-                if this.encryption_draft().is_some() {
+                if visit.as_ref().is_some_and(|visit| this.tiny_e2ee_draft_for(visit).is_some()) {
                     this.tiny_e2ee_load(cx);
                 }
                 cx.notify();

@@ -470,6 +470,7 @@ impl Shell {
         };
         self.reload(dirty, cx);
         self.load_directs(cx);
+        self.tiny_e2ee_load(cx);
     }
 
     /// What chatd reported since the last `Wait`. Stored things are read again, each by its own

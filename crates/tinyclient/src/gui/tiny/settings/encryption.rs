@@ -24,6 +24,7 @@ use protocol::{
 #[derive(Default)]
 pub(in crate::gui) struct Draft {
     pub status: Option<E2eeStatus>,
+    /// An explicit action or backup is running; background reads own separate request slots.
     pub loading: bool,
     pub asked: bool,
     pub error: Option<String>,
@@ -43,6 +44,107 @@ pub(in crate::gui) struct Draft {
     pub details: bool,
     /// Only one backup form is open at a time: save (`true`) or import (`false`).
     pub backup_mode: Option<bool>,
+    scope: std::rc::Rc<()>,
+    status_read: Option<std::rc::Rc<()>>,
+    status_again: bool,
+    link_read: Option<std::rc::Rc<()>>,
+    link_again: bool,
+}
+
+/// The account and visible-page visit that own an asynchronous reply.
+#[derive(Clone)]
+pub(super) struct Visit {
+    pub account: protocol::AccountKey,
+    scope: std::rc::Rc<()>,
+}
+
+#[derive(Clone)]
+pub(super) struct Read {
+    pub visit: Visit,
+    request: std::rc::Rc<()>,
+}
+
+fn begin_read(pending: &mut Option<std::rc::Rc<()>>, again: &mut bool) -> Option<std::rc::Rc<()>> {
+    if pending.is_some() {
+        *again = true;
+        return None;
+    }
+    let request = std::rc::Rc::new(());
+    *pending = Some(request.clone());
+    Some(request)
+}
+
+fn finish_read(pending: &mut Option<std::rc::Rc<()>>, again: &mut bool, request: &std::rc::Rc<()>) -> Option<bool> {
+    if !pending.as_ref().is_some_and(|current| std::rc::Rc::ptr_eq(current, request)) {
+        return None;
+    }
+    *pending = None;
+    Some(std::mem::take(again))
+}
+
+impl Draft {
+    pub(super) fn visit(&self, account: &protocol::AccountKey) -> Visit {
+        Visit { account: account.clone(), scope: self.scope.clone() }
+    }
+
+    pub(super) fn accepts(&self, visit: &Visit, account: Option<&protocol::AccountKey>, visible: bool) -> bool {
+        visible && account == Some(&visit.account) && std::rc::Rc::ptr_eq(&self.scope, &visit.scope)
+    }
+
+    fn begin_status(&mut self, account: &protocol::AccountKey, visible: bool) -> Option<Read> {
+        if !visible { return None; }
+        let request = begin_read(&mut self.status_read, &mut self.status_again)?;
+        self.asked = true;
+        Some(Read { visit: self.visit(account), request })
+    }
+
+    fn status_changed(&mut self, change: &protocol::Change, account: &protocol::AccountKey, visible: bool) -> Option<Read> {
+        if !matches!(change, protocol::Change::Tiny { account: changed } if changed == account) {
+            return None;
+        }
+        self.begin_status(account, visible)
+    }
+
+    fn complete_status(&mut self, read: &Read, account: Option<&protocol::AccountKey>, visible: bool, answer: std::io::Result<Response>) -> Option<bool> {
+        if !self.accepts(&read.visit, account, visible) { return None; }
+        let again = finish_read(&mut self.status_read, &mut self.status_again, &read.request)?;
+        match answer {
+            Ok(Response::TinyE2ee { status }) => {
+                if status.revoked {
+                    self.link = None;
+                    self.qr = None;
+                    self.link_read = None;
+                    self.link_again = false;
+                }
+                self.status = Some(status);
+                self.error = None;
+            }
+            Ok(Response::Error { detail, .. }) => self.error = Some(detail),
+            Ok(_) => self.error = Some(crate::client::OTHER_ANSWER.to_owned()),
+            Err(err) => self.error = Some(crate::client::trouble_words("tiny", &err)),
+        }
+        Some(again)
+    }
+
+    pub(super) fn begin_link(&mut self, account: &protocol::AccountKey, visible: bool) -> Option<Read> {
+        if !visible || self.status.as_ref().is_some_and(|status| status.revoked) { return None; }
+        let request = begin_read(&mut self.link_read, &mut self.link_again)?;
+        Some(Read { visit: self.visit(account), request })
+    }
+
+    pub(super) fn complete_link(&mut self, read: &Read, account: Option<&protocol::AccountKey>, visible: bool) -> Option<bool> {
+        if !self.accepts(&read.visit, account, visible) { return None; }
+        finish_read(&mut self.link_read, &mut self.link_again, &read.request)
+    }
+
+    pub(super) fn invalidate_reads(&mut self) {
+        self.scope = std::rc::Rc::new(());
+        self.status_read = None;
+        self.status_again = false;
+        self.link_read = None;
+        self.link_again = false;
+        self.loading = false;
+    }
 }
 
 /// The words a device's state reads as.
@@ -86,49 +188,48 @@ impl Shell {
         self.tiny_open_settings(super::Page::Encryption, None, window, cx);
     }
 
+    pub(super) fn tiny_e2ee_visit(&self) -> Option<Visit> {
+        let account = self.tiny_state.account.as_ref()?;
+        let overlay = self.tiny_state.settings.as_ref()?;
+        (overlay.page == super::Page::Encryption).then(|| overlay.encryption.visit(account))
+    }
+
+    pub(super) fn tiny_e2ee_draft_for(&mut self, visit: &Visit) -> Option<&mut Draft> {
+        let account = self.tiny_state.account.as_ref();
+        let overlay = self.tiny_state.settings.as_mut()?;
+        overlay.encryption.accepts(visit, account, overlay.page == super::Page::Encryption)
+            .then_some(&mut overlay.encryption)
+    }
+
     pub(in crate::gui) fn tiny_e2ee_load(&mut self, cx: &mut Context<Self>) {
-        let Some(account) = self.tiny_state.account.clone() else {
-            return;
-        };
-        let Some(draft) = self
-            .tiny_state
-            .settings
-            .as_mut()
-            .map(|overlay| &mut overlay.encryption)
-        else {
-            return;
-        };
-        draft.loading = true;
-        draft.asked = true;
+        let Some(account) = self.tiny_state.account.clone() else { return; };
+        let Some(overlay) = self.tiny_state.settings.as_mut() else { return; };
+        let Some(read) = overlay.encryption.begin_status(&account, overlay.page == super::Page::Encryption) else { return; };
+        self.tiny_e2ee_status_read(read, cx);
+    }
+
+    pub(in crate::gui) fn tiny_e2ee_changed(&mut self, change: &protocol::Change, cx: &mut Context<Self>) {
+        let Some(account) = self.tiny_state.account.clone() else { return; };
+        let Some(overlay) = self.tiny_state.settings.as_mut() else { return; };
+        let Some(read) = overlay.encryption.status_changed(change, &account, overlay.page == super::Page::Encryption) else { return; };
+        self.tiny_e2ee_status_read(read, cx);
+    }
+
+    fn tiny_e2ee_status_read(&mut self, read: Read, cx: &mut Context<Self>) {
+        let account = read.visit.account.clone();
         cx.notify();
         self.off_thread(
             cx,
-            move || {
-                ask(&Request::TinyE2ee {
-                    account,
-                    ask: E2eeAsk::Status,
-                })
-            },
+            move || ask(&Request::TinyE2ee { account, ask: E2eeAsk::Status }),
             move |this, answer, cx| {
-                let Some(draft) = this
-                    .tiny_state
-                    .settings
-                    .as_mut()
-                    .map(|overlay| &mut overlay.encryption)
-                else {
-                    return;
-                };
-                draft.loading = false;
-                match answer {
-                    Ok(Response::TinyE2ee { status }) => {
-                        draft.status = Some(status);
-                        draft.error = None;
-                    }
-                    Ok(Response::Error { detail, .. }) => draft.error = Some(detail),
-                    Ok(_) => draft.error = Some(crate::client::OTHER_ANSWER.to_owned()),
-                    Err(err) => draft.error = Some(crate::client::trouble_words("tiny", &err)),
+                let account = this.tiny_state.account.as_ref();
+                let Some(overlay) = this.tiny_state.settings.as_mut() else { return; };
+                let Some(again) = overlay.encryption.complete_status(&read, account, overlay.page == super::Page::Encryption, answer) else { return; };
+                if again {
+                    this.tiny_e2ee_load(cx);
+                } else {
+                    this.tiny_e2ee_link_load(cx);
                 }
-                this.tiny_e2ee_link_load(cx);
                 cx.notify();
             },
         );
@@ -136,9 +237,8 @@ impl Shell {
 
     /// Sends one ask; on `Ok` says `done` and reads the page again.
     fn tiny_e2ee_do(&mut self, ask_for: E2eeAsk, done: &'static str, cx: &mut Context<Self>) {
-        let Some(account) = self.tiny_state.account.clone() else {
-            return;
-        };
+        let Some(visit) = self.tiny_e2ee_visit() else { return; };
+        let account = visit.account.clone();
         if let Some(draft) = self
             .tiny_state
             .settings
@@ -159,14 +259,7 @@ impl Shell {
                 })
             },
             move |this, answer, cx| {
-                let Some(draft) = this
-                    .tiny_state
-                    .settings
-                    .as_mut()
-                    .map(|overlay| &mut overlay.encryption)
-                else {
-                    return;
-                };
+                let Some(draft) = this.tiny_e2ee_draft_for(&visit) else { return; };
                 draft.loading = false;
                 match answer {
                     Ok(Response::Ok) => draft.note = Some(done.to_owned()),
@@ -314,7 +407,7 @@ pub(in crate::gui::tiny) fn encryption(
         ));
     }
     let Some(status) = &draft.status else {
-        let words = if draft.loading {
+        let words = if draft.status_read.is_some() {
             "Reading this device's encryption…"
         } else {
             "Nothing read yet."
@@ -749,6 +842,113 @@ pub(in crate::gui::tiny) fn encryption(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn account(name: &str) -> protocol::AccountKey {
+        protocol::AccountKey { network: protocol::Network::Tiny, account: name.into() }
+    }
+
+    fn ready() -> E2eeStatus {
+        E2eeStatus { device: DeviceState::Ready, ..E2eeStatus::default() }
+    }
+
+    fn removed() -> std::io::Result<Response> {
+        Ok(Response::TinyE2ee { status: E2eeStatus {
+            revoked: true,
+            device: DeviceState::Failed { why: "Removed".into() },
+            ..E2eeStatus::default()
+        } })
+    }
+
+    #[test]
+    fn encryption_refresh_device_event_updates_the_open_page_without_resetting_choices() {
+        let account = account("one");
+        let mut draft = Draft { status: Some(ready()), asked: true, history: "days:7".into(), details: true, backup_mode: Some(true), ..Draft::default() };
+        let read = draft.status_changed(&protocol::Change::Tiny { account: account.clone() }, &account, true)
+            .expect("a device event must read Status, not just the link");
+        assert_eq!(draft.complete_status(&read, Some(&account), true, removed()), Some(false));
+        assert!(draft.status.as_ref().unwrap().revoked);
+        assert_eq!(draft.history, "days:7");
+        assert!(draft.details);
+        assert_eq!(draft.backup_mode, Some(true));
+    }
+
+    #[test]
+    fn encryption_refresh_coalesces_events_and_reads_the_latest_status_after_an_in_flight_reply() {
+        let account = account("one");
+        let mut draft = Draft::default();
+        let first = draft.begin_status(&account, true).unwrap();
+        assert!(draft.begin_status(&account, true).is_none(), "only one status request may run at a time");
+        assert!(draft.begin_status(&account, true).is_none());
+        assert_eq!(draft.complete_status(&first, Some(&account), true, Ok(Response::TinyE2ee { status: ready() })), Some(true));
+        let latest = draft.begin_status(&account, true).unwrap();
+        assert_eq!(draft.complete_status(&latest, Some(&account), true, removed()), Some(false));
+        assert!(draft.status.as_ref().unwrap().revoked);
+    }
+
+    #[test]
+    fn encryption_refresh_rejects_old_account_overlay_and_page_visit_replies() {
+        let one = account("one");
+        let two = account("two");
+        let mut old = Draft::default();
+        let read = old.begin_status(&one, true).unwrap();
+        let mut reopened = Draft { status: Some(ready()), ..Draft::default() };
+        assert_eq!(reopened.complete_status(&read, Some(&one), true, removed()), None, "closing and reopening creates a new overlay lifetime");
+        assert!(!reopened.status.as_ref().unwrap().revoked);
+        assert_eq!(old.complete_status(&read, Some(&two), true, removed()), None, "the old account must not write into the current one");
+        old.invalidate_reads();
+        let current = old.begin_status(&one, true).unwrap();
+        assert_eq!(old.complete_status(&read, Some(&one), true, removed()), None, "returning to the tab must supersede the earlier visit");
+        assert_eq!(old.complete_status(&current, Some(&one), true, removed()), Some(false));
+        assert!(old.status.as_ref().unwrap().revoked);
+    }
+
+    #[test]
+    fn encryption_refresh_ignores_hidden_pages_and_other_accounts_events() {
+        let account = account("one");
+        let mut draft = Draft::default();
+        assert!(draft.begin_status(&account, false).is_none());
+        assert!(draft.status_changed(&protocol::Change::Tiny { account: super::tests::account("other") }, &account, true).is_none());
+        assert!(draft.status_changed(&protocol::Change::Status, &account, true).is_none());
+        let read = draft.begin_status(&account, true).unwrap();
+        assert_eq!(draft.complete_status(&read, Some(&account), false, removed()), None);
+        assert!(draft.status.is_none());
+    }
+
+    #[test]
+    fn encryption_refresh_removal_cancels_link_replies_and_future_progress_reads() {
+        let account = account("one");
+        let mut draft = Draft { status: Some(ready()), link: Some(protocol::E2eeLink {
+            role: "old".into(), stage: protocol::LinkStage::Sending, ..protocol::E2eeLink::default()
+        }), ..Draft::default() };
+        let status = draft.begin_status(&account, true).unwrap();
+        let link = draft.begin_link(&account, true).unwrap();
+        assert!(draft.begin_link(&account, true).is_none());
+        assert_eq!(draft.complete_status(&status, Some(&account), true, removed()), Some(false));
+        assert!(draft.link.is_none());
+        assert_eq!(draft.complete_link(&link, Some(&account), true), None);
+        assert!(draft.begin_link(&account, true).is_none(), "a removed device must not keep a progress timer alive");
+    }
+
+    #[test]
+    fn encryption_refresh_background_replies_preserve_an_active_backup_or_action() {
+        let account = account("one");
+        for answer in [Ok(Response::TinyE2ee { status: ready() }), Err(std::io::Error::from(std::io::ErrorKind::TimedOut))] {
+            let mut draft = Draft { status: Some(ready()), loading: true, ..Draft::default() };
+            let read = draft.begin_status(&account, true).unwrap();
+            assert_eq!(draft.complete_status(&read, Some(&account), true, answer), Some(false));
+            assert!(draft.loading, "background status completion must not reenable Save/Import while its action is pending");
+        }
+    }
+
+    #[test]
+    fn encryption_refresh_background_reads_do_not_disable_action_controls() {
+        let account = account("one");
+        let mut draft = Draft { status: Some(ready()), ..Draft::default() };
+        let read = draft.begin_status(&account, true).unwrap();
+        assert!(!draft.loading, "only an explicit action owns the backup busy state");
+        assert_eq!(draft.complete_status(&read, Some(&account), true, Ok(Response::TinyE2ee { status: ready() })), Some(false));
+        assert!(!draft.loading);
+    }
 
     #[test]
     fn the_words_never_claim_more_than_holds() {

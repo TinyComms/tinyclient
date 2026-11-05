@@ -1119,10 +1119,8 @@ impl Shell {
                 if self.tiny_state.seen && self.tiny_state.community.is_some() {
                     self.fetch(account, None, cx);
                 }
-                // A device link moved on by itself.
-                if self.tiny_state.settings.as_ref().is_some_and(|overlay| overlay.page == settings::Page::Encryption && overlay.encryption.asked) {
-                    self.tiny_e2ee_link_load(cx);
-                }
+                // Device changes affect approval/revocation as well as link progress.
+                self.tiny_e2ee_changed(change, cx);
             }
             Change::Occupants { conversation, occupants } if conversation.account() == account => {
                 let Some(room) = self.tiny_state.community.as_mut().and_then(|community| community.rooms.iter_mut().find(|room| room.id == conversation.id)) else {
