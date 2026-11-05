@@ -9,6 +9,10 @@ the `tiny-linux` SSH alias. A throwaway server and database contain invented acc
 The scenario checks encrypted DM and channel history, edits, reply references, actual downloaded
 picture bytes and SHA-256, immediate incoming messages, outgoing identity, revocation, and
 wrong-code, substituted-key, corrupt-archive, expired-code and reused-code failures.
+Picture references come from matching downloads on both original devices before linking. Tiny
+cleans image metadata before encryption, so raw input PNG bytes are retained as provenance but
+are not the expected uploaded bytes. New devices, backup restore and gap fill must match the
+pre-link reference hash and length exactly; image similarity is not sufficient.
 
 The first post-link message is sent after one cache snapshot, before history pagination. Its
 elapsed time from link completion is recorded. No commit wait is inserted before the send.

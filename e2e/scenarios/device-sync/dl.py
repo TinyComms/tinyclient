@@ -35,7 +35,7 @@ import uuid
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "lib"))
 from devices import WinLocal, LinuxSsh, WinVmSsh  # noqa: E402
-from attachments import verify_picture
+from attachments import verify_picture, picture_baseline
 
 CLIENT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 SPACE = os.path.dirname(CLIENT)
@@ -523,9 +523,23 @@ class Scenario:
         self.L.step("windows", f"history sent before any link: {len(self.history)} messages in DM + channel", all(h["id"] for h in self.history),
                     missing=[h["text"] for h in self.history if not h["id"]])
         # Control: what Ada and Bea read now. Each new device must read the same.
+        controls = []
         for d in (A, Bea):
             res = self.read_history(d)
             self.L.check("H1", f"{d.label} reads all {len(self.history)} pre-link messages (control)", res["ok"], expected_on_base=True, **res["why"])
+            controls.append((d, res["seen"]))
+        # Encrypted image upload intentionally re-encodes PNG/JPEG and removes metadata.
+        # Keep the raw input hash for provenance, but compare every later download byte-for-byte
+        # with the same already-uploaded attachment on BOTH original devices before any link.
+        for h in self.history:
+            if h["kind"] != "picture":
+                continue
+            baseline = picture_baseline([(d, seen.get(h["id"], {})) for d, seen in controls], self.pics[h["tag"]])
+            self.L.check("H1.picture." + h["tag"], "both original devices download identical pre-link picture bytes",
+                         baseline["ok"], expected_on_base=True, picture=baseline)
+            if not baseline["ok"]:
+                raise RuntimeError("pre-link attachment controls did not agree")
+            self.pics[h["tag"]] = baseline
         with open(os.path.join(self.out, "history.json"), "w") as f:
             json.dump({"dm": self.dm, "channel": self.ch, "messages": self.history, "pictures": self.pics,
                        "send_failures": self.send_failures}, f, indent=1)
@@ -665,7 +679,7 @@ class Scenario:
                      all(o["ok"] for o in ordering), platform, expected_on_base=False, ordering=ordering)
         pictures = [verify_picture(N, res["seen"].get(h["id"], {}), self.pics[h["tag"]])
                     for h in self.history if h["kind"] == "picture"]
-        self.L.check(f"{prefix}.H4", f"{N.label} downloads each pre-link picture with the original SHA-256 and length",
+        self.L.check(f"{prefix}.H4", f"{N.label} downloads each picture with its pre-link SHA-256 and length",
                      all(p["ok"] for p in pictures), platform, expected_on_base=False, pictures=pictures)
         self.linker.shot(N, platform, f"{prefix}-history-scrolled")
         bea_after = Bea.e2ee({"op": "person", "user_id": A.user_id})[1]
