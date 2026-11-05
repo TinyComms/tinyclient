@@ -511,11 +511,11 @@
       </details>
       <details>
         <summary>Does it connect to anything besides the networks?</summary>
-        <p>One update check. About once an hour while the window is open, it asks GitHub whether a newer release exists, and sends only <code>tinyclient/&lt;version&gt;</code>. If you add a Tiny server, it also talks to that server, and your browser to the server&rsquo;s sign-in page. No analytics, no crash upload. <a href="docs/privacy.html">Privacy &amp; security →</a></p>
+        <p>One update check: about once an hour while the window is open, it asks GitHub whether a newer release exists, and sends only <code>tinyclient/&lt;version&gt;</code>. If a Wikipedia link has no preview, the window asks Wikipedia for a summary (no message text). When a Tiny call turns on screen share, camera, or watching a picture, and Cisco&rsquo;s OpenH264 library is not already on disk, <code>mediad</code> downloads it from Cisco; a voice-only call does not. If you add a Tiny server, it also talks to that server, and your browser to the server&rsquo;s sign-in page. No analytics, no crash upload. <a href="docs/privacy.html">Privacy &amp; security →</a></p>
       </details>
       <details>
         <summary>Is what it stores encrypted?</summary>
-        <p>Sessions live in your system&rsquo;s keychain, and Signal&rsquo;s keys are sealed with a key held only there. The message and media cache is not encrypted by tinyclient, so keep your disk encryption on: FileVault, BitLocker or LUKS.</p>
+        <p>Sessions live in your system&rsquo;s keychain, and Signal&rsquo;s keys are sealed with a key held only there. On a Tiny server, conversations created encrypted seal message text and sealed files end to end (from v0.2.37); plaintext conversations are still readable by that server. The local message and media cache is not encrypted by tinyclient, so keep your disk encryption on: FileVault, BitLocker or LUKS.</p>
       </details>
       <details>
         <summary>Will it notify me?</summary>
@@ -607,6 +607,9 @@
           <li><a href="docs/contributing.html">Contributing</a></li>
         </ul>
       </nav>
+    </div>
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft, Signal or Google; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0). Wikipedia summaries use the <a href="https://www.mediawiki.org/wiki/API:Main_page">MediaWiki API</a>. This product includes OpenH264 Video Codec provided by Cisco Systems, Inc.</p>
     </div>
   </div>
 </footer>
