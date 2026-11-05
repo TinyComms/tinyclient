@@ -17,7 +17,7 @@ DIRTY=$(git -C "$CLIENT" status --porcelain --untracked-files=no | wc -l)
 echo "client $CLIENT @ $SHORT ($REF; uncommitted changes in tracked files there: $DIRTY; only the commit is built)"
 TAR=$(mktemp -u /tmp/dl-src-XXXX).tar
 git -C "$CLIENT" -c core.autocrlf=false archive --format=tar -o "$TAR" "$SHA"
-tar -rf "$TAR" -C "$ROOT" dlctl/Cargo.toml dlctl/src/main.rs drivers/linux-host.sh
+tar -rf "$TAR" -C "$ROOT" dlctl/Cargo.toml dlctl/src/main.rs drivers/linux-host.sh drivers/x11input.py
 # git archive stamps files with the commit's time; in the shared target dir an older commit's files
 # would look already built next to a later one's artifacts. Stamp them "now" so cargo rebuilds them.
 ssh "$HOST" "rm -rf ~/tiny-dl/src/$SHORT && mkdir -p ~/tiny-dl/src/$SHORT ~/tiny-dl/bin && tar -x -C ~/tiny-dl/src/$SHORT && find ~/tiny-dl/src/$SHORT -type f -exec touch {} +" < "$TAR"
@@ -42,6 +42,7 @@ mkdir -p ~/tiny-dl/bin/app
 cp "$CARGO_TARGET_DIR/$dir/tinyclient" "$CARGO_TARGET_DIR/$dir/chatd" "$CARGO_TARGET_DIR/$dir/mediad" ~/tiny-dl/bin/app/
 cp "$CARGO_TARGET_DIR/release/dlctl" ~/tiny-dl/bin/dlctl
 cp drivers/linux-host.sh ~/tiny-dl/linux-host.sh
+cp drivers/x11input.py ~/tiny-dl/x11input.py
 echo "$short" > ~/tiny-dl/bin/app/SHA
 ~/tiny-dl/bin/app/tinyclient --version
 echo "ready: ~/tiny-dl/bin/app ($short, $profile)"

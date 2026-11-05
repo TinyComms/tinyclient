@@ -361,6 +361,8 @@ class Scenario:
         whoever is at the desk. Position measured from shots (top-left anchored layout)."""
         if isinstance(d, WinLocal) and d.window:
             d._win("post", X=200, Y=144)
+        elif isinstance(d, LinuxSsh):
+            d.sh("DISPLAY=:0 XAUTHORITY=/run/user/1000/gdm/Xauthority python3 ~/tiny-dl/x11input.py click 200 144")
 
     def stop_grabber(self):
         if not self.grabber:
