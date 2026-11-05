@@ -361,7 +361,13 @@ fn channel_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>,
     if ctx.conversation(&row).is_err() {
         return;
     }
-    Note::from_last(&channel.id, channel.unread, None, None, channel.last_message.as_ref(), false).sealed(channel.e2ee).apply(ctx, saved, names);
+    // The broadcast copies the actor's unread into the channel object. Ours stays until our
+    // own list (`publish`) says otherwise, or a live message moves it.
+    let unread = match ctx.known(&channel.id) {
+        Ok(Some(existing)) => existing.unread,
+        _ => channel.unread,
+    };
+    Note::from_last(&channel.id, unread, None, None, channel.last_message.as_ref(), false).sealed(channel.e2ee).apply(ctx, saved, names);
 }
 
 fn direct_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, frame: &Value) {
@@ -1557,6 +1563,36 @@ mod tests {
         assert!(!unicode_emoji(":smile:"));
         assert!(!unicode_emoji("ok"));
         assert!(!unicode_emoji(""));
+    }
+
+    /// `channel.updated` is broadcast with the actor's own unread baked into `app_channel_json`.
+    /// Applying that count clears everyone else's badge. The viewer's count comes from the list.
+    #[test]
+    fn a_channel_update_does_not_apply_someone_elses_unread() {
+        let (_adapter, ctx, saved) = fixture(|_| None);
+        assert_eq!(ctx.known("channel-1").unwrap().unwrap().unread, 2);
+        let frame = json!({
+            "channel": {
+                "id": "channel-1",
+                "name": "general",
+                "topic": "Moved",
+                "category_id": "cat-1",
+                "category_name": "Text",
+                "position": 1,
+                "unread": 0,
+                "last_message": {
+                    "id": "c-10",
+                    "author_id": PEER,
+                    "body": "later",
+                    "created_at": "2024-01-02T03:05:05Z"
+                }
+            }
+        });
+        on_live(&ctx, &saved, &HashMap::new(), "channel.updated", &frame);
+        let channel = ctx.known("channel-1").unwrap().unwrap();
+        assert_eq!(channel.unread, 2, "a channel update carries the actor's unread, not ours");
+        assert_eq!(channel.topic, "Moved");
+        assert_eq!(channel.preview, "later");
     }
 
     #[test]

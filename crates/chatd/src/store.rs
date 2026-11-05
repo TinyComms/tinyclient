@@ -532,6 +532,17 @@ pub(crate) fn id_is_ahead(newer: &str, older: &str) -> bool {
     (newer.len(), newer) > (older.len(), older)
 }
 
+/// Tiny message ids are UUIDs. They are all one length, and text order is not time order.
+fn is_uuid(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() == 36
+        && bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+        && id.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+}
+
 fn from_word<T: DeserializeOwned>(word: String) -> rusqlite::Result<T> {
     serde_json::from_value(serde_json::Value::String(word))
         .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
@@ -1755,13 +1766,55 @@ impl Store {
         Ok(changed == 1)
     }
 
+    fn message_sent(&self, conversation: &Key, id: &str) -> Option<i64> {
+        self.db
+            .query_row(
+                "SELECT sent FROM message
+                  WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
+                params![word(&conversation.network), conversation.account, conversation.id, id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Whether `newer` is a later message than `older`. A stored send time wins. Otherwise
+    /// snowflakes, Telegram ids and Slack timestamps use [`id_is_ahead`]. Two Tiny UUIDs with
+    /// no distinct send time are not ordered: their text order is not a clock.
+    fn cursor_ahead(&self, conversation: &Key, newer: &str, older: &str) -> bool {
+        if newer.is_empty() || older.is_empty() || newer == older {
+            return false;
+        }
+        match (self.message_sent(conversation, newer), self.message_sent(conversation, older)) {
+            (Some(left), Some(right)) if left != right => return left > right,
+            (Some(_), Some(_)) if is_uuid(newer) || is_uuid(older) => return false,
+            _ if is_uuid(newer) || is_uuid(older) => return false,
+            _ => {}
+        }
+        id_is_ahead(newer, older)
+    }
+
+    /// True when both ids are UUIDs and send time does not say which one is later.
+    fn ids_incomparable(&self, conversation: &Key, left: &str, right: &str) -> bool {
+        if left.is_empty() || right.is_empty() || left == right || (!is_uuid(left) && !is_uuid(right)) {
+            return false;
+        }
+        match (self.message_sent(conversation, left), self.message_sent(conversation, right)) {
+            (Some(left_sent), Some(right_sent)) if left_sent != right_sent => false,
+            _ => true,
+        }
+    }
+
     /// The unread state the network reported: at connect, or when another device read it. The
     /// preview is left alone; it comes from messages. Mentions going up are noticed: the Inbox
     /// keeps a channel a day after it mentioned me.
     ///
     /// A count older than what this install already marked read is a lost tell (ack still in
     /// flight, or a Tiny channel list with unread and no cursor at the same `updated`), not the
-    /// truth: the badge stays cleared and `last_read` never moves backwards. A newer `updated`
+    /// truth: the badge stays cleared and `last_read` never moves backwards. That same list must
+    /// not clear a badge a live message already raised: Tiny channels have no cursor, and their
+    /// ids are UUIDs, so text order cannot say the preview was already read. A newer `updated`
     /// with no cursor is real activity (Discord's unread push) and may raise the badge again.
     pub fn set_counts(
         &mut self,
@@ -1785,15 +1838,30 @@ impl Store {
         };
         let net_read = last_read.filter(|id| !id.is_empty());
         // Local marker newer than the network's: keep ours, ignore its badge.
-        let local_ahead = !have_read.is_empty() && net_read.is_some_and(|net| id_is_ahead(&have_read, net));
-        // Caught up, no cursor, and nothing newer than we already know: Tiny's list refresh.
-        let caught_up = !have_read.is_empty() && (preview.is_empty() || !id_is_ahead(&preview, &have_read));
-        let stale_list = net_read.is_none() && caught_up && updated <= have_updated;
+        let local_ahead = !have_read.is_empty() && net_read.is_some_and(|net| self.cursor_ahead(conversation, &have_read, net));
+        // A cursor this store cannot order, on a list that is not newer, must not rewind.
+        let cursor_unordered = net_read.is_some_and(|net| {
+            !have_read.is_empty()
+                && have_read != net
+                && !self.cursor_ahead(conversation, &have_read, net)
+                && !self.cursor_ahead(conversation, net, &have_read)
+        });
+        let local_ahead = local_ahead || (cursor_unordered && updated <= have_updated);
+        // Caught up when nothing still unread sits past the marker. A different UUID preview
+        // with a live badge is not caught up: text order would say the older id was newer.
+        let preview_ahead = have_unread > 0
+            && !preview.is_empty()
+            && preview != have_read
+            && (self.cursor_ahead(conversation, &preview, &have_read) || self.ids_incomparable(conversation, &preview, &have_read));
+        let caught_up = !have_read.is_empty() && !preview_ahead;
+        let stale_list = net_read.is_none() && updated <= have_updated;
 
         let (unread, mentions, marker) = if local_ahead {
             (have_unread, have_mentions, None)
-        } else if stale_list {
+        } else if stale_list && caught_up {
             (unread.min(have_unread), mentions.min(have_mentions), None)
+        } else if stale_list {
+            (unread.max(have_unread), mentions.max(have_mentions), None)
         } else {
             (unread, mentions, net_read)
         };
@@ -1856,8 +1924,9 @@ impl Store {
         let Some((unread, mentions, last_read)) = current else {
             return Ok(false);
         };
-        // Never move the marker backwards. An empty target still clears a badge.
-        let marker = if !target.is_empty() && (last_read.is_empty() || !id_is_ahead(&last_read, &target)) {
+        // Never move the marker backwards. An empty target still clears a badge. UUID text
+        // order is not time, so a later Tiny message that sorts first still becomes the cursor.
+        let marker = if !target.is_empty() && (last_read.is_empty() || self.cursor_ahead(conversation, &target, &last_read)) {
             target
         } else {
             last_read.clone()
@@ -1947,17 +2016,22 @@ impl Store {
                 account: row.get(1)?,
                 id: row.get(2)?,
             };
-            let preview: String = row.get(3)?;
-            let last_read: String = row.get(4)?;
-            let request = row.get::<_, String>(5)? == "request";
-            let marker = if !preview.is_empty() && (last_read.is_empty() || id_is_ahead(&preview, &last_read)) {
-                preview
-            } else {
-                last_read
-            };
-            Ok((key, marker, request))
+            Ok((key, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)? == "request"))
         })?;
-        rows.collect()
+        let rows: Vec<_> = rows.collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        // The statement has to finish before cursor checks read message times.
+        Ok(rows
+            .into_iter()
+            .map(|(key, preview, last_read, request)| {
+                let marker = if !preview.is_empty() && (last_read.is_empty() || self.cursor_ahead(&key, &preview, &last_read)) {
+                    preview
+                } else {
+                    last_read
+                };
+                (key, marker, request)
+            })
+            .collect())
     }
 
     // Messages.
@@ -3342,6 +3416,58 @@ mod tests {
         assert!(store.set_counts(&key, 0, 0, Some("3"), 30).unwrap());
         let row = store.conversation(&key).unwrap().unwrap();
         assert_eq!((row.unread, row.last_read.as_deref()), (0, Some("3")));
+    }
+
+    /// Opening a Tiny server refetches every channel. That list has an unread count and no
+    /// cursor. A fetch that started before a live message, or that repeats the message we
+    /// already counted, must not wipe the badge.
+    #[test]
+    fn a_channel_list_without_a_cursor_does_not_clear_a_live_unread() {
+        let (mut store, key) = store();
+        let later = "00000000-0000-4000-8000-000000000001";
+        store.ingest(&key, &said(later, "hello", 20), true).unwrap();
+        assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 1);
+
+        store.set_counts(&key, 0, 0, None, 10).unwrap();
+        assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 1, "an older list is not a read");
+        store.set_counts(&key, 0, 0, None, 20).unwrap();
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!(row.unread, 1, "a list that has not moved past the live message must not clear it");
+        assert_eq!(row.last_read.as_deref(), None);
+    }
+
+    /// Tiny message ids are UUIDs. Lexicographic order is not time order, so a newer message
+    /// can sort behind the cursor this install already stored. A channel refresh still has no
+    /// cursor and must not treat that as caught up.
+    #[test]
+    fn a_newer_tiny_message_that_sorts_behind_the_cursor_stays_unread() {
+        let (mut store, key) = store();
+        let earlier = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        let later = "00000000-0000-4000-8000-000000000001";
+        assert!(earlier > later, "the fixture is the UUID case: the newer id sorts first");
+
+        store.ingest(&key, &said(earlier, "old", 10), true).unwrap();
+        assert!(store.mark_read(&key, earlier).unwrap());
+        store.ingest(&key, &said(later, "new", 20), true).unwrap();
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.unread, row.last_read.as_deref()), (1, Some(earlier)));
+        assert_eq!(store.preview_id(&key).unwrap(), later);
+        let marks = store.unread_marks(Some(Network::Discord)).unwrap();
+        assert!(
+            marks.iter().any(|(found, marker, request)| found == &key && marker == later && !request),
+            "the ack is the newer message, not the uuid that sorts first"
+        );
+
+        store.set_counts(&key, 0, 0, None, 20).unwrap();
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!(row.unread, 1, "caught up is not 'the preview uuid sorts first'");
+        assert_eq!(row.last_read.as_deref(), Some(earlier));
+
+        assert!(store.mark_read(&key, later).unwrap());
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.unread, row.last_read.as_deref()), (0, Some(later)));
+        assert!(!store.set_counts(&key, 4, 0, None, 20).unwrap(), "a stale count must not bring the badge back");
+        assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 0);
     }
 
     #[test]
