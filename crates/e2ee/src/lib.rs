@@ -13,6 +13,8 @@
 //! * [`attachment`]: the sealed blob format, as streams.
 //! * [`store`]: the state store trait, the sealed snapshot's key and the local cache sealing.
 //! * [`safety`]: safety numbers.
+//! * [`link`]: linking a new device of a person from one they have (the code, the channel, the
+//!   messages), and [`archive`]: the history it is given, as a sealed stream.
 //!
 //! # The calls, in the order a client makes them
 //!
@@ -46,6 +48,7 @@
 //! 6. The local cache of decrypted messages: [`store::seal_cache_value`] with the message id as
 //!    `row_id`.
 
+pub mod archive;
 pub mod attachment;
 pub mod engine;
 pub mod envelope;
@@ -53,6 +56,7 @@ pub mod error;
 pub mod groups;
 pub mod identity;
 pub mod ids;
+pub mod link;
 pub mod messaging;
 mod provider;
 pub mod safety;
@@ -86,6 +90,26 @@ pub mod parsers {
     /// ciphertexts, key packages, external sender keys, inside a fresh engine.
     pub fn mls_message(bytes: &[u8]) {
         crate::groups::fuzz_all(bytes);
+    }
+
+    /// A pasted link code, and a channel message opened with a channel from a fixed code.
+    pub fn link(bytes: &[u8]) {
+        let text = String::from_utf8_lossy(bytes);
+        let _ = crate::link::LinkCode::parse(&text);
+        let _ = crate::link::Scope::parse(&text);
+        let _ = crate::link::parse_link_id(&text);
+        if let Ok(pending) = crate::link::Pending::create([1u8; 16]) {
+            if let Ok((_, mut old)) = crate::link::join(pending.code()) {
+                let _ = old.receive(bytes);
+            }
+            let _ = pending.accept(bytes);
+        }
+    }
+
+    /// A history archive, opened with a fixed key, and merged into nothing.
+    pub fn archive(bytes: &[u8]) {
+        let key = crate::archive::ArchiveKey::from_bytes([7u8; 32]);
+        let _ = crate::archive::read(&key, b"fuzz", bytes, |_| Ok(()));
     }
 
     /// The sealed attachment as a whole, opened with a fixed key.

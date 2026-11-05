@@ -211,6 +211,28 @@ here rests on the cross-signature chain, not on lifetimes.
   Receiving operations write too, but a failed write does not lose what they decrypted: `flush()`
   reports it.
 
+### 2.x Device linking and the history archive (`link`, `archive`)
+
+The contract is tiny's `research_notes/device-link-protocol.md`. Where it left a detail open:
+
+* A channel message on the wire is `counter (u64 BE) || AES-256-GCM(plaintext)`, so the receiver
+  knows the nonce. The `dir` byte of the associated data is `0` for new to old and `1` for old to
+  new. A message with a counter at or below the last one opened is refused; a gap is allowed (the
+  relay may lose a post, and the next message is still the newer).
+* The ECDH input to HKDF is the shared point's x coordinate (`raw_secret_bytes`), as SEC1 and
+  `p256::ecdh` define it. `p256`'s `ecdh` feature is the only change to the dependencies; it pulls
+  in nothing the tree did not already build.
+* The six check digits are the 3 bytes as a big-endian number mod 10^6. They are not an extra key:
+  the 128-bit secret in the code is what defeats a server in the middle; the digits catch a code
+  swapped on its way and give the person something to compare.
+* The archive's header is `"TNYH1" || nonce prefix (7)`; a record is a 4 byte big-endian length then
+  that much JSON, at most 1 MiB. Unknown record kinds, a second `meta`, anything after `end`, and
+  `meta.v` other than 1 are refused (no forward compatibility within v1: a v2 is a new magic).
+* `archive::read` hands out records as their chunks authenticate, so `archive::merge` reads the blob
+  twice: once to check all of it (and that `meta.user` is the person), then to merge. A truncated or
+  altered blob therefore merges nothing. Merging never overwrites a row the device has, and drops
+  rows for conversations the person is not in.
+
 ## 3. Dependencies
 
 Everything but the dev-dependency below is already in `Cargo.lock` at the version used.
