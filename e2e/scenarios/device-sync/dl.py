@@ -793,7 +793,9 @@ class Scenario:
             if name == "gapfill":
                 A.e2ee({"op": "verify", "user_id": bea_id, "verified": False})
             spare = dict(self.seed["sessions"]["a_spare"], base_url=f"http://localhost:{self.server['proxy_port']}")
-            N = WinLocal("a_" + name, spare, self.a.app_dir, DLCTL, STATE, "Ada " + purpose, gui=not self.a.no_gui)
+            # Keep the shell from issuing background message reads (and therefore Want) before
+            # the backup/sibling-readiness assertion. These extended cases exercise chatd IPC.
+            N = WinLocal("a_" + name, spare, self.a.app_dir, DLCTL, STATE, "Ada " + purpose, gui=False)
             self.devices[N.name] = N
             if not N.start():
                 self.L.step("windows", purpose + " device starts", False)

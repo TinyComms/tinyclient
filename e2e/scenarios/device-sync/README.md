@@ -57,6 +57,8 @@ tampered-file rejection, a nonempty import roundtrip, and same-user gap fill aft
 no archive history. Keep `release` false until the whole required platform plan is recorded.
 The extended sync case injects one transient handshake 503 for the fresh device and checks that
 an old device's new verified mark reaches it before it sends any local Want or Verified message.
+The fresh profiles in these extended cases run chatd without a window so shell background reads
+cannot initialize sibling sync or fill history before the assertion. These are IPC checks.
 
 The device-sync feature stack requires `--extended`: its evidence must include a nonempty
 backup import and sibling gap fill, as well as the initial linked-device send. The descriptor
