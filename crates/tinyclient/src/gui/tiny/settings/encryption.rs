@@ -33,6 +33,12 @@ pub(in crate::gui) struct Draft {
     pub recovery: Option<String>,
     /// The person whose devices are open, fetched now.
     pub person: Option<E2eePerson>,
+    /// The device link in progress on this device, as last read.
+    pub link: Option<protocol::E2eeLink>,
+    /// The QR of the link's code, made once per code.
+    pub qr: Option<(String, std::rc::Rc<crate::gui::signin::qr::Qr>)>,
+    /// The history picked to send a new device; empty is `linking::DEFAULT_HISTORY`.
+    pub history: String,
 }
 
 /// The words a device's state reads as.
@@ -118,6 +124,7 @@ impl Shell {
                     Ok(_) => draft.error = Some(crate::client::OTHER_ANSWER.to_owned()),
                     Err(err) => draft.error = Some(crate::client::trouble_words("tiny", &err)),
                 }
+                this.tiny_e2ee_link_load(cx);
                 cx.notify();
             },
         );
@@ -173,22 +180,9 @@ impl Shell {
         );
     }
 
-    fn tiny_e2ee_approve(&mut self, cx: &mut Context<Self>) {
-        let code = self
-            .tiny_state
-            .settings_fields
-            .link_code
-            .read(cx)
-            .text()
-            .trim()
-            .to_owned();
-        if code.is_empty() {
-            return;
-        }
-        self.tiny_state
-            .settings_fields
-            .link_code
-            .update(cx, |input, cx| input.clear(cx));
+    /// Approves a device from a `tiny-device-` code: the way before device linking, still how a
+    /// device on a server without it is added.
+    pub(in crate::gui::tiny) fn tiny_e2ee_approve_code(&mut self, code: String, cx: &mut Context<Self>) {
         self.tiny_e2ee_do(
             E2eeAsk::Approve { code },
             "Approved. The new device can read and send from now on.",
@@ -376,6 +370,7 @@ pub(in crate::gui::tiny) fn encryption(
                     .child(status.fingerprint.clone()),
             );
     }
+    let new_device = super::linking::new_device(status, draft, cx);
     if let DeviceState::AwaitingApproval { code } = &status.device {
         let copied = code.clone();
         this = this
@@ -383,7 +378,11 @@ pub(in crate::gui::tiny) fn encryption(
                 div()
                     .type_small()
                     .text_color(theme::text_faint())
-                    .child("Link code"),
+                    .child(if new_device.is_some() {
+                        "Or, on a device that can't add devices yet, paste this link code"
+                    } else {
+                        "Link code"
+                    }),
             )
             .child(
                 div()
@@ -406,9 +405,16 @@ pub(in crate::gui::tiny) fn encryption(
                 ),
             );
     }
-    page = page.child(super::section("This device").child(this));
+    let mut this_device = super::section("This device");
+    if let Some(panel) = new_device {
+        this_device = this_device.child(panel);
+    }
+    page = page.child(this_device.child(this));
     if status.device == DeviceState::Off {
         return page.into_any_element();
+    }
+    if let Some(notice) = super::linking::added_notice("tiny-e2ee-added", &status.added, cx) {
+        page = page.child(notice);
     }
 
     // Your devices.
@@ -448,14 +454,10 @@ pub(in crate::gui::tiny) fn encryption(
                 .child("No device is registered yet."),
         );
     }
-    let approve = div()
-        .p(px(12.))
-        .flex()
-        .flex_col()
-        .gap(px(8.))
-        .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child("Setting up tinyclient on another computer? It shows a link code. Paste it here to approve that device. Check that its fingerprint matches what it shows."))
-        .child(div().flex().gap(px(8.)).child(kit::input(&fields.link_code, None, window, cx).flex_1()).child(button("tiny-e2ee-approve", ButtonKind::Primary, "Approve").on_click(cx.listener(|this, _, _, cx| this.tiny_e2ee_approve(cx)))));
-    page = page.child(super::section("Your devices").child(mine.child(approve)));
+    if status.device == DeviceState::Ready {
+        mine = mine.child(super::linking::add_device(shell, status, draft, window, cx));
+    }
+    page = page.child(super::section("Your devices").child(mine));
 
     // People.
     let mut people = card();

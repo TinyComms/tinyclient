@@ -76,6 +76,10 @@ impl Shell {
                     .child(div().type_small().text_color(theme::text_faint()).child(facts)),
             );
         let mut column = div().w_full().max_w(px(READABLE)).px(px(32.)).pt(px(32.)).pb(px(40.)).flex().flex_col().gap(px(24.)).child(hero).child(actions);
+        // A device of the person that this one did not add: said here too, where it is seen.
+        if let Some(notice) = super::settings::linking::added_notice("tiny-home-added", &page.community.new_devices, cx) {
+            column = column.child(notice);
+        }
         if let Some(welcome) = welcome {
             column = column.child(
                 card()
