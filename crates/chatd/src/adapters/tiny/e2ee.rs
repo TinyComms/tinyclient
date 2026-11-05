@@ -235,6 +235,12 @@ struct Notes {
     /// Conversations whose server key changed: nothing is sent there until it is looked at.
     #[serde(default)]
     key_changed: BTreeSet<String>,
+    /// This person's devices as last listed: one not among them is "New device added".
+    #[serde(default)]
+    mine: BTreeSet<String>,
+    /// The person's devices added since they last looked, for the notice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    added: Vec<E2eeDevice>,
 }
 
 /// One opened message, as the cache keeps it.
@@ -252,6 +258,17 @@ pub(crate) struct Opened {
     /// The newest edit folded into this message, by its id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edited_by: Option<String>,
+    /// When it was sent (Unix seconds), as the server dated it; 0 for a message opened before
+    /// this was kept. What a device link's "last N days" goes by.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub at: i64,
+    /// Not opened here: taken in from this device of the person by a device link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_from: Option<String>,
+}
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
 }
 
 /// An attachment of an opened message: enough to fetch and open it again.
@@ -333,6 +350,8 @@ pub(crate) struct Row<'a> {
     pub device_id: &'a str,
     pub target_id: Option<&'a str>,
     pub client_id: Option<&'a str>,
+    /// The server's `created_at`.
+    pub created_at: &'a str,
 }
 
 /// The sealed cache of one conversation: an append-only file of `id base64(sealed)` lines, each
@@ -414,6 +433,8 @@ pub(crate) struct Device {
     /// People whose device list was checked since the server last said it changed
     /// (`e2ee.device`): a sync does not ask for theirs again.
     checked: BTreeSet<String>,
+    /// The server relays device links (`e2ee_device_link`).
+    linking: bool,
 }
 
 type Shared = Arc<Mutex<Device>>;
@@ -720,6 +741,7 @@ impl Device {
             encrypted: HashMap::new(),
             files: HashMap::new(),
             checked: BTreeSet::new(),
+            linking: false,
         }
     }
 
@@ -819,6 +841,10 @@ impl Device {
             self.mode.clear();
             return Ok(DeviceState::Off);
         }
+        self.linking = body
+            .get("features")
+            .and_then(Value::as_array)
+            .is_some_and(|all| all.iter().any(|f| f.as_str() == Some("e2ee_device_link")));
         self.mode = body
             .get("e2ee_text")
             .and_then(Value::as_str)
@@ -1545,6 +1571,8 @@ impl Device {
                         .collect(),
                     edits: incoming.target_id.clone().filter(|_| kind == Kind::Edit),
                     edited_by: None,
+                    at: super::messages::unix_of(row.created_at).unwrap_or(0),
+                    imported_from: None,
                 };
                 self.remember(conversation_id, row.id, opened.clone());
                 if kind == Kind::Edit {
@@ -1597,6 +1625,10 @@ impl Device {
             attachments: envelope.attachments.iter().map(OpenedFile::of).collect(),
             edits: target_id.map(str::to_owned),
             edited_by: None,
+            at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64),
+            imported_from: None,
         };
         if let Some(cache) = self.cache(conversation_id) {
             cache.pending.insert(client_id.to_owned(), opened.clone());
@@ -1648,8 +1680,57 @@ impl Device {
         Some(sealed)
     }
 
-    /// The live socket said something about this protocol.
-    pub(crate) fn heard(&mut self, kind: &str, frame: &Value) {
+    /// The person's devices as the server lists them now, against the last list: a device not
+    /// seen before (and not this one) is added to the "New device added" notice, a device gone
+    /// is dropped from it. True when the notice changed. The first list ever is taken as known.
+    fn note_devices(&mut self, rows: &[Value]) -> bool {
+        let this = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.device_id().to_string());
+        let listed = self.devices_of(&self.saved.user_id.clone(), rows, this.as_deref());
+        let ids: BTreeSet<String> = listed
+            .iter()
+            .map(|device| device.device_id.clone())
+            .collect();
+        let before = self.notes.added.clone();
+        let first = self.notes.mine.is_empty();
+        self.notes
+            .added
+            .retain(|device| ids.contains(&device.device_id));
+        if !first {
+            for device in listed {
+                if !device.this
+                    && !self.notes.mine.contains(&device.device_id)
+                    && !self
+                        .notes
+                        .added
+                        .iter()
+                        .any(|known| known.device_id == device.device_id)
+                {
+                    self.notes.added.push(device);
+                }
+            }
+        }
+        let changed = self.notes.added != before;
+        if changed || self.notes.mine != ids {
+            self.notes.mine = ids;
+            self.save_notes();
+        }
+        changed
+    }
+
+    /// The person saw the notice about this device of theirs.
+    fn seen_device(&mut self, device_id: &str) {
+        self.notes
+            .added
+            .retain(|device| device.device_id != device_id);
+        self.save_notes();
+    }
+
+    /// The live socket said something about this protocol. True when the "New device added"
+    /// notice changed.
+    pub(crate) fn heard(&mut self, kind: &str, frame: &Value) -> bool {
         let field = |name: &str| {
             frame
                 .get(name)
@@ -1688,9 +1769,15 @@ impl Device {
                         tracing::warn!("chatd: Tiny e2ee: {why}");
                     }
                 }
+                if user == self.saved.user_id && self.ready() {
+                    if let Ok(rows) = self.list(&user) {
+                        return self.note_devices(&rows);
+                    }
+                }
             }
             _ => {}
         }
+        false
     }
 
     /// `E2eeAsk::Status`.
@@ -1700,6 +1787,7 @@ impl Device {
             device: self.state.clone(),
             recovery_set: self.notes.recovery.is_some(),
             backup: false,
+            linking: self.linking,
             ..E2eeStatus::default()
         };
         let Some(engine) = self.engine.as_ref() else {
@@ -1710,7 +1798,11 @@ impl Device {
         status.fingerprint = fingerprint(&engine.signature_key());
         if let Ok(rows) = self.list(&self.saved.user_id) {
             status.devices = self.devices_of(&self.saved.user_id.clone(), &rows, Some(&this));
+            if self.ready() {
+                self.note_devices(&rows);
+            }
         }
+        status.added = self.notes.added.clone();
         let met: Vec<String> = self
             .notes
             .met
@@ -1874,6 +1966,7 @@ impl Device {
         }
         match self.ask("DELETE", &format!("/v1/e2ee/devices/{device_id}"), None)? {
             (200 | 204, _) => {
+                self.seen_device(device_id);
                 let mine = self
                     .engine
                     .as_ref()
@@ -1949,13 +2042,44 @@ fn device_label() -> String {
     }
 }
 
-/// Serves `Request::TinyE2ee`.
+/// The "New device added" notice of this account, from what is known here (no request).
+pub(crate) fn added(saved: &Saved) -> Vec<E2eeDevice> {
+    started(saved)
+        .map(|shared| lock(&shared).notes.added.clone())
+        .unwrap_or_default()
+}
+
+/// Serves `Request::TinyE2ee`. `told` is called when something the shell shows changed by itself
+/// (a device link moved on).
 pub(crate) fn answer(
     saved: &Saved,
     ask: protocol::E2eeAsk,
     names: &HashMap<String, String>,
+    told: linking::Told,
 ) -> protocol::Response {
     use protocol::{E2eeAsk, ErrorCode, Response};
+    // A link's own steps never wait for this device's lock, which a link holds now and then.
+    match ask {
+        E2eeAsk::Link => {
+            return Response::TinyE2eeLink {
+                link: linking::view(saved),
+            }
+        }
+        E2eeAsk::LinkConfirm { history, check } => {
+            return match linking::confirm(saved, &history, &check) {
+                Ok(()) => Response::Ok,
+                Err(detail) => Response::Error {
+                    code: ErrorCode::Refused,
+                    detail,
+                },
+            }
+        }
+        E2eeAsk::LinkCancel => {
+            linking::cancel(saved);
+            return Response::Ok;
+        }
+        _ => {}
+    }
     let shared = device(saved);
     let mut device = lock(&shared);
     if device.engine.is_none() || device.state != DeviceState::Ready {
@@ -1991,6 +2115,24 @@ pub(crate) fn answer(
             },
         },
         E2eeAsk::CheckRecovery { key } => done(device.check_recovery(&key)),
+        E2eeAsk::SeenDevice { device_id } => {
+            device.seen_device(&device_id);
+            Response::Ok
+        }
+        E2eeAsk::LinkStart => {
+            let linking = device.linking;
+            drop(device);
+            done(linking::start_new(saved, &shared, linking, told))
+        }
+        E2eeAsk::LinkJoin { code } => {
+            // A code from a device whose server does not link devices: approved as before.
+            if code.trim().starts_with("tiny-device-") {
+                return done(device.approve(&code));
+            }
+            drop(device);
+            done(linking::start_old(saved, &shared, &code, told))
+        }
+        E2eeAsk::Link | E2eeAsk::LinkConfirm { .. } | E2eeAsk::LinkCancel => Response::Ok,
     }
 }
 
@@ -2017,6 +2159,8 @@ pub(crate) fn attachment_id() -> Result<String, String> {
 pub(crate) fn attachment_key() -> Result<AttachmentKey, String> {
     AttachmentKey::generate().map_err(|_| "No randomness is available.".to_owned())
 }
+
+mod linking;
 
 #[cfg(test)]
 mod live;
@@ -2216,6 +2360,50 @@ mod tests {
             assert_eq!(text, None, "without the kept key the old rows stay sealed");
             let _ = std::fs::remove_dir_all(dir_of(&saved));
         });
+    }
+
+    #[test]
+    fn a_device_of_the_person_that_was_not_there_before_is_noticed_until_seen() {
+        let saved = Saved {
+            base_url: "http://127.0.0.1:9".into(),
+            token: "t".into(),
+            user_id: "7e57ada0-0000-4000-8000-0000000000aa".into(),
+            email: None,
+            display_name: String::new(),
+            role: "member".into(),
+            plain_http_ok: false,
+            e2ee: None,
+        };
+        let mut device = Device::new(&saved);
+        device.dir = std::env::temp_dir().join(format!("chatd-e2ee-notice-{}", std::process::id()));
+        private_dir(&device.dir).unwrap();
+        let user = UserId::parse(&saved.user_id).unwrap();
+        device.engine = Some(Engine::detached(user).unwrap());
+        let this = device.engine.as_ref().unwrap().device_id().to_string();
+        let row = |id: &str| json!({ "device_id": id, "signature_key": b64(&[4u8; 65]), "label": "Phone" });
+        let other = DeviceId::random().unwrap().to_string();
+        let third = DeviceId::random().unwrap().to_string();
+        assert!(
+            !device.note_devices(&[row(&this), row(&other)]),
+            "the first list is what the person had"
+        );
+        assert!(device.notes.added.is_empty());
+        assert!(device.note_devices(&[row(&this), row(&other), row(&third)]));
+        assert_eq!(device.notes.added.len(), 1);
+        assert_eq!(device.notes.added[0].device_id, third);
+        assert_eq!(device.notes.added[0].label, "Phone");
+        assert!(
+            !device.note_devices(&[row(&this), row(&other), row(&third)]),
+            "said once"
+        );
+        device.seen_device(&third);
+        assert!(device.notes.added.is_empty());
+        // One revoked elsewhere before the person looked takes its notice with it.
+        let fourth = DeviceId::random().unwrap().to_string();
+        assert!(device.note_devices(&[row(&this), row(&fourth)]));
+        assert!(device.note_devices(&[row(&this)]));
+        assert!(device.notes.added.is_empty());
+        let _ = std::fs::remove_dir_all(&device.dir);
     }
 
     #[test]

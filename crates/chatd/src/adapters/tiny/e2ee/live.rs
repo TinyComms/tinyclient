@@ -59,6 +59,7 @@ fn read_page(device: &mut Device, conversation: &str) -> HashMap<String, Read> {
             device_id: row.get("device_id").and_then(Value::as_str).unwrap_or(""),
             target_id: row.get("target_id").and_then(Value::as_str),
             client_id: row.get("client_id").and_then(Value::as_str),
+            created_at: row.get("created_at").and_then(Value::as_str).unwrap_or(""),
         })
         .collect();
     device.read(conversation, &wires)

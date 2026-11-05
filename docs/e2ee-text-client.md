@@ -11,6 +11,7 @@ rows become messages), and the Encryption page of Server Settings in the shell.
 | What | Where |
 |---|---|
 | The state key and the cache key | In the account's keychain item, inside the Tiny session JSON (`e2ee`), written before anything is sealed with them. Never on disk. |
+| The cache key of an account signed out with its history kept | The keychain item `Tiny kept history` (`{"<user> <server>": key}`), until that account signs in here again and takes it back. |
 | The engine's sealed snapshot (identity key, trust store, MLS groups) | `<support>/e2ee/Tiny-<user>/text/device.state` |
 | Opened messages, sealed one by one under the cache key with the message id as associated data | `.../text/cache-<conversation>.log` |
 | Handshake positions, people met, verified safety numbers, the recovery key's check value | `.../text/notes.json` (nothing that opens anything) |
@@ -18,7 +19,9 @@ rows become messages), and the Encryption page of Server Settings in the shell.
 
 The `text` and `outgoing` directories are made owner-only: 0700 on Unix, and on Windows a
 protected access list with only the owner and SYSTEM. Signing out revokes the device on the
-server and deletes the directory.
+server and deletes its state, and by default keeps the opened messages ("Keep my messages on this
+device"): the cache stays sealed and its key moves to `Tiny kept history`, so the next sign-in of
+that account here (a new device) reads them. "Erase" deletes the directory and the kept key.
 
 ## Flows
 
@@ -62,6 +65,20 @@ server and deletes the directory.
   60-digit safety number (`e2ee::safety`), "Mark as verified", and a warning when a verified number
   changed or a person has a new identity (their new devices are not let into any group until the
   person accepts it).
+- **Adding a device with its history** (servers with `e2ee_device_link`; the contract is tiny's
+  `research_notes/device-link-protocol.md`, the crypto `e2ee::link` and `e2ee::archive`, the
+  flows `e2ee/linking.rs`). The new device makes a link and shows a `tiny-link-1.` code (text and
+  QR). The person gives it to a device they have, which answers with an ephemeral key; both show
+  six digits. The old device shows the new one's label, system and fingerprint and asks the
+  person to type the digits and choose the history (none, 7 or 30 days, all, with sizes). Then it
+  cross-signs, packs its cache (and verified marks) into an archive under a fresh key, uploads
+  it, and sends the key and signature on the channel. The new device registers with the
+  signature, downloads, checks the SHA-256 and the archive, merges it (never overwriting, only
+  conversations the person is in, rows marked `imported_from`), says done, and both delete the
+  link. Any failure, a cancel or wrong digits sends `abort` and deletes the link. A server without
+  the feature keeps the paste-the-code approval, and a `tiny-device-` code pasted where a link code
+  goes is approved that way. Every device of the person shows "New device added" for a device it
+  did not add itself, with Revoke, from the next `e2ee.device`.
 - **Recovery key.** 128 bits from the system's random source, shown once as 26 base32 characters
   in six groups; only an HKDF check value is kept, so it can be checked later. There is no key
   backup yet (the crate has none): the page says the key backs nothing up.
@@ -92,7 +109,10 @@ and the recovery key.
 - chatd's message store (SQLite) keeps the opened text of encrypted conversations in plain text,
   as it keeps every network's messages; the media cache keeps opened files. Only the e2ee cache is
   sealed. Sealing the store is follow-up.
-- No key backup and no restore from the recovery key; no device linking with history transfer.
+- No key backup and no restore from the recovery key.
+- Device linking: no OS unlock (Windows Hello, Touch ID, a phone's biometrics) before the old
+  device approves; the person types the six digits instead. Messages opened before this release
+  carry no date, so "last N days" leaves them out (they go with "all").
 - The community root key (`/v1/e2ee/community`, `e2ee.community`) is not pinned or checked yet.
 - Ratchet trees are always inside the Welcome; the tree endpoint (`GET .../tree`, `ratchet_tree`
   on commit) is not used, so very large groups hit the Welcome limit sooner.

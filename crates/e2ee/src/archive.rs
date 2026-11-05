@@ -416,6 +416,8 @@ pub fn read<R: Read>(
 
 /// Where an archive is merged: the new device's sealed cache, as the caller keeps it.
 pub trait Target {
+    /// The archive checked out and is about to be merged: its first record.
+    fn start(&mut self, _meta: &Meta) {}
     /// Whether the person is in this conversation. Records for any other are dropped.
     fn is_member(&mut self, conv: &str) -> bool;
     /// Whether this device already has the message: it is never overwritten.
@@ -457,6 +459,7 @@ pub fn merge<R: Read>(
         Ok(())
     })?;
     let meta = meta.ok_or(Error::Malformed("archive: no meta record first"))?;
+    target.start(&meta);
     let mut merged = Merged::default();
     read(key, link_id, open()?, |record| {
         match record {

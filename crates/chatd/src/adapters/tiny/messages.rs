@@ -176,9 +176,13 @@ pub(crate) fn on_live(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         // someone's devices changed. Off the socket's thread: it asks the server.
         "e2ee.handshake" | "e2ee.keys_low" | "e2ee.device" => {
             if let Some(device) = e2ee::started(saved) {
-                let (kind, frame) = (kind.to_owned(), frame.clone());
+                let (kind, frame, ctx) = (kind.to_owned(), frame.clone(), ctx.clone());
                 let _ = std::thread::Builder::new().name("tiny-e2ee".into()).spawn(move || {
-                    device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).heard(&kind, &frame);
+                    let noticed = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).heard(&kind, &frame);
+                    // "New device added": the page shows it, on every device of the person.
+                    if noticed {
+                        ctx.community_changed();
+                    }
                 });
             }
         }
@@ -450,6 +454,7 @@ fn open_rows(saved: &Saved, conversation_id: &str, wires: &[&WireMessage]) -> Ha
             device_id: wire.device_id.as_deref().unwrap_or(""),
             target_id: wire.target_id.as_deref(),
             client_id: wire.client_id.as_deref(),
+            created_at: &wire.created_at,
         })
         .collect();
     let mut device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1180,6 +1185,14 @@ fn title_or(name: &str, fallback: &str) -> String {
 
 fn present(value: &Option<String>) -> bool {
     value.as_deref().is_some_and(|text| !text.is_empty())
+}
+
+/// The ids of the conversations the person is in: their channels and their direct messages.
+/// `None` when either list could not be read.
+pub(crate) fn conversation_ids(saved: &Saved) -> Option<std::collections::BTreeSet<String>> {
+    let channels = optional_list::<WireChannel>(saved, "/v1/channels", "channels")?;
+    let directs = optional_list::<WireDirect>(saved, "/v1/directs", "directs")?;
+    Some(channels.into_iter().map(|channel| channel.id).chain(directs.into_iter().map(|direct| direct.id)).collect())
 }
 
 fn optional_list<T: serde::de::DeserializeOwned>(saved: &Saved, path: &str, key: &str) -> Option<Vec<T>> {

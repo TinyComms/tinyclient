@@ -145,6 +145,90 @@ pub enum E2eeAsk {
     RecoveryKey,
     /// Checks a recovery key the person typed. Answers `Ok`, or an error that says it does not match.
     CheckRecovery { key: String },
+    /// On a device waiting to be approved: makes a link and shows its code, then waits for a
+    /// device the person has to answer. Answers `Ok`; what follows is in `Link`, and each step
+    /// is a `Change::Tiny`.
+    LinkStart,
+    /// On a device the person has: the code a new device shows, pasted or scanned. A
+    /// `tiny-device-` code (from a device on a server without device linking) is approved the old
+    /// way. Answers `Ok`.
+    LinkJoin { code: String },
+    /// On the device the person has: they checked the new device and typed the six digits it
+    /// shows. `history` is `none`, `days:N` or `all`. Answers `Ok`, or an error when the digits
+    /// do not match (the link stops).
+    LinkConfirm { history: String, check: String },
+    /// Stops the link on this device and tells the other one. Answers `Ok`.
+    LinkCancel,
+    /// The link in progress, without asking the server. Answers `TinyE2eeLink`.
+    Link,
+    /// The person knows a new device of theirs ("New device added"): the notice goes. Answers `Ok`.
+    SeenDevice { device_id: String },
+}
+
+/// Where a device link stands, on either device.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkStage {
+    /// The new device shows its code and waits for a device the person has to take it.
+    #[default]
+    Waiting,
+    /// Both devices show the same six digits. The old one asks the person to confirm.
+    Confirm,
+    /// The old device is signing the new one and packing up history.
+    Sending,
+    /// The new device is registering and unpacking history.
+    Receiving,
+    Done,
+    /// Stopped: `error` says why, in words.
+    Failed,
+}
+
+/// The device link in progress on this device (`E2eeAsk::Link`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eeLink {
+    /// `new` on the device being added, `old` on the device approving it.
+    pub role: String,
+    pub stage: LinkStage,
+    /// On the new device: the code to show, as text and as a QR of the same string.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code: String,
+    /// When the code runs out (the server's `expires_at`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub expires_at: String,
+    /// Six digits, once both devices have them. The new device shows them; the old one asks for
+    /// them.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub check: String,
+    /// On the old device: what the new device says it is, and its key's fingerprint.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub os: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fingerprint: String,
+    /// On the old device, at `Confirm`: how much history each choice would send.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<E2eeHistory>,
+    /// Bytes of history moved so far, of `total`.
+    #[serde(default, skip_serializing_if = "crate::is_zero64")]
+    pub done: u64,
+    #[serde(default, skip_serializing_if = "crate::is_zero64")]
+    pub total: u64,
+    /// Messages the new device took in, at `Done`.
+    #[serde(default, skip_serializing_if = "crate::is_zero64")]
+    pub messages: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+/// One choice of how much history to send, with its size.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eeHistory {
+    /// `none`, `days:N` or `all`.
+    pub history: String,
+    pub messages: u64,
+    /// About what it takes to send.
+    pub bytes: u64,
 }
 
 /// Where this device stands.
@@ -230,6 +314,13 @@ pub struct E2eeStatus {
     /// Key backup is not built yet: the recovery key is shown and checked, and backs nothing up.
     #[serde(default, skip_serializing_if = "crate::is_false")]
     pub backup: bool,
+    /// The server relays device links (`e2ee_device_link`): a new device is added with a code
+    /// and gets its history. Without it, the paste-the-code approval is all there is.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub linking: bool,
+    /// The person's devices that appeared since they last looked: "New device added".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added: Vec<E2eeDevice>,
 }
 
 #[cfg(test)]

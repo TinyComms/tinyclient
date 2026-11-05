@@ -839,6 +839,8 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
         Some(extras) => (extras.server, extras.roles, extras.categories, extras.bans),
         None => (None, Vec::new(), Vec::new(), Vec::new()),
     };
+    // "New device added", from what this device knows: no request.
+    let new_devices = e2ee::added(&saved);
     Response::TinyCommunity {
         community: TinyCommunity {
             role: saved.role,
@@ -857,6 +859,7 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
             categories,
             bans,
             provider,
+            new_devices,
         },
     }
 }
@@ -1057,13 +1060,18 @@ pub(crate) fn rename(account: AccountKey, display_name: String) -> Response {
 /// Ends every session of this account on the server. A 401 is already the same thing: the
 /// caller forgets the session either way.
 /// `Request::TinyE2ee`: this account's encryption device, its people and their safety numbers.
-pub(crate) fn e2ee_ask(account: AccountKey, ask: protocol::E2eeAsk) -> Response {
+/// `told` is called when a device link moves on by itself.
+pub(crate) fn e2ee_ask(account: AccountKey, ask: protocol::E2eeAsk, told: Arc<dyn Fn() + Send + Sync>) -> Response {
     let saved = match open(&account) {
         Ok(saved) => saved,
         Err(answer) => return answer,
     };
-    let names: std::collections::HashMap<String, String> = members_of(&saved).map(|members| members.into_iter().map(|member| (member.user_id, member.display_name)).collect()).unwrap_or_default();
-    e2ee::answer(&saved, ask, &names)
+    // Only the asks that show people need their names: a link's steps are asked often.
+    let names: std::collections::HashMap<String, String> = match ask {
+        protocol::E2eeAsk::Status | protocol::E2eeAsk::Person { .. } => members_of(&saved).map(|members| members.into_iter().map(|member| (member.user_id, member.display_name)).collect()).unwrap_or_default(),
+        _ => std::collections::HashMap::new(),
+    };
+    e2ee::answer(&saved, ask, &names, told)
 }
 
 pub(crate) fn end_sessions(account: &AccountKey) -> Result<(), Response> {
