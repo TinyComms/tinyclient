@@ -556,6 +556,11 @@ class Scenario:
         res = self.read_history(N, seconds=0, paginate=False)
         self.L.check(f"{prefix}.H3a", f"right after the link, {N.label} shows the pre-link history (all {len(self.history)} messages)", res["ok"], platform,
                      expected_on_base=False, waiting_on="client: imported history visible before any newer message arrives", **res["why"])
+        # Queue the linked device's first send before Bea sends anything that could warm its MLS
+        # groups. Do not wait for it here: the opposite direction must also begin immediately.
+        first_text = f"{self.canary}-{prefix}-new-device-sends-first"
+        first_sent_at = time.time()
+        first_client_id = self.send(N, self.ch, first_text, wait=False)
         # Send before reading/import assertions: scrolling history can itself take longer than
         # the server's membership batch window and would conceal a broken immediate join.
         sent_at = time.time()
@@ -563,6 +568,10 @@ class Scenario:
         got = N.wait_until("new msg", lambda: any(m.get("id") == immediate and readable(m) for m in (N.messages(self.dm) or [])), 60)
         self.L.check(f"{prefix}.H7a", f"{N.label} reads a message Bea sends right after the link", bool(got), platform,
                      expected_on_base=True, sent_after_link_s=round(sent_at - linked_at, 3), message_id=immediate)
+        first_seen = Bea.wait_until("new device first send", lambda: next((m for m in (Bea.messages(self.ch) or [])
+            if m.get("text") == first_text and readable(m) and (m.get("sender") or {}).get("id") == A.user_id), None), 60)
+        self.L.check(f"{prefix}.H8a", f"{N.label} sends first after the link and Bea reads it as Ada", bool(first_seen), platform,
+                     expected_on_base=True, sent_after_link_s=round(first_sent_at - linked_at, 3), client_id=first_client_id)
         after = (A.e2ee_status() or {}).get("devices") or []
         self.linked.append(N)
         self.L.check(f"{prefix}.H2b", f"Ada A lists the new device ({before} -> {len(after)})", len(after) == before + 1, platform, expected_on_base=True)
