@@ -1,0 +1,12 @@
+{
+  "id": "keep-opened-messages",
+  "title": "A message already opened stays in the chat after the store gains columns",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not restart desktop chatd against a scratch store. The columns are added in the same library this desktop run opens.",
+    "ios": "The phone proof build does not restart desktop chatd against a scratch store. The columns are added in the same library this desktop run opens."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 45
+}
