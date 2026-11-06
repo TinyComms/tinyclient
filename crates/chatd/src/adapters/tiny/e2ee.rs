@@ -474,8 +474,24 @@ pub(crate) fn started(saved: &Saved) -> Option<Shared> {
 }
 
 /// Opened plaintext this device already has for `message_id`, from the sealed cache.
-/// After a sqlite wipe the cache can still hold what was opened; the inbox preview reads it
-/// here when the store row is gone.
+/// Works even when the MLS device is not started yet: the cache key lives in the session.
+pub(crate) fn opened_row(saved: &Saved, conversation_id: &str, message_id: &str) -> Option<Opened> {
+    if let Some(shared) = started(saved) {
+        let mut device = lock(&shared);
+        if let Some(opened) = device
+            .cache(conversation_id)
+            .and_then(|cache| cache.rows.get(message_id).cloned())
+        {
+            return Some(opened);
+        }
+    }
+    let secrets = saved.e2ee.as_ref()?;
+    let (_, cache_key) = secrets.keys()?;
+    let cache = Cache::load(&dir_of(saved), conversation_id, &cache_key);
+    cache.rows.get(message_id).cloned()
+}
+
+/// Previously opened nonempty text, for the inbox preview.
 pub(crate) fn opened_text(saved: &Saved, conversation_id: &str, message_id: &str) -> Option<String> {
     if let Some(shared) = started(saved) {
         let mut device = lock(&shared);
