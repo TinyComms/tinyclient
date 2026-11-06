@@ -71,6 +71,11 @@ pub(crate) fn prove_cancel_join() -> Result<(), &'static str> {
     }
 }
 
+/// The lab's stale-page driver. A late empty newest page does not clear a newer read.
+pub(crate) fn prove_stale_page() -> Result<(), &'static str> {
+    conversation::prove_stale_page()
+}
+
 /// The lab's text-drag driver. A release outside the message pane ends the selection drag.
 pub(crate) fn prove_text_drag() -> Result<(), &'static str> {
     let mut dragging = true;
