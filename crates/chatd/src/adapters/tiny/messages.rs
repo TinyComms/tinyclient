@@ -587,11 +587,29 @@ fn upgraded(ctx: &Context, saved: &Saved, frame: &Value) {
 }
 
 /// The last line of an encrypted conversation, from what this device opened, or a word that says
-/// there is one.
+/// there is one. An Encrypted row with no opened text is not a blank inbox line.
 fn sealed_preview(ctx: &Context, conversation_id: &str, message_id: &str) -> String {
     match ctx.stored_message(conversation_id, message_id) {
-        Ok(Some(message)) if message.seal == Seal::Encrypted => message.text,
-        _ => "Encrypted message".to_owned(),
+        Ok(Some(message)) => sealed_preview_words(message.seal, &message.text),
+        _ => sealed_preview_words(Seal::Encrypted, ""),
+    }
+}
+
+fn sealed_preview_words(seal: Seal, text: &str) -> String {
+    if seal == Seal::Encrypted && !text.trim().is_empty() {
+        text.to_owned()
+    } else {
+        "Encrypted message".to_owned()
+    }
+}
+
+/// The lab's sealed-preview proof. An encrypted row with no opened text still names the preview.
+pub(super) fn prove_sealed_preview() -> Result<(), String> {
+    let words = sealed_preview_words(Seal::Encrypted, "");
+    if words == "Encrypted message" {
+        Ok(())
+    } else {
+        Err(format!("empty encrypted preview was {words:?}, not Encrypted message"))
     }
 }
 
@@ -2077,6 +2095,20 @@ mod tests {
         let outcome = post_message(&ctx, &saved, "sealed-1", "client-9", "secret words", None, &[]);
         assert_eq!(outcome.err().as_deref(), Some(NOT_SET_UP));
         assert!(!posted.load(std::sync::atomic::Ordering::SeqCst), "nothing was posted in plain text");
+    }
+
+    /// An Encrypted row with no opened text used to become a blank inbox preview.
+    #[test]
+    fn an_encrypted_row_with_no_opened_text_still_names_the_preview() {
+        assert_eq!(super::sealed_preview_words(Seal::Encrypted, ""), "Encrypted message");
+        assert_eq!(super::sealed_preview_words(Seal::Encrypted, "  "), "Encrypted message");
+        assert_eq!(super::sealed_preview_words(Seal::Encrypted, "opened words"), "opened words");
+        assert_eq!(super::prove_sealed_preview(), Ok(()));
+        let (_adapter, ctx, _saved) = fixture(|_| None);
+        let mut message = Message::plain("s-empty", "Bea", "", 1_700_000_000, false);
+        message.seal = Seal::Encrypted;
+        ctx.hub.store().ingest(&ctx.key("direct-1"), &message, false).unwrap();
+        assert_eq!(super::sealed_preview(&ctx, "direct-1", "s-empty"), "Encrypted message");
     }
 
     /// A current server sets `e2ee`. One that sends ciphertext without that flag must not be

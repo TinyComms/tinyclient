@@ -26,6 +26,11 @@ pub fn prove_missing_seal() -> Result<(), String> {
     messages::prove_missing_seal()
 }
 
+/// The lab's sealed-preview proof. See `messages::prove_sealed_preview`.
+pub fn prove_sealed_preview() -> Result<(), String> {
+    messages::prove_sealed_preview()
+}
+
 /// The lab's refused-list proof. See `messages::prove_refused_list`.
 pub fn prove_refused_list() -> Result<(), String> {
     messages::prove_refused_list()
