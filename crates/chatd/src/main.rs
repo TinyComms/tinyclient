@@ -48,6 +48,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-exit:0");
         return Ok(());
     }
+    // The lab's cache-before-enrol driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("cache-before-enrol") {
+        if let Err(err) = chatd::adapters::tiny::prove_cache_before_enrol() {
+            eprintln!("cache-before-enrol: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
     // The lab's cache-open-without-device driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("cache-open-without-device") {
         if let Err(err) = chatd::adapters::tiny::prove_cache_open_without_device() {

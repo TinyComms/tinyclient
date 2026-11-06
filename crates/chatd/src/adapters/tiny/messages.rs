@@ -730,6 +730,15 @@ pub(super) fn prove_sealed_cache_preview() -> Result<(), String> {
 /// still restores opened text from the sealed cache, so a wipe-and-update does not fill the
 /// pane with "Can't be decrypted" stubs. The lab sets `TINYCLIENT_PROVE=cache-open-without-device`.
 pub(super) fn prove_cache_open_without_device() -> Result<(), String> {
+    prove_cache_recovery(false)
+}
+
+/// A device whose capabilities check cannot enrol still reads its previously opened cache.
+pub(super) fn prove_cache_before_enrol() -> Result<(), String> {
+    prove_cache_recovery(true)
+}
+
+fn prove_cache_recovery(start_device: bool) -> Result<(), String> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|err| err.to_string())?;
     let base = format!("http://{}", listener.local_addr().map_err(|err| err.to_string())?);
     let conversation = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0";
@@ -751,7 +760,10 @@ pub(super) fn prove_cache_open_without_device() -> Result<(), String> {
         e2ee: Some(secrets),
     };
     e2ee::write_opened_cache(&saved, conversation, message_id, "still here")?;
-    if e2ee::started(&saved).is_some() {
+    if start_device {
+        // The fixture refuses capabilities, leaving an existing device without an engine.
+        e2ee::begin(&saved);
+    } else if e2ee::started(&saved).is_some() {
         return Err("the MLS device was started; this prove needs only the sealed cache".to_owned());
     }
     let hub = std::sync::Arc::new(crate::hub::Hub::new(
@@ -769,8 +781,8 @@ pub(super) fn prove_cache_open_without_device() -> Result<(), String> {
         .upsert_conversation(&account, &row)
         .map_err(|err| err.to_string())?;
     load_page(&ctx, &saved, conversation, None, PAGE);
-    if e2ee::started(&saved).is_some() {
-        return Err("fetch started the MLS device".to_owned());
+    if e2ee::started(&saved).is_some() != start_device {
+        return Err("fetch changed whether the MLS device was started".to_owned());
     }
     match ctx
         .stored_message(conversation, message_id)
@@ -2451,6 +2463,11 @@ mod tests {
     #[test]
     fn a_history_fetch_restores_opened_text_from_the_sealed_cache_without_a_device() {
         assert_eq!(super::prove_cache_open_without_device(), Ok(()));
+    }
+
+    #[test]
+    fn a_started_device_reads_cached_history_before_enrolment() {
+        assert_eq!(super::prove_cache_before_enrol(), Ok(()));
     }
 
     /// A later undecryptable fetch keeps the text this device already opened.
