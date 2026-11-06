@@ -1,0 +1,12 @@
+{
+  "id": "text-drag",
+  "title": "Releasing a text selection outside the message pane ends the drag",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same release ends the drag on the phone's message pane.",
+    "ios": "The phone proof build does not run the desktop window. The same release ends the drag on the phone's message pane."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

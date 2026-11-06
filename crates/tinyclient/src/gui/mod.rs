@@ -36,6 +36,16 @@ mod theme;
 mod tiny;
 mod time;
 
+/// The lab's text-drag driver. A release outside the message pane ends the selection drag.
+pub(crate) fn prove_text_drag() -> Result<(), &'static str> {
+    let mut dragging = true;
+    if !conversation::release_text_drag(&mut dragging, false) || dragging {
+        Err("a release outside the pane left the selection drag up")
+    } else {
+        Ok(())
+    }
+}
+
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 
