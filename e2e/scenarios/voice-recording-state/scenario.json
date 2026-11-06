@@ -1,0 +1,7 @@
+{
+  "id": "voice-recording-state",
+  "title": "Record a voice note, stop it, then play and pause the staged note before sending",
+  "platforms": ["linux"],
+  "needs": [],
+  "release": false
+}

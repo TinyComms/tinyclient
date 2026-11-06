@@ -1996,7 +1996,7 @@ impl Composer {
     }
 
     /// A 28 pt icon button on the card, its bounds kept for what it opens.
-    /// The mic on the card. A recording under way shows a red dot in its place, and the next
+    /// The mic on the card. A recording under way shows a stop square in its place, and the next
     /// press stops it: the gate (`Controls::voice`) decides it is on the card at all.
     fn mic_button(&self, on: bool, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
         if !on {
@@ -2007,13 +2007,13 @@ impl Composer {
             .as_ref()
             .is_some_and(|recording| Some(&recording.conversation) == self.target.as_ref().map(|target| &target.key) && matches!(recording.state, RecordState::Active));
         let (icon, words) = match hot {
-            true => ("icons/record.svg", "Stop recording"),
+            true => ("icons/square.svg", "Stop recording"),
             false => ("icons/mic.svg", "Record a voice message"),
         };
         Some(
             self.card_button("mic", Some(icon), false, None)
                 .tooltip(tip(words, None))
-                // A recording's dot is its own: the button says what the next press does.
+                // The button says what the next press does.
                 .map(|button| match hot {
                     true => button.bg(theme::danger_soft()),
                     false => button,
@@ -2035,7 +2035,7 @@ impl Composer {
     }
 
     /// `Change::Recording`: the recording on show here, and a finished note staged as a chip so
-    /// it is sent like any file. The note came from chatd's cache, so a removed chip gives the
+    /// it is sent like any file. The note came from chatd's recorder, so a removed chip gives the
     /// recording in rather than taking the file with it.
     fn recording_changed(&mut self, recording: &Option<Rec>, cx: &mut Context<Self>) {
         self.recording = recording.clone();
@@ -2769,6 +2769,15 @@ impl Render for Composer {
 }
 
 impl Shell {
+    pub(super) fn composer_playback_redraw(&self, cx: &mut Context<Self>) {
+        let ids: Vec<_> = [self.composer_state.main.get(), self.composer_state.thread.get()]
+            .into_iter().flatten().map(Entity::entity_id).collect();
+        let app: &mut gpui::App = cx;
+        for id in ids {
+            app.notify(id);
+        }
+    }
+
     fn composer_in(&self, thread: bool, cx: &mut Context<Self>) -> Entity<Composer> {
         let slot = if thread { &self.composer_state.thread } else { &self.composer_state.main };
         slot.get_or_init(|| {

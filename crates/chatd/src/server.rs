@@ -1136,6 +1136,9 @@ impl Chat {
         }
         self.hub.changed(Change::Messages { conversation: conversation.clone() });
         self.hub.changed(Change::Conversation { conversation: conversation.clone() });
+        for file in &with.files {
+            self.hub.player.stop_file(&self.hub, std::path::Path::new(&file.path));
+        }
         let (conversation_id, text) = (conversation.id, message.text.clone());
         let command = match with.is_plain() {
             true => Command::Send { conversation_id, client_id, text, reply_to },
@@ -2388,7 +2391,7 @@ impl Chat {
             },
             // Answered `Ok` whatever became of it: the recording's own word is `Change::Recording`.
             Request::Record(request) => {
-                self.hub.recorder.request(&self.hub, &support_dir().join("media"), request);
+                self.hub.recorder.request(&self.hub, request);
                 Response::Ok
             }
             Request::Media(request) => {

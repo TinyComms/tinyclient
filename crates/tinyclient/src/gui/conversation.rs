@@ -1400,6 +1400,7 @@ impl Shell {
         for pane in panes {
             app.notify(pane);
         }
+        self.composer_playback_redraw(cx);
     }
 
     /// Offered every change chatd reports, after `Shell` has applied its own part.
