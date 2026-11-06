@@ -1360,9 +1360,9 @@ impl Store {
             .optional()
     }
 
-    /// Whether a space already holds text channels and/or directs. Directs sort after channels
-    /// by position, so a paged tree read can miss them.
-    pub fn space_text_kinds(&self, space: &Key) -> rusqlite::Result<(bool, bool)> {
+    /// Whether a space already holds text channels, directs, and/or voice rooms. Directs sort
+    /// after channels by position, so a paged tree read can miss them.
+    pub fn space_text_kinds(&self, space: &Key) -> rusqlite::Result<(bool, bool, bool)> {
         let key = params![word(&space.network), space.account, space.id];
         let channels: bool = self.db.query_row(
             "SELECT EXISTS (
@@ -1382,7 +1382,16 @@ impl Store {
             key,
             |row| row.get(0),
         )?;
-        Ok((channels, directs))
+        let voice: bool = self.db.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM conversation
+                  WHERE network = ?1 AND account = ?2 AND space = ?3 AND parent = ''
+                    AND kind = 'voice'
+             )",
+            key,
+            |row| row.get(0),
+        )?;
+        Ok((channels, directs, voice))
     }
 
     /// Whether a conversation may appear where the user asked for what is listed: hidden

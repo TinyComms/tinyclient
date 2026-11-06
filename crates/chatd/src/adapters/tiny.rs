@@ -685,11 +685,13 @@ fn members_of(saved: &Saved) -> Result<Vec<TinyMember>, &'static str> {
     }
 }
 
-/// A server older than rooms answers 404: it has none.
+/// A server older than rooms answers 404: it has none. A 403 is a refusal, not an empty list:
+/// treating it as empty makes replace_tree delete every stored voice room.
 fn rooms_of(saved: &Saved) -> Listed<Vec<TinyRoom>> {
     match asked("GET", saved, "/v1/rooms", None) {
         Err(detail) => Listed::Failed(detail),
-        Ok((403 | 404, _)) => Listed::Empty,
+        Ok((404, _)) => Listed::Empty,
+        Ok((403, body)) => Listed::Failed(explain(403, &body, Missing::Plain)),
         // Who sits in each call comes from the live socket, never from this list.
         Ok((200, body)) => match rows::<TinyRoom>(body, "rooms") {
             Ok(rooms) => Listed::Rows(rooms.into_iter().map(|room| TinyRoom { participants: Vec::new(), ..room }).collect()),

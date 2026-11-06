@@ -50,8 +50,8 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
     // A 200 with an empty channels or directs list still runs replace_tree: every conversation
     // that list left out is deleted with its messages. A brief empty answer during a server
     // update is not an empty community. A first connect with nothing of that kind still replaces.
+    let (had_channels, had_directs, had_voice) = kept_list_kinds(ctx);
     if channels.is_empty() || directs.is_empty() {
-        let (had_channels, had_directs) = kept_text_kinds(ctx);
         if (channels.is_empty() && had_channels) || (directs.is_empty() && had_directs) {
             tracing::warn!("chatd: Tiny server: empty channel or direct list; keeping the stored tree");
             return;
@@ -65,6 +65,12 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
             return;
         }
     };
+    // Same for voice rooms: an empty rooms answer (or a 404 on an old server that never had
+    // rooms) must not delete rooms already stored.
+    if rooms.is_empty() && had_voice {
+        tracing::warn!("chatd: Tiny server: empty rooms list; keeping the stored tree");
+        return;
+    }
     let mut people: Vec<PersonRow> = names
         .iter()
         .filter(|(id, _)| super::safe_id(id))
@@ -1206,11 +1212,11 @@ fn present(value: &Option<String>) -> bool {
     value.as_deref().is_some_and(|text| !text.is_empty())
 }
 
-/// Whether the stored space already has text channels and/or directs. Used to refuse an empty
-/// list that would delete those rows and their messages. Directs sort after channels, so this
-/// must not use a paged tree read.
-fn kept_text_kinds(ctx: &Context) -> (bool, bool) {
-    ctx.hub.store().space_text_kinds(&ctx.key(SPACE)).unwrap_or((false, false))
+/// Whether the stored space already has text channels, directs, and/or voice rooms. Used to
+/// refuse an empty list that would delete those rows and their messages. Directs sort after
+/// channels, so this must not use a paged tree read.
+fn kept_list_kinds(ctx: &Context) -> (bool, bool, bool) {
+    ctx.hub.store().space_text_kinds(&ctx.key(SPACE)).unwrap_or((false, false, false))
 }
 
 fn optional_list<T: serde::de::DeserializeOwned>(saved: &Saved, path: &str, key: &str) -> Option<Vec<T>> {
@@ -1943,7 +1949,27 @@ mod tests {
             !page.conversations.iter().any(|row| row.kind == ConversationKind::Direct),
             "the first tree page is only channels"
         );
-        assert_eq!(ctx.hub.store().space_text_kinds(&space).unwrap(), (true, true));
+        assert_eq!(ctx.hub.store().space_text_kinds(&space).unwrap(), (true, true, false));
+    }
+
+    /// An empty rooms list with voice rooms already stored would delete those rooms.
+    #[test]
+    fn an_empty_rooms_list_does_not_drop_stored_voice_rooms() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            if request.starts_with("GET /v1/rooms ") && seen.fetch_add(1, Ordering::Relaxed) >= 1 {
+                return Some(http(200, "OK", "[]"));
+            }
+            None
+        });
+        assert!(ctx.known("room-1").unwrap().is_some(), "fixture stores a voice room");
+        refresh(&ctx, &saved);
+        assert!(
+            ctx.known("room-1").unwrap().is_some(),
+            "an empty rooms list leaves the stored voice room"
+        );
     }
 
     #[test]
