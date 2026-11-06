@@ -1,0 +1,12 @@
+{
+  "id": "join-before-room",
+  "title": "call.join goes out before the room's mediad settings",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same join order is what a phone call uses.",
+    "ios": "The phone proof build does not run desktop chatd. The same join order is what a phone call uses."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

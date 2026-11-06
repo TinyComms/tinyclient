@@ -15,6 +15,14 @@ fn main() -> io::Result<()> {
         }
         return Ok(());
     }
+    // The lab's join-order driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("join-before-room") {
+        if let Err(err) = chatd::adapters::tiny::prove_join_before_room() {
+            eprintln!("join-before-room: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     // The lab's sealed-row driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("sealed-row") {
         if let Err(err) = chatd::adapters::tiny::prove_missing_seal() {
