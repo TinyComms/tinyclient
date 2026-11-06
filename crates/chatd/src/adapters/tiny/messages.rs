@@ -730,6 +730,15 @@ pub(super) fn prove_sealed_cache_preview() -> Result<(), String> {
 /// still restores opened text from the sealed cache, so a wipe-and-update does not fill the
 /// pane with "Can't be decrypted" stubs. The lab sets `TINYCLIENT_PROVE=cache-open-without-device`.
 pub(super) fn prove_cache_open_without_device() -> Result<(), String> {
+    prove_cache_recovery(false)
+}
+
+/// A device whose capabilities check cannot enrol still reads its previously opened cache.
+pub(super) fn prove_cache_before_enrol() -> Result<(), String> {
+    prove_cache_recovery(true)
+}
+
+fn prove_cache_recovery(start_device: bool) -> Result<(), String> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|err| err.to_string())?;
     let base = format!("http://{}", listener.local_addr().map_err(|err| err.to_string())?);
     let conversation = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0";
@@ -751,7 +760,10 @@ pub(super) fn prove_cache_open_without_device() -> Result<(), String> {
         e2ee: Some(secrets),
     };
     e2ee::write_opened_cache(&saved, conversation, message_id, "still here")?;
-    if e2ee::started(&saved).is_some() {
+    if start_device {
+        // The fixture refuses capabilities, leaving an existing device without an engine.
+        e2ee::begin(&saved);
+    } else if e2ee::started(&saved).is_some() {
         return Err("the MLS device was started; this prove needs only the sealed cache".to_owned());
     }
     let hub = std::sync::Arc::new(crate::hub::Hub::new(
@@ -769,8 +781,8 @@ pub(super) fn prove_cache_open_without_device() -> Result<(), String> {
         .upsert_conversation(&account, &row)
         .map_err(|err| err.to_string())?;
     load_page(&ctx, &saved, conversation, None, PAGE);
-    if e2ee::started(&saved).is_some() {
-        return Err("fetch started the MLS device".to_owned());
+    if e2ee::started(&saved).is_some() != start_device {
+        return Err("fetch changed whether the MLS device was started".to_owned());
     }
     match ctx
         .stored_message(conversation, message_id)
@@ -855,6 +867,48 @@ pub(super) fn prove_keep_opened_sealed() -> Result<(), String> {
             stored.seal, stored.text
         )),
         None => Err("opened row was deleted".to_owned()),
+    }
+}
+
+/// Opening a Tiny chat reaches the real adapter command loop and fetches its history.
+pub(super) fn prove_tiny_open_backfill() -> Result<(), String> {
+    const ME: &str = "11111111-1111-1111-1111-111111111111";
+    const PEER: &str = "22222222-2222-2222-2222-222222222222";
+    let base = super::serve(|request| {
+        let body = if request.starts_with("GET /v1/conversations/direct-1/messages?") {
+            json!({"messages":[{"id":"m-backfill","author_id":PEER,"body":"fetched after open","created_at":"2024-01-02T03:04:05Z"}]})
+        } else if request.starts_with("GET /v1/channels ") {
+            json!({"channels":[]})
+        } else if request.starts_with("GET /v1/directs ") {
+            json!({"directs":[{"id":"direct-1","peer":{"user_id":PEER,"display_name":"Bea"}}]})
+        } else if request.starts_with("GET /v1/members ") || request.starts_with("GET /v1/rooms ") {
+            json!([])
+        } else {
+            return super::http(404, "Not Found", "{}");
+        };
+        super::http(200, "OK", &body.to_string())
+    });
+    let saved = Saved {
+        base_url: base, token: "fixture-token".to_owned(), user_id: ME.to_owned(),
+        email: None, display_name: "Ada".to_owned(), role: "member".to_owned(),
+        plain_http_ok: false, e2ee: None,
+    };
+    let hub = std::sync::Arc::new(crate::hub::Hub::new(
+        crate::store::Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?,
+    ));
+    let account = protocol::AccountKey { network: protocol::Network::Tiny, account: ME.to_owned() };
+    let (adapter, ctx, inbox) = crate::adapters::local(account, hub);
+    super::start(ctx.clone(), &serde_json::to_string(&saved).map_err(|err| err.to_string())?, inbox)?;
+    adapter.command(Command::Backfill("direct-1".to_owned()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if let Some(message) = ctx.stored_message("direct-1", "m-backfill").map_err(|err| err.to_string())? {
+            return if message.text == "fetched after open" { Ok(()) } else { Err("backfill stored the wrong text".to_owned()) };
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("opening the chat never fetched history".to_owned());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -2355,6 +2409,11 @@ mod tests {
     }
 
     #[test]
+    fn an_open_backfill_reaches_the_running_tiny_adapter() {
+        assert_eq!(super::prove_tiny_open_backfill(), Ok(()));
+    }
+
+    #[test]
     fn a_message_page_is_stored_oldest_first() {
         let (_adapter, ctx, saved) = fixture(|request| {
             if request.starts_with("GET /v1/conversations/channel-1/messages?") && request.contains("limit=50") {
@@ -2451,6 +2510,11 @@ mod tests {
     #[test]
     fn a_history_fetch_restores_opened_text_from_the_sealed_cache_without_a_device() {
         assert_eq!(super::prove_cache_open_without_device(), Ok(()));
+    }
+
+    #[test]
+    fn a_started_device_reads_cached_history_before_enrolment() {
+        assert_eq!(super::prove_cache_before_enrol(), Ok(()));
     }
 
     /// A later undecryptable fetch keeps the text this device already opened.

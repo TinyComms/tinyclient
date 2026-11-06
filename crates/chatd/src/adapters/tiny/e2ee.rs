@@ -1370,6 +1370,10 @@ impl Device {
     }
 
     fn cache(&mut self, conversation_id: &str) -> Option<&mut Cache> {
+        // Previously opened text stays readable while enrolment is unavailable or off.
+        if self.cache_key.is_none() {
+            self.cache_key = self.saved.e2ee.as_ref().and_then(Secrets::keys).map(|(_, key)| key);
+        }
         let key = self.cache_key.as_ref()?;
         if !self.caches.contains_key(conversation_id) {
             let cache = Cache::load(&self.dir, conversation_id, key);
