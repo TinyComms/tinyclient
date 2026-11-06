@@ -1,0 +1,12 @@
+{
+  "id": "sealed-preview",
+  "title": "An encrypted row with no opened text still names the preview",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd against a localhost preview. The same preview check keeps the words this desktop run checks.",
+    "ios": "The phone proof build does not run desktop chatd against a localhost preview. The same preview check keeps the words this desktop run checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
