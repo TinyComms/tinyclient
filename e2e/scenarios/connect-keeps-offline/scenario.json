@@ -1,0 +1,12 @@
+{
+  "id": "connect-keeps-offline",
+  "title": "A failed connect marks cached accounts offline so chats still show",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same connect check marks accounts offline.",
+    "ios": "The phone proof build does not run desktop chatd. The same connect check marks accounts offline."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

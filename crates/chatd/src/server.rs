@@ -346,7 +346,13 @@ impl Chat {
                     session::Stored::Found(session) => {
                         match chat.connect(network, &session) {
                             Ok(()) => settled.push(network),
-                            Err(err) => tracing::warn!("chatd: {}: {err}; keeping its cache", network.label()),
+                            Err(err) => {
+                                tracing::warn!("chatd: {}: {err}; keeping its cache", network.label());
+                                // accounts() or start can fail before an adapter is inserted.
+                                // Without a link, status drops the account as SignedOut, shows()
+                                // is false, and the open pane clears even though the cache stays.
+                                chat.keep_cached_offline(network, &err);
+                            }
                         }
                         chat.hub.read_now(network, false, false);
                     }
@@ -392,6 +398,12 @@ impl Chat {
                 read.recv().unwrap_or_else(|_| session::Stored::Unreadable("the keychain read ended without an answer".to_owned()))
             }
         }
+    }
+
+    /// Marks every stored account of `network` Offline with `why`. Used when a session was found
+    /// but connect failed, so cached chats still show instead of a signed-out empty page.
+    fn keep_cached_offline(&self, network: Network, why: &str) {
+        mark_network_offline(&self.hub, network, why);
     }
 
     /// Starts an adapter for every account in a network's session.
@@ -2855,11 +2867,55 @@ pub fn prove_kept_backfill() -> Result<(), &'static str> {
     }
 }
 
+/// Marks every stored account of `network` Offline with `why`.
+fn mark_network_offline(hub: &crate::hub::Hub, network: Network, why: &str) {
+    let Ok(rows) = hub.store().accounts() else {
+        return;
+    };
+    for row in rows.into_iter().filter(|row| row.key.network == network) {
+        hub.set_link(&row.key, Link::Offline, why);
+    }
+}
+
+/// The lab's connect-keeps-offline driver. A connect failure marks cached accounts Offline.
+pub fn prove_connect_keeps_offline() -> Result<(), String> {
+    let hub = std::sync::Arc::new(crate::hub::Hub::new(
+        crate::store::Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?,
+    ));
+    let account = protocol::AccountKey {
+        network: Network::Tiny,
+        account: "11111111-1111-1111-1111-111111111111".into(),
+    };
+    hub.store()
+        .set_account(&account, "Ada", "")
+        .map_err(|err| err.to_string())?;
+    mark_network_offline(&hub, Network::Tiny, "connect failed");
+    match hub.link(&account) {
+        Link::Offline => Ok(()),
+        other => Err(format!("link was {other:?}, not Offline")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::published_link;
     use crate::adapters::Command;
-    use protocol::Link;
+    use protocol::{AccountKey, Link, Network};
+
+    #[test]
+    fn a_failed_connect_marks_cached_accounts_offline_so_chats_still_show() {
+        let hub = std::sync::Arc::new(crate::hub::Hub::new(
+            crate::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+        ));
+        let account = AccountKey {
+            network: Network::Tiny,
+            account: "11111111-1111-1111-1111-111111111111".into(),
+        };
+        hub.store().set_account(&account, "Ada", "").unwrap();
+        super::mark_network_offline(&hub, Network::Tiny, "connect failed");
+        assert_eq!(hub.link(&account), Link::Offline);
+        assert_eq!(super::prove_connect_keeps_offline(), Ok(()));
+    }
 
     /// Opening the newest page asks for a catch-up. If that ask arrives before the adapter
     /// is in the map, it has to be kept: the later list refresh is not a message change, so
