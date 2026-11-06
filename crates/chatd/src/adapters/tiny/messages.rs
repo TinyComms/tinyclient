@@ -47,20 +47,13 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
     let Some(directs) = optional_list::<WireDirect>(saved, "/v1/directs", "directs") else {
         return;
     };
-    // A 200 with empty channels and directs is still an empty tree replace: every conversation
-    // left out is deleted with its messages. A brief empty answer during a server update is not
-    // an empty community. A first connect with nothing stored still replaces as empty.
-    if channels.is_empty() && directs.is_empty() {
-        let space = ctx.key(SPACE);
-        let kept = ctx
-            .hub
-            .store()
-            .tree(&space, 0, 1)
-            .ok()
-            .flatten()
-            .is_some_and(|tree| tree.total > 0);
-        if kept {
-            tracing::warn!("chatd: Tiny server: empty channel and direct lists; keeping the stored tree");
+    // A 200 with an empty channels or directs list still runs replace_tree: every conversation
+    // that list left out is deleted with its messages. A brief empty answer during a server
+    // update is not an empty community. A first connect with nothing of that kind still replaces.
+    if channels.is_empty() || directs.is_empty() {
+        let (had_channels, had_directs) = kept_text_kinds(ctx);
+        if (channels.is_empty() && had_channels) || (directs.is_empty() && had_directs) {
+            tracing::warn!("chatd: Tiny server: empty channel or direct list; keeping the stored tree");
             return;
         }
     }
@@ -1213,6 +1206,21 @@ fn present(value: &Option<String>) -> bool {
     value.as_deref().is_some_and(|text| !text.is_empty())
 }
 
+/// Whether the stored space already has text channels and/or directs. Used to refuse an empty
+/// list that would delete those rows and their messages.
+fn kept_text_kinds(ctx: &Context) -> (bool, bool) {
+    let space = ctx.key(SPACE);
+    let Ok(Some(tree)) = ctx.hub.store().tree(&space, 0, PAGE_MAX) else {
+        return (false, false);
+    };
+    let channels = tree
+        .conversations
+        .iter()
+        .any(|row| matches!(row.kind, ConversationKind::Channel | ConversationKind::Announcement));
+    let directs = tree.conversations.iter().any(|row| row.kind == ConversationKind::Direct);
+    (channels, directs)
+}
+
 fn optional_list<T: serde::de::DeserializeOwned>(saved: &Saved, path: &str, key: &str) -> Option<Vec<T>> {
     match super::asked("GET", saved, path, None) {
         // A refusal is not an empty server. An empty list deletes every conversation left out,
@@ -1891,6 +1899,33 @@ mod tests {
         assert_eq!(
             page.messages.iter().find(|message| message.id == "m-kept").map(|message| message.text.as_str()),
             Some("kept")
+        );
+    }
+
+    /// An empty directs list with channels still present would delete every DM and its messages.
+    #[test]
+    fn an_empty_direct_list_does_not_drop_stored_messages() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            if request.starts_with("GET /v1/directs ") && seen.fetch_add(1, Ordering::Relaxed) >= 1 {
+                return Some(http(200, "OK", r#"{"directs":[]}"#));
+            }
+            None
+        });
+        let kept = Message::plain("m-dm", "Ada", "kept dm", 1_700_000_000, false);
+        ctx.hub.store().ingest(&ctx.key("direct-1"), &kept, false).unwrap();
+        refresh(&ctx, &saved);
+        let page = ctx
+            .hub
+            .store()
+            .messages(&ctx.key("direct-1"), &Page::Newest, 10, 1_800_000_000)
+            .unwrap()
+            .expect("an empty direct list leaves the direct");
+        assert_eq!(
+            page.messages.iter().find(|message| message.id == "m-dm").map(|message| message.text.as_str()),
+            Some("kept dm")
         );
     }
 
