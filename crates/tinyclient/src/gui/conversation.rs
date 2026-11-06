@@ -1307,7 +1307,15 @@ impl Render for Pane {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if std::mem::take(&mut this.dragging) {
+                    if release_text_drag(&mut this.dragging, true) {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if release_text_drag(&mut this.dragging, false) {
                         cx.notify();
                     }
                 }),
@@ -1533,6 +1541,13 @@ fn landing(below: f32, height: f32, new: usize, mut tall: impl FnMut(usize) -> f
     Some(ListOffset { item_ix: at, offset_in_item: px(offset) })
 }
 
+/// A text drag ends when the button comes up. The release is often outside the message
+/// pane. Hearing only the release that lands on the pane left the blue selection following
+/// the pointer, and the row toolbar stayed hidden so the next clicks did nothing.
+pub(crate) fn release_text_drag(dragging: &mut bool, _over_messages: bool) -> bool {
+    std::mem::take(dragging)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1625,5 +1640,15 @@ mod tests {
         let pressed = Selection { message: "m".into(), anchor: (1, 4), head: None };
         assert_eq!(pressed.within(1), None);
         assert_eq!(dragged((1, 4), (1, 4)).within(1), None);
+    }
+
+    #[test]
+    fn a_release_outside_the_message_pane_ends_the_text_drag() {
+        let mut dragging = true;
+        assert!(
+            release_text_drag(&mut dragging, false),
+            "the button came up outside the pane"
+        );
+        assert!(!dragging);
     }
 }
