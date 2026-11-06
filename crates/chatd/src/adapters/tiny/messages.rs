@@ -342,7 +342,14 @@ impl Note {
         let _ = ctx.counts(&self.id, self.unread, 0, self.last_read.as_deref(), updated);
         if let Some(last) = &self.last {
             if super::safe_id(&last.id) {
-                let text = if self.sealed { sealed_preview(ctx, &self.id, &last.id) } else { last.body.clone() };
+                if self.sealed {
+                    rehydrate_opened(ctx, saved, &self.id, last, self.mine, names);
+                }
+                let text = if self.sealed {
+                    sealed_preview(ctx, saved, &self.id, &last.id)
+                } else {
+                    last.body.clone()
+                };
                 let _ = ctx.preview(&self.id, &PreviewLine {
                     id: last.id.clone(),
                     text,
@@ -600,12 +607,50 @@ fn upgraded(ctx: &Context, saved: &Saved, frame: &Value) {
     }
 }
 
+/// When sqlite lost a sealed row but the sealed cache still has it, put that opened text back
+/// into the store so the pane is not empty for the last line. Full older history still needs a
+/// fetch; this restores what the list already names.
+fn rehydrate_opened(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    last: &WireLast,
+    mine: bool,
+    names: &HashMap<String, String>,
+) {
+    if ctx
+        .stored_message(conversation_id, &last.id)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return;
+    }
+    let Some(text) = e2ee::opened_text(saved, conversation_id, &last.id) else {
+        return;
+    };
+    let sender = if mine {
+        String::new()
+    } else {
+        name_of(names, saved, &last.author_id)
+    };
+    let sent = rfc3339(&last.created_at).unwrap_or(0);
+    let mut message = Message::plain(&last.id, &sender, &text, sent, mine);
+    message.sender.id = last.author_id.clone();
+    message.seal = Seal::Encrypted;
+    let _ = ctx.history(conversation_id, &[message]);
+}
+
 /// The last line of an encrypted conversation, from what this device opened, or a word that says
-/// there is one. An Encrypted row with no opened text is not a blank inbox line.
-fn sealed_preview(ctx: &Context, conversation_id: &str, message_id: &str) -> String {
+/// there is one. An Encrypted row with no opened text is not a blank inbox line. When the sqlite
+/// row was wiped but the sealed cache still holds the opened text, that text is the preview.
+fn sealed_preview(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str) -> String {
     match ctx.stored_message(conversation_id, message_id) {
         Ok(Some(message)) => sealed_preview_words(message.seal, &message.text),
-        _ => sealed_preview_words(Seal::Encrypted, ""),
+        _ => match e2ee::opened_text(saved, conversation_id, message_id) {
+            Some(text) => sealed_preview_words(Seal::Encrypted, &text),
+            None => sealed_preview_words(Seal::Encrypted, ""),
+        },
     }
 }
 
@@ -624,6 +669,60 @@ pub(super) fn prove_sealed_preview() -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("empty encrypted preview was {words:?}, not Encrypted message"))
+    }
+}
+
+/// The lab's sealed-cache-preview proof. A wiped sqlite row still names the inbox from the sealed
+/// cache, and the last opened line is written back into the store. The lab sets
+/// `TINYCLIENT_PROVE=sealed-cache-preview`.
+pub(super) fn prove_sealed_cache_preview() -> Result<(), String> {
+    let secrets = e2ee::Secrets::generate().map_err(|err| err.to_string())?;
+    let saved = Saved {
+        base_url: "http://127.0.0.1:9".to_owned(),
+        token: "t".to_owned(),
+        user_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned(),
+        email: None,
+        display_name: "Ada".to_owned(),
+        role: "owner".to_owned(),
+        plain_http_ok: false,
+        e2ee: Some(secrets),
+    };
+    let conversation = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0";
+    let message_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    e2ee::write_opened_cache(&saved, conversation, message_id, "still here")?;
+    let hub = std::sync::Arc::new(crate::hub::Hub::new(
+        crate::store::Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?,
+    ));
+    let account = protocol::AccountKey {
+        network: protocol::Network::Tiny,
+        account: saved.user_id.clone(),
+    };
+    let (_adapter, ctx, _inbox) = crate::adapters::local(account.clone(), hub);
+    let mut row = crate::store::ConversationRow::new(conversation, ConversationKind::Direct, "Bea");
+    row.encryption = Encryption::EndToEnd;
+    ctx.hub
+        .store()
+        .upsert_conversation(&account, &row)
+        .map_err(|err| err.to_string())?;
+    let last = WireLast {
+        id: message_id.to_owned(),
+        author_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc".to_owned(),
+        body: String::new(),
+        created_at: "2024-01-02T03:04:05Z".to_owned(),
+    };
+    let names = HashMap::new();
+    rehydrate_opened(&ctx, &saved, conversation, &last, false, &names);
+    let words = sealed_preview(&ctx, &saved, conversation, message_id);
+    if words != "still here" {
+        return Err(format!("wiped-store preview was {words:?}, not still here"));
+    }
+    match ctx.stored_message(conversation, message_id).map_err(|err| err.to_string())? {
+        Some(message) if message.text == "still here" && message.seal == Seal::Encrypted => Ok(()),
+        Some(message) => Err(format!(
+            "rehydrated row was {:?} / {:?}",
+            message.seal, message.text
+        )),
+        None => Err("sealed cache did not rehydrate the store row".to_owned()),
     }
 }
 
@@ -2259,11 +2358,18 @@ mod tests {
         assert_eq!(super::sealed_preview_words(Seal::Encrypted, "  "), "Encrypted message");
         assert_eq!(super::sealed_preview_words(Seal::Encrypted, "opened words"), "opened words");
         assert_eq!(super::prove_sealed_preview(), Ok(()));
-        let (_adapter, ctx, _saved) = fixture(|_| None);
+        let (_adapter, ctx, saved) = fixture(|_| None);
         let mut message = Message::plain("s-empty", "Bea", "", 1_700_000_000, false);
         message.seal = Seal::Encrypted;
         ctx.hub.store().ingest(&ctx.key("direct-1"), &message, false).unwrap();
-        assert_eq!(super::sealed_preview(&ctx, "direct-1", "s-empty"), "Encrypted message");
+        assert_eq!(super::sealed_preview(&ctx, &saved, "direct-1", "s-empty"), "Encrypted message");
+    }
+
+    /// After a sqlite wipe the sealed cache can still hold what this device opened. The inbox
+    /// preview must use that text, not the generic "Encrypted message" placeholder.
+    #[test]
+    fn a_wiped_store_still_names_the_preview_from_the_sealed_cache() {
+        assert_eq!(super::prove_sealed_cache_preview(), Ok(()));
     }
 
     /// After an update the MLS device may not be started yet. A history fetch must still restore
