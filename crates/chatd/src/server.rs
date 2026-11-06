@@ -955,7 +955,14 @@ impl Chat {
                         let after = id.clone();
                         self.command(&account, Command::HistoryAfter { conversation_id, after });
                     }
-                    Page::Around { id } if !found.older || !found.newer || !found.messages.iter().any(|message| message.id == *id) => {
+                    Page::Around { id }
+                        if around_needs_catchup(
+                            found.older,
+                            found.newer,
+                            found.messages.iter().any(|message| message.id == *id),
+                            window_has_blank(&found.messages),
+                        ) =>
+                    {
                         let around = id.clone();
                         self.command(&account, Command::HistoryAround { conversation_id, around });
                     }
@@ -2718,6 +2725,37 @@ fn published_link(live: Link, kept: impl IntoIterator<Item = Link>) -> Link {
     }
 }
 
+/// Whether a page opened around one message should ask the network. A full window that holds
+/// the anchor usually should not. It should when a row is blank plaintext: an encrypted
+/// message stored without the flag looks like that, and the cache cannot see it.
+fn around_needs_catchup(older: bool, newer: bool, anchor_present: bool, blank: bool) -> bool {
+    !older || !newer || !anchor_present || blank
+}
+
+/// A stored row with no words and no file. A captionless photo is empty text on purpose.
+fn window_has_blank(messages: &[Message]) -> bool {
+    messages.iter().any(|message| {
+        message.seal == protocol::Seal::Plain && !message.deleted && message.attachments.is_empty() && message.text.trim().is_empty()
+    })
+}
+
+/// The lab's around-blank driver. A full window of blank rows still asks. A window of words does not.
+pub fn prove_around_blank() -> Result<(), &'static str> {
+    let asks = around_needs_catchup(true, true, true, true);
+    let keeps = !around_needs_catchup(true, true, true, false);
+    let photo = {
+        let mut photo = Message::plain("m", "Ada", "", 1, false);
+        photo.attachments.push(protocol::Attachment::new("pic", protocol::MediaFile::new("f", protocol::MediaKind::Image)));
+        !window_has_blank(&[photo])
+    };
+    let blank = window_has_blank(&[Message::plain("m", "Ada", "", 1, false)]);
+    if asks && keeps && photo && blank {
+        Ok(())
+    } else {
+        Err("a full window of blank rows would not be caught up")
+    }
+}
+
 /// A history catch-up. Anything else asked before the adapter exists is not replayed:
 /// a call leave, a send, or a search has no one waiting on the stored page.
 fn kept_without_adapter(command: &Command) -> bool {
@@ -2761,6 +2799,20 @@ mod tests {
             around: "m".into(),
         }));
         assert!(!super::kept_without_adapter(&Command::CallLeave("c".into())));
+    }
+
+    /// A chat with a full cache around the read marker does not ask again. A window of blank
+    /// plaintext does: those rows were an encrypted message stored with no flag, and the cache
+    /// cannot see that. A captionless photo is empty text on purpose and is not one of them.
+    #[test]
+    fn a_full_window_of_blank_rows_still_asks() {
+        assert!(super::around_needs_catchup(true, true, true, true));
+        assert!(!super::around_needs_catchup(true, true, true, false));
+        assert!(super::around_needs_catchup(true, true, false, false));
+        let mut photo = protocol::Message::plain("m", "Ada", "", 1, false);
+        photo.attachments.push(protocol::Attachment::new("pic", protocol::MediaFile::new("f", protocol::MediaKind::Image)));
+        assert!(!super::window_has_blank(&[photo]));
+        assert!(super::window_has_blank(&[protocol::Message::plain("m", "Ada", "  ", 1, false)]));
     }
 
     #[test]

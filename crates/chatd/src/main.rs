@@ -39,6 +39,14 @@ fn main() -> io::Result<()> {
         }
         return Ok(());
     }
+    // The lab's around-blank driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("around-blank") {
+        if let Err(err) = chatd::server::prove_around_blank() {
+            eprintln!("around-blank: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     // The lab's kept-backfill driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("kept-backfill") {
         if let Err(err) = chatd::server::prove_kept_backfill() {
