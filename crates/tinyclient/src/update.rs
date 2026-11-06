@@ -460,7 +460,8 @@ fn spawn_swap(pid: u32, payload: &Path, dest: &Path, version: &str) -> io::Resul
         let result = dir.join(SWAP_RESULT);
         let _ = fs::remove_file(&result);
         fs::write(&script, windows_script(pid, payload, dest, version, &result))?;
-        Command::new("cmd")
+        let mut command = Command::new("cmd");
+        hide_helper_console(&mut command)
             .args([
                 "/C",
                 "start",
@@ -653,9 +654,24 @@ fn curl(url: &str, out: &Path, seconds: u64, api: bool, limit: u64) -> io::Resul
     Err(io::Error::other("the update was redirected too many times"))
 }
 
+/// Flags for curl.exe. Zero opens a terminal on Windows when the app looks for an update.
+pub(crate) fn helper_console_flags() -> u32 {
+    0x0800_0000
+}
+
+fn hide_helper_console(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(helper_console_flags());
+    }
+    command
+}
+
 /// One request, not following a redirect. Its status and where it sends us, if it does.
 fn curl_once(url: &str, out: &Path, seconds: u64, api: bool, limit: u64) -> io::Result<(u32, String)> {
     let mut cmd = Command::new(if cfg!(windows) { "curl.exe" } else { "curl" });
+    hide_helper_console(&mut cmd);
     cmd.args([
         "--fail",
         "--silent",
@@ -936,6 +952,15 @@ fn json_string<'a>(json: &'a str, key: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_update_check_does_not_open_a_console() {
+        assert_eq!(
+            helper_console_flags() & 0x0800_0000,
+            0x0800_0000,
+            "curl.exe opens a terminal when the app looks for an update"
+        );
+    }
 
     #[test]
     fn a_newer_release_is_newer_and_a_pre_release_is_not() {

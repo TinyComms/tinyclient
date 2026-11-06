@@ -160,6 +160,14 @@ fn main() -> ExitCode {
         println!("tinyclient {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
+    // The lab's no-console driver. A build without this opens the window below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("no-console") {
+        if update::helper_console_flags() & 0x0800_0000 == 0 {
+            eprintln!("no-console: an update check would open a terminal");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     let _log = protocol::log_policy::install("tinyclient", protocol::log_policy::LogPolicy::from_env());
     #[cfg(feature = "gui")]
     if !args.iter().any(|arg| arg == "--text" || arg == "--notify-test") && query.is_none() {
