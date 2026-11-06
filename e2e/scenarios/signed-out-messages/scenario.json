@@ -1,0 +1,12 @@
+{
+  "id": "signed-out-messages",
+  "title": "A signed-out history read is a refusal, not an empty page",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same signed-out check refuses the page.",
+    "ios": "The phone proof build does not run desktop chatd. The same signed-out check refuses the page."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

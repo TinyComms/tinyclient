@@ -918,13 +918,9 @@ impl Chat {
 
     fn messages(&self, conversation: Key, page: Page, limit: u32) -> Response {
         if !self.shows(&conversation.account()) {
-            return Response::Messages {
-                conversation,
-                messages: Vec::new(),
-                last_read: None,
-                older: false,
-                newer: false,
-            };
+            // Same refusal as Tree and Conversation. An empty Messages page is a successful
+            // newest read, and the open pane clears itself with it even when rows stay on disk.
+            return hidden_history();
         }
         // A Slack or Teams thread is named by its parent, so the row can exist before any reply.
         if let Err(err) = self.ensure_thread(&conversation) {
@@ -2744,6 +2740,20 @@ fn published_link(live: Link, kept: impl IntoIterator<Item = Link>) -> Link {
     }
 }
 
+/// What `messages` answers when the account must not show its cache. Tree and Conversation
+/// already refuse with NotFound. An empty Messages page would clear the open pane.
+fn hidden_history() -> Response {
+    error(ErrorCode::NotFound, "signed out")
+}
+
+/// The lab's signed-out-messages driver. A signed-out history read is a refusal, not an empty page.
+pub fn prove_signed_out_messages() -> Result<(), String> {
+    match hidden_history() {
+        Response::Error { code, detail, .. } if code == ErrorCode::NotFound && detail.contains("signed out") => Ok(()),
+        other => Err(format!("hidden history was {other:?}, not a signed-out refusal")),
+    }
+}
+
 /// Whether a page opened around one message should ask the network. A full window that holds
 /// the anchor usually should not. It should when a row is blank plaintext: an encrypted
 /// message stored without the flag looks like that, and the cache cannot see it.
@@ -2922,6 +2932,17 @@ mod tests {
         assert_eq!(published_link(Link::SignedOut, std::iter::empty()), Link::SignedOut);
         assert_eq!(published_link(Link::Connected, [Link::Offline]), Link::Connected);
         assert_eq!(published_link(Link::Expired, [Link::Offline]), Link::Expired);
+    }
+
+    /// A signed-out history read must refuse. An empty Messages page is a successful newest
+    /// answer, and the open pane clears itself with it even though the cache is still on disk.
+    #[test]
+    fn a_signed_out_history_read_is_a_refusal_not_an_empty_page() {
+        assert_eq!(super::prove_signed_out_messages(), Ok(()));
+        assert!(
+            !matches!(super::hidden_history(), protocol::Response::Messages { .. }),
+            "an empty page would clear the open pane"
+        );
     }
 
     #[test]
