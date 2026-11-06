@@ -195,21 +195,21 @@ class RecoveryRun:
         self.require_held()
         y = self.journal.step("prepared")["device_ids"]["y"]
         after = min(row["cursor"] for row in self.journal.step("held")["cursors"].values())
-        feed = self.get(f"{self.root}/handshake?generation=0&device_id={y}&after={after}", role="y")
-        commits = [row for row in feed if row.get("kind") == "commit"]
-        welcomes = [row for row in feed if row.get("kind") == "welcome"]
-        if not commits or not welcomes:
-            raise ValueError("actual accepted nested commit and Y-targeted Welcome required")
+        x = self.journal.step("prepared")["device_ids"]["x"]
+        existing_feed = self.get(f"{self.root}/handshake?generation=0&device_id={x}&after={after}", role="x")
+        joiner_feed = self.get(f"{self.root}/handshake?generation=0&device_id={y}&after={after}", role="y")
+        coordinates = rt.nested_add_coordinates(existing_feed, joiner_feed, self.conv,
+                                                self.journal.step("prepared")["metadata"]["epoch"])
         fresh = self.find_message("y", message_id)
         server_rows = message_rows(self.get(f"/v1/conversations/{self.conv}/messages?limit=100"))
         accepted = next((row for row in server_rows if row.get("id") == message_id), None)
-        x = self.journal.step("prepared")["device_ids"]["x"]
         rt.assert_authored_ciphertext(accepted, self.conv, x, 0)
-        if accepted.get("epoch", -1) < max(row["epoch"] for row in commits):
+        if accepted.get("epoch") != coordinates["epoch"]:
             raise ValueError("Y control predates its nested Add")
         self.require_held()
-        self.journal.record("nested", {"blocking_seq": max(row["seq"] for row in commits),
-                    "feed_coordinates": [{key: row.get(key) for key in ("seq", "kind", "epoch", "generation", "group_id")} for row in feed],
+        self.journal.record("nested", {"blocking_seq": coordinates["commit_seq"],
+                    "feed_coordinates": {role: [{key: row.get(key) for key in ("seq", "kind", "epoch", "generation", "group_id")} for row in feed]
+                                         for role, feed in (("existing_x", existing_feed), ("joining_y", joiner_feed))},
                     "y_decrypted_message_id": fresh["id"], "server_message_id": accepted["id"]})
 
     def revoked(self):

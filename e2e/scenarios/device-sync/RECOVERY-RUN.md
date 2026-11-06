@@ -99,6 +99,9 @@ owner flow. Complete strict Add/Welcome. X sends a new encrypted control and Y
 actually decrypts it. The following command corroborates the accepted commit,
 Y-targeted Welcome and that fresh X-authored server ciphertext. It reads the
 service directly, so the observer never occupies an original reader's slot.
+It obtains the old-epoch commit from existing X's feed and the next-epoch
+Welcome from joining Y's feed: new members cannot read the preceding commit.
+Matching group, generation, sequence order and next-epoch ciphertext are required.
 
 ```powershell
 python recovery_run.py nested --manifest $m --out $out --message-id $newXtoYMessage
@@ -142,7 +145,7 @@ Record those on the actual peers.
 **External checkpoints:** Desktop GUI fresh sends and picture byte comparisons;
 old text/picture reads; preserved X/Y actual fresh-ciphertext decryption refusal;
 ordinary new sibling strict current Welcome; real Android native UI with
-`hostId: local`, `deviceId: Pixel_7` and its bound device CLI; durable fixture-key
+the recorded owned device host/id and its bound device CLI; durable fixture-key
 restart; chosen-marker server scan; recording captions/motion/duration validation.
 The driver cannot mark any of these as proved. A host phone viewport and HTTP
 access denial cannot substitute for native or cryptographic exclusion evidence.

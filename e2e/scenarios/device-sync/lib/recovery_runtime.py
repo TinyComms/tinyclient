@@ -184,6 +184,22 @@ def fence_cases(conversation, old_generation, captured):
     return cases
 
 
+def nested_add_coordinates(existing_feed, joiner_feed, group, old_epoch):
+    """The new member sees its Welcome, not the preceding old-epoch commit."""
+    if type(old_epoch) is not int or old_epoch < 0:
+        raise ValueError("invalid pre-Add epoch")
+    commits = [row for row in existing_feed if row.get("kind") == "commit"
+               and row.get("generation") == 0 and row.get("group_id") == group and row.get("epoch") == old_epoch]
+    welcomes = [row for row in joiner_feed if row.get("kind") == "welcome"
+                and row.get("generation") == 0 and row.get("group_id") == group and row.get("epoch") == old_epoch + 1]
+    pairs = [(commit, welcome) for commit in commits for welcome in welcomes
+             if type(commit.get("seq")) is int and type(welcome.get("seq")) is int and commit["seq"] < welcome["seq"]]
+    if len(pairs) != 1:
+        raise ValueError("actual existing-member commit and corresponding next-epoch joiner Welcome required")
+    commit, welcome = pairs[0]
+    return {"commit_seq": commit["seq"], "welcome_seq": welcome["seq"], "epoch": old_epoch + 1}
+
+
 def assert_send_refused(client_id, rc, answer, before, after):
     if not isinstance(answer, dict):
         raise ValueError("bounded terminal application error required; timeout is inconclusive")

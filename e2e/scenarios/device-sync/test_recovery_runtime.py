@@ -117,6 +117,16 @@ class RuntimePreparationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             runtime.assert_send_refused("client-1", 5, None, [], [])
 
+    def test_nested_add_correlates_existing_member_commit_with_joiners_next_epoch_welcome(self):
+        group = "11111111-1111-4111-8111-111111111111"
+        old = [{"kind": "commit", "seq": 12, "epoch": 2, "generation": 0, "group_id": group}]
+        new = [{"kind": "welcome", "seq": 13, "epoch": 3, "generation": 0, "group_id": group}]
+        self.assertEqual(runtime.nested_add_coordinates(old, new, group, 2),
+                         {"commit_seq": 12, "welcome_seq": 13, "epoch": 3})
+        for bad in (dict(new[0], epoch=2), dict(new[0], seq=11), dict(new[0], group_id="22222222-2222-4222-8222-222222222222")):
+            with self.assertRaises(ValueError):
+                runtime.nested_add_coordinates(old, [bad], group, 2)
+
     def test_fence_oracle_rejects_generic_conflicts_and_http_permission_denials(self):
         self.assertTrue(callable(getattr(runtime, "assert_generation_fence", None)), "fence oracle missing")
         runtime.assert_generation_fence(409, {"error": "generation_changed"})
