@@ -298,7 +298,10 @@ impl Gate {
                 step.speaking = Some(true);
             }
         } else if self.talking {
-            self.quiet += 1;
+            // A tick the microphone did not deliver is a hole in the send, not a quiet frame.
+            if captured || muted {
+                self.quiet += 1;
+            }
             if muted || self.quiet >= hold.max(1) {
                 self.talking = false;
                 self.trail = TRAIL;
@@ -340,6 +343,33 @@ impl Gate {
         }
         step
     }
+}
+
+/// A missed microphone tick is a hole, not a quiet frame, so it does not spend the hangover.
+pub fn prove_missed_frame() -> Result<(), &'static str> {
+    let mut gate = Gate::default();
+    let loud = [8_000i16; FRAME_SAMPLES];
+    if !matches!(gate.step(&loud, true, false, true, 13).send, Some(Send::Frame(_))) {
+        return Err("the gate did not open on a loud frame");
+    }
+    let missed = gate.step(&loud, false, false, false, 13);
+    if missed.send.is_some() {
+        return Err("a hole is not a silence packet");
+    }
+    if !gate.talking() {
+        return Err("a missed frame closed the gate");
+    }
+    for _ in 0..12 {
+        gate.step(&[0; FRAME_SAMPLES], true, false, false, 13);
+    }
+    if !gate.talking() {
+        return Err("one missed frame counted toward the hangover");
+    }
+    let closing = gate.step(&[0; FRAME_SAMPLES], true, false, false, 13);
+    if gate.talking() || !matches!(closing.send, Some(Send::Frame(_))) {
+        return Err("a real quiet spell still closes the gate");
+    }
+    Ok(())
 }
 
 /// Ramps one frame down to silence. The first sample stays, the last is zero, so the trail of
@@ -1485,5 +1515,22 @@ mod gate_tests {
         assert_eq!(frame[FRAME_SAMPLES - 1], 0, "the fade ends at silence");
         let trail = gate.step(&loud, true, true, false, 13);
         assert!(matches!(trail.send, Some(Send::Silence)));
+    }
+
+    #[test]
+    fn a_missed_microphone_frame_does_not_count_as_quiet() {
+        let mut gate = Gate::default();
+        let loud = [8_000i16; FRAME_SAMPLES];
+        assert!(matches!(gate.step(&loud, true, false, true, 13).send, Some(Send::Frame(_))));
+        let missed = gate.step(&loud, false, false, false, 13);
+        assert!(missed.send.is_none(), "a hole is not a silence packet");
+        assert!(gate.talking(), "a missed frame closed the gate");
+        for _ in 0..12 {
+            gate.step(&[0; FRAME_SAMPLES], true, false, false, 13);
+        }
+        assert!(gate.talking(), "one missed frame counted toward the hangover");
+        let closing = gate.step(&[0; FRAME_SAMPLES], true, false, false, 13);
+        assert!(!gate.talking(), "a real quiet spell still closes the gate");
+        assert!(matches!(closing.send, Some(Send::Frame(_))));
     }
 }
