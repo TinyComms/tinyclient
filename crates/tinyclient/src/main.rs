@@ -162,7 +162,8 @@ fn main() -> ExitCode {
     }
     // The lab's no-console driver. A build without this opens the window below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("no-console") {
-        if update::helper_console_flags() & 0x0800_0000 == 0 {
+        let swap = update::windows_swap_args(std::path::Path::new("apply.ps1"));
+        if update::helper_console_flags() & 0x0800_0000 == 0 || swap.iter().any(|arg| arg == "start") {
             eprintln!("no-console: an update check would open a terminal");
             return ExitCode::from(1);
         }

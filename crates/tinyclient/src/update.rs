@@ -460,20 +460,8 @@ fn spawn_swap(pid: u32, payload: &Path, dest: &Path, version: &str) -> io::Resul
         let result = dir.join(SWAP_RESULT);
         let _ = fs::remove_file(&result);
         fs::write(&script, windows_script(pid, payload, dest, version, &result))?;
-        let mut command = Command::new("cmd");
-        hide_helper_console(&mut command)
-            .args([
-                "/C",
-                "start",
-                "",
-                "/MIN",
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-            ])
-            .arg(&script)
+        let mut command = Command::new(windows_swap_program());
+        hide_helper_console(&mut command).args(windows_swap_args(&script))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -657,6 +645,23 @@ fn curl(url: &str, out: &Path, seconds: u64, api: bool, limit: u64) -> io::Resul
 /// Flags for curl.exe. Zero opens a terminal on Windows when the app looks for an update.
 pub(crate) fn helper_console_flags() -> u32 {
     0x0800_0000
+}
+
+fn windows_swap_program() -> &'static str {
+    "powershell"
+}
+
+/// How the swap script is started. `Start-Process` detaches it, and both windows stay hidden.
+/// `cmd /C start` opened a new console even when cmd itself had no window.
+pub(crate) fn windows_swap_args(script: &Path) -> Vec<String> {
+    let quoted = script.display().to_string().replace('\'', "''");
+    vec![
+        "-NoProfile".into(),
+        "-WindowStyle".into(),
+        "Hidden".into(),
+        "-Command".into(),
+        format!("Start-Process -WindowStyle Hidden powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{quoted}'"),
+    ]
 }
 
 fn hide_helper_console(command: &mut Command) -> &mut Command {
@@ -952,6 +957,13 @@ fn json_string<'a>(json: &'a str, key: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_update_swap_does_not_open_a_console() {
+        let args = windows_swap_args(Path::new("apply.ps1"));
+        assert!(!args.iter().any(|arg| arg == "start"), "start opens a new console");
+        assert!(args.iter().any(|arg| arg == "Hidden"), "the swap window stays hidden");
+    }
 
     #[test]
     fn an_update_check_does_not_open_a_console() {
