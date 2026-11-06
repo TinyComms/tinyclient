@@ -1127,7 +1127,8 @@ impl Context {
         self.hub.calls.tiny_slots(&self.hub, &self.key(conversation_id), audio);
     }
 
-    /// The call in this room is over and the network already knows: mediad goes, quietly.
+    /// The call in this room is over and the network already knows. A joined call plays the
+    /// leave chime, then mediad goes.
     pub fn call_over(&self, conversation_id: &str) -> bool {
         self.hub.calls.end_if(&self.hub, &self.key(conversation_id))
     }

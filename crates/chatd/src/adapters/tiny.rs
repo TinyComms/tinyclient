@@ -21,6 +21,23 @@ mod messages;
 mod sealing;
 pub mod signin;
 
+/// The lab's sealed-row proof. See `messages::prove_missing_seal`.
+pub fn prove_missing_seal() -> Result<(), String> {
+    messages::prove_missing_seal()
+}
+
+/// The lab's join-order proof. `call.join` is sent before the room's mediad settings.
+pub fn prove_join_before_room() -> Result<(), &'static str> {
+    let steps = live::after_offer();
+    let join = steps.iter().position(|step| *step == live::AfterOffer::Join);
+    let room = steps.iter().position(|step| *step == live::AfterOffer::Room);
+    if join.zip(room).is_some_and(|(join, room)| join < room) {
+        Ok(())
+    } else {
+        Err("room settings ran before call.join")
+    }
+}
+
 use super::{serve_commands, Command, Context, Signed};
 use crate::hub::Hub;
 use crate::session;

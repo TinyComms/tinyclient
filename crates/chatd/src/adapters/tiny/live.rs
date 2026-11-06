@@ -711,7 +711,7 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                 let sent = match ask {
                     Ask::Join { room_id, reply } if live.seats_only() => ask_join(wire, pending, refs, room_id, None, Some(reply), timing),
                     Ask::Join { room_id, reply } => match offer(ctx, saved, seat, &room_id) {
-                        Ok(sdp) => ask_join(wire, pending, refs, room_id, Some(sdp), Some(reply), timing),
+                        Ok(sdp) => send_then_room(ctx, saved, seat, wire, pending, refs, room_id, sdp, Some(reply), timing),
                         Err(words) => {
                             let _ = reply.send(Err(Refusal::Refused(words)));
                             Ok(())
@@ -905,7 +905,7 @@ fn move_with(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, wire: &
     match offer(ctx, saved, seat, &room) {
         Ok(sdp) => {
             note_rejoin(ctx, seat, &room);
-            ask_join(wire, pending, refs, room, Some(sdp), None, timing)
+            send_then_room(ctx, saved, seat, wire, pending, refs, room, sdp, None, timing)
         }
         Err(words) => {
             seat.wanted = None;
@@ -969,11 +969,49 @@ fn offer(ctx: &Context, saved: &Saved, seat: &mut Seat, room: &str) -> Result<Of
     let offered = e2ee.is_some();
     let offer = TinyOffer { user_id: seat.me.clone(), host: host.unwrap_or_default(), slots: ROOM_CAP - 1, muted: false, deafened: false, e2ee };
     let sdp = ctx.tiny_offer(room, offer)?;
+    Ok((sdp, offered))
+}
+
+/// What follows mediad's offer. The room's bitrate and push-to-talk wait on mediad, so
+/// `call.join` goes out first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AfterOffer {
+    Join,
+    Room,
+}
+
+pub(crate) fn after_offer() -> [AfterOffer; 2] {
+    [AfterOffer::Join, AfterOffer::Room]
+}
+
+/// Sends `call.join`, then applies the room, in `after_offer`'s order.
+fn send_then_room(
+    ctx: &Context,
+    saved: &Saved,
+    seat: &mut Seat,
+    wire: &mut Wire,
+    pending: &mut Vec<Pending>,
+    refs: u64,
+    room_id: String,
+    sdp: Offered,
+    mut reply: Option<Reply<()>>,
+    timing: &Timing,
+) -> io::Result<()> {
+    for step in after_offer() {
+        match step {
+            AfterOffer::Join => ask_join(wire, pending, refs, room_id.clone(), Some(sdp.clone()), reply.take(), timing)?,
+            AfterOffer::Room => apply_room(ctx, saved, seat, &room_id),
+        }
+    }
+    Ok(())
+}
+
+/// The room's bitrate, push-to-talk, and roster. These wait on mediad.
+fn apply_room(ctx: &Context, saved: &Saved, seat: &mut Seat, room: &str) {
     let (kbps, push_to_talk) = super::manage::room_audio(saved, room);
     ctx.tiny_room(room, kbps, push_to_talk);
     seat.rostered.clear();
     roster(ctx, seat, room);
-    Ok((sdp, offered))
 }
 
 /// The room to take again after `ready`, when the user's seat went with the old socket.
@@ -997,7 +1035,7 @@ fn rejoin_with(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, wire:
     match offer(ctx, saved, seat, &room) {
         Ok(sdp) => {
             note_rejoin(ctx, seat, &room);
-            ask_join(wire, pending, refs, room, Some(sdp), None, timing)
+            send_then_room(ctx, saved, seat, wire, pending, refs, room, sdp, None, timing)
         }
         Err(words) => {
             seat.wanted = None;
@@ -1863,6 +1901,19 @@ impl Wire {
     fn close(&mut self) {
         let _ = self.socket.close(None);
         let _ = self.socket.flush();
+    }
+}
+
+#[cfg(test)]
+mod join_order {
+    use super::{after_offer, AfterOffer};
+
+    #[test]
+    fn call_join_goes_out_before_the_room_settings() {
+        let steps = after_offer();
+        let join = steps.iter().position(|step| *step == AfterOffer::Join).expect("a join step");
+        let room = steps.iter().position(|step| *step == AfterOffer::Room).expect("a room step");
+        assert!(join < room, "room settings ran before call.join");
     }
 }
 

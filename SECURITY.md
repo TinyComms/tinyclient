@@ -113,11 +113,12 @@ another (`crates/chatd/src/upload.rs`), and only over HTTPS. Test overrides of a
 turns off the credential store, so a stray variable cannot send a real session elsewhere
 (`crates/chatd/src/adapters/net.rs`).
 
-**Tiny server text and files are not end-to-end encrypted.** A message's text, its attachments'
-bytes and names go to the server as its API takes them
-(`crates/chatd/src/adapters/tiny/messages.rs`, `upload.rs`) and the server stores them readable.
-Only a Tiny server's calls are end to end (below). Encrypted text is being designed in
-tinyserver (`docs/e2ee-text.md` there); none of it is in this client yet.
+**Tiny server text and files.** From v0.2.37 (#126, #127), conversations created encrypted seal
+message text, edits, replies, and sealed attachment bytes and names end to end
+(`crates/e2ee`, `crates/chatd/src/adapters/tiny/messages.rs`). The server stores ciphertext.
+Direct messages are created encrypted; a channel is encrypted only when made that way (or later
+upgraded). Plaintext conversations still send text and attachments readable by the server.
+Calls are separately end to end when the server offers it (below).
 
 **Plain http to a Tiny server.** A Tiny server's address may be `http`, so a server on your own
 machine or network works. The session's token and everything else sent over http can be read by

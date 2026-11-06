@@ -43,26 +43,39 @@ env:
   CARGO_NDK_VERSION: "4.1.2"
   NDK_VERSION: "30.0.16248370"
   GRADLE_VERSION: "9.6.0"
+  # Cargo.toml release is thin LTO and one codegen unit, which is what a tag ships.
+  # This workflow only proves the library links and the shell packages, and those settings
+  # are why it was slow. A warm cache still spent 6m04s on arm64 and 5m25s on x86_64
+  # (run 41925105003): the cache keeps dependencies, then LLVM rebuilds the workspace
+  # crates. A miss spent 13m and 11m (run 41927743886, 24m06s on that step) because the
+  # 1.5 GB android entry had been evicted. The repository cache sits on its 10 GB cap.
+  # Overrides here apply to this workflow's --release builds only, and they are part of
+  # the cache key, so desktop CI keeps the real release profile.
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+  CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
 
 jobs:
   # Each phone builds its Rust library and packages the app in one job. They used to be two jobs
   # apiece, and the app job waited in a second runner queue and then downloaded the library.
-  # Every build is release, so a pull request reuses the dependencies in main's cache. A cheaper
-  # profile was tried for pull requests: with nothing cached for it, it was slower (Android 19.7
-  # minutes against about 11).
+  # v2 is a different cache from the thin-LTO target dirs. The restore prefix ignores the
+  # env hash, so leaving v1 would download that 1 GB and then compile it all again.
   android-app:
     name: android (libs + assembleDebug)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
+      # x86_64 is the emulator slice. A local build still makes it. CI would compile and
+      # link the whole library a second time, and that second target is what made the
+      # android cache the one that no longer fit.
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,x86_64-linux-android
+          targets: aarch64-linux-android
 
       - uses: swatinem/rust-cache@v2
         with:
-          prefix-key: v1-rust
+          prefix-key: v2-rust
           shared-key: mobile-android
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -72,12 +85,29 @@ jobs:
           packages: platform-tools
 
       - name: NDK r30
+        # The runner image leaves ANDROID_NDK_ROOT on r27. cargo-ndk warns and can link
+        # against that one while ANDROID_NDK_HOME says r30.
         run: |
           sdkmanager --install "ndk;$NDK_VERSION" >/dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
       - name: cargo-ndk
-        run: cargo install cargo-ndk --version "$CARGO_NDK_VERSION" --locked
+        # The release archive is the same version as `cargo install --locked`, without
+        # compiling cargo-ndk itself (35s) on every cache miss.
+        run: |
+          if command -v cargo-ndk >/dev/null 2>&1; then
+            exit 0
+          fi
+          archive="cargo-ndk-x86_64-unknown-linux-gnu-v${CARGO_NDK_VERSION}.tgz"
+          curl -fsSL -o "/tmp/${archive}" \
+            "https://github.com/bbqsrc/cargo-ndk/releases/download/v${CARGO_NDK_VERSION}/${archive}"
+          rm -rf /tmp/cargo-ndk-extract
+          mkdir -p /tmp/cargo-ndk-extract "${CARGO_HOME:-$HOME/.cargo}/bin"
+          tar -xzf "/tmp/${archive}" -C /tmp/cargo-ndk-extract
+          src=$(echo /tmp/cargo-ndk-extract/cargo-ndk-*)
+          install -m 755 "$src/cargo-ndk" "$src/cargo-ndk-env" "$src/cargo-ndk-runner" "$src/cargo-ndk-test" \
+            "${CARGO_HOME:-$HOME/.cargo}/bin/"
 
       - name: Build the Rust library
         env:
@@ -89,7 +119,7 @@ jobs:
         # The app loads only the shared library, so `--crate-type cdylib` builds that one instead
         # of every type in [lib] crate-type.
         run: |
-          cargo ndk -t arm64-v8a -t x86_64 --platform 29 \
+          cargo ndk -t arm64-v8a --platform 29 \
             -o mobile/android/app/src/main/jniLibs \
             rustc --release -p tinyclient --lib --features mobile --crate-type cdylib
 
@@ -148,7 +178,7 @@ jobs:
 
       - uses: swatinem/rust-cache@v2
         with:
-          prefix-key: v1-rust
+          prefix-key: v2-rust
           shared-key: mobile-ios
           save-if: ${{ github.ref == 'refs/heads/main' }}
 

@@ -36,6 +36,51 @@ mod theme;
 mod tiny;
 mod time;
 
+/// The lab's focus-ring driver. A keyboard scroll frame uses an inset ring, not a fill.
+pub(crate) fn prove_focus_ring() -> Result<(), &'static str> {
+    if components::scroll::frame_focus_ring().iter().all(|shadow| shadow.inset) {
+        Ok(())
+    } else {
+        Err("the scroll frame focus ring is outset, so a transparent frame fills")
+    }
+}
+
+/// The lab's health-grade driver. A green link does not hide a dry speaker.
+pub(crate) fn prove_health_grade() -> Result<(), &'static str> {
+    let dry = call::health::Health {
+        underruns: Some(3),
+        steady: Some(call::health::Grade::Great),
+        rtt_ms: Some(40),
+        jitter_ms: Some(2),
+        loss_permille: Some(0),
+        ..call::health::Health::default()
+    };
+    if dry.grade() == call::health::Grade::Poor {
+        Ok(())
+    } else {
+        Err("a green link hid a dry speaker")
+    }
+}
+
+/// The lab's cancel-join driver. A leave is accepted while a join is still in flight.
+pub(crate) fn prove_cancel_join() -> Result<(), &'static str> {
+    if tiny::call_accepts(true, true) && !tiny::call_accepts(true, false) {
+        Ok(())
+    } else {
+        Err("a join in flight swallowed the leave")
+    }
+}
+
+/// The lab's text-drag driver. A release outside the message pane ends the selection drag.
+pub(crate) fn prove_text_drag() -> Result<(), &'static str> {
+    let mut dragging = true;
+    if !conversation::release_text_drag(&mut dragging, false) || dragging {
+        Err("a release outside the pane left the selection drag up")
+    } else {
+        Ok(())
+    }
+}
+
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 

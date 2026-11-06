@@ -609,6 +609,37 @@ fn the_test_sound_outside_a_call_plays_on_a_mediad_of_its_own_that_then_exits() 
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Hanging up a call we are in plays the leave chime for us. Peers already hear it from the
+/// roster. Voices are silent here, so the sink's tail is that chime and not the call.
+#[test]
+fn the_person_leaving_hears_the_leave_cue() {
+    let _turn = alone();
+    let (hub, dir) = hub();
+    let played = dir.join("played.pcm");
+    std::env::set_var("TINYCLIENT_MEDIAD_SINK", &played);
+    hub.set_setting("", protocol::settings::VOICE_VOLUME, Some("0".into())).unwrap();
+    hub.set_setting("", protocol::settings::CUE_VOLUME, Some("100".into())).unwrap();
+    let voice = Voice::new();
+    assert!(hub.calls.start(&hub, lounge()).is_ok());
+    hub.calls.join(&hub, &lounge(), voice.join());
+    let (mut peer, _) = voice.identified();
+    voice.admit(&mut peer);
+    until("joined", || state(&hub) == Some(CallState::Joined));
+    assert_eq!(hub.calls.end(&hub), Some(lounge()));
+    until("mediad gone", || mediads() == 0);
+    std::env::remove_var("TINYCLIENT_MEDIAD_SINK");
+    let bytes = std::fs::read(&played).unwrap_or_default();
+    let tail: Vec<i16> = bytes
+        .chunks_exact(2)
+        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+        .rev()
+        .take(24_000)
+        .collect();
+    let peak = tail.iter().map(|sample| sample.saturating_abs()).max().unwrap_or(0);
+    assert!(peak > 1000, "the leave cue is the last thing played, peak {peak}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn a_call_starts_muted_when_the_user_joins_muted_and_a_test_gives_way_to_it() {
     let _turn = alone();

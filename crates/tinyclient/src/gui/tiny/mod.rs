@@ -408,6 +408,11 @@ fn preferred_tiny(accounts: &[(AccountKey, Link)], current: Option<&AccountKey>)
         .map(|(key, _)| key.clone())
 }
 
+/// A join in flight does not swallow a leave. The leave is the cancel.
+pub(crate) fn call_accepts(busy: bool, leave: bool) -> bool {
+    !busy || leave
+}
+
 /// Why Join cannot be pressed now.
 fn join_blocked(live: bool, media: &str) -> Option<&'static str> {
     match media {
@@ -863,7 +868,8 @@ impl Shell {
 
     /// A call request. Nothing is read again on success: the seats arrive as `Occupants`.
     fn call(&mut self, request: Request, cx: &mut Context<Self>) {
-        if self.tiny_state.call_busy {
+        let leave = matches!(request, Request::TinyCallLeave { .. });
+        if !call_accepts(self.tiny_state.call_busy, leave) {
             return;
         }
         self.tiny_state.call_busy = true;
@@ -1633,6 +1639,13 @@ mod tests {
         let gone = [(second.clone(), Link::Connected)];
         assert_eq!(preferred_tiny(&gone, Some(&first)).as_ref(), Some(&second));
         assert_eq!(preferred_tiny(&[(first.clone(), Link::SignedOut)], Some(&first)), None);
+    }
+
+    #[test]
+    fn a_leave_is_accepted_while_a_join_is_in_flight() {
+        assert!(call_accepts(true, true), "a join in flight swallowed the leave");
+        assert!(!call_accepts(true, false), "a second join waits");
+        assert!(call_accepts(false, false));
     }
 
     #[test]

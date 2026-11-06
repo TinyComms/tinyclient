@@ -452,10 +452,16 @@ fn refold(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, convers
     }
 }
 
+/// A row that carries ciphertext is sealed even when the payload omits `e2ee`. Treating it as
+/// plaintext stores the empty body, and the pane draws no words.
+fn row_is_sealed(wire: &WireMessage) -> bool {
+    wire.e2ee || wire.ciphertext.as_ref().is_some_and(|text| !text.is_empty())
+}
+
 /// What the end-to-end encrypted rows of a page say. Empty for a plaintext page, and when this
 /// device has no encryption state (its rows then read "Can't be decrypted on this device").
 fn open_rows(ctx: &Context, saved: &Saved, conversation_id: &str, wires: &[&WireMessage]) -> HashMap<String, Read> {
-    if !wires.iter().any(|wire| wire.e2ee) {
+    if !wires.iter().any(|wire| row_is_sealed(wire)) {
         return HashMap::new();
     }
     let Some(device) = e2ee::started(saved) else {
@@ -463,7 +469,7 @@ fn open_rows(ctx: &Context, saved: &Saved, conversation_id: &str, wires: &[&Wire
     };
     let rows: Vec<e2ee::Row> = wires
         .iter()
-        .filter(|wire| wire.e2ee && !present(&wire.deleted_at))
+        .filter(|wire| row_is_sealed(wire) && !present(&wire.deleted_at))
         .map(|wire| e2ee::Row {
             id: &wire.id,
             author_id: &wire.author_id,
@@ -1028,7 +1034,7 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
     let deleted = present(&wire.deleted_at);
     let sent = rfc3339(&wire.created_at).unwrap_or(0);
     let outgoing = wire.author_id == saved.user_id;
-    if wire.e2ee {
+    if row_is_sealed(wire) {
         return map_sealed(saved, names, wire, opened.get(&wire.id), deleted, sent, outgoing, media);
     }
     let mut message = Message::plain(&wire.id, name_of(names, saved, &wire.author_id), if deleted { "" } else { &wire.body }, sent, outgoing);
@@ -1618,6 +1624,61 @@ struct WireReaction {
     me: bool,
 }
 
+/// Proves a ciphertext row with no `e2ee` flag is stored as undecryptable, not as blank plaintext.
+/// The lab sets `TINYCLIENT_PROVE=sealed-row`. A build from before the fix ignores that and keeps
+/// serving, so the same driver fails there.
+pub(super) fn prove_missing_seal() -> Result<(), String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|err| err.to_string())?;
+    let base = format!("http://{}", listener.local_addr().map_err(|err| err.to_string())?);
+    std::thread::spawn(move || answer_seal_probe(listener));
+    let saved = Saved {
+        base_url: base,
+        token: "t".to_owned(),
+        user_id: "11111111-1111-1111-1111-111111111111".to_owned(),
+        email: None,
+        display_name: "Ada".to_owned(),
+        role: "owner".to_owned(),
+        plain_http_ok: false,
+        e2ee: None,
+    };
+    let hub = std::sync::Arc::new(crate::hub::Hub::new(
+        crate::store::Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?,
+    ));
+    let account = protocol::AccountKey { network: protocol::Network::Tiny, account: saved.user_id.clone() };
+    let (_adapter, ctx, _inbox) = crate::adapters::local(account, hub);
+    load_page(&ctx, &saved, "direct-1", None, PAGE);
+    let stored = ctx.stored_message("direct-1", "s-2").map_err(|err| err.to_string())?.ok_or("the ciphertext row was not stored")?;
+    if stored.seal == Seal::Undecryptable && stored.text == protocol::UNDECRYPTABLE {
+        Ok(())
+    } else {
+        Err(format!("the row was stored as {:?} with text {:?}", stored.seal, stored.text))
+    }
+}
+
+fn answer_seal_probe(listener: std::net::TcpListener) {
+    let _ = listener.set_nonblocking(true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let sealed = r#"{"messages":[{"id":"s-2","author_id":"22222222-2222-2222-2222-222222222222","body":"","ciphertext":"AAAA","epoch":3,"device_id":"d-1","created_at":"2024-01-02T03:04:05Z"}]}"#;
+    while std::time::Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                let mut got = [0u8; 2048];
+                let read = std::io::Read::read(&mut stream, &mut got).unwrap_or(0);
+                let request = String::from_utf8_lossy(&got[..read]);
+                let (status, payload) = if request.contains("/messages") { ("200 OK", sealed) } else { ("404 Not Found", "{}") };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(_) => break,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1904,6 +1965,25 @@ mod tests {
         let outcome = post_message(&ctx, &saved, "sealed-1", "client-9", "secret words", None, &[]);
         assert_eq!(outcome.err().as_deref(), Some(NOT_SET_UP));
         assert!(!posted.load(std::sync::atomic::Ordering::SeqCst), "nothing was posted in plain text");
+    }
+
+    /// A current server sets `e2ee`. One that sends ciphertext without that flag must not be
+    /// stored as an empty plaintext row: the pane would draw no words at all.
+    #[test]
+    fn a_sealed_row_without_the_flag_is_not_stored_as_blank_plaintext() {
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            if request.starts_with("GET /v1/conversations/direct-1/messages?") {
+                return Some(http(200, "OK", &format!(
+                    r#"{{"messages":[{{"id":"s-2","author_id":"{PEER}","body":"","ciphertext":"AAAA","epoch":3,"device_id":"d-1","created_at":"{WHEN}"}}]}}"#
+                )));
+            }
+            None
+        });
+        load_page(&ctx, &saved, "direct-1", None, PAGE);
+        let stored = ctx.stored_message("direct-1", "s-2").unwrap().unwrap();
+        assert_eq!(stored.seal, Seal::Undecryptable);
+        assert_ne!(stored.text, "");
+        assert_eq!(stored.text, protocol::UNDECRYPTABLE);
     }
 
     #[test]

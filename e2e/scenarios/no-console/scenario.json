@@ -1,0 +1,12 @@
+{
+  "id": "no-console",
+  "title": "Looking for an update does not open a terminal",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone build does not shell out to curl.exe. The desktop check is the one that opened a terminal.",
+    "ios": "The phone build does not shell out to curl.exe. The desktop check is the one that opened a terminal."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

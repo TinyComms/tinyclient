@@ -1,0 +1,12 @@
+{
+  "id": "short-hole",
+  "title": "A short hole after a quiet frame is concealed, not treated as a pause",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not start desktop mediad. The same jitter check is in the library the phone links.",
+    "ios": "The phone proof build does not start desktop mediad. The same jitter check is in the library the phone links."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 45
+}
