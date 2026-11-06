@@ -36,6 +36,15 @@ mod theme;
 mod tiny;
 mod time;
 
+/// The lab's focus-ring driver. A keyboard scroll frame uses an inset ring, not a fill.
+pub(crate) fn prove_focus_ring() -> Result<(), &'static str> {
+    if components::scroll::frame_focus_ring().iter().all(|shadow| shadow.inset) {
+        Ok(())
+    } else {
+        Err("the scroll frame focus ring is outset, so a transparent frame fills")
+    }
+}
+
 /// The lab's text-drag driver. A release outside the message pane ends the selection drag.
 pub(crate) fn prove_text_drag() -> Result<(), &'static str> {
     let mut dragging = true;
