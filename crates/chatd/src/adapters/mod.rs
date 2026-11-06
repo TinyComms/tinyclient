@@ -1493,10 +1493,31 @@ pub fn start(account: AccountKey, session: &str, hub: Arc<Hub>) -> Result<Adapte
         Network::Tiny => tiny::start(ctx.clone(), session, inbox),
     };
     if let Err(why) = started {
-        ctx.link(Link::SignedOut);
+        // Stay Offline with the reason. SignedOut made shows() false, so messages() answered
+        // an empty page and the open pane cleared even though the cache was still on disk.
+        ctx.hub.set_link(&ctx.account, Link::Offline, &why);
         return Err(why);
     }
     Ok(Adapter { commands, stop })
+}
+
+/// The lab's failed-start-offline driver. A start that fails leaves the account offline,
+/// so messages() still answers from the cache instead of an empty signed-out page.
+pub fn prove_failed_start_offline() -> Result<(), String> {
+    let hub = Arc::new(crate::hub::Hub::new(
+        crate::store::Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?,
+    ));
+    let account = AccountKey {
+        network: Network::Tiny,
+        account: "11111111-1111-1111-1111-111111111111".into(),
+    };
+    if start(account.clone(), "not-json", hub.clone()).is_ok() {
+        return Err("a broken session started".to_owned());
+    }
+    match hub.link(&account) {
+        Link::Offline => Ok(()),
+        other => Err(format!("link was {other:?}, not Offline")),
+    }
 }
 
 /// An adapter with no network behind it, for whatever serves an account inside chatd (the
@@ -1593,6 +1614,21 @@ mod tests {
         let links = hub.links();
         let linked = links.iter().find(|linked| linked.account == *account).expect("the account is linked");
         (linked.link, linked.detail.clone())
+    }
+
+    #[test]
+    fn a_failed_start_keeps_the_account_offline_so_cached_messages_still_show() {
+        let hub = hub();
+        let account = AccountKey {
+            network: Network::Tiny,
+            account: "11111111-1111-1111-1111-111111111111".into(),
+        };
+        let err = super::start(account.clone(), "not-json", hub.clone());
+        assert!(err.is_err(), "a broken session must not start");
+        let (link, detail) = linked(&hub, &account);
+        assert_eq!(link, Link::Offline, "SignedOut would hide the cache and clear the pane");
+        assert!(!detail.is_empty(), "the start error is kept on the account");
+        assert_eq!(super::prove_failed_start_offline(), Ok(()));
     }
 
     #[test]
