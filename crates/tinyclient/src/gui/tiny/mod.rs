@@ -554,6 +554,15 @@ impl Shell {
         }
     }
 
+    /// An attention banner belongs to one server. Reload it even if its home is cached:
+    /// the core's Look action reconnects a session replaced by another device.
+    pub(in crate::gui) fn tiny_reconnect(&mut self, account: AccountKey, cx: &mut Context<Self>) {
+        if account.network != Network::Tiny { return; }
+        self.go(Mode::Network(Network::Tiny), cx);
+        self.tiny_state.seen = true;
+        self.fetch(account, None, cx);
+    }
+
     /// The name of the Tiny room `key` names, and its server's, for the call dock.
     pub(super) fn tiny_room(&self, key: &Key) -> Option<(String, String)> {
         let community = self.tiny_state.community.as_ref().filter(|_| self.tiny_state.account.as_ref() == Some(&key.account()))?;

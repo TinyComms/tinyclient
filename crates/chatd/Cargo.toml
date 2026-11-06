@@ -92,6 +92,13 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 default = ["signal"]
 signal = ["dep:presage", "dep:aes-gcm-siv", "dep:futures", "dep:async-trait", "dep:chrono", "dep:rand", "tokio/rt"]
 
+[dev-dependencies]
+# Real MLS receive regressions construct the service's ordinary signed proposals/Welcomes.
+# Same libraries/versions already used by e2ee; never part of the production adapter API.
+openmls = "0.8.1"
+openmls_traits = "0.5.0"
+openmls_rust_crypto = "0.5.1"
+
 [target.'cfg(not(target_os = "android"))'.dependencies]
 ureq = { version = "3", default-features = false, features = ["native-tls"] }
 tungstenite = { version = "0.30", default-features = false, features = ["native-tls"] }

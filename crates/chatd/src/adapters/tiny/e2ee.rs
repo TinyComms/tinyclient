@@ -1612,7 +1612,9 @@ impl Device {
         let Some(conv) = uuid(conversation_id).map(ConversationId) else {
             return out;
         };
-        let mut synced = false;
+        // One sync attempt per encryption group on this page. A blocked historical
+        // generation must not spend the current group's Welcome attempt.
+        let mut synced = BTreeSet::new();
         let mut ordered: Vec<&Row> = rows.iter().collect();
         ordered.sort_by_key(|row| (row.generation.unwrap_or(0), row.epoch));
         for row in ordered {
@@ -1661,7 +1663,7 @@ impl Device {
         conversation_id: &str,
         _conv: ConversationId,
         row: &Row,
-        synced: &mut bool,
+        synced: &mut BTreeSet<ConversationId>,
     ) -> Read {
         let cached = self.cache(conversation_id).and_then(|cache| cache.rows.get(row.id).cloned());
         if let Some(opened) = &cached {
@@ -1695,8 +1697,13 @@ impl Device {
             return fallback();
         };
         let mut opened = engine.decrypt(conv, &ciphertext, &claimed);
-        if matches!(opened, Err(Error::FutureEpoch { .. } | Error::NoGroup)) && !*synced {
-            *synced = true;
+        // FutureEpoch: behind on handshake. NoGroup / NotAMember: accepted a repair but not
+        // the Welcome yet. Limit one sync attempt per encryption group on this page.
+        if matches!(
+            opened,
+            Err(Error::FutureEpoch { .. } | Error::NoGroup | Error::NotAMember)
+        ) && synced.insert(conv)
+        {
             let generation = row.generation.unwrap_or(0);
             let outer = ConversationId::parse(conversation_id).ok();
             let active = outer.and_then(|outer| self.engine.as_ref()?.active_group(outer).ok());
@@ -2409,6 +2416,9 @@ pub(crate) mod siblings;
 
 #[cfg(test)]
 mod live;
+
+#[cfg(test)]
+mod receive_tests;
 
 #[cfg(test)]
 mod tests {

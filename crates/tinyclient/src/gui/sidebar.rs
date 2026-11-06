@@ -1397,7 +1397,7 @@ impl Shell {
                 self.trouble.get(&account.key).map(|since| since.elapsed()).unwrap_or_default() >= TROUBLE_SHOWN
             });
             if let Some((tone, words)) = words {
-                found.push((network, tone, words));
+                found.push((account.key.clone(), tone, words));
             }
         }
         // One per pane: the most urgent, not the first account's.
@@ -1405,15 +1405,18 @@ impl Shell {
         found
             .into_iter()
             .take(1)
-            .map(|(network, tone, words)| match tone {
+            .map(|(account, tone, words)| { let network = account.network; match tone {
                 Tone::Danger => banner(tone, words).child(
                     banner_action("sign-in-again", "Sign in").on_click(cx.listener(move |this, _, _, cx| this.sign_in(network, cx))),
                 ),
                 Tone::Attention => banner(tone, words).child(
-                    banner_action("open-network", format!("Open {}", network.label())).on_click(move |_, _, cx| cx.open_url(network_app(network))),
+                    banner_action("open-network", format!("Open {}", network.label())).on_click(cx.listener(move |this, _, _, cx| {
+                        if network == Network::Tiny { this.tiny_reconnect(account.clone(), cx); }
+                        else { cx.open_url(network_app(network)); }
+                    })),
                 ),
                 tone => banner(tone, words),
-            })
+            }})
             .collect()
     }
 
