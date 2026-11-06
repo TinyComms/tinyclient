@@ -1,0 +1,12 @@
+{
+  "id": "kept-backfill",
+  "title": "A history catch-up is kept until the adapter exists",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same catch-up check keeps the ask.",
+    "ios": "The phone proof build does not run desktop chatd. The same catch-up check keeps the ask."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

@@ -126,6 +126,8 @@ fn search_fate(fresh_sent: Option<&str>, waiting: Option<&str>, query: &str) -> 
 pub struct Chat {
     hub: Arc<Hub>,
     adapters: Adapters,
+    /// History catch-ups asked before that account's adapter was in the map.
+    held: Mutex<Vec<(AccountKey, Command)>>,
     blobs: Blobs,
     searches: Arc<Searches>,
     /// Itself, for the work a request starts that outlives the request (`ReadSessions`).
@@ -209,6 +211,7 @@ impl Chat {
             blobs: Blobs::new(hub.clone(), support_dir().join("media")),
             hub,
             adapters: Arc::default(),
+            held: Mutex::new(Vec::new()),
             searches: Arc::default(),
             this: OnceLock::new(),
             in_process,
@@ -401,9 +404,34 @@ impl Chat {
             let named = self.hub.store().set_account(&account, &signed.name, "");
             named.map_err(|err| err.to_string())?;
             let adapter = adapters::start(account.clone(), &signed.session, self.hub.clone())?;
-            lock(&self.adapters).insert(account, adapter);
+            // Insert and take the catch-ups under one hold, so an ask that arrives in
+            // between is either queued here or delivered to the adapter, not dropped.
+            let ready = {
+                let mut adapters = lock(&self.adapters);
+                adapters.insert(account.clone(), adapter);
+                self.take_held(&account)
+            };
+            for command in ready {
+                self.command(&account, command);
+            }
         }
         Ok(())
+    }
+
+    /// History catch-ups queued for `account` before its adapter existed.
+    fn take_held(&self, account: &AccountKey) -> Vec<Command> {
+        let mut held = lock(&self.held);
+        let mut keep = Vec::new();
+        let mut ready = Vec::new();
+        for (key, command) in held.drain(..) {
+            if key == *account {
+                ready.push(command);
+            } else {
+                keep.push((key, command));
+            }
+        }
+        *held = keep;
+        ready
     }
 
     /// Drops the cache of accounts that no longer have a session: signed out while chatd was
@@ -425,6 +453,7 @@ impl Chat {
     }
 
     fn forget(&self, account: &AccountKey) {
+        lock(&self.held).retain(|(key, _)| key != account);
         self.hub.player.forget(&self.hub, account);
         self.blobs.forget(account);
         if let Err(err) = self.hub.store().forget(account) {
@@ -526,8 +555,16 @@ impl Chat {
     }
 
     fn command(&self, account: &AccountKey, command: Command) {
-        if let Some(adapter) = lock(&self.adapters).get(account) {
+        let adapters = lock(&self.adapters);
+        if let Some(adapter) = adapters.get(account) {
             adapter.command(command);
+            return;
+        }
+        // A catch-up asked while this account's adapter is still starting. Dropping it
+        // leaves the stored page on screen: the list refresh that follows is not a
+        // message change, so the pane does not ask again.
+        if kept_without_adapter(&command) {
+            lock(&self.held).push((account.clone(), command));
         }
     }
 
@@ -2681,10 +2718,50 @@ fn published_link(live: Link, kept: impl IntoIterator<Item = Link>) -> Link {
     }
 }
 
+/// A history catch-up. Anything else asked before the adapter exists is not replayed:
+/// a call leave, a send, or a search has no one waiting on the stored page.
+fn kept_without_adapter(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Backfill(_) | Command::History { .. } | Command::HistoryAfter { .. } | Command::HistoryAround { .. }
+    )
+}
+
+/// The lab's kept-backfill driver. A catch-up asked before the adapter exists is kept.
+pub fn prove_kept_backfill() -> Result<(), &'static str> {
+    if kept_without_adapter(&Command::Backfill("c".into())) && !kept_without_adapter(&Command::CallLeave("c".into())) {
+        Ok(())
+    } else {
+        Err("a backfill before the adapter exists would be dropped")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::published_link;
+    use crate::adapters::Command;
     use protocol::Link;
+
+    /// Opening the newest page asks for a catch-up. If that ask arrives before the adapter
+    /// is in the map, it has to be kept: the later list refresh is not a message change, so
+    /// the pane does not ask again. A call leave is not a catch-up and is not kept.
+    #[test]
+    fn a_backfill_is_kept_until_the_adapter_exists() {
+        assert!(super::kept_without_adapter(&Command::Backfill("c".into())));
+        assert!(super::kept_without_adapter(&Command::History {
+            conversation_id: "c".into(),
+            before: "m".into(),
+        }));
+        assert!(super::kept_without_adapter(&Command::HistoryAfter {
+            conversation_id: "c".into(),
+            after: "m".into(),
+        }));
+        assert!(super::kept_without_adapter(&Command::HistoryAround {
+            conversation_id: "c".into(),
+            around: "m".into(),
+        }));
+        assert!(!super::kept_without_adapter(&Command::CallLeave("c".into())));
+    }
 
     #[test]
     fn a_repeated_people_search_is_already_done_and_one_waiting_is_left_alone() {
