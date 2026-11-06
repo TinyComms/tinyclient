@@ -91,6 +91,11 @@ pub(crate) fn prove_scroll_release() -> Result<(), &'static str> {
     components::scroll::prove_scroll_release()
 }
 
+/// The lab's selection-clamp driver. A backwards caret pair paints no accent width.
+pub(crate) fn prove_selection_clamp() -> Result<(), &'static str> {
+    conversation::prove_selection_clamp()
+}
+
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 

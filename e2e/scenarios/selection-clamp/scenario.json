@@ -1,0 +1,12 @@
+{
+  "id": "selection-clamp",
+  "title": "A backwards selection caret pair paints no accent width",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same clamp paints selection on the phone's message pane.",
+    "ios": "The phone proof build does not run the desktop window. The same clamp paints selection on the phone's message pane."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
