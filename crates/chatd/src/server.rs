@@ -945,9 +945,13 @@ impl Chat {
                 let conversation_id = conversation.id.clone();
                 match &page {
                     Page::Newest => self.command(&account, Command::Backfill(conversation_id)),
-                    Page::Before { id } if !found.older => {
-                        let before = found.messages.first().map_or(id, |oldest| &oldest.id).clone();
-                        self.command(&account, Command::History { conversation_id, before });
+                    Page::Before { id } => {
+                        // `before` excludes that id. The oldest row extends the cache. The anchor
+                        // is the page on screen, which a window of blank plaintext still needs.
+                        let oldest = found.messages.first().map(|oldest| oldest.id.as_str());
+                        for before in before_cursors(id, oldest, window_has_blank(&found.messages), !found.older) {
+                            self.command(&account, Command::History { conversation_id: conversation_id.clone(), before: before.to_owned() });
+                        }
                     }
                     // The cache cannot see a gap in itself, so the adapter is asked each time
                     // and fetches only what it finds missing.
@@ -2753,11 +2757,41 @@ fn around_followup(successor: Option<&str>) -> Option<&str> {
     successor.filter(|id| !id.is_empty())
 }
 
+/// Cursors for a page scrolled up. `before` excludes that id, so the anchor is the page on
+/// screen and the oldest row is the next older page. A blank window asks for the anchor even
+/// when older rows are already cached. The same id is asked once. An empty oldest id is the anchor.
+fn before_cursors<'a>(anchor: &'a str, oldest: Option<&'a str>, blank: bool, no_older: bool) -> Vec<&'a str> {
+    let mut cursors = Vec::new();
+    if blank {
+        cursors.push(anchor);
+    }
+    if no_older {
+        let edge = oldest.filter(|id| !id.is_empty()).unwrap_or(anchor);
+        if !cursors.contains(&edge) {
+            cursors.push(edge);
+        }
+    }
+    cursors
+}
+
 /// A stored row with no words and no file. A captionless photo is empty text on purpose.
 fn window_has_blank(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
         message.seal == protocol::Seal::Plain && !message.deleted && message.attachments.is_empty() && message.text.trim().is_empty()
     })
+}
+
+/// The lab's before-blank driver. A blank scrolled page asks for the rows on screen.
+/// A page of real words that already has older rows does not. The next older page still asks.
+pub fn prove_before_blank() -> Result<(), &'static str> {
+    let on_screen = before_cursors("anchor", Some("oldest"), true, false) == ["anchor"];
+    let extend = before_cursors("anchor", Some("oldest"), false, true) == ["oldest"];
+    let quiet = before_cursors("anchor", Some("oldest"), false, false).is_empty();
+    if on_screen && extend && quiet {
+        Ok(())
+    } else {
+        Err("a blank scrolled page would not be caught up")
+    }
 }
 
 /// The lab's around-blank driver. A full window of blank rows still asks. A window of words does not.
@@ -2844,6 +2878,22 @@ mod tests {
         assert_eq!(super::around_followup(Some("next")), Some("next"));
         assert_eq!(super::around_followup(None), None);
         assert_eq!(super::around_followup(Some("")), None);
+    }
+
+    /// Scrolling up asks for the next older page only when the cache has none. The server's
+    /// `before` cursor excludes that id, so before the oldest row is the page above this one,
+    /// and before the anchor is the page on screen. A page of blank plaintext has to ask for
+    /// the rows on screen even when older rows are already cached. A page of real words that
+    /// already has older rows asks for nothing. The same id is asked once.
+    #[test]
+    fn a_blank_scrolled_page_asks_for_the_rows_on_screen() {
+        assert_eq!(super::before_cursors("anchor", Some("oldest"), true, false), ["anchor"]);
+        assert_eq!(super::before_cursors("anchor", Some("oldest"), false, true), ["oldest"]);
+        assert_eq!(super::before_cursors("anchor", Some("oldest"), true, true), ["anchor", "oldest"]);
+        assert!(super::before_cursors("anchor", Some("oldest"), false, false).is_empty());
+        assert_eq!(super::before_cursors("same", Some("same"), true, true), ["same"]);
+        assert_eq!(super::before_cursors("anchor", None, false, true), ["anchor"]);
+        assert_eq!(super::before_cursors("anchor", Some(""), false, true), ["anchor"]);
     }
 
     #[test]
