@@ -904,7 +904,8 @@ impl Chat {
     /// earlier open left in the cache.
     fn topics(&self, forum: Key, offset: u32, limit: u32, landing: bool) -> Response {
         if !self.shows(&forum.account()) {
-            return Response::Conversations { conversations: Vec::new(), total: 0, counts: InboxCounts::default() };
+            // Same refusal as Tree. An empty Conversations page looks like a real empty forum.
+            return hidden_list();
         }
         if landing && offset == 0 {
             let _ = self.ask(&forum.account(), |reply| Command::OpenForum { conversation_id: forum.id.clone(), reply });
@@ -1895,7 +1896,8 @@ impl Chat {
             },
             Request::Threads { space, offset, limit } => {
                 if !self.shows(&space.account()) {
-                    return Response::Conversations { conversations: Vec::new(), total: 0, counts: InboxCounts::default() };
+                    // Same refusal as Tree. An empty Conversations page looks like a real empty list.
+                    return hidden_list();
                 }
                 let read = self.hub.store().threads(&space, offset, limit.min(PAGE_LIMIT));
                 if offset == 0 {
@@ -2754,6 +2756,20 @@ pub fn prove_signed_out_messages() -> Result<(), String> {
     }
 }
 
+/// What Threads and Topics answer when the account must not show its cache. Tree already
+/// refuses with NotFound. An empty Conversations page looks like a real empty list.
+fn hidden_list() -> Response {
+    error(ErrorCode::NotFound, "signed out")
+}
+
+/// The lab's signed-out-threads driver. A signed-out Threads/Topics read is a refusal, not an empty list.
+pub fn prove_signed_out_threads() -> Result<(), String> {
+    match hidden_list() {
+        Response::Error { code, detail, .. } if code == ErrorCode::NotFound && detail.contains("signed out") => Ok(()),
+        other => Err(format!("hidden list was {other:?}, not a signed-out refusal")),
+    }
+}
+
 /// Whether a page opened around one message should ask the network. A full window that holds
 /// the anchor usually should not. It should when a row is blank plaintext: an encrypted
 /// message stored without the flag looks like that, and the cache cannot see it.
@@ -2942,6 +2958,17 @@ mod tests {
         assert!(
             !matches!(super::hidden_history(), protocol::Response::Messages { .. }),
             "an empty page would clear the open pane"
+        );
+    }
+
+    /// A signed-out Threads or Topics read must refuse. An empty Conversations page looks like
+    /// a real empty list, and the home then draws none of the cached rows.
+    #[test]
+    fn a_signed_out_threads_read_is_a_refusal_not_an_empty_list() {
+        assert_eq!(super::prove_signed_out_threads(), Ok(()));
+        assert!(
+            !matches!(super::hidden_list(), protocol::Response::Conversations { .. }),
+            "an empty list would clear the drilled home"
         );
     }
 

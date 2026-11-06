@@ -1,0 +1,12 @@
+{
+  "id": "signed-out-threads",
+  "title": "A signed-out Threads read is a refusal, not an empty list",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same signed-out check refuses the list.",
+    "ios": "The phone proof build does not run desktop chatd. The same signed-out check refuses the list."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

@@ -31,7 +31,9 @@ struct Read {
 fn conversations(request: &Request) -> std::io::Result<(Vec<Conversation>, u32)> {
     match ask(request)? {
         Response::Conversations { conversations, total, .. } => Ok((conversations, total)),
-        _ => Ok((Vec::new(), 0)),
+        // A signed-out refusal must not look like an empty forum or thread list.
+        Response::Error { detail, .. } => Err(std::io::Error::new(std::io::ErrorKind::Other, detail)),
+        _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, crate::client::OTHER_ANSWER)),
     }
 }
 
