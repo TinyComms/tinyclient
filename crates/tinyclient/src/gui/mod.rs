@@ -36,6 +36,15 @@ mod theme;
 mod tiny;
 mod time;
 
+/// The lab's focus-ring driver. A keyboard scroll frame uses an inset ring, not a fill.
+pub(crate) fn prove_focus_ring() -> Result<(), &'static str> {
+    if components::scroll::frame_focus_ring().iter().all(|shadow| shadow.inset) {
+        Ok(())
+    } else {
+        Err("the scroll frame focus ring is outset, so a transparent frame fills")
+    }
+}
+
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 

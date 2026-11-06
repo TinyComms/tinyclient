@@ -160,6 +160,15 @@ fn main() -> ExitCode {
         println!("tinyclient {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
+    // The lab's focus-ring driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("focus-ring") {
+        if let Err(err) = gui::prove_focus_ring() {
+            eprintln!("focus-ring: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     let _log = protocol::log_policy::install("tinyclient", protocol::log_policy::LogPolicy::from_env());
     #[cfg(feature = "gui")]
     if !args.iter().any(|arg| arg == "--text" || arg == "--notify-test") && query.is_none() {

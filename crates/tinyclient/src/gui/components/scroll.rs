@@ -393,7 +393,7 @@ impl RenderOnce for ScrollFrame {
                 frame
                     .track_focus(&focus)
                     .tab_index(0)
-                    .focus_visible(|style| style.shadow(theme::focus_ring()))
+                    .focus_visible(|style| style.shadow(frame_focus_ring()))
             })
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 if self.keyboard && !click_focus.contains_focused(window, cx) {
@@ -439,9 +439,15 @@ impl RenderOnce for ScrollFrame {
     }
 }
 
+/// Keyboard focus on a scroll frame. An outset ring is painted under the whole frame, and a
+/// transparent frame shows that as a fill.
+pub(crate) fn frame_focus_ring() -> Vec<gpui::BoxShadow> {
+    theme::focus_ring_inset()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::thumb;
+    use super::{frame_focus_ring, thumb};
     #[test]
     fn thumb_tracks_endpoints_and_clamps() {
         assert_eq!(thumb(200., 200., 600., 0.), (0., 50.));
@@ -450,6 +456,14 @@ mod tests {
         assert_eq!(thumb(200., 200., 10000., 0.).1, 32.);
         assert_eq!(thumb(20., 20., 1000., 0.), (0., 16.));
         assert_eq!(thumb(20., 20., 1000., -1000.), (4., 16.));
+    }
+
+    #[test]
+    fn a_keyboard_scroll_frame_focus_ring_does_not_fill_the_frame() {
+        assert!(
+            frame_focus_ring().iter().all(|shadow| shadow.inset),
+            "an outset shadow is painted under a transparent frame"
+        );
     }
 }
 
