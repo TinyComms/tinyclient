@@ -46,6 +46,11 @@ pub fn prove_sealed_cache_preview() -> Result<(), String> {
     messages::prove_sealed_cache_preview()
 }
 
+/// The lab's cache-before-enrol proof.
+pub fn prove_cache_before_enrol() -> Result<(), String> {
+    messages::prove_cache_before_enrol()
+}
+
 /// The lab's keep-opened-sealed proof. See `messages::prove_keep_opened_sealed`.
 pub fn prove_keep_opened_sealed() -> Result<(), String> {
     messages::prove_keep_opened_sealed()
