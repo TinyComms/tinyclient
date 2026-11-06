@@ -230,6 +230,8 @@ pub struct Pane {
     history_miss: Option<HistoryMiss>,
     /// Refreshes on their way. A change that arrives meanwhile is read once they land.
     refreshing: u32,
+    /// Replacing reads started since this pane opened. An earlier answer does not land over a later one.
+    page_epoch: u64,
     stale: bool,
 
     /// Scrolled more than [`AWAY`] from the bottom.
@@ -347,6 +349,7 @@ impl Pane {
             older_failed: None,
             history_miss: None,
             refreshing: 0,
+            page_epoch: 0,
             stale: false,
             away: false,
             unseen: 0,
@@ -471,6 +474,7 @@ impl Pane {
         self.older_failed = None;
         self.history_miss = None;
         self.refreshing = 0;
+        self.page_epoch = 0;
         self.stale = false;
         self.away = false;
         self.unseen = 0;
@@ -564,10 +568,19 @@ impl Pane {
             Purpose::Newest | Purpose::Around | Purpose::Arrivals => self.refreshing += 1,
             Purpose::Jump(_) | Purpose::Bottom => {}
         }
+        // Open does not count as a refresh, so a history change can start a second read
+        // while the first is still in flight. The later replacing read wins. Older, newer,
+        // and arrival pages stay beside it.
+        let asked = if replaces_window(&purpose) {
+            self.page_epoch = self.page_epoch.saturating_add(1);
+            self.page_epoch
+        } else {
+            self.page_epoch
+        };
         let request = Request::Messages { conversation: conversation.clone(), page: page.clone(), limit };
         cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
-            let _ = this.update(cx, |this, cx| this.loaded(&conversation, &page, purpose, answer, cx));
+            let _ = this.update(cx, |this, cx| this.loaded(&conversation, &page, purpose, asked, answer, cx));
         })
         .detach();
     }
@@ -577,6 +590,7 @@ impl Pane {
         conversation: &Key,
         page: &Page,
         purpose: Purpose,
+        asked: u64,
         answer: io::Result<Response>,
         cx: &mut Context<Self>,
     ) {
@@ -588,6 +602,17 @@ impl Pane {
             Purpose::Newer => self.loading_newer = false,
             Purpose::Newest | Purpose::Around | Purpose::Arrivals => self.refreshing = self.refreshing.saturating_sub(1),
             Purpose::Jump(_) | Purpose::Bottom => {}
+        }
+        // A page asked earlier must not land last and put an empty or blank window over the
+        // rows a later read already showed. The current page still lands, so a store that is
+        // really empty still clears the pane.
+        if stale_page(&purpose, asked, self.page_epoch) {
+            if self.stale && self.refreshing == 0 {
+                self.stale = false;
+                self.refresh(cx);
+            }
+            cx.notify();
+            return;
         }
         let (messages, last_read, older, newer) = match answer {
             Ok(Response::Messages { messages, last_read, older, newer, .. }) => (messages, last_read, older, newer),
@@ -1548,9 +1573,51 @@ pub(crate) fn release_text_drag(dragging: &mut bool, _over_messages: bool) -> bo
     std::mem::take(dragging)
 }
 
+/// A page that replaces the window. Older, newer, and arrivals extend it instead.
+fn replaces_window(purpose: &Purpose) -> bool {
+    matches!(
+        purpose,
+        Purpose::Open | Purpose::Newest | Purpose::Around | Purpose::Jump(_) | Purpose::Bottom | Purpose::Restore(..)
+    )
+}
+
+/// `asked` is the read's number. `newest` is the latest replacing read started since.
+/// A page asked earlier must not land over a later one. The current page still lands,
+/// including an empty newest page, so a store that is really empty still clears the pane.
+fn stale_page(purpose: &Purpose, asked: u64, newest: u64) -> bool {
+    replaces_window(purpose) && asked < newest
+}
+
+/// The lab's stale-page driver. A late empty newest page does not clear a newer read.
+pub(crate) fn prove_stale_page() -> Result<(), &'static str> {
+    if stale_page(&Purpose::Newest, 1, 2)
+        && stale_page(&Purpose::Open, 1, 2)
+        && !stale_page(&Purpose::Newest, 2, 2)
+        && !stale_page(&Purpose::Older, 1, 2)
+    {
+        Ok(())
+    } else {
+        Err("a late newest page would replace a newer read")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The open read and the refill can both be in flight. The one asked earlier must not land
+    /// last and put an empty or blank page over the rows the later read already showed. The
+    /// current newest page still lands, so a store that is really empty still clears the pane.
+    #[test]
+    fn a_late_newest_page_does_not_replace_a_newer_read() {
+        assert!(stale_page(&Purpose::Newest, 1, 2));
+        assert!(stale_page(&Purpose::Open, 1, 2));
+        assert!(stale_page(&Purpose::Around, 1, 2));
+        assert!(stale_page(&Purpose::Restore("m".into(), 0.), 1, 2));
+        assert!(!stale_page(&Purpose::Newest, 2, 2));
+        assert!(!stale_page(&Purpose::Older, 1, 2));
+        assert!(!stale_page(&Purpose::Arrivals, 1, 2));
+    }
 
     #[test]
     fn a_failed_page_says_which_one_and_a_newer_failure_stops_the_retry() {
