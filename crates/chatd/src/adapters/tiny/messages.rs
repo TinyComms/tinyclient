@@ -1207,18 +1207,10 @@ fn present(value: &Option<String>) -> bool {
 }
 
 /// Whether the stored space already has text channels and/or directs. Used to refuse an empty
-/// list that would delete those rows and their messages.
+/// list that would delete those rows and their messages. Directs sort after channels, so this
+/// must not use a paged tree read.
 fn kept_text_kinds(ctx: &Context) -> (bool, bool) {
-    let space = ctx.key(SPACE);
-    let Ok(Some(tree)) = ctx.hub.store().tree(&space, 0, PAGE_MAX) else {
-        return (false, false);
-    };
-    let channels = tree
-        .conversations
-        .iter()
-        .any(|row| matches!(row.kind, ConversationKind::Channel | ConversationKind::Announcement));
-    let directs = tree.conversations.iter().any(|row| row.kind == ConversationKind::Direct);
-    (channels, directs)
+    ctx.hub.store().space_text_kinds(&ctx.key(SPACE)).unwrap_or((false, false))
 }
 
 fn optional_list<T: serde::de::DeserializeOwned>(saved: &Saved, path: &str, key: &str) -> Option<Vec<T>> {
@@ -1927,6 +1919,31 @@ mod tests {
             page.messages.iter().find(|message| message.id == "m-dm").map(|message| message.text.as_str()),
             Some("kept dm")
         );
+    }
+
+    /// Directs sort after channels. A paged tree of the first page can miss them and let an
+    /// empty directs list delete every DM.
+    #[test]
+    fn space_text_kinds_finds_directs_past_the_first_tree_page() {
+        let (_adapter, ctx, _saved) = fixture(|_| None);
+        let space = ctx.key(SPACE);
+        let account = space.account();
+        for index in 0..120 {
+            let mut row = crate::store::ConversationRow::new(format!("ch-{index}"), ConversationKind::Channel, format!("#{index}"));
+            row.space = Some(SPACE.to_owned());
+            row.position = index;
+            ctx.hub.store().upsert_conversation(&account, &row).unwrap();
+        }
+        let mut direct = crate::store::ConversationRow::new("dm-late", ConversationKind::Direct, "Bea");
+        direct.space = Some(SPACE.to_owned());
+        direct.position = DIRECTS_AT;
+        ctx.hub.store().upsert_conversation(&account, &direct).unwrap();
+        let page = ctx.hub.store().tree(&space, 0, PAGE_MAX).unwrap().unwrap();
+        assert!(
+            !page.conversations.iter().any(|row| row.kind == ConversationKind::Direct),
+            "the first tree page is only channels"
+        );
+        assert_eq!(ctx.hub.store().space_text_kinds(&space).unwrap(), (true, true));
     }
 
     #[test]

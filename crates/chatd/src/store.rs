@@ -1360,6 +1360,31 @@ impl Store {
             .optional()
     }
 
+    /// Whether a space already holds text channels and/or directs. Directs sort after channels
+    /// by position, so a paged tree read can miss them.
+    pub fn space_text_kinds(&self, space: &Key) -> rusqlite::Result<(bool, bool)> {
+        let key = params![word(&space.network), space.account, space.id];
+        let channels: bool = self.db.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM conversation
+                  WHERE network = ?1 AND account = ?2 AND space = ?3 AND parent = ''
+                    AND kind IN ('channel', 'announcement')
+             )",
+            key,
+            |row| row.get(0),
+        )?;
+        let directs: bool = self.db.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM conversation
+                  WHERE network = ?1 AND account = ?2 AND space = ?3 AND parent = ''
+                    AND kind = 'direct'
+             )",
+            key,
+            |row| row.get(0),
+        )?;
+        Ok((channels, directs))
+    }
+
     /// Whether a conversation may appear where the user asked for what is listed: hidden
     /// conversations and message requests stay out of it, as they stay out of the cache's own
     /// search. A conversation the store does not know is not listed.
