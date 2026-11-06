@@ -1380,7 +1380,7 @@ impl Shell {
             return vec![window];
         }
         let mode = &self.sidebar_state.mode;
-        let mut found: Vec<(Network, Tone, String)> = Vec::new();
+        let mut found: Vec<(AccountKey, Tone, String)> = Vec::new();
         for account in &snapshot.accounts {
             let network = account.key.network;
             let here = match mode {
@@ -1405,7 +1405,9 @@ impl Shell {
         found
             .into_iter()
             .take(1)
-            .map(|(account, tone, words)| { let network = account.network; match tone {
+            .map(|(account, tone, words)| {
+                let network = account.network;
+                match tone {
                 Tone::Danger => banner(tone, words).child(
                     banner_action("sign-in-again", "Sign in").on_click(cx.listener(move |this, _, _, cx| this.sign_in(network, cx))),
                 ),
