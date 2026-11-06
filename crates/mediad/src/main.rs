@@ -43,6 +43,14 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    // The lab's bridge-image driver. A build without this opens the audio engine below and stays up.
+    if env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("bridge-image") {
+        if let Err(err) = mediad::process::prove_bridge_image() {
+            eprintln!("bridge-image: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     let _log = protocol::log_policy::install("mediad", protocol::log_policy::LogPolicy::from_env());
     protocol::crash::install_panic_hook("mediad");
     let code = mediad::serve::run(&args);

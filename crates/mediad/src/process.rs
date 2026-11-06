@@ -47,7 +47,8 @@ pub struct Processor {
 /// The 48 kHz ⟷ 16 kHz bridge for voice isolation, and the last samples it still needs.
 struct Band {
     hist: [f32; TAPS - 1],
-    prev: f32,
+    /// The high-rate samples the reconstruction filter has not finished with.
+    up_hist: [f32; TAPS - 1],
 }
 
 impl Default for Processor {
@@ -60,7 +61,7 @@ impl Default for Band {
     fn default() -> Band {
         Band {
             hist: [0.; TAPS - 1],
-            prev: 0.,
+            up_hist: [0.; TAPS - 1],
         }
     }
 }
@@ -293,19 +294,68 @@ impl Band {
         self.hist.copy_from_slice(&window[end - keep..end]);
     }
 
-    /// 16 kHz mono in, 48 kHz mono out. Linear, one sample late, which is under a tenth of a
-    /// millisecond on top of the model's own 10 ms.
+    /// 16 kHz mono in, 48 kHz mono out. Zero-stuffed and low-passed, so the copies a linear
+    /// stretch would paint above 8 kHz are not there for fullband Opus to encode.
     fn up(&mut self, input: &[f32; LOW * 2], out: &mut [f32; FRAME]) {
-        let mut last = self.prev;
+        let coeff = lowpass();
+        let mut window = [0f32; FRAME + TAPS];
+        let keep = TAPS - 1;
+        window[..keep].copy_from_slice(&self.up_hist);
         for (i, &sample) in input.iter().enumerate() {
-            let at = i * 3;
-            out[at] = last;
-            out[at + 1] = last + (sample - last) / 3.;
-            out[at + 2] = last + (sample - last) * 2. / 3.;
-            last = sample;
+            window[keep + i * 3] = sample * 3.;
         }
-        self.prev = last;
+        for (i, sample) in out.iter_mut().enumerate() {
+            let at = keep + i;
+            let mut acc = 0f32;
+            for (k, tap) in coeff.iter().enumerate() {
+                acc += tap * window[at - k];
+            }
+            *sample = acc;
+        }
+        let end = keep + FRAME;
+        self.up_hist.copy_from_slice(&window[end - keep..end]);
     }
+}
+
+/// A 6 kHz tone through the 16 kHz bridge must not come back with a 10 kHz image.
+pub fn prove_bridge_image() -> Result<(), &'static str> {
+    let mut band = Band::default();
+    let mut phase = 0f32;
+    let mut heard = Vec::new();
+    for _ in 0..20 {
+        let mut input = [0f32; FRAME];
+        for sample in &mut input {
+            phase += 6000. / RATE as f32;
+            *sample = (phase * std::f32::consts::TAU).sin() * 0.4;
+        }
+        let mut low = [0f32; LOW * 2];
+        let mut out = [0f32; FRAME];
+        band.down(&input, &mut low);
+        band.up(&low, &mut out);
+        heard.extend_from_slice(&out);
+    }
+    let settled = &heard[FRAME * 4..];
+    let (tone, image) = (bin_level(settled, 6000.), bin_level(settled, 10000.));
+    if tone <= 0.02 {
+        return Err("the tone did not survive");
+    }
+    if image * 10. >= tone {
+        return Err("a high tone came back with an image above 8 kHz");
+    }
+    Ok(())
+}
+
+fn bin_level(samples: &[f32], hz: f32) -> f64 {
+    let step = hz / RATE as f32;
+    let mut phase = 0f32;
+    let (mut i, mut q) = (0f64, 0f64);
+    for &sample in samples {
+        let angle = phase * std::f32::consts::TAU;
+        i += f64::from(sample) * f64::from(angle.cos());
+        q += f64::from(sample) * f64::from(angle.sin());
+        phase = (phase + step) % 1.;
+    }
+    (i * i + q * q).sqrt() / samples.len() as f64
 }
 
 /// Soft mic gain from Settings (0 to 100, 100 = unity), applied in place before processing.
@@ -523,6 +573,46 @@ mod tests {
             reduced.abs() < 3.,
             "the bridge moved a tone by {reduced:.1} dB"
         );
+    }
+
+    /// A 6 kHz tone is inside the 16 kHz bridge. Linear interpolation paints a 10 kHz image
+    /// of it, and fullband Opus then encodes that image.
+    #[test]
+    fn the_rate_bridge_does_not_image_a_high_tone() {
+        let mut band = Band::default();
+        let mut phase = 0f32;
+        let mut heard = Vec::new();
+        for _ in 0..20 {
+            let mut input = [0f32; FRAME];
+            for sample in &mut input {
+                phase += 6000. / RATE as f32;
+                *sample = (phase * std::f32::consts::TAU).sin() * 0.4;
+            }
+            let mut low = [0f32; LOW * 2];
+            let mut out = [0f32; FRAME];
+            band.down(&input, &mut low);
+            band.up(&low, &mut out);
+            heard.extend_from_slice(&out);
+        }
+        let settled = &heard[FRAME * 4..];
+        let tone = bin_level(settled, 6000.);
+        let image = bin_level(settled, 10000.);
+        assert!(tone > 0.02, "the tone did not survive: {tone}");
+        assert!(image * 10. < tone, "a 10 kHz image of {image} sits beside the tone {tone}");
+    }
+
+    /// Level of one frequency in `samples`, as a mean magnitude.
+    fn bin_level(samples: &[f32], hz: f32) -> f64 {
+        let step = hz / RATE as f32;
+        let mut phase = 0f32;
+        let (mut i, mut q) = (0f64, 0f64);
+        for &sample in samples {
+            let angle = phase * std::f32::consts::TAU;
+            i += f64::from(sample) * f64::from(angle.cos());
+            q += f64::from(sample) * f64::from(angle.sin());
+            phase = (phase + step) % 1.;
+        }
+        (i * i + q * q).sqrt() / samples.len() as f64
     }
 
     /// Automatic gain brings a quiet voice up.
