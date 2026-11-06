@@ -41,6 +41,11 @@ pub fn prove_empty_list() -> Result<(), String> {
     messages::prove_empty_list()
 }
 
+/// The lab's first-encrypted-message proof. See `e2ee::prove_first_encrypted_message`.
+pub fn prove_first_encrypted_message() -> Result<(), String> {
+    e2ee::prove_first_encrypted_message()
+}
+
 /// The lab's join-order proof. `call.join` is sent before the room's mediad settings.
 pub fn prove_join_before_room() -> Result<(), &'static str> {
     let steps = live::after_offer();
@@ -65,7 +70,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long one request may take. A redirect is not followed, so this is one host.
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -1144,9 +1149,91 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
     Ok(())
 }
 
+/// One read. A timeout is not the end of the request: the body can arrive in a later packet.
+fn read_some(stream: &mut std::net::TcpStream, got: &mut Vec<u8>, deadline: Instant) -> bool {
+    let mut buf = [0u8; 2048];
+    while Instant::now() < deadline {
+        match std::io::Read::read(stream, &mut buf) {
+            Ok(0) => return false,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                continue
+            }
+            Err(_) => return false,
+            Ok(read) => {
+                got.extend_from_slice(&buf[..read]);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A JSON response for the in-process fake tinyserver (unit tests and lab proves).
+pub(crate) fn http(status: u16, reason: &str, body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// Bind a one-shot HTTP listener for the in-process fake tinyserver (unit tests and lab proves).
+pub(crate) fn serve(handler: impl Fn(&str) -> Vec<u8> + Send + 'static) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        // Long enough for a test that waits its turn for the session lock.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        listener.set_nonblocking(true).expect("nonblocking");
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+                    let mut got = Vec::new();
+                    let header_end = loop {
+                        if let Some(at) = got.windows(4).position(|window| window == b"\r\n\r\n") {
+                            break Some(at + 4);
+                        }
+                        if !read_some(&mut stream, &mut got, deadline) {
+                            break None;
+                        }
+                    };
+                    if let Some(header_end) = header_end {
+                        let head = String::from_utf8_lossy(&got[..header_end]);
+                        let length = head.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(length) = length {
+                            while got.len() < header_end + length && read_some(&mut stream, &mut got, deadline) {}
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&got).into_owned();
+                    let _ = std::io::Write::write_all(&mut stream, &handler(&request));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    pub(crate) use super::{http, serve};
 
     fn session() -> &'static str {
         r#"{"base_url":"http://127.0.0.1:8080","token":"t","user_id":"11111111-1111-1111-1111-111111111111","email":"ada@example.com","display_name":"Ada","role":"owner"}"#
@@ -1949,78 +2036,5 @@ pub(crate) mod tests {
     pub(crate) fn json_body(request: &str) -> serde_json::Value {
         let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
         serde_json::from_str(body).unwrap_or_else(|err| panic!("body {err}"))
-    }
-
-    pub(crate) fn http(status: u16, reason: &str, body: &str) -> Vec<u8> {
-        format!(
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .into_bytes()
-    }
-
-    /// One read. A timeout is not the end of the request: the body can arrive in a later packet.
-    fn read_some(stream: &mut std::net::TcpStream, got: &mut Vec<u8>, deadline: std::time::Instant) -> bool {
-        let mut buf = [0u8; 2048];
-        while std::time::Instant::now() < deadline {
-            match std::io::Read::read(stream, &mut buf) {
-                Ok(0) => return false,
-                Err(err) if err.kind() == std::io::ErrorKind::TimedOut || err.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(_) => return false,
-                Ok(read) => {
-                    got.extend_from_slice(&buf[..read]);
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    pub(crate) fn serve(handler: impl Fn(&str) -> Vec<u8> + Send + 'static) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        std::thread::spawn(move || {
-            // Long enough for a test that waits its turn for the session lock.
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            listener.set_nonblocking(true).expect("nonblocking");
-            while std::time::Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let _ = stream.set_nonblocking(false);
-                        let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
-                        let mut got = Vec::new();
-                        let header_end = loop {
-                            if let Some(at) = got.windows(4).position(|window| window == b"\r\n\r\n") {
-                                break Some(at + 4);
-                            }
-                            if !read_some(&mut stream, &mut got, deadline) {
-                                break None;
-                            }
-                        };
-                        if let Some(header_end) = header_end {
-                            let head = String::from_utf8_lossy(&got[..header_end]);
-                            let length = head.lines().find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                if name.eq_ignore_ascii_case("content-length") {
-                                    value.trim().parse::<usize>().ok()
-                                } else {
-                                    None
-                                }
-                            });
-                            if let Some(length) = length {
-                                while got.len() < header_end + length && read_some(&mut stream, &mut got, deadline) {}
-                            }
-                        }
-                        let request = String::from_utf8_lossy(&got).into_owned();
-                        let _ = std::io::Write::write_all(&mut stream, &handler(&request));
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-        format!("http://127.0.0.1:{port}")
     }
 }

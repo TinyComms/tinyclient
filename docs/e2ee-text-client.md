@@ -34,15 +34,22 @@ server and deletes the directory.
   starts the group if nobody has (`POST .../group`), applies the handshake feed in order (an Add
   for a device not yet verified makes it fetch that person's list and try once more), and commits
   what is pending, with the Welcome for every device it adds. It runs on `e2ee.handshake`, before
-  every send, and when a message is from an epoch ahead.
+  every send, and when a message is from an epoch ahead (once per read).
 - **Sending.** Never plaintext to an encrypted conversation: if this device is not ready, the send
-  is an error. The envelope is encrypted (`kind` and `target_id` in the authenticated data) and
+  is an error. While the server lists an Add for someone with no device in the group yet, the send
+  waits, syncing every 2 s, up to 45 s: the server signs Adds only after its commit batch
+  (`e2ee_commit_batch_secs`, 30 s by default from when the group started), and a message sent
+  before then is for a group the others join later, so they could never open it. A new
+  conversation's first message waits like this. The wait is on the account's sealed-send thread,
+  in order, off the device's lock; past 45 s the message goes to the group as it is. The envelope is encrypted (`kind` and `target_id` in the authenticated data) and
   posted; the plaintext is kept in the cache under the server's id, since a device cannot open its
   own message. An edit is a `kind: edit` ciphertext that keeps the message's attachments.
 - **Reading.** Rows of an encrypted conversation are opened (or read from the cache) oldest epoch
   first; an edit is folded into its target if the target's author sent it. The server's `body` is
   never read for such a row. What does not open reads "Can't be decrypted on this device" with
-  `Seal::Undecryptable`. A plaintext conversation is `Encryption::Plain` until this device is
+  `Seal::Undecryptable`. A row that did not open because this device was not in the group (or its
+  epoch) yet is read again on the conversation's next `e2ee.handshake`, which reloads the newest
+  page, so it opens without another message. A plaintext conversation is `Encryption::Plain` until this device is
   ready and the server allows encryption: it then asks `POST /v1/conversations/{id}/e2ee`. Older
   messages stay in the clear and the header says they can still be read by the server. A
   conversation that was encrypted from the start does not say that.
@@ -68,7 +75,10 @@ server and deletes the directory.
 
 ## Testing
 
-`cargo test -p chatd --lib -- e2ee sealing fetch messages` runs the unit tests. The end-to-end
+`cargo test -p chatd --lib -- e2ee sealing fetch messages` runs the unit tests. `e2ee::fake` runs
+two devices against an in-process server that signs real external Adds after a commit batch
+counted in requests: a new conversation's first message opens for the other person, and a row
+that missed its group is read again when the group comes. The end-to-end
 test `adapters::tiny::e2ee::live` is ignored unless `TINY_E2EE_SESSIONS` holds a JSON array of five
 Tiny sessions on one tinyserver built from the encrypted-text branch: Ada, Bea, Cyd, then two more
 of Ada's. Sessions were made with tinyserver's own `db` functions (`owner_invite`, `sign_in`,

@@ -41,6 +41,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// The engine's snapshot under the store.
 const STATE: &str = "device.state";
@@ -52,6 +53,20 @@ const HANDSHAKE_PAGE: usize = 100;
 const PASSES: usize = 8;
 /// Opened messages kept per conversation in the cache.
 const CACHED: usize = 20_000;
+/// How long a send waits for the people of a conversation to join its group. The server signs
+/// their Adds only after its commit batch (`e2ee_commit_batch_secs`, 30 s by default, counted from
+/// when the group started), and a message sent before then is for the devices already in it,
+/// which the others can never open. Past this the message goes to the group as it is.
+const JOIN_WAIT: Duration = Duration::from_secs(45);
+/// How often a waiting send asks again. Asking is what has the server sign the batch.
+fn join_poll() -> Duration {
+    // Unit tests and the lab prove use a short poll so a held commit batch finishes quickly.
+    if cfg!(test) || std::env::var_os("TINYCLIENT_PROVE").is_some() {
+        Duration::from_millis(10)
+    } else {
+        Duration::from_secs(2)
+    }
+}
 
 /// The keys the keychain keeps for this device, inside the session JSON. Not `Debug`.
 #[derive(Clone, Serialize, Deserialize)]
@@ -410,6 +425,12 @@ pub(crate) struct Device {
     /// People whose device list was checked since the server last said it changed
     /// (`e2ee.device`): a sync does not ask for theirs again.
     checked: BTreeSet<String>,
+    /// Conversations where someone the server is adding has no device in the group yet, as the
+    /// last sync saw them.
+    joining: BTreeSet<String>,
+    /// Conversations with a row that did not open because this device was not in the group, or
+    /// not at its epoch, yet. Read again when the group's handshake next comes.
+    unopened: BTreeSet<String>,
 }
 
 type Shared = Arc<Mutex<Device>>;
@@ -626,6 +647,8 @@ impl Device {
             encrypted: HashMap::new(),
             files: HashMap::new(),
             checked: BTreeSet::new(),
+            joining: BTreeSet::new(),
+            unopened: BTreeSet::new(),
         }
     }
 
@@ -964,9 +987,15 @@ impl Device {
             }
             if info.get("e2ee").and_then(Value::as_bool) != Some(true) {
                 self.note_encrypted(conversation_id, false);
+                self.joining.remove(conversation_id);
                 return Ok(());
             }
             self.note_encrypted(conversation_id, true);
+            if joining(&info) {
+                self.joining.insert(conversation_id.to_owned());
+            } else {
+                self.joining.remove(conversation_id);
+            }
             let server_key = info
                 .get("external_sender")
                 .and_then(Value::as_str)
@@ -998,6 +1027,7 @@ impl Device {
                 }
             }
             let has = self.engine()?.has_group(conv);
+            let mut started = false;
             if !has {
                 if info.get("epoch").is_none_or(Value::is_null) {
                     // Nobody has started it: this device does.
@@ -1008,10 +1038,13 @@ impl Device {
                         Some(json!({ "device_id": device_id })),
                     )?;
                     match status {
-                        201 | 200 => self
-                            .engine()?
-                            .create_group(conv, &server_key)
-                            .map_err(|err| format!("The group could not be started: {err}"))?,
+                        // The server adds the others now: the next pass reads who is waiting.
+                        201 | 200 => {
+                            self.engine()?
+                                .create_group(conv, &server_key)
+                                .map_err(|err| format!("The group could not be started: {err}"))?;
+                            started = true;
+                        }
                         // Someone else did first: their Welcome is in the feed.
                         409 => {}
                         status => {
@@ -1034,7 +1067,7 @@ impl Device {
             }
             let moved = self.feed(conversation_id, conv, &server_key)?;
             let committed = self.commit(conversation_id, conv)?;
-            if !moved && !committed {
+            if !moved && !committed && !started {
                 break;
             }
         }
@@ -1417,6 +1450,9 @@ impl Device {
             };
             opened = engine.decrypt(conv, &ciphertext, &claimed);
         }
+        if matches!(opened, Err(Error::FutureEpoch { .. } | Error::NoGroup)) {
+            self.unopened.insert(conversation_id.to_owned());
+        }
         match opened {
             Ok(incoming) => {
                 let opened = Opened {
@@ -1533,8 +1569,9 @@ impl Device {
         Some(sealed)
     }
 
-    /// The live socket said something about this protocol.
-    pub(crate) fn heard(&mut self, kind: &str, frame: &Value) {
+    /// The live socket said something about this protocol. `Some` is a conversation whose rows
+    /// should be read again: one did not open for want of the group, and the group may be here.
+    pub(crate) fn heard(&mut self, kind: &str, frame: &Value) -> Option<String> {
         let field = |name: &str| {
             frame
                 .get(name)
@@ -1546,8 +1583,12 @@ impl Device {
             "e2ee.handshake" => {
                 let conversation_id = field("conversation_id");
                 if super::safe_id(&conversation_id) && self.ready() {
-                    if let Err(why) = self.sync(&conversation_id) {
-                        tracing::warn!("chatd: Tiny e2ee: {conversation_id}: {why}");
+                    match self.sync(&conversation_id) {
+                        Ok(()) if self.unopened.remove(&conversation_id) => {
+                            return Some(conversation_id)
+                        }
+                        Ok(()) => {}
+                        Err(why) => tracing::warn!("chatd: Tiny e2ee: {conversation_id}: {why}"),
                     }
                 }
             }
@@ -1576,6 +1617,7 @@ impl Device {
             }
             _ => {}
         }
+        None
     }
 
     /// `E2eeAsk::Status`.
@@ -1901,6 +1943,76 @@ pub(crate) fn attachment_id() -> Result<String, String> {
 /// A new attachment key, for a file about to be sealed.
 pub(crate) fn attachment_key() -> Result<AttachmentKey, String> {
     AttachmentKey::generate().map_err(|_| "No randomness is available.".to_owned())
+}
+
+/// Whether the server is adding someone who has no device in the group yet: a message sent now
+/// is one they can never open.
+fn joining(info: &Value) -> bool {
+    let rows = |list: &str| {
+        info.get(list)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let members: BTreeSet<String> = rows("members")
+        .iter()
+        .filter_map(|row| row.get("user_id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    rows("pending").iter().any(|row| {
+        row.get("op").and_then(Value::as_str) == Some("add")
+            && row
+                .get("user_id")
+                .and_then(Value::as_str)
+                .is_some_and(|user| !members.contains(user))
+    })
+}
+
+/// Sends a message or an edit to an encrypted conversation ([`Device::post`]), once the people
+/// the server is adding are in its group, waiting up to [`JOIN_WAIT`] for that. The wait is off
+/// the device's lock, so reading and the live socket go on.
+pub(crate) fn send(
+    shared: &Shared,
+    conversation_id: &str,
+    client_id: &str,
+    kind: Kind,
+    target_id: Option<&str>,
+    envelope: &Envelope,
+    attachment_ids: &[String],
+) -> Result<Value, String> {
+    let until = Instant::now() + JOIN_WAIT;
+    loop {
+        let mut device = lock(shared);
+        device.sync(conversation_id)?;
+        if !device.joining.contains(conversation_id) {
+            break;
+        }
+        if Instant::now() >= until {
+            tracing::warn!(
+                "chatd: Tiny e2ee: {conversation_id}: sent while someone is still joining"
+            );
+            break;
+        }
+        drop(device);
+        std::thread::sleep(join_poll());
+    }
+    lock(shared).post(
+        conversation_id,
+        client_id,
+        kind,
+        target_id,
+        envelope,
+        attachment_ids,
+    )
+}
+
+/// In-process tinyserver for the first-message prove and its unit tests. Compiled into chatd so
+/// `TINYCLIENT_PROVE=first-encrypted-message` can run without `cargo test`.
+mod fake;
+
+/// Lab prove: see [`fake::prove_first_encrypted_message`].
+pub fn prove_first_encrypted_message() -> Result<(), String> {
+    fake::prove_first_encrypted_message()
 }
 
 #[cfg(test)]

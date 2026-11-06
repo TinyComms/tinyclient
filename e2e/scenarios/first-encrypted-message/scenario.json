@@ -1,0 +1,12 @@
+{
+  "id": "first-encrypted-message",
+  "title": "The first message of a new encrypted conversation opens for the other person",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd against a localhost MLS fake. The same wait is what this desktop run checks.",
+    "ios": "The phone proof build does not run desktop chatd against a localhost MLS fake. The same wait is what this desktop run checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 90
+}

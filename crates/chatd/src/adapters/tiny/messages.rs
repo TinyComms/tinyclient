@@ -189,12 +189,17 @@ pub(crate) fn on_live(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         "read.updated" => read_updated(ctx, saved, frame),
         "server.updated" => ctx.capabilities(account_caps(saved)),
         // The group of an encrypted conversation changed, this device's key packages ran low, or
-        // someone's devices changed. Off the socket's thread: it asks the server.
+        // someone's devices changed. Off the socket's thread: it asks the server. A row that did
+        // not open for want of the group is read again once the group is here.
         "e2ee.handshake" | "e2ee.keys_low" | "e2ee.device" => {
             if let Some(device) = e2ee::started(saved) {
                 let (kind, frame) = (kind.to_owned(), frame.clone());
+                let (ctx, saved) = (ctx.clone(), saved.clone());
                 let _ = std::thread::Builder::new().name("tiny-e2ee".into()).spawn(move || {
-                    device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).heard(&kind, &frame);
+                    let again = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).heard(&kind, &frame);
+                    if let Some(id) = again {
+                        load_page(&ctx, &saved, &id, None, PAGE);
+                    }
                 });
             }
         }
@@ -255,10 +260,7 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
         }
         Command::OpenSpace(_) | Command::OpenHome => refresh(ctx, saved),
         Command::MarkRead { conversation_id, message_id } => mark_read(saved, &conversation_id, &message_id),
-        Command::Send { conversation_id, client_id, text, reply_to } => {
-            let outcome = post_message(ctx, saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[]);
-            ctx.sent(&conversation_id, &client_id, outcome);
-        }
+        Command::Send { conversation_id, client_id, text, reply_to } => send(ctx, saved, conversation_id, client_id, text, reply_to),
         Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
             send_with(ctx, saved, conversation_id, client_id, text, reply_to, *with);
         }
@@ -702,6 +704,59 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
     }
 }
 
+/// A send of text. One to an encrypted conversation can wait for the people of a new group to
+/// join it (`e2ee::send`), so it goes to this account's sealed-send thread, in order, and the
+/// commands go on meanwhile.
+fn send(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>) {
+    if super::safe_id(&conversation_id) && sealed_here(ctx, saved, &conversation_id) == Ok(true) {
+        let account = (saved.base_url.clone(), saved.user_id.clone());
+        let (posting, saved) = (ctx.clone(), saved.clone());
+        in_order(account, Box::new(move || {
+            let outcome = post_message(&posting, &saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[]);
+            posting.sent(&conversation_id, &client_id, outcome);
+        }));
+        return;
+    }
+    let outcome = post_message(ctx, saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[]);
+    ctx.sent(&conversation_id, &client_id, outcome);
+}
+
+type Job = Box<dyn FnOnce() + Send>;
+
+/// The sealed-send thread of each account (server and user), by what takes its jobs.
+type Queues = HashMap<(String, String), std::sync::mpsc::Sender<Job>>;
+
+/// Runs `job` on the account's sealed-send thread, after the ones before it. Made when first
+/// needed, and again if it ended.
+fn in_order(account: (String, String), job: Job) {
+    static QUEUES: std::sync::OnceLock<std::sync::Mutex<Queues>> = std::sync::OnceLock::new();
+    let mut queues = QUEUES.get_or_init(Default::default).lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let job = match queues.get(&account) {
+        Some(queue) => match queue.send(job) {
+            Ok(()) => return,
+            Err(std::sync::mpsc::SendError(job)) => job,
+        },
+        None => job,
+    };
+    let (queue, jobs) = std::sync::mpsc::channel::<Job>();
+    let started = std::thread::Builder::new().name("tiny-sealed-send".into()).spawn(move || {
+        for job in jobs {
+            job();
+        }
+    });
+    match started {
+        Ok(_) => {
+            let _ = queue.send(job);
+            queues.insert(account, queue);
+        }
+        // No thread to be had: this one sends it.
+        Err(_) => {
+            drop(queues);
+            job();
+        }
+    }
+}
+
 fn post_message(ctx: &Context, saved: &Saved, conversation_id: &str, client_id: &str, text: &str, reply_to: Option<&str>, attachment_ids: &[String]) -> Result<Message, String> {
     if !super::safe_id(conversation_id) {
         return Err(super::CHECK.to_owned());
@@ -753,7 +808,7 @@ fn post_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, client_id: &
     envelope.reply_to = reply_to.filter(|id| super::safe_id(id)).map(str::to_owned);
     envelope.attachments = attachments;
     envelope.sent_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_millis() as i64);
-    let answer = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).post(conversation_id, client_id, e2ee_core::Kind::Message, None, &envelope, attachment_ids)?;
+    let answer = e2ee::send(&device, conversation_id, client_id, e2ee_core::Kind::Message, None, &envelope, attachment_ids)?;
     accept_message(ctx, saved, conversation_id, &answer)
 }
 

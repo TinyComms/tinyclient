@@ -88,6 +88,12 @@ tempfile = "3"
 # features the shell already builds.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 
+# The in-process tinyserver of `adapters/tiny/e2ee/fake.rs` (lab prove + unit tests) signs the
+# external Add proposals a real server signs. Same versions the e2ee crate links.
+openmls = "0.8.1"
+openmls_traits = "0.5.0"
+openmls_rust_crypto = "0.5.1"
+
 [features]
 default = ["signal"]
 signal = ["dep:presage", "dep:aes-gcm-siv", "dep:futures", "dep:async-trait", "dep:chrono", "dep:rand", "tokio/rt"]
