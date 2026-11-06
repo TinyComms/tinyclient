@@ -47,6 +47,16 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
     let Some(directs) = optional_list::<WireDirect>(saved, "/v1/directs", "directs") else {
         return;
     };
+    // A 200 with an empty channels or directs list still runs replace_tree: every conversation
+    // that list left out is deleted with its messages. A brief empty answer during a server
+    // update is not an empty community. A first connect with nothing of that kind still replaces.
+    let (had_channels, had_directs, had_voice) = kept_list_kinds(ctx);
+    if channels.is_empty() || directs.is_empty() {
+        if (channels.is_empty() && had_channels) || (directs.is_empty() && had_directs) {
+            tracing::warn!("chatd: Tiny server: empty channel or direct list; keeping the stored tree");
+            return;
+        }
+    }
     let rooms = match super::rooms_of(saved) {
         super::Listed::Rows(rows) => rows,
         super::Listed::Empty => Vec::new(),
@@ -55,6 +65,12 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
             return;
         }
     };
+    // Same for voice rooms: an empty rooms answer (or a 404 on an old server that never had
+    // rooms) must not delete rooms already stored.
+    if rooms.is_empty() && had_voice {
+        tracing::warn!("chatd: Tiny server: empty rooms list; keeping the stored tree");
+        return;
+    }
     let mut people: Vec<PersonRow> = names
         .iter()
         .filter(|(id, _)| super::safe_id(id))
@@ -1196,6 +1212,13 @@ fn present(value: &Option<String>) -> bool {
     value.as_deref().is_some_and(|text| !text.is_empty())
 }
 
+/// Whether the stored space already has text channels, directs, and/or voice rooms. Used to
+/// refuse an empty list that would delete those rows and their messages. Directs sort after
+/// channels, so this must not use a paged tree read.
+fn kept_list_kinds(ctx: &Context) -> (bool, bool, bool) {
+    ctx.hub.store().space_text_kinds(&ctx.key(SPACE)).unwrap_or((false, false, false))
+}
+
 fn optional_list<T: serde::de::DeserializeOwned>(saved: &Saved, path: &str, key: &str) -> Option<Vec<T>> {
     match super::asked("GET", saved, path, None) {
         // A refusal is not an empty server. An empty list deletes every conversation left out,
@@ -1532,6 +1555,80 @@ pub(super) fn prove_missing_seal() -> Result<(), String> {
     }
 }
 
+/// Proves an empty channel and direct list does not delete messages already stored.
+/// The lab sets `TINYCLIENT_PROVE=empty-list`. A build from before the fix ignores that and
+/// keeps serving, so the same driver fails there.
+pub(super) fn prove_empty_list() -> Result<(), String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|err| err.to_string())?;
+    let base = format!("http://{}", listener.local_addr().map_err(|err| err.to_string())?);
+    std::thread::spawn(move || answer_empty_list(listener));
+    let saved = Saved {
+        base_url: base,
+        token: "t".to_owned(),
+        user_id: "11111111-1111-1111-1111-111111111111".to_owned(),
+        email: None,
+        display_name: "Ada".to_owned(),
+        role: "owner".to_owned(),
+        plain_http_ok: false,
+        e2ee: None,
+    };
+    let hub = std::sync::Arc::new(crate::hub::Hub::new(
+        crate::store::Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?,
+    ));
+    let account = protocol::AccountKey { network: protocol::Network::Tiny, account: saved.user_id.clone() };
+    let (_adapter, ctx, _inbox) = crate::adapters::local(account, hub);
+    refresh(&ctx, &saved);
+    if ctx.known("channel-1").map_err(|err| err.to_string())?.is_none() {
+        return Err("the channel list was not stored".to_owned());
+    }
+    let kept = Message::plain("m-kept", "Ada", "kept", 1_700_000_000, false);
+    ctx.hub.store().ingest(&ctx.key("channel-1"), &kept, false).map_err(|err| err.to_string())?;
+    refresh(&ctx, &saved);
+    match ctx.stored_message("channel-1", "m-kept").map_err(|err| err.to_string())? {
+        Some(message) if message.text == "kept" => Ok(()),
+        Some(message) => Err(format!("the stored text was {:?}", message.text)),
+        None => Err("an empty channel list deleted the stored message".to_owned()),
+    }
+}
+
+fn answer_empty_list(listener: std::net::TcpListener) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let channels = AtomicUsize::new(0);
+    let _ = listener.set_nonblocking(true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let listed = r#"{"channels":[{"id":"channel-1","name":"general"}]}"#;
+    while std::time::Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                let mut got = [0u8; 2048];
+                let read = std::io::Read::read(&mut stream, &mut got).unwrap_or(0);
+                let request = String::from_utf8_lossy(&got[..read]);
+                let (status, payload) = if request.contains("GET /v1/channels") {
+                    if channels.fetch_add(1, Ordering::Relaxed) == 0 {
+                        ("200 OK", listed)
+                    } else {
+                        ("200 OK", r#"{"channels":[]}"#)
+                    }
+                } else if request.contains("GET /v1/directs") {
+                    ("200 OK", r#"{"directs":[]}"#)
+                } else if request.contains("GET /v1/rooms") || request.contains("GET /v1/members") {
+                    ("200 OK", "[]")
+                } else {
+                    ("404 Not Found", "{}")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(_) => break,
+        }
+    }
+}
+
 /// Proves a refused channel list does not delete messages already stored.
 /// The lab sets `TINYCLIENT_PROVE=refused-list`. A build from before the fix ignores that and
 /// keeps serving, so the same driver fails there.
@@ -1766,6 +1863,113 @@ mod tests {
         assert_eq!(
             page.messages.iter().find(|message| message.id == "m-kept").map(|message| message.text.as_str()),
             Some("kept")
+        );
+    }
+
+    /// A 200 with empty channels and directs is still an empty tree replace. Keeping the stored
+    /// tree leaves messages that a server blip would otherwise delete.
+    #[test]
+    fn an_empty_channel_list_does_not_drop_stored_messages() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            if request.starts_with("GET /v1/channels ") {
+                if seen.fetch_add(1, Ordering::Relaxed) >= 1 {
+                    return Some(http(200, "OK", r#"{"channels":[]}"#));
+                }
+                return None;
+            }
+            if request.starts_with("GET /v1/directs ") && seen.load(Ordering::Relaxed) >= 2 {
+                return Some(http(200, "OK", r#"{"directs":[]}"#));
+            }
+            None
+        });
+        let kept = Message::plain("m-kept", "Ada", "kept", 1_700_000_000, false);
+        ctx.hub.store().ingest(&ctx.key("channel-1"), &kept, false).unwrap();
+        refresh(&ctx, &saved);
+        let page = ctx
+            .hub
+            .store()
+            .messages(&ctx.key("channel-1"), &Page::Newest, 10, 1_800_000_000)
+            .unwrap()
+            .expect("an empty channel list leaves the channel");
+        assert_eq!(
+            page.messages.iter().find(|message| message.id == "m-kept").map(|message| message.text.as_str()),
+            Some("kept")
+        );
+    }
+
+    /// An empty directs list with channels still present would delete every DM and its messages.
+    #[test]
+    fn an_empty_direct_list_does_not_drop_stored_messages() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            if request.starts_with("GET /v1/directs ") && seen.fetch_add(1, Ordering::Relaxed) >= 1 {
+                return Some(http(200, "OK", r#"{"directs":[]}"#));
+            }
+            None
+        });
+        let kept = Message::plain("m-dm", "Ada", "kept dm", 1_700_000_000, false);
+        ctx.hub.store().ingest(&ctx.key("direct-1"), &kept, false).unwrap();
+        refresh(&ctx, &saved);
+        let page = ctx
+            .hub
+            .store()
+            .messages(&ctx.key("direct-1"), &Page::Newest, 10, 1_800_000_000)
+            .unwrap()
+            .expect("an empty direct list leaves the direct");
+        assert_eq!(
+            page.messages.iter().find(|message| message.id == "m-dm").map(|message| message.text.as_str()),
+            Some("kept dm")
+        );
+    }
+
+    /// Directs sort after channels. A paged tree of the first page can miss them and let an
+    /// empty directs list delete every DM.
+    #[test]
+    fn space_text_kinds_finds_directs_past_the_first_tree_page() {
+        let (_adapter, ctx, _saved) = fixture(|_| None);
+        let space = ctx.key(SPACE);
+        let account = space.account();
+        for index in 0..120 {
+            let mut row = crate::store::ConversationRow::new(format!("ch-{index}"), ConversationKind::Channel, format!("#{index}"));
+            row.space = Some(SPACE.to_owned());
+            row.position = index;
+            ctx.hub.store().upsert_conversation(&account, &row).unwrap();
+        }
+        let mut direct = crate::store::ConversationRow::new("dm-late", ConversationKind::Direct, "Bea");
+        direct.space = Some(SPACE.to_owned());
+        direct.position = DIRECTS_AT;
+        ctx.hub.store().upsert_conversation(&account, &direct).unwrap();
+        let page = ctx.hub.store().tree(&space, 0, PAGE_MAX).unwrap().unwrap();
+        assert!(
+            !page.conversations.iter().any(|row| row.kind == ConversationKind::Direct),
+            "the first tree page is only channels"
+        );
+        // Fixture already stores room-1 as Voice.
+        assert_eq!(ctx.hub.store().space_text_kinds(&space).unwrap(), (true, true, true));
+    }
+
+    /// An empty rooms list with voice rooms already stored would delete those rooms.
+    #[test]
+    fn an_empty_rooms_list_does_not_drop_stored_voice_rooms() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            if request.starts_with("GET /v1/rooms ") && seen.fetch_add(1, Ordering::Relaxed) >= 1 {
+                return Some(http(200, "OK", "[]"));
+            }
+            None
+        });
+        assert!(ctx.known("room-1").unwrap().is_some(), "fixture stores a voice room");
+        refresh(&ctx, &saved);
+        assert!(
+            ctx.known("room-1").unwrap().is_some(),
+            "an empty rooms list leaves the stored voice room"
         );
     }
 

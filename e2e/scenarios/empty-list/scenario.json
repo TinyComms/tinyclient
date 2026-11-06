@@ -1,0 +1,12 @@
+{
+  "id": "empty-list",
+  "title": "An empty channel list does not delete stored messages",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd against a localhost channel list. The same list check keeps the row this desktop run checks.",
+    "ios": "The phone proof build does not run desktop chatd against a localhost channel list. The same list check keeps the row this desktop run checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
