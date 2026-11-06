@@ -59,10 +59,14 @@ const CACHED: usize = 20_000;
 /// which the others can never open. Past this the message goes to the group as it is.
 const JOIN_WAIT: Duration = Duration::from_secs(45);
 /// How often a waiting send asks again. Asking is what has the server sign the batch.
-#[cfg(not(test))]
-const JOIN_POLL: Duration = Duration::from_secs(2);
-#[cfg(test)]
-const JOIN_POLL: Duration = Duration::from_millis(10);
+fn join_poll() -> Duration {
+    // Unit tests and the lab prove use a short poll so a held commit batch finishes quickly.
+    if cfg!(test) || std::env::var_os("TINYCLIENT_PROVE").is_some() {
+        Duration::from_millis(10)
+    } else {
+        Duration::from_secs(2)
+    }
+}
 
 /// The keys the keychain keeps for this device, inside the session JSON. Not `Debug`.
 #[derive(Clone, Serialize, Deserialize)]
@@ -1990,7 +1994,7 @@ pub(crate) fn send(
             break;
         }
         drop(device);
-        std::thread::sleep(JOIN_POLL);
+        std::thread::sleep(join_poll());
     }
     lock(shared).post(
         conversation_id,
@@ -2002,8 +2006,14 @@ pub(crate) fn send(
     )
 }
 
-#[cfg(test)]
+/// In-process tinyserver for the first-message prove and its unit tests. Compiled into chatd so
+/// `TINYCLIENT_PROVE=first-encrypted-message` can run without `cargo test`.
 mod fake;
+
+/// Lab prove: see [`fake::prove_first_encrypted_message`].
+pub fn prove_first_encrypted_message() -> Result<(), String> {
+    fake::prove_first_encrypted_message()
+}
 
 #[cfg(test)]
 mod live;

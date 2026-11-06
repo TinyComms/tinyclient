@@ -39,6 +39,15 @@ fn main() -> io::Result<()> {
         }
         return Ok(());
     }
+    // The lab's first-encrypted-message driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("first-encrypted-message") {
+        if let Err(err) = chatd::adapters::tiny::prove_first_encrypted_message() {
+            eprintln!("first-encrypted-message: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
     // The lab's refused-list driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("refused-list") {
         if let Err(err) = chatd::adapters::tiny::prove_refused_list() {

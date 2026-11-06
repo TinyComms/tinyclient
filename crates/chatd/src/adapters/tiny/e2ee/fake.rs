@@ -71,9 +71,9 @@ impl Fake {
             messages: Vec::new(),
         }));
         let serving = server.clone();
-        let base = crate::adapters::tiny::tests::serve(move |request| {
+        let base = crate::adapters::tiny::serve(move |request| {
             let (status, body) = lock(&serving).answer(request);
-            crate::adapters::tiny::tests::http(status, "-", &body.to_string())
+            crate::adapters::tiny::http(status, "-", &body.to_string())
         });
         Fake { server, base }
     }
@@ -380,39 +380,43 @@ fn id_of(answer: &Value) -> String {
     answer["id"].as_str().unwrap().to_owned()
 }
 
-/// The server signs the Adds of a new conversation only after its commit batch: the first
-/// message waits for the other person to be in the group, rather than go to a group of one.
-#[test]
-fn the_first_message_of_a_new_conversation_opens_for_the_other_person() {
+/// Lab prove: Ada's first message opens for Bea when the send waits out the commit batch.
+pub(crate) fn prove_first_encrypted_message() -> Result<(), String> {
     let fake = Fake::start(3);
     let ada: Shared = Arc::new(Mutex::new(device(&fake, ADA, "ada")));
     let mut bea = device(&fake, BEA, "bea");
     let hello = Envelope::message("hello Bea");
     let answer = send(&ada, CONVERSATION, "c-1", Kind::Message, None, &hello, &[])
-        .expect("Ada's first message goes");
+        .map_err(|err| format!("Ada's first message: {err}"))?;
     let first = id_of(&answer);
-    // Whatever was waiting is signed and committed by now, as Ada's next sync would.
     lock(&fake.server).hold = 0;
     lock(&ada)
         .sync(CONVERSATION)
-        .expect("Ada's device commits the Adds");
+        .map_err(|err| format!("Ada commits the Adds: {err}"))?;
     let read = fake.read(&mut bea);
-    assert_eq!(
-        text(&read, &first),
-        "hello Bea",
-        "the first message opens for the other person, without a second one"
-    );
+    let opened = text(&read, &first);
+    if opened != "hello Bea" {
+        return Err(format!("Bea saw {opened:?}, not hello Bea"));
+    }
     let reply = Envelope::message("hi Ada");
     let answer = bea
         .post(CONVERSATION, "c-2", Kind::Message, None, &reply, &[])
-        .expect("Bea answers");
+        .map_err(|err| format!("Bea answers: {err}"))?;
     let read = fake.read(&mut lock(&ada));
-    assert_eq!(text(&read, &id_of(&answer)), "hi Ada");
-    assert_eq!(
-        text(&read, &first),
-        "hello Bea",
-        "Ada's own message, from her cache"
-    );
+    if text(&read, &id_of(&answer)) != "hi Ada" {
+        return Err("Ada did not open Bea's reply".into());
+    }
+    if text(&read, &first) != "hello Bea" {
+        return Err("Ada lost her own first message".into());
+    }
+    Ok(())
+}
+
+/// The server signs the Adds of a new conversation only after its commit batch: the first
+/// message waits for the other person to be in the group, rather than go to a group of one.
+#[test]
+fn the_first_message_of_a_new_conversation_opens_for_the_other_person() {
+    prove_first_encrypted_message().expect("first message opens for the other person");
 }
 
 /// A row that did not open because this device was not in the group yet (here, the sync of the
