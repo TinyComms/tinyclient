@@ -31,6 +31,11 @@ pub fn prove_refused_list() -> Result<(), String> {
     messages::prove_refused_list()
 }
 
+/// The lab's empty-list proof. See `messages::prove_empty_list`.
+pub fn prove_empty_list() -> Result<(), String> {
+    messages::prove_empty_list()
+}
+
 /// The lab's join-order proof. `call.join` is sent before the room's mediad settings.
 pub fn prove_join_before_room() -> Result<(), &'static str> {
     let steps = live::after_offer();

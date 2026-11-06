@@ -39,6 +39,14 @@ fn main() -> io::Result<()> {
         }
         return Ok(());
     }
+    // The lab's empty-list driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("empty-list") {
+        if let Err(err) = chatd::adapters::tiny::prove_empty_list() {
+            eprintln!("empty-list: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     // The lab's before-blank driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("before-blank") {
         if let Err(err) = chatd::server::prove_before_blank() {

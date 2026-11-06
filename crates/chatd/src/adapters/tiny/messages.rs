@@ -47,6 +47,23 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
     let Some(directs) = optional_list::<WireDirect>(saved, "/v1/directs", "directs") else {
         return;
     };
+    // A 200 with empty channels and directs is still an empty tree replace: every conversation
+    // left out is deleted with its messages. A brief empty answer during a server update is not
+    // an empty community. A first connect with nothing stored still replaces as empty.
+    if channels.is_empty() && directs.is_empty() {
+        let space = ctx.key(SPACE);
+        let kept = ctx
+            .hub
+            .store()
+            .tree(&space, 0, 1)
+            .ok()
+            .flatten()
+            .is_some_and(|tree| tree.total > 0);
+        if kept {
+            tracing::warn!("chatd: Tiny server: empty channel and direct lists; keeping the stored tree");
+            return;
+        }
+    }
     let rooms = match super::rooms_of(saved) {
         super::Listed::Rows(rows) => rows,
         super::Listed::Empty => Vec::new(),
@@ -1532,6 +1549,80 @@ pub(super) fn prove_missing_seal() -> Result<(), String> {
     }
 }
 
+/// Proves an empty channel and direct list does not delete messages already stored.
+/// The lab sets `TINYCLIENT_PROVE=empty-list`. A build from before the fix ignores that and
+/// keeps serving, so the same driver fails there.
+pub(super) fn prove_empty_list() -> Result<(), String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|err| err.to_string())?;
+    let base = format!("http://{}", listener.local_addr().map_err(|err| err.to_string())?);
+    std::thread::spawn(move || answer_empty_list(listener));
+    let saved = Saved {
+        base_url: base,
+        token: "t".to_owned(),
+        user_id: "11111111-1111-1111-1111-111111111111".to_owned(),
+        email: None,
+        display_name: "Ada".to_owned(),
+        role: "owner".to_owned(),
+        plain_http_ok: false,
+        e2ee: None,
+    };
+    let hub = std::sync::Arc::new(crate::hub::Hub::new(
+        crate::store::Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?,
+    ));
+    let account = protocol::AccountKey { network: protocol::Network::Tiny, account: saved.user_id.clone() };
+    let (_adapter, ctx, _inbox) = crate::adapters::local(account, hub);
+    refresh(&ctx, &saved);
+    if ctx.known("channel-1").map_err(|err| err.to_string())?.is_none() {
+        return Err("the channel list was not stored".to_owned());
+    }
+    let kept = Message::plain("m-kept", "Ada", "kept", 1_700_000_000, false);
+    ctx.hub.store().ingest(&ctx.key("channel-1"), &kept, false).map_err(|err| err.to_string())?;
+    refresh(&ctx, &saved);
+    match ctx.stored_message("channel-1", "m-kept").map_err(|err| err.to_string())? {
+        Some(message) if message.text == "kept" => Ok(()),
+        Some(message) => Err(format!("the stored text was {:?}", message.text)),
+        None => Err("an empty channel list deleted the stored message".to_owned()),
+    }
+}
+
+fn answer_empty_list(listener: std::net::TcpListener) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let channels = AtomicUsize::new(0);
+    let _ = listener.set_nonblocking(true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let listed = r#"{"channels":[{"id":"channel-1","name":"general"}]}"#;
+    while std::time::Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                let mut got = [0u8; 2048];
+                let read = std::io::Read::read(&mut stream, &mut got).unwrap_or(0);
+                let request = String::from_utf8_lossy(&got[..read]);
+                let (status, payload) = if request.contains("GET /v1/channels") {
+                    if channels.fetch_add(1, Ordering::Relaxed) == 0 {
+                        ("200 OK", listed)
+                    } else {
+                        ("200 OK", r#"{"channels":[]}"#)
+                    }
+                } else if request.contains("GET /v1/directs") {
+                    ("200 OK", r#"{"directs":[]}"#)
+                } else if request.contains("GET /v1/rooms") || request.contains("GET /v1/members") {
+                    ("200 OK", "[]")
+                } else {
+                    ("404 Not Found", "{}")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(_) => break,
+        }
+    }
+}
+
 /// Proves a refused channel list does not delete messages already stored.
 /// The lab sets `TINYCLIENT_PROVE=refused-list`. A build from before the fix ignores that and
 /// keeps serving, so the same driver fails there.
@@ -1763,6 +1854,40 @@ mod tests {
             .messages(&ctx.key("channel-1"), &Page::Newest, 10, 1_800_000_000)
             .unwrap()
             .expect("a refused channel list leaves the channel");
+        assert_eq!(
+            page.messages.iter().find(|message| message.id == "m-kept").map(|message| message.text.as_str()),
+            Some("kept")
+        );
+    }
+
+    /// A 200 with empty channels and directs is still an empty tree replace. Keeping the stored
+    /// tree leaves messages that a server blip would otherwise delete.
+    #[test]
+    fn an_empty_channel_list_does_not_drop_stored_messages() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            if request.starts_with("GET /v1/channels ") {
+                if seen.fetch_add(1, Ordering::Relaxed) >= 1 {
+                    return Some(http(200, "OK", r#"{"channels":[]}"#));
+                }
+                return None;
+            }
+            if request.starts_with("GET /v1/directs ") && seen.load(Ordering::Relaxed) >= 2 {
+                return Some(http(200, "OK", r#"{"directs":[]}"#));
+            }
+            None
+        });
+        let kept = Message::plain("m-kept", "Ada", "kept", 1_700_000_000, false);
+        ctx.hub.store().ingest(&ctx.key("channel-1"), &kept, false).unwrap();
+        refresh(&ctx, &saved);
+        let page = ctx
+            .hub
+            .store()
+            .messages(&ctx.key("channel-1"), &Page::Newest, 10, 1_800_000_000)
+            .unwrap()
+            .expect("an empty channel list leaves the channel");
         assert_eq!(
             page.messages.iter().find(|message| message.id == "m-kept").map(|message| message.text.as_str()),
             Some("kept")
