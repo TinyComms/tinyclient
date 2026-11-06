@@ -15,6 +15,14 @@ fn main() -> io::Result<()> {
         }
         return Ok(());
     }
+    // The lab's sealed-row driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("sealed-row") {
+        if let Err(err) = chatd::adapters::tiny::prove_missing_seal() {
+            eprintln!("sealed-row: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());
     protocol::crash::install_panic_hook("chatd");
     let dir = protocol::support_dir();

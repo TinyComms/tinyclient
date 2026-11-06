@@ -1,7 +1,8 @@
 //! Everything chatd remembers lives here, on disk. Nothing is cached in the process.
 //!
 //! The database is a cache of what the networks hold. Sessions are in the keychain, so a schema
-//! change drops every table and the adapters fill them again.
+//! change drops every table and the adapters fill them again. Schema 8 and 9 only added columns.
+//! Those rows stay, including messages this device already opened.
 //!
 //! Every table is keyed by `(network, account)`. Empty text stands for "none" in the columns that
 //! name another row (`space`, `section`, `avatar`, `peer`, `last_read`).
@@ -23,6 +24,8 @@ use std::time::Duration;
 /// Raise this when a table changes. `open` then drops the cache and starts over.
 /// 6 rebuilds caches written at 5 before `conversation.voice_limit` existed. That column
 /// was added without a version change, so Win+K died with `no such column: c.voice_limit`.
+/// 9 adds the expiry columns to an 8. 10 adds `message.seq` to a 9. Those two steps keep
+/// the rows, because the opened text is not on the server once a chat is end-to-end encrypted.
 const SCHEMA: i32 = 10;
 
 /// Retention: the newest messages kept per conversation.
@@ -861,6 +864,45 @@ const SETTINGS: &str = "
 /// The shape of the settings rows. A migration from an older one runs in `migrate_settings`.
 const SETTINGS_VERSION: u32 = 1;
 
+/// True when `version` was brought up to [`SCHEMA`] by adding columns. False when the
+/// caller should drop the cache and create it again. A shape that is not the real 8 or 9
+/// still rebuilds.
+fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
+    if version != 8 && version != 9 {
+        return Ok(false);
+    }
+    if !column(db, "message", "text")? || !column(db, "conversation", "title")? {
+        return Ok(false);
+    }
+    if version == 8 {
+        if !column(db, "conversation", "preview_expires")? {
+            db.execute_batch("ALTER TABLE conversation ADD COLUMN preview_expires INTEGER")?;
+        }
+        if !column(db, "message", "expires")? {
+            db.execute_batch("ALTER TABLE message ADD COLUMN expires INTEGER")?;
+        }
+        db.execute_batch(
+            "CREATE INDEX IF NOT EXISTS conversation_preview_expires ON conversation (preview_expires) WHERE preview_expires IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS message_expires ON message (expires) WHERE expires IS NOT NULL;",
+        )?;
+    }
+    if !column(db, "message", "seq")? {
+        db.execute_batch("ALTER TABLE message ADD COLUMN seq INTEGER NOT NULL DEFAULT 0")?;
+    }
+    Ok(true)
+}
+
+fn column(db: &Connection, table: &str, name: &str) -> rusqlite::Result<bool> {
+    let mut info = db.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = info.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 impl Store {
     pub fn open(path: &Path) -> rusqlite::Result<Store> {
         // Owner-only before SQLite creates it, so it never exists with wider rights (Unix), and
@@ -884,14 +926,18 @@ impl Store {
         }
         let version: i32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version != SCHEMA {
-            let old: Vec<String> = db
-                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'settings'")?
-                .query_map([], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            for table in old {
-                db.execute_batch(&format!("DROP TABLE \"{table}\";"))?;
+            // 8 and 9 grew by columns. Dropping here blanked every encrypted chat on update,
+            // and the server no longer has the opened text to fill back in.
+            if !keep_added_columns(&db, version)? {
+                let old: Vec<String> = db
+                    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'settings'")?
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                for table in old {
+                    db.execute_batch(&format!("DROP TABLE \"{table}\";"))?;
+                }
+                db.execute_batch(TABLES)?;
             }
-            db.execute_batch(TABLES)?;
             db.execute_batch(&format!("PRAGMA user_version = {SCHEMA};"))?;
         }
         let mut store = Store { db };
@@ -4146,6 +4192,57 @@ mod tests {
         assert_eq!(store.until_expiry(NOW).unwrap(), Some(Duration::from_secs(10)));
         assert_eq!(store.expire(NOW + 10).unwrap(), [key]);
         drop(store);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// v0.2.56 wrote schema 8. The steps to 9 and 10 only added columns, and the opened
+    /// text lives in this file. A later client has to keep those rows.
+    #[test]
+    fn opening_a_schema_8_cache_keeps_messages_already_opened() {
+        let path = scratch("keep-schema-8");
+        let account = AccountKey { network: Network::Telegram, account: "me".into() };
+        let key = Key::new(&account, "dm");
+        {
+            let mut store = Store::open(&path).unwrap();
+            store.upsert_conversation(&account, &ConversationRow::new("dm", ConversationKind::Direct, "Ada")).unwrap();
+            store.ingest(&key, &said("m1", "still here", NOW), false).unwrap();
+            store
+                .db
+                .execute_batch(
+                    "DROP INDEX IF EXISTS conversation_preview_expires;
+                     ALTER TABLE conversation DROP COLUMN preview_expires;
+                     DROP INDEX IF EXISTS message_expires;
+                     ALTER TABLE message DROP COLUMN expires;
+                     ALTER TABLE message DROP COLUMN seq;
+                     PRAGMA user_version = 8;",
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let text = store.message(&key, "m1").unwrap().map(|message| message.text);
+        assert_eq!(text.as_deref(), Some("still here"), "a client update must not blank a chat it already opened");
+        let version: i32 = store.db.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// v0.2.57 wrote schema 9. Schema 10 only adds the post order. The words stay.
+    #[test]
+    fn opening_a_schema_9_cache_keeps_messages_already_opened() {
+        let path = scratch("keep-schema-9");
+        let account = AccountKey { network: Network::Telegram, account: "me".into() };
+        let key = Key::new(&account, "dm");
+        {
+            let mut store = Store::open(&path).unwrap();
+            store.upsert_conversation(&account, &ConversationRow::new("dm", ConversationKind::Direct, "Ada")).unwrap();
+            store.ingest(&key, &said("m1", "still here", NOW), false).unwrap();
+            store.db.execute_batch("ALTER TABLE message DROP COLUMN seq; PRAGMA user_version = 9;").unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let text = store.message(&key, "m1").unwrap().map(|message| message.text);
+        assert_eq!(text.as_deref(), Some("still here"), "adding the sequence column must not blank a chat");
+        let version: i32 = store.db.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
