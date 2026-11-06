@@ -1198,7 +1198,12 @@ fn present(value: &Option<String>) -> bool {
 
 fn optional_list<T: serde::de::DeserializeOwned>(saved: &Saved, path: &str, key: &str) -> Option<Vec<T>> {
     match super::asked("GET", saved, path, None) {
-        Ok((403 | 404, _)) => Some(Vec::new()),
+        // A refusal is not an empty server. An empty list deletes every conversation left out,
+        // and the messages stored with them.
+        Ok((status @ (403 | 404), _)) => {
+            tracing::warn!("chatd: Tiny server: {path} answered {status}");
+            None
+        }
         Ok((200, body)) => match list_of(body, key) {
             Ok(rows) => Some(rows),
             Err(()) => {
@@ -1527,6 +1532,80 @@ pub(super) fn prove_missing_seal() -> Result<(), String> {
     }
 }
 
+/// Proves a refused channel list does not delete messages already stored.
+/// The lab sets `TINYCLIENT_PROVE=refused-list`. A build from before the fix ignores that and
+/// keeps serving, so the same driver fails there.
+pub(super) fn prove_refused_list() -> Result<(), String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|err| err.to_string())?;
+    let base = format!("http://{}", listener.local_addr().map_err(|err| err.to_string())?);
+    std::thread::spawn(move || answer_refused_list(listener));
+    let saved = Saved {
+        base_url: base,
+        token: "t".to_owned(),
+        user_id: "11111111-1111-1111-1111-111111111111".to_owned(),
+        email: None,
+        display_name: "Ada".to_owned(),
+        role: "owner".to_owned(),
+        plain_http_ok: false,
+        e2ee: None,
+    };
+    let hub = std::sync::Arc::new(crate::hub::Hub::new(
+        crate::store::Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?,
+    ));
+    let account = protocol::AccountKey { network: protocol::Network::Tiny, account: saved.user_id.clone() };
+    let (_adapter, ctx, _inbox) = crate::adapters::local(account, hub);
+    refresh(&ctx, &saved);
+    if ctx.known("channel-1").map_err(|err| err.to_string())?.is_none() {
+        return Err("the channel list was not stored".to_owned());
+    }
+    let kept = Message::plain("m-kept", "Ada", "kept", 1_700_000_000, false);
+    ctx.hub.store().ingest(&ctx.key("channel-1"), &kept, false).map_err(|err| err.to_string())?;
+    refresh(&ctx, &saved);
+    match ctx.stored_message("channel-1", "m-kept").map_err(|err| err.to_string())? {
+        Some(message) if message.text == "kept" => Ok(()),
+        Some(message) => Err(format!("the stored text was {:?}", message.text)),
+        None => Err("a refused channel list deleted the stored message".to_owned()),
+    }
+}
+
+fn answer_refused_list(listener: std::net::TcpListener) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let channels = AtomicUsize::new(0);
+    let _ = listener.set_nonblocking(true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let listed = r#"{"channels":[{"id":"channel-1","name":"general"}]}"#;
+    while std::time::Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                let mut got = [0u8; 2048];
+                let read = std::io::Read::read(&mut stream, &mut got).unwrap_or(0);
+                let request = String::from_utf8_lossy(&got[..read]);
+                let (status, payload) = if request.contains("GET /v1/channels") {
+                    if channels.fetch_add(1, Ordering::Relaxed) == 0 {
+                        ("200 OK", listed)
+                    } else {
+                        ("403 Forbidden", r#"{"error":"forbidden"}"#)
+                    }
+                } else if request.contains("GET /v1/directs") {
+                    ("200 OK", r#"{"directs":[]}"#)
+                } else if request.contains("GET /v1/rooms") || request.contains("GET /v1/members") {
+                    ("200 OK", "[]")
+                } else {
+                    ("404 Not Found", "{}")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(_) => break,
+        }
+    }
+}
+
 fn answer_seal_probe(listener: std::net::TcpListener) {
     let _ = listener.set_nonblocking(true);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -1660,6 +1739,34 @@ mod tests {
         assert_eq!(channel.unread, 2, "a channel update carries the actor's unread, not ours");
         assert_eq!(channel.topic, "Moved");
         assert_eq!(channel.preview, "later");
+    }
+
+    /// A 403 on the channel list is a refusal, not an empty server. Treating it as empty makes
+    /// the next tree replace delete every channel's stored messages.
+    #[test]
+    fn a_refused_channel_list_does_not_drop_stored_messages() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            if request.starts_with("GET /v1/channels ") && seen.fetch_add(1, Ordering::Relaxed) > 0 {
+                return Some(http(403, "Forbidden", r#"{"error":"forbidden"}"#));
+            }
+            None
+        });
+        let kept = Message::plain("m-kept", "Ada", "kept", 1_700_000_000, false);
+        ctx.hub.store().ingest(&ctx.key("channel-1"), &kept, false).unwrap();
+        refresh(&ctx, &saved);
+        let page = ctx
+            .hub
+            .store()
+            .messages(&ctx.key("channel-1"), &Page::Newest, 10, 1_800_000_000)
+            .unwrap()
+            .expect("a refused channel list leaves the channel");
+        assert_eq!(
+            page.messages.iter().find(|message| message.id == "m-kept").map(|message| message.text.as_str()),
+            Some("kept")
+        );
     }
 
     #[test]
