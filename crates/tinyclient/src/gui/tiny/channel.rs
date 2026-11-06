@@ -14,7 +14,7 @@
 use super::stage::{self, Focus, Sending, Stream};
 use super::{join_blocked, model, Float, Page};
 use crate::gui::call::health::{self, Grade};
-use crate::gui::components::{button_disabled, button_with_icon, glyph, tip, Avatar, ButtonKind};
+use crate::gui::components::{button, button_disabled, button_with_icon, glyph, tip, Avatar, ButtonKind};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, img, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDownEvent, ObjectFit, RenderImage, SharedString, Stateful, Window};
@@ -820,7 +820,10 @@ impl Shell {
         let join: AnyElement = match blocked {
             _ if !page.community.allowed("community.calls.join") => div().into_any_element(),
             Some(_) => button_disabled("Join channel").h(px(32.)).into_any_element(),
-            None if self.tiny_state.call_busy => button_disabled("Joining…").h(px(32.)).into_any_element(),
+            None if self.tiny_state.call_busy => button("tiny-cancel-empty", ButtonKind::Danger, "Cancel")
+                .h(px(32.))
+                .on_click(cx.listener(|this, _, _, cx| this.tiny_leave(cx)))
+                .into_any_element(),
             None => {
                 let room_id = room.id.clone();
                 button_with_icon("tiny-join-empty", ButtonKind::Primary, "icons/volume-2.svg", "Join channel")
@@ -950,8 +953,14 @@ impl Shell {
                 div().type_ui().text_color(theme::text_soft()).child("You can't join calls on this server.").into_any_element()
             } else if model::full(room) {
                 button_disabled(format!("{} is full · {} of {}", room.name, room.participants.len(), room.user_limit)).h(px(36.)).into_any_element()
-            } else if blocked.is_some() || self.tiny_state.call_busy {
-                button_disabled(if self.tiny_state.call_busy { "Joining…" } else { "Join channel" }).h(px(36.)).into_any_element()
+            } else if self.tiny_state.call_busy {
+                button("tiny-cancel", ButtonKind::Danger, "Cancel")
+                    .h(px(36.))
+                    .px(px(18.))
+                    .on_click(cx.listener(|this, _, _, cx| this.tiny_leave(cx)))
+                    .into_any_element()
+            } else if blocked.is_some() {
+                button_disabled("Join channel").h(px(36.)).into_any_element()
             } else {
                 let room_id = room.id.clone();
                 button_with_icon("tiny-join", ButtonKind::Primary, "icons/volume-2.svg", "Join channel")
@@ -982,28 +991,24 @@ impl Shell {
         let connecting = call.is_some_and(|call| matches!(call.state, CallState::Connecting | CallState::RingingOut));
         let speaking = call.is_some_and(|call| call.state == CallState::Joined && call.speaking) && !muted && held.is_none();
         let leave_word = if connecting { "Cancel" } else { "Leave" };
-        let leave = if self.tiny_state.call_busy {
-            button_disabled(leave_word).h(px(44.)).px(px(20.)).rounded_full().into_any_element()
-        } else {
-            div()
-                .id("tiny-leave")
-                .h(px(44.))
-                .px(px(20.))
-                .rounded_full()
-                .bg(theme::danger_fill())
-                .hover(|style| style.bg(theme::danger()))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .cursor_pointer()
-                .tab_index(0)
-                .focus_visible(|style| style.shadow(theme::focus_ring_gap(theme::overlay())))
-                .tooltip(tip(if connecting { "Cancel joining" } else { "Leave the call" }, Some("⌘⇧H")))
-                .on_click(cx.listener(|this, _, _, cx| this.tiny_leave(cx)))
-                .child(glyph("icons/phone-off.svg", 18., theme::on_accent()))
-                .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::on_accent()).child(leave_word))
-                .into_any_element()
-        };
+        let leave = div()
+            .id("tiny-leave")
+            .h(px(44.))
+            .px(px(20.))
+            .rounded_full()
+            .bg(theme::danger_fill())
+            .hover(|style| style.bg(theme::danger()))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .cursor_pointer()
+            .tab_index(0)
+            .focus_visible(|style| style.shadow(theme::focus_ring_gap(theme::overlay())))
+            .tooltip(tip(if connecting { "Cancel joining" } else { "Leave the call" }, Some("⌘⇧H")))
+            .on_click(cx.listener(|this, _, _, cx| this.tiny_leave(cx)))
+            .child(glyph("icons/phone-off.svg", 18., theme::on_accent()))
+            .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::on_accent()).child(leave_word))
+            .into_any_element();
         let mute = match held {
             Some(words) => bar_button("tiny-bar-mute", "icons/mic-off.svg", Look::Held).tooltip(tip(words, None)),
             None => bar_button("tiny-bar-mute", if muted { "icons/mic-off.svg" } else { "icons/mic.svg" }, if muted { Look::Off } else { Look::Rest })
