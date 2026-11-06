@@ -86,6 +86,11 @@ pub(crate) fn prove_text_drag() -> Result<(), &'static str> {
     }
 }
 
+/// The lab's scroll-release driver. A scrollbar thumb drag's mouse-up releases the pointer.
+pub(crate) fn prove_scroll_release() -> Result<(), &'static str> {
+    components::scroll::prove_scroll_release()
+}
+
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 

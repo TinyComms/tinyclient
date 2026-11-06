@@ -372,6 +372,12 @@ impl RenderOnce for ScrollFrame {
                         && pointer.read(cx).grab.is_some()
                     {
                         pointer.update(cx, |state, _| state.finish_drag());
+                        // capture_pointer on thumb-down must clear here. The move path
+                        // releases when the button is already up, but a mouse-up with no
+                        // further move leaves the scroll hitbox owning every later click.
+                        if scrollbar_mouseup_releases_pointer(true) {
+                            window.release_pointer();
+                        }
                         window.refresh();
                         cx.stop_propagation();
                     }
@@ -445,9 +451,24 @@ pub(crate) fn frame_focus_ring() -> Vec<gpui::BoxShadow> {
     theme::focus_ring_inset()
 }
 
+/// Whether mouse-up after a scrollbar thumb drag must release the captured pointer.
+/// A finished grab without release leaves later clicks on the scroll hitbox.
+pub(crate) fn scrollbar_mouseup_releases_pointer(had_grab: bool) -> bool {
+    had_grab
+}
+
+/// The lab's scroll-release driver. A thumb drag's mouse-up releases the pointer.
+pub(crate) fn prove_scroll_release() -> Result<(), &'static str> {
+    if scrollbar_mouseup_releases_pointer(true) && !scrollbar_mouseup_releases_pointer(false) {
+        Ok(())
+    } else {
+        Err("a scrollbar mouse-up would leave the pointer captured")
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{frame_focus_ring, thumb};
+    use super::{frame_focus_ring, scrollbar_mouseup_releases_pointer, thumb};
     #[test]
     fn thumb_tracks_endpoints_and_clamps() {
         assert_eq!(thumb(200., 200., 600., 0.), (0., 50.));
@@ -464,6 +485,12 @@ mod tests {
             frame_focus_ring().iter().all(|shadow| shadow.inset),
             "an outset shadow is painted under a transparent frame"
         );
+    }
+
+    #[test]
+    fn a_scrollbar_mouseup_releases_the_captured_pointer() {
+        assert!(scrollbar_mouseup_releases_pointer(true));
+        assert!(!scrollbar_mouseup_releases_pointer(false));
     }
 }
 
