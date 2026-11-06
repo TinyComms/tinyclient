@@ -170,6 +170,20 @@ pub enum E2eeAsk {
     /// Takes a backup file of this person in: only conversations they are in now, nothing this
     /// device has already. Answers `TinyBackup` with the messages added.
     ImportBackup { path: String, passphrase: String },
+    /// Starts an owner-approved encryption update for this conversation. Progress is in Status.
+    Repair { conversation_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairStage { Approving, Updating, WaitingForDevices, Done, Failed }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eeRepair {
+    pub conversation_id: String,
+    pub stage: RepairStage,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
 }
 
 /// Where a device link stands, on either device.
@@ -304,6 +318,11 @@ pub struct E2eePerson {
 /// `TinyE2ee`'s answer to `Status`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct E2eeStatus {
+    /// This server supports signed encryption updates for individual conversations.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub group_generations: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<E2eeRepair>,
     /// The server speaks encrypted text (`e2ee_text`), and what it lets new conversations be:
     /// `off`, `optional` or `new_required`.
     #[serde(default, skip_serializing_if = "String::is_empty")]

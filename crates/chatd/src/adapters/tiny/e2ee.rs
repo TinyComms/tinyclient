@@ -254,6 +254,13 @@ struct Notes {
 pub(crate) struct Opened {
     #[serde(default)]
     pub text: String,
+    /// Authenticated group generation for a locally opened/sent row. Legacy caches omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<Authentication>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_attribution: Option<cache_auth::SavedAttribution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
     /// Sender's Unix milliseconds, authenticated inside the encrypted envelope. Absent in
@@ -345,6 +352,8 @@ impl OpenedFile {
 #[derive(Clone)]
 pub(crate) enum Read {
     Opened(Opened),
+    /// Saved plaintext from before sender authentication was retained. Never a wire identity.
+    Legacy(Opened),
     /// An edit, folded into its target: not a row of its own.
     Edit,
     Undecryptable,
@@ -357,6 +366,8 @@ pub(crate) struct Row<'a> {
     pub kind: &'a str,
     pub ciphertext: Option<&'a str>,
     pub epoch: u64,
+    pub generation: Option<u64>,
+    pub group_id: Option<&'a str>,
     pub device_id: &'a str,
     pub target_id: Option<&'a str>,
     pub client_id: Option<&'a str>,
@@ -452,6 +463,10 @@ pub(crate) struct Device {
     /// The server has the person's own conversation (`e2ee_self`): their devices fill each
     /// other's gaps there.
     self_capable: bool,
+    /// The server fences independently signed cryptographic group generations.
+    generations: bool,
+    /// Scoped to a repair job while it holds this device lock.
+    operation_deadline: Option<std::time::Instant>,
     siblings: siblings::Siblings,
 }
 
@@ -479,8 +494,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// speak encrypted text.
 pub(crate) fn device(saved: &Saved) -> Shared {
     let key = (saved.base_url.clone(), saved.user_id.clone());
-    if let Some(found) = lock(devices()).get(&key) {
-        let found = found.clone();
+    // Never retain the registry guard while waiting for a device. Repair jobs briefly read
+    // the registry while holding their device to check that the account still owns it.
+    let found = { lock(devices()).get(&key).cloned() };
+    if let Some(found) = found {
         lock(&found).saved.token.clone_from(&saved.token);
         return found;
     }
@@ -784,11 +801,17 @@ impl Device {
             commands: None,
             link_max: linking::ARCHIVE_MAX,
             self_capable: false,
+            generations: false,
+            operation_deadline: None,
             siblings: siblings::Siblings::default(),
         }
     }
 
     fn ask(&self, method: &str, path: &str, body: Option<Value>) -> Result<(u16, Value), String> {
+        if let Some(deadline) = self.operation_deadline {
+            let remaining = deadline.checked_duration_since(std::time::Instant::now()).ok_or("Encryption update timed out. Try again to continue safely.")?;
+            return super::call_with_timeout(method, &super::endpoint(&self.saved.base_url, path), Some(&self.saved.token), body, remaining.min(super::TIMEOUT)).map_err(|_| super::UNREACHABLE.to_owned());
+        }
         super::asked(method, &self.saved, path, body).map_err(str::to_owned)
     }
 
@@ -890,6 +913,8 @@ impl Device {
             self.mode.clear();
             return Ok(DeviceState::Off);
         }
+        self.generations = body.get("features").and_then(Value::as_array)
+            .is_some_and(|all| all.iter().any(|feature| feature.as_str() == Some("e2ee_group_generations")));
         self.self_capable = body
             .get("features")
             .and_then(Value::as_array)
@@ -1071,8 +1096,12 @@ impl Device {
 
     /// Verifies `user_id`'s device list from the server into the trust store.
     fn verify_user(&mut self, user_id: &str) -> Result<(), String> {
-        let user = UserId::parse(user_id).map_err(|_| super::CHECK.to_owned())?;
         let rows = self.list(user_id)?;
+        self.verify_rows(user_id, &rows)
+    }
+
+    fn verify_rows(&mut self, user_id: &str, rows: &[Value]) -> Result<(), String> {
+        let user = UserId::parse(user_id).map_err(|_| super::CHECK.to_owned())?;
         let records: Vec<DeviceRecord> = rows
             .iter()
             .filter_map(|row| {
@@ -1112,20 +1141,26 @@ impl Device {
     }
 
     /// Whether `conversation_id` is end-to-end encrypted, as the server says. Asked once.
-    pub(crate) fn is_encrypted(&mut self, conversation_id: &str) -> bool {
-        if let Some(known) = self.encrypted.get(conversation_id) {
-            return *known;
+    pub(crate) fn is_encrypted(&mut self, conversation_id: &str) -> Result<bool, String> {
+        if self.engine.is_none() { return Ok(self.encrypted.get(conversation_id).copied().unwrap_or(false)); }
+        if ConversationId::parse(conversation_id).is_ok() {
+            // Durable cryptographic state wins over missing labels or an unavailable server.
+            let active = self.active(conversation_id)?;
+            if active.head_hash.is_some() { return Ok(true); }
         }
-        let known = match self.ask(
-            "GET",
-            &format!("/v1/e2ee/conversations/{conversation_id}"),
-            None,
-        ) {
-            Ok((200, body)) => body.get("e2ee").and_then(Value::as_bool).unwrap_or(false),
-            _ => return false,
+        if let Some(known) = self.encrypted.get(conversation_id) { return Ok(*known); }
+        let known = if self.generations {
+            let (_, body) = self.group_info(conversation_id)?;
+            body.get("e2ee").and_then(Value::as_bool).unwrap_or(false)
+        } else {
+            // Unknown legacy/plaintext conversations retain their original discovery behavior.
+            match self.ask("GET", &format!("/v1/e2ee/conversations/{conversation_id}"), None) {
+                Ok((200, body)) => body.get("e2ee").and_then(Value::as_bool).unwrap_or(false),
+                _ => false,
+            }
         };
         self.encrypted.insert(conversation_id.to_owned(), known);
-        known
+        Ok(known)
     }
 
     pub(crate) fn note_encrypted(&mut self, conversation_id: &str, encrypted: bool) {
@@ -1155,6 +1190,15 @@ impl Device {
             .iter()
             .filter_map(OpenedFile::to_ref)
             .collect()
+    }
+
+    pub(crate) fn editable_attachments(&mut self, conversation_id: &str, message_id: &str) -> Result<Vec<AttachmentRef>, String> {
+        let user = self.engine()?.user_id();
+        let authenticated = self.cache(conversation_id).and_then(|cache| cache.rows.get(message_id))
+            .and_then(|opened| opened.auth.as_ref()).is_some_and(|auth| auth.author == user
+                && auth.kind == "message" && auth.conversation_id.to_string() == conversation_id);
+        if !authenticated { return Err("This saved message can't be edited.".to_owned()); }
+        Ok(self.attachments_of(conversation_id, message_id))
     }
 
     pub(crate) fn ready(&self) -> bool {
@@ -1203,16 +1247,9 @@ impl Device {
         if !self.ready() {
             return Err("This device isn't set up for encrypted messages yet.".to_owned());
         }
-        let conv = ConversationId(uuid(conversation_id).ok_or(super::CHECK)?);
         for _ in 0..PASSES {
-            let (status, info) = self.ask(
-                "GET",
-                &format!("/v1/e2ee/conversations/{conversation_id}"),
-                None,
-            )?;
-            if status != 200 {
-                return Err(super::explain(status, &info, super::Missing::Plain).to_owned());
-            }
+            let (active, info) = self.group_info(conversation_id)?;
+            let conv = active.group_id;
             if info.get("e2ee").and_then(Value::as_bool) != Some(true) {
                 self.note_encrypted(conversation_id, false);
                 return Ok(());
@@ -1253,11 +1290,9 @@ impl Device {
                 if info.get("epoch").is_none_or(Value::is_null) {
                     // Nobody has started it: this device does.
                     let device_id = self.engine()?.device_id().to_string();
-                    let (status, _) = self.ask(
-                        "POST",
-                        &format!("/v1/e2ee/conversations/{conversation_id}/group"),
-                        Some(json!({ "device_id": device_id })),
-                    )?;
+                    let mut body = json!({ "device_id": device_id });
+                    self.generation_body(&mut body, active.generation);
+                    let (status, _) = self.ask("POST", &format!("/v1/e2ee/conversations/{conversation_id}/group"), Some(body))?;
                     match status {
                         201 | 200 => self
                             .engine()?
@@ -1301,11 +1336,22 @@ impl Device {
         conv: ConversationId,
         server_key: &[u8],
     ) -> Result<bool, String> {
+        let active = self.active(conversation_id)?;
+        if active.group_id != conv { return Err("Encryption changed. Try again.".to_owned()); }
+        self.feed_at(conversation_id, conv, active.generation, server_key)
+    }
+
+    fn feed_at(&mut self, conversation_id: &str, conv: ConversationId, generation: u64, server_key: &[u8]) -> Result<bool, String> {
+        self.active(conversation_id)?;
+        let outer = ConversationId::parse(conversation_id).map_err(|_| super::CHECK.to_owned())?;
+        if self.engine()?.group_at(outer, generation).map_err(|err| words(&err))? != conv { return Err("Encryption changed. Try again.".to_owned()); }
+        let cursor = if generation == 0 { conversation_id.to_owned() } else { format!("{conversation_id}:{}", generation) };
         let device_id = self.engine()?.device_id().to_string();
         let mut moved = false;
-        loop {
-            let after = self.notes.seqs.get(conversation_id).copied().unwrap_or(0);
-            let (status, rows) = self.ask("GET", &format!("/v1/e2ee/conversations/{conversation_id}/handshake?after={after}&device_id={device_id}"), None)?;
+        for _ in 0..PASSES {
+            let after = self.notes.seqs.get(&cursor).copied().unwrap_or(0);
+            let path = self.generation_query(format!("/v1/e2ee/conversations/{conversation_id}/handshake?after={after}&device_id={device_id}"), generation);
+            let (status, rows) = self.ask("GET", &path, None)?;
             if status != 200 {
                 return Err(format!(
                     "The server did not give the group's changes ({status})."
@@ -1317,11 +1363,16 @@ impl Device {
             }
             let count = rows.len();
             for row in rows {
+                if self.generations && (row["generation"].as_u64() != Some(generation)
+                    || row["group_id"].as_str().is_none_or(|id| ConversationId::parse(id).is_err())
+                    || (generation > 0 && row["group_id"].as_str() != Some(conv.to_string().as_str()))) {
+                    return Err("The group's changes do not match this encryption update.".to_owned());
+                }
                 let seq = row.get("seq").and_then(Value::as_i64).unwrap_or(after);
                 let kind = row.get("kind").and_then(Value::as_str).unwrap_or("");
                 let epoch = row.get("epoch").and_then(Value::as_u64).unwrap_or(0);
                 let Some(data) = row.get("data").and_then(Value::as_str).and_then(unb64) else {
-                    self.advance(conversation_id, seq);
+                    self.advance(&cursor, seq);
                     continue;
                 };
                 match self.apply(conv, kind, epoch, &data, server_key) {
@@ -1343,12 +1394,13 @@ impl Device {
                     }
                     Applied::Stop(why) => return Err(why),
                 }
-                self.advance(conversation_id, seq);
+                self.advance(&cursor, seq);
             }
             if count < HANDSHAKE_PAGE {
                 return Ok(moved);
             }
         }
+        Err("This conversation is still updating. Try again shortly.".to_owned())
     }
 
     fn advance(&mut self, conversation_id: &str, seq: i64) {
@@ -1490,7 +1542,10 @@ impl Device {
         };
         let device_id = engine.device_id().to_string();
         let welcomes: Vec<Value> = bundle.welcomes.iter().map(|welcome| json!({ "device_id": welcome.device.device.to_string(), "data": b64(&welcome.data) })).collect();
-        let body = json!({ "device_id": device_id, "epoch": bundle.epoch, "commit": b64(&bundle.commit), "welcomes": welcomes });
+        let mut body = json!({ "device_id": device_id, "epoch": bundle.epoch, "commit": b64(&bundle.commit), "welcomes": welcomes });
+        let active = self.active(conversation_id)?;
+        if active.group_id != conv { return Err("Encryption changed. Try again.".to_owned()); }
+        self.generation_body(&mut body, active.generation);
         let (status, answer) = self.ask(
             "POST",
             &format!("/v1/e2ee/conversations/{conversation_id}/commit"),
@@ -1506,6 +1561,10 @@ impl Device {
             }
             // Another member's commit won, or the proposals changed: the feed settles ours.
             409 => {
+                if answer["error"] == "generation_changed" {
+                    self.discover_generations(conversation_id)?;
+                    return Ok(true);
+                }
                 if answer.get("error").and_then(Value::as_str) == Some("proposals_changed") {
                     let _ = engine.abort_commit(conv);
                 }
@@ -1534,7 +1593,7 @@ impl Device {
         self.caches.get_mut(conversation_id)
     }
 
-    fn remember(&mut self, conversation_id: &str, id: &str, opened: Opened) {
+    pub(super) fn remember(&mut self, conversation_id: &str, id: &str, opened: Opened) {
         for file in &opened.attachments {
             self.files
                 .insert(file.id.clone(), (conversation_id.to_owned(), file.clone()));
@@ -1555,49 +1614,27 @@ impl Device {
         };
         let mut synced = false;
         let mut ordered: Vec<&Row> = rows.iter().collect();
-        ordered.sort_by_key(|row| row.epoch);
+        ordered.sort_by_key(|row| (row.generation.unwrap_or(0), row.epoch));
         for row in ordered {
             let read = self.read_one(conversation_id, conv, row, &mut synced);
             out.insert(row.id.to_owned(), read);
         }
         // An edit counts once its target is known, and only from the target's author.
-        let edits: Vec<(String, String, Opened, String)> = rows
-            .iter()
-            .filter(|row| row.kind == "edit")
+        let edits: Vec<(String, String, Opened, UserId)> = rows.iter()
+            .filter(|row| matches!(out.get(row.id), Some(Read::Edit)))
             .filter_map(|row| {
                 let opened = self.cache(conversation_id)?.rows.get(row.id)?.clone();
-                Some((
-                    row.id.to_owned(),
-                    opened.edits.clone()?,
-                    opened,
-                    row.author_id.to_owned(),
-                ))
-            })
-            .collect();
+                let auth = opened.auth.as_ref()?;
+                if auth.kind != "edit" || !auth.matches(conversation_id, row) { return None; }
+                Some((row.id.to_owned(), auth.target_id.clone()?, opened.clone(), auth.author))
+            }).collect();
         for (edit_id, target, edit, author) in edits {
-            let target_author = rows
-                .iter()
-                .find(|row| row.id == target)
-                .map(|row| row.author_id.to_owned());
-            let Some(mut opened) = self
-                .cache(conversation_id)
-                .and_then(|cache| cache.rows.get(&target).cloned())
-            else {
-                continue;
-            };
-            if target_author
-                .as_deref()
-                .is_some_and(|target_author| target_author != author)
-            {
-                continue;
-            }
-            if opened
-                .edited_by
-                .as_deref()
-                .is_some_and(|by| by >= edit_id.as_str())
-            {
-                continue;
-            }
+            let Some(mut opened) = self.cache(conversation_id).and_then(|cache| cache.rows.get(&target).cloned()) else { continue; };
+            let Some(target_auth) = opened.auth.as_ref() else { continue; };
+            if target_auth.author != author || target_auth.kind != "message" || target_auth.conversation_id.to_string() != conversation_id { continue; }
+            // A malformed current target row must not be restored through the edit path.
+            if rows.iter().any(|row| row.id == target && !target_auth.matches(conversation_id, row)) { continue; }
+            if opened.edited_by.as_deref().is_some_and(|by| by >= edit_id.as_str()) { continue; }
             opened.text = edit.text;
             opened.attachments = edit.attachments;
             opened.edited_by = Some(edit_id);
@@ -1622,60 +1659,55 @@ impl Device {
     fn read_one(
         &mut self,
         conversation_id: &str,
-        conv: ConversationId,
+        _conv: ConversationId,
         row: &Row,
         synced: &mut bool,
     ) -> Read {
-        if let Some(opened) = self
-            .cache(conversation_id)
-            .and_then(|cache| cache.rows.get(row.id).cloned())
-        {
-            return if opened.edits.is_some() {
-                Read::Edit
-            } else {
-                Read::Opened(opened)
-            };
-        }
-        // Our own message, sent from this device: kept when it was sent, by its client id.
-        if let Some(client_id) = row.client_id {
-            if let Some(opened) = self
-                .cache(conversation_id)
-                .and_then(|cache| cache.pending.remove(client_id))
-            {
-                let edit = opened.edits.is_some();
-                self.remember(conversation_id, row.id, opened.clone());
-                return if edit {
-                    Read::Edit
-                } else {
-                    Read::Opened(opened)
-                };
+        let cached = self.cache(conversation_id).and_then(|cache| cache.rows.get(row.id).cloned());
+        if let Some(opened) = &cached {
+            if let Some(auth) = &opened.auth {
+                if !auth.matches(conversation_id, row) { return Read::Undecryptable; }
+                return if auth.kind == "edit" { Read::Edit } else { Read::Opened(opened.clone()) };
             }
         }
+        let legacy = cached.filter(|opened| opened.auth.is_none() && opened.edits.is_none());
+        let fallback = || legacy.clone().map_or(Read::Undecryptable, Read::Legacy);
+        // Pending plaintext belongs to the exact local sender and authenticated row context.
+        if let Some(client_id) = row.client_id {
+            if let Some(opened) = self.cache(conversation_id).and_then(|cache| cache.pending.get(client_id).cloned()) {
+                if !opened.auth.as_ref().is_some_and(|auth| auth.matches(conversation_id, row)) { return Read::Undecryptable; }
+                if let Some(cache) = self.cache(conversation_id) { cache.pending.remove(client_id); }
+                let edit = opened.edits.is_some();
+                self.remember(conversation_id, row.id, opened.clone());
+                return if edit { Read::Edit } else { Read::Opened(opened) };
+            }
+        }
+        let conv = match self.row_group(conversation_id, row) {
+            Ok(conv) => conv,
+            Err(why) => { tracing::debug!("chatd: Tiny e2ee: {why}"); return fallback(); }
+        };
         let Some(ciphertext) = row.ciphertext.and_then(unb64) else {
-            return Read::Undecryptable;
+            return fallback();
         };
-        let kind = if row.kind == "edit" {
-            Kind::Edit
-        } else {
-            Kind::Message
-        };
-        let claimed = Claimed {
-            author: UserId::parse(row.author_id).ok(),
-            device: DeviceId::parse(row.device_id).ok(),
-            kind,
-            target_id: row.target_id,
-        };
+        let (Ok(kind), Ok(author), Ok(device)) = (Kind::parse(row.kind), UserId::parse(row.author_id), DeviceId::parse(row.device_id)) else { return fallback(); };
+        let claimed = Claimed { author: Some(author), device: Some(device), kind, target_id: row.target_id };
         let Some(engine) = self.engine.as_mut() else {
-            return Read::Undecryptable;
+            return fallback();
         };
         let mut opened = engine.decrypt(conv, &ciphertext, &claimed);
         if matches!(opened, Err(Error::FutureEpoch { .. } | Error::NoGroup)) && !*synced {
             *synced = true;
-            if let Err(why) = self.sync(conversation_id) {
-                tracing::warn!("chatd: Tiny e2ee: {conversation_id}: {why}");
-            }
+            let generation = row.generation.unwrap_or(0);
+            let outer = ConversationId::parse(conversation_id).ok();
+            let active = outer.and_then(|outer| self.engine.as_ref()?.active_group(outer).ok());
+            let historical_key = active.filter(|active| generation < active.generation)
+                .and_then(|_| self.engine.as_ref()?.server_key(conv));
+            let sync = if let Some(key) = historical_key {
+                self.feed_at(conversation_id, conv, generation, &key).map(|_| ())
+            } else { self.sync(conversation_id) };
+            if let Err(why) = sync { tracing::warn!("chatd: Tiny e2ee: {conversation_id}: {why}"); }
             let Some(engine) = self.engine.as_mut() else {
-                return Read::Undecryptable;
+                return fallback();
             };
             opened = engine.decrypt(conv, &ciphertext, &claimed);
         }
@@ -1683,6 +1715,9 @@ impl Device {
             Ok(incoming) => {
                 let opened = Opened {
                     text: incoming.envelope.text.clone(),
+                    generation: Some(row.generation.unwrap_or(0)),
+                    auth: Some(Authentication::new(ConversationId::parse(conversation_id).expect("checked conversation"), conv, row.generation.unwrap_or(0), incoming.epoch, &incoming.sender, incoming.kind, incoming.target_id.as_deref())),
+                    saved_attribution: None,
                     reply_to: incoming.envelope.reply_to.clone(),
                     sent_at: incoming.envelope.sent_at,
                     attachments: incoming
@@ -1696,6 +1731,9 @@ impl Device {
                     at: super::messages::unix_of(row.created_at).unwrap_or(0),
                     imported_from: None,
                 };
+                if legacy.as_ref().is_some_and(|saved| saved.text != opened.text || saved.attachments != opened.attachments || saved.edited_by.is_some()) {
+                    return fallback();
+                }
                 self.remember(conversation_id, row.id, opened.clone());
                 if kind == Kind::Edit {
                     Read::Edit
@@ -1705,11 +1743,7 @@ impl Device {
             }
             Err(err) => {
                 tracing::debug!("chatd: Tiny e2ee: a message did not open: {err}");
-                if kind == Kind::Edit {
-                    Read::Edit
-                } else {
-                    Read::Undecryptable
-                }
+                fallback()
             }
         }
     }
@@ -1728,9 +1762,12 @@ impl Device {
         if self.notes.key_changed.contains(conversation_id) {
             return Err(words(&Error::ServerKeyChanged));
         }
-        let conv = ConversationId(uuid(conversation_id).ok_or(super::CHECK)?);
-        let opened = Opened {
+        let _ = self.active(conversation_id)?;
+        let mut opened = Opened {
             text: envelope.text.clone(),
+            generation: None,
+            auth: None,
+            saved_attribution: None,
             reply_to: envelope.reply_to.clone(),
             sent_at: envelope.sent_at,
             attachments: envelope.attachments.iter().map(OpenedFile::of).collect(),
@@ -1741,22 +1778,19 @@ impl Device {
                 .map_or(0, |since| since.as_secs() as i64),
             imported_from: None,
         };
-        if let Some(cache) = self.cache(conversation_id) {
-            cache.pending.insert(client_id.to_owned(), opened.clone());
-        }
         for _ in 0..PASSES {
             // Removals and joins first: a message is never sent to someone already leaving.
             self.sync(conversation_id)?;
+            let active = self.active(conversation_id)?;
+            let conv = active.group_id;
             let sealed = match self.engine()?.encrypt(conv, kind, target_id, envelope) {
                 Ok(sealed) => sealed,
-                Err(Error::PendingProposals | Error::PendingRemove | Error::CommitInFlight) => {
-                    self.sync(conversation_id)?;
-                    self.engine()?
-                        .encrypt(conv, kind, target_id, envelope)
-                        .map_err(|err| words(&err))?
-                }
+                Err(Error::PendingProposals | Error::PendingRemove | Error::CommitInFlight) => continue,
                 Err(err) => return Err(words(&err)),
             };
+            opened.generation = Some(active.generation);
+            opened.auth = Some(Authentication::new(ConversationId::parse(conversation_id).expect("checked conversation"), conv, active.generation, sealed.epoch, &self.engine()?.device_ref(), kind, target_id));
+            if let Some(cache) = self.cache(conversation_id) { cache.pending.insert(client_id.to_owned(), opened.clone()); }
             let device_id = self.engine()?.device_id().to_string();
             let mut body = json!({
                 "ciphertext": b64(&sealed.ciphertext),
@@ -1765,6 +1799,7 @@ impl Device {
                 "client_id": client_id,
                 "kind": kind.as_str(),
             });
+            self.generation_body(&mut body, active.generation);
             if let Some(target) = target_id {
                 body["target_id"] = Value::String(target.to_owned());
             }
@@ -1792,7 +1827,7 @@ impl Device {
                     }
                     return Ok(answer);
                 }
-                409 if matches!(answer.get("error").and_then(Value::as_str), Some("proposals_changed" | "stale_epoch")) => continue,
+                409 if matches!(answer.get("error").and_then(Value::as_str), Some("proposals_changed" | "stale_epoch" | "generation_changed")) => continue,
                 400 if answer.get("error").and_then(Value::as_str) == Some("e2ee_group_too_large") => {
                     return Err("This encrypted conversation has too many devices to send a message.".to_owned());
                 }
@@ -1925,6 +1960,8 @@ impl Device {
     /// `E2eeAsk::Status`.
     pub(crate) fn status(&mut self, names: &HashMap<String, String>) -> E2eeStatus {
         let mut status = E2eeStatus {
+            group_generations: self.generations,
+            repair: repair::view(&self.saved),
             mode: self.mode.clone(),
             device: self.state.clone(),
             recovery_set: self.notes.recovery.is_some(),
@@ -2214,6 +2251,12 @@ pub(crate) fn answer(
     }
     // A link's own steps never wait for this device's lock, which a link holds now and then.
     match ask {
+        E2eeAsk::Repair { conversation_id } => {
+            return match repair::start(saved, &conversation_id, told) {
+                Ok(()) => Response::Ok,
+                Err(detail) => Response::Error { code: ErrorCode::Refused, detail },
+            };
+        }
         E2eeAsk::Link => {
             return Response::TinyE2eeLink {
                 link: linking::view(saved),
@@ -2327,6 +2370,7 @@ pub(crate) fn answer(
         | E2eeAsk::LinkCancel
         | E2eeAsk::ExportBackup { .. }
         | E2eeAsk::ImportBackup { .. } => Response::Ok,
+        E2eeAsk::Repair { .. } => unreachable!("repair starts before taking the device lock"),
     }
 }
 
@@ -2357,6 +2401,9 @@ pub(crate) fn attachment_key() -> Result<AttachmentKey, String> {
 mod backup;
 mod linking;
 mod approval;
+mod repair;
+mod cache_auth;
+use cache_auth::Authentication;
 mod export_rows;
 pub(crate) mod siblings;
 
@@ -2444,9 +2491,9 @@ mod tests {
         let notes: Value = serde_json::from_slice(&std::fs::read(device.dir.join("notes.json")).unwrap()).unwrap();
         assert_eq!(notes["revoked_device"], own_id.to_string());
         let row = Row { id: message, author_id: &device.saved.user_id.clone(), kind: "message",
-            ciphertext: None, epoch: 0, device_id: "", target_id: None, client_id: None, created_at: "" };
+            ciphertext: None, epoch: 0, generation: None, group_id: None, device_id: "", target_id: None, client_id: None, created_at: "" };
         let mut read = device.read(conversation, &[row]);
-        assert!(matches!(read.remove(message), Some(Read::Opened(opened)) if opened.text == "saved before removal"));
+        assert!(matches!(read.remove(message), Some(Read::Legacy(opened)) if opened.text == "saved before removal"));
     }
 
     #[test]
@@ -2483,8 +2530,8 @@ mod tests {
         let notes: Value = serde_json::from_slice(&std::fs::read(device.dir.join("notes.json")).unwrap()).unwrap();
         assert_eq!(notes["revoked_device"], own_id.to_string());
         let row = Row { id: message, author_id: &device.saved.user_id.clone(), kind: "message",
-            ciphertext: None, epoch: 0, device_id: "", target_id: None, client_id: None, created_at: "" };
-        assert!(matches!(device.read(conversation, &[row]).remove(message), Some(Read::Opened(opened)) if opened.text == "saved before self removal"));
+            ciphertext: None, epoch: 0, generation: None, group_id: None, device_id: "", target_id: None, client_id: None, created_at: "" };
+        assert!(matches!(device.read(conversation, &[row]).remove(message), Some(Read::Legacy(opened)) if opened.text == "saved before self removal"));
     }
 
     #[test]

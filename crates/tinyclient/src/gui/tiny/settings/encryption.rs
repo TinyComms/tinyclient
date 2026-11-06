@@ -42,6 +42,8 @@ pub(in crate::gui) struct Draft {
     pub history: String,
     /// Fingerprints, compatibility codes and recovery information are shown on demand.
     pub details: bool,
+    /// The encrypted conversation captured when its header opened this page.
+    pub conversation: Option<protocol::Key>,
     /// Only one backup form is open at a time: save (`true`) or import (`false`).
     pub backup_mode: Option<bool>,
     scope: std::rc::Rc<()>,
@@ -83,6 +85,18 @@ fn finish_read(pending: &mut Option<std::rc::Rc<()>>, again: &mut bool, request:
 }
 
 impl Draft {
+    fn complete_repair(&mut self, visit: &Visit, account: Option<&protocol::AccountKey>, visible: bool, conversation: &protocol::Key, answer: std::io::Result<Response>) -> bool {
+        if !self.accepts(visit, account, visible) || self.conversation.as_ref() != Some(conversation) { return false; }
+        self.loading = false;
+        match answer {
+            Ok(Response::Ok) => {},
+            Ok(Response::Error { detail, .. }) => self.error = Some(detail),
+            Ok(_) => self.error = Some(crate::client::OTHER_ANSWER.to_owned()),
+            Err(err) => self.error = Some(crate::client::trouble_words("tiny", &err)),
+        }
+        true
+    }
+
     pub(super) fn visit(&self, account: &protocol::AccountKey) -> Visit {
         Visit { account: account.clone(), scope: self.scope.clone() }
     }
@@ -177,15 +191,21 @@ impl Shell {
     /// the Tiny page holds.
     pub(in crate::gui) fn tiny_open_encryption(
         &mut self,
-        account: &protocol::AccountKey,
+        conversation: &protocol::Key,
+        encrypted: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.tiny_state.account.as_ref() != Some(account) || self.tiny_state.community.is_none()
+        let account = conversation.account();
+        if self.tiny_state.account.as_ref() != Some(&account) || self.tiny_state.community.is_none()
         {
             return;
         }
         self.tiny_open_settings(super::Page::Encryption, None, window, cx);
+        if let Some(overlay) = self.tiny_state.settings.as_mut() {
+            overlay.encryption.conversation = encrypted.then(|| conversation.clone());
+        }
+        cx.notify();
     }
 
     pub(super) fn tiny_e2ee_visit(&self) -> Option<Visit> {
@@ -277,6 +297,26 @@ impl Shell {
         );
     }
 
+    fn tiny_e2ee_repair(&mut self, cx: &mut Context<Self>) {
+        let Some(visit) = self.tiny_e2ee_visit() else { return; };
+        let Some(draft) = self.tiny_e2ee_draft_for(&visit) else { return; };
+        let Some(conversation) = draft.conversation.clone() else { return; };
+        if draft.loading || !draft.status.as_ref().is_some_and(|status| status.group_generations && status.device == DeviceState::Ready && !status.revoked) { return; }
+        draft.loading = true;
+        draft.error = None;
+        draft.note = None;
+        let account = visit.account.clone();
+        let request_id = conversation.id.clone();
+        self.off_thread(cx, move || ask(&Request::TinyE2ee { account, ask: E2eeAsk::Repair { conversation_id: request_id } }), move |this, answer, cx| {
+            let account = this.tiny_state.account.as_ref();
+            let Some(overlay) = this.tiny_state.settings.as_mut() else { return; };
+            if !overlay.encryption.complete_repair(&visit, account, overlay.page == super::Page::Encryption, &conversation, answer) { return; }
+            this.tiny_e2ee_load(cx);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     /// Approves a device from a `tiny-device-` code: the way before device linking, still how a
     /// device on a server without it is added.
     pub(in crate::gui::tiny) fn tiny_e2ee_approve_code(&mut self, code: String, cx: &mut Context<Self>) {
@@ -309,6 +349,29 @@ impl Shell {
             cx,
         );
     }
+}
+
+fn repair_card(draft: &Draft, status: &E2eeStatus, cx: &mut Context<Shell>) -> Div {
+    let repair = status.repair.as_ref().filter(|repair| draft.conversation.as_ref().is_some_and(|key| key.id == repair.conversation_id));
+    let (words, busy, failed) = match repair.map(|repair| &repair.stage) {
+        Some(protocol::RepairStage::Approving) => ("Approve on this device…", true, false),
+        Some(protocol::RepairStage::Updating) => ("Updating encryption…", true, false),
+        Some(protocol::RepairStage::WaitingForDevices) => ("Waiting for devices…", true, false),
+        Some(protocol::RepairStage::Done) => ("Encryption updated. Saved messages are still available.", false, false),
+        Some(protocol::RepairStage::Failed) => ("Saved messages are still available.", false, true),
+        None => ("Saved messages stay available.", false, false),
+    };
+    let mut body = card().p(px(12.)).gap(px(10.))
+        .child(kit::security_words(words).type_ui().text_color(theme::text_soft()));
+    if failed {
+        if let Some(repair) = repair { body = body.child(kit::note("icons/triangle-alert.svg", theme::danger(), kit::security_wrap(&repair.error))); }
+    }
+    if !busy {
+        body = body.child(div().flex().min_w_0().child(button_with_icon(
+            "tiny-e2ee-repair", ButtonKind::Secondary, "icons/shield.svg", "Update encryption",
+        ).when(draft.loading, |button| button.opacity(0.5)).on_click(cx.listener(|this, _, _, cx| this.tiny_e2ee_repair(cx)))));
+    }
+    kit::security_section("icons/lock.svg", "This chat").child(body)
 }
 
 fn device_row(
@@ -526,6 +589,10 @@ pub(in crate::gui::tiny) fn encryption(
     // in Security details until this device is approved.
     if matches!(status.device, DeviceState::AwaitingApproval { .. }) && !draft.details {
         return page.into_any_element();
+    }
+
+    if status.device == DeviceState::Ready && status.group_generations && draft.conversation.is_some() {
+        page = page.child(repair_card(draft, status, cx));
     }
 
     // Your devices.
@@ -849,6 +916,25 @@ mod tests {
 
     fn ready() -> E2eeStatus {
         E2eeStatus { device: DeviceState::Ready, ..E2eeStatus::default() }
+    }
+
+    #[test]
+    fn encryption_repair_completion_is_bound_to_account_visit_and_conversation() {
+        let account = account("one");
+        let conversation = protocol::Key::new(&account, "chat-one");
+        let mut draft = Draft { conversation: Some(conversation.clone()), loading: true, ..Draft::default() };
+        let visit = draft.visit(&account);
+        let failed = || Ok(Response::Error { code: protocol::ErrorCode::Refused, detail: "Update refused".into() });
+        assert!(!draft.complete_repair(&visit, Some(&super::tests::account("other")), true, &conversation, failed()));
+        assert!(!draft.complete_repair(&visit, Some(&account), false, &conversation, failed()));
+        assert!(!draft.complete_repair(&visit, Some(&account), true, &protocol::Key::new(&account, "chat-two"), failed()));
+        assert!(draft.loading);
+        assert!(draft.error.is_none());
+        draft.invalidate_reads();
+        assert!(!draft.complete_repair(&visit, Some(&account), true, &conversation, failed()));
+        let current = draft.visit(&account);
+        assert!(draft.complete_repair(&current, Some(&account), true, &conversation, failed()));
+        assert_eq!(draft.error.as_deref(), Some("Update refused"));
     }
 
     fn removed() -> std::io::Result<Response> {

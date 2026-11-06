@@ -257,7 +257,7 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             send_with(ctx, saved, conversation_id, client_id, text, reply_to, *with);
         }
         Command::CancelSend { client_id, .. } => upload::cancel(&ctx.account, &client_id),
-        Command::React { conversation_id: _, message_id, emoji, on, reply } => react(saved, &message_id, &emoji, on, reply),
+        Command::React { conversation_id, message_id, emoji, on, reply } => react(ctx, saved, &conversation_id, &message_id, &emoji, on, reply),
         Command::ReactionRules { reply, .. } => {
             let _ = reply.send(Ok(ReactionRules::default()));
         }
@@ -410,10 +410,10 @@ fn deliver(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, conver
         return;
     }
     let mut media = Vec::new();
-    let opened = open_rows(saved, conversation_id, &[wire]);
+    let opened = open_rows(ctx, saved, conversation_id, &[wire]);
     if wire.kind.as_deref() == Some("edit") {
         // An encrypted edit is a row of its own: what it changed is its target.
-        refold(ctx, saved, conversation_id, &opened);
+        refold(ctx, saved, names, conversation_id, &opened);
         return;
     }
     let Some(message) = map_message(saved, names, wire, &opened, &mut media) else {
@@ -426,7 +426,7 @@ fn deliver(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, conver
 }
 
 /// An encrypted edit came: each target it folded into is shown again with its new text.
-fn refold(ctx: &Context, saved: &Saved, conversation_id: &str, opened: &HashMap<String, Read>) {
+fn refold(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, conversation_id: &str, opened: &HashMap<String, Read>) {
     for (id, read) in opened {
         let Read::Opened(opened) = read else {
             continue;
@@ -434,6 +434,13 @@ fn refold(ctx: &Context, saved: &Saved, conversation_id: &str, opened: &HashMap<
         let Ok(Some(mut message)) = ctx.stored_message(conversation_id, id) else {
             continue;
         };
+        let Some(auth) = &opened.auth else { continue; };
+        let author = auth.author.to_string();
+        message.sender.id = author.clone();
+        message.sender.name = name_of(names, saved, &author);
+        message.sender.avatar = None;
+        message.outgoing = author == saved.user_id;
+        message.saved_history = false;
         message.text = opened.text.clone();
         message.edited = true;
         let mut media = Vec::new();
@@ -447,7 +454,7 @@ fn refold(ctx: &Context, saved: &Saved, conversation_id: &str, opened: &HashMap<
 
 /// What the end-to-end encrypted rows of a page say. Empty for a plaintext page, and when this
 /// device has no encryption state (its rows then read "Can't be decrypted on this device").
-fn open_rows(saved: &Saved, conversation_id: &str, wires: &[&WireMessage]) -> HashMap<String, Read> {
+fn open_rows(ctx: &Context, saved: &Saved, conversation_id: &str, wires: &[&WireMessage]) -> HashMap<String, Read> {
     if !wires.iter().any(|wire| wire.e2ee) {
         return HashMap::new();
     }
@@ -463,16 +470,28 @@ fn open_rows(saved: &Saved, conversation_id: &str, wires: &[&WireMessage]) -> Ha
             kind: wire.kind.as_deref().unwrap_or("message"),
             ciphertext: wire.ciphertext.as_deref(),
             epoch: wire.epoch.unwrap_or(0),
+            generation: wire.generation,
+            group_id: wire.group_id.as_deref(),
             device_id: wire.device_id.as_deref().unwrap_or(""),
             target_id: wire.target_id.as_deref(),
             client_id: wire.client_id.as_deref(),
             created_at: &wire.created_at,
         })
         .collect();
+    let saved_rows: HashMap<String, Message> = wires.iter().take(PAGE_MAX as usize)
+        .filter_map(|wire| ctx.stored_message(conversation_id, &wire.id).ok().flatten().map(|message| (wire.id.clone(), message))).collect();
     let read = {
         let mut device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         device.note_encrypted(conversation_id, true);
-        device.read(conversation_id, &rows)
+        let mut read = device.read(conversation_id, &rows);
+        for (id, read) in &mut read {
+            if let Read::Legacy(opened) = read {
+                if let Some(saved) = saved_rows.get(id) {
+                    if saved.id == *id && opened.keep_saved_attribution(saved) { device.remember(conversation_id, id, opened.clone()); }
+                }
+            }
+        }
+        read
     };
     // What did not open is asked of the person's other devices, off this thread.
     e2ee::siblings::ask_soon(device);
@@ -491,6 +510,8 @@ fn from_sibling(ctx: &Context, saved: &Saved, wire: &WireMessage) {
         kind: wire.kind.as_deref().unwrap_or("message"),
         ciphertext: wire.ciphertext.as_deref(),
         epoch: wire.epoch.unwrap_or(0),
+            generation: wire.generation,
+            group_id: wire.group_id.as_deref(),
         device_id: wire.device_id.as_deref().unwrap_or(""),
         target_id: wire.target_id.as_deref(),
         client_id: wire.client_id.as_deref(),
@@ -694,7 +715,7 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
             let wires: Vec<WireMessage> = list_of(body, "messages").map_err(|()| super::UNREADABLE.to_owned())?;
             let names = member_names(saved);
             let mut media = Vec::new();
-            let opened = open_rows(saved, conversation_id, &wires.iter().collect::<Vec<_>>());
+            let opened = open_rows(ctx, saved, conversation_id, &wires.iter().collect::<Vec<_>>());
             let messages: Vec<Message> = wires.iter().filter(|wire| wire.kind.as_deref() != Some("edit")).filter_map(|wire| map_message(saved, &names, wire, &opened, &mut media)).collect();
             if !media.is_empty() {
                 let _ = ctx.media(&media);
@@ -745,7 +766,7 @@ fn sealed_here(ctx: &Context, saved: &Saved, conversation_id: &str) -> Result<bo
         return if labelled { Err(NOT_SET_UP.to_owned()) } else { Ok(false) };
     };
     let mut device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let encrypted = labelled || device.is_encrypted(conversation_id);
+    let encrypted = labelled || device.is_encrypted(conversation_id)?;
     if encrypted && !device.ready() {
         return Err(NOT_SET_UP.to_owned());
     }
@@ -826,7 +847,7 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
     });
 }
 
-fn react(saved: &Saved, message_id: &str, emoji: &str, on: bool, reply: crate::adapters::Reply<()>) {
+fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, emoji: &str, on: bool, reply: crate::adapters::Reply<()>) {
     if !unicode_emoji(emoji) {
         let _ = reply.send(Err(Refusal::Refused("That reaction isn't allowed here.".to_owned())));
         return;
@@ -834,6 +855,16 @@ fn react(saved: &Saved, message_id: &str, emoji: &str, on: bool, reply: crate::a
     if !super::safe_id(message_id) {
         let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
         return;
+    }
+    match sealed_here(ctx, saved, conversation_id) {
+        Ok(true) => {
+            let result = e2ee::started(saved).ok_or("Encryption isn't set up on this device.".to_owned())
+                .and_then(|shared| shared.lock().unwrap_or_else(|err| err.into_inner()).react_generation(conversation_id, message_id, emoji, on));
+            let _ = reply.send(result.map_err(Refusal::Refused));
+            return;
+        }
+        Ok(false) => {}
+        Err(why) => { let _ = reply.send(Err(Refusal::Refused(why))); return; }
     }
     let path = format!("/v1/messages/{message_id}/reactions");
     let method = if on { "PUT" } else { "DELETE" };
@@ -879,7 +910,7 @@ fn edit_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: 
     let device = e2ee::started(saved).ok_or(NOT_SET_UP)?;
     let mut device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut envelope = e2ee_core::Envelope::message(text);
-    envelope.attachments = device.attachments_of(conversation_id, message_id);
+    envelope.attachments = device.editable_attachments(conversation_id, message_id)?;
     let client_id = format!("edit-{message_id}-{}", crate::hub::now());
     device.post(conversation_id, &client_id, e2ee_core::Kind::Edit, Some(message_id), &envelope, &[])?;
     drop(device);
@@ -982,7 +1013,7 @@ fn answer_ok(answer: Result<(u16, Value), &'static str>, reply: crate::adapters:
 fn accept_message(ctx: &Context, saved: &Saved, conversation: &str, value: &Value) -> Result<Message, String> {
     let wire = one_wire(value).ok_or(super::UNREADABLE)?;
     let mut media = Vec::new();
-    let opened = open_rows(saved, conversation, &[&wire]);
+    let opened = open_rows(ctx, saved, conversation, &[&wire]);
     let message = map_message(saved, &member_names(saved), &wire, &opened, &mut media).ok_or(super::UNREADABLE)?;
     if !media.is_empty() {
         let _ = ctx.media(&media);
@@ -1047,7 +1078,28 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
     message.seal = Seal::Encrypted;
     if !deleted {
         match read {
-            Some(Read::Opened(opened)) => {
+            Some(Read::Opened(opened)) | Some(Read::Legacy(opened)) => {
+                if let Some(auth) = &opened.auth {
+                    let author = auth.author.to_string();
+                    message.sender.id = author.clone();
+                    message.sender.name = name_of(names, saved, &author);
+                    message.outgoing = author == saved.user_id;
+                } else {
+                    message.saved_history = true;
+                    message.sender.id.clear();
+                    message.sender.name = "Saved message".to_owned();
+                    message.outgoing = false;
+                    message.sent = if opened.at != 0 { opened.at } else { sent };
+                    message.sent_subsec_millis = 0;
+                    message.client_id = None;
+                    if let Some(attribution) = &opened.saved_attribution {
+                        message.sender.id = attribution.id.clone();
+                        message.sender.name = attribution.name.clone();
+                        message.outgoing = attribution.outgoing;
+                        message.sent = attribution.sent;
+                        message.sent_subsec_millis = attribution.sent_subsec_millis;
+                    }
+                }
                 if let Some(millis) = opened.sent_at {
                     message.sent = millis.div_euclid(1000);
                     message.sent_subsec_millis = millis.rem_euclid(1000) as u32;
@@ -1509,6 +1561,10 @@ struct WireMessage {
     ciphertext: Option<String>,
     #[serde(default)]
     epoch: Option<u64>,
+    #[serde(default, deserialize_with = "message_generation")]
+    generation: Option<u64>,
+    #[serde(default, deserialize_with = "message_group")]
+    group_id: Option<String>,
     #[serde(default)]
     device_id: Option<String>,
     #[serde(default)]
@@ -1517,6 +1573,18 @@ struct WireMessage {
     /// which leaves the clock and the id to break a tie.
     #[serde(default)]
     seq: i64,
+}
+
+fn message_generation<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    let generation = u64::deserialize(deserializer)?;
+    if generation > i64::MAX as u64 { return Err(serde::de::Error::custom("invalid encryption generation")); }
+    Ok(Some(generation))
+}
+
+fn message_group<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    let group = String::deserialize(deserializer)?;
+    e2ee_core::ConversationId::parse(&group).map_err(serde::de::Error::custom)?;
+    Ok(Some(group))
 }
 
 #[derive(Deserialize)]
@@ -1657,6 +1725,49 @@ mod tests {
         assert!(!unicode_emoji(":smile:"));
         assert!(!unicode_emoji("ok"));
         assert!(!unicode_emoji(""));
+    }
+
+    #[test]
+    fn legacy_saved_text_has_neutral_attribution_even_when_wire_claims_it_is_mine() {
+        let saved = saved("http://unused");
+        let wire: WireMessage = serde_json::from_value(json!({"id":"legacy", "author_id":ME, "e2ee":true, "created_at":WHEN, "client_id":"forged-own"})).unwrap();
+        let opened = e2ee::Opened { text:"saved words".into(), at:123, ..e2ee::Opened::default() };
+        let reads = HashMap::from([("legacy".to_owned(), Read::Legacy(opened))]);
+        let mapped = map_message(&saved, &HashMap::new(), &wire, &reads, &mut Vec::new()).unwrap();
+        assert_eq!(mapped.text, "saved words");
+        assert_eq!(mapped.sender.name, "Saved message");
+        assert!(mapped.sender.id.is_empty());
+        assert!(!mapped.outgoing);
+        assert!(mapped.client_id.is_none());
+        assert!(mapped.saved_history);
+        assert_eq!(mapped.sent, 123);
+    }
+
+    #[test]
+    fn message_generation_decoder_accepts_legacy_absence_but_never_coerces_present_invalid_metadata() {
+        let legacy: WireMessage = serde_json::from_value(json!({"id":"legacy"})).unwrap();
+        assert!(legacy.generation.is_none());
+        for generation in [json!(null), json!(-1), json!("1"), json!(u64::MAX)] {
+            assert!(serde_json::from_value::<WireMessage>(json!({"id":"bad", "generation":generation})).is_err());
+        }
+        assert!(serde_json::from_value::<WireMessage>(json!({"id":"bad", "generation":1, "group_id":"wrong"})).is_err());
+    }
+
+    #[test]
+    fn legacy_saved_attribution_comes_from_preexisting_local_content_not_the_current_wire_claim() {
+        let saved = saved("http://unused");
+        let wire: WireMessage = serde_json::from_value(json!({"id":"legacy", "author_id":ME, "e2ee":true, "created_at":WHEN})).unwrap();
+        let mut opened = e2ee::Opened { text:"saved words".into(), ..e2ee::Opened::default() };
+        let mut previous = Message::plain("legacy", "Bea", "saved words", 456, false);
+        previous.sender.id = PEER.to_owned(); previous.seal = Seal::Encrypted;
+        assert!(opened.keep_saved_attribution(&previous));
+        let reads = HashMap::from([("legacy".to_owned(), Read::Legacy(opened))]);
+        let mapped = map_message(&saved, &HashMap::new(), &wire, &reads, &mut Vec::new()).unwrap();
+        assert_eq!(mapped.sender.name, "Bea");
+        assert_eq!(mapped.sender.id, PEER);
+        assert!(!mapped.outgoing);
+        assert!(mapped.saved_history);
+        assert_eq!(mapped.sent, 456);
     }
 
     /// `channel.updated` is broadcast with the actor's own unread baked into `app_channel_json`.

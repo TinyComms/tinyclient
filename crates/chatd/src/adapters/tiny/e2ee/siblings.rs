@@ -562,12 +562,15 @@ impl Device {
                 let (Some(id), Some(author_id)) = (text("id"), text("author_id")) else {
                     continue;
                 };
+                let Ok((generation, group_id)) = super::repair::row_metadata(row) else { continue; };
                 let wire = Row {
                     id,
                     author_id,
                     kind: text("kind").unwrap_or("message"),
                     ciphertext: text("ciphertext"),
                     epoch: row.get("epoch").and_then(Value::as_u64).unwrap_or(0),
+                    generation,
+                    group_id,
                     device_id: text("device_id").unwrap_or(""),
                     target_id: text("target_id"),
                     client_id: text("client_id"),
@@ -638,6 +641,19 @@ mod tests {
         device
     }
 
+    const AUTHENTICATED_SIBLING: &str = "99999999-9999-4999-8999-999999999999";
+
+    // These retry/paging tests begin after a genuine MLS read. Model that sealed cache
+    // boundary explicitly; legacy text without sender authentication is never a control row.
+    fn authenticated_sync(device: &Device, text: &str) -> Opened {
+        static KEY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        let sender = e2ee::DeviceRef { user: e2ee::UserId::parse(ME).unwrap(),
+            device: e2ee::DeviceId::parse(AUTHENTICATED_SIBLING).unwrap(),
+            signature_key: KEY.get_or_init(|| e2ee::identity::DeviceKey::generate().unwrap().public_key()).clone() };
+        let conv = e2ee::ConversationId::parse(device.notes.self_conv.as_deref().unwrap_or("5e1f0000-0000-4000-8000-000000000001")).unwrap();
+        Opened { text:text.to_owned(), generation:Some(0), auth:Some(super::super::Authentication::new(conv, conv, 0, 0, &sender, Kind::Message, None)), ..Opened::default() }
+    }
+
     #[test]
     fn a_sync_row_that_becomes_readable_is_retried_instead_of_permanently_skipped() {
         let mut device = device("retry-readable");
@@ -648,7 +664,8 @@ mod tests {
             kind: "message",
             ciphertext: Some("AAAA"),
             epoch: 0,
-            device_id: "sibling",
+            generation: None, group_id: None,
+            device_id: AUTHENTICATED_SIBLING,
             target_id: None,
             client_id: None,
             created_at: "",
@@ -660,7 +677,7 @@ mod tests {
             conv: "c1".into(),
             rows: vec![("m1".into(), opened("recovered"))],
         };
-        device.remember(&own, row.id, opened(&answer.text().unwrap()));
+        device.remember(&own, row.id, authenticated_sync(&device, &answer.text().unwrap()));
         assert_eq!(device.sibling_said(&row), ["c1"]);
         assert_eq!(device.cache("c1").unwrap().rows["m1"].text, "recovered");
         assert!(
@@ -682,7 +699,7 @@ mod tests {
             user: "bea".into(),
             number: Some("123456".into()),
         };
-        receiver.remember(&own, "verification-row", opened(&mark.text().unwrap()));
+        receiver.remember(&own, "verification-row", authenticated_sync(&receiver, &mark.text().unwrap()));
         let own_route = own.clone();
         receiver.saved.base_url = super::super::super::tests::serve(move |request| {
             let body = if request.starts_with("GET /v1/capabilities ") {
@@ -694,7 +711,7 @@ mod tests {
             } else if request.starts_with("POST /v1/e2ee/self ") {
                 serde_json::json!({"conversation_id":own_route})
             } else if request.starts_with("GET /v1/conversations/") {
-                serde_json::json!({"messages":[{"id":"verification-row","author_id":ME,"device_id":"sibling","ciphertext":"AAAA"}]})
+                serde_json::json!({"messages":[{"id":"verification-row","author_id":ME,"device_id":AUTHENTICATED_SIBLING,"ciphertext":"AAAA"}]})
             } else {
                 return super::super::super::tests::http(404, "Test", "{}");
             };
@@ -728,7 +745,8 @@ mod tests {
             kind: "message",
             ciphertext: Some("AAAA"),
             epoch: 0,
-            device_id: "sibling",
+            generation: None, group_id: None,
+            device_id: AUTHENTICATED_SIBLING,
             target_id: None,
             client_id: None,
             created_at: "",
@@ -738,7 +756,7 @@ mod tests {
             user: "bea".into(),
             number: Some("654321".into()),
         };
-        receiver.remember(&own, row.id, opened(&mark.text().unwrap()));
+        receiver.remember(&own, row.id, authenticated_sync(&receiver, &mark.text().unwrap()));
         receiver.saved.base_url = super::super::super::tests::serve(move |request| {
             let body = if request.starts_with("GET /v1/e2ee/conversations/")
                 && request.contains("/handshake?")
@@ -747,7 +765,7 @@ mod tests {
             } else if request.starts_with("GET /v1/e2ee/conversations/") {
                 serde_json::json!({"e2ee":true,"epoch":0,"external_sender":super::super::b64(&server_key)})
             } else if request.starts_with("GET /v1/conversations/") {
-                serde_json::json!({"messages":[{"id":"verification-row","author_id":ME,"device_id":"sibling","ciphertext":"AAAA"}]})
+                serde_json::json!({"messages":[{"id":"verification-row","author_id":ME,"device_id":AUTHENTICATED_SIBLING,"ciphertext":"AAAA"}]})
             } else {
                 return super::super::super::tests::http(404, "Test", "{}");
             };
@@ -784,8 +802,8 @@ mod tests {
         let mut wire = Vec::new();
         for (i, reply) in replies.into_iter().enumerate() {
             let id = format!("self-{i:04}");
-            receiver.remember(&own, &id, opened(&reply.text().unwrap()));
-            wire.push(serde_json::json!({"id":id,"author_id":ME,"device_id":"sibling","epoch":0,"ciphertext":"AAAA"}));
+            receiver.remember(&own, &id, authenticated_sync(&receiver, &reply.text().unwrap()));
+            wire.push(serde_json::json!({"id":id,"author_id":ME,"device_id":AUTHENTICATED_SIBLING,"epoch":0,"ciphertext":"AAAA"}));
         }
         let base = super::super::super::tests::serve(move |request| {
             if !request.starts_with("GET /v1/conversations/") {
@@ -1013,6 +1031,7 @@ mod tests {
             kind: "message",
             ciphertext: Some("AAAA"),
             epoch: 0,
+            generation: None, group_id: None,
             device_id: from,
             target_id: None,
             client_id: None,

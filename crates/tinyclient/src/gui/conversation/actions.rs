@@ -135,7 +135,7 @@ pub fn can(message: &Message, network: Network, kind: ConversationKind, in_threa
         // CONTRACT: nothing says how long a network lets a message be edited, so Edit is offered
         // on every message of mine and a refusal is the network's answer. Messages never edits
         // or deletes, so those items stay off.
-        edit: sent && own && network != Network::Messages,
+        edit: sent && own && !message.saved_history && network != Network::Messages,
         delete: own && network != Network::Messages,
         unsent: !sent && message.outgoing,
     }
@@ -609,6 +609,7 @@ impl Pane {
     }
 
     pub(super) fn edit(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) {
+        if message.saved_history { return; }
         let message = message.clone();
         let _ = self.shell.update(cx, |shell, cx| {
             shell.composer_edit(&message, cx);
@@ -1451,5 +1452,17 @@ mod tests {
         let mut joined = Message::plain("4", "Wren", "joined", 5, false);
         joined.kind = MessageKind::System;
         assert!(!can(&joined, Network::Discord, channel, false).act);
+    }
+
+    #[test]
+    fn saved_history_cannot_offer_edits_but_keeps_the_owners_delete_action() {
+        let mut saved = Message::plain("saved", "Ada", "past", 1, true);
+        saved.saved_history = true;
+        let actions = can(&saved, Network::Tiny, ConversationKind::Direct, false);
+        assert!(!actions.edit);
+        assert!(actions.delete && actions.reply);
+        saved.outgoing = false;
+        let neutral = can(&saved, Network::Tiny, ConversationKind::Direct, false);
+        assert!(!neutral.edit && !neutral.delete);
     }
 }

@@ -835,6 +835,7 @@ impl Pane {
                     .children(silent_mark(message)),
             )
             .children(message.sender.bot.then(|| tag("APP")))
+            .children(message.saved_history.then(|| tag("SAVED")))
             .children(message.pinned.then(|| {
                 div()
                     .flex_none()

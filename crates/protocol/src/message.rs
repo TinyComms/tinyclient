@@ -325,6 +325,10 @@ pub struct Sender {
 pub struct Message {
     pub id: String,
     pub sender: Sender,
+    /// Saved legacy plaintext whose sender authentication was not retained. Any old local
+    /// attribution is historical display metadata, never cryptographic authorization.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub saved_history: bool,
     /// Unix seconds.
     pub sent: i64,
     /// Milliseconds within `sent`, when the source supplies finer ordering.
@@ -409,6 +413,7 @@ impl Message {
     ) -> Message {
         Message {
             id: id.into(),
+            saved_history: false,
             sender: Sender {
                 name: sender.into(),
                 ..Sender::default()
