@@ -187,6 +187,15 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    // The lab's scroll-release driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("scroll-release") {
+        if let Err(err) = gui::prove_scroll_release() {
+            eprintln!("scroll-release: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     // The lab's health-grade driver. A build without this opens the window below and stays up.
     #[cfg(feature = "gui")]
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("health-grade") {

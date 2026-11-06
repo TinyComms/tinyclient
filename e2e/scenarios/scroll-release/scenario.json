@@ -1,0 +1,12 @@
+{
+  "id": "scroll-release",
+  "title": "Releasing a scrollbar thumb drag releases the captured pointer",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same mouse-up releases the pointer on the phone's scroll frames.",
+    "ios": "The phone proof build does not run the desktop window. The same mouse-up releases the pointer on the phone's scroll frames."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
