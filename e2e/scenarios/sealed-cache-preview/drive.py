@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""A wiped store still names the inbox preview from the sealed cache.
+"""A wiped store still names the inbox and rehydrates the last opened line from the sealed cache.
 
 Starts this build's chatd with TINYCLIENT_PROVE=sealed-cache-preview. That build writes an
 opened line into the sealed cache with no sqlite row, and exits 0 only when the preview is that
-text. A build from before the fix ignores the variable and keeps serving.
+text and the store row is written back. A build from before the fix ignores the variable and keeps
+serving.
 
 Env from the lab: E2E_OUT, E2E_T0, E2E_APP_DIR.
 """
@@ -76,7 +77,7 @@ def main():
             proc.kill()
             proc.wait(timeout=5)
             code = None
-    step("a wiped store still names the preview from the sealed cache", code == 0)
+    step("a wiped store still names the preview and rehydrates the last opened line", code == 0)
     return 1 if FAILED else 0
 
 

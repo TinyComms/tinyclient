@@ -1,6 +1,6 @@
 {
   "id": "sealed-cache-preview",
-  "title": "A wiped store still names the inbox preview from the sealed cache",
+  "title": "A wiped store still names the inbox and rehydrates the last opened line from the sealed cache",
   "platforms": ["windows", "linux", "macos"],
   "not_applicable": {
     "android": "The phone proof build does not run desktop chatd against a localhost sealed cache. The same preview path is what this desktop run checks.",
