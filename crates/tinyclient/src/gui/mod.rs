@@ -62,6 +62,15 @@ pub(crate) fn prove_health_grade() -> Result<(), &'static str> {
     }
 }
 
+/// The lab's cancel-join driver. A leave is accepted while a join is still in flight.
+pub(crate) fn prove_cancel_join() -> Result<(), &'static str> {
+    if tiny::call_accepts(true, true) && !tiny::call_accepts(true, false) {
+        Ok(())
+    } else {
+        Err("a join in flight swallowed the leave")
+    }
+}
+
 /// The lab's text-drag driver. A release outside the message pane ends the selection drag.
 pub(crate) fn prove_text_drag() -> Result<(), &'static str> {
     let mut dragging = true;
