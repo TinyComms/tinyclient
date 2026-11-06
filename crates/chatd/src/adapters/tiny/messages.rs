@@ -1949,7 +1949,8 @@ mod tests {
             !page.conversations.iter().any(|row| row.kind == ConversationKind::Direct),
             "the first tree page is only channels"
         );
-        assert_eq!(ctx.hub.store().space_text_kinds(&space).unwrap(), (true, true, false));
+        // Fixture already stores room-1 as Voice.
+        assert_eq!(ctx.hub.store().space_text_kinds(&space).unwrap(), (true, true, true));
     }
 
     /// An empty rooms list with voice rooms already stored would delete those rooms.
