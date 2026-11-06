@@ -1,0 +1,12 @@
+{
+  "id": "bridge-image",
+  "title": "The 16 kHz voice bridge does not image a high tone",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not start desktop mediad. The same bridge check is in the library the phone links.",
+    "ios": "The phone proof build does not start desktop mediad. The same bridge check is in the library the phone links."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 45
+}
