@@ -78,7 +78,7 @@ pub(crate) struct Secrets {
 }
 
 impl Secrets {
-    fn generate() -> Result<Secrets, String> {
+    pub(crate) fn generate() -> Result<Secrets, String> {
         let state = StateKey::generate().map_err(|err| err.to_string())?;
         let cache = CacheKey::generate().map_err(|err| err.to_string())?;
         Ok(Secrets {
@@ -471,6 +471,74 @@ pub(crate) fn started(saved: &Saved) -> Option<Shared> {
     lock(devices())
         .get(&(saved.base_url.clone(), saved.user_id.clone()))
         .cloned()
+}
+
+/// Opened plaintext this device already has for `message_id`, from the sealed cache.
+/// Works even when the MLS device is not started yet: the cache key lives in the session.
+pub(crate) fn opened_row(saved: &Saved, conversation_id: &str, message_id: &str) -> Option<Opened> {
+    if let Some(shared) = started(saved) {
+        let mut device = lock(&shared);
+        if let Some(opened) = device
+            .cache(conversation_id)
+            .and_then(|cache| cache.rows.get(message_id).cloned())
+        {
+            return Some(opened);
+        }
+    }
+    let secrets = saved.e2ee.as_ref()?;
+    let (_, cache_key) = secrets.keys()?;
+    let cache = Cache::load(&dir_of(saved), conversation_id, &cache_key);
+    cache.rows.get(message_id).cloned()
+}
+
+/// Previously opened nonempty text, for the inbox preview.
+pub(crate) fn opened_text(saved: &Saved, conversation_id: &str, message_id: &str) -> Option<String> {
+    if let Some(shared) = started(saved) {
+        let mut device = lock(&shared);
+        if let Some(text) = device
+            .cache(conversation_id)
+            .and_then(|cache| cache.rows.get(message_id).cloned())
+            .map(|opened| opened.text)
+            .filter(|text| !text.trim().is_empty())
+        {
+            return Some(text);
+        }
+    }
+    let secrets = saved.e2ee.as_ref()?;
+    let (_, cache_key) = secrets.keys()?;
+    let cache = Cache::load(&dir_of(saved), conversation_id, &cache_key);
+    cache
+        .rows
+        .get(message_id)
+        .map(|opened| opened.text.clone())
+        .filter(|text| !text.trim().is_empty())
+}
+
+/// Writes one opened line into the sealed cache (lab prove and unit tests).
+pub(crate) fn write_opened_cache(
+    saved: &Saved,
+    conversation_id: &str,
+    message_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    let secrets = saved
+        .e2ee
+        .as_ref()
+        .ok_or("This device has no encryption keys.")?;
+    let (_, cache_key) = secrets
+        .keys()
+        .ok_or("This device's keys are unreadable.")?;
+    private_dir(&dir_of(saved)).map_err(|err| err.to_string())?;
+    let mut cache = Cache::load(&dir_of(saved), conversation_id, &cache_key);
+    cache.put(
+        &cache_key,
+        message_id,
+        Opened {
+            text: text.to_owned(),
+            ..Opened::default()
+        },
+    );
+    Ok(())
 }
 
 /// Signs this install in as a device: called when the account starts. Never fails the account.
@@ -2106,6 +2174,30 @@ mod tests {
         write_private(&dir.join("x"), b"y").unwrap();
         assert_eq!(std::fs::read(dir.join("x")).unwrap(), b"y");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn opened_text_reads_the_sealed_cache_when_the_store_row_is_gone() {
+        let secrets = Secrets::generate().unwrap();
+        let saved = Saved {
+            base_url: "http://127.0.0.1:9".to_owned(),
+            token: "t".to_owned(),
+            user_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned(),
+            email: None,
+            display_name: "Ada".to_owned(),
+            role: "owner".to_owned(),
+            plain_http_ok: false,
+            e2ee: Some(secrets),
+        };
+        let conversation = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0";
+        let message = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        write_opened_cache(&saved, conversation, message, "still here").unwrap();
+        assert_eq!(
+            opened_text(&saved, conversation, message).as_deref(),
+            Some("still here")
+        );
+        assert_eq!(opened_text(&saved, conversation, "cccccccc-cccc-4ccc-8ccc-cccccccccccc"), None);
+        let _ = std::fs::remove_dir_all(dir_of(&saved));
     }
 
     #[test]

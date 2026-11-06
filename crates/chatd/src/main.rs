@@ -48,6 +48,24 @@ fn main() -> io::Result<()> {
         eprintln!("prove-exit:0");
         return Ok(());
     }
+    // The lab's cache-open-without-device driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("cache-open-without-device") {
+        if let Err(err) = chatd::adapters::tiny::prove_cache_open_without_device() {
+            eprintln!("cache-open-without-device: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
+    // The lab's sealed-cache-preview driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("sealed-cache-preview") {
+        if let Err(err) = chatd::adapters::tiny::prove_sealed_cache_preview() {
+            eprintln!("sealed-cache-preview: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
     // The lab's keep-opened-sealed driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("keep-opened-sealed") {
         if let Err(err) = chatd::adapters::tiny::prove_keep_opened_sealed() {
