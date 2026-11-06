@@ -80,6 +80,13 @@
             android:name="dev.tinyclient.app.CallService"
             android:exported="false"
             android:foregroundServiceType="microphone|camera|mediaProjection" />
+
+        <!-- Chromium binds back while the auth tab is foreground, keeping the in-process
+             loopback listener runnable. Empty Binder only; never a started service. -->
+        <service
+            android:name="dev.tinyclient.app.AuthKeepAliveService"
+            android:exported="true"
+            android:stopWithTask="true" />
     </application>
 
 </manifest>

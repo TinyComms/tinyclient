@@ -116,9 +116,9 @@ jobs:
         with:
           gradle-version: ${{ env.GRADLE_VERSION }}
 
-      - name: assembleDebug
+      - name: Auth lifecycle tests and assembleDebug
         working-directory: mobile/android
-        run: gradle :app:assembleDebug --console=plain
+        run: gradle :app:testDebugUnitTest :app:assembleDebug --console=plain
 
       - name: APK alignment
         run: |
