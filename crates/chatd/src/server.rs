@@ -964,7 +964,22 @@ impl Chat {
                         ) =>
                     {
                         let around = id.clone();
-                        self.command(&account, Command::HistoryAround { conversation_id, around });
+                        // The list cursor is exclusive, so a page before the anchor misses the
+                        // anchor and the newer half. The first message after this window is the
+                        // cursor that still includes the window's last row.
+                        let last = found.messages.last().map(|message| message.id.clone());
+                        let successor = last.and_then(|last| {
+                            self.hub
+                                .store()
+                                .messages(&conversation, &Page::After { id: last }, 1, now())
+                                .ok()
+                                .flatten()
+                                .and_then(|page| page.messages.into_iter().next().map(|message| message.id))
+                        });
+                        self.command(&account, Command::HistoryAround { conversation_id: conversation_id.clone(), around });
+                        if let Some(before) = around_followup(successor.as_deref()).map(str::to_owned) {
+                            self.command(&account, Command::History { conversation_id, before });
+                        }
                     }
                     _ => {}
                 }
@@ -2732,6 +2747,12 @@ fn around_needs_catchup(older: bool, newer: bool, anchor_present: bool, blank: b
     !older || !newer || !anchor_present || blank
 }
 
+/// `before` excludes that row. The cursor that still includes the last row of the open window
+/// is the first stored message after it. At the tip there is no such message.
+fn around_followup(successor: Option<&str>) -> Option<&str> {
+    successor.filter(|id| !id.is_empty())
+}
+
 /// A stored row with no words and no file. A captionless photo is empty text on purpose.
 fn window_has_blank(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
@@ -2813,6 +2834,16 @@ mod tests {
         photo.attachments.push(protocol::Attachment::new("pic", protocol::MediaFile::new("f", protocol::MediaKind::Image)));
         assert!(!super::window_has_blank(&[photo]));
         assert!(super::window_has_blank(&[protocol::Message::plain("m", "Ada", "  ", 1, false)]));
+    }
+
+    /// The server's `before` cursor excludes that message. The page that still includes the
+    /// last row of the open window is the one before the next stored message. At the tip there
+    /// is no next message, and the newest page is what covers the window.
+    #[test]
+    fn the_page_that_covers_the_window_starts_after_its_last_row() {
+        assert_eq!(super::around_followup(Some("next")), Some("next"));
+        assert_eq!(super::around_followup(None), None);
+        assert_eq!(super::around_followup(Some("")), None);
     }
 
     #[test]
