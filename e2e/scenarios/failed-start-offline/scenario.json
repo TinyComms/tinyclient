@@ -1,0 +1,13 @@
+{
+  "id": "failed-start-offline",
+  "title": "A failed adapter start leaves the account offline so cached chats still show",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same start check leaves the account offline.",
+    "ios": "The phone proof build does not run desktop chatd. The same start check leaves the account offline."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
+
