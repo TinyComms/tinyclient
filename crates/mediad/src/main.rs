@@ -35,6 +35,14 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    // The lab's missed-frame driver. A build without this opens the audio engine below and stays up.
+    if env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("missed-frame") {
+        if let Err(err) = mediad::media::prove_missed_frame() {
+            eprintln!("missed-frame: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     let _log = protocol::log_policy::install("mediad", protocol::log_policy::LogPolicy::from_env());
     protocol::crash::install_panic_hook("mediad");
     let code = mediad::serve::run(&args);

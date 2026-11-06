@@ -1,0 +1,12 @@
+{
+  "id": "missed-frame",
+  "title": "A missed microphone frame does not count as quiet",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not start desktop mediad. The same gate check is in the library the phone links.",
+    "ios": "The phone proof build does not start desktop mediad. The same gate check is in the library the phone links."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 45
+}
