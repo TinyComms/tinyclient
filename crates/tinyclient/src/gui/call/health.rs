@@ -86,7 +86,17 @@ impl Health {
         if self.video_stalled {
             return Grade::Poor;
         }
-        self.steady.unwrap_or_else(|| self.reading())
+        let link = self.steady.unwrap_or_else(|| self.reading());
+        // The bars follow the link. A dry speaker or concealed audio is the sound itself,
+        // so a green link must not hide it.
+        let heard = if self.underruns.is_some_and(|n| n >= 3) {
+            Grade::Poor
+        } else if self.concealed_permille.is_some_and(|n| n > 30) {
+            Grade::Fair
+        } else {
+            return link;
+        };
+        if link == Grade::Unknown || heard.bars() < link.bars() { heard } else { link }
     }
 
     /// What these numbers mean to someone listening. Opus with in-band FEC hides a percent of
@@ -425,6 +435,16 @@ mod tests {
         stats.video.as_mut().unwrap().watching_ms = 4000;
         stats.video.as_mut().unwrap().receive_expected = false;
         assert!(!Health::from_stats(&stats).video_stalled, "sending without watching needs no local video");
+    }
+
+    #[test]
+    fn a_dry_speaker_is_not_an_excellent_connection() {
+        let dry = Health { underruns: Some(3), steady: Some(Grade::Great), ..link(40, 0, 2) };
+        assert_eq!(dry.grade(), Grade::Poor, "a green link hid a dry speaker");
+        let filled = Health { concealed_permille: Some(60), steady: Some(Grade::Great), ..link(40, 0, 2) };
+        assert_eq!(filled.grade(), Grade::Fair, "a green link hid concealed audio");
+        let blip = Health { underruns: Some(1), steady: Some(Grade::Great), ..link(40, 0, 2) };
+        assert_eq!(blip.grade(), Grade::Great, "one underrun is a blip");
     }
 
     #[test]

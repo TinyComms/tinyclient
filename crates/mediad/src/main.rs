@@ -27,6 +27,14 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    // The lab's empty-ring driver. A build without this opens the audio engine below and stays up.
+    if env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("drift-empty") {
+        if let Err(err) = mediad::audio::prove_drift_empty() {
+            eprintln!("drift-empty: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     // The lab's missed-frame driver. A build without this opens the audio engine below and stays up.
     if env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("missed-frame") {
         if let Err(err) = mediad::media::prove_missed_frame() {
