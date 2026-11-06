@@ -1,0 +1,12 @@
+{
+  "id": "around-blank",
+  "title": "A full window of blank rows still asks for history",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same catch-up check asks for a blank window.",
+    "ios": "The phone proof build does not run desktop chatd. The same catch-up check asks for a blank window."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
