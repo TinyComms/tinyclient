@@ -126,7 +126,12 @@ impl Drift {
     }
 
     /// The ring held `ms` at a tick. Gives a new adjustment once a second.
+    /// An empty ring is the speaker refilling after it ran dry, not a clock that ran fast,
+    /// so that tick is not counted.
     pub(crate) fn observe(&mut self, ms: f64) -> Option<f64> {
+        if ms <= 0. {
+            return None;
+        }
         self.low = self.low.min(ms);
         self.seen += 1;
         if self.seen < 50 {
@@ -152,6 +157,24 @@ impl Drift {
 
     fn restart(&mut self) {
         *self = Drift::new(self.target_ms);
+    }
+}
+
+/// An empty ring is the speaker refilling, not a fast clock. One empty tick must not move the drift.
+pub fn prove_drift_empty() -> Result<(), &'static str> {
+    let mut drift = Drift::new(60.);
+    for _ in 0..49 {
+        if drift.observe(60.).is_some() {
+            return Err("a held tick adjusted before the second was up");
+        }
+    }
+    if drift.observe(0.).is_some() {
+        return Err("an empty ring counted as the second's low");
+    }
+    match drift.observe(60.) {
+        Some(adjust) if adjust.abs() < 1e-6 => Ok(()),
+        Some(_) => Err("an empty ring moved the drift"),
+        None => Err("the fiftieth held tick did not adjust"),
     }
 }
 
@@ -1673,6 +1696,17 @@ mod tests {
         assert!(cushion.tick());
         assert_eq!(cushion.ms, 60);
         assert!(!(0..CUSHION_CLEAN * 3).any(|_| cushion.tick()), "and no shallower than it began");
+    }
+
+    #[test]
+    fn an_empty_ring_does_not_move_the_drift() {
+        let mut drift = Drift::new(60.);
+        for _ in 0..49 {
+            assert!(drift.observe(60.).is_none());
+        }
+        assert!(drift.observe(0.).is_none(), "an empty ring counted as the second's low");
+        let adjust = drift.observe(60.).expect("the fiftieth held tick");
+        assert!(adjust.abs() < 1e-6, "an empty ring moved the drift: {adjust}");
     }
 
     #[test]
