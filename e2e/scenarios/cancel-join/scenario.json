@@ -1,0 +1,12 @@
+{
+  "id": "cancel-join",
+  "title": "A join in flight can be cancelled",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same leave-while-busy check is what a phone join uses.",
+    "ios": "The phone proof build does not run the desktop window. The same leave-while-busy check is what a phone join uses."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
