@@ -26,7 +26,7 @@ pub const CIPHERSUITE: mls::Ciphersuite = mls::Ciphersuite::MLS_128_DHKEMP256_AE
 pub const MAX_KEY_PACKAGES: usize = 50;
 /// Regular key packages are good for 84 days (OpenMLS's own range limit for a leaf's lifetime).
 const KEY_PACKAGE_LIFETIME: u64 = 60 * 60 * 24 * 84;
-const SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_VERSION: u32 = 2;
 
 /// What every leaf of ours says it supports: this ciphersuite, basic credentials, and the last-resort
 /// key package extension (a key package that carries an extension must list it).
@@ -111,6 +111,8 @@ struct Snapshot {
     trust: Trust,
     meta: BTreeMap<ConversationId, ConvMeta>,
     storage: Vec<(Bytes, Bytes)>,
+    #[serde(default)]
+    repair: Option<crate::repair::RepairState>,
 }
 
 pub struct Engine {
@@ -122,6 +124,7 @@ pub struct Engine {
     /// one, so the next use reloads the last stored state.
     pub(crate) groups: HashMap<ConversationId, mls::MlsGroup>,
     pub(crate) config: Config,
+    pub(crate) repair: crate::repair::RepairState,
     persistence: Option<Persistence>,
     dirty: bool,
     save_error: Option<String>,
@@ -151,6 +154,7 @@ impl Engine {
             meta: BTreeMap::new(),
             groups: HashMap::new(),
             config: Config::default(),
+            repair: crate::repair::RepairState::default(),
             persistence: None,
             dirty: true,
             save_error: None,
@@ -203,16 +207,26 @@ impl Engine {
         let plain = open_state(key, name, blob)?;
         let snapshot: Snapshot =
             serde_json::from_slice(&plain).map_err(|_| Error::Malformed("state"))?;
-        if snapshot.version != SNAPSHOT_VERSION {
+        if snapshot.version != 1 && snapshot.version != SNAPSHOT_VERSION {
             return Err(Error::UnsupportedVersion);
         }
+        let repair = if snapshot.version == 1 {
+            if snapshot.repair.is_some() {
+                return Err(Error::Malformed("legacy state with repair metadata"));
+            }
+            crate::repair::RepairState::legacy(&snapshot.meta)?
+        } else {
+            snapshot
+                .repair
+                .ok_or(Error::Malformed("missing generation metadata"))?
+        };
         let signing = DeviceKey::from_bytes(&snapshot.signing_key)?;
         let entries = snapshot
             .storage
             .into_iter()
             .map(|(key, value)| (key.0, value.0))
             .collect();
-        Ok(Engine {
+        let mut engine = Engine {
             identity: DeviceIdentity {
                 user: snapshot.user,
                 device: snapshot.device,
@@ -223,10 +237,13 @@ impl Engine {
             meta: snapshot.meta,
             groups: HashMap::new(),
             config: Config::default(),
+            repair,
             persistence: None,
             dirty: false,
             save_error: None,
-        })
+        };
+        engine.validate_repair_state()?;
+        Ok(engine)
     }
 
     fn snapshot_plain(&self) -> Result<Zeroizing<Vec<u8>>> {
@@ -243,6 +260,7 @@ impl Engine {
                 .into_iter()
                 .map(|(key, value)| (Bytes(key), Bytes(value)))
                 .collect(),
+            repair: Some(self.repair.clone()),
         };
         serde_json::to_vec(&snapshot)
             .map(Zeroizing::new)
@@ -292,6 +310,39 @@ impl Engine {
                 Ok(())
             }
         }
+    }
+
+    /// A repair publishes provider state, its mapping and its outbound guards as one snapshot.
+    pub(crate) fn repair_transaction<T>(
+        &mut self,
+        conversation: ConversationId,
+        change: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let checkpoint = self.provider.checkpoint();
+        let previous_meta = self.meta.clone();
+        let previous_repair = self.repair.clone();
+        let previous_dirty = self.dirty;
+        let previous_error = self.save_error.clone();
+        let result = change(self).and_then(|value| {
+            self.repair.failed_writes.remove(&conversation);
+            self.validate_repair_state()?;
+            self.persist(true)?;
+            Ok(value)
+        });
+        if let Err(error) = &result {
+            self.provider.restore(checkpoint);
+            self.groups.clear();
+            self.meta = previous_meta;
+            self.repair = previous_repair;
+            self.dirty = previous_dirty;
+            self.save_error = previous_error;
+            if matches!(error, Error::Storage(_) | Error::Io(_)) {
+                // Do not allow a caller to ignore failed durable lifecycle publication.
+                self.repair.failed_writes.insert(conversation);
+                self.dirty = true;
+            }
+        }
+        result
     }
 
     // --- Identity ---

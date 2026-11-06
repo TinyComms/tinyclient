@@ -36,6 +36,12 @@ pub enum Error {
     NoGroup,
     #[error("a group for this conversation already exists")]
     GroupExists,
+    #[error("a conversation repair is awaiting resolution")]
+    RepairPending,
+    #[error("this cryptographic group has been retired")]
+    RetiredGroup,
+    #[error("the conversation repair was refused: {0}")]
+    InvalidRepair(&'static str),
     /// This device was removed from the group.
     #[error("this device is not in the group")]
     NotAMember,

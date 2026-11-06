@@ -165,6 +165,7 @@ impl Engine {
         target_id: Option<&str>,
         envelope: &Envelope,
     ) -> Result<Sealed> {
+        self.repair_outbound_allowed(conv)?;
         if (kind == Kind::Edit) != target_id.is_some() {
             return Err(Error::Malformed("edit target"));
         }
@@ -242,6 +243,7 @@ impl Engine {
         ciphertext: &[u8],
         claimed: &Claimed<'_>,
     ) -> Result<Incoming> {
+        self.repair_receive_allowed(conv)?;
         self.usable(conv)?;
         self.load_group(conv)?;
         let message = guard(|| mls::MlsMessageIn::tls_deserialize_exact(ciphertext))?
@@ -364,6 +366,7 @@ impl Engine {
         signer: &crate::identity::DeviceKey,
         envelope: &Envelope,
     ) -> Result<Vec<u8>> {
+        self.repair_outbound_allowed(conv)?;
         self.usable(conv)?;
         self.load_group(conv)?;
         let Engine {

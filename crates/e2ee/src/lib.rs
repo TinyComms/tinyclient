@@ -61,6 +61,7 @@ pub mod ids;
 pub mod link;
 pub mod messaging;
 mod provider;
+pub mod repair;
 pub mod safety;
 mod sealed;
 pub mod store;
