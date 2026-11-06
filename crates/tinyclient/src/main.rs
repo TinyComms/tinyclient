@@ -169,6 +169,15 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    // The lab's focus-ring driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("focus-ring") {
+        if let Err(err) = gui::prove_focus_ring() {
+            eprintln!("focus-ring: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     // The lab's text-drag driver. A build without this opens the window below and stays up.
     #[cfg(feature = "gui")]
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("text-drag") {

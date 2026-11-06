@@ -1,0 +1,12 @@
+{
+  "id": "focus-ring",
+  "title": "Keyboard focus on a scroll frame is an inset ring, not a blue fill",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same inset ring is what a phone scroll frame uses.",
+    "ios": "The phone proof build does not run the desktop window. The same inset ring is what a phone scroll frame uses."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
