@@ -41,6 +41,11 @@ pub fn prove_sealed_cache_preview() -> Result<(), String> {
     messages::prove_sealed_cache_preview()
 }
 
+/// The lab's keep-opened-sealed proof. See `messages::prove_keep_opened_sealed`.
+pub fn prove_keep_opened_sealed() -> Result<(), String> {
+    messages::prove_keep_opened_sealed()
+}
+
 /// The lab's refused-list proof. See `messages::prove_refused_list`.
 pub fn prove_refused_list() -> Result<(), String> {
     messages::prove_refused_list()

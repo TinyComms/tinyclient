@@ -10,7 +10,7 @@
 use protocol::{
     clip, AccountKey, CallSupport, Conversation, ConversationKind, Folder, Group, InboxCounts,
     InboxFilter, Key, Mark, MediaFile, MediaKind, Message, MessageHit, Network, Page, Person,
-    Presence, Reaction, Relation, SendState, SharedItem, SharedKind, Shelf, Space, Special,
+    Presence, Reaction, Relation, Seal, SendState, SharedItem, SharedKind, Shelf, Space, Special,
     DRAFT_LIMIT, FOLDERS_LIMIT, FOLDERS_PER_ROW, FOLDER_MEMBERS,
 };
 use rusqlite::types::Value;
@@ -2192,6 +2192,15 @@ impl Store {
             .optional()?;
         let outcome = match before {
             Some((text, old)) if text == incoming.text && old == body => Stored::Same,
+            // A later fetch that cannot open must not replace what this device already opened.
+            Some((text, old))
+                if incoming.seal == Seal::Undecryptable
+                    && !text.trim().is_empty()
+                    && serde_json::from_str::<Message>(&old)
+                        .is_ok_and(|had| had.seal == Seal::Encrypted) =>
+            {
+                Stored::Same
+            }
             Some(_) => Stored::Updated,
             None => Stored::New,
         };
