@@ -32,9 +32,10 @@ const IDLE: u32 = 20;
 /// holding is 20 ms the buffer never gives back.
 const REORDER: u32 = 2;
 /// The widest hole after a quiet frame that is taken for a loss, on a call whose sequence runs on
-/// through a pause. A sender's gate that shut stays shut for longer than this, and a word's quiet
-/// first frame can be followed by a packet lost like any other.
-const LOST_NOT_PAUSED: i64 = 2;
+/// through a pause. A soft frame counts as quiet, and a hole of a few packets is one that never
+/// arrived. The speech gate keeps sending for its hold and its trail, which is longer than this,
+/// so a wider gap is the next word after a pause.
+const LOST_NOT_PAUSED: i64 = 5;
 /// A jump this large in sequence numbers is a new stream on the same SSRC.
 const RESTART: i64 = 1000;
 
@@ -275,6 +276,24 @@ impl Jitter {
     }
 }
 
+/// A quiet frame and a three-packet hole is a loss, so the decoder conceals it. A pause is wider.
+pub fn prove_short_hole() -> Result<(), &'static str> {
+    let mut jitter = Jitter { clocked: true, ..Jitter::default() };
+    for n in [1u16, 2, 3, 7, 8, 9] {
+        jitter.insert(n, n.to_be_bytes().to_vec());
+    }
+    for _ in 0..3 {
+        if !matches!(jitter.pop(), Pop::Packet(_)) {
+            return Err("the frames before the hole did not play");
+        }
+        jitter.hushed = true;
+    }
+    if !matches!(jitter.pop(), Pop::Hold) || !matches!(jitter.pop(), Pop::Hold) || !matches!(jitter.pop(), Pop::Lost(3)) {
+        return Err("a three-packet hole after a quiet frame was taken for a pause");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +443,13 @@ mod tests {
         }
         assert_eq!(jitter.pop(), Pop::Spurt(packet(20)));
         assert_eq!(jitter.lost, 0);
+    }
+
+    /// A soft frame is quiet, and three packets missing after it is still a loss. Treating that
+    /// as a pause skips concealment, and the voice jumps while the server still looks fine.
+    #[test]
+    fn a_short_hole_after_a_quiet_frame_is_a_loss() {
+        assert_eq!(super::prove_short_hole(), Ok(()));
     }
 
     /// A word's first frame can be quiet. The packet after it going missing is still a loss, and
