@@ -31,6 +31,11 @@ pub fn prove_sealed_preview() -> Result<(), String> {
     messages::prove_sealed_preview()
 }
 
+/// The lab's cache-open-without-device proof. See `messages::prove_cache_open_without_device`.
+pub fn prove_cache_open_without_device() -> Result<(), String> {
+    messages::prove_cache_open_without_device()
+}
+
 /// The lab's refused-list proof. See `messages::prove_refused_list`.
 pub fn prove_refused_list() -> Result<(), String> {
     messages::prove_refused_list()

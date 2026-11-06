@@ -78,7 +78,7 @@ pub(crate) struct Secrets {
 }
 
 impl Secrets {
-    fn generate() -> Result<Secrets, String> {
+    pub(crate) fn generate() -> Result<Secrets, String> {
         let state = StateKey::generate().map_err(|err| err.to_string())?;
         let cache = CacheKey::generate().map_err(|err| err.to_string())?;
         Ok(Secrets {
@@ -471,6 +471,51 @@ pub(crate) fn started(saved: &Saved) -> Option<Shared> {
     lock(devices())
         .get(&(saved.base_url.clone(), saved.user_id.clone()))
         .cloned()
+}
+
+/// Opened plaintext this device already has for `message_id`, from the sealed cache.
+/// Works even when the MLS device is not started yet: the cache key lives in the session.
+pub(crate) fn opened_row(saved: &Saved, conversation_id: &str, message_id: &str) -> Option<Opened> {
+    if let Some(shared) = started(saved) {
+        let mut device = lock(&shared);
+        if let Some(opened) = device
+            .cache(conversation_id)
+            .and_then(|cache| cache.rows.get(message_id).cloned())
+        {
+            return Some(opened);
+        }
+    }
+    let secrets = saved.e2ee.as_ref()?;
+    let (_, cache_key) = secrets.keys()?;
+    let cache = Cache::load(&dir_of(saved), conversation_id, &cache_key);
+    cache.rows.get(message_id).cloned()
+}
+
+/// Writes one opened line into the sealed cache (lab prove and unit tests).
+pub(crate) fn write_opened_cache(
+    saved: &Saved,
+    conversation_id: &str,
+    message_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    let secrets = saved
+        .e2ee
+        .as_ref()
+        .ok_or("This device has no encryption keys.")?;
+    let (_, cache_key) = secrets
+        .keys()
+        .ok_or("This device's keys are unreadable.")?;
+    private_dir(&dir_of(saved)).map_err(|err| err.to_string())?;
+    let mut cache = Cache::load(&dir_of(saved), conversation_id, &cache_key);
+    cache.put(
+        &cache_key,
+        message_id,
+        Opened {
+            text: text.to_owned(),
+            ..Opened::default()
+        },
+    );
+    Ok(())
 }
 
 /// Signs this install in as a device: called when the account starts. Never fails the account.

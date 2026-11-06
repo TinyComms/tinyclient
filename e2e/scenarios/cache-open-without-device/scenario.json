@@ -1,0 +1,12 @@
+{
+  "id": "cache-open-without-device",
+  "title": "A history fetch before the MLS device is started restores opened text from the sealed cache",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd against a localhost sealed cache. The same open_rows path is what this desktop run checks.",
+    "ios": "The phone proof build does not run desktop chatd against a localhost sealed cache. The same open_rows path is what this desktop run checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
