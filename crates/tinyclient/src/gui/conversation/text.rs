@@ -187,6 +187,23 @@ pub fn segments(layout: &TextLayout, range: &Range<usize>) -> Vec<Bounds<Pixels>
     parts(layout, range).into_iter().map(|(_, bounds)| bounds).collect()
 }
 
+/// One selection quad on a visual line. A failed caret must not paint a negative width: that
+/// fills a blue accent across the pane and can leave the next click looking stuck.
+pub(crate) fn selection_part(origin_x: Pixels, y: Pixels, left: Pixels, right: Pixels, line_height: Pixels) -> Bounds<Pixels> {
+    let width = (right - left).max(px(0.));
+    Bounds::new(point(origin_x + left, y), size(width, line_height))
+}
+
+/// The lab's selection-clamp driver. A backwards caret pair paints no width.
+pub(crate) fn prove_selection_clamp() -> Result<(), &'static str> {
+    let part = selection_part(px(10.), px(20.), px(80.), px(40.), px(16.));
+    if part.size.width == px(0.) && part.origin == point(px(90.), px(20.)) {
+        Ok(())
+    } else {
+        Err("a backwards selection caret pair would paint a negative accent")
+    }
+}
+
 /// The same, with the bytes each box holds.
 fn parts(layout: &TextLayout, range: &Range<usize>) -> Vec<(Range<usize>, Bounds<Pixels>)> {
     let origin = layout.bounds().origin;
@@ -205,7 +222,7 @@ fn parts(layout: &TextLayout, range: &Range<usize>) -> Vec<(Range<usize>, Bounds
                 let x_at = |caret: CaretPosition| line.visual_position_for_caret(caret, line_height).map_or(px(0.), |at| at.x);
                 let left = x_at(CaretPosition::attached_to_next_cluster(start - line_start));
                 let right = x_at(CaretPosition::attached_to_previous_cluster(end - line_start));
-                found.push((start..end, Bounds::new(point(origin.x + left, y), size(right - left, line_height))));
+                found.push((start..end, selection_part(origin.x, y, left, right, line_height)));
             }
             y += line_height;
         }
@@ -468,7 +485,17 @@ impl Element for Rich {
 
 #[cfg(test)]
 mod tests {
-    use super::orphan_break;
+    use super::{orphan_break, selection_part};
+    use gpui::{point, px};
+
+    #[test]
+    fn a_backwards_selection_caret_pair_does_not_paint_a_negative_width() {
+        let part = selection_part(px(10.), px(20.), px(80.), px(40.), px(16.));
+        assert_eq!(part.size.width, px(0.));
+        assert_eq!(part.origin, point(px(90.), px(20.)));
+        let forward = selection_part(px(10.), px(20.), px(40.), px(80.), px(16.));
+        assert_eq!(forward.size.width, px(40.));
+    }
 
     #[test]
     fn a_wrap_that_leaves_a_lone_question_mark_breaks_before_its_word() {

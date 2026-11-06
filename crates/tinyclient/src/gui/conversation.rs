@@ -1589,6 +1589,10 @@ fn stale_page(purpose: &Purpose, asked: u64, newest: u64) -> bool {
 }
 
 /// The lab's stale-page driver. A late empty newest page does not clear a newer read.
+pub(crate) fn prove_selection_clamp() -> Result<(), &'static str> {
+    text::prove_selection_clamp()
+}
+
 pub(crate) fn prove_stale_page() -> Result<(), &'static str> {
     if stale_page(&Purpose::Newest, 1, 2)
         && stale_page(&Purpose::Open, 1, 2)
