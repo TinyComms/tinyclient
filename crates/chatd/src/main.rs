@@ -48,6 +48,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-exit:0");
         return Ok(());
     }
+    // Exercise an open through the real Tiny adapter command loop.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("tiny-open-backfill") {
+        if let Err(err) = chatd::adapters::tiny::prove_tiny_open_backfill() {
+            eprintln!("tiny-open-backfill: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
     // The lab's cache-open-without-device driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("cache-open-without-device") {
         if let Err(err) = chatd::adapters::tiny::prove_cache_open_without_device() {

@@ -858,6 +858,48 @@ pub(super) fn prove_keep_opened_sealed() -> Result<(), String> {
     }
 }
 
+/// Opening a Tiny chat reaches the real adapter command loop and fetches its history.
+pub(super) fn prove_tiny_open_backfill() -> Result<(), String> {
+    const ME: &str = "11111111-1111-1111-1111-111111111111";
+    const PEER: &str = "22222222-2222-2222-2222-222222222222";
+    let base = super::serve(|request| {
+        let body = if request.starts_with("GET /v1/conversations/direct-1/messages?") {
+            json!({"messages":[{"id":"m-backfill","author_id":PEER,"body":"fetched after open","created_at":"2024-01-02T03:04:05Z"}]})
+        } else if request.starts_with("GET /v1/channels ") {
+            json!({"channels":[]})
+        } else if request.starts_with("GET /v1/directs ") {
+            json!({"directs":[{"id":"direct-1","peer":{"user_id":PEER,"display_name":"Bea"}}]})
+        } else if request.starts_with("GET /v1/members ") || request.starts_with("GET /v1/rooms ") {
+            json!([])
+        } else {
+            return super::http(404, "Not Found", "{}");
+        };
+        super::http(200, "OK", &body.to_string())
+    });
+    let saved = Saved {
+        base_url: base, token: "fixture-token".to_owned(), user_id: ME.to_owned(),
+        email: None, display_name: "Ada".to_owned(), role: "member".to_owned(),
+        plain_http_ok: false, e2ee: None,
+    };
+    let hub = std::sync::Arc::new(crate::hub::Hub::new(
+        crate::store::Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?,
+    ));
+    let account = protocol::AccountKey { network: protocol::Network::Tiny, account: ME.to_owned() };
+    let (adapter, ctx, inbox) = crate::adapters::local(account, hub);
+    super::start(ctx.clone(), &serde_json::to_string(&saved).map_err(|err| err.to_string())?, inbox)?;
+    adapter.command(Command::Backfill("direct-1".to_owned()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if let Some(message) = ctx.stored_message("direct-1", "m-backfill").map_err(|err| err.to_string())? {
+            return if message.text == "fetched after open" { Ok(()) } else { Err("backfill stored the wrong text".to_owned()) };
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("opening the chat never fetched history".to_owned());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 fn merge_reaction(ctx: &Context, saved: &Saved, frame: &Value) {
     let conversation_id = field(frame, "conversation_id");
     let message_id = field(frame, "message_id");
@@ -2352,6 +2394,11 @@ mod tests {
         ctx.link(protocol::Link::Offline);
         refresh(&ctx, &saved);
         assert_eq!(ctx.hub.capabilities(&ctx.account).max_file_bytes, 2_097_152);
+    }
+
+    #[test]
+    fn an_open_backfill_reaches_the_running_tiny_adapter() {
+        assert_eq!(super::prove_tiny_open_backfill(), Ok(()));
     }
 
     #[test]

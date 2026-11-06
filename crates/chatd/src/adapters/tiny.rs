@@ -26,6 +26,11 @@ pub fn prove_missing_seal() -> Result<(), String> {
     messages::prove_missing_seal()
 }
 
+/// The lab's adapter backfill proof.
+pub fn prove_tiny_open_backfill() -> Result<(), String> {
+    messages::prove_tiny_open_backfill()
+}
+
 /// The lab's sealed-preview proof. See `messages::prove_sealed_preview`.
 pub fn prove_sealed_preview() -> Result<(), String> {
     messages::prove_sealed_preview()
@@ -1141,7 +1146,7 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
                 &ctx,
                 inbox,
                 Duration::from_millis(200),
-                |_| {},
+                |id| messages::serve(&ctx, &saved, &live, Command::Backfill(id.to_owned())),
                 |command| match command {
                     Command::Tiny(ask) => live.ask(ask),
                     // chatd's call in a room ended (hung up, or failed), or its mute changed.
