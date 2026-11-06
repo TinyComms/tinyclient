@@ -7,6 +7,14 @@ fn main() -> io::Result<()> {
         println!("chatd {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    // The lab's leave-chime driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("leave-chime") {
+        if let Err(err) = chatd::leave_prove::run() {
+            eprintln!("leave-chime: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     // The lab's sealed-row driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("sealed-row") {
         if let Err(err) = chatd::adapters::tiny::prove_missing_seal() {

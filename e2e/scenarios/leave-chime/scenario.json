@@ -1,0 +1,12 @@
+{
+  "id": "leave-chime",
+  "title": "The person who hangs up hears the leave chime",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd against a localhost voice server. The chime is played by the same call code this desktop run hangs up.",
+    "ios": "The phone proof build does not run desktop chatd against a localhost voice server. The chime is played by the same call code this desktop run hangs up."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

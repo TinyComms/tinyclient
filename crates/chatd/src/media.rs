@@ -949,8 +949,10 @@ impl Calls {
     }
 
     /// Ends whatever is in the slot: hangs up, declines the ring, dismisses the failure. Gives the
-    /// conversation it was in. Dropping the call waits for mediad to exit.
+    /// conversation it was in. Dropping the call waits for mediad to exit. A call that had
+    /// joined plays the leave chime first, while mediad can still store it.
     pub fn end(&self, hub: &Hub) -> Option<Key> {
+        self.cue_if_joined(hub, None);
         let ended = match std::mem::take(&mut *crate::hub::lock(&self.slot)) {
             Slot::Idle => return None,
             Slot::Shown(live) => live.call.conversation.clone(),
@@ -1318,8 +1320,10 @@ impl Calls {
     }
 
     /// Ends the call if it is in `conversation`, in whatever state, without telling the
-    /// adapter: the network already knows. True if there was one.
+    /// adapter: the network already knows. A joined call plays the leave chime for the
+    /// person hanging up. True if there was one.
     pub fn end_if(&self, hub: &Hub, conversation: &Key) -> bool {
+        self.cue_if_joined(hub, Some(conversation));
         let ended = {
             let mut slot = crate::hub::lock(&self.slot);
             let here = match &*slot {
@@ -1335,6 +1339,24 @@ impl Calls {
         drop(ended);
         self.tell(hub);
         true
+    }
+
+    /// Stores the leave chime before mediad is dropped. Hang-up closes its input, and a cue
+    /// written after that never plays. A ring, or a call that never joined, stays quiet.
+    fn cue_if_joined(&self, hub: &Hub, conversation: Option<&Key>) {
+        let joined = {
+            let slot = crate::hub::lock(&self.slot);
+            match &*slot {
+                Slot::Active(active) => {
+                    let live = crate::hub::lock(&active.live);
+                    live.call.state == CallState::Joined && conversation.is_none_or(|id| live.call.conversation == *id)
+                }
+                _ => false,
+            }
+        };
+        if joined {
+            let _ = self.request(hub, &MediaRequest::Cue { cue: Cue::Left });
+        }
     }
 }
 
