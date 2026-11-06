@@ -45,6 +45,23 @@ pub(crate) fn prove_focus_ring() -> Result<(), &'static str> {
     }
 }
 
+/// The lab's health-grade driver. A green link does not hide a dry speaker.
+pub(crate) fn prove_health_grade() -> Result<(), &'static str> {
+    let dry = call::health::Health {
+        underruns: Some(3),
+        steady: Some(call::health::Grade::Great),
+        rtt_ms: Some(40),
+        jitter_ms: Some(2),
+        loss_permille: Some(0),
+        ..call::health::Health::default()
+    };
+    if dry.grade() == call::health::Grade::Poor {
+        Ok(())
+    } else {
+        Err("a green link hid a dry speaker")
+    }
+}
+
 /// The lab's cancel-join driver. A leave is accepted while a join is still in flight.
 pub(crate) fn prove_cancel_join() -> Result<(), &'static str> {
     if tiny::call_accepts(true, true) && !tiny::call_accepts(true, false) {

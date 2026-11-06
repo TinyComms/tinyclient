@@ -1,0 +1,12 @@
+{
+  "id": "drift-empty",
+  "title": "An empty speaker ring does not move the drift control",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not start desktop mediad. The same drift check is in the library the phone links.",
+    "ios": "The phone proof build does not start desktop mediad. The same drift check is in the library the phone links."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 45
+}

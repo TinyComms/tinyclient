@@ -1,0 +1,12 @@
+{
+  "id": "health-grade",
+  "title": "A dry speaker is not shown as an excellent connection",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same grade is what a phone call shows.",
+    "ios": "The phone proof build does not run the desktop window. The same grade is what a phone call shows."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
