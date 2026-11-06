@@ -127,7 +127,11 @@ class HandshakeDeliveryGate:
         record = {"conn": cid, "gate_id": gate["id"], "device_id": device,
                   "conversation_id": gate["conversation_id"]}
         if key in self.pending:
-            log(dict(record, event="handshake_gate_capacity"))
+            # The app's ordinary 10s HTTP deadline is shorter than this bounded
+            # fixture gate. Keep its first slot held, refuse reconnects without
+            # forwarding and never extend the shared deadline. This is expected
+            # fault setup, not an extra held slot or successful handshake.
+            log(dict(record, event="handshake_gate_retry_refused"))
             return False
         self.pending.add(key)
         deadline = self.deadline

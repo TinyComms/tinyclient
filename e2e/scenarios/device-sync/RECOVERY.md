@@ -34,6 +34,9 @@ Retain any other intentional fault controls.
 }
 ```
 
+The attach-only phase driver is documented in [RECOVERY-RUN.md](RECOVERY-RUN.md).
+It starts/stops no app and retains explicit checkpoints for recorded native actions.
+
 Set `expires_at` to the current Unix time plus the bounded duration, rather than
 copying the example timestamp. The hard maximum is 120 seconds, with at most
 one pending request per named device and at most two named devices. The first
@@ -56,7 +59,11 @@ extending its deadline cannot release requests or let retries bypass an armed
 gate. Do not use the existing `Linker.proxy(...)` helper while gated: that
 helper replaces the whole control file. Observe `handshake_gate_held`,
 `handshake_gate_released`, `handshake_gate_timeout` and
-`handshake_gate_capacity` records in `wire.jsonl`. Held events contain public
+`handshake_gate_capacity` records in `wire.jsonl`. The normal client HTTP timeout
+is shorter than this gate. Retries while the first request is pending receive an
+intentional 503 and `handshake_gate_retry_refused`; this is expected fault setup,
+never successful delivery or cryptographic proof. It occupies no additional slot,
+forwards nothing and cannot extend the shared deadline. Held events contain public
 gate/conversation/device IDs, never tokens, bodies, keys or query strings.
 
 ## Deterministic red sequence

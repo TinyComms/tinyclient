@@ -174,3 +174,24 @@ class HandshakeDeliveryGateTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"503 Service Unavailable", await asyncio.wait_for(retry.read(), 1))
         self.assertEqual(self.forwarded, [])
         self.assertIn(b"503 Service Unavailable", await asyncio.wait_for(held.read(), 1))
+
+    async def test_client_timeout_retries_are_explicit_setup_refusals_until_exact_release(self):
+        # Real app HTTP deadline is 10s, shorter than the bounded native-action
+        # gate. Model that disconnect without waiting ten wall-clock seconds.
+        await self.request()
+        await self.wait_for_event("handshake_gate_held")
+        original = self.writers[-1]
+        original.close()
+        await original.wait_closed()
+        for _ in range(3):
+            retry = await self.request()
+            self.assertIn(b"503 Service Unavailable", await asyncio.wait_for(retry.read(), 1))
+        events = self.records()
+        self.assertEqual(sum(row.get("event") == "handshake_gate_retry_refused" for row in events), 3)
+        self.assertFalse(any(row.get("event") == "handshake_gate_capacity" for row in events))
+        self.assertEqual(self.forwarded, [])
+        self.gate["state"] = "released"
+        self.set_gate()
+        await self.wait_for_event("handshake_gate_released")
+        live = await self.request()
+        self.assertIn(b"200 OK", await asyncio.wait_for(live.read(), 1))
