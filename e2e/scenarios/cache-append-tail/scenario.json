@@ -1,0 +1,16 @@
+{
+  "id": "cache-append-tail",
+  "title": "Encrypted cache records survive appends after an interrupted write",
+  "platforms": [
+    "windows",
+    "linux",
+    "macos"
+  ],
+  "not_applicable": {
+    "android": "This driver executes the desktop chatd cache proof; mobile uses the same cache code but no native mobile runtime proof is claimed.",
+    "ios": "This driver executes the desktop chatd cache proof; mobile uses the same cache code but no native mobile runtime proof is claimed."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

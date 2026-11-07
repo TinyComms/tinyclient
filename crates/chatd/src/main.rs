@@ -84,6 +84,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-exit:0");
         return Ok(());
     }
+    // A torn cache tail must not absorb the next complete encrypted record.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("cache-append-tail") {
+        if let Err(err) = chatd::adapters::tiny::prove_cache_append_tail() {
+            eprintln!("cache-append-tail: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-cache-append-tail:0");
+        return Ok(());
+    }
     // The lab's keep-opened-sealed driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("keep-opened-sealed") {
         if let Err(err) = chatd::adapters::tiny::prove_keep_opened_sealed() {
