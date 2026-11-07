@@ -35,13 +35,14 @@ not replace screenshots or window actions. Recordings follow `e2e/README.md`
 (recorder before first step, playable mp4, ≥360px short side, SHA/step burn-in,
 `steps.jsonl` / `proof.json`).
 
-The pixel oracle uses Pillow/pytesseract when installed, otherwise the Windows OCR
-API with a configured language. Missing OCR or a missing window is setup-incomplete. Both phases
+The conversation pixel oracle uses the Windows OCR API with a configured language.
+Missing OCR or a missing window is setup-incomplete. Both phases
 must observe the exact server-assigned message ID in a scoped messages page;
 an empty page while asynchronous backfill is running is never history-loss RED.
-The peer row is selected from its unique visible name and OCR word bounds in the
-sidebar, with foreground/hit-PID guards. Missing or ambiguous text sends no click;
-the fixture does not supply guessed coordinates.
+The peer is opened through the normal Ctrl+K Jump command, with literal query text
+observed before Enter and foreground-PID guards. There are no guessed coordinates.
+Message pixels are checked below the fresh-conversation intro in the opened pane;
+a matching sidebar preview cannot pass that assertion.
 Use a single-word synthetic display name per peer (for example Ada and Bea);
 preflight rejects unsupported names before any profile is changed.
 

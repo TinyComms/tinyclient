@@ -60,18 +60,6 @@ def click(pid: int, x: int, y: int) -> None:
     _ps(["-ExpectedPid", str(pid), "-Action", "click", "-X", str(x), "-Y", str(y)])
 
 
-def sidebar_word_center(words, width, name):
-    candidates = [word for word in words
-                  if word.get("text", "").casefold() == name.casefold()
-                  and 0 <= word.get("x", -1) < min(300, width * 0.3)
-                  and word.get("y", 0) >= 50
-                  and word.get("width", 0) > 0 and word.get("height", 0) > 0]
-    if len(candidates) != 1:
-        raise NativeError("no unique visible peer name in the sidebar; no click sent")
-    word = candidates[0]
-    return (round(word["x"] + word["width"] / 2), round(word["y"] + word["height"] / 2))
-
-
 def windows_ocr(path):
     done = subprocess.run([
         "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -82,21 +70,21 @@ def windows_ocr(path):
     return json.loads(done.stdout)
 
 
-def select_sidebar_peer(pid, name, screenshot, seconds=15):
-    """One click, located from observed text rather than configured coordinates."""
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        prepare(pid)
-        shot(pid, screenshot)
-        observed = windows_ocr(screenshot)
-        try:
-            x, y = sidebar_word_center(observed.get("words", []), rect(pid)["width"], name)
-        except NativeError:
-            time.sleep(0.5)
-            continue
-        click(pid, x, y)  # Foreground and hit-PID checked by owned_input.ps1.
-        return {"x": x, "y": y, "name": name}
-    raise NativeError("peer name never became uniquely visible; no click sent")
+def select_sidebar_peer(pid, name, screenshot):
+    """Use the app's normal Jump command, with query pixels checked before Enter."""
+    prepare(pid)
+    _ps(["-ExpectedPid", str(pid), "-Action", "type", "-Text", "^k"])
+    time.sleep(0.4)
+    # SendKeys treats these characters as commands unless escaped.
+    literal = "".join("{{}" if ch == "{" else "{}}" if ch == "}" else
+                      "{" + ch + "}" if ch in "+^%~()[]" else ch for ch in name)
+    _ps(["-ExpectedPid", str(pid), "-Action", "type", "-Text", literal])
+    time.sleep(0.7)
+    shot(pid, screenshot)
+    if name.casefold() not in windows_ocr(screenshot)["text"].casefold():
+        raise NativeError("peer query is not visible in Jump; refused Enter")
+    _ps(["-ExpectedPid", str(pid), "-Action", "type", "-Text", "{ENTER}"])
+    return {"method": "ctrl-k query enter", "name": name}
 
 
 def rect(pid: int) -> dict:
@@ -134,6 +122,21 @@ def png_mentions_marker(path: str, marker: str) -> bool | None:
         except Exception:
             return None
     return marker in "".join(text.split())
+
+
+def conversation_mentions_marker(path, marker):
+    try:
+        words = windows_ocr(path)["words"]
+        anchors = [word for word in words if word.get("text", "").casefold() == "this"
+                   and word.get("x", 0) >= 300 and word.get("y", 0) >= 50]
+        if not anchors:
+            return None  # No fresh-conversation intro; a sidebar preview cannot certify the pane.
+        anchor = min(anchors, key=lambda word: word["x"])
+        text = "".join(word["text"] for word in words
+                       if word["x"] >= anchor["x"] and word["y"] > anchor["y"] + anchor["height"])
+        return marker in "".join(text.split())
+    except Exception:
+        return None
 
 
 def require_windows() -> None:

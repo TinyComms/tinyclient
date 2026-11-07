@@ -293,14 +293,14 @@ def main() -> int:
         step("receiver window is visible under the fault", shown)
         if not shown:
             return incomplete("receiver window never appeared")
-        step("select the peer from visible sidebar text under the fault", True)
+        step("open the peer through Jump under the fault", True)
         peer_name = sender["session"]["display_name"]
         selected = native.select_sidebar_peer(window.pid, peer_name, str(shots / "before-select-during.png"))
         fixture.write_receipt(OUT, "during-navigation.json", selected)
         time.sleep(2.0)
         during_shot = str(shots / "during-fault.png")
         native.shot(window.pid, during_shot, printwindow=False)
-        during_pixels = native.png_mentions_marker(during_shot, marker)
+        during_pixels = native.conversation_mentions_marker(during_shot, marker)
         step("during-fault window captured for pixel review", True, "shots/during-fault.png")
         if during_pixels is None:
             return incomplete("pixel text oracle unavailable; no native proof claimed")
@@ -358,13 +358,13 @@ def main() -> int:
         step("receiver window is visible after restart", shown)
         if not shown:
             return incomplete("receiver window never appeared after restart")
-        step("select the peer from visible sidebar text after restart", True)
+        step("open the peer through Jump after restart", True)
         selected = native.select_sidebar_peer(window.pid, peer_name, str(shots / "before-select-after.png"))
         fixture.write_receipt(OUT, "after-navigation.json", selected)
         time.sleep(2.0)
         after_shot = str(shots / "after-restart.png")
         native.shot(window.pid, after_shot, printwindow=False)
-        after_pixels = native.png_mentions_marker(after_shot, marker)
+        after_pixels = native.conversation_mentions_marker(after_shot, marker)
         step("after-restart window captured for pixel review", True, "shots/after-restart.png")
         if after_pixels is None:
             return incomplete("pixel text oracle unavailable after restart")
