@@ -1,0 +1,12 @@
+{
+  "id": "pane-focus-pointer",
+  "title": "A mouse press on scroll chrome does not focus the pane",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same mouse-press rule applies to phone scroll frames.",
+    "ios": "The phone proof build does not run the desktop window. The same mouse-press rule applies to phone scroll frames."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

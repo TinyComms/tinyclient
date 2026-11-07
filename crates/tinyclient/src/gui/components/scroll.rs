@@ -309,8 +309,12 @@ impl RenderOnce for ScrollFrame {
                             .clamp(-limit, 0.));
                             down_target.set(offset);
                         }
-                        if let Some(focus) = &down_focus {
-                            window.focus(focus, cx);
+                        // Thumb and track presses scroll; they must not steal focus onto the
+                        // frame. Keyboard focus stays on Tab / programmatic focus only.
+                        if scrollbar_press_focuses_frame() {
+                            if let Some(focus) = &down_focus {
+                                window.focus(focus, cx);
+                            }
                         }
                         window.prevent_default();
                         cx.stop_propagation();
@@ -402,8 +406,17 @@ impl RenderOnce for ScrollFrame {
                     .focus_visible(|style| style.shadow(frame_focus_ring()))
             })
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                if self.keyboard && !click_focus.contains_focused(window, cx) {
+                // GPUI's track_focus registers an earlier bubble listener that focuses
+                // this frame on every press unless default is prevented. Call that here
+                // (still before the auto-focus listener in reverse registration order)
+                // so empty chrome does not steal focus from controls.
+                if mouse_press_focuses_scroll_frame(
+                    self.keyboard,
+                    click_focus.contains_focused(window, cx),
+                ) {
                     window.focus(&click_focus, cx);
+                } else {
+                    window.prevent_default();
                 }
             })
             .on_key_down(move |event, window, cx| {
@@ -457,6 +470,24 @@ pub(crate) fn scrollbar_mouseup_releases_pointer(had_grab: bool) -> bool {
     had_grab
 }
 
+/// Whether a left press on empty scroll chrome should move focus onto the frame.
+///
+/// GPUI's `track_focus` auto-focuses on mouse press. Allowing that on scroll frames
+/// made every keyboard-enabled pane look "active" (blue inset ring once any key set
+/// keyboard modality) and stole focus from controls, so later clicks felt dead. When
+/// this returns false the frame's mouse-down handler calls `prevent_default` so the
+/// auto-focus transfer is skipped. Tab still focuses the frame for page keys;
+/// `focus_visible` keeps the ring keyboard-only.
+pub(crate) fn mouse_press_focuses_scroll_frame(keyboard: bool, contains_focused: bool) -> bool {
+    let _ = (keyboard, contains_focused);
+    false
+}
+
+/// Whether a scrollbar thumb or track press should focus the scroll frame.
+pub(crate) fn scrollbar_press_focuses_frame() -> bool {
+    false
+}
+
 /// The lab's scroll-release driver. A thumb drag's mouse-up releases the pointer.
 pub(crate) fn prove_scroll_release() -> Result<(), &'static str> {
     if scrollbar_mouseup_releases_pointer(true) && !scrollbar_mouseup_releases_pointer(false) {
@@ -466,9 +497,30 @@ pub(crate) fn prove_scroll_release() -> Result<(), &'static str> {
     }
 }
 
+/// The lab's pane-focus-pointer driver. A mouse press on scroll chrome must not
+/// move focus onto the frame (Tab still can; the ring stays keyboard-only).
+pub(crate) fn prove_pane_focus_pointer() -> Result<(), &'static str> {
+    if mouse_press_focuses_scroll_frame(true, false) {
+        return Err("a mouse press on scroll chrome still moves focus onto the frame");
+    }
+    if mouse_press_focuses_scroll_frame(true, true) {
+        return Err("a mouse press focuses the frame even when a descendant is focused");
+    }
+    if mouse_press_focuses_scroll_frame(false, false) {
+        return Err("a non-keyboard scroll frame takes focus from a mouse press");
+    }
+    if scrollbar_press_focuses_frame() {
+        return Err("a scrollbar press still moves focus onto the frame");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{frame_focus_ring, scrollbar_mouseup_releases_pointer, thumb};
+    use super::{
+        frame_focus_ring, mouse_press_focuses_scroll_frame, scrollbar_mouseup_releases_pointer,
+        scrollbar_press_focuses_frame, thumb,
+    };
     #[test]
     fn thumb_tracks_endpoints_and_clamps() {
         assert_eq!(thumb(200., 200., 600., 0.), (0., 50.));
@@ -491,6 +543,20 @@ mod tests {
     fn a_scrollbar_mouseup_releases_the_captured_pointer() {
         assert!(scrollbar_mouseup_releases_pointer(true));
         assert!(!scrollbar_mouseup_releases_pointer(false));
+    }
+
+    #[test]
+    fn a_mouse_press_does_not_focus_the_scroll_frame() {
+        assert!(
+            !mouse_press_focuses_scroll_frame(true, false),
+            "empty chrome must not steal focus on mouse press"
+        );
+        assert!(!mouse_press_focuses_scroll_frame(true, true));
+        assert!(!mouse_press_focuses_scroll_frame(false, false));
+        assert!(
+            !scrollbar_press_focuses_frame(),
+            "a scrollbar press must not focus the frame"
+        );
     }
 }
 
@@ -576,6 +642,36 @@ mod interaction_tests {
         );
         window.draw();
         window.read(|page, _| assert!(page.scroll.offset().y < px(0.)));
+    }
+
+    #[test]
+    fn a_mouse_click_keeps_focus_off_the_scroll_frame_and_clicks_still_work() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window(|_, cx| Page {
+            scroll: ScrollHandle::new(),
+            clicks: Rc::new(Cell::new(0)),
+            control: cx.focus_handle(),
+            keys: 0,
+        });
+        window.draw();
+        window.update(|page, window, cx| window.focus(&page.control, cx));
+        window.draw();
+        window.update(|page, window, _| assert!(page.control.is_focused(window)));
+        let bounds = window.read(|page, _| page.scroll.bounds());
+        // Empty chrome below the control: must not steal focus onto the frame.
+        window.simulate_click(
+            bounds.origin + point(px(20.), px(80.)),
+            MouseButton::Left,
+        );
+        window.draw();
+        window.update(|page, window, _| {
+            assert!(
+                page.control.is_focused(window),
+                "a mouse press on scroll chrome stole focus from the control"
+            );
+        });
+        window.simulate_click(bounds.origin + point(px(20.), px(20.)), MouseButton::Left);
+        window.read(|page, _| assert_eq!(page.clicks.get(), 1));
     }
 
     #[test]

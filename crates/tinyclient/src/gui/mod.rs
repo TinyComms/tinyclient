@@ -91,6 +91,11 @@ pub(crate) fn prove_scroll_release() -> Result<(), &'static str> {
     components::scroll::prove_scroll_release()
 }
 
+/// The lab's pane-focus-pointer driver. A mouse press on scroll chrome does not focus the frame.
+pub(crate) fn prove_pane_focus_pointer() -> Result<(), &'static str> {
+    components::scroll::prove_pane_focus_pointer()
+}
+
 /// The lab's selection-clamp driver. A backwards caret pair paints no accent width.
 pub(crate) fn prove_selection_clamp() -> Result<(), &'static str> {
     conversation::prove_selection_clamp()
