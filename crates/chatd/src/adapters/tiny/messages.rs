@@ -431,9 +431,11 @@ fn direct_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, 
     row.group = Some("directs".to_owned());
     row.peer = Some(direct.peer.user_id.clone());
     row.position = DIRECTS_AT;
-    let history = direct.plaintext_history || (paired && ctx.known(&direct.id).ok().flatten()
-        .is_some_and(|row| row.encryption == Encryption::EndToEndAfterPlain));
-    row.encryption = encryption_of(saved, &direct.id, direct.e2ee, history);
+    // A replayed creation predates any later upgrade. It can add encryption, never remove it.
+    let kept = if paired { ctx.known(&direct.id).ok().flatten().map(|row| row.encryption) } else { None };
+    let sealed = direct.e2ee || kept.is_some_and(|encryption| encryption.is_sealed());
+    let history = direct.plaintext_history || kept == Some(Encryption::EndToEndAfterPlain);
+    row.encryption = encryption_of(saved, &direct.id, sealed, history);
     if ctx.conversation(&row).is_err() {
         return;
     }
@@ -2262,6 +2264,26 @@ mod tests {
             assert_eq!((rows[0].title.as_str(), rows[0].preview.as_str(), rows[0].unread), ("Bea", "hello Ada", 1));
             assert_eq!(rows[0].encryption, Encryption::EndToEndAfterPlain);
             assert_eq!(rows[0].last_read.as_deref(), Some("read-before"));
+        }
+    }
+
+    #[test]
+    fn a_stale_direct_creation_cannot_downgrade_an_encrypted_conversation() {
+        for encryption in [Encryption::EndToEnd, Encryption::EndToEndAfterPlain] {
+            for old_flag in [Some(false), None] {
+                let (_adapter, ctx) = open_ctx();
+                let saved = saved("http://127.0.0.1:1");
+                let mut row = ConversationRow::new("upgraded-direct", ConversationKind::Direct, "Bea");
+                row.encryption = encryption;
+                ctx.hub.store().upsert_conversation(&ctx.account, &row).unwrap();
+                let mut direct = json!({"id": "upgraded-direct", "low_user_id": ME, "high_user_id": PEER});
+                if let Some(flag) = old_flag { direct["e2ee"] = json!(flag); }
+                on_live(&ctx, &saved, &HashMap::new(), "direct.created", &json!({"direct": direct}));
+                assert_eq!(ctx.known("upgraded-direct").unwrap().unwrap().encryption, encryption,
+                    "stale e2ee={old_flag:?} must retain {encryption:?}");
+                assert_ne!(sealed_here(&ctx, &saved, "upgraded-direct"), Ok(false),
+                    "a creation replay must not permit plaintext sending");
+            }
         }
     }
 
