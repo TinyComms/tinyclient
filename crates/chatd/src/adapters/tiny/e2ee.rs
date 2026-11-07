@@ -392,7 +392,9 @@ impl Cache {
         }
         if let Ok(plain) = serde_json::to_vec(&opened) {
             if let Ok(blob) = e2ee::store::seal_cache_value(key, id.as_bytes(), &plain) {
-                let line = format!("{id} {}\n", STANDARD.encode(blob));
+                // An interrupted append may leave no newline. Fence the next complete record
+                // from that tail; readers already skip empty lines and invalid records.
+                let line = format!("\n{id} {}\n", STANDARD.encode(blob));
                 let written = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -405,6 +407,33 @@ impl Cache {
         }
         self.rows.insert(id.to_owned(), opened);
     }
+}
+
+/// Lab proof: interrupted cache writes cannot swallow the next complete encrypted record.
+pub fn prove_cache_append_tail() -> Result<(), String> {
+    for complete_tail in [false, true] {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let key = CacheKey::generate().map_err(|err| err.to_string())?;
+        let mut cache = Cache::load(dir.path(), "c1", &key);
+        cache.put(&key, "m1", Opened { text: "earlier words".into(), ..Opened::default() });
+        let tail = if complete_tail {
+            std::fs::read_to_string(&cache.path).map_err(|err| err.to_string())?.trim().to_owned()
+        } else {
+            "torn-id unfinished".to_owned()
+        };
+        std::fs::OpenOptions::new().append(true).open(&cache.path)
+            .and_then(|mut file| file.write_all(tail.as_bytes())).map_err(|err| err.to_string())?;
+        // Reopen as after a restart, then append a genuinely encrypted new record.
+        let mut cache = Cache::load(dir.path(), "c1", &key);
+        cache.put(&key, "m2", Opened { text: "later words".into(), ..Opened::default() });
+        let restored = Cache::load(dir.path(), "c1", &key);
+        for (id, words) in [("m1", "earlier words"), ("m2", "later words")] {
+            if restored.rows.get(id).map(|row| row.text.as_str()) != Some(words) {
+                return Err(format!("cache lost {id} after unterminated tail (complete_tail={complete_tail})"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// This install as a device of one person on one server.
@@ -2093,6 +2122,11 @@ mod live;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encrypted_records_appended_after_an_unterminated_tail_survive_restart() {
+        assert_eq!(prove_cache_append_tail(), Ok(()));
+    }
 
     #[test]
     fn a_recovery_key_is_128_bits_in_six_groups_and_reads_back() {

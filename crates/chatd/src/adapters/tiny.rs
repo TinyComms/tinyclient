@@ -51,6 +51,11 @@ pub fn prove_cache_before_enrol() -> Result<(), String> {
     messages::prove_cache_before_enrol()
 }
 
+/// The lab's cache-append-tail proof.
+pub fn prove_cache_append_tail() -> Result<(), String> {
+    e2ee::prove_cache_append_tail()
+}
+
 /// The lab's keep-opened-sealed proof. See `messages::prove_keep_opened_sealed`.
 pub fn prove_keep_opened_sealed() -> Result<(), String> {
     messages::prove_keep_opened_sealed()
