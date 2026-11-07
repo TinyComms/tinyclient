@@ -79,7 +79,7 @@ def wait_window(pid: int, seconds: float = 45.0) -> bool:
 def png_mentions_marker(path: str, marker: str) -> bool | None:
     """Best-effort pixel/text gate.
 
-    Returns True/False when Tesseract OCR is available. Missing/broken OCR returns
+    Uses Tesseract when installed, otherwise the Windows OCR API. Missing/broken OCR returns
     None, which must make the run incomplete rather than certifying IPC as pixels.
     """
     try:
@@ -88,7 +88,18 @@ def png_mentions_marker(path: str, marker: str) -> bool | None:
         image = Image.open(path)
         text = pytesseract.image_to_string(image)
     except Exception:
-        return None
+        try:
+            if sys.platform != "win32":
+                return None
+            done = subprocess.run([
+                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", str(HERE / "ocr.windows.ps1"), "-Path", str(Path(path).resolve()),
+            ], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
+            if done.returncode != 0:
+                return None
+            text = json.loads(done.stdout)["text"]
+        except Exception:
+            return None
     return marker in "".join(text.split())
 
 

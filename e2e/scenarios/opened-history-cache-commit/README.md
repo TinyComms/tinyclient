@@ -35,8 +35,8 @@ not replace screenshots or window actions. Recordings follow `e2e/README.md`
 (recorder before first step, playable mp4, ≥360px short side, SHA/step burn-in,
 `steps.jsonl` / `proof.json`).
 
-The pixel oracle requires Pillow, pytesseract, and a working Tesseract installation
-on the lab host. Missing OCR or a missing window is setup-incomplete. Both phases
+The pixel oracle uses Pillow/pytesseract when installed, otherwise the Windows OCR
+API with a configured language. Missing OCR or a missing window is setup-incomplete. Both phases
 must observe the exact server-assigned message ID in a scoped messages page;
 an empty page while asynchronous backfill is running is never history-loss RED.
 
