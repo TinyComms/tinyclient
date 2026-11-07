@@ -748,9 +748,9 @@ fn upgraded(ctx: &Context, saved: &Saved, frame: &Value) {
     }
 }
 
-/// When sqlite lost a sealed row but the sealed cache still has it, put that opened text back
+/// When sqlite lost a sealed row but the sealed cache still has it, put that opened value back
 /// into the store so the pane is not empty for the last line. Full older history still needs a
-/// fetch; this restores what the list already names.
+/// fetch; this restores what the list already names, including captionless attachments.
 fn rehydrate_opened(
     ctx: &Context,
     saved: &Saved,
@@ -767,18 +767,27 @@ fn rehydrate_opened(
     {
         return;
     }
-    let Some(text) = e2ee::opened_text(saved, conversation_id, &last.id) else {
+    let Some(opened) = e2ee::opened_row(saved, conversation_id, &last.id) else {
         return;
     };
+    let mut media = Vec::new();
+    let attachments = sealed_attachments(saved, &opened, &mut media);
+    if opened.text.trim().is_empty() && attachments.is_empty() {
+        return;
+    }
     let sender = if mine {
         String::new()
     } else {
         name_of(names, saved, &last.author_id)
     };
     let sent = rfc3339(&last.created_at).unwrap_or(0);
-    let mut message = Message::plain(&last.id, &sender, &text, sent, mine);
+    let mut message = Message::plain(&last.id, &sender, &opened.text, sent, mine);
     message.sender.id = last.author_id.clone();
     message.seal = Seal::Encrypted;
+    message.attachments = attachments;
+    if !media.is_empty() {
+        let _ = ctx.media(&media);
+    }
     let _ = ctx.history(conversation_id, &[message]);
 }
 
@@ -811,6 +820,144 @@ pub(super) fn prove_sealed_preview() -> Result<(), String> {
     } else {
         Err(format!("empty encrypted preview was {words:?}, not Encrypted message"))
     }
+}
+
+/// The lab's sealed-preview-attachments proof. A wiped sqlite row still restores a captionless
+/// image and a captioned attachment from the authenticated sealed cache. The lab sets
+/// `TINYCLIENT_PROVE=sealed-preview-attachments`.
+pub(super) fn prove_sealed_preview_attachments() -> Result<(), String> {
+    prove_rehydrate_attachment("", "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "photo.png")?;
+    prove_rehydrate_attachment(
+        "with a caption",
+        "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        "shot.jpg",
+    )?;
+    // Text-only rehydrate stays green beside the attachment cases.
+    prove_sealed_cache_preview()
+}
+
+fn prove_rehydrate_attachment(text: &str, file_id: &str, name: &str) -> Result<(), String> {
+    let secrets = e2ee::Secrets::generate().map_err(|err| err.to_string())?;
+    let saved = Saved {
+        base_url: "http://127.0.0.1:9".to_owned(),
+        token: "t".to_owned(),
+        user_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned(),
+        email: None,
+        display_name: "Ada".to_owned(),
+        role: "owner".to_owned(),
+        plain_http_ok: false,
+        e2ee: Some(secrets),
+    };
+    let conversation = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0";
+    let message_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let mime = if name.ends_with(".jpg") {
+        "image/jpeg"
+    } else {
+        "image/png"
+    };
+    e2ee::write_opened_row(
+        &saved,
+        conversation,
+        message_id,
+        e2ee::Opened {
+            text: text.to_owned(),
+            attachments: vec![e2ee::OpenedFile {
+                id: file_id.to_owned(),
+                key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+                name: name.to_owned(),
+                mime: mime.to_owned(),
+                bytes: 42,
+                sha256: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".to_owned(),
+                width: 640,
+                height: 480,
+            }],
+            ..e2ee::Opened::default()
+        },
+    )?;
+    let hub = std::sync::Arc::new(crate::hub::Hub::new(
+        crate::store::Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?,
+    ));
+    let account = protocol::AccountKey {
+        network: protocol::Network::Tiny,
+        account: saved.user_id.clone(),
+    };
+    let (_adapter, ctx, _inbox) = crate::adapters::local(account.clone(), hub);
+    let mut row = crate::store::ConversationRow::new(conversation, ConversationKind::Direct, "Bea");
+    row.encryption = Encryption::EndToEnd;
+    ctx.hub
+        .store()
+        .upsert_conversation(&account, &row)
+        .map_err(|err| err.to_string())?;
+    let last = WireLast {
+        id: message_id.to_owned(),
+        author_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc".to_owned(),
+        body: String::new(),
+        created_at: "2024-01-02T03:04:05Z".to_owned(),
+    };
+    let names = HashMap::new();
+    rehydrate_opened(&ctx, &saved, conversation, &last, false, &names);
+    let message = match ctx.stored_message(conversation, message_id).map_err(|err| err.to_string())? {
+        Some(message) => message,
+        None => {
+            return Err(format!(
+                "sealed cache did not rehydrate attachment row (text={text:?})"
+            ))
+        }
+    };
+    if message.seal != Seal::Encrypted {
+        return Err(format!("rehydrated seal was {:?}, not Encrypted", message.seal));
+    }
+    if message.text != text {
+        return Err(format!(
+            "rehydrated text was {:?}, not {text:?}",
+            message.text
+        ));
+    }
+    if message.attachments.len() != 1 {
+        return Err(format!(
+            "rehydrated attachments were {}, not 1 (text={text:?})",
+            message.attachments.len()
+        ));
+    }
+    let attachment = &message.attachments[0];
+    if attachment.file.id != file_id
+        || attachment.name != name
+        || attachment.mime != mime
+        || attachment.file.kind != MediaKind::Image
+        || attachment.file.width != 640
+        || attachment.file.height != 480
+        || attachment.file.bytes != 42
+    {
+        return Err(format!(
+            "rehydrated attachment metadata was wrong: id={} name={} mime={} kind={:?} {}x{} bytes={}",
+            attachment.file.id,
+            attachment.name,
+            attachment.mime,
+            attachment.file.kind,
+            attachment.file.width,
+            attachment.file.height,
+            attachment.file.bytes
+        ));
+    }
+    let registered = ctx
+        .hub
+        .store()
+        .media(&account, &[file_id.to_owned()])
+        .map_err(|err| err.to_string())?;
+    if registered.len() != 1 {
+        return Err(format!(
+            "rehydrated media was not registered (got {})",
+            registered.len()
+        ));
+    }
+    let expected_url = format!("http://127.0.0.1:9/v1/media/{file_id}");
+    if registered[0].1 != expected_url {
+        return Err(format!(
+            "registered media url was {:?}, not {expected_url}",
+            registered[0].1
+        ));
+    }
+    Ok(())
 }
 
 /// The lab's sealed-cache-preview proof. A wiped sqlite row still names the inbox from the sealed
@@ -2978,6 +3125,13 @@ mod tests {
     #[test]
     fn a_wiped_store_still_names_the_preview_from_the_sealed_cache() {
         assert_eq!(super::prove_sealed_cache_preview(), Ok(()));
+    }
+
+    /// After a sqlite wipe, a captionless image and a captioned attachment in the sealed cache
+    /// must rehydrate into the store with Seal::Encrypted and registered media.
+    #[test]
+    fn a_wiped_store_restores_cached_sealed_attachments() {
+        assert_eq!(super::prove_sealed_preview_attachments(), Ok(()));
     }
 
     /// After an update the MLS device may not be started yet. A history fetch must still restore

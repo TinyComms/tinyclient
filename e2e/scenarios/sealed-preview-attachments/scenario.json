@@ -1,0 +1,12 @@
+{
+  "id": "sealed-preview-attachments",
+  "title": "A wiped store restores captionless and captioned sealed attachments from the authenticated cache",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd against a localhost sealed cache. The same rehydrate path is what this desktop run checks.",
+    "ios": "The phone proof build does not run desktop chatd against a localhost sealed cache. The same rehydrate path is what this desktop run checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

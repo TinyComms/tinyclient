@@ -100,6 +100,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-exit:0");
         return Ok(());
     }
+    // The lab's sealed-preview-attachments driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("sealed-preview-attachments") {
+        if let Err(err) = chatd::adapters::tiny::prove_sealed_preview_attachments() {
+            eprintln!("sealed-preview-attachments: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
     // A torn cache tail must not absorb the next complete encrypted record.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("cache-append-tail") {
         if let Err(err) = chatd::adapters::tiny::prove_cache_append_tail() {
