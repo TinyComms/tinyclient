@@ -1812,7 +1812,7 @@ fn a_session_ended_elsewhere_keeps_what_was_read_and_signing_out_ends_it_on_tele
 
     let world = World::signed_in();
     world.connected();
-    world.ask(Request::SignOut { account: account() });
+    world.ask(Request::SignOut { account: account(), erase: false });
     assert_eq!(world.called("LogOut"), 1);
     assert!(world.conversation("u7002").is_none());
 }

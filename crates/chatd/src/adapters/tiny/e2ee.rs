@@ -122,7 +122,11 @@ pub(crate) fn with_secrets(session: &str, saved: &Saved, secrets: &Secrets) -> O
 
 /// The owner-only directory this account keeps its encrypted text state in.
 fn dir_of(saved: &Saved) -> PathBuf {
-    let safe: String = format!("Tiny-{}", saved.user_id)
+    dir_for(&saved.user_id)
+}
+
+fn dir_for(user_id: &str) -> PathBuf {
+    let safe: String = format!("Tiny-{user_id}")
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' {
@@ -433,15 +437,38 @@ struct Notes {
     /// Conversations whose server key changed: nothing is sent there until it is looked at.
     #[serde(default)]
     key_changed: BTreeSet<String>,
+    /// This person's devices as last listed: one not among them is "New device added".
+    #[serde(default)]
+    mine: BTreeSet<String>,
+    /// The person's devices added since they last looked, for the notice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    added: Vec<E2eeDevice>,
+    /// The person's own conversation (`POST /v1/e2ee/self`), where their devices talk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    self_conv: Option<String>,
+    /// A confirmed removal applies to this identity, never a later fresh identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revoked_device: Option<String>,
 }
 
 /// One opened message, as the cache keeps it.
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Opened {
     #[serde(default)]
     pub text: String,
+    /// Authenticated group generation for a locally opened/sent row. Legacy caches omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<Authentication>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_attribution: Option<cache_auth::SavedAttribution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    /// Sender's Unix milliseconds, authenticated inside the encrypted envelope. Absent in
+    /// older caches; never copied to server-visible message metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<OpenedFile>,
     /// An edit: the message it edits. Its text replaces the target's.
@@ -450,10 +477,21 @@ pub(crate) struct Opened {
     /// The newest edit folded into this message, by its id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edited_by: Option<String>,
+    /// When it was sent (Unix seconds), as the server dated it; 0 for a message opened before
+    /// this was kept. What a device link's "last N days" goes by.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub at: i64,
+    /// Not opened here: taken in from this device of the person by a device link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_from: Option<String>,
+}
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
 }
 
 /// An attachment of an opened message: enough to fetch and open it again.
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct OpenedFile {
     pub id: String,
     /// Base64 of the 32 byte key.
@@ -516,6 +554,8 @@ impl OpenedFile {
 #[derive(Clone)]
 pub(crate) enum Read {
     Opened(Opened),
+    /// Saved plaintext from before sender authentication was retained. Never a wire identity.
+    Legacy(Opened),
     /// An edit, folded into its target: not a row of its own.
     Edit,
     Undecryptable,
@@ -528,9 +568,13 @@ pub(crate) struct Row<'a> {
     pub kind: &'a str,
     pub ciphertext: Option<&'a str>,
     pub epoch: u64,
+    pub generation: Option<u64>,
+    pub group_id: Option<&'a str>,
     pub device_id: &'a str,
     pub target_id: Option<&'a str>,
     pub client_id: Option<&'a str>,
+    /// The server's `created_at`.
+    pub created_at: &'a str,
 }
 
 /// The sealed cache of one conversation: an append-only file of `id base64(sealed)` lines, each
@@ -715,6 +759,20 @@ pub(crate) struct Device {
     /// Conversations with a row that did not open because this device was not in the group, or
     /// not at its epoch, yet. Read again when the group's handshake next comes.
     unopened: BTreeSet<String>,
+    /// The server relays device links (`e2ee_device_link`).
+    linking: bool,
+    /// The adapter's inbox, once the account started.
+    commands: Option<std::sync::mpsc::Sender<crate::adapters::Command>>,
+    /// The largest archive one link carries (`e2ee_link_archive_max`).
+    link_max: u64,
+    /// The server has the person's own conversation (`e2ee_self`): their devices fill each
+    /// other's gaps there.
+    self_capable: bool,
+    /// The server fences independently signed cryptographic group generations.
+    generations: bool,
+    /// Scoped to a repair job while it holds this device lock.
+    operation_deadline: Option<std::time::Instant>,
+    siblings: siblings::Siblings,
 }
 
 type Shared = Arc<Mutex<Device>>;
@@ -741,8 +799,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// speak encrypted text.
 pub(crate) fn device(saved: &Saved) -> Shared {
     let key = (saved.base_url.clone(), saved.user_id.clone());
-    if let Some(found) = lock(devices()).get(&key) {
-        let found = found.clone();
+    // Never retain the registry guard while waiting for a device. Repair jobs briefly read
+    // the registry while holding their device to check that the account still owns it.
+    let found = { lock(devices()).get(&key).cloned() };
+    if let Some(found) = found {
         lock(&found).saved.token.clone_from(&saved.token);
         return found;
     }
@@ -839,28 +899,121 @@ pub(crate) fn write_opened_row(
 }
 
 /// Signs this install in as a device: called when the account starts. Never fails the account.
-pub(crate) fn begin(saved: &Saved) {
+/// `commands` is the adapter's own inbox: what this module took in by itself (a device link's
+/// history) is shown by asking the adapter to read those conversations again.
+pub(crate) fn begin(saved: &Saved, commands: std::sync::mpsc::Sender<crate::adapters::Command>) {
     let shared = device(saved);
     let mut device = lock(&shared);
+    device.commands = Some(commands);
     device.enrol();
 }
 
-/// Signing out: the device is revoked on the server, then forgotten here.
+/// Signing out: the device is revoked on the server and its state forgotten here. What it opened
+/// stays, sealed under the cache key [`keep_history`] keeps in the keychain, unless the person
+/// chose to erase it ([`erase_history`]); a later sign-in here is a new device that reads it.
 pub(crate) fn sign_out(saved: &Saved) {
+    let key = (saved.base_url.clone(), saved.user_id.clone());
     if let Some(shared) = started(saved) {
         let device = lock(&shared);
+        // First, while it is quick: the key, from the keys this device held.
+        if let Err(why) = keep_history(&device.saved) {
+            tracing::warn!("chatd: Tiny e2ee: the history key could not be kept: {why}");
+        }
         if let Some(engine) = device.engine.as_ref() {
             let id = engine.device_id().to_string();
             let _ = device.ask("DELETE", &format!("/v1/e2ee/devices/{id}"), None);
         }
     }
-    forget(saved);
+    lock(devices()).remove(&key);
+    lock(scratch_secrets()).remove(&key);
+    start_over(&dir_of(saved));
 }
 
-/// Forgets the account's device: its state, its cache and its notes.
-pub(crate) fn forget(saved: &Saved) {
-    lock(devices()).remove(&(saved.base_url.clone(), saved.user_id.clone()));
-    let _ = std::fs::remove_dir_all(dir_of(saved));
+/// The keychain item that keeps the cache keys of accounts signed out with their history kept:
+/// `{"<user id> <server>": "<base64 cache key>"}`. Taken back by the next sign-in of that account
+/// on this install, and dropped from here then.
+const KEPT: &str = "Tiny kept history";
+
+fn kept_name(user_id: &str, base_url: &str) -> String {
+    format!("{user_id} {base_url}")
+}
+
+/// What [`KEPT`] holds. An item that could not be read is an error, never taken for empty: it
+/// would be overwritten.
+fn kept() -> Result<BTreeMap<String, String>, String> {
+    Ok(crate::session::item::read(KEPT)?
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default())
+}
+
+fn save_kept(kept: &BTreeMap<String, String>) -> Result<(), String> {
+    if kept.is_empty() {
+        crate::session::item::forget(KEPT);
+        return Ok(());
+    }
+    let text = serde_json::to_string(kept).map_err(|err| err.to_string())?;
+    crate::session::item::save(KEPT, &text)
+}
+
+/// Signing out, keeping the history: the cache key of `saved` goes to [`KEPT`] before its
+/// session, which held it, is forgotten.
+pub(crate) fn keep_history(saved: &Saved) -> Result<(), String> {
+    let Some(secrets) = &saved.e2ee else {
+        return Ok(());
+    };
+    let mut all = kept()?;
+    all.insert(
+        kept_name(&saved.user_id, &saved.base_url),
+        secrets.cache.clone(),
+    );
+    save_kept(&all)
+}
+
+/// Signing out, erasing: this account's folder (what was opened, the notes) and its kept key.
+pub(crate) fn erase_history(user_id: &str) {
+    let _ = std::fs::remove_dir_all(dir_for(user_id));
+    if let Ok(mut all) = kept() {
+        let before = all.len();
+        all.retain(|name, _| !name.starts_with(&format!("{user_id} ")));
+        if all.len() != before {
+            let _ = save_kept(&all);
+        }
+    }
+}
+
+/// Removes everything a device of this folder kept but what it opened and what the person
+/// verified: the next device made here is a new one, and its handshake positions start again.
+fn start_over(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("cache-") && name.ends_with(".log") {
+            continue;
+        }
+        if name == "notes.json" {
+            let notes: Notes = std::fs::read(entry.path())
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+            let kept = Notes {
+                met: notes.met,
+                verified: notes.verified,
+                recovery: notes.recovery,
+                ..Notes::default()
+            };
+            if let Ok(bytes) = serde_json::to_vec(&kept) {
+                let _ = write_private(&entry.path(), &bytes);
+            }
+            continue;
+        }
+        let _ = if entry.path().is_dir() {
+            std::fs::remove_dir_all(entry.path())
+        } else {
+            std::fs::remove_file(entry.path())
+        };
+    }
 }
 
 fn uuid(text: &str) -> Option<[u8; 16]> {
@@ -999,6 +1152,24 @@ fn words(error: &Error) -> String {
 }
 
 impl Device {
+    fn revoked(&self) -> bool {
+        self.engine.as_ref().is_some_and(|engine| {
+            self.notes.revoked_device.as_deref() == Some(engine.device_id().to_string().as_str())
+        })
+    }
+
+    fn mark_revoked(&mut self) -> bool {
+        let Some(engine) = self.engine.as_ref() else { return false };
+        let id = engine.device_id().to_string();
+        let changed = self.notes.revoked_device.as_ref() != Some(&id) || self.state == DeviceState::Ready;
+        self.notes.revoked_device = Some(id);
+        self.state = DeviceState::Failed {
+            why: "This device was removed. Saved messages are still available.".to_owned(),
+        };
+        if changed { self.save_notes(); }
+        changed
+    }
+
     fn new(saved: &Saved) -> Device {
         Device {
             saved: saved.clone(),
@@ -1014,10 +1185,21 @@ impl Device {
             checked: BTreeSet::new(),
             joining: BTreeSet::new(),
             unopened: BTreeSet::new(),
+            linking: false,
+            commands: None,
+            link_max: linking::ARCHIVE_MAX,
+            self_capable: false,
+            generations: false,
+            operation_deadline: None,
+            siblings: siblings::Siblings::default(),
         }
     }
 
     fn ask(&self, method: &str, path: &str, body: Option<Value>) -> Result<(u16, Value), String> {
+        if let Some(deadline) = self.operation_deadline {
+            let remaining = deadline.checked_duration_since(std::time::Instant::now()).ok_or("Encryption update timed out. Try again to continue safely.")?;
+            return super::call_with_timeout(method, &super::endpoint(&self.saved.base_url, path), Some(&self.saved.token), body, remaining.min(super::TIMEOUT)).map_err(|_| super::UNREACHABLE.to_owned());
+        }
         super::asked(method, &self.saved, path, body).map_err(str::to_owned)
     }
 
@@ -1052,7 +1234,21 @@ impl Device {
             self.saved.e2ee = Some(kept.clone());
             return Ok(kept);
         }
-        let secrets = Secrets::generate()?;
+        let mut secrets = Secrets::generate()?;
+        // Signed out here before with the history kept: the cache key comes back, so what was
+        // opened then opens again. A state sealed under a key no session holds any more never
+        // opens: this is a new device.
+        let name = kept_name(&self.saved.user_id, &self.saved.base_url);
+        let mut kept = kept().unwrap_or_default();
+        let reused = kept.remove(&name);
+        if let Some(cache) = &reused {
+            secrets.cache.clone_from(cache);
+        }
+        start_over(&self.dir);
+        self.notes = std::fs::read(self.dir.join("notes.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
         if crate::session::enabled() {
             let saved = self.saved.clone();
             let fresh = secrets.clone();
@@ -1064,6 +1260,13 @@ impl Device {
             }
         } else {
             lock(scratch_secrets()).insert(key, secrets.clone());
+        }
+        if reused.is_some() {
+            if let Err(why) = save_kept(&kept) {
+                tracing::warn!(
+                    "chatd: Tiny e2ee: the kept history key could not be dropped: {why}"
+                );
+            }
         }
         self.saved.e2ee = Some(secrets.clone());
         Ok(secrets)
@@ -1079,6 +1282,12 @@ impl Device {
                 self.state = DeviceState::Failed { why };
             }
         }
+        if self.ready() {
+            // Startup can run while approval is still pending. Every successful enrollment,
+            // including the one after linking, must initialize the hidden sibling group.
+            let gained = self.catch_up().into_iter().collect();
+            self.reload(&gained);
+        }
     }
 
     fn try_enrol(&mut self) -> Result<DeviceState, String> {
@@ -1092,6 +1301,21 @@ impl Device {
             self.mode.clear();
             return Ok(DeviceState::Off);
         }
+        self.generations = body.get("features").and_then(Value::as_array)
+            .is_some_and(|all| all.iter().any(|feature| feature.as_str() == Some("e2ee_group_generations")));
+        self.self_capable = body
+            .get("features")
+            .and_then(Value::as_array)
+            .is_some_and(|all| all.iter().any(|f| f.as_str() == Some("e2ee_self")));
+        self.link_max = body
+            .get("e2ee_link_archive_max")
+            .and_then(Value::as_u64)
+            .filter(|most| *most > 0)
+            .unwrap_or(linking::ARCHIVE_MAX);
+        self.linking = body
+            .get("features")
+            .and_then(Value::as_array)
+            .is_some_and(|all| all.iter().any(|f| f.as_str() == Some("e2ee_device_link")));
         self.mode = body
             .get("e2ee_text")
             .and_then(Value::as_str)
@@ -1127,7 +1351,18 @@ impl Device {
             self.engine = Some(engine);
             self.cache_key = Some(cache_key);
         }
+        if self.revoked() {
+            self.mark_revoked();
+            return Ok(self.state.clone());
+        }
         self.register()
+    }
+
+    /// Makes or opens the engine (and with it the cache key) unless it is ready.
+    fn enrol_if_needed(&mut self) {
+        if self.engine.is_none() || self.state != DeviceState::Ready {
+            self.enrol();
+        }
     }
 
     fn engine(&mut self) -> Result<&mut Engine, String> {
@@ -1175,6 +1410,11 @@ impl Device {
                 Ok(DeviceState::AwaitingApproval {
                     code: link_code(device_id, &key),
                 })
+            }
+            400 if answer.get("error").and_then(Value::as_str) == Some("bad_device") => {
+                // This identity cannot be registered again after server-side removal.
+                self.mark_revoked();
+                Ok(self.state.clone())
             }
             status => Err(format!("The server refused this device ({status}).")),
         }
@@ -1244,8 +1484,12 @@ impl Device {
 
     /// Verifies `user_id`'s device list from the server into the trust store.
     fn verify_user(&mut self, user_id: &str) -> Result<(), String> {
-        let user = UserId::parse(user_id).map_err(|_| super::CHECK.to_owned())?;
         let rows = self.list(user_id)?;
+        self.verify_rows(user_id, &rows)
+    }
+
+    fn verify_rows(&mut self, user_id: &str, rows: &[Value]) -> Result<(), String> {
+        let user = UserId::parse(user_id).map_err(|_| super::CHECK.to_owned())?;
         let records: Vec<DeviceRecord> = rows
             .iter()
             .filter_map(|row| {
@@ -1285,20 +1529,26 @@ impl Device {
     }
 
     /// Whether `conversation_id` is end-to-end encrypted, as the server says. Asked once.
-    pub(crate) fn is_encrypted(&mut self, conversation_id: &str) -> bool {
-        if let Some(known) = self.encrypted.get(conversation_id) {
-            return *known;
+    pub(crate) fn is_encrypted(&mut self, conversation_id: &str) -> Result<bool, String> {
+        if self.engine.is_none() { return Ok(self.encrypted.get(conversation_id).copied().unwrap_or(false)); }
+        if ConversationId::parse(conversation_id).is_ok() {
+            // Durable cryptographic state wins over missing labels or an unavailable server.
+            let active = self.active(conversation_id)?;
+            if active.head_hash.is_some() { return Ok(true); }
         }
-        let known = match self.ask(
-            "GET",
-            &format!("/v1/e2ee/conversations/{conversation_id}"),
-            None,
-        ) {
-            Ok((200, body)) => body.get("e2ee").and_then(Value::as_bool).unwrap_or(false),
-            _ => return false,
+        if let Some(known) = self.encrypted.get(conversation_id) { return Ok(*known); }
+        let known = if self.generations {
+            let (_, body) = self.group_info(conversation_id)?;
+            body.get("e2ee").and_then(Value::as_bool).unwrap_or(false)
+        } else {
+            // Unknown legacy/plaintext conversations retain their original discovery behavior.
+            match self.ask("GET", &format!("/v1/e2ee/conversations/{conversation_id}"), None) {
+                Ok((200, body)) => body.get("e2ee").and_then(Value::as_bool).unwrap_or(false),
+                _ => false,
+            }
         };
         self.encrypted.insert(conversation_id.to_owned(), known);
-        known
+        Ok(known)
     }
 
     pub(crate) fn note_encrypted(&mut self, conversation_id: &str, encrypted: bool) {
@@ -1330,26 +1580,64 @@ impl Device {
             .collect()
     }
 
+    pub(crate) fn editable_attachments(&mut self, conversation_id: &str, message_id: &str) -> Result<Vec<AttachmentRef>, String> {
+        let user = self.engine()?.user_id();
+        let authenticated = self.cache(conversation_id).and_then(|cache| cache.rows.get(message_id))
+            .and_then(|opened| opened.auth.as_ref()).is_some_and(|auth| auth.author == user
+                && auth.kind == "message" && auth.conversation_id.to_string() == conversation_id);
+        if !authenticated { return Err("This saved message can't be edited.".to_owned()); }
+        Ok(self.attachments_of(conversation_id, message_id))
+    }
+
     pub(crate) fn ready(&self) -> bool {
         self.state == DeviceState::Ready && self.engine.is_some()
     }
 
     /// Brings this device's view of one conversation's group up to date: verifies the members,
     /// starts the group if nobody has, applies the handshake feed, and commits what is pending.
+    /// Has the adapter read these conversations' newest messages again, which now open from the
+    /// cache: they gained rows this device did not open itself.
+    fn reload(&self, conversations: &BTreeSet<String>) {
+        let Some(commands) = &self.commands else {
+            return;
+        };
+        for conversation in conversations {
+            let _ = commands.send(crate::adapters::Command::Backfill(conversation.clone()));
+        }
+    }
+
+    /// The encrypted conversations this device knows of: the ones the server said are, and the
+    /// ones it has opened messages of.
+    fn known_encrypted(&self) -> BTreeSet<String> {
+        let mut out: BTreeSet<String> = self
+            .encrypted
+            .iter()
+            .filter(|(_, encrypted)| **encrypted)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(conv) = name
+                    .strip_prefix("cache-")
+                    .and_then(|rest| rest.strip_suffix(".log"))
+                {
+                    if super::safe_id(conv) {
+                        out.insert(conv.to_owned());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub(crate) fn sync(&mut self, conversation_id: &str) -> Result<(), String> {
         if !self.ready() {
             return Err("This device isn't set up for encrypted messages yet.".to_owned());
         }
-        let conv = ConversationId(uuid(conversation_id).ok_or(super::CHECK)?);
         for _ in 0..PASSES {
-            let (status, info) = self.ask(
-                "GET",
-                &format!("/v1/e2ee/conversations/{conversation_id}"),
-                None,
-            )?;
-            if status != 200 {
-                return Err(super::explain(status, &info, super::Missing::Plain).to_owned());
-            }
+            let (active, info) = self.group_info(conversation_id)?;
+            let conv = active.group_id;
             if info.get("e2ee").and_then(Value::as_bool) != Some(true) {
                 self.note_encrypted(conversation_id, false);
                 self.joining.remove(conversation_id);
@@ -1397,11 +1685,9 @@ impl Device {
                 if info.get("epoch").is_none_or(Value::is_null) {
                     // Nobody has started it: this device does.
                     let device_id = self.engine()?.device_id().to_string();
-                    let (status, _) = self.ask(
-                        "POST",
-                        &format!("/v1/e2ee/conversations/{conversation_id}/group"),
-                        Some(json!({ "device_id": device_id })),
-                    )?;
+                    let mut body = json!({ "device_id": device_id });
+                    self.generation_body(&mut body, active.generation);
+                    let (status, _) = self.ask("POST", &format!("/v1/e2ee/conversations/{conversation_id}/group"), Some(body))?;
                     match status {
                         // The server adds the others now: the next pass reads who is waiting.
                         201 | 200 => {
@@ -1448,11 +1734,22 @@ impl Device {
         conv: ConversationId,
         server_key: &[u8],
     ) -> Result<bool, String> {
+        let active = self.active(conversation_id)?;
+        if active.group_id != conv { return Err("Encryption changed. Try again.".to_owned()); }
+        self.feed_at(conversation_id, conv, active.generation, server_key)
+    }
+
+    fn feed_at(&mut self, conversation_id: &str, conv: ConversationId, generation: u64, server_key: &[u8]) -> Result<bool, String> {
+        self.active(conversation_id)?;
+        let outer = ConversationId::parse(conversation_id).map_err(|_| super::CHECK.to_owned())?;
+        if self.engine()?.group_at(outer, generation).map_err(|err| words(&err))? != conv { return Err("Encryption changed. Try again.".to_owned()); }
+        let cursor = if generation == 0 { conversation_id.to_owned() } else { format!("{conversation_id}:{}", generation) };
         let device_id = self.engine()?.device_id().to_string();
         let mut moved = false;
-        loop {
-            let after = self.notes.seqs.get(conversation_id).copied().unwrap_or(0);
-            let (status, rows) = self.ask("GET", &format!("/v1/e2ee/conversations/{conversation_id}/handshake?after={after}&device_id={device_id}"), None)?;
+        for _ in 0..PASSES {
+            let after = self.notes.seqs.get(&cursor).copied().unwrap_or(0);
+            let path = self.generation_query(format!("/v1/e2ee/conversations/{conversation_id}/handshake?after={after}&device_id={device_id}"), generation);
+            let (status, rows) = self.ask("GET", &path, None)?;
             if status != 200 {
                 return Err(format!(
                     "The server did not give the group's changes ({status})."
@@ -1464,11 +1761,16 @@ impl Device {
             }
             let count = rows.len();
             for row in rows {
+                if self.generations && (row["generation"].as_u64() != Some(generation)
+                    || row["group_id"].as_str().is_none_or(|id| ConversationId::parse(id).is_err())
+                    || (generation > 0 && row["group_id"].as_str() != Some(conv.to_string().as_str()))) {
+                    return Err("The group's changes do not match this encryption update.".to_owned());
+                }
                 let seq = row.get("seq").and_then(Value::as_i64).unwrap_or(after);
                 let kind = row.get("kind").and_then(Value::as_str).unwrap_or("");
                 let epoch = row.get("epoch").and_then(Value::as_u64).unwrap_or(0);
                 let Some(data) = row.get("data").and_then(Value::as_str).and_then(unb64) else {
-                    self.advance(conversation_id, seq);
+                    self.advance(&cursor, seq);
                     continue;
                 };
                 match self.apply(conv, kind, epoch, &data, server_key) {
@@ -1490,12 +1792,13 @@ impl Device {
                     }
                     Applied::Stop(why) => return Err(why),
                 }
-                self.advance(conversation_id, seq);
+                self.advance(&cursor, seq);
             }
             if count < HANDSHAKE_PAGE {
                 return Ok(moved);
             }
         }
+        Err("This conversation is still updating. Try again shortly.".to_owned())
     }
 
     fn advance(&mut self, conversation_id: &str, seq: i64) {
@@ -1637,7 +1940,10 @@ impl Device {
         };
         let device_id = engine.device_id().to_string();
         let welcomes: Vec<Value> = bundle.welcomes.iter().map(|welcome| json!({ "device_id": welcome.device.device.to_string(), "data": b64(&welcome.data) })).collect();
-        let body = json!({ "device_id": device_id, "epoch": bundle.epoch, "commit": b64(&bundle.commit), "welcomes": welcomes });
+        let mut body = json!({ "device_id": device_id, "epoch": bundle.epoch, "commit": b64(&bundle.commit), "welcomes": welcomes });
+        let active = self.active(conversation_id)?;
+        if active.group_id != conv { return Err("Encryption changed. Try again.".to_owned()); }
+        self.generation_body(&mut body, active.generation);
         let (status, answer) = self.ask(
             "POST",
             &format!("/v1/e2ee/conversations/{conversation_id}/commit"),
@@ -1653,6 +1959,10 @@ impl Device {
             }
             // Another member's commit won, or the proposals changed: the feed settles ours.
             409 => {
+                if answer["error"] == "generation_changed" {
+                    self.discover_generations(conversation_id)?;
+                    return Ok(true);
+                }
                 if answer.get("error").and_then(Value::as_str) == Some("proposals_changed") {
                     let _ = engine.abort_commit(conv);
                 }
@@ -1690,7 +2000,7 @@ impl Device {
         self.caches.get_mut(conversation_id)
     }
 
-    fn remember(&mut self, conversation_id: &str, id: &str, opened: Opened) {
+    pub(super) fn remember(&mut self, conversation_id: &str, id: &str, opened: Opened) {
         for file in &opened.attachments {
             self.files
                 .insert(file.id.clone(), (conversation_id.to_owned(), file.clone()));
@@ -1709,51 +2019,31 @@ impl Device {
         let Some(conv) = uuid(conversation_id).map(ConversationId) else {
             return out;
         };
-        let mut synced = false;
+        // One sync attempt per encryption group on this page. A blocked historical
+        // generation must not spend the current group's Welcome attempt.
+        let mut synced = BTreeSet::new();
         let mut ordered: Vec<&Row> = rows.iter().collect();
-        ordered.sort_by_key(|row| row.epoch);
+        ordered.sort_by_key(|row| (row.generation.unwrap_or(0), row.epoch));
         for row in ordered {
             let read = self.read_one(conversation_id, conv, row, &mut synced);
             out.insert(row.id.to_owned(), read);
         }
         // An edit counts once its target is known, and only from the target's author.
-        let edits: Vec<(String, String, Opened, String)> = rows
-            .iter()
-            .filter(|row| row.kind == "edit")
+        let edits: Vec<(String, String, Opened, UserId)> = rows.iter()
+            .filter(|row| matches!(out.get(row.id), Some(Read::Edit)))
             .filter_map(|row| {
                 let opened = self.cache(conversation_id)?.rows.get(row.id)?.clone();
-                Some((
-                    row.id.to_owned(),
-                    opened.edits.clone()?,
-                    opened,
-                    row.author_id.to_owned(),
-                ))
-            })
-            .collect();
+                let auth = opened.auth.as_ref()?;
+                if auth.kind != "edit" || !auth.matches(conversation_id, row) { return None; }
+                Some((row.id.to_owned(), auth.target_id.clone()?, opened.clone(), auth.author))
+            }).collect();
         for (edit_id, target, edit, author) in edits {
-            let target_author = rows
-                .iter()
-                .find(|row| row.id == target)
-                .map(|row| row.author_id.to_owned());
-            let Some(mut opened) = self
-                .cache(conversation_id)
-                .and_then(|cache| cache.rows.get(&target).cloned())
-            else {
-                continue;
-            };
-            if target_author
-                .as_deref()
-                .is_some_and(|target_author| target_author != author)
-            {
-                continue;
-            }
-            if opened
-                .edited_by
-                .as_deref()
-                .is_some_and(|by| by >= edit_id.as_str())
-            {
-                continue;
-            }
+            let Some(mut opened) = self.cache(conversation_id).and_then(|cache| cache.rows.get(&target).cloned()) else { continue; };
+            let Some(target_auth) = opened.auth.as_ref() else { continue; };
+            if target_auth.author != author || target_auth.kind != "message" || target_auth.conversation_id.to_string() != conversation_id { continue; }
+            // A malformed current target row must not be restored through the edit path.
+            if rows.iter().any(|row| row.id == target && !target_auth.matches(conversation_id, row)) { continue; }
+            if opened.edited_by.as_deref().is_some_and(|by| by >= edit_id.as_str()) { continue; }
             opened.text = edit.text;
             opened.attachments = edit.attachments;
             opened.edited_by = Some(edit_id);
@@ -1761,66 +2051,77 @@ impl Device {
             self.remember(conversation_id, &target, opened);
         }
         let _ = self.engine.as_mut().map(Engine::flush);
+        // What did not open here may have on another device of the person.
+        let missing: Vec<String> = rows
+            .iter()
+            .filter(|row| {
+                row.kind != "edit" && matches!(out.get(row.id), Some(Read::Undecryptable))
+            })
+            .map(|row| row.id.to_owned())
+            .collect();
+        if !missing.is_empty() {
+            self.want(conversation_id, missing);
+        }
         out
     }
 
     fn read_one(
         &mut self,
         conversation_id: &str,
-        conv: ConversationId,
+        _conv: ConversationId,
         row: &Row,
-        synced: &mut bool,
+        synced: &mut BTreeSet<ConversationId>,
     ) -> Read {
-        if let Some(opened) = self
-            .cache(conversation_id)
-            .and_then(|cache| cache.rows.get(row.id).cloned())
-        {
-            return if opened.edits.is_some() {
-                Read::Edit
-            } else {
-                Read::Opened(opened)
-            };
+        let cached = self.cache(conversation_id).and_then(|cache| cache.rows.get(row.id).cloned());
+        if let Some(opened) = &cached {
+            if let Some(auth) = &opened.auth {
+                if !auth.matches(conversation_id, row) { return Read::Undecryptable; }
+                return if auth.kind == "edit" { Read::Edit } else { Read::Opened(opened.clone()) };
+            }
         }
-        // Our own message, sent from this device: kept when it was sent, by its client id.
+        let legacy = cached.filter(|opened| opened.auth.is_none() && opened.edits.is_none());
+        let fallback = || legacy.clone().map_or(Read::Undecryptable, Read::Legacy);
+        // Pending plaintext belongs to the exact local sender and authenticated row context.
         if let Some(client_id) = row.client_id {
-            if let Some(opened) = self
-                .cache(conversation_id)
-                .and_then(|cache| cache.pending.remove(client_id))
-            {
+            if let Some(opened) = self.cache(conversation_id).and_then(|cache| cache.pending.get(client_id).cloned()) {
+                if !opened.auth.as_ref().is_some_and(|auth| auth.matches(conversation_id, row)) { return Read::Undecryptable; }
+                if let Some(cache) = self.cache(conversation_id) { cache.pending.remove(client_id); }
                 let edit = opened.edits.is_some();
                 self.remember(conversation_id, row.id, opened.clone());
-                return if edit {
-                    Read::Edit
-                } else {
-                    Read::Opened(opened)
-                };
+                return if edit { Read::Edit } else { Read::Opened(opened) };
             }
         }
+        let conv = match self.row_group(conversation_id, row) {
+            Ok(conv) => conv,
+            Err(why) => { tracing::debug!("chatd: Tiny e2ee: {why}"); return fallback(); }
+        };
         let Some(ciphertext) = row.ciphertext.and_then(unb64) else {
-            return Read::Undecryptable;
+            return fallback();
         };
-        let kind = if row.kind == "edit" {
-            Kind::Edit
-        } else {
-            Kind::Message
-        };
-        let claimed = Claimed {
-            author: UserId::parse(row.author_id).ok(),
-            device: DeviceId::parse(row.device_id).ok(),
-            kind,
-            target_id: row.target_id,
-        };
+        let (Ok(kind), Ok(author), Ok(device)) = (Kind::parse(row.kind), UserId::parse(row.author_id), DeviceId::parse(row.device_id)) else { return fallback(); };
+        let claimed = Claimed { author: Some(author), device: Some(device), kind, target_id: row.target_id };
         let Some(engine) = self.engine.as_mut() else {
-            return Read::Undecryptable;
+            return fallback();
         };
         let mut opened = engine.decrypt(conv, &ciphertext, &claimed);
-        if matches!(opened, Err(Error::FutureEpoch { .. } | Error::NoGroup)) && !*synced {
-            *synced = true;
-            if let Err(why) = self.sync(conversation_id) {
-                tracing::warn!("chatd: Tiny e2ee: {conversation_id}: {why}");
-            }
+        // FutureEpoch: behind on handshake. NoGroup / NotAMember: accepted a repair but not
+        // the Welcome yet. Limit one sync attempt per encryption group on this page.
+        if matches!(
+            opened,
+            Err(Error::FutureEpoch { .. } | Error::NoGroup | Error::NotAMember)
+        ) && synced.insert(conv)
+        {
+            let generation = row.generation.unwrap_or(0);
+            let outer = ConversationId::parse(conversation_id).ok();
+            let active = outer.and_then(|outer| self.engine.as_ref()?.active_group(outer).ok());
+            let historical_key = active.filter(|active| generation < active.generation)
+                .and_then(|_| self.engine.as_ref()?.server_key(conv));
+            let sync = if let Some(key) = historical_key {
+                self.feed_at(conversation_id, conv, generation, &key).map(|_| ())
+            } else { self.sync(conversation_id) };
+            if let Err(why) = sync { tracing::warn!("chatd: Tiny e2ee: {conversation_id}: {why}"); }
             let Some(engine) = self.engine.as_mut() else {
-                return Read::Undecryptable;
+                return fallback();
             };
             opened = engine.decrypt(conv, &ciphertext, &claimed);
         }
@@ -1831,7 +2132,11 @@ impl Device {
             Ok(incoming) => {
                 let opened = Opened {
                     text: incoming.envelope.text.clone(),
+                    generation: Some(row.generation.unwrap_or(0)),
+                    auth: Some(Authentication::new(ConversationId::parse(conversation_id).expect("checked conversation"), conv, row.generation.unwrap_or(0), incoming.epoch, &incoming.sender, incoming.kind, incoming.target_id.as_deref())),
+                    saved_attribution: None,
                     reply_to: incoming.envelope.reply_to.clone(),
+                    sent_at: incoming.envelope.sent_at,
                     attachments: incoming
                         .envelope
                         .attachments
@@ -1840,7 +2145,12 @@ impl Device {
                         .collect(),
                     edits: incoming.target_id.clone().filter(|_| kind == Kind::Edit),
                     edited_by: None,
+                    at: super::messages::unix_of(row.created_at).unwrap_or(0),
+                    imported_from: None,
                 };
+                if legacy.as_ref().is_some_and(|saved| saved.text != opened.text || saved.attachments != opened.attachments || saved.edited_by.is_some()) {
+                    return fallback();
+                }
                 self.remember(conversation_id, row.id, opened.clone());
                 if kind == Kind::Edit {
                     Read::Edit
@@ -1850,11 +2160,7 @@ impl Device {
             }
             Err(err) => {
                 tracing::debug!("chatd: Tiny e2ee: a message did not open: {err}");
-                if kind == Kind::Edit {
-                    Read::Edit
-                } else {
-                    Read::Undecryptable
-                }
+                fallback()
             }
         }
     }
@@ -1873,66 +2179,79 @@ impl Device {
         if self.notes.key_changed.contains(conversation_id) {
             return Err(words(&Error::ServerKeyChanged));
         }
-        let conv = ConversationId(uuid(conversation_id).ok_or(super::CHECK)?);
-        // Removals and joins first: a message is never sent to someone already leaving.
-        self.sync(conversation_id)?;
-        let sealed = match self.engine()?.encrypt(conv, kind, target_id, envelope) {
-            Ok(sealed) => sealed,
-            Err(Error::PendingProposals | Error::PendingRemove | Error::CommitInFlight) => {
-                self.sync(conversation_id)?;
-                self.engine()?
-                    .encrypt(conv, kind, target_id, envelope)
-                    .map_err(|err| words(&err))?
-            }
-            Err(err) => return Err(words(&err)),
-        };
-        let opened = Opened {
+        let _ = self.active(conversation_id)?;
+        let mut opened = Opened {
             text: envelope.text.clone(),
+            generation: None,
+            auth: None,
+            saved_attribution: None,
             reply_to: envelope.reply_to.clone(),
+            sent_at: envelope.sent_at,
             attachments: envelope.attachments.iter().map(OpenedFile::of).collect(),
             edits: target_id.map(str::to_owned),
             edited_by: None,
+            at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64),
+            imported_from: None,
         };
-        if let Some(cache) = self.cache(conversation_id) {
-            cache.pending.insert(client_id.to_owned(), opened.clone());
-        }
-        let device_id = self.engine()?.device_id().to_string();
-        let mut body = json!({
-            "ciphertext": b64(&sealed.ciphertext),
-            "epoch": sealed.epoch,
-            "device_id": device_id,
-            "client_id": client_id,
-            "kind": kind.as_str(),
-        });
-        if let Some(target) = target_id {
-            body["target_id"] = Value::String(target.to_owned());
-        }
-        if !attachment_ids.is_empty() {
-            body["attachment_ids"] = json!(attachment_ids);
-        }
-        let (status, answer) = self.ask(
-            "POST",
-            &format!("/v1/conversations/{conversation_id}/messages"),
-            Some(body),
-        )?;
-        match status {
-            200 | 201 => {
-                let id = answer
-                    .get("id")
-                    .or_else(|| answer.pointer("/message/id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                if super::safe_id(&id) {
-                    if let Some(cache) = self.cache(conversation_id) {
-                        cache.pending.remove(client_id);
-                    }
-                    self.remember(conversation_id, &id, opened);
-                }
-                Ok(answer)
+        for _ in 0..PASSES {
+            // Removals and joins first: a message is never sent to someone already leaving.
+            self.sync(conversation_id)?;
+            let active = self.active(conversation_id)?;
+            let conv = active.group_id;
+            let sealed = match self.engine()?.encrypt(conv, kind, target_id, envelope) {
+                Ok(sealed) => sealed,
+                Err(Error::PendingProposals | Error::PendingRemove | Error::CommitInFlight) => continue,
+                Err(err) => return Err(words(&err)),
+            };
+            opened.generation = Some(active.generation);
+            opened.auth = Some(Authentication::new(ConversationId::parse(conversation_id).expect("checked conversation"), conv, active.generation, sealed.epoch, &self.engine()?.device_ref(), kind, target_id));
+            if let Some(cache) = self.cache(conversation_id) { cache.pending.insert(client_id.to_owned(), opened.clone()); }
+            let device_id = self.engine()?.device_id().to_string();
+            let mut body = json!({
+                "ciphertext": b64(&sealed.ciphertext),
+                "epoch": sealed.epoch,
+                "device_id": device_id,
+                "client_id": client_id,
+                "kind": kind.as_str(),
+            });
+            self.generation_body(&mut body, active.generation);
+            if let Some(target) = target_id {
+                body["target_id"] = Value::String(target.to_owned());
             }
-            status => Err(super::explain(status, &answer, super::Missing::Plain).to_owned()),
+            if !attachment_ids.is_empty() {
+                body["attachment_ids"] = json!(attachment_ids);
+            }
+            let (status, answer) = self.ask(
+                "POST",
+                &format!("/v1/conversations/{conversation_id}/messages"),
+                Some(body),
+            )?;
+            match status {
+                200 | 201 => {
+                    let id = answer
+                        .get("id")
+                        .or_else(|| answer.pointer("/message/id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    if super::safe_id(&id) {
+                        if let Some(cache) = self.cache(conversation_id) {
+                            cache.pending.remove(client_id);
+                        }
+                        self.remember(conversation_id, &id, opened);
+                    }
+                    return Ok(answer);
+                }
+                409 if matches!(answer.get("error").and_then(Value::as_str), Some("proposals_changed" | "stale_epoch" | "generation_changed")) => continue,
+                400 if answer.get("error").and_then(Value::as_str) == Some("e2ee_group_too_large") => {
+                    return Err("This encrypted conversation has too many devices to send a message.".to_owned());
+                }
+                status => return Err(super::explain(status, &answer, super::Missing::Plain).to_owned()),
+            }
         }
+        Err("This conversation is still updating its devices. Your message was kept; try sending it again shortly.".to_owned())
     }
 
     /// Opening details for a sealed attachment this device has seen in a message.
@@ -1943,9 +2262,59 @@ impl Device {
         Some(sealed)
     }
 
-    /// The live socket said something about this protocol. `Some` is a conversation whose rows
-    /// should be read again: one did not open for want of the group, and the group may be here.
-    pub(crate) fn heard(&mut self, kind: &str, frame: &Value) -> Option<String> {
+    /// The person's devices as the server lists them now, against the last list: a device not
+    /// seen before (and not this one) is added to the "New device added" notice, a device gone
+    /// is dropped from it. True when the notice changed. The first list ever is taken as known.
+    fn note_devices(&mut self, rows: &[Value]) -> bool {
+        let this = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.device_id().to_string());
+        let listed = self.devices_of(&self.saved.user_id.clone(), rows, this.as_deref());
+        let ids: BTreeSet<String> = listed
+            .iter()
+            .map(|device| device.device_id.clone())
+            .collect();
+        let revoked = self.ready() && this.as_ref().is_some_and(|id| !ids.contains(id));
+        let revoked_changed = revoked && self.mark_revoked();
+        let before = self.notes.added.clone();
+        let first = self.notes.mine.is_empty();
+        self.notes
+            .added
+            .retain(|device| ids.contains(&device.device_id));
+        if !first {
+            for device in listed {
+                if !device.this
+                    && !self.notes.mine.contains(&device.device_id)
+                    && !self
+                        .notes
+                        .added
+                        .iter()
+                        .any(|known| known.device_id == device.device_id)
+                {
+                    self.notes.added.push(device);
+                }
+            }
+        }
+        let changed = self.notes.added != before;
+        if changed || self.notes.mine != ids {
+            self.notes.mine = ids;
+            self.save_notes();
+        }
+        changed || revoked_changed
+    }
+
+    /// The person saw the notice about this device of theirs.
+    fn seen_device(&mut self, device_id: &str) {
+        self.notes
+            .added
+            .retain(|device| device.device_id != device_id);
+        self.save_notes();
+    }
+
+    /// The live socket said something about this protocol. True when the "New device added"
+    /// notice changed.
+    pub(crate) fn heard(&mut self, kind: &str, frame: &Value) -> bool {
         let field = |name: &str| {
             frame
                 .get(name)
@@ -1958,10 +2327,15 @@ impl Device {
                 let conversation_id = field("conversation_id");
                 if super::safe_id(&conversation_id) && self.ready() {
                     match self.sync(&conversation_id) {
-                        Ok(()) if self.unopened.remove(&conversation_id) => {
-                            return Some(conversation_id)
+                        Ok(()) => {
+                            self.unopened.remove(&conversation_id);
+                            if self.is_self(&conversation_id) {
+                                let gained = self.catch_up().into_iter().collect();
+                                self.reload(&gained);
+                            } else {
+                                self.reload(&BTreeSet::from([conversation_id]));
+                            }
                         }
-                        Ok(()) => {}
                         Err(why) => tracing::warn!("chatd: Tiny e2ee: {conversation_id}: {why}"),
                     }
                 }
@@ -1988,19 +2362,29 @@ impl Device {
                         tracing::warn!("chatd: Tiny e2ee: {why}");
                     }
                 }
+                if user == self.saved.user_id && self.ready() {
+                    if let Ok(rows) = self.list(&user) {
+                        let devices_changed = self.note_devices(&rows);
+                        let sync_changed = self.sibling_notice();
+                        return devices_changed || sync_changed;
+                    }
+                }
             }
             _ => {}
         }
-        None
+        self.sibling_notice()
     }
 
     /// `E2eeAsk::Status`.
     pub(crate) fn status(&mut self, names: &HashMap<String, String>) -> E2eeStatus {
         let mut status = E2eeStatus {
+            group_generations: self.generations,
+            repair: repair::view(&self.saved),
             mode: self.mode.clone(),
             device: self.state.clone(),
             recovery_set: self.notes.recovery.is_some(),
             backup: false,
+            linking: self.linking,
             ..E2eeStatus::default()
         };
         let Some(engine) = self.engine.as_ref() else {
@@ -2011,7 +2395,13 @@ impl Device {
         status.fingerprint = fingerprint(&engine.signature_key());
         if let Ok(rows) = self.list(&self.saved.user_id) {
             status.devices = self.devices_of(&self.saved.user_id.clone(), &rows, Some(&this));
+            if self.ready() {
+                self.note_devices(&rows);
+            }
         }
+        status.added = self.notes.added.clone();
+        status.device = self.state.clone();
+        status.revoked = self.revoked();
         let met: Vec<String> = self
             .notes
             .met
@@ -2125,11 +2515,14 @@ impl Device {
             }
             self.notes
                 .verified
-                .insert(user_id.to_owned(), person.safety);
+                .insert(user_id.to_owned(), person.safety.clone());
+            self.save_notes();
+            self.tell_verified(user_id, Some(person.safety));
         } else {
             self.notes.verified.remove(user_id);
+            self.save_notes();
+            self.tell_verified(user_id, None);
         }
-        self.save_notes();
         Ok(())
     }
 
@@ -2145,7 +2538,8 @@ impl Device {
     }
 
     /// Signs and registers a new device of this person from its link code.
-    pub(crate) fn approve(&mut self, code: &str) -> Result<(), String> {
+    pub(crate) fn approve(&mut self, code: &str, cancelled: &dyn Fn() -> bool) -> Result<(), String> {
+        if cancelled() { return Err("Device approval timed out.".to_owned()); }
         if !self.ready() {
             return Err("This device has to be set up before it can approve another.".to_owned());
         }
@@ -2156,6 +2550,7 @@ impl Device {
             .cross_sign(device, &key)
             .map_err(|err| format!("It couldn't be approved: {err}"))?;
         let body = json!({ "signature_key": b64(&key), "cross_signature": b64(&signature), "label": "Approved device" });
+        if cancelled() { return Err("Device approval timed out.".to_owned()); }
         match self.ask("PUT", &format!("/v1/e2ee/devices/{device}"), Some(body))? {
             (200 | 201, _) => {
                 let me = self.saved.user_id.clone();
@@ -2175,15 +2570,13 @@ impl Device {
         }
         match self.ask("DELETE", &format!("/v1/e2ee/devices/{device_id}"), None)? {
             (200 | 204, _) => {
+                self.seen_device(device_id);
                 let mine = self
                     .engine
                     .as_ref()
                     .map(|engine| engine.device_id().to_string());
                 if mine.as_deref() == Some(device_id) {
-                    self.state = DeviceState::Failed {
-                        why: "This device was revoked. Sign in again to set it up as a new device."
-                            .to_owned(),
-                    };
+                    self.mark_revoked();
                 }
                 let me = self.saved.user_id.clone();
                 let _ = self.verify_user(&me);
@@ -2250,13 +2643,90 @@ fn device_label() -> String {
     }
 }
 
-/// Serves `Request::TinyE2ee`.
+/// The "New device added" notice of this account, from what is known here (no request).
+pub(crate) fn added(saved: &Saved) -> Vec<E2eeDevice> {
+    started(saved)
+        .map(|shared| lock(&shared).notes.added.clone())
+        .unwrap_or_default()
+}
+
+/// Serves `Request::TinyE2ee`. `told` is called when something the shell shows changed by itself
+/// (a device link moved on).
 pub(crate) fn answer(
     saved: &Saved,
     ask: protocol::E2eeAsk,
     names: &HashMap<String, String>,
+    told: linking::Told,
 ) -> protocol::Response {
     use protocol::{E2eeAsk, ErrorCode, Response};
+    // Owner authentication belongs before the device lock, including the old-server fallback.
+    match &ask {
+        E2eeAsk::Approve { code } => return approval::approve(saved, code),
+        E2eeAsk::LinkJoin { code } if code.trim().starts_with("tiny-device-") => {
+            return approval::approve(saved, code);
+        }
+        _ => {}
+    }
+    // A link's own steps never wait for this device's lock, which a link holds now and then.
+    match ask {
+        E2eeAsk::Repair { conversation_id } => {
+            return match repair::start(saved, &conversation_id, told) {
+                Ok(()) => Response::Ok,
+                Err(detail) => Response::Error { code: ErrorCode::Refused, detail },
+            };
+        }
+        E2eeAsk::Link => {
+            return Response::TinyE2eeLink {
+                link: linking::view(saved),
+            }
+        }
+        E2eeAsk::LinkConfirm { history, check } => {
+            return match linking::confirm(saved, &history, &check) {
+                Ok(()) => Response::Ok,
+                Err(detail) => Response::Error {
+                    code: ErrorCode::Refused,
+                    detail,
+                },
+            }
+        }
+        E2eeAsk::LinkCancel => {
+            linking::cancel(saved);
+            return Response::Ok;
+        }
+        // A second of Argon2 and a whole cache: not under the device's lock, which they take
+        // only to read the keys and to merge.
+        E2eeAsk::ExportBackup { path, passphrase } => {
+            let passphrase = e2ee::Zeroizing::new(passphrase);
+            let shared = device(saved);
+            lock(&shared).enrol_if_needed();
+            return match backup::export(&shared, Path::new(&path), &passphrase) {
+                Ok(messages) => Response::TinyBackup { messages },
+                Err(detail) => Response::Error {
+                    code: ErrorCode::Refused,
+                    detail,
+                },
+            };
+        }
+        E2eeAsk::ImportBackup { path, passphrase } => {
+            let passphrase = e2ee::Zeroizing::new(passphrase);
+            let shared = device(saved);
+            lock(&shared).enrol_if_needed();
+            let Some(members) = super::messages::conversation_ids(saved) else {
+                return Response::Error {
+                    code: ErrorCode::Refused,
+                    detail: "Couldn't ask the server which conversations are yours. Check your connection and try again.".to_owned(),
+                };
+            };
+            return match backup::import(&shared, Path::new(&path), &passphrase, members) {
+                Ok(messages) => Response::TinyBackup { messages },
+                Err(detail) => Response::Error {
+                    code: ErrorCode::Refused,
+                    detail,
+                },
+            };
+        }
+        _ => {}
+    }
     let shared = device(saved);
     let mut device = lock(&shared);
     if device.engine.is_none() || device.state != DeviceState::Ready {
@@ -2280,8 +2750,16 @@ pub(crate) fn answer(
                 detail,
             },
         },
-        E2eeAsk::Approve { code } => done(device.approve(&code)),
-        E2eeAsk::Revoke { device_id } => done(device.revoke(&device_id)),
+        E2eeAsk::Approve { .. } => unreachable!("approval is handled before taking the device lock"),
+        E2eeAsk::Revoke { device_id } => {
+            let revoked = device.revoke(&device_id);
+            drop(device);
+            if revoked.is_ok() {
+                // Out of every group soon, not when someone next happens to send.
+                linking::nudge(shared.clone());
+            }
+            done(revoked)
+        }
         E2eeAsk::Verify { user_id, verified } => done(device.verify(&user_id, verified)),
         E2eeAsk::AcceptIdentity { user_id } => done(device.accept_identity(&user_id)),
         E2eeAsk::RecoveryKey => match device.recovery_key() {
@@ -2292,6 +2770,25 @@ pub(crate) fn answer(
             },
         },
         E2eeAsk::CheckRecovery { key } => done(device.check_recovery(&key)),
+        E2eeAsk::SeenDevice { device_id } => {
+            device.seen_device(&device_id);
+            Response::Ok
+        }
+        E2eeAsk::LinkStart => {
+            let linking = device.linking;
+            drop(device);
+            done(linking::start_new(saved, &shared, linking, told))
+        }
+        E2eeAsk::LinkJoin { code } => {
+            drop(device);
+            done(linking::start_old(saved, &shared, &code, told))
+        }
+        E2eeAsk::Link
+        | E2eeAsk::LinkConfirm { .. }
+        | E2eeAsk::LinkCancel
+        | E2eeAsk::ExportBackup { .. }
+        | E2eeAsk::ImportBackup { .. } => Response::Ok,
+        E2eeAsk::Repair { .. } => unreachable!("repair starts before taking the device lock"),
     }
 }
 
@@ -2388,15 +2885,214 @@ mod fake;
 pub fn prove_first_encrypted_message() -> Result<(), String> {
     fake::prove_first_encrypted_message()
 }
+mod backup;
+mod linking;
+mod approval;
+mod repair;
+mod cache_auth;
+use cache_auth::Authentication;
+mod export_rows;
+pub(crate) mod siblings;
 
 #[cfg(test)]
 mod live;
+
+#[cfg(test)]
+mod receive_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(windows)]
     use e2ee::store::Store;
+
+    fn posting_device(name: &str, reject: usize) -> (Device, Arc<Mutex<Vec<Value>>>) {
+        let server_key = e2ee::identity::DeviceKey::generate().unwrap().public_key();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let posted = requests.clone();
+        let public = server_key.clone();
+        let base = super::super::tests::serve(move |request| {
+            let (status, body) = if request.starts_with("GET /v1/e2ee/conversations/") && request.contains("/handshake?") {
+                if request.contains("after=0&") {
+                    (200, json!([{"seq":1,"kind":"unknown","epoch":0,"data":""}]))
+                } else {
+                    (200, json!([]))
+                }
+            } else if request.starts_with("GET /v1/e2ee/conversations/") {
+                (200, json!({"e2ee": true, "epoch": 0, "external_sender": b64(&public)}))
+            } else if request.starts_with("POST /v1/conversations/") {
+                let body = request.split_once("\r\n\r\n").unwrap().1;
+                let mut posts = lock(&posted);
+                posts.push(serde_json::from_str(body).unwrap());
+                if posts.len() <= reject {
+                    (409, json!({"error": "proposals_changed"}))
+                } else {
+                    (201, json!({"id": "accepted"}))
+                }
+            } else {
+                (200, json!([]))
+            };
+            super::super::tests::http(status, "Test", &body.to_string())
+        });
+        let saved = Saved {
+            base_url: base, token: "t".into(), user_id: "11111111-1111-1111-1111-111111111111".into(),
+            email: None, display_name: "Ada".into(), role: "member".into(), plain_http_ok: false, e2ee: None,
+        };
+        let mut device = Device::new(&saved);
+        device.dir = std::env::temp_dir().join(format!("chatd-post-{}-{name}", std::process::id()));
+        private_dir(&device.dir).unwrap();
+        let mut engine = Engine::detached(UserId::parse(&saved.user_id).unwrap()).unwrap();
+        engine.create_group(ConversationId::parse("22222222-2222-2222-2222-222222222222").unwrap(), &server_key).unwrap();
+        device.engine = Some(engine);
+        device.cache_key = Some(CacheKey::generate().unwrap());
+        device.state = DeviceState::Ready;
+        (device, requests)
+    }
+
+    #[test]
+    fn device_membership_changes_are_settled_immediately() {
+        let (mut device, _) = posting_device("nudge", 0);
+        let conversation = "22222222-2222-2222-2222-222222222222";
+        device.note_encrypted(conversation, true);
+        let shared = Arc::new(Mutex::new(device));
+        linking::nudge(shared.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if lock(&shared).notes.seqs.get(conversation) == Some(&1) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "a linked device must not wait for the old batching timer to get its Welcome");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        lock(&shared).state = DeviceState::Failed { why: "test complete".into() };
+    }
+
+    #[test]
+    fn a_removed_device_stops_claiming_ready_without_losing_its_local_keys() {
+        let (mut device, _) = posting_device("status-revoked", 0);
+        let own_id = device.engine.as_ref().unwrap().device_id();
+        let conversation = "22222222-2222-2222-2222-222222222222";
+        let message = "33333333-3333-3333-3333-333333333333";
+        device.remember(conversation, message, Opened { text: "saved before removal".into(), ..Opened::default() });
+        let status = device.status(&HashMap::new());
+        assert_ne!(status.device, DeviceState::Ready, "the confirmed device list no longer contains this device");
+        assert!(status.revoked);
+        assert!(!device.ready());
+        assert_eq!(device.engine.as_ref().unwrap().device_id(), own_id);
+        assert!(device.cache_key.is_some(), "removing future access must keep saved history keys");
+        let notes: Value = serde_json::from_slice(&std::fs::read(device.dir.join("notes.json")).unwrap()).unwrap();
+        assert_eq!(notes["revoked_device"], own_id.to_string());
+        let row = Row { id: message, author_id: &device.saved.user_id.clone(), kind: "message",
+            ciphertext: None, epoch: 0, generation: None, group_id: None, device_id: "", target_id: None, client_id: None, created_at: "" };
+        let mut read = device.read(conversation, &[row]);
+        assert!(matches!(read.remove(message), Some(Read::Legacy(opened)) if opened.text == "saved before removal"));
+    }
+
+    #[test]
+    fn explicit_self_removal_keeps_saved_history_and_does_not_register_again() {
+        let (mut device, _) = posting_device("explicit-self-removal", 0);
+        let own_id = device.engine.as_ref().unwrap().device_id();
+        let conversation = "22222222-2222-2222-2222-222222222222";
+        let message = "33333333-3333-3333-3333-333333333333";
+        device.remember(conversation, message, Opened { text: "saved before self removal".into(), ..Opened::default() });
+        let registrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = registrations.clone();
+        device.saved.base_url = super::super::tests::serve(move |request| {
+            if request.starts_with("GET /v1/capabilities ") {
+                return super::super::tests::http(200, "OK", r#"{"features":["e2ee_text"],"e2ee_text":"optional"}"#);
+            }
+            if request.starts_with("PUT ") {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return super::super::tests::http(409, "Conflict", r#"{"error":"device_exists"}"#);
+            }
+            super::super::tests::http(200, "OK", "[]")
+        });
+        device.revoke("44444444-4444-4444-4444-444444444444").unwrap();
+        assert!(!device.revoked(), "removing another device must keep this device approved");
+        assert_eq!(device.state, DeviceState::Ready);
+        device.revoke(&own_id.to_string()).unwrap();
+        assert!(device.revoked(), "explicit self removal must persist the same terminal marker as external removal");
+        assert!(matches!(device.try_enrol().unwrap(), DeviceState::Failed { .. }));
+        assert_eq!(registrations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let status = device.status(&HashMap::new());
+        assert!(status.revoked);
+        assert!(matches!(status.device, DeviceState::Failed { ref why } if why == "This device was removed. Saved messages are still available."));
+        assert_eq!(device.engine.as_ref().unwrap().device_id(), own_id);
+        assert!(device.cache_key.is_some());
+        let notes: Value = serde_json::from_slice(&std::fs::read(device.dir.join("notes.json")).unwrap()).unwrap();
+        assert_eq!(notes["revoked_device"], own_id.to_string());
+        let row = Row { id: message, author_id: &device.saved.user_id.clone(), kind: "message",
+            ciphertext: None, epoch: 0, generation: None, group_id: None, device_id: "", target_id: None, client_id: None, created_at: "" };
+        assert!(matches!(device.read(conversation, &[row]).remove(message), Some(Read::Legacy(opened)) if opened.text == "saved before self removal"));
+    }
+
+    #[test]
+    fn a_failed_device_list_request_does_not_claim_revocation() {
+        let (mut device, _) = posting_device("status-offline", 0);
+        device.saved.base_url = super::super::tests::serve(|_| super::super::tests::http(503, "Unavailable", "{}"));
+        let status = device.status(&HashMap::new());
+        assert_eq!(status.device, DeviceState::Ready);
+        assert!(!status.revoked);
+        assert!(device.ready());
+    }
+
+    #[test]
+    fn a_remembered_removed_identity_is_not_registered_again() {
+        let (mut device, _) = posting_device("revoked-reopen", 0);
+        device.mark_revoked();
+        device.notes = serde_json::from_slice(&std::fs::read(device.dir.join("notes.json")).unwrap()).unwrap();
+        device.state = DeviceState::Off;
+        let registrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = registrations.clone();
+        device.saved.base_url = super::super::tests::serve(move |request| {
+            if request.starts_with("PUT ") { observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+            super::super::tests::http(200, "OK", r#"{"features":["e2ee_text"],"e2ee_text":"optional"}"#)
+        });
+        assert!(matches!(device.try_enrol().unwrap(), DeviceState::Failed { .. }));
+        assert!(device.revoked());
+        assert_eq!(registrations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        device.engine = Some(Engine::detached(UserId::parse(&device.saved.user_id).unwrap()).unwrap());
+        assert!(!device.revoked(), "the remembered removal belongs only to the old identity");
+    }
+
+    #[test]
+    fn a_membership_race_reseals_the_same_outgoing_message_before_retrying() {
+        let (mut device, posts) = posting_device("retry", 1);
+        let mut envelope = Envelope::message("private retry");
+        envelope.sent_at = Some(1_704_164_645_900);
+        let result = device.post("22222222-2222-2222-2222-222222222222", "same-client", Kind::Message, None, &envelope, &[]);
+        assert!(result.is_ok(), "{result:?}");
+        let posts = lock(&posts);
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[0]["client_id"], "same-client");
+        assert_eq!(posts[1]["client_id"], "same-client");
+        assert_ne!(posts[0]["ciphertext"], posts[1]["ciphertext"], "refreshing must re-encrypt rather than resend stale ciphertext");
+        assert!(posts.iter().all(|post| post.get("sent_at").is_none() && post.get("body").is_none()));
+        let opened = device.cache("22222222-2222-2222-2222-222222222222").unwrap().rows.get("accepted").unwrap();
+        assert_eq!(opened.text, "private retry");
+        assert_eq!(opened.sent_at, Some(1_704_164_645_900));
+    }
+
+    #[test]
+    fn an_unsettled_audience_fails_closed_and_keeps_the_outgoing_plaintext() {
+        let (mut device, posts) = posting_device("unsettled", usize::MAX);
+        let result = device.post("22222222-2222-2222-2222-222222222222", "pending", Kind::Message, None, &Envelope::message("kept for retry"), &[]);
+        assert!(result.is_err());
+        assert_eq!(lock(&posts).len(), PASSES, "membership retries are bounded");
+        let cache = device.cache("22222222-2222-2222-2222-222222222222").unwrap();
+        assert_eq!(cache.pending.get("pending").unwrap().text, "kept for retry");
+        assert!(!cache.rows.contains_key("accepted"));
+    }
+
+    #[test]
+    fn a_handshake_schedules_a_reread_of_messages_that_may_now_open() {
+        let (mut device, _) = posting_device("handshake-reread", 0);
+        let (send, receive) = std::sync::mpsc::channel();
+        device.commands = Some(send);
+        device.heard("e2ee.handshake", &json!({"conversation_id":"22222222-2222-2222-2222-222222222222"}));
+        assert!(matches!(receive.try_recv(), Ok(crate::adapters::Command::Backfill(id))
+            if id == "22222222-2222-2222-2222-222222222222"));
+    }
 
     #[test]
     fn encrypted_records_appended_after_an_unterminated_tail_survive_restart() {
@@ -2597,6 +3293,157 @@ mod tests {
         );
         let again = windows_acl::dacl_sddl(&dir).unwrap();
         assert_eq!(again, expected);
+    }
+
+    /// A device of the test session's account that has opened one message, `m1` in `c1`.
+    fn a_device_that_read_something(account: &protocol::AccountKey) -> Saved {
+        let mut saved =
+            super::super::parse(&crate::session::load(protocol::Network::Tiny).unwrap()).unwrap();
+        assert_eq!(saved.user_id, account.account);
+        let _ = std::fs::remove_dir_all(dir_of(&saved));
+        saved.e2ee = Some(Secrets::generate().unwrap());
+        let shared = device(&saved);
+        let mut device = lock(&shared);
+        device.saved.e2ee.clone_from(&saved.e2ee);
+        private_dir(&device.dir).unwrap();
+        device.cache_key = saved
+            .e2ee
+            .as_ref()
+            .and_then(Secrets::keys)
+            .map(|(_, cache)| cache);
+        device.remember(
+            "c1",
+            "m1",
+            Opened {
+                text: "kept".into(),
+                ..Opened::default()
+            },
+        );
+        device.notes.seqs.insert("c1".into(), 7);
+        device.notes.verified.insert("u2".into(), "123".into());
+        device.save_notes();
+        std::fs::write(device.dir.join(STATE), b"a state sealed under the old key").unwrap();
+        saved
+    }
+
+    /// What a new device of the same account, signed in here again, finds of `m1`.
+    fn signed_in_again(saved: &Saved) -> (Device, Option<String>) {
+        let mut again = saved.clone();
+        again.e2ee = None;
+        let mut device = Device::new(&again);
+        let (_, cache) = device.secrets().unwrap().keys().unwrap();
+        let text = Cache::load(&device.dir, "c1", &cache)
+            .rows
+            .get("m1")
+            .map(|opened| opened.text.clone());
+        (device, text)
+    }
+
+    #[test]
+    fn signing_out_keeps_what_was_read_and_signing_in_again_reads_it() {
+        super::super::tests::with_session("http://127.0.0.1:9", "member", |account| {
+            let saved = a_device_that_read_something(&account);
+            sign_out(&saved);
+            let dir = dir_of(&saved);
+            assert!(
+                !dir.join(STATE).exists(),
+                "the device itself is gone: the next one is new"
+            );
+            assert!(started(&saved).is_none());
+            let (device, text) = signed_in_again(&saved);
+            assert_eq!(
+                text.as_deref(),
+                Some("kept"),
+                "the history opens under the kept key"
+            );
+            assert!(
+                device.notes.seqs.is_empty(),
+                "a new device walks the handshakes again"
+            );
+            assert_eq!(
+                device.notes.verified.get("u2").map(String::as_str),
+                Some("123")
+            );
+            assert!(
+                kept().unwrap().is_empty(),
+                "the kept key moved back into the session"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    #[test]
+    fn signing_out_and_erasing_leaves_nothing_to_read() {
+        super::super::tests::with_session("http://127.0.0.1:9", "member", |account| {
+            let saved = a_device_that_read_something(&account);
+            sign_out(&saved);
+            assert!(!kept().unwrap().is_empty());
+            erase_history(&account.account);
+            assert!(!dir_of(&saved).exists());
+            assert!(kept().unwrap().is_empty());
+            let (_, text) = signed_in_again(&saved);
+            assert_eq!(text, None);
+            let _ = std::fs::remove_dir_all(dir_of(&saved));
+        });
+    }
+
+    #[test]
+    fn a_state_whose_key_is_gone_is_started_over_not_a_failure() {
+        super::super::tests::with_session("http://127.0.0.1:9", "member", |account| {
+            let saved = a_device_that_read_something(&account);
+            // The session lost its keys without a sign-out (an older client's, or a keychain
+            // restored from before): the folder is still there.
+            lock(devices()).remove(&(saved.base_url.clone(), saved.user_id.clone()));
+            lock(scratch_secrets()).clear();
+            let (device, text) = signed_in_again(&saved);
+            assert!(!device.dir.join(STATE).exists());
+            assert_eq!(text, None, "without the kept key the old rows stay sealed");
+            let _ = std::fs::remove_dir_all(dir_of(&saved));
+        });
+    }
+
+    #[test]
+    fn a_device_of_the_person_that_was_not_there_before_is_noticed_until_seen() {
+        let saved = Saved {
+            base_url: "http://127.0.0.1:9".into(),
+            token: "t".into(),
+            user_id: "7e57ada0-0000-4000-8000-0000000000aa".into(),
+            email: None,
+            display_name: String::new(),
+            role: "member".into(),
+            plain_http_ok: false,
+            e2ee: None,
+        };
+        let mut device = Device::new(&saved);
+        device.dir = std::env::temp_dir().join(format!("chatd-e2ee-notice-{}", std::process::id()));
+        private_dir(&device.dir).unwrap();
+        let user = UserId::parse(&saved.user_id).unwrap();
+        device.engine = Some(Engine::detached(user).unwrap());
+        let this = device.engine.as_ref().unwrap().device_id().to_string();
+        let row = |id: &str| json!({ "device_id": id, "signature_key": b64(&[4u8; 65]), "label": "Phone" });
+        let other = DeviceId::random().unwrap().to_string();
+        let third = DeviceId::random().unwrap().to_string();
+        assert!(
+            !device.note_devices(&[row(&this), row(&other)]),
+            "the first list is what the person had"
+        );
+        assert!(device.notes.added.is_empty());
+        assert!(device.note_devices(&[row(&this), row(&other), row(&third)]));
+        assert_eq!(device.notes.added.len(), 1);
+        assert_eq!(device.notes.added[0].device_id, third);
+        assert_eq!(device.notes.added[0].label, "Phone");
+        assert!(
+            !device.note_devices(&[row(&this), row(&other), row(&third)]),
+            "said once"
+        );
+        device.seen_device(&third);
+        assert!(device.notes.added.is_empty());
+        // One revoked elsewhere before the person looked takes its notice with it.
+        let fourth = DeviceId::random().unwrap().to_string();
+        assert!(device.note_devices(&[row(&this), row(&fourth)]));
+        assert!(device.note_devices(&[row(&this)]));
+        assert!(device.notes.added.is_empty());
+        let _ = std::fs::remove_dir_all(&device.dir);
     }
 
     #[test]

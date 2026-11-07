@@ -79,6 +79,64 @@ fn a_removed_device_cannot_read_later_messages_and_a_new_one_cannot_read_earlier
 }
 
 #[test]
+fn a_past_epoch_sender_is_not_relabelled_when_its_leaf_is_reused() {
+    let mut world = World::new();
+    let (a, b, c) = (world.person("a"), world.person("b"), world.person("c"));
+    world.sync_trust();
+    world.start(a);
+    world.change(&[a], a, &[b], &[]);
+    let old_leaf = world.leaf(a, b);
+    let old_sender = world.clients[b].engine.device_ref();
+    let ciphertext = world.send(b, "sent before removal");
+
+    world.change(&[a, b], a, &[], &[b]);
+    world.directory.get_mut(&old_sender.user).unwrap().clear();
+    world.sync_trust();
+    world.change(&[a], a, &[c], &[]);
+    assert_eq!(
+        world.leaf(a, c),
+        old_leaf,
+        "the new sender reuses the old leaf"
+    );
+
+    let relabelled = world.open(a, &ciphertext, c);
+    assert!(
+        matches!(relabelled, Err(Error::SenderMismatch)),
+        "a past sender must not become the current occupant: {relabelled:?}"
+    );
+    // Rejecting false claims must preserve the old message's ratchet key.
+    let incoming = world.open(a, &ciphertext, b).unwrap();
+    assert_eq!(incoming.sender, old_sender);
+    assert!(!incoming.sender_trusted, "the old device was revoked");
+    assert_eq!(incoming.envelope.text, "sent before removal");
+}
+
+#[test]
+fn a_removed_past_epoch_sender_keeps_its_identity_after_restart() {
+    let mut world = World::new();
+    let (a, b) = (world.person("a"), world.person("b"));
+    world.sync_trust();
+    world.start(a);
+    world.change(&[a], a, &[b], &[]);
+    let old_sender = world.clients[b].engine.device_ref();
+    let ciphertext = world.send(b, "the old leaf is now empty");
+    world.change(&[a, b], a, &[], &[b]);
+    world.directory.get_mut(&old_sender.user).unwrap().clear();
+    world.sync_trust();
+
+    let key = e2ee::store::StateKey::generate().unwrap();
+    let saved = world.clients[a]
+        .engine
+        .snapshot(&key, "past-sender")
+        .unwrap();
+    world.clients[a].engine = e2ee::Engine::from_snapshot(&key, "past-sender", &saved).unwrap();
+    let incoming = world.open(a, &ciphertext, b).unwrap();
+    assert_eq!(incoming.sender, old_sender);
+    assert!(!incoming.sender_trusted);
+    assert_eq!(incoming.envelope.text, "the old leaf is now empty");
+}
+
+#[test]
 fn twenty_devices_add_remove_and_commit() {
     let (mut world, all) = group_of(20);
     let epoch = world.epoch(all[0]);
@@ -1781,4 +1839,33 @@ fn messages_are_padded_to_buckets_so_the_server_sees_short_medium_or_long() {
         })
         .collect();
     assert_eq!(edits[0], edits[1]);
+}
+
+#[test]
+fn a_message_opens_after_as_many_membership_changes_as_are_kept_and_no_more() {
+    let kept = e2ee::Config::default().max_past_epochs;
+    assert_eq!(kept, 8);
+    let mut world = World::new();
+    let (a, b) = (world.person("a"), world.person("b"));
+    let joiners: Vec<usize> = (0..=kept).map(|n| world.person(&format!("p{n}"))).collect();
+    world.sync_trust();
+    world.start(a);
+    world.change(&[a], a, &[b], &[]);
+    let read_late = world.send(a, "read after the changes");
+    let read_too_late = world.send(a, "read after one change more");
+    let mut members = vec![a, b];
+    for (n, joiner) in joiners.iter().enumerate() {
+        world.change(&members.clone(), a, &[*joiner], &[]);
+        members.push(*joiner);
+        if n + 1 == kept {
+            let opened = world
+                .open(b, &read_late, a)
+                .expect("within the kept epochs");
+            assert_eq!(opened.envelope.text, "read after the changes");
+        }
+    }
+    assert!(
+        world.open(b, &read_too_late, a).is_err(),
+        "past the kept epochs the keys are gone"
+    );
 }

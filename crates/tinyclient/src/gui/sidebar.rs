@@ -1380,7 +1380,7 @@ impl Shell {
             return vec![window];
         }
         let mode = &self.sidebar_state.mode;
-        let mut found: Vec<(Network, Tone, String)> = Vec::new();
+        let mut found: Vec<(AccountKey, Tone, String)> = Vec::new();
         for account in &snapshot.accounts {
             let network = account.key.network;
             let here = match mode {
@@ -1397,7 +1397,7 @@ impl Shell {
                 self.trouble.get(&account.key).map(|since| since.elapsed()).unwrap_or_default() >= TROUBLE_SHOWN
             });
             if let Some((tone, words)) = words {
-                found.push((network, tone, words));
+                found.push((account.key.clone(), tone, words));
             }
         }
         // One per pane: the most urgent, not the first account's.
@@ -1405,15 +1405,20 @@ impl Shell {
         found
             .into_iter()
             .take(1)
-            .map(|(network, tone, words)| match tone {
+            .map(|(account, tone, words)| {
+                let network = account.network;
+                match tone {
                 Tone::Danger => banner(tone, words).child(
                     banner_action("sign-in-again", "Sign in").on_click(cx.listener(move |this, _, _, cx| this.sign_in(network, cx))),
                 ),
                 Tone::Attention => banner(tone, words).child(
-                    banner_action("open-network", format!("Open {}", network.label())).on_click(move |_, _, cx| cx.open_url(network_app(network))),
+                    banner_action("open-network", format!("Open {}", network.label())).on_click(cx.listener(move |this, _, _, cx| {
+                        if network == Network::Tiny { this.tiny_reconnect(account.clone(), cx); }
+                        else { cx.open_url(network_app(network)); }
+                    })),
                 ),
                 tone => banner(tone, words),
-            })
+            }})
             .collect()
     }
 
@@ -1698,7 +1703,7 @@ impl Shell {
         menu = menu.child(super::components::menu_item_danger("slack-sign-out", Some("icons/log-out.svg"), format!("Sign out of {name}")).on_click(cx.listener(move |this, _, _, cx| {
             this.sidebar_state.slack_menu = false;
             if let Some(account) = account.clone() {
-                this.sign_out(account, cx);
+                this.sign_out(account, false, cx);
             }
         })));
         if phone {

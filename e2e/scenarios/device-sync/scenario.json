@@ -1,0 +1,10 @@
+{
+  "id": "device-sync",
+  "title": "A linked device preserves history order, sends immediately, restores encrypted backups, fills history gaps from sibling devices and loses access after revocation",
+  "platforms": ["windows", "linux"],
+  "needs": ["server-device-link", "server-self-sync", "two-people", "device-sync-coordinator", "device-sync-extended"],
+  "release": false,
+  "max_still_seconds": 120,
+  "execution": "coordinated-ipc",
+  "required_args": ["--extended"]
+}

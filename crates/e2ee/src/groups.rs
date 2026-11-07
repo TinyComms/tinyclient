@@ -426,9 +426,20 @@ impl Engine {
     /// a bare 65 byte key or a TLS `ExternalSender`). Do this only when the server says this device
     /// starts the group (`POST /v1/e2ee/conversations/{id}/group`).
     pub fn create_group(&mut self, conv: ConversationId, server_key: &[u8]) -> Result<()> {
+        self.repair_replacement_allowed(conv)?;
         if self.has_group(conv) {
             return Err(Error::GroupExists);
         }
+        self.create_group_state(conv, server_key)?;
+        self.register_legacy_group(conv)?;
+        self.persist(true)
+    }
+
+    pub(crate) fn create_group_state(
+        &mut self,
+        conv: ConversationId,
+        server_key: &[u8],
+    ) -> Result<()> {
         let (key, sender) = parse_server_key(server_key)?;
         let extensions = mls::Extensions::single(mls::Extension::ExternalSenders(vec![sender]))
             .map_err(Error::mls)?;
@@ -451,11 +462,12 @@ impl Engine {
                 ..ConvMeta::default()
             },
         );
-        self.persist(true)
+        Ok(())
     }
 
     /// Forgets a conversation entirely: its group, its keys and its pin.
     pub fn forget_conversation(&mut self, conv: ConversationId) -> Result<()> {
+        self.repair_forget_allowed(conv)?;
         if let Some(mut group) = self.groups.remove(&conv) {
             group.delete(self.provider.storage()).map_err(Error::mls)?;
         } else if let Some(mut group) =
@@ -515,9 +527,11 @@ impl Engine {
     /// copy of the key, in its context, changes only with a commit; this re-pins what is shown.
     pub fn accept_server_key(&mut self, conv: ConversationId, new_key: &[u8]) -> Result<()> {
         let (key, _) = parse_server_key(new_key)?;
+        self.repair_server_pin_allowed(conv, &key)?;
         let meta = self.meta_mut(conv)?;
-        meta.server_key = key.into();
+        meta.server_key = key.clone().into();
         meta.server_key_alert = false;
+        self.update_legacy_server_pin(conv, key);
         self.persist(true)
     }
 
@@ -554,6 +568,7 @@ impl Engine {
         conv: ConversationId,
         data: &[u8],
     ) -> Result<ProposalOutcome> {
+        self.repair_receive_allowed(conv)?;
         self.usable(conv)?;
         self.load_group(conv)?;
         let messages = parse_proposal_messages(data)?;
@@ -667,6 +682,7 @@ impl Engine {
     /// flight, until [`Engine::confirm_commit`] or [`Engine::abort_commit`]; nothing is sent
     /// meanwhile.
     pub fn commit_pending(&mut self, conv: ConversationId) -> Result<Option<CommitBundle>> {
+        self.repair_outbound_allowed(conv)?;
         self.usable(conv)?;
         self.load_group(conv)?;
         let Engine {
@@ -756,6 +772,7 @@ impl Engine {
 
     /// The server accepted our commit (`204`): merge it. The epoch advances.
     pub fn confirm_commit(&mut self, conv: ConversationId) -> Result<CommitOutcome> {
+        self.repair_outbound_allowed(conv)?;
         self.usable(conv)?;
         self.load_group(conv)?;
         let Engine {
@@ -829,6 +846,7 @@ impl Engine {
         message_epoch: u64,
         data: &[u8],
     ) -> Result<CommitOutcome> {
+        self.repair_receive_allowed(conv)?;
         if data.len() > MAX_HANDSHAKE_BYTES {
             return Err(Error::TooLarge("commit"));
         }
@@ -982,6 +1000,7 @@ impl Engine {
         data: &[u8],
         server_key: Option<&[u8]>,
     ) -> Result<JoinOutcome> {
+        self.repair_welcome_allowed(conv)?;
         if data.len() > MAX_HANDSHAKE_BYTES {
             return Err(Error::TooLarge("welcome"));
         }
@@ -1130,6 +1149,7 @@ impl Engine {
                 ..ConvMeta::default()
             },
         );
+        self.register_legacy_group(conv)?;
         self.persist(true)?;
         Ok(JoinOutcome {
             epoch,
@@ -1358,6 +1378,7 @@ pub enum Forge<'a> {
 impl Engine {
     #[doc(hidden)]
     pub fn forge_commit(&mut self, conv: ConversationId, forge: Forge<'_>) -> Result<Vec<u8>> {
+        self.repair_outbound_allowed(conv)?;
         self.load_group(conv)?;
         let Engine {
             groups,
@@ -1435,6 +1456,7 @@ impl Engine {
     /// `commit` item to [`Engine::handle_commit`], which confirms ours if it is the one that won
     /// and drops ours and applies the winner if it is not.
     pub fn pending_commit(&self, conv: ConversationId) -> Option<CommitBundle> {
+        self.repair_outbound_allowed(conv).ok()?;
         self.meta
             .get(&conv)
             .and_then(|entry| entry.pending_commit.as_ref())

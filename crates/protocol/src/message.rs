@@ -325,8 +325,15 @@ pub struct Sender {
 pub struct Message {
     pub id: String,
     pub sender: Sender,
+    /// Saved legacy plaintext whose sender authentication was not retained. Any old local
+    /// attribution is historical display metadata, never cryptographic authorization.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub saved_history: bool,
     /// Unix seconds.
     pub sent: i64,
+    /// Milliseconds within `sent`, when the source supplies finer ordering.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sent_subsec_millis: u32,
     /// The network's own order, when the clock is coarser than one message. Tiny stamps an
     /// encrypted message to the minute and a plaintext message to the second, then numbers
     /// each post. `0` on a network that has no such number, and on a send that has not been
@@ -406,11 +413,13 @@ impl Message {
     ) -> Message {
         Message {
             id: id.into(),
+            saved_history: false,
             sender: Sender {
                 name: sender.into(),
                 ..Sender::default()
             },
             sent,
+            sent_subsec_millis: 0,
             seq: 0,
             expires_at: None,
             outgoing,
@@ -437,11 +446,11 @@ impl Message {
 
     /// Where this message sits among the others in its conversation.
     ///
-    /// Time first. A server sequence breaks a tie: Tiny's encrypted messages share a minute
+    /// Time including private milliseconds first. A server sequence breaks a tie: Tiny's encrypted messages share a minute
     /// and its plaintext messages share a second, and the id is not the order. A row with no
     /// sequence sorts after sequenced rows at that same time, then by id, shorter first.
-    pub fn rank(&self) -> (i64, u8, i64, usize, String) {
-        (self.sent, u8::from(self.seq == 0), self.seq, self.id.len(), self.id.clone())
+    pub fn rank(&self) -> (i64, u32, u8, i64, usize, String) {
+        (self.sent, self.sent_subsec_millis, u8::from(self.seq == 0), self.seq, self.id.len(), self.id.clone())
     }
 
     /// Cuts everything a network could make arbitrarily large to its limit. The store does this

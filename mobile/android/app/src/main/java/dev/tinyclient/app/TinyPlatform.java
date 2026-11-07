@@ -44,6 +44,7 @@ public final class TinyPlatform {
 
     static void detach(TinyActivity a) {
         if (activity == a) {
+            DeviceApproval.cancelAll();
             activity = null;
         }
     }
