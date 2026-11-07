@@ -15,6 +15,8 @@ Environment (all paths absolute; no host/provider names or secrets in-tree):
 from __future__ import annotations
 
 import json
+import base64
+import binascii
 import os
 import sqlite3
 import time
@@ -45,6 +47,24 @@ def load_contract(path: str | None = None) -> dict[str, Any]:
             raise FixtureError("fixture contract missing %s" % key)
     if not str(data["marker"]).startswith(MARKER_PREFIX):
         raise FixtureError("fixture marker must start with %s" % MARKER_PREFIX)
+    # Scratch sessions bypass the keychain. Never let each restart silently create
+    # new wrapping keys and discard the device state this scenario is testing.
+    for role in ("receiver", "sender"):
+        person = data[role]
+        session = person.get("session", {})
+        keys = session.get("e2ee") if isinstance(session, Mapping) else None
+        if not isinstance(keys, Mapping) or session.get("user_id") != person.get("user_id"):
+            raise FixtureError("%s needs its own stable session.e2ee wrapping keys before first launch" % role)
+        name = session.get("display_name")
+        if not isinstance(name, str) or not name or name.split() != [name]:
+            raise FixtureError("%s needs a single-word synthetic display_name for sidebar pixel selection" % role)
+        for name in ("state", "cache"):
+            try:
+                encoded = keys.get(name)
+                if not isinstance(encoded, str) or len(base64.b64decode(encoded, validate=True)) != 32:
+                    raise ValueError("invalid key")
+            except (ValueError, binascii.Error):
+                raise FixtureError("%s has missing/invalid durable wrapping keys" % role) from None
     return data
 
 

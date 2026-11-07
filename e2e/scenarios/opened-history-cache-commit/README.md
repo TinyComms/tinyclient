@@ -39,6 +39,11 @@ The pixel oracle uses Pillow/pytesseract when installed, otherwise the Windows O
 API with a configured language. Missing OCR or a missing window is setup-incomplete. Both phases
 must observe the exact server-assigned message ID in a scoped messages page;
 an empty page while asynchronous backfill is running is never history-loss RED.
+The peer row is selected from its unique visible name and OCR word bounds in the
+sidebar, with foreground/hit-PID guards. Missing or ambiguous text sends no click;
+the fixture does not supply guessed coordinates.
+Use a single-word synthetic display name per peer (for example Ada and Bea);
+preflight rejects unsupported names before any profile is changed.
 
 ## Environment
 
@@ -46,6 +51,11 @@ an empty page while asynchronous backfill is running is never history-loss RED.
 - `E2E_CACHE_COMMIT_FIXTURE` — absolute JSON describing owned profiles/sessions,
   conversation id, and marker (`opened-history-cache-commit-…`)
 - `E2E_DLCTL` — optional absolute `dlctl` when it is not beside the app bundle
+
+Each fixture session must include persistent `e2ee.state` and `e2ee.cache` wrapping
+keys (base64, 32 bytes each), created once for a NEW fixture before its first app
+launch. Missing/invalid keys refuse setup before any profile is changed. Keep
+these synthetic keys private; never regenerate them to resume an existing device.
 
 No real host/provider names, IPs, SIDs, tokens, or old user data belong in public
 scripts or recordings. Fixture bootstrap stays env-driven and private.

@@ -45,6 +45,29 @@ def status(profile: str, app_dir: str) -> dict[str, Any]:
     return request(profile, {"op": "status"}, app_dir=app_dir)
 
 
+def e2ee_status(profile: str, app_dir: str, user_id: str) -> dict[str, Any]:
+    return request(
+        profile,
+        {
+            "op": "tiny_e2ee",
+            "account": {"network": "tiny", "account": user_id},
+            "ask": {"op": "status"},
+        },
+        app_dir=app_dir,
+        timeout=45,
+    )
+
+
+def e2ee_device_state(answer: Mapping[str, Any]) -> str:
+    status = answer.get("status") if isinstance(answer.get("status"), Mapping) else answer
+    if not isinstance(status, Mapping):
+        return ""
+    device = status.get("device")
+    if isinstance(device, Mapping):
+        return str(device.get("state") or "")
+    return str(device or "")
+
+
 def send_text(
     profile: str,
     app_dir: str,
@@ -72,15 +95,27 @@ def messages(
     network: str,
     account: str,
     conversation: str,
+    limit: int = 50,
 ) -> dict[str, Any]:
     return request(
         profile,
         {
             "op": "messages",
             "conversation": {"network": network, "account": account, "id": conversation},
+            "limit": int(limit),
         },
         app_dir=app_dir,
     )
+
+
+def row_send_state(row: Mapping[str, Any]) -> str:
+    if "state" not in row:
+        return "sent"  # serde omits the default Sent variant.
+    state = row["state"]
+    if isinstance(state, Mapping):
+        value = state.get("state")
+        return value if value in ("sent", "pending", "failed") else "invalid"
+    return "invalid"
 
 
 def text_contains_marker(answer: Mapping[str, Any], marker: str) -> bool:
@@ -90,7 +125,7 @@ def text_contains_marker(answer: Mapping[str, Any], marker: str) -> bool:
         isinstance(row, Mapping)
         and row.get("text") == marker
         and row.get("seal") == "encrypted"
-        and row.get("state", "sent") == "sent"
+        and row_send_state(row) == "sent"
         for row in answer.get("messages", [])
     )
 
@@ -106,7 +141,7 @@ def target_state(answer, conversation, message_id, marker):
         return "missing"
     if text_contains_marker({"op": "messages", "messages": [target]}, marker):
         return "opened"
-    if target.get("seal") == "undecryptable" and target.get("state", "sent") == "sent":
+    if target.get("seal") == "undecryptable" and row_send_state(target) == "sent":
         return "undecryptable"
     raise ValueError("target row is neither the exact opened message nor an undecryptable row")
 

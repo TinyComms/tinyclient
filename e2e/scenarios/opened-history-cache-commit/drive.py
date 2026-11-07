@@ -241,6 +241,23 @@ def main() -> int:
                 receiver_connected=recv_ok,
             )
 
+        def e2ee_ready(profile: str, user_id: str) -> bool:
+            try:
+                answer = ipc.e2ee_status(profile, APP, user_id)
+            except Exception:
+                return False
+            return ipc.e2ee_device_state(answer) == "ready"
+
+        send_e2ee = fixture.wait_until(90, lambda: e2ee_ready(send_profile, sender["user_id"]))
+        recv_e2ee = fixture.wait_until(90, lambda: e2ee_ready(recv_profile, receiver["user_id"]))
+        step("owned sender and receiver e2ee devices are ready", send_e2ee and recv_e2ee)
+        if not (send_e2ee and recv_e2ee):
+            return incomplete(
+                "e2ee device not ready",
+                sender_e2ee=send_e2ee,
+                receiver_e2ee=recv_e2ee,
+            )
+
         client_id = "cache-commit-%s" % uuid.uuid4().hex[:12]
         try:
             sent = ipc.send_text(
@@ -276,10 +293,10 @@ def main() -> int:
         step("receiver window is visible under the fault", shown)
         if not shown:
             return incomplete("receiver window never appeared")
-        native.prepare(window.pid)
-        click_x = int(contract.get("native", {}).get("conversation_click_x", 230))
-        click_y = int(contract.get("native", {}).get("conversation_click_y", 220))
-        native.click(window.pid, click_x, click_y)
+        step("select the peer from visible sidebar text under the fault", True)
+        peer_name = sender["session"]["display_name"]
+        selected = native.select_sidebar_peer(window.pid, peer_name, str(shots / "before-select-during.png"))
+        fixture.write_receipt(OUT, "during-navigation.json", selected)
         time.sleep(2.0)
         during_shot = str(shots / "during-fault.png")
         native.shot(window.pid, during_shot, printwindow=False)
@@ -341,8 +358,9 @@ def main() -> int:
         step("receiver window is visible after restart", shown)
         if not shown:
             return incomplete("receiver window never appeared after restart")
-        native.prepare(window.pid)
-        native.click(window.pid, click_x, click_y)
+        step("select the peer from visible sidebar text after restart", True)
+        selected = native.select_sidebar_peer(window.pid, peer_name, str(shots / "before-select-after.png"))
+        fixture.write_receipt(OUT, "after-navigation.json", selected)
         time.sleep(2.0)
         after_shot = str(shots / "after-restart.png")
         native.shot(window.pid, after_shot, printwindow=False)

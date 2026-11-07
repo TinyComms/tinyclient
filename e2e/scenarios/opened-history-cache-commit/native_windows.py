@@ -60,6 +60,45 @@ def click(pid: int, x: int, y: int) -> None:
     _ps(["-ExpectedPid", str(pid), "-Action", "click", "-X", str(x), "-Y", str(y)])
 
 
+def sidebar_word_center(words, width, name):
+    candidates = [word for word in words
+                  if word.get("text", "").casefold() == name.casefold()
+                  and 0 <= word.get("x", -1) < min(300, width * 0.3)
+                  and word.get("y", 0) >= 50
+                  and word.get("width", 0) > 0 and word.get("height", 0) > 0]
+    if len(candidates) != 1:
+        raise NativeError("no unique visible peer name in the sidebar; no click sent")
+    word = candidates[0]
+    return (round(word["x"] + word["width"] / 2), round(word["y"] + word["height"] / 2))
+
+
+def windows_ocr(path):
+    done = subprocess.run([
+        "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+        "-File", str(HERE / "ocr.windows.ps1"), "-Path", str(Path(path).resolve()),
+    ], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
+    if done.returncode != 0:
+        raise NativeError("Windows pixel text observation unavailable")
+    return json.loads(done.stdout)
+
+
+def select_sidebar_peer(pid, name, screenshot, seconds=15):
+    """One click, located from observed text rather than configured coordinates."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        prepare(pid)
+        shot(pid, screenshot)
+        observed = windows_ocr(screenshot)
+        try:
+            x, y = sidebar_word_center(observed.get("words", []), rect(pid)["width"], name)
+        except NativeError:
+            time.sleep(0.5)
+            continue
+        click(pid, x, y)  # Foreground and hit-PID checked by owned_input.ps1.
+        return {"x": x, "y": y, "name": name}
+    raise NativeError("peer name never became uniquely visible; no click sent")
+
+
 def rect(pid: int) -> dict:
     raw = _ps(["-ExpectedPid", str(pid), "-Action", "rect"])
     return json.loads(raw)
@@ -91,13 +130,7 @@ def png_mentions_marker(path: str, marker: str) -> bool | None:
         try:
             if sys.platform != "win32":
                 return None
-            done = subprocess.run([
-                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                "-File", str(HERE / "ocr.windows.ps1"), "-Path", str(Path(path).resolve()),
-            ], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
-            if done.returncode != 0:
-                return None
-            text = json.loads(done.stdout)["text"]
+            text = windows_ocr(path)["text"]
         except Exception:
             return None
     return marker in "".join(text.split())
