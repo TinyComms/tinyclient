@@ -881,6 +881,21 @@ pub(super) fn prove_sealed_preview() -> Result<(), String> {
     }
 }
 
+/// The lab's keycap-reaction proof. A keycap is taken as a reaction, and a bare digit still is not.
+pub(super) fn prove_keycap_reaction() -> Result<(), String> {
+    for keycap in ["1\u{FE0F}\u{20E3}", "0\u{20E3}", "#\u{FE0F}\u{20E3}"] {
+        if !unicode_emoji(keycap) {
+            return Err(format!("the keycap {keycap:?} was refused as a reaction"));
+        }
+    }
+    for not_one in ["1", "10\u{FE0F}\u{20E3}", "1\u{FE0F}", ":one:"] {
+        if unicode_emoji(not_one) {
+            return Err(format!("{not_one:?} was taken as a reaction"));
+        }
+    }
+    Ok(())
+}
+
 /// The lab's sealed-preview-attachments proof. A wiped sqlite row still restores a captionless
 /// image and a captioned attachment from the authenticated sealed cache. The lab sets
 /// `TINYCLIENT_PROVE=sealed-preview-attachments`.
@@ -1887,14 +1902,17 @@ fn media_kind(kind: &str, mime: &str) -> MediaKind {
     }
 }
 
-/// Unicode emoji only. A shortcode, a word, or a path is not one.
+/// Unicode emoji only. A shortcode, a word, or a path is not one. A keycap is one, though it
+/// starts with an ASCII digit (1️⃣ is `1`, U+FE0F, U+20E3), and tinyserver takes it.
 fn unicode_emoji(emoji: &str) -> bool {
     let mut textual = false;
     if emoji.is_empty() {
         return false;
     }
-    for ch in emoji.chars() {
-        if ch.is_ascii_alphanumeric() || ch == ':' || ch == '/' {
+    for (at, ch) in emoji.char_indices() {
+        let after = &emoji[at + ch.len_utf8()..];
+        let keycap = ch.is_ascii_digit() && (after.starts_with('\u{20E3}') || after.starts_with("\u{FE0F}\u{20E3}"));
+        if !keycap && (ch.is_ascii_alphanumeric() || ch == ':' || ch == '/') {
             return false;
         }
         if !ch.is_ascii() {
@@ -2879,6 +2897,20 @@ mod tests {
         assert!(!unicode_emoji(":smile:"));
         assert!(!unicode_emoji("ok"));
         assert!(!unicode_emoji(""));
+    }
+
+    /// A keycap reaction (1️⃣) was refused when sent and dropped when another app had put one on
+    /// a message, because it starts with an ASCII digit.
+    #[test]
+    fn a_keycap_is_a_reaction_and_a_bare_digit_is_not() {
+        assert!(unicode_emoji("1\u{FE0F}\u{20E3}"));
+        assert!(unicode_emoji("7\u{20E3}"), "a keycap without its variation selector");
+        assert!(unicode_emoji("*\u{FE0F}\u{20E3}"));
+        assert!(!unicode_emoji("1"));
+        assert!(!unicode_emoji("1\u{FE0F}"), "a digit and a variation selector are not a keycap");
+        assert!(!unicode_emoji("10\u{FE0F}\u{20E3}"), "only the digit right before the keycap mark is part of it");
+        assert!(!unicode_emoji("a\u{20E3}"));
+        assert!(super::prove_keycap_reaction().is_ok());
     }
 
     #[test]
