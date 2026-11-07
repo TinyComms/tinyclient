@@ -208,7 +208,7 @@ pub struct ChainReport {
     pub first_contact: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct UserTrust {
     /// A root has been pinned. Stays set when every device is revoked, so a later unsigned
     /// "first" device is reported as a new identity and not trusted silently.
@@ -218,12 +218,54 @@ struct UserTrust {
 }
 
 /// Which devices of which people this client trusts. Persisted inside the engine's state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trust {
     users: BTreeMap<UserId, UserTrust>,
 }
 
 impl Trust {
+    /// Validates public verification records received over an authenticated link or backup.
+    /// This type contains only public signing keys, identifiers, and revocation tombstones.
+    pub fn validate_public(&self) -> Result<()> {
+        for trust in self.users.values() {
+            if !trust.pinned && !trust.devices.is_empty() {
+                return Err(Error::Malformed("public trust"));
+            }
+            for key in trust.devices.values() {
+                check_key(key)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Copies previously unknown people's public pins. Existing pinned entries, including
+    /// empty revocation tombstones, stay intact; older archives cannot restore revoked devices.
+    pub(crate) fn import_public(&mut self, source: &Trust) -> Result<()> {
+        source.validate_public()?;
+        for (user, incoming) in &source.users {
+            if !self.knows(*user) && incoming.pinned {
+                self.users.insert(*user, incoming.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Includes this device's authenticated public identity when exporting its public pins.
+    pub(crate) fn include_own_public(&mut self, own: DeviceRef) -> Result<()> {
+        check_key(&own.signature_key)?;
+        let entry = self.users.entry(own.user).or_default();
+        if entry
+            .devices
+            .get(&own.device)
+            .is_some_and(|key| key[..] != own.signature_key)
+        {
+            return Err(Error::IdentityChanged);
+        }
+        entry.devices.insert(own.device, Bytes(own.signature_key));
+        entry.pinned = true;
+        Ok(())
+    }
+
     pub fn new() -> Trust {
         Trust::default()
     }

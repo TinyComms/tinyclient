@@ -89,6 +89,9 @@ impl Fake {
                 kind: "message",
                 ciphertext: row["ciphertext"].as_str(),
                 epoch: row["epoch"].as_u64().unwrap(),
+                generation: None,
+                group_id: None,
+                created_at: "2026-11-05T00:00:00Z",
                 device_id: row["device_id"].as_str().unwrap(),
                 target_id: None,
                 client_id: row["client_id"].as_str(),
@@ -369,7 +372,7 @@ fn device(fake: &Fake, user: &str, name: &str) -> Device {
 
 fn text(read: &HashMap<String, Read>, id: &str) -> String {
     match read.get(id) {
-        Some(Read::Opened(opened)) => opened.text.clone(),
+        Some(Read::Opened(opened) | Read::Legacy(opened)) => opened.text.clone(),
         Some(Read::Undecryptable) => protocol::UNDECRYPTABLE.to_owned(),
         Some(Read::Edit) => "(edit)".to_owned(),
         None => "(absent)".to_owned(),
@@ -434,20 +437,22 @@ fn a_message_that_did_not_open_for_want_of_the_group_is_read_again_when_it_arriv
     lock(&fake.server).fail = 1;
     let read = fake.read(&mut bea);
     assert_eq!(text(&read, &first), protocol::UNDECRYPTABLE);
-    let reread = bea.heard(
+    let (commands, inbox) = std::sync::mpsc::channel();
+    bea.commands = Some(commands);
+    bea.heard(
         "e2ee.handshake",
         &json!({ "conversation_id": CONVERSATION }),
     );
-    assert_eq!(
-        reread.as_deref(),
-        Some(CONVERSATION),
+    assert!(
+        matches!(inbox.try_recv(), Ok(crate::adapters::Command::Backfill(id)) if id == CONVERSATION),
         "the handshake that brings the group asks for the rows again"
     );
     let read = fake.read(&mut bea);
     assert_eq!(text(&read, &first), "hello Bea");
-    let again = bea.heard(
+    bea.heard(
         "e2ee.handshake",
         &json!({ "conversation_id": CONVERSATION }),
     );
-    assert_eq!(again, None, "and only once: everything opened");
+    assert!(matches!(inbox.try_recv(), Ok(crate::adapters::Command::Backfill(id)) if id == CONVERSATION),
+        "later handshakes also refresh rows for linked-device catch-up");
 }

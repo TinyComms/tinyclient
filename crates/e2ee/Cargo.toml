@@ -19,7 +19,8 @@ openmls_rust_crypto = "0.5.1"
 # the local cache. `stream` is the only feature added to what the tree already builds.
 aes-gcm = { version = "0.10", features = ["stream", "zeroize"] }
 # P-256 ECDSA for the device identity and its cross-signatures. Already linked by openmls.
-p256 = { version = "0.13", features = ["ecdsa"] }
+# `ecdh` for the device link channel (`link`); it adds no crate the tree does not already build.
+p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
 sha2 = "0.10"
 # A fresh sub-key per sealed blob, so one long-lived state key never meets a nonce twice.
 hkdf = "0.12"
@@ -35,6 +36,9 @@ tempfile = "3"
 # The safety number reuses DAVE's pairwise fingerprint (scrypt over the sorted identities) and its
 # displayable code, exactly as mediad's calls do. The version mediad pins.
 davey = "=0.1.5"
+# Argon2id for the passphrase of an encrypted backup file (`backup`). The version Cargo.lock
+# already holds through libsignal; no crate is added.
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 
 [features]
 # Test-only helpers (`Engine::forge_message`). Never enabled by a client build.

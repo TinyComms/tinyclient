@@ -152,7 +152,7 @@ struct Open {
 #[derive(Default)]
 struct ReadMark {
     /// The newest message the network has been told about, in [`Message::rank`] order.
-    sent: Option<(i64, u8, i64, usize, String)>,
+    sent: Option<(i64, u32, u8, i64, usize, String)>,
     at: Option<Instant>,
     /// Seen since, waiting for the second to pass.
     next: Option<String>,
@@ -1193,7 +1193,7 @@ impl Pane {
         .detach();
     }
 
-    fn mark_read(&mut self, order: (i64, u8, i64, usize, String), cx: &mut Context<Self>) {
+    fn mark_read(&mut self, order: (i64, u32, u8, i64, usize, String), cx: &mut Context<Self>) {
         // The last gate before the socket, whoever called.
         if !may_mark_read(SCREENSHOTS, self.active, self.open.is_some(), true) {
             return;
@@ -1201,7 +1201,7 @@ impl Pane {
         let Some(conversation) = self.key().cloned() else {
             return;
         };
-        let request = Request::MarkRead { conversation, message_id: order.4.clone() };
+        let request = Request::MarkRead { conversation, message_id: order.5.clone() };
         self.read.sent = Some(order);
         self.read.at = Some(Instant::now());
         cx.background_executor().spawn(async move { ask(&request) }).detach();

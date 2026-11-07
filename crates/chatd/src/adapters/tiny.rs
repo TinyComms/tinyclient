@@ -275,6 +275,20 @@ pub fn local_servers() -> Response {
     }
 }
 
+/// Signing out of `account` with its encrypted history kept: each of its servers' cache keys moves
+/// from the session, about to be forgotten, to a keychain item of its own (`e2ee::keep_history`).
+pub fn keep_history(session: &str, account: &str) -> Result<(), String> {
+    for saved in saved_rows(session)?.iter().filter(|saved| saved.user_id == account) {
+        e2ee::keep_history(saved)?;
+    }
+    Ok(())
+}
+
+/// Signing out of `account` with its encrypted history erased from this device.
+pub fn erase_history(account: &str) {
+    e2ee::erase_history(account);
+}
+
 /// The session with one server removed. `None` only when that was the last one. An account that
 /// is not in the blob leaves the original string untouched.
 pub fn without(session: &str, account: &str) -> Option<String> {
@@ -922,6 +936,8 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
         Some(extras) => (extras.server, extras.roles, extras.categories, extras.bans),
         None => (None, Vec::new(), Vec::new(), Vec::new()),
     };
+    // "New device added", from what this device knows: no request.
+    let new_devices = e2ee::added(&saved);
     Response::TinyCommunity {
         community: TinyCommunity {
             role: saved.role,
@@ -940,6 +956,7 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
             categories,
             bans,
             provider,
+            new_devices,
         },
     }
 }
@@ -1140,13 +1157,18 @@ pub(crate) fn rename(account: AccountKey, display_name: String) -> Response {
 /// Ends every session of this account on the server. A 401 is already the same thing: the
 /// caller forgets the session either way.
 /// `Request::TinyE2ee`: this account's encryption device, its people and their safety numbers.
-pub(crate) fn e2ee_ask(account: AccountKey, ask: protocol::E2eeAsk) -> Response {
+/// `told` is called when a device link moves on by itself.
+pub(crate) fn e2ee_ask(account: AccountKey, ask: protocol::E2eeAsk, told: Arc<dyn Fn() + Send + Sync>) -> Response {
     let saved = match open(&account) {
         Ok(saved) => saved,
         Err(answer) => return answer,
     };
-    let names: std::collections::HashMap<String, String> = members_of(&saved).map(|members| members.into_iter().map(|member| (member.user_id, member.display_name)).collect()).unwrap_or_default();
-    e2ee::answer(&saved, ask, &names)
+    // Only the asks that show people need their names: a link's steps are asked often.
+    let names: std::collections::HashMap<String, String> = match ask {
+        protocol::E2eeAsk::Status | protocol::E2eeAsk::Person { .. } => members_of(&saved).map(|members| members.into_iter().map(|member| (member.user_id, member.display_name)).collect()).unwrap_or_default(),
+        _ => std::collections::HashMap::new(),
+    };
+    e2ee::answer(&saved, ask, &names, told)
 }
 
 pub(crate) fn end_sessions(account: &AccountKey) -> Result<(), Response> {
@@ -1178,54 +1200,9 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
         .spawn(move || {
             // This install as an encryption device of the person, before any conversation is read:
             // made, registered, key packages up. Never stops the account.
-            e2ee::begin(&saved);
+            e2ee::begin(&saved, ctx.commands.clone());
             messages::refresh(&ctx, &saved);
-            serve_commands(
-                &ctx,
-                inbox,
-                Duration::from_millis(200),
-                |id| messages::serve(&ctx, &saved, &live, Command::Backfill(id.to_owned())),
-                |command| match command {
-                    Command::Tiny(ask) => live.ask(ask),
-                    // A direct call's join is a ring, or an accept when one is already ringing in.
-                    // Media starts only once the server says the ring was accepted.
-                    Command::CallJoin(id) => {
-                        let key = ctx.key(&id);
-                        let (call, _) = ctx.hub.calls.describe();
-                        let incoming = call.as_ref().is_some_and(|call| {
-                            call.conversation == key
-                                && matches!(call.state, protocol::CallState::RingingIn { .. })
-                        }) || ctx.hub.calls.aside().is_some_and(|call| {
-                            call.conversation == key
-                                && matches!(call.state, protocol::CallState::RingingIn { .. })
-                        });
-                        let (reply, _) = std::sync::mpsc::channel();
-                        if incoming {
-                            live.ask(live::Ask::Accept {
-                                direct_id: id,
-                                reply,
-                            });
-                        } else {
-                            live.ask(live::Ask::Ring {
-                                direct_id: id,
-                                attempt: None,
-                                reply,
-                            });
-                        }
-                    }
-                    // chatd's call in a room ended (hung up, or failed), or its mute changed.
-                    Command::CallLeave(room_id) => live.ask(live::Ask::Hangup { room_id }),
-                    Command::CallAudio { muted, deafened } => live.ask(live::Ask::State { muted, deafened }),
-                    Command::SignOut(reply) => {
-                        // This install stops being a device of the person: revoked on the server
-                        // while the session still works, its keys and cache forgotten here.
-                        e2ee::sign_out(&saved);
-                        delete_session(&saved);
-                        let _ = reply.send(Ok(()));
-                    }
-                    other => messages::serve(&ctx, &saved, &live, other),
-                },
-            );
+            serve_inbox(&ctx, &saved, &live, inbox);
             // The socket thread sleeps on the socket; this is how it hears the adapter stopped.
             live.wake();
         })
@@ -1311,6 +1288,57 @@ pub(crate) fn serve(handler: impl Fn(&str) -> Vec<u8> + Send + 'static) -> Strin
         }
     });
     format!("http://127.0.0.1:{port}")
+}
+
+/// The account's commands, until it stops. A conversation opened (`Backfill`) or warmed reads
+/// its newest page from the server, as every other command that reads one does.
+fn serve_inbox(ctx: &Context, saved: &Saved, live: &live::Live, inbox: Receiver<Command>) {
+    serve_commands(
+        ctx,
+        inbox,
+        Duration::from_millis(200),
+        |id| messages::serve(ctx, saved, live, Command::Backfill(id.to_owned())),
+        |command| match command {
+            Command::Tiny(ask) => live.ask(ask),
+            // A direct call's join is a ring, or an accept when one is already ringing in.
+            // Media starts only once the server says the ring was accepted.
+            Command::CallJoin(id) => {
+                let key = ctx.key(&id);
+                let (call, _) = ctx.hub.calls.describe();
+                let incoming = call.as_ref().is_some_and(|call| {
+                    call.conversation == key
+                        && matches!(call.state, protocol::CallState::RingingIn { .. })
+                }) || ctx.hub.calls.aside().is_some_and(|call| {
+                    call.conversation == key
+                        && matches!(call.state, protocol::CallState::RingingIn { .. })
+                });
+                let (reply, _) = std::sync::mpsc::channel();
+                if incoming {
+                    live.ask(live::Ask::Accept {
+                        direct_id: id,
+                        reply,
+                    });
+                } else {
+                    live.ask(live::Ask::Ring {
+                        direct_id: id,
+                        attempt: None,
+                        reply,
+                    });
+                }
+            }
+            // chatd's call in a room ended (hung up, or failed), or its mute changed.
+            Command::CallLeave(room_id) => live.ask(live::Ask::Hangup { room_id }),
+            Command::CallAudio { muted, deafened } => live.ask(live::Ask::State { muted, deafened }),
+            Command::SignOut(reply) => {
+                // This install stops being a device of the person: revoked on the server
+                // while the session still works, its keys and cache forgotten here.
+                e2ee::sign_out(saved);
+                delete_session(saved);
+                let _ = reply.send(Ok(()));
+            }
+            other => messages::serve(ctx, saved, live, other),
+        },
+    );
 }
 
 #[cfg(test)]

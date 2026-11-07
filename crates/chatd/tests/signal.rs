@@ -425,7 +425,7 @@ fn an_unlinked_device_expires_keeps_what_was_read_and_signing_out_unlinks() {
 
     let world = World::linked();
     world.connected();
-    world.ask(Request::SignOut { account: account() });
+    world.ask(Request::SignOut { account: account(), erase: false });
     world.heard("unlink");
     assert!(world.conversation(CLUB).is_none());
 }

@@ -23,10 +23,30 @@ use crate::ids::{ConversationId, DeviceId, DeviceRef, UserId};
 use crate::wire::guard;
 use openmls::prelude as mls;
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
+use openmls_traits::storage::{traits, Entity, StorageProvider as _, CURRENT_VERSION};
 use openmls_traits::OpenMlsProvider as _;
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 const AAD_LABEL: &[u8] = b"tiny-e2ee-v1 msg";
+
+// OpenMLS authenticates old messages against the old epoch's members, but ProcessedMessage
+// exposes only their credential, not their signing key. Read just the public member records
+// from its persisted message-secret store; omitted secret fields are skipped by serde. This
+// projection is read-only and must never be written back as an OpenMLS message-secret store.
+#[derive(Deserialize, Serialize)]
+struct PastEpochMembers {
+    past_epoch_trees: Vec<EpochMembers>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct EpochMembers {
+    epoch: u64,
+    leaves: Vec<mls::Member>,
+}
+
+impl Entity<CURRENT_VERSION> for PastEpochMembers {}
+impl traits::MessageSecrets<CURRENT_VERSION> for PastEpochMembers {}
 
 /// The sizes an envelope is padded up to: 256 B for most chat messages, reactions and control
 /// messages, up to 16 KiB, the envelope cap ([`crate::envelope::MAX_ENVELOPE_BYTES`]).
@@ -145,6 +165,7 @@ impl Engine {
         target_id: Option<&str>,
         envelope: &Envelope,
     ) -> Result<Sealed> {
+        self.repair_outbound_allowed(conv)?;
         if (kind == Kind::Edit) != target_id.is_some() {
             return Err(Error::Malformed("edit target"));
         }
@@ -222,6 +243,7 @@ impl Engine {
         ciphertext: &[u8],
         claimed: &Claimed<'_>,
     ) -> Result<Incoming> {
+        self.repair_receive_allowed(conv)?;
         self.usable(conv)?;
         self.load_group(conv)?;
         let message = guard(|| mls::MlsMessageIn::tls_deserialize_exact(ciphertext))?
@@ -265,7 +287,24 @@ impl Engine {
             let mls::Sender::Member(leaf) = *processed.sender() else {
                 return Err(Error::SenderMismatch);
             };
-            let member = group.member_at(leaf).ok_or(Error::SenderMismatch)?;
+            let member = if epoch == local {
+                group.member_at(leaf)
+            } else {
+                provider
+                    .storage()
+                    .message_secrets::<mls::GroupId, PastEpochMembers>(group.group_id())
+                    .map_err(Error::mls)?
+                    .and_then(|past| {
+                        past.past_epoch_trees
+                            .into_iter()
+                            .find(|past| past.epoch == epoch)
+                    })
+                    .and_then(|past| past.leaves.into_iter().find(|member| member.index == leaf))
+            }
+            .ok_or(Error::SenderMismatch)?;
+            if &member.credential != processed.credential() {
+                return Err(Error::SenderMismatch);
+            }
             let sender = {
                 let (user, device) =
                     crate::ids::parse_credential(member.credential.serialized_content())?;
@@ -327,6 +366,7 @@ impl Engine {
         signer: &crate::identity::DeviceKey,
         envelope: &Envelope,
     ) -> Result<Vec<u8>> {
+        self.repair_outbound_allowed(conv)?;
         self.usable(conv)?;
         self.load_group(conv)?;
         let Engine {

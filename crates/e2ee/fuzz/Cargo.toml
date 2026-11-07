@@ -42,3 +42,17 @@ path = "fuzz_targets/mls_message.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "link"
+path = "fuzz_targets/link.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive"
+path = "fuzz_targets/archive.rs"
+test = false
+doc = false
+bench = false

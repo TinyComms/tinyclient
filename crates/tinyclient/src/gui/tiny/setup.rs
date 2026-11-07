@@ -88,7 +88,7 @@ impl State {
 }
 
 /// A selectable card: lit when chosen, faint and quiet when it cannot be.
-fn pick_card(id: impl Into<ElementId>, on: bool, enabled: bool) -> Stateful<Div> {
+pub(super) fn pick_card(id: impl Into<ElementId>, on: bool, enabled: bool) -> Stateful<Div> {
     div()
         .id(id)
         .w_full()
@@ -105,7 +105,7 @@ fn pick_card(id: impl Into<ElementId>, on: bool, enabled: bool) -> Stateful<Div>
 }
 
 /// A round mark, filled when it is the one picked.
-fn radio(on: bool) -> Div {
+pub(super) fn radio(on: bool) -> Div {
     let ring = div().flex_none().mt(px(2.)).size(px(14.)).rounded(px(7.)).flex().items_center().justify_center();
     if on {
         ring.bg(theme::accent()).child(div().size(px(6.)).rounded(px(3.)).bg(theme::on_accent()))
