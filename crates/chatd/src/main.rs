@@ -39,6 +39,15 @@ fn main() -> io::Result<()> {
         }
         return Ok(());
     }
+    // The lab's legacy-saved-speakers driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("legacy-saved-speakers") {
+        if let Err(err) = chatd::adapters::tiny::prove_legacy_saved_speakers() {
+            eprintln!("legacy-saved-speakers: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-legacy-saved-speakers:0");
+        return Ok(());
+    }
     // The lab's sealed-row driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("sealed-row") {
         if let Err(err) = chatd::adapters::tiny::prove_missing_seal() {

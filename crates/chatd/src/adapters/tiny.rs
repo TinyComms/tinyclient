@@ -43,6 +43,11 @@ pub fn prove_sealed_preview() -> Result<(), String> {
     messages::prove_sealed_preview()
 }
 
+/// The lab's legacy-saved-speakers proof. See `messages::prove_legacy_saved_speakers`.
+pub fn prove_legacy_saved_speakers() -> Result<(), String> {
+    messages::prove_legacy_saved_speakers()
+}
+
 /// The lab's cache-open-without-device proof. See `messages::prove_cache_open_without_device`.
 pub fn prove_cache_open_without_device() -> Result<(), String> {
     messages::prove_cache_open_without_device()
