@@ -396,10 +396,29 @@ fn channel_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>,
 }
 
 fn direct_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, frame: &Value) {
-    let Some(direct) = nested_value(frame, "direct").and_then(|value| serde_json::from_value::<WireDirect>(value).ok()) else {
+    let Some(mut value) = nested_value(frame, "direct") else {
         return;
     };
-    if !super::safe_id(&direct.id) || !super::safe_id(&direct.peer.user_id) {
+    // Live events name the pair; REST names the caller's peer. Validate the pair before
+    // accepting either shape, including an event that also happens to carry a peer field.
+    let paired = value.get("low_user_id").is_some() || value.get("high_user_id").is_some();
+    if paired {
+        let (Some(low), Some(high)) = (value.get("low_user_id").and_then(Value::as_str), value.get("high_user_id").and_then(Value::as_str)) else {
+            return;
+        };
+        if !super::safe_id(low) || !super::safe_id(high) || low == high {
+            return;
+        }
+        let peer = if low == saved.user_id { high } else if high == saved.user_id { low } else { return };
+        let name = names.get(peer).filter(|name| !name.is_empty()).cloned().or_else(|| {
+            ctx.hub.store().person(&ctx.key(peer)).ok().flatten().map(|person| person.name)
+        }).unwrap_or_else(|| "Someone".to_owned());
+        value["peer"] = json!({"user_id": peer, "display_name": name});
+    }
+    let Ok(direct) = serde_json::from_value::<WireDirect>(value) else {
+        return;
+    };
+    if !super::safe_id(&direct.id) || !super::safe_id(&direct.peer.user_id) || direct.peer.user_id == saved.user_id {
         return;
     }
     let name = title_or(&direct.peer.display_name, "Someone");
@@ -412,12 +431,20 @@ fn direct_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, 
     row.group = Some("directs".to_owned());
     row.peer = Some(direct.peer.user_id.clone());
     row.position = DIRECTS_AT;
-    row.encryption = encryption_of(saved, &direct.id, direct.e2ee, direct.plaintext_history);
+    // A replayed creation predates any later upgrade. It can add encryption, never remove it.
+    let kept = if paired { ctx.known(&direct.id).ok().flatten().map(|row| row.encryption) } else { None };
+    let sealed = direct.e2ee || kept.is_some_and(|encryption| encryption.is_sealed());
+    let history = direct.plaintext_history || kept == Some(Encryption::EndToEndAfterPlain);
+    row.encryption = encryption_of(saved, &direct.id, sealed, history);
     if ctx.conversation(&row).is_err() {
         return;
     }
-    let mine = direct.last_message.as_ref().is_some_and(|last| last.author_id == saved.user_id);
-    Note::from_last(&direct.id, direct.unread, direct.last_read.as_deref(), direct.peer_read.as_deref(), direct.last_message.as_ref(), mine).sealed(direct.e2ee).apply(ctx, saved, names);
+    // A creation event carries no viewer counts or message preview. Replaying it must
+    // leave messages already heard intact; only the REST shape supplies a full snapshot.
+    if !paired {
+        let mine = direct.last_message.as_ref().is_some_and(|last| last.author_id == saved.user_id);
+        Note::from_last(&direct.id, direct.unread, direct.last_read.as_deref(), direct.peer_read.as_deref(), direct.last_message.as_ref(), mine).sealed(direct.e2ee).apply(ctx, saved, names);
+    }
 }
 
 fn deliver(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, conversation_id: &str, wire: &WireMessage) {
@@ -2206,6 +2233,92 @@ mod tests {
         assert!(!unicode_emoji(":smile:"));
         assert!(!unicode_emoji("ok"));
         assert!(!unicode_emoji(""));
+    }
+
+    #[test]
+    fn a_new_direct_event_records_the_peer_on_either_side_before_the_first_message() {
+        for (low, high) in [(ME, PEER), (PEER, ME)] {
+            let (_adapter, ctx) = open_ctx();
+            let saved = saved("http://127.0.0.1:1");
+            let names = HashMap::from([(PEER.to_owned(), "Bea".to_owned())]);
+            let frame = json!({"direct": {"id": "new-direct", "low_user_id": low,
+                "high_user_id": high, "e2ee": true, "created_at": WHEN}});
+            on_live(&ctx, &saved, &names, "direct.created", &frame);
+            let row = ctx.known("new-direct").unwrap().expect("new direct is recorded before a message arrives");
+            assert_eq!((row.title.as_str(), row.peer.as_deref(), row.kind, row.encryption),
+                ("Bea", Some(PEER), ConversationKind::Direct, Encryption::EndToEnd));
+            assert_eq!(row.group_title, "Direct messages");
+            assert_eq!(ctx.hub.store().person(&ctx.key(PEER)).unwrap().unwrap().name, "Bea");
+
+            let first = json!({"conversation_id": "new-direct", "message": {
+                "id": "first", "author_id": PEER, "body": "hello Ada", "created_at": WHEN}});
+            on_live(&ctx, &saved, &names, "message.created", &first);
+            // Replayed creation must not clear the first message's preview or unread count.
+            ctx.counts("new-direct", 1, 0, Some("read-before"), rfc3339(WHEN).unwrap()).unwrap();
+            ctx.mark_encryption("new-direct", Encryption::EndToEndAfterPlain).unwrap();
+            on_live(&ctx, &saved, &HashMap::new(), "direct.created", &frame);
+            on_live(&ctx, &saved, &names, "message.created", &first);
+            let (rows, total) = ctx.hub.store().inbox(Some(Network::Tiny), InboxFilter::Directs, 0, 10, &[]).unwrap();
+            assert_eq!(total, 1);
+            assert_eq!(rows.len(), 1);
+            assert_eq!((rows[0].title.as_str(), rows[0].preview.as_str(), rows[0].unread), ("Bea", "hello Ada", 1));
+            assert_eq!(rows[0].encryption, Encryption::EndToEndAfterPlain);
+            assert_eq!(rows[0].last_read.as_deref(), Some("read-before"));
+        }
+    }
+
+    #[test]
+    fn a_stale_direct_creation_cannot_downgrade_an_encrypted_conversation() {
+        for encryption in [Encryption::EndToEnd, Encryption::EndToEndAfterPlain] {
+            for old_flag in [Some(false), None] {
+                let (_adapter, ctx) = open_ctx();
+                let saved = saved("http://127.0.0.1:1");
+                let mut row = ConversationRow::new("upgraded-direct", ConversationKind::Direct, "Bea");
+                row.encryption = encryption;
+                ctx.hub.store().upsert_conversation(&ctx.account, &row).unwrap();
+                let mut direct = json!({"id": "upgraded-direct", "low_user_id": ME, "high_user_id": PEER});
+                if let Some(flag) = old_flag { direct["e2ee"] = json!(flag); }
+                on_live(&ctx, &saved, &HashMap::new(), "direct.created", &json!({"direct": direct}));
+                assert_eq!(ctx.known("upgraded-direct").unwrap().unwrap().encryption, encryption,
+                    "stale e2ee={old_flag:?} must retain {encryption:?}");
+                assert_ne!(sealed_here(&ctx, &saved, "upgraded-direct"), Ok(false),
+                    "a creation replay must not permit plaintext sending");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unrelated_or_invalid_direct_pair_is_not_published() {
+        for (low, high) in [(PEER, "33333333"), (ME, ME), (ME, "bad/id"), ("", ME)] {
+            let (_adapter, ctx) = open_ctx();
+            let saved = saved("http://127.0.0.1:1");
+            // A peer field must not bypass validation when a pair is present.
+            let frame = json!({"direct": {"id": "new-direct", "low_user_id": low,
+                "high_user_id": high, "peer": {"user_id": PEER, "display_name": "Bea"}}});
+            on_live(&ctx, &saved, &HashMap::new(), "direct.created", &frame);
+            assert!(ctx.known("new-direct").unwrap().is_none(), "invalid pair {low}/{high}");
+        }
+        for pair in [json!({"low_user_id": ME}), json!({"high_user_id": ME}), json!({"low_user_id": ME, "high_user_id": null})] {
+            let (_adapter, ctx) = open_ctx();
+            let saved = saved("http://127.0.0.1:1");
+            let mut direct = pair;
+            direct["id"] = json!("incomplete-direct");
+            direct["peer"] = json!({"user_id": PEER, "display_name": "Bea"});
+            on_live(&ctx, &saved, &HashMap::new(), "direct.created", &json!({"direct": direct}));
+            assert!(ctx.known("incomplete-direct").unwrap().is_none(), "incomplete pair rejected");
+        }
+    }
+
+    #[test]
+    fn a_direct_event_still_accepts_a_rest_shaped_peer() {
+        let (_adapter, ctx) = open_ctx();
+        let saved = saved("http://127.0.0.1:1");
+        let frame = json!({"direct": {"id": "new-direct", "peer": {"user_id": PEER, "display_name": "Bea"},
+            "e2ee": true, "unread": 2, "last_message": {"id": "last", "body": "hello", "created_at": WHEN}}});
+        on_live(&ctx, &saved, &HashMap::new(), "direct.created", &frame);
+        let row = ctx.known("new-direct").unwrap().unwrap();
+        assert_eq!((row.title.as_str(), row.peer.as_deref(), row.encryption, row.unread),
+            ("Bea", Some(PEER), Encryption::EndToEnd, 2));
     }
 
     /// `channel.updated` is broadcast with the actor's own unread baked into `app_channel_json`.

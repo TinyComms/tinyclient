@@ -7,6 +7,14 @@ fn main() -> io::Result<()> {
         println!("chatd {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("tiny-direct-created") {
+        if let Err(err) = chatd::adapters::tiny::prove_tiny_direct_created() {
+            eprintln!("tiny-direct-created: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
     // The lab's leave-chime driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("leave-chime") {
         if let Err(err) = chatd::leave_prove::run() {

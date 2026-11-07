@@ -1,0 +1,16 @@
+{
+  "id": "tiny-direct-created",
+  "max_still_seconds": 60,
+  "not_applicable": {
+    "android": "Headless desktop daemon IPC scenario; no phone UI certification.",
+    "ios": "Headless desktop daemon IPC scenario; no phone UI certification."
+  },
+  "release": false,
+  "needs": [],
+  "title": "A newly received DM publishes its named peer, first message and fetched history through daemon IPC",
+  "platforms": [
+    "windows",
+    "linux",
+    "macos"
+  ]
+}
