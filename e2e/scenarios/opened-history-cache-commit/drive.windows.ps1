@@ -1,4 +1,5 @@
-# opened-history-cache-commit on Windows. The lab runs this in the console session it is already filming.
+# opened-history-cache-commit on Windows. Lab already films the console session.
+# Fixture controller + native pixel driver (no TINYCLIENT_PROVE).
 $ErrorActionPreference = 'Stop'
 $drive = Join-Path $PSScriptRoot 'drive.py'
 if (Get-Command py -ErrorAction SilentlyContinue) {
