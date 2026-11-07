@@ -538,7 +538,7 @@ fn signing_out_removes_the_accounts_directory() {
     assert!(chatd.fetched("avatar-1").path.is_some());
     assert!(chatd.media_dir().exists());
 
-    let signed_out = chatd.ask(Request::SignOut { account: account() });
+    let signed_out = chatd.ask(Request::SignOut { account: account(), erase: false });
     assert!(matches!(signed_out, Response::Status { .. }), "{signed_out:?}");
     assert!(!chatd.media_dir().exists());
     // Its rows went with it, so the file is no longer known.

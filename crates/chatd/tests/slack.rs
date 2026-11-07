@@ -1855,7 +1855,7 @@ fn presence_a_profile_and_signing_out() {
     // Signing out of one workspace has nothing to end on Slack, so it answers at once, and the
     // browser's session, which the other workspace shares, is left alone.
     let asked = Instant::now();
-    let Response::Status { accounts, .. } = world.ask(Request::SignOut { account: beta("").account() }) else {
+    let Response::Status { accounts, .. } = world.ask(Request::SignOut { account: beta("").account(), erase: false }) else {
         panic!("no status");
     };
     assert!(asked.elapsed() < Duration::from_secs(2), "{:?}", asked.elapsed());

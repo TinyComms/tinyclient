@@ -1757,7 +1757,7 @@ impl Chat {
         }
     }
 
-    fn sign_out(&self, account: AccountKey) -> Response {
+    fn sign_out(&self, account: AccountKey, erase: bool) -> Response {
         // Taken out of the map first, so nothing else is asked of it; kept until it has had
         // its time to end the session on the network, since dropping it stops its threads.
         let adapter = lock(&self.adapters).remove(&account);
@@ -1773,6 +1773,17 @@ impl Chat {
             // Forgetting the item now would sign out every other account it holds.
             session::Stored::Unreadable(why) => return error(ErrorCode::Internal, format!("The session could not be read from {}: {why}", session::STORE)),
         };
+        if account.network == Network::Tiny {
+            if erase {
+                adapters::tiny::erase_history(&account.account);
+            } else if let Some(session) = &stored {
+                // The key of what this device opened outlives the session that held it. Kept or
+                // not, the sign-out goes on: the history then stays sealed and unread.
+                if let Err(why) = adapters::tiny::keep_history(session, &account.account) {
+                    tracing::warn!("chatd: Tiny: the history key could not be kept: {why}");
+                }
+            }
+        }
         let left = stored.and_then(|session| adapters::without(account.network, &session, &account.account));
         match left {
             Some(session) => {
@@ -2317,7 +2328,7 @@ impl Chat {
                 }
                 Response::Ok
             }
-            Request::SignOut { account } => self.sign_out(account),
+            Request::SignOut { account, erase } => self.sign_out(account, erase),
             Request::TinyLocalServers => adapters::tiny::local_servers(),
             Request::TinyCommunity { account } => {
                 // Opening the server is the user asking: a socket another device replaced connects again.
@@ -2340,7 +2351,10 @@ impl Chat {
                 }
                 Err(err) => error(ErrorCode::Refused, format!("That key couldn't be remembered: {err}")),
             },
-            Request::TinyE2ee { account, ask } => adapters::tiny::e2ee_ask(account, ask),
+            Request::TinyE2ee { account, ask } => {
+                let (hub, changed) = (self.hub.clone(), account.clone());
+                adapters::tiny::e2ee_ask(account, ask, Arc::new(move || hub.changed(Change::Tiny { account: changed.clone() })))
+            }
             Request::TinyInvite { account, role } => adapters::tiny::invite(account, role),
             Request::TinyRole { account, user_id, role } => adapters::tiny::set_role(account, user_id, role),
             Request::TinyRemove { account, user_id } => adapters::tiny::remove(account, user_id),
@@ -2348,7 +2362,7 @@ impl Chat {
             Request::TinyRename { account, display_name } => adapters::tiny::rename(account, display_name),
             // Ended on the server first, then forgotten here exactly as one sign-out is.
             Request::TinySignOutEverywhere { account } => match adapters::tiny::end_sessions(&account) {
-                Ok(()) => self.sign_out(account),
+                Ok(()) => self.sign_out(account, false),
                 Err(answer) => answer,
             },
             Request::TinyServerUpdate { account, edit } => adapters::tiny::manage::server_update(account, edit),

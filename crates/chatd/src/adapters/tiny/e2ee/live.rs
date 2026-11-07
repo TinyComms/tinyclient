@@ -56,9 +56,12 @@ fn read_page(device: &mut Device, conversation: &str) -> HashMap<String, Read> {
             kind: row.get("kind").and_then(Value::as_str).unwrap_or("message"),
             ciphertext: row.get("ciphertext").and_then(Value::as_str),
             epoch: row.get("epoch").and_then(Value::as_u64).unwrap_or(0),
+            generation: row.get("generation").and_then(Value::as_u64),
+            group_id: row.get("group_id").and_then(Value::as_str),
             device_id: row.get("device_id").and_then(Value::as_str).unwrap_or(""),
             target_id: row.get("target_id").and_then(Value::as_str),
             client_id: row.get("client_id").and_then(Value::as_str),
+            created_at: row.get("created_at").and_then(Value::as_str).unwrap_or(""),
         })
         .collect();
     device.read(conversation, &wires)
@@ -66,7 +69,7 @@ fn read_page(device: &mut Device, conversation: &str) -> HashMap<String, Read> {
 
 fn text(read: &HashMap<String, Read>, id: &str) -> String {
     match read.get(id) {
-        Some(Read::Opened(opened)) => opened.text.clone(),
+        Some(Read::Opened(opened)) | Some(Read::Legacy(opened)) => opened.text.clone(),
         Some(Read::Undecryptable) => protocol::UNDECRYPTABLE.to_owned(),
         Some(Read::Edit) => "(edit)".to_owned(),
         None => "(absent)".to_owned(),
@@ -140,10 +143,10 @@ fn live_e2ee_text_round_trip() {
         panic!("a second device waits for approval, got {:?}", ada2.state);
     };
     assert!(
-        ada.approve("tiny-device-AAAA").is_err(),
+        ada.approve("tiny-device-AAAA", &|| false).is_err(),
         "a code that is not one is refused"
     );
-    ada.approve(&code).expect("approved");
+    ada.approve(&code, &|| false).expect("approved");
     ada2.enrol();
     assert_eq!(
         ada2.state,
@@ -166,7 +169,7 @@ fn live_e2ee_text_round_trip() {
         .and_then(Value::as_str)
         .unwrap()
         .to_owned();
-    assert!(ada.is_encrypted(&dm));
+    assert!(ada.is_encrypted(&dm).unwrap());
     ada.sync(&dm)
         .expect("Ada starts the group and adds everyone");
     bea.sync(&dm).expect("Bea joins from her Welcome");
@@ -329,7 +332,7 @@ fn live_e2ee_text_round_trip() {
     let DeviceState::AwaitingApproval { code } = ada3.state.clone() else {
         panic!("waits for approval");
     };
-    ada.approve(&code).unwrap();
+    ada.approve(&code, &|| false).unwrap();
     ada3.enrol();
     ada.sync(&dm).expect("Ada adds her third device");
     ada3.sync(&dm).expect("it joins");

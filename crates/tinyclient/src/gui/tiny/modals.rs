@@ -177,9 +177,39 @@ impl Shell {
                 }
                 None => modal("Profile").child(words("They are no longer on this server.")),
             },
-            Modal::SignOut => modal(format!("Sign out of {}?", page.name))
-                .child(words("Your sign-in here is forgotten on this computer, with everything tinyclient saved for it. You can join again with an invite or by signing in."))
-                .child(self.buttons("Sign out", ButtonKind::Danger, cx, |this, cx| this.tiny_sign_out(cx))),
+            Modal::SignOut { erase } => {
+                let erase = *erase;
+                let choice = |ix: usize, on: bool, title: &'static str, about: &'static str| {
+                    super::setup::pick_card(("tiny-sign-out-keep", ix), on, true)
+                        .child(super::setup::radio(on))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child(title))
+                                .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child(about)),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.tiny_state.modal = Some(Modal::SignOut { erase: ix == 1 });
+                            cx.notify();
+                        }))
+                };
+                modal(format!("Sign out of {}?", page.name))
+                    .child(words("Your sign-in here is forgotten on this computer. You can join again with an invite or by signing in."))
+                    .child(
+                        div()
+                            .mt(px(16.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.))
+                            .child(choice(0, !erase, "Keep my messages on this device", "Encrypted messages stay here, locked. They show again when you sign in to this server here."))
+                            .child(choice(1, erase, "Erase", "Encrypted messages you read here are deleted from this device. This can't be undone.")),
+                    )
+                    .child(self.buttons("Sign out", ButtonKind::Danger, cx, move |this, cx| this.tiny_sign_out(erase, cx)))
+            }
             Modal::DeleteRole(role_id) => {
                 let role = page.community.roles.iter().find(|role| role.id == *role_id);
                 let name = role.map(|role| role.name.clone()).unwrap_or_default();
@@ -629,7 +659,7 @@ mod tests {
         assert!(!links(Vec::new()).holds_secrets(), "nothing made yet: the scrim closes it");
         let made = protocol::TinyClaimLink { user_id: "ana".into(), display_name: "Ana".into(), url: "https://premier.example/claim/x".into() };
         assert!(links(vec![made]).holds_secrets());
-        assert!(!Modal::SignOut.holds_secrets());
+        assert!(!Modal::SignOut { erase: false }.holds_secrets());
     }
 
     #[test]

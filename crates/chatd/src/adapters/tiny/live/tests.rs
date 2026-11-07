@@ -2,7 +2,7 @@
 //! the REST routes the socket reads beside it. Timings are shortened through `Timing`.
 
 use super::*;
-use crate::adapters::{local, Adapter};
+use crate::adapters::{local, Adapter, Command};
 use crate::hub::Hub;
 use crate::store::Store;
 use protocol::{AccountKey, Change, Key, Network};
@@ -2244,3 +2244,83 @@ fn a_refused_direct_attempt_does_not_poison_the_next_ring() {
 }
 
 mod direct_probe;
+
+#[test]
+fn opening_a_conversation_reads_its_newest_page_from_the_server() {
+    // A conversation opened on the shell is `Backfill`: before, the Tiny adapter took it and did
+    // nothing, so a conversation showed only what the socket or scrolling up had brought.
+    let fake = fake(&[], |_, _| {});
+    let hub = Arc::new(Hub::new(Store::open(std::path::Path::new(":memory:")).expect("a store in memory")));
+    let (adapter, ctx, inbox) = local(AccountKey { network: Network::Tiny, account: ME.to_owned() }, hub);
+    let saved = Saved {
+        base_url: fake.base.clone(),
+        token: "t".to_owned(),
+        user_id: ME.to_owned(),
+        email: None,
+        display_name: "Ada".to_owned(),
+        role: "owner".to_owned(),
+        plain_http_ok: false,
+        e2ee: None,
+    };
+    let live = Arc::new(Live::new().expect("a wake pair"));
+    let (serving, serving_live) = (ctx.clone(), live.clone());
+    let thread = std::thread::spawn(move || super::super::serve_inbox(&serving, &saved, &serving_live, inbox));
+    let conversation = "c0ffee00-0000-4000-8000-000000000001";
+    ctx.commands.send(Command::Backfill(conversation.to_owned())).expect("the inbox");
+    let wanted = format!("GET /v1/conversations/{conversation}/messages?limit=");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let asked = loop {
+        match fake.seen.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Seen::Rest(line)) if line.starts_with(&wanted) => break true,
+            Ok(_) => {}
+            Err(_) => break false,
+        }
+    };
+    drop(adapter);
+    let _ = ctx.commands.send(Command::Stop);
+    let _ = thread.join();
+    assert!(asked, "the newest page was asked of the server");
+}
+
+#[test]
+fn the_command_inbox_accepts_an_incoming_direct_before_starting_media() {
+    with_mediad();
+    let (saw_accept, accepted) = channel();
+    let fake = fake_with("up", &[], move |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([])));
+        conn.send(ringing("call.ringing", BEA));
+        let frame = conn.next(Duration::from_secs(3));
+        if let Some(frame) = &frame {
+            conn.send(json!({"type": "ok", "ref": frame["ref"]}));
+        }
+        let _ = saw_accept.send(frame);
+        conn.idle(Duration::from_millis(500));
+    });
+    let hub = Arc::new(Hub::new(Store::open(std::path::Path::new(":memory:")).unwrap()));
+    let account = AccountKey { network: Network::Tiny, account: ME.to_owned() };
+    let (adapter, ctx, inbox) = local(account.clone(), hub.clone());
+    let saved = Saved {
+        base_url: fake.base.clone(), token: "t".into(), user_id: ME.into(),
+        email: None, display_name: "Ada".into(), role: "owner".into(),
+        plain_http_ok: false, e2ee: None,
+    };
+    let live = Arc::new(Live::new().unwrap());
+    let (socket_ctx, socket_saved, socket_live) = (ctx.clone(), saved.clone(), live.clone());
+    let socket = std::thread::spawn(move || keep_live(&socket_ctx, &socket_saved, &socket_live, &QUICK));
+    let running = Running { hub, account, live: live.clone(), adapter: Some(adapter), thread: Some(socket) };
+    let (command_ctx, command_live) = (ctx.clone(), live.clone());
+    let commands = std::thread::spawn(move || super::super::serve_inbox(&command_ctx, &saved, &command_live, inbox));
+    until("incoming ring reached the shared call slot", || {
+        direct_call(&running).is_some_and(|call| matches!(call.state, protocol::CallState::RingingIn { .. }))
+    });
+    ctx.commands.send(Command::CallJoin(DIRECT.into())).unwrap();
+    let observed = accepted.recv_timeout(Duration::from_secs(5));
+    let media_started = running.hub.calls.describe().1;
+    let _ = ctx.commands.send(Command::Stop);
+    drop(running);
+    commands.join().unwrap();
+    let frame = observed.expect("fake server completed its observation").expect("inbox sent call.accept");
+    assert_eq!(frame["type"], "call.accept");
+    assert_eq!(frame["direct_id"], DIRECT);
+    assert!(!media_started, "media waits for the server's acceptance event");
+}

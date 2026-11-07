@@ -2704,7 +2704,7 @@ fn member_search_is_paced_per_server_and_remembered() {
 #[test]
 fn signing_out_ends_the_session_on_discord_before_it_is_forgotten() {
     let world = World::start();
-    let answered = world.ask(Request::SignOut { account: world.account() });
+    let answered = world.ask(Request::SignOut { account: world.account(), erase: false });
     assert!(matches!(answered, Response::Status { .. }), "{answered:?}");
     let ended = world.discord.requests_to("POST", "/auth/logout");
     assert_eq!(ended.len(), 1, "the session was ended before the answer");

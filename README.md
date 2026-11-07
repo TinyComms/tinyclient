@@ -122,6 +122,12 @@ Download from [tinyclient.io](https://tinyclient.io), or from the [latest releas
 
 There is no macOS Intel build and no Windows arm64 build. Linux arm64 files use `aarch64` in the name. The `.deb` and `.rpm` package name is `tinyclient` on both architectures.
 
+Tiny device linking verifies the owner through the operating system before approving another
+device. Windows desktop verification is documented for Windows 11 (build 22000) and later.
+On Windows 10, a configured verifier without the required desktop API blocks approval; use
+another device to approve. When Windows reports no verifier configured or present, linking
+keeps the code and six-digit confirmation and skips only the unavailable OS check.
+
 Linux packages are built on Ubuntu 22.04, so they need that glibc or newer. The release workflow then installs the `.deb` on Ubuntu 24.04 and Debian 12, and the `.rpm` on current Fedora and openSUSE Tumbleweed, on x86_64 and arm64. The `.deb` and `.rpm` bring in the libraries they were linked against. The AppImage and `.tar.gz` use the system's GTK 3, WebKitGTK 4.1, ALSA, OpenSSL 3, and Vulkan.
 
 The four programs stay in one directory: `tinyclient`, `chatd`, `mediad`, and `tinyclient-login`. Each finds the others beside itself. Start `tinyclient`. It starts `chatd` when nothing answers on the socket.

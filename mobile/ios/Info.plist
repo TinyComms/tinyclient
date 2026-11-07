@@ -61,6 +61,8 @@
 	<string>Tiny uses the microphone for voice and video calls and voice messages.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Tiny uses the camera for video calls.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Tiny uses Face ID to confirm that you approve adding a device to your account.</string>
 
 	<!-- A call keeps its audio session (and its sound) when the app goes to the background. -->
 	<key>UIBackgroundModes</key>

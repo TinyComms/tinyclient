@@ -1,0 +1,15 @@
+[package]
+name = "dlctl"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Talks to one chatd over its own IPC (the socket/pipe the window uses), with raw JSON requests, so
+# it keeps working while the protocol grows (link requests the device-link branch adds included).
+# The pipe name on Windows is a hash of the socket path, so this links the app's own `protocol`
+# crate instead of guessing it. Build: see ../README.md.
+[dependencies]
+protocol = { path = "../../../../crates/protocol" }
+serde_json = "1"
+
+[workspace]

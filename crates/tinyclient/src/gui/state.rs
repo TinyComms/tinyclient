@@ -524,6 +524,7 @@ impl Shell {
         };
         self.reload(dirty, cx);
         self.load_directs(cx);
+        self.tiny_e2ee_load(cx);
     }
 
     /// What chatd reported since the last `Wait`. Stored things are read again, each by its own
@@ -1022,14 +1023,15 @@ impl Shell {
     }
 
     /// Forgets one account's session and everything stored for it.
-    pub(super) fn sign_out(&mut self, account: AccountKey, cx: &mut Context<Self>) {
+    /// `erase`: a Tiny server's encrypted history goes too (`Request::SignOut`).
+    pub(super) fn sign_out(&mut self, account: AccountKey, erase: bool, cx: &mut Context<Self>) {
         if self.open.as_ref().is_some_and(|open| open.account() == account) {
             self.open = None;
             if let Some(snapshot) = &mut self.snapshot {
                 snapshot.open = None;
             }
         }
-        let request = Request::SignOut { account };
+        let request = Request::SignOut { account, erase };
         self.off_thread(cx, move || ask(&request), |this, _, cx| {
             this.load_status(cx);
             this.reload_all(cx);

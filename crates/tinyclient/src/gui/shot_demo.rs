@@ -717,9 +717,21 @@ fn page(key: &Key, page: &Page, limit: u32) -> Response {
             (start, (start + limit).min(all.len()))
         }
     };
+    let messages = all[from..to].to_vec();
+    #[cfg(feature = "gui-shot")]
+    let messages = {
+        let mut messages = messages;
+        if let (Ok(reason), Some(last)) = (std::env::var("TINYCLIENT_SHOT_SEND_ERROR"), messages.last_mut()) {
+            last.sender = sender(ME);
+            last.outgoing = true;
+            last.state = protocol::SendState::Failed { reason };
+            last.text = "A message that could not be sent.".into();
+        }
+        messages
+    };
     Response::Messages {
         conversation: key.clone(),
-        messages: all[from..to].to_vec(),
+        messages,
         last_read: find(key).and_then(|row| row.last_read.clone()).or_else(|| all.last().map(|m| m.id.clone())),
         older: from > 0,
         newer: to < all.len(),
@@ -841,6 +853,7 @@ fn premier() -> protocol::TinyCommunity {
         categories: Vec::new(),
         bans: Vec::new(),
         provider: String::new(),
+        new_devices: Vec::new(),
     }
 }
 
@@ -1167,6 +1180,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
         Request::TinyCommunity { .. } => Response::TinyCommunity { community: premier() },
         Request::TinyPasskeysRead { .. } => Response::TinyPasskeys { passkeys: my_passkeys() },
         Request::TinyE2ee { ask: protocol::E2eeAsk::Status, .. } => Response::TinyE2ee { status: e2ee_status() },
+        Request::TinyE2ee { ask: protocol::E2eeAsk::Link, .. } => Response::TinyE2eeLink { link: e2ee_link() },
         Request::TinyE2ee { ask: protocol::E2eeAsk::Person { user_id }, .. } => match e2ee_status().people.into_iter().find(|person| person.user_id == *user_id) {
             Some(person) => Response::TinyE2eePerson { person },
             None => Response::Error { code: protocol::ErrorCode::NotFound, detail: "Nobody by that id.".into() },
@@ -1189,6 +1203,30 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
 /// Encryption on Premier, as this device sees it: set up, a second device of mine, and the two
 /// people met in encrypted conversations, one verified and one whose number changed.
 fn e2ee_status() -> protocol::E2eeStatus {
+    // Explicitly fabricated layout fixtures. This path exists only in the screenshot build;
+    // regular demo/mobile builds and the real request transport never read it.
+    #[cfg(feature = "gui-shot")]
+    if let Some(status) = std::env::var_os("TINYCLIENT_SHOT_E2EE_STATUS")
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    {
+        return status;
+    }
+    default_e2ee_status()
+}
+
+fn e2ee_link() -> Option<protocol::E2eeLink> {
+    #[cfg(feature = "gui-shot")]
+    if let Some(link) = std::env::var_os("TINYCLIENT_SHOT_E2EE_LINK")
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    {
+        return link;
+    }
+    None
+}
+
+fn default_e2ee_status() -> protocol::E2eeStatus {
     use protocol::{DeviceState, E2eeDevice, E2eePerson, E2eeStatus, Trust};
     let digits = |seed: u32| -> String { (0..60u32).map(|n| char::from(b'0' + ((n * 7 + seed * 3 + n / 5) % 10) as u8)).collect() };
     let device = |id: &str, label: &str, fingerprint: &str, this: bool| E2eeDevice {
@@ -1225,6 +1263,8 @@ fn e2ee_status() -> protocol::E2eeStatus {
         ],
         recovery_set: true,
         backup: false,
+        linking: true,
+        ..E2eeStatus::default()
     }
 }
 #[cfg(test)]
