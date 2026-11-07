@@ -2,10 +2,10 @@
   "id": "opened-history-cache-commit",
   "title": "A failed sealed-cache append cannot leave only a consumed receive ratchet",
   "platforms": [
-    "windows"
+    "windows",
+    "linux"
   ],
   "not_applicable": {
-    "linux": "Person-facing matched-case proof is Windows-native window input/pixels; Linux is not claimed here.",
     "macos": "Person-facing matched-case proof is Windows-native window input/pixels; macOS is not claimed here.",
     "android": "Desktop sealed-cache fault is observed on the Windows app window; mobile runtime proof is not claimed.",
     "ios": "Desktop sealed-cache fault is observed on the Windows app window; mobile runtime proof is not claimed."

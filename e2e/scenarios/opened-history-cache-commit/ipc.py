@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+import socket
+import struct
 import subprocess
 import sys
 import uuid
@@ -21,7 +24,39 @@ def dlctl_bin(app_dir: str) -> str:
     return ""
 
 
+def _unix_request(profile, payload, timeout):
+    directory = Path(profile)
+    if not directory.is_absolute():
+        raise RuntimeError("fixture profile must be absolute")
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    if len(body) > 1024 * 1024:  # protocol::FRAME_LIMIT
+        raise RuntimeError("fixture IPC request exceeds the protocol size limit")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+        stream.settimeout(timeout)
+        stream.connect(str(directory / "chat.sock"))
+        stream.sendall(struct.pack("!I", len(body)) + body)
+
+        def read_exact(length):
+            chunks = bytearray()
+            while len(chunks) < length:
+                chunk = stream.recv(length - len(chunks))
+                if not chunk:
+                    raise RuntimeError("fixture IPC closed before the frame completed")
+                chunks.extend(chunk)
+            return bytes(chunks)
+
+        length = struct.unpack("!I", read_exact(4))[0]
+        if length > 1024 * 1024:
+            raise RuntimeError("fixture IPC answer exceeds the diagnostic size limit")
+        answer = json.loads(read_exact(length))
+        if not isinstance(answer, dict):
+            raise RuntimeError("fixture IPC answer is not an object")
+        return answer
+
+
 def request(profile: str, payload: Mapping[str, Any], app_dir: str = "", timeout: int = 60) -> dict[str, Any]:
+    if sys.platform.startswith("linux") and not os.environ.get("E2E_DLCTL", "").strip():
+        return _unix_request(profile, payload, timeout)
     binary = dlctl_bin(app_dir) if app_dir else dlctl_bin("")
     if not binary:
         raise RuntimeError(

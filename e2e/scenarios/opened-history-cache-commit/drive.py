@@ -2,7 +2,7 @@
 """Normal-app sealed-cache append fault: base loses history; branch keeps it.
 
 This driver does NOT use TINYCLIENT_PROVE. Fixture setup lives in
-fixture_controller.py; person-facing observation uses native_windows.py.
+fixture_controller.py; person-facing observation uses the native platform adapter.
 
 Matched case (same protocol on base and branch):
   1. Owned synthetic receiver/sender profiles from E2E_CACHE_COMMIT_FIXTURE
@@ -186,12 +186,18 @@ def main() -> int:
     except fixture.FixtureError as err:
         return incomplete(str(err))
 
-    if sys.platform != "win32":
-        return incomplete("Windows native pixel driver required", platform=sys.platform)
-
-    import native_windows as native
-
-    native.require_windows()
+    if sys.platform == "win32":
+        import native_windows as native
+        require_native = native.require_windows
+    elif sys.platform.startswith("linux"):
+        import native_linux as native
+        require_native = native.require_linux
+    else:
+        return incomplete("no native pixel adapter for this platform", platform=sys.platform)
+    try:
+        require_native()
+    except native.NativeError as err:
+        return incomplete(str(err), platform=sys.platform)
     receiver = contract["receiver"]
     sender = contract["sender"]
     recv_profile = str(fixture.receiver_profile(contract))
