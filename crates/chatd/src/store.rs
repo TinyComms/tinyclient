@@ -2434,7 +2434,20 @@ impl Store {
                 && !message.sender.name.is_empty()
                 && message.sender.name != "You"
             {
-                return Ok(Some(message.sender));
+                let mut sender = message.sender;
+                if let Some(avatar) = sender.avatar.as_mut() {
+                    if let Some((known, _)) = self.media(&conversation.account(), &[avatar.id.clone()])?.into_iter().next() {
+                        // Like messages(), hydrate from this account's current media row:
+                        // the serialized sender predates a completed avatar download.
+                        if let Some(path) = known.path {
+                            avatar.path = Some(path);
+                            avatar.bytes = known.bytes;
+                        } else {
+                            avatar.failed = known.failed;
+                        }
+                    }
+                }
+                return Ok(Some(sender));
             }
         }
         Ok(None)

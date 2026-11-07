@@ -605,6 +605,7 @@ fn a_pending_send_shows_my_cached_identity_before_the_network_acks() {
     assert_eq!(message.sender.name, "Robin Vale");
     assert_ne!(message.sender.name, "Harbor Labs");
     assert!(message.sender.avatar.is_some(), "harbor pending has my avatar: {message:?}");
+    assert!(message.sender.avatar.as_ref().and_then(|file| file.path.as_deref()).is_some_and(|path| std::path::Path::new(path).is_file()), "pending avatar is already on disk before ack: {message:?}");
     assert_eq!(message.shown_sender(), "Robin Vale");
 
     let photo = chatd.pick("identity.png", 32 * 1024);

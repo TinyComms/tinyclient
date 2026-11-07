@@ -3088,6 +3088,9 @@ pub fn prove_pending_message_identity() -> Result<(), String> {
     prior.sender.id = "user-1".into();
     prior.sender.avatar = Some(MediaFile::new("ava-nick", MediaKind::Avatar));
     store.ingest(&nick_chat, &prior, false).map_err(|err| err.to_string())?;
+    store.register_media(&first, &[(MediaFile::new("ava-nick", MediaKind::Avatar), "https://cdn.example/nick.png".into())])
+        .map_err(|err| err.to_string())?;
+    store.media_landed(&first, "ava-nick", "/cached/nick.png", 321, 20).map_err(|err| err.to_string())?;
 
     let from_nick = pending_self_sender(&store, &nick_chat);
     if from_nick.id != "user-1" || from_nick.name != "Ada Nick" {
@@ -3095,6 +3098,9 @@ pub fn prove_pending_message_identity() -> Result<(), String> {
     }
     if from_nick.avatar.as_ref().map(|file| file.id.as_str()) != Some("ava-nick") {
         return Err(format!("context avatar was {:?}, not ava-nick", from_nick.avatar));
+    }
+    if from_nick.avatar.as_ref().and_then(|file| file.path.as_deref()) != Some("/cached/nick.png") {
+        return Err("context avatar lost its already-landed local path".into());
     }
 
     let from_person = pending_self_sender(&store, &Key::new(&second, "c-b"));
@@ -3194,6 +3200,31 @@ mod tests {
         assert_eq!(pending.sender.id, "me-1");
         assert_eq!(pending.shown_sender(), "Ops Nick");
         assert_ne!(pending.sender.name, "Night Shift");
+    }
+
+    #[test]
+    fn a_pending_context_avatar_has_its_accounts_landed_path_before_ack() {
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let first = AccountKey { network: Network::Slack, account: "first".into() };
+        let second = AccountKey { network: Network::Slack, account: "second".into() };
+        for (account, path, bytes) in [(&first, "/cached/first/avatar.png", 123), (&second, "/cached/second/avatar.png", 456)] {
+            super::seed_self(&mut store, account, "Workspace", "me", "Robin", "avatar").unwrap();
+            store.upsert_conversation(account, &ConversationRow::new("chat", ConversationKind::Channel, "general")).unwrap();
+            let mut previous = Message::plain("previous", "Chat Nick", "earlier", 10, true);
+            previous.sender.id = "me".into();
+            previous.sender.avatar = Some(MediaFile::new("avatar", MediaKind::Avatar));
+            store.ingest(&Key::new(account, "chat"), &previous, false).unwrap();
+            // The image landed after the message body was stored with no local path.
+            store.media_landed(account, "avatar", path, bytes, 20).unwrap();
+        }
+        let chat = super::Chat::new(store);
+        for (account, path, bytes) in [(&first, "/cached/first/avatar.png", 123), (&second, "/cached/second/avatar.png", 456)] {
+            let pending = chat.new_message(&Key::new(account, "chat"), "pending".into(), "going".into(), None, &Outgoing::default());
+            assert_eq!(pending.sender.name, "Chat Nick");
+            let avatar = pending.sender.avatar.unwrap();
+            assert_eq!(avatar.path.as_deref(), Some(path));
+            assert_eq!(avatar.bytes, bytes);
+        }
     }
 
     #[test]
