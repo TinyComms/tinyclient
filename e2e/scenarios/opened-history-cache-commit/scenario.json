@@ -1,0 +1,16 @@
+{
+  "id": "opened-history-cache-commit",
+  "title": "A failed sealed-cache append cannot leave only a consumed receive ratchet",
+  "platforms": [
+    "windows",
+    "linux",
+    "macos"
+  ],
+  "not_applicable": {
+    "android": "This driver executes the desktop chatd durable receive/cache proof; mobile uses the same path but no native mobile runtime proof is claimed.",
+    "ios": "This driver executes the desktop chatd durable receive/cache proof; mobile uses the same path but no native mobile runtime proof is claimed."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

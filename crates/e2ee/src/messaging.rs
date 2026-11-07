@@ -243,6 +243,50 @@ impl Engine {
         ciphertext: &[u8],
         claimed: &Claimed<'_>,
     ) -> Result<Incoming> {
+        // Existing callers keep the lenient save: a receive that also writes opened history must
+        // use [`Engine::decrypt_committed`] so a failed durable commit cannot leave only a consumed
+        // ratchet.
+        let (incoming, checkpoint) = self.decrypt_open(conv, ciphertext, claimed)?;
+        drop(checkpoint);
+        self.persist(false)?;
+        Ok(incoming)
+    }
+
+    /// Like [`Engine::decrypt`], but runs `commit` while the receive checkpoint is still
+    /// reversible and before the advanced ratchet is written. If `commit` fails, the pre-read
+    /// state is restored and the receive spends no key. After a successful commit, the caller
+    /// must already have durable recovery data. State saving then follows [`Engine::decrypt`]:
+    /// a failed save leaves the accepted receive consumed in memory and reports the error on
+    /// [`Engine::flush`]. It must never rewind an accepted receive to match a lagging disk.
+    pub fn decrypt_committed<F>(
+        &mut self,
+        conv: ConversationId,
+        ciphertext: &[u8],
+        claimed: &Claimed<'_>,
+        commit: F,
+    ) -> Result<Incoming>
+    where
+        F: FnOnce(&Incoming) -> Result<()>,
+    {
+        let (incoming, checkpoint) = self.decrypt_open(conv, ciphertext, claimed)?;
+        if let Err(error) = commit(&incoming) {
+            self.provider.restore(checkpoint);
+            self.groups.remove(&conv);
+            return Err(error);
+        }
+        drop(checkpoint);
+        self.persist(false)?;
+        Ok(incoming)
+    }
+
+    /// Authenticate and open a ciphertext, leaving the provider checkpoint for the caller to
+    /// drop (accept) or restore (refuse).
+    fn decrypt_open(
+        &mut self,
+        conv: ConversationId,
+        ciphertext: &[u8],
+        claimed: &Claimed<'_>,
+    ) -> Result<(Incoming, crate::provider::Checkpoint)> {
         self.repair_receive_allowed(conv)?;
         self.usable(conv)?;
         self.load_group(conv)?;
@@ -339,17 +383,18 @@ impl Engine {
                 return Err(error);
             }
         };
-        drop(checkpoint);
         let sender_trusted = trust.is_trusted(sender.user, sender.device, &sender.signature_key);
-        self.persist(false)?;
-        Ok(Incoming {
-            sender,
-            sender_trusted,
-            epoch,
-            kind: claimed.kind,
-            target_id: claimed.target_id.map(str::to_owned),
-            envelope,
-        })
+        Ok((
+            Incoming {
+                sender,
+                sender_trusted,
+                epoch,
+                kind: claimed.kind,
+                target_id: claimed.target_id.map(str::to_owned),
+                envelope,
+            },
+            checkpoint,
+        ))
     }
 
     /// A ciphertext under this device's leaf, at the generation its next real message will use,

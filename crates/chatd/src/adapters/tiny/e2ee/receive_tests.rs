@@ -304,6 +304,148 @@ fn add(
     (bundle, proposals)
 }
 
+/// A failed sealed-cache append must not leave only a consumed receive ratchet. After storage is
+/// repaired, the same ciphertext opens and survives a cold restart with the same keys.
+#[test]
+fn opened_history_survives_a_failed_cache_append_and_restart() {
+    assert_eq!(prove_opened_history_cache_commit(), Ok(()));
+}
+
+/// Cache durable + state save lagging: restart serves the sealed row; a mismatched claim still
+/// spends no key and does not replace authenticated cache metadata.
+#[test]
+fn sealed_cache_survives_state_save_lag_and_rejects_mismatched_replay() {
+    let fixture = tempfile::tempdir().unwrap();
+    let a_dir = fixture.path().join("sender");
+    let b_dir = fixture.path().join("receiver");
+    private_dir(&a_dir).unwrap();
+    private_dir(&b_dir).unwrap();
+    let alice = UserId::random().unwrap();
+    let bea = UserId::random().unwrap();
+    let mut a = Engine::create(
+        alice,
+        Box::new(FileStore::new(&a_dir)),
+        StateKey::generate().unwrap(),
+        STATE,
+    )
+    .unwrap();
+    let state_key = StateKey::generate().unwrap();
+    let cache_key = CacheKey::generate().unwrap();
+    let mut b = Engine::create(
+        bea,
+        Box::new(FileStore::new(&b_dir)),
+        state_key.clone(),
+        STATE,
+    )
+    .unwrap();
+    a.verify_devices(bea, &[record(&b, None, 1)]).unwrap();
+    b.verify_devices(alice, &[record(&a, None, 1)]).unwrap();
+    let conv = ConversationId::random().unwrap();
+    let server = DeviceKey::generate().unwrap();
+    let public = server.public_key();
+    a.create_group(conv, &public).unwrap();
+    let (bundle, _) = add(&mut a, conv, &server, &b.key_packages(1).unwrap().remove(0));
+    b.handle_welcome(conv, &bundle.welcomes[0].data, Some(&public))
+        .unwrap();
+    let sent = a
+        .encrypt(
+            conv,
+            Kind::Message,
+            None,
+            &Envelope::message("lagged state history"),
+        )
+        .unwrap();
+    let id = conv.to_string();
+    let before = std::fs::read(b_dir.join(STATE)).unwrap();
+    let saved = Saved {
+        base_url: "https://diagnostic.invalid".into(),
+        token: "synthetic".into(),
+        user_id: bea.to_string(),
+        email: None,
+        display_name: "Fixture".into(),
+        role: "member".into(),
+        plain_http_ok: false,
+        e2ee: None,
+    };
+    let author = alice.to_string();
+    let from = a.device_id().to_string();
+    let ciphertext = b64(&sent.ciphertext);
+    let row = Row {
+        id: "m1",
+        author_id: &author,
+        device_id: &from,
+        kind: "message",
+        ciphertext: Some(&ciphertext),
+        epoch: sent.epoch,
+        generation: None,
+        group_id: None,
+        target_id: None,
+        client_id: None,
+        created_at: "2026-01-01T00:00:00Z",
+    };
+    let mut device = {
+        let mut device = Device::new(&saved);
+        device.dir = b_dir.clone();
+        device.engine = Some(b);
+        device.cache_key = Some(cache_key.clone());
+        device.state = DeviceState::Ready;
+        device
+    };
+    let wrong_epoch = Row { epoch: sent.epoch + 1, ..row };
+    let refused = device.read(&id, std::slice::from_ref(&wrong_epoch));
+    assert!(matches!(refused.get("m1"), Some(Read::Undecryptable)),
+        "wire context must match before the receive is durably accepted");
+    assert_eq!(std::fs::read(b_dir.join(STATE)).unwrap(), before,
+        "a mismatched row must not consume the genuine ciphertext");
+    assert!(device.cache(&id).unwrap().rows.get("m1").is_none());
+    let opened = device.read(&id, std::slice::from_ref(&row));
+    assert!(
+        matches!(opened.get("m1"), Some(Read::Opened(o)) if o.text == "lagged state history")
+    );
+    // Simulate the opposite cut: durable cache present, on-disk ratchet not yet advanced.
+    std::fs::write(b_dir.join(STATE), &before).unwrap();
+    drop(device);
+    let b = Engine::open(Box::new(FileStore::new(&b_dir)), state_key.clone(), STATE)
+        .unwrap()
+        .unwrap();
+    let mut restarted = {
+        let mut device = Device::new(&saved);
+        device.dir = b_dir.clone();
+        device.engine = Some(b);
+        device.cache_key = Some(cache_key.clone());
+        device.state = DeviceState::Ready;
+        device
+    };
+    let after = restarted.read(&id, std::slice::from_ref(&row));
+    assert!(
+        matches!(after.get("m1"), Some(Read::Opened(o)) if o.text == "lagged state history"),
+        "sealed cache must serve history when the ratchet snapshot lags"
+    );
+    let other = UserId::random().unwrap().to_string();
+    let mismatched = Row {
+        id: "m1",
+        author_id: &other,
+        device_id: &from,
+        kind: "message",
+        ciphertext: Some(&ciphertext),
+        epoch: sent.epoch,
+        generation: None,
+        group_id: None,
+        target_id: None,
+        client_id: None,
+        created_at: "2026-01-01T00:00:00Z",
+    };
+    let refused = restarted.read(&id, std::slice::from_ref(&mismatched));
+    assert!(
+        matches!(refused.get("m1"), Some(Read::Undecryptable)),
+        "cached auth must refuse a mismatched claim without replacing the sealed row"
+    );
+    let again = restarted.read(&id, std::slice::from_ref(&row));
+    assert!(
+        matches!(again.get("m1"), Some(Read::Opened(o)) if o.text == "lagged state history")
+    );
+}
+
 #[test]
 fn mixed_generation_receive_does_not_spend_current_welcome_on_blocked_historical_rows() {
     let alice = UserId::parse("11111111-1111-4111-8111-111111111111").unwrap();
