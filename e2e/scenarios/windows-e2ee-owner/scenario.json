@@ -1,0 +1,16 @@
+{
+  "id": "windows-e2ee-owner",
+  "title": "Windows E2EE private_dir keeps the process user on administrator-owned folders",
+  "platforms": [
+    "windows"
+  ],
+  "not_applicable": {
+    "macos": "Windows DACL owner-vs-process-user lockout; Unix keeps 0700 unchanged.",
+    "linux": "Windows DACL owner-vs-process-user lockout; Unix keeps 0700 unchanged.",
+    "android": "Desktop Windows chatd private_dir permission proof; not a phone UI certification.",
+    "ios": "Desktop Windows chatd private_dir permission proof; not a phone UI certification."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

@@ -144,8 +144,9 @@ fn base() -> PathBuf {
 }
 
 /// Makes `dir` and limits it to this user: 0700 on Unix, and on Windows a protected access list
-/// that holds only the owner and the system (no inherited entries, so another account on the
-/// machine with read access to the profile still cannot list it).
+/// for the current process user and the system (no inherited entries, so another account on the
+/// machine with read access to the profile still cannot list it). The directory owner can differ
+/// from the process user; owner-rights alone would lock the interactive user out.
 pub(crate) fn private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
@@ -154,31 +155,217 @@ pub(crate) fn private_dir(dir: &Path) -> std::io::Result<()> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     #[cfg(windows)]
-    windows_acl::owner_only(dir)?;
+    windows_acl::current_user_only(dir)?;
     Ok(())
 }
 
 #[cfg(windows)]
 mod windows_acl {
+    use std::mem::{align_of, size_of};
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
-    use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, FALSE, HANDLE, HLOCAL};
+    #[cfg(test)]
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{
-        SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR,
+        GetTokenInformation, SetFileSecurityW, TokenUser, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
     };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct Handle(HANDLE);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: opened for this guard.
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    struct Local(*mut u16);
+    impl Drop for Local {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: allocated by ConvertSidToStringSidW / ConvertSecurityDescriptorToString….
+                unsafe { LocalFree(self.0 as HLOCAL) };
+            }
+        }
+    }
 
     fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
         text.encode_wide().chain(std::iter::once(0)).collect()
     }
 
-    /// Full control for the owner (`OW`, owner rights) and the system, inherited by what is made
-    /// inside; nothing inherited from above.
-    pub fn owner_only(dir: &Path) -> std::io::Result<()> {
-        let sddl = wide(std::ffi::OsStr::new("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)"));
+    /// SID string of the process token user (`TokenUser`), fail-closed on any API error.
+    pub(crate) fn process_user_sid_string() -> std::io::Result<String> {
+        let mut token = Handle(std::ptr::null_mut());
+        // SAFETY: GetCurrentProcess is a pseudo-handle; token is closed by `Handle`.
+        let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token.0) };
+        if opened == FALSE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut needed = 0u32;
+        // SAFETY: size probe; ERROR_INSUFFICIENT_BUFFER is expected.
+        unsafe {
+            GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        }
+        if needed == 0 || (needed as usize) < size_of::<TOKEN_USER>() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // u64 words keep the TOKEN_USER pointer field naturally aligned on 64-bit Windows.
+        let words = (needed as usize + size_of::<u64>() - 1) / size_of::<u64>();
+        let mut buf = vec![0u64; words];
+        debug_assert!(align_of::<u64>() >= align_of::<TOKEN_USER>());
+        let mut got = 0u32;
+        // SAFETY: buffer is aligned for TOKEN_USER and at least `needed` bytes.
+        let ok = unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buf.as_mut_ptr().cast(),
+                needed,
+                &mut got,
+            )
+        };
+        if ok == FALSE || got == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: GetTokenInformation wrote a TOKEN_USER; Sid points into `buf`.
+        let user = unsafe { &*buf.as_ptr().cast::<TOKEN_USER>() };
+        if user.User.Sid.is_null() {
+            return Err(std::io::Error::other("token user SID missing"));
+        }
+        let mut sid_str: *mut u16 = std::ptr::null_mut();
+        // SAFETY: Sid is valid until `buf` drops; string freed by `Local`.
+        let converted = unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_str) };
+        if converted == FALSE || sid_str.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let owned = Local(sid_str);
+        // SAFETY: ConvertSidToStringSidW writes a NUL-terminated UTF-16 string.
+        let wide = unsafe {
+            let mut len = 0usize;
+            const MAX: usize = 256;
+            while len < MAX && *owned.0.add(len) != 0 {
+                len += 1;
+            }
+            if len == MAX {
+                return Err(std::io::Error::other("SID string too long"));
+            }
+            std::slice::from_raw_parts(owned.0, len)
+        };
+        String::from_utf16(wide).map_err(|_| std::io::Error::other("SID string not UTF-16"))
+    }
+
+    /// DACL-only SDDL for `path` (no owner/group), fail-closed on API errors.
+    #[cfg(test)]
+    pub(crate) fn dacl_sddl(path: &Path) -> std::io::Result<String> {
+        let wide_path = wide(path.as_os_str());
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: path is NUL-terminated; descriptor freed below.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 || descriptor.is_null() {
+            return Err(std::io::Error::from_raw_os_error(status as i32));
+        }
+        let result = descriptor_dacl_sddl(descriptor);
+        // SAFETY: matching LocalFree for GetNamedSecurityInfoW allocation.
+        unsafe { LocalFree(descriptor as HLOCAL) };
+        result
+    }
+
+    /// Windows may serialize a numeric SID as an SDDL alias (for example, `LA`).
+    #[cfg(test)]
+    pub(crate) fn canonical_dacl_sddl(sddl: &str) -> std::io::Result<String> {
+        let sddl = wide(std::ffi::OsStr::new(sddl));
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: input is NUL-terminated; the allocated descriptor is freed below.
+        let made = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        };
+        if made == FALSE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let result = descriptor_dacl_sddl(descriptor);
+        // SAFETY: matching LocalFree for ConvertStringSecurityDescriptorToSecurityDescriptorW.
+        unsafe { LocalFree(descriptor as HLOCAL) };
+        result
+    }
+
+    #[cfg(test)]
+    fn descriptor_dacl_sddl(descriptor: PSECURITY_DESCRIPTOR) -> std::io::Result<String> {
+        let mut sddl_ptr: *mut u16 = std::ptr::null_mut();
+        let mut sddl_chars = 0u32;
+        // SAFETY: descriptor from GetNamedSecurityInfoW; string freed by LocalFree.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut sddl_ptr,
+                &mut sddl_chars,
+            )
+        };
+        let convert_err = std::io::Error::last_os_error();
+        if ok == FALSE || sddl_ptr.is_null() {
+            return Err(convert_err);
+        }
+        let owned = Local(sddl_ptr);
+        let cap = if sddl_chars > 0 {
+            (sddl_chars as usize).min(4096)
+        } else {
+            4096
+        };
+        // SAFETY: API wrote a NUL-terminated SDDL; bound the scan by the reported length.
+        let wide = unsafe {
+            let mut len = 0usize;
+            while len < cap && *owned.0.add(len) != 0 {
+                len += 1;
+            }
+            if len == cap && cap == 4096 {
+                return Err(std::io::Error::other("DACL SDDL too long"));
+            }
+            std::slice::from_raw_parts(owned.0, len)
+        };
+        String::from_utf16(wide).map_err(|_| std::io::Error::other("DACL SDDL not UTF-16"))
+    }
+
+    /// Protected DACL: full control for the current process user and SYSTEM. Not owner-rights
+    /// (`OW`): the folder owner can be Administrators after elevated staging or restore.
+    pub fn current_user_only(dir: &Path) -> std::io::Result<()> {
+        let sid = process_user_sid_string()?;
+        // Fail closed: refuse anything that is not a plain SID string from the token API.
+        if !sid.starts_with("S-1-")
+            || !sid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || sid.len() > 256
+        {
+            return Err(std::io::Error::other("refusing unexpected process SID"));
+        }
+        let sddl = wide(std::ffi::OsStr::new(&format!(
+            "D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)"
+        )));
         let path = wide(dir.as_os_str());
         let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         // SAFETY: both strings end in NUL; the descriptor is freed below.
@@ -415,21 +602,43 @@ pub fn prove_cache_append_tail() -> Result<(), String> {
         let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
         let key = CacheKey::generate().map_err(|err| err.to_string())?;
         let mut cache = Cache::load(dir.path(), "c1", &key);
-        cache.put(&key, "m1", Opened { text: "earlier words".into(), ..Opened::default() });
+        cache.put(
+            &key,
+            "m1",
+            Opened {
+                text: "earlier words".into(),
+                ..Opened::default()
+            },
+        );
         let tail = if complete_tail {
-            std::fs::read_to_string(&cache.path).map_err(|err| err.to_string())?.trim().to_owned()
+            std::fs::read_to_string(&cache.path)
+                .map_err(|err| err.to_string())?
+                .trim()
+                .to_owned()
         } else {
             "torn-id unfinished".to_owned()
         };
-        std::fs::OpenOptions::new().append(true).open(&cache.path)
-            .and_then(|mut file| file.write_all(tail.as_bytes())).map_err(|err| err.to_string())?;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&cache.path)
+            .and_then(|mut file| file.write_all(tail.as_bytes()))
+            .map_err(|err| err.to_string())?;
         // Reopen as after a restart, then append a genuinely encrypted new record.
         let mut cache = Cache::load(dir.path(), "c1", &key);
-        cache.put(&key, "m2", Opened { text: "later words".into(), ..Opened::default() });
+        cache.put(
+            &key,
+            "m2",
+            Opened {
+                text: "later words".into(),
+                ..Opened::default()
+            },
+        );
         let restored = Cache::load(dir.path(), "c1", &key);
         for (id, words) in [("m1", "earlier words"), ("m2", "later words")] {
             if restored.rows.get(id).map(|row| row.text.as_str()) != Some(words) {
-                return Err(format!("cache lost {id} after unterminated tail (complete_tail={complete_tail})"));
+                return Err(format!(
+                    "cache lost {id} after unterminated tail (complete_tail={complete_tail})"
+                ));
             }
         }
     }
@@ -521,7 +730,11 @@ pub(crate) fn opened_row(saved: &Saved, conversation_id: &str, message_id: &str)
 }
 
 /// Previously opened nonempty text, for the inbox preview.
-pub(crate) fn opened_text(saved: &Saved, conversation_id: &str, message_id: &str) -> Option<String> {
+pub(crate) fn opened_text(
+    saved: &Saved,
+    conversation_id: &str,
+    message_id: &str,
+) -> Option<String> {
     if let Some(shared) = started(saved) {
         let mut device = lock(&shared);
         if let Some(text) = device
@@ -554,9 +767,7 @@ pub(crate) fn write_opened_cache(
         .e2ee
         .as_ref()
         .ok_or("This device has no encryption keys.")?;
-    let (_, cache_key) = secrets
-        .keys()
-        .ok_or("This device's keys are unreadable.")?;
+    let (_, cache_key) = secrets.keys().ok_or("This device's keys are unreadable.")?;
     private_dir(&dir_of(saved)).map_err(|err| err.to_string())?;
     let mut cache = Cache::load(&dir_of(saved), conversation_id, &cache_key);
     cache.put(
@@ -1401,7 +1612,12 @@ impl Device {
     fn cache(&mut self, conversation_id: &str) -> Option<&mut Cache> {
         // Previously opened text stays readable while enrolment is unavailable or off.
         if self.cache_key.is_none() {
-            self.cache_key = self.saved.e2ee.as_ref().and_then(Secrets::keys).map(|(_, key)| key);
+            self.cache_key = self
+                .saved
+                .e2ee
+                .as_ref()
+                .and_then(Secrets::keys)
+                .map(|(_, key)| key);
         }
         let key = self.cache_key.as_ref()?;
         if !self.caches.contains_key(conversation_id) {
@@ -2122,6 +2338,8 @@ mod live;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use e2ee::store::Store;
 
     #[test]
     fn encrypted_records_appended_after_an_unterminated_tail_survive_restart() {
@@ -2197,6 +2415,20 @@ mod tests {
         assert_ne!(print, fingerprint(&[5u8; 65]));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn dacl_comparison_accepts_sid_aliases_without_accepting_other_trustees() {
+        let canonical = windows_acl::canonical_dacl_sddl;
+        let numeric = canonical("D:P(A;OICI;FA;;;S-1-5-18)").unwrap();
+        assert_eq!(numeric, canonical("D:P(A;OICI;FA;;;SY)").unwrap());
+        assert!(!numeric.contains("S-1-5-18"), "Windows emits the SY alias");
+        assert_ne!(numeric, canonical("D:P(A;OICI;FA;;;OW)").unwrap());
+        assert_ne!(
+            numeric,
+            canonical("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BU)").unwrap()
+        );
+    }
+
     #[test]
     fn the_folder_is_the_owners_alone() {
         let dir = std::env::temp_dir().join(format!("chatd-e2ee-private-{}", std::process::id()));
@@ -2209,9 +2441,105 @@ mod tests {
                 0o700
             );
         }
-        write_private(&dir.join("x"), b"y").unwrap();
-        assert_eq!(std::fs::read(dir.join("x")).unwrap(), b"y");
+        #[cfg(windows)]
+        {
+            let sid = windows_acl::process_user_sid_string().unwrap();
+            let dacl = windows_acl::dacl_sddl(&dir).unwrap();
+            let expected = windows_acl::canonical_dacl_sddl(&format!(
+                "D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)"
+            ))
+            .unwrap();
+            assert_eq!(
+                dacl, expected,
+                "protected DACL must grant only the process user and SYSTEM full control"
+            );
+            assert!(
+                dacl.contains(";;;SY)"),
+                "protected DACL must keep SYSTEM: {dacl}"
+            );
+            assert!(
+                !dacl.contains(";;;OW)"),
+                "owner-rights OW locks out when the directory owner is not the process user: {dacl}"
+            );
+            for broad in [";;;WD)", ";;;BU)", ";;;BA)"] {
+                assert!(
+                    !dacl.contains(broad),
+                    "protected DACL must not grant {broad}: {dacl}"
+                );
+            }
+            let store = FileStore::new(&dir);
+            store.save("device.state", b"state-one").unwrap();
+            store.save("device.state", b"state-two").unwrap();
+            assert_eq!(
+                store.load("device.state").unwrap().as_deref(),
+                Some(&b"state-two"[..])
+            );
+            write_private(&dir.join("marker"), b"keep").unwrap();
+            assert_eq!(std::fs::read(dir.join("marker")).unwrap(), b"keep");
+            let again = windows_acl::dacl_sddl(&dir).unwrap();
+            assert_eq!(again, expected);
+        }
+        #[cfg(not(windows))]
+        {
+            write_private(&dir.join("x"), b"y").unwrap();
+            assert_eq!(std::fs::read(dir.join("x")).unwrap(), b"y");
+        }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Administrators-owned directory that initially grants the interactive user full control.
+    /// Set `TINYCLIENT_WINDOWS_E2EE_OWNER_FIXTURE` to that directory. Run under a limited
+    /// interactive token; do not take ownership or repair already-locked product folders.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires TINYCLIENT_WINDOWS_E2EE_OWNER_FIXTURE from elevated setup; run with --ignored"]
+    fn administrators_owned_fixture_keeps_user_bytes_and_persist() {
+        let raw = std::env::var("TINYCLIENT_WINDOWS_E2EE_OWNER_FIXTURE")
+            .expect("TINYCLIENT_WINDOWS_E2EE_OWNER_FIXTURE must point at the prepared directory");
+        let dir = PathBuf::from(raw);
+        assert!(
+            dir.is_absolute() && dir.is_dir(),
+            "fixture must be an absolute existing directory"
+        );
+        let marker = std::fs::read(dir.join("marker.bin")).expect("preexisting marker.bin");
+        assert_eq!(
+            marker,
+            [1, 2, 3, 4, 5, 9, 9, 9],
+            "dedicated permission-test fixture required; never use a real profile"
+        );
+        let state = std::fs::read(dir.join("device.state")).expect("preexisting device.state");
+        let cache = std::fs::read(dir.join("cache-c1.log")).expect("preexisting cache-c1.log");
+        private_dir(&dir).expect("private_dir must succeed while the user still has WRITE_DAC");
+        assert_eq!(std::fs::read(dir.join("marker.bin")).unwrap(), marker);
+        assert_eq!(std::fs::read(dir.join("device.state")).unwrap(), state);
+        assert_eq!(std::fs::read(dir.join("cache-c1.log")).unwrap(), cache);
+        let sid = windows_acl::process_user_sid_string().unwrap();
+        let dacl = windows_acl::dacl_sddl(&dir).unwrap();
+        let expected =
+            windows_acl::canonical_dacl_sddl(&format!("D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)"))
+                .unwrap();
+        assert_eq!(dacl, expected);
+        assert!(dacl.contains(";;;SY)"), "DACL missing SYSTEM: {dacl}");
+        assert!(!dacl.contains(";;;OW)"), "DACL must not use OW: {dacl}");
+        for broad in [";;;WD)", ";;;BU)", ";;;BA)"] {
+            assert!(!dacl.contains(broad), "DACL must not grant {broad}: {dacl}");
+        }
+        let store = FileStore::new(&dir);
+        store.save("device.state", b"after-one").unwrap();
+        store.save("device.state", b"after-two").unwrap();
+        assert_eq!(
+            store.load("device.state").unwrap().as_deref(),
+            Some(&b"after-two"[..])
+        );
+        assert_eq!(std::fs::read(dir.join("marker.bin")).unwrap(), marker);
+        assert_eq!(std::fs::read(dir.join("cache-c1.log")).unwrap(), cache);
+        let reopen = FileStore::new(&dir);
+        assert_eq!(
+            reopen.load("device.state").unwrap().as_deref(),
+            Some(&b"after-two"[..])
+        );
+        let again = windows_acl::dacl_sddl(&dir).unwrap();
+        assert_eq!(again, expected);
     }
 
     #[test]
@@ -2234,7 +2562,10 @@ mod tests {
             opened_text(&saved, conversation, message).as_deref(),
             Some("still here")
         );
-        assert_eq!(opened_text(&saved, conversation, "cccccccc-cccc-4ccc-8ccc-cccccccccccc"), None);
+        assert_eq!(
+            opened_text(&saved, conversation, "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+            None
+        );
         let _ = std::fs::remove_dir_all(dir_of(&saved));
     }
 
