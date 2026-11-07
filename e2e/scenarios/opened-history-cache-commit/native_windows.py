@@ -51,7 +51,7 @@ def front(pid: int) -> None:
     _ps(["-ExpectedPid", str(pid), "-Action", "front"])
 
 
-def shot(pid: int, path: str, printwindow: bool = True) -> None:
+def shot(pid: int, path: str, printwindow: bool = False) -> None:
     action = "printwindow" if printwindow else "capture"
     _ps(["-ExpectedPid", str(pid), "-Action", action, "-Screenshot", path])
 
@@ -79,17 +79,17 @@ def wait_window(pid: int, seconds: float = 45.0) -> bool:
 def png_mentions_marker(path: str, marker: str) -> bool | None:
     """Best-effort pixel/text gate.
 
-    Returns True/False when Tesseract OCR is available; None when OCR is absent so
-    the caller must rely on human/lab review of the screenshot plus `--text` assist.
+    Returns True/False when Tesseract OCR is available. Missing/broken OCR returns
+    None, which must make the run incomplete rather than certifying IPC as pixels.
     """
     try:
         from PIL import Image  # type: ignore
         import pytesseract  # type: ignore
+        image = Image.open(path)
+        text = pytesseract.image_to_string(image)
     except Exception:
         return None
-    image = Image.open(path)
-    text = pytesseract.image_to_string(image)
-    return marker in text
+    return marker in "".join(text.split())
 
 
 def require_windows() -> None:

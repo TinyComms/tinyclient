@@ -1,6 +1,6 @@
 """Session environment helper for scratch Tiny runs.
 
-Keeps a literal space in TINYCLIENT_SESSION_TINYSERVER and strips other
+Keeps a literal space in TINYCLIENT_SESSION_TINY SERVER and strips other
 TINYCLIENT_SESSION_* keys so a lab host's signed-in profile cannot leak in.
 """
 
@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from typing import Mapping, MutableMapping
 
-SESSION_VARIABLE = "TINYCLIENT_SESSION_TINYSERVER"
+SESSION_VARIABLE = "TINYCLIENT_SESSION_TINY SERVER"
 
 
 def environment(parent: Mapping[str, str], profile: str, session: Mapping[str, object]) -> dict[str, str]:

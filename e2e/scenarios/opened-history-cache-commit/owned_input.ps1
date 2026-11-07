@@ -64,7 +64,7 @@ if ($Action -eq 'prepare') {
     Start-Sleep -Milliseconds 200
 }
 
-if ($Action -in @('prepare', 'front', 'click', 'type')) {
+if ($Action -in @('prepare', 'front', 'click', 'type', 'capture', 'printwindow')) {
     [TinyOwnedInput204]::ShowWindow($target, 9) | Out-Null
     [TinyOwnedInput204]::SetForegroundWindow($target) | Out-Null
     Start-Sleep -Milliseconds 150

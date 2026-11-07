@@ -25,7 +25,7 @@ scenario drives the **normal Windows app** (release-profile `tinyclient` + `chat
 | File | Role |
 | --- | --- |
 | `fixture_controller.py` | Synthetic fixture paths, empty-dir blocker, SQLite wipe |
-| `session_contract.py` | Literal-space `TINYCLIENT_SESSION_TINYSERVER` env |
+| `session_contract.py` | Literal-space `TINYCLIENT_SESSION_TINY SERVER` env |
 | `ipc.py` | Fixture/diagnostic chatd IPC via `dlctl` (not native proof) |
 | `native_windows.py` / `owned_input.ps1` | Person-facing window input/pixels |
 | `drive.py` / `drive.windows.ps1` | Orchestrates the matched case |
@@ -34,6 +34,11 @@ scenario drives the **normal Windows app** (release-profile `tinyclient` + `chat
 not replace screenshots or window actions. Recordings follow `e2e/README.md`
 (recorder before first step, playable mp4, ≥360px short side, SHA/step burn-in,
 `steps.jsonl` / `proof.json`).
+
+The pixel oracle requires Pillow, pytesseract, and a working Tesseract installation
+on the lab host. Missing OCR or a missing window is setup-incomplete. Both phases
+must observe the exact server-assigned message ID in a scoped messages page;
+an empty page while asynchronous backfill is running is never history-loss RED.
 
 ## Environment
 

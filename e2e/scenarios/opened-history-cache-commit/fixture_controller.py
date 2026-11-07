@@ -114,24 +114,28 @@ def wipe_message_index(contract: Mapping[str, Any]) -> dict[str, Any]:
     if not db_path.is_file():
         raise FixtureError("receiver chat.sqlite missing")
     conv = contract["conversation_id"]
+    scope = ("tiny", contract["receiver"]["user_id"], conv)
     uri = "file:%s?mode=rw" % db_path.as_posix()
     conn = sqlite3.connect(uri, uri=True, timeout=30)
     conn.isolation_level = None
     try:
         conn.execute("PRAGMA busy_timeout=30000")
-        before = conn.execute(
-            "SELECT COUNT(*) FROM message WHERE conversation = ?", (conv,)
-        ).fetchone()[0]
         conn.execute("BEGIN IMMEDIATE")
+        conv_rows = conn.execute(
+            "SELECT COUNT(*) FROM conversation WHERE network = ? AND account = ? AND id = ?",
+            scope,
+        ).fetchone()[0]
+        if conv_rows != 1:
+            raise FixtureError("receiver conversation missing; refusing to change message index")
+        before = conn.execute(
+            "SELECT COUNT(*) FROM message WHERE network = ? AND account = ? AND conversation = ?", scope
+        ).fetchone()[0]
         deleted = conn.execute(
-            "DELETE FROM message WHERE conversation = ?", (conv,)
+            "DELETE FROM message WHERE network = ? AND account = ? AND conversation = ?", scope
         ).rowcount
         conn.execute("COMMIT")
         after = conn.execute(
-            "SELECT COUNT(*) FROM message WHERE conversation = ?", (conv,)
-        ).fetchone()[0]
-        conv_rows = conn.execute(
-            "SELECT COUNT(*) FROM conversation WHERE id = ?", (conv,)
+            "SELECT COUNT(*) FROM message WHERE network = ? AND account = ? AND conversation = ?", scope
         ).fetchone()[0]
     finally:
         conn.close()

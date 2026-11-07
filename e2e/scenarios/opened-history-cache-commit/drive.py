@@ -98,8 +98,9 @@ def stop_owned() -> None:
         except Exception:
             try:
                 proc.kill()
+                proc.wait(timeout=8)
             except Exception:
-                pass
+                raise fixture.FixtureError("owned process did not stop; refusing cold-restart proof")
 
 
 def wait_connected(profile: str, user_id: str, app_dir: str, seconds: float = 60.0) -> bool:
@@ -113,16 +114,30 @@ def wait_connected(profile: str, user_id: str, app_dir: str, seconds: float = 60
     return fixture.wait_until(seconds, ready)
 
 
-def marker_present(profile: str, app_dir: str, contract: dict) -> tuple[bool, dict]:
-    receiver = contract["receiver"]
-    answer = ipc.messages(
-        profile,
-        app_dir,
-        "tiny",
-        receiver["user_id"],
-        contract["conversation_id"],
-    )
-    return ipc.text_contains_marker(answer, contract["marker"]), answer
+def wait_target(profile: str, app_dir: str, contract: dict, message_id: str, seconds=45):
+    key = {"network": "tiny", "account": contract["receiver"]["user_id"],
+           "id": contract["conversation_id"]}
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        answer = ipc.messages(profile, app_dir, "tiny", key["account"], key["id"])
+        state = ipc.target_state(answer, key, message_id, contract["marker"])
+        if state != "missing":
+            return state, answer
+        time.sleep(0.5)  # Messages answers the cache while queuing asynchronous backfill.
+    raise fixture.FixtureError("exact delivered message never appeared; no history-loss RED")
+
+
+def wait_delivered(profile, app_dir, contract, seconds=60):
+    key = {"network": "tiny", "account": contract["sender"]["user_id"],
+           "id": contract["conversation_id"]}
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        answer = ipc.messages(profile, app_dir, "tiny", key["account"], key["id"])
+        message_id = ipc.delivered_id(answer, key, contract["marker"])
+        if message_id:
+            return message_id
+        time.sleep(0.5)
+    raise fixture.FixtureError("peer send never acquired an encrypted server message id")
 
 
 def incomplete(reason: str, **extra) -> int:
@@ -131,6 +146,14 @@ def incomplete(reason: str, **extra) -> int:
     payload.update(extra)
     fixture.write_receipt(OUT, "setup-incomplete.json", payload)
     return 1
+
+
+def classify_case(during_state, after_state, during_pixels, after_pixels):
+    if during_state == "opened" and after_state == "undecryptable" and during_pixels is True and after_pixels is False:
+        return "base-history-loss-red"
+    if during_state == "undecryptable" and after_state == "opened" and during_pixels is False and after_pixels is True:
+        return "branch-recoverable-green"
+    return "setup-incomplete"
 
 
 def main() -> int:
@@ -232,8 +255,10 @@ def main() -> int:
         if not send_ok:
             return incomplete("peer send failed", answer=sent)
 
-        time.sleep(2.5)
-        during_plain, during_ipc = marker_present(recv_profile, APP, contract)
+        message_id = wait_delivered(send_profile, APP, contract)
+        fixture.write_receipt(OUT, "delivered-message.json", {"message_id": message_id})
+        during_state, during_ipc = wait_target(recv_profile, APP, contract, message_id)
+        during_plain = during_state == "opened"
         fixture.write_receipt(OUT, "during-fault-ipc.json", {
             "plain": during_plain,
             "answer": during_ipc,
@@ -257,8 +282,11 @@ def main() -> int:
         native.click(window.pid, click_x, click_y)
         time.sleep(2.0)
         during_shot = str(shots / "during-fault.png")
-        native.shot(window.pid, during_shot)
+        native.shot(window.pid, during_shot, printwindow=False)
+        during_pixels = native.png_mentions_marker(during_shot, marker)
         step("during-fault window captured for pixel review", True, "shots/during-fault.png")
+        if during_pixels is None:
+            return incomplete("pixel text oracle unavailable; no native proof claimed")
 
         if window.poll() is None:
             window.terminate()
@@ -291,9 +319,8 @@ def main() -> int:
         step("receiver chatd reconnected after repair", recv_ok)
         if not recv_ok:
             return incomplete("receiver did not reconnect after repair")
-        time.sleep(2.5)
-
-        after_plain, after_ipc = marker_present(recv_profile, APP, contract)
+        after_state, after_ipc = wait_target(recv_profile, APP, contract, message_id)
+        after_plain = after_state == "opened"
         cache_file = fixture.cache_is_file(contract)
         fixture.write_receipt(OUT, "after-restart-ipc.json", {
             "plain": after_plain,
@@ -312,16 +339,25 @@ def main() -> int:
         )
         shown = native.wait_window(window.pid, 60)
         step("receiver window is visible after restart", shown)
-        if shown:
-            native.prepare(window.pid)
-            native.click(window.pid, click_x, click_y)
-            time.sleep(2.0)
-            after_shot = str(shots / "after-restart.png")
-            native.shot(window.pid, after_shot)
-            step("after-restart window captured for pixel review", True, "shots/after-restart.png")
+        if not shown:
+            return incomplete("receiver window never appeared after restart")
+        native.prepare(window.pid)
+        native.click(window.pid, click_x, click_y)
+        time.sleep(2.0)
+        after_shot = str(shots / "after-restart.png")
+        native.shot(window.pid, after_shot, printwindow=False)
+        after_pixels = native.png_mentions_marker(after_shot, marker)
+        step("after-restart window captured for pixel review", True, "shots/after-restart.png")
+        if after_pixels is None:
+            return incomplete("pixel text oracle unavailable after restart")
 
         # Classify the matched case. Wrong login / never decrypted / generic loss is incomplete.
-        if during_plain and not after_plain:
+        case = classify_case(during_state, after_state, during_pixels, after_pixels)
+        fixture.write_receipt(OUT, "pixel-observations.json", {
+            "during": during_pixels, "after": after_pixels, "class": case,
+            "during_state": during_state, "after_state": after_state, "message_id": message_id,
+        })
+        if case == "base-history-loss-red":
             step("message opened while the sealed-cache append was blocked", True)
             step(
                 "opened plaintext is still present after cache-fault repair and cold restart",
@@ -334,7 +370,9 @@ def main() -> int:
                 "after_plain": False,
                 "cache_is_file": cache_file,
             })
-        elif (not during_plain) and after_plain:
+        elif case == "branch-recoverable-green":
+            if not cache_file:
+                return incomplete("opened row has no durable cache file after repair")
             step("failed cache commit did not claim a durable open", True)
             step(
                 "opened plaintext is still present after cache-fault repair and cold restart",
@@ -356,9 +394,11 @@ def main() -> int:
             )
         else:
             return incomplete(
-                "marker never opened under fault and did not recover; not valid RED",
-                during_plain=False,
-                after_plain=False,
+                "message states and window pixels do not demonstrate the matched history transition",
+                during_state=during_state,
+                after_state=after_state,
+                during_pixels=during_pixels,
+                after_pixels=after_pixels,
             )
 
         return 1 if FAILED else 0

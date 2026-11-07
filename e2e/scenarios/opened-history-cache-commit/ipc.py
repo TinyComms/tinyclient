@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 from typing import Any, Mapping
 
 
@@ -83,4 +84,43 @@ def messages(
 
 
 def text_contains_marker(answer: Mapping[str, Any], marker: str) -> bool:
-    return marker in json.dumps(answer)
+    if answer.get("op") != "messages":
+        return False
+    return any(
+        isinstance(row, Mapping)
+        and row.get("text") == marker
+        and row.get("seal") == "encrypted"
+        and row.get("state", "sent") == "sent"
+        for row in answer.get("messages", [])
+    )
+
+
+def target_state(answer, conversation, message_id, marker):
+    if answer.get("op") != "messages" or answer.get("conversation") != conversation:
+        raise ValueError("history reply is not a messages page for the expected account/conversation")
+    rows = answer.get("messages")
+    if not isinstance(rows, list):
+        raise ValueError("history reply has no messages array")
+    target = next((row for row in rows if isinstance(row, Mapping) and row.get("id") == message_id), None)
+    if target is None:
+        return "missing"
+    if text_contains_marker({"op": "messages", "messages": [target]}, marker):
+        return "opened"
+    if target.get("seal") == "undecryptable" and target.get("state", "sent") == "sent":
+        return "undecryptable"
+    raise ValueError("target row is neither the exact opened message nor an undecryptable row")
+
+
+def delivered_id(answer, conversation, marker):
+    if answer.get("op") != "messages" or answer.get("conversation") != conversation:
+        raise ValueError("sender history reply is not scoped to the expected conversation")
+    for row in answer.get("messages", []):
+        if not isinstance(row, Mapping):
+            continue
+        if not text_contains_marker({"op": "messages", "messages": [row]}, marker):
+            continue
+        try:
+            return str(uuid.UUID(row.get("id", "")))
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return None
