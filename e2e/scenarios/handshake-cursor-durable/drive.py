@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Source component proof only: real MLS Welcome, state fault and cold/warm retry."""
+"""Source component proof only: real MLS handshake faults and cold/warm retry."""
 import json
 import os
 from pathlib import Path
@@ -7,7 +7,13 @@ import re
 import subprocess
 import time
 
-TEST = "adapters::tiny::e2ee::receive_tests::failed_welcome_save_keeps_the_feed_retryable_after_restart_or_in_memory"
+PREFIX = "adapters::tiny::e2ee::receive_tests::"
+TESTS = (
+    ("failed_welcome_save_keeps_the_feed_retryable_after_restart_or_in_memory",
+     "failed Welcome save remains retryable after cold restart and in-memory retry"),
+    ("failed_commit_save_keeps_new_ciphertext_readable_after_restart_or_in_memory",
+     "failed membership commit save preserves new ciphertext through cold and warm retry"),
+)
 
 
 def main():
@@ -22,27 +28,31 @@ def main():
     env["TINYCLIENT_DIR"] = str(out / "scratch")
     steps = out / "steps.jsonl"
     steps.write_text("", encoding="utf-8")
-    passed = False
-    try:
-        result = subprocess.run(
-            [env.get("CARGO", "cargo"), "test", "--locked", "-p", "chatd", "--lib", TEST,
-             "--", "--exact", "--nocapture"],
-            cwd=source, env=env, capture_output=True, text=True, timeout=600,
-        )
-        output = result.stdout + result.stderr
-        (out / "component.log").write_text(output, encoding="utf-8")
-        passed = result.returncode == 0 and all(re.search(pattern, output, re.M) for pattern in (
-            r"^running 1 test$", r"^test " + re.escape(TEST) + r" \.\.\. ok$",
-            r"^test result: ok\. 1 passed; 0 failed; 0 ignored;",
-        ))
-    except (OSError, subprocess.TimeoutExpired) as error:
-        (out / "component.log").write_text(str(error), encoding="utf-8")
-    steps.write_text(json.dumps({
-        "t": round(time.time() - started, 3),
-        "step": "failed Welcome save remains retryable after cold restart and in-memory retry",
-        "ok": bool(passed),
-    }) + "\n", encoding="utf-8")
-    return 0 if passed else 1
+    all_passed = True
+    for index, (name, label) in enumerate(TESTS):
+        test = PREFIX + name
+        passed = False
+        log = out / f"component-{index + 1}.log"
+        try:
+            result = subprocess.run(
+                [env.get("CARGO", "cargo"), "test", "--locked", "-p", "chatd", "--lib", test,
+                 "--", "--exact", "--nocapture"],
+                cwd=source, env=env, capture_output=True, text=True, timeout=600,
+            )
+            output = result.stdout + result.stderr
+            log.write_text(output, encoding="utf-8")
+            passed = result.returncode == 0 and all(re.search(pattern, output, re.M) for pattern in (
+                r"^running 1 test$", r"^test " + re.escape(test) + r" \.\.\. ok$",
+                r"^test result: ok\. 1 passed; 0 failed; 0 ignored;",
+            ))
+        except (OSError, subprocess.TimeoutExpired) as error:
+            log.write_text(str(error), encoding="utf-8")
+        with steps.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "t": round(time.time() - started, 3), "step": label, "ok": bool(passed),
+            }) + "\n")
+        all_passed = all_passed and passed
+    return 0 if all_passed else 1
 
 
 if __name__ == "__main__":

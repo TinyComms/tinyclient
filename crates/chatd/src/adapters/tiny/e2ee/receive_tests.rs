@@ -3,6 +3,7 @@
 use super::*;
 use e2ee::groups::CommitBundle;
 use e2ee::identity::DeviceKey;
+use e2ee::store::Store;
 use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _};
 use openmls::prelude::{
     ExternalProposal, GroupEpoch, GroupId, KeyPackageIn, MlsMessageOut, ProtocolVersion,
@@ -10,34 +11,32 @@ use openmls::prelude::{
 };
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::OpenMlsProvider as _;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[derive(Clone)]
+struct FailingState {
+    dir: PathBuf,
+    fail: Arc<AtomicBool>,
+}
+impl Store for FailingState {
+    fn load(&self, name: &str) -> e2ee::Result<Option<Vec<u8>>> {
+        FileStore::new(&self.dir).load(name)
+    }
+    fn remove(&self, name: &str) -> e2ee::Result<()> {
+        FileStore::new(&self.dir).remove(name)
+    }
+    fn save(&self, name: &str, bytes: &[u8]) -> e2ee::Result<()> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(Error::Storage(
+                "injected handshake state write failure".into(),
+            ));
+        }
+        FileStore::new(&self.dir).save(name, bytes)
+    }
+}
 
 #[test]
 fn failed_welcome_save_keeps_the_feed_retryable_after_restart_or_in_memory() {
-    use e2ee::store::Store;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    #[derive(Clone)]
-    struct FailingState {
-        dir: PathBuf,
-        fail: Arc<AtomicBool>,
-    }
-    impl Store for FailingState {
-        fn load(&self, name: &str) -> e2ee::Result<Option<Vec<u8>>> {
-            FileStore::new(&self.dir).load(name)
-        }
-        fn remove(&self, name: &str) -> e2ee::Result<()> {
-            FileStore::new(&self.dir).remove(name)
-        }
-        fn save(&self, name: &str, bytes: &[u8]) -> e2ee::Result<()> {
-            if self.fail.load(Ordering::SeqCst) {
-                return Err(Error::Storage(
-                    "injected handshake state write failure".into(),
-                ));
-            }
-            FileStore::new(&self.dir).save(name, bytes)
-        }
-    }
-
     for cold in [true, false] {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("receiver");
@@ -127,6 +126,132 @@ fn failed_welcome_save_keeps_the_feed_retryable_after_restart_or_in_memory() {
         let notes: Notes =
             serde_json::from_slice(&std::fs::read(dir.join("notes.json")).unwrap()).unwrap();
         assert_eq!(notes.seqs.get(&conversation), Some(&1));
+    }
+}
+
+#[test]
+fn failed_commit_save_keeps_new_ciphertext_readable_after_restart_or_in_memory() {
+    for cold in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("receiver");
+        private_dir(&dir).unwrap();
+        let store = FailingState {
+            dir: dir.clone(),
+            fail: Arc::new(AtomicBool::new(false)),
+        };
+        let state_key = StateKey::generate().unwrap();
+        let alice = UserId::random().unwrap();
+        let bea = UserId::random().unwrap();
+        let carol = UserId::random().unwrap();
+        let conv = ConversationId::random().unwrap();
+        let conversation = conv.to_string();
+        let server = DeviceKey::generate().unwrap();
+        let public = server.public_key();
+        let mut a = Engine::detached(alice).unwrap();
+        let mut b = Engine::create(bea, Box::new(store.clone()), state_key.clone(), STATE).unwrap();
+        let mut c = Engine::detached(carol).unwrap();
+        a.verify_devices(bea, &[record(&b, None, 1)]).unwrap();
+        b.verify_devices(alice, &[record(&a, None, 1)]).unwrap();
+        a.create_group(conv, &public).unwrap();
+        let (first, _) = add(&mut a, conv, &server, &b.key_packages(1).unwrap().remove(0));
+        let welcome = first
+            .welcomes
+            .iter()
+            .find(|w| w.device.device == b.device_id())
+            .unwrap();
+        b.handle_welcome(conv, &welcome.data, Some(&public))
+            .unwrap();
+        a.verify_devices(carol, &[record(&c, None, 1)]).unwrap();
+        b.verify_devices(carol, &[record(&c, None, 1)]).unwrap();
+        let (commit, proposals) = add(&mut a, conv, &server, &c.key_packages(1).unwrap().remove(0));
+        assert!(b
+            .handle_proposals(conv, &proposals)
+            .unwrap()
+            .rejected
+            .is_empty());
+        assert_eq!(b.epoch(conv).unwrap(), 1);
+        let sealed = a
+            .encrypt(
+                conv,
+                Kind::Message,
+                None,
+                &Envelope::message("after the saved membership change"),
+            )
+            .unwrap();
+        assert_eq!(sealed.epoch, 2);
+        let base = super::super::tests::serve(move |request| {
+            assert!(
+                request.contains("/handshake?"),
+                "unexpected fixture request"
+            );
+            let rows = if request.contains("after=0&") {
+                json!([{"seq":1,"kind":"commit","epoch":commit.epoch,"data":b64(&commit.commit)}])
+            } else {
+                json!([])
+            };
+            super::super::tests::http(200, "OK", &rows.to_string())
+        });
+        let saved = Saved {
+            base_url: base,
+            token: "synthetic".into(),
+            user_id: bea.to_string(),
+            email: None,
+            display_name: "Bea".into(),
+            role: "member".into(),
+            plain_http_ok: false,
+            e2ee: None,
+        };
+        let mut device = Device::new(&saved);
+        device.dir = dir.clone();
+        device.engine = Some(b);
+        device.save_notes();
+        let before = std::fs::read(dir.join(STATE)).unwrap();
+        store.fail.store(true, Ordering::SeqCst);
+        let refused = device.feed_at(&conversation, conv, 0, &public);
+        let cursor_after_failure = device.notes.seqs.get(&conversation).copied().unwrap_or(0);
+        assert_eq!(
+            device.engine().unwrap().epoch(conv).unwrap(),
+            2,
+            "commit was accepted in memory"
+        );
+        assert_eq!(
+            std::fs::read(dir.join(STATE)).unwrap(),
+            before,
+            "failed save must leave old disk snapshot"
+        );
+        if cold {
+            drop(device);
+            device = Device::new(&saved);
+            device.dir = dir.clone();
+            device.notes =
+                serde_json::from_slice(&std::fs::read(dir.join("notes.json")).unwrap()).unwrap();
+            device.engine =
+                Engine::open(Box::new(store.clone()), state_key.clone(), STATE).unwrap();
+            assert_eq!(device.engine().unwrap().epoch(conv).unwrap(), 1);
+        }
+        store.fail.store(false, Ordering::SeqCst);
+        device.feed_at(&conversation, conv, 0, &public).unwrap();
+        let mut persisted = Engine::open(Box::new(store.clone()), state_key, STATE)
+            .unwrap()
+            .unwrap();
+        let opened = persisted.decrypt(
+            conv,
+            &sealed.ciphertext,
+            &Claimed {
+                author: Some(alice),
+                device: Some(a.device_id()),
+                kind: Kind::Message,
+                target_id: None,
+            },
+        );
+        assert!(opened.is_ok(), "new ciphertext must remain readable after failed commit save (cold={cold}, refused={}, advanced_cursor={cursor_after_failure}): {:?}", refused.is_err(), opened.as_ref().err());
+        assert_eq!(
+            opened.unwrap().envelope.text,
+            "after the saved membership change"
+        );
+        assert!(refused.is_err(), "storage failure must be reported");
+        assert_eq!(cursor_after_failure, 0);
+        assert_eq!(device.notes.seqs.get(&conversation), Some(&1));
     }
 }
 

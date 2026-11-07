@@ -1,6 +1,6 @@
 {
   "id": "handshake-cursor-durable",
-  "title": "A failed Welcome state save cannot skip joining the group after restart",
+  "title": "Failed handshake saves cannot skip joining or reading new-epoch messages after restart",
   "platforms": ["windows", "linux", "macos"],
   "not_applicable": {
     "android": "This source component driver executes chatd's real MLS/FileStore regression; no native mobile proof is claimed. The shared-code PR still requires the full platform plan.",
