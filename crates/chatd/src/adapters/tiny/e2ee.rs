@@ -809,6 +809,24 @@ pub(crate) fn write_opened_cache(
     message_id: &str,
     text: &str,
 ) -> Result<(), String> {
+    write_opened_row(
+        saved,
+        conversation_id,
+        message_id,
+        Opened {
+            text: text.to_owned(),
+            ..Opened::default()
+        },
+    )
+}
+
+/// Writes one authenticated opened value into the sealed cache (lab prove and unit tests).
+pub(crate) fn write_opened_row(
+    saved: &Saved,
+    conversation_id: &str,
+    message_id: &str,
+    opened: Opened,
+) -> Result<(), String> {
     let secrets = saved
         .e2ee
         .as_ref()
@@ -816,14 +834,7 @@ pub(crate) fn write_opened_cache(
     let (_, cache_key) = secrets.keys().ok_or("This device's keys are unreadable.")?;
     private_dir(&dir_of(saved)).map_err(|err| err.to_string())?;
     let mut cache = Cache::load(&dir_of(saved), conversation_id, &cache_key);
-    cache.put(
-        &cache_key,
-        message_id,
-        Opened {
-            text: text.to_owned(),
-            ..Opened::default()
-        },
-    );
+    cache.put(&cache_key, message_id, opened);
     Ok(())
 }
 

@@ -53,6 +53,11 @@ pub fn prove_sealed_cache_preview() -> Result<(), String> {
     messages::prove_sealed_cache_preview()
 }
 
+/// The lab's sealed-preview-attachments proof. See `messages::prove_sealed_preview_attachments`.
+pub fn prove_sealed_preview_attachments() -> Result<(), String> {
+    messages::prove_sealed_preview_attachments()
+}
+
 /// The lab's cache-before-enrol proof.
 pub fn prove_cache_before_enrol() -> Result<(), String> {
     messages::prove_cache_before_enrol()
