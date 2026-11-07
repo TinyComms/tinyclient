@@ -645,6 +645,52 @@ pub fn prove_cache_append_tail() -> Result<(), String> {
     Ok(())
 }
 
+/// Lab proof: renewing a session still opens the original device and sealed history.
+pub fn prove_reauthenticated_history() -> Result<(), String> {
+    let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+    let user = UserId::random().map_err(|err| err.to_string())?;
+    let secrets = Secrets::generate()?;
+    let session = json!({
+        "base_url": "https://reauth.example", "user_id": user.to_string(), "token": "old-token",
+        "display_name": "Ada", "role": "member", "e2ee": &secrets,
+    });
+    let (state_key, cache_key) = secrets.keys().ok_or("initial keys unreadable")?;
+    let engine = Engine::create(user, Box::new(FileStore::new(dir.path())), state_key, STATE)
+        .map_err(|err| err.to_string())?;
+    let device_id = engine.device_id();
+    drop(engine);
+    let mut cache = Cache::load(dir.path(), "c1", &cache_key);
+    cache.put(&cache_key, "m1", Opened { text: "history before signing in again".into(), ..Opened::default() });
+    drop(cache);
+    let state_before = std::fs::read(dir.path().join(STATE)).map_err(|err| err.to_string())?;
+    let cache_before = std::fs::read(dir.path().join("cache-c1.log")).map_err(|err| err.to_string())?;
+    let mut fresh = session.clone();
+    fresh.as_object_mut().ok_or("session is not an object")?.remove("e2ee");
+    fresh["token"] = json!("renewed-token");
+    let renewed = super::combine(&session.to_string(), &fresh.to_string())?;
+    let renewed = super::parse(&renewed)?;
+    if renewed.token != "renewed-token" {
+        return Err("signing in did not renew the token".into());
+    }
+    let (state_key, cache_key) = renewed.e2ee.as_ref()
+        .and_then(Secrets::keys).ok_or("signing in removed this install's encryption keys")?;
+    let reopened = Engine::open(Box::new(FileStore::new(dir.path())), state_key, STATE)
+        .map_err(|err| err.to_string())?.ok_or("original device state disappeared")?;
+    if reopened.device_id() != device_id {
+        return Err("signing in replaced the device identity".into());
+    }
+    let cache = Cache::load(dir.path(), "c1", &cache_key);
+    if cache.rows.get("m1").map(|row| row.text.as_str()) != Some("history before signing in again") {
+        return Err("signing in lost previously opened history".into());
+    }
+    if std::fs::read(dir.path().join(STATE)).map_err(|err| err.to_string())? != state_before
+        || std::fs::read(dir.path().join("cache-c1.log")).map_err(|err| err.to_string())? != cache_before
+    {
+        return Err("signing in rewrote existing encrypted files".into());
+    }
+    Ok(())
+}
+
 /// This install as a device of one person on one server.
 pub(crate) struct Device {
     saved: Saved,

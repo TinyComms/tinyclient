@@ -63,6 +63,11 @@ pub fn prove_cache_append_tail() -> Result<(), String> {
     e2ee::prove_cache_append_tail()
 }
 
+/// The lab's reauthentication history proof, using real encrypted device/cache files.
+pub fn prove_reauthenticated_history() -> Result<(), String> {
+    e2ee::prove_reauthenticated_history()
+}
+
 /// The lab's keep-opened-sealed proof. See `messages::prove_keep_opened_sealed`.
 pub fn prove_keep_opened_sealed() -> Result<(), String> {
     messages::prove_keep_opened_sealed()
@@ -307,14 +312,30 @@ pub fn without(session: &str, account: &str) -> Option<String> {
     }
 }
 
-/// Drops a server with the same user or the same address, then appends `fresh`. One server stays
-/// a single object, and a replacement of the only server keeps `fresh` as it was given.
+/// Drops a server with the same user or the same address, then appends `fresh`. Signing in again
+/// to the same account and address keeps this install's encryption keys when `fresh` has none.
+/// One server stays a single object; otherwise `fresh` is kept as given.
 pub(crate) fn combine(existing: &str, fresh: &str) -> Result<String, String> {
-    let fresh_saved = parse(fresh)?;
+    let mut fresh_saved = parse(fresh)?;
     let mut kept = saved_rows(existing)?;
+    let mut fresh_session = fresh.to_owned();
+    if fresh_saved.e2ee.is_none() {
+        if let Some(keys) = kept.iter()
+            .find(|saved| saved.user_id == fresh_saved.user_id && saved.base_url == fresh_saved.base_url)
+            .and_then(|saved| saved.e2ee.clone())
+        {
+            // Keep any future fields in a single fresh session, as the old replacement path did.
+            let mut value: Value = serde_json::from_str(fresh)
+                .map_err(|_| "the Tiny server session is unreadable".to_owned())?;
+            value["e2ee"] = serde_json::to_value(&keys)
+                .map_err(|_| "the Tiny server session is unreadable".to_owned())?;
+            fresh_session = value.to_string();
+            fresh_saved.e2ee = Some(keys);
+        }
+    }
     kept.retain(|saved| saved.user_id != fresh_saved.user_id && saved.base_url != fresh_saved.base_url);
     if kept.is_empty() {
-        return Ok(fresh.to_owned());
+        return Ok(fresh_session);
     }
     kept.push(fresh_saved);
     serde_json::to_string(&kept).map_err(|_| "the Tiny server session is unreadable".to_owned())
@@ -1404,6 +1425,57 @@ pub(crate) mod tests {
         let wire = serde_json::to_string(&origins).unwrap();
         assert!(!wire.contains("\"token\""));
         assert!(local_origins("not json").is_err());
+    }
+
+    #[test]
+    fn signing_in_again_keeps_this_devices_encryption_keys() {
+        let mut old: Value = serde_json::from_str(session()).unwrap();
+        old["e2ee"] = serde_json::to_value(e2ee::Secrets::generate().unwrap()).unwrap();
+        let mut fresh: Value = serde_json::from_str(session()).unwrap();
+        fresh["token"] = serde_json::json!("renewed-token");
+        fresh["display_name"] = serde_json::json!("Ada renamed");
+        fresh["future_field"] = serde_json::json!("keep this too");
+        for existing in [old.to_string(), format!("[{},{}]", old, other())] {
+            let merged = combine(&existing, &fresh.to_string()).unwrap();
+            let rows = saved_rows(&merged).unwrap();
+            let renewed = rows.iter().find(|row| row.user_id == old["user_id"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&renewed.e2ee).unwrap(), old["e2ee"],
+                "renewing the token must retain the install's existing state and cache keys"
+            );
+            assert_eq!(renewed.token, "renewed-token");
+            assert_eq!(renewed.display_name, "Ada renamed");
+            if rows.len() == 1 {
+                let value: Value = serde_json::from_str(&merged).unwrap();
+                assert_eq!(value["future_field"], "keep this too");
+            } else {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].base_url, "https://other.example");
+            }
+        }
+    }
+
+    #[test]
+    fn signing_in_only_reuses_keys_for_the_same_account_and_address() {
+        let mut old: Value = serde_json::from_str(session()).unwrap();
+        old["e2ee"] = serde_json::to_value(e2ee::Secrets::generate().unwrap()).unwrap();
+        for field in ["user_id", "base_url"] {
+            let mut fresh: Value = serde_json::from_str(session()).unwrap();
+            fresh[field] = if field == "user_id" {
+                serde_json::json!("33333333-3333-3333-3333-333333333333")
+            } else {
+                serde_json::json!("https://another.example")
+            };
+            let merged = combine(&old.to_string(), &fresh.to_string()).unwrap();
+            assert!(parse(&merged).unwrap().e2ee.is_none(), "different {field} must not inherit keys");
+        }
+        let mut fresh: Value = serde_json::from_str(session()).unwrap();
+        fresh["e2ee"] = serde_json::to_value(e2ee::Secrets::generate().unwrap()).unwrap();
+        let merged: Value = serde_json::from_str(&combine(&old.to_string(), &fresh.to_string()).unwrap()).unwrap();
+        assert_eq!(merged["e2ee"], fresh["e2ee"], "explicitly supplied keys are retained");
+        fresh["e2ee"] = Value::Null;
+        let merged: Value = serde_json::from_str(&combine(&old.to_string(), &fresh.to_string()).unwrap()).unwrap();
+        assert_eq!(merged["e2ee"], old["e2ee"], "null keys also mean no new keys supplied");
     }
 
     #[test]
