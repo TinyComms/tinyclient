@@ -826,7 +826,7 @@ fn answer_cache_open_probe(listener: std::net::TcpListener, sealed: String) {
     }
 }
 
-/// Previously opened text survives a fetch that cannot decrypt it.
+/// Previously opened text and captionless media survive a fetch that cannot decrypt them.
 pub(super) fn prove_keep_opened_sealed() -> Result<(), String> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|err| err.to_string())?;
     let base = format!("http://{}", listener.local_addr().map_err(|err| err.to_string())?);
@@ -849,25 +849,25 @@ pub(super) fn prove_keep_opened_sealed() -> Result<(), String> {
         account: saved.user_id.clone(),
     };
     let (_adapter, ctx, _inbox) = crate::adapters::local(account, hub);
-    let mut message = Message::plain("s-keep", "Bea", "opened words", 1_700_000_000, false);
-    message.sender.id = "22222222-2222-2222-2222-222222222222".to_owned();
-    message.seal = Seal::Encrypted;
-    ctx.hub
-        .store()
-        .ingest(&ctx.key("direct-1"), &message, false)
-        .map_err(|err| err.to_string())?;
-    load_page(&ctx, &saved, "direct-1", None, PAGE);
-    match ctx
-        .stored_message("direct-1", "s-keep")
-        .map_err(|err| err.to_string())?
-    {
-        Some(stored) if stored.text == "opened words" && stored.seal == Seal::Encrypted => Ok(()),
-        Some(stored) => Err(format!(
-            "opened row became {:?} / {:?}",
-            stored.seal, stored.text
-        )),
-        None => Err("opened row was deleted".to_owned()),
+    for media_only in [false, true] {
+        let mut message = Message::plain("s-keep", "Bea", if media_only { "" } else { "opened words" }, 1_700_000_000, false);
+        message.sender.id = "22222222-2222-2222-2222-222222222222".to_owned();
+        message.seal = Seal::Encrypted;
+        if media_only {
+            message.attachments.push(protocol::Attachment::new(
+                "picture.png", MediaFile::new("opened-picture", protocol::MediaKind::Image),
+            ));
+        }
+        ctx.hub.store().ingest(&ctx.key("direct-1"), &message, false)
+            .map_err(|err| err.to_string())?;
+        load_page(&ctx, &saved, "direct-1", None, PAGE);
+        let stored = ctx.stored_message("direct-1", "s-keep")
+            .map_err(|err| err.to_string())?.ok_or("opened row was deleted")?;
+        if stored.text != message.text || stored.seal != Seal::Encrypted || stored.attachments != message.attachments {
+            return Err(format!("opened row lost content after decrypt failure (media_only={media_only}, seal={:?})", stored.seal));
+        }
     }
+    Ok(())
 }
 
 /// Opening a Tiny chat reaches the real adapter command loop and fetches its history.

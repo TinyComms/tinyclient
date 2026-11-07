@@ -90,6 +90,7 @@ fn main() -> io::Result<()> {
             eprintln!("keep-opened-sealed: {err}");
             std::process::exit(1);
         }
+        eprintln!("prove-media-preserved:0");
         eprintln!("prove-exit:0");
         return Ok(());
     }

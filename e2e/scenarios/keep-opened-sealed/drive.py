@@ -3,8 +3,7 @@
 
 Starts this build's chatd with TINYCLIENT_PROVE=keep-opened-sealed. That build stores an opened
 encrypted row, fetches the same id as undecryptable ciphertext with no device, and exits 0 only
-when the opened text is still there. A build from before the fix ignores the variable and keeps
-serving.
+when the opened text and captionless attachment are still there. The earlier text-only proof lacks the media completion marker and fails this driver.
 
 Env from the lab: E2E_OUT, E2E_T0, E2E_APP_DIR.
 """
@@ -77,7 +76,9 @@ def main():
             proc.kill()
             proc.wait(timeout=5)
             code = None
-    step("an opened sealed row is kept when a later fetch cannot open it", code == 0)
+    with open(os.path.join(OUT, "chatd.err.log"), encoding="utf-8") as handle:
+        checked_media = "prove-media-preserved:0" in handle.read()
+    step("opened text and captionless media survive a later decrypt failure", code == 0 and checked_media)
     return 1 if FAILED else 0
 
 

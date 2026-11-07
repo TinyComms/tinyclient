@@ -2195,9 +2195,9 @@ impl Store {
             // A later fetch that cannot open must not replace what this device already opened.
             Some((text, old))
                 if incoming.seal == Seal::Undecryptable
-                    && !text.trim().is_empty()
                     && serde_json::from_str::<Message>(&old)
-                        .is_ok_and(|had| had.seal == Seal::Encrypted) =>
+                        .is_ok_and(|had| had.seal == Seal::Encrypted
+                            && (!text.trim().is_empty() || !had.attachments.is_empty())) =>
             {
                 Stored::Same
             }
@@ -3284,6 +3284,36 @@ mod tests {
 
     fn ids(page: &MessagePage) -> Vec<&str> {
         page.messages.iter().map(|message| message.id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_blank_encrypted_placeholder_can_be_replaced_by_a_decrypt_failure() {
+        let (mut store, key) = store();
+        let mut message = said("sealed", "", NOW);
+        message.seal = Seal::Encrypted;
+        store.ingest(&key, &message, false).unwrap();
+        message.seal = Seal::Undecryptable;
+        message.text = protocol::UNDECRYPTABLE.to_owned();
+        store.ingest(&key, &message, false).unwrap();
+        let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(page.messages[0].seal, Seal::Undecryptable);
+    }
+
+    #[test]
+    fn deleting_a_captionless_encrypted_attachment_still_removes_it() {
+        let (mut store, key) = store();
+        let mut message = said("sealed", "", NOW);
+        message.seal = Seal::Encrypted;
+        message.attachments.push(protocol::Attachment::new(
+            "picture.png", MediaFile::new("picture", protocol::MediaKind::Image),
+        ));
+        store.ingest(&key, &message, false).unwrap();
+        message.deleted = true;
+        message.attachments.clear();
+        store.ingest(&key, &message, false).unwrap();
+        let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert!(page.messages[0].deleted);
+        assert!(page.messages[0].attachments.is_empty());
     }
 
     #[test]
