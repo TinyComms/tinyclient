@@ -1,0 +1,23 @@
+{
+  "_comment": [
+    "How the proof drives a link, as chatd IPC requests (what the window sends). `legacy` is today's",
+    "flow: the new device shows a tiny-device-... code and the old one sends tiny_e2ee approve{code};",
+    "it links but moves no history. `v1` is the device-link flow, with the request names the client",
+    "branch feat/device-link uses (crates/protocol/src/e2ee.rs E2eeAsk::Link*, as of 2026-11-05,",
+    "uncommitted there). If they change, change only this file. Templates: {account} {code} {check}",
+    "{history} are filled in. mode: auto = v1 when the server advertises e2ee_device_link, else legacy."
+  ],
+  "mode": "auto",
+  "v1": {
+    "new_start":   {"op": "tiny_e2ee", "account": {"network": "tiny", "account": "{account}"}, "ask": {"op": "link_start"}},
+    "state":       {"op": "tiny_e2ee", "account": {"network": "tiny", "account": "{account}"}, "ask": {"op": "link"}},
+    "old_join":    {"op": "tiny_e2ee", "account": {"network": "tiny", "account": "{account}"}, "ask": {"op": "link_join", "code": "{code}"}},
+    "old_confirm": {"op": "tiny_e2ee", "account": {"network": "tiny", "account": "{account}"}, "ask": {"op": "link_confirm", "history": "{history}", "check": "{check}"}},
+    "cancel":      {"op": "tiny_e2ee", "account": {"network": "tiny", "account": "{account}"}, "ask": {"op": "link_cancel"}},
+    "seen_device": {"op": "tiny_e2ee", "account": {"network": "tiny", "account": "{account}"}, "ask": {"op": "seen_device", "device_id": "{device}"}},
+    "code_regex":  "tiny-link-1\\.[A-Za-z0-9_-]{120,}",
+    "check_regex": "^\\d{6}$",
+    "notice_regex": "(?i)new device added",
+    "stages_final": ["done", "failed"]
+  }
+}

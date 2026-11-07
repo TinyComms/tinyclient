@@ -1170,7 +1170,7 @@ fn signing_out_waits_for_the_network_to_end_the_session_but_not_for_long() {
         let chatd = Daemon::demo(&[("TINYCLIENT_DEMO_SIGN_OUT_MS", network_takes)]);
         let account = harbor("").account();
         let began = Instant::now();
-        let Response::Status { accounts, .. } = chatd.ask(Request::SignOut { account: account.clone() }) else {
+        let Response::Status { accounts, .. } = chatd.ask(Request::SignOut { account: account.clone(), erase: false }) else {
             panic!("not a status");
         };
         assert!(accounts.iter().all(|status| status.key != account), "still signed in");

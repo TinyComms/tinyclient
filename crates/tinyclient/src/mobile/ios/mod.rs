@@ -16,6 +16,7 @@
 
 mod audio;
 mod auth;
+mod approval;
 mod camera;
 mod codec;
 mod unified;
@@ -35,6 +36,7 @@ pub(super) fn register() {
     let phone = Arc::new(Ios);
     mediad::platform::register(phone.clone());
     protocol::web_sign_in::register(phone.clone());
+    protocol::device_approval::register(Arc::new(approval::IosApproval));
     audio::register_hooks();
     camera::register_hooks();
     selftest::maybe_start(phone);

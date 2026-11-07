@@ -28,6 +28,7 @@
 
 pub(crate) use login::teams;
 mod messages;
+mod device_approval;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -44,6 +45,13 @@ fn main() {
     }
     let _log = protocol::log_policy::install("login", protocol::log_policy::LogPolicy::from_env());
     protocol::crash::install_panic_hook("login");
+    if args.first().map(String::as_str) == Some("--device-approval") {
+        if args.len() != 2 {
+            std::process::exit(USAGE);
+        }
+        device_approval::run(&args[1]);
+        return;
+    }
     if args.first().map(String::as_str) == Some("--messages-browser-cleanup") {
         messages::cleanup_worker(&args);
         return;

@@ -26,7 +26,7 @@ pub const CIPHERSUITE: mls::Ciphersuite = mls::Ciphersuite::MLS_128_DHKEMP256_AE
 pub const MAX_KEY_PACKAGES: usize = 50;
 /// Regular key packages are good for 84 days (OpenMLS's own range limit for a leaf's lifetime).
 const KEY_PACKAGE_LIFETIME: u64 = 60 * 60 * 24 * 84;
-const SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_VERSION: u32 = 2;
 
 /// What every leaf of ours says it supports: this ciphersuite, basic credentials, and the last-resort
 /// key package extension (a key package that carries an extension must list it).
@@ -45,7 +45,9 @@ pub(crate) fn capabilities() -> mls::Capabilities {
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
     /// Past epochs whose message keys are kept so that a message sent just before a commit still
-    /// opens. Each is a window in which an old key could leak; 4 covers a normal reorder.
+    /// opens. Each is a window in which an old key could leak. Epochs move only on membership
+    /// changes, so 8 covers a device that was away while its people added and revoked a few
+    /// devices (`docs/e2ee-core-notes.md` 1.9).
     pub max_past_epochs: usize,
     /// How far out of order, within one epoch and sender, a message may arrive.
     pub out_of_order_tolerance: u32,
@@ -60,7 +62,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
-            max_past_epochs: 4,
+            max_past_epochs: 8,
             out_of_order_tolerance: 64,
             maximum_forward_distance: 2000,
             commits_remembered: 256,
@@ -109,6 +111,8 @@ struct Snapshot {
     trust: Trust,
     meta: BTreeMap<ConversationId, ConvMeta>,
     storage: Vec<(Bytes, Bytes)>,
+    #[serde(default)]
+    repair: Option<crate::repair::RepairState>,
 }
 
 pub struct Engine {
@@ -120,6 +124,7 @@ pub struct Engine {
     /// one, so the next use reloads the last stored state.
     pub(crate) groups: HashMap<ConversationId, mls::MlsGroup>,
     pub(crate) config: Config,
+    pub(crate) repair: crate::repair::RepairState,
     persistence: Option<Persistence>,
     dirty: bool,
     save_error: Option<String>,
@@ -149,6 +154,7 @@ impl Engine {
             meta: BTreeMap::new(),
             groups: HashMap::new(),
             config: Config::default(),
+            repair: crate::repair::RepairState::default(),
             persistence: None,
             dirty: true,
             save_error: None,
@@ -201,16 +207,26 @@ impl Engine {
         let plain = open_state(key, name, blob)?;
         let snapshot: Snapshot =
             serde_json::from_slice(&plain).map_err(|_| Error::Malformed("state"))?;
-        if snapshot.version != SNAPSHOT_VERSION {
+        if snapshot.version != 1 && snapshot.version != SNAPSHOT_VERSION {
             return Err(Error::UnsupportedVersion);
         }
+        let repair = if snapshot.version == 1 {
+            if snapshot.repair.is_some() {
+                return Err(Error::Malformed("legacy state with repair metadata"));
+            }
+            crate::repair::RepairState::legacy(&snapshot.meta)?
+        } else {
+            snapshot
+                .repair
+                .ok_or(Error::Malformed("missing generation metadata"))?
+        };
         let signing = DeviceKey::from_bytes(&snapshot.signing_key)?;
         let entries = snapshot
             .storage
             .into_iter()
             .map(|(key, value)| (key.0, value.0))
             .collect();
-        Ok(Engine {
+        let mut engine = Engine {
             identity: DeviceIdentity {
                 user: snapshot.user,
                 device: snapshot.device,
@@ -221,10 +237,13 @@ impl Engine {
             meta: snapshot.meta,
             groups: HashMap::new(),
             config: Config::default(),
+            repair,
             persistence: None,
             dirty: false,
             save_error: None,
-        })
+        };
+        engine.validate_repair_state()?;
+        Ok(engine)
     }
 
     fn snapshot_plain(&self) -> Result<Zeroizing<Vec<u8>>> {
@@ -241,6 +260,7 @@ impl Engine {
                 .into_iter()
                 .map(|(key, value)| (Bytes(key), Bytes(value)))
                 .collect(),
+            repair: Some(self.repair.clone()),
         };
         serde_json::to_vec(&snapshot)
             .map(Zeroizing::new)
@@ -292,6 +312,39 @@ impl Engine {
         }
     }
 
+    /// A repair publishes provider state, its mapping and its outbound guards as one snapshot.
+    pub(crate) fn repair_transaction<T>(
+        &mut self,
+        conversation: ConversationId,
+        change: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let checkpoint = self.provider.checkpoint();
+        let previous_meta = self.meta.clone();
+        let previous_repair = self.repair.clone();
+        let previous_dirty = self.dirty;
+        let previous_error = self.save_error.clone();
+        let result = change(self).and_then(|value| {
+            self.repair.failed_writes.remove(&conversation);
+            self.validate_repair_state()?;
+            self.persist(true)?;
+            Ok(value)
+        });
+        if let Err(error) = &result {
+            self.provider.restore(checkpoint);
+            self.groups.clear();
+            self.meta = previous_meta;
+            self.repair = previous_repair;
+            self.dirty = previous_dirty;
+            self.save_error = previous_error;
+            if matches!(error, Error::Storage(_) | Error::Io(_)) {
+                // Do not allow a caller to ignore failed durable lifecycle publication.
+                self.repair.failed_writes.insert(conversation);
+                self.dirty = true;
+            }
+        }
+        result
+    }
+
     // --- Identity ---
 
     pub fn user_id(&self) -> UserId {
@@ -320,6 +373,45 @@ impl Engine {
     /// What is trusted. Verify a device list with [`Engine::verify_devices`] (it persists).
     pub fn trust(&self) -> &Trust {
         &self.trust
+    }
+
+    /// Public verification records for an authenticated link or encrypted backup. This includes
+    /// this device's public signer even before it has fetched its own directory. It never
+    /// exports signing secrets, MLS state, or any state/cache encryption key.
+    pub fn public_trust(&self) -> Result<Trust> {
+        let mut public = self.trust.clone();
+        public.include_own_public(self.device_ref())?;
+        public.validate_public()?;
+        Ok(public)
+    }
+
+    /// Checks imported public records before any state or message-cache mutation.
+    pub fn validate_public_trust(&self, public: &Trust) -> Result<()> {
+        public.validate_public()?;
+        if public.devices(self.user_id()).iter().any(|device| {
+            device.device == self.device_id() && device.signature_key != self.signature_key()
+        }) {
+            return Err(Error::IdentityChanged);
+        }
+        Ok(())
+    }
+
+    /// Persists public pins inherited from an authenticated device or backup, retaining every
+    /// already-pinned person on this device, including their revocation tombstones.
+    pub fn import_public_trust(&mut self, public: &Trust) -> Result<()> {
+        self.validate_public_trust(public)?;
+        let mut candidate = self.trust.clone();
+        candidate.import_public(public)?;
+        let previous = std::mem::replace(&mut self.trust, candidate);
+        let previous_dirty = self.dirty;
+        let previous_error = self.save_error.clone();
+        if let Err(error) = self.persist(true) {
+            self.trust = previous;
+            self.dirty = previous_dirty;
+            self.save_error = previous_error;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Verifies the server's device list for `user` and records the result (see

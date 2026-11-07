@@ -642,6 +642,7 @@ mod tests {
             categories: vec![],
             bans: vec![],
             provider: String::new(),
+            new_devices: Vec::new(),
         }
     }
 

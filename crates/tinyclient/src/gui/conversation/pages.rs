@@ -21,7 +21,7 @@ pub struct Window {
 }
 
 /// chatd's own order: [`Message::rank`].
-type Order = (i64, u8, i64, usize, String);
+type Order = (i64, u32, u8, i64, usize, String);
 
 fn order(message: &Message) -> Order {
     message.rank()
@@ -210,6 +210,19 @@ mod tests {
 
     fn before(id: u32) -> Page {
         Page::Before { id: id.to_string() }
+    }
+
+    #[test]
+    fn merging_subsecond_messages_keeps_the_older_end() {
+        let message = |id: &str, millis| {
+            let mut value = serde_json::to_value(Message::plain(id, "Ada", id, 20, false)).unwrap();
+            value["sent_subsec_millis"] = serde_json::json!(millis);
+            serde_json::from_value(value).unwrap()
+        };
+        let mut window = Window::default();
+        window.merge(&Page::Newest, vec![message("z-first", 100), message("a-later", 500)], false, false);
+        window.merge(&Page::Newest, vec![message("a-later", 500), message("b-final", 900)], true, false);
+        assert_eq!(window.messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["z-first", "a-later", "b-final"]);
     }
 
     #[test]

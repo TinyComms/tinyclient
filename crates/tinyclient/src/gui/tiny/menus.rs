@@ -96,7 +96,7 @@ impl Shell {
                 this.tiny_close_float(cx);
                 this.sign_in(Network::Tiny, cx);
             })))
-            .child(self.plain(menu_item_danger("tiny-menu-sign-out", Some("icons/log-out.svg"), "Sign out of this server…"), cx).on_click(cx.listener(|this, _, window, cx| this.tiny_open_modal(Modal::SignOut, window, cx))))
+            .child(self.plain(menu_item_danger("tiny-menu-sign-out", Some("icons/log-out.svg"), "Sign out of this server…"), cx).on_click(cx.listener(|this, _, window, cx| this.tiny_open_modal(Modal::SignOut { erase: false }, window, cx))))
     }
 
     pub(super) fn tiny_person_menu(&self, page: &Page, user_id: &str, cx: &mut Context<Self>) -> Div {
