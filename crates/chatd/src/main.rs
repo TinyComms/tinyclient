@@ -109,6 +109,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-exit:0");
         return Ok(());
     }
+    // Long conversations must keep saving newly opened history across restarts.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("cache-history-limit") {
+        if let Err(err) = chatd::adapters::tiny::prove_cache_history_limit() {
+            eprintln!("cache-history-limit: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-cache-history-limit:0");
+        return Ok(());
+    }
     // A torn cache tail must not absorb the next complete encrypted record.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("cache-append-tail") {
         if let Err(err) = chatd::adapters::tiny::prove_cache_append_tail() {

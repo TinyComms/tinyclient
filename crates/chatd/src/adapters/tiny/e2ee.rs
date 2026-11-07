@@ -51,7 +51,8 @@ const KEY_PACKAGES: usize = 50;
 const HANDSHAKE_PAGE: usize = 100;
 /// Passes over the handshake feed in one sync, so a busy group cannot hold the thread for good.
 const PASSES: usize = 8;
-/// Opened messages kept per conversation in the cache.
+/// Maximum opened messages per conversation selected by the history exporter.
+/// Local durable history must keep saving beyond this transfer limit.
 const CACHED: usize = 20_000;
 /// How long a send waits for the people of a conversation to join its group. The server signs
 /// their Adds only after its commit batch (`e2ee_commit_batch_secs`, 30 s by default, counted from
@@ -618,9 +619,8 @@ impl Cache {
         if !super::safe_id(id) {
             return;
         }
-        if self.rows.len() >= CACHED && !self.rows.contains_key(id) {
-            return;
-        }
+        // MLS cannot open the same incoming ciphertext again after its ratchet advances.
+        // This is durable history: dropping new rows at a size limit loses them on restart.
         if let Ok(plain) = serde_json::to_vec(&opened) {
             if let Ok(blob) = e2ee::store::seal_cache_value(key, id.as_bytes(), &plain) {
                 // An interrupted append may leave no newline. Fence the next complete record
@@ -638,6 +638,35 @@ impl Cache {
         }
         self.rows.insert(id.to_owned(), opened);
     }
+}
+
+/// Daemon regression: a long conversation keeps newly opened history across restarts.
+pub fn prove_cache_history_limit() -> Result<(), String> {
+    let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+    let key = CacheKey::generate().map_err(|err| err.to_string())?;
+    {
+        let mut cache = Cache::load(dir.path(), "long-conversation", &key);
+        // Cross the old limit through real sealed appends, rather than a fabricated row count.
+        for index in 0..=20_000 {
+            cache.put(
+                &key,
+                &format!("m{index}"),
+                Opened {
+                    text: format!("saved words {index}"),
+                    ..Opened::default()
+                },
+            );
+        }
+    }
+    let restored = Cache::load(dir.path(), "long-conversation", &key);
+    for index in 0..=20_000 {
+        let id = format!("m{index}");
+        let expected = format!("saved words {index}");
+        if restored.rows.get(&id).map(|row| row.text.as_str()) != Some(expected.as_str()) {
+            return Err(format!("sealed history lost {id} after restart"));
+        }
+    }
+    Ok(())
 }
 
 /// Lab proof: interrupted cache writes cannot swallow the next complete encrypted record.
@@ -3097,6 +3126,11 @@ mod tests {
     #[test]
     fn encrypted_records_appended_after_an_unterminated_tail_survive_restart() {
         assert_eq!(prove_cache_append_tail(), Ok(()));
+    }
+
+    #[test]
+    fn encrypted_history_beyond_twenty_thousand_messages_survives_restart() {
+        assert_eq!(prove_cache_history_limit(), Ok(()));
     }
 
     #[test]

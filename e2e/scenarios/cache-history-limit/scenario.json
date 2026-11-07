@@ -1,0 +1,16 @@
+{
+  "id": "cache-history-limit",
+  "title": "Encrypted history beyond 20,000 messages survives restart",
+  "platforms": [
+    "windows",
+    "linux",
+    "macos"
+  ],
+  "not_applicable": {
+    "android": "This driver executes the desktop chatd cache proof; mobile uses the same cache code but no native mobile runtime proof is claimed.",
+    "ios": "This driver executes the desktop chatd cache proof; mobile uses the same cache code but no native mobile runtime proof is claimed."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 150
+}
