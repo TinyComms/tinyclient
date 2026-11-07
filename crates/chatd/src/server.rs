@@ -158,6 +158,13 @@ fn call_error(err: CallError) -> Response {
     }
 }
 
+fn response_detail(response: &Response) -> String {
+    match response {
+        Response::Error { detail, .. } => detail.clone(),
+        _ => "That didn't work. Try again.".to_owned(),
+    }
+}
+
 /// `TINYCLIENT_LOGIN`, or the `tinyclient-login` next to this binary.
 pub(crate) fn login_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("TINYCLIENT_LOGIN") {
@@ -666,6 +673,7 @@ impl Chat {
             accounts,
             media: if running { Media::Running } else { Media::Stopped },
             call,
+            ring: self.hub.calls.aside(),
             seq: self.hub.seq(),
             keychain,
             started: self.hub.started,
@@ -1828,12 +1836,10 @@ impl Chat {
     /// Only a conversation tinyclient can carry a call for starts one. Anything else is refused
     /// before mediad is spawned or the network hears a thing.
     fn call_start(&self, conversation: Key) -> Response {
-        // A Tiny room is no stored conversation: its call is a seat taken over the live socket.
+        // A Tiny room is a seat on the live socket. A direct message rings, and media starts
+        // only once the other person accepts.
         if conversation.network == Network::Tiny {
-            return match self.tiny_join(conversation.account(), conversation.id) {
-                Response::Ok => self.status(),
-                refused => refused,
-            };
+            return self.tiny_call_start(conversation);
         }
         match self.hub.store().conversation(&conversation) {
             Ok(Some(row)) if row.call == CallSupport::Native => {}
@@ -1849,6 +1855,80 @@ impl Chat {
         }
         self.join(conversation);
         self.status()
+    }
+
+    /// A Tiny voice room is joined as before. A direct message the server can ring is a ring,
+    /// with no mediad until it is accepted. An id this client has never stored is still joined
+    /// as a room, which is how a room call is started.
+    fn tiny_call_start(&self, conversation: Key) -> Response {
+        let row = match self.hub.store().conversation(&conversation) {
+            Ok(row) => row,
+            Err(err) => return internal(err),
+        };
+        let direct = row
+            .as_ref()
+            .is_some_and(|row| row.kind.is_direct() && row.call == CallSupport::Native);
+        if !direct {
+            if row.as_ref().is_some_and(|row| row.kind.is_direct()) {
+                return error(
+                    ErrorCode::Unsupported,
+                    "This conversation has no calls tinyclient can join.",
+                );
+            }
+            return match self.tiny_join(conversation.account(), conversation.id) {
+                Response::Ok => self.status(),
+                refused => refused,
+            };
+        }
+        if self.hub.link(&conversation.account()) != Link::Connected {
+            self.hub.calls.show_failed(
+                &self.hub,
+                conversation,
+                protocol::CallFailure::Lost,
+                adapters::tiny::live::OFFLINE,
+            );
+            return self.status();
+        }
+        let attempt = match self.hub.calls.place(&self.hub, conversation.clone()) {
+            Ok(attempt) => attempt,
+            Err(err) => return call_error(err),
+        };
+        let direct_id = conversation.id.clone();
+        match self.ask(&conversation.account(), |reply| {
+            Command::Tiny(adapters::tiny::live::Ask::Ring { direct_id, attempt: Some(attempt), reply })
+        }) {
+            Ok(()) => self.status(),
+            Err(refused) => {
+                self.hub.calls.fail_ring_attempt(
+                    &self.hub,
+                    &conversation,
+                    attempt,
+                    protocol::CallFailure::Refused,
+                    &response_detail(&refused),
+                );
+                *refused
+            }
+        }
+    }
+
+    /// Accepts the ring that is showing. A Tiny direct call does not start mediad here: the
+    /// server says `call.accepted`, and the offer goes out then. Every other network starts
+    /// mediad and joins at once.
+    fn call_accept(&self) -> Response {
+        let Some(conversation) = self.hub.calls.incoming(&self.hub) else {
+            return call_error(CallError::NoCall);
+        };
+        if conversation.network == Network::Tiny {
+            self.command(&conversation.account(), Command::CallJoin(conversation.id));
+            return self.status();
+        }
+        match self.hub.calls.accept(&self.hub) {
+            Ok(conversation) => {
+                self.join(conversation);
+                self.status()
+            }
+            Err(err) => call_error(err),
+        }
     }
 
     /// Has the adapter join, muted when the user joins muted (V4).
@@ -2089,9 +2169,20 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
-            Request::StartDirect { person } => {
+            request @ (Request::StartDirect { .. } | Request::StartDirectCall { .. }) => {
+                let (person, call) = match request {
+                    Request::StartDirect { person } => (person, false),
+                    Request::StartDirectCall { person } => (person, true),
+                    _ => unreachable!(),
+                };
                 let person_id = person.id.clone();
-                let started = self.ask(&person.account(), |reply| Command::StartDirect { person_id, reply });
+                let started = self.ask(&person.account(), |reply| {
+                    if call && person.network == Network::Tiny {
+                        Command::StartDirectCall { person_id, reply }
+                    } else {
+                        Command::StartDirect { person_id, reply }
+                    }
+                });
                 let id = match started {
                     Ok(id) => id,
                     Err(refused) => return *refused,
@@ -2356,16 +2447,18 @@ impl Chat {
             },
 
             Request::CallStart { conversation } => self.call_start(conversation),
-            Request::CallAccept => match self.hub.calls.accept(&self.hub) {
-                Ok(conversation) => {
-                    self.join(conversation);
-                    self.status()
+            Request::CallAccept => self.call_accept(),
+            // A ring waiting beside a call is declined on its own. Ending the call does not
+            // take that ring into the slot, so the next call the user places is not that ring.
+            Request::CallDecline => {
+                if let Some(conversation) = self.hub.calls.decline_waiting(&self.hub) {
+                    self.command(&conversation.account(), Command::CallLeave(conversation.id));
+                } else if let Some(conversation) = self.hub.calls.end(&self.hub) {
+                    self.command(&conversation.account(), Command::CallLeave(conversation.id));
                 }
-                Err(err) => call_error(err),
-            },
-            // Declining, cancelling and leaving are the same on our side: whatever is in the
-            // slot goes, and the network is told.
-            Request::CallDecline | Request::CallEnd => {
+                self.status()
+            }
+            Request::CallEnd => {
                 if let Some(conversation) = self.hub.calls.end(&self.hub) {
                     self.command(&conversation.account(), Command::CallLeave(conversation.id));
                 }
@@ -2577,7 +2670,9 @@ pub fn serve(listener: ChatListener, chat: Chat) -> io::Result<()> {
             }
         };
         let chat = chat.clone();
-        let spawned = std::thread::Builder::new().name("connection".into()).stack_size(256 * 1024).spawn(move || {
+        // Authentication requests can exceed 256 KiB in debug builds as the request/status
+        // contract grows. Leave headroom so sign-in returns a reply instead of aborting chatd.
+        let spawned = std::thread::Builder::new().name("connection".into()).stack_size(1024 * 1024).spawn(move || {
             if let Err(err) = serve_connection(&chat, stream) {
                 tracing::warn!("chatd: connection: {err}");
             }

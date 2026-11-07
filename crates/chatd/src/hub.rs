@@ -482,7 +482,7 @@ impl Hub {
     pub fn changed(&self, change: Change) {
         match &change {
             Change::Conversation { conversation } => self.notify(crate::notify::Event::Row(conversation.clone())),
-            Change::Call { call } => self.notify(crate::notify::Event::Call(call.clone())),
+            Change::Call { call, .. } => self.notify(crate::notify::Event::Call(call.clone())),
             _ => {}
         }
         let mut changes = lock(&self.changes);

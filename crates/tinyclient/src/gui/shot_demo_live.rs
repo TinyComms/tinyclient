@@ -8,8 +8,8 @@
 use super::{find, members, photo, who};
 use crate::view::now;
 use protocol::{
-    Call, CallPicture, CallState, Change, Content, ConversationKind, Direction, Key, MediaRequest, Network, Participant, PictureKind,
-    Request, Response, VideoStream,
+    Call, CallPicture, CallState, Change, Content, ConversationKind, Direction, Key, MediaRequest,
+    Network, Participant, PictureKind, Request, Response, VideoStream,
 };
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
@@ -23,7 +23,12 @@ struct State {
     frame: u64,
 }
 
-static STATE: Mutex<State> = Mutex::new(State { seq: 1, call: None, run: 0, frame: 0 });
+static STATE: Mutex<State> = Mutex::new(State {
+    seq: 1,
+    call: None,
+    run: 0,
+    frame: 0,
+});
 static CHANGED: Condvar = Condvar::new();
 
 /// What `Status` says the last change was, for the shell's first `Wait`.
@@ -57,11 +62,20 @@ fn change(run: Option<u64>, apply: impl FnOnce(&mut Option<Call>, &mut u64)) -> 
 pub fn wait(since: u64) -> std::io::Result<Response> {
     let quiet = || std::io::Error::new(std::io::ErrorKind::TimedOut, "the demo is quiet");
     let state = STATE.lock().map_err(|_| quiet())?;
-    let (state, _) = CHANGED.wait_timeout_while(state, Duration::from_secs(20), |state| state.seq <= since).map_err(|_| quiet())?;
+    let (state, _) = CHANGED
+        .wait_timeout_while(state, Duration::from_secs(20), |state| state.seq <= since)
+        .map_err(|_| quiet())?;
     if state.seq <= since {
         return Err(quiet());
     }
-    Ok(Response::Changes { seq: state.seq, reset: false, changes: vec![Change::Call { call: state.call.clone() }] })
+    Ok(Response::Changes {
+        seq: state.seq,
+        reset: false,
+        changes: vec![Change::Call {
+            call: state.call.clone(),
+            ring: None,
+        }],
+    })
 }
 
 fn person(id: &str) -> Participant {

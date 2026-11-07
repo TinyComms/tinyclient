@@ -18,10 +18,13 @@
 //! without audio a join only takes a seat, and nothing here touches mediad.
 
 use super::super::discord::gateway::{wait_sockets, Pollable, WakePair, POLL_IN, POLL_OUT};
-use super::super::{net, Context, Refusal, Reply, ReconnectWait, PANIC_PAUSE, RECONNECTING};
-use crate::hub::lock;
+use super::super::{net, Context, ReconnectWait, Refusal, Reply, PANIC_PAUSE, RECONNECTING};
 use super::{members_of, Saved};
-use protocol::{join_host, CallFailure, CallState, Cue, Link, MediaRequest, Occupant, Participant, PictureKind, Presence, TinyE2ee, TinyOffer, TinyPicture, TinySeat, TinySlot};
+use crate::hub::lock;
+use protocol::{
+    join_host, CallFailure, CallState, Cue, Link, MediaRequest, Occupant, Participant, PictureKind,
+    Presence, TinyE2ee, TinyOffer, TinyPicture, TinySeat, TinySlot,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -96,16 +99,18 @@ const HELD: Duration = Duration::from_secs(30);
 /// has a receive slot for each of the others.
 const ROOM_CAP: u16 = 12;
 
-const OFFLINE: &str = "Tiny server isn't connected. Try again in a moment.";
+pub(crate) const OFFLINE: &str = "Tiny server isn't connected. Try again in a moment.";
 const LOST: &str = "The connection to the server dropped. Try again.";
 const NO_ANSWER: &str = "The server didn't answer. Try again.";
 const BUSY: &str = "Wait for the last request to finish.";
 const AUDIO_DOWN: &str = "This server's audio is down. Try again later.";
-const MEDIA_TIMEOUT: &str = "Call audio couldn't connect to the server. A VPN or firewall may be blocking it.";
+const MEDIA_TIMEOUT: &str =
+    "Call audio couldn't connect to the server. A VPN or firewall may be blocking it.";
 const MEDIA_LOST: &str = "The server stopped hearing this call's audio, so you've left the call.";
 /// The sentence mediad used to end a Tiny call that did not come back. Said once the resume
 /// budget is spent, in the same voice as a Discord call that did not come back.
-const DROPPED: &str = "The connection to the server dropped and didn't come back. You've left the call.";
+const DROPPED: &str =
+    "The connection to the server dropped and didn't come back. You've left the call.";
 /// A reason this build has no words of its own for: a newer server's.
 const SERVER_ENDED: &str = "The server ended this call.";
 const KICKED: &str = "You were removed from the call.";
@@ -119,28 +124,71 @@ pub(crate) const REPLACED: &str = "This account connected on another device, so 
 
 /// What the command thread hands the socket thread.
 pub enum Ask {
-    Join { room_id: String, reply: Reply<()> },
-    Leave { reply: Reply<()> },
-    Kick { room_id: String, user_id: String, reply: Reply<()> },
+    Join {
+        room_id: String,
+        reply: Reply<()>,
+    },
+    /// Ring the other person of a direct message. The answer is only the ok, not the whole ring.
+    Ring {
+        direct_id: String,
+        attempt: Option<u64>,
+        reply: Reply<()>,
+    },
+    /// Accept a direct ring that is already showing. Media starts when `call.accepted` arrives.
+    Accept {
+        direct_id: String,
+        reply: Reply<()>,
+    },
+    Leave {
+        reply: Reply<()>,
+    },
+    Kick {
+        room_id: String,
+        user_id: String,
+        reply: Reply<()>,
+    },
     /// The page was opened. A socket another device replaced tries again.
     Look,
     /// The call in this room ended in chatd (hung up, or failed): leave it on the server if
     /// we are still in it there.
-    Hangup { room_id: String },
+    Hangup {
+        room_id: String,
+    },
     /// Our mute and deafen changed in a call with audio.
-    State { muted: bool, deafened: bool },
+    State {
+        muted: bool,
+        deafened: bool,
+    },
     /// The draft in this conversation is changing. The shell already paces it.
-    Type { conversation_id: String },
+    Type {
+        conversation_id: String,
+    },
     /// Server-mute or server-deafen someone in a room's call, or undo it. `None` leaves it.
-    Moderate { room_id: String, user_id: String, server_muted: Option<bool>, server_deafened: Option<bool>, reply: Reply<()> },
+    Moderate {
+        room_id: String,
+        user_id: String,
+        server_muted: Option<bool>,
+        server_deafened: Option<bool>,
+        reply: Reply<()>,
+    },
     /// Move someone in a call to another room.
-    Move { user_id: String, room_id: String, reply: Reply<()> },
+    Move {
+        user_id: String,
+        room_id: String,
+        reply: Reply<()>,
+    },
     /// The priority key is held, or let go: told to the server with our mute and deafen.
-    Priority { on: bool },
+    Priority {
+        on: bool,
+    },
     /// A `call.e2ee` frame from mediad, for the server as it is.
-    E2ee { frame: String },
+    E2ee {
+        frame: String,
+    },
     /// A renegotiation offer from mediad, for `call.offer`.
-    Offer { sdp: String },
+    Offer {
+        sdp: String,
+    },
     /// mediad lost the link, and the call is still up. Join again after the resume pause. Not
     /// kept while the socket is down: the call's state says it, and `ready` reads that.
     Resume,
@@ -151,8 +199,22 @@ pub enum Ask {
 impl Ask {
     fn into_reply(self) -> Option<Reply<()>> {
         match self {
-            Ask::Join { reply, .. } | Ask::Leave { reply } | Ask::Kick { reply, .. } | Ask::Moderate { reply, .. } | Ask::Move { reply, .. } => Some(reply),
-            Ask::Look | Ask::Hangup { .. } | Ask::State { .. } | Ask::Type { .. } | Ask::Priority { .. } | Ask::E2ee { .. } | Ask::Offer { .. } | Ask::Resume | Ask::Settled => None,
+            Ask::Join { reply, .. }
+            | Ask::Ring { reply, .. }
+            | Ask::Accept { reply, .. }
+            | Ask::Leave { reply }
+            | Ask::Kick { reply, .. }
+            | Ask::Moderate { reply, .. }
+            | Ask::Move { reply, .. } => Some(reply),
+            Ask::Look
+            | Ask::Hangup { .. }
+            | Ask::State { .. }
+            | Ask::Type { .. }
+            | Ask::Priority { .. }
+            | Ask::E2ee { .. }
+            | Ask::Offer { .. }
+            | Ask::Resume
+            | Ask::Settled => None,
         }
     }
 
@@ -278,6 +340,23 @@ impl Live {
     }
 }
 
+/// A direct call on this socket. The shell names it by `direct_id`. Media and the MLS group
+/// name it `d:{ring_id}`, which is never stored as a room.
+#[derive(Clone)]
+struct DirectSeat {
+    direct_id: String,
+    ring_id: String,
+    intent: Option<u64>,
+    outgoing: bool,
+    /// This device sent `call.accept`.
+    accepting: bool,
+    /// `call.join` for this direct has been sent.
+    joining: bool,
+    caller_id: String,
+    callee_id: String,
+    people: Vec<Sitting>,
+}
+
 /// What is known across connections. Ephemeral: gone at restart, and `ready` replaces it.
 struct Seat {
     /// The server and user, for what the page reads of each seat (`manage::Known::seats`).
@@ -324,6 +403,19 @@ struct Seat {
     resume_at: Option<Instant>,
     /// The next `Interrupted` is the echo of a rejoin sent while the call still looked up.
     echo: bool,
+    /// The direct call this socket is ringing, accepting, or seated in. Its media room is
+    /// `d:{ring_id}`. The shell's conversation stays `direct_id`.
+    direct: Option<DirectSeat>,
+    /// Outgoing intent belongs to this socket, not every device of the caller.
+    placed_direct: Option<(String, u64)>,
+    /// Recently ended attempts, so late frames cannot revive one or end a redial.
+    ended_directs: VecDeque<(String, String)>,
+    /// An accepted attempt the user already ended must be left without joining media.
+    leave_direct: Option<(String, String)>,
+    /// `call.accepted` was ours: join once this frame has been read.
+    join_direct: bool,
+    /// Mute and deafen still to tell, once the direct call has a media session.
+    say_state: bool,
     /// A `call.join` for a drop is in flight. Another drop waits for it.
     rejoining: bool,
     /// When the socket was first seen down with the call's media down too. `ready` clears it.
@@ -416,7 +508,10 @@ fn words(someone: bool, code: &str) -> &'static str {
         "bad_frame" => "The server couldn't read that request.",
         "bad_sdp" => "The server couldn't use tinyclient's audio setup.",
         "media_unavailable" => "This server's audio isn't available. Try again later.",
-        "e2ee_required" => "This room only takes calls encrypted end to end, and this one couldn't be. Try again.",
+        "e2ee_required" => {
+            "This room only takes calls encrypted end to end, and this one couldn't be. Try again."
+        }
+        "busy" => "They're already in a call.",
         _ => "That didn't work. Try again.",
     }
 }
@@ -461,12 +556,20 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
         echo: false,
         rejoining: false,
         stranded: None,
+        direct: None,
+        placed_direct: None,
+        ended_directs: VecDeque::new(),
+        leave_direct: None,
+        join_direct: false,
+        say_state: false,
     };
     let mut pause = timing.first;
     while !ctx.stopped() {
         let generation = ctx.stop.recovery.load(Ordering::Relaxed);
         let began = Instant::now();
-        let end = match catch_unwind(AssertUnwindSafe(|| connect(ctx, saved, live, &mut seat, timing))) {
+        let end = match catch_unwind(AssertUnwindSafe(|| {
+            connect(ctx, saved, live, &mut seat, timing)
+        })) {
             Ok(end) => end,
             Err(_) => {
                 live.connected(false);
@@ -509,14 +612,20 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
                 return;
             }
             End::Removed => {
-                tracing::warn!("chatd: {}: removed from the server", ctx.account.network.label());
+                tracing::warn!(
+                    "chatd: {}: removed from the server",
+                    ctx.account.network.label()
+                );
                 ctx.hub.set_link(&ctx.account, Link::Expired, REMOVED);
                 call_gone(ctx, &mut seat, CallFailure::Refused, REMOVED);
                 return;
             }
             End::Replaced => {
                 // Two devices that each reconnect at once would close each other forever.
-                tracing::warn!("chatd: {}: replaced by another device; waiting for the user", ctx.account.network.label());
+                tracing::warn!(
+                    "chatd: {}: replaced by another device; waiting for the user",
+                    ctx.account.network.label()
+                );
                 ctx.hub.set_offline(&ctx.account, false);
                 ctx.attention(REPLACED);
                 call_gone(ctx, &mut seat, CallFailure::Refused, REPLACED);
@@ -541,7 +650,11 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
                 timing.absent
             }
             End::Dropped(why) => {
-                tracing::warn!("chatd: {}: live socket: {}", ctx.account.network.label(), net::redact(&why));
+                tracing::warn!(
+                    "chatd: {}: live socket: {}",
+                    ctx.account.network.label(),
+                    net::redact(&why)
+                );
                 pause
             }
         };
@@ -608,8 +721,12 @@ struct Pending {
 
 #[derive(Clone)]
 enum Asked {
-    /// A join, and whether it carries audio.
-    Join(String, bool),
+    /// A join, and whether it carries audio. The id is the shell's: a room, or a direct message.
+    Join(String, bool, Option<u64>),
+    /// `call.ring`. The id is the direct message.
+    Ring(String, u64),
+    /// `call.accept`. The id is the direct message.
+    Accept(String, u64),
     Leave,
     Kick,
     State,
@@ -617,6 +734,8 @@ enum Asked {
     Moderate,
     /// A `call.offer`. The answer is `call.answer`, or `share_taken`.
     Offer,
+    /// `call.cancel`, `call.decline`, or `call.leave` of a direct. A room seat is left alone.
+    Direct,
 }
 
 fn connect(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Timing) -> End {
@@ -635,7 +754,7 @@ fn connect(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &
     for pending in pending {
         if let Some(reply) = pending.reply {
             // A join with audio that never got its answer has a mediad waiting for nothing.
-            if let Asked::Join(room, true) = &pending.asked {
+            if let Asked::Join(room, true, _) = &pending.asked {
                 ctx.call_over(room);
             }
             let _ = reply.send(Err(Refusal::Refused(LOST.to_owned())));
@@ -648,7 +767,15 @@ fn connect(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Timing, wire: &mut Wire, pending: &mut Vec<Pending>) -> End {
+fn serve(
+    ctx: &Context,
+    saved: &Saved,
+    live: &Live,
+    seat: &mut Seat,
+    timing: &Timing,
+    wire: &mut Wire,
+    pending: &mut Vec<Pending>,
+) -> End {
     let wake = live.wake.poll_read();
     let opened = Instant::now();
     live.note(Did::Opened { at: opened });
@@ -672,15 +799,19 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                         Ok(frame) => frame,
                         Err(_) => continue,
                     };
-                    if let Some(end) = heard_frame(ctx, saved, live, seat, pending, &mut ready, &frame) {
+                    if let Some(end) =
+                        heard_frame(ctx, saved, live, seat, pending, &mut ready, &frame)
+                    {
                         return end;
                     }
                     if ready && frame.get("type").and_then(Value::as_str) == Some("ready") {
                         seat.stranded = None;
                         refs += 1;
                         let sent = match rejoin(seat) {
-                            Some(room) => rejoin_with(ctx, saved, live, seat, wire, pending, refs, room, timing),
-                            None => seat_kept(ctx, live, seat, wire, pending, refs, timing),
+                            Some(room) => rejoin_with(
+                                ctx, saved, live, seat, wire, pending, refs, room, timing,
+                            ),
+                            None => seat_kept(ctx, saved, live, seat, wire, pending, refs, timing),
                         };
                         if let Err(err) = sent {
                             return End::Dropped(err.to_string());
@@ -688,14 +819,40 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                     }
                     if let Some(room) = seat.move_to.take() {
                         refs += 1;
-                        if let Err(err) = move_with(ctx, saved, live, seat, wire, pending, refs, room, timing) {
+                        if let Err(err) =
+                            move_with(ctx, saved, live, seat, wire, pending, refs, room, timing)
+                        {
                             return End::Dropped(err.to_string());
                         }
                     }
                     if let Some(room) = seat.recover.take() {
                         refs += 1;
-                        tracing::warn!("chatd: Tiny server: the call's media was lost; joining again");
-                        if let Err(err) = rejoin_with(ctx, saved, live, seat, wire, pending, refs, room, timing) {
+                        tracing::warn!(
+                            "chatd: Tiny server: the call's media was lost; joining again"
+                        );
+                        if let Err(err) =
+                            rejoin_with(ctx, saved, live, seat, wire, pending, refs, room, timing)
+                        {
+                            return End::Dropped(err.to_string());
+                        }
+                    }
+                    if let Some((direct_id, ring_id)) = seat.leave_direct.take() {
+                        refs += 1;
+                        if let Err(err) = send_direct_leave(wire, pending, refs, &direct_id, &ring_id, timing) {
+                            return End::Dropped(err.to_string());
+                        }
+                    }
+                    if std::mem::take(&mut seat.join_direct) {
+                        refs += 1;
+                        if let Err(err) =
+                            join_direct(ctx, saved, live, seat, wire, pending, refs, timing)
+                        {
+                            return End::Dropped(err.to_string());
+                        }
+                    }
+                    if std::mem::take(&mut seat.say_state) {
+                        refs += 1;
+                        if let Err(err) = state(wire, pending, refs, seat, timing) {
                             return End::Dropped(err.to_string());
                         }
                     }
@@ -709,7 +866,66 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
             for ask in live.take() {
                 refs += 1;
                 let sent = match ask {
-                    Ask::Join { room_id, reply } if live.seats_only() => ask_join(wire, pending, refs, room_id, None, Some(reply), timing),
+                    Ask::Ring { direct_id, attempt, reply } => {
+                        let attempt = attempt.unwrap_or_else(|| ctx.hub.calls.ring_attempt());
+                        if attempt != ctx.hub.calls.ring_attempt() {
+                            let _ = reply.send(Err(Refusal::Refused("That call is gone.".into())));
+                            continue;
+                        }
+                        seat.placed_direct = Some((direct_id.clone(), attempt));
+                        seat.direct = Some(DirectSeat {
+                            direct_id: direct_id.clone(), ring_id: String::new(), intent: Some(attempt), outgoing: true,
+                            accepting: false, joining: false, caller_id: seat.me.clone(),
+                            callee_id: String::new(), people: Vec::new(),
+                        });
+                        let reference = refs.to_string();
+                        pending.push(Pending {
+                            reference: reference.clone(),
+                            asked: Asked::Ring(direct_id.clone(), attempt),
+                            until: Instant::now() + timing.answer,
+                            reply: Some(reply),
+                        });
+                        wire.send(
+                            json!({"type": "call.ring", "ref": reference, "direct_id": direct_id})
+                                .to_string(),
+                        )
+                    }
+                    Ask::Accept { direct_id, reply } => {
+                        let Some(intent) = ctx.hub.calls.call_intent(&ctx.key(&direct_id)) else {
+                            let _ = reply.send(Err(Refusal::Refused("That call is gone.".into())));
+                            continue;
+                        };
+                        match seat.direct.as_mut() {
+                            Some(direct) if direct.direct_id == direct_id => {
+                                direct.accepting = true;
+                                direct.intent = ctx.hub.calls.call_intent(&ctx.key(&direct_id));
+                            }
+                            _ => {
+                                seat.direct = Some(DirectSeat {
+                                    direct_id: direct_id.clone(),
+                                    ring_id: String::new(),
+                                    intent: ctx.hub.calls.call_intent(&ctx.key(&direct_id)),
+                                    outgoing: false,
+                                    accepting: true,
+                                    joining: false,
+                                    caller_id: String::new(),
+                                    callee_id: seat.me.clone(),
+                                    people: Vec::new(),
+                                });
+                            }
+                        }
+                        let reference = refs.to_string();
+                        pending.push(Pending {
+                            reference: reference.clone(),
+                            asked: Asked::Accept(direct_id.clone(), intent),
+                            until: Instant::now() + timing.answer,
+                            reply: Some(reply),
+                        });
+                        wire.send(json!({"type": "call.accept", "ref": reference, "direct_id": direct_id}).to_string())
+                    }
+                    Ask::Join { room_id, reply } if live.seats_only() => {
+                        ask_join(wire, pending, refs, room_id, None, Some(reply), timing)
+                    }
                     Ask::Join { room_id, reply } => match offer(ctx, saved, seat, &room_id) {
                         Ok(sdp) => send_then_room(ctx, saved, seat, wire, pending, refs, room_id, sdp, Some(reply), timing),
                         Err(words) => {
@@ -724,23 +940,15 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                             ctx.call_over(&room);
                         }
                         let reference = refs.to_string();
-                        pending.push(Pending { reference: reference.clone(), asked: Asked::Leave, until: Instant::now() + timing.answer, reply: Some(reply) });
+                        pending.push(Pending {
+                            reference: reference.clone(),
+                            asked: Asked::Leave,
+                            until: Instant::now() + timing.answer,
+                            reply: Some(reply),
+                        });
                         wire.send(json!({"type": "call.leave", "ref": reference}).to_string())
                     }
-                    Ask::Hangup { room_id } => {
-                        forget_resume(seat);
-                        let joining = pending.iter().any(|waiting| matches!(&waiting.asked, Asked::Join(room, _) if *room == room_id));
-                        if seat.wanted.as_deref() == Some(room_id.as_str()) {
-                            seat.wanted = None;
-                        }
-                        if seated_in(seat, &room_id) || joining {
-                            let reference = refs.to_string();
-                            pending.push(Pending { reference: reference.clone(), asked: Asked::Leave, until: Instant::now() + timing.answer, reply: None });
-                            wire.send(json!({"type": "call.leave", "ref": reference}).to_string())
-                        } else {
-                            Ok(())
-                        }
-                    }
+                    Ask::Hangup { room_id } => hangup(seat, wire, pending, refs, &room_id, timing),
                     Ask::State { muted, deafened } => {
                         (seat.muted, seat.deafened) = (muted, deafened);
                         state(wire, pending, refs, seat, timing)
@@ -755,13 +963,31 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                     Ask::E2ee { .. } => Ok(()),
                     Ask::Offer { sdp } if seat.call_id.is_some() => {
                         let reference = refs.to_string();
-                        pending.push(Pending { reference: reference.clone(), asked: Asked::Offer, until: Instant::now() + timing.answer, reply: None });
-                        wire.send(json!({"type": "call.offer", "ref": reference, "sdp": sdp}).to_string())
+                        pending.push(Pending {
+                            reference: reference.clone(),
+                            asked: Asked::Offer,
+                            until: Instant::now() + timing.answer,
+                            reply: None,
+                        });
+                        wire.send(
+                            json!({"type": "call.offer", "ref": reference, "sdp": sdp}).to_string(),
+                        )
                     }
                     Ask::Offer { .. } => Ok(()),
-                    Ask::Moderate { room_id, user_id, server_muted, server_deafened, reply } => {
+                    Ask::Moderate {
+                        room_id,
+                        user_id,
+                        server_muted,
+                        server_deafened,
+                        reply,
+                    } => {
                         let reference = refs.to_string();
-                        pending.push(Pending { reference: reference.clone(), asked: Asked::Moderate, until: Instant::now() + timing.answer, reply: Some(reply) });
+                        pending.push(Pending {
+                            reference: reference.clone(),
+                            asked: Asked::Moderate,
+                            until: Instant::now() + timing.answer,
+                            reply: Some(reply),
+                        });
                         let mut frame = json!({"type": "call.moderate", "ref": reference, "room_id": room_id, "user_id": user_id});
                         if let Some(muted) = server_muted {
                             frame["server_muted"] = json!(muted);
@@ -771,14 +997,32 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                         }
                         wire.send(frame.to_string())
                     }
-                    Ask::Move { user_id, room_id, reply } => {
+                    Ask::Move {
+                        user_id,
+                        room_id,
+                        reply,
+                    } => {
                         let reference = refs.to_string();
-                        pending.push(Pending { reference: reference.clone(), asked: Asked::Moderate, until: Instant::now() + timing.answer, reply: Some(reply) });
+                        pending.push(Pending {
+                            reference: reference.clone(),
+                            asked: Asked::Moderate,
+                            until: Instant::now() + timing.answer,
+                            reply: Some(reply),
+                        });
                         wire.send(json!({"type": "call.move", "ref": reference, "user_id": user_id, "room_id": room_id}).to_string())
                     }
-                    Ask::Kick { room_id, user_id, reply } => {
+                    Ask::Kick {
+                        room_id,
+                        user_id,
+                        reply,
+                    } => {
                         let reference = refs.to_string();
-                        pending.push(Pending { reference: reference.clone(), asked: Asked::Kick, until: Instant::now() + timing.answer, reply: Some(reply) });
+                        pending.push(Pending {
+                            reference: reference.clone(),
+                            asked: Asked::Kick,
+                            until: Instant::now() + timing.answer,
+                            reply: Some(reply),
+                        });
                         wire.send(json!({"type": "call.kick", "ref": reference, "room_id": room_id, "user_id": user_id}).to_string())
                     }
                     Ask::Look => Ok(()),
@@ -792,7 +1036,9 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                         settled(seat);
                         Ok(())
                     }
-                    Ask::Type { conversation_id } => wire.send(json!({"type": "typing", "conversation_id": conversation_id}).to_string()),
+                    Ask::Type { conversation_id } => wire.send(
+                        json!({"type": "typing", "conversation_id": conversation_id}).to_string(),
+                    ),
                 };
                 if let Err(err) = sent {
                     return End::Dropped(err.to_string());
@@ -800,15 +1046,23 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
             }
         }
         let now = Instant::now();
-        let (late, waiting): (Vec<Pending>, Vec<Pending>) = std::mem::take(pending).into_iter().partition(|pending| pending.until <= now);
+        let (late, waiting): (Vec<Pending>, Vec<Pending>) = std::mem::take(pending)
+            .into_iter()
+            .partition(|pending| pending.until <= now);
         *pending = waiting;
         for late in late {
+            if let Asked::Join(id, _, Some(intent)) = &late.asked {
+                if ctx.hub.calls.call_intent(&ctx.key(id)) != Some(*intent) { continue; }
+            }
             if let Asked::Offer = &late.asked {
                 if let Some(room) = seat.wanted.clone() {
-                    ctx.tell_media(&room, MediaRequest::TinyRenegotiation { sdp: String::new() });
+                    ctx.tell_media(
+                        &room,
+                        MediaRequest::TinyRenegotiation { sdp: String::new() },
+                    );
                 }
             }
-            if let Asked::Join(room, media) = &late.asked {
+            if let Asked::Join(room, media, _) = &late.asked {
                 seat.rejoining = false;
                 if *media {
                     if late.reply.is_some() {
@@ -819,7 +1073,7 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                         seat.echo = false;
                         if !spend_resume(seat) {
                             ctx.call_failed(room, CallFailure::Lost, DROPPED);
-                            tell(ctx, seat, room);
+                            showed(ctx, seat, room);
                         }
                     }
                 }
@@ -835,7 +1089,9 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                 if ctx.in_call(&room) && !seat.rejoining && seat.recover.is_none() {
                     refs += 1;
                     tracing::warn!("chatd: Tiny server: media dropped; joining again");
-                    if let Err(err) = rejoin_with(ctx, saved, live, seat, wire, pending, refs, room, timing) {
+                    if let Err(err) =
+                        rejoin_with(ctx, saved, live, seat, wire, pending, refs, room, timing)
+                    {
                         return End::Dropped(err.to_string());
                     }
                 }
@@ -845,19 +1101,34 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
             return End::Dropped("the server stopped answering".to_owned());
         }
         // A seat taken since the last ping brings the next one forward.
-        let every = if seat.wanted.is_some() { timing.call_ping } else { timing.ping };
+        let every = if seat.wanted.is_some() {
+            timing.call_ping
+        } else {
+            timing.ping
+        };
         next_ping = next_ping.min(pinged + every);
         if now >= next_ping {
             if let Err(err) = wire.send(json!({"type": "ping"}).to_string()) {
                 return End::Dropped(err.to_string());
             }
-            live.note(Did::Pinged { due: next_ping, sent: now });
-            let by = now + if std::mem::take(&mut doubted) { timing.doubt } else { timing.pong };
+            live.note(Did::Pinged {
+                due: next_ping,
+                sent: now,
+            });
+            let by = now
+                + if std::mem::take(&mut doubted) {
+                    timing.doubt
+                } else {
+                    timing.pong
+                };
             owed = Some(owed.map_or(by, |at| at.min(by)));
             pinged = now;
             next_ping = now + every;
         }
-        let mut until = pending.iter().map(|pending| pending.until).fold(next_ping, Instant::min);
+        let mut until = pending
+            .iter()
+            .map(|pending| pending.until)
+            .fold(next_ping, Instant::min);
         if let Some(by) = owed {
             until = until.min(by);
         }
@@ -934,7 +1205,7 @@ fn ask_join(wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, room_id: Str
             frame["e2ee"] = json!(E2EE_VERSION);
         }
     }
-    pending.push(Pending { reference, asked: Asked::Join(room_id, media), until: Instant::now() + timing.answer, reply });
+    pending.push(Pending { reference, asked: Asked::Join(room_id, media, None), until: Instant::now() + timing.answer, reply });
     wire.send(frame.to_string())
 }
 
@@ -961,13 +1232,42 @@ fn must_encrypt(host: &str, room_required: bool, offered: bool) -> Result<bool, 
 /// group and where this account keeps its identity key; mediad then hears who is in the call.
 /// On an Incognito host, or in a room that requires it, the offer is `required`: the server
 /// turning encryption off blocks the call for good, and a server that offers none is not joined.
+fn server_host(saved: &Saved) -> String {
+    tungstenite::http::Uri::try_from(saved.base_url.as_str())
+        .ok()
+        .and_then(|uri| {
+            uri.host()
+                .map(|host| host.trim_matches(['[', ']']).to_owned())
+        })
+        .unwrap_or_default()
+}
+
 fn offer(ctx: &Context, saved: &Saved, seat: &mut Seat, room: &str) -> Result<Offered, String> {
-    let host = tungstenite::http::Uri::try_from(saved.base_url.as_str()).ok().and_then(|uri| uri.host().map(|host| host.trim_matches(['[', ']']).to_owned()));
-    let required = must_encrypt(host.as_deref().unwrap_or(""), super::manage::room_e2ee_required(saved, room), seat.e2ee)?;
-    let identity = || crate::verified::identity_path(&ctx.account).to_string_lossy().into_owned();
-    let e2ee = seat.e2ee.then(|| TinyE2ee { room_id: room.to_owned(), identity: identity(), required });
+    let host = server_host(saved);
+    let required = must_encrypt(
+        &host,
+        super::manage::room_e2ee_required(saved, room),
+        seat.e2ee,
+    )?;
+    let identity = || {
+        crate::verified::identity_path(&ctx.account)
+            .to_string_lossy()
+            .into_owned()
+    };
+    let e2ee = seat.e2ee.then(|| TinyE2ee {
+        room_id: room.to_owned(),
+        identity: identity(),
+        required,
+    });
     let offered = e2ee.is_some();
-    let offer = TinyOffer { user_id: seat.me.clone(), host: host.unwrap_or_default(), slots: ROOM_CAP - 1, muted: false, deafened: false, e2ee };
+    let offer = TinyOffer {
+        user_id: seat.me.clone(),
+        host,
+        slots: ROOM_CAP - 1,
+        muted: false,
+        deafened: false,
+        e2ee,
+    };
     let sdp = ctx.tiny_offer(room, offer)?;
     Ok((sdp, offered))
 }
@@ -1017,14 +1317,45 @@ fn apply_room(ctx: &Context, saved: &Saved, seat: &mut Seat, room: &str) {
 /// The room to take again after `ready`, when the user's seat went with the old socket.
 fn rejoin(seat: &Seat) -> Option<String> {
     let room = seat.wanted.clone()?;
-    let seated = seat.calls.values().any(|people| people.iter().any(|who| who.user == seat.me));
+    // A direct call's shell id is not a room. Joining it again is `join_direct`, not `call.join` of a room.
+    if seat
+        .direct
+        .as_ref()
+        .is_some_and(|direct| direct.direct_id == room)
+    {
+        return None;
+    }
+    let seated = seat
+        .calls
+        .values()
+        .any(|people| people.iter().any(|who| who.user == seat.me));
     (!seated).then_some(room)
 }
 
 /// Takes the seat again. With audio, only while chatd still holds the call, and with a fresh
 /// offer: the old media session went with the server.
 #[allow(clippy::too_many_arguments)]
-fn rejoin_with(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, room: String, timing: &Timing) -> io::Result<()> {
+fn rejoin_with(
+    ctx: &Context,
+    saved: &Saved,
+    live: &Live,
+    seat: &mut Seat,
+    wire: &mut Wire,
+    pending: &mut Vec<Pending>,
+    refs: u64,
+    room: String,
+    timing: &Timing,
+) -> io::Result<()> {
+    if seat
+        .direct
+        .as_ref()
+        .is_some_and(|direct| direct.direct_id == room)
+    {
+        if let Some(direct) = seat.direct.as_mut() {
+            direct.joining = false;
+        }
+        return join_direct(ctx, saved, live, seat, wire, pending, refs, timing);
+    }
     if live.seats_only() {
         return ask_join(wire, pending, refs, room, None, None, timing);
     }
@@ -1050,13 +1381,53 @@ fn rejoin_with(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, wire:
 /// it was down is settled here: a call hung up meanwhile leaves the seat the server kept for it,
 /// and a call whose media went meanwhile (mediad says so once, and that word was refused, or the
 /// join it started went with the socket) is resumed now.
-fn seat_kept(ctx: &Context, live: &Live, seat: &mut Seat, wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, timing: &Timing) -> io::Result<()> {
+fn seat_kept(
+    ctx: &Context,
+    saved: &Saved,
+    live: &Live,
+    seat: &mut Seat,
+    wire: &mut Wire,
+    pending: &mut Vec<Pending>,
+    refs: u64,
+    timing: &Timing,
+) -> io::Result<()> {
     let Some(room) = seat.wanted.clone().filter(|_| !live.seats_only()) else {
         return Ok(());
     };
+    // A direct message is not a room. The seat is taken again with `call.join` of `direct_id`
+    // only while this process still holds the call. A restart does not.
+    if seat
+        .direct
+        .as_ref()
+        .is_some_and(|direct| direct.direct_id == room)
+    {
+        if !ctx.in_call(&room) {
+            let ring = seat.direct.as_ref().unwrap().ring_id.clone();
+            return send_direct_leave(wire, pending, refs, &room, &ring, timing);
+        }
+        let seated = seat
+            .direct
+            .as_ref()
+            .is_some_and(|direct| direct.people.iter().any(|who| who.user == seat.me));
+        if !seated {
+            if let Some(direct) = seat.direct.as_mut() {
+                direct.joining = false;
+            }
+            return join_direct(ctx, saved, live, seat, wire, pending, refs, timing);
+        }
+        if call_is_down(ctx, &room) {
+            resume_media(ctx, seat, pending);
+        }
+        return Ok(());
+    }
     if !ctx.in_call(&room) {
         let reference = refs.to_string();
-        pending.push(Pending { reference: reference.clone(), asked: Asked::Leave, until: Instant::now() + timing.answer, reply: None });
+        pending.push(Pending {
+            reference: reference.clone(),
+            asked: Asked::Leave,
+            until: Instant::now() + timing.answer,
+            reply: None,
+        });
         return wire.send(json!({"type": "call.leave", "ref": reference}).to_string());
     }
     if call_is_down(ctx, &room) {
@@ -1079,6 +1450,30 @@ struct ReadyFrame {
     /// Read row by row (`calls_of`): one call this client cannot read leaves the others.
     #[serde(default)]
     calls: Value,
+    /// A direct ring this person is in. Not a room, and it does not start mediad.
+    #[serde(default)]
+    ring: Option<RingReady>,
+    /// The direct call this person is seated in. Kept out of `calls`.
+    #[serde(default)]
+    direct_call: Option<DirectReady>,
+}
+
+#[derive(Deserialize)]
+struct RingReady {
+    direct_id: String,
+    ring_id: String,
+    caller_id: String,
+    callee_id: String,
+    #[serde(default)]
+    accepted: bool,
+}
+
+#[derive(Deserialize)]
+struct DirectReady {
+    direct_id: String,
+    ring_id: String,
+    #[serde(default)]
+    participants: Value,
 }
 
 #[derive(Deserialize, Default)]
@@ -1120,12 +1515,28 @@ fn text<'a>(frame: &'a Value, field: &str) -> Option<&'a str> {
 }
 
 /// One frame from the server. `Some` ends the connection.
-fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pending: &mut Vec<Pending>, ready: &mut bool, frame: &Value) -> Option<End> {
+fn heard_frame(
+    ctx: &Context,
+    saved: &Saved,
+    live: &Live,
+    seat: &mut Seat,
+    pending: &mut Vec<Pending>,
+    ready: &mut bool,
+    frame: &Value,
+) -> Option<End> {
     let kind = text(frame, "type").unwrap_or("");
+    if let Some(ring) = text(frame, "room_id").and_then(|room| room.strip_prefix("d:")) {
+        if seat.direct.as_ref().is_none_or(|direct| direct.ring_id != ring
+            || text(frame, "direct_id").is_some_and(|id| id != direct.direct_id)) {
+            return None;
+        }
+    }
     match kind {
         "ready" => {
             let Ok(heard) = serde_json::from_value::<ReadyFrame>(frame.clone()) else {
-                return Some(End::Dropped("the server's ready could not be read".to_owned()));
+                return Some(End::Dropped(
+                    "the server's ready could not be read".to_owned(),
+                ));
             };
             ready_heard(ctx, saved, live, seat, heard);
             *ready = true;
@@ -1135,26 +1546,49 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
         "resync" => return Some(End::Resync),
         "pong" => {}
         "presence" => {
-            if let (Some(user), Some(online)) = (text(frame, "user_id"), frame.get("online").and_then(Value::as_bool)) {
-                ctx.presence(user, if online { Presence::Online } else { Presence::Offline }, "", true);
+            if let (Some(user), Some(online)) = (
+                text(frame, "user_id"),
+                frame.get("online").and_then(Value::as_bool),
+            ) {
+                ctx.presence(
+                    user,
+                    if online {
+                        Presence::Online
+                    } else {
+                        Presence::Offline
+                    },
+                    "",
+                    true,
+                );
             }
         }
         "call.joined" => {
             if let (Some(room), Some(user)) = (text(frame, "room_id"), text(frame, "user_id")) {
-                seated(ctx, seat, room, user, frame);
-                duck(ctx, seat, room);
+                if let Some(direct_id) = direct_key(seat, room, frame) {
+                    direct_seated(ctx, seat, &direct_id, user, frame);
+                } else {
+                    seated(ctx, seat, room, user, frame);
+                    duck(ctx, seat, room);
+                }
             }
         }
         // Whatever the reason, `media_timeout` and `media_lost` among them.
         "call.left" => {
             if let (Some(room), Some(user)) = (text(frame, "room_id"), text(frame, "user_id")) {
-                // `left` first, while this is still our seat: a media blip, or a resume already
-                // underway, can keep it. `unseated` then drops us from the room.
-                if user == seat.me {
-                    left(ctx, seat, room, text(frame, "reason").unwrap_or(""));
+                if let Some(direct_id) = direct_key(seat, room, frame) {
+                    if user == seat.me {
+                        left(ctx, seat, &direct_id, text(frame, "reason").unwrap_or(""));
+                    }
+                    direct_unseated(ctx, seat, &direct_id, user);
+                } else {
+                    // `left` first, while this is still our seat: a media blip, or a resume already
+                    // underway, can keep it. `unseated` then drops us from the room.
+                    if user == seat.me {
+                        left(ctx, seat, room, text(frame, "reason").unwrap_or(""));
+                    }
+                    unseated(ctx, seat, room, user);
+                    duck(ctx, seat, room);
                 }
-                unseated(ctx, seat, room, user);
-                duck(ctx, seat, room);
             }
         }
         // A moderator moved us. Joining the new room needs the socket, so it happens once this
@@ -1169,21 +1603,41 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
         // never leave it. Only for the seat that has media, in the order it came.
         "call.e2ee" => {
             if let (true, Some(room)) = (seat.call_id.is_some(), seat.wanted.clone()) {
-                ctx.tell_media(&room, MediaRequest::TinyE2ee { frame: frame.to_string() });
+                ctx.tell_media(
+                    &room,
+                    MediaRequest::TinyE2ee {
+                        frame: frame.to_string(),
+                    },
+                );
             }
         }
         "call.slots" => {
-            let current = seat.call_id.is_some() && text(frame, "call_id") == seat.call_id.as_deref();
+            let current =
+                seat.call_id.is_some() && text(frame, "call_id") == seat.call_id.as_deref();
             if let (true, Some(room)) = (current, seat.wanted.clone()) {
-                let audio = frame.get("audio").and_then(Value::as_array).into_iter().flatten().take(SEATS);
-                let audio = audio.filter_map(|slot| Some(TinySlot { mid: text(slot, "mid")?.to_owned(), user_id: text(slot, "user_id")?.to_owned() }));
+                let audio = frame
+                    .get("audio")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .take(SEATS);
+                let audio = audio.filter_map(|slot| {
+                    Some(TinySlot {
+                        mid: text(slot, "mid")?.to_owned(),
+                        user_id: text(slot, "user_id")?.to_owned(),
+                    })
+                });
                 ctx.tiny_slots(&room, audio.collect());
                 let video = frame.get("video").filter(|video| !video.is_null());
                 let picture = video.and_then(|video| {
                     Some(TinyPicture {
                         mid: text(video, "mid")?.to_owned(),
                         user_id: text(video, "user_id")?.to_owned(),
-                        kind: if text(video, "kind") == Some("share") { PictureKind::Share } else { PictureKind::Camera },
+                        kind: if text(video, "kind") == Some("share") {
+                            PictureKind::Share
+                        } else {
+                            PictureKind::Camera
+                        },
                     })
                 });
                 ctx.tell_media(&room, MediaRequest::TinyPicture { picture });
@@ -1191,19 +1645,48 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
         }
         "call.speaking" => {
             if let Some(room) = text(frame, "room_id") {
-                let users = frame.get("user_ids").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).take(SEATS);
+                let users = frame
+                    .get("user_ids")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .take(SEATS);
                 seat.speaking = users.map(str::to_owned).collect();
-                tell(ctx, seat, room);
+                if let Some(direct_id) = direct_key(seat, room, frame) {
+                    tell_direct(ctx, seat, &direct_id);
+                } else {
+                    tell(ctx, seat, room);
+                }
             }
         }
+        "call.ringing" => hear_ring(ctx, seat, frame),
+        "call.accepted" => hear_accepted(ctx, seat, frame),
+        "call.declined" => hear_declined(ctx, seat, frame),
+        "call.cancelled" => hear_cancelled(ctx, seat, frame),
+        "call.missed" => hear_missed(ctx, seat, frame),
+        "call.busy" => hear_busy(ctx, seat, frame),
         "call.state" => {
             if let (Some(room), Some(user)) = (text(frame, "room_id"), text(frame, "user_id")) {
-                if let Some(who) = seat.calls.get_mut(room).and_then(|people| people.iter_mut().find(|who| who.user == user)) {
+                if let Some(direct_id) = direct_key(seat, room, frame) {
+                    direct_state(ctx, seat, &direct_id, user, frame);
+                } else if let Some(who) = seat
+                    .calls
+                    .get_mut(room)
+                    .and_then(|people| people.iter_mut().find(|who| who.user == user))
+                {
                     let before = who.clone();
                     who.heard(frame);
                     let reread = who.reread(&before);
                     if user == seat.me && before.sharing && !who.sharing {
-                        ctx.tell_media(room, MediaRequest::ShareSend { on: false, screen: None, quality: None });
+                        ctx.tell_media(
+                            room,
+                            MediaRequest::ShareSend {
+                                on: false,
+                                screen: None,
+                                quality: None,
+                            },
+                        );
                     }
                     if user == seat.me && before.camera && !who.camera {
                         ctx.tell_media(room, MediaRequest::Camera { on: false });
@@ -1219,11 +1702,14 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
         "ok" | "error" => answered(ctx, seat, pending, frame, kind == "ok"),
         "typing" => {
             let user = text(frame, "user_id").unwrap_or("");
-            let named = text(frame, "display_name").or_else(|| seat.names.get(user).map(String::as_str));
+            let named =
+                text(frame, "display_name").or_else(|| seat.names.get(user).map(String::as_str));
             super::messages::heard_typing(ctx, named, frame);
         }
         _ if frame.get("seq").is_some() => durable(ctx, saved, seat, kind, frame),
-        _ if super::messages::live_kind(kind) => super::messages::on_live(ctx, saved, &seat.names, kind, frame),
+        _ if super::messages::live_kind(kind) => {
+            super::messages::on_live(ctx, saved, &seat.names, kind, frame)
+        }
         // A type this client does not know yet, from a newer server.
         _ => {}
     }
@@ -1238,15 +1724,25 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
         seat.e2ee = super::manage::capabilities_of(saved).has(protocol::TINY_FEATURE_E2EE_CALLS);
     }
     seat.since = Some(heard.seq);
-    if heard.me.role != seat.role && matches!(heard.me.role.as_str(), "owner" | "admin" | "member") {
-        seat.role = heard.me.role;
+    if heard.me.role != seat.role && matches!(heard.me.role.as_str(), "owner" | "admin" | "member")
+    {
+        seat.role = heard.me.role.clone();
         save_role(ctx, &seat.me, &seat.role);
     }
     if fresh || !seat.described {
         if let Ok(members) = members_of(saved) {
-            seat.names = members.iter().take(NAMES).map(|member| (member.user_id.clone(), member.display_name.clone())).collect();
+            seat.names = members
+                .iter()
+                .take(NAMES)
+                .map(|member| (member.user_id.clone(), member.display_name.clone()))
+                .collect();
             if !seat.described {
-                let email = members.iter().find(|member| member.user_id == seat.me).map_or(saved.email.as_deref().unwrap_or(""), |member| member.email.as_str());
+                let email = members
+                    .iter()
+                    .find(|member| member.user_id == seat.me)
+                    .map_or(saved.email.as_deref().unwrap_or(""), |member| {
+                        member.email.as_str()
+                    });
                 let _ = ctx.describe(&join_host(&saved.base_url), email);
                 seat.described = true;
             }
@@ -1259,13 +1755,16 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
     if !seat.me.is_empty() {
         ctx.presence(&seat.me, Presence::Online, "", true);
     }
+    // Before `calls` is taken off the frame. A ring here does not start mediad.
+    restore_direct(ctx, seat, &heard);
     let before: Vec<String> = seat.calls.keys().cloned().collect();
     let calls: Vec<CallFrame> = super::rows(heard.calls, "calls").unwrap_or_default();
     seat.calls = calls
         .into_iter()
         .take(ROOMS)
         .map(|call| {
-            let people: Vec<ParticipantFrame> = super::rows(call.participants, "call seats").unwrap_or_default();
+            let people: Vec<ParticipantFrame> =
+                super::rows(call.participants, "call seats").unwrap_or_default();
             let people = people.into_iter().take(SEATS).map(|who| Sitting {
                 user: who.user_id,
                 muted: who.muted,
@@ -1279,18 +1778,28 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
             });
             (call.room_id, people.collect::<Vec<_>>())
         })
-        .filter(|(_, people)| !people.is_empty())
+        .filter(|(room, people)| !people.is_empty() && !room.starts_with("d:"))
         .collect();
     super::manage::remember(saved, |known| known.seats.clear());
     // A room `ready` no longer lists is told as empty, or as ours alone while our call is up in
     // it: the seat is taken again below, and the page does not say nobody is here meanwhile.
-    let mut told: Vec<&str> = before.iter().map(String::as_str).chain(seat.calls.keys().map(String::as_str)).chain(seat.wanted.as_deref()).collect();
+    let mut told: Vec<&str> = before
+        .iter()
+        .map(String::as_str)
+        .chain(seat.calls.keys().map(String::as_str))
+        .chain(seat.wanted.as_deref())
+        .collect();
     told.sort_unstable();
     told.dedup();
     for room in told {
         tell(ctx, seat, room);
     }
-    let ours: Vec<String> = seat.calls.keys().filter(|room| ctx.in_call(room)).cloned().collect();
+    let ours: Vec<String> = seat
+        .calls
+        .keys()
+        .filter(|room| ctx.in_call(room))
+        .cloned()
+        .collect();
     for room in ours {
         duck(ctx, seat, &room);
     }
@@ -1382,7 +1891,10 @@ fn roster(ctx: &Context, seat: &mut Seat, room: &str) {
     if !seat.e2ee || !ctx.in_call(room) {
         return;
     }
-    let people: Vec<String> = seat.calls.get(room).into_iter().flatten().map(|who| who.user.clone()).collect();
+    let people: Vec<String> = people_of(seat, room)
+        .iter()
+        .map(|who| who.user.clone())
+        .collect();
     if people != seat.rostered {
         seat.rostered = people.clone();
         ctx.tell_media(room, MediaRequest::TinyRoster { user_ids: people });
@@ -1396,7 +1908,11 @@ fn duck(ctx: &Context, seat: &mut Seat, room: &str) {
     if !ctx.in_call(room) {
         return;
     }
-    let holders: Vec<String> = seat.calls.get(room).into_iter().flatten().filter(|who| who.priority && who.user != seat.me).map(|who| who.user.clone()).collect();
+    let holders: Vec<String> = people_of(seat, room)
+        .iter()
+        .filter(|who| who.priority && who.user != seat.me)
+        .map(|who| who.user.clone())
+        .collect();
     if holders != seat.ducking {
         seat.ducking = holders.clone();
         ctx.tell_media(room, MediaRequest::Priority { user_ids: holders });
@@ -1478,7 +1994,13 @@ fn left(ctx: &Context, seat: &mut Seat, room: &str, reason: &str) {
     }
     // The grace ran out on the socket that held the seat (a server that does not rebind one):
     // the seat is gone and the media with it, and the call takes it again as for any drop.
-    if reason == "disconnected" && seat.wanted.as_deref() == Some(room) && (seat.resume_at.is_some() || seat.rejoining || seat.recover.is_some() || spend_resume(seat)) {
+    if reason == "disconnected"
+        && seat.wanted.as_deref() == Some(room)
+        && (seat.resume_at.is_some()
+            || seat.rejoining
+            || seat.recover.is_some()
+            || spend_resume(seat))
+    {
         return;
     }
     forget_resume(seat);
@@ -1494,12 +2016,18 @@ fn left(ctx: &Context, seat: &mut Seat, room: &str, reason: &str) {
         "removed" => Some((CallFailure::Refused, REMOVED)),
         "session_ended" => Some((CallFailure::Refused, ENDED)),
         // Only our own hang-up, here or on another device, ends a call without a word.
-        "left" => None,
+        // The other person of a direct call hanging up is the same: the dock says it ended.
+        "left" | "peer_left" => None,
         _ => Some((CallFailure::Lost, SERVER_ENDED)),
     };
     // Put out by someone: the cue that says so plays out as the call ends.
     if matches!(reason, "kicked" | "banned" | "timed_out" | "room_deleted") {
-        ctx.tell_media(room, MediaRequest::Cue { cue: Cue::Disconnected });
+        ctx.tell_media(
+            room,
+            MediaRequest::Cue {
+                cue: Cue::Disconnected,
+            },
+        );
     }
     match words {
         // chatd then has the adapter hang up, which sends nothing: we are not in the room.
@@ -1521,7 +2049,10 @@ const MEDIA_HELD: Duration = Duration::from_secs(60);
 #[derive(Debug, PartialEq, Eq)]
 enum Plan {
     /// Join again after `pause`. `resumes` is how many of [`RESUMES`] this drop uses.
-    Resume { resumes: u32, pause: Duration },
+    Resume {
+        resumes: u32,
+        pause: Duration,
+    },
     GiveUp,
 }
 
@@ -1557,7 +2088,7 @@ fn call_gone(ctx: &Context, seat: &mut Seat, reason: CallFailure, words: &str) {
     forget_resume(seat);
     if let Some(room) = seat.wanted.take().filter(|room| ctx.in_call(room)) {
         ctx.call_failed(&room, reason, words);
-        tell(ctx, seat, &room);
+        showed(ctx, seat, &room);
     }
 }
 
@@ -1611,7 +2142,10 @@ fn resume_media(ctx: &Context, seat: &mut Seat, pending: &[Pending]) {
     if seat.resume_at.is_some() || seat.rejoining || seat.recover.is_some() {
         return;
     }
-    if pending.iter().any(|waiting| matches!(&waiting.asked, Asked::Join(id, true) if id == &room)) {
+    if pending
+        .iter()
+        .any(|waiting| matches!(&waiting.asked, Asked::Join(id, true, _) if id == &room))
+    {
         return;
     }
     if !may_resume(ctx, &room) {
@@ -1619,7 +2153,7 @@ fn resume_media(ctx: &Context, seat: &mut Seat, pending: &[Pending]) {
     }
     if !spend_resume(seat) {
         ctx.call_failed(&room, CallFailure::Lost, DROPPED);
-        tell(ctx, seat, &room);
+        showed(ctx, seat, &room);
     }
 }
 
@@ -1660,43 +2194,834 @@ fn recovering(recovered: &mut Vec<Instant>, now: Instant) -> bool {
     true
 }
 
+/// Who a room or a direct call lists, for the roster mediad keeps.
+fn people_of<'a>(seat: &'a Seat, room: &str) -> &'a [Sitting] {
+    if let Some(direct) = seat
+        .direct
+        .as_ref()
+        .filter(|direct| direct.direct_id == room)
+    {
+        return direct.people.as_slice();
+    }
+    seat.calls.get(room).map(Vec::as_slice).unwrap_or(&[])
+}
+
+/// A direct call is not a voice channel. The page must not gain a join pill for its id.
+fn showed(ctx: &Context, seat: &Seat, room: &str) {
+    if seat
+        .direct
+        .as_ref()
+        .is_some_and(|direct| direct.direct_id == room)
+    {
+        tell_direct(ctx, seat, room);
+    } else {
+        tell(ctx, seat, room);
+    }
+}
+
+fn person_name(seat: &Seat, user: &str) -> String {
+    seat.names
+        .get(user)
+        .filter(|name| !name.is_empty())
+        .cloned()
+        .or_else(|| {
+            (user == seat.me && !seat.saved.display_name.is_empty())
+                .then(|| seat.saved.display_name.clone())
+        })
+        .unwrap_or_else(|| "Someone".to_owned())
+}
+
+fn sittings(value: &Value) -> Vec<Sitting> {
+    let people: Vec<ParticipantFrame> =
+        super::rows(value.clone(), "call seats").unwrap_or_default();
+    people
+        .into_iter()
+        .take(SEATS)
+        .map(|who| Sitting {
+            user: who.user_id,
+            muted: who.muted,
+            deafened: who.deafened,
+            server_muted: who.server_muted,
+            server_deafened: who.server_deafened,
+            suppressed: who.suppressed,
+            priority: who.priority,
+            camera: who.camera,
+            sharing: who.sharing,
+        })
+        .collect()
+}
+
+/// `ready` names a ring or a seated direct. Neither starts mediad. A restart has no call here,
+/// so a seat the server still holds is left until it times out, the same as a room.
+fn restore_direct(ctx: &Context, seat: &mut Seat, heard: &ReadyFrame) {
+    if let Some(call) = &heard.direct_call {
+        if call.direct_id.is_empty() || call.ring_id.is_empty() {
+            return;
+        }
+        let people = sittings(&call.participants);
+        let previous = seat
+            .direct
+            .clone()
+            .filter(|direct| direct.direct_id == call.direct_id);
+        let outgoing = heard
+            .ring
+            .as_ref()
+            .is_some_and(|ring| ring.caller_id == seat.me)
+            || previous.as_ref().is_some_and(|direct| direct.outgoing);
+        let caller_id = heard
+            .ring
+            .as_ref()
+            .map(|ring| ring.caller_id.clone())
+            .or_else(|| previous.as_ref().map(|direct| direct.caller_id.clone()))
+            .unwrap_or_default();
+        let callee_id = heard
+            .ring
+            .as_ref()
+            .map(|ring| ring.callee_id.clone())
+            .or_else(|| previous.as_ref().map(|direct| direct.callee_id.clone()))
+            .unwrap_or_default();
+        seat.direct = Some(DirectSeat {
+            direct_id: call.direct_id.clone(),
+            ring_id: call.ring_id.clone(),
+            intent: previous.as_ref().and_then(|direct| direct.intent),
+            outgoing,
+            accepting: previous.as_ref().is_some_and(|direct| direct.accepting),
+            joining: previous.as_ref().is_some_and(|direct| direct.joining),
+            caller_id,
+            callee_id,
+            people,
+        });
+        hear_accepted(ctx, seat, &json!({
+            "direct_id": call.direct_id, "ring_id": call.ring_id,
+            "caller_id": seat.direct.as_ref().map(|direct| direct.caller_id.clone()).unwrap_or_default(),
+            "callee_id": seat.direct.as_ref().map(|direct| direct.callee_id.clone()).unwrap_or_default(),
+        }));
+        return;
+    }
+    let Some(ring) = &heard.ring else {
+        return;
+    };
+    if ring.direct_id.is_empty() {
+        return;
+    }
+    if seat
+        .direct
+        .as_ref()
+        .is_some_and(|direct| direct.direct_id == ring.direct_id && direct.joining)
+    {
+        if let Some(direct) = seat.direct.as_mut() {
+            direct.ring_id.clone_from(&ring.ring_id);
+        }
+        return;
+    }
+    let outgoing = ring.caller_id == seat.me;
+    let accepting = seat
+        .direct
+        .as_ref()
+        .is_some_and(|direct| direct.direct_id == ring.direct_id && direct.accepting);
+    seat.direct = Some(DirectSeat {
+        direct_id: ring.direct_id.clone(),
+        ring_id: ring.ring_id.clone(),
+        intent: seat.direct.as_ref().and_then(|direct| direct.intent),
+        outgoing,
+        accepting,
+        joining: false,
+        caller_id: ring.caller_id.clone(),
+        callee_id: ring.callee_id.clone(),
+        people: Vec::new(),
+    });
+    // The caller already placed the ring. Answering on this device joins from `call.accepted`.
+    if ring.accepted {
+        hear_accepted(ctx, seat, &json!({"direct_id": ring.direct_id, "ring_id": ring.ring_id,
+            "caller_id": ring.caller_id, "callee_id": ring.callee_id}));
+        return;
+    }
+    if outgoing { return; }
+    ctx.ring(&ring.direct_id, &person_name(seat, &ring.caller_id));
+}
+
+fn send_leave(
+    wire: &mut Wire,
+    pending: &mut Vec<Pending>,
+    refs: u64,
+    timing: &Timing,
+) -> io::Result<()> {
+    let reference = refs.to_string();
+    pending.push(Pending {
+        reference: reference.clone(),
+        asked: Asked::Leave,
+        until: Instant::now() + timing.answer,
+        reply: None,
+    });
+    wire.send(json!({"type": "call.leave", "ref": reference}).to_string())
+}
+
+/// Hangs up one call. A room leaves only that room. A direct cancels, declines, or leaves,
+/// and does not drop a room the person is still in.
+fn hangup(
+    seat: &mut Seat,
+    wire: &mut Wire,
+    pending: &mut Vec<Pending>,
+    refs: u64,
+    room_id: &str,
+    timing: &Timing,
+) -> io::Result<()> {
+    if seat
+        .direct
+        .as_ref()
+        .is_some_and(|direct| direct.direct_id == room_id)
+    {
+        return hangup_direct(seat, wire, pending, refs, room_id, timing);
+    }
+    forget_resume(seat);
+    let joining = pending
+        .iter()
+        .any(|waiting| matches!(&waiting.asked, Asked::Join(room, _, _) if room == room_id));
+    if seat.wanted.as_deref() == Some(room_id) {
+        seat.wanted = None;
+    }
+    if seated_in(seat, room_id) || joining {
+        send_leave(wire, pending, refs, timing)
+    } else {
+        Ok(())
+    }
+}
+
+fn hangup_direct(
+    seat: &mut Seat,
+    wire: &mut Wire,
+    pending: &mut Vec<Pending>,
+    refs: u64,
+    room_id: &str,
+    timing: &Timing,
+) -> io::Result<()> {
+    let Some(direct) = seat.direct.clone() else {
+        return Ok(());
+    };
+    let seated = direct.joining
+        || direct.people.iter().any(|who| who.user == seat.me)
+        || (seat.call_id.is_some() && seat.wanted.as_deref() == Some(room_id));
+    let kind = if seated {
+        "call.leave"
+    } else if direct.outgoing {
+        "call.cancel"
+    } else {
+        "call.decline"
+    };
+    if seat.wanted.as_deref() == Some(room_id) {
+        forget_resume(seat);
+        seat.wanted = None;
+    }
+    ended_direct(seat, &direct.direct_id, &direct.ring_id);
+    seat.placed_direct = None;
+    seat.direct = None;
+    seat.join_direct = false;
+    seat.say_state = false;
+    if seated {
+        seat.call_id = None;
+    }
+    let reference = refs.to_string();
+    pending.push(Pending {
+        reference: reference.clone(),
+        asked: Asked::Direct,
+        until: Instant::now() + timing.answer,
+        reply: None,
+    });
+    let mut frame = json!({"type": kind, "ref": reference});
+    frame["direct_id"] = json!(direct.direct_id);
+    if kind == "call.leave" { frame["ring_id"] = json!(direct.ring_id); }
+    wire.send(frame.to_string())
+}
+
+/// The shell id of a direct-call frame. A `d:` room is never stored as a voice channel.
+fn direct_key(seat: &Seat, room: &str, frame: &Value) -> Option<String> {
+    let named = text(frame, "direct_id")
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+    if named.is_some() || room.starts_with("d:") {
+        return Some(named.unwrap_or_else(|| {
+            room.strip_prefix("d:")
+                .and_then(|ring| {
+                    seat.direct
+                        .as_ref()
+                        .filter(|direct| direct.ring_id == ring)
+                        .map(|direct| direct.direct_id.clone())
+                })
+                .unwrap_or_default()
+        }));
+    }
+    None
+}
+
+fn direct_matches(seat: &Seat, direct_id: &str) -> bool {
+    !direct_id.is_empty()
+        && seat
+            .direct
+            .as_ref()
+            .is_some_and(|direct| direct.direct_id == direct_id)
+}
+
+fn direct_seated(ctx: &Context, seat: &mut Seat, direct_id: &str, user: &str, frame: &Value) {
+    if !direct_matches(seat, direct_id) {
+        return;
+    }
+    if let Some(direct) = seat.direct.as_mut() {
+        if !direct.people.iter().any(|who| who.user == user) && direct.people.len() < SEATS {
+            let mut who = Sitting::new(user);
+            who.heard(frame);
+            direct.people.push(who);
+        }
+    }
+    if user == seat.me {
+        seat.wanted = Some(direct_id.to_owned());
+    }
+    tell_direct(ctx, seat, direct_id);
+    roster(ctx, seat, direct_id);
+    duck(ctx, seat, direct_id);
+}
+
+fn direct_unseated(ctx: &Context, seat: &mut Seat, direct_id: &str, user: &str) {
+    if !direct_matches(seat, direct_id) {
+        return;
+    }
+    if let Some(direct) = seat.direct.as_mut() {
+        direct.people.retain(|who| who.user != user);
+    }
+    let again = seat.recover.is_some() || seat.resume_at.is_some() || seat.rejoining;
+    if user == seat.me && !again {
+        if seat.wanted.as_deref() == Some(direct_id) {
+            seat.wanted = None;
+        }
+        seat.call_id = None;
+        seat.direct = None;
+        seat.join_direct = false;
+    }
+    tell_direct(ctx, seat, direct_id);
+}
+
+fn direct_state(ctx: &Context, seat: &mut Seat, direct_id: &str, user: &str, frame: &Value) {
+    if !direct_matches(seat, direct_id) {
+        return;
+    }
+    let Some(who) = seat
+        .direct
+        .as_mut()
+        .and_then(|direct| direct.people.iter_mut().find(|who| who.user == user))
+    else {
+        return;
+    };
+    let before = who.clone();
+    who.heard(frame);
+    let share_off = user == seat.me && before.sharing && !who.sharing;
+    let camera_off = user == seat.me && before.camera && !who.camera;
+    if share_off {
+        ctx.tell_media(
+            direct_id,
+            MediaRequest::ShareSend {
+                on: false,
+                screen: None,
+                quality: None,
+            },
+        );
+    }
+    if camera_off {
+        ctx.tell_media(direct_id, MediaRequest::Camera { on: false });
+    }
+    tell_direct(ctx, seat, direct_id);
+    duck(ctx, seat, direct_id);
+}
+
+/// Everyone in the direct call but us. No occupants, and no room seat on the server page.
+fn tell_direct(ctx: &Context, seat: &Seat, direct_id: &str) {
+    if !ctx.in_call(direct_id) {
+        return;
+    }
+    let Some(direct) = seat
+        .direct
+        .as_ref()
+        .filter(|direct| direct.direct_id == direct_id)
+    else {
+        return;
+    };
+    let roster = direct
+        .people
+        .iter()
+        .filter(|who| who.user != seat.me)
+        .map(|who| Participant {
+            id: who.user.clone(),
+            name: person_name(seat, &who.user),
+            speaking: false,
+            muted: who.muted,
+            deafened: who.deafened,
+            server_muted: who.server_muted,
+            server_deafened: who.server_deafened,
+            suppressed: who.suppressed,
+            priority: who.priority,
+            camera: who.camera,
+            sharing: who.sharing,
+        });
+    ctx.participants(direct_id, roster.collect());
+}
+
+fn remember_direct(
+    seat: &mut Seat,
+    direct_id: &str,
+    ring_id: &str,
+    caller_id: &str,
+    callee_id: &str,
+    outgoing: bool,
+) {
+    let previous = seat
+        .direct
+        .clone()
+        .filter(|direct| direct.direct_id == direct_id);
+    seat.direct = Some(DirectSeat {
+        direct_id: direct_id.to_owned(),
+        ring_id: if ring_id.is_empty() {
+            previous
+                .as_ref()
+                .map(|direct| direct.ring_id.clone())
+                .unwrap_or_default()
+        } else {
+            ring_id.to_owned()
+        },
+        intent: previous.as_ref().and_then(|direct| direct.intent),
+        outgoing,
+        accepting: previous.as_ref().is_some_and(|direct| direct.accepting),
+        joining: previous.as_ref().is_some_and(|direct| direct.joining),
+        caller_id: if caller_id.is_empty() {
+            previous
+                .as_ref()
+                .map(|direct| direct.caller_id.clone())
+                .unwrap_or_default()
+        } else {
+            caller_id.to_owned()
+        },
+        callee_id: if callee_id.is_empty() {
+            previous
+                .as_ref()
+                .map(|direct| direct.callee_id.clone())
+                .unwrap_or_default()
+        } else {
+            callee_id.to_owned()
+        },
+        people: previous.map(|direct| direct.people).unwrap_or_default(),
+    });
+}
+
+fn clear_direct(seat: &mut Seat, direct_id: &str) {
+    if seat
+        .direct
+        .as_ref()
+        .is_some_and(|direct| direct.direct_id == direct_id && !direct.joining)
+    {
+        seat.direct = None;
+        seat.join_direct = false;
+    }
+}
+
+fn ended_direct(seat: &mut Seat, direct_id: &str, ring_id: &str) {
+    if !seat.ended_directs.iter().any(|(id, ring)| id == direct_id && ring == ring_id) {
+        seat.ended_directs.push_back((direct_id.to_owned(), ring_id.to_owned()));
+        while seat.ended_directs.len() > 16 { seat.ended_directs.pop_front(); }
+    }
+}
+
+fn was_ended(seat: &Seat, direct_id: &str, ring_id: &str) -> bool {
+    seat.ended_directs.iter().any(|(id, ring)| id == direct_id && (ring.is_empty() || ring == ring_id))
+}
+
+fn direct_intent(ctx: &Context, seat: &Seat, direct_id: &str) -> bool {
+    let owned = seat.placed_direct.as_ref().is_some_and(|(id, attempt)| id == direct_id && *attempt == ctx.hub.calls.ring_attempt())
+        || seat.wanted.as_deref() == Some(direct_id)
+        || seat.direct.as_ref().is_some_and(|direct| direct.direct_id == direct_id && direct.accepting);
+    owned && seat.direct.as_ref().filter(|direct| direct.direct_id == direct_id)
+        .and_then(|direct| direct.intent).is_some_and(|intent| ctx.hub.calls.call_intent(&ctx.key(direct_id)) == Some(intent))
+}
+
+fn same_direct_attempt(seat: &Seat, direct_id: &str, frame: &Value) -> bool {
+    seat.direct.as_ref().is_some_and(|direct| direct.direct_id == direct_id
+        && !direct.ring_id.is_empty() && text(frame, "ring_id") == Some(direct.ring_id.as_str()))
+}
+
+fn send_direct_leave(wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64,
+    direct_id: &str, ring_id: &str, timing: &Timing) -> io::Result<()> {
+    let reference = refs.to_string();
+    pending.push(Pending { reference: reference.clone(), asked: Asked::Direct,
+        until: Instant::now() + timing.answer, reply: None });
+    wire.send(json!({"type":"call.leave", "ref":reference, "direct_id":direct_id, "ring_id":ring_id}).to_string())
+}
+
+fn hear_ring(ctx: &Context, seat: &mut Seat, frame: &Value) {
+    let Some(direct_id) = text(frame, "direct_id").filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let caller_id = text(frame, "caller_id").unwrap_or("");
+    let outgoing = caller_id == seat.me;
+    let ring_id = text(frame, "ring_id").unwrap_or("");
+    // A ring cancelled before its first event has no id yet. Learn that id once and ignore it.
+    if let Some((_, ended_ring)) = seat.ended_directs.iter_mut().find(|(id, ring)| id == direct_id && ring.is_empty()) {
+        *ended_ring = ring_id.to_owned();
+        return;
+    }
+    if was_ended(seat, direct_id, ring_id) { return; }
+
+    remember_direct(
+        seat,
+        direct_id,
+        text(frame, "ring_id").unwrap_or(""),
+        caller_id,
+        text(frame, "callee_id").unwrap_or(""),
+        outgoing,
+    );
+    if !outgoing {
+        ctx.ring(direct_id, &person_name(seat, caller_id));
+    }
+}
+
+fn hear_accepted(ctx: &Context, seat: &mut Seat, frame: &Value) {
+    let Some(direct_id) = text(frame, "direct_id").filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let ring_id = text(frame, "ring_id").unwrap_or("");
+    if was_ended(seat, direct_id, ring_id) {
+        if !ring_id.is_empty() { seat.leave_direct = Some((direct_id.to_owned(), ring_id.to_owned())); }
+        return;
+    }
+    if !direct_intent(ctx, seat, direct_id) {
+        let owned = seat.placed_direct.as_ref().is_some_and(|(id, attempt)| id == direct_id && *attempt == ctx.hub.calls.ring_attempt())
+            || seat.direct.as_ref().is_some_and(|direct| direct.direct_id == direct_id && direct.accepting);
+        if owned && !ring_id.is_empty() {
+            ended_direct(seat, direct_id, ring_id);
+            seat.leave_direct = Some((direct_id.to_owned(), ring_id.to_owned()));
+            seat.placed_direct = None;
+        }
+        if !owned && text(frame, "caller_id") != Some(seat.me.as_str()) {
+            ctx.ring_stopped(direct_id);
+            clear_direct(seat, direct_id);
+        }
+        // A passive caller device must neither join nor end another device's call.
+        return;
+    }
+    let caller_id = text(frame, "caller_id").unwrap_or("");
+    let outgoing = caller_id == seat.me;
+    let accepting = seat
+        .direct
+        .as_ref()
+        .is_some_and(|direct| direct.direct_id == direct_id && direct.accepting);
+    if !outgoing && !accepting {
+        ctx.ring_stopped(direct_id);
+        clear_direct(seat, direct_id);
+        return;
+    }
+    remember_direct(
+        seat,
+        direct_id,
+        text(frame, "ring_id").unwrap_or(""),
+        caller_id,
+        text(frame, "callee_id").unwrap_or(""),
+        outgoing,
+    );
+    if seat
+        .direct
+        .as_ref()
+        .is_some_and(|direct| direct.direct_id == direct_id && !direct.joining)
+    {
+        seat.join_direct = true;
+    }
+}
+
+fn hear_declined(ctx: &Context, seat: &mut Seat, frame: &Value) {
+    let Some(direct_id) = text(frame, "direct_id").filter(|id| !id.is_empty()) else {
+        return;
+    };
+    if !same_direct_attempt(seat, direct_id, frame) { return; }
+
+    let outgoing = text(frame, "caller_id") == Some(seat.me.as_str())
+        || seat
+            .direct
+            .as_ref()
+            .is_some_and(|direct| direct.direct_id == direct_id && direct.outgoing);
+    if outgoing {
+        ctx.hub.calls.show_failed(
+            &ctx.hub,
+            ctx.key(direct_id),
+            CallFailure::NoAnswer,
+            "They declined.",
+        );
+    } else {
+        ctx.ring_stopped(direct_id);
+    }
+    seat.placed_direct = None;
+    clear_direct(seat, direct_id);
+}
+
+fn hear_cancelled(ctx: &Context, seat: &mut Seat, frame: &Value) {
+    let Some(direct_id) = text(frame, "direct_id").filter(|id| !id.is_empty()) else {
+        return;
+    };
+    if !same_direct_attempt(seat, direct_id, frame) { return; }
+
+    if text(frame, "caller_id") == Some(seat.me.as_str()) {
+        let key = ctx.key(direct_id);
+        let (call, _) = ctx.hub.calls.describe();
+        let ringing = call.is_some_and(|call| {
+            call.conversation == key
+                && matches!(call.state, CallState::RingingOut | CallState::Connecting)
+        });
+        if ringing {
+            ctx.call_over(direct_id);
+        }
+    } else {
+        ctx.ring_stopped(direct_id);
+    }
+    seat.placed_direct = None;
+    clear_direct(seat, direct_id);
+}
+
+fn hear_missed(ctx: &Context, seat: &mut Seat, frame: &Value) {
+    let Some(direct_id) = text(frame, "direct_id").filter(|id| !id.is_empty()) else {
+        return;
+    };
+    if !same_direct_attempt(seat, direct_id, frame) { return; }
+
+    let outgoing = text(frame, "caller_id") == Some(seat.me.as_str())
+        || seat
+            .direct
+            .as_ref()
+            .is_some_and(|direct| direct.direct_id == direct_id && direct.outgoing);
+    if outgoing {
+        ctx.hub.calls.show_failed(
+            &ctx.hub,
+            ctx.key(direct_id),
+            CallFailure::NoAnswer,
+            crate::media::NO_ANSWER,
+        );
+    } else {
+        ctx.ring_stopped(direct_id);
+    }
+    seat.placed_direct = None;
+    clear_direct(seat, direct_id);
+}
+
+fn hear_busy(ctx: &Context, seat: &mut Seat, frame: &Value) {
+    let Some(direct_id) = text(frame, "direct_id").filter(|id| !id.is_empty()) else {
+        return;
+    };
+    ctx.hub.calls.show_failed(
+        &ctx.hub,
+        ctx.key(direct_id),
+        CallFailure::Refused,
+        "They're already in a call.",
+    );
+    clear_direct(seat, direct_id);
+}
+
+/// Joins an accepted direct. Media is `d:{ring_id}`. The shell keeps the direct message's id.
+#[allow(clippy::too_many_arguments)]
+fn join_direct(
+    ctx: &Context,
+    saved: &Saved,
+    live: &Live,
+    seat: &mut Seat,
+    wire: &mut Wire,
+    pending: &mut Vec<Pending>,
+    refs: u64,
+    timing: &Timing,
+) -> io::Result<()> {
+    let Some(direct) = seat.direct.clone() else {
+        return Ok(());
+    };
+    if !direct_intent(ctx, seat, &direct.direct_id) {
+        if !direct.ring_id.is_empty() {
+            ended_direct(seat, &direct.direct_id, &direct.ring_id);
+            return send_direct_leave(wire, pending, refs, &direct.direct_id, &direct.ring_id, timing);
+        }
+        return Ok(());
+    }
+    if direct.ring_id.is_empty() || direct.joining {
+        return Ok(());
+    }
+    if let Some((muted, deafened)) = shown_audio(ctx, &direct.direct_id) {
+        seat.muted = muted;
+        seat.deafened = deafened;
+    }
+    let direct_id = direct.direct_id.clone();
+    if live.seats_only() {
+        if let Some(direct) = seat.direct.as_mut() {
+            direct.joining = true;
+        }
+        seat.wanted = Some(direct_id.clone());
+        return ask_direct_join(wire, pending, refs, direct_id, None, direct.intent.unwrap(), timing);
+    }
+    match offer_direct(ctx, saved, seat) {
+        Ok(sdp) => {
+            if !direct_intent(ctx, seat, &direct_id) {
+                return send_direct_leave(wire, pending, refs, &direct_id, &direct.ring_id, timing);
+            }
+
+            if let Some(direct) = seat.direct.as_mut() {
+                direct.joining = true;
+            }
+            seat.wanted = Some(direct_id.clone());
+            ask_direct_join(wire, pending, refs, direct_id, Some(sdp), direct.intent.unwrap(), timing)
+        }
+        Err(words) => {
+            if let Some(intent) = direct.intent {
+                ctx.hub.calls.fail_ring_attempt(&ctx.hub, &ctx.key(&direct_id), intent, CallFailure::Lost, &words);
+            }
+            send_direct_leave(wire, pending, refs, &direct_id, &direct.ring_id, timing)
+        }
+    }
+}
+
+/// Mute and deafen chosen while the ring had no mediad.
+fn shown_audio(ctx: &Context, direct_id: &str) -> Option<(bool, bool)> {
+    let (call, running) = ctx.hub.calls.describe();
+    if running {
+        return None;
+    }
+    call.filter(|call| call.conversation == ctx.key(direct_id))
+        .map(|call| (call.muted, call.deafened))
+}
+
+/// mediad's offer for a direct call. The group name is `d:{ring_id}`, not the conversation.
+/// The caller's shell stays on ringing until the other person is actually in.
+fn offer_direct(ctx: &Context, saved: &Saved, seat: &mut Seat) -> Result<Offered, String> {
+    let Some(direct) = seat.direct.clone() else {
+        return Err("That call is gone.".to_owned());
+    };
+    if direct.ring_id.is_empty() {
+        return Err("That call is gone.".to_owned());
+    }
+    let host = server_host(saved);
+    let required = must_encrypt(&host, false, seat.e2ee)?;
+    let identity = crate::verified::identity_path(&ctx.account)
+        .to_string_lossy()
+        .into_owned();
+    let e2ee = seat.e2ee.then(|| TinyE2ee {
+        room_id: format!("d:{}", direct.ring_id),
+        identity,
+        required,
+    });
+    let offered = e2ee.is_some();
+    let proposal = TinyOffer {
+        user_id: seat.me.clone(),
+        host,
+        slots: ROOM_CAP - 1,
+        muted: seat.muted,
+        deafened: seat.deafened,
+        e2ee,
+    };
+    let sdp = ctx.tiny_direct_offer(&direct.direct_id, proposal, direct.intent.ok_or("That call is gone.")?)?;
+    if seat.muted || seat.deafened {
+        let _ = ctx.hub.calls.set_audio(&ctx.hub, seat.muted, seat.deafened);
+    }
+    let connecting = ctx.hub.calls.describe().0.is_some_and(|call| {
+        call.conversation == ctx.key(&direct.direct_id) && call.state == CallState::Connecting
+    });
+    if direct.outgoing && connecting {
+        ctx.ringing_out(&direct.direct_id);
+    }
+    seat.rostered.clear();
+    roster(ctx, seat, &direct.direct_id);
+    Ok((sdp, offered))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ask_direct_join(
+    wire: &mut Wire,
+    pending: &mut Vec<Pending>,
+    refs: u64,
+    direct_id: String,
+    sdp: Option<Offered>,
+    intent: u64,
+    timing: &Timing,
+) -> io::Result<()> {
+    let reference = refs.to_string();
+    let mut frame = json!({"type": "call.join", "ref": reference, "direct_id": direct_id});
+    let media = sdp.is_some();
+    if let Some((sdp, e2ee)) = sdp {
+        frame["sdp"] = json!(sdp);
+        if e2ee {
+            frame["e2ee"] = json!(E2EE_VERSION);
+        }
+    }
+    pending.push(Pending {
+        reference,
+        asked: Asked::Join(direct_id, media, Some(intent)),
+        until: Instant::now() + timing.answer,
+        reply: None,
+    });
+    wire.send(frame.to_string())
+}
+
 fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &Value, ok: bool) {
     let reference = match frame.get("ref") {
         Some(Value::String(reference)) => reference.clone(),
         Some(Value::Number(reference)) => reference.to_string(),
         _ => {
             if !ok {
-                tracing::warn!("chatd: Tiny server: live socket error {}", text(frame, "code").unwrap_or("?"));
+                tracing::warn!(
+                    "chatd: Tiny server: live socket error {}",
+                    text(frame, "code").unwrap_or("?")
+                );
             }
             return;
         }
     };
-    let Some(at) = pending.iter().position(|pending| pending.reference == reference) else {
+    let Some(at) = pending
+        .iter()
+        .position(|pending| pending.reference == reference)
+    else {
         return;
     };
     let pending = pending.remove(at);
-    if matches!(pending.asked, Asked::Join(_, _)) {
+    if let Asked::Join(id, _, Some(intent)) = &pending.asked {
+        if ctx.hub.calls.call_intent(&ctx.key(id)) != Some(*intent) { return; }
+    }
+    if matches!(pending.asked, Asked::Join(_, _, _)) {
         seat.rejoining = false;
     }
     let answer = if ok {
         match &pending.asked {
-            Asked::Join(room, media) => {
+            Asked::Join(room, media, _) => {
+                let direct = seat
+                    .direct
+                    .as_ref()
+                    .is_some_and(|direct| direct.direct_id == *room);
                 seat.wanted = Some(room.clone());
-                seat.last = Some(room.clone());
+                // `last` is the room a move carries the call from. A direct message is not one.
+                if !direct {
+                    seat.last = Some(room.clone());
+                }
                 // With audio the answer is `call.answer`, and it goes to mediad first.
                 if let (true, Some(sdp)) = (*media, text(frame, "sdp")) {
                     seat.call_id = text(frame, "call_id").map(str::to_owned);
                     ctx.tiny_answer(room, sdp.to_owned());
+                }
+                if direct && (seat.muted || seat.deafened) {
+                    seat.say_state = true;
                 }
             }
             Asked::Leave => {
                 seat.wanted = None;
                 seat.call_id = None;
             }
-            Asked::Kick | Asked::State | Asked::Moderate => {}
+            Asked::Kick
+            | Asked::State
+            | Asked::Moderate
+            | Asked::Ring(_, _)
+            | Asked::Accept(_, _)
+            | Asked::Direct => {}
             Asked::Offer => {
                 if let (Some(sdp), Some(room)) = (text(frame, "sdp"), seat.wanted.clone()) {
-                    ctx.tell_media(&room, MediaRequest::TinyRenegotiation { sdp: sdp.to_owned() });
+                    ctx.tell_media(
+                        &room,
+                        MediaRequest::TinyRenegotiation {
+                            sdp: sdp.to_owned(),
+                        },
+                    );
                 }
             }
         }
@@ -1704,14 +3029,44 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
     } else {
         let code = text(frame, "code").unwrap_or("");
         let said = words(matches!(pending.asked, Asked::Kick | Asked::Moderate), code);
-        if let Asked::Join(room, true) = &pending.asked {
+        if let Asked::Join(room, true, _) = &pending.asked {
             // A join with audio the server refused: its mediad goes. A rejoin that fails is
             // shown as the end of the call; the user asked for the first join, and is told.
-            if pending.reply.is_none() {
+            // A direct id is not a room, so it is not published as a channel to join.
+            let direct = seat
+                .direct
+                .as_ref()
+                .is_some_and(|direct| direct.direct_id == *room);
+            if direct {
+                ctx.hub
+                    .calls
+                    .show_failed(&ctx.hub, ctx.key(room), CallFailure::Refused, said);
+                seat.direct = None;
+                seat.join_direct = false;
+            } else if pending.reply.is_none() {
                 ctx.call_failed(room, CallFailure::Refused, said);
                 tell(ctx, seat, room);
             } else {
                 ctx.call_over(room);
+            }
+        }
+        if let Asked::Ring(direct_id, _) = &pending.asked {
+            seat.ended_directs.retain(|(id, ring)| id != direct_id || !ring.is_empty());
+        }
+        let direct_failure = match &pending.asked {
+            Asked::Ring(id, attempt) | Asked::Accept(id, attempt)
+                if ctx.hub.calls.call_intent(&ctx.key(id)) == Some(*attempt) => Some((id, *attempt)),
+            _ => None,
+        };
+        if let Some((direct_id, attempt)) = direct_failure {
+            ctx.hub.calls.fail_ring_attempt(&ctx.hub, &ctx.key(direct_id), attempt, CallFailure::Refused, said);
+            if seat
+                .direct
+                .as_ref()
+                .is_some_and(|direct| &direct.direct_id == direct_id && direct.intent == Some(attempt))
+            {
+                seat.direct = None;
+                if seat.placed_direct.as_ref().is_some_and(|(_, token)| *token == attempt) { seat.placed_direct = None; }
             }
         }
         if matches!(pending.asked, Asked::State) {
@@ -1719,12 +3074,15 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
         }
         if let Asked::Offer = &pending.asked {
             if let Some(room) = seat.wanted.clone() {
-                ctx.tell_media(&room, MediaRequest::TinyRenegotiation { sdp: String::new() });
+                ctx.tell_media(
+                    &room,
+                    MediaRequest::TinyRenegotiation { sdp: String::new() },
+                );
             }
         }
         // A rejoin nobody asked for that fails is not tried again. A refused renegotiation
         // leaves the seat where it is.
-        if pending.reply.is_none() && !matches!(pending.asked, Asked::Offer) {
+        if pending.reply.is_none() && !matches!(pending.asked, Asked::Offer | Asked::Direct) {
             seat.wanted = None;
         }
         Err(Refusal::Refused(said.to_owned()))

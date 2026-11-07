@@ -10,14 +10,14 @@ mod test_mediad;
 use chatd::hub::Hub;
 use chatd::media::CallError;
 use chatd::store::Store;
+use protocol::ChatStream;
 use protocol::{
-    read_frame, write_frame, Call, CallFailure, CallState, Change, Dave, Key, MediaRequest, Network,
-    Participant, Request, Response, VoiceJoin,
+    read_frame, write_frame, Call, CallFailure, CallState, Change, Dave, Key, MediaRequest,
+    Network, Participant, Request, Response, VoiceJoin,
 };
 use serde_json::{json, Value};
 use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream, UdpSocket};
-use protocol::ChatStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -250,12 +250,19 @@ fn a_join_is_drawn_as_a_call_only_once_the_voice_server_admits_us_and_a_refusal_
     let seq = hub.seq();
 
     assert!(hub.calls.start(&hub, lounge()).is_ok());
-    assert!(matches!(hub.calls.start(&hub, lounge()), Err(CallError::Active)), "one call at a time");
+    assert!(
+        matches!(hub.calls.start(&hub, lounge()), Err(CallError::Active)),
+        "one call at a time"
+    );
     assert!(hub.calls.describe().1, "mediad runs from connecting");
     assert_eq!(mediads(), 1);
     // Muted before the network has answered: it must survive the join.
     assert!(hub.calls.set_audio(&hub, true, false).is_ok());
-    let alice = Participant { id: "222".into(), name: "Alice".into(), ..Participant::default() };
+    let alice = Participant {
+        id: "222".into(),
+        name: "Alice".into(),
+        ..Participant::default()
+    };
     hub.calls.set_participants(&hub, &lounge(), vec![alice]);
 
     // The adapter has both gateway events and hands the session over.
@@ -264,7 +271,11 @@ fn a_join_is_drawn_as_a_call_only_once_the_voice_server_admits_us_and_a_refusal_
     assert_eq!(identify["token"], "voice-token");
     assert_eq!(identify["max_dave_protocol_version"], 1);
     let call = hub.calls.describe().0.unwrap();
-    assert_eq!(call.state, CallState::Connecting, "identified is not joined");
+    assert_eq!(
+        call.state,
+        CallState::Connecting,
+        "identified is not joined"
+    );
     assert_eq!(call.joined, 0);
     assert!(call.engine_linked, "a voice engine took the session");
 
@@ -274,25 +285,57 @@ fn a_join_is_drawn_as_a_call_only_once_the_voice_server_admits_us_and_a_refusal_
     assert!(call.joined > 0);
     assert!(call.muted, "mute set while connecting is kept");
     assert_eq!(call.participants[0].name, "Alice");
-    until("devices", || hub.calls.describe().0.is_some_and(|call| call.input == "tone"));
+    until("devices", || {
+        hub.calls
+            .describe()
+            .0
+            .is_some_and(|call| call.input == "tone")
+    });
     // Muted from the start: the gateway is never told we speak, though the tone is loud.
-    assert_eq!(peer.expect(5)["speaking"], 0, "only the announcement of our SSRC");
+    assert_eq!(
+        peer.expect(5)["speaking"],
+        0,
+        "only the announcement of our SSRC"
+    );
 
     // The shell was told, with the whole call, without asking.
     let (_, _, changes) = hub.wait(seq, Duration::from_millis(10));
     assert!(changes.iter().any(|change| matches!(change,
-        Change::Call { call: Some(call) } if call.state == CallState::Joined && call.input == "tone")));
+        Change::Call { call: Some(call), .. } if call.state == CallState::Joined && call.input == "tone")));
 
     // Requests reach mediad and each gets its one reply.
     assert!(hub.calls.set_audio(&hub, false, false).is_ok());
     assert_eq!(peer.expect(5)["speaking"], 1, "unmuted, the tone is speech");
-    assert!(hub.calls.request(&hub, &MediaRequest::Devices { input: None, output: None, camera: None }).is_ok());
+    assert!(hub
+        .calls
+        .request(
+            &hub,
+            &MediaRequest::Devices {
+                input: None,
+                output: None,
+                camera: None
+            }
+        )
+        .is_ok());
 
     // Discord ends it: DAVE required. The reason is shown and mediad is gone.
     peer.close(4017);
-    until("failed", || matches!(state(&hub), Some(CallState::Failed { reason: CallFailure::Encryption, .. })));
-    until("mediad to exit", || mediads() == 0 && !hub.calls.describe().1);
-    assert!(matches!(hub.calls.set_audio(&hub, true, false), Err(CallError::NoCall)));
+    until("failed", || {
+        matches!(
+            state(&hub),
+            Some(CallState::Failed {
+                reason: CallFailure::Encryption,
+                ..
+            })
+        )
+    });
+    until("mediad to exit", || {
+        mediads() == 0 && !hub.calls.describe().1
+    });
+    assert!(matches!(
+        hub.calls.set_audio(&hub, true, false),
+        Err(CallError::NoCall)
+    ));
     // It stays until dismissed.
     sleep(Duration::from_millis(300));
     assert!(matches!(state(&hub), Some(CallState::Failed { .. })));
@@ -423,7 +466,11 @@ fn a_second_voice_session_for_a_call_that_is_up_moves_the_call_and_keeps_it() {
     let (hub, dir) = hub();
     let (old, new) = (Voice::new(), Voice::new());
     assert!(hub.calls.start(&hub, lounge()).is_ok());
-    let alice = Participant { id: "222".into(), name: "Alice".into(), ..Participant::default() };
+    let alice = Participant {
+        id: "222".into(),
+        name: "Alice".into(),
+        ..Participant::default()
+    };
     hub.calls.set_participants(&hub, &lounge(), vec![alice]);
     hub.calls.join(&hub, &lounge(), old.join());
     let (mut first, _) = old.identified();
@@ -436,27 +483,51 @@ fn a_second_voice_session_for_a_call_that_is_up_moves_the_call_and_keeps_it() {
 
     // The voice server moved (a region change): the adapter hands over a new session for the
     // same call. chatd sends it as `Rejoin`; mediad drops the old connection and takes it.
-    let moved = VoiceJoin { session_id: "session-2".into(), token: "voice-token-2".into(), ..new.join() };
+    let moved = VoiceJoin {
+        session_id: "session-2".into(),
+        token: "voice-token-2".into(),
+        ..new.join()
+    };
     hub.calls.join(&hub, &lounge(), moved);
     let (mut second, identify) = new.identified();
-    assert_eq!((&identify["session_id"], &identify["token"]), (&json!("session-2"), &json!("voice-token-2")));
-    assert_eq!(state(&hub), Some(CallState::Reconnecting), "between the two servers the call is reconnecting, not gone");
+    assert_eq!(
+        (&identify["session_id"], &identify["token"]),
+        (&json!("session-2"), &json!("voice-token-2"))
+    );
+    assert_eq!(
+        state(&hub),
+        Some(CallState::Reconnecting),
+        "between the two servers the call is reconnecting, not gone"
+    );
     new.admit(&mut second);
     until("joined again", || state(&hub) == Some(CallState::Joined));
 
     let after = hub.calls.describe().0.unwrap();
-    assert_eq!(after.joined, before.joined, "the same call: its clock did not restart");
+    assert_eq!(
+        after.joined, before.joined,
+        "the same call: its clock did not restart"
+    );
     assert_eq!(after.participants[0].name, "Alice");
     assert!(after.muted, "mute is kept across the move");
-    assert_eq!((mediads(), mediad_pid()), (1, pid), "the same mediad carried it over");
+    assert_eq!(
+        (mediads(), mediad_pid()),
+        (1, pid),
+        "the same mediad carried it over"
+    );
     let (_, _, changes) = hub.wait(seq, Duration::from_millis(10));
-    assert!(changes.iter().all(|change| !matches!(change, Change::Call { call: None })), "the call never left the screen");
+    assert!(
+        changes
+            .iter()
+            .all(|change| !matches!(change, Change::Call { call: None, .. })),
+        "the call never left the screen"
+    );
     // The old voice server heard a goodbye, not a dropped socket.
     let goodbye = loop {
         match first.ws.read() {
             Ok(Message::Close(frame)) => break frame.map(|frame| u16::from(frame.code)),
             Ok(_) => {}
-            Err(tungstenite::Error::Io(err)) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(tungstenite::Error::Io(err))
+                if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(_) => break None,
         }
     };

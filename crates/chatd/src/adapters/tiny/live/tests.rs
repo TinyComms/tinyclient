@@ -1805,3 +1805,442 @@ fn an_incognito_host_or_a_requiring_room_never_carries_a_call_on_unencrypted() {
     assert_eq!(must_encrypt("chat.example.org", true, true), Ok(true));
     assert_eq!(must_encrypt("chat.example.org", true, false), Err(ROOM_CANNOT_ENCRYPT));
 }
+
+const DIRECT: &str = "55555555-5555-5555-5555-555555555555";
+const RING_ID: &str = "66666666-6666-6666-6666-666666666666";
+
+fn ringing(kind: &str, caller: &str) -> Value {
+    json!({
+        "type": kind,
+        "direct_id": DIRECT,
+        "ring_id": RING_ID,
+        "caller_id": caller,
+        "callee_id": if caller == ME { BEA } else { ME },
+    })
+}
+
+fn direct_call(running: &Running) -> Option<protocol::Call> {
+    running
+        .hub
+        .calls
+        .describe()
+        .0
+        .filter(|call| call.conversation == running.key(DIRECT))
+}
+
+#[test]
+fn a_declined_direct_ring_fails_without_joining() {
+    let fake = fake(&[], |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([])));
+        let ring = conn.next(Duration::from_secs(5)).expect("call.ring");
+        assert_eq!(ring["type"], "call.ring");
+        assert_eq!(ring["direct_id"], DIRECT);
+        conn.send(ringing("call.ringing", ME));
+        conn.send(ringing("call.declined", ME));
+        conn.send(json!({"type": "ok", "ref": ring["ref"]}));
+        let extra = conn.next(Duration::from_millis(400));
+        assert!(extra.is_none(), "a declined ring never joins: {extra:?}");
+        conn.idle(Duration::from_millis(400));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    assert!(running
+        .hub
+        .calls
+        .place(&running.hub, running.key(DIRECT))
+        .is_ok());
+    assert_eq!(
+        running.ask(|reply| Ask::Ring {
+            attempt: None,
+            direct_id: DIRECT.into(),
+            reply
+        }),
+        Ok(())
+    );
+    until("declined", || {
+        direct_call(&running).is_some_and(|call| {
+            matches!(call.state, protocol::CallState::Failed { reason: protocol::CallFailure::NoAnswer, ref detail } if detail.contains("declined"))
+        })
+    });
+    assert!(!running.hub.calls.describe().1);
+    let _ = running.hub.calls.end(&running.hub);
+}
+
+#[test]
+fn cancelling_an_outgoing_direct_ring_sends_call_cancel() {
+    let fake = fake(&[], |_, mut conn| {
+        conn.send(ready(1, &[ME], json!([])));
+        let ring = conn.next(Duration::from_secs(5)).expect("call.ring");
+        assert_eq!(ring["type"], "call.ring");
+        conn.send(ringing("call.ringing", ME));
+        conn.send(json!({"type": "ok", "ref": ring["ref"]}));
+        let cancel = conn.next(Duration::from_secs(5)).expect("call.cancel");
+        assert_eq!(cancel["type"], "call.cancel");
+        assert_eq!(cancel["direct_id"], DIRECT);
+        assert!(cancel.get("room_id").is_none());
+        conn.send(json!({"type": "ok", "ref": cancel["ref"]}));
+        conn.idle(Duration::from_millis(400));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    assert!(running
+        .hub
+        .calls
+        .place(&running.hub, running.key(DIRECT))
+        .is_ok());
+    assert_eq!(
+        running.ask(|reply| Ask::Ring {
+            attempt: None,
+            direct_id: DIRECT.into(),
+            reply
+        }),
+        Ok(())
+    );
+    running.live.ask(Ask::Hangup {
+        room_id: DIRECT.into(),
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = running.hub.calls.end(&running.hub);
+}
+
+#[test]
+fn a_direct_call_rings_before_it_joins_and_stays_ringing_with_an_empty_roster() {
+    with_mediad();
+    let (said, heard) = channel();
+    let fake = fake_with("up", &[], move |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([])));
+        let ring = conn.next(Duration::from_secs(5)).expect("call.ring");
+        assert_eq!(
+            (ring["type"].as_str(), ring["direct_id"].as_str()),
+            (Some("call.ring"), Some(DIRECT))
+        );
+        conn.send(ringing("call.ringing", ME));
+        conn.send(json!({"type": "ok", "ref": ring["ref"]}));
+        let early = conn.next(Duration::from_millis(300));
+        assert!(
+            early.is_none(),
+            "no join before the other person accepts: {early:?}"
+        );
+        conn.send(ringing("call.accepted", ME));
+        let join = conn.next(Duration::from_secs(30)).expect("call.join");
+        assert_eq!(join["type"], "call.join");
+        assert_eq!(join["direct_id"], DIRECT);
+        assert!(join.get("room_id").is_none());
+        let sdp = join["sdp"].as_str().expect("an offer");
+        conn.send(json!({"type": "call.answer", "ref": join["ref"], "call_id": "c-direct", "sdp": answer_for(sdp)}));
+        let _ = said.send("offered");
+        // A delayed media departure from an older attempt must not clear this call's engine.
+        conn.send(json!({"type":"call.left", "room_id":"d:77777777-7777-7777-7777-777777777777", "direct_id":DIRECT, "user_id":ME, "reason":"left"}));
+        conn.send(json!({
+            "type": "call.joined",
+            "room_id": format!("d:{RING_ID}"),
+            "direct_id": DIRECT,
+            "user_id": BEA,
+        }));
+        let state = conn.next(Duration::from_secs(5)).expect("call.state");
+        assert_eq!(state["type"], "call.state");
+        assert_eq!(state["muted"], true);
+        assert!(state.get("room_id").is_none());
+        conn.send(json!({"type": "ok", "ref": state["ref"]}));
+        let _ = said.send("muted");
+        conn.idle(Duration::from_secs(2));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    until("audio is up", || !running.live.seats_only());
+    assert!(running
+        .hub
+        .calls
+        .place(&running.hub, running.key(DIRECT))
+        .is_ok());
+    assert_eq!(
+        running.ask(|reply| Ask::Ring {
+            attempt: None,
+            direct_id: DIRECT.into(),
+            reply
+        }),
+        Ok(())
+    );
+    assert_eq!(
+        heard
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the offer went out"),
+        "offered"
+    );
+    until("ringing out, mediad up, nobody counted as joined", || {
+        let (call, media) = running.hub.calls.describe();
+        media
+            && call.is_some_and(|call| {
+                call.conversation == running.key(DIRECT)
+                    && call.state == protocol::CallState::RingingOut
+                    && call.joined == 0
+            })
+    });
+    running.live.ask(Ask::State {
+        muted: true,
+        deafened: false,
+    });
+    assert_eq!(
+        heard.recv_timeout(Duration::from_secs(5)).expect("mute"),
+        "muted"
+    );
+    until("Bea is on the roster", || {
+        direct_call(&running).is_some_and(|call| call.participants.iter().any(|who| who.id == BEA))
+    });
+    let call = direct_call(&running).expect("the call");
+    assert_eq!(call.state, protocol::CallState::RingingOut);
+    assert_eq!(call.joined, 0);
+    assert!(running.hub.occupants(&running.key(DIRECT)).is_none());
+}
+
+#[test]
+fn an_incoming_direct_ring_has_no_mediad_until_it_is_accepted() {
+    with_mediad();
+    let fake = fake_with("up", &[], |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([])));
+        conn.send(ringing("call.ringing", BEA));
+        let accept = conn.next(Duration::from_secs(5)).expect("call.accept");
+        assert_eq!(accept["type"], "call.accept");
+        assert_eq!(accept["direct_id"], DIRECT);
+        conn.send(json!({"type": "ok", "ref": accept["ref"]}));
+        conn.send(ringing("call.accepted", BEA));
+        let join = conn.next(Duration::from_secs(30)).expect("call.join");
+        assert_eq!(join["type"], "call.join");
+        assert_eq!(join["direct_id"], DIRECT);
+        assert!(join.get("room_id").is_none());
+        let sdp = join["sdp"].as_str().expect("an offer");
+        conn.send(json!({"type": "call.answer", "ref": join["ref"], "call_id": "c-in", "sdp": answer_for(sdp)}));
+        conn.idle(Duration::from_secs(2));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    until("audio is up", || !running.live.seats_only());
+    until("ringing in", || {
+        direct_call(&running)
+            .is_some_and(|call| matches!(call.state, protocol::CallState::RingingIn { .. }))
+    });
+    assert!(!running.hub.calls.describe().1);
+    assert_eq!(
+        running.ask(|reply| Ask::Accept {
+            direct_id: DIRECT.into(),
+            reply
+        }),
+        Ok(())
+    );
+    until("mediad is up and the ring is over", || {
+        let (call, media) = running.hub.calls.describe();
+        media
+            && call.is_some_and(|call| {
+                call.conversation == running.key(DIRECT)
+                    && !matches!(call.state, protocol::CallState::RingingIn { .. })
+            })
+    });
+}
+
+#[test]
+fn a_direct_ring_during_a_room_call_waits_beside_it() {
+    with_mediad();
+    let fake = fake_with("up", &[], |_, mut conn| {
+        conn.send(ready(
+            1,
+            &[ME, BEA],
+            json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}]),
+        ));
+        answer_join(&mut conn, "c-room");
+        conn.send(ringing("call.ringing", BEA));
+        let extra = conn.next(Duration::from_millis(800));
+        assert!(extra.is_none(), "the room call is not replaced: {extra:?}");
+        conn.idle(Duration::from_secs(2));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    until("audio is up", || !running.live.seats_only());
+    assert_eq!(running.join_with_audio(ROOM), Ok(()));
+    until("the direct ring is waiting", || {
+        running.hub.calls.aside().is_some_and(|ring| {
+            ring.conversation == running.key(DIRECT)
+                && matches!(ring.state, protocol::CallState::RingingIn { .. })
+        })
+    });
+    let (call, media) = running.hub.calls.describe();
+    assert!(media);
+    let call = call.expect("the room call");
+    assert_eq!(call.conversation, running.key(ROOM));
+    assert!(!matches!(call.state, protocol::CallState::RingingIn { .. }));
+}
+
+
+#[test]
+fn a_cancelled_direct_never_rejoins_when_acceptance_arrives_late() {
+    with_mediad();
+    let (seen, heard) = channel();
+    let fake = fake_with("up", &[], move |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([])));
+        let ring = conn.next(Duration::from_secs(5)).unwrap();
+        conn.send(ringing("call.ringing", ME));
+        conn.send(json!({"type":"ok","ref":ring["ref"]}));
+        let cancel = conn.next(Duration::from_secs(5)).unwrap();
+        assert_eq!(cancel["type"], "call.cancel");
+        conn.send(json!({"type":"error","ref":cancel["ref"],"code":"not_found"}));
+        conn.send(ringing("call.accepted", ME));
+        seen.send(conn.next(Duration::from_secs(3))).unwrap();
+        conn.idle(Duration::from_millis(300));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected && !running.live.seats_only());
+    running.hub.calls.place(&running.hub, running.key(DIRECT)).unwrap();
+    assert_eq!(running.ask(|reply| Ask::Ring { attempt: None, direct_id: DIRECT.into(), reply }), Ok(()));
+    running.hub.calls.end(&running.hub);
+    running.live.ask(Ask::Hangup { room_id: DIRECT.into() });
+    let frame = heard.recv_timeout(Duration::from_secs(8)).unwrap().expect("scoped cleanup");
+    assert_eq!(frame["type"], "call.leave", "late acceptance must clean up, never join");
+    assert_eq!(frame["direct_id"], DIRECT);
+    assert_eq!(frame["ring_id"], RING_ID);
+    assert!(running.hub.calls.describe().0.is_none());
+    assert!(!running.hub.calls.describe().1);
+}
+
+#[test]
+fn a_passive_caller_device_does_not_join_or_end_another_devices_direct() {
+    with_mediad();
+    let (seen, heard) = channel();
+    let fake = fake_with("up", &[], move |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([])));
+        conn.send(ringing("call.ringing", ME));
+        conn.send(ringing("call.accepted", ME));
+        seen.send(conn.next(Duration::from_secs(2))).unwrap();
+        conn.idle(Duration::from_millis(300));
+    });
+    let running = run(&fake.base, QUICK);
+    assert!(heard.recv_timeout(Duration::from_secs(8)).unwrap().is_none(), "a passive device neither joins nor leaves the active device's call");
+    assert!(running.hub.calls.describe().0.is_none());
+    assert!(!running.hub.calls.describe().1);
+}
+
+#[test]
+fn an_accepted_direct_ready_recovers_a_missed_acceptance_event() {
+    with_mediad();
+    let (seen, heard) = channel();
+    let fake = fake_with("up", &[], move |attempt, mut conn| {
+        if attempt == 0 {
+            conn.send(ready(1, &[ME, BEA], json!([])));
+            let ring = conn.next(Duration::from_secs(5)).unwrap();
+            conn.send(ringing("call.ringing", ME));
+            conn.send(json!({"type":"ok","ref":ring["ref"]}));
+            conn.close(1012);
+        } else {
+            let mut accepted = ready(1, &[ME, BEA], json!([]));
+            let mut ring = ringing("call.ringing", ME);
+            ring["accepted"] = json!(true);
+            accepted["ring"] = ring;
+            conn.send(accepted);
+            let joined = conn.next(Duration::from_secs(3));
+            seen.send(joined.clone()).unwrap();
+            if let Some(joined) = joined.filter(|frame| frame["type"] == "call.join") {
+                conn.send(json!({"type":"call.answer","ref":joined["ref"],"call_id":"recovered-direct","sdp":answer_for(joined["sdp"].as_str().unwrap())}));
+            }
+            conn.idle(Duration::from_secs(1));
+        }
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected && !running.live.seats_only());
+    running.hub.calls.place(&running.hub, running.key(DIRECT)).unwrap();
+    assert_eq!(running.ask(|reply| Ask::Ring { attempt: None, direct_id: DIRECT.into(), reply }), Ok(()));
+    let joined = heard.recv_timeout(Duration::from_secs(10)).unwrap().expect("accepted-ready must send the missed join");
+    assert_eq!(joined["type"], "call.join");
+    assert_eq!(joined["direct_id"], DIRECT);
+    running.hub.calls.end(&running.hub);
+    running.live.ask(Ask::Hangup { room_id: DIRECT.into() });
+}
+
+
+#[test]
+fn a_previous_direct_cancel_does_not_end_a_rapid_redial() {
+    let fake = fake(&[], |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([])));
+        let first = conn.next(Duration::from_secs(5)).unwrap();
+        conn.send(ringing("call.ringing", ME));
+        conn.send(json!({"type":"ok","ref":first["ref"]}));
+        let cancel = conn.next(Duration::from_secs(5)).unwrap();
+        assert_eq!(cancel["type"], "call.cancel");
+        let second = conn.next(Duration::from_secs(5)).unwrap();
+        assert_eq!(second["type"], "call.ring");
+        conn.send(ringing("call.cancelled", ME));
+        conn.send(json!({"type":"ok","ref":cancel["ref"]}));
+        let mut new_ring = ringing("call.ringing", ME);
+        new_ring["ring_id"] = json!("77777777-7777-7777-7777-777777777777");
+        conn.send(new_ring);
+        conn.send(json!({"type":"ok","ref":second["ref"]}));
+        conn.idle(Duration::from_secs(1));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    running.hub.calls.place(&running.hub, running.key(DIRECT)).unwrap();
+    assert_eq!(running.ask(|reply| Ask::Ring { attempt: None, direct_id: DIRECT.into(), reply }), Ok(()));
+    running.hub.calls.end(&running.hub);
+    running.live.ask(Ask::Hangup { room_id: DIRECT.into() });
+    running.hub.calls.place(&running.hub, running.key(DIRECT)).unwrap();
+    assert_eq!(running.ask(|reply| Ask::Ring { attempt: None, direct_id: DIRECT.into(), reply }), Ok(()));
+    assert!(running.hub.calls.describe().0.is_some_and(|call| call.state == protocol::CallState::RingingOut), "the previous ring's cancellation must not end the new attempt");
+    running.hub.calls.end(&running.hub);
+    running.live.ask(Ask::Hangup { room_id: DIRECT.into() });
+}
+
+
+#[test]
+fn a_passive_callee_stops_ringing_when_another_device_accepts() {
+    let (accept, accepted) = channel();
+    let accepted = Arc::new(std::sync::Mutex::new(accepted));
+    let (done, finished) = channel();
+    let fake = fake(&[], move |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([])));
+        conn.send(ringing("call.ringing", BEA));
+        accepted.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+        conn.send(ringing("call.accepted", BEA));
+        done.send(conn.next(Duration::from_millis(400))).unwrap();
+        conn.idle(Duration::from_millis(200));
+    });
+    let running = run(&fake.base, QUICK);
+    until("incoming ring", || direct_call(&running).is_some());
+    accept.send(()).unwrap();
+    assert!(finished.recv_timeout(Duration::from_secs(5)).unwrap().is_none(), "the device that did not answer never joins or leaves");
+    assert!(direct_call(&running).is_none(), "another device's acceptance stops this ring");
+    assert!(!running.hub.calls.describe().1);
+}
+
+#[test]
+fn a_refused_direct_attempt_does_not_poison_the_next_ring() {
+    let (first_seen, first_received) = channel();
+    let (observed, saw) = channel();
+    let fake = fake(&[], move |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([])));
+        let first = conn.next(Duration::from_secs(5)).unwrap();
+        first_seen.send(()).unwrap();
+        let cancel = conn.next(Duration::from_secs(5)).unwrap();
+        assert_eq!(cancel["type"], "call.cancel");
+        conn.send(json!({"type":"error","ref":first["ref"],"code":"busy"}));
+        conn.send(json!({"type":"ok","ref":cancel["ref"]}));
+        let second = conn.next(Duration::from_secs(5)).unwrap();
+        conn.send(ringing("call.ringing", ME));
+        conn.send(json!({"type":"ok","ref":second["ref"]}));
+        conn.send(ringing("call.accepted", ME));
+        observed.send(conn.next(Duration::from_secs(2))).unwrap();
+        conn.idle(Duration::from_millis(200));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    running.hub.calls.place(&running.hub, running.key(DIRECT)).unwrap();
+    let (reply, result) = channel();
+    running.live.ask(Ask::Ring { attempt: None, direct_id: DIRECT.into(), reply });
+    first_received.recv_timeout(Duration::from_secs(5)).unwrap();
+    running.hub.calls.end(&running.hub);
+    running.live.ask(Ask::Hangup { room_id: DIRECT.into() });
+    assert!(result.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+    running.hub.calls.place(&running.hub, running.key(DIRECT)).unwrap();
+    assert_eq!(running.ask(|reply| Ask::Ring { attempt: None, direct_id: DIRECT.into(), reply }), Ok(()));
+    assert_eq!(saw.recv_timeout(Duration::from_secs(5)).unwrap().expect("new call joins")["type"], "call.join");
+    running.hub.calls.end(&running.hub);
+    running.live.ask(Ask::Hangup { room_id: DIRECT.into() });
+}
+
+mod direct_probe;

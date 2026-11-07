@@ -41,21 +41,23 @@ mod status;
 pub use hub::{ask_later, Hub};
 
 use super::anim::Play;
-use super::theme;
 use super::components::Avatar;
 use super::composer::typing_preview;
 use super::layout::{RightKind, RightPane};
 use super::sidebar::Mode;
 use super::state::Shell;
+use super::theme;
 use card::{Float, Floating};
-use gpui::{prelude::*, AnyElement, Context, Div, Entity, Pixels, Point, Rgba, SharedString, Window};
+use gpui::{
+    prelude::*, AnyElement, Context, Div, Entity, Pixels, Point, Rgba, SharedString, Window,
+};
 use info::InfoPane;
 use list::PeopleList;
 use members::MemberList;
 use presence::{Ring, Shape};
 use protocol::{
-    AccountKey, Change, Conversation, ConversationKind, InboxFilter, Key, Link, MediaFile, Network, Person,
-    Presence, RelateAction, Request, Response, PAGE_LIMIT,
+    AccountKey, Change, Conversation, ConversationKind, InboxFilter, Key, Link,
+    MediaFile, Network, Person, Presence, RelateAction, Request, Response, PAGE_LIMIT,
 };
 use status::StatusMenu;
 use std::cell::{Cell, OnceCell};
@@ -99,6 +101,8 @@ pub(in crate::gui) struct Scene {
     pub accounts: Vec<Own>,
     /// The people in the call that is up.
     pub in_call: Vec<Key>,
+    /// Tiny accounts that can ring any member, including before a direct exists.
+    pub callable_accounts: Vec<AccountKey>,
 }
 
 /// True when this run only draws a state for `--shot`: nothing that changes the user's state on
@@ -160,9 +164,14 @@ fn header_line(word: &str, status: &str, in_call: bool) -> Option<String> {
     }
 }
 
-/// Whether tinyclient can ring this person itself.
-fn can_call(network: Network) -> bool {
-    network == Network::Discord
+/// Whether tinyclient can ring this person itself. Discord always can. A Tiny person can
+/// when their account advertises direct calls, even before a direct conversation exists.
+fn can_call(scene: &Scene, person: &Key) -> bool {
+    match person.network {
+        Network::Discord => true,
+        Network::Tiny => scene.callable_accounts.contains(&person.account()),
+        _ => false,
+    }
 }
 
 impl State {
@@ -320,7 +329,11 @@ impl Shell {
             open: open.map(|open| open.key.clone()),
             peer: open.and_then(peer_of),
             open_kind: open.map(|open| open.kind),
-            links: snapshot.networks.iter().map(|status| (status.network, status.link)).collect(),
+            links: snapshot
+                .networks
+                .iter()
+                .map(|status| (status.network, status.link))
+                .collect(),
             accounts: snapshot
                 .accounts
                 .iter()
@@ -339,8 +352,16 @@ impl Shell {
                 .call
                 .iter()
                 .filter(|call| call.state == protocol::CallState::Joined)
-                .flat_map(|call| call.participants.iter().map(|person| Key { id: person.id.clone(), ..call.conversation.clone() }))
+                .flat_map(|call| {
+                    call.participants.iter().map(|person| Key {
+                        id: person.id.clone(),
+                        ..call.conversation.clone()
+                    })
+                })
                 .collect(),
+            callable_accounts: snapshot.accounts.iter()
+                .filter(|account| account.key.network == Network::Tiny && account.can.direct_calls)
+                .map(|account| account.key.clone()).collect(),
         }
     }
 
@@ -547,13 +568,20 @@ impl Shell {
             };
             if let Response::Conversations { conversations, .. } = crate::client::ask(&stored)? {
                 if let Some(row) = existing_direct(&conversations, &key) {
-                    return Ok(Response::Conversation { conversation: row.clone() });
+                    return Ok(Response::Conversation {
+                        conversation: row.clone(),
+                    });
                 }
             }
             if only_draws() {
                 return Ok(Response::Ok);
             }
-            crate::client::ask(&Request::StartDirect { person: key })
+            let request = if call && key.network == Network::Tiny {
+                Request::StartDirectCall { person: key }
+            } else {
+                Request::StartDirect { person: key }
+            };
+            crate::client::ask(&request)
         };
         self.off_thread(cx, read, move |shell, answer, cx| {
             let refused = match answer {
@@ -758,6 +786,15 @@ mod tests {
             draft: String::new(),
             folders: Vec::new(), archived: false, pin: None, hidden: false, followed: false, bot: false, meeting: false, special: Default::default(), mark: None, topic_icon: None, opted_out: false, quiet: false, preview_from: String::new(), preview_mine: false, seen: false, delivered: false, sending: false,
         }
+    }
+
+    #[test]
+    fn a_member_can_be_called_without_a_cached_direct_on_a_capable_account() {
+        let person = Key { network: Network::Tiny, account: "capable".into(), id: "bea".into() };
+        let scene = Scene { callable_accounts: vec![person.account()], ..Scene::default() };
+        assert!(can_call(&scene, &person));
+        assert!(!can_call(&Scene::default(), &person), "older servers offer no call");
+        assert!(!can_call(&scene, &Key { account: "older".into(), ..person }), "another account's capability is irrelevant");
     }
 
     #[test]

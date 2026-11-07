@@ -9,15 +9,15 @@
 //! server has the adapter leave on the network, so nobody is left ringing or shown in a channel.
 
 use crate::hub::{now, Hub};
+use protocol::media_host::MediaChild;
 use protocol::settings::{CAMERA, GLOBAL, INPUT, JOIN_MUTED, OUTPUT, REQUIRE_CALL_E2EE};
 use protocol::{
-    PictureKind,
-    clip, read_frame, write_frame, AudioDevice, Call, CallFailure, CallPicture, CallState, Change, Content, Cue, Direction, Key, MediaRequest,
-    MediaResponse, Participant, TinyOffer, TinySlot, VideoStream, VoiceJoin, DEVICES_LIMIT, OCCUPANTS_LIMIT,
+    clip, read_frame, write_frame, AudioDevice, Call, CallFailure, CallPicture, CallState, Change,
+    Content, Cue, Direction, Key, MediaRequest, MediaResponse, Participant, PictureKind, TinyOffer,
+    TinySlot, VideoStream, VoiceJoin, DEVICES_LIMIT, OCCUPANTS_LIMIT,
 };
 use std::io::{self, BufReader};
 use std::path::PathBuf;
-use protocol::media_host::MediaChild;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver};
@@ -51,7 +51,8 @@ pub const NO_ANSWER: &str = "Nobody picked up.";
 /// What the dock shows when mediad is gone or mute; what mediad or the system said is logged.
 const ENGINE_STOPPED: &str = "The call engine stopped.";
 const ENGINE_SILENT: &str = "The call engine stopped answering. Try again.";
-const ENGINE_MISSING: &str = "The call engine could not start. Reinstall tinyclient, then try again.";
+const ENGINE_MISSING: &str =
+    "The call engine could not start. Reinstall tinyclient, then try again.";
 /// A Tiny server call asked for while another network's call is up.
 pub const IN_ANOTHER_CALL: &str = "Leave the call you're in first.";
 
@@ -65,6 +66,7 @@ pub enum CallError {
 
 /// A call and what is known about it beyond what the shell is told.
 struct Live {
+    intent: u64,
     call: Call,
     /// Who mediad says is speaking, by user id. The roster comes from the adapter and may name
     /// them only later.
@@ -120,6 +122,11 @@ type Signal = Box<dyn Fn(&Key, String) + Send + Sync>;
 #[derive(Default)]
 pub struct Calls {
     slot: Mutex<Slot>,
+    /// An incoming ring that arrived while a call is already up. It has no mediad, and it does
+    /// not replace the call that is up.
+    aside: Mutex<Option<Call>>,
+    /// The outgoing ring `place` is watching. A later one does not fail the earlier.
+    placed: AtomicU64,
     next: AtomicU64,
     failed: Mutex<Option<Failed>>,
     signal: Mutex<Option<Signal>>,
@@ -199,6 +206,7 @@ pub(crate) fn mediad_path() -> io::Result<PathBuf> {
 }
 
 fn new_call(conversation: Key, state: CallState) -> Live {
+    static NEXT_INTENT: AtomicU64 = AtomicU64::new(1);
     let call = Call {
         conversation,
         state,
@@ -224,6 +232,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         self_view: None,
     };
     Live {
+        intent: NEXT_INTENT.fetch_add(1, Ordering::Relaxed),
         call,
         talking: Vec::new(),
         since: Instant::now(),
@@ -469,7 +478,11 @@ impl ActiveCall {
         protocol::log_policy::share_session(&mut command);
         // The process on a desktop; mediad's threads in this process on a phone.
         let spawned = protocol::media_host::spawn(&mut command);
-        let protocol::media_host::Spawned { mut child, stdin, stdout } = spawned.map_err(|err| {
+        let protocol::media_host::Spawned {
+            mut child,
+            stdin,
+            stdout,
+        } = spawned.map_err(|err| {
             tracing::warn!("chatd: could not run {}: {err}", path.display());
             io::Error::other(ENGINE_MISSING)
         })?;
@@ -479,14 +492,20 @@ impl ActiveCall {
         // stale binary, one wedged before its first word) must fail the call rather than hold
         // every Status answer and every ring with it.
         let (said, answered) = channel();
-        let spawned = std::thread::Builder::new().name("mediad-ready".into()).stack_size(128 * 1024).spawn(move || {
-            let frame = read_frame::<MediaResponse>(&mut stdout);
-            let _ = said.send((frame, stdout));
-        });
+        let spawned = std::thread::Builder::new()
+            .name("mediad-ready".into())
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let frame = read_frame::<MediaResponse>(&mut stdout);
+                let _ = said.send((frame, stdout));
+            });
         if let Err(err) = spawned {
             let _ = child.kill();
             let _ = child.wait();
-            tracing::warn!("chatd: the reader of {} did not start: {err}", path.display());
+            tracing::warn!(
+                "chatd: the reader of {} did not start: {err}",
+                path.display()
+            );
             return Err(io::Error::other(ENGINE_MISSING));
         }
         let (frame, mut stdout) = match answered.recv_timeout(READY) {
@@ -496,7 +515,11 @@ impl ActiveCall {
                 let _ = child.wait();
                 tracing::warn!("mediad frame was not ready");
                 let silent = matches!(answer, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
-                return Err(io::Error::other(if silent { ENGINE_SILENT } else { ENGINE_MISSING }));
+                return Err(io::Error::other(if silent {
+                    ENGINE_SILENT
+                } else {
+                    ENGINE_MISSING
+                }));
             }
         };
         let engine_linked = match frame {
@@ -518,61 +541,70 @@ impl ActiveCall {
         let (reply, replies) = channel();
 
         let (reader, seen) = (hub.clone(), live.clone());
-        std::thread::Builder::new().stack_size(256 * 1024).spawn(move || {
-            // Ends when mediad closes its stdout, which is when it exits.
-            while let Ok(frame) = read_frame::<MediaResponse>(&mut stdout) {
-                if frame.is_reply() {
-                    let _ = reply.send(frame);
-                    continue;
-                }
-                if let MediaResponse::DeviceList { inputs, outputs } = &frame {
-                    learn_devices(&reader, inputs, outputs);
-                }
-                // A frame for the server: the adapter of the call's account sends it.
-                if let MediaResponse::TinyE2ee { frame } = &frame {
-                    let conversation = crate::hub::lock(&seen).call.conversation.clone();
-                    reader.calls.signal(&conversation, frame.clone());
-                    continue;
-                }
-                if let MediaResponse::TinyRenegotiate { sdp } = &frame {
-                    let conversation = crate::hub::lock(&seen).call.conversation.clone();
-                    reader.calls.offer(&conversation, sdp.clone());
-                    continue;
-                }
-                let notify = match &frame {
-                    MediaResponse::Interrupted => Some(false),
-                    MediaResponse::Connected { .. } => Some(true),
-                    _ => None,
-                };
-                let mut live = crate::hub::lock(&seen);
-                let conversation = live.call.conversation.clone();
-                let draw = live.apply(frame);
-                let call = draw.then(|| live.call.clone());
-                let state_now = live.call.state.clone();
-                drop(live);
-                // Outside the call lock. A drop while already reconnecting does not redraw, and
-                // still has to be resumed; the first connect is not one.
-                if conversation.network == protocol::Network::Tiny {
-                    match notify {
-                        Some(false) if matches!(state_now, CallState::Reconnecting) => reader.calls.tiny_down(&conversation),
-                        Some(true) => reader.calls.tiny_up(&conversation),
-                        _ => {}
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                // Ends when mediad closes its stdout, which is when it exits.
+                while let Ok(frame) = read_frame::<MediaResponse>(&mut stdout) {
+                    if frame.is_reply() {
+                        let _ = reply.send(frame);
+                        continue;
+                    }
+                    if let MediaResponse::DeviceList { inputs, outputs } = &frame {
+                        learn_devices(&reader, inputs, outputs);
+                    }
+                    // A frame for the server: the adapter of the call's account sends it.
+                    if let MediaResponse::TinyE2ee { frame } = &frame {
+                        let conversation = crate::hub::lock(&seen).call.conversation.clone();
+                        reader.calls.signal(&conversation, frame.clone());
+                        continue;
+                    }
+                    if let MediaResponse::TinyRenegotiate { sdp } = &frame {
+                        let conversation = crate::hub::lock(&seen).call.conversation.clone();
+                        reader.calls.offer(&conversation, sdp.clone());
+                        continue;
+                    }
+                    let notify = match &frame {
+                        MediaResponse::Interrupted => Some(false),
+                        MediaResponse::Connected { .. } => Some(true),
+                        _ => None,
+                    };
+                    let mut live = crate::hub::lock(&seen);
+                    let conversation = live.call.conversation.clone();
+                    let draw = live.apply(frame);
+                    let call = draw.then(|| live.call.clone());
+                    let state_now = live.call.state.clone();
+                    drop(live);
+                    // Outside the call lock. A drop while already reconnecting does not redraw, and
+                    // still has to be resumed; the first connect is not one.
+                    if conversation.network == protocol::Network::Tiny {
+                        match notify {
+                            Some(false) if matches!(state_now, CallState::Reconnecting) => {
+                                reader.calls.tiny_down(&conversation)
+                            }
+                            Some(true) => reader.calls.tiny_up(&conversation),
+                            _ => {}
+                        }
+                    }
+                    if let Some(call) = call {
+                        reader.changed(Change::Call {
+                            call: Some(call),
+                            ring: reader.calls.aside(),
+                        });
                     }
                 }
-                if let Some(call) = call {
-                    reader.changed(Change::Call { call: Some(call) });
-                }
-            }
-            reader.calls.reap(&reader, id);
-        })?;
+                reader.calls.reap(&reader, id);
+            })?;
 
         let watcher = hub.clone();
-        std::thread::Builder::new().stack_size(256 * 1024).spawn(move || {
-            // Ends with the call it watches.
-            while watcher.calls.watch(&watcher, id) {
-                sleep(WATCH);
-            }
-        })?;
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                // Ends with the call it watches.
+                while watcher.calls.watch(&watcher, id) {
+                    sleep(WATCH);
+                }
+            })?;
         Ok(ActiveCall {
             id,
             child,
@@ -665,7 +697,15 @@ impl Calls {
     }
 
     fn tell(&self, hub: &Hub) {
-        hub.changed(Change::Call { call: self.describe().0 });
+        hub.changed(Change::Call {
+            call: self.describe().0,
+            ring: self.aside(),
+        });
+    }
+
+    /// The ring waiting beside the call, if someone called while one was up.
+    pub fn aside(&self) -> Option<Call> {
+        crate::hub::lock(&self.aside).clone()
     }
 
     /// Who hears of a call that failed: the server, which has the adapter leave on the network.
@@ -749,6 +789,10 @@ impl Calls {
 
     /// Starts mediad for a call in `conversation`. A ring or a failure being shown gives way.
     pub fn start(&self, hub: &Arc<Hub>, conversation: Key) -> Result<(), CallError> {
+        self.start_with_intent(hub, conversation, None)
+    }
+
+    fn start_with_intent(&self, hub: &Arc<Hub>, conversation: Key, intent: Option<u64>) -> Result<(), CallError> {
         // A microphone test gives way: the call needs the devices.
         let tester = crate::hub::lock(&self.tester).take();
         if tester.is_some() {
@@ -762,6 +806,10 @@ impl Calls {
         };
         {
             let mut slot = crate::hub::lock(&self.slot);
+            if intent.is_some() && !matches!(&*slot, Slot::Shown(live)
+                if Some(live.intent) == intent && live.call.conversation == conversation && !matches!(live.call.state, CallState::Failed { .. })) {
+                return Err(CallError::NoCall);
+            }
             if slot.running().is_some() {
                 return Err(CallError::Active);
             }
@@ -769,6 +817,7 @@ impl Calls {
             *slot = Slot::Idle;
             let id = self.next.fetch_add(1, Ordering::Relaxed);
             let mut active = ActiveCall::start(hub, id, conversation.clone()).map_err(CallError::Media)?;
+            if let Some(intent) = intent { crate::hub::lock(&active.live).intent = intent; }
             // The user's defaults, before the voice session arrives: mediad opens the devices
             // only once it holds one. A mediad that refuses them still carries the call.
             crate::hub::lock(&active.live).call.muted = muted;
@@ -932,6 +981,156 @@ impl Calls {
         }
     }
 
+    /// An outgoing direct ring, with no mediad. The shell shows it until the other person
+    /// answers or a minute passes. A call that is already up is left as it is.
+    pub fn place(&self, hub: &Arc<Hub>, conversation: Key) -> Result<u64, CallError> {
+        let muted = hub.settings().on(JOIN_MUTED);
+        let id;
+        {
+            let mut slot = crate::hub::lock(&self.slot);
+            if slot.running().is_some() {
+                return Err(CallError::Active);
+            }
+            if let Slot::Shown(live) = &*slot {
+                if live.call.conversation == conversation
+                    && matches!(live.call.state, CallState::RingingOut)
+                {
+                    return Ok(self.placed.load(Ordering::Relaxed));
+                }
+            }
+            let mut live = new_call(conversation, CallState::RingingOut);
+            live.call.muted = muted;
+            id = live.intent;
+            *slot = Slot::Shown(Box::new(live));
+            self.placed.store(id, Ordering::Relaxed);
+        }
+        self.tell(hub);
+        let watcher = hub.clone();
+        if let Err(err) = std::thread::Builder::new()
+            .name("call-ring".into())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                while watcher.calls.watch_shown(&watcher, id) {
+                    sleep(WATCH);
+                }
+            })
+        {
+            tracing::warn!("chatd: the ring's clock did not start: {err}");
+        }
+        Ok(id)
+    }
+
+    pub fn call_intent(&self, conversation: &Key) -> Option<u64> {
+        let slot = crate::hub::lock(&self.slot);
+        let live = match &*slot {
+            Slot::Shown(live) => live,
+            Slot::Active(active) => {
+                let live = crate::hub::lock(&active.live);
+                return (live.call.conversation == *conversation && !matches!(live.call.state, CallState::Failed { .. })).then_some(live.intent);
+            }
+            Slot::Idle => return None,
+        };
+        (live.call.conversation == *conversation && !matches!(live.call.state, CallState::Failed { .. })).then_some(live.intent)
+    }
+
+    pub fn ring_attempt(&self) -> u64 { self.placed.load(Ordering::Relaxed) }
+
+    pub fn fail_ring_attempt(&self, hub: &Hub, conversation: &Key, attempt: u64, reason: CallFailure, detail: &str) {
+        self.update(hub, conversation, |live| {
+            if live.intent == attempt { live.enter(failed(reason, detail)); }
+        });
+        self.tell(hub);
+    }
+
+    /// A ring we placed, with no mediad, ran out of time. False once that ring is no longer the one shown.
+    fn watch_shown(&self, hub: &Hub, id: u64) -> bool {
+        if self.placed.load(Ordering::Relaxed) != id {
+            return false;
+        }
+        let conversation = {
+            let mut slot = crate::hub::lock(&self.slot);
+            let Slot::Shown(live) = &mut *slot else {
+                return false;
+            };
+            if !matches!(live.call.state, CallState::RingingOut) {
+                return false;
+            }
+            let Some(overdue) = live.overdue() else {
+                return true;
+            };
+            let conversation = live.call.conversation.clone();
+            live.enter(overdue);
+            conversation
+        };
+        self.tell(hub);
+        self.gave_up(&conversation);
+        false
+    }
+
+    /// A failure that has to be on screen even when no call was up yet. A running call is left alone.
+    pub fn show_failed(
+        &self,
+        hub: &Hub,
+        conversation: Key,
+        reason: CallFailure,
+        detail: impl Into<String>,
+    ) {
+        let state = failed(reason, detail);
+        if self.update(hub, &conversation, |live| live.enter(state.clone())) {
+            self.tell(hub);
+            return;
+        }
+        {
+            let mut slot = crate::hub::lock(&self.slot);
+            if slot.running().is_some() {
+                return;
+            }
+            *slot = Slot::Shown(Box::new(new_call(conversation, state)));
+        }
+        self.tell(hub);
+    }
+
+    /// The incoming ring to answer, promoting one that waited beside a call once that call is gone.
+    /// Does not start mediad.
+    pub fn incoming(&self, hub: &Hub) -> Option<Key> {
+        let promoted = {
+            let mut slot = crate::hub::lock(&self.slot);
+            if let Slot::Shown(live) = &*slot {
+                if matches!(live.call.state, CallState::RingingIn { .. }) {
+                    return Some(live.call.conversation.clone());
+                }
+            }
+            if !matches!(*slot, Slot::Idle) {
+                return None;
+            }
+            let ring = crate::hub::lock(&self.aside).take()?;
+            if !matches!(ring.state, CallState::RingingIn { .. }) {
+                return None;
+            }
+            let key = ring.conversation.clone();
+            let mut live = new_call(key.clone(), ring.state.clone());
+            live.call = ring;
+            *slot = Slot::Shown(Box::new(live));
+            key
+        };
+        self.tell(hub);
+        Some(promoted)
+    }
+
+    /// Declines only the ring that is waiting beside the call. The call that is up stays up.
+    pub fn decline_waiting(&self, hub: &Hub) -> Option<Key> {
+        let key = {
+            let mut aside = crate::hub::lock(&self.aside);
+            let ring = aside.as_ref()?;
+            if !matches!(ring.state, CallState::RingingIn { .. }) {
+                return None;
+            }
+            aside.take().map(|ring| ring.conversation)
+        }?;
+        self.tell(hub);
+        Some(key)
+    }
+
     /// Answers the ring. Gives the conversation, for the adapter to join on the network.
     pub fn accept(&self, hub: &Arc<Hub>) -> Result<Key, CallError> {
         let ringing = match &*crate::hub::lock(&self.slot) {
@@ -1081,8 +1280,24 @@ impl Calls {
 
     /// Our own mute and deafen, told to mediad. The adapter tells the network.
     pub fn set_audio(&self, hub: &Hub, muted: bool, deafened: bool) -> Result<Key, CallError> {
-        let (conversation, _) = self.describe();
-        let conversation = conversation.ok_or(CallError::NoCall)?.conversation;
+        let (call, running) = self.describe();
+        let call = call.ok_or(CallError::NoCall)?;
+        let conversation = call.conversation.clone();
+        // A direct ring has no mediad yet. The choice is kept and applied when one starts.
+        if !running {
+            if !matches!(
+                call.state,
+                CallState::RingingOut | CallState::RingingIn { .. }
+            ) {
+                return Err(CallError::NoCall);
+            }
+            self.update(hub, &conversation, |live| {
+                live.call.muted = muted;
+                live.call.deafened = deafened;
+            });
+            self.tell(hub);
+            return Ok(conversation);
+        }
         self.request(hub, &MediaRequest::Audio { muted, deafened })?;
         self.update(hub, &conversation, |live| {
             live.call.muted = muted;
@@ -1093,18 +1308,33 @@ impl Calls {
 
     // What the adapter reports.
 
-    /// Someone is calling. Ignored while a call is up: the adapter may notify, nothing rings.
-    ///
-    /// The system notification for a ring (design 07 §4) is to be posted from here and withdrawn
-    /// in `ring_stopped`. Not built: it needs chatd to run inside the signed bundle
-    /// (`packaging/bundle.sh`), which it now can.
+    /// Someone is calling. While a call is up, or we are already ringing out, the new ring waits
+    /// beside it. It does not replace the call, and it does not start mediad. A second one while
+    /// one is already waiting is dropped.
     pub fn ring(&self, hub: &Hub, conversation: Key, from: &str) {
+        let state = CallState::RingingIn {
+            from: from.to_owned(),
+        };
+        let hold = {
+            let slot = crate::hub::lock(&self.slot);
+            match &*slot {
+                Slot::Active(_) => true,
+                Slot::Shown(live) if matches!(live.call.state, CallState::RingingOut) => true,
+                _ => false,
+            }
+        };
+        if hold {
+            let mut aside = crate::hub::lock(&self.aside);
+            if aside.is_none() {
+                *aside = Some(new_call(conversation, state).call);
+            }
+            drop(aside);
+            self.tell(hub);
+            return;
+        }
         {
             let mut slot = crate::hub::lock(&self.slot);
-            if matches!(&*slot, Slot::Active(_)) {
-                return;
-            }
-            let state = CallState::RingingIn { from: from.to_owned() };
+            if matches!(&*slot, Slot::Shown(live) if live.call.conversation == conversation && matches!(live.call.state, CallState::RingingIn { .. })) { return; }
             *slot = Slot::Shown(Box::new(new_call(conversation, state)));
         }
         self.tell(hub);
@@ -1112,21 +1342,34 @@ impl Calls {
 
     /// The caller gave up, or it was answered on another device.
     pub fn ring_stopped(&self, hub: &Hub, conversation: &Key) {
+        let mut stopped = false;
+        {
+            let mut aside = crate::hub::lock(&self.aside);
+            if aside
+                .as_ref()
+                .is_some_and(|call| call.conversation == *conversation)
+            {
+                *aside = None;
+                stopped = true;
+            }
+        }
         {
             let mut slot = crate::hub::lock(&self.slot);
             let ringing = matches!(&*slot, Slot::Shown(live)
                 if live.call.conversation == *conversation && matches!(live.call.state, CallState::RingingIn { .. }));
-            if !ringing {
-                return;
+            if ringing {
+                *slot = Slot::Idle;
+                stopped = true;
             }
-            *slot = Slot::Idle;
         }
-        self.tell(hub);
+        if stopped {
+            self.tell(hub);
+        }
     }
 
     /// The network's own word on the call: ringing out, or refused before media began.
     pub fn set_state(&self, hub: &Hub, conversation: &Key, state: CallState) {
-        self.update(hub, conversation, |live| {
+        let changed = self.update(hub, conversation, |live| {
             // Word that we are ringing may arrive after the other side already answered.
             let answered = live.answered || (live.connected && !live.call.participants.is_empty());
             if state == CallState::RingingOut && answered {
@@ -1134,28 +1377,44 @@ impl Calls {
             }
             live.enter(state);
         });
+        if changed {
+            self.tell(hub);
+        }
     }
 
     /// The other side of a ring we placed picked up.
     pub fn answered(&self, hub: &Hub, conversation: &Key) {
-        self.update(hub, conversation, Live::answer);
+        if self.update(hub, conversation, Live::answer) {
+            self.tell(hub);
+        }
     }
 
     /// Everyone in the call but us, as the network lists them. Who is speaking is mediad's to say
     /// and is carried over.
-    pub fn set_participants(&self, hub: &Hub, conversation: &Key, mut participants: Vec<Participant>) {
+    pub fn set_participants(
+        &self,
+        hub: &Hub,
+        conversation: &Key,
+        mut participants: Vec<Participant>,
+    ) {
         let mut cue = None;
-        self.update(hub, conversation, |live| {
+        let known = self.update(hub, conversation, |live| {
             cue = arrival(&live.call, &participants, now());
             for participant in &mut participants {
                 participant.speaking = live.talking.contains(&participant.id);
             }
             live.call.participants = participants;
             // The first other person in a call we rang is the answer.
-            if live.call.state == CallState::RingingOut && live.connected && !live.call.participants.is_empty() {
+            if live.call.state == CallState::RingingOut
+                && live.connected
+                && !live.call.participants.is_empty()
+            {
                 live.join();
             }
         });
+        if known {
+            self.tell(hub);
+        }
         // mediad decides whether it is heard (S7, deafen).
         if let Some(cue) = cue {
             let _ = self.request(hub, &MediaRequest::Cue { cue });
@@ -1218,29 +1477,59 @@ impl Calls {
     /// the seat; any other call is in the way. What failed is said in words. A person who only
     /// joins end-to-end encrypted calls (`REQUIRE_CALL_E2EE`) has `required` set on the offer, and
     /// is refused here when the offer has no encryption.
-    pub fn tiny_offer(&self, hub: &Arc<Hub>, conversation: &Key, mut offer: TinyOffer) -> Result<String, String> {
+    pub fn tiny_offer(&self, hub: &Arc<Hub>, conversation: &Key, offer: TinyOffer) -> Result<String, String> {
+        self.tiny_offer_with(hub, conversation, offer, None)
+    }
+
+    /// A direct can promote only its current visible ring, never create a call after hangup.
+    pub fn tiny_direct_offer(&self, hub: &Arc<Hub>, conversation: &Key, offer: TinyOffer, intent: u64) -> Result<String, String> {
+        self.tiny_offer_with(hub, conversation, offer, Some(intent))
+    }
+
+    fn tiny_offer_with(&self, hub: &Arc<Hub>, conversation: &Key, mut offer: TinyOffer, intent: Option<u64>) -> Result<String, String> {
+        let direct = intent.is_some();
         let required = hub.settings().on(REQUIRE_CALL_E2EE);
         require_end_to_end(required, &mut offer)?;
         let (call, running) = self.describe();
         let here = call.as_ref().is_some_and(|call| call.conversation == *conversation) && running;
         if !here {
+            if direct && call.as_ref().is_none_or(|call| call.conversation != *conversation || matches!(call.state, CallState::Failed { .. })) {
+                return Err("That call is gone.".to_owned());
+            }
             match call {
                 Some(call) if running && call.conversation.account() != conversation.account() => return Err(IN_ANOTHER_CALL.to_owned()),
                 Some(call) if running => drop(self.end_if(hub, &call.conversation)),
                 _ => {}
             }
-            self.start(hub, conversation.clone()).map_err(|err| match err {
+            self.start_with_intent(hub, conversation.clone(), intent).map_err(|err| match err {
                 CallError::Active => IN_ANOTHER_CALL.to_owned(),
                 CallError::NoCall => ENGINE_STOPPED.to_owned(),
                 CallError::Media(err) => err.to_string(),
             })?;
         }
         self.update(hub, conversation, |live| {
+            if intent.is_some() && intent != Some(live.intent) { return; }
             offer.muted = live.call.muted;
             offer.deafened = live.call.deafened;
             live.me = offer.user_id.clone();
         });
-        match self.request(hub, &MediaRequest::TinyOffer(offer)) {
+        let request = MediaRequest::TinyOffer(offer);
+        let answer = if direct {
+            let result = {
+                let mut slot = crate::hub::lock(&self.slot);
+                match slot.running() {
+                    Some(active) if {
+                        let live = crate::hub::lock(&active.live);
+                        live.call.conversation == *conversation && Some(live.intent) == intent
+                    } =>
+                        active.request(&request).map_err(CallError::Media),
+                    _ => Err(CallError::NoCall),
+                }
+            };
+            self.tell(hub);
+            result
+        } else { self.request(hub, &request) };
+        match answer {
             Ok(MediaResponse::Offer { sdp }) => Ok(sdp),
             answer => {
                 let variant = match &answer {
@@ -1249,7 +1538,8 @@ impl Calls {
                 };
                 tracing::warn!(variant, "mediad frame was {variant}");
                 if !here {
-                    self.end_if(hub, conversation);
+                    if let Some(intent) = intent { self.end_intent(hub, conversation, intent); }
+                    else { self.end_if(hub, conversation); }
                 }
                 Err(match answer {
                     Err(CallError::Media(err)) if err.kind() == io::ErrorKind::Other => err.to_string(),
@@ -1317,6 +1607,24 @@ impl Calls {
             let _ = self.request(hub, &MediaRequest::Cue { cue: Cue::Moved });
         }
         moved
+    }
+
+    fn end_intent(&self, hub: &Hub, conversation: &Key, intent: u64) {
+        let ended = {
+            let mut slot = crate::hub::lock(&self.slot);
+            let matches = match &*slot {
+                Slot::Shown(live) => live.intent == intent && live.call.conversation == *conversation,
+                Slot::Active(active) => {
+                    let live = crate::hub::lock(&active.live);
+                    live.intent == intent && live.call.conversation == *conversation
+                }
+                Slot::Idle => false,
+            };
+            if !matches { return; }
+            std::mem::take(&mut *slot)
+        };
+        drop(ended);
+        self.tell(hub);
     }
 
     /// Ends the call if it is in `conversation`, in whatever state, without telling the
@@ -1410,6 +1718,30 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_direct_offer_cannot_promote_or_fail_a_replacement_ring() {
+        for incoming in [false, true] {
+            let hub = Arc::new(Hub::new(crate::store::Store::open(std::path::Path::new(":memory:")).unwrap()));
+            let key = Key { network: Network::Tiny, account: "me".into(), id: "direct".into() };
+            if incoming { hub.calls.ring(&hub, key.clone(), "Bea"); }
+            else { hub.calls.place(&hub, key.clone()).unwrap(); }
+            let old = hub.calls.call_intent(&key).unwrap();
+            hub.calls.end(&hub);
+            let next = hub.calls.place(&hub, key.clone()).unwrap();
+            assert_ne!(old, next);
+            let offer = TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots: 1,
+                muted: false, deafened: false, e2ee: None };
+            assert!(hub.calls.tiny_direct_offer(&hub, &key, offer, old).is_err());
+            hub.calls.fail_ring_attempt(&hub, &key, old, CallFailure::Refused, "old refusal");
+            hub.calls.end_intent(&hub, &key, old);
+            assert_eq!(hub.calls.call_intent(&key), Some(next));
+            let (call, media) = hub.calls.describe();
+            assert_eq!(call.unwrap().state, CallState::RingingOut);
+            assert!(!media, "a stale offer never starts the engine for a new unaccepted ring");
+            hub.calls.end(&hub);
+        }
+    }
+
+    #[test]
     fn only_the_voice_connection_being_up_makes_a_call_joined() {
         let mut live = live(CallState::Connecting);
         assert!(!live.apply(MediaResponse::Source { user_id: "a".into(), ssrc: 7 }));
@@ -1482,7 +1814,6 @@ mod tests {
         assert!(live.call.speaking);
         assert!(live.call.participants.iter().all(|who| who.id != "me"));
     }
-
 
     fn tiny_offer(e2ee: Option<protocol::TinyE2ee>) -> TinyOffer {
         TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots: 11, muted: false, deafened: false, e2ee }
@@ -1622,5 +1953,59 @@ mod tests {
         live.enter(CallState::Reconnecting);
         ago(&mut live, Duration::from_secs(3600));
         assert_eq!(live.overdue(), None, "reconnecting has no clock");
+    }
+
+    #[test]
+    fn a_ring_beside_an_outgoing_one_waits_and_ending_does_not_promote_it() {
+        let hub = std::sync::Arc::new(crate::hub::Hub::new(
+            crate::store::Store::open(std::path::Path::new(":memory:")).expect("store"),
+        ));
+        let outgoing = Key {
+            network: Network::Discord,
+            account: "me".into(),
+            id: "room".into(),
+        };
+        let waiting = Key {
+            network: Network::Tiny,
+            account: "me".into(),
+            id: "dm".into(),
+        };
+        let later = Key {
+            network: Network::Tiny,
+            account: "me".into(),
+            id: "other".into(),
+        };
+        hub.calls.place(&hub, outgoing.clone()).expect("placed");
+        hub.calls.ring(&hub, waiting.clone(), "Bea");
+        hub.calls.ring(&hub, later, "Cara");
+        let (call, running) = hub.calls.describe();
+        assert!(!running);
+        let call = call.expect("the outgoing ring");
+        assert_eq!(call.conversation, outgoing);
+        assert!(matches!(call.state, CallState::RingingOut));
+        assert_eq!(
+            hub.calls
+                .aside()
+                .expect("the first waiting ring")
+                .conversation,
+            waiting
+        );
+        assert_eq!(hub.calls.end(&hub), Some(outgoing));
+        assert!(hub.calls.describe().0.is_none());
+        assert_eq!(
+            hub.calls
+                .aside()
+                .expect("ending does not take the waiting ring")
+                .conversation,
+            waiting
+        );
+        assert_eq!(hub.calls.incoming(&hub), Some(waiting));
+        let (call, running) = hub.calls.describe();
+        assert!(!running);
+        assert!(matches!(
+            call.expect("the promoted ring").state,
+            CallState::RingingIn { .. }
+        ));
+        assert!(hub.calls.aside().is_none());
     }
 }

@@ -1172,6 +1172,11 @@ pub enum Request {
     StartDirect {
         person: Key,
     },
+    /// Opens a Tiny direct for a call. Text enrollment is not required to ring; creating the
+    /// conversation keeps the server's text encryption policy and sending text stays guarded.
+    StartDirectCall {
+        person: Key,
+    },
     /// The thread a channel message starts. Discord only: its thread is a new channel, so this
     /// creates it and answers with that conversation. Slack and Teams name a thread from the
     /// message, and opening or sending there is enough.
@@ -1854,7 +1859,12 @@ pub enum Change {
     /// times a second. Its outcome is the message's own change.
     Upload { conversation: Key, client_id: String, sent: u64, total: u64 },
     /// Ephemeral. The call as it is now: who is speaking, mute, state. `None` when it is over.
-    Call { call: Option<Call> },
+    /// `ring` is a second incoming call waiting while this one is up. It has no mediad.
+    Call {
+        call: Option<Call>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ring: Option<Call>,
+    },
     /// Ephemeral. A sign-in the shell is drawing moved on by itself: the code was scanned, or
     /// ran out and was replaced.
     SignIn { network: Network, step: SignInStep },
@@ -1947,6 +1957,9 @@ pub enum Response {
         accounts: Vec<AccountStatus>,
         media: Media,
         call: Option<Call>,
+        /// A ring waiting beside `call`. Empty when nobody else is calling.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ring: Option<Call>,
         /// Where `Wait` starts from.
         seq: u64,
         /// What chatd is doing with the keychain: reading, waiting on macOS, refused.

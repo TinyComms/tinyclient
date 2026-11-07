@@ -2308,6 +2308,80 @@ impl Store {
         Ok(outcome)
     }
 
+    /// A transcript line that is not a message. The conversation must already exist. A row
+    /// with this id is left alone, so a replay does not count twice. `bump_unread` adds one
+    /// to the unread count and changes nothing else on the conversation: not the preview,
+    /// not when it was updated, not whether it is hidden.
+    pub fn insert_line(
+        &mut self,
+        conversation: &Key,
+        message: &Message,
+        bump_unread: bool,
+    ) -> rusqlite::Result<bool> {
+        let tx = self.db.transaction()?;
+        let (network, account, id) = (
+            word(&conversation.network),
+            &conversation.account,
+            &conversation.id,
+        );
+        let here: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM conversation WHERE network = ?1 AND account = ?2 AND id = ?3",
+                params![network, account, id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if here.is_none() {
+            return Ok(false);
+        }
+        let already: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
+                params![network, account, id, message.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if already.is_some() {
+            return Ok(false);
+        }
+        let mut stored = message.clone();
+        stored.bound();
+        stored.id.clear();
+        stored.text.clear();
+        let body = serde_json::to_string(&stored).map_err(broken)?;
+        let pending = match message.state {
+            SendState::Sent => 0,
+            SendState::Pending => 1,
+            SendState::Failed { .. } => 2,
+        };
+        tx.execute(
+            "INSERT OR REPLACE INTO message
+                 (network, account, conversation, id, sent, text, pending, client_id, expires, body, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                network,
+                account,
+                id,
+                message.id,
+                message.sent,
+                message.text,
+                pending,
+                message.client_id,
+                message.expires_at,
+                body,
+                message.seq,
+            ],
+        )?;
+        if bump_unread && !message.outgoing {
+            tx.execute(
+                "UPDATE conversation SET unread = unread + 1 WHERE network = ?1 AND account = ?2 AND id = ?3",
+                params![network, account, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// The newest stored message as a list line. Does not mark the conversation opened.
     pub fn newest_line(&self, conversation: &Key) -> rusqlite::Result<Option<PreviewLine>> {
         let message = self

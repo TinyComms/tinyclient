@@ -956,13 +956,18 @@ impl PeopleList {
                     .tooltip(tip("Message", None))
                     .on_click(cx.listener(move |this, _, _, cx| this.start(message.clone(), false, cx))),
             )
-            .when(can_call(person.key.network) && !person.bot, |actions| {
-                actions.child(
-                    stop(icon_button(("call", ix), "icons/phone.svg", false))
-                        .tooltip(tip("Call", None))
-                        .on_click(cx.listener(move |this, _, _, cx| this.start(call.clone(), true, cx))),
-                )
-            })
+            .when(
+                can_call(&self.scene, &person.key) && !person.bot,
+                |actions| {
+                    actions.child(
+                        stop(icon_button(("call", ix), "icons/phone.svg", false))
+                            .tooltip(tip("Call", None))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.start(call.clone(), true, cx)
+                            })),
+                    )
+                },
+            )
     }
 
     /// A request's buttons are always shown, not only under the pointer. Each sends one

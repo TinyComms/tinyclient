@@ -327,7 +327,22 @@ fn shown(snapshot: &Snapshot) -> Option<Call> {
     if let Some(call) = shot::call(snapshot) {
         return Some(call);
     }
-    snapshot.call.clone()
+    snapshot.call.clone().or_else(|| {
+        // A ring that waited beside a call is all that is left once that call ends.
+        snapshot
+            .ring
+            .clone()
+            .filter(|ring| matches!(ring.state, CallState::RingingIn { .. }))
+    })
+}
+
+/// The incoming call an answer/decline shortcut acts on, and whether leaving a call needs confirmation.
+fn incoming_action(snapshot: &Snapshot) -> Option<(&Call, bool)> {
+    if let Some(ring) = snapshot.ring.as_ref().filter(|ring| matches!(ring.state, CallState::RingingIn { .. })) {
+        return Some((ring, snapshot.call.is_some()));
+    }
+    snapshot.call.as_ref().filter(|call| matches!(call.state, CallState::RingingIn { .. }))
+        .map(|call| (call, false))
 }
 
 /// The names of who is in a conversation's call, for a tooltip: "Iris, Jun and 1 more".
@@ -469,7 +484,7 @@ impl Shell {
     /// Offered every change chatd reports, after `Shell` has applied its own part.
     pub(super) fn call_changed(&mut self, change: &Change, cx: &mut Context<Self>) {
         ensure_keys(cx);
-        let Change::Call { call } = change else {
+        let Change::Call { call, .. } = change else {
             return;
         };
         let last = call.as_ref().map(|call| (call.conversation.clone(), discriminant(&call.state)));
@@ -706,14 +721,24 @@ impl Shell {
     }
 
     /// Goes where the call is: its conversation, or for a Tiny room the server's page on it.
+    /// A direct message is not a room, so its title opens the conversation.
     pub(in crate::gui) fn call_go(&mut self, key: Key, title: &str, cx: &mut Context<Self>) {
-        if key.network != Network::Tiny {
-            self.select(key, title, cx);
+        let open_direct = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.open.as_ref())
+            .is_some_and(|row| row.key == key && row.kind.is_direct());
+        let listed_direct = self
+            .sidebar_state
+            .find(&self.trees, &key)
+            .is_some_and(|row| row.kind.is_direct());
+        if key.network == Network::Tiny && !open_direct && !listed_direct {
+            self.go(super::sidebar::Mode::Network(Network::Tiny), cx);
+            self.prefer_tiny(key.account(), cx);
+            self.tiny_pick_channel(Some(key.id), cx);
             return;
         }
-        self.go(super::sidebar::Mode::Network(Network::Tiny), cx);
-        self.prefer_tiny(key.account(), cx);
-        self.tiny_pick_channel(Some(key.id), cx);
+        self.select(key, title, cx);
     }
 
     /// A join was asked for here: a new room that follows is not a moderator's move.
@@ -841,15 +866,20 @@ impl Shell {
 
     /// ⌘⇧A.
     pub(super) fn call_accept(&mut self, cx: &mut Context<Self>) {
-        let ringing = self.call_now().filter(|call| matches!(call.state, CallState::RingingIn { .. }));
-        if let Some(conversation) = ringing.map(|call| call.conversation.clone()) {
+        let Some((ring, confirm)) = self.snapshot.as_ref().and_then(incoming_action) else { return };
+        let conversation = ring.conversation.clone();
+        if confirm {
+            let CallState::RingingIn { from } = &ring.state else { return };
+            self.call_state.confirm = Some(Confirm { conversation, title: from.clone(), answer: true });
+            cx.notify();
+        } else {
             self.call_begin(vec![Request::CallAccept], conversation, cx);
         }
     }
 
-    /// ⌘⇧R.
+    /// Decline the incoming call, including one waiting beside an active call.
     pub(super) fn call_decline(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.call_now().map(|call| &call.state), Some(CallState::RingingIn { .. })) {
+        if self.snapshot.as_ref().and_then(incoming_action).is_some() {
             self.call_ask(Request::CallDecline, cx);
         }
     }
@@ -1198,6 +1228,33 @@ mod tests {
             speaking: false,
         };
         Occupants { people: names.iter().map(person).collect(), total }
+    }
+
+    #[test]
+    fn waiting_call_shortcuts_target_the_ring_and_confirm_switching_calls() {
+        let call = |id: &str, state| {
+            let mut call: Call = serde_json::from_value(serde_json::json!({
+                "conversation": Key { network: Network::Tiny, account: "server".into(), id: id.into() },
+                "state": "joined", "participants": [], "muted": false, "deafened": false,
+                "joined": 1, "engine_linked": true, "video": []
+            })).unwrap();
+            call.state = state;
+            call
+        };
+        let incoming = || call("peer", CallState::RingingIn { from: "Bea".into() });
+        let target = |snapshot: &Snapshot| incoming_action(snapshot).map(|(ring, confirm)| (ring.conversation.id.clone(), confirm));
+        let mut snapshot = Snapshot::waiting();
+        snapshot.call = Some(call("room", CallState::Joined));
+        assert_eq!(target(&snapshot), None);
+        snapshot.ring = Some(incoming());
+        assert_eq!(target(&snapshot), Some(("peer".to_owned(), true)), "waiting ring needs the same leave confirmation as its button");
+        snapshot.call = None;
+        assert_eq!(target(&snapshot), Some(("peer".to_owned(), false)), "no active call needs no leave confirmation");
+        snapshot.ring = None;
+        snapshot.call = Some(incoming());
+        assert_eq!(target(&snapshot), Some(("peer".to_owned(), false)));
+        snapshot.call = Some(call("peer", CallState::RingingOut));
+        assert_eq!(target(&snapshot), None);
     }
 
     #[test]

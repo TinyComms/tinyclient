@@ -2,14 +2,15 @@
 //! one `Wait` open; each change chatd reports names the one thing to read again. Every socket
 //! call runs off the main thread.
 
+use super::app::{self, service::Service};
 use super::layout::{self, Slots};
 use super::sidebar::{self, pages::PAGE, Mode};
 use super::{call, composer, conversation, people};
 use crate::client::ask;
 use gpui::{Context, FocusHandle, Subscription, Task, Window};
 use protocol::{
-    AccountKey, AccountStatus, Call, Change, Conversation, ErrorCode, Group, Key, Link,
-    MediaFile, Network, NetworkStatus, Occupants, Page, Relation, Request, Response, Space,
+    AccountKey, AccountStatus, Call, Change, Conversation, ErrorCode, Group, Key, Link, MediaFile,
+    Network, NetworkStatus, Occupants, Page, Relation, Request, Response, Space,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -17,7 +18,6 @@ use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use super::app::{self, service::Service};
 
 /// A tree page, as large as chatd gives.
 const TREE_PAGE: u32 = 500;
@@ -60,6 +60,9 @@ pub struct Snapshot {
     pub networks: Vec<NetworkStatus>,
     pub accounts: Vec<AccountStatus>,
     pub call: Option<Call>,
+    /// A ring waiting beside `call`. The dock shows it when the call slot is empty, and as a
+    /// strip while another call is up.
+    pub ring: Option<Call>,
     /// The open conversation's row, when one is open and still exists.
     pub open: Option<Conversation>,
 }
@@ -67,7 +70,13 @@ pub struct Snapshot {
 impl Snapshot {
     /// What stands in before chatd's first answer: nothing signed in that we know of yet.
     pub fn waiting() -> Snapshot {
-        Snapshot { networks: Vec::new(), accounts: Vec::new(), call: None, open: None }
+        Snapshot {
+            networks: Vec::new(),
+            accounts: Vec::new(),
+            call: None,
+            ring: None,
+            open: None,
+        }
     }
 
     pub fn link(&self, network: Network) -> Link {
@@ -350,6 +359,7 @@ impl Shell {
         networks: Vec<NetworkStatus>,
         accounts: Vec<AccountStatus>,
         call: Option<Call>,
+        ring: Option<Call>,
         cx: &mut Context<Self>,
     ) {
         let had = self.snapshot.is_some();
@@ -359,12 +369,24 @@ impl Shell {
             .flat_map(|snapshot| snapshot.accounts.iter().map(|account| account.key.clone()))
             .collect();
         let open = self.snapshot.take().and_then(|snapshot| snapshot.open);
-        let links_before: Vec<(AccountKey, Link)> =
-            self.snapshot.iter().flat_map(|s| s.accounts.iter().map(|a| (a.key.clone(), a.link))).collect();
+        let links_before: Vec<(AccountKey, Link)> = self
+            .snapshot
+            .iter()
+            .flat_map(|s| s.accounts.iter().map(|a| (a.key.clone(), a.link)))
+            .collect();
         // By account: a network counts as connected while one of its workspaces is down.
-        self.trouble.retain(|key, _| accounts.iter().any(|account| &account.key == key && account.link == Link::Offline));
-        for account in accounts.iter().filter(|account| account.link == Link::Offline) {
-            if let std::collections::hash_map::Entry::Vacant(first) = self.trouble.entry(account.key.clone()) {
+        self.trouble.retain(|key, _| {
+            accounts
+                .iter()
+                .any(|account| &account.key == key && account.link == Link::Offline)
+        });
+        for account in accounts
+            .iter()
+            .filter(|account| account.link == Link::Offline)
+        {
+            if let std::collections::hash_map::Entry::Vacant(first) =
+                self.trouble.entry(account.key.clone())
+            {
                 first.insert(Instant::now());
                 // One wake at the threshold; nothing counts down before it.
                 cx.spawn(async move |this, cx| {
@@ -374,15 +396,28 @@ impl Shell {
                 .detach();
             }
         }
-        let links_changed = links_before != accounts.iter().map(|a| (a.key.clone(), a.link)).collect::<Vec<_>>();
+        let links_changed = links_before
+            != accounts
+                .iter()
+                .map(|a| (a.key.clone(), a.link))
+                .collect::<Vec<_>>();
         let arrived = had.then(|| {
             accounts
                 .iter()
-                .filter(|account| account.key.network == Network::Tiny && !known.iter().any(|key| key == &account.key))
+                .filter(|account| {
+                    account.key.network == Network::Tiny
+                        && !known.iter().any(|key| key == &account.key)
+                })
                 .map(|account| account.key.clone())
                 .last()
         });
-        self.snapshot = Some(Snapshot { networks, accounts, call, open });
+        self.snapshot = Some(Snapshot {
+            networks,
+            accounts,
+            call,
+            ring,
+            open,
+        });
         if let Some(Some(account)) = arrived {
             self.prefer_tiny(account, cx);
         }
@@ -391,14 +426,22 @@ impl Shell {
         }
         // A network that signed out takes its place in the sidebar with it.
         if let Some(network) = self.sidebar_state.mode.network() {
-            if self.snapshot.as_ref().is_some_and(|s| s.link(network) == Link::SignedOut) {
+            if self
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.link(network) == Link::SignedOut)
+            {
                 self.sidebar_state.navigation_changed();
                 self.sidebar_state.mode = Mode::Inbox;
             }
         }
         // A signed-out account keeps its cache on disk and shows none of it.
         self.drop_signed_out(cx);
-        let accounts = self.snapshot.as_ref().map(|snapshot| snapshot.accounts.clone()).unwrap_or_default();
+        let accounts = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.accounts.clone())
+            .unwrap_or_default();
         self.attention_changed(&accounts, cx);
         cx.notify();
     }
@@ -451,11 +494,22 @@ impl Shell {
     }
 
     pub(super) fn load_status(&mut self, cx: &mut Context<Self>) {
-        self.off_thread(cx, || ask(&Request::Status), |this, answer, cx| {
-            if let Ok(Response::Status { networks, accounts, call, .. }) = answer {
-                this.apply_status(networks, accounts, call, cx);
-            }
-        });
+        self.off_thread(
+            cx,
+            || ask(&Request::Status),
+            |this, answer, cx| {
+                if let Ok(Response::Status {
+                    networks,
+                    accounts,
+                    call,
+                    ring,
+                    ..
+                }) = answer
+                {
+                    this.apply_status(networks, accounts, call, ring, cx);
+                }
+            },
+        );
     }
 
     /// Reads again everything that is on screen: at start, and when chatd no longer knows what
@@ -486,14 +540,18 @@ impl Shell {
             }
             match change {
                 Change::Media { account, file } => self.media_landed(account, file, cx),
-                Change::Call { call } => {
+                Change::Call { call, ring } => {
                     if let Some(snapshot) = &mut self.snapshot {
                         snapshot.call = call.clone();
+                        snapshot.ring = ring.clone();
                         cx.notify();
                     }
                     self.feed_follow(call.as_ref(), cx);
                 }
-                Change::Occupants { conversation, occupants } => self.occupants_changed(conversation, occupants, cx),
+                Change::Occupants {
+                    conversation,
+                    occupants,
+                } => self.occupants_changed(conversation, occupants, cx),
                 Change::Playback { playback } => self.playback_changed(playback.clone(), cx),
                 Change::Settings => self.load_settings(cx),
                 Change::Open { conversation } => self.open_from_notification(conversation, cx),
@@ -993,9 +1051,15 @@ mod tests {
         let account = key("").account();
         let mut dirty = Dirty::default();
         for change in [
-            Change::Conversation { conversation: key("a") },
-            Change::Conversation { conversation: key("a") },
-            Change::Tree { space: key("server") },
+            Change::Conversation {
+                conversation: key("a"),
+            },
+            Change::Conversation {
+                conversation: key("a"),
+            },
+            Change::Tree {
+                space: key("server"),
+            },
         ] {
             dirty.note(&change);
         }
@@ -1010,29 +1074,60 @@ mod tests {
         };
         assert_eq!(dirty, expected);
 
-        assert_eq!(sign_in_words(Network::Slack, ErrorCode::SignIn, "The sign-in window was closed."), None);
+        assert_eq!(
+            sign_in_words(
+                Network::Slack,
+                ErrorCode::SignIn,
+                "The sign-in window was closed."
+            ),
+            None
+        );
         assert_eq!(
             sign_in_words(Network::Discord, ErrorCode::SignInUnreachable, "x").as_deref(),
             Some("Couldn't reach Discord. Check your connection and try again.")
         );
         assert_eq!(
-            sign_in_words(Network::Slack, ErrorCode::SignIn, "The sign-in window stopped before it finished.").as_deref(),
+            sign_in_words(
+                Network::Slack,
+                ErrorCode::SignIn,
+                "The sign-in window stopped before it finished."
+            )
+            .as_deref(),
             Some("The sign-in window closed unexpectedly. Try again.")
         );
-        assert!(sign_in_words(Network::Slack, ErrorCode::SignInBlocked, "x").unwrap().starts_with("Your organization doesn't allow this app."));
+        assert!(sign_in_words(Network::Slack, ErrorCode::SignInBlocked, "x")
+            .unwrap()
+            .starts_with("Your organization doesn't allow this app."));
 
         let mut links = Dirty::default();
         links.note(&Change::Status);
-        assert_eq!(links, Dirty { status: true, ..Dirty::default() });
+        assert_eq!(
+            links,
+            Dirty {
+                status: true,
+                ..Dirty::default()
+            }
+        );
         let mut spaces = Dirty::default();
-        spaces.note(&Change::Spaces { account: account.clone() });
-        assert_eq!(spaces, Dirty { spaces: true, ..Dirty::default() });
+        spaces.note(&Change::Spaces {
+            account: account.clone(),
+        });
+        assert_eq!(
+            spaces,
+            Dirty {
+                spaces: true,
+                ..Dirty::default()
+            }
+        );
 
         // Typing, presence, the call, another view's messages and people, a file landing: no
         // list is read again for any of them.
         let mut quiet = Dirty::default();
         for change in [
-            Change::Typing { conversation: key("a"), typists: Vec::new() },
+            Change::Typing {
+                conversation: key("a"),
+                typists: Vec::new(),
+            },
             Change::Presence {
                 person: key("p"),
                 presence: Presence::Idle,
@@ -1040,10 +1135,20 @@ mod tests {
                 emoji: String::new(),
                 activity: None,
             },
-            Change::Call { call: None },
-            Change::Messages { conversation: key("a") },
-            Change::People { account: account.clone() },
-            Change::Media { account, file: MediaFile::new("f", MediaKind::Image) },
+            Change::Call {
+                call: None,
+                ring: None,
+            },
+            Change::Messages {
+                conversation: key("a"),
+            },
+            Change::People {
+                account: account.clone(),
+            },
+            Change::Media {
+                account,
+                file: MediaFile::new("f", MediaKind::Image),
+            },
         ] {
             dirty.note(&change);
             quiet.note(&change);

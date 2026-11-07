@@ -715,6 +715,7 @@ impl Discord {
             file_scan: false,
             allow_archives: false,
             voice_notes: false,
+            direct_calls: false,
         });
         self.state.lock().unwrap().premium = premium;
     }

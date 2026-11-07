@@ -285,6 +285,9 @@ impl EmojiScope {
 /// the adapter reports it (`Context::capabilities`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
+    /// This Tiny account can ring a member before a direct conversation exists.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub direct_calls: bool,
     /// Largest file, in bytes. 0: files cannot be sent.
     #[serde(default, skip_serializing_if = "crate::is_zero64")]
     pub max_file_bytes: u64,
