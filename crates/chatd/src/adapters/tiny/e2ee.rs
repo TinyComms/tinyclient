@@ -285,6 +285,37 @@ mod windows_acl {
         if status != 0 || descriptor.is_null() {
             return Err(std::io::Error::from_raw_os_error(status as i32));
         }
+        let result = descriptor_dacl_sddl(descriptor);
+        // SAFETY: matching LocalFree for GetNamedSecurityInfoW allocation.
+        unsafe { LocalFree(descriptor as HLOCAL) };
+        result
+    }
+
+    /// Windows may serialize a numeric SID as an SDDL alias (for example, `LA`).
+    #[cfg(test)]
+    pub(crate) fn canonical_dacl_sddl(sddl: &str) -> std::io::Result<String> {
+        let sddl = wide(std::ffi::OsStr::new(sddl));
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: input is NUL-terminated; the allocated descriptor is freed below.
+        let made = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        };
+        if made == FALSE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let result = descriptor_dacl_sddl(descriptor);
+        // SAFETY: matching LocalFree for ConvertStringSecurityDescriptorToSecurityDescriptorW.
+        unsafe { LocalFree(descriptor as HLOCAL) };
+        result
+    }
+
+    #[cfg(test)]
+    fn descriptor_dacl_sddl(descriptor: PSECURITY_DESCRIPTOR) -> std::io::Result<String> {
         let mut sddl_ptr: *mut u16 = std::ptr::null_mut();
         let mut sddl_chars = 0u32;
         // SAFETY: descriptor from GetNamedSecurityInfoW; string freed by LocalFree.
@@ -298,8 +329,6 @@ mod windows_acl {
             )
         };
         let convert_err = std::io::Error::last_os_error();
-        // SAFETY: matching LocalFree for GetNamedSecurityInfoW allocation.
-        unsafe { LocalFree(descriptor as HLOCAL) };
         if ok == FALSE || sddl_ptr.is_null() {
             return Err(convert_err);
         }
@@ -2386,6 +2415,20 @@ mod tests {
         assert_ne!(print, fingerprint(&[5u8; 65]));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn dacl_comparison_accepts_sid_aliases_without_accepting_other_trustees() {
+        let canonical = windows_acl::canonical_dacl_sddl;
+        let numeric = canonical("D:P(A;OICI;FA;;;S-1-5-18)").unwrap();
+        assert_eq!(numeric, canonical("D:P(A;OICI;FA;;;SY)").unwrap());
+        assert!(!numeric.contains("S-1-5-18"), "Windows emits the SY alias");
+        assert_ne!(numeric, canonical("D:P(A;OICI;FA;;;OW)").unwrap());
+        assert_ne!(
+            numeric,
+            canonical("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BU)").unwrap()
+        );
+    }
+
     #[test]
     fn the_folder_is_the_owners_alone() {
         let dir = std::env::temp_dir().join(format!("chatd-e2ee-private-{}", std::process::id()));
@@ -2402,9 +2445,13 @@ mod tests {
         {
             let sid = windows_acl::process_user_sid_string().unwrap();
             let dacl = windows_acl::dacl_sddl(&dir).unwrap();
-            assert!(
-                dacl.contains(&format!(";;;{sid})")),
-                "protected DACL must name the process user, not only the directory owner: {dacl}"
+            let expected = windows_acl::canonical_dacl_sddl(&format!(
+                "D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)"
+            ))
+            .unwrap();
+            assert_eq!(
+                dacl, expected,
+                "protected DACL must grant only the process user and SYSTEM full control"
             );
             assert!(
                 dacl.contains(";;;SY)"),
@@ -2430,7 +2477,7 @@ mod tests {
             write_private(&dir.join("marker"), b"keep").unwrap();
             assert_eq!(std::fs::read(dir.join("marker")).unwrap(), b"keep");
             let again = windows_acl::dacl_sddl(&dir).unwrap();
-            assert!(again.contains(&format!(";;;{sid})")) && again.contains(";;;SY)"));
+            assert_eq!(again, expected);
         }
         #[cfg(not(windows))]
         {
@@ -2468,10 +2515,10 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("cache-c1.log")).unwrap(), cache);
         let sid = windows_acl::process_user_sid_string().unwrap();
         let dacl = windows_acl::dacl_sddl(&dir).unwrap();
-        assert!(
-            dacl.contains(&format!(";;;{sid})")),
-            "DACL missing process user: {dacl}"
-        );
+        let expected =
+            windows_acl::canonical_dacl_sddl(&format!("D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)"))
+                .unwrap();
+        assert_eq!(dacl, expected);
         assert!(dacl.contains(";;;SY)"), "DACL missing SYSTEM: {dacl}");
         assert!(!dacl.contains(";;;OW)"), "DACL must not use OW: {dacl}");
         for broad in [";;;WD)", ";;;BU)", ";;;BA)"] {
@@ -2492,7 +2539,7 @@ mod tests {
             Some(&b"after-two"[..])
         );
         let again = windows_acl::dacl_sddl(&dir).unwrap();
-        assert!(again.contains(&format!(";;;{sid})")) && again.contains(";;;SY)"));
+        assert_eq!(again, expected);
     }
 
     #[test]
