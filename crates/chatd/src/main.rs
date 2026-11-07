@@ -7,6 +7,14 @@ fn main() -> io::Result<()> {
         println!("chatd {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("tiny-reauth-history") {
+        if let Err(err) = chatd::adapters::tiny::prove_reauthenticated_history() {
+            eprintln!("tiny-reauth-history: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-tiny-reauth-history:0");
+        return Ok(());
+    }
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("tiny-direct-created") {
         if let Err(err) = chatd::adapters::tiny::prove_tiny_direct_created() {
             eprintln!("tiny-direct-created: {err}");

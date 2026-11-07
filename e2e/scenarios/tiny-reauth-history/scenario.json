@@ -1,0 +1,16 @@
+{
+  "id": "tiny-reauth-history",
+  "title": "Signing in again preserves this install's encrypted history",
+  "platforms": [
+    "windows",
+    "linux",
+    "macos"
+  ],
+  "not_applicable": {
+    "android": "This driver runs desktop chatd session merge and encrypted-file reopen; no native mobile runtime proof is claimed.",
+    "ios": "This driver runs desktop chatd session merge and encrypted-file reopen; no native mobile runtime proof is claimed."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
