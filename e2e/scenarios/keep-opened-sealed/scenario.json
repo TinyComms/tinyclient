@@ -1,6 +1,6 @@
 {
   "id": "keep-opened-sealed",
-  "title": "An opened sealed row is kept when a later fetch cannot open it",
+  "title": "Opened sealed text and captionless attachments survive a later decrypt failure",
   "platforms": ["windows", "linux", "macos"],
   "not_applicable": {
     "android": "The phone proof build does not run desktop chatd against a localhost history fetch. The same store keep is what this desktop run checks.",
