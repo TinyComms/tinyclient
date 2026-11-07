@@ -164,6 +164,10 @@ fn titles(rows: &[protocol::Conversation]) -> Vec<&str> {
 const ROBIN: &str = "210000000000000000";
 const TELEGRAM: &str = "7000000";
 const TEAMS: &str = "harbor-tenant";
+const HARBOR: &str = "T04HARBOR1";
+const FERNHILL: &str = "T07FERNHL2";
+const SLACK_ME_HARBOR: &str = "U04ROBIN01";
+const SLACK_ME_FERNHILL: &str = "U07ROBIN02";
 
 #[test]
 fn the_socket_answers_while_a_keychain_read_waits_and_the_cached_account_stays_on_screen() {
@@ -576,6 +580,117 @@ fn a_staged_paste_leaves_outbox_once_it_is_sent_or_discarded_and_a_picked_file_s
     assert!(chatd.message(&telegram, "1700000000000202").is_none());
     assert!(!pasted.exists(), "the discarded paste left outbox/");
     assert!(picked.exists(), "the user's own file stays");
+}
+
+#[test]
+fn a_pending_send_shows_my_cached_identity_before_the_network_acks() {
+    // Hold the file path long enough that Sent is observed while the upload is still pending.
+    let chatd = Daemon::demo(&[("TINYCLIENT_DEMO_UPLOAD_MS", "2500")]);
+    let harbor = at(Network::Slack, HARBOR, "C04CHANNEL03");
+    let fernhill = at(Network::Slack, FERNHILL, "C07CHANNEL00");
+    let discord = at(Network::Discord, ROBIN, "400000000000000007");
+    let telegram = at(Network::Telegram, TELEGRAM, "u7000001");
+
+    let Response::Sent { message } = chatd.ask(Request::Send {
+        conversation: harbor.clone(),
+        client_id: "1700000000000301".into(),
+        text: "standup note".into(),
+        reply_to: None,
+        with: Default::default(),
+    }) else {
+        panic!("harbor text not sent");
+    };
+    assert_eq!(message.state, SendState::Pending);
+    assert_eq!(message.sender.id, SLACK_ME_HARBOR);
+    assert_eq!(message.sender.name, "Robin Vale");
+    assert_ne!(message.sender.name, "Harbor Labs");
+    assert!(message.sender.avatar.is_some(), "harbor pending has my avatar: {message:?}");
+    assert!(message.sender.avatar.as_ref().and_then(|file| file.path.as_deref()).is_some_and(|path| std::path::Path::new(path).is_file()), "pending avatar is already on disk before ack: {message:?}");
+    assert_eq!(message.shown_sender(), "Robin Vale");
+
+    let photo = chatd.pick("identity.png", 32 * 1024);
+    let with = Outgoing {
+        files: vec![OutgoingFile {
+            path: photo.to_string_lossy().into_owned(),
+            name: String::new(),
+            spoiler: false,
+            as_file: false,
+            original: false,
+        }],
+        ..Outgoing::default()
+    };
+    let Response::Sent { message } = chatd.ask(Request::Send {
+        conversation: harbor.clone(),
+        client_id: "1700000000000302".into(),
+        text: "with file".into(),
+        reply_to: None,
+        with,
+    }) else {
+        panic!("harbor file not sent");
+    };
+    assert_eq!(message.state, SendState::Pending);
+    assert_eq!((message.sender.id.as_str(), message.sender.name.as_str()), (SLACK_ME_HARBOR, "Robin Vale"));
+    assert!(message.sender.avatar.is_some());
+    // Still pending: acknowledgement has not replaced the row yet.
+    assert_eq!(
+        chatd.message(&harbor, "1700000000000302").map(|message| message.state),
+        Some(SendState::Pending)
+    );
+
+    let Response::Sent { message } = chatd.ask(Request::Send {
+        conversation: fernhill.clone(),
+        client_id: "1700000000000303".into(),
+        text: "other workspace".into(),
+        reply_to: None,
+        with: Default::default(),
+    }) else {
+        panic!("fernhill not sent");
+    };
+    assert_eq!(message.sender.id, SLACK_ME_FERNHILL);
+    assert_eq!(message.sender.name, "Robin Vale");
+    assert_ne!(message.sender.name, "Fernhill Collective");
+    assert!(message.sender.avatar.is_some());
+    assert_ne!(
+        message.sender.avatar.as_ref().map(|file| file.id.as_str()),
+        chatd.message(&harbor, "1700000000000301").and_then(|message| message.sender.avatar).as_ref().map(|file| file.id.as_str())
+    );
+
+    for (conversation, client_id) in [
+        (discord, "1700000000000304"),
+        (telegram.clone(), "1700000000000305"),
+    ] {
+        let Response::Sent { message } = chatd.ask(Request::Send {
+            conversation: conversation.clone(),
+            client_id: client_id.into(),
+            text: "across".into(),
+            reply_to: None,
+            with: Default::default(),
+        }) else {
+            panic!("{client_id} not sent");
+        };
+        assert_eq!(message.state, SendState::Pending);
+        assert!(!message.sender.id.is_empty(), "{client_id}: {message:?}");
+        assert_eq!(message.sender.name, "Robin Vale");
+        assert_ne!(message.sender.name, "You");
+    }
+
+    let quoted = chatd.message(&telegram, "1700000000000305").expect("telegram pending");
+    let Response::Sent { message } = chatd.ask(Request::Send {
+        conversation: telegram.clone(),
+        client_id: "1700000000000306".into(),
+        text: "replying".into(),
+        reply_to: Some(quoted.id),
+        with: Default::default(),
+    }) else {
+        panic!("reply not sent");
+    };
+    assert_eq!((message.sender.id.is_empty(), message.sender.name.as_str()), (false, "Robin Vale"));
+
+    let settled = chatd.until("harbor text to settle with the same author", || {
+        chatd.message(&harbor, "1700000000000301").filter(|message| message.state == SendState::Sent)
+    });
+    assert_eq!(settled.sender.id, SLACK_ME_HARBOR);
+    assert_eq!(settled.sender.name, "Robin Vale");
 }
 
 #[cfg(target_os = "linux")]

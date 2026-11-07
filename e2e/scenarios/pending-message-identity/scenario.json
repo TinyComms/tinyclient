@@ -1,0 +1,12 @@
+{
+  "id": "pending-message-identity",
+  "title": "A pending send shows the cached self sender before the network acknowledges",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "This driver runs desktop chatd against a local cache; no native mobile GUI proof is claimed.",
+    "ios": "This driver runs desktop chatd against a local cache; no native mobile GUI proof is claimed."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

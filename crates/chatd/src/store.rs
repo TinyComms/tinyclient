@@ -2421,6 +2421,48 @@ impl Store {
         }))
     }
 
+    /// The newest settled message of ours in this conversation that already names us: a guild
+    /// nick, display name and avatar as that chat last showed. Does not mark it opened.
+    pub fn recent_own_sender(&self, conversation: &Key, me: &str) -> rusqlite::Result<Option<protocol::Sender>> {
+        if me.is_empty() {
+            return Ok(None);
+        }
+        let mut query = self.db.prepare(&format!(
+            "SELECT id, text, body FROM message
+              WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND pending = 0
+                AND (expires IS NULL OR expires > ?4)
+              {NEWEST_FIRST} LIMIT 40"
+        ))?;
+        let rows = query.query_map(
+            params![word(&conversation.network), conversation.account, conversation.id, crate::hub::now()],
+            message_from,
+        )?;
+        for row in rows {
+            let message = row?;
+            if message.outgoing
+                && message.sender.id == me
+                && !message.sender.name.is_empty()
+                && message.sender.name != "You"
+            {
+                let mut sender = message.sender;
+                if let Some(avatar) = sender.avatar.as_mut() {
+                    if let Some((known, _)) = self.media(&conversation.account(), &[avatar.id.clone()])?.into_iter().next() {
+                        // Like messages(), hydrate from this account's current media row:
+                        // the serialized sender predates a completed avatar download.
+                        if let Some(path) = known.path {
+                            avatar.path = Some(path);
+                            avatar.bytes = known.bytes;
+                        } else {
+                            avatar.failed = known.failed;
+                        }
+                    }
+                }
+                return Ok(Some(sender));
+            }
+        }
+        Ok(None)
+    }
+
     /// One message, while its own timer still runs; one that ran out is gone, as if it were
     /// never stored.
     pub fn message(&self, conversation: &Key, id: &str) -> rusqlite::Result<Option<Message>> {

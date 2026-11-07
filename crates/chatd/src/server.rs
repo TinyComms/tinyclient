@@ -9,7 +9,7 @@ use protocol::{
     clip, read_frame_bytes, support_dir, write_frame, CatalogKind, ConversationInfo, MediaFile, MediaKind, Outgoing, SharedKind, SpaceInfo, AccountKey, AccountStatus, CallSupport, Capabilities,
     Change, ChatListener, ChatStream, Conversation, ConversationKind, ErrorCode, InboxCounts, Key,
     Link, Media, MediaRequest, Message, MessageKind, Network, NetworkStatus, Page, Person, Presence,
-    Profile, Reaction, RelateAction, Relation, Request, Response, SendState, Watching,
+    Profile, Reaction, RelateAction, Relation, Request, Response, SendState, Sender, Watching,
     MUTUAL_SPACES, PAGE_LIMIT, SEARCH_MIN_CHARS, WATCH_LIMIT,
 };
 use std::collections::HashMap;
@@ -1193,7 +1193,11 @@ impl Chat {
     }
 
     fn new_message(&self, conversation: &Key, client_id: String, text: String, reply_to: Option<&str>, with: &Outgoing) -> Message {
-        let mut message = Message::plain(&client_id, "You", text, now(), true);
+        let store = self.hub.store();
+        // Fill who we are from local cache now: the pending row must not wait for the network
+        // echo to learn our id, name or avatar. "You" stays only when nothing is cached.
+        let mut message = Message::plain(&client_id, "", text, now(), true);
+        message.sender = pending_self_sender(&store, conversation);
         // The files are listed at once, from where they are, so the pending row shows them.
         message.attachments = with
             .files
@@ -1212,7 +1216,6 @@ impl Chat {
             })
             .collect();
         message.client_id = Some(client_id);
-        let store = self.hub.store();
         let quoted = reply_to.and_then(|id| store.message(conversation, id).ok().flatten());
         message.reply_to = quoted.map(|quoted| protocol::ReplyTo {
             id: quoted.id,
@@ -3008,11 +3011,246 @@ pub fn prove_connect_keeps_offline() -> Result<(), String> {
     }
 }
 
+/// Who we are on this conversation's account for a pending outgoing row: a prior message of
+/// ours in this chat when one names us (per-chat nick/avatar), else the cached self person.
+/// Never the account or workspace label. "You" only while nothing of us is cached.
+fn pending_self_sender(store: &Store, conversation: &Key) -> Sender {
+    let account = conversation.account();
+    let row = match store.accounts() {
+        Ok(rows) => rows.into_iter().find(|row| row.key == account),
+        Err(_) => None,
+    };
+    let Some(row) = row.filter(|row| !row.me.is_empty()) else {
+        return Sender { name: "You".into(), ..Sender::default() };
+    };
+    let me = row.me.clone();
+    let contextual = store.recent_own_sender(conversation, &me).ok().flatten();
+    let person = store.person(&Key::new(&account, &me)).ok().flatten();
+    let name = contextual
+        .as_ref()
+        .map(|sender| sender.name.as_str())
+        .filter(|name| !name.is_empty() && *name != "You")
+        .or_else(|| person.as_ref().map(|person| person.name.as_str()).filter(|name| !name.is_empty()))
+        .unwrap_or("You")
+        .to_owned();
+    let avatar = contextual
+        .and_then(|sender| sender.avatar)
+        .or_else(|| person.and_then(|person| person.avatar))
+        .or(row.avatar);
+    Sender { id: me, name, avatar, bot: false }
+}
+
+/// Seeds one account's self person with a picture already on the media row.
+fn seed_self(
+    store: &mut Store,
+    account: &AccountKey,
+    label: &str,
+    me: &str,
+    name: &str,
+    avatar_id: &str,
+) -> Result<(), String> {
+    store.set_account(account, label, me).map_err(|err| err.to_string())?;
+    let avatar = MediaFile::new(avatar_id, MediaKind::Avatar);
+    store
+        .register_media(account, &[(avatar.clone(), format!("https://cdn.example/{avatar_id}.png"))])
+        .map_err(|err| err.to_string())?;
+    store
+        .upsert_people(
+            account,
+            &[crate::store::PersonRow {
+                id: me.to_owned(),
+                name: name.to_owned(),
+                handle: String::new(),
+                avatar: Some(avatar_id.to_owned()),
+                bot: false,
+                status: String::new(),
+                link: String::new(),
+            }],
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+/// The lab's pending-message-identity driver. A pending Send names the cached self sender for
+/// that conversation's account before any network acknowledgement, keeps accounts isolated, and
+/// falls back safely when nothing of us is cached.
+pub fn prove_pending_message_identity() -> Result<(), String> {
+    let mut store = Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?;
+    let first = AccountKey { network: Network::Discord, account: "acct-a".into() };
+    let second = AccountKey { network: Network::Discord, account: "acct-b".into() };
+    let same_id = AccountKey { network: Network::Slack, account: "TWORKSPACE".into() };
+    let other_net = AccountKey { network: Network::Slack, account: "TOTHER".into() };
+    seed_self(&mut store, &first, "Moss Server", "user-1", "Ada Vale", "ava-ada")?;
+    seed_self(&mut store, &second, "Fern Server", "user-1", "Bea Vale", "ava-bea")?;
+    seed_self(&mut store, &same_id, "Harbor Labs", "U04ME", "Ada Harbor", "ava-harbor")?;
+    seed_self(&mut store, &other_net, "Fernhill", "U04ME", "Ada Fern", "ava-fern")?;
+    store
+        .upsert_conversation(&first, &crate::store::ConversationRow::new("c-a", ConversationKind::Channel, "general"))
+        .map_err(|err| err.to_string())?;
+    store
+        .upsert_conversation(&second, &crate::store::ConversationRow::new("c-b", ConversationKind::Channel, "general"))
+        .map_err(|err| err.to_string())?;
+    store
+        .upsert_conversation(&same_id, &crate::store::ConversationRow::new("C0GEN", ConversationKind::Channel, "general"))
+        .map_err(|err| err.to_string())?;
+    store
+        .upsert_conversation(&other_net, &crate::store::ConversationRow::new("C0GEN", ConversationKind::Channel, "general"))
+        .map_err(|err| err.to_string())?;
+
+    let nick_chat = Key::new(&first, "c-a");
+    let mut prior = Message::plain("prior-1", "Ada Nick", "earlier", 1_700_000_000, true);
+    prior.sender.id = "user-1".into();
+    prior.sender.avatar = Some(MediaFile::new("ava-nick", MediaKind::Avatar));
+    store.ingest(&nick_chat, &prior, false).map_err(|err| err.to_string())?;
+    store.register_media(&first, &[(MediaFile::new("ava-nick", MediaKind::Avatar), "https://cdn.example/nick.png".into())])
+        .map_err(|err| err.to_string())?;
+    let fixture_dir = support_dir().join("pending-message-identity");
+    std::fs::create_dir_all(&fixture_dir).map_err(|err| err.to_string())?;
+    let nick_path = fixture_dir.join("nick.png");
+    std::fs::write(&nick_path, vec![0u8; 321]).map_err(|err| err.to_string())?;
+    let nick_path = nick_path.to_string_lossy().into_owned();
+    store.media_landed(&first, "ava-nick", &nick_path, 321, now()).map_err(|err| err.to_string())?;
+
+    let from_nick = pending_self_sender(&store, &nick_chat);
+    if from_nick.id != "user-1" || from_nick.name != "Ada Nick" {
+        return Err(format!("context sender was {from_nick:?}, not Ada Nick"));
+    }
+    if from_nick.avatar.as_ref().map(|file| file.id.as_str()) != Some("ava-nick") {
+        return Err(format!("context avatar was {:?}, not ava-nick", from_nick.avatar));
+    }
+    if from_nick.avatar.as_ref().and_then(|file| file.path.as_deref()) != Some(nick_path.as_str()) {
+        return Err("context avatar lost its already-landed local path".into());
+    }
+
+    let from_person = pending_self_sender(&store, &Key::new(&second, "c-b"));
+    if from_person.id != "user-1" || from_person.name != "Bea Vale" || from_person.name.contains("Fern") {
+        return Err(format!("second account sender was {from_person:?}; used workspace label or first account"));
+    }
+    if from_person.avatar.as_ref().map(|file| file.id.as_str()) != Some("ava-bea") {
+        return Err(format!("second account avatar was {:?}, not ava-bea", from_person.avatar));
+    }
+
+    let harbor = pending_self_sender(&store, &Key::new(&same_id, "C0GEN"));
+    let fern = pending_self_sender(&store, &Key::new(&other_net, "C0GEN"));
+    if harbor.name != "Ada Harbor" || fern.name != "Ada Fern" || harbor.avatar == fern.avatar {
+        return Err(format!("same own id across accounts leaked: {harbor:?} / {fern:?}"));
+    }
+    if harbor.name == "Harbor Labs" || fern.name == "Fernhill" {
+        return Err(format!("workspace label used as author: {harbor:?} / {fern:?}"));
+    }
+
+    let unknown = AccountKey { network: Network::Teams, account: "lonely".into() };
+    store.set_account(&unknown, "Tenant Label", "").map_err(|err| err.to_string())?;
+    store
+        .upsert_conversation(&unknown, &crate::store::ConversationRow::new("chat", ConversationKind::Direct, "Notes"))
+        .map_err(|err| err.to_string())?;
+    let fallback = pending_self_sender(&store, &Key::new(&unknown, "chat"));
+    if fallback.id != "" || fallback.name != "You" || fallback.avatar.is_some() {
+        return Err(format!("unknown profile fallback was {fallback:?}, not You"));
+    }
+
+    // The shared Send constructor fills the same sender before any acknowledgement.
+    let chat = Chat::new(store);
+    let pending = chat.new_message(&nick_chat, "client-pending".into(), "on it".into(), None, &Outgoing::default());
+    if pending.client_id.as_deref() != Some("client-pending") {
+        return Err(format!("pending client_id was {:?}", pending.client_id));
+    }
+    if pending.sender != from_nick || pending.shown_sender() != "Ada Nick" {
+        return Err(format!(
+            "new_message sender was {:?} (shown {}), expected {from_nick:?}",
+            pending.sender,
+            pending.shown_sender()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::published_link;
     use crate::adapters::Command;
-    use protocol::{AccountKey, Link, Network};
+    use crate::store::{ConversationRow, PersonRow, Store};
+    use protocol::{AccountKey, ConversationKind, Key, Link, MediaFile, MediaKind, Message, Network, Outgoing};
+
+    #[test]
+    fn a_pending_message_names_the_cached_self_sender_before_any_ack() {
+        assert_eq!(super::prove_pending_message_identity(), Ok(()));
+    }
+
+    #[test]
+    fn a_pending_sender_prefers_this_chat_then_the_person_and_never_the_account_label() {
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let account = AccountKey { network: Network::Tiny, account: "night".into() };
+        store.set_account(&account, "Night Shift", "me-1").unwrap();
+        store
+            .register_media(&account, &[(MediaFile::new("face", MediaKind::Avatar), "https://cdn.example/face.png".into())])
+            .unwrap();
+        store
+            .upsert_people(
+                &account,
+                &[PersonRow {
+                    id: "me-1".into(),
+                    name: "Robin Vale".into(),
+                    handle: String::new(),
+                    avatar: Some("face".into()),
+                    bot: false,
+                    status: String::new(),
+                    link: String::new(),
+                }],
+            )
+            .unwrap();
+        store
+            .upsert_conversation(&account, &ConversationRow::new("room", ConversationKind::Channel, "ops"))
+            .unwrap();
+        let room = Key::new(&account, "room");
+        let person = super::pending_self_sender(&store, &room);
+        assert_eq!((person.id.as_str(), person.name.as_str()), ("me-1", "Robin Vale"));
+        assert_eq!(person.avatar.as_ref().map(|file| file.id.as_str()), Some("face"));
+
+        let mut prior = Message::plain("p1", "Ops Nick", "hi", 10, true);
+        prior.sender.id = "me-1".into();
+        store.ingest(&room, &prior, false).unwrap();
+        let nick = super::pending_self_sender(&store, &room);
+        assert_eq!(nick.name, "Ops Nick");
+
+        let chat = super::Chat::new(store);
+        let pending = chat.new_message(&room, "c1".into(), "going".into(), None, &Outgoing::default());
+        assert_eq!(pending.sender.name, "Ops Nick");
+        assert_eq!(pending.sender.id, "me-1");
+        assert_eq!(pending.shown_sender(), "Ops Nick");
+        assert_ne!(pending.sender.name, "Night Shift");
+    }
+
+    #[test]
+    fn a_pending_context_avatar_has_its_accounts_landed_path_before_ack() {
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let first = AccountKey { network: Network::Slack, account: "first".into() };
+        let second = AccountKey { network: Network::Slack, account: "second".into() };
+        let fixture_dir = protocol::support_dir().join("pending-avatar-paths");
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        for (account, file, bytes) in [(&first, "first.png", 123), (&second, "second.png", 456)] {
+            super::seed_self(&mut store, account, "Workspace", "me", "Robin", "avatar").unwrap();
+            store.upsert_conversation(account, &ConversationRow::new("chat", ConversationKind::Channel, "general")).unwrap();
+            let mut previous = Message::plain("previous", "Chat Nick", "earlier", 10, true);
+            previous.sender.id = "me".into();
+            previous.sender.avatar = Some(MediaFile::new("avatar", MediaKind::Avatar));
+            store.ingest(&Key::new(account, "chat"), &previous, false).unwrap();
+            // The image landed after the message body was stored with no local path.
+            let path = fixture_dir.join(file);
+            std::fs::write(&path, vec![0u8; bytes as usize]).unwrap();
+            store.media_landed(account, "avatar", &path.to_string_lossy(), bytes, crate::hub::now()).unwrap();
+        }
+        let chat = super::Chat::new(store);
+        for (account, file, bytes) in [(&first, "first.png", 123), (&second, "second.png", 456)] {
+            let pending = chat.new_message(&Key::new(account, "chat"), "pending".into(), "going".into(), None, &Outgoing::default());
+            assert_eq!(pending.sender.name, "Chat Nick");
+            let avatar = pending.sender.avatar.unwrap();
+            let path = fixture_dir.join(file).to_string_lossy().into_owned();
+            assert_eq!(avatar.path.as_deref(), Some(path.as_str()));
+            assert!(std::path::Path::new(&path).is_file());
+            assert_eq!(avatar.bytes, bytes);
+        }
+    }
 
     #[test]
     fn a_failed_connect_marks_cached_accounts_offline_so_chats_still_show() {
