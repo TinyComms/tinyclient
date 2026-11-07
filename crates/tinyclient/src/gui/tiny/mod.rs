@@ -89,7 +89,11 @@ pub(super) enum Modal {
     RenameRoom(String),
     NewCategory,
     Profile(String),
-    SignOut,
+    /// Signing out of the server: the encrypted history kept on this device (the default) or
+    /// erased.
+    SignOut {
+        erase: bool,
+    },
     /// Server Settings' confirmations.
     DeleteRole(String),
     KickMany(Vec<String>),
@@ -553,6 +557,15 @@ impl Shell {
             self.tiny_state.seen = false;
             self.tiny_state.forget_page();
         }
+    }
+
+    /// An attention banner belongs to one server. Reload it even if its home is cached:
+    /// the core's Look action reconnects a session replaced by another device.
+    pub(in crate::gui) fn tiny_reconnect(&mut self, account: AccountKey, cx: &mut Context<Self>) {
+        if account.network != Network::Tiny { return; }
+        self.go(Mode::Network(Network::Tiny), cx);
+        self.tiny_state.seen = true;
+        self.fetch(account, None, cx);
     }
 
     /// The name of the Tiny room `key` names, and its server's, for the call dock.
@@ -1121,6 +1134,8 @@ impl Shell {
                 if self.tiny_state.seen && self.tiny_state.community.is_some() {
                     self.fetch(account, None, cx);
                 }
+                // Device changes affect approval/revocation as well as link progress.
+                self.tiny_e2ee_changed(change, cx);
             }
             Change::Occupants { conversation, occupants } if conversation.account() == account => {
                 let Some(room) = self.tiny_state.community.as_mut().and_then(|community| community.rooms.iter_mut().find(|room| room.id == conversation.id)) else {
@@ -1244,12 +1259,12 @@ impl Shell {
         self.act(Request::TinyLayout { account, groups }, cx);
     }
 
-    pub(super) fn tiny_sign_out(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn tiny_sign_out(&mut self, erase: bool, cx: &mut Context<Self>) {
         let Some(account) = self.with_account() else {
             return;
         };
         self.tiny_state.modal = None;
-        self.sign_out(account, cx);
+        self.sign_out(account, erase, cx);
     }
 
     /// The name field's Return: whichever modal holds it.

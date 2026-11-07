@@ -4,6 +4,7 @@
     <!-- The product talks to a hub over the network; the demo build does not need it but the
          permission is harmless and avoids a manifest edit in the first real build. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
 
     <!-- Calls (src/mobile/android, java/dev/tinyclient/app): the microphone and camera are asked
          for at run time; the foreground service keeps a call going in the background, with the
@@ -79,6 +80,13 @@
             android:name="dev.tinyclient.app.CallService"
             android:exported="false"
             android:foregroundServiceType="microphone|camera|mediaProjection" />
+
+        <!-- Chromium binds back while the auth tab is foreground, keeping the in-process
+             loopback listener runnable. Empty Binder only; never a started service. -->
+        <service
+            android:name="dev.tinyclient.app.AuthKeepAliveService"
+            android:exported="true"
+            android:stopWithTask="true" />
     </application>
 
 </manifest>

@@ -7,10 +7,10 @@
 //! A safety number marked as compared and since changed says so. The recovery key is shown once;
 //! key backup is not built yet, and the page says that too.
 
-use super::kit::{self, card};
+use super::kit::{self, security_card as card};
 use super::page_head;
 use crate::client::ask;
-use crate::gui::components::{button, glyph, ButtonKind};
+use crate::gui::components::{button, button_with_icon, glyph, ButtonKind};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use crate::gui::tiny::Page as Facts;
@@ -24,6 +24,7 @@ use protocol::{
 #[derive(Default)]
 pub(in crate::gui) struct Draft {
     pub status: Option<E2eeStatus>,
+    /// An explicit action or backup is running; background reads own separate request slots.
     pub loading: bool,
     pub asked: bool,
     pub error: Option<String>,
@@ -33,16 +34,141 @@ pub(in crate::gui) struct Draft {
     pub recovery: Option<String>,
     /// The person whose devices are open, fetched now.
     pub person: Option<E2eePerson>,
+    /// The device link in progress on this device, as last read.
+    pub link: Option<protocol::E2eeLink>,
+    /// The QR of the link's code, made once per code.
+    pub qr: Option<(String, std::rc::Rc<crate::gui::signin::qr::Qr>)>,
+    /// The history picked to send a new device; empty is `linking::DEFAULT_HISTORY`.
+    pub history: String,
+    /// Fingerprints, compatibility codes and recovery information are shown on demand.
+    pub details: bool,
+    /// The encrypted conversation captured when its header opened this page.
+    pub conversation: Option<protocol::Key>,
+    /// Only one backup form is open at a time: save (`true`) or import (`false`).
+    pub backup_mode: Option<bool>,
+    scope: std::rc::Rc<()>,
+    status_read: Option<std::rc::Rc<()>>,
+    status_again: bool,
+    link_read: Option<std::rc::Rc<()>>,
+    link_again: bool,
+}
+
+/// The account and visible-page visit that own an asynchronous reply.
+#[derive(Clone)]
+pub(super) struct Visit {
+    pub account: protocol::AccountKey,
+    scope: std::rc::Rc<()>,
+}
+
+#[derive(Clone)]
+pub(super) struct Read {
+    pub visit: Visit,
+    request: std::rc::Rc<()>,
+}
+
+fn begin_read(pending: &mut Option<std::rc::Rc<()>>, again: &mut bool) -> Option<std::rc::Rc<()>> {
+    if pending.is_some() {
+        *again = true;
+        return None;
+    }
+    let request = std::rc::Rc::new(());
+    *pending = Some(request.clone());
+    Some(request)
+}
+
+fn finish_read(pending: &mut Option<std::rc::Rc<()>>, again: &mut bool, request: &std::rc::Rc<()>) -> Option<bool> {
+    if !pending.as_ref().is_some_and(|current| std::rc::Rc::ptr_eq(current, request)) {
+        return None;
+    }
+    *pending = None;
+    Some(std::mem::take(again))
+}
+
+impl Draft {
+    fn complete_repair(&mut self, visit: &Visit, account: Option<&protocol::AccountKey>, visible: bool, conversation: &protocol::Key, answer: std::io::Result<Response>) -> bool {
+        if !self.accepts(visit, account, visible) || self.conversation.as_ref() != Some(conversation) { return false; }
+        self.loading = false;
+        match answer {
+            Ok(Response::Ok) => {},
+            Ok(Response::Error { detail, .. }) => self.error = Some(detail),
+            Ok(_) => self.error = Some(crate::client::OTHER_ANSWER.to_owned()),
+            Err(err) => self.error = Some(crate::client::trouble_words("tiny", &err)),
+        }
+        true
+    }
+
+    pub(super) fn visit(&self, account: &protocol::AccountKey) -> Visit {
+        Visit { account: account.clone(), scope: self.scope.clone() }
+    }
+
+    pub(super) fn accepts(&self, visit: &Visit, account: Option<&protocol::AccountKey>, visible: bool) -> bool {
+        visible && account == Some(&visit.account) && std::rc::Rc::ptr_eq(&self.scope, &visit.scope)
+    }
+
+    fn begin_status(&mut self, account: &protocol::AccountKey, visible: bool) -> Option<Read> {
+        if !visible { return None; }
+        let request = begin_read(&mut self.status_read, &mut self.status_again)?;
+        self.asked = true;
+        Some(Read { visit: self.visit(account), request })
+    }
+
+    fn status_changed(&mut self, change: &protocol::Change, account: &protocol::AccountKey, visible: bool) -> Option<Read> {
+        if !matches!(change, protocol::Change::Tiny { account: changed } if changed == account) {
+            return None;
+        }
+        self.begin_status(account, visible)
+    }
+
+    fn complete_status(&mut self, read: &Read, account: Option<&protocol::AccountKey>, visible: bool, answer: std::io::Result<Response>) -> Option<bool> {
+        if !self.accepts(&read.visit, account, visible) { return None; }
+        let again = finish_read(&mut self.status_read, &mut self.status_again, &read.request)?;
+        match answer {
+            Ok(Response::TinyE2ee { status }) => {
+                if status.revoked {
+                    self.link = None;
+                    self.qr = None;
+                    self.link_read = None;
+                    self.link_again = false;
+                }
+                self.status = Some(status);
+                self.error = None;
+            }
+            Ok(Response::Error { detail, .. }) => self.error = Some(detail),
+            Ok(_) => self.error = Some(crate::client::OTHER_ANSWER.to_owned()),
+            Err(err) => self.error = Some(crate::client::trouble_words("tiny", &err)),
+        }
+        Some(again)
+    }
+
+    pub(super) fn begin_link(&mut self, account: &protocol::AccountKey, visible: bool) -> Option<Read> {
+        if !visible || self.status.as_ref().is_some_and(|status| status.revoked) { return None; }
+        let request = begin_read(&mut self.link_read, &mut self.link_again)?;
+        Some(Read { visit: self.visit(account), request })
+    }
+
+    pub(super) fn complete_link(&mut self, read: &Read, account: Option<&protocol::AccountKey>, visible: bool) -> Option<bool> {
+        if !self.accepts(&read.visit, account, visible) { return None; }
+        finish_read(&mut self.link_read, &mut self.link_again, &read.request)
+    }
+
+    pub(super) fn invalidate_reads(&mut self) {
+        self.scope = std::rc::Rc::new(());
+        self.status_read = None;
+        self.status_again = false;
+        self.link_read = None;
+        self.link_again = false;
+        self.loading = false;
+    }
 }
 
 /// The words a device's state reads as.
 pub(in crate::gui) fn state_words(state: &DeviceState) -> (&'static str, String) {
     match state {
         DeviceState::Off => ("icons/lock.svg", "This server doesn't offer end-to-end encrypted messages.".to_owned()),
-        DeviceState::Ready => ("icons/shield.svg", "This device is set up. It can read and send end-to-end encrypted messages from now on.".to_owned()),
+        DeviceState::Ready => ("icons/shield.svg", "This device is ready for encrypted messages.".to_owned()),
         DeviceState::AwaitingApproval { .. } => (
             "icons/key.svg",
-            "You already use another device on this server. Approve this one there: open Encryption on that device and paste the link code below.".to_owned(),
+            "Approve this device from one you already use.".to_owned(),
         ),
         DeviceState::Failed { why } => ("icons/triangle-alert.svg", why.clone()),
     }
@@ -51,7 +177,7 @@ pub(in crate::gui) fn state_words(state: &DeviceState) -> (&'static str, String)
 /// How a person's safety number stands, in words.
 pub(in crate::gui) fn trust_words(person: &E2eePerson) -> &'static str {
     if person.identity_changed {
-        return "New identity: none of their devices chain to the ones you knew. Their new devices are not let into your conversations until you accept it.";
+        return "New identity. Verify with them before accepting it.";
     }
     match person.trust {
         Trust::Verified => "Verified",
@@ -65,58 +191,64 @@ impl Shell {
     /// the Tiny page holds.
     pub(in crate::gui) fn tiny_open_encryption(
         &mut self,
-        account: &protocol::AccountKey,
+        conversation: &protocol::Key,
+        encrypted: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.tiny_state.account.as_ref() != Some(account) || self.tiny_state.community.is_none()
+        let account = conversation.account();
+        if self.tiny_state.account.as_ref() != Some(&account) || self.tiny_state.community.is_none()
         {
             return;
         }
         self.tiny_open_settings(super::Page::Encryption, None, window, cx);
+        if let Some(overlay) = self.tiny_state.settings.as_mut() {
+            overlay.encryption.conversation = encrypted.then(|| conversation.clone());
+        }
+        cx.notify();
+    }
+
+    pub(super) fn tiny_e2ee_visit(&self) -> Option<Visit> {
+        let account = self.tiny_state.account.as_ref()?;
+        let overlay = self.tiny_state.settings.as_ref()?;
+        (overlay.page == super::Page::Encryption).then(|| overlay.encryption.visit(account))
+    }
+
+    pub(super) fn tiny_e2ee_draft_for(&mut self, visit: &Visit) -> Option<&mut Draft> {
+        let account = self.tiny_state.account.as_ref();
+        let overlay = self.tiny_state.settings.as_mut()?;
+        overlay.encryption.accepts(visit, account, overlay.page == super::Page::Encryption)
+            .then_some(&mut overlay.encryption)
     }
 
     pub(in crate::gui) fn tiny_e2ee_load(&mut self, cx: &mut Context<Self>) {
-        let Some(account) = self.tiny_state.account.clone() else {
-            return;
-        };
-        let Some(draft) = self
-            .tiny_state
-            .settings
-            .as_mut()
-            .map(|overlay| &mut overlay.encryption)
-        else {
-            return;
-        };
-        draft.loading = true;
-        draft.asked = true;
+        let Some(account) = self.tiny_state.account.clone() else { return; };
+        let Some(overlay) = self.tiny_state.settings.as_mut() else { return; };
+        let Some(read) = overlay.encryption.begin_status(&account, overlay.page == super::Page::Encryption) else { return; };
+        self.tiny_e2ee_status_read(read, cx);
+    }
+
+    pub(in crate::gui) fn tiny_e2ee_changed(&mut self, change: &protocol::Change, cx: &mut Context<Self>) {
+        let Some(account) = self.tiny_state.account.clone() else { return; };
+        let Some(overlay) = self.tiny_state.settings.as_mut() else { return; };
+        let Some(read) = overlay.encryption.status_changed(change, &account, overlay.page == super::Page::Encryption) else { return; };
+        self.tiny_e2ee_status_read(read, cx);
+    }
+
+    fn tiny_e2ee_status_read(&mut self, read: Read, cx: &mut Context<Self>) {
+        let account = read.visit.account.clone();
         cx.notify();
         self.off_thread(
             cx,
-            move || {
-                ask(&Request::TinyE2ee {
-                    account,
-                    ask: E2eeAsk::Status,
-                })
-            },
+            move || ask(&Request::TinyE2ee { account, ask: E2eeAsk::Status }),
             move |this, answer, cx| {
-                let Some(draft) = this
-                    .tiny_state
-                    .settings
-                    .as_mut()
-                    .map(|overlay| &mut overlay.encryption)
-                else {
-                    return;
-                };
-                draft.loading = false;
-                match answer {
-                    Ok(Response::TinyE2ee { status }) => {
-                        draft.status = Some(status);
-                        draft.error = None;
-                    }
-                    Ok(Response::Error { detail, .. }) => draft.error = Some(detail),
-                    Ok(_) => draft.error = Some(crate::client::OTHER_ANSWER.to_owned()),
-                    Err(err) => draft.error = Some(crate::client::trouble_words("tiny", &err)),
+                let account = this.tiny_state.account.as_ref();
+                let Some(overlay) = this.tiny_state.settings.as_mut() else { return; };
+                let Some(again) = overlay.encryption.complete_status(&read, account, overlay.page == super::Page::Encryption, answer) else { return; };
+                if again {
+                    this.tiny_e2ee_load(cx);
+                } else {
+                    this.tiny_e2ee_link_load(cx);
                 }
                 cx.notify();
             },
@@ -125,9 +257,8 @@ impl Shell {
 
     /// Sends one ask; on `Ok` says `done` and reads the page again.
     fn tiny_e2ee_do(&mut self, ask_for: E2eeAsk, done: &'static str, cx: &mut Context<Self>) {
-        let Some(account) = self.tiny_state.account.clone() else {
-            return;
-        };
+        let Some(visit) = self.tiny_e2ee_visit() else { return; };
+        let account = visit.account.clone();
         if let Some(draft) = self
             .tiny_state
             .settings
@@ -148,14 +279,7 @@ impl Shell {
                 })
             },
             move |this, answer, cx| {
-                let Some(draft) = this
-                    .tiny_state
-                    .settings
-                    .as_mut()
-                    .map(|overlay| &mut overlay.encryption)
-                else {
-                    return;
-                };
+                let Some(draft) = this.tiny_e2ee_draft_for(&visit) else { return; };
                 draft.loading = false;
                 match answer {
                     Ok(Response::Ok) => draft.note = Some(done.to_owned()),
@@ -173,25 +297,32 @@ impl Shell {
         );
     }
 
-    fn tiny_e2ee_approve(&mut self, cx: &mut Context<Self>) {
-        let code = self
-            .tiny_state
-            .settings_fields
-            .link_code
-            .read(cx)
-            .text()
-            .trim()
-            .to_owned();
-        if code.is_empty() {
-            return;
-        }
-        self.tiny_state
-            .settings_fields
-            .link_code
-            .update(cx, |input, cx| input.clear(cx));
+    fn tiny_e2ee_repair(&mut self, cx: &mut Context<Self>) {
+        let Some(visit) = self.tiny_e2ee_visit() else { return; };
+        let Some(draft) = self.tiny_e2ee_draft_for(&visit) else { return; };
+        let Some(conversation) = draft.conversation.clone() else { return; };
+        if draft.loading || !draft.status.as_ref().is_some_and(|status| status.group_generations && status.device == DeviceState::Ready && !status.revoked) { return; }
+        draft.loading = true;
+        draft.error = None;
+        draft.note = None;
+        let account = visit.account.clone();
+        let request_id = conversation.id.clone();
+        self.off_thread(cx, move || ask(&Request::TinyE2ee { account, ask: E2eeAsk::Repair { conversation_id: request_id } }), move |this, answer, cx| {
+            let account = this.tiny_state.account.as_ref();
+            let Some(overlay) = this.tiny_state.settings.as_mut() else { return; };
+            if !overlay.encryption.complete_repair(&visit, account, overlay.page == super::Page::Encryption, &conversation, answer) { return; }
+            this.tiny_e2ee_load(cx);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Approves a device from a `tiny-device-` code: the way before device linking, still how a
+    /// device on a server without it is added.
+    pub(in crate::gui::tiny) fn tiny_e2ee_approve_code(&mut self, code: String, cx: &mut Context<Self>) {
         self.tiny_e2ee_do(
             E2eeAsk::Approve { code },
-            "Approved. The new device can read and send from now on.",
+            "Device approved.",
             cx,
         );
     }
@@ -220,10 +351,34 @@ impl Shell {
     }
 }
 
+fn repair_card(draft: &Draft, status: &E2eeStatus, cx: &mut Context<Shell>) -> Div {
+    let repair = status.repair.as_ref().filter(|repair| draft.conversation.as_ref().is_some_and(|key| key.id == repair.conversation_id));
+    let (words, busy, failed) = match repair.map(|repair| &repair.stage) {
+        Some(protocol::RepairStage::Approving) => ("Approve on this device…", true, false),
+        Some(protocol::RepairStage::Updating) => ("Updating encryption…", true, false),
+        Some(protocol::RepairStage::WaitingForDevices) => ("Waiting for devices…", true, false),
+        Some(protocol::RepairStage::Done) => ("Encryption updated. Saved messages are still available.", false, false),
+        Some(protocol::RepairStage::Failed) => ("Saved messages are still available.", false, true),
+        None => ("Saved messages stay available.", false, false),
+    };
+    let mut body = card().p(px(12.)).gap(px(10.))
+        .child(kit::security_words(words).type_ui().text_color(theme::text_soft()));
+    if failed {
+        if let Some(repair) = repair { body = body.child(kit::note("icons/triangle-alert.svg", theme::danger(), kit::security_wrap(&repair.error))); }
+    }
+    if !busy {
+        body = body.child(div().flex().min_w_0().child(button_with_icon(
+            "tiny-e2ee-repair", ButtonKind::Secondary, "icons/shield.svg", "Update encryption",
+        ).when(draft.loading, |button| button.opacity(0.5)).on_click(cx.listener(|this, _, _, cx| this.tiny_e2ee_repair(cx)))));
+    }
+    kit::security_section("icons/lock.svg", "This chat").child(body)
+}
+
 fn device_row(
     id: impl Into<SharedString>,
     device: &E2eeDevice,
     revoke: Option<gpui::Stateful<Div>>,
+    details: bool,
 ) -> gpui::Stateful<Div> {
     let title = if device.this {
         "This device".to_owned()
@@ -240,62 +395,45 @@ fn device_row(
     } else {
         theme::text()
     };
-    kit::table_row(id.into(), false)
-        .child(glyph(
-            if device.untrusted {
-                "icons/triangle-alert.svg"
-            } else {
-                "icons/key.svg"
-            },
-            16.,
-            tone,
+    let mut column = div().flex_1().min_w_0().max_w_full().flex().flex_col().gap(px(4.))
+        .child(kit::security_words(title).when(!details, |title| title.line_clamp(2)).type_ui().font_weight(theme::MEDIUM).text_color(tone))
+        .when(details, |column| column.child(
+            kit::security_words(&device.fingerprint).type_small().font_family(theme::MONO).text_color(theme::text_soft()),
         ))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .truncate()
-                        .type_ui()
-                        .font_weight(theme::MEDIUM)
-                        .text_color(tone)
-                        .child(title),
-                )
-                .child(
-                    div()
-                        // Whole on a phone, where the row is too narrow for it: it is what two
-                        // screens compare.
-                        .when(!crate::gui::phone::active(), |line| line.truncate())
-                        .when(crate::gui::phone::active(), |line| line.whitespace_normal())
-                        .type_small()
-                        .font_family(theme::MONO)
-                        .text_color(theme::text_soft())
-                        .child(device.fingerprint.clone()),
-                )
-                .when(device.untrusted, |column| {
-                    column.child(
-                        div()
-                            .whitespace_normal()
-                            .type_small()
-                            .text_color(theme::danger())
-                            .child(
-                                "Not approved by any of their devices. Nothing is encrypted to it.",
-                            ),
-                    )
-                })
-                .when(!since.is_empty(), |column| {
-                    column.child(
-                        div()
-                            .type_small()
-                            .text_color(theme::text_faint())
-                            .child(format!("Added {since}")),
-                    )
-                }),
-        )
+        .when(device.untrusted, |column| column.child(
+            kit::security_words("Unapproved. Cannot read your messages.").type_small().text_color(theme::danger()),
+        ))
+        .when(details && !since.is_empty(), |column| column.child(
+            kit::security_words(format!("Added {since}")).type_small().text_color(theme::text_faint()),
+        ));
+    let phone = crate::gui::phone::active();
+    let mut revoke = revoke;
+    if phone {
+        column = column.children(revoke.take().map(|action| div().flex().child(action)));
+    }
+    kit::table_row(id.into(), false)
+        .items_start()
+        .child(div().pt(px(2.)).child(glyph(
+            if device.untrusted { "icons/triangle-alert.svg" } else { "icons/smartphone.svg" },
+            16., tone,
+        )))
+        .child(column)
         .children(revoke)
+
+}
+
+fn security_details(open: bool, cx: &mut Context<Shell>) -> Div {
+    div().flex().child(
+        button_with_icon("tiny-e2ee-details", ButtonKind::Ghost,
+            if open { "icons/chevron-up.svg" } else { "icons/chevron-down.svg" },
+            if open { "Hide details" } else { "Security details" })
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let Some(draft) = this.tiny_state.settings.as_mut().map(|overlay| &mut overlay.encryption) {
+                    draft.details = !draft.details;
+                }
+                cx.notify();
+            })),
+    )
 }
 
 pub(in crate::gui::tiny) fn encryption(
@@ -313,26 +451,26 @@ pub(in crate::gui::tiny) fn encryption(
         return div().into_any_element();
     };
     let fields = &shell.tiny_state.settings_fields;
-    let mut page = div().flex().flex_col().gap(px(20.)).child(page_head(
-        "Encryption",
-        "Only people's devices can read end-to-end encrypted conversations. The server stores ciphertext.",
-    ));
+    let mut page = div().min_w_0().max_w_full().flex().flex_col().gap(px(24.))
+        .when(!crate::gui::phone::active(), |page| page.child(page_head(
+            "Encryption", "",
+        )));
     if let Some(error) = &draft.error {
         page = page.child(kit::note(
             "icons/triangle-alert.svg",
             theme::danger(),
-            error.clone(),
+            kit::security_wrap(error),
         ));
     }
     if let Some(note) = &draft.note {
         page = page.child(kit::note(
             "icons/shield.svg",
             theme::positive(),
-            note.clone(),
+            kit::security_wrap(note),
         ));
     }
     let Some(status) = &draft.status else {
-        let words = if draft.loading {
+        let words = if draft.status_read.is_some() {
             "Reading this device's encryption…"
         } else {
             "Nothing read yet."
@@ -342,14 +480,36 @@ pub(in crate::gui::tiny) fn encryption(
             .into_any_element();
     };
 
+    let owner_link = draft.link.as_ref().is_some_and(|link| link.role == "old" && matches!(
+        link.stage,
+        protocol::LinkStage::Confirm | protocol::LinkStage::OwnerApproval |
+        protocol::LinkStage::Sending | protocol::LinkStage::Receiving,
+    ));
+    if owner_link && status.device == DeviceState::Ready && !status.revoked {
+        return page.child(
+            kit::security_section("icons/smartphone.svg", "Add a device")
+                .child(super::linking::add_device(shell, status, draft, window, cx))
+                .child(security_details(draft.details, cx)),
+        ).into_any_element();
+    }
+
     // This device.
-    let (icon, words) = state_words(&status.device);
+    let (icon, words) = if status.revoked {
+        ("icons/triangle-alert.svg", "This device was removed. Saved messages are still available.".to_owned())
+    } else {
+        state_words(&status.device)
+    };
+    let state_tone = match (&status.device, status.revoked) {
+        (_, true) | (DeviceState::Failed { .. }, _) => theme::danger(),
+        (DeviceState::Ready, _) => theme::positive(),
+        _ => theme::text_soft(),
+    };
     let mut this = card().p(px(12.)).gap(px(10.)).child(
         div()
             .flex()
             .items_start()
             .gap(px(10.))
-            .child(glyph(icon, 16., theme::text_soft()))
+            .child(glyph(icon, 16., state_tone))
             .child(
                 div()
                     .flex_1()
@@ -357,62 +517,89 @@ pub(in crate::gui::tiny) fn encryption(
                     .whitespace_normal()
                     .type_ui()
                     .text_color(theme::text())
-                    .child(words),
+                    .child(kit::security_wrap(&words)),
             ),
     );
-    if !status.fingerprint.is_empty() {
+    if draft.details && !status.fingerprint.is_empty() {
         this = this
             .child(
                 div()
                     .type_small()
                     .text_color(theme::text_faint())
-                    .child("This device's key fingerprint"),
+                    .child("Key fingerprint"),
             )
             .child(
-                div()
-                    .type_ui()
+                kit::security_words(&status.fingerprint)
+                    .type_small()
                     .font_family(theme::MONO)
-                    .text_color(theme::text())
-                    .child(status.fingerprint.clone()),
+                    .text_color(theme::text()),
             );
     }
+    let new_device = super::linking::new_device(status, draft, cx);
     if let DeviceState::AwaitingApproval { code } = &status.device {
-        let copied = code.clone();
-        this = this
-            .child(
-                div()
-                    .type_small()
-                    .text_color(theme::text_faint())
-                    .child("Link code"),
-            )
-            .child(
-                div()
-                    .whitespace_normal()
-                    .type_small()
-                    .font_family(theme::MONO)
-                    .text_color(theme::text())
-                    .child(code.clone()),
-            )
-            .child(
-                div().flex().child(
-                    button(
-                        "tiny-e2ee-copy-code",
-                        ButtonKind::Secondary,
-                        "Copy link code",
-                    )
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()))
-                    })),
-                ),
-            );
+        if new_device.is_none() || draft.details {
+            let copied = code.clone();
+            this = this
+                .child(
+                    div()
+                        .type_small()
+                        .text_color(theme::text_faint())
+                        .child(if new_device.is_some() {
+                            "For an older device"
+                        } else {
+                            "Link code"
+                        }),
+                )
+
+                .child(
+                    div().flex().child(
+                        button(
+                            "tiny-e2ee-copy-code",
+                            ButtonKind::Secondary,
+                            "Copy link code",
+                        )
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()))
+                        })),
+                    ),
+                );
+        }
     }
-    page = page.child(super::section("This device").child(this));
+    let mut this_device = kit::security_section("icons/shield.svg", "This device");
+    let linking = new_device.is_some();
+    if let Some(panel) = new_device {
+        this_device = this_device.child(panel);
+    }
+    if !linking || draft.details {
+        this_device = this_device.child(this);
+    }
+    this_device = this_device.child(security_details(draft.details, cx));
+    page = page.child(this_device);
     if status.device == DeviceState::Off {
         return page.into_any_element();
+    }
+    if status.revoked {
+        // Saved history stays usable after removal, including its local encrypted backup.
+        return page.child(super::backup::backup(shell, draft.loading, window, cx)).into_any_element();
+    }
+    if let Some(notice) = super::linking::added_notice("tiny-e2ee-added", &status.added, cx) {
+        page = page.child(notice);
+    }
+    // Keep setup focused on the current step. Device and backup management remain available
+    // in Security details until this device is approved.
+    if matches!(status.device, DeviceState::AwaitingApproval { .. }) && !draft.details {
+        return page.into_any_element();
+    }
+
+    if status.device == DeviceState::Ready && status.group_generations && draft.conversation.is_some() {
+        page = page.child(repair_card(draft, status, cx));
     }
 
     // Your devices.
     let mut mine = card();
+    if status.device == DeviceState::Ready {
+        mine = mine.child(super::linking::add_device(shell, status, draft, window, cx));
+    }
     for (ix, device) in status.devices.iter().enumerate() {
         let id = device.device_id.clone();
         let revoke = button(
@@ -437,6 +624,7 @@ pub(in crate::gui::tiny) fn encryption(
             SharedString::from(format!("tiny-e2ee-mine-{ix}")),
             device,
             Some(revoke),
+            draft.details,
         ));
     }
     if status.devices.is_empty() {
@@ -448,14 +636,7 @@ pub(in crate::gui::tiny) fn encryption(
                 .child("No device is registered yet."),
         );
     }
-    let approve = div()
-        .p(px(12.))
-        .flex()
-        .flex_col()
-        .gap(px(8.))
-        .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child("Setting up tinyclient on another computer? It shows a link code. Paste it here to approve that device. Check that its fingerprint matches what it shows."))
-        .child(div().flex().gap(px(8.)).child(kit::input(&fields.link_code, None, window, cx).flex_1()).child(button("tiny-e2ee-approve", ButtonKind::Primary, "Approve").on_click(cx.listener(|this, _, _, cx| this.tiny_e2ee_approve(cx)))));
-    page = page.child(super::section("Your devices").child(mine.child(approve)));
+    page = page.child(kit::security_section("icons/smartphone.svg", "Your devices").child(mine));
 
     // People.
     let mut people = card();
@@ -558,11 +739,10 @@ pub(in crate::gui::tiny) fn encryption(
         };
         people = people.child(
             kit::table_row(SharedString::from(format!("tiny-e2ee-person-{ix}")), false)
-                // On a phone the buttons go under the key, which keeps the width it needs.
-                .when(crate::gui::phone::active(), |row| row.flex_col().items_start().gap(px(6.)))
+                .flex_col().items_start().gap(px(10.))
                 .child(
                     div()
-                        .flex_1()
+                        .w_full()
                         .min_w_0()
                         .flex()
                         .flex_col()
@@ -587,7 +767,7 @@ pub(in crate::gui::tiny) fn encryption(
                                 }),
                         )
                         .child(emoji_row)
-                        .when(!person.safety.is_empty(), |column| {
+                        .when(draft.details && !person.safety.is_empty(), |column| {
                             column.child(
                                 div()
                                     .whitespace_normal()
@@ -615,6 +795,8 @@ pub(in crate::gui::tiny) fn encryption(
                     div()
                         .flex_none()
                         .flex()
+                        .max_w_full()
+                        .flex_wrap()
                         .gap(px(4.))
                         .children(accept)
                         .child(devices)
@@ -631,12 +813,12 @@ pub(in crate::gui::tiny) fn encryption(
                 .p(px(12.))
                 .type_ui()
                 .text_color(theme::text_soft())
-                .child("Nobody yet. People appear here once you share an encrypted conversation."),
+                .child("People you message will appear here."),
         );
     }
     page = page.child(
-        super::section("People")
-            .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child("Same four emojis on both screens? Nobody, the server included, has put a device between you. Digits stay under the emojis for a precise check."))
+        kit::security_section("icons/users.svg", "People")
+            .when(!status.people.is_empty(), |section| section.child(kit::security_words("Compare these emojis together to verify a conversation.").type_small().text_color(theme::text_soft())))
             .child(people),
     );
     if let Some(person) = &draft.person {
@@ -646,6 +828,7 @@ pub(in crate::gui::tiny) fn encryption(
                 SharedString::from(format!("tiny-e2ee-theirs-{ix}")),
                 device,
                 None,
+                true,
             ));
         }
         let name = if person.name.is_empty() {
@@ -671,17 +854,16 @@ pub(in crate::gui::tiny) fn encryption(
 
     // Recovery.
     let mut recovery = card().p(px(12.)).gap(px(10.)).child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child(
-        "A recovery key is 128 random bits, shown once. Write it down and keep it somewhere safe. Encrypted key backup is not available yet: for now the key backs nothing up, and losing every device still means a new identity.",
+        "Recovery keys do not restore messages yet. Use a backup file below to save your messages.",
     ));
     if let Some(key) = &draft.recovery {
         let copied = key.clone();
         recovery = recovery
             .child(
-                div()
-                    .type_title()
+                kit::security_words(key)
+                    .type_ui()
                     .font_family(theme::MONO)
-                    .text_color(theme::text())
-                    .child(key.clone()),
+                    .text_color(theme::text()),
             )
             .child(div().flex().child(
                 button("tiny-e2ee-copy-recovery", ButtonKind::Secondary, "Copy").on_click(
@@ -712,20 +894,147 @@ pub(in crate::gui::tiny) fn encryption(
             div()
                 .flex()
                 .gap(px(8.))
-                .child(kit::input(&fields.recovery_check, None, window, cx).flex_1())
+                .child(kit::input(&fields.recovery_check, None, window, cx).flex_1().min_w_0().max_w_full())
                 .child(
                     button("tiny-e2ee-check", ButtonKind::Ghost, "Check")
                         .on_click(cx.listener(|this, _, _, cx| this.tiny_e2ee_check(cx))),
                 ),
         );
     }
-    page.child(super::section("Recovery key").child(recovery))
+    page.when(draft.details, |page| page.child(kit::security_section("icons/key.svg", "Recovery key").child(recovery)))
+        .child(super::backup::backup(shell, draft.loading, window, cx))
         .into_any_element()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn account(name: &str) -> protocol::AccountKey {
+        protocol::AccountKey { network: protocol::Network::Tiny, account: name.into() }
+    }
+
+    fn ready() -> E2eeStatus {
+        E2eeStatus { device: DeviceState::Ready, ..E2eeStatus::default() }
+    }
+
+    #[test]
+    fn encryption_repair_completion_is_bound_to_account_visit_and_conversation() {
+        let account = account("one");
+        let conversation = protocol::Key::new(&account, "chat-one");
+        let mut draft = Draft { conversation: Some(conversation.clone()), loading: true, ..Draft::default() };
+        let visit = draft.visit(&account);
+        let failed = || Ok(Response::Error { code: protocol::ErrorCode::Refused, detail: "Update refused".into() });
+        assert!(!draft.complete_repair(&visit, Some(&super::tests::account("other")), true, &conversation, failed()));
+        assert!(!draft.complete_repair(&visit, Some(&account), false, &conversation, failed()));
+        assert!(!draft.complete_repair(&visit, Some(&account), true, &protocol::Key::new(&account, "chat-two"), failed()));
+        assert!(draft.loading);
+        assert!(draft.error.is_none());
+        draft.invalidate_reads();
+        assert!(!draft.complete_repair(&visit, Some(&account), true, &conversation, failed()));
+        let current = draft.visit(&account);
+        assert!(draft.complete_repair(&current, Some(&account), true, &conversation, failed()));
+        assert_eq!(draft.error.as_deref(), Some("Update refused"));
+    }
+
+    fn removed() -> std::io::Result<Response> {
+        Ok(Response::TinyE2ee { status: E2eeStatus {
+            revoked: true,
+            device: DeviceState::Failed { why: "Removed".into() },
+            ..E2eeStatus::default()
+        } })
+    }
+
+    #[test]
+    fn encryption_refresh_device_event_updates_the_open_page_without_resetting_choices() {
+        let account = account("one");
+        let mut draft = Draft { status: Some(ready()), asked: true, history: "days:7".into(), details: true, backup_mode: Some(true), ..Draft::default() };
+        let read = draft.status_changed(&protocol::Change::Tiny { account: account.clone() }, &account, true)
+            .expect("a device event must read Status, not just the link");
+        assert_eq!(draft.complete_status(&read, Some(&account), true, removed()), Some(false));
+        assert!(draft.status.as_ref().unwrap().revoked);
+        assert_eq!(draft.history, "days:7");
+        assert!(draft.details);
+        assert_eq!(draft.backup_mode, Some(true));
+    }
+
+    #[test]
+    fn encryption_refresh_coalesces_events_and_reads_the_latest_status_after_an_in_flight_reply() {
+        let account = account("one");
+        let mut draft = Draft::default();
+        let first = draft.begin_status(&account, true).unwrap();
+        assert!(draft.begin_status(&account, true).is_none(), "only one status request may run at a time");
+        assert!(draft.begin_status(&account, true).is_none());
+        assert_eq!(draft.complete_status(&first, Some(&account), true, Ok(Response::TinyE2ee { status: ready() })), Some(true));
+        let latest = draft.begin_status(&account, true).unwrap();
+        assert_eq!(draft.complete_status(&latest, Some(&account), true, removed()), Some(false));
+        assert!(draft.status.as_ref().unwrap().revoked);
+    }
+
+    #[test]
+    fn encryption_refresh_rejects_old_account_overlay_and_page_visit_replies() {
+        let one = account("one");
+        let two = account("two");
+        let mut old = Draft::default();
+        let read = old.begin_status(&one, true).unwrap();
+        let mut reopened = Draft { status: Some(ready()), ..Draft::default() };
+        assert_eq!(reopened.complete_status(&read, Some(&one), true, removed()), None, "closing and reopening creates a new overlay lifetime");
+        assert!(!reopened.status.as_ref().unwrap().revoked);
+        assert_eq!(old.complete_status(&read, Some(&two), true, removed()), None, "the old account must not write into the current one");
+        old.invalidate_reads();
+        let current = old.begin_status(&one, true).unwrap();
+        assert_eq!(old.complete_status(&read, Some(&one), true, removed()), None, "returning to the tab must supersede the earlier visit");
+        assert_eq!(old.complete_status(&current, Some(&one), true, removed()), Some(false));
+        assert!(old.status.as_ref().unwrap().revoked);
+    }
+
+    #[test]
+    fn encryption_refresh_ignores_hidden_pages_and_other_accounts_events() {
+        let account = account("one");
+        let mut draft = Draft::default();
+        assert!(draft.begin_status(&account, false).is_none());
+        assert!(draft.status_changed(&protocol::Change::Tiny { account: super::tests::account("other") }, &account, true).is_none());
+        assert!(draft.status_changed(&protocol::Change::Status, &account, true).is_none());
+        let read = draft.begin_status(&account, true).unwrap();
+        assert_eq!(draft.complete_status(&read, Some(&account), false, removed()), None);
+        assert!(draft.status.is_none());
+    }
+
+    #[test]
+    fn encryption_refresh_removal_cancels_link_replies_and_future_progress_reads() {
+        let account = account("one");
+        let mut draft = Draft { status: Some(ready()), link: Some(protocol::E2eeLink {
+            role: "old".into(), stage: protocol::LinkStage::Sending, ..protocol::E2eeLink::default()
+        }), ..Draft::default() };
+        let status = draft.begin_status(&account, true).unwrap();
+        let link = draft.begin_link(&account, true).unwrap();
+        assert!(draft.begin_link(&account, true).is_none());
+        assert_eq!(draft.complete_status(&status, Some(&account), true, removed()), Some(false));
+        assert!(draft.link.is_none());
+        assert_eq!(draft.complete_link(&link, Some(&account), true), None);
+        assert!(draft.begin_link(&account, true).is_none(), "a removed device must not keep a progress timer alive");
+    }
+
+    #[test]
+    fn encryption_refresh_background_replies_preserve_an_active_backup_or_action() {
+        let account = account("one");
+        for answer in [Ok(Response::TinyE2ee { status: ready() }), Err(std::io::Error::from(std::io::ErrorKind::TimedOut))] {
+            let mut draft = Draft { status: Some(ready()), loading: true, ..Draft::default() };
+            let read = draft.begin_status(&account, true).unwrap();
+            assert_eq!(draft.complete_status(&read, Some(&account), true, answer), Some(false));
+            assert!(draft.loading, "background status completion must not reenable Save/Import while its action is pending");
+        }
+    }
+
+    #[test]
+    fn encryption_refresh_background_reads_do_not_disable_action_controls() {
+        let account = account("one");
+        let mut draft = Draft { status: Some(ready()), ..Draft::default() };
+        let read = draft.begin_status(&account, true).unwrap();
+        assert!(!draft.loading, "only an explicit action owns the backup busy state");
+        assert_eq!(draft.complete_status(&read, Some(&account), true, Ok(Response::TinyE2ee { status: ready() })), Some(false));
+        assert!(!draft.loading);
+    }
 
     #[test]
     fn the_words_never_claim_more_than_holds() {
@@ -747,7 +1056,7 @@ mod tests {
         assert!(
             state_words(&DeviceState::AwaitingApproval { code: "x".into() })
                 .1
-                .contains("Approve this one there")
+                .contains("Approve this device")
         );
     }
 }

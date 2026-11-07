@@ -293,6 +293,10 @@ pub struct TinyCommunity {
     /// chatd. Empty when the server did not say.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider: String,
+    /// The person's own encryption devices added since they last looked, filled in by chatd from
+    /// what it knows (no request): the page says "New device added" with a way to revoke it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_devices: Vec<crate::E2eeDevice>,
 }
 
 impl TinyCommunity {

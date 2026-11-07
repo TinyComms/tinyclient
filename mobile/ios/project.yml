@@ -71,6 +71,7 @@ targets:
       - sdk: ReplayKit.framework
       - sdk: WebKit.framework
       - sdk: AuthenticationServices.framework
+      - sdk: LocalAuthentication.framework
       - target: Broadcast
         embed: true
   Broadcast:

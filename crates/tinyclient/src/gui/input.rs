@@ -18,6 +18,7 @@ use gpui::{
 };
 use std::ops::Range;
 use std::rc::Rc;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Lines a multi-line field shows before it scrolls.
 pub const MAX_ROWS: usize = 8;
@@ -229,11 +230,63 @@ struct Row {
     wraps: bool,
 }
 
+/// Display text and the translation between editor and painted byte offsets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DisplayText {
+    text: SharedString,
+    /// Grapheme boundaries in the real value. No secret bytes enter the shaped text.
+    source_offsets: Option<Vec<usize>>,
+}
+
+impl DisplayText {
+    fn new(text: &str, secret: bool) -> Self {
+        if !secret {
+            return Self { text: text.to_owned().into(), source_offsets: None };
+        }
+        let mut offsets: Vec<usize> = text.grapheme_indices(true).map(|(offset, _)| offset).collect();
+        let masked = "•".repeat(offsets.len());
+        offsets.push(text.len());
+        Self { text: masked.into(), source_offsets: Some(offsets) }
+    }
+
+    fn painted(&self, offset: usize) -> usize {
+        match &self.source_offsets {
+            Some(offsets) => offsets.partition_point(|at| *at <= offset).saturating_sub(1) * "•".len(),
+            None => offset.min(self.text.len()),
+        }
+    }
+
+    fn source(&self, offset: usize) -> usize {
+        match &self.source_offsets {
+            Some(offsets) => offsets[(offset / "•".len()).min(offsets.len() - 1)],
+            None => offset.min(self.text.len()),
+        }
+    }
+}
+
+/// Secret fields never publish their value to Copy, Cut or PRIMARY.
+fn exported_text(text: &str, secret: bool) -> Option<String> {
+    (!secret).then(|| text.to_owned())
+}
+
+/// Native input services need a document with the same UTF-16 and scalar indices.
+fn native_text(text: &str, secret: bool) -> Option<String> {
+    Some(if secret {
+        // Android computes surrounding deletion in both UTF-16 units and Unicode scalars.
+        // Keep both coordinate systems intact without giving its mirrored buffer plaintext.
+        // Painting uses the separate grapheme mask, so these symbols are never drawn.
+        text.chars().map(|ch| if ch.len_utf16() == 2 { '🔒' } else { '•' }).collect()
+    } else {
+        text.to_owned()
+    })
+}
+
 /// The field's text as shaped for one width.
 struct Laid {
     lines: Vec<ShapedText>,
     rows: Vec<Row>,
     text: SharedString,
+    display: DisplayText,
     line_height: Pixels,
 }
 
@@ -259,11 +312,12 @@ impl Rows for Laid {
     }
 
     fn range(&self, row: usize) -> Range<usize> {
-        self.rows[row].range.clone()
+        let range = &self.rows[row].range;
+        self.display.source(range.start)..self.display.source(range.end)
     }
 
     fn x_of(&self, row: usize, offset: usize) -> f32 {
-        self.x(&self.rows[row], offset).into()
+        self.x(&self.rows[row], self.display.painted(offset)).into()
     }
 
     fn offset_at(&self, row: usize, x: f32) -> usize {
@@ -281,7 +335,7 @@ impl Rows for Laid {
         } else {
             row.range.end
         };
-        found.clamp(row.range.start, end.max(row.range.start))
+        self.display.source(found.clamp(row.range.start, end.max(row.range.start)))
     }
 }
 
@@ -329,6 +383,7 @@ pub struct TextInput {
     focus_handle: FocusHandle,
     editor: Editor,
     placeholder: SharedString,
+    secret: bool,
     laid: Option<Rc<Laid>>,
     bounds: Option<Bounds<Pixels>>,
     line_height: Pixels,
@@ -349,6 +404,13 @@ impl TextInput {
         TextInput::with(false, placeholder, cx)
     }
 
+    /// A single-line value whose actual text is kept only by the editor and its holder.
+    pub fn secret(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> TextInput {
+        let mut input = TextInput::new(placeholder, cx);
+        input.secret = true;
+        input
+    }
+
     /// Return sends, Shift-Return breaks the line.
     pub fn multiline(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> TextInput {
         TextInput::with(true, placeholder, cx)
@@ -359,6 +421,7 @@ impl TextInput {
             focus_handle: cx.focus_handle(),
             editor: Editor::new(multiline),
             placeholder: placeholder.into(),
+            secret: false,
             laid: None,
             bounds: None,
             line_height: px(20.),
@@ -441,7 +504,7 @@ impl TextInput {
 
     fn rows(&self) -> Rc<dyn Rows> {
         match &self.laid {
-            Some(laid) if laid.text.as_ref() == self.editor.text() => laid.clone(),
+            Some(laid) if laid.display == DisplayText::new(self.editor.text(), self.secret) => laid.clone(),
             _ => Rc::new(PlainRows::new(self.editor.text(), None)),
         }
     }
@@ -703,6 +766,13 @@ impl TextInput {
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
+        if self.secret {
+            if let Some(text) = item.text() {
+                self.editor.insert(&text);
+                self.edited(cx);
+            }
+            return;
+        }
         match pasted(item.entries()) {
             Pasted::Files(paths) => cx.emit(InputPaste::Files(paths)),
             Pasted::Image(image) => cx.emit(InputPaste::Image(image)),
@@ -718,11 +788,14 @@ impl TextInput {
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if !self.editor.selection().is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.editor.selected_text().to_owned()));
+            if let Some(text) = exported_text(self.editor.selected_text(), self.secret) {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
         }
     }
 
     fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
+        if self.secret { return; }
         if let Some(cut) = self.editor.cut() {
             cx.write_to_clipboard(ClipboardItem::new_string(cut));
             self.edited(cx);
@@ -733,7 +806,9 @@ impl TextInput {
     fn publish_primary(&self, _cx: &App) {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         if !self.editor.selection().is_empty() {
-            _cx.write_to_primary(ClipboardItem::new_string(self.editor.selected_text().to_owned()));
+            if let Some(text) = exported_text(self.editor.selected_text(), self.secret) {
+                _cx.write_to_primary(ClipboardItem::new_string(text));
+            }
         }
     }
 
@@ -852,7 +927,7 @@ impl TextInput {
         let (Some(bounds), Some(laid)) = (self.bounds, self.laid.as_ref()) else {
             return 0;
         };
-        if self.editor.text().is_empty() || laid.text.as_ref() != self.editor.text() {
+        if self.editor.text().is_empty() || laid.display != DisplayText::new(self.editor.text(), self.secret) {
             return self.editor.text().len().min(self.editor.cursor());
         }
         let (scroll_x, scroll_y) = self.scrolled();
@@ -953,7 +1028,7 @@ impl EntityInputHandler for TextInput {
     ) -> Option<String> {
         let range = self.editor.range_from_utf16(&range_utf16);
         actual_range.replace(self.editor.range_to_utf16(&range));
-        Some(self.editor.text()[range].to_owned())
+        native_text(&self.editor.text()[range], self.secret)
     }
 
     fn selected_text_range(
@@ -966,6 +1041,16 @@ impl EntityInputHandler for TextInput {
             range: self.editor.range_to_utf16(&self.editor.selection()),
             reversed: self.editor.reversed(),
         })
+    }
+
+    fn set_selected_text_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.select_utf16(range_utf16);
+        cx.notify();
     }
 
     fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
@@ -1013,8 +1098,8 @@ impl EntityInputHandler for TextInput {
         let (scroll_x, scroll_y) = self.scrolled();
         let top = bounds.top() + self.line_height * index as f32 - scroll_y;
         Some(Bounds::from_corners(
-            point(bounds.left() + laid.x(row, range.start) - scroll_x, top),
-            point(bounds.left() + laid.x(row, range.end) - scroll_x, top + self.line_height),
+            point(bounds.left() + laid.x(row, laid.display.painted(range.start)) - scroll_x, top),
+            point(bounds.left() + laid.x(row, laid.display.painted(range.end)) - scroll_x, top + self.line_height),
         ))
     }
 
@@ -1043,13 +1128,14 @@ impl Shaping {
     /// ellipsis when it does not fit, where the text itself wraps.
     fn lay_out(&self, input: &TextInput, room: Option<Pixels>, window: &mut Window) -> Laid {
         let content = input.editor.text();
+        let display = DisplayText::new(content, input.secret);
         let (text, placeholder): (SharedString, bool) = if content.is_empty() {
             // A placeholder never wraps or breaks.
             (input.placeholder.replace('\n', " ").into(), true)
         } else {
-            (SharedString::new(content), false)
+            (display.text.clone(), false)
         };
-        let marked = input.editor.marked().filter(|_| !placeholder);
+        let marked = input.editor.marked().filter(|_| !placeholder).map(|range| display.painted(range.start)..display.painted(range.end));
         let run = |len: usize, color: Hsla, underlined: bool| TextRun {
             len,
             font: self.font.clone(),
@@ -1085,7 +1171,7 @@ impl Shaping {
             let within = |range: &Range<usize>| {
                 range.start.saturating_sub(line_start).min(line.len())..range.end.saturating_sub(line_start).min(line.len())
             };
-            let named: Vec<Range<usize>> = if placeholder { Vec::new() } else { input.highlights.iter().map(within).collect() };
+            let named: Vec<Range<usize>> = if placeholder || input.secret { Vec::new() } else { input.highlights.iter().map(within).collect() };
             let mut cuts = vec![0, line.len()];
             cuts.extend(dim.iter().flat_map(|range| [range.start, range.end]));
             cuts.extend(named.iter().flat_map(|range| [range.start, range.end]).filter(|cut| line.is_char_boundary(*cut)));
@@ -1130,7 +1216,7 @@ impl Shaping {
             lines.push(shaped);
             line_start += line.len() + 1;
         }
-        Laid { lines, rows, text, line_height: window.line_height() }
+        Laid { lines, rows, text, display, line_height: window.line_height() }
     }
 }
 
@@ -1258,9 +1344,12 @@ impl Element for TextElement {
         let multiline = input.editor.is_multiline();
         let laid = Rc::new(shaping.lay_out(input, Some(bounds.size.width), window));
         let empty = input.editor.text().is_empty();
-        let selection = if empty { 0..0 } else { input.editor.selection() };
-        let caret = if empty { 0 } else { input.editor.cursor() };
-        let caret_row = laid.row_of(caret);
+        let selection = if empty { 0..0 } else {
+            let selected = input.editor.selection();
+            laid.display.painted(selected.start)..laid.display.painted(selected.end)
+        };
+        let caret = if empty { 0 } else { laid.display.painted(input.editor.cursor()) };
+        let caret_row = laid.row_of(if empty { 0 } else { input.editor.cursor() });
         let caret_x = laid.x(&laid.rows[caret_row], caret);
 
         // Keep the caret's line in view, and never scroll past the text.
@@ -1450,11 +1539,141 @@ impl Focusable for TextInput {
     }
 }
 
+#[cfg(all(test, feature = "gui-shot"))]
+mod secret_input_gui_tests {
+    use super::*;
+
+    #[test]
+    fn secret_input_paint_and_composition_never_shape_the_passphrase() {
+        let mut app = gpui::TestApp::new();
+        let mut window = app.open_window(|window, cx| {
+            let mut input = TextInput::secret("Backup passphrase", cx);
+            input.set_text("aé👩🏽‍💻e\u{301}", cx);
+            window.focus(&input.focus_handle, cx);
+            input
+        });
+        window.draw();
+        window.read(|input, _| {
+            let laid = input.laid.as_ref().expect("secret input was painted");
+            assert_eq!(&*laid.text, "••••");
+            assert_eq!(&*laid.lines[0].text, "••••");
+            assert_eq!(laid.range(0), 0..input.text().len());
+            assert_eq!(laid.display.source(laid.display.painted(input.cursor())), input.cursor());
+        });
+        window.update(|input, window, cx| {
+            EntityInputHandler::replace_and_mark_text_in_range(input, None, "秘密", None, window, cx);
+            assert_eq!(input.text(), "aé👩🏽‍💻e\u{301}秘密");
+        });
+        window.draw();
+        window.read(|input, _| {
+            let laid = input.laid.as_ref().unwrap();
+            assert_eq!(&*laid.lines[0].text, "••••••");
+        });
+    }
+
+    #[test]
+    fn secret_input_native_readback_and_copy_cut_leave_the_clipboard_untouched() {
+        let mut app = gpui::TestApp::new();
+        let mut window = app.open_window(|_, cx| TextInput::secret("Backup passphrase", cx));
+        window.update(|input, window, cx| {
+            input.set_text("secret café 🔑", cx);
+            input.editor.select_all();
+            cx.write_to_clipboard(ClipboardItem::new_string("clipboard sentinel"));
+            input.copy(&Copy, window, cx);
+            input.cut(&Cut, window, cx);
+            input.publish_primary(cx);
+            assert_eq!(cx.read_from_clipboard().and_then(|item| item.text()).as_deref(), Some("clipboard sentinel"));
+            assert_eq!(input.text(), "secret café 🔑", "Cut is disabled for secret values");
+            let mut actual = None;
+            let snapshot = EntityInputHandler::text_for_range(input, 0..100, &mut actual, window, cx).unwrap();
+            assert_eq!(snapshot, native_text(input.text(), true).unwrap());
+            assert_eq!(actual, Some(0..input.text().encode_utf16().count()));
+            EntityInputHandler::set_selected_text_range(input, 10..7, window, cx);
+            let selected = EntityInputHandler::selected_text_range(input, false, window, cx).unwrap();
+            assert_eq!(selected.range, 7..10);
+            assert!(selected.reversed);
+            let config = EntityInputHandler::text_input_configuration(input, window, cx);
+            assert!(!config.autocorrect && !config.suggestions);
+            assert_eq!(config.autocapitalize, gpui::Autocapitalize::None);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{markup, pasted, Pasted};
     use gpui::{ClipboardEntry, ClipboardString, ExternalPaths, Image, ImageFormat};
     use std::path::PathBuf;
+
+    #[test]
+    fn secret_input_shapes_only_grapheme_masks_and_preserves_the_editor_value() {
+        let raw = "café e\u{301} 👩🏽‍💻 🇺🇸";
+        let mut editor = super::Editor::new(false);
+        editor.set_text(raw);
+        let display = super::DisplayText::new(editor.text(), true);
+        assert_eq!(&*display.text, "••••••••••");
+        assert_eq!(editor.text(), raw, "the backup still needs the exact passphrase");
+        assert_eq!(&*super::DisplayText::new(raw, false).text, raw);
+    }
+
+    #[test]
+    fn secret_input_maps_multibyte_and_combining_carets_and_selections() {
+        let raw = "aé👩🏽‍💻e\u{301}";
+        let display = super::DisplayText::new(raw, true);
+        let source = [0, 1, 3, 18, 21];
+        for (grapheme, offset) in source.into_iter().enumerate() {
+            assert_eq!(display.painted(offset), grapheme * "•".len());
+            assert_eq!(display.source(grapheme * "•".len()), offset);
+        }
+        assert_eq!(display.painted(2), 3, "inside a UTF-8 character snaps to its mask");
+        assert_eq!(display.painted(20), 9, "combining sequence stays one mask");
+        assert_eq!(display.source(usize::MAX), raw.len());
+    }
+
+    #[test]
+    fn secret_input_does_not_export_plaintext_to_clipboards() {
+        assert_eq!(super::exported_text("private café 🔑", true), None);
+        assert_eq!(super::exported_text("ordinary text", false), Some("ordinary text".to_owned()));
+    }
+
+    #[test]
+    fn secret_input_editing_keeps_unicode_passphrase_and_mask_caret_in_step() {
+        let mut editor = super::Editor::new(false);
+        editor.set_text("aé🔑");
+        editor.go(super::Motion::Left, true, &super::PlainRows::new(editor.text(), None));
+        assert_eq!(editor.selected_text(), "🔑");
+        editor.insert("e\u{301}");
+        let display = super::DisplayText::new(editor.text(), true);
+        assert_eq!(editor.text(), "aée\u{301}");
+        assert_eq!(&*display.text, "•••");
+        assert_eq!(display.painted(editor.cursor()), 9);
+        assert!(editor.undo());
+        assert_eq!(editor.text(), "aé🔑");
+    }
+
+    #[test]
+    fn secret_input_native_snapshot_preserves_each_scalars_utf16_width_without_plaintext() {
+        let raw = "Aé😀e\u{301}👩🏽‍💻Z";
+        let snapshot = super::native_text(raw, true).expect("Android deletion needs Some native text");
+        assert_eq!(snapshot.chars().map(char::len_utf16).collect::<Vec<_>>(), raw.chars().map(char::len_utf16).collect::<Vec<_>>());
+        assert!(snapshot.chars().all(|ch| ch == '•' || ch == '🔒'));
+        assert_eq!(super::native_text(raw, false).as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn secret_input_native_codepoint_deletion_keeps_supplementary_and_combining_offsets() {
+        for (raw, before, expected) in [("A😀B", 2, "A"), ("Ae\u{301}B", 2, "Ae"), ("aé👩🏽‍💻Z", 2, "aé👩🏽‍")] {
+            let mut editor = super::Editor::new(false);
+            editor.set_text(raw);
+            let snapshot = super::native_text(editor.text(), true).expect("Android must receive a masked document");
+            // Android counts scalars in its snapshot, then sends the resulting UTF-16 range.
+            let cut = snapshot.chars().count().saturating_sub(before);
+            let start = snapshot.chars().take(cut).map(char::len_utf16).sum();
+            let end = snapshot.encode_utf16().count();
+            editor.ime_replace(Some(start..end), "");
+            assert_eq!(editor.text(), expected);
+        }
+    }
 
     #[test]
     fn word_line_and_shift_selections_survive_a_stationary_move() {

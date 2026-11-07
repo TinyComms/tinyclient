@@ -219,7 +219,7 @@ impl Shell {
         // Green when only the members' devices can read it. Amber when the server can.
         // A plaintext conversation is never drawn with the lock.
         let (icon, tone) = if sealed { ("icons/lock.svg", theme::online()) } else { ("icons/triangle-alert.svg", theme::warning()) };
-        let account = open.key.account();
+        let conversation = open.key.clone();
         Some(
             div()
                 .id("conversation-encryption")
@@ -235,7 +235,7 @@ impl Shell {
                 .hover(|style| style.text_color(theme::text()))
                 .tooltip(tip(open.encryption.explained(), None))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_encryption(&account, window, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_encryption(&conversation, sealed, window, cx)))
                 .child(glyph(icon, 12., tone))
                 .child(open.encryption.words()),
         )

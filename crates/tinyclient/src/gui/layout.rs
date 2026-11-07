@@ -778,7 +778,7 @@ impl Shell {
                         menu_item_danger(("sign-out", items_id(&account.key.account)), Some("icons/log-out.svg"), "Sign out")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_menu(cx);
-                                this.sign_out(key.clone(), cx);
+                                this.sign_out(key.clone(), false, cx);
                             }))
                             .into_any_element(),
                     );

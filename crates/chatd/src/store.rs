@@ -294,17 +294,17 @@ const PERSON: &str = "
     FROM person p
     LEFT JOIN media m ON m.network = p.network AND m.account = p.account AND m.id = p.avatar";
 
-/// One message's place. Time, then whether it has no server sequence (those sit after the
+/// One message's place. Time including private milliseconds, then whether it has no server sequence (those sit after the
 /// sequenced rows at that same time), then the sequence, then id, shorter first so a numeric
 /// id still sorts as a number. [`Message::rank`] is the same order.
 /// Select-list form of the place. The comparison is `{PLACE} < (SELECT {PLACE_TERMS} ...)`.
 /// Selecting `{PLACE}` itself is one column, and SQLite answers "row value misused".
-const PLACE_TERMS: &str = "sent, (seq = 0), seq, length(id), id";
-const PLACE: &str = "(sent, (seq = 0), seq, length(id), id)";
+const PLACE_TERMS: &str = "sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), (seq = 0), seq, length(id), id";
+const PLACE: &str = "(sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), (seq = 0), seq, length(id), id)";
 /// Messages in the order they are read. The newest-first form is the reverse of [`PLACE`],
 /// so a page read that way and then reversed matches the oldest-first form.
-const NEWEST_FIRST: &str = "ORDER BY sent DESC, (seq = 0) DESC, seq DESC, length(id) DESC, id DESC";
-const OLDEST_FIRST: &str = "ORDER BY sent, (seq = 0), seq, length(id), id";
+const NEWEST_FIRST: &str = "ORDER BY sent DESC, coalesce(json_extract(body, '$.sent_subsec_millis'), 0) DESC, (seq = 0) DESC, seq DESC, length(id) DESC, id DESC";
+const OLDEST_FIRST: &str = "ORDER BY sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), (seq = 0), seq, length(id), id";
 
 pub struct Store {
     db: Connection,
@@ -1857,44 +1857,48 @@ impl Store {
         Ok(changed == 1)
     }
 
-    fn message_sent(&self, conversation: &Key, id: &str) -> Option<i64> {
+    fn message_place(&self, conversation: &Key, id: &str) -> Option<(i64, u32, i64)> {
         self.db
             .query_row(
-                "SELECT sent FROM message
+                "SELECT sent, coalesce(json_extract(body, '$.sent_subsec_millis'), 0), seq FROM message
                   WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
                 params![word(&conversation.network), conversation.account, conversation.id, id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .ok()
             .flatten()
     }
 
-    /// Whether `newer` is a later message than `older`. A stored send time wins. Otherwise
-    /// snowflakes, Telegram ids and Slack timestamps use [`id_is_ahead`]. Two Tiny UUIDs with
-    /// no distinct send time are not ordered: their text order is not a clock.
+    /// Whether `newer` is a later message than `older`. Private sender time wins, then the
+    /// server sequence when both rows have one. Otherwise snowflakes, Telegram ids and Slack
+    /// timestamps use [`id_is_ahead`]. UUID text order is not a clock.
     fn cursor_ahead(&self, conversation: &Key, newer: &str, older: &str) -> bool {
         if newer.is_empty() || older.is_empty() || newer == older {
             return false;
         }
-        match (self.message_sent(conversation, newer), self.message_sent(conversation, older)) {
-            (Some(left), Some(right)) if left != right => return left > right,
-            (Some(_), Some(_)) if is_uuid(newer) || is_uuid(older) => return false,
-            _ if is_uuid(newer) || is_uuid(older) => return false,
-            _ => {}
+        if let (Some((left, left_millis, left_seq)), Some((right, right_millis, right_seq))) =
+            (self.message_place(conversation, newer), self.message_place(conversation, older))
+        {
+            if (left, left_millis) != (right, right_millis) {
+                return (left, left_millis) > (right, right_millis);
+            }
+            if left_seq > 0 && right_seq > 0 && left_seq != right_seq {
+                return left_seq > right_seq;
+            }
+        }
+        if is_uuid(newer) || is_uuid(older) {
+            return false;
         }
         id_is_ahead(newer, older)
     }
 
-    /// True when both ids are UUIDs and send time does not say which one is later.
+    /// True when a UUID is involved and neither timestamp nor sequence orders the ids.
     fn ids_incomparable(&self, conversation: &Key, left: &str, right: &str) -> bool {
         if left.is_empty() || right.is_empty() || left == right || (!is_uuid(left) && !is_uuid(right)) {
             return false;
         }
-        match (self.message_sent(conversation, left), self.message_sent(conversation, right)) {
-            (Some(left_sent), Some(right_sent)) if left_sent != right_sent => false,
-            _ => true,
-        }
+        !self.cursor_ahead(conversation, left, right) && !self.cursor_ahead(conversation, right, left)
     }
 
     /// The unread state the network reported: at connect, or when another device read it. The
@@ -2228,24 +2232,30 @@ impl Store {
         // A live send clears the badge: pending from the shell, or the network's echo (`unread`).
         // History of a past post of ours must not.
         let clear_read = incoming.outgoing && (unread || matches!(incoming.state, SendState::Pending));
-        // Same stamp is not the same moment. A later sequence wins; one with no sequence does
-        // not displace a sequenced row, and it does not lose to another unsequenced one.
-        let (updated, preview_seq): (i64, i64) = tx
+        // Compare private sender milliseconds before the server sequence. With equal time,
+        // one with no sequence does not displace a sequenced row, and does not lose to another
+        // unsequenced one.
+        let (updated, preview_millis, preview_seq): (i64, u32, i64) = tx
             .query_row(
                 "SELECT c.updated,
+                        COALESCE((SELECT json_extract(m.body, '$.sent_subsec_millis') FROM message m
+                                    WHERE m.network = c.network AND m.account = c.account
+                                      AND m.conversation = c.id AND m.id = c.preview_id), 0),
                         COALESCE((SELECT m.seq FROM message m
                                     WHERE m.network = c.network AND m.account = c.account
                                       AND m.conversation = c.id AND m.id = c.preview_id), 0)
                    FROM conversation c
                   WHERE c.network = ?1 AND c.account = ?2 AND c.id = ?3",
                 params![network, account, id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?
-            .unwrap_or((0, 0));
+            .unwrap_or((0, 0, 0));
+        let incoming_time = (incoming.sent, incoming.sent_subsec_millis);
+        let preview_time = (updated, preview_millis);
         let replace_preview = replaced_preview
-            || incoming.sent > updated
-            || (incoming.sent == updated && if incoming.seq > 0 { incoming.seq > preview_seq } else { preview_seq == 0 });
+            || incoming_time > preview_time
+            || (incoming_time == preview_time && if incoming.seq > 0 { incoming.seq > preview_seq } else { preview_seq == 0 });
         match outcome {
             Stored::New => {
                 tx.execute(
@@ -3497,6 +3507,116 @@ mod tests {
         assert!(store.search_messages(None, None, Some(&elsewhere), "world", 10).unwrap().is_empty());
         // With no space named, the cache answers as a whole.
         assert_eq!(store.search_messages(None, None, None, "world", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pages_preserve_subsecond_order_with_random_message_ids() {
+        let (mut store, key) = store();
+        for (id, millis) in [("z-first", 100), ("a-middle", 500), ("b-last", 900)] {
+            let mut value = serde_json::to_value(said(id, id, 20)).unwrap();
+            value["sent_subsec_millis"] = serde_json::json!(millis);
+            store.ingest(&key, &serde_json::from_value(value).unwrap(), false).unwrap();
+        }
+        let newest = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(ids(&newest), ["z-first", "a-middle", "b-last"]);
+        let before = store.messages(&key, &Page::Before { id: "a-middle".into() }, 10, NOW).unwrap().unwrap();
+        assert_eq!(ids(&before), ["z-first"]);
+        let after = store.messages(&key, &Page::After { id: "a-middle".into() }, 10, NOW).unwrap().unwrap();
+        assert_eq!(ids(&after), ["b-last"]);
+    }
+
+    #[test]
+    fn merged_order_pages_prefer_precise_time_then_sequence() {
+        let (mut store, key) = store();
+        let mut messages = Vec::new();
+        for (id, millis, seq) in [
+            ("ffffffff-ffff-4fff-8fff-ffffffffffff", 100, 30),
+            ("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", 500, 20),
+            ("dddddddd-dddd-4ddd-8ddd-dddddddddddd", 500, 21),
+            ("00000000-0000-4000-8000-000000000001", 900, 1),
+        ] {
+            let mut message = said(id, id, 20);
+            message.sent_subsec_millis = millis;
+            message.seq = seq;
+            message.previews.push(protocol::Preview {
+                url: format!("https://example.com/{id}"),
+                site: String::new(), title: id.into(), description: String::new(), image: None,
+            });
+            messages.push(message);
+        }
+        // Sender time, post sequence, UUID text and arrival order all differ.
+        for index in [3, 1, 0, 2] {
+            store.ingest(&key, &messages[index], false).unwrap();
+        }
+        let expected: Vec<_> = messages.iter().map(|message| message.id.as_str()).collect();
+        let newest = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(ids(&newest), expected);
+        let mut ranked = newest.messages.clone();
+        ranked.sort_by_key(Message::rank);
+        assert_eq!(ranked, newest.messages, "the shell and SQL use one order");
+        let before = store.messages(&key, &Page::Before { id: messages[2].id.clone() }, 10, NOW).unwrap().unwrap();
+        assert_eq!(ids(&before), expected[..2]);
+        let after = store.messages(&key, &Page::After { id: messages[1].id.clone() }, 10, NOW).unwrap().unwrap();
+        assert_eq!(ids(&after), expected[2..]);
+        let around = store.messages(&key, &Page::Around { id: messages[1].id.clone() }, 2, NOW).unwrap().unwrap();
+        assert_eq!(ids(&around), expected[..3]);
+        let (shared, more) = store.shared(&key, SharedKind::Links, Some(&messages[2].id), 10).unwrap().unwrap();
+        assert!(!more);
+        assert_eq!(shared.iter().map(|item| item.message_id.as_str()).collect::<Vec<_>>(), [expected[1], expected[0]]);
+
+        let mut edited = messages[0].clone();
+        edited.seq = 0;
+        edited.text = "edited older message".into();
+        store.ingest(&key, &edited, false).unwrap();
+        let after_edit = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(ids(&after_edit), expected);
+        assert_eq!((after_edit.messages[0].sent_subsec_millis, after_edit.messages[0].seq), (100, 30));
+        assert_eq!(store.preview_id(&key).unwrap(), messages[3].id);
+    }
+
+    #[test]
+    fn merged_order_preview_follows_private_time_despite_sequence_and_arrival() {
+        for newest_arrives_first in [true, false] {
+            let (mut store, key) = store();
+            let mut earlier = said("ffffffff-ffff-4fff-8fff-ffffffffffff", "earlier", 20);
+            earlier.sent_subsec_millis = 100;
+            earlier.seq = 9;
+            let mut later = said("00000000-0000-4000-8000-000000000001", "later", 20);
+            later.sent_subsec_millis = 900;
+            later.seq = 1;
+            let arrivals = if newest_arrives_first { [&later, &earlier] } else { [&earlier, &later] };
+            for message in arrivals {
+                store.ingest(&key, message, false).unwrap();
+            }
+            assert_eq!(store.preview_id(&key).unwrap(), later.id);
+            assert_eq!(store.conversation(&key).unwrap().unwrap().preview, "later");
+        }
+    }
+
+    #[test]
+    fn merged_order_read_cursor_uses_private_time_and_equal_time_sequence() {
+        for (earlier_millis, later_millis, earlier_seq, later_seq) in [(100, 900, 9, 1), (0, 0, 1, 2)] {
+            let (mut store, key) = store();
+            let mut earlier = said("ffffffff-ffff-4fff-8fff-ffffffffffff", "earlier", 20);
+            earlier.sent_subsec_millis = earlier_millis;
+            earlier.seq = earlier_seq;
+            let mut later = said("00000000-0000-4000-8000-000000000001", "later", 20);
+            later.sent_subsec_millis = later_millis;
+            later.seq = later_seq;
+            store.ingest(&key, &earlier, true).unwrap();
+            assert!(store.mark_read(&key, &earlier.id).unwrap());
+            store.ingest(&key, &later, true).unwrap();
+            let marks = store.unread_marks(Some(Network::Discord)).unwrap();
+            assert!(marks.iter().any(|(found, marker, _)| found == &key && marker == &later.id));
+            store.set_counts(&key, 0, 0, None, 20).unwrap();
+            assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 1);
+            assert!(store.mark_read(&key, &later.id).unwrap());
+            let row = store.conversation(&key).unwrap().unwrap();
+            assert_eq!((row.unread, row.last_read.as_deref()), (0, Some(later.id.as_str())));
+            store.set_counts(&key, 4, 0, Some(&earlier.id), 20).unwrap();
+            let row = store.conversation(&key).unwrap().unwrap();
+            assert_eq!((row.unread, row.last_read.as_deref()), (0, Some(later.id.as_str())));
+        }
     }
 
     #[test]

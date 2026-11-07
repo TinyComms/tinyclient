@@ -20,7 +20,7 @@
 //! it is sent, and is never logged.
 
 mod page;
-mod qr;
+pub(in crate::gui) mod qr;
 #[cfg(feature = "gui-shot")]
 mod shot;
 pub(super) mod welcome;
@@ -1472,7 +1472,7 @@ fn quiet_tile() -> Div {
 
 /// The code on its white tile: one canvas of filled squares, a whole number of points each,
 /// centered in the room the padding leaves. The padding is the quiet zone a reader needs.
-fn code_tile(code: Rc<qr::Qr>) -> Div {
+pub(in crate::gui) fn code_tile(code: Rc<qr::Qr>) -> Div {
     let squares = canvas(
         |_, _, _| (),
         move |bounds, (), window, _| {
