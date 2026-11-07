@@ -32,6 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 import common  # noqa: E402
+import coordinated  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location("pr_gate", os.path.join(ROOT, ".github", "scripts", "pr-gate.py"))
 pr_gate = importlib.util.module_from_spec(_spec)
@@ -97,7 +98,7 @@ def one_run(platform, label, app_sha, scenario_sha, scenario, scenario_dir, src_
 
 def _one_run(platform, label, app_sha, scenario_sha, scenario, scenario_dir, src_tar, out, log):
     """An adapter's run, then the lab's own check of what it brought back. Never raises."""
-    adapter = load_adapter(platform)
+    adapter = coordinated if scenario.get("execution") == "coordinated-ipc" else load_adapter(platform)
     # One folder per scenario: two scenarios on one platform must not overwrite each other's evidence.
     where = os.path.join(out, platform, label, scenario["id"])
     os.makedirs(where, exist_ok=True)

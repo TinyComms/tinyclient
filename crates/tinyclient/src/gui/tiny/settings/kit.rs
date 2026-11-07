@@ -34,6 +34,60 @@ pub(in crate::gui::tiny) fn card() -> Div {
     div().w_full().rounded(px(theme::R_CARD)).bg(theme::raised()).border_1().border_color(theme::hairline()).flex().flex_col()
 }
 
+/// Encryption forms can contain server errors and device names without spaces. Give those
+/// strings wrap opportunities without shortening them; clipboard actions use the original.
+pub(in crate::gui::tiny) fn security_words(words: impl AsRef<str>) -> Div {
+    div().min_w_0().max_w_full().whitespace_normal().child(security_wrap(words.as_ref()))
+}
+
+pub(in crate::gui::tiny) fn security_wrap(words: &str) -> String {
+    let mut shown = String::with_capacity(words.len());
+    let mut run = 0;
+    for letter in words.chars() {
+        if letter.is_whitespace() {
+            run = 0;
+        } else {
+            if run == 8 {
+                shown.push('\u{200b}');
+                run = 0;
+            }
+            run += 1;
+        }
+        shown.push(letter);
+    }
+    shown
+}
+
+/// The active encryption step has the same surface and radius as other settings cards.
+pub(in crate::gui::tiny) fn security_card() -> Div {
+    card().min_w_0().max_w_full().shadow(theme::shadow_tooltip())
+}
+
+/// A labelled encryption section, with a familiar icon rather than more explanatory copy.
+pub(in crate::gui::tiny) fn security_section(icon: &'static str, title: &'static str) -> Div {
+    div().min_w_0().flex().flex_col().gap(px(10.)).child(
+        div().flex().items_center().gap(px(8.))
+            .child(glyph(icon, 16., theme::text_soft()))
+            .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child(title)),
+    )
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::security_wrap;
+
+    #[test]
+    fn long_device_names_and_errors_wrap_without_losing_characters() {
+        for text in ["a".repeat(400), "W".repeat(400), "设备".repeat(80), "No spaces: ".to_owned() + &"x".repeat(120)] {
+            let shown = security_wrap(&text);
+            assert_eq!(shown.replace('\u{200b}', ""), text);
+            assert!(shown.split(|c: char| c.is_whitespace() || c == '\u{200b}').all(|part| part.chars().count() <= 8));
+        }
+        assert_eq!(security_wrap("042 117"), "042 117");
+        assert_eq!(security_wrap("edf6 5cb7 1e0b"), "edf6 5cb7 1e0b");
+    }
+}
+
 /// A note in a card: a glyph, then words that wrap.
 pub(in crate::gui::tiny) fn note(icon: &'static str, tone: Rgba, words: impl Into<SharedString>) -> Div {
     card()

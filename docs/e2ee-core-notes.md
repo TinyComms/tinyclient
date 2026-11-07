@@ -119,10 +119,24 @@ Membership changes come only from proposals signed by the pinned key.
 ### 1.9 Messages and commits arrive in two feeds
 
 `GET .../handshake` and the message list are separate. A message of epoch `e` that is read after the
-commit leaving `e` can only be opened within `Config::max_past_epochs` (default 4) epochs, because
+commit leaving `e` can only be opened within `Config::max_past_epochs` (default 8) epochs, because
 MLS discards older epoch secrets. The caller should open messages of epoch `e` before applying the
 commit that leaves it when it reads both from the start. A message from a future epoch is
 `Error::FutureEpoch` (apply handshake first).
+
+Why 8 (it was 4). An epoch here ends only with a membership change: the server's Add and Remove
+proposals, committed; this protocol forbids Updates, so no epoch ends on a timer. A device that was
+off while its conversations gained a phone, lost a revoked laptop and gained a linked device has
+seen three or four commits per conversation before it reads what was said in between, and with
+device linking that is the ordinary case, not the rare one. What keeping an epoch costs in forward
+secrecy: someone who takes this device's state learns the message keys of messages of the kept
+epochs that this device has not opened yet. Keys of messages it opened are already deleted by the
+sender ratchet, and their plaintext is in the local cache anyway, which the same theft opens. A
+removed member gains nothing, since it never had the later epochs. So the window is "unread
+messages of the last 8 membership changes", still bounded by changes, not time. The cost is the
+secret tree kept per epoch (section 5: the per-message cost at 1000 devices grows with it); a caller
+with very large groups can still lower it. It applies to groups made or joined after the change,
+as every `Config` value does.
 
 ### 1.10 A device cannot open its own messages
 
@@ -196,6 +210,28 @@ here rests on the cross-signature chain, not on lifetimes.
   only after the write succeeded, so a crash cannot make a device use one message key twice.
   Receiving operations write too, but a failed write does not lose what they decrypted: `flush()`
   reports it.
+
+### 2.x Device linking and the history archive (`link`, `archive`)
+
+The contract is tiny's `research_notes/device-link-protocol.md`. Where it left a detail open:
+
+* A channel message on the wire is `counter (u64 BE) || AES-256-GCM(plaintext)`, so the receiver
+  knows the nonce. The `dir` byte of the associated data is `0` for new to old and `1` for old to
+  new. A message with a counter at or below the last one opened is refused; a gap is allowed (the
+  relay may lose a post, and the next message is still the newer).
+* The ECDH input to HKDF is the shared point's x coordinate (`raw_secret_bytes`), as SEC1 and
+  `p256::ecdh` define it. `p256`'s `ecdh` feature is the only change to the dependencies; it pulls
+  in nothing the tree did not already build.
+* The six check digits are the 3 bytes as a big-endian number mod 10^6. They are not an extra key:
+  the 128-bit secret in the code is what defeats a server in the middle; the digits catch a code
+  swapped on its way and give the person something to compare.
+* The archive's header is `"TNYH1" || nonce prefix (7)`; a record is a 4 byte big-endian length then
+  that much JSON, at most 1 MiB. Unknown record kinds, a second `meta`, anything after `end`, and
+  `meta.v` other than 1 are refused (no forward compatibility within v1: a v2 is a new magic).
+* `archive::read` hands out records as their chunks authenticate, so `archive::merge` reads the blob
+  twice: once to check all of it (and that `meta.user` is the person), then to merge. A truncated or
+  altered blob therefore merges nothing. Merging never overwrites a row the device has, and drops
+  rows for conversations the person is not in.
 
 ## 3. Dependencies
 

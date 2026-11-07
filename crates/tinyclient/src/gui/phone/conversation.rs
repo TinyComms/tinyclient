@@ -52,7 +52,7 @@ impl Shell {
         let encryption = (!open.encryption.is_unknown()).then(|| {
             let sealed = open.encryption.is_sealed();
             let (icon, tone) = if sealed { ("icons/lock.svg", theme::text_soft()) } else { ("icons/triangle-alert.svg", theme::text_faint()) };
-            let account = open.key.account();
+            let conversation = open.key.clone();
             div()
                 .id("phone-encryption")
                 .flex_1()
@@ -64,7 +64,7 @@ impl Shell {
                 .font_weight(theme::REGULAR)
                 .text_color(tone)
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_encryption(&account, window, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_encryption(&conversation, sealed, window, cx)))
                 .child(div().flex_none().child(glyph(icon, 11., tone)))
                 .child(div().min_w_0().truncate().child(phone_words(open.encryption)))
         });

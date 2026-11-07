@@ -601,6 +601,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
             },
         ],
         provider: "Pocket ID".to_owned(),
+        new_devices: Vec::new(),
     };
     *PAGE.lock().unwrap() = Some(community);
     Ok(me)

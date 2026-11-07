@@ -405,6 +405,13 @@ impl Editor {
         self.goal_x = None;
     }
 
+    /// Native selection endpoints are UTF-16 scalars, not necessarily grapheme boundaries.
+    pub fn select_utf16(&mut self, range: Range<usize>) {
+        self.reversed = range.start > range.end;
+        self.selection = self.range_from_utf16(&range);
+        self.goal_x = None;
+    }
+
     pub fn select_all(&mut self) {
         self.selection = 0..self.text.len();
         self.reversed = false;
@@ -553,6 +560,23 @@ fn utf8_offset(text: &str, utf16: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_selection_preserves_scalar_endpoints_direction_and_composition() {
+        let mut editor = Editor::new(false);
+        editor.set_text("A😀e\u{301}Z");
+        editor.select_utf16(4..3);
+        assert_eq!(editor.range_to_utf16(&editor.selection()), 3..4);
+        assert!(editor.reversed());
+        assert_eq!(editor.selected_text(), "e");
+        editor.ime_mark(None, "秘密", Some(1..1));
+        let marked = editor.marked();
+        editor.select_utf16(0..1);
+        assert_eq!(editor.range_to_utf16(&editor.selection()), 0..1);
+        assert_eq!(editor.marked(), marked, "native selection must not discard composition");
+        editor.select_utf16(usize::MAX..usize::MAX);
+        assert_eq!(editor.cursor(), editor.text().len());
+    }
 
     fn typed(text: &str) -> Editor {
         let mut editor = Editor::new(true);
