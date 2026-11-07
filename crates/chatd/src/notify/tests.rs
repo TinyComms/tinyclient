@@ -396,6 +396,35 @@ fn a_ring_follows_incoming_calls_and_quiet_time_lets_it_through_by_default() {
 }
 
 #[test]
+fn a_tiny_direct_rings_when_server_notifications_are_off() {
+    let mut values = Values::default();
+    set(&mut values, GLOBAL, settings::NOTIFY_TINY, "off");
+    let room = key(Network::Tiny, "R1");
+    assert!(decide_ring(&values, &room, &moment()).is_none());
+    assert!(decide_ring_in(&values, &room, &moment(), true).is_some());
+}
+
+#[test]
+fn a_waiting_ring_notification_opens_the_ui_for_confirmation() {
+    let fake = Fake::default();
+    let mut notes = Notes::new(Box::new(fake.clone()));
+    let room = key(Network::Tiny, "direct");
+    let call = ringing(&room, "Bea");
+    let verdict = || decide_ring_in(&Values::default(), &room, &moment(), true);
+    notes.call_while_busy(Some(&call), verdict(), "", "Tiny server", true);
+    let id = ring_id(&room);
+    assert_eq!(fake.log().shown[&id].kind, Kind::Plain,
+        "a waiting banner must open the app, not advertise an Accept action that cannot confirm leaving");
+    assert_eq!(notes.conversation(&id), Some(&room));
+    // Once the other call ends, the same ring may offer direct accept/decline.
+    notes.call_while_busy(Some(&call), verdict(), "", "Tiny server", false);
+    assert_eq!(fake.log().shown[&id].kind, Kind::Call);
+    // Starting another call while it still rings must remove those actions again.
+    notes.call_while_busy(Some(&call), verdict(), "", "Tiny server", true);
+    assert_eq!(fake.log().shown[&id].kind, Kind::Plain);
+}
+
+#[test]
 fn a_ring_is_posted_once_with_accept_and_decline_and_withdrawn_when_it_stops() {
     let fake = Fake::default();
     let mut notes = Notes::new(Box::new(fake.clone()));

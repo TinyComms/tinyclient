@@ -294,6 +294,8 @@ pub enum Command {
     },
     /// The id of the direct conversation with a person, created if there is none.
     StartDirect { person_id: String, reply: Reply<String> },
+    /// Tiny call setup can create encrypted text history without enrolling a text device.
+    StartDirectCall { person_id: String, reply: Reply<String> },
     /// The id of the thread a channel message starts. Discord only: create the thread channel,
     /// record it, and answer with its id. `name` is already one line, at most 100 characters.
     StartThread {
@@ -410,7 +412,7 @@ impl Command {
     pub fn unsupported(self, ctx: &Context) {
         match self {
             Command::Members { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::StartDirect { reply, .. } | Command::StartThread { reply, .. } | Command::Handoff { reply, .. } => {
+            Command::StartDirect { reply, .. } | Command::StartDirectCall { reply, .. } | Command::StartThread { reply, .. } | Command::Handoff { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -790,6 +792,25 @@ impl Context {
         Ok(())
     }
 
+    /// A direct-call line. It is not a message: the list preview stays, and nothing is
+    /// announced as a new conversation. `bump_unread` is a missed call we did not place.
+    pub fn quiet_line(
+        &self,
+        conversation_id: &str,
+        message: &Message,
+        bump_unread: bool,
+    ) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self
+            .hub
+            .store()
+            .insert_line(&conversation, message, bump_unread)?
+        {
+            self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(())
+    }
+
     /// A page of history, in any order. Does not count as unread: the network already said how
     /// much is. Messages already stored and unchanged cost nothing.
     pub fn history(&self, conversation_id: &str, messages: &[Message]) -> Stores {
@@ -1115,6 +1136,10 @@ impl Context {
     /// rejoin of the room the call is in keeps the call.
     pub fn tiny_offer(&self, conversation_id: &str, offer: protocol::TinyOffer) -> Result<String, String> {
         self.hub.calls.tiny_offer(&self.hub, &self.key(conversation_id), offer)
+    }
+
+    pub fn tiny_direct_offer(&self, conversation_id: &str, offer: protocol::TinyOffer, intent: u64) -> Result<String, String> {
+        self.hub.calls.tiny_direct_offer(&self.hub, &self.key(conversation_id), offer, intent)
     }
 
     /// The server's answer to that offer: mediad connects with it.

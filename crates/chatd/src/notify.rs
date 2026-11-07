@@ -14,10 +14,13 @@
 use crate::hub::{lock, now, Hub};
 use crate::server::Chat;
 use notifier::{Activation, Kind, Note, Sink};
-use protocol::settings::{self, Values, GLOBAL};
-use protocol::{Call, CallState, Conversation, ConversationKind, Key, Message, Network, Request, Response, Special, Watching};
-use std::collections::{HashMap, VecDeque};
 use protocol::media_host::MediaChild;
+use protocol::settings::{self, Values, GLOBAL};
+use protocol::{
+    Call, CallState, Conversation, ConversationKind, Key, Message, Network, Request, Response,
+    Special, Watching,
+};
+use std::collections::{HashMap, VecDeque};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, Weak};
@@ -177,19 +180,36 @@ pub fn decide(values: &Values, conversation: &Conversation, message: &Message, m
 
 /// Whether a ring posts (N5, N9, N3) and whether it is heard. `None`: nothing at all.
 pub fn decide_ring(values: &Values, conversation: &Key, moment: &Moment) -> Option<Verdict> {
+    decide_ring_in(values, conversation, moment, false)
+}
+
+/// `direct` is a one-to-one conversation. A Tiny direct rings even when Tiny server
+/// notifications are off, the same way a Tiny direct message does.
+pub fn decide_ring_in(
+    values: &Values,
+    conversation: &Key,
+    moment: &Moment,
+    direct: bool,
+) -> Option<Verdict> {
     let calls = values.word(GLOBAL, settings::CALLS);
     if calls == "off" || level(values, conversation) == "off" || moment.dnd {
         return None;
     }
-    if conversation.network == Network::Tiny && !values.on(settings::NOTIFY_TINY) {
+    if conversation.network == Network::Tiny && !direct && !values.on(settings::NOTIFY_TINY) {
         return None;
     }
     if hushed(values, moment) && !values.on(settings::CALLS_THROUGH) {
         return None;
     }
     let ring = values.word(GLOBAL, settings::RING_SOUND);
-    let sound = (calls == "ring" && values.on(settings::SOUNDS) && ring != "none").then(|| ring.to_owned());
-    Some(Verdict { banner: !moment.watching.focused, sound, preview: preview(values, moment.locked), mention: false })
+    let sound =
+        (calls == "ring" && values.on(settings::SOUNDS) && ring != "none").then(|| ring.to_owned());
+    Some(Verdict {
+        banner: !moment.watching.focused,
+        sound,
+        preview: preview(values, moment.locked),
+        mention: false,
+    })
 }
 
 /// The notification's id for a conversation, stable across messages.
@@ -231,12 +251,13 @@ pub struct Notes {
     /// Note ids back to their conversations, for what the user does with one.
     ids: HashMap<String, Key>,
     ringing: Option<Key>,
+    ringing_busy: bool,
     sounded: Option<Instant>,
 }
 
 impl Notes {
     pub fn new(sink: Box<dyn Sink>) -> Notes {
-        Notes { sink, groups: HashMap::new(), ids: HashMap::new(), ringing: None, sounded: None }
+        Notes { sink, groups: HashMap::new(), ids: HashMap::new(), ringing: None, ringing_busy: false, sounded: None }
     }
 
     /// The conversation a note is about.
@@ -321,16 +342,22 @@ impl Notes {
     /// `verdict` is [`decide_ring`]'s for the ringing conversation, and `place` and `network`
     /// name it ("#general · Northwind", "Discord").
     pub fn call(&mut self, call: Option<&Call>, verdict: Option<Verdict>, place: &str, network: &str) -> Option<String> {
+        self.call_while_busy(call, verdict, place, network, false)
+    }
+
+    /// Waiting calls open the UI so leaving the active call can be confirmed there.
+    fn call_while_busy(&mut self, call: Option<&Call>, verdict: Option<Verdict>, place: &str, network: &str, busy: bool) -> Option<String> {
         let ringing = call.and_then(|call| match &call.state {
             CallState::RingingIn { from } => Some((call.conversation.clone(), from.clone())),
             _ => None,
         });
         match (ringing, self.ringing.clone()) {
-            (Some((key, _)), Some(shown)) if key == shown => None,
+            (Some((key, _)), Some(shown)) if key == shown && self.ringing_busy == busy => None,
             (Some((key, from)), _) => {
                 self.stop_ring();
                 let verdict = verdict?;
                 self.ringing = Some(key.clone());
+                self.ringing_busy = busy;
                 // A ring nobody is told about still has to be heard: the card is all the
                 // window shows, so chatd plays every sound the system will not.
                 if !verdict.banner {
@@ -346,8 +373,8 @@ impl Notes {
                     id: id.clone(),
                     title,
                     subtitle,
-                    body: "Incoming call".to_owned(),
-                    kind: Kind::Call,
+                    body: if busy { "Open tinyclient to answer." } else { "Incoming call" }.to_owned(),
+                    kind: if busy { Kind::Plain } else { Kind::Call },
                     reply_hint: String::new(),
                     sound: verdict.sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
                     locked_body: "Incoming call".to_owned(),
@@ -369,6 +396,7 @@ impl Notes {
     }
 
     fn stop_ring(&mut self) {
+        self.ringing_busy = false;
         if let Some(key) = self.ringing.take() {
             let id = ring_id(&key);
             self.sink.withdraw(&id);
@@ -444,7 +472,10 @@ pub fn local_minute(unix: i64) -> u32 {
 /// What the hub tells the notification thread.
 pub enum Event {
     /// A new live message from someone else, stored.
-    Message { conversation: Key, message: Box<Message> },
+    Message {
+        conversation: Key,
+        message: Box<Message>,
+    },
     /// A conversation's row changed: it may have been read.
     Row(Key),
     Call(Option<Call>),
@@ -481,7 +512,8 @@ pub fn enabled() -> bool {
 }
 
 /// Why the test notification could not be sent when [`enabled`] is false.
-pub const DISABLED: &str = "Notifications are off for a scratch directory. TINYCLIENT_NOTIFY=on turns them on.";
+pub const DISABLED: &str =
+    "Notifications are off for a scratch directory. TINYCLIENT_NOTIFY=on turns them on.";
 
 /// Starts the notification thread; the hub sends it [`Event`]s from then on.
 pub fn start(hub: Arc<Hub>, chat: Weak<Chat>) {
@@ -603,15 +635,22 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
         let values = hub.settings().clone();
         let volume = values.number(settings::ALERT_VOLUME);
         match event {
-            Event::Message { conversation, message } => {
-                let Ok(Some(row)) = hub.store().conversation(&conversation) else { continue };
+            Event::Message {
+                conversation,
+                message,
+            } => {
+                let Ok(Some(row)) = hub.store().conversation(&conversation) else {
+                    continue;
+                };
                 let at = Instant::now();
                 let mut moment = moment(hub, &conversation, &notes, at);
                 if decide(&values, &row, &message, &moment).is_none() {
                     continue;
                 }
                 moment.dnd = dnd(hub, &conversation);
-                let Some(verdict) = decide(&values, &row, &message, &moment) else { continue };
+                let Some(verdict) = decide(&values, &row, &message, &moment) else {
+                    continue;
+                };
                 if let Some(word) = notes.message(&row, &message, &verdict, at) {
                     playing.extend(play(&word, volume, None, 0));
                 }
@@ -620,31 +659,57 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                 if !notes.has(&conversation) {
                     continue;
                 }
-                let read = hub.store().conversation(&conversation).ok().flatten().is_none_or(|row| row.unread == 0 && row.mentions == 0);
+                let read = hub
+                    .store()
+                    .conversation(&conversation)
+                    .ok()
+                    .flatten()
+                    .is_none_or(|row| row.unread == 0 && row.mentions == 0);
                 if read {
                     notes.read(&conversation);
                 }
             }
             Event::Call(call) => {
-                let ringing = call.as_ref().filter(|call| matches!(call.state, CallState::RingingIn { .. })).map(|call| call.conversation.clone());
+                // A call that is up must not withdraw a ring that is waiting beside it. The
+                // banner is that ring, or the call itself when the call is the ring.
+                let aside = hub.calls.aside();
+                let waiting = call.is_some() && aside.as_ref().is_some_and(|ring| matches!(ring.state, CallState::RingingIn { .. }));
+                let banner = aside
+                    .filter(|ring| matches!(ring.state, CallState::RingingIn { .. }))
+                    .or_else(|| {
+                        call.clone()
+                            .filter(|call| matches!(call.state, CallState::RingingIn { .. }))
+                    });
+                let ringing = banner.as_ref().map(|call| call.conversation.clone());
                 let (verdict, place) = match &ringing {
                     Some(key) => {
                         let row = hub.store().conversation(key).ok().flatten();
-                        let place = row.filter(|row| row.kind != ConversationKind::Direct).map(|row| place(&row)).unwrap_or_default();
-                        let moment = Moment { dnd: dnd(hub, key), ..moment(hub, key, &notes, Instant::now()) };
-                        (decide_ring(&values, key, &moment), place)
+                        let direct = row.as_ref().is_some_and(|row| row.kind.is_direct());
+                        let place = row
+                            .filter(|row| row.kind != ConversationKind::Direct)
+                            .map(|row| place(&row))
+                            .unwrap_or_default();
+                        let moment = Moment {
+                            dnd: dnd(hub, key),
+                            ..moment(hub, key, &notes, Instant::now())
+                        };
+                        (decide_ring_in(&values, key, &moment, direct), place)
                     }
                     None => (None, String::new()),
                 };
                 // A ring back is mine, not a notification: it plays while I am calling
                 // someone, on every network, and stops the instant they answer or I cancel.
-                let calling = call.as_ref().is_some_and(|call| call.state == CallState::RingingOut);
+                let calling = call
+                    .as_ref()
+                    .is_some_and(|call| call.state == CallState::RingingOut);
                 match (calling, ringback_word(&values)) {
                     (true, Some(word)) => {
                         let already = back.as_ref().is_some_and(|(playing, _)| *playing == word);
                         if !already {
                             stop_back(&mut back);
-                            if let Some(child) = play(&word, volume, Some(RINGBACK_GAP), RINGBACK_FOR) {
+                            if let Some(child) =
+                                play(&word, volume, Some(RINGBACK_GAP), RINGBACK_FOR)
+                            {
                                 tracing::info!("chatd: ringing back with {word}");
                                 back = Some((word, child));
                             }
@@ -653,7 +718,10 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                     _ => stop_back(&mut back),
                 }
                 let network = ringing.as_ref().map_or("", |key| key.network.label());
-                match notes.call(call.as_ref(), verdict, &place, network).as_deref() {
+                match notes
+                    .call_while_busy(banner.as_ref(), verdict, &place, network, waiting)
+                    .as_deref()
+                {
                     Some("") => stop(&mut ring),
                     Some(word) => {
                         stop(&mut ring);
@@ -731,7 +799,12 @@ fn act(hub: &Hub, chat: &Weak<Chat>, notes: &Notes, done: Activation) {
             }
         }
         Activation::Accept(_) => {
-            let _ = chat.handle(Request::CallAccept);
+            // An older banner can be clicked after another call started. Leave that call
+            // alone and open the waiting-call UI, whose answer action asks for confirmation.
+            let waiting = hub.calls.aside().is_some_and(|ring| matches!(ring.state, CallState::RingingIn { .. }));
+            if !(waiting && hub.calls.describe().0.is_some()) {
+                let _ = chat.handle(Request::CallAccept);
+            }
             open(hub, &conversation);
         }
         Activation::Decline(_) => {

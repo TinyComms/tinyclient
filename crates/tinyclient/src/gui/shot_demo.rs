@@ -998,6 +998,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             // The loopback call (a real camera through the phone's codec) when one runs, else the
             // simulated one.
             call: demo_call_now().or_else(live::current),
+            ring: None,
             seq: live::seq(),
             keychain: protocol::Keychain::default(),
             started: 1,

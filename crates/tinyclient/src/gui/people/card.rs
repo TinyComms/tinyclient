@@ -250,6 +250,7 @@ impl Floating {
 
     fn seen(&self, person: &Key) -> Seen {
         Seen {
+            native_calls: super::can_call(&self.scene, person),
             in_their_dm: self.scene.peer.as_ref() == Some(person),
             direct: self.direct.as_ref().map(|row| (row.call, row.muted)),
             online: self.online(person),

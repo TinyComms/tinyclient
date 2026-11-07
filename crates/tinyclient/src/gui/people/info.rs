@@ -446,6 +446,7 @@ impl InfoPane {
 
     fn seen(&self, person: &Person) -> Seen {
         Seen {
+            native_calls: super::can_call(&self.scene, &person.key),
             in_their_dm: self.scene.peer.as_ref() == Some(&person.key),
             direct: self.row.as_ref().map(|row| (row.call, self.notify_of(row, None) == Notify::Nothing)),
             online: self.online(person.key.network),

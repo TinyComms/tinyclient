@@ -7,8 +7,8 @@ use super::health::{self, Grade};
 use super::people::{self, ringed};
 use super::security::Place;
 use super::{
-    ensure_daemon, ensure_keys, handoff_label, icon as glyph_in, in_call, open, Confirm, Ended, Menu,
-    Subject,
+    ensure_daemon, ensure_keys, handoff_label, icon as glyph_in, in_call, open, Confirm, Ended,
+    Menu, Subject,
 };
 use crate::gui::components::{glyph, network_icon, tip, Avatar};
 use crate::gui::state::{Shell, Snapshot};
@@ -16,7 +16,10 @@ use crate::gui::theme;
 use gpui::{
     deferred, div, prelude::*, px, relative, AnyElement, Context, Div, FontWeight, Rgba, Stateful,
 };
-use protocol::{Call, CallFailure, CallState, Content, ConversationKind, Direction, Key, MediaRequest, Network, Request};
+use protocol::{
+    Call, CallFailure, CallState, Content, ConversationKind, Direction, Key, MediaRequest, Network,
+    Request,
+};
 
 const SETTINGS: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
 /// Dock insets (8 + 8) plus the card's own padding (9 + 9). The name line is this much
@@ -371,7 +374,11 @@ impl Shell {
     /// The dock, for the end of the sidebar column as a flex-none child: full width, as tall as
     /// its rows. The narrowest sidebar still shows the server name on its own line. `None` when
     /// there is no call.
-    pub(in crate::gui) fn call_dock(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Option<Div> {
+    pub(in crate::gui) fn call_dock(
+        &self,
+        snapshot: &Snapshot,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
         ensure_keys(cx);
         ensure_daemon();
         #[cfg(feature = "gui-shot")]
@@ -384,10 +391,20 @@ impl Shell {
             Some(call) => {
                 let subject = Subject::of(self, snapshot, &call);
                 match (&call.state, confirm) {
-                    (CallState::Failed { reason, detail }, _) => self.call_failed(&call, &subject, *reason, detail, cx),
-                    (CallState::RingingIn { from }, _) => self.call_incoming(&call, &subject, from, cx),
-                    (_, Some(confirm)) => self.call_question(&question(confirm, &subject.title), cx),
-                    _ if self.tiny_column_has(&call.conversation) => self.call_compact(&call, &subject, cx),
+                    (CallState::Failed { reason, detail }, _) => {
+                        self.call_failed(&call, &subject, *reason, detail, cx)
+                    }
+                    (CallState::RingingIn { from }, _) => {
+                        self.call_incoming(&call, &subject, from, cx)
+                    }
+                    (_, Some(confirm)) => {
+                        self.call_question(&question(confirm, &subject.title), cx)
+                    }
+                    // A direct call keeps the full card. Only a voice room, whose mute lives in
+                    // the server's own panel, collapses to the compact bar.
+                    _ if self.tiny_room(&call.conversation).is_some() => {
+                        self.call_compact(&call, &subject, cx)
+                    }
                     _ => self.call_bar(&call, &subject, cx),
                 }
             }
@@ -534,10 +551,31 @@ impl Shell {
             .child(div().flex().flex_wrap().gap(px(4.)).child(stay).child(go))
     }
 
+    /// A ring waiting beside the call that is up. `--shot` can still name one of its own.
+    /// When the call slot is empty, that ring is the card itself, not a strip on top of it.
+    fn call_waiting_strip(&self) -> Option<(Confirm, String)> {
+        #[cfg(feature = "gui-shot")]
+        if let Some(strip) = super::shot::strip() {
+            return Some(strip);
+        }
+        let snapshot = self.snapshot.as_ref()?;
+        if snapshot.call.is_none() {
+            return None;
+        }
+        let ring = snapshot.ring.as_ref()?;
+        let CallState::RingingIn { from } = &ring.state else {
+            return None;
+        };
+        let confirm = Confirm {
+            conversation: ring.conversation.clone(),
+            title: from.clone(),
+            answer: true,
+        };
+        Some((confirm, from.clone()))
+    }
+
     /// Someone is calling while a call is up: a 40 px strip on top of the bar, with who and
     /// where, Decline and Accept. Accept asks before it leaves the call that is up.
-    // CONTRACT: chatd holds one call and drops a ring that arrives during it, so nothing ever
-    // fills this outside `--shot`. When `Status` can carry a second ring, pass it here.
     fn call_strip(&self, ring: &Confirm, from: &str, cx: &mut Context<Self>) -> Div {
         let mini = |id: &'static str, icon: &'static str, fill: Rgba, color: Rgba| {
             div()
@@ -728,7 +766,7 @@ impl Shell {
             .on_click(cx.listener(|this, _, _, cx| this.call_leave(cx)));
         // The name takes the card's width. Signal, lock and Leave sit on the row above it,
         // and wrap under it when the column is the narrowest sidebar.
-        card().child(
+        card().children(self.call_waiting_strip().map(|(ring, from)| self.call_strip(&ring, &from, cx))).child(
             div()
                 .flex()
                 .flex_wrap()
@@ -870,7 +908,10 @@ impl Shell {
     /// Ringing out, connecting, joined and reconnecting. As tall as the name, the server line
     /// and the controls, which wrap when the sidebar is at its narrowest.
     fn call_bar(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
-        let place = subject.space.as_deref().unwrap_or(call.conversation.network.label());
+        let place = subject
+            .space
+            .as_deref()
+            .unwrap_or(call.conversation.network.label());
         let alone = self.call_left_alone(call);
         let words = match (&call.state, alone.as_deref()) {
             (CallState::RingingOut, _) => "Ringing…".to_owned(),
@@ -890,7 +931,11 @@ impl Shell {
 
         let mute = control(
             "call-mute",
-            if off { "icons/mic-off.svg" } else { "icons/mic.svg" },
+            if off {
+                "icons/mic-off.svg"
+            } else {
+                "icons/mic.svg"
+            },
             if off { Look::Off } else { Look::Rest },
             enabled,
         )
@@ -901,51 +946,93 @@ impl Shell {
         // While I am heard: a 2 px ring inside the button, the same green as a speaker's.
         .when(call.speaking && !off && joined, |mute| {
             mute.relative().child(
-                div().absolute().top_0().left_0().size_full().rounded(px(8.)).border_2().border_color(theme::positive()),
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .rounded(px(8.))
+                    .border_2()
+                    .border_color(theme::positive()),
             )
         });
         let deafen = control(
             "call-deafen",
-            if call.deafened { "icons/headphone-off.svg" } else { "icons/headphones.svg" },
+            if call.deafened {
+                "icons/headphone-off.svg"
+            } else {
+                "icons/headphones.svg"
+            },
             if call.deafened { Look::Off } else { Look::Rest },
             enabled,
         )
         .when(enabled, |deafen| {
             deafen
-                .tooltip(tip(if call.deafened { "Undeafen" } else { "Deafen" }, Some("⌘⇧D")))
+                .tooltip(tip(
+                    if call.deafened { "Undeafen" } else { "Deafen" },
+                    Some("⌘⇧D"),
+                ))
                 .on_click(cx.listener(|this, _, _, cx| this.call_deafen(cx)))
         });
         let pictures = self.call_pictures(call);
         let share_on = encoding(call, Content::Share);
         let camera_on = encoding(call, Content::Camera);
         let share = pictures.then(|| {
-            control("call-share", "icons/monitor-up.svg", if share_on { Look::On } else { Look::Rest }, enabled)
-                .when(enabled, |share| {
-                    share
-                        .tooltip(tip(if share_on { "Stop sharing" } else { "Share your screen" }, None))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if share_on {
-                                this.tiny_stop_share(cx);
-                            } else {
-                                this.tiny_share(window, cx);
-                            }
-                        }))
-                })
+            control(
+                "call-share",
+                "icons/monitor-up.svg",
+                if share_on { Look::On } else { Look::Rest },
+                enabled,
+            )
+            .when(enabled, |share| {
+                share
+                    .tooltip(tip(
+                        if share_on {
+                            "Stop sharing"
+                        } else {
+                            "Share your screen"
+                        },
+                        None,
+                    ))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if share_on {
+                            this.tiny_stop_share(cx);
+                        } else {
+                            this.tiny_share(window, cx);
+                        }
+                    }))
+            })
         });
         let camera = pictures.then(|| {
-            control("call-camera", "icons/video.svg", if camera_on { Look::On } else { Look::Rest }, enabled)
-                .when(enabled, |camera| {
-                    camera
-                        .tooltip(tip(if camera_on { "Turn camera off" } else { "Turn camera on" }, None))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx)
-                        }))
-                })
+            control(
+                "call-camera",
+                "icons/video.svg",
+                if camera_on { Look::On } else { Look::Rest },
+                enabled,
+            )
+            .when(enabled, |camera| {
+                camera
+                    .tooltip(tip(
+                        if camera_on {
+                            "Turn camera off"
+                        } else {
+                            "Turn camera on"
+                        },
+                        None,
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx)
+                    }))
+            })
         });
         let devices = control(
             "call-devices",
             "icons/settings.svg",
-            if menu == Some(Menu::Devices) { Look::Open } else { Look::Rest },
+            if menu == Some(Menu::Devices) {
+                Look::Open
+            } else {
+                Look::Rest
+            },
             enabled,
         )
         .when(enabled, |devices| {
@@ -956,9 +1043,19 @@ impl Shell {
         let end = if in_call(call) {
             leave()
         } else {
-            worded("call-cancel", None, "Cancel", theme::danger_soft(), theme::danger())
-                .hover(|style| style.bg(theme::danger_fill()).text_color(theme::on_accent()))
-                .tooltip(tip("Cancel", Some("⌘⇧H")))
+            worded(
+                "call-cancel",
+                None,
+                "Cancel",
+                theme::danger_soft(),
+                theme::danger(),
+            )
+            .hover(|style| {
+                style
+                    .bg(theme::danger_fill())
+                    .text_color(theme::on_accent())
+            })
+            .tooltip(tip("Cancel", Some("⌘⇧H")))
         };
         // Joined controls share the width equally, including when video adds two buttons.
         let controls = div()
@@ -975,20 +1072,24 @@ impl Shell {
             .children(share.map(|button| button.flex_1().min_w_0()))
             .children(camera.map(|button| button.flex_1().min_w_0()))
             .child(devices.when(in_call(call), |button| button.flex_1().min_w_0()))
-            .child(end.when(in_call(call), |button| button.flex_1().min_w_0()).on_click(cx.listener(|this, _, _, cx| this.call_leave(cx))));
+            .child(
+                end.when(in_call(call), |button| button.flex_1().min_w_0())
+                    .on_click(cx.listener(|this, _, _, cx| this.call_leave(cx))),
+            );
 
         let popover = match menu {
             Some(Menu::Devices) => Some((300., self.call_devices_menu(call, cx).p(px(6.)))),
             Some(Menu::People) if joined => Some((280., people::list(call, subject).py(px(6.)))),
-            Some(Menu::Security) if self.call_security_open(Place::Dock) => Some((320., div().child(self.call_security_panel(call, cx)))),
+            Some(Menu::Security) if self.call_security_open(Place::Dock) => {
+                Some((320., div().child(self.call_security_panel(call, cx))))
+            }
             _ => None,
         };
-        #[cfg(feature = "gui-shot")]
-        let strip = super::shot::strip();
-        #[cfg(not(feature = "gui-shot"))]
-        let strip: Option<(Confirm, String)> = None;
         card()
-            .children(strip.map(|(ring, from)| self.call_strip(&ring, &from, cx)))
+            .children(
+                self.call_waiting_strip()
+                    .map(|(ring, from)| self.call_strip(&ring, &from, cx)),
+            )
             .child(self.call_title(call, subject, words, cx))
             .child(controls)
             .children(popover.map(|(width, body)| {

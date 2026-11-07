@@ -578,7 +578,9 @@ impl Shell {
     /// The Tiny call on show, if this server has one, in whatever state: its room.
     pub(super) fn tiny_call(&self) -> Option<protocol::Call> {
         let account = self.tiny_state.account.as_ref()?;
-        self.call_shown(self.snapshot.as_ref()?).filter(|call| call.conversation.account() == *account)
+        self.call_shown(self.snapshot.as_ref()?).filter(|call| {
+            call.conversation.account() == *account && self.tiny_room(&call.conversation).is_some()
+        })
     }
 
     /// Where a made-up call of `--shot` goes: the room I sit in, else the first.

@@ -4,16 +4,17 @@
 //! maps the server's JSON into that store and answers the commands the shell already sends.
 //! A GIF or a video is an attachment the existing viewer fetches. Reactions are Unicode emoji.
 
-use ::e2ee as e2ee_core;
 use super::e2ee::{self, Read};
 use super::live::{Ask, Live};
 use super::Saved;
+use crate::adapters::{CatalogPage, Command, Context, Download, Refusal};
 use crate::blobs::upload::{self, Target};
 use crate::store::{ConversationRow, PersonRow, PreviewLine, SpaceRow};
-use crate::adapters::{CatalogPage, Command, Context, Download, Refusal};
+use ::e2ee as e2ee_core;
 use protocol::{
-    join_host, Attachment, CallSupport, Capabilities, CatalogKind, ConversationKind, Group, GroupKind,
-    Encryption, MediaFile, MediaKind, Message, Outgoing, Reaction, ReactionRules, ReplyTo, Seal,
+    join_host, Attachment, CallSupport, Capabilities, CatalogKind, ConversationKind, Encryption,
+    Group, GroupKind, MediaFile, MediaKind, Message, MessageKind, Outgoing, Reaction,
+    ReactionRules, ReplyTo, Seal, TINY_FEATURE_DIRECT_CALLS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -71,10 +72,15 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         tracing::warn!("chatd: Tiny server: empty rooms list; keeping the stored tree");
         return;
     }
+    let callable = directs_callable(saved);
     let mut people: Vec<PersonRow> = names
         .iter()
         .filter(|(id, _)| super::safe_id(id))
-        .map(|(id, name)| PersonRow { id: id.clone(), name: name.clone(), ..PersonRow::default() })
+        .map(|(id, name)| PersonRow {
+            id: id.clone(),
+            name: name.clone(),
+            ..PersonRow::default()
+        })
         .collect();
     let mut groups = Vec::new();
     let mut rows = Vec::new();
@@ -84,13 +90,22 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         if !super::safe_id(&channel.id) {
             continue;
         }
-        let mut row = ConversationRow::new(&channel.id, ConversationKind::Channel, title_or(&channel.name, &channel.id));
+        let mut row = ConversationRow::new(
+            &channel.id,
+            ConversationKind::Channel,
+            title_or(&channel.name, &channel.id),
+        );
         row.space = Some(SPACE.to_owned());
         row.topic = channel.topic.clone();
         row.position = channel.position;
-        let (e2ee, history) = sealed_state(saved, &channel.id, channel.e2ee, channel.plaintext_history);
+        let (e2ee, history) =
+            sealed_state(saved, &channel.id, channel.e2ee, channel.plaintext_history);
         row.encryption = encryption_of(saved, &channel.id, e2ee, history);
-        if let Some(category) = channel.category_id.as_deref().filter(|id| super::safe_id(id)) {
+        if let Some(category) = channel
+            .category_id
+            .as_deref()
+            .filter(|id| super::safe_id(id))
+        {
             row.group = Some(category.to_owned());
             if categories.insert(category.to_owned()) {
                 let position = channels
@@ -99,11 +114,25 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
                     .map(|other| other.position)
                     .min()
                     .unwrap_or(0);
-                let name = channel.category_name.as_deref().filter(|name| !name.is_empty()).unwrap_or(category);
+                let name = channel
+                    .category_name
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(category);
                 groups.push(Group::new(category, name, position));
             }
         }
-        noted.push(Note::from_last(&channel.id, channel.unread, None, None, channel.last_message.as_ref(), false).sealed(channel.e2ee));
+        noted.push(
+            Note::from_last(
+                &channel.id,
+                channel.unread,
+                None,
+                None,
+                channel.last_message.as_ref(),
+                false,
+            )
+            .sealed(channel.e2ee),
+        );
         rows.push(row);
     }
     if !directs.is_empty() {
@@ -117,24 +146,38 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         }
         let name = title_or(&direct.peer.display_name, "Someone");
         if !people.iter().any(|person| person.id == direct.peer.user_id) {
-            people.push(PersonRow { id: direct.peer.user_id.clone(), name: name.clone(), ..PersonRow::default() });
+            people.push(PersonRow {
+                id: direct.peer.user_id.clone(),
+                name: name.clone(),
+                ..PersonRow::default()
+            });
         }
         let mut row = ConversationRow::new(&direct.id, ConversationKind::Direct, name);
         row.space = Some(SPACE.to_owned());
         row.group = Some("directs".to_owned());
         row.peer = Some(direct.peer.user_id.clone());
         row.position = DIRECTS_AT + index as i32;
-        let (e2ee, history) = sealed_state(saved, &direct.id, direct.e2ee, direct.plaintext_history);
+        if callable {
+            row.call = CallSupport::Native;
+        }
+        let (e2ee, history) =
+            sealed_state(saved, &direct.id, direct.e2ee, direct.plaintext_history);
         row.encryption = encryption_of(saved, &direct.id, e2ee, history);
-        let mine = direct.last_message.as_ref().is_some_and(|last| last.author_id == saved.user_id);
-        noted.push(Note::from_last(
-            &direct.id,
-            direct.unread,
-            direct.last_read.as_deref(),
-            direct.peer_read.as_deref(),
-            direct.last_message.as_ref(),
-            mine,
-        ).sealed(direct.e2ee));
+        let mine = direct
+            .last_message
+            .as_ref()
+            .is_some_and(|last| last.author_id == saved.user_id);
+        noted.push(
+            Note::from_last(
+                &direct.id,
+                direct.unread,
+                direct.last_read.as_deref(),
+                direct.peer_read.as_deref(),
+                direct.last_message.as_ref(),
+                mine,
+            )
+            .sealed(direct.e2ee),
+        );
         rows.push(row);
     }
     if !rooms.is_empty() {
@@ -144,7 +187,11 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         if !super::safe_id(&room.id) {
             continue;
         }
-        let mut row = ConversationRow::new(&room.id, ConversationKind::Voice, title_or(&room.name, &room.id));
+        let mut row = ConversationRow::new(
+            &room.id,
+            ConversationKind::Voice,
+            title_or(&room.name, &room.id),
+        );
         row.space = Some(SPACE.to_owned());
         row.group = Some("rooms".to_owned());
         row.position = ROOMS_AT + index as i32;
@@ -160,10 +207,32 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
     for note in &noted {
         note.apply(ctx, saved, names);
     }
+    for direct in &directs {
+        if let Some(call) = &direct.last_call {
+            record_call(ctx, saved, names, &direct.id, call);
+        }
+    }
+}
+
+/// The server lists direct calls. A server not yet checked is asked; a 404 is an older one.
+fn directs_callable(saved: &Saved) -> bool {
+    let known = super::manage::known(saved);
+    let capabilities = if known.checked {
+        known.capabilities
+    } else {
+        super::manage::capabilities_of(saved)
+    };
+    capabilities.has(TINY_FEATURE_DIRECT_CALLS)
 }
 
 /// A durable frame, or one of the message frames a server sent without a seq.
-pub(crate) fn on_live(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, kind: &str, frame: &Value) {
+pub(crate) fn on_live(
+    ctx: &Context,
+    saved: &Saved,
+    names: &HashMap<String, String>,
+    kind: &str,
+    frame: &Value,
+) {
     match kind {
         "channel.created" | "channel.updated" => channel_upsert(ctx, saved, names, frame),
         "channel.deleted" => {
@@ -172,6 +241,11 @@ pub(crate) fn on_live(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
             }
         }
         "direct.created" => direct_upsert(ctx, saved, names, frame),
+        "direct.call" => {
+            if let Ok(call) = serde_json::from_value::<WireCall>(frame.clone()) {
+                record_call(ctx, saved, names, &call.direct_id, &call);
+            }
+        }
         "e2ee.upgraded" => upgraded(ctx, saved, frame),
         "message.created" | "message.edited" => {
             if let Some((conversation, wire)) = framed_message(frame) {
@@ -214,6 +288,7 @@ pub(crate) fn live_kind(kind: &str) -> bool {
             | "channel.updated"
             | "channel.deleted"
             | "direct.created"
+            | "direct.call"
             | "e2ee.upgraded"
             | "message.created"
             | "message.edited"
@@ -247,9 +322,17 @@ pub(crate) fn heard_typing(ctx: &Context, name: Option<&str>, frame: &Value) {
 pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command) {
     match command {
         Command::Backfill(id) | Command::Warm(id) => load_page(ctx, saved, &id, None, PAGE),
-        Command::History { conversation_id, before } => load_page(ctx, saved, &conversation_id, Some(before), PAGE),
-        Command::HistoryAfter { conversation_id, .. } => load_page(ctx, saved, &conversation_id, None, PAGE),
-        Command::HistoryAround { conversation_id, around } => {
+        Command::History {
+            conversation_id,
+            before,
+        } => load_page(ctx, saved, &conversation_id, Some(before), PAGE),
+        Command::HistoryAfter {
+            conversation_id, ..
+        } => load_page(ctx, saved, &conversation_id, None, PAGE),
+        Command::HistoryAround {
+            conversation_id,
+            around,
+        } => {
             load_page(ctx, saved, &conversation_id, Some(around), PAGE);
             load_page(ctx, saved, &conversation_id, None, PAGE);
         }
@@ -265,18 +348,34 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             send_with(ctx, saved, conversation_id, client_id, text, reply_to, *with);
         }
         Command::CancelSend { client_id, .. } => upload::cancel(&ctx.account, &client_id),
-        Command::React { conversation_id: _, message_id, emoji, on, reply } => react(saved, &message_id, &emoji, on, reply),
+        Command::React {
+            conversation_id: _,
+            message_id,
+            emoji,
+            on,
+            reply,
+        } => react(saved, &message_id, &emoji, on, reply),
         Command::ReactionRules { reply, .. } => {
             let _ = reply.send(Ok(ReactionRules::default()));
         }
-        Command::Edit { conversation_id, message_id, text, reply } => edit(ctx, saved, &conversation_id, &message_id, &text, reply),
-        Command::Delete { conversation_id, message_id, reply } => delete(ctx, saved, &conversation_id, &message_id, reply),
+        Command::Edit {
+            conversation_id,
+            message_id,
+            text,
+            reply,
+        } => edit(ctx, saved, &conversation_id, &message_id, &text, reply),
+        Command::Delete {
+            conversation_id,
+            message_id,
+            reply,
+        } => delete(ctx, saved, &conversation_id, &message_id, reply),
         Command::Typing(conversation_id) => {
             if super::safe_id(&conversation_id) {
                 live.ask(Ask::Type { conversation_id });
             }
         }
         Command::StartDirect { person_id, reply } => start_direct(ctx, saved, &person_id, reply),
+        Command::StartDirectCall { person_id, reply } => start_direct_intent(ctx, saved, &person_id, true, reply),
         Command::Catalog { kind, reply, .. } => match kind {
             CatalogKind::Emoji | CatalogKind::Gifs => {
                 let _ = reply.send(Ok(CatalogPage::default()));
@@ -288,14 +387,24 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
         Command::Download { id, url, reply } => {
             if same_server(&saved.base_url, &url) {
                 // A sealed attachment opens with what its message said; the cache opens it.
-                let sealed = e2ee::started(saved).and_then(|device| device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).sealed_file(&id));
+                let sealed = e2ee::started(saved).and_then(|device| {
+                    device
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .sealed_file(&id)
+                });
                 let _ = reply.send(Ok(Download {
                     url,
-                    headers: vec![("Authorization".to_owned(), format!("Bearer {}", saved.token))],
+                    headers: vec![(
+                        "Authorization".to_owned(),
+                        format!("Bearer {}", saved.token),
+                    )],
                     sealed,
                 }));
             } else {
-                let _ = reply.send(Err(Refusal::Refused("That file is on another server.".to_owned())));
+                let _ = reply.send(Err(Refusal::Refused(
+                    "That file is on another server.".to_owned(),
+                )));
             }
         }
         other => other.unsupported(ctx),
@@ -422,7 +531,11 @@ fn direct_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, 
         return;
     }
     let name = title_or(&direct.peer.display_name, "Someone");
-    let _ = ctx.people(&[PersonRow { id: direct.peer.user_id.clone(), name: name.clone(), ..PersonRow::default() }]);
+    let _ = ctx.people(&[PersonRow {
+        id: direct.peer.user_id.clone(),
+        name: name.clone(),
+        ..PersonRow::default()
+    }]);
     let mut group = Group::new("directs", "Direct messages", DIRECTS_AT);
     group.kind = GroupKind::Directs;
     let _ = ctx.group(SPACE, &group);
@@ -431,6 +544,7 @@ fn direct_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, 
     row.group = Some("directs".to_owned());
     row.peer = Some(direct.peer.user_id.clone());
     row.position = DIRECTS_AT;
+    row.call = if directs_callable(saved) { CallSupport::Native } else { CallSupport::None };
     // A replayed creation predates any later upgrade. It can add encryption, never remove it.
     let kept = if paired { ctx.known(&direct.id).ok().flatten().map(|row| row.encryption) } else { None };
     let sealed = direct.e2ee || kept.is_some_and(|encryption| encryption.is_sealed());
@@ -1289,28 +1403,67 @@ fn mark_read(saved: &Saved, conversation_id: &str, message_id: &str) {
     }
 }
 
-fn start_direct(ctx: &Context, saved: &Saved, person_id: &str, reply: crate::adapters::Reply<String>) {
+fn start_direct(
+    ctx: &Context,
+    saved: &Saved,
+    person_id: &str,
+    reply: crate::adapters::Reply<String>,
+) {
+    start_direct_intent(ctx, saved, person_id, false, reply);
+}
+
+fn start_direct_intent(ctx: &Context, saved: &Saved, person_id: &str, call: bool, reply: crate::adapters::Reply<String>) {
     if !super::safe_id(person_id) {
         let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
         return;
     }
     // A new direct message is end-to-end encrypted when this device can be in one and the server
     // allows it; a server that requires it gets nothing else.
+    let encrypted = if call {
+        // A text device is deliberately not enrolled here. The server permits making an encrypted
+        // conversation before either device exists; text sends still use their normal guard.
+        let capabilities = match super::asked("GET", saved, "/v1/capabilities", None) {
+            Ok((200, body)) => body,
+            _ => {
+                let _ = reply.send(Err(Refusal::Refused(super::UNREACHABLE.to_owned())));
+                return;
+            }
+        };
+        let features = capabilities.get("features").and_then(Value::as_array);
+        let has = |feature: &str| features.is_some_and(|features| features.iter().any(|value| value.as_str() == Some(feature)));
+        if !has(TINY_FEATURE_DIRECT_CALLS) {
+            let _ = reply.send(Err(Refusal::Unsupported));
+            return;
+        }
+        has(protocol::TINY_FEATURE_E2EE_TEXT)
+            && capabilities.get("e2ee_text").and_then(Value::as_str).unwrap_or("optional") != "off"
+    } else {
     let mode = e2ee::started(saved).map(|device| {
-        let device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let device = device
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         (device.ready(), device.mode().to_owned())
     });
-    let encrypted = match mode {
+    match mode {
         Some((true, mode)) => mode != "off" && !mode.is_empty(),
         Some((false, mode)) if mode == "new_required" || mode == "required" => {
             let _ = reply.send(Err(Refusal::Refused(NOT_SET_UP.to_owned())));
             return;
         }
         _ => false,
-    };
-    match super::asked("POST", saved, "/v1/directs", Some(json!({ "user_id": person_id, "e2ee": encrypted }))) {
+    } };
+    match super::asked(
+        "POST",
+        saved,
+        "/v1/directs",
+        Some(json!({ "user_id": person_id, "e2ee": encrypted })),
+    ) {
         Ok((200 | 201, body)) => {
-            let id = body.get("id").and_then(Value::as_str).or_else(|| body.pointer("/direct/id").and_then(Value::as_str)).unwrap_or("");
+            let id = body
+                .get("id")
+                .and_then(Value::as_str)
+                .or_else(|| body.pointer("/direct/id").and_then(Value::as_str))
+                .unwrap_or("");
             if !super::safe_id(id) {
                 let _ = reply.send(Err(Refusal::Refused(super::UNREADABLE.to_owned())));
                 return;
@@ -1322,13 +1475,17 @@ fn start_direct(ctx: &Context, saved: &Saved, person_id: &str, reply: crate::ada
                 row.group = Some("directs".to_owned());
                 row.peer = Some(person_id.to_owned());
                 row.position = DIRECTS_AT;
+                row.call = if directs_callable(saved) { CallSupport::Native } else { CallSupport::None };
+                row.encryption = encryption_of(saved, id, encrypted, false);
                 let _ = ctx.conversation(&row);
                 let _ = ctx.counts(id, 0, 0, None, 1);
             }
             let _ = reply.send(Ok(id.to_owned()));
         }
         Ok((status, body)) => {
-            let _ = reply.send(Err(Refusal::Refused(super::explain(status, &body, super::Missing::Plain).to_owned())));
+            let _ = reply.send(Err(Refusal::Refused(
+                super::explain(status, &body, super::Missing::Plain).to_owned(),
+            )));
         }
         Err(detail) => {
             let _ = reply.send(Err(Refusal::Refused(detail.to_owned())));
@@ -1522,6 +1679,7 @@ fn account_caps(saved: &Saved) -> Capabilities {
     Capabilities {
         max_file_bytes: limits.image.max(limits.file),
         max_files: protocol::ATTACHMENTS_LIMIT as u32,
+        direct_calls: directs_callable(saved),
         file_scan: scans,
         allow_archives: scans && limits.archives,
         ..Capabilities::default()
@@ -1830,6 +1988,91 @@ struct WireDirect {
     peer_read: Option<String>,
     #[serde(default)]
     last_message: Option<WireLast>,
+    /// The newest finished call with this person. Absent until one has ended.
+    #[serde(default)]
+    last_call: Option<WireCall>,
+}
+
+/// One finished direct call. `GET /v1/directs` names it `id`; a live `direct.call` names it `ring_id`.
+#[derive(Clone, Deserialize, Default)]
+struct WireCall {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    ring_id: String,
+    #[serde(default)]
+    direct_id: String,
+    #[serde(default)]
+    caller_id: String,
+    #[serde(default)]
+    outcome: String,
+    #[serde(default)]
+    ended_at: String,
+}
+
+/// The grey line for a finished call. Nothing about the conversation row changes except the
+/// unread count, and only for a missed call we did not place.
+fn record_call(
+    ctx: &Context,
+    saved: &Saved,
+    names: &HashMap<String, String>,
+    direct_id: &str,
+    call: &WireCall,
+) {
+    let ring_id = if call.ring_id.is_empty() {
+        call.id.as_str()
+    } else {
+        call.ring_id.as_str()
+    };
+    if !super::safe_id(direct_id) || !super::safe_id(ring_id) || !super::safe_id(&call.caller_id) {
+        return;
+    }
+    if !matches!(
+        call.outcome.as_str(),
+        "missed" | "declined" | "cancelled" | "ended"
+    ) {
+        return;
+    }
+    if ctx.known(direct_id).ok().flatten().is_none() {
+        return;
+    }
+    let outgoing = call.caller_id == saved.user_id;
+    let name = caller_name(ctx, saved, names, direct_id, &call.caller_id);
+    let mut message = Message::plain(
+        ring_id,
+        name.clone(),
+        format!("{name} started a call."),
+        rfc3339(&call.ended_at).unwrap_or(0),
+        outgoing,
+    );
+    message.kind = MessageKind::System;
+    message.sender.id = call.caller_id.clone();
+    let _ = ctx.quiet_line(direct_id, &message, call.outcome == "missed" && !outgoing);
+}
+
+fn caller_name(
+    ctx: &Context,
+    saved: &Saved,
+    names: &HashMap<String, String>,
+    direct_id: &str,
+    caller_id: &str,
+) -> String {
+    if caller_id == saved.user_id {
+        return if saved.display_name.is_empty() {
+            "Someone".to_owned()
+        } else {
+            saved.display_name.clone()
+        };
+    }
+    if let Some(name) = names.get(caller_id).filter(|name| !name.is_empty()) {
+        return name.clone();
+    }
+    if let Ok(Some(row)) = ctx.known(direct_id) {
+        if row.peer.as_deref() == Some(caller_id) && !row.title.is_empty() {
+            return row.title;
+        }
+    }
+    "Someone".to_owned()
 }
 
 #[derive(Clone, Deserialize)]
@@ -2222,6 +2465,63 @@ mod tests {
     }
 
     #[test]
+    fn call_intent_creates_an_encrypted_direct_without_a_text_device() {
+        let posted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = posted.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            if request.starts_with("GET /v1/capabilities ") {
+                return Some(http(200, "OK", r#"{"features":["direct_calls","e2ee_text"],"e2ee_text":"required"}"#));
+            }
+            if request.starts_with("POST /v1/directs ") {
+                seen.lock().unwrap().push(request.to_owned());
+                return Some(http(201, "Created", r#"{"id":"first-call","e2ee":true}"#));
+            }
+            None
+        });
+        assert!(e2ee::started(&saved).is_none(), "no text enrollment");
+        assert_eq!(serde_json::to_value(account_caps(&saved)).unwrap()["direct_calls"], true, "members can call before a direct row exists");
+        let (reply, result) = std::sync::mpsc::channel();
+        serve(&ctx, &saved, &Live::new().unwrap(), Command::StartDirectCall { person_id: PEER.into(), reply });
+        assert_eq!(result.recv().unwrap().unwrap(), "first-call");
+        let row = ctx.known("first-call").unwrap().unwrap();
+        assert_eq!(row.call, CallSupport::Native);
+        assert_eq!(row.encryption, Encryption::EndToEnd);
+        let requests = posted.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["e2ee"], true, "call setup never creates plaintext text history");
+        assert_eq!(post_message(&ctx, &saved, "first-call", "client-call", "secret", None, &[]).unwrap_err(), NOT_SET_UP, "text enrollment is still required");
+    }
+
+    #[test]
+    fn direct_calls_capability_applies_to_list_created_and_fallback_directs() {
+        let (_adapter, ctx, saved) = fixture(|request| {
+            if request.starts_with("GET /v1/capabilities ") {
+                return Some(http(200, "OK", r#"{"features":["direct_calls"]}"#));
+            }
+            if request.starts_with("POST /v1/directs ") {
+                return Some(http(201, "Created", r#"{"id":"direct-new"}"#));
+            }
+            None
+        });
+        assert_eq!(ctx.known("direct-1").unwrap().unwrap().call, CallSupport::Native, "listed direct is callable");
+        on_live(&ctx, &saved, &HashMap::new(), "direct.created", &json!({
+            "direct": {"id":"direct-live","peer":{"user_id":PEER,"display_name":"Bea"}}
+        }));
+        assert_eq!(ctx.known("direct-live").unwrap().unwrap().call, CallSupport::Native, "new incoming direct is callable");
+        let (reply, result) = std::sync::mpsc::channel();
+        start_direct(&ctx, &saved, PEER, reply);
+        assert_eq!(result.recv().unwrap().unwrap(), "direct-new");
+        assert_eq!(ctx.known("direct-new").unwrap().unwrap().call, CallSupport::Native, "first call needs no prior messages");
+    }
+
+    #[test]
+    fn an_older_server_does_not_offer_direct_calls() {
+        let (_adapter, ctx, _saved) = fixture(|_| None);
+        assert_eq!(ctx.known("direct-1").unwrap().unwrap().call, CallSupport::None);
+    }
+
+    #[test]
     fn a_timestamp_is_unix_seconds() {
         assert_eq!(rfc3339("2024-01-02T03:04:05Z"), Some(1_704_164_645));
         assert_eq!(rfc3339("2024-01-02T04:04:05+01:00"), Some(1_704_164_645));
@@ -2503,8 +2803,70 @@ mod tests {
         let room = ctx.known("room-1").unwrap().unwrap();
         assert_eq!(room.kind, ConversationKind::Voice);
         assert_eq!(room.call, CallSupport::Native);
-        let (rows, _) = ctx.hub.store().inbox(Some(Network::Tiny), InboxFilter::All, 0, 20, &[]).unwrap();
+        let (rows, _) = ctx
+            .hub
+            .store()
+            .inbox(Some(Network::Tiny), InboxFilter::All, 0, 20, &[])
+            .unwrap();
         assert!(rows.iter().any(|row| row.key.id == "direct-1"));
+        assert_eq!(direct.call, CallSupport::None);
+    }
+
+    #[test]
+    fn a_direct_is_callable_and_a_missed_call_is_a_quiet_line() {
+        let (_adapter, ctx, saved) = fixture(|request| {
+            if request.starts_with("GET /v1/capabilities ") {
+                return Some(http(200, "OK", r#"{"features":["direct_calls"]}"#));
+            }
+            if request.starts_with("GET /v1/directs ") {
+                return Some(http(
+                    200,
+                    "OK",
+                    &format!(
+                        r#"{{"directs":[{{"id":"direct-1","peer":{{"user_id":"{PEER}","display_name":"Bea"}},"unread":1,"last_read":"m-1","last_message":{{"id":"m-2","author_id":"{ME}","body":"mine","created_at":"{WHEN}"}},"last_call":{{"id":"ring-1","outcome":"missed","caller_id":"{PEER}","ended_at":"{WHEN}"}}}}]}}"#
+                    ),
+                ));
+            }
+            None
+        });
+        let direct = ctx.known("direct-1").unwrap().unwrap();
+        assert_eq!(direct.call, CallSupport::Native);
+        assert_eq!(direct.preview, "mine");
+        assert!(direct.preview_mine);
+        assert_eq!(direct.unread, 2);
+        let stored = ctx.stored_message("direct-1", "ring-1").unwrap().unwrap();
+        assert_eq!(stored.text, "Bea started a call.");
+        assert_eq!(stored.kind, MessageKind::System);
+        assert_eq!(stored.sender.id, PEER);
+        assert!(!stored.outgoing);
+
+        let again = json!({
+            "direct_id": "direct-1",
+            "ring_id": "ring-1",
+            "caller_id": PEER,
+            "callee_id": ME,
+            "outcome": "missed",
+            "ended_at": WHEN,
+        });
+        on_live(&ctx, &saved, &HashMap::new(), "direct.call", &again);
+        assert_eq!(ctx.known("direct-1").unwrap().unwrap().unread, 2);
+
+        let ended = json!({
+            "direct_id": "direct-1",
+            "ring_id": "ring-2",
+            "caller_id": ME,
+            "callee_id": PEER,
+            "outcome": "ended",
+            "ended_at": WHEN,
+        });
+        on_live(&ctx, &saved, &HashMap::new(), "direct.call", &ended);
+        let mine = ctx.stored_message("direct-1", "ring-2").unwrap().unwrap();
+        assert_eq!(mine.text, "Ada started a call.");
+        assert!(mine.outgoing);
+        assert_eq!(mine.kind, MessageKind::System);
+        let after = ctx.known("direct-1").unwrap().unwrap();
+        assert_eq!(after.preview, "mine");
+        assert_eq!(after.unread, 2);
     }
 
     #[test]

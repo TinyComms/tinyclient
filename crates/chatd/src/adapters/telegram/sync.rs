@@ -189,6 +189,7 @@ fn capabilities(premium: bool) -> Capabilities {
         file_scan: false,
         allow_archives: false,
         voice_notes: true,
+        direct_calls: false,
     }
 }
 

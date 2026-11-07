@@ -26,6 +26,8 @@ pub enum Surface {
 /// Where the person is seen from: what the shell knows that the profile does not.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Seen {
+    /// The account can ring members even when no direct is cached.
+    pub native_calls: bool,
     /// The open conversation is the one with them.
     pub in_their_dm: bool,
     /// Their direct conversation, when one is held: how it calls and whether it is muted.
@@ -88,6 +90,7 @@ pub fn actions(person: &Person, seen: &Seen, surface: Surface) -> Actions {
         // opens in Telegram's own app, as their DM's does.
         (false, None) => match network {
             Network::Discord => Some(Call::Native),
+            Network::Tiny if seen.native_calls => Some(Call::Native),
             Network::Telegram if person.mark != Some(Mark::Verified) => Some(Call::Handoff(handoff_words(network))),
             _ => None,
         },
@@ -867,7 +870,7 @@ mod tests {
         }
     }
 
-    const DM: Seen = Seen { in_their_dm: true, direct: Some((CallSupport::Native, false)), online: true };
+    const DM: Seen = Seen { native_calls: false, in_their_dm: true, direct: Some((CallSupport::Native, false)), online: true };
 
     #[test]
     fn inside_their_dm_there_is_no_message_button_and_mute_is_the_switch() {
@@ -886,8 +889,19 @@ mod tests {
     }
 
     #[test]
+    fn a_tiny_member_card_offers_a_first_call_only_on_a_capable_account() {
+        let member = person(Network::Tiny, Relation::None);
+        let capable = Seen { native_calls: true, ..Seen::default() };
+        assert_eq!(actions(&member, &capable, Surface::Card).call, Some(Call::Native));
+        assert_eq!(actions(&member, &capable, Surface::Pane).call, Some(Call::Native));
+        assert_eq!(actions(&member, &Seen::default(), Surface::Card).call, None);
+        let mut bot = member; bot.bot = true;
+        assert_eq!(actions(&bot, &capable, Surface::Card).call, None);
+    }
+
+    #[test]
     fn calls_are_native_handed_off_or_absent_by_network_and_never_for_apps() {
-        let seen = |call| Seen { in_their_dm: false, direct: Some((call, false)), online: true };
+        let seen = |call| Seen { native_calls: false, in_their_dm: false, direct: Some((call, false)), online: true };
         let tess = person(Network::Slack, Relation::Contact);
         assert_eq!(actions(&tess, &seen(CallSupport::Handoff), Surface::Pane).call, Some(Call::Handoff("Huddle in Slack".into())));
         let omar = person(Network::Teams, Relation::Contact);
@@ -994,7 +1008,7 @@ mod tests {
     #[test]
     fn menus_follow_the_designs_order_and_destructive_items_come_last() {
         let juno = person(Network::Discord, Relation::Friend);
-        let from_channel = Seen { in_their_dm: false, direct: Some((CallSupport::Native, true)), online: true };
+        let from_channel = Seen { native_calls: false, in_their_dm: false, direct: Some((CallSupport::Native, true)), online: true };
         assert_eq!(
             person_menu(&juno, &from_channel, true, false),
             vec![Item::Mute { muted: true }, Item::Separator, Item::CopyHandle, Item::CopyLink, Item::CopyId, Item::OpenIn, Item::Separator, Item::RemoveFriend, Item::Block]

@@ -347,6 +347,8 @@ pub const TINY_FEATURE_AUDIT_QUERY: &str = "audit_query";
 pub const TINY_FEATURE_VOICE_MODERATION: &str = "voice_moderation";
 /// Calls can be end-to-end encrypted: MLS between the apps, which the server only relays.
 pub const TINY_FEATURE_E2EE_CALLS: &str = "e2ee_calls";
+/// A direct message can ring the other person. An older server has no such call, so the button stays off.
+pub const TINY_FEATURE_DIRECT_CALLS: &str = "direct_calls";
 /// Text, direct messages and files can be end-to-end encrypted: MLS groups per conversation.
 pub const TINY_FEATURE_E2EE_TEXT: &str = "e2ee_text";
 /// The domain Incognito hosts communities under. A community there promises calls that are end

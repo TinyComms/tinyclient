@@ -1,0 +1,12 @@
+{
+  "id": "tiny-direct-calls",
+  "title": "Native direct calls ring before accepted encrypted audio flows",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "This headless native probe needs two process binaries; phone interaction needs a separate lab scenario.",
+    "ios": "This headless native probe needs two process binaries; phone interaction needs a separate lab scenario."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 120
+}

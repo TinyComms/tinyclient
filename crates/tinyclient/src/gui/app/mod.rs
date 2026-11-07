@@ -130,14 +130,14 @@ impl Shell {
         cx.spawn(async move |this, cx| loop {
             let status = crate::client::ask_within_async(Request::Status, Some(service::SLOW)).await;
             match status {
-                Ok(Response::Status { networks, accounts, call, seq, keychain, started, session, .. }) => {
+                Ok(Response::Status { networks, accounts, call, ring, seq, keychain, started, session, .. }) => {
                     if !session.is_empty() {
                         protocol::log_policy::adopt_session(&session);
                     }
                     let applied = this.update(cx, |this, cx| {
                         let came_back = this.service.phase == Phase::Reconnecting;
                         let restarted = this.service.answered(started, keychain, unix_now());
-                        this.apply_status(networks, accounts, call, cx);
+                        this.apply_status(networks, accounts, call, ring, cx);
                         this.load_settings(cx);
                         this.reload_all(cx);
                         if restarted || came_back {

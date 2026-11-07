@@ -1166,6 +1166,32 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
                 |id| messages::serve(&ctx, &saved, &live, Command::Backfill(id.to_owned())),
                 |command| match command {
                     Command::Tiny(ask) => live.ask(ask),
+                    // A direct call's join is a ring, or an accept when one is already ringing in.
+                    // Media starts only once the server says the ring was accepted.
+                    Command::CallJoin(id) => {
+                        let key = ctx.key(&id);
+                        let (call, _) = ctx.hub.calls.describe();
+                        let incoming = call.as_ref().is_some_and(|call| {
+                            call.conversation == key
+                                && matches!(call.state, protocol::CallState::RingingIn { .. })
+                        }) || ctx.hub.calls.aside().is_some_and(|call| {
+                            call.conversation == key
+                                && matches!(call.state, protocol::CallState::RingingIn { .. })
+                        });
+                        let (reply, _) = std::sync::mpsc::channel();
+                        if incoming {
+                            live.ask(live::Ask::Accept {
+                                direct_id: id,
+                                reply,
+                            });
+                        } else {
+                            live.ask(live::Ask::Ring {
+                                direct_id: id,
+                                attempt: None,
+                                reply,
+                            });
+                        }
+                    }
                     // chatd's call in a room ended (hung up, or failed), or its mute changed.
                     Command::CallLeave(room_id) => live.ask(live::Ask::Hangup { room_id }),
                     Command::CallAudio { muted, deafened } => live.ask(live::Ask::State { muted, deafened }),
