@@ -31,6 +31,13 @@ pub fn prove_tiny_open_backfill() -> Result<(), String> {
     messages::prove_tiny_open_backfill()
 }
 
+mod direct_prove;
+
+/// Headless daemon scenario for a newly received DM, including its first message and history.
+pub fn prove_tiny_direct_created() -> Result<(), String> {
+    direct_prove::run()
+}
+
 /// The lab's sealed-preview proof. See `messages::prove_sealed_preview`.
 pub fn prove_sealed_preview() -> Result<(), String> {
     messages::prove_sealed_preview()
