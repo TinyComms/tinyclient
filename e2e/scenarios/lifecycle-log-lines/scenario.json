@@ -1,0 +1,12 @@
+{
+  "id": "lifecycle-log-lines",
+  "title": "The window's lifecycle lines are on disk while the app runs, and a closed window leaves its reason behind",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone build has no desktop window to open and close; its records reach logcat.",
+    "ios": "The phone build has no desktop window to open and close; its records reach the system log."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
