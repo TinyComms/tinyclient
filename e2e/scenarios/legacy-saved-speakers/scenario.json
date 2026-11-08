@@ -1,0 +1,12 @@
+{
+  "id": "legacy-saved-speakers",
+  "title": "Unauthenticated sealed history keeps distinct wire speakers instead of one Saved message wall",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd against a localhost sealed map. The same map_sealed path is what this desktop run checks.",
+    "ios": "The phone proof build does not run desktop chatd against a localhost sealed map. The same map_sealed path is what this desktop run checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

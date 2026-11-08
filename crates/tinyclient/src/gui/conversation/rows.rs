@@ -75,6 +75,10 @@ fn continues(before: &Message, message: &Message, same_day: fn(i64, i64) -> bool
     before.kind == MessageKind::Normal
         && message.kind == MessageKind::Normal
         && message.reply_to.is_none()
+        // Empty ids used to mean "Saved message" for every unauthenticated sealed row; treating
+        // them as equal collapsed a whole back-and-forth under one header.
+        && !before.sender.id.is_empty()
+        && !message.sender.id.is_empty()
         // The same bot user posting as a different app is a different author.
         && before.sender.id == message.sender.id
         && before.sender.name == message.sender.name
@@ -228,6 +232,14 @@ mod tests {
         let ci = with(said("1", "CI", t), |m| m.sender.id = "B1".into());
         let deploys = with(said("2", "Deploys", t + 1), |m| m.sender.id = "B1".into());
         assert_eq!(shape(&lay(&[ci, deploys], None)), "SDHH");
+    }
+
+    #[test]
+    fn empty_sender_ids_never_group_even_with_the_same_display_name() {
+        let t = 10 * DAY;
+        let first = with(said("1", "Saved message", t), |m| m.sender.id.clear());
+        let second = with(said("2", "Saved message", t + 1), |m| m.sender.id.clear());
+        assert_eq!(shape(&lay(&[first, second], None)), "SDHH");
     }
 
     #[test]

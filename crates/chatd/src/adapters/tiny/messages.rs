@@ -1798,12 +1798,11 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
                     message.sender.name = name_of(names, saved, &author);
                     message.outgoing = author == saved.user_id;
                 } else {
+                    // Unauthenticated cache hits (device-link archive, pre-auth caches, decrypt
+                    // fallback) keep the wire author for display only. Clearing id made every
+                    // speaker share one empty id, so continues() collapsed a back-and-forth into
+                    // one monologue. saved_history still blocks edits; MLS auth still wins above.
                     message.saved_history = true;
-                    message.sender.id.clear();
-                    message.sender.name = "Saved message".to_owned();
-                    message.outgoing = false;
-                    message.sent = if opened.at != 0 { opened.at } else { sent };
-                    message.sent_subsec_millis = 0;
                     message.client_id = None;
                     if let Some(attribution) = &opened.saved_attribution {
                         message.sender.id = attribution.id.clone();
@@ -1811,6 +1810,9 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
                         message.outgoing = attribution.outgoing;
                         message.sent = attribution.sent;
                         message.sent_subsec_millis = attribution.sent_subsec_millis;
+                    } else if message.sent == 0 && opened.at != 0 {
+                        message.sent = opened.at;
+                        message.sent_subsec_millis = 0;
                     }
                 }
                 if let Some(millis) = opened.sent_at {
@@ -2429,6 +2431,57 @@ struct WireReaction {
     me: bool,
 }
 
+/// Proves unauthenticated sealed cache rows keep distinct wire speakers instead of collapsing to
+/// one empty-id "Saved message". The lab sets `TINYCLIENT_PROVE=legacy-saved-speakers`.
+pub(super) fn prove_legacy_saved_speakers() -> Result<(), String> {
+    const ME: &str = "11111111-1111-1111-1111-111111111111";
+    const PEER: &str = "22222222-2222-2222-2222-222222222222";
+    let saved = Saved {
+        base_url: "http://127.0.0.1:9".to_owned(),
+        token: "t".to_owned(),
+        user_id: ME.to_owned(),
+        email: None,
+        display_name: "Justin".to_owned(),
+        role: "member".to_owned(),
+        plain_http_ok: false,
+        e2ee: None,
+    };
+    let names = HashMap::from([(PEER.to_owned(), "Larsen".to_owned())]);
+    let mine: WireMessage = serde_json::from_value(serde_json::json!({
+        "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "author_id": ME, "e2ee": true,
+        "created_at": "2024-01-02T03:04:05Z"
+    }))
+    .map_err(|err| err.to_string())?;
+    let theirs: WireMessage = serde_json::from_value(serde_json::json!({
+        "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "author_id": PEER, "e2ee": true,
+        "created_at": "2024-01-02T03:04:06Z"
+    }))
+    .map_err(|err| err.to_string())?;
+    let opened = e2ee::Opened {
+        text: "hi".into(),
+        ..e2ee::Opened::default()
+    };
+    let reads = HashMap::from([
+        (mine.id.clone(), Read::Legacy(opened.clone())),
+        (theirs.id.clone(), Read::Legacy(opened)),
+    ]);
+    let mine = map_message(&saved, &names, &mine, &reads, &mut Vec::new()).ok_or("mine missing")?;
+    let theirs = map_message(&saved, &names, &theirs, &reads, &mut Vec::new()).ok_or("theirs missing")?;
+    if !mine.saved_history || !theirs.saved_history {
+        return Err("legacy rows must stay marked as saved history".into());
+    }
+    if mine.sender.id != ME || !mine.outgoing || mine.sender.name != "Justin" {
+        return Err(format!("mine mapped as {} / {} outgoing={}", mine.sender.id, mine.sender.name, mine.outgoing));
+    }
+    if theirs.sender.id != PEER || theirs.outgoing || theirs.sender.name != "Larsen" {
+        return Err(format!("theirs mapped as {} / {} outgoing={}", theirs.sender.id, theirs.sender.name, theirs.outgoing));
+    }
+    if mine.sender.id == theirs.sender.id {
+        return Err("both speakers collapsed to the same id".into());
+    }
+    Ok(())
+}
+
 /// Proves a ciphertext row with no `e2ee` flag is stored as undecryptable, not as blank plaintext.
 /// The lab sets `TINYCLIENT_PROVE=sealed-row`. A build from before the fix ignores that and keeps
 /// serving, so the same driver fails there.
@@ -2915,19 +2968,40 @@ mod tests {
     }
 
     #[test]
-    fn legacy_saved_text_has_neutral_attribution_even_when_wire_claims_it_is_mine() {
-        let saved = saved("http://unused");
+    fn legacy_saved_text_keeps_wire_display_attribution_and_marks_saved_history() {
+        let mut saved = saved("http://unused");
+        saved.display_name = "Justin".into();
         let wire: WireMessage = serde_json::from_value(json!({"id":"legacy", "author_id":ME, "e2ee":true, "created_at":WHEN, "client_id":"forged-own"})).unwrap();
         let opened = e2ee::Opened { text:"saved words".into(), at:123, ..e2ee::Opened::default() };
         let reads = HashMap::from([("legacy".to_owned(), Read::Legacy(opened))]);
         let mapped = map_message(&saved, &HashMap::new(), &wire, &reads, &mut Vec::new()).unwrap();
         assert_eq!(mapped.text, "saved words");
-        assert_eq!(mapped.sender.name, "Saved message");
-        assert!(mapped.sender.id.is_empty());
-        assert!(!mapped.outgoing);
+        assert_eq!(mapped.sender.name, "Justin");
+        assert_eq!(mapped.sender.id, ME);
+        assert!(mapped.outgoing);
         assert!(mapped.client_id.is_none());
         assert!(mapped.saved_history);
-        assert_eq!(mapped.sent, 123);
+        // Wire created_at wins over coarse opened.at so speakers keep distinct timestamps.
+        assert_eq!(mapped.sent, rfc3339(WHEN).unwrap());
+    }
+
+    #[test]
+    fn legacy_saved_text_from_two_wire_authors_keeps_both_speakers() {
+        let saved = saved("http://unused");
+        let names = HashMap::from([(PEER.to_owned(), "Larsen".to_owned())]);
+        let mine: WireMessage = serde_json::from_value(json!({"id":"mine", "author_id":ME, "e2ee":true, "created_at":WHEN})).unwrap();
+        let theirs: WireMessage = serde_json::from_value(json!({"id":"theirs", "author_id":PEER, "e2ee":true, "created_at":WHEN})).unwrap();
+        let opened = e2ee::Opened { text:"hi".into(), ..e2ee::Opened::default() };
+        let reads = HashMap::from([
+            ("mine".to_owned(), Read::Legacy(opened.clone())),
+            ("theirs".to_owned(), Read::Legacy(opened)),
+        ]);
+        let mine = map_message(&saved, &names, &mine, &reads, &mut Vec::new()).unwrap();
+        let theirs = map_message(&saved, &names, &theirs, &reads, &mut Vec::new()).unwrap();
+        assert_eq!((mine.sender.id.as_str(), mine.outgoing, mine.saved_history), (ME, true, true));
+        assert_eq!((theirs.sender.id.as_str(), theirs.sender.name.as_str(), theirs.outgoing, theirs.saved_history),
+            (PEER, "Larsen", false, true));
+        assert_ne!(mine.sender.id, theirs.sender.id);
     }
 
     #[test]

@@ -555,7 +555,8 @@ impl OpenedFile {
 #[derive(Clone)]
 pub(crate) enum Read {
     Opened(Opened),
-    /// Saved plaintext from before sender authentication was retained. Never a wire identity.
+    /// Saved plaintext from before sender authentication was retained. Its speaker is the
+    /// wire author, unverified and for display only; `saved_history` keeps it read-only.
     Legacy(Opened),
     /// An edit, folded into its target: not a row of its own.
     Edit,
