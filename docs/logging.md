@@ -31,6 +31,8 @@ Under the support directory (`TINYCLIENT_DIR`, otherwise the platform data dir):
 | `logs/bundles/<session>-<process>-<utc>.log` | The in-memory ring, written only by Save debug log |
 | `crash.log` | A panic, already passed through `redact`. Mode `0600` on Unix |
 
+Each operator line is flushed as it is written. The window also records lifecycle lines (`logging to`, `window open`, `window should close`, `close window`, `quit asked`, `window gone`) so a hang or a vanished HWND still leaves a reason on disk.
+
 The old `chatd.log` at the top of the support directory is not opened, copied, or deleted.
 
 Save debug log in Settings › About writes the window ring and asks chatd, which also asks a live mediad. Export off writes nothing and the window says "Debug logs are turned off." Bundles older than 24 hours are removed on the next save. On Unix the log directory is mode `0700`, and the operator files and the bundle are mode `0600`.

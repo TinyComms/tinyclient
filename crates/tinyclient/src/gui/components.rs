@@ -592,20 +592,34 @@ pub fn brand_state(title: &str, detail: &str) -> Div {
 }
 
 fn empty_state_body(icon: impl IntoElement, title: &str, detail: &str) -> Div {
+    // Full width of the region, children centred: a shrink-wrapped title with only
+    // `text_center` can drift to the right after a resize (GPUI keeps a stale text
+    // width). Cap both lines the same way the mockup does (`max-width: 320px`).
     div()
+        .w_full()
         .flex_none()
         .px(px(theme::PANE_PAD))
         .flex()
         .flex_col()
         .items_center()
         .child(icon)
-        .child(div().mt(px(12.)).type_title().text_center().text_color(theme::text()).child(title.to_owned()))
+        .child(
+            div()
+                .mt(px(12.))
+                .w_full()
+                .max_w(px(320.))
+                .text_align(gpui::TextAlign::Center)
+                .type_title()
+                .text_color(theme::text())
+                .child(title.to_owned()),
+        )
         .when(!detail.is_empty(), |body| {
             body.child(
                 div()
                     .mt(px(4.))
+                    .w_full()
                     .max_w(px(320.))
-                    .text_center()
+                    .text_align(gpui::TextAlign::Center)
                     .type_ui()
                     .text_color(theme::text_soft())
                     .child(crate::gui::shortcuts::label(detail)),
@@ -620,11 +634,19 @@ fn empty_state_column(icon: Svg, title: &str, detail: &str) -> Div {
 /// Puts `content` a little above the middle: the free height splits 45 above to 55 below.
 fn centered_high(content: Div) -> Div {
     let spacer = |grow: f32| {
-        let mut spacer = div().flex_basis(px(0.)).min_h(px(0.));
+        let mut spacer = div().w_full().flex_basis(px(0.)).min_h(px(0.));
         spacer.style().flex_grow = Some(grow);
         spacer
     };
-    div().size_full().flex().flex_col().items_center().child(spacer(45.)).child(content).child(spacer(55.))
+    div()
+        .size_full()
+        .min_w(px(0.))
+        .flex()
+        .flex_col()
+        .items_center()
+        .child(spacer(45.))
+        .child(content)
+        .child(spacer(55.))
 }
 
 /// The title inside a pane's 52 pt strip: 16/600, one line. See [`title_strip`].
