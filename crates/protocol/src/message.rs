@@ -325,8 +325,9 @@ pub struct Sender {
 pub struct Message {
     pub id: String,
     pub sender: Sender,
-    /// Saved legacy plaintext whose sender authentication was not retained. Any old local
-    /// attribution is historical display metadata, never cryptographic authorization.
+    /// Saved legacy plaintext whose sender authentication was not retained. The sender shown
+    /// is the wire author or old local attribution: display metadata, never cryptographic
+    /// authorization, so the row cannot be edited.
     #[serde(default, skip_serializing_if = "is_false")]
     pub saved_history: bool,
     /// Unix seconds.

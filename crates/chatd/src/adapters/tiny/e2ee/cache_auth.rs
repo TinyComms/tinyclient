@@ -1,4 +1,5 @@
 //! Authentication retained with sealed plaintext, independently of later server row claims.
+//! A row without it shows the wire author, unverified, and stays `saved_history`.
 
 use super::*;
 
