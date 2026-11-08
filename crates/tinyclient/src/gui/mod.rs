@@ -859,6 +859,10 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
             let opened = cx.open_window(options, |window, cx| {
                 // The red button closes the window as ⌘W does (Keep receiving decides how).
                 window.on_window_should_close(cx, |_, cx| {
+                    tracing::warn!("tinyclient: window should close");
+                    if let Some(guard) = protocol::log_policy::current() {
+                        guard.flush();
+                    }
                     app::menubar::close_window(cx);
                     false
                 });
@@ -869,11 +873,24 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
                 })
             });
             let window = match opened {
-                Ok(window) => window,
+                Ok(window) => {
+                    tracing::info!(
+                        "tinyclient: window open pid={} windows={}",
+                        std::process::id(),
+                        cx.windows().len()
+                    );
+                    if let Some(guard) = protocol::log_policy::current() {
+                        guard.flush();
+                    }
+                    window
+                }
                 Err(err) => {
                     // No window (no GPU, a headless session): say so and leave, never panic.
                     // Nothing can be drawn without a window, so the record is the only report.
                     tracing::warn!("tinyclient: the window could not open: {err}");
+                    if let Some(guard) = protocol::log_policy::current() {
+                        guard.flush();
+                    }
                     // On Android the `log` records are what reach logcat (`lib.rs`, `android_log`).
                     #[cfg(target_os = "android")]
                     log::error!("tinyclient: the window could not open: {err}");
@@ -881,6 +898,9 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
                     return;
                 }
             };
+            // The HWND can die while GPUI's loop keeps spinning on "Invalid window handle"
+            // and never drains timers. Watch from a plain OS thread so a hung UI still exits.
+            watch_for_vanished_window();
             if let Some(invite) = invite {
                 links.borrow_mut().push_back(invite);
             }
@@ -910,6 +930,82 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
             let _ = window;
             cx.activate(true);
         });
+}
+
+/// Watches for the main HWND vanishing while the process hangs. OS thread, not GPUI timers.
+fn watch_for_vanished_window() {
+    #[cfg(windows)]
+    {
+        std::thread::Builder::new()
+            .name("window-watch".into())
+            .spawn(|| {
+                let mut seen = false;
+                let mut missing = 0u8;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    if os_window_alive() {
+                        seen = true;
+                        missing = 0;
+                        continue;
+                    }
+                    if !seen {
+                        continue;
+                    }
+                    missing = missing.saturating_add(1);
+                    if missing < 2 {
+                        continue;
+                    }
+                    tracing::warn!("tinyclient: OS window gone; exiting hung process");
+                    if let Some(guard) = protocol::log_policy::current() {
+                        guard.flush();
+                    }
+                    std::process::exit(1);
+                }
+            })
+            .ok();
+    }
+}
+
+/// Whether this process still owns a titled or visible top-level window.
+fn os_window_alive() -> bool {
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use windows_sys::Win32::Foundation::{HWND, LPARAM};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+        };
+
+        static WANT_PID: AtomicU32 = AtomicU32::new(0);
+        static FOUND: AtomicBool = AtomicBool::new(false);
+        WANT_PID.store(std::process::id(), Ordering::SeqCst);
+        FOUND.store(false, Ordering::SeqCst);
+        unsafe extern "system" fn each(hwnd: HWND, _: LPARAM) -> i32 {
+            let mut window_pid = 0u32;
+            unsafe { GetWindowThreadProcessId(hwnd, &mut window_pid) };
+            if window_pid != WANT_PID.load(Ordering::SeqCst) || unsafe { IsWindow(hwnd) == 0 } {
+                return 1;
+            }
+            // Ignore untitled message-only helpers; the shell window is titled or visible
+            // (minimised still counts via IsIconic).
+            let mut title = [0u16; 8];
+            let titled = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) } > 0;
+            let shown = unsafe { IsWindowVisible(hwnd) != 0 || IsIconic(hwnd) != 0 };
+            if titled || shown {
+                FOUND.store(true, Ordering::SeqCst);
+                return 0;
+            }
+            1
+        }
+        unsafe {
+            let _ = EnumWindows(Some(each), 0);
+        }
+        FOUND.load(Ordering::SeqCst)
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
 }
 
 #[cfg(test)]

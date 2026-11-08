@@ -330,7 +330,12 @@ impl Shell {
                     .items_center()
                     .child(self.strip_controls(window, cx)),
             )
-            .child(brand_state("Pick a conversation", "⌘K jumps anywhere."))
+            .child(
+                brand_state("Pick a conversation", "⌘K jumps anywhere.")
+                    .flex_1()
+                    .min_w(px(0.))
+                    .min_h(px(0.)),
+            )
     }
 
     /// Says the result of something the user just did that is not visible where they look.

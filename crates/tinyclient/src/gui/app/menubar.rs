@@ -164,6 +164,10 @@ pub fn bind_keys(cx: &mut App) {
 
 /// ⌘Q. chatd is stopped by `stop_chatd_on_quit`, as for every other way out.
 pub fn quit(cx: &mut App) {
+    tracing::warn!("tinyclient: quit asked");
+    if let Some(guard) = protocol::log_policy::current() {
+        guard.flush();
+    }
     cx.quit();
 }
 
@@ -193,8 +197,13 @@ pub fn stop_chatd_on_quit(cx: &mut App) {
 /// otherwise closing quits there too.
 pub fn close_window(cx: &mut App) {
     if cfg!(target_os = "macos") && super::prefs::values().on(protocol::settings::KEEP_RUNNING) {
+        tracing::warn!("tinyclient: close window hides (Keep receiving)");
+        if let Some(guard) = protocol::log_policy::current() {
+            guard.flush();
+        }
         cx.hide();
     } else {
+        tracing::warn!("tinyclient: close window quits");
         quit(cx);
     }
 }

@@ -461,8 +461,18 @@ impl LogFile {
         };
         file.write_all(line.as_bytes())?;
         file.write_all(b"\n")?;
+        // Flush every line: a hung or hard-killed process otherwise leaves the
+        // last seconds of "why it closed" still in the libc buffer.
+        file.flush()?;
         self.len = self.len.saturating_add(extra);
         Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self.file.as_mut() {
+            Some(file) => file.flush(),
+            None => Ok(()),
+        }
     }
 }
 
@@ -634,9 +644,19 @@ pub struct LogGuard {
     process: &'static str,
     policy: Arc<Mutex<LogPolicy>>,
     ring: Arc<Mutex<Ring>>,
+    file: Arc<Mutex<Option<LogFile>>>,
 }
 
 impl LogGuard {
+    /// Forces the operator file to disk. Call after a lifecycle line that must
+    /// survive a hang or an abrupt exit (window gone, quit, panic path).
+    pub fn flush(&self) {
+        if let Some(file) = self.file.lock().unwrap_or_else(|err| err.into_inner()).as_mut() {
+            let _ = file.flush();
+        }
+        let _ = io::stderr().flush();
+    }
+
     /// Replaces the ceilings and the export flag. The open file stays open.
     /// A new operator ceiling is written to the file, so the Logs window shows Verbose logging
     /// taking hold in each process.
@@ -650,6 +670,7 @@ impl LogGuard {
             } else {
                 tracing::warn!("{line}");
             }
+            self.flush();
         }
     }
 
@@ -712,7 +733,7 @@ pub fn install(process: &'static str, policy: LogPolicy) -> &'static LogGuard {
     let policy = Arc::new(Mutex::new(policy));
     let ring = Arc::new(Mutex::new(Ring::default()));
     let path = logs_dir().join(format!("{process}.log"));
-    let file = Arc::new(Mutex::new(LogFile::open(path).ok()));
+    let file = Arc::new(Mutex::new(LogFile::open(path.clone()).ok()));
     let stderr = stderr_too();
     let operator = RedactLayer {
         policy: Arc::clone(&policy),
@@ -739,8 +760,19 @@ pub fn install(process: &'static str, policy: LogPolicy) -> &'static LogGuard {
     if rust_log {
         tracing::info!("RUST_LOG is ignored; set TINYCLIENT_LOG_LEVEL");
     }
-    let guard = Box::leak(Box::new(LogGuard { process, policy, ring }));
+    let guard = Box::leak(Box::new(LogGuard {
+        process,
+        policy,
+        ring,
+        file: Arc::clone(&file),
+    }));
     let _ = GUARD.set(guard);
+    tracing::info!(
+        "{process}: logging to {} support={}",
+        path.display(),
+        crate::support_dir().display()
+    );
+    guard.flush();
     guard
 }
 
