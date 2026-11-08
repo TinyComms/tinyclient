@@ -2818,6 +2818,10 @@ fn hear_busy(ctx: &Context, seat: &mut Seat, frame: &Value) {
 }
 
 /// Joins an accepted direct. Media is `d:{ring_id}`. The shell keeps the direct message's id.
+/// A direct call encodes like a seat in a default room: the voice-quality ladder over the
+/// server's room default of 64 kb/s, since a direct has no room row of its own to ask.
+const DIRECT_CALL_KBPS: u32 = 64;
+
 #[allow(clippy::too_many_arguments)]
 fn join_direct(
     ctx: &Context,
@@ -2848,11 +2852,15 @@ fn join_direct(
     }
     let direct_id = direct.direct_id.clone();
     if live.seats_only() {
+        let intent = direct.intent.unwrap();
         if let Some(direct) = seat.direct.as_mut() {
             direct.joining = true;
         }
         seat.wanted = Some(direct_id.clone());
-        return ask_direct_join(wire, pending, refs, direct_id, None, direct.intent.unwrap(), timing);
+        let sent =
+            ask_direct_join(wire, pending, refs, direct_id.clone(), None, intent, timing);
+        ctx.tiny_room(&direct_id, DIRECT_CALL_KBPS, false);
+        return sent;
     }
     match offer_direct(ctx, saved, seat) {
         Ok(sdp) => {
@@ -2864,7 +2872,17 @@ fn join_direct(
                 direct.joining = true;
             }
             seat.wanted = Some(direct_id.clone());
-            ask_direct_join(wire, pending, refs, direct_id, Some(sdp), direct.intent.unwrap(), timing)
+            let sent = ask_direct_join(
+                wire,
+                pending,
+                refs,
+                direct_id.clone(),
+                Some(sdp),
+                direct.intent.unwrap(),
+                timing,
+            );
+            ctx.tiny_room(&direct_id, DIRECT_CALL_KBPS, false);
+            sent
         }
         Err(words) => {
             if let Some(intent) = direct.intent {
