@@ -1799,7 +1799,7 @@ impl Device {
                 let kind = row.get("kind").and_then(Value::as_str).unwrap_or("");
                 let epoch = row.get("epoch").and_then(Value::as_u64).unwrap_or(0);
                 let Some(data) = row.get("data").and_then(Value::as_str).and_then(unb64) else {
-                    self.advance(&cursor, seq);
+                    self.advance(&cursor, seq)?;
                     continue;
                 };
                 match self.apply(conv, kind, epoch, &data, server_key) {
@@ -1821,7 +1821,7 @@ impl Device {
                     }
                     Applied::Stop(why) => return Err(why),
                 }
-                self.advance(&cursor, seq);
+                self.advance(&cursor, seq)?;
             }
             if count < HANDSHAKE_PAGE {
                 return Ok(moved);
@@ -1830,7 +1830,13 @@ impl Device {
         Err("This conversation is still updating. Try again shortly.".to_owned())
     }
 
-    fn advance(&mut self, conversation_id: &str, seq: i64) {
+    fn advance(&mut self, conversation_id: &str, seq: i64) -> Result<(), String> {
+        // Never acknowledge a handshake beyond the MLS snapshot on disk. Welcome errors can
+        // leave a joined group only in memory, and commits/proposals use lenient persistence.
+        // A failed flush keeps the feed position retryable, including after a cold restart.
+        self.engine()?.flush().map_err(|err| {
+            format!("The conversation's encryption state could not be saved: {err}")
+        })?;
         let at = self
             .notes
             .seqs
@@ -1840,6 +1846,7 @@ impl Device {
             *at = seq;
             self.save_notes();
         }
+        Ok(())
     }
 
     fn apply(

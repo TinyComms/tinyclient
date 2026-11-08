@@ -1,0 +1,12 @@
+{
+  "id": "handshake-cursor-durable",
+  "title": "Failed handshake saves cannot skip joining or reading new-epoch messages after restart",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "This source component driver executes chatd's real MLS/FileStore regression; no native mobile proof is claimed. The shared-code PR still requires the full platform plan.",
+    "ios": "This source component driver executes chatd's real MLS/FileStore regression; no native mobile proof is claimed. The shared-code PR still requires the full platform plan."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
