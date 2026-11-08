@@ -622,22 +622,46 @@ impl Cache {
         }
         // MLS cannot open the same incoming ciphertext again after its ratchet advances.
         // This is durable history: dropping new rows at a size limit loses them on restart.
-        if let Ok(plain) = serde_json::to_vec(&opened) {
-            if let Ok(blob) = e2ee::store::seal_cache_value(key, id.as_bytes(), &plain) {
-                // An interrupted append may leave no newline. Fence the next complete record
-                // from that tail; readers already skip empty lines and invalid records.
-                let line = format!("\n{id} {}\n", STANDARD.encode(blob));
-                let written = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.path)
-                    .and_then(|mut file| file.write_all(line.as_bytes()));
-                if let Err(err) = written {
-                    tracing::warn!("chatd: Tiny e2ee: the cache could not be written: {err}");
-                }
-            }
+        if let Err(err) = self.write_sealed(key, id, &opened) {
+            tracing::warn!("chatd: Tiny e2ee: the cache could not be written: {err}");
         }
+        // Soft path (outgoing/import/siblings): keep the in-memory row even when the append
+        // failed. Receive must use [`Cache::put_durable`] so a failed append cannot claim success.
         self.rows.insert(id.to_owned(), opened);
+    }
+
+    /// Strict sealed append used on authenticated receive. Serialization, sealing, write or sync
+    /// failure is returned and the in-memory map is left unchanged. Unlike [`Cache::put`], a
+    /// failed append here cannot claim success.
+    fn put_durable(&mut self, key: &CacheKey, id: &str, opened: Opened) -> Result<(), String> {
+        if !super::safe_id(id) {
+            return Err("message id is not safe for the sealed cache".into());
+        }
+        self.write_sealed(key, id, &opened)?
+            .sync_all().map_err(|err| err.to_string())?;
+        // A newly created log needs its directory entry durable before the ratchet is saved.
+        #[cfg(unix)]
+        std::fs::File::open(self.path.parent().ok_or("sealed cache has no directory")?)
+            .and_then(|dir| dir.sync_all()).map_err(|err| err.to_string())?;
+        self.rows.insert(id.to_owned(), opened);
+        Ok(())
+    }
+
+    fn write_sealed(&self, key: &CacheKey, id: &str, opened: &Opened) -> Result<std::fs::File, String> {
+        let plain = serde_json::to_vec(opened).map_err(|err| err.to_string())?;
+        let blob = e2ee::store::seal_cache_value(key, id.as_bytes(), &plain)
+            .map_err(|err| err.to_string())?;
+        // An interrupted append may leave no newline. Fence the next complete record
+        // from that tail; readers already skip empty lines and invalid records.
+        let line = format!("\n{id} {}\n", STANDARD.encode(blob));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|err| err.to_string())?;
+        file.write_all(line.as_bytes())
+            .map_err(|err| err.to_string())?;
+        Ok(file)
     }
 }
 
@@ -714,6 +738,185 @@ pub fn prove_cache_append_tail() -> Result<(), String> {
                     "cache lost {id} after unterminated tail (complete_tail={complete_tail})"
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Lab proof: a failed sealed-cache append must not consume the receive ratchet; after repair the
+/// same ciphertext opens and survives restart. Daemon marker only; not native GUI proof.
+pub fn prove_opened_history_cache_commit() -> Result<(), String> {
+    for fail_cache in [false, true] {
+        let fixture = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let a_dir = fixture.path().join("sender");
+        let b_dir = fixture.path().join("receiver");
+        private_dir(&a_dir).map_err(|err| err.to_string())?;
+        private_dir(&b_dir).map_err(|err| err.to_string())?;
+        let alice = UserId::random().map_err(|err| err.to_string())?;
+        let bea = UserId::random().map_err(|err| err.to_string())?;
+        let mut a = Engine::create(
+            alice,
+            Box::new(FileStore::new(&a_dir)),
+            StateKey::generate().map_err(|err| err.to_string())?,
+            STATE,
+        )
+        .map_err(|err| err.to_string())?;
+        let state_key = StateKey::generate().map_err(|err| err.to_string())?;
+        let cache_key = CacheKey::generate().map_err(|err| err.to_string())?;
+        let mut b = Engine::create(
+            bea,
+            Box::new(FileStore::new(&b_dir)),
+            state_key.clone(),
+            STATE,
+        )
+        .map_err(|err| err.to_string())?;
+        a.verify_devices(
+            bea,
+            &[DeviceRecord {
+                device_id: b.device_id(),
+                signature_key: b.signature_key(),
+                cross_signature: None,
+                created_at: 1,
+            }],
+        )
+        .map_err(|err| err.to_string())?;
+        b.verify_devices(
+            alice,
+            &[DeviceRecord {
+                device_id: a.device_id(),
+                signature_key: a.signature_key(),
+                cross_signature: None,
+                created_at: 1,
+            }],
+        )
+        .map_err(|err| err.to_string())?;
+        let conv = ConversationId::random().map_err(|err| err.to_string())?;
+        let server = e2ee::identity::DeviceKey::generate().map_err(|err| err.to_string())?;
+        let public = server.public_key();
+        a.create_group(conv, &public).map_err(|err| err.to_string())?;
+        let package = b
+            .key_packages(1)
+            .map_err(|err| err.to_string())?
+            .remove(0);
+        let crypto = openmls_rust_crypto::OpenMlsRustCrypto::default();
+        use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _};
+        use openmls::prelude::{
+            ExternalProposal, GroupEpoch, GroupId, KeyPackageIn, MlsMessageOut, ProtocolVersion,
+            SenderExtensionIndex,
+        };
+        use openmls_traits::OpenMlsProvider as _;
+        let parsed = KeyPackageIn::tls_deserialize_exact_bytes(&package)
+            .map_err(|err| err.to_string())?
+            .validate(crypto.crypto(), ProtocolVersion::Mls10)
+            .map_err(|err| err.to_string())?;
+        let proposal: MlsMessageOut = ExternalProposal::new_add::<openmls_rust_crypto::OpenMlsRustCrypto>(
+            parsed,
+            GroupId::from_slice(&conv.0),
+            GroupEpoch::from(a.epoch(conv).map_err(|err| err.to_string())?),
+            &server,
+            SenderExtensionIndex::new(0),
+        )
+        .map_err(|err| err.to_string())?;
+        let proposals = vec![proposal]
+            .tls_serialize_detached()
+            .map_err(|err| err.to_string())?;
+        let outcome = a
+            .handle_proposals(conv, &proposals)
+            .map_err(|err| err.to_string())?;
+        if !outcome.rejected.is_empty() {
+            return Err("add proposal was rejected".into());
+        }
+        let bundle = a
+            .commit_pending(conv)
+            .map_err(|err| err.to_string())?
+            .ok_or("missing commit bundle")?;
+        a.confirm_commit(conv).map_err(|err| err.to_string())?;
+        b.handle_welcome(conv, &bundle.welcomes[0].data, Some(&public))
+            .map_err(|err| err.to_string())?;
+        let sent = a
+            .encrypt(
+                conv,
+                Kind::Message,
+                None,
+                &Envelope::message("fixture history before restart"),
+            )
+            .map_err(|err| err.to_string())?;
+        let id = conv.to_string();
+        let cache_path = b_dir.join(format!("cache-{id}.log"));
+        if fail_cache {
+            std::fs::create_dir(&cache_path).map_err(|err| err.to_string())?;
+        }
+        let saved = Saved {
+            base_url: "https://prove.invalid".into(),
+            token: "synthetic".into(),
+            user_id: bea.to_string(),
+            email: None,
+            display_name: "Fixture".into(),
+            role: "member".into(),
+            plain_http_ok: false,
+            e2ee: None,
+        };
+        let author = alice.to_string();
+        let from = a.device_id().to_string();
+        let ciphertext = b64(&sent.ciphertext);
+        let row = Row {
+            id: "m1",
+            author_id: &author,
+            device_id: &from,
+            kind: "message",
+            ciphertext: Some(&ciphertext),
+            epoch: sent.epoch,
+            generation: None,
+            group_id: None,
+            target_id: None,
+            client_id: None,
+            created_at: "2026-01-01T00:00:00Z",
+        };
+        let before = std::fs::read(b_dir.join(STATE)).map_err(|err| err.to_string())?;
+        let mut device = Device::new(&saved);
+        device.dir = b_dir.clone();
+        device.engine = Some(b);
+        device.cache_key = Some(cache_key.clone());
+        device.state = DeviceState::Ready;
+        let first = device.read(&id, std::slice::from_ref(&row));
+        if fail_cache {
+            if !matches!(first.get("m1"), Some(Read::Undecryptable)) {
+                return Err("failed cache commit claimed an opened row".into());
+            }
+            if std::fs::read(b_dir.join(STATE)).map_err(|err| err.to_string())? != before {
+                return Err("receive ratchet advanced despite a failed cache append".into());
+            }
+            std::fs::remove_dir(&cache_path).map_err(|err| err.to_string())?;
+            let repaired = device.read(&id, std::slice::from_ref(&row));
+            if !matches!(
+                repaired.get("m1"),
+                Some(Read::Opened(o)) if o.text == "fixture history before restart"
+            ) {
+                return Err("ciphertext did not open after cache path repair".into());
+            }
+        } else if !matches!(
+            first.get("m1"),
+            Some(Read::Opened(o)) if o.text == "fixture history before restart"
+        ) {
+            return Err("control receive did not open".into());
+        }
+        drop(device);
+        let b = Engine::open(Box::new(FileStore::new(&b_dir)), state_key, STATE)
+            .map_err(|err| err.to_string())?
+            .ok_or("receiver state missing after restart")?;
+        let mut restarted = Device::new(&saved);
+        restarted.dir = b_dir;
+        restarted.engine = Some(b);
+        restarted.cache_key = Some(cache_key);
+        restarted.state = DeviceState::Ready;
+        let after = restarted.read(&id, std::slice::from_ref(&row));
+        if !matches!(
+            after.get("m1"),
+            Some(Read::Opened(o)) if o.text == "fixture history before restart"
+        ) {
+            return Err(format!(
+                "history did not survive restart (fail_cache={fail_cache})"
+            ));
         }
     }
     Ok(())
@@ -2050,6 +2253,31 @@ impl Device {
         }
     }
 
+    /// Durable receive commit: sealed cache append must succeed before the advanced ratchet is
+    /// kept. Failures leave no in-memory opened row.
+    fn remember_durable(
+        &mut self,
+        conversation_id: &str,
+        id: &str,
+        opened: Opened,
+    ) -> Result<(), Error> {
+        let Some(key) = self.cache_key.clone() else {
+            return Err(Error::Storage("sealed cache key is missing".into()));
+        };
+        let Some(cache) = self.cache(conversation_id) else {
+            return Err(Error::Storage("sealed cache could not be opened".into()));
+        };
+        cache.put_durable(&key, id, opened.clone()).map_err(|err| {
+            tracing::warn!("chatd: Tiny e2ee: opened history could not be saved: {err}");
+            Error::Storage(err)
+        })?;
+        for file in &opened.attachments {
+            self.files
+                .insert(file.id.clone(), (conversation_id.to_owned(), file.clone()));
+        }
+        Ok(())
+    }
+
     /// What a page of rows says, oldest first, the edits folded into their targets.
     pub(crate) fn read(&mut self, conversation_id: &str, rows: &[Row]) -> HashMap<String, Read> {
         let mut out = HashMap::new();
@@ -2137,10 +2365,20 @@ impl Device {
         };
         let (Ok(kind), Ok(author), Ok(device)) = (Kind::parse(row.kind), UserId::parse(row.author_id), DeviceId::parse(row.device_id)) else { return fallback(); };
         let claimed = Claimed { author: Some(author), device: Some(device), kind, target_id: row.target_id };
-        let Some(engine) = self.engine.as_mut() else {
+        let Some(mut engine) = self.engine.take() else {
             return fallback();
         };
-        let mut opened = engine.decrypt(conv, &ciphertext, &claimed);
+        let mut opened = Self::receive_committed(
+            &mut engine,
+            self,
+            conversation_id,
+            conv,
+            row,
+            &ciphertext,
+            &claimed,
+            kind,
+            legacy.as_ref(),
+        );
         // FutureEpoch: behind on handshake. NoGroup / NotAMember: accepted a repair but not
         // the Welcome yet. Limit one sync attempt per encryption group on this page.
         if matches!(
@@ -2148,6 +2386,7 @@ impl Device {
             Err(Error::FutureEpoch { .. } | Error::NoGroup | Error::NotAMember)
         ) && synced.insert(conv)
         {
+            self.engine = Some(engine);
             let generation = row.generation.unwrap_or(0);
             let outer = ConversationId::parse(conversation_id).ok();
             let active = outer.and_then(|outer| self.engine.as_ref()?.active_group(outer).ok());
@@ -2157,38 +2396,28 @@ impl Device {
                 self.feed_at(conversation_id, conv, generation, &key).map(|_| ())
             } else { self.sync(conversation_id) };
             if let Err(why) = sync { tracing::warn!("chatd: Tiny e2ee: {conversation_id}: {why}"); }
-            let Some(engine) = self.engine.as_mut() else {
+            let Some(mut again) = self.engine.take() else {
                 return fallback();
             };
-            opened = engine.decrypt(conv, &ciphertext, &claimed);
+            opened = Self::receive_committed(
+                &mut again,
+                self,
+                conversation_id,
+                conv,
+                row,
+                &ciphertext,
+                &claimed,
+                kind,
+                legacy.as_ref(),
+            );
+            engine = again;
         }
+        self.engine = Some(engine);
         if matches!(opened, Err(Error::FutureEpoch { .. } | Error::NoGroup)) {
             self.unopened.insert(conversation_id.to_owned());
         }
         match opened {
-            Ok(incoming) => {
-                let opened = Opened {
-                    text: incoming.envelope.text.clone(),
-                    generation: Some(row.generation.unwrap_or(0)),
-                    auth: Some(Authentication::new(ConversationId::parse(conversation_id).expect("checked conversation"), conv, row.generation.unwrap_or(0), incoming.epoch, &incoming.sender, incoming.kind, incoming.target_id.as_deref())),
-                    saved_attribution: None,
-                    reply_to: incoming.envelope.reply_to.clone(),
-                    sent_at: incoming.envelope.sent_at,
-                    attachments: incoming
-                        .envelope
-                        .attachments
-                        .iter()
-                        .map(OpenedFile::of)
-                        .collect(),
-                    edits: incoming.target_id.clone().filter(|_| kind == Kind::Edit),
-                    edited_by: None,
-                    at: super::messages::unix_of(row.created_at).unwrap_or(0),
-                    imported_from: None,
-                };
-                if legacy.as_ref().is_some_and(|saved| saved.text != opened.text || saved.attachments != opened.attachments || saved.edited_by.is_some()) {
-                    return fallback();
-                }
-                self.remember(conversation_id, row.id, opened.clone());
+            Ok(opened) => {
                 if kind == Kind::Edit {
                     Read::Edit
                 } else {
@@ -2200,6 +2429,65 @@ impl Device {
                 fallback()
             }
         }
+    }
+
+    /// Decrypt, durably seal the authenticated opened row, then persist the advanced ratchet.
+    /// A refused cache commit restores the pre-read ratchet so the genuine ciphertext still opens
+    /// after storage is repaired.
+    fn receive_committed(
+        engine: &mut Engine,
+        device: &mut Device,
+        conversation_id: &str,
+        conv: ConversationId,
+        row: &Row<'_>,
+        ciphertext: &[u8],
+        claimed: &Claimed<'_>,
+        kind: Kind,
+        legacy: Option<&Opened>,
+    ) -> Result<Opened, Error> {
+        let mut committed = None;
+        engine.decrypt_committed(conv, ciphertext, claimed, |incoming| {
+            let opened = Opened {
+                text: incoming.envelope.text.clone(),
+                generation: Some(row.generation.unwrap_or(0)),
+                auth: Some(Authentication::new(
+                    ConversationId::parse(conversation_id).expect("checked conversation"),
+                    conv,
+                    row.generation.unwrap_or(0),
+                    incoming.epoch,
+                    &incoming.sender,
+                    incoming.kind,
+                    incoming.target_id.as_deref(),
+                )),
+                saved_attribution: None,
+                reply_to: incoming.envelope.reply_to.clone(),
+                sent_at: incoming.envelope.sent_at,
+                attachments: incoming
+                    .envelope
+                    .attachments
+                    .iter()
+                    .map(OpenedFile::of)
+                    .collect(),
+                edits: incoming.target_id.clone().filter(|_| kind == Kind::Edit),
+                edited_by: None,
+                at: super::messages::unix_of(row.created_at).unwrap_or(0),
+                imported_from: None,
+            };
+            if !opened.auth.as_ref().is_some_and(|auth| auth.matches(conversation_id, row)) {
+                return Err(Error::Authentication);
+            }
+            if legacy.is_some_and(|saved| {
+                saved.text != opened.text
+                    || saved.attachments != opened.attachments
+                    || saved.edited_by.is_some()
+            }) {
+                return Err(Error::Authentication);
+            }
+            device.remember_durable(conversation_id, row.id, opened.clone())?;
+            committed = Some(opened);
+            Ok(())
+        })?;
+        committed.ok_or_else(|| Error::Storage("receive commit produced no opened row".into()))
     }
 
     /// Encrypts a message or an edit and posts it. The plaintext is kept in the cache, under the
@@ -3139,6 +3427,36 @@ mod tests {
     #[test]
     fn encrypted_history_beyond_twenty_thousand_messages_survives_restart() {
         assert_eq!(prove_cache_history_limit(), Ok(()));
+    }
+
+    #[test]
+    fn opened_history_cache_commit_prove_matches_receive_regression() {
+        assert_eq!(prove_opened_history_cache_commit(), Ok(()));
+    }
+
+    #[test]
+    fn cache_attachment_registration_follows_commit_mode() {
+        let (mut device, _) = posting_device("cache-attachment-commit", 0);
+        let fixture = tempfile::tempdir().unwrap();
+        device.dir = fixture.path().to_owned();
+        let file = OpenedFile {
+            id: "11111111-1111-4111-8111-111111111111".into(), key: b64(&[7; 32]), sha256: b64(&[9; 32]),
+            name: "picture.png".into(), mime: "image/png".into(), bytes: 1,
+            ..OpenedFile::default()
+        };
+        let mut opened = Opened { attachments: vec![file], ..Opened::default() };
+        device.remember("33333333-3333-4333-8333-333333333333", "m1", opened.clone());
+        assert!(device.sealed_file("11111111-1111-4111-8111-111111111111").is_some(),
+            "outgoing/import history must retain immediate attachment lookup");
+        opened.attachments[0].id = "22222222-2222-4222-8222-222222222222".into();
+        let blocked = fixture.path().join("cache-44444444-4444-4444-8444-444444444444.log");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(device.remember_durable("44444444-4444-4444-8444-444444444444", "m2", opened.clone()).is_err());
+        assert!(device.sealed_file("22222222-2222-4222-8222-222222222222").is_none(),
+            "a refused durable commit must not register its attachment");
+        std::fs::remove_dir(&blocked).unwrap();
+        device.remember_durable("44444444-4444-4444-8444-444444444444", "m2", opened).unwrap();
+        assert!(device.sealed_file("22222222-2222-4222-8222-222222222222").is_some());
     }
 
     #[test]

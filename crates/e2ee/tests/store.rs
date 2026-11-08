@@ -178,6 +178,105 @@ fn encrypting_and_making_key_packages_fail_when_the_state_cannot_be_written() {
 }
 
 #[test]
+fn decrypt_committed_restores_ratchet_when_commit_refuses() {
+    let mut world = World::new();
+    let a = world.person("a");
+    let b = world.person("b");
+    world.sync_trust();
+    world.start(a);
+    world.change(&[a], a, &[b], &[]);
+    let conv = world.conv();
+    let sent = world.send(a, "must stay openable after a refused commit");
+    let claimed = Claimed {
+        author: Some(world.clients[a].user()),
+        device: Some(world.clients[a].device()),
+        kind: Kind::Message,
+        target_id: None,
+    };
+    let err = world.clients[b]
+        .engine
+        .decrypt_committed(conv, &sent, &claimed, |_| Err(Error::Storage("cache full".into())))
+        .expect_err("refused commit must surface");
+    assert!(matches!(err, Error::Storage(_)));
+    assert_eq!(
+        world.clients[b]
+            .engine
+            .decrypt(conv, &sent, &claimed)
+            .unwrap()
+            .envelope
+            .text,
+        "must stay openable after a refused commit"
+    );
+}
+
+#[test]
+fn decrypt_committed_keeps_plaintext_when_state_save_lags() {
+    let store = Shared::default();
+    let key = StateKey::generate().unwrap();
+    let mut world = World::new();
+    let a = world.person("a");
+    let mut bob =
+        Engine::create(UserId::random().unwrap(), Box::new(store.clone()), key.clone(), "s")
+            .unwrap();
+    world.sync_trust();
+    let alice_user = world.clients[a].user();
+    bob.verify_devices(alice_user, &world.directory[&alice_user].clone())
+        .unwrap();
+    world.start(a);
+    let conv = world.conv();
+    let bob_record = e2ee::identity::DeviceRecord {
+        device_id: bob.device_id(),
+        signature_key: bob.signature_key(),
+        cross_signature: None,
+        created_at: 1,
+    };
+    world.clients[a]
+        .engine
+        .verify_devices(bob.user_id(), &[bob_record])
+        .unwrap();
+    let package = bob.key_packages(1).unwrap().remove(0);
+    world.clients[a]
+        .engine
+        .handle_proposals(conv, &world.ds.proposals(&[&package], &[], 0))
+        .unwrap();
+    let bundle = world.clients[a]
+        .engine
+        .commit_pending(conv)
+        .unwrap()
+        .unwrap();
+    world.clients[a].engine.confirm_commit(conv).unwrap();
+    bob.handle_welcome(conv, &bundle.welcomes[0].data, Some(&world.ds.public()))
+        .unwrap();
+    let sent = world.send(a, "opened while state lags");
+    let claimed = Claimed {
+        author: Some(alice_user),
+        device: None,
+        kind: Kind::Message,
+        target_id: None,
+    };
+    let before = store.load("s").unwrap().unwrap();
+    store.fail.store(true, Ordering::SeqCst);
+    let mut committed = false;
+    let opened = bob
+        .decrypt_committed(conv, &sent, &claimed, |_| {
+            committed = true;
+            Ok(())
+        })
+        .expect("plaintext remains available when only the state save fails");
+    assert!(committed);
+    assert_eq!(opened.envelope.text, "opened while state lags");
+    assert_eq!(store.load("s").unwrap().unwrap(), before);
+    assert!(bob.flush().is_err(), "the failed state save must remain visible");
+    store.fail.store(false, Ordering::SeqCst);
+    // An accepted receive must stay consumed in memory even while its state save lags.
+    assert!(matches!(bob.decrypt(conv, &sent, &claimed), Err(Error::Undecryptable)),
+        "state-save failure must not rewind an accepted receive");
+    bob.flush().unwrap();
+    let mut reopened = Engine::open(Box::new(store.clone()), key, "s").unwrap().unwrap();
+    assert!(matches!(reopened.decrypt(conv, &sent, &claimed), Err(Error::Undecryptable)));
+}
+
+#[test]
 fn receiving_survives_a_failed_write_and_reports_it_on_flush() {
     let store = Shared::default();
     let key = StateKey::generate().unwrap();

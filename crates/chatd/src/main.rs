@@ -136,6 +136,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-cache-append-tail:0");
         return Ok(());
     }
+    // A failed sealed-cache append must not leave only a consumed receive ratchet.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("opened-history-cache-commit") {
+        if let Err(err) = chatd::adapters::tiny::prove_opened_history_cache_commit() {
+            eprintln!("opened-history-cache-commit: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-opened-history-cache-commit:0");
+        return Ok(());
+    }
     // The lab's keep-opened-sealed driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("keep-opened-sealed") {
         if let Err(err) = chatd::adapters::tiny::prove_keep_opened_sealed() {

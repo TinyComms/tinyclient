@@ -254,7 +254,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         drop(hub);
-        std::fs::remove_dir_all(dir).unwrap();
+        // Recorded is published before the reader exits and drops its Hub/SQLite handle.
+        // Windows cannot delete the database until that asynchronous cleanup finishes.
+        let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+        while let Err(err) = std::fs::remove_dir_all(&dir) {
+            assert!(cfg!(windows) && err.raw_os_error() == Some(32)
+                && Instant::now() < cleanup_deadline, "recorder fixture cleanup: {err}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn recording(since: u64) -> Recording {

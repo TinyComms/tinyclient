@@ -78,6 +78,11 @@ pub fn prove_cache_history_limit() -> Result<(), String> {
     e2ee::prove_cache_history_limit()
 }
 
+/// The lab's durable receive/cache commit proof.
+pub fn prove_opened_history_cache_commit() -> Result<(), String> {
+    e2ee::prove_opened_history_cache_commit()
+}
+
 /// The lab's reauthentication history proof, using real encrypted device/cache files.
 pub fn prove_reauthenticated_history() -> Result<(), String> {
     e2ee::prove_reauthenticated_history()
