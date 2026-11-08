@@ -3426,6 +3426,9 @@ mod tests {
     #[test]
     fn encrypted_history_beyond_twenty_thousand_messages_survives_restart() {
         assert_eq!(prove_cache_history_limit(), Ok(()));
+    }
+
+    #[test]
     fn opened_history_cache_commit_prove_matches_receive_regression() {
         assert_eq!(prove_opened_history_cache_commit(), Ok(()));
     }

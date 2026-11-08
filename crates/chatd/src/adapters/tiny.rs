@@ -71,6 +71,8 @@ pub fn prove_cache_append_tail() -> Result<(), String> {
 /// The lab's long-conversation sealed history proof.
 pub fn prove_cache_history_limit() -> Result<(), String> {
     e2ee::prove_cache_history_limit()
+}
+
 /// The lab's durable receive/cache commit proof.
 pub fn prove_opened_history_cache_commit() -> Result<(), String> {
     e2ee::prove_opened_history_cache_commit()
