@@ -1,0 +1,7 @@
+{
+  "id": "encrypted-membership-reconnect",
+  "title": "Returning clients finish a pending encrypted-chat admission after missing its live event",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": ["server", "two-people"],
+  "release": false
+}

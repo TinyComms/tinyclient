@@ -212,6 +212,9 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
             record_call(ctx, saved, names, &direct.id, call);
         }
     }
+    // Includes groups with no messages yet: opening only cached history does not
+    // drive pending Adds, and their live hint may have arrived while we were offline.
+    e2ee::resume(saved);
 }
 
 /// The server lists direct calls. A server not yet checked is asked; a 404 is an older one.

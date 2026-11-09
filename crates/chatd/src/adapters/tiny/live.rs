@@ -1809,6 +1809,8 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
     // without another members read: a resume is not fresh and reads nothing here.
     if fresh {
         super::messages::publish(ctx, saved, &seat.names);
+    } else {
+        super::e2ee::resume(saved);
     }
 }
 
