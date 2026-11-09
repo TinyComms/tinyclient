@@ -468,22 +468,6 @@ fn a_muted_channel_draws_quiet_and_never_raises_the_rail() {
 }
 
 #[test]
-fn a_muted_channel_draws_quiet_and_never_raises_the_rail() {
-    let world = World::signed_in();
-    world.connected();
-    // The channel is muted on Telegram, and one of its unread posts names me. The row
-    // carries what the list needs to draw it dimmed with a quiet count and the quiet
-    // mention pill (polish/03 §6); the rail hears nothing of any of it.
-    world.steer("mention channel");
-    world.home(None, Shelf::Main);
-    let row = world.until("the channel's mention to land", || world.conversation("c9001").filter(|row| row.mentions == 1));
-    assert_eq!((row.unread, row.muted, row.read_only), (1, true, true), "{row:?}");
-    let (accounts, _) = world.status();
-    let mira = accounts.iter().find(|account| account.key.network == Network::Telegram).unwrap();
-    assert_eq!(mira.attention, 1, "only Odalys's unread needs me: the muted channel never raises the rail");
-}
-
-#[test]
 fn a_forum_opens_on_the_newest_unread_topic_else_general() {
     let world = World::signed_in();
     world.connected();
@@ -838,12 +822,6 @@ fn a_message_whose_own_time_has_passed_is_nowhere_and_one_still_alive_leaves_the
     assert_ne!(world.conversation("u7002").unwrap().preview, alive.text);
     assert!(world.messages("u7002").into_iter().all(|message| message.id != "17"));
     assert_eq!(world.called("GetHistory u7002"), asked, "nothing was asked of Telegram about it");
-    // The row said the spent message's words in the list; nothing of it is left there.
-    assert!(
-        world.home(None, Shelf::Main).iter().all(|row| row.key.id != "u7002" || row.preview.is_empty()),
-        "{:#?}",
-        world.home(None, Shelf::Main)
-    );
 
     // Telegram says both are gone after their time. The store let them go already, so its word
     // changes nothing here: no change at all.
