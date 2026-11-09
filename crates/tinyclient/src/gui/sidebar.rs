@@ -209,7 +209,7 @@ impl State {
         saved.folder = folder;
     }
 
-    fn new(cx: &mut Context<Shell>) -> State {
+    pub fn new(cx: &mut Context<Shell>) -> State {
         #[cfg(feature = "gui-shot")]
         shot::schedule(cx);
         Self::with_focus(cx.focus_handle())
