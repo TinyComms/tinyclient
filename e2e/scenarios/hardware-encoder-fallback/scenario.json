@@ -5,6 +5,6 @@
   "needs": [],
   "release": false,
   "driver": "run.sh",
-  "proof_scope": "encoder selection and helpers, unit-level; the on-hardware record needs a machine with a hardware MFT",
+  "proof_scope": "encoder selection, the fake-MFT open/refusal/keyframe path, and the NV12/Annex B helpers, unit-level; the on-hardware record needs a machine with a hardware MFT",
   "native_client_proof": "the released client shows screen share and camera running on the machine's own hardware encoder, with the OpenH264 download as the fallback"
 }

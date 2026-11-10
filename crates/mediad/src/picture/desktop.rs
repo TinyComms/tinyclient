@@ -48,6 +48,18 @@ struct Coded {
     backend: Backend,
     width: u32,
     height: u32,
+    /// What the track asked at open: what a mid-share failover sets the software encoder
+    /// up with. Windows only: the failover is.
+    #[cfg(windows)]
+    bps: u32,
+    #[cfg(windows)]
+    fps: f32,
+    #[cfg(windows)]
+    screen: bool,
+    /// Whether the hardware's mid-share failure has been said once, so a failing frame a
+    /// second does not say it a second a time.
+    #[cfg(windows)]
+    said: bool,
 }
 
 /// One of the two encoders behind [`Coded`]: the machine's own hardware, or Cisco's
@@ -137,19 +149,83 @@ impl Coded {
     /// OpenH264, downloaded at run time, takes every other machine and every refusal, with
     /// the words it has always had.
     fn open(width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Result<Coded, String> {
-        #[cfg(windows)]
+        Ok(Coded::with(Self::backend(width, height, bps, fps, screen)?, width, height, bps, fps, screen))
+    }
+
+    #[cfg(windows)]
+    fn with(backend: Backend, width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Coded {
+        Coded { backend, width, height, bps, fps, screen, said: false }
+    }
+
+    #[cfg(not(windows))]
+    fn with(backend: Backend, width: u32, height: u32, _bps: u32, _fps: f32, _screen: bool) -> Coded {
+        Coded { backend, width, height }
+    }
+
+    /// The machine's own hardware when Windows lists one, else OpenH264. The one place a
+    /// refusal of the hardware becomes the software encoder.
+    #[cfg(windows)]
+    fn backend(width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Result<Backend, String> {
         if mf_encoder::choose(&mf_encoder::available()) == mf_encoder::Choice::MediaFoundation {
-            match mf_encoder::Encoder::open(width, height, bps, fps, screen) {
-                Ok(encoder) => return Ok(Coded { backend: Backend::MediaFoundation(encoder), width, height }),
-                Err(why) => tracing::warn!("mediad: the Media Foundation encoder could not be set up ({why}); OpenH264 takes over."),
-            }
+            return settle(mf_encoder::Encoder::open(width, height, bps, fps, screen), || Backend::open_h264(bps, fps, screen));
         }
-        let backend = Backend::open_h264(bps, fps, screen)?;
-        Ok(Coded { backend, width, height })
+        Backend::open_h264(bps, fps, screen)
+    }
+
+    #[cfg(not(windows))]
+    fn backend(width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Result<Backend, String> {
+        Backend::open_h264(bps, fps, screen)
     }
 
     fn encode(&mut self, planes: &Planes, ask: &Ask) -> Result<Encoded, String> {
+        // The hardware failing mid-share does not end the share: one frame's error swaps
+        // the backend to OpenH264, whose first frame is a keyframe, and the track keeps
+        // going. The swap itself may have to wait for the OpenH264 download; until it
+        // lands the frame is skipped and the next one tries again.
+        #[cfg(windows)]
+        if matches!(self.backend, Backend::MediaFoundation(_)) {
+            match self.backend.encode(planes, ask) {
+                Ok(encoded) => return Ok(encoded),
+                Err(why) => {
+                    if !self.said {
+                        tracing::warn!("mediad: the Media Foundation encoder failed mid-share ({why}); OpenH264 takes over with a keyframe.");
+                        self.said = true;
+                    } else {
+                        tracing::debug!("mediad: the Media Foundation encoder failed again ({why}).");
+                    }
+                    match Backend::open_h264(self.bps, self.fps, self.screen) {
+                        Ok(fresh) => {
+                            self.backend = fresh;
+                            // The fresh encoder's first frame is a keyframe of its own; the
+                            // ask is forced besides, so one that was due is not lost to the
+                            // swap.
+                            let forced = Ask { key: true, ..*ask };
+                            return self.backend.encode(planes, &forced);
+                        }
+                        Err(why) => {
+                            tracing::debug!("mediad: OpenH264 is not ready to take over ({why}); this frame is skipped.");
+                            return Ok(Encoded::default());
+                        }
+                    }
+                }
+            }
+        }
         self.backend.encode(planes, ask)
+    }
+}
+
+/// The encoder the hardware gave, else the software one, with the refusal's words said in
+/// the log. The one place an open of the hardware becomes the fallback, whatever the
+/// refusal was: no encoder, a refused type, or a driver that would put a profile other
+/// than the baseline on the wire.
+#[cfg(windows)]
+fn settle(first: Result<mf_encoder::Encoder, String>, software: impl FnOnce() -> Result<Backend, String>) -> Result<Backend, String> {
+    match first {
+        Ok(encoder) => Ok(Backend::MediaFoundation(encoder)),
+        Err(why) => {
+            tracing::warn!("mediad: the Media Foundation encoder could not be set up ({why}); OpenH264 takes over.");
+            software()
+        }
     }
 }
 
@@ -996,6 +1072,19 @@ pub fn probe_camera() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal of the hardware settles on the software encoder, and the software
+    /// encoder's own answer is what the track gets: the hardware's words are said in the
+    /// log, and what comes back from the fallback is passed on whole, a refusal included.
+    /// The hardware opening is the one-line arm above it.
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_hardware_encoder_settles_on_the_software_one() {
+        let refused = Err("the hardware encoder encodes H.264 profile 100, not the baseline the SFU takes.".to_owned());
+        let why = settle(refused, || Err("OpenH264 could not be downloaded. The call stays a voice call.".to_owned()))
+            .expect_err("the software answer is the track's");
+        assert!(why.contains("OpenH264"), "{why}");
+    }
 
     #[test]
     fn openh264_is_fetched_from_cisco() {
