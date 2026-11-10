@@ -323,12 +323,13 @@ impl Source for Hardware {
         // SAFETY: the activate is still owned here.
         unsafe { let _ = activate.ShutdownObject(); }
         drop(activate);
-        // SAFETY: both casts are on the transform this open created.
-        let events: IMFMediaEventGenerator = unsafe { transform.cast() }
+        // Both casts are on the transform this open created; `cast` is safe in
+        // windows-core: it cannot name a null or wrong-vtable object without an `Err`.
+        let events: IMFMediaEventGenerator = transform.cast()
             .map_err(|err| format!("the hardware encoder has no event queue: {err}"))?;
         // `codec` is `None` when the MFT exposes no codec properties, which leaves a
         // keyframe ask and a bitrate move without their handle; the picture still encodes.
-        let codec: Option<ICodecAPI> = unsafe { transform.cast() }.ok();
+        let codec: Option<ICodecAPI> = transform.cast().ok();
         Ok(Box::new(RealMft { transform, events, codec }))
     }
 }
@@ -674,7 +675,7 @@ impl Drop for Encoder {
 
 /// The input type the encoder is fed: NV12 at the promised stride, whole frames, at the
 /// size and rate the track asked for.
-fn input_type(width: usize, height: usize, stride: usize, frame: usize, fps: f32) -> Result<windows::Win32::Media::MediaFoundation::IMFMediaType, String> {
+fn input_type(width: usize, height: usize, stride: usize, frame: usize, fps: f32) -> Result<IMFMediaType, String> {
     // SAFETY: the media type is created here and returned; the caller sets it before drop.
     unsafe {
         let kind = MFCreateMediaType().map_err(|err| format!("the input type could not be built: {err}"))?;
@@ -696,7 +697,7 @@ fn input_type(width: usize, height: usize, stride: usize, frame: usize, fps: f32
 /// held to the promise by [`Encoder::open_with`]; there is no retry without the profile,
 /// because whatever else the driver picked would go out on the wire as a stream the SFU
 /// was told never to expect. A level holds the size and rate, 5.1 for a 1440p share at 60.
-fn output_type(width: usize, height: usize, bps: u32, fps: f32, screen: bool) -> Result<windows::Win32::Media::MediaFoundation::IMFMediaType, String> {
+fn output_type(width: usize, height: usize, bps: u32, fps: f32, screen: bool) -> Result<IMFMediaType, String> {
     let level = if screen { eAVEncH264VLevel5_1 } else { eAVEncH264VLevel3_1 };
     // SAFETY: as in `input_type`, the type is returned to be set.
     unsafe {
@@ -1082,8 +1083,9 @@ mod tests {
         let mut fake = FakeMft::default();
         fake.output_refusal = Some("would not take an H.264 output".to_owned());
         let shared = SharedFake::new(fake);
-        let why = Encoder::open_with(&FakeSource(shared.clone()), Platform::unstarted(), 4, 4, 2_500_000, 30., true)
-            .expect_err("a refused output type is a refused encoder");
+        let Err(why) = Encoder::open_with(&FakeSource(shared.clone()), Platform::unstarted(), 4, 4, 2_500_000, 30., true) else {
+            panic!("a refused output type is a refused encoder");
+        };
         assert!(why.contains("H.264 output"), "{why}");
         assert!(!shared.with(|fake| fake.input_set), "the NV12 input ask never came after the refusal");
         // And the refusal is the fallback's cue, the same as a failed probe.
@@ -1097,15 +1099,17 @@ mod tests {
     fn a_profile_other_than_the_baseline_promised_is_refused() {
         let mut high = FakeMft::default();
         high.negotiated_profile = Some(eAVEncH264VProfile_Main.0 as u32);
-        let why = Encoder::open_with(&FakeSource(SharedFake::new(high)), Platform::unstarted(), 4, 4, 2_500_000, 30., true)
-            .expect_err("Main is not the baseline the SFU takes");
+        let Err(why) = Encoder::open_with(&FakeSource(SharedFake::new(high)), Platform::unstarted(), 4, 4, 2_500_000, 30., true) else {
+            panic!("Main is not the baseline the SFU takes");
+        };
         assert!(why.contains("not the baseline"), "{why}");
         assert_eq!(choose(&Err(why)), Choice::OpenH264);
 
         let mut silent = FakeMft::default();
         silent.negotiated_profile = None;
-        let why = Encoder::open_with(&FakeSource(SharedFake::new(silent)), Platform::unstarted(), 4, 4, 2_500_000, 30., true)
-            .expect_err("a kept type that names no profile cannot be held to the promise");
+        let Err(why) = Encoder::open_with(&FakeSource(SharedFake::new(silent)), Platform::unstarted(), 4, 4, 2_500_000, 30., true) else {
+            panic!("a kept type that names no profile cannot be held to the promise");
+        };
         assert!(why.contains("profile"), "{why}");
 
         // Constrained baseline and plain baseline are the promise kept.

@@ -1081,8 +1081,9 @@ mod tests {
     #[test]
     fn a_refused_hardware_encoder_settles_on_the_software_one() {
         let refused = Err("the hardware encoder encodes H.264 profile 100, not the baseline the SFU takes.".to_owned());
-        let why = settle(refused, || Err("OpenH264 could not be downloaded. The call stays a voice call.".to_owned()))
-            .expect_err("the software answer is the track's");
+        let Err(why) = settle(refused, || Err("OpenH264 could not be downloaded. The call stays a voice call.".to_owned())) else {
+            panic!("the software answer is the track's");
+        };
         assert!(why.contains("OpenH264"), "{why}");
     }
 
