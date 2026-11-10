@@ -1006,7 +1006,14 @@ fn capture_x11() -> Result<Rgba, String> {
     Ok(Rgba { width: width as u32, height: height as u32, pixels: reply.data, bgra: true })
 }
 
-const DOWNLOAD_FAILED: &str = "OpenH264 could not be downloaded. The call stays a voice call.";
+/// What the call is told when Cisco's host could not be reached. A VPN or a firewall that
+/// quietly drops the host is the usual reason, and that is said, so "Connecting…" is not
+/// read as a slow network.
+const DOWNLOAD_FAILED: &str = "OpenH264 could not be downloaded. A VPN or firewall may be blocking ciscobinary.openh264.org. The call stays a voice call. Turn share or camera on again to retry.";
+/// What the call is told when the download arrived but the disk would not take it.
+const SAVE_FAILED: &str = "OpenH264 could not be written to disk. The call stays a voice call. Turn share or camera on again to retry.";
+/// What the call is told when the download thread could not be started at all.
+const START_FAILED: &str = "OpenH264 could not start downloading. The call stays a voice call. Turn share or camera on again to retry.";
 
 enum Fetch {
     Idle,
@@ -1019,7 +1026,8 @@ fn fetch() -> &'static Mutex<Fetch> {
     FETCH.get_or_init(|| Mutex::new(Fetch::Idle))
 }
 
-/// Starts the download when the binary is not here yet, and returns at once.
+/// Starts the download when the binary is not here yet, and returns at once. One already on
+/// disk (a download that worked before is kept for every start after it) needs no network.
 pub fn warm() {
     let Ok(path) = library_path() else {
         return;
@@ -1050,23 +1058,36 @@ fn start_download(path: PathBuf) {
     *state = Fetch::Busy;
     drop(state);
     let started = std::thread::Builder::new().name("openh264".into()).spawn(move || {
-        let result = download(&path);
+        let result = download_with_retries(&path);
         if let Ok(mut state) = fetch().lock() {
             *state = match result {
                 Ok(()) => Fetch::Idle,
-                Err(err) => Fetch::Failed(err),
+                Err(words) => Fetch::Failed(words),
             };
         }
     });
     if started.is_err() {
         if let Ok(mut state) = fetch().lock() {
-            *state = Fetch::Failed(DOWNLOAD_FAILED.to_owned());
+            *state = Fetch::Failed(START_FAILED.to_owned());
         }
     }
 }
 
 /// Cisco's OpenH264 2.6.0 for this machine. A download in progress is [`CODEC_LATER`], not a
-/// failure, and this never blocks on the network.
+/// failure, and this never blocks on the network. A failed download says its words, and the
+/// next share or camera that is turned on starts a new download.
+///
+/// A later day, Windows could leave the download out altogether: the system's own Media
+/// Foundation ships an H.264 encoder on every machine that has a GPU driver. The shape it
+/// would take: `MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE)` lists what is
+/// there; one encoder opens as an async `IMFTransform` taking NV12 in (the capture's BGRA is
+/// turned into NV12 instead of today's I420, and the encoder runs on the GPU) and H.264 out;
+/// `ICodecAPI` sets `CODECAPI_AVEncCommonRateControlMode` to CBR, points
+/// `CODECAPI_AVEncCommonMeanBitRate` at the ask's bps, and answers an `Ask.key` with
+/// `CODECAPI_AVEncVideoForceKeyFrame`. `Coded::open` would pick that first and fall back to
+/// this download when `MFTEnumEx` finds nothing or the transform fails to open. macOS's
+/// VideoToolbox fills the same hole; Android's phone already encodes through MediaCodec. No
+/// Cisco download, and no redistribution question at all, since the OS's own encoder is used.
 fn load_api() -> Result<OpenH264API, String> {
     let path = library_path()?;
     if let Some(api) = open_cached(&path) {
@@ -1099,15 +1120,33 @@ fn open_cached(path: &Path) -> Option<OpenH264API> {
 
 fn library_path() -> Result<PathBuf, String> {
     let name = library_name().ok_or_else(|| "OpenH264 has no build for this system.".to_owned())?;
-    let dir = if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+    let dir = cache_dir(
+        std::env::var_os("LOCALAPPDATA"),
+        std::env::var_os("HOME"),
+        std::env::temp_dir(),
+    );
+    std::fs::create_dir_all(&dir).map_err(|err| {
+        tracing::warn!("mediad: OpenH264's cache folder could not be made: {err}");
+        SAVE_FAILED.to_owned()
+    })?;
+    Ok(dir.join(name))
+}
+
+/// Where the downloaded codec is kept. `%LOCALAPPDATA%\tinyclient` on Windows,
+/// `~/.cache/tinyclient` wherever there is a home, and the temp folder last: a place that
+/// survives a restart, so Cisco is asked once and every later call finds the file on disk.
+fn cache_dir(
+    local: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    fallback: PathBuf,
+) -> PathBuf {
+    if let Some(local) = local {
         PathBuf::from(local).join("tinyclient")
-    } else if let Some(home) = std::env::var_os("HOME") {
+    } else if let Some(home) = home {
         PathBuf::from(home).join(".cache").join("tinyclient")
     } else {
-        std::env::temp_dir().join("tinyclient")
-    };
-    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-    Ok(dir.join(name))
+        fallback.join("tinyclient")
+    }
 }
 
 fn library_name() -> Option<&'static str> {
@@ -1138,20 +1177,79 @@ fn library_url(name: &str) -> String {
     format!("https://ciscobinary.openh264.org/{name}.bz2")
 }
 
-fn download(path: &Path) -> Result<(), String> {
-    let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| "OpenH264 has no name.".to_owned())?;
-    let url = library_url(name);
-    let response = ureq::get(&url).timeout(Duration::from_secs(20)).call().map_err(|err| {
-        tracing::warn!("mediad: OpenH264 download failed: {err}");
-        DOWNLOAD_FAILED.to_owned()
+/// How many tries the download gets before it gives up and says so. Three, each with its
+/// own 20 seconds: a flaky link gets its second chance, and a blocked one still ends in
+/// said words inside about a minute instead of a share that waits forever.
+const ATTEMPTS: u32 = 3;
+
+/// The pause after attempt `attempt` (0 comes after the first try) grows, so a busy or
+/// blocked network is not hammered: 1, 4, 16 seconds, and every later one 64.
+fn retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(1u64 << (attempt * 2).min(6))
+}
+
+/// The download, tried up to [`ATTEMPTS`] times with a growing pause. Every failure is
+/// logged precisely and said plainly once the tries are out.
+fn download_with_retries(path: &Path) -> Result<(), String> {
+    let mut words = DOWNLOAD_FAILED.to_owned();
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(retry_delay(attempt - 1));
+        }
+        match download(path) {
+            Ok(()) => return Ok(()),
+            Err(failed) => {
+                tracing::warn!("mediad: OpenH264 download attempt {} of {ATTEMPTS} failed", attempt + 1);
+                words = failed.to_owned();
+            }
+        }
+    }
+    Err(words)
+}
+
+/// One try: Cisco's bz2 of this machine's library, written whole or not at all. The words of
+/// a failure name the step that went wrong; the precise error is only in the log. A stalled
+/// read is cut off after 20 seconds, so a VPN that takes the connection but not the bytes
+/// cannot hold this thread forever.
+fn download(path: &Path) -> Result<(), &'static str> {
+    let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+        tracing::warn!("mediad: OpenH264 has no file name to fetch");
+        DOWNLOAD_FAILED
     })?;
+    let url = library_url(name);
+    let response = ureq::get(&url)
+        .timeout(Duration::from_secs(20))
+        .timeout_read(Duration::from_secs(20))
+        .call()
+        .map_err(|err| {
+            tracing::warn!("mediad: OpenH264 could not be fetched from Cisco: {err}");
+            DOWNLOAD_FAILED
+        })?;
     let mut packed = Vec::new();
-    response.into_reader().read_to_end(&mut packed).map_err(|err| err.to_string())?;
+    response
+        .into_reader()
+        .take(64 * 1024 * 1024)
+        .read_to_end(&mut packed)
+        .map_err(|err| {
+            tracing::warn!("mediad: OpenH264's download was cut short: {err}");
+            DOWNLOAD_FAILED
+        })?;
     let mut plain = Vec::new();
-    bzip2_rs::DecoderReader::new(&packed[..]).read_to_end(&mut plain).map_err(|err| err.to_string())?;
+    bzip2_rs::DecoderReader::new(&packed[..])
+        .read_to_end(&mut plain)
+        .map_err(|err| {
+            tracing::warn!("mediad: OpenH264's download did not uncompress: {err}");
+            DOWNLOAD_FAILED
+        })?;
     let tmp = path.with_extension("part");
-    std::fs::write(&tmp, &plain).map_err(|err| err.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|err| err.to_string())?;
+    std::fs::write(&tmp, &plain).map_err(|err| {
+        tracing::warn!("mediad: OpenH264 could not be written to disk: {err}");
+        SAVE_FAILED
+    })?;
+    std::fs::rename(&tmp, path).map_err(|err| {
+        tracing::warn!("mediad: OpenH264 could not be moved into place: {err}");
+        SAVE_FAILED
+    })?;
     Ok(())
 }
 
@@ -1288,6 +1386,47 @@ mod tests {
         assert!(url.ends_with(".bz2"), "{url}");
         assert!(url.contains(name), "{url}");
         assert!(!url.contains("github.com"), "{url}");
+    }
+
+    #[test]
+    fn the_download_is_tried_again_before_it_gives_up() {
+        assert_eq!(ATTEMPTS, 3, "a flaky link gets another try, a blocked one does not wait all day");
+        assert_eq!(retry_delay(0), Duration::from_secs(1));
+        assert_eq!(retry_delay(1), Duration::from_secs(4));
+        assert_eq!(retry_delay(2), Duration::from_secs(16));
+        assert!(retry_delay(9) == retry_delay(10), "the pause stops growing");
+        assert!(retry_delay(10) <= Duration::from_secs(64));
+    }
+
+    #[test]
+    fn the_words_say_what_failed_and_how_to_retry() {
+        for words in [DOWNLOAD_FAILED, SAVE_FAILED, START_FAILED] {
+            assert!(words.contains("OpenH264"), "{words}");
+            assert!(words.contains("voice call"), "{words}");
+            assert!(words.contains("retry"), "{words}");
+        }
+        assert!(DOWNLOAD_FAILED.contains("ciscobinary.openh264.org"), "{DOWNLOAD_FAILED}");
+        assert!(!SAVE_FAILED.contains("downloaded"), "{SAVE_FAILED}");
+    }
+
+    #[test]
+    fn the_codec_is_cached_where_a_restart_finds_it() {
+        let tmp = std::env::temp_dir();
+        let local = cache_dir(Some("C:\\Users\\ada".into()), None, tmp.clone());
+        assert_eq!(local, PathBuf::from("C:\\Users\\ada\\tinyclient"));
+        let home = cache_dir(None, Some("/home/ada".into()), tmp.clone());
+        assert_eq!(home, PathBuf::from("/home/ada/.cache/tinyclient"));
+        assert_eq!(cache_dir(None, None, tmp.clone()), tmp.join("tinyclient"), "the temp folder is the last resort");
+    }
+
+    /// A file that is not Cisco's cannot be loaded (the loader checks the hash), so it is
+    /// taken away and downloaded again: nothing broken is ever kept.
+    #[test]
+    fn a_broken_cached_file_is_taken_away() {
+        let path = std::env::temp_dir().join("tinyclient-test-not-a-codec.dll");
+        std::fs::write(&path, b"not a codec").unwrap();
+        assert!(open_cached(&path).is_none());
+        assert!(!path.exists(), "the broken file is gone");
     }
 
     /// A camera, or a screen, through real OpenH264: `cargo test -p mediad --lib -- --ignored`
