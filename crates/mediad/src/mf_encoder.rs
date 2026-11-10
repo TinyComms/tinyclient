@@ -488,7 +488,9 @@ fn yes() -> VARIANT {
 
 /// `planes` as NV12 into `out`, Y rows at `stride` and the two chroma planes interleaved
 /// under them. The padding rows and bytes stay what the buffer was made with, and a buffer
-/// too short takes what fits and nothing past it.
+/// too short takes what fits and nothing past it. The phone's `convert::nv12` packs the
+/// same planes tightly into a `VideoFrame`; this one is the shape the input type promises
+/// the machine's encoder: its stride, in the buffer its sample was given.
 fn nv12(planes: &Planes, stride: usize, out: &mut [u8]) {
     let (width, height) = (planes.width, planes.height);
     for row in 0..height {
