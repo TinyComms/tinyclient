@@ -46,6 +46,8 @@ const RECON_DELAY: usize = BRIDGE_DELAY + HUSH_DELAY;
 /// centered one filter-half later than the low-pass, so the delayed original sits that much
 /// earlier and the bands land on the same sample again.
 const DELAY: usize = RECON_DELAY - TAPS / 2;
+/// The ring that supplies [`DELAY`] is one frame long, so the delay must fit inside a frame.
+const _: () = assert!(DELAY < FRAME);
 
 pub struct Processor {
     /// High-pass, echo cancellation, and WebRTC noise suppression when that is the mode.
@@ -66,9 +68,8 @@ struct Band {
     up_hist: [f32; TAPS - 1],
     /// The high-pass's own history over the original.
     hp_hist: [f32; TAPS - 1],
-    /// The previous frame's high band, at the same frame positions. The delay against the
-    /// reconstruction is a read offset into this frame-sized ring, so the ring must be at
-    /// least a frame long.
+    /// The high band's past, as a delay line of `DELAY`: written at `i`, read at `i - DELAY`.
+    /// One frame long, so `DELAY` must stay under [`FRAME`].
     hp_ring: [f32; FRAME],
 }
 
@@ -362,9 +363,11 @@ impl Band {
         self.up_hist.copy_from_slice(&window[end - keep..end]);
         // The original's high band rejoins: the same causal filter shape as the low-pass,
         // centered one filter-half earlier in the delayed original, so its samples land on
-        // the reconstruction's lag without a phase step between the bands. The previous
-        // frame's high band, read at an offset, is that delay; reading all of it before
-        // writing any of the fresh one keeps a frame-sized ring honest.
+        // the reconstruction's lag without a phase step between the bands. The ring is the
+        // rest of the lag: sample `i` reads what the high-pass produced at `i - DELAY`,
+        // earlier this frame once `i` passes the delay, the last frame's before that. It
+        // must read one slot while writing another: a ring read and written at the same
+        // slot hands every sample the whole previous frame back, whatever the offset.
         let mut hwin = [0f32; keep + FRAME];
         hwin[..keep].copy_from_slice(&self.hp_hist);
         hwin[keep..].copy_from_slice(original);
@@ -376,8 +379,9 @@ impl Band {
             for (k, tap) in hp.iter().enumerate() {
                 acc += tap * hwin[at - k];
             }
-            let slot = (i + offset) % FRAME;
-            out[i] += std::mem::replace(&mut self.hp_ring[slot], acc);
+            let joined = self.hp_ring[(i + offset) % FRAME];
+            self.hp_ring[i] = acc;
+            out[i] += joined;
         }
         self.hp_hist.copy_from_slice(&hwin[end - keep..end]);
     }
@@ -407,6 +411,72 @@ pub fn prove_bridge_image() -> Result<(), &'static str> {
     }
     if image * 10. >= tone {
         return Err("a high tone came back with an image above 8 kHz");
+    }
+    Ok(())
+}
+
+/// The lab's high-band driver: with Enhanced chosen, what the microphone has above the
+/// 7.2 kHz cut must reach the send, and at the path's lag. Before the rejoin it did not
+/// reach the send at all, and with the ring reading the slot it wrote it came back a whole
+/// frame late, which smears every sibilant across the crossover.
+pub fn prove_high_band() -> Result<(), &'static str> {
+    // The lag, to the sample: an impulse's high band is the high-pass's response, and the
+    // ring is all that stands between it and the reconstruction, so its peak belongs at
+    // `impulse + RECON_DELAY`.
+    let mut band = Band::default();
+    let at = FRAME / 2;
+    let mut original = [0f32; FRAME];
+    original[at] = 1.;
+    let quiet = [0f32; LOW * 2];
+    let mut heard = Vec::new();
+    for _ in 0..2 {
+        let mut out = [0f32; FRAME];
+        band.up(&quiet, &original, &mut out);
+        heard.extend_from_slice(&out);
+        original = [0f32; FRAME];
+    }
+    let (mut peak, mut loud) = (0, 0f32);
+    for (n, &sample) in heard.iter().enumerate() {
+        if sample.abs() > loud {
+            (peak, loud) = (n, sample.abs());
+        }
+    }
+    if peak.abs_diff(at + RECON_DELAY) > 2 {
+        return Err("the high band rejoined a frame late, not at the path's lag");
+    }
+    // And the whole Enhanced path passes a tone above the cut: the voice keeps its
+    // sibilants, at that same lag.
+    let mut processor = Processor::new();
+    processor.set(Some(AudioProcessing {
+        echo_cancellation: false,
+        auto_gain: false,
+        noise: NoiseMode::Enhanced,
+    }));
+    let mut phase = 0f64;
+    let mut heard = Vec::new();
+    for n in 0..80 {
+        let mut frame = [0f32; FRAME];
+        for sample in &mut frame {
+            phase += 10_000. / RATE as f64;
+            *sample = (phase * std::f64::consts::TAU).sin() as f32 * 0.4;
+        }
+        let mut stereo_frame = [0i16; FRAME_SAMPLES];
+        for (pair, &s) in stereo_frame.as_chunks_mut::<CHANNELS>().0.iter_mut().zip(&frame) {
+            pair.fill((s * 8000.) as i16);
+        }
+        processor.capture(&mut stereo_frame);
+        if n > 20 {
+            heard.extend(
+                stereo_frame
+                    .iter()
+                    .step_by(CHANNELS)
+                    .map(|&s| f32::from(s) / 32768.),
+            );
+        }
+    }
+    let tone = bin_level(&heard, 10_000.);
+    if tone <= 0.005 {
+        return Err("the tone above the cut did not survive Enhanced");
     }
     Ok(())
 }
@@ -629,6 +699,7 @@ mod tests {
 
     /// A 10 kHz tone is above the 7.2 kHz cut the bridge works at, and used to come back as
     /// silence. The original's high band rejoins the reconstruction, so what a fullband
+    /// encoder sends keeps the sparkle isolation used to cut.
     #[test]
     fn the_bridge_keeps_a_tone_above_the_cut() {
         let mut band = Band::default();
@@ -767,6 +838,16 @@ mod tests {
             lag.abs_diff(RECON_DELAY) <= 15,
             "the enhanced path's lag is {lag}, not near {RECON_DELAY}"
         );
+    }
+
+    /// The ring that delays the high band hands over exactly `DELAY` samples: an impulse's
+    /// high-passed response lands with its peak at the path lag, where the reconstruction of
+    /// its low band already sits. A ring read at the slot it writes hands every sample the
+    /// whole previous frame back instead, which smears the high band 418 samples past the
+    /// low band it joins. The lab's `high-band` driver proves the same.
+    #[test]
+    fn the_high_band_joins_at_the_path_delay() {
+        assert_eq!(prove_high_band(), Ok(()));
     }
 
     /// Where `out` correlates best with `original`, over a window around `around`.
