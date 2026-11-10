@@ -1,0 +1,10 @@
+{
+  "id": "hardware-encoder-fallback",
+  "title": "A camera or screen share encodes through the machine's hardware encoder when present and falls back to the OpenH264 download otherwise",
+  "platforms": ["windows"],
+  "needs": [],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "encoder selection and helpers, unit-level; the on-hardware record needs a machine with a hardware MFT",
+  "native_client_proof": "the released client shows screen share and camera running on the machine's own hardware encoder, with the OpenH264 download as the fallback"
+}
