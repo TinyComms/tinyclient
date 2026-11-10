@@ -1,9 +1,13 @@
-//! The desktop's pictures: OpenH264 (Cisco's binary, fetched at run time), nokhwa's camera
-//! (Media Foundation, AVFoundation, V4L2), and the screen through GDI, Core Graphics, the X11
+//! The desktop's pictures: a share or camera encoded first by the machine's own hardware
+//! through Media Foundation (`mf_encoder`, Windows), else by OpenH264 (Cisco's binary,
+//! fetched at run time), which decodes whatever arrives either way. nokhwa's camera (Media
+//! Foundation, AVFoundation, V4L2), and the screen through GDI, Core Graphics, the X11
 //! root, or the Linux desktop portal. Moved here from `picture.rs`, which keeps what phones share.
 
 use super::*;
 use crate::rt;
+#[cfg(windows)]
+use crate::mf_encoder;
 use openh264::decoder::{Decoder, DecoderConfig};
 use openh264::encoder::{BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, Level, Profile, RateControlMode, UsageType};
 use openh264::formats::YUVSource;
@@ -41,21 +45,29 @@ impl YUVSource for Planes {
 }
 
 struct Coded {
-    encoder: Encoder,
+    backend: Backend,
     width: u32,
     height: u32,
-    /// What the encoder holds now.
-    bps: u32,
-    fps: f32,
-    /// OpenH264 sets up on the first frame, and takes no options before that.
-    begun: bool,
 }
 
-impl Coded {
-    /// `bps` is also the most this encoder ever spends: [`Coded::tune`] only goes under it, and
-    /// so is `fps`. A share's encoder is level 5.1, which holds 1440p at 60, and spreads its work
-    /// over threads: one thread could not encode 1080p inside a frame at 60.
-    fn open(width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Result<Coded, String> {
+/// One of the two encoders behind [`Coded`]: the machine's own hardware, or Cisco's
+/// OpenH264 when that could not be set up.
+enum Backend {
+    /// Windows Media Foundation's hardware encoders (NVIDIA, Intel, AMD), which take no
+    /// download and hardly any CPU.
+    #[cfg(windows)]
+    MediaFoundation(mf_encoder::Encoder),
+    /// The downloaded Cisco binary. It sets up on its first frame, and takes no options
+    /// before that.
+    OpenH264 { encoder: Encoder, begun: bool, bps: u32, fps: f32 },
+}
+
+impl Backend {
+    /// The OpenH264 fallback, opened the way it always was: `bps` is also the most this
+    /// encoder ever spends: [`Backend::encode`] only tunes under it, and so is `fps`. A
+    /// share's encoder is level 5.1, which holds 1440p at 60, and spreads its work over
+    /// threads: one thread could not encode 1080p inside a frame at 60.
+    fn open_h264(width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Result<Backend, String> {
         let api = load_api()?;
         let threads = if screen { std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8) as u16 } else { 1 };
         let config = EncoderConfig::new()
@@ -70,47 +82,92 @@ impl Coded {
             .complexity(if screen && fps > 30. { Complexity::Low } else { Complexity::Medium })
             .num_threads(threads);
         let encoder = Encoder::with_api_config(api, config).map_err(|err| err.to_string())?;
-        Ok(Coded { encoder, width, height, bps, fps, begun: false })
+        Ok(Backend::OpenH264 { encoder, begun: false, bps, fps })
     }
 
-    /// The rate and frame rate asked for, if they moved and the encoder can take them.
-    fn tune(&mut self, ask: &Ask) {
-        if !self.begun {
-            return;
-        }
-        if ask.bps != self.bps && ask.bps > 0 {
-            let mut info = SBitrateInfo { iLayer: SPATIAL_LAYER_ALL, iBitrate: ask.bps as i32 };
-            // SAFETY: OpenH264 reads this option as an `SBitrateInfo`, which outlives the call,
-            // and copies it. The encoder set up on its first frame.
-            let refused = unsafe { self.encoder.raw_api().set_option(ENCODER_OPTION_BITRATE, (&raw mut info).cast()) };
-            if refused == 0 {
-                self.bps = ask.bps;
-            } else {
-                tracing::warn!("mediad: the encoder refused a bitrate of {}: {refused}", ask.bps);
+    /// One frame in, one out. The rate and frame rate asked for, if they moved and the
+    /// encoder can take them. A keyframe is asked for when `ask` says so: with the
+    /// hardware, ahead of the frame, through the codec properties; with OpenH264, on the
+    /// encoder it holds.
+    fn encode(&mut self, planes: &Planes, ask: &Ask) -> Result<Encoded, String> {
+        match self {
+            #[cfg(windows)]
+            Backend::MediaFoundation(encoder) => encoder.encode(planes, ask),
+            Backend::OpenH264 { encoder, begun, bps, fps } => {
+                if *begun {
+                    if ask.bps != *bps && ask.bps > 0 {
+                        let mut info = SBitrateInfo { iLayer: SPATIAL_LAYER_ALL, iBitrate: ask.bps as i32 };
+                        // SAFETY: OpenH264 reads this option as an `SBitrateInfo`, which outlives the call,
+                        // and copies it. The encoder set up on its first frame.
+                        let refused = unsafe { encoder.raw_api().set_option(ENCODER_OPTION_BITRATE, (&raw mut info).cast()) };
+                        if refused == 0 {
+                            *bps = ask.bps;
+                        } else {
+                            tracing::warn!("mediad: the encoder refused a bitrate of {}: {refused}", ask.bps);
+                        }
+                    }
+                    if ask.fps != *fps && ask.fps > 0. {
+                        let mut rate = ask.fps;
+                        // SAFETY: as above, with a float, which is what this option is read as.
+                        let refused = unsafe { encoder.raw_api().set_option(ENCODER_OPTION_FRAME_RATE, (&raw mut rate).cast()) };
+                        if refused == 0 {
+                            *fps = ask.fps;
+                        }
+                    }
+                }
+                if ask.key && *begun {
+                    encoder.force_intra_frame();
+                }
+                let stamp = Timestamp::from_millis(ask.at.as_millis() as u64);
+                let encoded = encoder.encode_at(planes, stamp).map_err(|err| err.to_string())?;
+                let key = matches!(encoded.frame_type(), FrameType::IDR | FrameType::I);
+                let bytes = encoded.to_vec();
+                *begun = true;
+                Ok(Encoded { bytes, key })
             }
         }
-        if ask.fps != self.fps && ask.fps > 0. {
-            let mut fps = ask.fps;
-            // SAFETY: as above, with a float, which is what this option is read as.
-            let refused = unsafe { self.encoder.raw_api().set_option(ENCODER_OPTION_FRAME_RATE, (&raw mut fps).cast()) };
-            if refused == 0 {
-                self.fps = ask.fps;
+    }
+}
+
+impl Coded {
+    /// `bps` is also the most this encoder ever spends: a tune only goes under it, and so
+    /// is `fps`. A share's encoder is level 5.1, which holds 1440p at 60. The machine's own
+    /// hardware takes the job first when Windows lists an encoder for it ([`mf_encoder`]);
+    /// OpenH264, downloaded at run time, takes every other machine and every refusal, with
+    /// the words it has always had.
+    fn open(width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Result<Coded, String> {
+        #[cfg(windows)]
+        if mf_encoder::choose(&mf_encoder::available()) == mf_encoder::Choice::MediaFoundation {
+            match mf_encoder::Encoder::open(width, height, bps, fps, screen) {
+                Ok(encoder) => return Ok(Coded { backend: Backend::MediaFoundation(encoder), width, height }),
+                Err(why) => tracing::warn!("mediad: the Media Foundation encoder could not be set up ({why}); OpenH264 takes over."),
             }
         }
+        let backend = Backend::open_h264(width, height, bps, fps, screen)?;
+        Ok(Coded { backend, width, height })
     }
 
     fn encode(&mut self, planes: &Planes, ask: &Ask) -> Result<Encoded, String> {
-        self.tune(ask);
-        if ask.key && self.begun {
-            self.encoder.force_intra_frame();
-        }
-        let stamp = Timestamp::from_millis(ask.at.as_millis() as u64);
-        let encoded = self.encoder.encode_at(planes, stamp).map_err(|err| err.to_string())?;
-        let key = matches!(encoded.frame_type(), FrameType::IDR | FrameType::I);
-        let bytes = encoded.to_vec();
-        self.begun = true;
-        Ok(Encoded { bytes, key })
+        self.backend.encode(planes, ask)
     }
+}
+
+/// Whether the OpenH264 binary is wanted before this track's first frame: on Windows the
+/// machine's own hardware may take the job, and then no download is needed. A decode still
+/// wants the binary whatever the send side chose, so `warm` runs on regardless.
+fn needs_openh264() -> bool {
+    #[cfg(windows)]
+    {
+        match mf_encoder::available() {
+            Ok(()) => false,
+            Err(why) => {
+                tracing::debug!("mediad: no Media Foundation encoder ({why}); OpenH264 stays the codec.");
+                true
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    true
 }
 
 /// The encoder for one track at this size: the one it has, or a new one, which starts with a
@@ -198,8 +255,8 @@ impl Cost {
 impl Outgoing {
     /// One share frame, or why the screen could not be read.
     pub fn share(&mut self, ask: Ask) -> Result<Encoded, String> {
-        // A capture is wasted until the codec loads.
-        if self.share.is_none() {
+        // A capture is wasted until the codec loads, and the hardware needs no load at all.
+        if self.share.is_none() && needs_openh264() {
             load_api()?;
         }
         let quality = super::share_quality();
@@ -237,7 +294,7 @@ impl Outgoing {
     /// The camera's two layers, high then low, or why the camera could not be read. A layer with
     /// no `Ask` is stopped: nothing is spent on it and it comes back empty.
     pub fn camera(&mut self, high: Option<Ask>, low: Option<Ask>) -> Result<(Encoded, Encoded), String> {
-        if self.high.is_none() || self.low.is_none() {
+        if (self.high.is_none() || self.low.is_none()) && needs_openh264() {
             load_api()?;
         }
         let began = Instant::now();
@@ -950,12 +1007,13 @@ mod tests {
     }
 
     /// A camera, or a screen, through real OpenH264: `cargo test -p mediad --lib -- --ignored`
-    /// on a machine that has the binary.
+    /// on a machine that has the binary. The software backend is opened by name, so a machine
+    /// with a hardware encoder still tests OpenH264 here.
     #[test]
     #[ignore = "needs the OpenH264 binary, which is not in the tree"]
     fn frames_survive_the_real_codec_in_bitrate_mode_and_the_rate_moves() {
         let (width, height) = (640usize, 360usize);
-        let mut outgoing = Coded::open(width as u32, height as u32, CAMERA_HIGH_BPS, FULL_FPS, false).unwrap();
+        let mut outgoing = Backend::open_h264(width as u32, height as u32, CAMERA_HIGH_BPS, FULL_FPS, false).unwrap();
         let mut incoming = Incoming::default();
         let (mut key, mut bytes_high, mut bytes_low) = (false, 0usize, 0usize);
         for n in 0..90usize {

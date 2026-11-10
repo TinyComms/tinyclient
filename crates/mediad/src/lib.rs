@@ -37,6 +37,9 @@ pub mod hear;
 pub mod inproc;
 pub mod jitter;
 pub mod media;
+/// The machine's own H.264 hardware encoder, ahead of the OpenH264 download. Windows only.
+#[cfg(windows)]
+mod mf_encoder;
 pub mod ogg;
 pub mod opus;
 pub mod picture;
