@@ -28,7 +28,7 @@ use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, VARIANT_BOOL};
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonLowLatency, CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode,
-    IMFActivate, IMFCodecAPI, IMFMediaEventGenerator, IMFTransform, MFVideoInterlace_Progressive,
+    IMFActivate, ICodecAPI, IMFMediaEventGenerator, IMFTransform, MFVideoInterlace_Progressive,
     MF_E_NO_EVENTS_AVAILABLE, MF_EVENT_FLAG_NO_WAIT, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE,
     MF_MT_DEFAULT_STRIDE, MF_MT_FIXED_SIZE_SAMPLES, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
     MF_MT_MAJOR_TYPE, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SAMPLE_SIZE,
@@ -129,7 +129,7 @@ pub struct Encoder {
     events: IMFMediaEventGenerator,
     /// `None` when the MFT exposes no codec properties, which leaves a keyframe ask and a
     /// bitrate move without their handle; the picture still encodes.
-    codec: Option<IMFCodecAPI>,
+    codec: Option<ICodecAPI>,
     width: usize,
     height: usize,
     /// The stride promised in the input type: the width rounded up as the hardware wants.
@@ -211,7 +211,7 @@ impl Encoder {
                 Err(why) => return Err(why),
             }
 
-            let codec: Option<IMFCodecAPI> = transform.cast().ok();
+            let codec: Option<ICodecAPI> = transform.cast().ok();
             if let Some(codec) = &codec {
                 // Both rates are said twice on purpose: once on the output type, which the
                 // MFT reads as it opens, and once through the codec properties, which the
@@ -461,11 +461,15 @@ fn rate(fps: f32) -> u64 {
 
 /// A `VARIANT` holding a count, which is how the codec properties are read.
 fn counted(count: u32) -> VARIANT {
-    // SAFETY: a VARIANT is initialized here and read by the property call it is handed to.
+    // SAFETY: a VARIANT is initialized here and its body is filled before the property
+    // call it is handed to reads it.
     unsafe {
         let mut value = VariantInit();
-        value.Anonymous.Anonymous.vt = VT_UI4;
-        value.Anonymous.Anonymous.Anonymous.ulVal = count;
+        // The body is a union behind a ManuallyDrop, which rustc does not walk on its
+        // own: each layer is taken by hand.
+        let body = &mut *value.Anonymous.Anonymous;
+        body.vt = VT_UI4;
+        body.Anonymous.ulVal = count;
         value
     }
 }
@@ -475,8 +479,9 @@ fn yes() -> VARIANT {
     // SAFETY: as in `counted`, with a boolean.
     unsafe {
         let mut value = VariantInit();
-        value.Anonymous.Anonymous.vt = VT_BOOL;
-        value.Anonymous.Anonymous.Anonymous.boolVal = VARIANT_BOOL(-1);
+        let body = &mut *value.Anonymous.Anonymous;
+        body.vt = VT_BOOL;
+        body.Anonymous.boolVal = VARIANT_BOOL(-1);
         value
     }
 }

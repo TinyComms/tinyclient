@@ -66,8 +66,9 @@ impl Backend {
     /// The OpenH264 fallback, opened the way it always was: `bps` is also the most this
     /// encoder ever spends: [`Backend::encode`] only tunes under it, and so is `fps`. A
     /// share's encoder is level 5.1, which holds 1440p at 60, and spreads its work over
-    /// threads: one thread could not encode 1080p inside a frame at 60.
-    fn open_h264(width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Result<Backend, String> {
+    /// threads: one thread could not encode 1080p inside a frame at 60. The size itself is
+    /// the first frame's, not the opener's.
+    fn open_h264(bps: u32, fps: f32, screen: bool) -> Result<Backend, String> {
         let api = load_api()?;
         let threads = if screen { std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8) as u16 } else { 1 };
         let config = EncoderConfig::new()
@@ -143,7 +144,7 @@ impl Coded {
                 Err(why) => tracing::warn!("mediad: the Media Foundation encoder could not be set up ({why}); OpenH264 takes over."),
             }
         }
-        let backend = Backend::open_h264(width, height, bps, fps, screen)?;
+        let backend = Backend::open_h264(bps, fps, screen)?;
         Ok(Coded { backend, width, height })
     }
 
@@ -1013,7 +1014,7 @@ mod tests {
     #[ignore = "needs the OpenH264 binary, which is not in the tree"]
     fn frames_survive_the_real_codec_in_bitrate_mode_and_the_rate_moves() {
         let (width, height) = (640usize, 360usize);
-        let mut outgoing = Backend::open_h264(width as u32, height as u32, CAMERA_HIGH_BPS, FULL_FPS, false).unwrap();
+        let mut outgoing = Backend::open_h264(CAMERA_HIGH_BPS, FULL_FPS, false).unwrap();
         let mut incoming = Incoming::default();
         let (mut key, mut bytes_high, mut bytes_low) = (false, 0usize, 0usize);
         for n in 0..90usize {
