@@ -48,6 +48,11 @@ pub fn prove_legacy_saved_speakers() -> Result<(), String> {
     messages::prove_legacy_saved_speakers()
 }
 
+/// The lab's keycap-reaction proof. See `messages::prove_keycap_reaction`.
+pub fn prove_keycap_reaction() -> Result<(), String> {
+    messages::prove_keycap_reaction()
+}
+
 /// The lab's cache-open-without-device proof. See `messages::prove_cache_open_without_device`.
 pub fn prove_cache_open_without_device() -> Result<(), String> {
     messages::prove_cache_open_without_device()
