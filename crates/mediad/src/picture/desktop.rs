@@ -1217,14 +1217,12 @@ fn download(path: &Path) -> Result<(), &'static str> {
         DOWNLOAD_FAILED
     })?;
     let url = library_url(name);
-    let response = ureq::get(&url)
-        .timeout(Duration::from_secs(20))
-        .timeout_read(Duration::from_secs(20))
-        .call()
-        .map_err(|err| {
-            tracing::warn!("mediad: OpenH264 could not be fetched from Cisco: {err}");
-            DOWNLOAD_FAILED
-        })?;
+    // The 20 seconds are the whole try's deadline, body read included (`into_reader` keeps
+    // it), so a VPN that takes the connection but not the bytes cannot hold this thread.
+    let response = ureq::get(&url).timeout(Duration::from_secs(20)).call().map_err(|err| {
+        tracing::warn!("mediad: OpenH264 could not be fetched from Cisco: {err}");
+        DOWNLOAD_FAILED
+    })?;
     let mut packed = Vec::new();
     response
         .into_reader()
