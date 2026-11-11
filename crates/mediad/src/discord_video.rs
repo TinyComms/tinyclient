@@ -241,15 +241,16 @@ impl Drive {
             match word {
                 Word::Frame { payload, rtp, .. } => self.send_frame(dave, socket, rtp as u32, &payload),
                 Word::Failed { words, .. } => out::send(&MediaResponse::Notice { detail: words }),
-                // The camera thread paints my own tile. A screen leg has no camera, so it sends none.
-                Word::SelfView(painted) => out::send(&match painted {
+                // The capture thread paints my own tile: my screen, from a screen leg.
+                Word::SelfView { share, painted } => out::send(&match painted {
                     Some(painted) => MediaResponse::SelfView {
                         path: painted.path.display().to_string(),
                         width: painted.width,
                         height: painted.height,
                         generation: painted.generation,
+                        share,
                     },
-                    None => MediaResponse::SelfView { path: String::new(), width: 0, height: 0, generation: 0 },
+                    None => MediaResponse::SelfView { path: String::new(), width: 0, height: 0, generation: 0, share },
                 }),
             }
         }

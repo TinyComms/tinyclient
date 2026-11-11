@@ -1047,9 +1047,9 @@ impl Call {
                         out::send(&MediaResponse::Sending { share: false, camera: self.sending_camera });
                     }
                 }
-                Word::SelfView(painted) => out::send(&match painted {
-                    Some(painted) => MediaResponse::SelfView { path: painted.path.display().to_string(), width: painted.width, height: painted.height, generation: painted.generation },
-                    None => MediaResponse::SelfView { path: String::new(), width: 0, height: 0, generation: 0 },
+                Word::SelfView { share, painted } => out::send(&match painted {
+                    Some(painted) => MediaResponse::SelfView { path: painted.path.display().to_string(), width: painted.width, height: painted.height, generation: painted.generation, share },
+                    None => MediaResponse::SelfView { path: String::new(), width: 0, height: 0, generation: 0, share },
                 }),
                 Word::Failed { share: false, words } => {
                     if !self.camera_noted {

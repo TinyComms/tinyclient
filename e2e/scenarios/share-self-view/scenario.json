@@ -1,0 +1,12 @@
+{
+  "id": "share-self-view",
+  "title": "Sharing a screen paints a small live picture of it for my own tile, and takes it down when the share stops",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "A phone shares through its own platform capture, which paints no preview for the call stage; this is the desktop capture path.",
+    "ios": "A phone shares through its own platform capture, which paints no preview for the call stage; this is the desktop capture path."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 120
+}

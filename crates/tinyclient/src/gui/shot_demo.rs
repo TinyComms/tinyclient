@@ -939,6 +939,7 @@ fn demo_call(conversation: &protocol::Key) -> protocol::Call {
         security: None,
         picture: None,
         self_view: None,
+        share_view: None,
     }
 }
 

@@ -444,14 +444,16 @@ impl Shell {
         self.call_state.feed.shown().cloned()
     }
 
-    /// My own camera as it is sent, while it is on.
-    fn tiny_self_frame(&self, call: Option<&Call>) -> Option<Arc<RenderImage>> {
-        call?.self_view.as_ref().filter(|picture| !picture.path.is_empty())?;
-        self.call_state.self_feed.shown().cloned()
+    /// My own camera, or with `share` my own screen, as it is sent, while it is on.
+    fn tiny_self_frame(&self, call: Option<&Call>, share: bool) -> Option<Arc<RenderImage>> {
+        let (picture, feed) = if share { (call?.share_view.as_ref(), &self.call_state.screen_feed) } else { (call?.self_view.as_ref(), &self.call_state.self_feed) };
+        picture.filter(|picture| !picture.path.is_empty())?;
+        feed.shown().cloned()
     }
 
-    /// What a stream shows: its picture; mine, which is never sent back to me, said in words with
-    /// Stop; anyone else's, "Watch stream" until its first picture arrives.
+    /// What a stream shows: its picture; mine, the same small live view of it that I send, with
+    /// Stop over it (until the first one lands, words with Stop); anyone else's, "Watch stream"
+    /// until its first picture arrives.
     fn tiny_stream_body(&self, page: &Page, stream: &Stream, call: Option<&Call>, size: Size, cx: &mut Context<Self>) -> AnyElement {
         if let Some(frame) = self.tiny_frame(call, &stream.user_id) {
             return img(frame).size_full().object_fit(ObjectFit::Contain).into_any_element();
@@ -459,25 +461,35 @@ impl Shell {
         let small = size == Size::Strip;
         let large = size == Size::Big;
         let body = div().size_full().relative().flex().flex_col().items_center().justify_center().gap(px(if small { 4. } else { 10. })).p(px(8.));
-        if stream.mine && !stream.share {
-            // My camera as everyone sees it, with Stop over it.
-            if let Some(frame) = self.tiny_self_frame(call) {
-                let stop = button_with_icon("tiny-stream-camera-off", ButtonKind::Danger, "icons/video-off.svg", "Turn camera off").on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.call_ask(Request::Media(MediaRequest::Camera { on: false }), cx);
-                }));
+        if stream.mine {
+            // My camera or my screen as everyone sees it, with Stop over it.
+            if let Some(frame) = self.tiny_self_frame(call, stream.share) {
+                let stop = if stream.share {
+                    button_with_icon("tiny-stream-stop", ButtonKind::Danger, "icons/monitor-off.svg", "Stop sharing").on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.tiny_stop_share(cx);
+                    }))
+                } else {
+                    button_with_icon("tiny-stream-camera-off", ButtonKind::Danger, "icons/video-off.svg", "Turn camera off").on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.call_ask(Request::Media(MediaRequest::Camera { on: false }), cx);
+                    }))
+                };
                 return div()
                     .size_full()
                     .relative()
                     .child(img(frame).size_full().object_fit(ObjectFit::Contain))
                     .when(!small, |tile| {
-                        tile.child(div().absolute().bottom(px(10.)).left_0().right_0().flex().justify_center().child(stop.h(px(28.)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())))
+                        // A grid tile's caption sits at the bottom, so Stop goes along the top.
+                        let row = div().absolute().left_0().right_0().flex().justify_center();
+                        let row = if size == Size::Grid { row.top(px(8.)) } else { row.bottom(px(10.)) };
+                        // On a picture that can be any colour, so it sits on the overlay as the strip's does.
+                        tile.child(row.child(div().p(px(2.)).rounded(px(10.)).bg(theme::overlay()).child(stop.h(px(28.)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()))))
                     })
                     .into_any_element();
             }
         }
         if stream.mine {
-            let thumbnail = self.tiny_state.shared.as_ref().filter(|_| stream.share).map(|screen| screen.thumbnail.clone()).filter(|path| !path.is_empty());
             let words = if stream.share { "You're sharing your screen" } else { "Your camera is on" };
             let stop = if stream.share {
                 button_with_icon("tiny-stream-stop", ButtonKind::Danger, "icons/monitor-off.svg", "Stop sharing").on_click(cx.listener(|this, _, _, cx| {
@@ -491,11 +503,10 @@ impl Shell {
                 }))
             };
             let line = match &self.tiny_state.shared {
-                Some(screen) if stream.share => format!("Everyone in the call can watch {}. It isn't played back to you, so you don't see a mirror of your own screen.", screen.name),
+                Some(screen) if stream.share => format!("Everyone in the call can watch {}. A live view of it shows here as soon as the first picture is sent.", screen.name),
                 _ => "Everyone in the call can watch it.".to_owned(),
             };
             return body
-                .children(thumbnail.map(|path| img(std::path::PathBuf::from(path)).absolute().top_0().left_0().size_full().object_fit(ObjectFit::Cover).opacity(0.3)))
                 // A grid tile has room for the words and Stop, not the icon as well.
                 .when(small || large, |body| body.child(glyph(if stream.share { "icons/monitor-up.svg" } else { "icons/video.svg" }, if small { 18. } else { 36. }, theme::accent_text())))
                 .when(!small, |body| body.child(div().text_center().whitespace_normal().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(words)))
@@ -1127,11 +1138,28 @@ mod tests {
             security: None,
             picture: None,
             self_view: None,
+            share_view: None,
         }
     }
 
     fn seat(user_id: &str) -> TinySeat {
         TinySeat { user_id: user_id.into(), ..TinySeat::default() }
+    }
+
+    #[test]
+    fn my_camera_and_my_share_are_two_feeds_that_do_not_clobber_each_other() {
+        use super::super::feed::{named, Which};
+        let picture = |path: &str, generation, kind| protocol::CallPicture { path: path.into(), width: 640, height: 360, generation, user_id: String::new(), kind };
+        let mut call = joined(false, false, false);
+        let of = |call: &Call, which: fn(&Which) -> bool| named(Some(call)).into_iter().find(|(feed, _)| which(feed)).and_then(|(_, frame)| frame);
+        let (mine, screen): (fn(&Which) -> bool, fn(&Which) -> bool) = (|which| matches!(which, Which::Mine), |which| matches!(which, Which::Screen));
+        assert_eq!((of(&call, mine), of(&call, screen)), (None, None));
+        call.share_view = Some(picture("share.jpg", 7, protocol::PictureKind::Share));
+        assert_eq!((of(&call, mine), of(&call, screen)), (None, Some((7, "share.jpg".to_owned()))), "a share alone leaves the camera's feed empty");
+        call.self_view = Some(picture("camera.jpg", 2, protocol::PictureKind::Camera));
+        assert_eq!((of(&call, mine), of(&call, screen)), (Some((2, "camera.jpg".to_owned())), Some((7, "share.jpg".to_owned()))));
+        call.share_view = None;
+        assert_eq!((of(&call, mine), of(&call, screen)), (Some((2, "camera.jpg".to_owned())), None), "the share stopping lets go of its feed only");
     }
 
     #[test]
