@@ -109,7 +109,12 @@ fn child_pids(parent: u32, name: &str) -> Vec<u32> {
     #[cfg(not(windows))]
     {
         let out = Command::new("pgrep").args(["-P", &parent.to_string(), name]).output().unwrap();
-        String::from_utf8(out.stdout).unwrap().lines().filter_map(|pid| pid.trim().parse().ok()).collect()
+        // A killed child nobody has waited for yet is a zombie: listed, but gone.
+        let running = |pid: &u32| {
+            let state = Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+            !String::from_utf8_lossy(&state.stdout).trim().is_empty() && !String::from_utf8_lossy(&state.stdout).trim().starts_with('Z')
+        };
+        String::from_utf8(out.stdout).unwrap().lines().filter_map(|pid| pid.trim().parse().ok()).filter(running).collect()
     }
 }
 

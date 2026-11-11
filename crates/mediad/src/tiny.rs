@@ -1464,7 +1464,9 @@ impl Call {
 fn open_beside_connecting(controls: &Arc<Controls>) -> Option<std::sync::mpsc::Receiver<Result<Audio, crate::audio::AudioError>>> {
     let (sender, receiver) = std::sync::mpsc::channel();
     let controls = controls.clone();
-    let spawned = std::thread::Builder::new().name("devices-open".to_owned()).spawn(move || {
+    // `out::spawn`, not a bare thread: in process the thread must join this call's instance, or it
+    // reads the app's environment (not the call's) and opens whatever devices the app sees.
+    let spawned = out::spawn(std::thread::Builder::new().name("devices-open".to_owned()), move || {
         let started = Instant::now();
         let (input, output) = controls.take_chosen();
         let opened = Audio::open_waiting(input, output);
