@@ -772,10 +772,11 @@ fn an_engine_started_ahead_of_a_call_is_the_one_that_carries_it_and_a_dead_one_i
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// How long pressing Join waits for the call engine: started inside the click, or already
-/// running. Debug builds; the numbers are printed, and only the order is asserted.
+/// What pressing Join does about the call engine: started inside the click, or taken from the
+/// one already running. What is asserted is the structure (which process carries the call, and
+/// that none is spawned for it); how long each took is only printed for people to read.
 #[test]
-fn the_click_waits_less_for_an_engine_that_was_started_ahead() {
+fn the_click_takes_the_engine_started_ahead_instead_of_starting_one() {
     let _turn = alone();
     let (hub, dir) = hub();
     struct Off;
@@ -796,6 +797,7 @@ fn the_click_waits_less_for_an_engine_that_was_started_ahead() {
         let began = Instant::now();
         hub.calls.start(&hub, lounge()).unwrap();
         cold.push(began.elapsed());
+        assert_eq!(mediads(), 1, "the click started the engine");
         hub.calls.end(&hub);
         until("no engine", || mediads() == 0);
 
@@ -804,14 +806,16 @@ fn the_click_waits_less_for_an_engine_that_was_started_ahead() {
         // Ready, and settings applied: the click comes well after the engine is up.
         until("an engine ahead of the call", || mediads() == 1);
         sleep(Duration::from_millis(500));
+        let ahead = mediad_pid();
         let began = Instant::now();
         hub.calls.start(&hub, lounge()).unwrap();
         warm.push(began.elapsed());
+        assert_eq!(mediads(), 1, "the click spawned no second engine");
+        assert_eq!(mediad_pid(), ahead, "the call is carried by the engine started ahead");
         hub.calls.end(&hub);
         until("no engine", || mediads() == 0);
     }
     let (cold, warm) = (median(cold), median(warm));
     eprintln!("start of a call, median of 5: engine started in the click {cold:?}, started ahead {warm:?}");
-    assert!(warm < cold, "{warm:?} !< {cold:?}");
     let _ = std::fs::remove_dir_all(dir);
 }
