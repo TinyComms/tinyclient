@@ -23,6 +23,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-exit:0");
         return Ok(());
     }
+    // The lab's tiny-send-identity driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("tiny-send-identity") {
+        if let Err(err) = chatd::adapters::tiny::prove_tiny_send_identity() {
+            eprintln!("tiny-send-identity: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-tiny-send-identity:0");
+        return Ok(());
+    }
     // The lab's leave-chime driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("leave-chime") {
         if let Err(err) = chatd::leave_prove::run() {
@@ -234,6 +243,15 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-pending-message-identity:0");
+        return Ok(());
+    }
+    // The lab's keycap-reaction driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("keycap-reaction") {
+        if let Err(err) = chatd::adapters::tiny::prove_keycap_reaction() {
+            eprintln!("keycap-reaction: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
         return Ok(());
     }
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());

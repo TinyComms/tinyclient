@@ -230,6 +230,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         security: None,
         picture: None,
         self_view: None,
+        share_view: None,
     };
     Live {
         intent: NEXT_INTENT.fetch_add(1, Ordering::Relaxed),
@@ -415,12 +416,14 @@ impl Live {
                 }
                 self.call.picture = picture;
             }
-            MediaResponse::SelfView { path, width, height, generation } => {
-                let picture = (!path.is_empty()).then(|| CallPicture { path, width, height, generation, user_id: String::new(), kind: PictureKind::Camera });
-                if self.call.self_view == picture {
+            MediaResponse::SelfView { path, width, height, generation, share } => {
+                let kind = if share { PictureKind::Share } else { PictureKind::Camera };
+                let picture = (!path.is_empty()).then(|| CallPicture { path, width, height, generation, user_id: String::new(), kind });
+                let slot = if share { &mut self.call.share_view } else { &mut self.call.self_view };
+                if *slot == picture {
                     return false;
                 }
-                self.call.self_view = picture;
+                *slot = picture;
             }
             MediaResponse::Sending { share, camera } => {
                 let mut video: Vec<VideoStream> = self.call.video.iter().filter(|stream| stream.direction != Direction::Encode).cloned().collect();
@@ -430,7 +433,9 @@ impl Live {
                 if share {
                     video.insert(0, VideoStream { direction: Direction::Encode, content: Content::Share, source: String::new() });
                 }
-                if video == self.call.video {
+                // My preview of a share that is no longer sent goes with it.
+                let dropped = !share && self.call.share_view.take().is_some();
+                if video == self.call.video && !dropped {
                     return false;
                 }
                 self.call.video = video;
@@ -1739,6 +1744,34 @@ mod tests {
             assert!(!media, "a stale offer never starts the engine for a new unaccepted ring");
             hub.calls.end(&hub);
         }
+    }
+
+    #[test]
+    fn my_camera_and_my_share_keep_their_own_self_views() {
+        let view = |path: &str, generation: u64, share: bool| MediaResponse::SelfView { path: path.into(), width: 640, height: 360, generation, share };
+        let mut live = live(CallState::Joined);
+        assert!(live.apply(view("camera.jpg", 1, false)));
+        assert!(live.apply(view("share.jpg", 1, true)));
+        let camera = live.call.self_view.clone().unwrap();
+        let share = live.call.share_view.clone().unwrap();
+        assert_eq!((camera.path.as_str(), camera.kind), ("camera.jpg", PictureKind::Camera));
+        assert_eq!((share.path.as_str(), share.kind), ("share.jpg", PictureKind::Share));
+        assert!(!live.apply(view("share.jpg", 1, true)), "the same picture is no news");
+
+        // The share going off takes only its own view.
+        assert!(live.apply(view("", 0, true)));
+        assert!(live.call.share_view.is_none());
+        assert!(live.call.self_view.is_some(), "the camera is still on");
+    }
+
+    #[test]
+    fn a_share_that_is_no_longer_sent_takes_its_view_with_it() {
+        let mut live = live(CallState::Joined);
+        assert!(live.apply(MediaResponse::SelfView { path: "share.jpg".into(), width: 640, height: 360, generation: 1, share: true }));
+        live.apply(MediaResponse::Sending { share: true, camera: false });
+        assert!(live.call.share_view.is_some(), "still sending");
+        assert!(live.apply(MediaResponse::Sending { share: false, camera: false }));
+        assert!(live.call.share_view.is_none());
     }
 
     #[test]

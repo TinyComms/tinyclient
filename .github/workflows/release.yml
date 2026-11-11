@@ -105,6 +105,7 @@ jobs:
   macos:
     needs: wait-for-ci
     runs-on: macos-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
       - name: Name the files
@@ -169,6 +170,7 @@ jobs:
             runner: ubuntu-22.04-arm
             artifact: linux-aarch64
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
       - name: Name the files
@@ -246,6 +248,7 @@ jobs:
             image: opensuse/tumbleweed
             kind: rpm
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - name: Name the files
@@ -260,6 +263,7 @@ jobs:
   windows:
     needs: wait-for-ci
     runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
       - name: Name the files

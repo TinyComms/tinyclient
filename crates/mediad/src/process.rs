@@ -3,6 +3,10 @@
 //! suppressor and AGC2, with the high-pass filter in front). Enhanced noise, the default,
 //! isolates the near voice with `hush-vani` (weights compiled in) after echo cancellation and
 //! before automatic gain, so another voice or a cry is turned down instead of being raised.
+//! Voice isolation works on a 16 kHz band; everything above its 7.2 kHz cut rejoins the
+//! reconstruction from the original, delayed by the path's lag and scaled by the isolation's
+//! own gain, so a fullband encode keeps a voice's sparkle while whatever the model silences
+//! below the cut is silenced above it too, like the fallback's fullband suppression.
 //!
 //! The echo canceller needs what the speaker plays: the call's mix goes in as the far end
 //! ([`Processor::render`]) every tick, cues included, and each microphone frame comes out with
@@ -31,6 +35,40 @@ const LOW: usize = 160;
 /// Low-pass before throwing away two of every three samples. An odd length keeps the delay
 /// an integer number of samples.
 const TAPS: usize = 47;
+/// The 16 kHz reconstruction lags the original by this many 48 kHz samples, derived from the
+/// chain hop by hop rather than measured:
+/// - the decimation low-pass and the reconstruction low-pass are the same linear-phase FIR,
+///   [`TAPS`] taps, each centered (TAPS − 1) / 2 = 23 samples late: 46 together;
+/// - voice isolation buffers exactly one hop. Its 50 % overlap STFT rebuilds every input
+///   sample from the two analysis windows that cover it, and the second of those windows is
+///   complete one hop after the sample, which is the crate's `Hush::LATENCY_SAMPLES`: 160 at
+///   16 kHz, 480 at ours. For any gain the model applies per frame this lag is exact, the
+///   gain rides on the frame and not on the sample; only its deep filter mixes older frames
+///   in, and on speech the current frame dominates that mix.
+///
+/// 23 + 480 + 23 = 526. There is no end-to-end measurement against this: on synthetic
+/// signals the model attenuates by tens of decibels, so a full-path correlation peak sits
+/// on residue and wanders with the run length (519 over 60 frames, 557 over 120, 566 over
+/// 200 on CI), and WebRTC's high-pass in front adds 100–430 samples of its own around the
+/// 110–170 Hz fundamental, so no exact sample lag exists to assert there. The pieces are
+/// pinned where they are deterministic: the bridge's lag by the reconstruction test, the
+/// rejoin to the sample by the impulse check in [`prove_high_band`], the whole Enhanced
+/// wiring by its sparkle check.
+const BRIDGE_DELAY: usize = TAPS / 2 + TAPS / 2;
+const HUSH_DELAY: usize = Hush::LATENCY_SAMPLES * (RATE / Hush::SAMPLE_RATE) as usize;
+const RECON_DELAY: usize = BRIDGE_DELAY + HUSH_DELAY;
+/// How far back the original's samples are kept for the high band. The high-pass filter is
+/// centered one filter-half later than the low-pass, so the delayed original sits that much
+/// earlier and the bands land on the same sample again.
+const DELAY: usize = RECON_DELAY - TAPS / 2;
+/// The ring that supplies [`DELAY`] is one frame long, so the delay must fit inside a frame.
+const _: () = assert!(DELAY < FRAME);
+/// Below this RMS, about −80 dBFS, the original low band carries nothing to judge, so the
+/// high band's gain holds instead of chasing a ratio of silences.
+const HIGH_BAND_FLOOR: f32 = 1e-4;
+/// How far the high band's gain moves toward the newest hop's ratio, per hop (two per
+/// frame): a syllable moves it within tens of milliseconds, a hop of model flutter does not.
+const HIGH_BAND_RATE: f32 = 0.25;
 
 pub struct Processor {
     /// High-pass, echo cancellation, and WebRTC noise suppression when that is the mode.
@@ -49,6 +87,14 @@ struct Band {
     hist: [f32; TAPS - 1],
     /// The high-rate samples the reconstruction filter has not finished with.
     up_hist: [f32; TAPS - 1],
+    /// The high-pass's own history over the original.
+    hp_hist: [f32; TAPS - 1],
+    /// The high band's past, as a delay line of `DELAY`: written at `i`, read at `i - DELAY`.
+    /// One frame long, so `DELAY` must stay under [`FRAME`].
+    hp_ring: [f32; FRAME],
+    /// The high band's gain, following the isolation's own, smoothed over hops. Starts
+    /// neutral, so a quiet start hands the band through instead of chasing a silence.
+    high_gain: f32,
 }
 
 impl Default for Processor {
@@ -62,6 +108,9 @@ impl Default for Band {
         Band {
             hist: [0.; TAPS - 1],
             up_hist: [0.; TAPS - 1],
+            hp_hist: [0.; TAPS - 1],
+            hp_ring: [0.; FRAME],
+            high_gain: 1.,
         }
     }
 }
@@ -97,7 +146,11 @@ fn front_config(chosen: AudioProcessing, isolated: bool) -> Config {
             None
         } else {
             // If voice isolation did not start, Enhanced falls back to the strongest WebRTC filter.
-            let mode = if chosen.noise == NoiseMode::Enhanced { NoiseMode::High } else { chosen.noise };
+            let mode = if chosen.noise == NoiseMode::Enhanced {
+                NoiseMode::High
+            } else {
+                chosen.noise
+            };
             ns_level(mode)
         },
         gain_controller2: (!enhanced && chosen.auto_gain).then(agc),
@@ -147,6 +200,21 @@ fn lowpass() -> &'static [f32; TAPS] {
         }
         for tap in &mut coeff {
             *tap /= sum;
+        }
+        coeff
+    })
+}
+
+/// Hamming-windowed high-pass at 7.2 kHz, built as an impulse minus the low-pass: passband
+/// gain stays at one (delta minus the same gain) and the stopband takes the low-pass's
+/// rejection, on the same filter center as [`lowpass`].
+fn highpass() -> &'static [f32; TAPS] {
+    static COEFFS: OnceLock<[f32; TAPS]> = OnceLock::new();
+    COEFFS.get_or_init(|| {
+        let mut coeff = *lowpass();
+        coeff[TAPS / 2] -= 1.;
+        for tap in &mut coeff {
+            *tap = -*tap;
         }
         coeff
     })
@@ -238,7 +306,8 @@ impl Processor {
                     hush.process_frame(input, out);
                 }
             }
-            self.band.up(&clean, &mut done);
+            let original = done;
+            self.band.up(&clean, &low, &original, &mut done);
         }
         if let Some(apm) = &mut self.gain {
             let source = done;
@@ -256,6 +325,11 @@ impl Processor {
             .statistics()
             .echo_return_loss_enhancement
     }
+}
+
+/// Root mean square, the level a hop's high-band gain ratio is judged at.
+fn rms(samples: &[f32]) -> f32 {
+    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
 }
 
 fn run_blocks(apm: &mut sonora::AudioProcessing, input: &[f32; FRAME], output: &mut [f32; FRAME]) {
@@ -294,44 +368,97 @@ impl Band {
         self.hist.copy_from_slice(&window[end - keep..end]);
     }
 
-    /// 16 kHz mono in, 48 kHz mono out. Zero-stuffed and low-passed, so the copies a linear
-    /// stretch would paint above 8 kHz are not there for fullband Opus to encode.
-    fn up(&mut self, input: &[f32; LOW * 2], out: &mut [f32; FRAME]) {
+    /// 16 kHz mono in, 48 kHz mono out, with the original at hand and the low band the
+    /// model saw. Zero-stuffed and low-passed, so the copies a linear stretch would paint
+    /// above 8 kHz are not there for fullband Opus to encode. The original's part above the
+    /// 7.2 kHz cut rejoins from `original` at the path's lag, scaled by the isolation's own
+    /// gain, so whatever the model silences below the cut is silenced above it too, the way
+    /// the WebRTC fallback suppresses fullband.
+    fn up(
+        &mut self,
+        isolated: &[f32; LOW * 2],
+        noisy: &[f32; LOW * 2],
+        original: &[f32; FRAME],
+        out: &mut [f32; FRAME],
+    ) {
+        const KEEP: usize = TAPS - 1;
         let coeff = lowpass();
         let mut window = [0f32; FRAME + TAPS];
-        let keep = TAPS - 1;
-        window[..keep].copy_from_slice(&self.up_hist);
-        for (i, &sample) in input.iter().enumerate() {
-            window[keep + i * 3] = sample * 3.;
+        window[..KEEP].copy_from_slice(&self.up_hist);
+        for (i, &sample) in isolated.iter().enumerate() {
+            window[KEEP + i * 3] = sample * 3.;
         }
         for (i, sample) in out.iter_mut().enumerate() {
-            let at = keep + i;
+            let at = KEEP + i;
             let mut acc = 0f32;
             for (k, tap) in coeff.iter().enumerate() {
                 acc += tap * window[at - k];
             }
             *sample = acc;
         }
-        let end = keep + FRAME;
-        self.up_hist.copy_from_slice(&window[end - keep..end]);
+        let end = KEEP + FRAME;
+        self.up_hist.copy_from_slice(&window[end - KEEP..end]);
+        // The high band's gain: per hop, the ratio of isolated to original low-band energy,
+        // smoothed and clamped to muting. The model never has reason to lift the sparkle
+        // above the original, only to let a voice's through. Under the floor it holds:
+        // silence judges nothing. With the model passing the band (`isolated == noisy`)
+        // the ratio is exactly one and the gain stays exactly neutral, which is what the
+        // bridge tests rely on.
+        let mut gain = self.high_gain;
+        for (kept, heard) in isolated
+            .as_chunks::<LOW>()
+            .0
+            .iter()
+            .zip(noisy.as_chunks::<LOW>().0)
+        {
+            let noisy_rms = rms(heard);
+            if noisy_rms >= HIGH_BAND_FLOOR {
+                let ratio = (rms(kept) / noisy_rms).clamp(0., 1.);
+                gain += HIGH_BAND_RATE * (ratio - gain);
+            }
+        }
+        self.high_gain = gain;
+        // The original's high band rejoins: the same causal filter shape as the low-pass,
+        // centered one filter-half earlier in the delayed original, so its samples land on
+        // the reconstruction's lag without a phase step between the bands. The ring is the
+        // rest of the lag: sample `i` reads what the high-pass produced at `i - DELAY`,
+        // earlier this frame once `i` passes the delay, the last frame's before that. It
+        // must read one slot while writing another: a ring read and written at the same
+        // slot hands every sample the whole previous frame back, whatever the offset.
+        let mut hwin = [0f32; KEEP + FRAME];
+        hwin[..KEEP].copy_from_slice(&self.hp_hist);
+        hwin[KEEP..].copy_from_slice(original);
+        let hp = highpass();
+        let offset = FRAME - DELAY;
+        for i in 0..FRAME {
+            let at = KEEP + i;
+            let mut acc = 0f32;
+            for (k, tap) in hp.iter().enumerate() {
+                acc += tap * hwin[at - k];
+            }
+            let joined = self.hp_ring[(i + offset) % FRAME];
+            self.hp_ring[i] = acc;
+            out[i] += gain * joined;
+        }
+        self.hp_hist.copy_from_slice(&hwin[end - KEEP..end]);
     }
 }
 
 /// A 6 kHz tone through the 16 kHz bridge must not come back with a 10 kHz image.
 pub fn prove_bridge_image() -> Result<(), &'static str> {
     let mut band = Band::default();
-    let mut phase = 0f32;
+    let mut phase = 0f64;
     let mut heard = Vec::new();
     for _ in 0..20 {
         let mut input = [0f32; FRAME];
         for sample in &mut input {
-            phase += 6000. / RATE as f32;
-            *sample = (phase * std::f32::consts::TAU).sin() * 0.4;
+            phase += 6000. / RATE as f64;
+            *sample = (phase * std::f64::consts::TAU).sin() as f32 * 0.4;
         }
         let mut low = [0f32; LOW * 2];
         let mut out = [0f32; FRAME];
         band.down(&input, &mut low);
-        band.up(&low, &mut out);
+        band.up(&low, &low, &input, &mut out);
         heard.extend_from_slice(&out);
     }
     let settled = &heard[FRAME * 4..];
@@ -345,14 +472,107 @@ pub fn prove_bridge_image() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The lab's high-band driver: with Enhanced chosen, an impulse's high band lands at the
+/// path's lag, and the voice's sparkle above the 7.2 kHz cut reaches the send at exactly
+/// the isolation's own gain, whatever the model decides about the synthetic voice under
+/// it. Before the rejoin the sparkle did not reach the send at all, and with the ring
+/// reading the slot it wrote it came back a whole frame late, which smears every sibilant
+/// across the crossover.
+pub fn prove_high_band() -> Result<(), &'static str> {
+    // The lag, to the sample: an impulse's high band is the high-pass's response, and the
+    // ring is all that stands between it and the reconstruction, so its peak belongs at
+    // `impulse + RECON_DELAY`. The low band is silent, so the gain holds at neutral.
+    let mut band = Band::default();
+    let at = FRAME / 2;
+    let mut original = [0f32; FRAME];
+    original[at] = 1.;
+    let quiet = [0f32; LOW * 2];
+    let mut heard = Vec::new();
+    for _ in 0..2 {
+        let mut out = [0f32; FRAME];
+        band.up(&quiet, &quiet, &original, &mut out);
+        heard.extend_from_slice(&out);
+        original = [0f32; FRAME];
+    }
+    let (mut peak, mut loud) = (0, 0f32);
+    for (n, &sample) in heard.iter().enumerate() {
+        if sample.abs() > loud {
+            (peak, loud) = (n, sample.abs());
+        }
+    }
+    if peak.abs_diff(at + RECON_DELAY) > 2 {
+        return Err("the high band rejoined a frame late, not at the path's lag");
+    }
+    // And the wiring, whatever the model decides about this synthetic voice: the sparkle
+    // above the cut reaches the send at exactly the isolation's own gain, so a voice the
+    // model passes keeps its sibilants and one the model silences loses them with the band
+    // below the cut. The gain each frame used is read straight off the band, so the
+    // expectation holds whether hush passes, turns down, or mutes the harmonics; on
+    // synthetic harmonics it mutes, and a bare tone would prove nothing.
+    let mut processor = Processor::new();
+    processor.set(Some(AudioProcessing {
+        echo_cancellation: false,
+        auto_gain: false,
+        noise: NoiseMode::Enhanced,
+    }));
+    let mut heard = Vec::new();
+    let mut gains = Vec::new();
+    for n in 0..80 {
+        let mut frame = [0f32; FRAME];
+        for (s, sample) in frame.iter_mut().enumerate() {
+            let t = (n * FRAME + s) as f64 / f64::from(RATE);
+            let f0 = 140. + 30. * (t * std::f64::consts::TAU * 3.).sin();
+            let gate = if (t * 4.) as u32 % 3 == 2 { 0. } else { 1. };
+            let mut voice = 0f64;
+            for k in 1..=8 {
+                voice += (t * std::f64::consts::TAU * f0 * k as f64).sin() / k as f64;
+            }
+            let sparkle = (t * std::f64::consts::TAU * 10_000.).sin();
+            *sample = (0.3 * gate * voice + 0.5 * sparkle) as f32;
+        }
+        let mut stereo_frame = [0i16; FRAME_SAMPLES];
+        for (pair, &s) in stereo_frame
+            .as_chunks_mut::<CHANNELS>()
+            .0
+            .iter_mut()
+            .zip(&frame)
+        {
+            pair.fill((s * 8000.) as i16);
+        }
+        processor.capture(&mut stereo_frame);
+        if n > 20 {
+            heard.extend(
+                stereo_frame
+                    .iter()
+                    .step_by(CHANNELS)
+                    .map(|&s| f32::from(s) / 32768.),
+            );
+            gains.push(f64::from(processor.band.high_gain));
+        }
+    }
+    // The sparkle's round trip: 0.5 in, the i16 trip scales by 8000/32768 there and
+    // 32767/32768 back, WebRTC's high-pass passes 10 kHz at 0.944 (sonora 0.2.0's 48 kHz
+    // coefficients), the rejoin's high-pass at 1.001. `bin_level` reads half the amplitude,
+    // so the send carries 0.0577 of the input per unit of isolation gain.
+    let mean_gain = gains.iter().sum::<f64>() / gains.len() as f64;
+    let expected = 0.5 * 8000. / 32768. * (32767. / 32768.) * 0.944 * 1.001 / 2. * mean_gain;
+    let sparkle = bin_level(&heard, 10_000.);
+    if (sparkle - expected).abs() > 0.25 * expected + 0.002 {
+        return Err("the sparkle above the cut does not follow the isolation's gain");
+    }
+    Ok(())
+}
+
 fn bin_level(samples: &[f32], hz: f32) -> f64 {
-    let step = hz / RATE as f32;
-    let mut phase = 0f32;
+    // The reference phase runs in f64: at 10 kHz over tens of thousands of samples an f32
+    // accumulator drifts enough to smear the bin by tens of percent.
+    let step = hz as f64 / RATE as f64;
+    let mut phase = 0f64;
     let (mut i, mut q) = (0f64, 0f64);
     for &sample in samples {
-        let angle = phase * std::f32::consts::TAU;
-        i += f64::from(sample) * f64::from(angle.cos());
-        q += f64::from(sample) * f64::from(angle.sin());
+        let angle = phase * std::f64::consts::TAU;
+        i += f64::from(sample) * angle.cos();
+        q += f64::from(sample) * angle.sin();
         phase = (phase + step) % 1.;
     }
     (i * i + q * q).sqrt() / samples.len() as f64
@@ -514,8 +734,11 @@ mod tests {
         assert!(reduced > 6., "the hiss is only {reduced:.1} dB quieter");
     }
 
-    /// Enhanced (voice isolation) brings steady hiss down hard. The 16 kHz bridge alone is only
-    /// a few dB on white noise, so the bar sits well above that.
+    /// Enhanced (voice isolation) brings steady hiss down across the band. The model
+    /// silences the band it owns, and the high band above its 7.2 kHz cut follows the
+    /// isolation's gain, so what reaches the send is quiet fullband, the way the WebRTC
+    /// fallback suppresses. Measured over the whole band on purpose: the high band used to
+    /// slip through untouched, which a below-the-cut bin would not have seen.
     #[test]
     fn enhanced_noise_brings_steady_hiss_down() {
         let mut seed: u32 = 7;
@@ -540,28 +763,148 @@ mod tests {
         }
         let reduced = db(rms(&heard) / rms(&sent).max(1.));
         assert!(
-            reduced > 20.,
+            reduced > 15.,
             "enhanced hiss is only {reduced:.1} dB quieter"
         );
+    }
+
+    /// A 10 kHz tone is above the 7.2 kHz cut the bridge works at, and used to come back as
+    /// silence. The original's high band rejoins the reconstruction, so what a fullband
+    /// encoder sends keeps the sparkle isolation used to cut.
+    #[test]
+    fn the_bridge_keeps_a_tone_above_the_cut() {
+        let mut band = Band::default();
+        let mut phase = 0f64;
+        let mut heard = Vec::new();
+        for _ in 0..30 {
+            let mut input = [0f32; FRAME];
+            for sample in &mut input {
+                phase += 10_000. / RATE as f64;
+                *sample = (phase * std::f64::consts::TAU).sin() as f32 * 0.4;
+            }
+            let mut low = [0f32; LOW * 2];
+            let mut out = [0f32; FRAME];
+            band.down(&input, &mut low);
+            band.up(&low, &low, &input, &mut out);
+            heard.extend_from_slice(&out);
+        }
+        let settled = &heard[FRAME * 8..];
+        let tone = bin_level(settled, 10_000.);
+        assert!(
+            tone > 0.02,
+            "the 10 kHz tone did not survive the bridge: {tone}"
+        );
+    }
+
+    /// The high band follows the isolation's gain: the same original through the same
+    /// bridge, with the model's low band muted to a quarter, comes back with the band above
+    /// the cut at a quarter too. So what the model silences below the cut is silenced above
+    /// it, instead of every hiss harmonic over 7.2 kHz riding through untouched. The
+    /// smoothed gain settles a step above the quarter it chases, hence the window.
+    #[test]
+    fn the_high_band_follows_the_isolation_gain() {
+        fn run(mute: f32) -> Vec<f32> {
+            let mut band = Band::default();
+            let mut phase = 0f64;
+            let mut heard = Vec::new();
+            for n in 0..30 {
+                let mut input = [0f32; FRAME];
+                for sample in &mut input {
+                    phase += 10_000. / RATE as f64;
+                    *sample = (phase * std::f64::consts::TAU).sin() as f32 * 0.4;
+                }
+                let mut low = [0f32; LOW * 2];
+                band.down(&input, &mut low);
+                let mut kept = low;
+                for sample in kept.iter_mut() {
+                    *sample *= mute;
+                }
+                let mut out = [0f32; FRAME];
+                band.up(&kept, &low, &input, &mut out);
+                if n >= 15 {
+                    heard.extend_from_slice(&out);
+                }
+            }
+            heard
+        }
+        let ratio = bin_level(&run(0.25), 10_000.) / bin_level(&run(1.), 10_000.);
+        assert!(
+            (ratio - 0.25).abs() < 0.01,
+            "the high band is at {ratio} of its unmuted level, not the isolation's quarter"
+        );
+    }
+
+    /// The reconstruction lags the original by exactly the filters' delay. A wrong one would
+    /// comb-filter every tone near the cut, so the lag is measured, not assumed. The high
+    /// band is fed zeros, so only the reconstruction is measured.
+    #[test]
+    fn the_reconstruction_lags_the_original_by_the_filters_delay() {
+        let mut seed: u32 = 11;
+        let mut band = Band::default();
+        let mut original = Vec::new();
+        let mut out = Vec::new();
+        for _ in 0..60 {
+            let mut frame = [0f32; FRAME];
+            for sample in &mut frame {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *sample = (seed >> 8) as f32 / (1 << 24) as f32 * 2. - 1.;
+            }
+            let mut low = [0f32; LOW * 2];
+            let mut done = [0f32; FRAME];
+            band.down(&frame, &mut low);
+            band.up(&low, &low, &[0f32; FRAME], &mut done);
+            original.extend_from_slice(&frame);
+            out.extend_from_slice(&done);
+        }
+        let lag = lag_of(&original, &out, BRIDGE_DELAY, FRAME * 6);
+        assert_eq!(lag, BRIDGE_DELAY, "the bridge's lag is {lag}");
+    }
+
+    /// The ring that delays the high band hands over exactly `DELAY` samples: an impulse's
+    /// high-passed response lands with its peak at the path lag, where the reconstruction of
+    /// its low band already sits. A ring read at the slot it writes hands every sample the
+    /// whole previous frame back instead, which smears the high band 457 samples past the
+    /// low band it joins. The lab's `high-band` driver proves the same.
+    #[test]
+    fn the_high_band_joins_at_the_path_delay() {
+        assert_eq!(prove_high_band(), Ok(()));
+    }
+
+    /// Where `out` correlates best with `original`, over a window around `around`, after
+    /// `settle` samples of warm-up.
+    fn lag_of(original: &[f32], out: &[f32], around: usize, settle: usize) -> usize {
+        let mut best = (0f64, 0usize);
+        for lag in around - 40..=around + 40 {
+            let (mut num, mut den) = (0f64, 0f64);
+            for n in settle..out.len() {
+                num += f64::from(out[n]) * f64::from(original[n - lag]);
+                den += f64::from(original[n - lag]).powi(2);
+            }
+            let score = num.abs().sqrt() / den.sqrt().max(1e-9);
+            if score > best.0 {
+                best = (score, lag);
+            }
+        }
+        best.1
     }
 
     /// A low tone survives the 48 kHz to 16 kHz bridge and back at nearly the same level.
     #[test]
     fn the_rate_bridge_keeps_a_low_tone() {
         let mut band = Band::default();
-        let mut phase = 0f32;
+        let mut phase = 0f64;
         let (mut heard, mut sent) = (0f64, 0f64);
         let mut count = 0f64;
         for n in 0..100 {
             let mut input = [0f32; FRAME];
             for sample in &mut input {
-                phase += 200. / RATE as f32;
-                *sample = (phase * std::f32::consts::TAU).sin() * 0.4;
+                phase += 200. / RATE as f64;
+                *sample = (phase * std::f64::consts::TAU).sin() as f32 * 0.4;
             }
             let mut low = [0f32; LOW * 2];
             let mut out = [0f32; FRAME];
             band.down(&input, &mut low);
-            band.up(&low, &mut out);
+            band.up(&low, &low, &input, &mut out);
             if n > 10 {
                 heard += input.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>();
                 sent += out.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>();
@@ -580,36 +923,38 @@ mod tests {
     #[test]
     fn the_rate_bridge_does_not_image_a_high_tone() {
         let mut band = Band::default();
-        let mut phase = 0f32;
+        let mut phase = 0f64;
         let mut heard = Vec::new();
         for _ in 0..20 {
             let mut input = [0f32; FRAME];
             for sample in &mut input {
-                phase += 6000. / RATE as f32;
-                *sample = (phase * std::f32::consts::TAU).sin() * 0.4;
+                phase += 6000. / RATE as f64;
+                *sample = (phase * std::f64::consts::TAU).sin() as f32 * 0.4;
             }
             let mut low = [0f32; LOW * 2];
             let mut out = [0f32; FRAME];
             band.down(&input, &mut low);
-            band.up(&low, &mut out);
+            band.up(&low, &low, &input, &mut out);
             heard.extend_from_slice(&out);
         }
         let settled = &heard[FRAME * 4..];
         let tone = bin_level(settled, 6000.);
         let image = bin_level(settled, 10000.);
         assert!(tone > 0.02, "the tone did not survive: {tone}");
-        assert!(image * 10. < tone, "a 10 kHz image of {image} sits beside the tone {tone}");
+        assert!(
+            image * 10. < tone,
+            "a 10 kHz image of {image} sits beside the tone {tone}"
+        );
     }
 
-    /// Level of one frequency in `samples`, as a mean magnitude.
     fn bin_level(samples: &[f32], hz: f32) -> f64 {
-        let step = hz / RATE as f32;
-        let mut phase = 0f32;
+        let step = hz as f64 / RATE as f64;
+        let mut phase = 0f64;
         let (mut i, mut q) = (0f64, 0f64);
         for &sample in samples {
-            let angle = phase * std::f32::consts::TAU;
-            i += f64::from(sample) * f64::from(angle.cos());
-            q += f64::from(sample) * f64::from(angle.sin());
+            let angle = phase * std::f64::consts::TAU;
+            i += f64::from(sample) * angle.cos();
+            q += f64::from(sample) * angle.sin();
             phase = (phase + step) % 1.;
         }
         (i * i + q * q).sqrt() / samples.len() as f64
@@ -700,7 +1045,13 @@ mod tests {
         let frames = tone();
         let standard = meter(NoiseMode::Standard, &frames);
         let enhanced = meter(NoiseMode::Enhanced, &frames);
-        assert!(standard.iter().all(|level| (60..90).contains(level)), "standard: {standard:?}");
-        assert!(enhanced.iter().any(|level| *level < 50), "enhanced left the tone up: {enhanced:?}");
+        assert!(
+            standard.iter().all(|level| (60..90).contains(level)),
+            "standard: {standard:?}"
+        );
+        assert!(
+            enhanced.iter().any(|level| *level < 50),
+            "enhanced left the tone up: {enhanced:?}"
+        );
     }
 }

@@ -62,8 +62,14 @@ const FAMILY: i32 = 3;
 const CROWD: i64 = 100_000;
 const CODE: &str = "24680";
 const PASSWORD: &str = "correct horse";
-/// 2026-10-13 12:00 UTC, so every run stores the same times.
-const T0: i32 = 1_791_892_800;
+/// 2026-10-13 12:00 UTC, so every run stores the same times unless the harness says otherwise.
+const FIXED_T0: i32 = 1_791_892_800;
+/// Where the fake's clock starts, in unix seconds. `TINYCLIENT_TELEGRAM_T0` moves it: the Inbox leaves out
+/// a chat nobody touched for thirty days, so a world pinned to one date stops matching the day it ages out.
+fn t0() -> i32 {
+    static T0: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *T0.get_or_init(|| std::env::var("TINYCLIENT_TELEGRAM_T0").ok().and_then(|seconds| seconds.parse().ok()).unwrap_or(FIXED_T0))
+}
 /// The prime Telegram itself uses for the password proof, with generator 3.
 const PRIME: &str = "c71caeb9c6b1c9048e6c522f70f13f73980d40238e3e21c14934d037563d930f48198a0aa7c14058229493d22530f4dbfa336f6e0ac925139543aed44cce7c3720fd51f69458705ac68cd4fe6b6b13abdc9746512969328454f18faf8c595f642477fe96bb2a941d5bcd1d4ac8cc49880708fa9b378e3c4f3a9060bee67cf9a4a4a695811051907e162753b56b0f6b410dba74d8a84b2a14b3144e0ef1284754fd17ed950d5965b4b9dd46582db1178d169c6bc465b0d6ff9ca3928fef5b9ae4e418fc15e83ebea0f87fa9ff5eed70050ded2849f47bf959d956850ce929851f0d8115f635b105ee2e4e15d04b2454bf6f4fadf034b10403119cd8e3b92fcc5b";
 
@@ -95,7 +101,7 @@ fn user(id: i64, first: &str, last: &str, username: &str) -> tl::types::User {
     user.is_self = id == ME;
     user.contact = id == ODALYS;
     if id == ODALYS {
-        user.status = Some(tl::types::UserStatusOnline { expires: T0 + 300 }.into());
+        user.status = Some(tl::types::UserStatusOnline { expires: t0() + 300 }.into());
         user.photo = Some(tl::types::UserProfilePhoto { has_video: false, personal: false, photo_id: 5_002, stripped_thumb: None, dc_id: 2 }.into());
     }
     if id == TOBIN {
@@ -140,7 +146,7 @@ fn users() -> Vec<tl::enums::User> {
 
 fn a_channel(id: i64, title: &str, broadcast: bool, forum: bool, username: &str) -> tl::types::Channel {
     let mut channel: tl::types::Channel =
-        blank(&[&put(0u32), &put(0u32), &put(id), &put(title.to_owned()), &put(tl::enums::ChatPhoto::Empty), &put(T0 - 86_400)]);
+        blank(&[&put(0u32), &put(0u32), &put(id), &put(title.to_owned()), &put(tl::enums::ChatPhoto::Empty), &put(t0() - 86_400)]);
     channel.access_hash = Some(id * 1_000 + 9);
     channel.broadcast = broadcast;
     channel.megagroup = !broadcast;
@@ -161,7 +167,7 @@ fn chats() -> Vec<tl::enums::Chat> {
         title: "Trail crew".to_owned(),
         photo: tl::enums::ChatPhoto::Empty,
         participants_count: 3,
-        date: T0 - 86_400,
+        date: t0() - 86_400,
         version: 1,
         migrated_to: None,
         admin_rights: None,
@@ -246,7 +252,7 @@ fn dialog(peer: Who, top: i32, read: i32, outbox: i32, unread: i32, pinned: bool
 
 /// Telegram's word for the text a chat's draft holds, written by its own date.
 fn draft_message(text: &str) -> tl::enums::DraftMessage {
-    let draft: tl::types::DraftMessage = blank(&[&put(0u32), &put(text.to_owned()), &put(T0)]);
+    let draft: tl::types::DraftMessage = blank(&[&put(0u32), &put(text.to_owned()), &put(t0())]);
     draft.into()
 }
 
@@ -268,7 +274,7 @@ fn photo(id: i64) -> tl::enums::Photo {
         id,
         access_hash: id + 1,
         file_reference: vec![1, 2, 3],
-        date: T0,
+        date: t0(),
         sizes: vec![
             tl::types::PhotoStrippedSize { r#type: "i".to_owned(), bytes: vec![1, 20, 30] }.into(),
             tl::types::PhotoSize { r#type: "m".to_owned(), w: 320, h: 240, size: 4_096 + 9 }.into(),
@@ -377,34 +383,34 @@ impl World {
             file_at_once: 0,
         };
         let odalys = Who::User(ODALYS);
-        world.store(None, message(odalys, 10, ODALYS, T0 - 300, "Are you coming to the ridge on Saturday?"));
-        world.store(None, message(odalys, 11, ME, T0 - 240, "Yes. I'll bring the stove."));
-        world.store(None, message(odalys, 12, ODALYS, T0 - 60, "Good. Trailhead at seven."));
-        world.store(None, message(Who::Group(CREW), 20, TOBIN, T0 - 3_600, "Maps are in the shared folder."));
-        world.store(None, message(Who::Channel(NOTES), 5, 0, T0 - 7_200, "Snow line is at 1,900 m this week."));
-        let mut tools = message(Who::Channel(WORKSHOP), 41, TOBIN, T0 - 500, "Who has the torque wrench?");
+        world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
+        world.store(None, message(odalys, 11, ME, t0() - 240, "Yes. I'll bring the stove."));
+        world.store(None, message(odalys, 12, ODALYS, t0() - 60, "Good. Trailhead at seven."));
+        world.store(None, message(Who::Group(CREW), 20, TOBIN, t0() - 3_600, "Maps are in the shared folder."));
+        world.store(None, message(Who::Channel(NOTES), 5, 0, t0() - 7_200, "Snow line is at 1,900 m this week."));
+        let mut tools = message(Who::Channel(WORKSHOP), 41, TOBIN, t0() - 500, "Who has the torque wrench?");
         if held_at_wire("TINYCLIENT_TELEGRAM_FORUM_TTL") {
             tools.date = crate::hub::now() as i32;
             tools.ttl_period = Some(10);
         }
         world.store(Some(TOOLS), in_topic(tools, TOOLS));
-        world.store(Some(JIGS), in_topic(message(Who::Channel(WORKSHOP), JIGS, TOBIN, T0 - 200, "First jig done: the box joints came out clean."), JIGS));
-        world.store(None, message(Who::User(TOBIN), 30, TOBIN, T0 - 90_000, "Thanks for the lift."));
+        world.store(Some(JIGS), in_topic(message(Who::Channel(WORKSHOP), JIGS, TOBIN, t0() - 200, "First jig done: the box joints came out clean."), JIGS));
+        world.store(None, message(Who::User(TOBIN), 30, TOBIN, t0() - 90_000, "Thanks for the lift."));
         // My newest word to Tobin, which his dialog's read-outbox covers: the row's ✓✓ at boot.
-        world.store(None, message(Who::User(TOBIN), 31, ME, T0 - 80_000, "Trailhead at seven, then."));
-        world.store(None, message(Who::User(ME), 2, ME, T0 - 100_000, "Packing list: stove, map, headlamp."));
-        world.store(None, message(Who::User(SERVICE), 3, SERVICE, T0 - 110_000, "Login code: 24680. Do not give this code to anyone."));
-        world.store(None, message(Who::User(BOT), 4, BOT, T0 - 120_000, "Trail report: all clear."));
+        world.store(None, message(Who::User(TOBIN), 31, ME, t0() - 80_000, "Trailhead at seven, then."));
+        world.store(None, message(Who::User(ME), 2, ME, t0() - 100_000, "Packing list: stove, map, headlamp."));
+        world.store(None, message(Who::User(SERVICE), 3, SERVICE, t0() - 110_000, "Login code: 24680. Do not give this code to anyone."));
+        world.store(None, message(Who::User(BOT), 4, BOT, t0() - 120_000, "Trail report: all clear."));
         // My newest word to the bot, which its dialog's read-outbox stops below: ✓ without ✓✓.
-        world.store(None, message(Who::User(BOT), 5, ME, T0 - 115_000, "Any closures this weekend?"));
-        world.store(None, message(Who::User(SCAM), 6, SCAM, T0 - 130_000, "You won a prize!"));
-        world.store(None, message(Who::User(FAKE), 7, FAKE, T0 - 140_000, "Your account needs verification."));
+        world.store(None, message(Who::User(BOT), 5, ME, t0() - 115_000, "Any closures this weekend?"));
+        world.store(None, message(Who::User(SCAM), 6, SCAM, t0() - 130_000, "You won a prize!"));
+        world.store(None, message(Who::User(FAKE), 7, FAKE, t0() - 140_000, "Your account needs verification."));
         // A draft typed on the phone before this device signed in: it rides Odalys's dialog at
         // the next reading of it, as any draft typed elsewhere does.
         world.drafts.insert((Who::User(ODALYS), None), "Finished packing. Meet at the ridge?".to_owned());
         for at in 0..crowd() {
             let who = Who::User(CROWD + at);
-            world.store(None, message(who, 1, CROWD + at, T0 - 200_000 - at as i32 * 60, &format!("Hello from {at}")));
+            world.store(None, message(who, 1, CROWD + at, t0() - 200_000 - at as i32 * 60, &format!("Hello from {at}")));
         }
         world
     }
@@ -618,7 +624,7 @@ fn input_who(peer: &tl::enums::InputPeer) -> Who {
 }
 
 fn updates(updates: Vec<tl::enums::Update>) -> tl::enums::Updates {
-    tl::types::Updates { updates, users: users(), chats: chats(), date: T0, seq: 0 }.into()
+    tl::types::Updates { updates, users: users(), chats: chats(), date: t0(), seq: 0 }.into()
 }
 
 impl World {
@@ -658,12 +664,12 @@ fn discussion_answer(place: &str, unread: i32) -> Result<Vec<u8>, Fault> {
     if place != key(Who::Channel(NOTES), Some(5)) {
         return Err(rpc(400, "MESSAGE_ID_INVALID", None));
     }
-    let mut echo = message(Who::Channel(CHATTERS), ECHO, ME, T0 - 7_200, "Snow line is at 1,900 m this week.");
+    let mut echo = message(Who::Channel(CHATTERS), ECHO, ME, t0() - 7_200, "Snow line is at 1,900 m this week.");
     // The echo is the channel's post standing in the group: no author of its own, and the
     // forward header names the post it says again.
     echo.from_id = None;
     echo.out = false;
-    let mut from: tl::types::MessageFwdHeader = blank(&[&put(0u32), &put(T0 - 7_200)]);
+    let mut from: tl::types::MessageFwdHeader = blank(&[&put(0u32), &put(t0() - 7_200)]);
     from.from_id = Some(Who::Channel(NOTES).peer());
     from.channel_post = Some(5);
     echo.fwd_from = Some(from.into());
@@ -725,9 +731,9 @@ fn topics_answer(world: &mut World, forum: Who) -> Result<Vec<u8>, Fault> {
         order_by_create_date: false,
         count: 3,
         topics: vec![
-            topic(world, JIGS, "Jigs", JIGS, T0 - 200, 2, 5000),
-            topic(world, TOOLS, "Tools", top, T0 - 40_000, 1, 5001),
-            topic(world, 1, "General", 1, T0 - 90_000, 0, 5002),
+            topic(world, JIGS, "Jigs", JIGS, t0() - 200, 2, 5000),
+            topic(world, TOOLS, "Tools", top, t0() - 40_000, 1, 5001),
+            topic(world, 1, "General", 1, t0() - 90_000, 0, 5002),
         ],
         messages,
         chats: chats(),
@@ -892,7 +898,7 @@ impl World {
             // Bold on an accented word, a link on an emoji, a mention by id, code, a spoiler.
             "incoming" => {
                 let text = "Café at 🦀 dock, ask Tobin: stove.fuel() secret";
-                let mut message = message(odalys, 13, ODALYS, T0 + 10, text);
+                let mut message = message(odalys, 13, ODALYS, t0() + 10, text);
                 message.entities = Some(vec![
                     tl::types::MessageEntityBold { offset: 0, length: 4 }.into(),
                     tl::types::MessageEntityTextUrl { offset: 8, length: 2, url: "https://example.org/dock".to_owned() }.into(),
@@ -907,7 +913,7 @@ impl World {
             // is the plain emoji Telegram chose as the alt glyph.
             "emoji-text" => {
                 let text = "Cast off 🦀 at dawn";
-                let mut message = message(odalys, 22, ODALYS, T0 + 90, text);
+                let mut message = message(odalys, 22, ODALYS, t0() + 90, text);
                 message.entities = Some(vec![
                     tl::types::MessageEntityCustomEmoji { offset: 9, length: 2, document_id: 5002 }.into(),
                 ]);
@@ -917,7 +923,7 @@ impl World {
             // The same while its conversation is on screen, with a still emoji's document.
             "emoji-text-live" => {
                 let text = "Back at the 🔥 bench";
-                let mut message = message(odalys, 23, ODALYS, T0 + 100, text);
+                let mut message = message(odalys, 23, ODALYS, t0() + 100, text);
                 message.entities = Some(vec![
                     tl::types::MessageEntityCustomEmoji { offset: 12, length: 2, document_id: 5001 }.into(),
                 ]);
@@ -925,7 +931,7 @@ impl World {
                 vec![new(message)]
             }
             "photo" => {
-                let mut message = message(odalys, 14, ODALYS, T0 + 20, "The view from the ridge");
+                let mut message = message(odalys, 14, ODALYS, t0() + 20, "The view from the ridge");
                 message.media = Some(tl::types::MessageMediaPhoto { spoiler: false, live_photo: false, photo: Some(photo(6_014)), ttl_seconds: None, video: None }.into());
                 self.store(None, message.clone());
                 vec![new(message)]
@@ -972,7 +978,7 @@ impl World {
             // A comment gains reactions, as the thread's next page carries them: the page
             // answer is all that changes, nothing is told on the update stream.
             "comment-react" => {
-                let mut comment = message(Who::Channel(CHATTERS), 51, ODALYS, T0 - 40, "Yes, at the hut now.");
+                let mut comment = message(Who::Channel(CHATTERS), 51, ODALYS, t0() - 40, "Yes, at the hut now.");
                 comment.reactions = Some(comment_reactions().into());
                 // The thread's page is kept under the post's id, as `getReplies` counts it.
                 self.messages.entry(key(Who::Channel(NOTES), Some(5))).or_default().insert(51, comment.into());
@@ -990,8 +996,8 @@ impl World {
                 }.into())]
             }
             "edit" => {
-                let mut message = message(odalys, 13, ODALYS, T0 + 10, "Café at the dock, seven sharp");
-                message.edit_date = Some(T0 + 30);
+                let mut message = message(odalys, 13, ODALYS, t0() + 10, "Café at the dock, seven sharp");
+                message.edit_date = Some(t0() + 30);
                 self.store(None, message.clone());
                 vec![update(tl::types::UpdateEditMessage { message: message.into(), pts: 0, pts_count: 0 }.into())]
             }
@@ -1005,7 +1011,7 @@ impl World {
             // still to live: the store never shows the first and drops the second at its
             // moment, whether the account is online or not.
             "ttl" => {
-                let mut gone = message(odalys, 17, ODALYS, T0 - 3_600, "Gone before it arrived");
+                let mut gone = message(odalys, 17, ODALYS, t0() - 3_600, "Gone before it arrived");
                 gone.ttl_period = Some(60);
                 let mut alive = message(odalys, 18, ODALYS, crate::hub::now() as i32, "Vanishes in a moment");
                 alive.ttl_period = Some(10);
@@ -1023,7 +1029,7 @@ impl World {
                 vec![update(tl::types::UpdateDeleteMessages { messages: vec![17, 18], pts: 0, pts_count: 2 }.into())]
             }
             "topic" => {
-                let message = in_topic(message(Who::Channel(WORKSHOP), 42, TOBIN, T0 + 40, "Found it, bottom drawer."), TOOLS);
+                let message = in_topic(message(Who::Channel(WORKSHOP), 42, TOBIN, t0() + 40, "Found it, bottom drawer."), TOOLS);
                 self.store(Some(TOOLS), message.clone());
                 vec![update(tl::types::UpdateNewChannelMessage { message: message.into(), pts: 0, pts_count: 0 }.into())]
             }
@@ -1057,7 +1063,7 @@ impl World {
             }
             // Odalys goes offline; Tobin's last-seen stays hidden.
             "status" => vec![
-                update(tl::types::UpdateUserStatus { user_id: ODALYS, status: tl::types::UserStatusOffline { was_online: T0 }.into() }.into()),
+                update(tl::types::UpdateUserStatus { user_id: ODALYS, status: tl::types::UserStatusOffline { was_online: t0() }.into() }.into()),
                 update(tl::types::UpdateUserStatus { user_id: TOBIN, status: tl::enums::UserStatus::Recently(blank(&[&put(0u32)])) }.into()),
             ],
             "poll" => {
@@ -1082,7 +1088,7 @@ impl World {
                     hash: 0,
                 };
                 let results: tl::types::PollResults = blank(&[&put(0u32)]);
-                let mut message = message(Who::Group(CREW), 21, TOBIN, T0 + 50, "");
+                let mut message = message(Who::Group(CREW), 21, TOBIN, t0() + 50, "");
                 message.media = Some(tl::enums::MessageMedia::Poll(Box::new(tl::types::MessageMediaPoll { poll: poll.into(), results: results.into(), attached_media: None })));
                 self.store(None, message.clone());
                 vec![update(tl::types::UpdateNewMessage { message: message.into(), pts: 0, pts_count: 0 }.into())]
@@ -1092,7 +1098,7 @@ impl World {
                     id: 6_100,
                     access_hash: 6_101,
                     file_reference: vec![4],
-                    date: T0,
+                    date: t0(),
                     mime_type: "audio/ogg".to_owned(),
                     size: 18_000,
                     thumbs: None,
@@ -1107,7 +1113,7 @@ impl World {
                     }
                     .into()],
                 };
-                let mut message = message(odalys, 15, ODALYS, T0 + 60, "");
+                let mut message = message(odalys, 15, ODALYS, t0() + 60, "");
                 message.media = Some(
                     tl::types::MessageMediaDocument {
                         nopremium: false,
@@ -1128,8 +1134,8 @@ impl World {
             }
             // A post from the channel, forwarded into the direct chat as an answer to message 12.
             "forward" => {
-                let mut message = message(odalys, 16, ODALYS, T0 + 70, "Snow line is at 1,900 m this week.");
-                let mut from: tl::types::MessageFwdHeader = blank(&[&put(0u32), &put(T0 - 7_200)]);
+                let mut message = message(odalys, 16, ODALYS, t0() + 70, "Snow line is at 1,900 m this week.");
+                let mut from: tl::types::MessageFwdHeader = blank(&[&put(0u32), &put(t0() - 7_200)]);
                 from.from_id = Some(Who::Channel(NOTES).peer());
                 from.channel_post = Some(5);
                 message.fwd_from = Some(from.into());
@@ -1144,13 +1150,13 @@ impl World {
             // after the word says how many of them the user has not read.
             "comments" => {
                 self.comments_unread = words.next().and_then(|count| count.parse().ok()).unwrap_or(0);
-                let mut post = message(Who::Channel(NOTES), 5, 0, T0 - 7_200, "Snow line is at 1,900 m this week.");
+                let mut post = message(Who::Channel(NOTES), 5, 0, t0() - 7_200, "Snow line is at 1,900 m this week.");
                 post.replies = Some(blank::<tl::types::MessageReplies>(&[&put(1u32), &put(2i32), &put(0i32), &put(CHATTERS)]).into());
                 self.store(None, post.clone());
                 // A comment is a message of the discussion group, which `getReplies` answers
                 // for the post itself, so it is kept under the post's thread here.
                 let thread = self.messages.entry(key(Who::Channel(NOTES), Some(5))).or_default();
-                for (id, from, date, text) in [(50, TOBIN, T0 - 100, "On my way up front?"), (51, ODALYS, T0 - 40, "Yes, at the hut now.")] {
+                for (id, from, date, text) in [(50, TOBIN, t0() - 100, "On my way up front?"), (51, ODALYS, t0() - 40, "Yes, at the hut now.")] {
                     thread.insert(id, message(Who::Channel(CHATTERS), id, from, date, text).into());
                 }
                 vec![update(tl::types::UpdateEditChannelMessage { message: post.into(), pts: 0, pts_count: 0 }.into())]
@@ -1170,7 +1176,7 @@ impl World {
                     peer_id: Who::Group(CREW).peer(),
                     saved_peer_id: None,
                     reply_to: None,
-                    date: T0 + 80,
+                    date: t0() + 80,
                     action: tl::types::MessageActionChatEditTitle { title: "Ridge crew".to_owned() }.into(),
                     reactions: None,
                     ttl_period: None,
@@ -1213,13 +1219,13 @@ impl World {
                         vec![update(tl::types::UpdateNotifySettings { peer: tl::enums::NotifyPeer::NotifyBroadcasts, notify_settings: settings(None) }.into())]
                     }
                     Some("group") => {
-                        let mut said = message(Who::Group(CREW), 21, TOBIN, T0 + 90, "Are you seeing this?");
+                        let mut said = message(Who::Group(CREW), 21, TOBIN, t0() + 90, "Are you seeing this?");
                         said.mentioned = true;
                         self.store(None, said.clone());
                         vec![new(said)]
                     }
                     _ => {
-                        let mut said = message(Who::User(TOBIN), 32, TOBIN, T0 + 90, "Are you seeing this?");
+                        let mut said = message(Who::User(TOBIN), 32, TOBIN, t0() + 90, "Are you seeing this?");
                         said.mentioned = true;
                         self.store(None, said.clone());
                         vec![new(said)]
@@ -1373,7 +1379,7 @@ impl World {
         }
         if asked::<f::updates::GetState>(body).is_some() {
             self.log("GetState");
-            return answer(tl::enums::updates::State::State(tl::types::updates::State { pts: 1, qts: 0, date: T0, seq: 1, unread_count: 0 }));
+            return answer(tl::enums::updates::State::State(tl::types::updates::State { pts: 1, qts: 0, date: t0(), seq: 1, unread_count: 0 }));
         }
         if asked::<f::users::GetUsers>(body).is_some() {
             self.log("GetUsers");
@@ -1463,7 +1469,7 @@ impl World {
                     dialog
                 })
                 .collect();
-            let state = tl::types::updates::State { pts: 1, qts: 0, date: T0, seq: 1, unread_count: 0 };
+            let state = tl::types::updates::State { pts: 1, qts: 0, date: t0(), seq: 1, unread_count: 0 };
             return answer(tl::enums::messages::PeerDialogs::Dialogs(tl::types::messages::PeerDialogs { dialogs, messages: Vec::new(), chats: chats(), users: users(), state: state.into() }));
         }
         if let Some(request) = asked::<f::messages::GetPeerDialogs>(body) {
@@ -1489,7 +1495,7 @@ impl World {
                     drafted(self, &mut dialog, who);
                     dialog
                 }).collect();
-                let state = tl::types::updates::State { pts: 1, qts: 0, date: T0, seq: 1, unread_count: 0 };
+                let state = tl::types::updates::State { pts: 1, qts: 0, date: t0(), seq: 1, unread_count: 0 };
                 return answer(tl::enums::messages::PeerDialogs::Dialogs(tl::types::messages::PeerDialogs { dialogs, messages: Vec::new(), chats: chats(), users: users(), state: state.into() }));
             }
             return Err(rpc(400, "PEER_ID_INVALID", None));
@@ -1552,7 +1558,7 @@ impl World {
                     id,
                     access_hash: i64::from(id) + 7,
                     file_reference: vec![1u8, 2u8, 3u8],
-                    date: T0 - 90,
+                    date: t0() - 90,
                     mime_type: if animated { "application/x-tgsticker".to_owned() } else { "image/webp".to_owned() },
                     size: if animated { 20_000 } else { 4_096 + 9 },
                     thumbs: None,
@@ -1736,7 +1742,7 @@ impl World {
                 }
                 _ => file_piece(request.offset, request.limit),
             };
-            let piece = tl::types::upload::File { r#type: tl::enums::storage::FileType::FileJpeg, mtime: T0, bytes: held };
+            let piece = tl::types::upload::File { r#type: tl::enums::storage::FileType::FileJpeg, mtime: t0(), bytes: held };
             self.file_in += 1;
             self.file_at_once = self.file_at_once.max(self.file_in);
             let answered = answer(tl::enums::upload::File::File(piece));
@@ -1752,7 +1758,7 @@ impl World {
             return answer(self.me());
         }
         if let Some(request) = asked::<f::messages::GetFullChat>(body) {
-            let one = |user_id| tl::enums::ChatParticipant::Participant(tl::types::ChatParticipant { user_id, inviter_id: TOBIN, date: T0, rank: None });
+            let one = |user_id| tl::enums::ChatParticipant::Participant(tl::types::ChatParticipant { user_id, inviter_id: TOBIN, date: t0(), rank: None });
             let participants = tl::types::ChatParticipants { chat_id: request.chat_id, participants: vec![one(TOBIN), one(ODALYS), one(ME)], version: 1 };
             let mut full: tl::types::ChatFull = blank(&[
                 &put(0u32),
@@ -1814,7 +1820,7 @@ impl World {
                 messages.truncate(request.limit.max(0) as usize);
             }
             if name == "links" {
-                let mut linked = message(peer, 17, ODALYS, T0 - 30, "Route map");
+                let mut linked = message(peer, 17, ODALYS, t0() - 30, "Route map");
                 linked.entities = Some(vec![tl::types::MessageEntityTextUrl { offset: 0, length: 5, url: "https://example.org/route".to_owned() }.into()]);
                 messages = vec![linked.into()];
             }
@@ -1876,7 +1882,7 @@ impl World {
                 user_id,
                 inviter_id: None,
                 promoted_by: TOBIN,
-                date: T0 - 1_000,
+                date: t0() - 1_000,
                 admin_rights: rights.into(),
                 rank: Some("Quartermaster".to_owned()),
             };
@@ -1946,7 +1952,7 @@ impl World {
         if asked::<f::messages::GetAllStickers>(body).is_some() {
             self.log("GetAllStickers");
             let mut set: tl::types::StickerSet = blank(&[&put(0u32), &put(900i64), &put(901i64), &put("Hiking".to_owned()), &put("hiking".to_owned()), &put(2i32), &put(1i32)]);
-            set.installed_date = Some(T0);
+            set.installed_date = Some(t0());
             let found = tl::types::messages::AllStickers { hash: 1, sets: vec![set.into()] };
             return Some(answer(tl::enums::messages::AllStickers::Stickers(found)));
         }
@@ -2000,7 +2006,7 @@ fn gif(id: i64) -> tl::types::Document {
         id,
         access_hash: id + 1,
         file_reference: vec![7],
-        date: T0,
+        date: t0(),
         mime_type: "video/mp4".to_owned(),
         size: 120_000,
         thumbs: Some(vec![tl::types::PhotoSize { r#type: "m".to_owned(), w: 320, h: 180, size: 9_000 }.into()]),
@@ -2029,7 +2035,7 @@ fn sticker(id: i64) -> tl::types::Document {
         id,
         access_hash: id + 1,
         file_reference: vec![8],
-        date: T0,
+        date: t0(),
         mime_type: "application/x-tgsticker".to_owned(),
         size: 30_000,
         thumbs: Some(vec![tl::types::PhotoSize { r#type: "m".to_owned(), w: 128, h: 128, size: 4_000 }.into()]),
@@ -2092,7 +2098,7 @@ fn held_media(media: &tl::enums::InputMedia, id: i32) -> (String, tl::enums::Mes
                         id,
                         access_hash: id + 1,
                         file_reference: vec![9],
-                        date: T0,
+                        date: t0(),
                         mime_type: one.mime_type.clone(),
                         size: 18_000,
                         thumbs: None,

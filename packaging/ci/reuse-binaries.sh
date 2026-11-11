@@ -27,10 +27,12 @@ take() {
     mkdir -p target/release
     case "$kind" in
         macos)
-            app=$(find "$stage" -type d -name 'tinyclient.app' | head -1)
-            [ -n "$app" ] || return 1
+            # CI uploads target/release/tinyclient.app as a directory, and upload-artifact keeps
+            # what is inside it: the download is Contents/ with no tinyclient.app around it.
+            macos=$(find "$stage" -type d -path '*/Contents/MacOS' | head -1)
+            [ -n "$macos" ] || return 1
             for program in $programs; do
-                cp "$app/Contents/MacOS/$program" "target/release/$program"
+                cp "$macos/$program" "target/release/$program"
                 chmod +x "target/release/$program"
             done
             ;;

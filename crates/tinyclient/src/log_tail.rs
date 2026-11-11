@@ -78,9 +78,14 @@ impl Level {
     }
 }
 
-/// The level a file line starts with (`render` writes `warn chatd::media ...`). `None` for a
-/// line that does not, such as the second line of a message with a newline in it.
+/// The level a file line starts with, after its time (`2026-11-11T14:03:22.123Z warn chatd::media
+/// ...`; files from before the time was written start with the level). `None` for a line that
+/// does not, such as the second line of a message with a newline in it.
 pub fn level_of(line: &str) -> Option<Level> {
+    let line = match line.split_once(' ') {
+        Some((first, rest)) if is_stamp(first) => rest,
+        _ => line,
+    };
     Some(match line.split_once(' ').map_or(line, |(word, _)| word) {
         "error" => Level::Error,
         "warn" => Level::Warn,
@@ -89,6 +94,11 @@ pub fn level_of(line: &str) -> Option<Level> {
         "trace" => Level::Trace,
         _ => return None,
     })
+}
+
+/// The time a file line starts with: `2026-11-11T14:03:22.123Z`.
+fn is_stamp(word: &str) -> bool {
+    word.len() == 24 && word.ends_with('Z') && word.as_bytes()[10] == b'T' && word[..4].bytes().all(|b| b.is_ascii_digit())
 }
 
 pub fn is_noise(text: &str) -> bool {
@@ -310,6 +320,8 @@ mod tests {
         assert_eq!(level_of("error log RefCell already borrowed"), Some(Level::Error));
         assert_eq!(level_of("trace mediad x"), Some(Level::Trace));
         assert_eq!(level_of("debug"), Some(Level::Debug));
+        assert_eq!(level_of("2026-11-11T14:03:22.123Z warn mediad::tiny voice x session=ab"), Some(Level::Warn));
+        assert_eq!(level_of("2026-11-11T14:03:22.123Z"), None);
         assert_eq!(level_of("  at line 2 of a message"), None);
         assert_eq!(level_of("warning chatd"), None);
         assert_eq!(level_of(""), None);

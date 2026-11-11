@@ -101,11 +101,22 @@ fn frame(path: &Path) -> Option<Arc<RenderImage>> {
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])))
 }
 
-/// Which of the two feeds: the picture being watched, or my own camera.
+/// Which of the three feeds: the picture being watched, my own camera, or my own share.
 #[derive(Clone, Copy)]
 pub(in crate::gui) enum Which {
     Watched,
     Mine,
+    Screen,
+}
+
+/// The frame a call names for each feed: its generation and file.
+pub(in crate::gui) fn named(call: Option<&Call>) -> [(Which, Option<(u64, String)>); 3] {
+    let frame = |picture: Option<&protocol::CallPicture>| picture.map(|picture| (picture.generation, picture.path.clone()));
+    [
+        (Which::Watched, frame(call.and_then(|call| call.picture.as_ref()))),
+        (Which::Mine, frame(call.and_then(|call| call.self_view.as_ref()))),
+        (Which::Screen, frame(call.and_then(|call| call.share_view.as_ref()))),
+    ]
 }
 
 impl Shell {
@@ -113,18 +124,13 @@ impl Shell {
         match which {
             Which::Watched => &mut self.call_state.feed,
             Which::Mine => &mut self.call_state.self_feed,
+            Which::Screen => &mut self.call_state.screen_feed,
         }
     }
 
     /// The call changed: the frames it names are read, and ones no longer named are let go.
     pub(in crate::gui) fn feed_follow(&mut self, call: Option<&Call>, cx: &mut Context<Self>) {
-        let watched = call
-            .and_then(|call| call.picture.as_ref())
-            .map(|picture| (picture.generation, picture.path.clone()));
-        let mine = call
-            .and_then(|call| call.self_view.as_ref())
-            .map(|picture| (picture.generation, picture.path.clone()));
-        for (which, picture) in [(Which::Watched, watched), (Which::Mine, mine)] {
+        for (which, picture) in named(call) {
             let (read, gone) = self.feed_of(which).offer(picture);
             if let Some(gone) = gone {
                 cx.drop_image(gone, None);

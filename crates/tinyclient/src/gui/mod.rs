@@ -301,7 +301,8 @@ fn shell_bindings() -> Vec<KeyBinding> {
 /// `--autoplay always|hover|never` (when GIFs play), `--frames N` (N frames 150 ms apart, as
 /// `out-1.png` …, to see moving pictures move). On a Tiny server (`--mode tiny`): `--tiny-room
 /// N` (the Nth channel), `--tiny-menu header|channel|person:N` (N: the Nth seat, `:sub` adds its
-/// Move submenu), `--tiny-modal invite|code|kick|ban|profile`, `--tiny-settings`, `--tiny-card N`
+/// Move submenu), `--tiny-stream` (my own stream filling the stage, with `TINYCLIENT_SHOT_CALL=tiny_sharing`),
+/// `--tiny-modal invite|code|kick|ban|profile`, `--tiny-settings`, `--tiny-card N`
 /// (the Nth member's hover card), `--tiny-setup first|custom|refused|checklist|links|privacy|change|change-anyway|member` (first-run
 /// setup, or Server Settings › Privacy, over a made-up outline), `--tiny-confirm transfer|codes`.
 ///

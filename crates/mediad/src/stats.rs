@@ -21,11 +21,35 @@ use crate::RATE;
 use protocol::{CallPath, CallStats};
 use std::time::{Duration, Instant};
 
-/// RFC 3550 interarrival jitter for one sender, in samples at 48 kHz.
+/// Packets whose delay [`Arrivals::spread_ms`] reads: the last 10 s of speech.
+const SPREAD_WINDOW: usize = 500;
+/// A hole in the RTP time wider than this (100 ms) starts a new spurt: what came after it is
+/// not compared with what came before.
+const SPURT_BREAK: i64 = 5 * 960;
+/// A packet this soon after the one before (2 ms) came in the same lump: a stall let go of its
+/// backlog. How late the first of the lump was says it all; counting the rest too would read
+/// one stall as a dozen late packets, and a buffer sized for it would hold its 200 ms for 10 s.
+const LUMP: Duration = Duration::from_millis(2);
+
+/// One sender's arrivals, in samples at 48 kHz: RFC 3550's interarrival jitter, an average, and
+/// how late its packets come against the earliest of their talk spurt, whose high percentile is
+/// what a buffer has to hold to play them all. Wi-Fi delays a packet in one in a hundred by
+/// several times the average; a buffer sized from the average runs dry on each of them.
 #[derive(Debug, Default, Clone)]
 pub struct Arrivals {
     last: Option<(Instant, u32)>,
     jitter: f64,
+    /// The time of the spurt's first packet, against which every later one is placed, and the
+    /// least any packet of the spurt took to come against it, in samples.
+    spurt: Option<(Instant, i64, f64)>,
+    /// The RTP time last seen, unwrapped.
+    rtp: Option<i64>,
+    /// The next packet starts a spurt: the sender paused.
+    paused: bool,
+    /// When the last packet came.
+    came: Option<Instant>,
+    /// How late each recent packet came against the quickest of its spurt, in samples.
+    delays: std::collections::VecDeque<f64>,
 }
 
 impl Arrivals {
@@ -43,10 +67,59 @@ impl Arrivals {
         if self.last.is_none_or(|(_, stamped)| rtp.wrapping_sub(stamped) as i32 >= 0) {
             self.last = Some((at, rtp));
         }
+        self.place(rtp, at);
+    }
+
+    /// The packet just taken was the silence a sender sends before it pauses: whatever comes
+    /// next starts a new spurt, and how long the pause was is not lateness.
+    pub fn paused(&mut self) {
+        self.paused = true;
+    }
+
+    fn place(&mut self, rtp: u32, at: Instant) {
+        let unwrapped = self.rtp.map_or(i64::from(rtp), |last| last + i64::from(rtp.wrapping_sub(last as u32) as i32));
+        let stepped = self.rtp.map_or(0, |last| unwrapped - last);
+        self.rtp = Some(self.rtp.map_or(unwrapped, |last| last.max(unwrapped)));
+        let fresh = std::mem::take(&mut self.paused) || stepped > SPURT_BREAK;
+        let Some((start, start_rtp, least)) = self.spurt.as_mut().filter(|_| !fresh) else {
+            self.spurt = Some((at, unwrapped, 0.));
+            self.came = Some(at);
+            return;
+        };
+        let took = at.saturating_duration_since(*start).as_secs_f64() * f64::from(RATE) - (unwrapped - *start_rtp) as f64;
+        if took > f64::from(RATE) {
+            // A second behind: the sender's clock stood still through a pause. Start again here.
+            self.spurt = Some((at, unwrapped, 0.));
+            self.came = Some(at);
+            return;
+        }
+        *least = least.min(took);
+        let lumped = self.came.replace(at).is_some_and(|came| at.saturating_duration_since(came) < LUMP);
+        if lumped {
+            return;
+        }
+        self.delays.push_back(took - *least);
+        if self.delays.len() > SPREAD_WINDOW {
+            self.delays.pop_front();
+        }
     }
 
     pub fn ms(&self) -> u32 {
         (self.jitter * 1000. / f64::from(RATE)).round() as u32
+    }
+
+    /// How late the latest packets but one in a hundred came, of the last 10 s: what a buffer
+    /// holds to play 99 of every 100 on time.
+    pub fn spread_ms(&self) -> u32 {
+        if self.delays.is_empty() {
+            return 0;
+        }
+        let mut sorted: Vec<f64> = self.delays.iter().copied().collect();
+        // Past the latest one in a hundred, and never the single latest: in the first seconds
+        // of a call that would be one stall standing for all of them.
+        let at = sorted.len().saturating_sub(1 + (sorted.len() / 100).max(1));
+        let (_, nth, _) = sorted.select_nth_unstable_by(at, f64::total_cmp);
+        (*nth * 1000. / f64::from(RATE)).round() as u32
     }
 }
 
@@ -240,6 +313,40 @@ mod tests {
             shaky.arrived(n * 960, start + Duration::from_millis(u64::from(n) * 20 + wobble));
         }
         assert!((8..=11).contains(&shaky.ms()), "{}", shaky.ms());
+    }
+
+    /// One packet in fifty 45 ms late hardly moves the average, and is what the spread is for.
+    #[test]
+    fn the_spread_sees_the_stragglers_the_average_does_not() {
+        let start = Instant::now();
+        let mut arrivals = Arrivals::default();
+        for n in 0..500u32 {
+            let late = if n % 50 == 7 { 45 } else { u64::from(n % 3) };
+            arrivals.arrived(n * 960, start + Duration::from_millis(u64::from(n) * 20 + late));
+        }
+        assert!(arrivals.ms() <= 4, "the average: {} ms", arrivals.ms());
+        assert!((43..=46).contains(&arrivals.spread_ms()), "the spread: {} ms", arrivals.spread_ms());
+    }
+
+    /// A pause is not lateness: after the silence before it, or a hole in the RTP time, the next
+    /// spurt is placed against its own first packet.
+    #[test]
+    fn a_pause_does_not_read_as_a_late_packet() {
+        let start = Instant::now();
+        let mut arrivals = Arrivals::default();
+        for n in 0..20u32 {
+            arrivals.arrived(n * 960, start + Duration::from_millis(u64::from(n) * 20));
+        }
+        arrivals.paused();
+        // Discord's sequence and time carry on after a pause as if none had been.
+        for n in 20..40u32 {
+            arrivals.arrived(n * 960, start + Duration::from_millis(700 + u64::from(n) * 20));
+        }
+        // A Tiny call's RTP time runs on through it.
+        for n in 100..120u32 {
+            arrivals.arrived(n * 960, start + Duration::from_millis(1_400 + u64::from(n) * 20));
+        }
+        assert_eq!(arrivals.spread_ms(), 0);
     }
 
     #[test]

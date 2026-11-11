@@ -12,6 +12,7 @@ pub mod notify;
 pub mod playback;
 pub mod recorder;
 pub mod server;
+pub mod sendtime;
 pub mod session;
 pub mod store;
 pub mod tls;

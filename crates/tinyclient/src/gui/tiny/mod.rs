@@ -1518,6 +1518,16 @@ impl Shell {
             let room = self.tiny_state.channel.as_ref().and_then(|id| community.rooms.iter().find(|room| room.id == *id));
             self.tiny_state.focus = room.and_then(|room| room.participants.get(ix)).map(|seat| stage::Focus::Person(seat.user_id.clone()));
         }
+        // My own stream, filling the stage (a made-up call that has me sharing, `tiny_sharing`).
+        if std::env::args().any(|arg| arg == "--tiny-stream") {
+            self.tiny_state.focus = Some(stage::Focus::Stream(community.me.clone()));
+        }
+        // The picture mediad would have painted for my tile is read as a call's change reads it.
+        if std::env::var("TINYCLIENT_SHOT_CALL").is_ok_and(|name| name == "tiny_sharing") {
+            if let Some(call) = self.snapshot.as_ref().and_then(|snapshot| self.call_shown(snapshot)) {
+                self.feed_follow(Some(&call), cx);
+            }
+        }
         match flag("--tiny-menu").as_deref() {
             Some("header") => self.tiny_open_float(Float::Header, cx),
             Some("stats") => self.tiny_open_float(Float::Stats, cx),

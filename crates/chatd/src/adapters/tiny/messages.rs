@@ -881,6 +881,21 @@ pub(super) fn prove_sealed_preview() -> Result<(), String> {
     }
 }
 
+/// The lab's keycap-reaction proof. A keycap is taken as a reaction, and a bare digit still is not.
+pub(super) fn prove_keycap_reaction() -> Result<(), String> {
+    for keycap in ["1\u{FE0F}\u{20E3}", "0\u{20E3}", "#\u{FE0F}\u{20E3}"] {
+        if !unicode_emoji(keycap) {
+            return Err(format!("the keycap {keycap:?} was refused as a reaction"));
+        }
+    }
+    for not_one in ["1", "10\u{FE0F}\u{20E3}", "1\u{FE0F}", ":one:"] {
+        if unicode_emoji(not_one) {
+            return Err(format!("{not_one:?} was taken as a reaction"));
+        }
+    }
+    Ok(())
+}
+
 /// The lab's sealed-preview-attachments proof. A wiped sqlite row still restores a captionless
 /// image and a captioned attachment from the authenticated sealed cache. The lab sets
 /// `TINYCLIENT_PROVE=sealed-preview-attachments`.
@@ -1348,29 +1363,38 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
     }
 }
 
-/// A send of text. One to an encrypted conversation can wait for the people of a new group to
-/// join it (`e2ee::send`), so it goes to this account's sealed-send thread, in order, and the
-/// commands go on meanwhile.
+/// A send of text. It never runs on the commands thread: that one serves history, previews and
+/// everything else the person is waiting on, and a send there waited behind all of it. A send
+/// goes to this account's send thread, in order, and the commands go on meanwhile. One to an
+/// encrypted conversation can wait for the people of a new group to join it (`e2ee::send`), so
+/// it has a thread of its own, and does not hold up the plain ones.
 fn send(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>) {
-    if super::safe_id(&conversation_id) && sealed_here(ctx, saved, &conversation_id) == Ok(true) {
-        let account = (saved.base_url.clone(), saved.user_id.clone());
-        let (posting, saved) = (ctx.clone(), saved.clone());
-        in_order(account, Box::new(move || {
-            let outcome = post_message(&posting, &saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[]);
-            posting.sent(&conversation_id, &client_id, outcome);
-        }));
+    if !super::safe_id(&conversation_id) {
+        let outcome = Err(super::CHECK.to_owned());
+        ctx.sent(&conversation_id, &client_id, outcome);
         return;
     }
-    let outcome = post_message(ctx, saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[]);
-    ctx.sent(&conversation_id, &client_id, outcome);
+    let labelled = ctx.known(&conversation_id).ok().flatten().is_some_and(|row| row.encryption.is_sealed());
+    let user = if labelled { saved.user_id.clone() } else { format!("{}#plain", saved.user_id) };
+    let account = (saved.base_url.clone(), user);
+    let (posting, saved) = (ctx.clone(), saved.clone());
+    in_order(account, Box::new(move || {
+        let _ = crate::sendtime::run(&client_id, || {
+            let outcome = post_message(&posting, &saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[]);
+            let sent = outcome.is_ok();
+            posting.sent(&conversation_id, &client_id, outcome);
+            crate::sendtime::stage("store");
+            if sent { Ok(()) } else { Err(()) }
+        });
+    }));
 }
 
 type Job = Box<dyn FnOnce() + Send>;
 
-/// The sealed-send thread of each account (server and user), by what takes its jobs.
+/// The send thread of each account (server and user, and plain or sealed), by what takes its jobs.
 type Queues = HashMap<(String, String), std::sync::mpsc::Sender<Job>>;
 
-/// Runs `job` on the account's sealed-send thread, after the ones before it. Made when first
+/// Runs `job` on the account's send thread, after the ones before it. Made when first
 /// needed, and again if it ended.
 fn in_order(account: (String, String), job: Job) {
     static QUEUES: std::sync::OnceLock<std::sync::Mutex<Queues>> = std::sync::OnceLock::new();
@@ -1383,7 +1407,7 @@ fn in_order(account: (String, String), job: Job) {
         None => job,
     };
     let (queue, jobs) = std::sync::mpsc::channel::<Job>();
-    let started = std::thread::Builder::new().name("tiny-sealed-send".into()).spawn(move || {
+    let started = std::thread::Builder::new().name("tiny-send".into()).spawn(move || {
         for job in jobs {
             job();
         }
@@ -1418,7 +1442,9 @@ fn post_message(ctx: &Context, saved: &Saved, conversation_id: &str, client_id: 
         body.insert("attachment_ids".to_owned(), json!(attachment_ids));
     }
     let path = format!("/v1/conversations/{conversation_id}/messages");
-    match super::asked("POST", saved, &path, Some(Value::Object(body))) {
+    let answer = super::asked("POST", saved, &path, Some(Value::Object(body)));
+    crate::sendtime::stage("post");
+    match answer {
         Ok((200 | 201, value)) => accept_message(ctx, saved, conversation_id, &value),
         Ok((status, value)) => Err(super::explain(status, &value, super::Missing::Plain).to_owned()),
         Err(detail) => Err(detail.to_owned()),
@@ -1458,8 +1484,7 @@ fn post_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, client_id: &
 
 fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>, outgoing: Outgoing) {
     if outgoing.files.is_empty() {
-        let outcome = post_message(ctx, saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[]);
-        ctx.sent(&conversation_id, &client_id, outcome);
+        send(ctx, saved, conversation_id, client_id, text, reply_to);
         return;
     }
     if outgoing.files.len() > protocol::ATTACHMENTS_LIMIT {
@@ -1727,7 +1752,15 @@ fn accept_message(ctx: &Context, saved: &Saved, conversation: &str, value: &Valu
     let wire = one_wire(value).ok_or(super::UNREADABLE)?;
     let mut media = Vec::new();
     let opened = open_rows(ctx, saved, conversation, &[&wire]);
-    let message = map_message(saved, &member_names(saved), &wire, &opened, &mut media).ok_or(super::UNREADABLE)?;
+    crate::sendtime::stage("open");
+    // Our own message is named from the session. The people list (a full request to the server)
+    // is for the rest, and nothing waits on it to settle a row of ours.
+    let own = wire.author_id == saved.user_id && !saved.display_name.is_empty();
+    let names = if own { HashMap::new() } else { member_names(saved) };
+    if !own {
+        crate::sendtime::stage("members");
+    }
+    let message = map_message(saved, &names, &wire, &opened, &mut media).ok_or(super::UNREADABLE)?;
     if !media.is_empty() {
         let _ = ctx.media(&media);
     }
@@ -1887,14 +1920,17 @@ fn media_kind(kind: &str, mime: &str) -> MediaKind {
     }
 }
 
-/// Unicode emoji only. A shortcode, a word, or a path is not one.
+/// Unicode emoji only. A shortcode, a word, or a path is not one. A keycap is one, though it
+/// starts with an ASCII digit (1️⃣ is `1`, U+FE0F, U+20E3), and tinyserver takes it.
 fn unicode_emoji(emoji: &str) -> bool {
     let mut textual = false;
     if emoji.is_empty() {
         return false;
     }
-    for ch in emoji.chars() {
-        if ch.is_ascii_alphanumeric() || ch == ':' || ch == '/' {
+    for (at, ch) in emoji.char_indices() {
+        let after = &emoji[at + ch.len_utf8()..];
+        let keycap = ch.is_ascii_digit() && (after.starts_with('\u{20E3}') || after.starts_with("\u{FE0F}\u{20E3}"));
+        if !keycap && (ch.is_ascii_alphanumeric() || ch == ':' || ch == '/') {
             return false;
         }
         if !ch.is_ascii() {
@@ -2879,6 +2915,20 @@ mod tests {
         assert!(!unicode_emoji(":smile:"));
         assert!(!unicode_emoji("ok"));
         assert!(!unicode_emoji(""));
+    }
+
+    /// A keycap reaction (1️⃣) was refused when sent and dropped when another app had put one on
+    /// a message, because it starts with an ASCII digit.
+    #[test]
+    fn a_keycap_is_a_reaction_and_a_bare_digit_is_not() {
+        assert!(unicode_emoji("1\u{FE0F}\u{20E3}"));
+        assert!(unicode_emoji("7\u{20E3}"), "a keycap without its variation selector");
+        assert!(unicode_emoji("*\u{FE0F}\u{20E3}"));
+        assert!(!unicode_emoji("1"));
+        assert!(!unicode_emoji("1\u{FE0F}"), "a digit and a variation selector are not a keycap");
+        assert!(!unicode_emoji("10\u{FE0F}\u{20E3}"), "only the digit right before the keycap mark is part of it");
+        assert!(!unicode_emoji("a\u{20E3}"));
+        assert!(super::prove_keycap_reaction().is_ok());
     }
 
     #[test]
