@@ -96,6 +96,11 @@ pub(crate) fn prove_pane_focus_pointer() -> Result<(), &'static str> {
     components::scroll::prove_pane_focus_pointer()
 }
 
+/// The lab's push-to-talk-release driver. A mic let go before its recording runs is still stopped.
+pub(crate) fn prove_push_to_talk_release() -> Result<(), &'static str> {
+    composer::prove_push_to_talk_release()
+}
+
 /// The lab's selection-clamp driver. A backwards caret pair paints no accent width.
 pub(crate) fn prove_selection_clamp() -> Result<(), &'static str> {
     conversation::prove_selection_clamp()

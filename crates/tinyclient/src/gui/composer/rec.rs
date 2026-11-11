@@ -39,6 +39,59 @@ pub(in crate::gui) fn on_hold_up(recording: &Option<Recording>, target: &Key) ->
     runs.then_some(RecordRequest::Stop)
 }
 
+/// What a word from chatd means to a stop that is still owed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::gui) enum Owed {
+    /// The recording the hold began runs now: stop it, and the debt is paid.
+    Stop,
+    /// It ended by itself (a note kept, or a failure): nothing is owed any more.
+    Paid,
+    /// Not a word about it yet: the debt stands.
+    Wait,
+}
+
+/// The mic was let go before chatd said its recording runs: a quick tap, a release grace of
+/// none, or a recorder slow to start. `on_hold_up` had nothing to stop then, so the stop is owed
+/// to the conversation, and each `Change::Recording` after it is asked here. Without this the
+/// recording would start a moment later with nobody left to end it.
+pub(in crate::gui) fn on_owed_stop(recording: &Option<Recording>, owed: &Key) -> Owed {
+    match recording.as_ref().filter(|recording| recording.conversation == *owed) {
+        Some(recording) if matches!(recording.state, RecordState::Active) => Owed::Stop,
+        Some(_) => Owed::Paid,
+        // Nothing on show, or another conversation's: the start is still on its way.
+        None => Owed::Wait,
+    }
+}
+
+/// The lab's push-to-talk-release driver: the whole of a quick tap, as the composer walks it.
+/// The press records; the release finds nothing running yet and owes the stop; chatd's words
+/// arrive, and the one that says the recording runs is answered with the stop.
+pub(in crate::gui) fn prove_push_to_talk_release() -> Result<(), &'static str> {
+    let key = Key { network: protocol::Network::Telegram, account: "1".into(), id: "7002".into() };
+    let running = Recording { conversation: key.clone(), since: 10_000, state: RecordState::Active };
+    if !matches!(on_hold_down(&key), RecordRequest::Start { .. }) {
+        return Err("holding the mic did not start a recording");
+    }
+    if on_hold_up(&Some(running.clone()), &key) != Some(RecordRequest::Stop) {
+        return Err("letting go did not stop the recording that ran");
+    }
+    // The quick tap: let go before the recording is said to run.
+    if on_hold_up(&None, &key).is_some() {
+        return Err("letting go stopped a recording that was not there");
+    }
+    if on_owed_stop(&None, &key) != Owed::Wait {
+        return Err("the owed stop was dropped before the recording began");
+    }
+    if on_owed_stop(&Some(running.clone()), &key) != Owed::Stop {
+        return Err("a quick tap left the microphone recording");
+    }
+    let failed = Recording { state: RecordState::Failed { detail: "No microphone.".into() }, ..running };
+    if on_owed_stop(&Some(failed), &key) != Owed::Paid {
+        return Err("a recording that failed was still owed a stop");
+    }
+    Ok(())
+}
+
 /// The composer's foot on a recording, for the conversation it belongs to. `now` is unix
 /// milliseconds, as `since` is; `push` names the way the mic works, for what ends it.
 pub(in crate::gui) fn foot(recording: &Option<Recording>, target: &Key, now: u64, push: bool) -> Option<(String, Tone)> {
@@ -208,6 +261,33 @@ mod tests {
         let key = target();
         assert!(matches!(on_hold_down(&key), RecordRequest::Start { .. }), "every down records");
         assert_eq!(on_hold_up(&Some(active()), &key), Some(RecordRequest::Stop), "the release stops the run");
+    }
+
+    /// A tap let go before chatd says the recording runs: the stop is owed, waits out the words
+    /// that are not about it, and is paid by the one that says it runs.
+    #[test]
+    fn a_tap_let_go_before_the_recording_runs_still_stops_it() {
+        let key = target();
+        assert_eq!(on_hold_up(&None, &key), None, "nothing runs yet at the release");
+        // `start` clears what was on show first, so an empty word comes before the running one.
+        assert_eq!(on_owed_stop(&None, &key), Owed::Wait);
+        let elsewhere = Recording { conversation: Key { account: key.account.clone(), network: key.network, id: "9001".into() }, ..active() };
+        assert_eq!(on_owed_stop(&Some(elsewhere), &key), Owed::Wait, "another's recording is not the one owed");
+        assert_eq!(on_owed_stop(&Some(active()), &key), Owed::Stop, "the mic does not stay hot");
+    }
+
+    /// A recording that ended by itself owes no stop: asking would only end the next one.
+    #[test]
+    fn an_owed_stop_is_paid_by_a_recording_that_ended_by_itself() {
+        let key = target();
+        assert_eq!(on_owed_stop(&Some(kept("voice-1.opus")), &key), Owed::Paid);
+        let failed = Recording { state: RecordState::Failed { detail: "No microphone.".into() }, ..active() };
+        assert_eq!(on_owed_stop(&Some(failed), &key), Owed::Paid);
+    }
+
+    #[test]
+    fn the_lab_proof_of_a_quick_tap_holds() {
+        assert_eq!(prove_push_to_talk_release(), Ok(()));
     }
 
     /// A release stops only a recording that still runs here: a note kept, a failure, another

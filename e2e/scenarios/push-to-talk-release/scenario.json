@@ -1,0 +1,12 @@
+{
+  "id": "push-to-talk-release",
+  "title": "With push-to-talk on, a mic let go before its recording runs is still stopped",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same hold and release is what the phone composer's mic uses.",
+    "ios": "The phone proof build does not run the desktop window. The same hold and release is what the phone composer's mic uses."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
