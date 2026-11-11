@@ -372,6 +372,8 @@ fn serve() -> io::Result<()> {
     out::send(&MediaResponse::Ready { engine_linked: ENGINE_LINKED });
     let mut call = Call::default();
     let controls = call.controls.clone();
+    // A call needs a certificate; it is made while this process waits for one.
+    let _ = out::spawn(std::thread::Builder::new().name("warm-up".to_owned()), tiny::warm_up);
     // Ends with the process. A mediad that cannot start it has no device menu, and still calls.
     let _ = out::spawn(std::thread::Builder::new().name("devices".to_owned()), move || watch_devices(&controls));
     loop {

@@ -1838,6 +1838,7 @@ impl Chat {
     fn tiny_join(&self, account: AccountKey, room_id: String) -> Response {
         let ids = [room_id.clone()];
         let room = Key::new(&account, &room_id);
+        self.hub.calls.clicked(&room);
         let answer = self.tiny_call(&account, "community.calls.join", &ids, |reply| adapters::tiny::live::Ask::Join { room_id, reply });
         if answer == Response::Ok {
             if let Some(call) = self.hub.calls.describe().0.filter(|call| call.conversation == room && (call.muted || call.deafened)) {
@@ -1933,6 +1934,7 @@ impl Chat {
             return call_error(CallError::NoCall);
         };
         if conversation.network == Network::Tiny {
+            self.hub.calls.clicked(&conversation);
             self.command(&conversation.account(), Command::CallJoin(conversation.id));
             return self.status();
         }

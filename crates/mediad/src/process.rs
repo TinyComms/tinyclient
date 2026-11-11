@@ -158,6 +158,28 @@ fn front_config(chosen: AudioProcessing, isolated: bool) -> Config {
     }
 }
 
+/// The voice-isolation model, built the first time it is wanted and kept: building it is the
+/// slow part of turning isolation on. A call builds it while its devices open (`warm_isolation`),
+/// so the first microphone frame does not wait for it.
+fn hush_model() -> Option<Arc<Hush>> {
+    static MODEL: std::sync::Mutex<Option<Arc<Hush>>> = std::sync::Mutex::new(None);
+    let mut held = MODEL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.is_none() {
+        match Hush::new() {
+            Ok(model) => *held = Some(Arc::new(model)),
+            Err(err) => tracing::warn!("voice isolation did not start: {err}"),
+        }
+    }
+    held.clone()
+}
+
+/// Builds the voice-isolation model now if `chosen` will want it.
+pub fn warm_isolation(chosen: Option<AudioProcessing>) {
+    if chosen.is_some_and(|chosen| chosen.noise == NoiseMode::Enhanced) {
+        let _ = hush_model();
+    }
+}
+
 fn gain_config() -> Config {
     Config {
         gain_controller2: Some(agc()),
@@ -245,13 +267,7 @@ impl Processor {
             self.hush = None;
             return;
         };
-        let hush = (chosen.noise == NoiseMode::Enhanced).then(|| match Hush::new() {
-            Ok(model) => Some(HushStream::new(Arc::new(model))),
-            Err(err) => {
-                tracing::warn!("voice isolation did not start: {err}");
-                None
-            }
-        });
+        let hush = (chosen.noise == NoiseMode::Enhanced).then(|| hush_model().map(HushStream::new));
         let isolated = hush.as_ref().is_some_and(Option::is_some);
         self.hush = hush.flatten();
         self.front = wants_front(chosen).then(|| apm(front_config(chosen, isolated)));

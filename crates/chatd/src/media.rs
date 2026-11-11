@@ -43,6 +43,9 @@ const RING: Duration = Duration::from_secs(60);
 const WATCH: Duration = Duration::from_millis(250);
 /// How long a mediad started ahead of a call waits for one before it goes.
 const WARM_FOR: Duration = Duration::from_secs(10 * 60);
+/// A join that takes longer than this from the click to media is logged as slow, with where the
+/// time went.
+const SLOW_JOIN: Duration = Duration::from_secs(3);
 /// Speakers remembered ahead of the roster that names them.
 const TALKING: usize = 64;
 /// A roster change this soon after joining is the roster arriving, not someone joining.
@@ -168,6 +171,15 @@ pub struct Calls {
     warm: Mutex<Option<Warm>>,
     /// A mediad is being started ahead of a call; another is not started beside it.
     warming: AtomicBool,
+    /// Where the time of the join being made goes (`clicked`, `stage`).
+    timeline: Mutex<Option<Timeline>>,
+}
+
+/// The stages of one join, from the click. Only their names and times are kept.
+struct Timeline {
+    conversation: Key,
+    clicked: Instant,
+    stages: Vec<(&'static str, u64)>,
 }
 
 /// A mediad with no call (`mediad test`): it opens the microphone while the meter is on and the
@@ -663,7 +675,10 @@ impl ActiveCall {
                             Some(false) if matches!(state_now, CallState::Reconnecting) => {
                                 reader.calls.tiny_down(&conversation)
                             }
-                            Some(true) => reader.calls.tiny_up(&conversation),
+                            Some(true) => {
+                                reader.calls.joined(&conversation);
+                                reader.calls.tiny_up(&conversation)
+                            }
                             _ => {}
                         }
                     }
@@ -706,10 +721,6 @@ impl ActiveCall {
 
     fn handle(&self) -> Handle {
         Handle { pipe: self.pipe.clone(), live: self.live.clone() }
-    }
-
-    fn request(&self, request: &MediaRequest) -> io::Result<MediaResponse> {
-        self.handle().request(request)
     }
 
     /// The call this mediad was started ahead of is now `conversation`'s. What it learned of
@@ -932,10 +943,12 @@ impl Calls {
             }
         };
         active.adopt(conversation.clone(), intent, muted);
+        self.stage(&conversation, if applied.is_some() { "mediad_ready_warm" } else { "mediad_ready_cold" });
         // The user's defaults, before the voice session arrives: mediad opens the devices
         // only once it holds one. A mediad that refuses them still carries the call.
         let handle = active.handle();
         send_session(&handle, &wanted, applied.as_deref());
+        self.stage(&conversation, "settings_applied");
         // V9: everyone on this account whose volume for me is not the default.
         let gains = hub.settings().gains(&conversation.account());
         for (user_id, percent, muted) in gains {
@@ -969,6 +982,45 @@ impl Calls {
     fn take_warm(&self) -> Option<Warm> {
         let mut warm = crate::hub::lock(&self.warm).take()?;
         warm.active.alive().then_some(warm)
+    }
+
+    /// The person pressed Join, or answered: the clock of this join starts. Nothing here is
+    /// personal: stage names and milliseconds.
+    pub fn clicked(&self, conversation: &Key) {
+        tracing::info!(network = conversation.network.label(), "call join: clicked");
+        *crate::hub::lock(&self.timeline) = Some(Timeline { conversation: conversation.clone(), clicked: Instant::now(), stages: Vec::new() });
+    }
+
+    /// One stage of the join in `conversation` is done, `elapsed_ms` after the click. The stages
+    /// mediad reaches after this point it logs itself, from its own offer (`mediad.log`).
+    fn stage(&self, conversation: &Key, name: &'static str) {
+        let mut line = crate::hub::lock(&self.timeline);
+        let Some(timeline) = line.as_mut().filter(|timeline| timeline.conversation == *conversation) else {
+            return;
+        };
+        let elapsed_ms = timeline.clicked.elapsed().as_millis() as u64;
+        timeline.stages.push((name, elapsed_ms));
+        tracing::info!(stage = name, elapsed_ms, "call join");
+    }
+
+    /// Media is up: the join is over, and is told as a whole. Slow ones are a warning.
+    fn joined(&self, conversation: &Key) {
+        let mut line = crate::hub::lock(&self.timeline);
+        if !line.as_ref().is_some_and(|timeline| timeline.conversation == *conversation) {
+            return;
+        }
+        let Some(timeline) = line.take() else {
+            return;
+        };
+        drop(line);
+        let elapsed = timeline.clicked.elapsed();
+        let stages = timeline.stages.iter().map(|(name, ms)| format!("{name}={ms}")).collect::<Vec<_>>().join(" ");
+        let elapsed_ms = elapsed.as_millis() as u64;
+        if elapsed > SLOW_JOIN {
+            tracing::warn!(stage = "connected", elapsed_ms, stages = stages.as_str(), "call join was slow");
+        } else {
+            tracing::info!(stage = "connected", elapsed_ms, stages = stages.as_str(), "call join");
+        }
     }
 
     /// Starts a mediad ahead of the next call, so that joining finds one running with the
@@ -1745,7 +1797,10 @@ impl Calls {
             result
         } else { self.request(hub, &request) };
         match answer {
-            Ok(MediaResponse::Offer { sdp }) => Ok(sdp),
+            Ok(MediaResponse::Offer { sdp }) => {
+                self.stage(conversation, "offer_built");
+                Ok(sdp)
+            }
             answer => {
                 let variant = match &answer {
                     Ok(frame) => frame.name(),
@@ -1766,6 +1821,7 @@ impl Calls {
 
     /// The server's answer to the last offer. From here the wait is for mediad to connect.
     pub fn tiny_answer(&self, hub: &Hub, conversation: &Key, sdp: String) {
+        self.stage(conversation, "answer_received");
         let known = self.update(hub, conversation, |live| {
             live.joining = true;
             live.since = Instant::now();
@@ -1954,6 +2010,36 @@ mod tests {
             assert!(!media, "a stale offer never starts the engine for a new unaccepted ring");
             hub.calls.end(&hub);
         }
+    }
+
+    #[test]
+    fn a_join_is_timed_from_the_click_for_its_own_conversation_and_told_once() {
+        let calls = Calls::default();
+        let key = Key { network: Network::Tiny, account: "me".into(), id: "lounge".into() };
+        let other = Key { id: "den".into(), ..key.clone() };
+        calls.stage(&key, "offer_built");
+        assert!(crate::hub::lock(&calls.timeline).is_none(), "no click, no timeline");
+        calls.clicked(&key);
+        calls.stage(&key, "offer_built");
+        calls.stage(&other, "answer_received");
+        assert_eq!(crate::hub::lock(&calls.timeline).as_ref().unwrap().stages.len(), 1, "another room's stage is not this join's");
+        calls.joined(&other);
+        assert!(crate::hub::lock(&calls.timeline).is_some());
+        calls.joined(&key);
+        assert!(crate::hub::lock(&calls.timeline).is_none(), "told once, then gone");
+    }
+
+    #[test]
+    fn a_direct_call_starts_only_from_the_ring_showing_and_nothing_starts_over_a_running_engine() {
+        let key = Key { network: Network::Tiny, account: "me".into(), id: "direct".into() };
+        let ring = new_call(key.clone(), CallState::RingingOut);
+        let intent = ring.intent;
+        let mut slot = Slot::Shown(Box::new(ring));
+        assert!(admit(&mut slot, &key, Some(intent)).is_ok());
+        assert!(matches!(admit(&mut slot, &key, Some(intent + 1)), Err(CallError::NoCall)), "a ring that is gone");
+        assert!(admit(&mut slot, &key, None).is_ok(), "a room join needs no ring");
+        let mut idle = Slot::Idle;
+        assert!(matches!(admit(&mut idle, &key, Some(intent)), Err(CallError::NoCall)));
     }
 
     #[test]
