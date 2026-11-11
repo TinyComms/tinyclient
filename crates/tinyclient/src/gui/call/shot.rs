@@ -18,6 +18,9 @@
 //! faces; `tiny_security` opens the security panel from the channel's top bar,
 //! `tiny_security_bar` from the column's compact bar. `tiny_poor`'s numbers carry audio trouble
 //! too, for the health hints.
+//!
+//! `tiny_sharing` is a call where I share my screen and mediad has painted the first picture of
+//! it for my own tile (a made-up one, the demo's schematic); `--tiny-stream` focuses my stream.
 
 use super::phone::{Sheet, Shown};
 use super::security::Place;
@@ -198,6 +201,7 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
     // The open conversation's, so the header pill reads Leave or Cancel as it would.
     let conversation = snapshot.open.as_ref().map_or_else(|| key("shot"), |open| open.key.clone());
     let muted = matches!(name.as_str(), "joined_muted" | "muted_talking");
+    let sharing = name == "sharing";
     let participants = if tiny() {
         // A Tiny stage draws the room's seats, not the call's roster.
         Vec::new()
@@ -257,11 +261,21 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         input: "MacBook Pro Microphone".to_owned(),
         output: "MacBook Pro Speakers".to_owned(),
         engine_linked: true,
-        video: Vec::new(),
+        video: sharing.then(|| protocol::VideoStream { direction: protocol::Direction::Encode, content: protocol::Content::Share, source: String::new() }).into_iter().collect(),
         security: None,
         picture: None,
         self_view: None,
+        share_view: sharing.then(screen_picture).flatten(),
     })
+}
+
+/// A made-up picture of my own screen, as mediad paints it for my tile: the demo's schematic
+/// shrunk to the self-view size and written as a JPEG.
+fn screen_picture() -> Option<protocol::CallPicture> {
+    let shrunk = image::open(photo("schematic.webp")).ok()?.resize(640, 360, image::imageops::FilterType::Triangle).to_rgb8();
+    let path = std::env::temp_dir().join("tinyclient-shot-screen.jpg");
+    shrunk.save_with_format(&path, image::ImageFormat::Jpeg).ok()?;
+    Some(protocol::CallPicture { path: path.display().to_string(), width: shrunk.width(), height: shrunk.height(), generation: 1, user_id: String::new(), kind: protocol::PictureKind::Share })
 }
 
 fn mara() -> Subject {
@@ -384,6 +398,7 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joi
         security: None,
         picture: None,
         self_view: None,
+        share_view: None,
     }
 }
 

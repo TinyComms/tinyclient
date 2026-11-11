@@ -251,8 +251,8 @@ pub enum Word {
     },
     /// The share or the camera cannot go on, in words.
     Failed { share: bool, words: String },
-    /// My own camera, painted for my tile; `None` when the camera went off.
-    SelfView(Option<Painted>),
+    /// My own camera, or with `share` my own share, painted for my tile; `None` when it went off.
+    SelfView { share: bool, painted: Option<Painted> },
 }
 
 /// The RTP time at 90 kHz of a capture `since` the first one.
@@ -382,11 +382,19 @@ pub trait Source {
     fn self_view(&mut self) -> Option<Painted> {
         None
     }
+    /// My own share painted for me since last asked, on the same terms.
+    fn share_view(&mut self) -> Option<Painted> {
+        None
+    }
 }
 
 impl Source for Outgoing {
     fn self_view(&mut self) -> Option<Painted> {
         Outgoing::self_view(self)
+    }
+
+    fn share_view(&mut self) -> Option<Painted> {
+        Outgoing::share_view(self)
     }
 
     fn share(&mut self, ask: Ask) -> Result<Encoded, String> {
@@ -526,6 +534,11 @@ impl<S: Source> Capture<S> {
                     return false;
                 }
             }
+            if let Some(painted) = self.source.share_view() {
+                if self.tell.send(Word::SelfView { share: true, painted: Some(painted) }).is_err() {
+                    return false;
+                }
+            }
         }
         if wants.camera {
             let high = self.ask(Track::High, wants.rates.high, since, at, fps);
@@ -537,13 +550,11 @@ impl<S: Source> Capture<S> {
                     {
                         return false;
                     }
-        if wants.camera {
-            if let Some(painted) = self.source.self_view() {
-                if self.tell.send(Word::SelfView(Some(painted))).is_err() {
-                    return false;
-                }
-            }
-        }
+                    if let Some(painted) = self.source.self_view() {
+                        if self.tell.send(Word::SelfView { share: false, painted: Some(painted) }).is_err() {
+                            return false;
+                        }
+                    }
                 }
                 Err(words) => {
                     if let Some(ask) = high {
@@ -633,10 +644,11 @@ fn capture<S: Source>(mut work: Capture<S>, orders: &Orders) {
                 work.source.close_camera();
             }
             if seen.camera && !wants.camera {
-                let _ = work.tell.send(Word::SelfView(None));
+                let _ = work.tell.send(Word::SelfView { share: false, painted: None });
             }
             if seen.share && !wants.share {
                 work.source.close_share();
+                let _ = work.tell.send(Word::SelfView { share: true, painted: None });
             }
             schedule.rate(&wants);
             seen = wants;
@@ -1395,6 +1407,12 @@ mod tests {
         skip_next: bool,
         refuse: Option<String>,
         closed: u32,
+        /// Paints a picture of my camera and of my share with every round, as a desktop does.
+        painting: bool,
+    }
+
+    fn painted(name: &str) -> Painted {
+        Painted { path: std::path::PathBuf::from(name), width: 4, height: 2, generation: 1 }
     }
 
     fn coded(ask: Ask, name: u8) -> Encoded {
@@ -1429,6 +1447,14 @@ mod tests {
 
         fn close_camera(&mut self) {
             self.closed += 1;
+        }
+
+        fn self_view(&mut self) -> Option<Painted> {
+            self.painting.then(|| painted("camera.jpg"))
+        }
+
+        fn share_view(&mut self) -> Option<Painted> {
+            self.painting.then(|| painted("share.jpg"))
         }
     }
 
@@ -1491,6 +1517,76 @@ mod tests {
             (low, low_at),
             "h and l of one capture share their RTP time"
         );
+    }
+
+    fn views(words: &Receiver<Word>) -> Vec<(bool, Option<String>)> {
+        words
+            .try_iter()
+            .filter_map(|word| match word {
+                Word::SelfView { share, painted } => Some((share, painted.map(|painted| painted.path.display().to_string()))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn my_share_and_my_camera_are_painted_for_me_apart_when_both_are_on() {
+        let (mut capture, words) = work(Arc::default());
+        capture.source.painting = true;
+        assert!(capture.round(&wanting(true, true), Instant::now(), 15.));
+        assert_eq!(
+            views(&words),
+            [(true, Some("share.jpg".to_owned())), (false, Some("camera.jpg".to_owned()))],
+            "one slot each, so neither clobbers the other"
+        );
+    }
+
+    #[test]
+    fn only_what_is_on_is_painted_for_me() {
+        let (mut capture, words) = work(Arc::default());
+        capture.source.painting = true;
+        assert!(capture.round(&wanting(true, false), Instant::now(), 15.));
+        assert_eq!(views(&words), [(true, Some("share.jpg".to_owned()))], "a share alone has no camera view");
+        assert!(capture.round(&wanting(false, true), Instant::now(), 15.));
+        assert_eq!(views(&words), [(false, Some("camera.jpg".to_owned()))], "a camera alone has no share view");
+    }
+
+    #[test]
+    fn the_capture_thread_takes_my_share_view_down_when_the_share_stops() {
+        struct Viewing(Fake);
+        impl Source for Viewing {
+            fn share(&mut self, ask: Ask) -> Result<Encoded, String> {
+                self.0.share(ask)
+            }
+            fn camera(&mut self, high: Option<Ask>, low: Option<Ask>) -> Result<(Encoded, Encoded), String> {
+                self.0.camera(high, low)
+            }
+            fn close_camera(&mut self) {}
+            fn share_view(&mut self) -> Option<Painted> {
+                self.0.share_view()
+            }
+        }
+        let sender = start_capture(|| Viewing(Fake { painting: true, ..Fake::default() }), Arc::default()).unwrap();
+        let tell = |wants: Wants| {
+            sender.orders.order.lock().unwrap().wants = wants;
+            sender.orders.changed.notify_all();
+        };
+        tell(wanting(true, false));
+        let seen = |word: &Word| matches!(word, Word::SelfView { share: true, painted: Some(_) });
+        loop {
+            let word = sender.words.recv_timeout(Duration::from_secs(5)).unwrap();
+            if seen(&word) {
+                break;
+            }
+        }
+        tell(Wants::default());
+        let mut cleared = false;
+        while let Ok(word) = sender.words.recv_timeout(Duration::from_millis(300)) {
+            cleared |= matches!(word, Word::SelfView { share: true, painted: None });
+        }
+        assert!(cleared, "the tile is told my share is gone");
+        sender.orders.order.lock().unwrap().stop = true;
+        sender.orders.changed.notify_all();
     }
 
     #[test]
@@ -1947,12 +2043,51 @@ mod tests {
                     bytes += payload.len();
                 }
                 Some(Word::Failed { words, .. }) => panic!("{words}"),
-                Some(Word::SelfView(_)) => {}
+                Some(Word::SelfView { .. }) => {}
                 None => std::thread::yield_now(),
             }
         }
         eprintln!("{frames} frames, {bytes} bytes in 3 s");
         assert!(frames >= 30, "about 15 a second: {frames}");
+        video.stop();
+    }
+
+    /// What `e2e/scenarios/share-self-view` runs: my own share, painted for me from the real
+    /// screen through the real capture thread, and taken down when the share stops.
+    #[test]
+    #[ignore = "needs a screen and the OpenH264 binary"]
+    fn the_capture_thread_paints_my_own_share_from_a_real_screen() {
+        let mut video = Video::new(Arc::default());
+        video.want(Wants { share: true, rates: Rates::default(), ..Wants::default() });
+        let started = Instant::now();
+        let mut shown = None;
+        while shown.is_none() && started.elapsed() < Duration::from_secs(20) {
+            match video.next() {
+                Some(Word::SelfView { share: true, painted: Some(painted) }) => shown = Some(painted),
+                Some(Word::SelfView { share: false, .. }) => panic!("the camera is off, so no camera view"),
+                Some(Word::Failed { words, .. }) => panic!("{words}"),
+                Some(_) => {}
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        let shown = shown.expect("my own share was never painted for me");
+        let jpeg = std::fs::read(&shown.path).expect("the picture is on disk");
+        let size = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).expect("a JPEG the window can read");
+        assert_eq!((size.width(), size.height()), (shown.width, shown.height));
+        assert!(shown.width <= picture::SELF_VIEW.0 && shown.height <= picture::SELF_VIEW.1, "{}x{}", shown.width, shown.height);
+        eprintln!("share-self-view-proof: {}x{} JPEG of the real screen, {} bytes", shown.width, shown.height, jpeg.len());
+        video.want(Wants::default());
+        let stopped = Instant::now();
+        let mut cleared = false;
+        while !cleared && stopped.elapsed() < Duration::from_secs(10) {
+            match video.next() {
+                Some(Word::SelfView { share: true, painted: None }) => cleared = true,
+                Some(_) => {}
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert!(cleared, "the window is told my share is gone");
+        eprintln!("share-self-view-proof: cleared when the share stopped");
         video.stop();
     }
 
