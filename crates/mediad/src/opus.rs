@@ -207,8 +207,6 @@ impl Drop for Encoder {
 
 pub struct Decoder {
     state: *mut OpusDecoder,
-    /// The last packet was CELT-only, the mode whose concealment libopus is trusted with here.
-    celt: bool,
     /// A packet has been decoded: the decoder has a mode, and a last sample to fade from.
     started: bool,
     /// The last frame that came out, for concealing a loss ourselves.
@@ -221,6 +219,12 @@ pub struct Decoder {
     cursor: usize,
     gain: f32,
     concealing: bool,
+    /// Frames libopus made up, for a loss or a packet not here yet; and frames the pitch loop
+    /// made up because libopus would not. Read for the log.
+    pub concealed: u64,
+    pub looped: u64,
+    /// Ticks in a row [`Decoder::stand_in`] has carried the voice on for a packet not here yet.
+    standing: u32,
 }
 
 unsafe impl Send for Decoder {}
@@ -232,7 +236,6 @@ impl Decoder {
         let state = unsafe { opus_decoder_create(RATE as i32, CHANNELS as i32, &mut error) };
         (!state.is_null() && error == 0).then_some(Decoder {
             state,
-            celt: false,
             started: false,
             last: Vec::new(),
             misses: 0,
@@ -240,6 +243,9 @@ impl Decoder {
             cursor: 0,
             gain: 0.,
             concealing: false,
+            concealed: 0,
+            looped: 0,
+            standing: 0,
         })
     }
 
@@ -251,31 +257,14 @@ impl Decoder {
             return Some(self.conceal(lost.min(room), pcm));
         };
         self.forget();
-        // After a SILK or hybrid packet, libopus builds a CELT-only one out of 5 ms of SILK
-        // packet-loss concealment. A packet from an encoder carries a redundant CELT frame to
-        // splice there; the fixed silence packet does not, and this build's concealment
-        // saturates. The mode change resets CELT anyway, so start from a clean state instead.
-        let celt = packet[0] >> 3 >= 16;
-        let switched = celt && !self.celt && self.started;
-        if switched {
-            // SAFETY: `state` is a live decoder; the request takes no argument.
-            unsafe {
-                opus_decoder_ctl!(self.state, OPUS_RESET_STATE);
-            }
-        }
+        // After a SILK or hybrid packet, libopus builds the first CELT-only one out of 5 ms of
+        // SILK concealment. With the patched library (vendor/unsafe-libopus) that splice is the
+        // reference's, so a mode switch needs nothing of ours.
         // SAFETY: `pcm` has room for `room` samples per channel.
         let decoded = unsafe { opus_decode(self.state, packet.as_ptr(), packet.len() as i32, pcm.as_mut_ptr(), room as i32, 0) };
         let samples = usize::try_from(decoded).ok()?;
-        // The table-of-contents byte's top five bits are the configuration; 16 and up are CELT.
-        self.celt = celt;
         self.started = true;
-        if switched {
-            // No waveform continues across the switch, so fade this frame in from the sample
-            // the speech ended on. A step there is the click.
-            self.start_afresh(&mut pcm[..samples * CHANNELS]);
-        } else {
-            self.resume(&mut pcm[..samples * CHANNELS]);
-        }
+        self.resume(&mut pcm[..samples * CHANNELS]);
         Some(samples)
     }
 
@@ -307,31 +296,24 @@ impl Decoder {
         samples
     }
 
-    /// `frames` went by that the decoder will never see and no tick stands in for. Whatever it
-    /// decodes next starts from a clean state, as after that many concealed frames in a row.
+    /// `frames` went by that the decoder will never see and no tick stands in for. libopus takes
+    /// the next packet after them as after any loss.
     pub(crate) fn missed(&mut self, frames: u32) {
-        if frames > 0 {
-            self.carry_on();
-            self.misses = self.misses.saturating_add(frames);
-        }
+        self.misses = self.misses.saturating_add(frames);
     }
 
-    /// Stands in for a lost packet when the one after it cannot rebuild it ([`Decoder::recover`]).
-    /// After CELT, libopus conceals it. After a SILK or hybrid packet it may not:
-    /// `unsafe-libopus` 0.2.0 saturates there (a test below holds it to that, so a fixed library
-    /// is noticed), so the decoder is left untouched and the voice is carried on here instead:
-    /// the last pitch period of what was heard, repeated from exactly where it left off, fading
-    /// to silence over 60 ms. Repeating the whole last frame instead jumps at each seam, and
-    /// that jump is a click every lost packet.
+    /// Stands in for a lost packet when the one after it cannot rebuild it ([`Decoder::recover`]):
+    /// libopus conceals it, in every mode. Until the library was patched (vendor/unsafe-libopus)
+    /// it saturated after a SILK or hybrid packet, and a repeated pitch period stood in for it
+    /// there: that loop is the voice heard "under water". It is kept only for a decoder that
+    /// refuses to conceal.
     fn conceal(&mut self, samples: usize, pcm: &mut [i16]) -> usize {
         self.misses += 1;
-        if self.celt {
-            // SAFETY: a null packet asks for concealment of `samples` per channel, which fit.
-            let decoded = unsafe { opus_decode(self.state, std::ptr::null(), 0, pcm.as_mut_ptr(), samples as i32, 0) };
-            if let Ok(decoded) = usize::try_from(decoded) {
-                return decoded;
-            }
+        if let Some(decoded) = self.plc(samples, pcm) {
+            self.concealed += 1;
+            return decoded;
         }
+        self.looped += 1;
         self.carry_on();
         let out = &mut pcm[..samples * CHANNELS];
         let fall = 1. / (FADE_FRAMES * samples.max(1)) as f32;
@@ -340,6 +322,50 @@ impl Decoder {
             self.gain = (self.gain - fall).max(0.);
         }
         samples
+    }
+
+    /// libopus's own concealment of one frame, into `pcm`. `None` when it refused, or before the
+    /// first packet, when there is nothing to carry on.
+    fn plc(&mut self, samples: usize, pcm: &mut [i16]) -> Option<usize> {
+        if !self.started || self.concealing {
+            return None;
+        }
+        // SAFETY: a null packet asks for concealment of `samples` per channel, which fit.
+        let decoded = unsafe { opus_decode(self.state, std::ptr::null(), 0, pcm.as_mut_ptr(), samples as i32, 0) };
+        let decoded = usize::try_from(decoded).ok().filter(|&decoded| decoded > 0)?;
+        self.record(&pcm[..decoded * CHANNELS]);
+        Some(decoded)
+    }
+
+    /// A tick in mid-speech whose packet is not here yet, a reorder wait or a late one: libopus
+    /// carries the voice on, as for a loss, and the packet decodes after it as the one after a
+    /// loss does. Only after a quiet frame, where nothing is heard either way, does
+    /// [`Decoder::late`] fade out instead.
+    ///
+    /// It fades to silence over 60 ms, as the voice would at the end of a sentence cut short: a
+    /// packet that has not come by then may never, and libopus would ring on for as long as it
+    /// is asked.
+    pub(crate) fn stand_in(&mut self, samples: usize, pcm: &mut [i16]) -> usize {
+        match self.plc(samples, pcm) {
+            Some(decoded) => {
+                self.concealed += 1;
+                let out = &mut pcm[..decoded * CHANNELS];
+                let (from, span) = (self.standing as f32, (FADE_FRAMES * decoded) as f32);
+                for (n, pair) in out.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
+                    let gain = (1. - (from * decoded as f32 + n as f32 + 1.) / span).max(0.);
+                    for sample in pair {
+                        *sample = (f32::from(*sample) * gain) as i16;
+                    }
+                }
+                self.standing += 1;
+                self.record(out);
+                decoded
+            }
+            None => {
+                self.looped += 1;
+                self.late(samples, pcm)
+            }
+        }
     }
 
     /// One tick with nothing to play: a packet running late, or the end of a sentence, and only
@@ -405,6 +431,7 @@ impl Decoder {
     /// A real frame came out, into `pcm`: crossfaded from the concealment it follows, if any,
     /// so speaking again after a loss does not click either.
     fn resume(&mut self, pcm: &mut [i16]) {
+        self.standing = 0;
         if self.concealing {
             let frames = pcm.len() / CHANNELS;
             let fade = RESUME.min(frames);
@@ -418,23 +445,6 @@ impl Decoder {
             }
             self.concealing = false;
         }
-        self.record(pcm);
-    }
-
-    /// A frame in another mode came out of a decoder that was reset for it: no waveform
-    /// continues across the switch, so fade it in from the sample the last frame ended on.
-    /// Stepping from that sample to wherever the new mode starts is the click.
-    fn start_afresh(&mut self, pcm: &mut [i16]) {
-        let from = self.ending();
-        let frames = pcm.len() / CHANNELS;
-        let fade = RESUME.min(frames);
-        for n in 0..fade {
-            let toward = (n + 1) as f32 / (fade + 1) as f32;
-            for (channel, sample) in pcm[n * CHANNELS..(n + 1) * CHANNELS].iter_mut().enumerate() {
-                *sample = (f32::from(from[channel]) * (1. - toward) + f32::from(*sample) * toward) as i16;
-            }
-        }
-        self.concealing = false;
         self.record(pcm);
     }
 
@@ -741,8 +751,8 @@ mod tests {
     }
 
     /// At 12 kbit/s libopus sends speech-mode (SILK) packets, as a low-bitrate voice channel
-    /// does. Asking `unsafe-libopus` 0.2.0 to conceal a loss after one returns full-scale
-    /// samples and leaves the following frames too loud, so `Decoder` conceals those itself.
+    /// does. A loss after one is concealed at the voice's level, and the frames after it are not
+    /// too loud: libopus's concealment, now that the library is patched.
     #[test]
     fn a_loss_after_a_speech_mode_packet_is_concealed_without_a_bang() {
         let (mut encoder, mut decoder) = (Encoder::at(12_000).unwrap(), Decoder::new().unwrap());
@@ -756,6 +766,7 @@ mod tests {
                 assert_eq!(concealed, FRAME);
                 let level = peak(&pcm[..FRAME * CHANNELS]);
                 assert!((2000..9_500).contains(&level), "concealment peaks at {level}");
+                assert_eq!(decoder.looped, 0, "libopus concealed it, not the pitch loop");
                 continue;
             }
             let decoded = decoder.decode(Some(&packet[..len]), 0, &mut pcm).unwrap();
@@ -776,11 +787,11 @@ mod tests {
             .collect()
     }
 
-    /// Why `conceal` does not ask libopus after a speech-mode packet. Checked again against
-    /// `unsafe-libopus` 0.2.0: its concealment there returns full scale, and so does the frame
-    /// after. When this test fails the library was fixed and the workaround can go.
+    /// The library itself, below `Decoder`: stock `unsafe-libopus` 0.2.0 returned full scale
+    /// here, every sample, because c2rust turned `silk_SAT16`'s lower bound into +32768. This
+    /// holds the patch in vendor/unsafe-libopus to it.
     #[test]
-    fn the_library_still_saturates_when_asked_to_conceal_after_a_speech_mode_packet() {
+    fn the_library_conceals_a_speech_mode_loss_without_saturating() {
         let packets = encoded(12_000, 8);
         let mut error = 0;
         // SAFETY: a decoder of our own, destroyed below; `pcm` has room for the longest frame.
@@ -793,7 +804,12 @@ mod tests {
             assert!(peak(&pcm[..FRAME * CHANNELS]) < 9_000, "the tone peaks at 8000");
             let concealed = opus_decode(raw, std::ptr::null(), 0, pcm.as_mut_ptr(), FRAME as i32, 0);
             assert_eq!(concealed, FRAME as i32);
-            assert_eq!(peak(&pcm[..FRAME * CHANNELS]), 32_767, "fixed upstream? then drop the workaround");
+            let level = peak(&pcm[..FRAME * CHANNELS]);
+            assert!((1_000..9_000).contains(&level), "concealment peaks at {level}; 32767 is the unpatched library");
+            let next = opus_decode(raw, packets[7].as_ptr(), packets[7].len() as i32, pcm.as_mut_ptr(), MAX_FRAME as i32, 0);
+            assert_eq!(next, FRAME as i32);
+            let level = peak(&pcm[..FRAME * CHANNELS]);
+            assert!(level < 9_000, "the frame after the loss peaks at {level}");
             opus_decoder_destroy(raw);
         }
     }
@@ -842,12 +858,10 @@ mod tests {
         assert!(energy(&pcm[..FRAME * CHANNELS]) < 10.);
     }
 
-    /// The canned silence packet is CELT-only, and the sentence before it is SILK or hybrid. The
-    /// decoder used to take that for a mode switch and splice 5 ms of SILK concealment onto the
-    /// front, which this build saturates: a full-scale tick at the start of "silence". It is
-    /// decoded from a clean state and faded in from the sample the speech ended on instead.
-    /// A decoder that never heard speech (`the_silence_frame_is_opus_and_decodes_to_quiet`)
-    /// cannot see this.
+    /// The canned silence packet is CELT-only, and the sentence before it is SILK or hybrid.
+    /// libopus splices 5 ms of SILK concealment onto the front of it, which the unpatched library
+    /// saturated: a full-scale tick at the start of "silence". A decoder that never heard speech
+    /// (`the_silence_frame_is_opus_and_decodes_to_quiet`) cannot see this.
     #[test]
     fn a_silence_packet_after_speech_fades_in_instead_of_banging() {
         let mut encoder = Encoder::voice().unwrap();
