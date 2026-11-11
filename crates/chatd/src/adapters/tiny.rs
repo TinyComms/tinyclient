@@ -33,6 +33,8 @@ pub fn prove_tiny_open_backfill() -> Result<(), String> {
 
 mod direct_prove;
 mod send_prove;
+#[cfg(test)]
+mod reuse_tests;
 
 /// The lab's tiny-send-identity proof. A send names the person at once and settles without the
 /// members list. See `send_prove`.
