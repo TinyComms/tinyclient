@@ -95,6 +95,10 @@ struct Live {
     room_bitrate: Option<u32>,
     /// How mediad last said the call is protected, before whom the user verified is applied.
     secured: Option<protocol::CallSecurity>,
+    /// A call has this mediad (`ActiveCall::adopt`, or a mediad started for one). Until then it
+    /// is an engine waiting: what it says (its device list, again at every hot-plug) is learned
+    /// but never drawn or announced as a call.
+    adopted: bool,
 }
 
 /// What is said to a mediad and what it answers, one request and reply at a time. It has a lock
@@ -288,6 +292,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         push_to_talk: false,
         room_bitrate: None,
         secured: None,
+        adopted: false,
     }
 }
 
@@ -298,6 +303,15 @@ fn input_mode(settings: &protocol::settings::Values, push_to_talk: bool) -> prot
     } else {
         settings.input_mode()
     }
+}
+
+/// The key a mediad started ahead of any call carries (`warm_up`).
+fn nobody() -> Key {
+    Key { network: protocol::Network::Tiny, account: String::new(), id: String::new() }
+}
+
+fn conversation_is_nobody(key: &Key) -> bool {
+    *key == nobody()
 }
 
 /// Whether a call may start in `slot`: for a direct call, only from the ring that is showing,
@@ -422,6 +436,13 @@ impl Live {
             }
             _ => false,
         }
+    }
+
+    /// An event from mediad, taken in. The call to draw, when the event changes it and a call
+    /// has this mediad; an engine waiting for one draws and announces nothing.
+    fn hear(&mut self, event: MediaResponse) -> Option<Call> {
+        let draw = self.apply(event);
+        (draw && self.adopted).then(|| self.call.clone())
     }
 
     /// What an event from mediad does to the call. False when it changes nothing the shell draws.
@@ -630,6 +651,8 @@ impl ActiveCall {
         };
         let mut live = new_call(conversation, CallState::Connecting);
         live.call.engine_linked = engine_linked;
+        // A mediad started ahead of any call is started with no conversation (`warm_up`).
+        live.adopted = !conversation_is_nobody(&live.call.conversation);
         let live = Arc::new(Mutex::new(live));
         let (reply, replies) = channel();
 
@@ -664,13 +687,13 @@ impl ActiveCall {
                     };
                     let mut live = crate::hub::lock(&seen);
                     let conversation = live.call.conversation.clone();
-                    let draw = live.apply(frame);
-                    let call = draw.then(|| live.call.clone());
+                    let call = live.hear(frame);
+                    let adopted = live.adopted;
                     let state_now = live.call.state.clone();
                     drop(live);
                     // Outside the call lock. A drop while already reconnecting does not redraw, and
                     // still has to be resumed; the first connect is not one.
-                    if conversation.network == protocol::Network::Tiny {
+                    if adopted && conversation.network == protocol::Network::Tiny {
                         match notify {
                             Some(false) if matches!(state_now, CallState::Reconnecting) => {
                                 reader.calls.tiny_down(&conversation)
@@ -729,6 +752,7 @@ impl ActiveCall {
         let mut live = crate::hub::lock(&self.live);
         let (engine_linked, inputs, outputs) = (live.call.engine_linked, std::mem::take(&mut live.call.inputs), std::mem::take(&mut live.call.outputs));
         *live = new_call(conversation, CallState::Connecting);
+        live.adopted = true;
         live.call.engine_linked = engine_linked;
         (live.call.inputs, live.call.outputs) = (inputs, outputs);
         live.call.muted = muted;
@@ -1064,9 +1088,8 @@ impl Calls {
             return;
         }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let nobody = Key { network: protocol::Network::Tiny, account: String::new(), id: String::new() };
         let started = Instant::now();
-        let active = match ActiveCall::start(hub, id, nobody) {
+        let active = match ActiveCall::start(hub, id, nobody()) {
             Ok(active) => active,
             Err(err) => {
                 tracing::warn!("chatd: the call engine was not started ahead of a call: {err}");
@@ -2010,6 +2033,24 @@ mod tests {
             assert!(!media, "a stale offer never starts the engine for a new unaccepted ring");
             hub.calls.end(&hub);
         }
+    }
+
+    #[test]
+    fn an_engine_waiting_for_a_call_draws_and_announces_nothing_but_a_call_that_has_it_does() {
+        let devices = |name: &str| MediaResponse::DeviceList { inputs: vec![AudioDevice { name: name.into(), ..AudioDevice::default() }], outputs: Vec::new() };
+        let mut waiting = live(CallState::Connecting);
+        assert!(!waiting.adopted);
+        // The first list, and a hot-plug after it: learned, not drawn.
+        assert!(waiting.hear(devices("Mic")).is_none());
+        assert!(waiting.hear(devices("Headset")).is_none());
+        assert_eq!(waiting.call.inputs.len(), 1, "the list is still kept for the call that comes");
+        // A call takes it: the same event is drawn as before.
+        waiting.adopted = true;
+        assert!(waiting.hear(devices("Mic")).is_some());
+        assert!(waiting.hear(devices("Mic")).is_none(), "no change, nothing to draw");
+        // A cold start for a real conversation is a call from the first word; one for nobody is not.
+        assert!(conversation_is_nobody(&nobody()));
+        assert!(!conversation_is_nobody(&Key { network: Network::Tiny, account: "me".into(), id: "lounge".into() }));
     }
 
     #[test]
