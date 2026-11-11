@@ -45,7 +45,7 @@ required checks in branch protection. Do that only once a few weeks of reviews h
 more than they have been wrong; the model is not infallible, and a required check from a model
 that cries wolf trains people to merge past red.
 
-The job is `continue-on-error`, so a provider outage does not turn the Actions run red either. It
+A provider outage does not turn the Actions run red either: the review step warns and exits clean. It
 says so in the check (neutral) and the sticky comment.
 
 ## How it keeps the key safe

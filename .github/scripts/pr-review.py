@@ -650,8 +650,8 @@ def gh(*args, input=None):
     return done.stdout.strip()
 
 
-def gh_json(*args):
-    out = gh(*args)
+def gh_json(*args, input=None):
+    out = gh(*args, input=input)
     return json.loads(out) if out else None
 
 

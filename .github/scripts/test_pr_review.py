@@ -485,6 +485,169 @@ class Posting(unittest.TestCase):
         self.assertIsNone(pr.run_url_from_env({}))
 
 
+class FakeGh:
+    """Stands in for the gh CLI. `routes` is a list of (text the call must contain, answer); the
+    first match wins, an Exception is raised, and anything unmatched answers empty."""
+
+    def __init__(self, *routes):
+        self.routes = list(routes)
+        self.calls = []
+
+    def __call__(self, *args, input=None):
+        line = " ".join(args)
+        self.calls.append((line, json.loads(input) if input else None))
+        for needle, answer in self.routes:
+            if needle in line:
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer if isinstance(answer, str) else json.dumps(answer)
+        return ""
+
+    def posted(self, needle):
+        return [payload for line, payload in self.calls if needle in line and payload is not None]
+
+
+BOT = {"login": pr.BOT_LOGIN}
+PR_JSON = {"number": 7, "title": "Fix it", "body": "why", "user": {"login": "someone"}, "html_url": "https://github.com/o/r/pull/7",
+           "base": {"ref": "main"}, "head": {"ref": "fix", "sha": "headsha"}, "draft": False}
+PR_FILES = [[{"filename": "crates/chatd/src/io.rs", "status": "modified", "additions": 2, "deletions": 1, "patch": PATCH}]]
+
+
+class GitHubIO(unittest.TestCase):
+    def use(self, fake):
+        self.old = pr.gh
+        pr.gh = fake
+        self.addCleanup(setattr, pr, "gh", self.old)
+        return fake
+
+    def test_the_pull_request_and_its_files(self):
+        self.use(FakeGh(("pulls/7/files", PR_FILES), ("pulls/7", PR_JSON)))
+        meta, files = pr.fetch_pull_request("o/r", 7)
+        self.assertEqual((meta["head_sha"], meta["author"], meta["base_ref"]), ("headsha", "someone", "main"))
+        self.assertEqual(files[0]["filename"], "crates/chatd/src/io.rs")
+
+    def test_the_sticky_comment_is_created_once_then_edited(self):
+        fake = self.use(FakeGh(("issues/7/comments?", [])))
+        pr.upsert_status_card("o/r", 7, "card")
+        self.assertEqual(fake.posted("--method POST repos/o/r/issues/7/comments"), [{"body": "card"}])
+        fake = self.use(FakeGh(("issues/7/comments?", [[{"id": 5, "body": pr.MARKER + " old", "user": BOT}]])))
+        pr.upsert_status_card("o/r", 7, "card")
+        self.assertEqual(fake.posted("--method PATCH repos/o/r/issues/comments/5"), [{"body": "card"}])
+
+    def test_a_comment_with_the_marker_from_someone_else_is_not_taken_over(self):
+        fake = self.use(FakeGh(("issues/7/comments?", [[{"id": 5, "body": pr.MARKER, "user": {"login": "mallory"}}]])))
+        pr.upsert_status_card("o/r", 7, "card")
+        self.assertEqual(fake.posted("--method PATCH"), [])
+        self.assertEqual(len(fake.posted("--method POST repos/o/r/issues/7/comments")), 1)
+
+    def test_a_review_with_a_rejected_anchor_is_posted_again_in_the_body(self):
+        sub = {"commit_id": "c", "event": "COMMENT", "body": "top", "comments": [{"path": "a.rs", "line": 3, "side": "RIGHT", "body": "why"}]}
+        calls = []
+
+        def flaky(*args, input=None):
+            calls.append(json.loads(input))
+            if len(calls) == 1:
+                raise RuntimeError("422 line must be part of the diff")
+            return json.dumps({"html_url": "https://review"})
+        self.use(flaky)
+        self.assertEqual(pr.post_review("o/r", 7, sub), "https://review")
+        self.assertEqual(calls[1]["comments"], [])
+        self.assertIn("a.rs:3", calls[1]["body"])
+        self.assertIn("why", calls[1]["body"])
+
+    def test_the_last_review_goes_and_only_ours(self):
+        fake = self.use(FakeGh(
+            ("pulls/7/reviews?", [[
+                {"id": 1, "state": "CHANGES_REQUESTED", "body": pr.MARKER, "user": BOT},
+                {"id": 2, "state": "COMMENTED", "body": pr.MARKER, "user": BOT},
+                {"id": 3, "state": "CHANGES_REQUESTED", "body": pr.MARKER, "user": {"login": "human"}},
+                {"id": 4, "state": "CHANGES_REQUESTED", "body": "no marker", "user": BOT},
+            ]]),
+            ("reviews/1/comments", [[{"node_id": "N1"}]]),
+            ("reviews/2/comments", [[{"node_id": "N2"}]]),
+        ))
+        pr.supersede_prior_reviews("o/r", 7)
+        dismissed = [line for line, _ in fake.calls if "dismissals" in line]
+        self.assertEqual(len(dismissed), 1)
+        self.assertIn("reviews/1/dismissals", dismissed[0])
+        minimized = [line for line, _ in fake.calls if "minimizeComment" in line]
+        self.assertEqual(len(minimized), 2)
+        self.assertFalse(any("reviews/3" in l or "reviews/4" in l for l, _ in fake.calls))
+
+    def test_a_dismissal_that_fails_does_not_sink_the_new_review(self):
+        self.use(FakeGh(("pulls/7/reviews?", [[{"id": 1, "state": "CHANGES_REQUESTED", "body": pr.MARKER, "user": BOT}]]),
+                        ("dismissals", RuntimeError("403"))))
+        pr.supersede_prior_reviews("o/r", 7)
+
+    def test_the_check_run(self):
+        fake = self.use(FakeGh())
+        pr.post_check_run("o/r", "sha", "failure", "t", "s", "https://run", "9:1")
+        body = fake.posted("check-runs")[0]
+        self.assertEqual((body["name"], body["head_sha"], body["status"], body["conclusion"]), (pr.CHECK_NAME, "sha", "completed", "failure"))
+        self.assertEqual((body["details_url"], body["external_id"]), ("https://run", "9:1"))
+
+
+class Run(unittest.TestCase):
+    def setUp(self):
+        self.old = (pr.gh, pr.ask_for_review)
+        self.addCleanup(lambda: (setattr(pr, "gh", self.old[0]), setattr(pr, "ask_for_review", self.old[1])))
+        self.fake = FakeGh(("pulls/7/files", PR_FILES), ("pulls/7/reviews?", []), ("issues/7/comments?", []),
+                           ("--method POST repos/o/r/pulls/7/reviews", {"html_url": "https://review"}), ("pulls/7", PR_JSON))
+        pr.gh = self.fake
+        self.args = type("A", (), {"repo": "o/r", "pr": 7, "post": True, "output": None, "instructions": []})()
+
+    def conclusions(self):
+        return [p["conclusion"] for p in self.fake.posted("check-runs")]
+
+    def test_a_blocker_is_posted_whole(self):
+        pr.ask_for_review = lambda *a, **k: pr.Review("Bad.", [], [finding()])
+        self.assertEqual(pr.run(self.args, cfg()), 0)
+        review = self.fake.posted("--method POST repos/o/r/pulls/7/reviews")[0]
+        self.assertEqual((review["event"], review["commit_id"]), ("REQUEST_CHANGES", "headsha"))
+        self.assertEqual(review["comments"][0]["line"], 12)
+        self.assertEqual(self.conclusions(), ["failure"])
+        cards = [p["body"] for p in self.fake.posted("issues/7/comments")]
+        self.assertIn("in progress", cards[0])
+        self.assertIn("1 blocking finding", cards[-1])
+        self.assertIn("https://review", cards[-1])
+
+    def test_a_clean_review_is_green(self):
+        pr.ask_for_review = lambda *a, **k: pr.Review("Fine.", [], [])
+        pr.run(self.args, cfg())
+        self.assertEqual(self.conclusions(), ["success"])
+        self.assertEqual(self.fake.posted("--method POST repos/o/r/pulls/7/reviews")[0]["event"], "COMMENT")
+
+    def test_an_outage_is_neutral_and_says_so_then_fails_the_script(self):
+        def down(*a, **k):
+            raise pr.Transient("the AI provider could not be reached (boom)")
+        pr.ask_for_review = down
+        with self.assertRaises(pr.Transient):
+            pr.run(self.args, cfg())
+        self.assertEqual(self.conclusions(), ["neutral"])
+        self.assertEqual(self.fake.posted("--method POST repos/o/r/pulls/7/reviews"), [])
+        self.assertIn("unavailable", self.fake.posted("issues/7/comments")[-1]["body"])
+
+    def test_no_key_is_an_error_before_anything_is_posted(self):
+        with self.assertRaises(pr.ProviderError):
+            pr.run(self.args, pr.Config({}))
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_lockfile_only_pull_request_has_nothing_to_review(self):
+        lock = [[{"filename": "Cargo.lock", "status": "modified", "additions": 3, "deletions": 3, "patch": PATCH}]]
+        self.fake.routes.insert(0, ("pulls/7/files", lock))
+        called = []
+        pr.ask_for_review = lambda *a, **k: called.append(1)
+        self.assertEqual(pr.run(self.args, cfg()), 0)
+        self.assertEqual(called, [])
+        self.assertEqual(self.conclusions(), ["success"])
+
+    def test_without_post_nothing_is_written(self):
+        self.args.post = False
+        pr.ask_for_review = lambda *a, **k: pr.Review("Fine.", [], [])
+        pr.run(self.args, cfg())
+        self.assertTrue(all("--method" not in line for line, _ in self.fake.calls))
+
+
 class Workflows(unittest.TestCase):
     """The shapes that keep a public repository's key safe. A change here is a decision."""
 

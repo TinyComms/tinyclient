@@ -37,8 +37,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Advice, not a gate: an outage at the provider must not turn the pull request red. The result,
-    # including "unavailable", is posted as the check run `Tiny Agents / Code Review`.
-    continue-on-error: true
+    # including "unavailable", is posted as the check run `Tiny Agents / Code Review`, and the review
+    # step below never fails the job over it.
     steps:
       - name: Check out the review tooling
         uses: actions/checkout@v5
@@ -59,11 +59,15 @@ jobs:
           AI_MODEL: ${{ vars.AI_MODEL }}
           PR_NUMBER: ${{ inputs.pr_number }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           repo_name="${GITHUB_REPOSITORY#*/}"
-          python3 .tiny-review/.github/scripts/pr-review.py \
+          if ! python3 .tiny-review/.github/scripts/pr-review.py \
             --repo "$GITHUB_REPOSITORY" \
             --pr "$PR_NUMBER" \
             --instructions .tiny-review/.github/review/base.md \
             --instructions ".tiny-review/.github/review/${repo_name}.md" \
-            --post
+            --post; then
+            # The script has already said why on the pull request (a neutral check and the sticky
+            # comment). Advice that could not be given must not leave a red cross on the pull request.
+            echo "::warning title=Code review::the review did not complete; the check run on the pull request says why"
+          fi
