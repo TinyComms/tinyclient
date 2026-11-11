@@ -261,6 +261,17 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_that_followed_the_newest_message_draws_no_divider_above_it() {
+        let t = 10 * DAY;
+        let read = [said("1", "Mara", t), said("2", "You", t + 400)];
+        let arrived = [read[0].clone(), read[1].clone(), said("3", "Mara", t + 800)];
+        // The marker frozen at the opening puts a line above a reply read as it came.
+        assert_eq!(shape(&lay(&arrived, Some("2"))), "SDHHNH");
+        // Moved on to that reply, it draws none.
+        assert_eq!(shape(&lay(&arrived, Some("3"))), "SDHHH");
+    }
+
+    #[test]
     fn a_thread_starts_with_its_root_and_a_count() {
         let t = 10 * DAY;
         let root = said("r", "Mara", t);
