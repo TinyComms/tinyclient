@@ -1,6 +1,6 @@
 name: CI
 
-# A pull request gets the fast answer: Linux only, the tests split three ways, and nothing that
+# A pull request gets the fast answer: Linux only, the tests split five ways, and nothing that
 # is not about the change. Pushes to main (and a manual dispatch, `gh workflow run ci.yml --ref
 # <branch>`) get everything: Linux, macOS and Windows, and every release program, which is what
 # a later tag packages instead of compiling again. Tests and the release build run together:
@@ -43,14 +43,14 @@ env:
 
 jobs:
   # The tests are CPU-bound (about 1,300 CPU-seconds), so they scale with runners: each shard builds
-  # (a warm cache makes that about a minute and a half) and runs its third or half of them.
+  # (a warm cache makes that about a minute and a half) and runs its fifth (on main: third or half) of them.
   # `hash` keeps a test in the same shard from run to run.
   test:
     name: test (${{ matrix.os }} ${{ matrix.shard }}/${{ matrix.shards }})
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"ubuntu-22.04","shard":1,"shards":3},{"os":"ubuntu-22.04","shard":2,"shards":3},{"os":"ubuntu-22.04","shard":3,"shards":3}]' || '[{"os":"ubuntu-22.04","shard":1,"shards":3},{"os":"ubuntu-22.04","shard":2,"shards":3},{"os":"ubuntu-22.04","shard":3,"shards":3},{"os":"macos-latest","shard":1,"shards":2,"features":"--features tinyclient/gui"},{"os":"macos-latest","shard":2,"shards":2,"features":"--features tinyclient/gui"},{"os":"windows-latest","shard":1,"shards":2},{"os":"windows-latest","shard":2,"shards":2}]') }}
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"ubuntu-22.04","shard":1,"shards":5},{"os":"ubuntu-22.04","shard":2,"shards":5},{"os":"ubuntu-22.04","shard":3,"shards":5},{"os":"ubuntu-22.04","shard":4,"shards":5},{"os":"ubuntu-22.04","shard":5,"shards":5}]' || '[{"os":"ubuntu-22.04","shard":1,"shards":3},{"os":"ubuntu-22.04","shard":2,"shards":3},{"os":"ubuntu-22.04","shard":3,"shards":3},{"os":"macos-latest","shard":1,"shards":2,"features":"--features tinyclient/gui"},{"os":"macos-latest","shard":2,"shards":2,"features":"--features tinyclient/gui"},{"os":"windows-latest","shard":1,"shards":2},{"os":"windows-latest","shard":2,"shards":2}]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     steps:
