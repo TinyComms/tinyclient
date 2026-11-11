@@ -357,6 +357,14 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
     }
 }
 
+/// Whether the join drawn as Connecting can be dropped now that its ask was answered: the ask
+/// failed, or chatd already reports a live call. Otherwise chatd's word has not reached this
+/// window yet (or is still a failure left from the call before), and the drawing stays a
+/// moment so the dock does not blink out.
+fn connecting_settled(worked: bool, chatd: Option<&Call>) -> bool {
+    !worked || chatd.is_some_and(|call| !matches!(call.state, CallState::Failed { .. }))
+}
+
 /// What the dock draws: chatd's call, else what only this window knows. A join asked for just
 /// now is drawn over a failure still on show from the call before it, but never over a call
 /// that is live.
@@ -877,7 +885,7 @@ impl Shell {
     /// keeps the drawing a moment longer when chatd's call has not reached this window yet, so
     /// the dock does not blink out between the two; one that failed drops it at once.
     pub(in crate::gui) fn call_connecting_over(&mut self, worked: bool, cx: &mut Context<Self>) {
-        if !worked || self.call_now().is_some() {
+        if connecting_settled(worked, self.call_now()) {
             self.call_state.connecting = None;
             cx.notify();
             return;
@@ -1318,6 +1326,17 @@ mod tests {
         assert!(!securing(&call), "once the keys are there it is connected");
         call.security = None;
         assert!(!securing(&call), "a call with no encryption to set up is never securing");
+    }
+
+    #[test]
+    fn connecting_is_kept_for_a_grace_until_chatd_reports_a_live_call() {
+        let connecting = bare_call(key("lounge"), CallState::Connecting, false, false);
+        let failed = bare_call(key("den"), CallState::Failed { reason: CallFailure::Lost, detail: String::new() }, false, false);
+        assert!(!connecting_settled(true, None), "asked ok, chatd silent: keep it and arm the clear");
+        assert!(!connecting_settled(true, Some(&failed)), "a failure left from the call before is not chatd's word on this one");
+        assert!(connecting_settled(true, Some(&connecting)), "chatd has the call: its state is drawn");
+        assert!(connecting_settled(false, None), "the ask failed: drop it at once");
+        assert!(connecting_settled(false, Some(&connecting)));
     }
 
     #[test]
