@@ -516,8 +516,9 @@ pub struct Composer {
     anchors: Rc<Anchors>,
     /// The recording of this conversation, as chatd said it (`Change::Recording`).
     recording: Option<Rec>,
-    /// The mic held down (push-to-talk): the next release stops the recording after the grace.
-    holding: bool,
+    /// The mic held down (push-to-talk), and the conversation the hold began in: the next
+    /// release stops that one's recording after the grace, wherever the composer has gone since.
+    holding: Option<Key>,
     /// One timer, alive only between that release and the end of the release grace. A press
     /// inside the grace drops it, so the recording a new press starts is not stopped by it.
     release: Option<Task<()>>,
@@ -611,7 +612,7 @@ impl Composer {
             send_menu: false,
             anchors: Rc::new(Anchors::default()),
             recording: None,
-            holding: false,
+            holding: None,
             release: None,
             owed_stop: None,
             note: None,
@@ -2217,36 +2218,34 @@ impl Composer {
         let Some(target) = self.record_target() else {
             return;
         };
-        self.holding = true;
         ask_later(cx, Request::Record(rec::on_hold_down(&target)), |_, _| {});
+        self.holding = Some(target);
     }
 
     /// Push-to-talk, the release: the stop waits out the release grace, so the word's tail is
     /// kept with the rest. A release where no hold began is any click's, not the mic's.
     fn mic_released(&mut self, _: &gpui::MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.holding {
+        let Some(held) = self.holding.take() else {
             return;
-        }
-        self.holding = false;
+        };
         let ms = u64::from(crate::gui::app::prefs::values().number(protocol::settings::PTT_RELEASE_MS).min(1000));
         self.release = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(ms)).await;
-            let _ = this.update(cx, |this, cx| this.mic_grace_over(cx));
+            let _ = this.update(cx, |this, cx| this.mic_grace_over(held, cx));
         }));
     }
 
-    /// The grace ran out: stop the recording, while this conversation's still runs. The start
-    /// is asked for later and said back later still, so a quick tap ends its grace with nothing
-    /// running yet: the stop is owed then, and `recording_changed` pays it. A note that arrived
-    /// already (a quick word, or a failure) settles that debt without a stop.
-    fn mic_grace_over(&mut self, cx: &mut Context<Self>) {
+    /// The grace ran out: stop the recording of the conversation the hold began in (`held`),
+    /// while it still runs. It is that one whatever is open by now: a composer that moved on
+    /// during the grace neither leaves it running nor stops another's. The start is asked for
+    /// later and said back later still, so a quick tap ends its grace with nothing running yet:
+    /// the stop is owed then, and `recording_changed` pays it. A note that arrived already (a
+    /// quick word, or a failure) settles that debt without a stop.
+    fn mic_grace_over(&mut self, held: Key, cx: &mut Context<Self>) {
         self.release = None;
-        let Some(target) = self.target.as_ref().map(|target| target.key.clone()) else {
-            return;
-        };
-        match rec::on_hold_up(&self.recording, &target) {
+        match rec::on_hold_up(&self.recording, &held) {
             Some(request) => ask_later(cx, Request::Record(request), |_, _| {}),
-            None => self.owed_stop = Some(target),
+            None => self.owed_stop = Some(held),
         }
     }
 
