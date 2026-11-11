@@ -23,6 +23,7 @@ fn environment() {
     READY.call_once(|| {
         std::env::set_var("TINYCLIENT_MEDIAD", test_mediad::path());
         std::env::set_var("TINYCLIENT_MEDIAD_AUDIO", "null");
+        std::env::set_var("TINYCLIENT_PREWARM", "off");
     });
 }
 

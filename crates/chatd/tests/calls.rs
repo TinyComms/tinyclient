@@ -771,3 +771,47 @@ fn an_engine_started_ahead_of_a_call_is_the_one_that_carries_it_and_a_dead_one_i
     until("no engine", || mediads() == 0);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// How long pressing Join waits for the call engine: started inside the click, or already
+/// running. Debug builds; the numbers are printed, and only the order is asserted.
+#[test]
+fn the_click_waits_less_for_an_engine_that_was_started_ahead() {
+    let _turn = alone();
+    let (hub, dir) = hub();
+    struct Off;
+    impl Drop for Off {
+        fn drop(&mut self) {
+            std::env::set_var("TINYCLIENT_PREWARM", "off");
+        }
+    }
+    let _off = Off;
+    let median = |mut times: Vec<Duration>| {
+        times.sort();
+        times[times.len() / 2]
+    };
+    let mut cold = Vec::new();
+    let mut warm = Vec::new();
+    for _ in 0..5 {
+        std::env::set_var("TINYCLIENT_PREWARM", "off");
+        let began = Instant::now();
+        hub.calls.start(&hub, lounge()).unwrap();
+        cold.push(began.elapsed());
+        hub.calls.end(&hub);
+        until("no engine", || mediads() == 0);
+
+        std::env::remove_var("TINYCLIENT_PREWARM");
+        hub.calls.prewarm(&hub);
+        // Ready, and settings applied: the click comes well after the engine is up.
+        until("an engine ahead of the call", || mediads() == 1);
+        sleep(Duration::from_millis(500));
+        let began = Instant::now();
+        hub.calls.start(&hub, lounge()).unwrap();
+        warm.push(began.elapsed());
+        hub.calls.end(&hub);
+        until("no engine", || mediads() == 0);
+    }
+    let (cold, warm) = (median(cold), median(warm));
+    eprintln!("start of a call, median of 5: engine started in the click {cold:?}, started ahead {warm:?}");
+    assert!(warm < cold, "{warm:?} !< {cold:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
