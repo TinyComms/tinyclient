@@ -131,11 +131,47 @@ pub struct Outgoing {
     camera: Camera,
     cost: Cost,
     camera_cost: GrabCost,
-    /// My own camera, painted for me (`selfie`).
-    selfie_canvas: Canvas,
-    selfie_at: Option<Instant>,
-    selfie_generation: u64,
-    selfie_painted: Option<Painted>,
+    /// My own camera, painted for me.
+    selfie: Selfie,
+    /// My own share, painted for me. Apart from the camera's: both can be on at once.
+    screen_selfie: Selfie,
+}
+
+/// One of my own pictures shrunk and written as a JPEG a few times a second, for my own tile.
+#[derive(Default)]
+struct Selfie {
+    canvas: Canvas,
+    at: Option<Instant>,
+    generation: u64,
+    painted: Option<Painted>,
+}
+
+impl Selfie {
+    /// Paints this grab, unless the last was painted less than [`super::SELF_VIEW_EVERY`] ago.
+    fn shoot(&mut self, grabbed: &Rgba) {
+        if self.at.is_some_and(|at| at.elapsed() < super::SELF_VIEW_EVERY) {
+            return;
+        }
+        self.at = Some(Instant::now());
+        let (width, height) = fit(grabbed.width, grabbed.height, super::SELF_VIEW.0, super::SELF_VIEW.1);
+        let rgb = super::screens::shrink(grabbed, width, height);
+        self.generation = self.generation.wrapping_add(1);
+        if let Some(painted) = self.canvas.paint(&rgb, width, height, self.generation) {
+            self.painted = Some(painted);
+        }
+    }
+
+    /// The last picture painted and not yet taken.
+    fn take(&mut self) -> Option<Painted> {
+        self.painted.take()
+    }
+
+    /// The picture's file goes, and the next shot is due at once.
+    fn forget(&mut self) {
+        self.canvas.forget();
+        self.painted = None;
+        self.at = None;
+    }
 }
 
 /// What a camera frame costs to read, in the log once a second or so, with the rate the camera
@@ -209,29 +245,22 @@ impl Outgoing {
         let (width, height) = fit(grabbed.width, grabbed.height, quality.max.0, quality.max.1);
         let planes = i420(&grabbed.pixels, grabbed.width, grabbed.height, width, height, grabbed.bgra);
         let converted = Instant::now();
+        // The grab is the whole screen, so the preview costs one shrink a tenth of a second.
+        self.screen_selfie.shoot(&grabbed);
         let encoded = coded(&mut self.share, width, height, quality.bps, quality.fps as f32, true)?.encode(&planes, &ask);
         self.cost.note(began, captured, converted, Instant::now(), (grabbed.width, grabbed.height), (width, height));
         encoded
     }
 
-    /// My own camera for my own tile, a few times a second: the grab shrunk and written as a
-    /// JPEG, taken by [`Outgoing::self_view`].
-    fn selfie(&mut self, grabbed: &Rgba) {
-        if self.selfie_at.is_some_and(|at| at.elapsed() < super::SELF_VIEW_EVERY) {
-            return;
-        }
-        self.selfie_at = Some(Instant::now());
-        let (width, height) = fit(grabbed.width, grabbed.height, super::SELF_VIEW.0, super::SELF_VIEW.1);
-        let rgb = super::screens::shrink(grabbed, width, height);
-        self.selfie_generation = self.selfie_generation.wrapping_add(1);
-        if let Some(painted) = self.selfie_canvas.paint(&rgb, width, height, self.selfie_generation) {
-            self.selfie_painted = Some(painted);
-        }
+    /// My own camera as painted for me since last asked: a few times a second, the camera's
+    /// grab shrunk and written as a JPEG.
+    pub fn self_view(&mut self) -> Option<Painted> {
+        self.selfie.take()
     }
 
-    /// The last self view painted and not yet taken.
-    pub fn self_view(&mut self) -> Option<Painted> {
-        self.selfie_painted.take()
+    /// My own share as painted for me since last asked, on the same terms as [`Outgoing::self_view`].
+    pub fn share_view(&mut self) -> Option<Painted> {
+        self.screen_selfie.take()
     }
 
     /// The camera's two layers, high then low, or why the camera could not be read. A layer with
@@ -243,7 +272,7 @@ impl Outgoing {
         let began = Instant::now();
         let grabbed = self.camera.frame()?;
         self.camera_cost.note(began.elapsed(), (grabbed.width, grabbed.height));
-        self.selfie(&grabbed);
+        self.selfie.shoot(&grabbed);
         let layer = |slot: &mut Option<Coded>, ask: Option<Ask>, most: (u32, u32), nominal: u32| match ask {
             Some(ask) => {
                 let (width, height) = fit(grabbed.width, grabbed.height, most.0, most.1);
@@ -259,14 +288,13 @@ impl Outgoing {
 
     pub fn close_camera(&mut self) {
         self.camera.close();
-        self.selfie_canvas.forget();
-        self.selfie_painted = None;
-        self.selfie_at = None;
+        self.selfie.forget();
     }
 
     /// The share is off. Drop the encoder, and on Linux close the portal session so the recording indicator does not stay up.
     pub fn close_share(&mut self) {
         self.share = None;
+        self.screen_selfie.forget();
         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         super::portal::stop_screen();
     }
@@ -938,6 +966,45 @@ pub fn probe_camera() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn screen() -> Rgba {
+        Rgba { width: 1920, height: 1080, pixels: vec![200; 1920 * 1080 * 4], bgra: true }
+    }
+
+    #[test]
+    fn a_self_view_is_shrunk_to_the_corner_size_painted_at_a_steady_rate_and_let_go() {
+        let mut outgoing = Outgoing::default();
+        outgoing.screen_selfie.shoot(&screen());
+        let first = outgoing.share_view().expect("the first grab is painted at once");
+        assert_eq!((first.width, first.height), super::super::SELF_VIEW);
+        assert!(first.path.exists());
+        assert!(outgoing.share_view().is_none(), "taken once");
+        assert!(outgoing.self_view().is_none(), "the camera's slot is a different one");
+
+        outgoing.screen_selfie.shoot(&screen());
+        assert!(outgoing.share_view().is_none(), "a grab inside the interval is not painted");
+
+        outgoing.screen_selfie.at = None;
+        outgoing.screen_selfie.shoot(&screen());
+        let next = outgoing.share_view().unwrap();
+        assert_ne!(next.generation, first.generation);
+        assert!(!first.path.exists(), "the file before it is gone");
+
+        outgoing.screen_selfie.forget();
+        assert!(!next.path.exists(), "and so is the last one when the share stops");
+    }
+
+    #[test]
+    fn a_call_that_ends_while_sharing_leaves_no_picture_of_the_screen_behind() {
+        let mut outgoing = Outgoing::default();
+        outgoing.screen_selfie.shoot(&screen());
+        outgoing.selfie.shoot(&screen());
+        let files = [outgoing.share_view().unwrap().path, outgoing.self_view().unwrap().path];
+        assert!(files.iter().all(|file| file.exists()));
+        // `Video::stop` ends the capture thread without turning the share off first.
+        drop(outgoing);
+        assert!(files.iter().all(|file| !file.exists()), "{files:?}");
+    }
 
     #[test]
     fn openh264_is_fetched_from_cisco() {

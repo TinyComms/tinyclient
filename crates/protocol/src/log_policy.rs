@@ -281,6 +281,30 @@ fn cut(text: &str) -> &str {
 
 /// 32 hex characters shared by the window, chatd, and mediad. An invalid `TINYCLIENT_SESSION`
 /// is ignored and a new id is generated.
+/// A moment as the start of a log line: UTC to the millisecond, `2026-11-11T14:03:22.123Z`.
+pub fn stamp(at: SystemTime) -> String {
+    let since = at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = since.as_secs();
+    let (days, of_day) = ((secs / 86_400) as i64, secs % 86_400);
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's `civil_from_days`).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        of_day / 3_600,
+        of_day / 60 % 60,
+        of_day % 60,
+        since.subsec_millis()
+    )
+}
+
 pub fn session_id() -> &'static str {
     let mut slot = SESSION.lock().unwrap_or_else(|err| err.into_inner());
     if let Some(id) = *slot {
@@ -617,9 +641,13 @@ where
             message: &recorder.message,
             fields: &borrowed,
         };
-        let Some(mut line) = render(&policy, self.sink, &parts) else {
+        let Some(rendered) = render(&policy, self.sink, &parts) else {
             return;
         };
+        // When, so a line can be lined up with what someone heard or saw at the time.
+        let mut line = stamp(SystemTime::now());
+        line.push(' ');
+        line.push_str(&rendered);
         line.push_str(" session=");
         line.push_str(session_id());
         match self.sink {
@@ -783,6 +811,14 @@ pub fn current() -> Option<&'static LogGuard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_starts_with_its_time_in_utc() {
+        assert_eq!(stamp(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
+        // 2026-11-11 14:03:22.123 UTC, and a leap day.
+        assert_eq!(stamp(UNIX_EPOCH + Duration::from_millis(1_794_405_802_123)), "2026-11-11T14:03:22.123Z");
+        assert_eq!(stamp(UNIX_EPOCH + Duration::from_secs(1_709_164_800)), "2024-02-29T00:00:00.000Z");
+    }
 
     fn line_of(value: Option<String>) -> String {
         match value {

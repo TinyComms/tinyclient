@@ -101,6 +101,11 @@ pub(crate) fn prove_selection_clamp() -> Result<(), &'static str> {
     conversation::prove_selection_clamp()
 }
 
+/// The lab's offline-send-kept driver. A message held for an offline account that never goes comes back to the field.
+pub(crate) fn prove_offline_send_kept() -> Result<(), &'static str> {
+    composer::prove_offline_send_kept()
+}
+
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 
@@ -301,7 +306,8 @@ fn shell_bindings() -> Vec<KeyBinding> {
 /// `--autoplay always|hover|never` (when GIFs play), `--frames N` (N frames 150 ms apart, as
 /// `out-1.png` …, to see moving pictures move). On a Tiny server (`--mode tiny`): `--tiny-room
 /// N` (the Nth channel), `--tiny-menu header|channel|person:N` (N: the Nth seat, `:sub` adds its
-/// Move submenu), `--tiny-modal invite|code|kick|ban|profile`, `--tiny-settings`, `--tiny-card N`
+/// Move submenu), `--tiny-stream` (my own stream filling the stage, with `TINYCLIENT_SHOT_CALL=tiny_sharing`),
+/// `--tiny-modal invite|code|kick|ban|profile`, `--tiny-settings`, `--tiny-card N`
 /// (the Nth member's hover card), `--tiny-setup first|custom|refused|checklist|links|privacy|change|change-anyway|member` (first-run
 /// setup, or Server Settings › Privacy, over a made-up outline), `--tiny-confirm transfer|codes`.
 ///
@@ -813,6 +819,7 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
     let prefs = if shot_demo::on() { app::prefs::Prefs::default() } else { prefs };
     theme::set_text_step(prefs.text_step);
     app::prefs::set_choices(prefs.choices);
+    app::prefs::set_trusted_links(prefs.trusted_links.clone());
     anim::set_autoplay(prefs.autoplay);
     let application = application.with_assets(assets::Assets);
     // macOS delivers both launch and subsequent links as open-URL events. Keep them in

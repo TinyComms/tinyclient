@@ -106,6 +106,7 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>) -> 
         security: None,
         picture: None,
         self_view: None,
+        share_view: None,
     }
 }
 

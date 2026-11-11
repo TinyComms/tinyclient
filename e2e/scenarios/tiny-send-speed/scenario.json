@@ -1,0 +1,12 @@
+{
+  "id": "tiny-send-speed",
+  "title": "A Tiny message names its sender at once and settles without waiting on the member list",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "This driver runs desktop chatd against a loopback server; no native mobile GUI proof is claimed.",
+    "ios": "This driver runs desktop chatd against a loopback server; no native mobile GUI proof is claimed."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

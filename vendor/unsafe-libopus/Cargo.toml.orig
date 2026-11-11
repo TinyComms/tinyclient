@@ -1,0 +1,44 @@
+[package]
+name = "unsafe-libopus"
+authors = ["DCNick3"]
+version = "0.2.0"
+edition = "2021"
+
+repository = "https://github.com/DCNick3/unsafe-libopus"
+description = "libopus transpiled to rust by c2rust"
+
+license = "BSD-3-Clause"
+
+[workspace]
+members = [
+    "upstream-libopus",
+    "unsafe-libopus-tools",
+]
+
+[profile.release]
+debug = true
+
+[dependencies]
+# for complex numbers impl
+num-traits = "0.2.16"
+num-complex = "0.4.1"
+
+# for slicing arrays to other arrays
+arrayref = "0.3.7"
+
+# for dumping data in ent-dump
+hex = { version = "0.4.3", optional = true }
+
+[dev-dependencies]
+# some translated tests haven't been rewritten not to use libc yet
+libc = "0.2"
+libc-stdhandle = "0.1.0"
+
+insta = "1.29.0"
+
+[features]
+# dumps calls to entropy coder to console for easier upstream divergence debugging
+# (it's not _only_ entropy coder actually, there are some additional prints where it was found necessary)
+ent-dump = [
+    "hex"
+]

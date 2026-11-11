@@ -11,7 +11,9 @@
 //! With automatic install on, and only when this process is the installed app (not a build under
 //! `target/`), the archive is downloaded, checked against the release's `SHA256SUMS`, and on
 //! macOS the new app is checked with `codesign` before it is kept. It replaces this copy when
-//! the app quits. A failure is remembered for a day and said only in About.
+//! the app quits, and tinyclient opens again only when the quit was a Restart: a closed window
+//! stays closed. A failure is remembered for a day and said only in About. A build with no
+//! archive of its own (see [`archive_name`]) is still told about a newer release.
 //!
 //! The window draws the states. This module does the check, the file and the swap.
 
@@ -20,6 +22,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,6 +30,8 @@ const FEED: &str = "https://api.github.com/repos/TinyComms/tinyclient/releases/l
 const COMPARE: &str = "https://api.github.com/repos/TinyComms/tinyclient/compare";
 const RELEASES: &str = "https://github.com/TinyComms/tinyclient/releases/latest";
 const ARCHIVE_LIMIT: u64 = 200 * 1024 * 1024;
+/// How long a version that failed to install is left alone: About says "tomorrow".
+const RETRY_AFTER: i64 = 24 * 60 * 60;
 
 /// What the window is allowed to say. Quiet is said by saying nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,12 +124,15 @@ pub fn short_commit() -> Option<&'static str> {
     commit().get(..7)
 }
 
-/// This build's archive, as `.github/workflows/release.yml` names the unversioned copy.
+/// This build's archive, as `.github/workflows/release.yml` names the unversioned copy. A build
+/// with none cannot replace itself: it is told about a release and sent to its page.
 pub fn archive_name() -> Option<&'static str> {
     if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
         Some("tinyclient-macos.zip")
     } else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
         Some("tinyclient-linux-x86_64.tar.gz")
+    } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
+        Some("tinyclient-linux-aarch64.tar.gz")
     } else if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
         Some("tinyclient-windows-x86_64.zip")
     } else {
@@ -132,22 +140,21 @@ pub fn archive_name() -> Option<&'static str> {
     }
 }
 
-fn archive_suffix() -> Option<&'static str> {
-    archive_name().map(|name| match name {
-        name if name.ends_with("-macos.zip") => "-macos.zip",
-        name if name.ends_with("-linux-x86_64.tar.gz") => "-linux-x86_64.tar.gz",
-        _ => "-windows-x86_64.zip",
-    })
+/// What a versioned copy of `name` ends in: `tinyclient-v0.9.0-macos.zip` for `tinyclient-macos.zip`.
+fn archive_suffix(name: &str) -> &str {
+    name.strip_prefix("tinyclient").unwrap_or(name)
 }
 
 /// Where a quit may write the new copy. See [`replaceable`].
 pub fn install_into() -> Option<PathBuf> {
+    archive_name()?;
     let exe = std::env::current_exe().ok()?;
     if !replaceable(&exe) {
         return None;
     }
     if cfg!(target_os = "macos") {
-        return mac_bundle(&exe);
+        // The swap renames the bundle, so it is the folder holding it that has to be writable.
+        return mac_bundle(&exe).filter(|app| app.parent().is_some_and(writable));
     }
     let dir = exe.parent()?.to_owned();
     let sibling = |name: &str| dir.join(program(name)).is_file();
@@ -201,10 +208,14 @@ pub fn recall() {
     let saved = read_state(&work_dir().join("state"));
     // What the last swap did, left by the script that ran after we quit.
     let swapped = fs::read_to_string(work_dir().join(SWAP_RESULT)).unwrap_or_default();
+    let swapped_at = fs::metadata(work_dir().join(SWAP_RESULT)).and_then(|file| file.modified()).ok();
     let _ = fs::remove_file(work_dir().join(SWAP_RESULT));
     if let Some(version) = failed_swap(&swapped) {
         let mut memory = memory();
-        memory.checked = saved.checked;
+        // The day before the next try is counted from the swap that failed.
+        memory.checked = swapped_at
+            .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+            .map_or_else(unix_now, |d| d.as_secs() as i64);
         memory.shown = Shown::Failed { version };
         let _ = write_state(&work_dir(), &memory.shown, &saved.page, memory.checked);
         return;
@@ -232,7 +243,8 @@ pub fn pursue(policy: Policy) -> Shown {
     };
     {
         let mut memory = memory();
-        if memory.busy || archive_name().is_none() {
+        // A phone's store owns its updates. Every other build asks, with or without an archive.
+        if memory.busy || cfg!(any(target_os = "android", target_os = "ios")) {
             return memory.shown.clone();
         }
         memory.busy = true;
@@ -272,6 +284,14 @@ pub fn discard_download() {
     }
 }
 
+/// Set by Restart, just before it quits: the swap then opens tinyclient again. Any other quit,
+/// a closed window among them, installs what is waiting and stays closed.
+static REOPEN: AtomicBool = AtomicBool::new(false);
+
+pub fn reopen_after_quit() {
+    REOPEN.store(true, Ordering::Relaxed);
+}
+
 /// Starts the swap, which waits until this process has exited. Does nothing when no download
 /// is waiting. Called at the start of quit, before chatd is asked to stop.
 pub fn apply_on_quit() {
@@ -287,7 +307,13 @@ pub fn apply_on_quit() {
     if cfg!(target_os = "macos") && dest.extension().and_then(|ext| ext.to_str()) != Some("app") {
         return;
     }
-    let _ = spawn_swap(std::process::id(), &payload, &dest, &version);
+    let _ = spawn_swap(std::process::id(), &payload, &dest, &version, REOPEN.load(Ordering::Relaxed));
+}
+
+/// Whether `version` failed to install less than a day before `now`, so it is not fetched again
+/// yet. `checked` is when it failed.
+fn put_off(shown: &Shown, version: &str, checked: i64, now: i64) -> bool {
+    matches!(shown, Shown::Failed { version: failed } if failed == version) && (0..RETRY_AFTER).contains(&(now - checked))
 }
 
 enum Outcome {
@@ -331,6 +357,10 @@ fn fetch(download: bool) -> Outcome {
             checked: now,
             page: release.page,
         };
+    }
+    // Left as it is, `checked` too: the day runs from the failure, not from this look.
+    if put_off(&shown(), &release.version, memory().checked, now) {
+        return Outcome::Unchanged;
     }
     if let Shown::Ready { version } = shown() {
         if version == release.version && payload_ready(&work_dir()).is_some() {
@@ -418,6 +448,8 @@ fn payload_ready(dir: &Path) -> Option<PathBuf> {
             && app.join("Contents/MacOS/chatd").is_file())
         .then_some(app);
     }
+    // The Linux archive holds one `tinyclient` folder (`packaging/linux.sh`); the Windows zip is flat.
+    let staged = if staged.join("tinyclient").is_dir() { staged.join("tinyclient") } else { staged };
     let tinyclient = staged.join(program("tinyclient"));
     let chatd = staged.join(program("chatd"));
     (tinyclient.is_file() && chatd.is_file()).then_some(staged)
@@ -452,14 +484,14 @@ fn codesign_ok(app: &Path) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-fn spawn_swap(pid: u32, payload: &Path, dest: &Path, version: &str) -> io::Result<()> {
+fn spawn_swap(pid: u32, payload: &Path, dest: &Path, version: &str, reopen: bool) -> io::Result<()> {
     let dir = work_dir();
     fs::create_dir_all(&dir)?;
+    let result = dir.join(SWAP_RESULT);
+    let _ = fs::remove_file(&result);
     if cfg!(windows) {
         let script = dir.join("apply.ps1");
-        let result = dir.join(SWAP_RESULT);
-        let _ = fs::remove_file(&result);
-        fs::write(&script, windows_script(pid, payload, dest, version, &result))?;
+        fs::write(&script, windows_script(pid, payload, dest, version, &result, reopen))?;
         let mut command = Command::new(windows_swap_program());
         hide_helper_console(&mut command).args(windows_swap_args(&script))
             .stdin(std::process::Stdio::null())
@@ -470,9 +502,9 @@ fn spawn_swap(pid: u32, payload: &Path, dest: &Path, version: &str) -> io::Resul
     }
     let script = dir.join("apply.sh");
     let body = if cfg!(target_os = "macos") {
-        mac_script(pid, payload, dest)
+        mac_script(pid, payload, dest, version, &result, reopen)
     } else {
-        unix_script(pid, payload, dest)
+        unix_script(pid, payload, dest, version, &result, reopen)
     };
     fs::write(&script, body)?;
     // The inner shell is backgrounded at once, so it is reparented before we exit and is not
@@ -490,26 +522,65 @@ fn spawn_swap(pid: u32, payload: &Path, dest: &Path, version: &str) -> io::Resul
     Ok(())
 }
 
-fn mac_script(pid: u32, payload: &Path, dest: &Path) -> String {
-    format!(
-        "#!/bin/sh\nset -eu\nwhile kill -0 {pid} 2>/dev/null; do sleep 0.2; done\nsleep 0.5\nrm -rf {dest}\nditto {src} {dest}\nopen {dest}\n",
-        dest = shell_quote(&dest.display().to_string()),
-        src = shell_quote(&payload.display().to_string()),
-    )
+/// The new app is copied beside the old one, the old one is moved aside, and the new one takes
+/// its name. The old app is put back if that fails, so a failure never leaves no app at all.
+fn mac_script(pid: u32, payload: &Path, dest: &Path, version: &str, result: &Path, reopen: bool) -> String {
+    r#"#!/bin/sh
+set -u
+dest=@DEST@
+src=@SRC@
+result=@RESULT@
+version=@VERSION@
+while kill -0 @PID@ 2>/dev/null; do sleep 0.2; done
+sleep 0.5
+ok=
+rm -rf "$dest.new" "$dest.old"
+if ditto "$src" "$dest.new" && mv "$dest" "$dest.old"; then
+  if mv "$dest.new" "$dest"; then ok=1; rm -rf "$dest.old"; else mv "$dest.old" "$dest"; fi
+fi
+rm -rf "$dest.new"
+if [ -n "$ok" ]; then printf 'updated %s\n' "$version" > "$result"; else printf 'failed %s the app could not be replaced\n' "$version" > "$result"; fi
+@START@"#
+        .replace("@START@", if reopen { "open \"$dest\"\n" } else { "" })
+        .replace("@DEST@", &shell_quote(&dest.display().to_string()))
+        .replace("@SRC@", &shell_quote(&payload.display().to_string()))
+        .replace("@RESULT@", &shell_quote(&result.display().to_string()))
+        .replace("@VERSION@", &shell_quote(version))
+        .replace("@PID@", &pid.to_string())
 }
 
-fn unix_script(pid: u32, payload: &Path, dest: &Path) -> String {
-    let mut moves = String::new();
-    for name in ["tinyclient", "chatd", "mediad", "tinyclient-login"] {
-        let from = shell_quote(&payload.join(name).display().to_string());
-        let to = shell_quote(&dest.join(name).display().to_string());
-        moves.push_str(&format!("mv -f {from} {to}\nchmod +x {to}\n"));
-    }
-    let relaunch = shell_quote(&dest.join("tinyclient").display().to_string());
-    format!("#!/bin/sh\nset -eu\nwhile kill -0 {pid} 2>/dev/null; do sleep 0.2; done\nsleep 0.5\n{moves}{relaunch} >/dev/null 2>&1 &\n")
+/// As the Windows swap does: the old programs are moved aside first and put back if any step
+/// fails, so a failure never leaves two versions side by side.
+fn unix_script(pid: u32, payload: &Path, dest: &Path, version: &str, result: &Path, reopen: bool) -> String {
+    r#"#!/bin/sh
+set -u
+dest=@DEST@
+src=@SRC@
+result=@RESULT@
+version=@VERSION@
+names='tinyclient chatd mediad tinyclient-login'
+while kill -0 @PID@ 2>/dev/null; do sleep 0.2; done
+sleep 0.5
+ok=1
+for n in $names; do if [ -e "$dest/$n" ]; then mv -f "$dest/$n" "$dest/$n.old" || ok=; fi; done
+if [ -n "$ok" ]; then for n in $names; do mv -f "$src/$n" "$dest/$n" && chmod +x "$dest/$n" || ok=; done; fi
+if [ -n "$ok" ]; then
+  for n in $names; do rm -f "$dest/$n.old"; done
+  printf 'updated %s\n' "$version" > "$result"
+else
+  for n in $names; do if [ -e "$dest/$n.old" ]; then rm -f "$dest/$n"; mv -f "$dest/$n.old" "$dest/$n"; fi; done
+  printf 'failed %s the programs could not be replaced\n' "$version" > "$result"
+fi
+@START@"#
+        .replace("@START@", if reopen { "\"$dest/tinyclient\" >/dev/null 2>&1 &\n" } else { "" })
+        .replace("@DEST@", &shell_quote(&dest.display().to_string()))
+        .replace("@SRC@", &shell_quote(&payload.display().to_string()))
+        .replace("@RESULT@", &shell_quote(&result.display().to_string()))
+        .replace("@VERSION@", &shell_quote(version))
+        .replace("@PID@", &pid.to_string())
 }
 
-/// The file the Windows swap leaves: `updated <version>`, or `failed <version> <why>`.
+/// The file every swap leaves: `updated <version>`, or `failed <version> <why>`.
 const SWAP_RESULT: &str = "swap-result";
 
 /// The uninstall entry of the Inno Setup AppId in `packaging/windows/tinyclient.iss`. Windows
@@ -526,9 +597,9 @@ fn failed_swap(result: &str) -> Option<String> {
 /// Runs after the window has quit. chatd, mediad and a sign-in window outlive it by a moment, and
 /// Windows will not replace a running program, so it waits for everything started from this
 /// folder and stops what is still there after 15 s. The old programs are moved aside first and
-/// put back if any step fails, so a failure never leaves two versions side by side. Whatever
-/// happened, tinyclient opens again.
-fn windows_script(pid: u32, payload: &Path, dest: &Path, version: &str, result: &Path) -> String {
+/// put back if any step fails, so a failure never leaves two versions side by side. After a
+/// Restart, whatever happened, tinyclient opens again.
+fn windows_script(pid: u32, payload: &Path, dest: &Path, version: &str, result: &Path, reopen: bool) -> String {
     let quoted = |text: &str| format!("'{}'", text.replace('\'', "''"));
     r#"$ErrorActionPreference = 'Stop'
 $dest = @DEST@
@@ -554,8 +625,8 @@ try {
   }
   Set-Content -Path $result -Value ('failed ' + @VERSION@ + ' ' + $_.Exception.Message)
 }
-Start-Process (Join-Path $dest 'tinyclient.exe')
-"#
+@START@"#
+    .replace("@START@", if reopen { "Start-Process (Join-Path $dest 'tinyclient.exe')\n" } else { "" })
     .replace("@DEST@", &quoted(&dest.display().to_string()))
     .replace("@SRC@", &quoted(&payload.display().to_string()))
     .replace("@RESULT@", &quoted(&result.display().to_string()))
@@ -884,6 +955,12 @@ fn split_version(text: &str) -> Version {
 }
 
 fn parse_release(json: &str) -> Option<Release> {
+    release_for(json, archive_name())
+}
+
+/// `exact` is this build's archive. A build with none still learns the version and its page, and
+/// is given no files.
+fn release_for(json: &str, exact: Option<&str>) -> Option<Release> {
     if json.len() > 2 * 1024 * 1024 {
         return None;
     }
@@ -896,9 +973,11 @@ fn parse_release(json: &str) -> Option<Release> {
         .filter(|url| trusted_url(url))
         .unwrap_or(RELEASES)
         .to_owned();
+    let Some(exact) = exact else {
+        return Some(Release { tag, version, page, archive: String::new(), archive_url: String::new(), sums_url: String::new() });
+    };
     let assets = asset_pairs(json);
-    let suffix = archive_suffix()?;
-    let exact = archive_name()?;
+    let suffix = archive_suffix(exact);
     let archive = assets
         .iter()
         .find(|(name, _)| name == exact)
@@ -1144,7 +1223,7 @@ mod tests {
 
     #[test]
     fn a_versioned_archive_is_used_when_the_stable_name_is_absent() {
-        let suffix = archive_suffix().unwrap();
+        let suffix = archive_suffix(archive_name().unwrap());
         let json = format!(
             r#"{{"tag_name":"v2.0.0","html_url":"https://github.com/TinyComms/tinyclient/releases/tag/v2.0.0","assets":[
             {{"name":"tinyclient-v2.0.0{suffix}","browser_download_url":"https://github.com/TinyComms/tinyclient/releases/download/v2.0.0/archive"}},
@@ -1199,14 +1278,23 @@ mod tests {
     }
 
     #[test]
-    fn the_windows_swap_waits_for_the_folder_rolls_back_and_always_reopens() {
-        let script = windows_script(
-            42,
-            Path::new(r"C:\Users\o'brien\AppData\Roaming\tinyclient\update\staged"),
-            Path::new(r"C:\Users\o'brien\AppData\Local\Programs\tinyclient"),
-            "0.9.0",
-            Path::new(r"C:\Users\o'brien\AppData\Roaming\tinyclient\update\swap-result"),
-        );
+    fn the_windows_swap_waits_for_the_folder_rolls_back_and_reopens_only_after_a_restart() {
+        let swap = |reopen| {
+            windows_script(
+                42,
+                Path::new(r"C:\Users\o'brien\AppData\Roaming\tinyclient\update\staged"),
+                Path::new(r"C:\Users\o'brien\AppData\Local\Programs\tinyclient"),
+                "0.9.0",
+                Path::new(r"C:\Users\o'brien\AppData\Roaming\tinyclient\update\swap-result"),
+                reopen,
+            )
+        };
+        // A closed window: the same swap, and nothing is started after it.
+        let quiet = swap(false);
+        assert!(!quiet.contains("Start-Process"));
+        assert!(quiet.contains("Move-Item") && quiet.contains("'updated ' + '0.9.0'") && !quiet.contains('@'));
+        let script = swap(true);
+        assert_eq!(script.strip_suffix("Start-Process (Join-Path $dest 'tinyclient.exe')\n"), Some(quiet.as_str()));
         assert!(script.contains("Wait-Process -Id 42 "));
         assert!(script.contains(r"$dest = 'C:\Users\o''brien\AppData\Local\Programs\tinyclient'"));
         // What still runs from the folder is stopped before anything is moved.
@@ -1224,6 +1312,167 @@ mod tests {
         assert_eq!(failed_swap("failed 0.9.0 Access is denied."), Some("0.9.0".into()));
         assert_eq!(failed_swap("updated 0.9.0"), None);
         assert_eq!(failed_swap(""), None);
+        // What the macOS and Linux swaps write.
+        assert_eq!(failed_swap("failed 0.9.0 the app could not be replaced\n"), Some("0.9.0".into()));
+    }
+
+    #[test]
+    fn the_mac_and_linux_swaps_reopen_only_after_a_restart() {
+        let (src, dest, result) = (Path::new("/tmp/o'brien/staged/tinyclient.app"), Path::new("/Applications/tinyclient.app"), Path::new("/tmp/o'brien/swap-result"));
+        let mac = |reopen| mac_script(42, src, dest, "0.9.0", result, reopen);
+        assert_eq!(mac(true).strip_suffix("open \"$dest\"\n"), Some(mac(false).as_str()));
+        assert!(!mac(false).contains("open "));
+        let (src, dest) = (Path::new("/tmp/o'brien/staged"), Path::new("/home/o'brien/.local/lib/tinyclient"));
+        let linux = |reopen| unix_script(42, src, dest, "0.9.0", result, reopen);
+        assert_eq!(linux(true).strip_suffix("\"$dest/tinyclient\" >/dev/null 2>&1 &\n"), Some(linux(false).as_str()));
+        assert!(!linux(false).contains("2>&1 &"));
+        for script in [mac(false), linux(false)] {
+            assert!(script.contains("while kill -0 42 2>/dev/null"));
+            assert!(script.contains(r"src='/tmp/o'\''brien/staged") && script.contains(r"result='/tmp/o'\''brien/swap-result'"));
+            assert!(script.contains("version='0.9.0'") && !script.contains('@'));
+        }
+    }
+
+    #[test]
+    fn the_mac_and_linux_swaps_put_the_old_copy_back_and_say_what_happened() {
+        let result = Path::new("/tmp/swap-result");
+        let mac = mac_script(42, Path::new("/tmp/staged/tinyclient.app"), Path::new("/Applications/tinyclient.app"), "0.9.0", result, true);
+        // The old app is never removed before the new one is whole beside it.
+        assert!(!mac.contains("rm -rf \"$dest\"\n") && !mac.contains("rm -rf \"$dest\";"));
+        assert!(mac.find("ditto \"$src\" \"$dest.new\"").unwrap() < mac.find("mv \"$dest\" \"$dest.old\"").unwrap());
+        assert!(mac.contains("else mv \"$dest.old\" \"$dest\"; fi"));
+        let linux = unix_script(42, Path::new("/tmp/staged"), Path::new("/opt/tinyclient"), "0.9.0", result, true);
+        assert!(linux.find("mv -f \"$dest/$n\" \"$dest/$n.old\"").unwrap() < linux.find("mv -f \"$src/$n\" \"$dest/$n\"").unwrap());
+        assert!(linux.contains("rm -f \"$dest/$n\"; mv -f \"$dest/$n.old\" \"$dest/$n\""));
+        for script in [mac, linux] {
+            assert!(!script.contains("set -e"), "a failed step is handled, not left where it fell");
+            assert!(script.contains("printf 'updated %s\\n' \"$version\" > \"$result\""));
+            assert!(script.contains("printf 'failed %s the "));
+        }
+    }
+
+    /// A process that has already ended, so a swap script does not wait for it.
+    #[cfg(unix)]
+    fn ended() -> u32 {
+        let mut child = Command::new("/bin/sh").args(["-c", ":"]).spawn().unwrap();
+        child.wait().unwrap();
+        child.id()
+    }
+
+    /// Runs the generated Linux swap for real, in folders of its own.
+    #[cfg(unix)]
+    #[test]
+    fn the_linux_swap_replaces_the_programs_or_puts_every_old_one_back() {
+        let names = ["tinyclient", "chatd", "mediad", "tinyclient-login"];
+        let run = |tag: &str, staged: &[&str]| {
+            let root = std::env::temp_dir().join(format!("tinyclient-swap-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            let (src, dest) = (root.join("staged"), root.join("o'brien app"));
+            fs::create_dir_all(&src).unwrap();
+            fs::create_dir_all(&dest).unwrap();
+            for name in names {
+                fs::write(dest.join(name), "old").unwrap();
+            }
+            for name in staged {
+                fs::write(src.join(name), "new").unwrap();
+            }
+            fs::write(root.join("apply.sh"), unix_script(ended(), &src, &dest, "0.9.0", &root.join(SWAP_RESULT), false)).unwrap();
+            assert!(Command::new("/bin/sh").arg(root.join("apply.sh")).status().unwrap().success());
+            let result = fs::read_to_string(root.join(SWAP_RESULT)).unwrap();
+            let held: Vec<String> = names.iter().map(|name| fs::read_to_string(dest.join(name)).unwrap()).collect();
+            let files = fs::read_dir(&dest).unwrap().count();
+            let _ = fs::remove_dir_all(&root);
+            (result, held, files)
+        };
+        let (result, held, files) = run("good", &names);
+        assert_eq!(result, "updated 0.9.0\n");
+        assert!(held.iter().all(|text| text == "new") && files == 4);
+        // Two programs are missing from the download: the two that did move are taken out again.
+        let (result, held, files) = run("bad", &names[..2]);
+        assert_eq!(failed_swap(&result), Some("0.9.0".into()));
+        assert!(held.iter().all(|text| text == "old") && files == 4);
+    }
+
+    /// Runs the generated macOS swap for real, in folders of its own. It needs `ditto`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_mac_swap_replaces_the_app_or_leaves_the_old_one() {
+        let run = |tag: &str, staged: bool| {
+            let root = std::env::temp_dir().join(format!("tinyclient-swap-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            let (src, dest) = (root.join("staged/tinyclient.app"), root.join("o'brien/tinyclient.app"));
+            fs::create_dir_all(dest.join("Contents/MacOS")).unwrap();
+            fs::write(dest.join("Contents/MacOS/tinyclient"), "old").unwrap();
+            if staged {
+                fs::create_dir_all(src.join("Contents/MacOS")).unwrap();
+                fs::write(src.join("Contents/MacOS/tinyclient"), "new").unwrap();
+            }
+            fs::write(root.join("apply.sh"), mac_script(ended(), &src, &dest, "0.9.0", &root.join(SWAP_RESULT), false)).unwrap();
+            assert!(Command::new("/bin/sh").arg(root.join("apply.sh")).status().unwrap().success());
+            let result = fs::read_to_string(root.join(SWAP_RESULT)).unwrap();
+            let held = fs::read_to_string(dest.join("Contents/MacOS/tinyclient")).unwrap();
+            let beside = fs::read_dir(dest.parent().unwrap()).unwrap().count();
+            let _ = fs::remove_dir_all(&root);
+            (result, held, beside)
+        };
+        assert_eq!(run("mac-good", true), ("updated 0.9.0\n".to_owned(), "new".to_owned(), 1));
+        let (result, held, beside) = run("mac-bad", false);
+        assert_eq!((failed_swap(&result), held.as_str(), beside), (Some("0.9.0".into()), "old", 1));
+    }
+
+    #[test]
+    fn a_failed_version_is_left_alone_for_a_day_and_no_other_is() {
+        let failed = Shown::Failed { version: "0.9.0".into() };
+        let day = 24 * 60 * 60;
+        assert!(put_off(&failed, "0.9.0", 1_000, 1_000));
+        assert!(put_off(&failed, "0.9.0", 1_000, 1_000 + day - 1));
+        assert!(!put_off(&failed, "0.9.0", 1_000, 1_000 + day));
+        // A newer release is tried at once, and so is anything that did not fail.
+        assert!(!put_off(&failed, "0.9.1", 1_000, 1_001));
+        assert!(!put_off(&Shown::Ready { version: "0.9.0".into() }, "0.9.0", 1_000, 1_001));
+        assert!(!put_off(&Shown::Quiet, "0.9.0", 1_000, 1_001));
+        // A clock set back does not hold the update for longer than a day.
+        assert!(!put_off(&failed, "0.9.0", 1_000, 999));
+    }
+
+    #[test]
+    fn a_build_with_no_archive_still_learns_of_the_release() {
+        let json = r#"{"tag_name":"v2.0.0","html_url":"https://github.com/TinyComms/tinyclient/releases/tag/v2.0.0","assets":[
+            {"name":"tinyclient-linux-x86_64.tar.gz","browser_download_url":"https://github.com/TinyComms/tinyclient/releases/download/v2.0.0/tinyclient-linux-x86_64.tar.gz"},
+            {"name":"tinyclient-linux-aarch64.tar.gz","browser_download_url":"https://github.com/TinyComms/tinyclient/releases/download/v2.0.0/tinyclient-linux-aarch64.tar.gz"},
+            {"name":"SHA256SUMS","browser_download_url":"https://github.com/TinyComms/tinyclient/releases/download/v2.0.0/SHA256SUMS"}]}"#;
+        // No archive is made for this build: the version and the page to send it to, and no file.
+        let release = release_for(json, None).expect("a release to tell the user about");
+        assert_eq!((release.version.as_str(), release.archive_url.as_str()), ("2.0.0", ""));
+        assert!(release.page.ends_with("/releases/tag/v2.0.0"));
+        // The arm64 Linux archive is taken by its own name, not the x86_64 one before it.
+        let release = release_for(json, Some("tinyclient-linux-aarch64.tar.gz")).expect("parsed");
+        assert!(release.archive_url.ends_with("/tinyclient-linux-aarch64.tar.gz"));
+        assert_eq!(archive_suffix("tinyclient-linux-aarch64.tar.gz"), "-linux-aarch64.tar.gz");
+        // With an archive name, a release that has not got that file yet is still not taken.
+        assert!(release_for(json, Some("tinyclient-macos.zip")).is_none());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_download_is_found_flat_or_inside_the_linux_archives_folder() {
+        let dir = std::env::temp_dir().join(format!("tinyclient-payload-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(payload_ready(&dir), None);
+        // The Linux .tar.gz: `tinyclient/tinyclient`, `tinyclient/chatd`.
+        let folder = dir.join("staged").join("tinyclient");
+        fs::create_dir_all(&folder).unwrap();
+        for name in ["tinyclient", "chatd"] {
+            fs::write(folder.join(program(name)), "").unwrap();
+        }
+        assert_eq!(payload_ready(&dir), Some(folder.clone()));
+        // The Windows zip: the programs at the top.
+        fs::remove_dir_all(&folder).unwrap();
+        for name in ["tinyclient", "chatd"] {
+            fs::write(dir.join("staged").join(program(name)), "").unwrap();
+        }
+        assert_eq!(payload_ready(&dir), Some(dir.join("staged")));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

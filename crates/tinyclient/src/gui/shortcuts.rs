@@ -124,6 +124,9 @@ mod tests {
             ("ctrl-v", "Paste"),
             ("ctrl-left", "WordLeft"),
             ("ctrl-backspace", "DeleteWordLeft"),
+            ("ctrl-z", "Undo"),
+            ("ctrl-shift-z", "Redo"),
+            ("ctrl-y", "Redo"),
         ] {
             let stroke = gpui::Keystroke::parse(key).unwrap();
             let binding = bindings

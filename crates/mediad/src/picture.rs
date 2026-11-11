@@ -413,6 +413,14 @@ impl Canvas {
     }
 }
 
+/// A call that ends while a picture is on (the capture thread told to stop, with nothing turned
+/// off first) leaves no picture of a screen or a face behind in the temp folder.
+impl Drop for Canvas {
+    fn drop(&mut self) {
+        self.forget();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -245,6 +245,10 @@ pub struct Call {
     /// My own camera as it is sent, for my tile. `None` while it is off. Its `user_id` is empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_view: Option<CallPicture>,
+    /// My own share as it is sent, for the stage while I am sharing. `None` while it is off. Its
+    /// `user_id` is empty. Apart from `self_view`: a camera and a share can be on together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_view: Option<CallPicture>,
 }
 
 /// A Tiny server call's protection (tinyserver's `docs/calls.md`, "End-to-end encryption").
@@ -890,9 +894,16 @@ pub enum MediaResponse {
     },
     /// What our camera and share are actually sending, after an answer or a refusal.
     Sending { share: bool, camera: bool },
-    /// Our own camera as it is being sent, a few times a second, so the person sees what
-    /// everyone else sees; an empty path when the camera went off.
-    SelfView { path: String, width: u32, height: u32, generation: u64 },
+    /// Our own camera, or with `share` our own share, as it is being sent, a few times a second,
+    /// so the person sees what everyone else sees; an empty path when it went off.
+    SelfView {
+        path: String,
+        width: u32,
+        height: u32,
+        generation: u64,
+        #[serde(default)]
+        share: bool,
+    },
     /// A picture that could not be captured, in words. The voice call stays.
     Notice { detail: String },
 }
@@ -944,6 +955,16 @@ impl MediaResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_self_view_is_my_camera_unless_it_says_it_is_my_share() {
+        // A mediad from before shares had a preview sends none: that is my camera, never an error.
+        let older: MediaResponse = serde_json::from_str(r#"{"media":"self_view","path":"a.jpg","width":640,"height":360,"generation":3}"#).unwrap();
+        assert_eq!(older, MediaResponse::SelfView { path: "a.jpg".into(), width: 640, height: 360, generation: 3, share: false });
+        let mine = MediaResponse::SelfView { path: "b.jpg".into(), width: 640, height: 360, generation: 4, share: true };
+        let back: MediaResponse = serde_json::from_str(&serde_json::to_string(&mine).unwrap()).unwrap();
+        assert_eq!(back, mine);
+    }
 
     #[test]
     fn a_requirement_is_sent_only_when_it_is_made_and_read_as_off_when_absent() {

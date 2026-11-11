@@ -1,0 +1,12 @@
+{
+  "id": "linkify",
+  "title": "Web addresses in a Tiny message, plain or encrypted, are links on the right text",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd against a localhost preview. The same address check keeps the words this desktop run checks.",
+    "ios": "The phone proof build does not run desktop chatd against a localhost preview. The same address check keeps the words this desktop run checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

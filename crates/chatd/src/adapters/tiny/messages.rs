@@ -599,6 +599,7 @@ fn refold(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, convers
         message.saved_history = false;
         message.text = opened.text.clone();
         message.edited = true;
+        relink(&mut message);
         let mut media = Vec::new();
         message.attachments = sealed_attachments(saved, opened, &mut media);
         if !media.is_empty() {
@@ -844,6 +845,7 @@ fn rehydrate_opened(
     message.sender.id = last.author_id.clone();
     message.seal = Seal::Encrypted;
     message.attachments = attachments;
+    relink(&mut message);
     if !media.is_empty() {
         let _ = ctx.media(&media);
     }
@@ -879,6 +881,21 @@ pub(super) fn prove_sealed_preview() -> Result<(), String> {
     } else {
         Err(format!("empty encrypted preview was {words:?}, not Encrypted message"))
     }
+}
+
+/// The lab's keycap-reaction proof. A keycap is taken as a reaction, and a bare digit still is not.
+pub(super) fn prove_keycap_reaction() -> Result<(), String> {
+    for keycap in ["1\u{FE0F}\u{20E3}", "0\u{20E3}", "#\u{FE0F}\u{20E3}"] {
+        if !unicode_emoji(keycap) {
+            return Err(format!("the keycap {keycap:?} was refused as a reaction"));
+        }
+    }
+    for not_one in ["1", "10\u{FE0F}\u{20E3}", "1\u{FE0F}", ":one:"] {
+        if unicode_emoji(not_one) {
+            return Err(format!("{not_one:?} was taken as a reaction"));
+        }
+    }
+    Ok(())
 }
 
 /// The lab's sealed-preview-attachments proof. A wiped sqlite row still restores a captionless
@@ -1348,29 +1365,44 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
     }
 }
 
-/// A send of text. One to an encrypted conversation can wait for the people of a new group to
-/// join it (`e2ee::send`), so it goes to this account's sealed-send thread, in order, and the
-/// commands go on meanwhile.
+/// A send of text. It never runs on the commands thread: that one serves history, previews and
+/// everything else the person is waiting on, and a send there waited behind all of it. A send
+/// goes to this account's send thread, in order, and the commands go on meanwhile. One to an
+/// encrypted conversation can wait for the people of a new group to join it (`e2ee::send`), so
+/// it has a thread of its own, and does not hold up the plain ones.
 fn send(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>) {
-    if super::safe_id(&conversation_id) && sealed_here(ctx, saved, &conversation_id) == Ok(true) {
-        let account = (saved.base_url.clone(), saved.user_id.clone());
-        let (posting, saved) = (ctx.clone(), saved.clone());
-        in_order(account, Box::new(move || {
-            let outcome = post_message(&posting, &saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[]);
-            posting.sent(&conversation_id, &client_id, outcome);
-        }));
+    if !super::safe_id(&conversation_id) {
+        let outcome = Err(super::CHECK.to_owned());
+        ctx.sent(&conversation_id, &client_id, outcome);
         return;
     }
-    let outcome = post_message(ctx, saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[]);
-    ctx.sent(&conversation_id, &client_id, outcome);
+    // The same question the post asks, so a conversation the device knows is encrypted but the
+    // list has not labelled yet still goes to the sealed queue and never holds up the plain one.
+    let account = send_account(saved, sealed_here(ctx, saved, &conversation_id) == Ok(true));
+    let (posting, saved) = (ctx.clone(), saved.clone());
+    in_order(account, Box::new(move || {
+        let _ = crate::sendtime::run(&client_id, || {
+            let outcome = post_message(&posting, &saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[]);
+            let sent = outcome.is_ok();
+            posting.sent(&conversation_id, &client_id, outcome);
+            crate::sendtime::stage("store");
+            if sent { Ok(()) } else { Err(()) }
+        });
+    }));
+}
+
+/// The send thread an account's sends of one kind go to: sealed ones apart from plain ones.
+fn send_account(saved: &Saved, sealed: bool) -> (String, String) {
+    let user = if sealed { saved.user_id.clone() } else { format!("{}#plain", saved.user_id) };
+    (saved.base_url.clone(), user)
 }
 
 type Job = Box<dyn FnOnce() + Send>;
 
-/// The sealed-send thread of each account (server and user), by what takes its jobs.
+/// The send thread of each account (server and user, and plain or sealed), by what takes its jobs.
 type Queues = HashMap<(String, String), std::sync::mpsc::Sender<Job>>;
 
-/// Runs `job` on the account's sealed-send thread, after the ones before it. Made when first
+/// Runs `job` on the account's send thread, after the ones before it. Made when first
 /// needed, and again if it ended.
 fn in_order(account: (String, String), job: Job) {
     static QUEUES: std::sync::OnceLock<std::sync::Mutex<Queues>> = std::sync::OnceLock::new();
@@ -1383,7 +1415,7 @@ fn in_order(account: (String, String), job: Job) {
         None => job,
     };
     let (queue, jobs) = std::sync::mpsc::channel::<Job>();
-    let started = std::thread::Builder::new().name("tiny-sealed-send".into()).spawn(move || {
+    let started = std::thread::Builder::new().name("tiny-send".into()).spawn(move || {
         for job in jobs {
             job();
         }
@@ -1418,7 +1450,9 @@ fn post_message(ctx: &Context, saved: &Saved, conversation_id: &str, client_id: 
         body.insert("attachment_ids".to_owned(), json!(attachment_ids));
     }
     let path = format!("/v1/conversations/{conversation_id}/messages");
-    match super::asked("POST", saved, &path, Some(Value::Object(body))) {
+    let answer = super::asked("POST", saved, &path, Some(Value::Object(body)));
+    crate::sendtime::stage("post");
+    match answer {
         Ok((200 | 201, value)) => accept_message(ctx, saved, conversation_id, &value),
         Ok((status, value)) => Err(super::explain(status, &value, super::Missing::Plain).to_owned()),
         Err(detail) => Err(detail.to_owned()),
@@ -1458,8 +1492,7 @@ fn post_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, client_id: &
 
 fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>, outgoing: Outgoing) {
     if outgoing.files.is_empty() {
-        let outcome = post_message(ctx, saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[]);
-        ctx.sent(&conversation_id, &client_id, outcome);
+        send(ctx, saved, conversation_id, client_id, text, reply_to);
         return;
     }
     if outgoing.files.len() > protocol::ATTACHMENTS_LIMIT {
@@ -1566,6 +1599,7 @@ fn edit(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, t
             } else if let Ok(Some(mut message)) = ctx.stored_message(conversation_id, message_id) {
                 message.text = text.to_owned();
                 message.edited = true;
+                relink(&mut message);
                 let _ = ctx.message(conversation_id, &message);
             }
             let _ = reply.send(Ok(()));
@@ -1587,6 +1621,7 @@ fn edit_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: 
     if let Ok(Some(mut message)) = ctx.stored_message(conversation_id, message_id) {
         message.text = text.to_owned();
         message.edited = true;
+        relink(&mut message);
         let _ = ctx.message(conversation_id, &message);
     }
     Ok(())
@@ -1727,7 +1762,15 @@ fn accept_message(ctx: &Context, saved: &Saved, conversation: &str, value: &Valu
     let wire = one_wire(value).ok_or(super::UNREADABLE)?;
     let mut media = Vec::new();
     let opened = open_rows(ctx, saved, conversation, &[&wire]);
-    let message = map_message(saved, &member_names(saved), &wire, &opened, &mut media).ok_or(super::UNREADABLE)?;
+    crate::sendtime::stage("open");
+    // Our own message is named from the session. The people list (a full request to the server)
+    // is for the rest, and nothing waits on it to settle a row of ours.
+    let own = wire.author_id == saved.user_id && !saved.display_name.is_empty();
+    let names = if own { HashMap::new() } else { member_names(saved) };
+    if !own {
+        crate::sendtime::stage("members");
+    }
+    let message = map_message(saved, &names, &wire, &opened, &mut media).ok_or(super::UNREADABLE)?;
     if !media.is_empty() {
         let _ = ctx.media(&media);
     }
@@ -1774,7 +1817,15 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
         }
         message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me });
     }
+    relink(&mut message);
     Some(message)
+}
+
+/// Web addresses in the text become links. The spans point into the text as it is now, so those
+/// from before an edit go; Tiny sends plain text and has no other styling.
+fn relink(message: &mut Message) {
+    message.spans.clear();
+    protocol::link::linkify(message);
 }
 
 /// An end-to-end encrypted row: what this device opened, or the words that say it could not.
@@ -1837,6 +1888,7 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
         }
         message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me });
     }
+    relink(&mut message);
     Some(message)
 }
 
@@ -1887,14 +1939,17 @@ fn media_kind(kind: &str, mime: &str) -> MediaKind {
     }
 }
 
-/// Unicode emoji only. A shortcode, a word, or a path is not one.
+/// Unicode emoji only. A shortcode, a word, or a path is not one. A keycap is one, though it
+/// starts with an ASCII digit (1️⃣ is `1`, U+FE0F, U+20E3), and tinyserver takes it.
 fn unicode_emoji(emoji: &str) -> bool {
     let mut textual = false;
     if emoji.is_empty() {
         return false;
     }
-    for ch in emoji.chars() {
-        if ch.is_ascii_alphanumeric() || ch == ':' || ch == '/' {
+    for (at, ch) in emoji.char_indices() {
+        let after = &emoji[at + ch.len_utf8()..];
+        let keycap = ch.is_ascii_digit() && (after.starts_with('\u{20E3}') || after.starts_with("\u{FE0F}\u{20E3}"));
+        if !keycap && (ch.is_ascii_alphanumeric() || ch == ':' || ch == '/') {
             return false;
         }
         if !ch.is_ascii() {
@@ -2482,6 +2537,58 @@ pub(super) fn prove_legacy_saved_speakers() -> Result<(), String> {
     Ok(())
 }
 
+/// Proves a Tiny message's web addresses are links, in a plaintext row and in an opened encrypted
+/// one, with the spans on the right bytes after multibyte text and the address left as typed.
+/// The lab sets `TINYCLIENT_PROVE=linkify`. A build from before the feature ignores that and keeps
+/// serving, so the same driver fails there.
+pub(super) fn prove_linkify() -> Result<(), String> {
+    const ME: &str = "11111111-1111-1111-1111-111111111111";
+    let saved = Saved {
+        base_url: "http://127.0.0.1:9".to_owned(),
+        token: "t".to_owned(),
+        user_id: ME.to_owned(),
+        email: None,
+        display_name: "Ada".to_owned(),
+        role: "member".to_owned(),
+        plain_http_ok: false,
+        e2ee: None,
+    };
+    let text = "héllo 你好 docs: https://example.com/a%20b?q=1&r=2#top, and (www.example.org/x). Not mailto:a@example.com or `https://example.com/code`";
+    let want = ["https://example.com/a%20b?q=1&r=2#top", "www.example.org/x"];
+    let plain: WireMessage = serde_json::from_value(serde_json::json!({
+        "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "author_id": ME, "body": text, "created_at": "2024-01-02T03:04:05Z"
+    }))
+    .map_err(|err| err.to_string())?;
+    let sealed: WireMessage = serde_json::from_value(serde_json::json!({
+        "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "author_id": ME, "e2ee": true, "created_at": "2024-01-02T03:04:06Z"
+    }))
+    .map_err(|err| err.to_string())?;
+    let opened = e2ee::Opened { text: text.into(), ..e2ee::Opened::default() };
+    let reads = HashMap::from([(sealed.id.clone(), Read::Legacy(opened))]);
+    for (what, wire) in [("plaintext", &plain), ("encrypted", &sealed)] {
+        let message = map_message(&saved, &HashMap::new(), wire, &reads, &mut Vec::new()).ok_or(format!("the {what} row was dropped"))?;
+        let linked: Vec<(String, String)> = message
+            .spans
+            .iter()
+            .filter_map(|span| match &span.style {
+                protocol::Style::Link { url } => message.text.get(span.start as usize..span.end as usize).map(|shown| (shown.to_owned(), url.clone())),
+                _ => None,
+            })
+            .collect();
+        let got: Vec<&str> = linked.iter().map(|(shown, _)| shown.as_str()).collect();
+        if got != want {
+            return Err(format!("the {what} row linked {got:?}, not {want:?}"));
+        }
+        if linked[1].1 != "https://www.example.org/x" || linked[0].1 != want[0] {
+            return Err(format!("the {what} row opens {:?}", linked.iter().map(|(_, url)| url).collect::<Vec<_>>()));
+        }
+        if message.text != text {
+            return Err(format!("the {what} row's text was changed"));
+        }
+    }
+    Ok(())
+}
+
 /// Proves a ciphertext row with no `e2ee` flag is stored as undecryptable, not as blank plaintext.
 /// The lab sets `TINYCLIENT_PROVE=sealed-row`. A build from before the fix ignores that and keeps
 /// serving, so the same driver fails there.
@@ -2881,6 +2988,20 @@ mod tests {
         assert!(!unicode_emoji(""));
     }
 
+    /// A keycap reaction (1️⃣) was refused when sent and dropped when another app had put one on
+    /// a message, because it starts with an ASCII digit.
+    #[test]
+    fn a_keycap_is_a_reaction_and_a_bare_digit_is_not() {
+        assert!(unicode_emoji("1\u{FE0F}\u{20E3}"));
+        assert!(unicode_emoji("7\u{20E3}"), "a keycap without its variation selector");
+        assert!(unicode_emoji("*\u{FE0F}\u{20E3}"));
+        assert!(!unicode_emoji("1"));
+        assert!(!unicode_emoji("1\u{FE0F}"), "a digit and a variation selector are not a keycap");
+        assert!(!unicode_emoji("10\u{FE0F}\u{20E3}"), "only the digit right before the keycap mark is part of it");
+        assert!(!unicode_emoji("a\u{20E3}"));
+        assert!(super::prove_keycap_reaction().is_ok());
+    }
+
     #[test]
     fn a_new_direct_event_records_the_peer_on_either_side_before_the_first_message() {
         for (low, high) in [(ME, PEER), (PEER, ME)] {
@@ -2934,6 +3055,15 @@ mod tests {
     }
 
     #[test]
+    fn sealed_and_plain_sends_go_to_different_send_threads() {
+        let saved = saved("http://127.0.0.1:1");
+        let (sealed, plain) = (send_account(&saved, true), send_account(&saved, false));
+        assert_ne!(sealed, plain, "a sealed send that waits to join must not hold up a plain one");
+        assert_eq!(sealed.0, plain.0, "the same server");
+        assert_eq!(sealed.1, saved.user_id);
+    }
+
+    #[test]
     fn an_unrelated_or_invalid_direct_pair_is_not_published() {
         for (low, high) in [(PEER, "33333333"), (ME, ME), (ME, "bad/id"), ("", ME)] {
             let (_adapter, ctx) = open_ctx();
@@ -2965,6 +3095,21 @@ mod tests {
         let row = ctx.known("new-direct").unwrap().unwrap();
         assert_eq!((row.title.as_str(), row.peer.as_deref(), row.encryption, row.unread),
             ("Bea", Some(PEER), Encryption::EndToEnd, 2));
+    }
+
+    #[test]
+    fn web_addresses_in_a_message_become_links_and_an_edit_moves_them() {
+        assert_eq!(super::prove_linkify(), Ok(()));
+        let mut message = Message::plain("m", "Ada", "see https://a.example/x", 1, false);
+        super::relink(&mut message);
+        assert_eq!(message.spans.len(), 1);
+        message.text = "now a much longer line before https://b.example/y".to_owned();
+        super::relink(&mut message);
+        let [span] = &message.spans[..] else { panic!("{:?}", message.spans) };
+        assert_eq!(&message.text[span.start as usize..span.end as usize], "https://b.example/y");
+        message.text = "no address left".to_owned();
+        super::relink(&mut message);
+        assert!(message.spans.is_empty());
     }
 
     #[test]

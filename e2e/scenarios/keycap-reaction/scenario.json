@@ -1,0 +1,12 @@
+{
+  "id": "keycap-reaction",
+  "title": "A keycap emoji such as 1️⃣ is taken as a Tiny reaction",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same reaction filter is what this desktop run checks.",
+    "ios": "The phone proof build does not run desktop chatd. The same reaction filter is what this desktop run checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

@@ -22,7 +22,8 @@
 //!   reason, Retry and Delete. `None` for a message that went.
 //! - `held_sends(conversation)` are the messages sent while the account was offline, which
 //!   chatd does not store: draw each as a pending row with `held_line(conversation, held, cx)`
-//!   under its body. They wait 60 s for the link (`hold`), then fail in place.
+//!   under its body. They wait 60 s for the link (`hold`). One that never goes is not lost:
+//!   what was typed comes back to the composer it was typed in (`held_back`).
 //! - `send_failed_in(conversation)`: a message sent from here did not go and is unresolved.
 //! - `composer_links_changed(cx)` and `composer_changed(change, cx)` are called by the shell.
 
@@ -59,7 +60,7 @@ use gpui::{
     canvas, deferred, div, prelude::*, px, relative, App, Bounds, Context, Div, Entity, ExternalPaths, FocusHandle, Focusable,
     PathPromptOptions, Pixels, Point, Rgba, Subscription, Task, WeakEntity, Window,
 };
-use hold::{Flight, Held, Hold, Outcome};
+use hold::{Flight, Held, Hold, Outcome, Typed};
 use mention::Token;
 use picker::emoji::Custom;
 use picker::images::Images;
@@ -290,6 +291,18 @@ struct Draft {
     files: Vec<Staged>,
     /// A refusal or note that belongs to this conversation, shown again on the way back.
     note: Option<(String, Tone)>,
+    /// The message this draft answers. It is still a reply on the way back.
+    reply: Option<Reply>,
+}
+
+impl Draft {
+    /// A send went while this draft was parked. The reply it carried went with it; one chosen
+    /// since is the next message's and stays.
+    fn reply_went(&mut self, sent: Option<&str>) {
+        if self.reply.as_ref().map(|reply| reply.id.as_str()) == sent {
+            self.reply = None;
+        }
+    }
 }
 
 /// The parked text is still the message that went. A follow-up typed before the
@@ -298,6 +311,74 @@ fn parked_text_is_the_send(parked: &str, sent_field: &str) -> bool {
     parked == draft_text(sent_field)
 }
 
+/// A held message never went: what was typed goes back into `draft`, on a line of its own in
+/// front of anything typed since, with its mentions and the message it answered.
+fn put_back(draft: &mut Draft, typed: Typed, note: (String, Tone)) {
+    if draft.text.trim().is_empty() {
+        draft.text = typed.field;
+        draft.tokens = typed.tokens;
+    } else {
+        let shift = typed.field.len() + 1;
+        let since = std::mem::replace(&mut draft.tokens, typed.tokens);
+        draft.tokens.extend(since.into_iter().map(|mut token| {
+            token.range = token.range.start + shift..token.range.end + shift;
+            token
+        }));
+        draft.text = format!("{}\n{}", typed.field, draft.text);
+    }
+    if draft.reply.is_none() {
+        draft.reply = typed.reply;
+    }
+    draft.note = Some(note);
+}
+
+/// What the composer says of a held message that came back.
+fn back_words(reason: &str) -> (String, Tone) {
+    (format!("Not sent. {reason} Your text is kept."), Tone::Offline)
+}
+
+/// The lab's offline-send-kept driver. Two messages are sent while their accounts are offline.
+/// One link returns: that message is sent once and is never put back. The other stays down
+/// past the window: what was typed is back in the empty field, once, and is held no longer.
+pub(crate) fn prove_offline_send_kept() -> Result<(), &'static str> {
+    let key = |account: &str| Key { network: Network::Tiny, account: account.into(), id: "general".into() };
+    let (down, up) = (key("down"), key("up"));
+    let start = Instant::now();
+    let held = |key: &Key, id: &str, field: &str| {
+        let typed = Typed { field: field.to_owned(), ..Typed::default() };
+        Held::new(key.clone(), id.to_owned(), field.to_owned(), field.to_owned(), None, 0, start).typed(typed)
+    };
+    let mut hold = Hold::default();
+    if !hold.hold(held(&down, "1", "Back in ten"), start) || !hold.hold(held(&up, "2", "On my way"), start) {
+        return Err("a message sent while offline was not held");
+    }
+    let link = |key: &Key| if *key == up { Link::Connected } else { Link::Offline };
+    let ready = hold.linked(start + Duration::from_secs(5), link);
+    if ready.len() != 1 || ready[0].client_id != "2" || !hold.linked(start + Duration::from_secs(6), link).is_empty() {
+        return Err("the message whose link returned was not sent exactly once");
+    }
+    hold.sent(&up, "2");
+    hold.linked(start + hold::WINDOW, link);
+    let mut back = hold.take_failed();
+    if back.len() != 1 || back[0].client_id != "1" || hold.has(&down, "1") || !hold.take_failed().is_empty() {
+        return Err("the message that never went was not handed back exactly once");
+    }
+    let Some(gave_up) = back.pop() else {
+        return Err("the message that never went was not handed back");
+    };
+    let mut field = Draft::default();
+    let note = back_words(gave_up.failed().unwrap_or_default());
+    put_back(&mut field, gave_up.typed, note);
+    if field.text != "Back in ten" || field.note.is_none() {
+        return Err("a message that never went did not come back to the field");
+    }
+    if !hold.linked(start + Duration::from_secs(3600), |_| Link::Connected).is_empty() {
+        return Err("a message that came back to the field was sent later as well");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct Reply {
     id: String,
     name: String,
@@ -331,6 +412,9 @@ struct Outgoing {
     wire: String,
     client_id: String,
     reply_to: Option<String>,
+    /// The mentions and the reply as they were then, to put back if a held send never goes.
+    tokens: Vec<Token>,
+    reply: Option<Reply>,
     /// The chips that went, and the files the shell made for them.
     chips: Vec<u64>,
     made: Vec<PathBuf>,
@@ -561,7 +645,7 @@ impl Composer {
             self.tray = draft.files;
             self.offered = stored.to_owned();
             self.touched = false;
-            self.reply = None;
+            self.reply = draft.reply;
             self.caption = self.scan_caption_for(&target.key).or(note);
             self.sending = false;
             self.no_preview = false;
@@ -592,7 +676,7 @@ impl Composer {
     }
 
     /// Leaving a conversation: an edit ends, and the draft is saved and kept for the way back,
-    /// its chips with it.
+    /// its chips and the message it answers with it.
     fn leave(&mut self, cx: &mut Context<Self>) {
         self.end_edit(cx);
         self.save_draft(cx);
@@ -604,7 +688,7 @@ impl Composer {
             return;
         };
         let draft = Draft { text: draft_text(self.input.read(cx).text()), tokens: self.tokens.clone(), files,
-            note: self.caption.clone(), };
+            note: self.caption.clone(), reply: self.reply.take(), };
         self.remember(old, draft);
     }
 
@@ -814,6 +898,8 @@ impl Composer {
             field,
             client_id: client_id(),
             reply_to,
+            tokens: self.tokens.clone(),
+            reply: self.reply.clone(),
             chips: self.tray.iter().map(|chip| chip.id).collect(),
             made: self.tray.iter().flat_map(Staged::made).collect(),
             note: voice.is_some(),
@@ -866,6 +952,8 @@ impl Composer {
             wire: String::new(),
             client_id: client_id(),
             reply_to,
+            tokens: Vec::new(),
+            reply: None,
             chips: Vec::new(),
             made: Vec::new(),
             note: false,
@@ -947,7 +1035,8 @@ impl Composer {
                     out.reply_to.clone(),
                     now(),
                     Instant::now(),
-                );
+                )
+                .typed(Typed { thread: self.thread, field: out.field.clone(), tokens: out.tokens.clone(), reply: out.reply.clone() });
                 let held = self.shell.update(cx, |shell, cx| shell.hold_send(held, cx)).unwrap_or(false);
                 (!held).then(|| "Not sent. Too many messages are already waiting for a connection.".to_owned())
             }
@@ -1061,6 +1150,9 @@ impl Composer {
     fn went(&mut self, out: &Outgoing, cx: &mut Context<Self>) {
         let here = self.target.as_ref().is_some_and(|now| now.key == out.key);
         if !here {
+            if let Some(draft) = self.drafts.get_mut(&out.key) {
+                draft.reply_went(out.reply_to.as_deref());
+            }
             // A GIF or sticker sent nothing that was typed. The follow-up stays.
             if out.field.is_empty() && out.chips.is_empty() {
                 return;
@@ -1096,6 +1188,47 @@ impl Composer {
             self.draft_timer = None;
             self.save_draft(cx);
         }
+    }
+
+    /// A held message never went (its minute ran out, its account signed out, or chatd refused
+    /// it when the link returned). What was typed comes back so it is not lost: into the field
+    /// when this conversation is on screen, else into its parked draft for the way back.
+    fn held_back(&mut self, held: Held, cx: &mut Context<Self>) {
+        let Some(note) = held.failed().map(back_words) else {
+            return;
+        };
+        // A GIF or sticker typed nothing.
+        if held.typed.field.trim().is_empty() {
+            return;
+        }
+        let (key, typed) = (held.conversation, held.typed);
+        if self.target.as_ref().is_none_or(|now| now.key != key) {
+            let mut draft = self.drafts.get(&key).cloned().unwrap_or_default();
+            put_back(&mut draft, typed, note);
+            let text = draft_text(&draft.text);
+            self.remember(key.clone(), draft);
+            self.store_draft(key, text, cx);
+            return;
+        }
+        if let Some(editing) = self.editing.as_mut() {
+            // The edit keeps the field: the message waits with the draft the edit put aside.
+            put_back(&mut editing.stash, typed, note);
+            let reply = editing.stash.reply.take();
+            if editing.reply.is_none() {
+                editing.reply = reply;
+            }
+            return;
+        }
+        self.follow_text(cx);
+        let mut draft = Draft { text: self.input.read(cx).text().to_owned(), tokens: self.tokens.clone(), reply: self.reply.take(), ..Draft::default() };
+        put_back(&mut draft, typed, note);
+        self.set_field(&draft, cx);
+        self.reply = draft.reply;
+        self.caption = draft.note;
+        self.armed = None;
+        self.draft_timer = None;
+        self.save_draft(cx);
+        cx.notify();
     }
 
     // Files.
@@ -1540,13 +1673,13 @@ impl Composer {
                 self.follow_text(cx);
                 let files = std::mem::take(&mut self.tray);
                 (Draft { text: self.input.read(cx).text().to_owned(), tokens: self.tokens.clone(), files,
-                        note: self.caption.clone(), }, self.reply.take())
+                        note: self.caption.clone(), reply: None, }, self.reply.take())
             }
         };
         let (text, tokens) = mention::source(message);
         self.editing = Some(Editing { id: message.id.clone(), original: text.clone(), stash, reply });
         self.set_field(&Draft { text, tokens, files: Vec::new(),
-                note: None, }, cx);
+                note: None, reply: None, }, cx);
         self.close_picker(cx);
         self.caption = None;
         self.armed = None;
@@ -2541,7 +2674,7 @@ impl Composer {
     #[cfg(feature = "gui-shot")]
     fn stage_flag(&mut self, cx: &mut Context<Self>) {
         let field = |text: &str, tokens: Vec<Token>| Draft { text: text.to_owned(), tokens, files: Vec::new(),
-            note: None, };
+            note: None, reply: None, };
         let Some(target) = self.target.clone() else {
             return;
         };
@@ -2644,6 +2777,8 @@ impl Composer {
                     field: text,
                     client_id: client_id(),
                     reply_to: None,
+                    tokens: Vec::new(),
+                    reply: None,
                     chips: Vec::new(),
                     made: Vec::new(),
                     note: false,
@@ -2990,8 +3125,20 @@ impl Shell {
                 self.send_held(held, cx);
             }
         }
+        self.hold_returns(cx);
         self.hold_schedule(cx);
         cx.notify();
+    }
+
+    /// What the hold gave up on goes back to the composer it was typed in, so the text is not
+    /// lost. Once this update is over: a hold can fail in the middle of that composer's own.
+    fn hold_returns(&mut self, cx: &mut Context<Self>) {
+        for held in self.composer_state.hold.take_failed() {
+            let slot = if held.typed.thread { &self.composer_state.thread } else { &self.composer_state.main };
+            if let Some(composer) = slot.get().cloned() {
+                cx.defer(move |cx| composer.update(cx, |composer, cx| composer.held_back(held, cx)));
+            }
+        }
     }
 
     /// Keeps the one expiry timer in step with the hold: none when nothing waits.
@@ -3002,6 +3149,7 @@ impl Shell {
                 cx.background_executor().timer(wait).await;
                 let _ = this.update(cx, |shell, cx| {
                     shell.composer_state.hold.expire(Instant::now());
+                    shell.hold_returns(cx);
                     shell.hold_schedule(cx);
                     cx.notify();
                 });
@@ -3036,6 +3184,7 @@ impl Shell {
                     Ok(_) => hold.refused(key, id, false, "tinyclient's background process answered something it should not have.", Instant::now()),
                     Err(_) => hold.refused(key, id, false, NOT_ANSWERING, Instant::now()),
                 }
+                shell.hold_returns(cx);
                 shell.hold_schedule(cx);
                 cx.notify();
             });
@@ -3412,6 +3561,69 @@ mod tests {
         assert!(parked_text_is_the_send("", "   "));
         assert!(!parked_text_is_the_send("hello!", "hello"));
         assert!(!parked_text_is_the_send("hello", ""));
+    }
+
+    fn reply(id: &str) -> Option<Reply> {
+        Some(Reply { id: id.into(), name: "Mara".into(), snippet: "Migration finished clean.".into() })
+    }
+
+    fn mention(range: std::ops::Range<usize>, label: &str) -> Token {
+        Token { range, label: label.into(), kind: mention::Kind::Role, id: "41".into() }
+    }
+
+    #[test]
+    fn a_parked_draft_is_still_a_reply_until_that_reply_goes() {
+        let parked = Draft { text: "On it".into(), reply: reply("m1"), ..Draft::default() };
+        // Coming back takes a copy of what was parked: the message it answers comes with it.
+        let mut back = parked.clone();
+        assert_eq!(back.reply.as_ref().map(|reply| reply.id.as_str()), Some("m1"));
+        // Another send going, or one that answered nothing, leaves it a reply.
+        back.reply_went(Some("m0"));
+        back.reply_went(None);
+        assert!(back.reply.is_some());
+        back.reply_went(Some("m1"));
+        assert!(back.reply.is_none());
+    }
+
+    #[test]
+    fn a_held_message_that_gave_up_comes_back_to_the_empty_field() {
+        let typed = Typed { thread: false, field: "@crew back in ten".into(), tokens: vec![mention(0..5, "@crew")], reply: reply("m1") };
+        let note = back_words("Slack did not come back.");
+        assert_eq!(note, ("Not sent. Slack did not come back. Your text is kept.".to_owned(), Tone::Offline));
+        // The field as `went` left it: empty, or only spaces.
+        for empty in ["", "  \n"] {
+            let mut field = Draft { text: empty.into(), ..Draft::default() };
+            put_back(&mut field, typed.clone(), note.clone());
+            assert_eq!(field.text, "@crew back in ten");
+            assert_eq!(field.tokens, [mention(0..5, "@crew")]);
+            assert_eq!(field.reply, reply("m1"));
+            assert_eq!(field.note, Some(note.clone()));
+        }
+    }
+
+    #[test]
+    fn a_held_message_that_gave_up_goes_in_front_of_what_was_typed_since() {
+        let typed = Typed { thread: false, field: "@crew back in ten".into(), tokens: vec![mention(0..5, "@crew")], reply: reply("m1") };
+        let note = back_words("Slack did not come back.");
+        // Aimed elsewhere with a draft parked there, or here with new text in the field: the
+        // message takes the first line, and nothing typed since is lost.
+        let mut since = Draft { text: "and @crew bring rope".into(), tokens: vec![mention(4..9, "@crew")], reply: reply("m2"), ..Draft::default() };
+        put_back(&mut since, typed.clone(), note.clone());
+        assert_eq!(since.text, "@crew back in ten\nand @crew bring rope");
+        assert_eq!(since.tokens, [mention(0..5, "@crew"), mention(22..27, "@crew")]);
+        assert!(since.tokens.iter().all(|token| since.text.get(token.range.clone()) == Some("@crew")));
+        // A reply chosen since is the newer intent and stays.
+        assert_eq!(since.reply, reply("m2"));
+        assert_eq!(since.note, Some(note.clone()));
+        // Nothing parked there at all: the draft is the message.
+        let mut none = Draft::default();
+        put_back(&mut none, typed, note);
+        assert_eq!((none.text.as_str(), none.reply), ("@crew back in ten", reply("m1")));
+    }
+
+    #[test]
+    fn a_hold_that_gives_up_hands_the_text_back_and_one_that_sends_does_not() {
+        assert_eq!(prove_offline_send_kept(), Ok(()));
     }
 
     fn target(link: Link, kind: ConversationKind, read_only: bool) -> Target {

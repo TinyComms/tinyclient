@@ -755,6 +755,9 @@ fn with_mediad() {
         let mediad = crate::test_mediad::path();
         std::env::set_var("TINYCLIENT_MEDIAD", mediad);
         std::env::set_var("TINYCLIENT_MEDIAD_AUDIO", "tone");
+        // These tests start the engine themselves; one started ahead of a ring would also hold the
+        // file the next build of mediad replaces.
+        std::env::set_var("TINYCLIENT_PREWARM", "off");
     });
 }
 
@@ -2323,4 +2326,23 @@ fn the_command_inbox_accepts_an_incoming_direct_before_starting_media() {
     assert_eq!(frame["type"], "call.accept");
     assert_eq!(frame["direct_id"], DIRECT);
     assert!(!media_started, "media waits for the server's acceptance event");
+}
+
+#[test]
+fn the_account_is_described_by_the_person_id_and_a_pending_send_can_name_them() {
+    let hub = Arc::new(Hub::new(Store::open(std::path::Path::new(":memory:")).expect("store")));
+    let account = AccountKey { network: Network::Tiny, account: ME.to_owned() };
+    let (_adapter, ctx, _inbox) = local(account.clone(), hub.clone());
+    let mut saved = saved_for("http://127.0.0.1:9");
+    saved.email = Some("ada@example.com".to_owned());
+    describe_self(&ctx, &saved);
+    let row = hub.store().accounts().unwrap().into_iter().find(|row| row.key == account).expect("account row");
+    assert_eq!(row.me, ME, "our id on the account is the person id, never the email");
+    let person = hub.store().person(&Key::new(&account, ME)).unwrap().expect("self person");
+    assert_eq!(person.name, "Ada", "the session's display name stands in until the people list names us");
+
+    // A name the server gave is not replaced by the session's.
+    hub.store().upsert_people(&account, &[PersonRow { id: ME.to_owned(), name: "Ada Vale".to_owned(), ..PersonRow::default() }]).unwrap();
+    describe_self(&ctx, &saved);
+    assert_eq!(hub.store().person(&Key::new(&account, ME)).unwrap().unwrap().name, "Ada Vale");
 }

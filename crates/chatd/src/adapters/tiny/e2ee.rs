@@ -989,6 +989,8 @@ pub(crate) struct Device {
     /// Conversations where someone the server is adding has no device in the group yet, as the
     /// last sync saw them.
     joining: BTreeSet<String>,
+    /// Coalesce reconnect and device-link membership catch-up workers.
+    membership_nudge: bool,
     /// Conversations with a row that did not open because this device was not in the group, or
     /// not at its epoch, yet. Read again when the group's handshake next comes.
     unopened: BTreeSet<String>,
@@ -1139,6 +1141,14 @@ pub(crate) fn begin(saved: &Saved, commands: std::sync::mpsc::Sender<crate::adap
     let mut device = lock(&shared);
     device.commands = Some(commands);
     device.enrol();
+}
+
+/// Live hints can be missed while offline (or before enrollment finished). Once the
+/// conversation list is known, revisit its encrypted groups without waiting for a send.
+pub(crate) fn resume(saved: &Saved) {
+    if let Some(shared) = started(saved) {
+        linking::nudge(shared);
+    }
 }
 
 /// Signing out: the device is revoked on the server and its state forgotten here. What it opened
@@ -1417,6 +1427,7 @@ impl Device {
             files: HashMap::new(),
             checked: BTreeSet::new(),
             joining: BTreeSet::new(),
+            membership_nudge: false,
             unopened: BTreeSet::new(),
             linking: false,
             commands: None,
@@ -1865,16 +1876,24 @@ impl Device {
     }
 
     pub(crate) fn sync(&mut self, conversation_id: &str) -> Result<(), String> {
+        self.sync_settled(conversation_id).map(|_| ())
+    }
+
+    /// [`Device::sync`], saying whether it ended on a pass that moved nothing: the feed was
+    /// empty and nothing was committed or started, so this device and the server agree as of that
+    /// pass. False when it gave up after [`PASSES`] or the conversation is not encrypted.
+    pub(crate) fn sync_settled(&mut self, conversation_id: &str) -> Result<bool, String> {
         if !self.ready() {
             return Err("This device isn't set up for encrypted messages yet.".to_owned());
         }
+        let mut settled = false;
         for _ in 0..PASSES {
             let (active, info) = self.group_info(conversation_id)?;
             let conv = active.group_id;
             if info.get("e2ee").and_then(Value::as_bool) != Some(true) {
                 self.note_encrypted(conversation_id, false);
                 self.joining.remove(conversation_id);
-                return Ok(());
+                return Ok(false);
             }
             self.note_encrypted(conversation_id, true);
             if joining(&info) {
@@ -1952,11 +1971,12 @@ impl Device {
             let moved = self.feed(conversation_id, conv, &server_key)?;
             let committed = self.commit(conversation_id, conv)?;
             if !moved && !committed && !started {
+                settled = true;
                 break;
             }
         }
         let _ = self.engine()?.flush();
-        Ok(())
+        Ok(settled)
     }
 
     /// Applies the handshake feed from where this conversation was last read. True when anything
@@ -2501,6 +2521,23 @@ impl Device {
         envelope: &Envelope,
         attachment_ids: &[String],
     ) -> Result<Value, String> {
+        self.post_after(conversation_id, client_id, kind, target_id, envelope, attachment_ids, false)
+    }
+
+    /// [`Device::post`]. `synced` says the caller synced this conversation to a settled pass on
+    /// this very lock, so the first pass does not sync again. A later pass always does: a server
+    /// that moved on since answers `409` and the retry reads it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn post_after(
+        &mut self,
+        conversation_id: &str,
+        client_id: &str,
+        kind: Kind,
+        target_id: Option<&str>,
+        envelope: &Envelope,
+        attachment_ids: &[String],
+        synced: bool,
+    ) -> Result<Value, String> {
         if self.notes.key_changed.contains(conversation_id) {
             return Err(words(&Error::ServerKeyChanged));
         }
@@ -2520,9 +2557,11 @@ impl Device {
                 .map_or(0, |since| since.as_secs() as i64),
             imported_from: None,
         };
-        for _ in 0..PASSES {
+        for pass in 0..PASSES {
             // Removals and joins first: a message is never sent to someone already leaving.
-            self.sync(conversation_id)?;
+            if !(synced && pass == 0) {
+                self.sync(conversation_id)?;
+            }
             let active = self.active(conversation_id)?;
             let conv = active.group_id;
             let sealed = match self.engine()?.encrypt(conv, kind, target_id, envelope) {
@@ -2548,11 +2587,13 @@ impl Device {
             if !attachment_ids.is_empty() {
                 body["attachment_ids"] = json!(attachment_ids);
             }
+            crate::sendtime::stage("seal");
             let (status, answer) = self.ask(
                 "POST",
                 &format!("/v1/conversations/{conversation_id}/messages"),
                 Some(body),
             )?;
+            crate::sendtime::stage("post");
             match status {
                 200 | 201 => {
                     let id = answer
@@ -3177,29 +3218,35 @@ pub(crate) fn send(
     attachment_ids: &[String],
 ) -> Result<Value, String> {
     let until = Instant::now() + JOIN_WAIT;
-    loop {
-        let mut device = lock(shared);
-        device.sync(conversation_id)?;
+    let mut device = lock(shared);
+    // The lock stays held from the last sync to the encrypt, so what the sync settled on is what
+    // the post starts from and does not read the server again.
+    let settled = loop {
+        let settled = device.sync_settled(conversation_id)?;
         if !device.joining.contains(conversation_id) {
-            break;
+            break settled;
         }
         if Instant::now() >= until {
             tracing::warn!(
                 "chatd: Tiny e2ee: {conversation_id}: sent while someone is still joining"
             );
-            break;
+            break settled;
         }
         drop(device);
         std::thread::sleep(join_poll());
-    }
-    lock(shared).post(
+        device = lock(shared);
+    };
+    crate::sendtime::stage("sync");
+    let sent = device.post_after(
         conversation_id,
         client_id,
         kind,
         target_id,
         envelope,
         attachment_ids,
-    )
+        settled,
+    );
+    sent
 }
 
 /// In-process tinyserver for the first-message prove and its unit tests. Compiled into chatd so

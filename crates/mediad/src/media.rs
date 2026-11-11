@@ -3,7 +3,7 @@
 //! frame of the microphone and plays one frame of everyone mixed. Opening or replacing an audio
 //! device happens on another thread. The tick only swaps in a device that is already open.
 
-use crate::audio::{level, open_fresh, route_moved, Audio, AudioError, Fresh, Health, Retired};
+use crate::audio::{level, open_call, open_fresh, route_moved, Audio, AudioError, Fresh, Health, Retired};
 use crate::pick::{Backoff, Verdict, Watch};
 use crate::cue::Playing;
 use crate::hear::{self, Ear, Limiter};
@@ -12,6 +12,7 @@ use crate::stats::{Arrivals, Counts, Meter};
 use crate::dave::{Dave, Outgoing};
 use crate::jitter::{Jitter, Pop};
 use crate::opus::{Decoder, Encoder, MAX_FRAME};
+use crate::pace;
 use crate::permission::{microphone, Microphone};
 use crate::discord_video;
 use crate::rtp::{Cipher, Sender, PAYLOAD_TYPE, SILENCE};
@@ -103,6 +104,53 @@ pub(crate) struct Stream {
     pub(crate) arrivals: Arrivals,
     /// The running counts as the connection meter last had them.
     reported: Counts,
+    /// What the playout did, over the call and as the log last had it.
+    pub(crate) playout: Playout,
+    logged: Playout,
+    /// Ticks since the log last said; and how many ticks in a row, now, something has stood in
+    /// for packets in mid-speech.
+    since_logged: u32,
+    standing_in: u32,
+}
+
+/// Ticks between log lines about one voice's playout: 10 s. A line is written only when
+/// something had to be made up in that time.
+const PLAYOUT_LOG: u32 = 500;
+
+/// What one voice's playout did. Each of these is heard, one way or another: the log says how
+/// often, so a call that sounded wrong can be lined up with what happened.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Playout {
+    /// Frames played as they came.
+    pub played: u64,
+    /// Ticks in mid-speech that the packet due was not there yet (late, or a reorder wait),
+    /// and libopus carried the voice on.
+    pub waited: u64,
+    /// Frames lost and made up by libopus, and by the pitch loop because libopus would not.
+    pub concealed: u64,
+    pub looped: u64,
+    /// Frames played a pitch period longer, so the buffer did not run dry; shorter, to give back
+    /// delay in mid-speech; and quiet frames dropped whole for the same.
+    pub stretched: u64,
+    pub squeezed: u64,
+    pub shed: u64,
+    /// The longest anything stood in for packets in a row, in ticks.
+    pub longest: u32,
+}
+
+impl Playout {
+    fn since(&self, then: &Playout) -> Playout {
+        Playout {
+            played: self.played - then.played,
+            waited: self.waited - then.waited,
+            concealed: self.concealed - then.concealed,
+            looped: self.looped - then.looped,
+            stretched: self.stretched - then.stretched,
+            squeezed: self.squeezed - then.squeezed,
+            shed: self.shed - then.shed,
+            longest: self.longest,
+        }
+    }
 }
 
 impl Stream {
@@ -129,6 +177,10 @@ impl Stream {
             gain: None,
             arrivals: Arrivals::default(),
             reported: Counts::default(),
+            playout: Playout::default(),
+            logged: Playout::default(),
+            since_logged: 0,
+            standing_in: 0,
         })
     }
 
@@ -164,7 +216,8 @@ impl Stream {
     /// log.
     pub(crate) fn pull(&mut self, who: &dyn std::fmt::Display) -> Option<Vec<i16>> {
         let mut pcm = [0i16; MAX_FRAME * CHANNELS];
-        self.jitter.aim(self.arrivals.ms());
+        self.jitter.aim(self.arrivals.ms(), self.arrivals.spread_ms());
+        let mut stood_in = false;
         while self.pcm.len() < FRAME_SAMPLES {
             let decoded = match self.jitter.pop() {
                 Pop::Packet(packet) => {
@@ -173,24 +226,38 @@ impl Stream {
                         self.jitter.deepen();
                     }
                     let decoded = self.played(&packet, &mut pcm);
-                    // More is queued than this voice calls for. A quiet frame can go: nothing
-                    // is played faster, so nothing warbles, and the delay is gone.
+                    // More is queued than this voice calls for. A quiet frame can go whole.
                     if decoded.is_some() && self.jitter.hushed && self.jitter.shed() {
+                        self.playout.shed += 1;
                         continue;
+                    }
+                    if let Some(samples) = decoded {
+                        self.playout.played += 1;
+                        if self.paced(&pcm[..samples * CHANNELS]) {
+                            continue;
+                        }
                     }
                     decoded
                 }
-                // Not a loss yet. Pitch carries the voice; the decoder stays put so the packet
-                // after a real gap can still rebuild it.
+                // Not here yet, with a later packet already queued. In mid-speech libopus carries
+                // the voice on; the packet, when it comes, decodes after that as after a loss.
+                Pop::Hold if !self.jitter.hushed => {
+                    stood_in = true;
+                    self.playout.waited += 1;
+                    Some(self.decoder.stand_in(FRAME, &mut pcm))
+                }
                 Pop::Hold => Some(self.decoder.bridge(FRAME, &mut pcm)),
                 Pop::Spurt(packet) => {
                     // Cut off in mid-speech and never resumed: what came between is gone.
                     if std::mem::take(&mut self.stalled) {
                         self.decoder.missed(2);
                     }
-                    self.played(&packet, &mut pcm)
+                    let decoded = self.played(&packet, &mut pcm);
+                    self.playout.played += u64::from(decoded.is_some());
+                    decoded
                 }
                 Pop::Lost(frames) => {
+                    stood_in = true;
                     self.decoder.missed(frames - 1);
                     // The packet after the hole may carry a copy of what was lost.
                     let rebuilt = self.jitter.next().and_then(|next| self.decoder.recover(next, &mut pcm));
@@ -198,10 +265,17 @@ impl Stream {
                     rebuilt.or_else(|| self.decoder.decode(None, FRAME, &mut pcm))
                 }
                 Pop::Late => {
-                    // After the quiet end of a sentence this is nothing at all; while someone
-                    // is speaking, a stall the next packet may end.
-                    self.stalled |= !self.jitter.hushed;
-                    Some(self.decoder.late(FRAME, &mut pcm))
+                    // After the quiet end of a sentence this is nothing at all, and the voice
+                    // fades out. While someone is speaking it is a stall the next packet may
+                    // end, and libopus carries the voice on meanwhile.
+                    if self.jitter.hushed {
+                        Some(self.decoder.late(FRAME, &mut pcm))
+                    } else {
+                        stood_in = true;
+                        self.stalled = true;
+                        self.playout.waited += 1;
+                        Some(self.decoder.stand_in(FRAME, &mut pcm))
+                    }
                 }
                 Pop::Empty => break,
             };
@@ -215,7 +289,67 @@ impl Stream {
                 }
             }
         }
+        self.standing_in = if stood_in { self.standing_in + 1 } else { 0 };
+        self.playout.longest = self.playout.longest.max(self.standing_in);
+        // The decoder counts every frame libopus made up; those for a packet only waited for
+        // are counted apart.
+        self.playout.concealed = self.decoder.concealed.saturating_sub(self.playout.waited);
+        self.playout.looped = self.decoder.looped;
+        self.since_logged += 1;
+        if self.since_logged >= PLAYOUT_LOG {
+            self.log_playout(who, false);
+        }
         (self.pcm.len() >= FRAME_SAMPLES).then(|| self.pcm.drain(..FRAME_SAMPLES).collect())
+    }
+
+    /// Plays a frame just decoded a pitch period longer while the buffer is short of where it
+    /// should be, and shorter while it holds more than it needs in mid-speech. Whether it did
+    /// either: the frame is in `pcm` then.
+    fn paced(&mut self, frame: &[i16]) -> bool {
+        let queued = self.jitter.held() * FRAME_SAMPLES + self.pcm.len();
+        let steady = self.jitter.target().saturating_sub(1) * FRAME_SAMPLES;
+        let paced = if queued < steady {
+            pace::expand(frame).inspect(|_| self.playout.stretched += 1)
+        } else if !self.jitter.hushed && queued > steady + 2 * FRAME_SAMPLES {
+            pace::accelerate(frame).inspect(|_| self.playout.squeezed += 1)
+        } else {
+            None
+        };
+        let Some(paced) = paced else {
+            return false;
+        };
+        self.pcm.extend(paced);
+        true
+    }
+
+    /// A line about what this voice's playout did: over the last 10 s, when anything had to be
+    /// made up in them, or over the whole call (`whole`), always.
+    pub(crate) fn log_playout(&mut self, who: &dyn std::fmt::Display, whole: bool) {
+        let done = if whole { self.playout } else { self.playout.since(&self.logged) };
+        self.since_logged = 0;
+        self.logged = self.playout;
+        self.playout.longest = 0;
+        if !whole && done.waited + done.concealed + done.looped == 0 {
+            return;
+        }
+        tracing::warn!(
+            "mediad: {who} playout, {}: {} played, {} waited for, {} lost made up by libopus and {} by the pitch loop, {} stretched, {} squeezed, {} quiet dropped; longest stand-in {} ms; holding {} ms (spread {} ms, jitter {} ms); over the call {} lost ({} rebuilt), {} late",
+            if whole { "call" } else { "last 10 s" },
+            done.played,
+            done.waited,
+            done.concealed,
+            done.looped,
+            done.stretched,
+            done.squeezed,
+            done.shed,
+            done.longest * 20,
+            self.jitter.target() * 20,
+            self.arrivals.spread_ms(),
+            self.arrivals.ms(),
+            self.jitter.lost,
+            self.rebuilt,
+            self.jitter.late,
+        );
     }
 
     /// Decodes a packet whose turn it is, and notes how loud it was.
@@ -345,6 +479,100 @@ impl Gate {
     }
 }
 
+/// What one voice's playout did over [`wifi_call`].
+#[derive(Debug)]
+pub struct WifiCall {
+    pub playout: Playout,
+    pub lost: u64,
+    pub rebuilt: u64,
+    /// The loudest sample played, and how much was queued (packets) against what the buffer aims
+    /// for at the end, after speech went on through a stall.
+    pub peak: u16,
+    pub held: usize,
+    pub target: usize,
+}
+
+/// Three seconds of a voiced vowel at 24 kbit/s (a speech-mode, SILK or hybrid, stream) through
+/// one receive stream, arriving as over Wi-Fi: each packet up to 8 ms late, one in fifty 45 ms
+/// late, a 250 ms stall at 1.5 s that then delivers its backlog at once, one in 37 lost, and two
+/// in a row once, which no in-band copy can rebuild.
+/// Ticks are 20 ms; each takes what has arrived by then and plays a frame.
+pub fn wifi_call() -> Option<WifiCall> {
+    const FRAMES: usize = 150;
+    let mut encoder = Encoder::at(24_000)?;
+    let mut seed = 0x5eed_u32;
+    let mut sent = Vec::new();
+    for f in 0..FRAMES {
+        let mut pcm = [0i16; FRAME_SAMPLES];
+        for (n, pair) in pcm.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
+            let t = (f * FRAME + n) as f64 / 48_000.;
+            let swell = 0.6 + 0.4 * (t * 3. * std::f64::consts::TAU).sin();
+            let voice: f64 = (1..=10).map(|k| (t * 140. * k as f64 * std::f64::consts::TAU).sin() / k as f64).sum();
+            pair.fill((voice * swell * 4_000.) as i16);
+        }
+        let mut packet = [0u8; 1275];
+        let len = encoder.encode(&pcm, &mut packet)?;
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let mut due = f as u64 * 20 + u64::from(seed >> 16) % 9;
+        if f % 50 == 17 {
+            due += 45;
+        }
+        if (75..88).contains(&f) {
+            // Held up behind a stall until 1.75 s, then all at once.
+            due = due.max(1_750);
+        }
+        if f % 37 != 20 && !(100..102).contains(&f) {
+            sent.push((due, f as u16, packet[..len].to_vec()));
+        }
+    }
+    sent.sort_by_key(|(due, sequence, _)| (*due, *sequence));
+    let mut stream = Stream::new()?;
+    let start = Instant::now();
+    let mut peak = 0u16;
+    let mut next = 0;
+    for tick in 0..FRAMES as u64 + 40 {
+        let now = tick * 20;
+        while next < sent.len() && sent[next].0 <= now {
+            let (due, sequence, packet) = &sent[next];
+            stream.arrivals.arrived(u32::from(*sequence) * 960, start + Duration::from_millis(*due));
+            stream.jitter.insert(*sequence, packet.clone());
+            next += 1;
+        }
+        if let Some(frame) = stream.pull(&"wifi") {
+            peak = peak.max(frame.iter().map(|sample| sample.unsigned_abs()).max().unwrap_or(0));
+        }
+        if tick == FRAMES as u64 - 5 {
+            // Speech has gone on unbroken since the stall: what it left queued should be gone.
+            let (held, target) = (stream.jitter.held(), stream.jitter.target());
+            return Some(WifiCall { playout: stream.playout, lost: stream.jitter.lost, rebuilt: stream.rebuilt, peak, held, target });
+        }
+    }
+    None
+}
+
+/// The lab's voice-playout driver: a Wi-Fi call's voice is carried on by libopus and paced,
+/// never looped, saturated, or left behind by a stall.
+pub fn prove_voice_playout() -> Result<(), String> {
+    let call = wifi_call().ok_or("the codec did not start")?;
+    let fail = |what: &str| Err(format!("{what}: {call:?}"));
+    if call.playout.looped > 0 {
+        return fail("the pitch loop stood in for a lost packet");
+    }
+    if call.peak >= 30_000 {
+        return fail("a concealed frame saturated");
+    }
+    if call.lost == 0 || call.playout.concealed == 0 {
+        return fail("nothing was concealed, so nothing was proved");
+    }
+    if call.playout.waited > 16 {
+        return fail("the buffer ran dry on the stragglers, not only on the stall");
+    }
+    if call.held > call.target + 1 {
+        return fail("the stall's backlog was still queued in mid-speech");
+    }
+    Ok(())
+}
+
 /// A missed microphone tick is a hole, not a quiet frame, so it does not spend the hangover.
 pub fn prove_missed_frame() -> Result<(), &'static str> {
     let mut gate = Gate::default();
@@ -442,7 +670,9 @@ pub(crate) fn listen(controls: &Controls, audio: &mut Audio, processor: &mut Pro
     }
     let heard = if captured { level(frame) } else { 0 };
     let (open, hold) = crate::talk::opening(controls.input(), &controls.keys(), heard, gate.talking(), Instant::now());
-    (gate.step(frame, captured, muted, open, hold), heard)
+    // A microphone that is gone ends what was being said as muting does: the ring goes out
+    // instead of staying lit over a hole that never ends.
+    (gate.step(frame, captured, muted || audio.unheard(), open, hold), heard)
 }
 
 pub const NO_MICROPHONE: &str =
@@ -542,6 +772,10 @@ impl Loop {
         }
         if let Some(frame) = frame {
             stream.heard |= frame != SILENCE;
+            if frame == SILENCE {
+                // Discord's five silence frames before a pause: how long it lasts is not lateness.
+                stream.arrivals.paused();
+            }
             stream.jitter.insert(packet.sequence, frame);
         }
     }
@@ -712,12 +946,8 @@ impl Loop {
         }
         self.pictures.finish();
         finish_cue(&self.setup.controls, &mut self.cue, &mut self.setup.audio);
-        for (ssrc, stream) in &self.streams {
-            let (jitter, rebuilt) = (&stream.jitter, stream.rebuilt);
-            tracing::warn!(
-                "mediad: ssrc {ssrc}: {} lost ({rebuilt} rebuilt), {} late",
-                jitter.lost, jitter.late
-            );
+        for (ssrc, stream) in &mut self.streams {
+            stream.log_playout(&format_args!("ssrc {ssrc}"), true);
         }
         sign_off(&self.setup.audio);
     }
@@ -1036,7 +1266,8 @@ enum Note {
     Same,
     /// The route was checked and it has not moved.
     Quiet,
-    /// Nothing would open. Fatal when the side it was for is broken: the call has no device left.
+    /// Nothing would open. Fatal when it was the speaker and the one in use is broken: the call
+    /// has nothing left to play on. A call without a microphone goes on ([`open_call`]).
     Failed {
         err: AudioError,
         fatal: bool,
@@ -1066,17 +1297,26 @@ fn satisfy(ask: OpenAsk) -> Note {
         return Note::Quiet;
     }
     let mut backoff = ask.backoff;
-    match open_fresh(ask.want_input.as_deref(), ask.want_output.as_deref(), which, ask.mic_running, &mut backoff, &ask.health) {
+    // A microphone that broke, or was never there, leaves the call up without one. One that
+    // works stays in use when what was asked for instead will not open.
+    let open = if ask.broken.0 || ask.current_input.is_empty() { open_call } else { open_fresh };
+    match open(ask.want_input.as_deref(), ask.want_output.as_deref(), which, ask.mic_running, &mut backoff, &ask.health) {
         Ok(fresh) => {
             let keep = (ask.force.0 || ask.broken.0, ask.force.1 || ask.broken.1);
             let fresh = fresh.unless_same((&ask.current_input, &ask.current_output), keep);
             Note::Fresh { fresh, rebuild: ask.rebuild }
         }
         Err(err) => {
-            let fatal = (which.0 && ask.broken.0) || (which.1 && ask.broken.1);
+            let fatal = speaker_lost(&err, which, ask.broken);
             Note::Failed { err, fatal, backoff }
         }
     }
+}
+
+/// Whether a device that would not open ends the call: only a speaker, and only when the one in
+/// use broke. Losing the microphone never does.
+fn speaker_lost(err: &AudioError, which: (bool, bool), broken: (bool, bool)) -> bool {
+    matches!(err, AudioError::NoSpeaker | AudioError::Speaker(_)) && which.1 && broken.1
 }
 
 struct DeviceDesk {
@@ -1183,6 +1423,70 @@ mod device_tests {
         assert_eq!(devices.judge(rebuilt + GRACE, (2880, 0), (true, true)), [Verdict::Fine, Verdict::Stuck]);
         // It starts after all.
         assert_eq!(devices.judge(rebuilt + GRACE * 2, (3840, 4), (true, true)), [Verdict::Fine; 2]);
+    }
+
+    /// Before, a microphone that broke with nothing to stand in for it was fatal: the headset
+    /// dropped for two seconds and the call ended with "Plug in a microphone".
+    #[test]
+    fn losing_the_microphone_never_ends_the_call_and_losing_the_speaker_in_use_does() {
+        let (mic, speaker) = (AudioError::NoMicrophone, AudioError::NoSpeaker);
+        assert!(!speaker_lost(&mic, (true, false), (true, false)), "the only microphone broke");
+        assert!(!speaker_lost(&AudioError::Microphone("gone".to_owned()), (true, true), (true, true)));
+        assert!(speaker_lost(&speaker, (false, true), (false, true)), "nothing is left to play on");
+        assert!(speaker_lost(&AudioError::Speaker("gone".to_owned()), (true, true), (true, true)));
+        // A speaker that was only asked for, while the one in use still plays, is not the end.
+        assert!(!speaker_lost(&speaker, (true, true), (true, false)));
+    }
+
+    /// The whole of it on virtual devices: talking, the microphone goes, the ring goes out and
+    /// nothing more is sent; it comes back and the next word is sent, with no rejoin.
+    #[test]
+    fn a_microphone_lost_in_mid_word_stops_the_sending_and_one_that_returns_resumes_it() {
+        let (mut audio, mut mic, _speaker) = Audio::virtual_devices((48_000, 2), (48_000, 2));
+        let controls = Controls::default();
+        let (mut processor, mut gate) = (Processor::new(), Gate::default());
+        let mut frame = [0i16; FRAME_SAMPLES];
+        let loud: Vec<f32> = (0..FRAME_SAMPLES).map(|n| ((n / CHANNELS) as f32 * 440. * std::f32::consts::TAU / 48_000.).sin() * 0.5).collect();
+        let mut said = None;
+        for _ in 0..10 {
+            mic.deliver(&loud);
+            let (step, _) = listen(&controls, &mut audio, &mut processor, &mut gate, &mut frame);
+            said = step.speaking.or(said);
+        }
+        assert_eq!(said, Some(true), "the tone opens the gate");
+        // The headset drops, and nothing stands in for it.
+        mic.unplug();
+        assert_eq!(audio.device_broken(), (true, false));
+        drop(audio.install(Fresh::without_microphone()));
+        let (step, heard) = listen(&controls, &mut audio, &mut processor, &mut gate, &mut frame);
+        assert_eq!((step.speaking, heard), (Some(false), 0), "the ring stayed lit with no microphone");
+        let mut sent = 0;
+        for _ in 0..50 {
+            let (step, _) = listen(&controls, &mut audio, &mut processor, &mut gate, &mut frame);
+            assert_eq!(step.speaking, None);
+            sent += usize::from(matches!(step.send, Some(Send::Frame(_))));
+        }
+        assert_eq!(sent, 0, "a call with no microphone sent audio");
+        assert!(!gate.talking());
+        // A second of that is not a stream to rebuild or report: there is none.
+        let mut devices = Devices::start(false);
+        let start = Instant::now();
+        let running = (audio.sides().0 && audio.mic_running(), audio.sides().1);
+        devices.judge(start, audio.counts(), running);
+        assert_eq!(devices.judge(start + GRACE * 4, (0, 500), running), [Verdict::Fine; 2]);
+        // It is plugged back in: the reopen swaps it in, and the next word goes out.
+        let (fresh, mut mic) = Fresh::virtual_mic((48_000, 2), &audio.health());
+        drop(audio.install(fresh));
+        let mut said = None;
+        let mut sent = 0;
+        for _ in 0..10 {
+            mic.deliver(&loud);
+            let (step, _) = listen(&controls, &mut audio, &mut processor, &mut gate, &mut frame);
+            said = step.speaking.or(said);
+            sent += usize::from(matches!(step.send, Some(Send::Frame(_))));
+        }
+        assert_eq!(said, Some(true), "the microphone that came back is not heard");
+        assert!(sent >= 5, "{sent} frames sent after it came back");
     }
 
     #[test]
@@ -1446,10 +1750,17 @@ mod receive_tests {
         assert_eq!(stream.gaps, 0);
     }
 
-    /// Speech and pauses, with 60 ms too many queued, as a stall leaves it. The extra goes in
-    /// the first quiet frames, and not one frame of the speech goes with it.
     #[test]
-    fn a_backlog_drains_through_quiet_frames_and_never_through_speech() {
+    fn a_wifi_call_is_carried_on_by_libopus_and_paced_through_a_stall() {
+        eprintln!("{:?}", wifi_call());
+        prove_voice_playout().unwrap();
+    }
+
+    /// Speech and pauses, with 60 ms too many queued, as a stall leaves it. The speech plays a
+    /// pitch period faster now and then until the extra is gone, and not one frame of it is
+    /// dropped; the quiet frames after it go whole.
+    #[test]
+    fn a_backlog_drains_through_speech_played_faster_and_never_dropped() {
         let mut encoder = Encoder::voice().unwrap();
         let (speech, mut spare) = (tone_packets(60), Vec::new());
         for _ in 0..60 {
@@ -1467,7 +1778,9 @@ mod receive_tests {
             stream.jitter.insert(n, packet);
             played += usize::from(stream.pull(&"backlog").is_some());
             if n == 59 {
-                assert_eq!(stream.jitter.held(), 6, "speech is never dropped");
+                assert_eq!(stream.playout.shed, 0, "speech is never dropped");
+                assert!(stream.playout.squeezed > 0, "speech is played faster");
+                assert!(stream.jitter.held() < 6, "{} still queued at the end of the speech", stream.jitter.held());
             }
         }
         assert_eq!(played, 114);

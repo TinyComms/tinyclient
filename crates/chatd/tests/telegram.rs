@@ -24,6 +24,17 @@ const SESSION: &str = r#"{"user":7001,"name":"Mira Kessler","home":2,"dcs":[]}"#
 /// What the fake serves for any file: longer than one piece, so it takes two requests.
 const FILE_BYTES: u64 = 256 * 1024 + 9;
 
+/// Where the fake Telegram's clock starts: yesterday's midnight UTC, so its chats are always recent
+/// enough for the Inbox (it drops what nobody touched for thirty days) and `t0() + 300`, when its
+/// users stop being online, has always passed. One value for the whole process; chatd gets it by env.
+fn t0() -> i64 {
+    static T0: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *T0.get_or_init(|| {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        now - now % 86_400 - 86_400
+    })
+}
+
 fn key(id: &str) -> Key {
     Key { network: Network::Telegram, account: "7001".into(), id: id.into() }
 }
@@ -100,6 +111,7 @@ impl World {
         command
             .env("TINYCLIENT_DIR", &dir)
             .env("TINYCLIENT_TELEGRAM_FAKE", qr_seconds)
+            .env("TINYCLIENT_TELEGRAM_T0", t0().to_string())
             .env_remove("TINYCLIENT_SESSION_DISCORD")
             .env_remove("TINYCLIENT_SESSION_SLACK")
             .env_remove("TINYCLIENT_SESSION_TELEGRAM")
@@ -1073,9 +1085,9 @@ fn asking_a_channel_posts_comments_reads_the_discussion_group_under_the_post() {
     assert_eq!(world.called("GetHistory c9001_5"), 0);
 
     // The newest comment's time rides the post's footer, as "last reply", once the page was
-    // read: the section itself names no date. Comment 51 went at 2026-10-13 11:59:20 UTC.
+    // read: the section itself names no date. Comment 51 went 40 seconds before the fake's clock start.
     let fresh = world.until("the footer's last reply", || {
-        world.message("c9001", "5").filter(|post| post.thread.as_ref().is_some_and(|section| section.last == 1_791_892_760))
+        world.message("c9001", "5").filter(|post| post.thread.as_ref().is_some_and(|section| section.last == t0() - 40))
     });
     let section = fresh.thread.as_ref().unwrap();
     assert_eq!(section.replies, 2, "{section:?}");
@@ -1598,7 +1610,7 @@ fn the_panes_ask_telegram_once_each_and_counts_are_telegrams_own() {
     let Response::Profile { profile } = world.ask(Request::Profile { person: key("u7003"), space: Some(key("c9002")) }) else {
         panic!("no profile in the forum");
     };
-    assert_eq!((profile.nickname.as_str(), profile.joined), ("Quartermaster", Some(1_791_891_800)));
+    assert_eq!((profile.nickname.as_str(), profile.joined), ("Quartermaster", Some(t0() - 1_000)));
     assert_eq!(world.called("GetParticipant u7003"), 1);
     // A scam account's card warns.
     let Response::Profile { profile } = world.ask(Request::Profile { person: key("u7005"), space: None }) else {

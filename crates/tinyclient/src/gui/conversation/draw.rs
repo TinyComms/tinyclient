@@ -1042,7 +1042,7 @@ impl Pane {
                             cx.background_executor().spawn(async move { ask(&request) }).detach();
                         }
                     }
-                    cx.open_url(url);
+                    self.open_link(url, window, cx);
                 } else if let Some((MentionKind::User, person)) = &run.mention {
                     let (Some(person), at) = (self.person(person), window.mouse_position()) else {
                         return;
@@ -1645,7 +1645,7 @@ impl Pane {
             .border_1()
             .border_color(theme::hairline())
             .cursor_pointer()
-            .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url)));
+            .on_click(cx.listener(move |this, _, window, cx| this.open_link(&url, window, cx)));
         let Some(image) = image.cloned() else {
             return card.child(words).into_any_element();
         };

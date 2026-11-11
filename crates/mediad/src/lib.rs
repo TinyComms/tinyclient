@@ -39,6 +39,7 @@ pub mod jitter;
 pub mod media;
 pub mod ogg;
 pub mod opus;
+pub mod pace;
 pub mod picture;
 pub mod platform;
 pub mod out;

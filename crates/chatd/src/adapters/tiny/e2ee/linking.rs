@@ -286,9 +286,24 @@ const NUDGES: [Duration; 3] = [
 /// Settle a device addition or removal immediately, so a linked device gets its Welcome before
 /// its first send. Older servers batch membership changes, so retain the later retries too.
 pub(super) fn nudge(device: Shared) {
+    {
+        let mut state = lock(&device);
+        if !state.ready() || state.membership_nudge {
+            return;
+        }
+        state.membership_nudge = true;
+    }
+    struct Running(Shared);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            lock(&self.0).membership_nudge = false;
+        }
+    }
+    let running = Running(device.clone());
     let _ = std::thread::Builder::new()
         .name("tiny-e2ee-nudge".into())
         .spawn(move || {
+            let _running = running;
             for wait in NUDGES {
                 std::thread::sleep(wait);
                 let conversations = lock(&device).known_encrypted();
@@ -298,8 +313,10 @@ pub(super) fn nudge(device: Shared) {
                     if !device.ready() {
                         return;
                     }
-                    if let Err(why) = device.sync(&conversation) {
-                        tracing::debug!("chatd: Tiny e2ee: {conversation}: {why}");
+                    match device.sync(&conversation) {
+                        Ok(()) => device.reload(&BTreeSet::from([conversation])),
+                        // Cached groups can belong to rooms we have left or that were deleted.
+                        Err(why) => tracing::debug!("chatd: Tiny e2ee: {conversation}: {why}"),
                     }
                 }
             }

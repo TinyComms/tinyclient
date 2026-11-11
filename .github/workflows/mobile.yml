@@ -63,6 +63,7 @@ jobs:
   android-app:
     name: android (libs + assembleDebug)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
 
@@ -168,6 +169,7 @@ jobs:
     # Xcode is macOS-only. macos-26 carries Xcode 26.6 / iOS 26.5 SDK, which satisfies the
     # current mandate; move to the xcode-27 preview image before April 2027.
     runs-on: macos-26
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
 
