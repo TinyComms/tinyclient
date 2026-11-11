@@ -450,6 +450,14 @@ fn in_call(call: &Call) -> bool {
     matches!(call.state, CallState::Joined | CallState::Reconnecting)
 }
 
+/// The connection is up but the call's keys are not: nothing anyone says is sent or heard yet,
+/// so it is not drawn as "connected". Alone in the call there is nobody to wait on.
+pub(super) fn securing(call: &Call) -> bool {
+    call.state == CallState::Joined
+        && !call.participants.is_empty()
+        && call.security.as_ref().is_some_and(|security| security.mode == protocol::SecurityMode::Pending)
+}
+
 /// A glyph in a control. GPUI does not hand a parent's text color down to an SVG, so the color
 /// is the glyph's own, and `hover` names the control (its group) and the color it takes there.
 fn icon(name: &'static str, size: f32, color: Rgba, hover: Option<(&'static str, Rgba)>) -> Svg {
@@ -1295,6 +1303,21 @@ mod tests {
         assert_eq!(drawn(Some(old_failure), None, Some(&asked)).unwrap().conversation, key("lounge"), "a failure on show gives way to the join just asked for");
         assert_eq!(drawn(Some(joined.clone()), None, Some(&asked)).unwrap().state, CallState::Joined, "a live call is never drawn over");
         assert!(drawn(None, None, None).is_none());
+    }
+
+    #[test]
+    fn a_joined_call_without_keys_is_securing_not_connected() {
+        let pending = protocol::CallSecurity { mode: protocol::SecurityMode::Pending, ..Default::default() };
+        let someone = protocol::Participant { id: "bea".into(), ..Default::default() };
+        let mut call = bare_call(key("lounge"), CallState::Joined, false, false);
+        call.security = Some(pending.clone());
+        assert!(!securing(&call), "alone, there is nobody to wait on");
+        call.participants = vec![someone];
+        assert!(securing(&call));
+        call.security = Some(protocol::CallSecurity { mode: protocol::SecurityMode::EndToEnd, ..pending });
+        assert!(!securing(&call), "once the keys are there it is connected");
+        call.security = None;
+        assert!(!securing(&call), "a call with no encryption to set up is never securing");
     }
 
     #[test]

@@ -46,8 +46,9 @@ pub(super) fn quality(health: &Health) -> Rgba {
 
 /// The panel's second line while this server has a call, and whether a click on it opens
 /// Call health. `None` when the call is not one to speak of (failed: the dock says so).
-fn call_line(state: &CallState, health: Option<&Health>) -> Option<(String, Rgba)> {
+fn call_line(state: &CallState, health: Option<&Health>, securing: bool) -> Option<(String, Rgba)> {
     Some(match state {
+        CallState::Joined if securing => ("Securing…".to_owned(), theme::warning()),
         CallState::Connecting | CallState::RingingOut => ("Connecting…".to_owned(), theme::warning()),
         CallState::Reconnecting => ("Reconnecting…".to_owned(), theme::warning()),
         CallState::Joined => match health.and_then(|health| Some((health, health.rtt_ms?))) {
@@ -271,7 +272,7 @@ impl Shell {
         let call = self.tiny_call();
         let room = page.mine.and_then(|id| page.community.rooms.iter().find(|room| room.id == id));
         let health = self.tiny_health();
-        let in_call = call.as_ref().and_then(|call| call_line(&call.state, health.as_ref()));
+        let in_call = call.as_ref().and_then(|call| call_line(&call.state, health.as_ref(), crate::gui::call::securing(call)));
         let grade = health.map_or(Grade::Unknown, |health| health.grade());
         let joined = call.as_ref().is_some_and(|call| call.state == CallState::Joined);
         let (line, color, clickable): (String, Rgba, bool) = match (in_call, room) {
@@ -508,12 +509,13 @@ mod tests {
     #[test]
     fn the_panel_says_what_the_call_is_doing_not_just_that_there_is_one() {
         let good = Health::from_stats(&CallStats { rtt_ms: 38, jitter_ms: 3, ..CallStats::default() });
-        assert_eq!(call_line(&CallState::Joined, Some(&good)).map(|line| line.0), Some("Voice connected · 38 ms".to_owned()));
-        assert_eq!(call_line(&CallState::Joined, None).map(|line| line.0), Some("Voice connected".to_owned()));
-        assert_eq!(call_line(&CallState::Connecting, Some(&good)), Some(("Connecting…".to_owned(), theme::warning())));
-        assert_eq!(call_line(&CallState::Reconnecting, Some(&good)), Some(("Reconnecting…".to_owned(), theme::warning())));
+        assert_eq!(call_line(&CallState::Joined, Some(&good), false).map(|line| line.0), Some("Voice connected · 38 ms".to_owned()));
+        assert_eq!(call_line(&CallState::Joined, None, false).map(|line| line.0), Some("Voice connected".to_owned()));
+        assert_eq!(call_line(&CallState::Joined, Some(&good), true).map(|line| line.0), Some("Securing…".to_owned()), "keys not ready: nothing is heard yet");
+        assert_eq!(call_line(&CallState::Connecting, Some(&good), false), Some(("Connecting…".to_owned(), theme::warning())));
+        assert_eq!(call_line(&CallState::Reconnecting, Some(&good), false), Some(("Reconnecting…".to_owned(), theme::warning())));
         let failed = CallState::Failed { reason: protocol::CallFailure::Lost, detail: String::new() };
-        assert_eq!(call_line(&failed, Some(&good)), None, "a failed call is the dock's to tell, not 'Voice connected'");
+        assert_eq!(call_line(&failed, Some(&good), false), None, "a failed call is the dock's to tell, not 'Voice connected'");
     }
 
     #[test]
