@@ -32,6 +32,13 @@ pub fn prove_tiny_open_backfill() -> Result<(), String> {
 }
 
 mod direct_prove;
+mod send_prove;
+
+/// The lab's tiny-send-identity proof. A send names the person at once and settles without the
+/// members list. See `send_prove`.
+pub fn prove_tiny_send_identity() -> Result<(), String> {
+    send_prove::run()
+}
 
 /// Headless daemon scenario for a newly received DM, including its first message and history.
 pub fn prove_tiny_direct_created() -> Result<(), String> {
@@ -169,6 +176,7 @@ struct Me {
     /// The session tests read this. The account is named by the server's host.
     #[cfg_attr(not(test), allow(dead_code))]
     display_name: String,
+    #[cfg_attr(not(test), allow(dead_code))]
     email: String,
 }
 
@@ -401,10 +409,28 @@ fn saved_for(session: &str, user_id: &str) -> Result<Saved, String> {
         .ok_or_else(|| "the Tiny server session is for another account".to_owned())
 }
 
+/// The one agent every ordinary request goes through, so a connection to the server (the TCP
+/// connect and the TLS handshake, slow on Windows) is made once and kept for the next request.
+/// The pool is per host inside it, and an idle connection is let go after [`IDLE`].
 fn agent() -> ureq::Agent {
-    agent_with_timeout(TIMEOUT)
+    static SHARED: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            ureq::Agent::config_builder()
+                .tls_config(crate::tls::config())
+                .timeout_global(Some(TIMEOUT))
+                .max_idle_age(IDLE)
+                .http_status_as_error(false)
+                .max_redirects(0)
+                .max_redirects_will_error(false)
+                .user_agent("tinyclient")
+                .build()
+                .into()
+        })
+        .clone()
 }
 
+/// A bespoke agent for a request with its own long timeout (an upload). It keeps no pool.
 fn agent_with_timeout(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .tls_config(crate::tls::config())
@@ -416,6 +442,11 @@ fn agent_with_timeout(timeout: Duration) -> ureq::Agent {
         .build()
         .into()
 }
+
+/// How long an idle connection is kept for the next request. Longer than ureq's 15 s, so a
+/// person typing at their own pace still finds a warm connection; short enough that a server
+/// or middlebox that closes idle connections first is rarely met.
+const IDLE: Duration = Duration::from_secs(30);
 
 /// One request. A 3xx is a failure: a sign-in code and the bearer stay on the host that was asked.
 fn call(
@@ -434,19 +465,67 @@ fn call_with_timeout(
     body: Option<Value>,
     timeout: Duration,
 ) -> Result<(u16, Value), Fault> {
-    let agent = agent_with_timeout(timeout);
+    // A pooled connection the server closed while it sat idle fails on first use, before any
+    // answer. Asking again on a fresh one is safe for a read, and for a message post, which the
+    // server answers once per `client_id` (a retry returns the same message). Nothing else is
+    // sent twice.
+    let again = method == "GET" || (method == "POST" && body.as_ref().is_some_and(|body| body.get("client_id").is_some_and(Value::is_string)));
+    match call_once(method, url, token, body.clone(), timeout) {
+        Err(Attempt::Dropped) if again => {
+            tracing::debug!("chatd: Tiny server: a kept connection was closed; asking again on a new one");
+            call_once(method, url, token, body, timeout).map_err(Attempt::fault)
+        }
+        other => other.map_err(Attempt::fault),
+    }
+}
+
+/// Why one attempt failed: the connection was dropped before an answer, or for any other reason.
+enum Attempt {
+    Dropped,
+    Failed(Fault),
+}
+
+impl Attempt {
+    fn fault(self) -> Fault {
+        match self {
+            Attempt::Dropped => Fault::Unreachable,
+            Attempt::Failed(fault) => fault,
+        }
+    }
+}
+
+/// Whether a request error is the connection having been closed under us.
+fn dropped(err: &ureq::Error) -> bool {
+    matches!(err, ureq::Error::Io(io) if matches!(
+        io.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    ))
+}
+
+fn call_once(
+    method: &str,
+    url: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+    timeout: Duration,
+) -> Result<(u16, Value), Attempt> {
+    let agent = agent();
     let bearer = token.map(|token| format!("Bearer {token}"));
+    let bearer = bearer.as_deref();
     let sent = match method {
         "GET" => {
-            let mut request = agent.get(url);
-            if let Some(bearer) = bearer.as_deref() {
+            let mut request = agent.get(url).config().timeout_global(Some(timeout)).build();
+            if let Some(bearer) = bearer {
                 request = request.header("Authorization", bearer);
             }
             request.call()
         }
         "DELETE" => {
-            let mut request = agent.delete(url);
-            if let Some(bearer) = bearer.as_deref() {
+            let mut request = agent.delete(url).config().timeout_global(Some(timeout)).build();
+            if let Some(bearer) = bearer {
                 request = request.header("Authorization", bearer);
             }
             match body {
@@ -455,8 +534,8 @@ fn call_with_timeout(
             }
         }
         "POST" => {
-            let mut request = agent.post(url);
-            if let Some(bearer) = bearer.as_deref() {
+            let mut request = agent.post(url).config().timeout_global(Some(timeout)).build();
+            if let Some(bearer) = bearer {
                 request = request.header("Authorization", bearer);
             }
             match body {
@@ -465,8 +544,8 @@ fn call_with_timeout(
             }
         }
         "PATCH" => {
-            let mut request = agent.patch(url);
-            if let Some(bearer) = bearer.as_deref() {
+            let mut request = agent.patch(url).config().timeout_global(Some(timeout)).build();
+            if let Some(bearer) = bearer {
                 request = request.header("Authorization", bearer);
             }
             match body {
@@ -475,8 +554,8 @@ fn call_with_timeout(
             }
         }
         "PUT" => {
-            let mut request = agent.put(url);
-            if let Some(bearer) = bearer.as_deref() {
+            let mut request = agent.put(url).config().timeout_global(Some(timeout)).build();
+            if let Some(bearer) = bearer {
                 request = request.header("Authorization", bearer);
             }
             match body {
@@ -484,12 +563,12 @@ fn call_with_timeout(
                 None => request.send_empty(),
             }
         }
-        _ => return Err(Fault::Unreachable),
+        _ => return Err(Attempt::Failed(Fault::Unreachable)),
     };
-    let mut response = sent.map_err(|_| Fault::Unreachable)?;
+    let mut response = sent.map_err(|err| if dropped(&err) { Attempt::Dropped } else { Attempt::Failed(Fault::Unreachable) })?;
     let status = response.status().as_u16();
     if (300..400).contains(&status) {
-        return Err(Fault::Unreachable);
+        return Err(Attempt::Failed(Fault::Unreachable));
     }
     if status == 204 {
         return Ok((status, Value::Null));
