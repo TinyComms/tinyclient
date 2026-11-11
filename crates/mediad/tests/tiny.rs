@@ -344,6 +344,8 @@ struct Mediad {
     stdin: Option<Box<dyn Write + Send>>,
     frames: Receiver<MediaResponse>,
     seen: Vec<MediaResponse>,
+    /// A scratch `TINYCLIENT_DIR`: without one mediad logs into the installed app's own directory.
+    dir: PathBuf,
 }
 
 impl Mediad {
@@ -363,9 +365,12 @@ impl Mediad {
     }
 
     fn launch(audio: &str, ice: &str, sink: &PathBuf, in_process: bool) -> Mediad {
+        static STARTED: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!("tc-tiny-{}-{}", std::process::id(), STARTED.fetch_add(1, Ordering::Relaxed)));
         let mut command = Command::new(env!("CARGO_BIN_EXE_mediad"));
         command
             .arg("1")
+            .env("TINYCLIENT_DIR", &dir)
             .env("TINYCLIENT_MEDIAD_AUDIO", audio)
             .env("TINYCLIENT_MEDIAD_SINK", sink)
             .env("TINYCLIENT_MEDIAD_ICE", ice);
@@ -384,7 +389,7 @@ impl Mediad {
                 }
             }
         });
-        let mediad = Mediad { child, stdin, frames, seen: Vec::new() };
+        let mediad = Mediad { child, stdin, frames, seen: Vec::new(), dir };
         let ready = mediad.frames.recv_timeout(PATIENCE).unwrap();
         assert!(matches!(ready, MediaResponse::Ready { .. }), "{ready:?}");
         mediad
@@ -446,6 +451,7 @@ impl Drop for Mediad {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -560,6 +566,51 @@ fn an_in_process_mediad_that_is_killed_ends_and_the_test_process_goes_on() {
         }
     }
     let _ = std::fs::remove_file(&sink);
+}
+
+/// A desktop with no microphone at all joins a room. Before, the join ended with "Plug in a
+/// microphone" and a listener could never get in. Now the call connects and stays up: it says
+/// that nobody can hear it, it sends nothing, and it plays what the others say.
+#[test]
+fn someone_with_no_microphone_joins_listens_and_is_told_nobody_hears_them() {
+    let sfu = Sfu::start();
+    let (ada_sink, bea_sink) = (sink("unplugged-ada"), sink("unplugged-bea"));
+    let mut ada = Mediad::saying("unplugged", "udp", &ada_sink);
+    let mut bea = Mediad::start("udp", &bea_sink);
+    let mut slots = Vec::new();
+    for (who, mediad) in [("ada", &mut ada), ("bea", &mut bea)] {
+        let offer = mediad.offer(who);
+        let (answer, mids) = sfu.join(who, &offer);
+        assert_eq!(mediad.ask(MediaRequest::TinyAnswer { sdp: answer }), MediaResponse::Done);
+        slots.push(mids);
+    }
+    let map = |mid: &str, user: &str| vec![TinySlot { mid: mid.into(), user_id: user.into() }];
+    assert_eq!(ada.ask(MediaRequest::TinySlots { audio: map(&slots[0][0], "bea") }), MediaResponse::Done);
+    assert_eq!(bea.ask(MediaRequest::TinySlots { audio: map(&slots[1][0], "ada") }), MediaResponse::Done);
+    for mediad in [&mut ada, &mut bea] {
+        mediad.event("Connected", |event| matches!(event, MediaResponse::Connected { .. }));
+    }
+    // No device is named as the microphone, and the words stay up for as long as that lasts.
+    ada.event("the notice that nobody hears Ada", |event| {
+        matches!(event, MediaResponse::Devices { input, notice: Some(words), stuck: true, .. } if input.is_empty() && words.contains("nobody can hear you"))
+    });
+    wait_for("Ada hears Bea's tone", || (4000. ..7000.).contains(&played_level(&ada_sink, 0.5)));
+    // Longer than the device self-check and the dead-path watchdog wait.
+    sleep(Duration::from_secs(4));
+    assert_eq!(ada.ask(MediaRequest::Audio { muted: false, deafened: false }), MediaResponse::Done, "the call is still up");
+    assert_eq!(sfu.frames("ada"), 0, "someone with no microphone sent audio");
+    assert!((4000. ..7000.).contains(&played_level(&ada_sink, 0.5)), "Ada still hears Bea");
+    assert!(played_level(&bea_sink, 0.5) < 50., "Bea hears nothing from Ada");
+    let wrong = |event: &MediaResponse| match event {
+        MediaResponse::Failed { .. } | MediaResponse::Interrupted => true,
+        MediaResponse::Speaking { user_id, .. } => user_id == "ada",
+        _ => false,
+    };
+    assert!(!ada.seen.iter().any(wrong), "{:?}", ada.seen);
+    ada.hang_up();
+    bea.hang_up();
+    let _ = std::fs::remove_file(&ada_sink);
+    let _ = std::fs::remove_file(&bea_sink);
 }
 
 /// Both kinds offered, as a real call does: UDP carries it where it can.

@@ -45,13 +45,23 @@ struct Player {
     child: Child,
     out: BufReader<ChildStdout>,
     sink: PathBuf,
+    /// A scratch `TINYCLIENT_DIR`: without one mediad logs into the installed app's own directory.
+    dir: PathBuf,
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 impl Player {
     fn open(name: &str, path: &str, at: u32, rate: u16) -> Player {
         let sink = std::env::temp_dir().join(format!("tinyclient-play-{}-{name}.pcm", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tinyclient-play-{}-{name}", std::process::id()));
         let mut child = Command::new(env!("CARGO_BIN_EXE_mediad"))
             .arg("--play")
+            .env("TINYCLIENT_DIR", &dir)
             .env("TINYCLIENT_MEDIAD_AUDIO", "null")
             .env("TINYCLIENT_MEDIAD_SINK", &sink)
             .stdin(Stdio::piped())
@@ -59,7 +69,7 @@ impl Player {
             .spawn()
             .unwrap();
         let out = BufReader::new(child.stdout.take().unwrap());
-        let mut player = Player { child, out, sink };
+        let mut player = Player { child, out, sink, dir };
         player.ask(&PlayerRequest::Open { path: path.to_owned(), at, rate, output: None });
         player
     }
