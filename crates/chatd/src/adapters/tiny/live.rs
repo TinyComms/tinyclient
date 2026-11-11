@@ -21,6 +21,7 @@ use super::super::discord::gateway::{wait_sockets, Pollable, WakePair, POLL_IN, 
 use super::super::{net, Context, ReconnectWait, Refusal, Reply, PANIC_PAUSE, RECONNECTING};
 use super::{members_of, Saved};
 use crate::hub::lock;
+use crate::store::PersonRow;
 use protocol::{
     join_host, CallFailure, CallState, Cue, Link, MediaRequest, Occupant, Participant, PictureKind,
     Presence, TinyE2ee, TinyOffer, TinyPicture, TinySeat, TinySlot,
@@ -692,12 +693,23 @@ fn hold(ctx: &Context, live: &Live) -> bool {
     ctx.stopped()
 }
 
+/// Names the account by its server and says who we are on it. `me` is our person id, not the
+/// email: the pending row, presence and the shell all look us up by it. When no person of ours is
+/// cached yet, the session's display name stands in for it, so a pending message is not "You".
+fn describe_self(ctx: &Context, saved: &Saved) {
+    let _ = ctx.describe(&join_host(&saved.base_url), &saved.user_id);
+    let named = ctx.hub.store().person(&ctx.key(&saved.user_id)).ok().flatten().is_some_and(|person| !person.name.is_empty());
+    if !named && !saved.display_name.is_empty() {
+        let _ = ctx.people(&[PersonRow { id: saved.user_id.clone(), name: saved.display_name.clone(), ..PersonRow::default() }]);
+    }
+}
+
 /// A server with no live socket: connected if its session still works. False once it does not.
 fn absent(ctx: &Context, saved: &Saved, seat: &mut Seat) -> bool {
     match super::get_me(saved) {
-        Ok(me) => {
+        Ok(_) => {
             if !seat.described {
-                let _ = ctx.describe(&join_host(&saved.base_url), &me.email);
+                describe_self(ctx, saved);
                 seat.described = true;
             }
             ctx.link(Link::Connected);
@@ -1737,13 +1749,7 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
                 .map(|member| (member.user_id.clone(), member.display_name.clone()))
                 .collect();
             if !seat.described {
-                let email = members
-                    .iter()
-                    .find(|member| member.user_id == seat.me)
-                    .map_or(saved.email.as_deref().unwrap_or(""), |member| {
-                        member.email.as_str()
-                    });
-                let _ = ctx.describe(&join_host(&saved.base_url), email);
+                describe_self(ctx, saved);
                 seat.described = true;
             }
         }
