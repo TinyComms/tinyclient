@@ -11,6 +11,7 @@ mod emoji;
 mod header;
 mod icons;
 pub(in crate::gui) mod images;
+mod links;
 mod media;
 mod pages;
 mod player;
@@ -190,6 +191,14 @@ pub(super) fn may_mark_read(screenshots: bool, window_active: bool, open: bool, 
     !screenshots && window_active && open && on_screen
 }
 
+/// Whether the "New" marker follows the newest message as pages land. The line marks the first
+/// unread when the conversation opens. Once it is open, a message that arrives while the view
+/// is at the newest one in the active window was seen as it came. A line that is already up
+/// stays where it is until the user leaves.
+fn reads_as_it_lands(opened: bool, pinned: bool, window_active: bool, divider: bool) -> bool {
+    opened && pinned && window_active && !divider
+}
+
 const SCREENSHOTS: bool = cfg!(feature = "gui-shot");
 
 /// What to do with a file once it is on disk.
@@ -290,6 +299,8 @@ pub struct Pane {
     picker: Option<actions::Picking>,
     /// The message the delete dialog asks about.
     confirm: Option<Rc<Message>>,
+    /// The link a click asked about, until the person opens it or does not.
+    link_ask: Option<links::LinkAsk>,
     /// After an older page: the message that was on screen and how far below the top of the
     /// viewport it was, to put it back there once the rows above it can be measured.
     hold: Option<(String, f32)>,
@@ -381,6 +392,7 @@ impl Pane {
             menu: None,
             picker: None,
             confirm: None,
+            link_ask: None,
             hold: None,
             land: false,
             places: crate::gui::pane::Memory::default(),
@@ -499,6 +511,7 @@ impl Pane {
         self.menu = None;
         self.picker = None;
         self.confirm = None;
+        self.link_ask = None;
         self.hold = None;
         self.land = false;
         self.opening = false;
@@ -649,6 +662,7 @@ impl Pane {
                 return;
             }
         };
+        let opened = self.open.as_ref().is_some_and(|open| open.marker_known) && !self.window.messages.is_empty();
         if let Some(open) = self.open.as_mut().filter(|open| !open.marker_known) {
             open.last_read = last_read;
             open.marker_known = true;
@@ -677,6 +691,15 @@ impl Pane {
             _ => self.window.messages.len().saturating_sub(1),
         };
         self.window.trim(keep);
+
+        // What arrives under the reader's eyes is read: the marker moves on with it, so no "New"
+        // line is drawn above a message that came in while they were looking.
+        let divider = self.items.iter().any(|item| matches!(item, Item::New));
+        if reads_as_it_lands(opened, pinned, self.active, divider) && !self.window.newer {
+            if let (Some(open), Some(newest)) = (self.open.as_mut(), self.window.messages.last()) {
+                open.last_read = Some(newest.id.clone());
+            }
+        }
 
         // What joined the end since: mine sends the view to it, anyone else's is counted.
         let arrived = last.and_then(|last| self.window.position(&last.id)).map(|at| &self.window.messages[at + 1..]);
@@ -1622,6 +1645,19 @@ mod tests {
         assert!(!stale_page(&Purpose::Newest, 2, 2));
         assert!(!stale_page(&Purpose::Older, 1, 2));
         assert!(!stale_page(&Purpose::Arrivals, 1, 2));
+    }
+
+    #[test]
+    fn a_message_that_arrives_while_reading_at_the_bottom_gets_no_new_line() {
+        // Open, at the newest message, window active, no line up: the marker follows.
+        assert!(reads_as_it_lands(true, true, true, false));
+        // The first page is what places the line. It never moves the marker past the unread.
+        assert!(!reads_as_it_lands(false, true, true, false));
+        // Scrolled up, or the window is not active: what arrives is unread, under a line.
+        assert!(!reads_as_it_lands(true, false, true, false));
+        assert!(!reads_as_it_lands(true, true, false, false));
+        // A line from the opening stays put until the user leaves.
+        assert!(!reads_as_it_lands(true, true, true, true));
     }
 
     #[test]

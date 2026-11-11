@@ -3,7 +3,7 @@
 //! frame of the microphone and plays one frame of everyone mixed. Opening or replacing an audio
 //! device happens on another thread. The tick only swaps in a device that is already open.
 
-use crate::audio::{level, open_fresh, route_moved, Audio, AudioError, Fresh, Health, Retired};
+use crate::audio::{level, open_call, open_fresh, route_moved, Audio, AudioError, Fresh, Health, Retired};
 use crate::pick::{Backoff, Verdict, Watch};
 use crate::cue::Playing;
 use crate::hear::{self, Ear, Limiter};
@@ -670,7 +670,9 @@ pub(crate) fn listen(controls: &Controls, audio: &mut Audio, processor: &mut Pro
     }
     let heard = if captured { level(frame) } else { 0 };
     let (open, hold) = crate::talk::opening(controls.input(), &controls.keys(), heard, gate.talking(), Instant::now());
-    (gate.step(frame, captured, muted, open, hold), heard)
+    // A microphone that is gone ends what was being said as muting does: the ring goes out
+    // instead of staying lit over a hole that never ends.
+    (gate.step(frame, captured, muted || audio.unheard(), open, hold), heard)
 }
 
 pub const NO_MICROPHONE: &str =
@@ -1264,7 +1266,8 @@ enum Note {
     Same,
     /// The route was checked and it has not moved.
     Quiet,
-    /// Nothing would open. Fatal when the side it was for is broken: the call has no device left.
+    /// Nothing would open. Fatal when it was the speaker and the one in use is broken: the call
+    /// has nothing left to play on. A call without a microphone goes on ([`open_call`]).
     Failed {
         err: AudioError,
         fatal: bool,
@@ -1294,17 +1297,26 @@ fn satisfy(ask: OpenAsk) -> Note {
         return Note::Quiet;
     }
     let mut backoff = ask.backoff;
-    match open_fresh(ask.want_input.as_deref(), ask.want_output.as_deref(), which, ask.mic_running, &mut backoff, &ask.health) {
+    // A microphone that broke, or was never there, leaves the call up without one. One that
+    // works stays in use when what was asked for instead will not open.
+    let open = if ask.broken.0 || ask.current_input.is_empty() { open_call } else { open_fresh };
+    match open(ask.want_input.as_deref(), ask.want_output.as_deref(), which, ask.mic_running, &mut backoff, &ask.health) {
         Ok(fresh) => {
             let keep = (ask.force.0 || ask.broken.0, ask.force.1 || ask.broken.1);
             let fresh = fresh.unless_same((&ask.current_input, &ask.current_output), keep);
             Note::Fresh { fresh, rebuild: ask.rebuild }
         }
         Err(err) => {
-            let fatal = (which.0 && ask.broken.0) || (which.1 && ask.broken.1);
+            let fatal = speaker_lost(&err, which, ask.broken);
             Note::Failed { err, fatal, backoff }
         }
     }
+}
+
+/// Whether a device that would not open ends the call: only a speaker, and only when the one in
+/// use broke. Losing the microphone never does.
+fn speaker_lost(err: &AudioError, which: (bool, bool), broken: (bool, bool)) -> bool {
+    matches!(err, AudioError::NoSpeaker | AudioError::Speaker(_)) && which.1 && broken.1
 }
 
 struct DeviceDesk {
@@ -1411,6 +1423,70 @@ mod device_tests {
         assert_eq!(devices.judge(rebuilt + GRACE, (2880, 0), (true, true)), [Verdict::Fine, Verdict::Stuck]);
         // It starts after all.
         assert_eq!(devices.judge(rebuilt + GRACE * 2, (3840, 4), (true, true)), [Verdict::Fine; 2]);
+    }
+
+    /// Before, a microphone that broke with nothing to stand in for it was fatal: the headset
+    /// dropped for two seconds and the call ended with "Plug in a microphone".
+    #[test]
+    fn losing_the_microphone_never_ends_the_call_and_losing_the_speaker_in_use_does() {
+        let (mic, speaker) = (AudioError::NoMicrophone, AudioError::NoSpeaker);
+        assert!(!speaker_lost(&mic, (true, false), (true, false)), "the only microphone broke");
+        assert!(!speaker_lost(&AudioError::Microphone("gone".to_owned()), (true, true), (true, true)));
+        assert!(speaker_lost(&speaker, (false, true), (false, true)), "nothing is left to play on");
+        assert!(speaker_lost(&AudioError::Speaker("gone".to_owned()), (true, true), (true, true)));
+        // A speaker that was only asked for, while the one in use still plays, is not the end.
+        assert!(!speaker_lost(&speaker, (true, true), (true, false)));
+    }
+
+    /// The whole of it on virtual devices: talking, the microphone goes, the ring goes out and
+    /// nothing more is sent; it comes back and the next word is sent, with no rejoin.
+    #[test]
+    fn a_microphone_lost_in_mid_word_stops_the_sending_and_one_that_returns_resumes_it() {
+        let (mut audio, mut mic, _speaker) = Audio::virtual_devices((48_000, 2), (48_000, 2));
+        let controls = Controls::default();
+        let (mut processor, mut gate) = (Processor::new(), Gate::default());
+        let mut frame = [0i16; FRAME_SAMPLES];
+        let loud: Vec<f32> = (0..FRAME_SAMPLES).map(|n| ((n / CHANNELS) as f32 * 440. * std::f32::consts::TAU / 48_000.).sin() * 0.5).collect();
+        let mut said = None;
+        for _ in 0..10 {
+            mic.deliver(&loud);
+            let (step, _) = listen(&controls, &mut audio, &mut processor, &mut gate, &mut frame);
+            said = step.speaking.or(said);
+        }
+        assert_eq!(said, Some(true), "the tone opens the gate");
+        // The headset drops, and nothing stands in for it.
+        mic.unplug();
+        assert_eq!(audio.device_broken(), (true, false));
+        drop(audio.install(Fresh::without_microphone()));
+        let (step, heard) = listen(&controls, &mut audio, &mut processor, &mut gate, &mut frame);
+        assert_eq!((step.speaking, heard), (Some(false), 0), "the ring stayed lit with no microphone");
+        let mut sent = 0;
+        for _ in 0..50 {
+            let (step, _) = listen(&controls, &mut audio, &mut processor, &mut gate, &mut frame);
+            assert_eq!(step.speaking, None);
+            sent += usize::from(matches!(step.send, Some(Send::Frame(_))));
+        }
+        assert_eq!(sent, 0, "a call with no microphone sent audio");
+        assert!(!gate.talking());
+        // A second of that is not a stream to rebuild or report: there is none.
+        let mut devices = Devices::start(false);
+        let start = Instant::now();
+        let running = (audio.sides().0 && audio.mic_running(), audio.sides().1);
+        devices.judge(start, audio.counts(), running);
+        assert_eq!(devices.judge(start + GRACE * 4, (0, 500), running), [Verdict::Fine; 2]);
+        // It is plugged back in: the reopen swaps it in, and the next word goes out.
+        let (fresh, mut mic) = Fresh::virtual_mic((48_000, 2), &audio.health());
+        drop(audio.install(fresh));
+        let mut said = None;
+        let mut sent = 0;
+        for _ in 0..10 {
+            mic.deliver(&loud);
+            let (step, _) = listen(&controls, &mut audio, &mut processor, &mut gate, &mut frame);
+            said = step.speaking.or(said);
+            sent += usize::from(matches!(step.send, Some(Send::Frame(_))));
+        }
+        assert_eq!(said, Some(true), "the microphone that came back is not heard");
+        assert!(sent >= 5, "{sent} frames sent after it came back");
     }
 
     #[test]

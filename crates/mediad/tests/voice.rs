@@ -116,12 +116,17 @@ impl Mediad {
     }
 
     fn start_in(hears: &str, sink: Option<&PathBuf>, env: &[(&str, &PathBuf)]) -> Mediad {
+        // A mediad started outside a scratch `TINYCLIENT_DIR` (the test of the trust override)
+        // keeps its logs under the user's own data directory, the installed app's. That is
+        // moved into the scratch directory instead, by the variable each system names it with.
+        let home = if cfg!(windows) { "APPDATA" } else if cfg!(target_os = "macos") { "HOME" } else { "XDG_DATA_HOME" };
         let mut command = Command::new(env!("CARGO_BIN_EXE_mediad"));
         command
             .arg("1")
             .env_remove("TINYCLIENT_VOICE_PLAIN")
             .env_remove("TINYCLIENT_DIR")
             .env_remove("TINYCLIENT_VOICE_TRUST")
+            .env(home, tls().dir.join("home"))
             .env("TINYCLIENT_MEDIAD_AUDIO", hears)
             .envs(env.iter().copied())
             .stdin(Stdio::piped())

@@ -1,10 +1,13 @@
 //! Messages sent while their account was offline. chatd refuses those outright and stores
 //! nothing, so the shell holds each one for a minute: it goes if the link comes back in that
-//! time, and after it never goes unless the user asks. Also here: which sends this window made
+//! time, and after it never goes on its own: what was typed is handed back to the composer
+//! (`take_failed`), so it is not lost. Also here: which sends this window made
 //! are still on their way, so a conversation whose message failed can say so in the sidebar.
 //!
 //! Nothing here reads a clock or sends anything. The caller passes `now` and makes the request.
 
+use super::mention::Token;
+use super::Reply;
 use protocol::{Key, Link};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -25,6 +28,16 @@ enum Stage {
     Failed(String),
 }
 
+/// The composer as it was at the Return, to put back if the message never goes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Typed {
+    /// It was typed in the thread pane's composer.
+    pub thread: bool,
+    pub field: String,
+    pub tokens: Vec<Token>,
+    pub reply: Option<Reply>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Held {
     pub conversation: Key,
@@ -36,6 +49,7 @@ pub struct Held {
     pub reply_to: Option<String>,
     /// Unix seconds of the Return, for the row's place and time.
     pub since: i64,
+    pub typed: Typed,
     /// When the wait began: the Return, or the last Retry.
     at: Instant,
     stage: Stage,
@@ -43,7 +57,12 @@ pub struct Held {
 
 impl Held {
     pub fn new(conversation: Key, client_id: String, text: String, wire: String, reply_to: Option<String>, since: i64, now: Instant) -> Held {
-        Held { conversation, client_id, text, wire, reply_to, since, at: now, stage: Stage::Waiting }
+        Held { conversation, client_id, text, wire, reply_to, since, typed: Typed::default(), at: now, stage: Stage::Waiting }
+    }
+
+    pub fn typed(mut self, typed: Typed) -> Held {
+        self.typed = typed;
+        self
     }
 
     pub fn failed(&self) -> Option<&str> {
@@ -110,14 +129,14 @@ impl Hold {
     }
 
     /// The links changed. Returns what to send now: everything still inside its window whose
-    /// account is connected. A message whose account signed out is dropped with the account;
-    /// one whose session the network ended fails in place.
+    /// account is connected. A message whose account signed out, or whose session the network
+    /// ended, fails in place. One already handed to chatd waits for chatd's answer.
     pub fn linked(&mut self, now: Instant, link_of: impl Fn(&Key) -> Link) -> Vec<Held> {
         self.expire(now);
-        self.entries.retain(|held| link_of(&held.conversation) != Link::SignedOut);
         let mut ready = Vec::new();
         for held in &mut self.entries {
             match (link_of(&held.conversation), &held.stage) {
+                (Link::SignedOut, Stage::Waiting) => held.fail(format!("You signed out of {}.", held.conversation.network.label())),
                 (Link::Expired, Stage::Waiting) => held.fail(format!("{} signed you out.", held.conversation.network.label())),
                 (Link::Connected, Stage::Waiting) => {
                     held.stage = Stage::Sending;
@@ -165,6 +184,14 @@ impl Hold {
         let before = self.entries.len();
         self.sent(conversation, client_id);
         self.entries.len() != before
+    }
+
+    /// Takes out everything that failed, oldest first, for the composer to put back. Each
+    /// comes out once, and one that was sent, or is with chatd now, never does.
+    pub fn take_failed(&mut self) -> Vec<Held> {
+        let (failed, kept) = std::mem::take(&mut self.entries).into_iter().partition(|held| held.failed().is_some());
+        self.entries = kept;
+        failed
     }
 }
 
@@ -353,14 +380,49 @@ mod tests {
     }
 
     #[test]
-    fn signing_out_drops_what_was_held_and_an_ended_session_fails_it() {
+    fn what_gave_up_is_handed_back_once_with_what_was_typed() {
+        let start = Instant::now();
+        let mut hold = Hold::default();
+        let typed = Typed { field: " Back in ten ".into(), ..Typed::default() };
+        hold.hold(held("c", "1").typed(typed.clone()), start);
+        hold.hold(held("c", "2"), start + secs(30));
+        assert!(hold.take_failed().is_empty(), "nothing has failed yet");
+        assert!(hold.expire(start + secs(60)));
+        let back = hold.take_failed();
+        assert_eq!(back.iter().map(|held| (held.client_id.as_str(), &held.typed)).collect::<Vec<_>>(), [("1", &typed)]);
+        assert_eq!(back[0].failed(), Some("Slack did not come back."));
+        // It is the composer's again: not held, not marked, and never handed back twice.
+        assert!(!hold.has(&key("c"), "1") && !hold.failed_in(&key("c")));
+        assert!(hold.take_failed().is_empty());
+        // The younger one still waits for its own minute.
+        assert_eq!(hold.next_expiry(start + secs(60)), Some(secs(30)));
+    }
+
+    #[test]
+    fn a_held_message_that_goes_is_sent_once_and_never_handed_back() {
+        let start = Instant::now();
+        let mut hold = Hold::default();
+        hold.hold(held("c", "1"), start);
+        assert_eq!(hold.linked(start + secs(5), |_| Link::Connected).len(), 1);
+        // With chatd: the timer running out, or the links changing, neither fails nor sends it.
+        assert!(!hold.expire(start + secs(61)));
+        assert!(hold.linked(start + secs(62), |_| Link::SignedOut).is_empty());
+        assert!(hold.take_failed().is_empty());
+        hold.sent(&key("c"), "1");
+        assert!(!hold.expire(start + secs(3600)));
+        assert!(hold.linked(start + secs(3600), |_| Link::Connected).is_empty());
+        assert!(hold.take_failed().is_empty());
+    }
+
+    #[test]
+    fn signing_out_or_an_ended_session_fails_what_was_held() {
         let start = Instant::now();
         let mut hold = Hold::default();
         hold.hold(held("gone", "1"), start);
         hold.hold(held("ended", "2"), start);
         let link = |conversation: &Key| if conversation.id == "gone" { Link::SignedOut } else { Link::Expired };
         assert!(hold.linked(start + secs(1), link).is_empty());
-        assert!(!hold.has(&key("gone"), "1"));
+        assert_eq!(hold.of(&key("gone")).next().and_then(Held::failed), Some("You signed out of Slack."));
         assert_eq!(hold.of(&key("ended")).next().and_then(Held::failed), Some("Slack signed you out."));
         // Signing in again does not send it.
         assert!(hold.linked(start + secs(2), |_| Link::Connected).is_empty());

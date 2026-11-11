@@ -599,6 +599,7 @@ fn refold(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, convers
         message.saved_history = false;
         message.text = opened.text.clone();
         message.edited = true;
+        relink(&mut message);
         let mut media = Vec::new();
         message.attachments = sealed_attachments(saved, opened, &mut media);
         if !media.is_empty() {
@@ -844,6 +845,7 @@ fn rehydrate_opened(
     message.sender.id = last.author_id.clone();
     message.seal = Seal::Encrypted;
     message.attachments = attachments;
+    relink(&mut message);
     if !media.is_empty() {
         let _ = ctx.media(&media);
     }
@@ -1374,9 +1376,9 @@ fn send(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String
         ctx.sent(&conversation_id, &client_id, outcome);
         return;
     }
-    let labelled = ctx.known(&conversation_id).ok().flatten().is_some_and(|row| row.encryption.is_sealed());
-    let user = if labelled { saved.user_id.clone() } else { format!("{}#plain", saved.user_id) };
-    let account = (saved.base_url.clone(), user);
+    // The same question the post asks, so a conversation the device knows is encrypted but the
+    // list has not labelled yet still goes to the sealed queue and never holds up the plain one.
+    let account = send_account(saved, sealed_here(ctx, saved, &conversation_id) == Ok(true));
     let (posting, saved) = (ctx.clone(), saved.clone());
     in_order(account, Box::new(move || {
         let _ = crate::sendtime::run(&client_id, || {
@@ -1387,6 +1389,12 @@ fn send(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String
             if sent { Ok(()) } else { Err(()) }
         });
     }));
+}
+
+/// The send thread an account's sends of one kind go to: sealed ones apart from plain ones.
+fn send_account(saved: &Saved, sealed: bool) -> (String, String) {
+    let user = if sealed { saved.user_id.clone() } else { format!("{}#plain", saved.user_id) };
+    (saved.base_url.clone(), user)
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -1591,6 +1599,7 @@ fn edit(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, t
             } else if let Ok(Some(mut message)) = ctx.stored_message(conversation_id, message_id) {
                 message.text = text.to_owned();
                 message.edited = true;
+                relink(&mut message);
                 let _ = ctx.message(conversation_id, &message);
             }
             let _ = reply.send(Ok(()));
@@ -1612,6 +1621,7 @@ fn edit_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: 
     if let Ok(Some(mut message)) = ctx.stored_message(conversation_id, message_id) {
         message.text = text.to_owned();
         message.edited = true;
+        relink(&mut message);
         let _ = ctx.message(conversation_id, &message);
     }
     Ok(())
@@ -1807,7 +1817,15 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
         }
         message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me });
     }
+    relink(&mut message);
     Some(message)
+}
+
+/// Web addresses in the text become links. The spans point into the text as it is now, so those
+/// from before an edit go; Tiny sends plain text and has no other styling.
+fn relink(message: &mut Message) {
+    message.spans.clear();
+    protocol::link::linkify(message);
 }
 
 /// An end-to-end encrypted row: what this device opened, or the words that say it could not.
@@ -1870,6 +1888,7 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
         }
         message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me });
     }
+    relink(&mut message);
     Some(message)
 }
 
@@ -2518,6 +2537,58 @@ pub(super) fn prove_legacy_saved_speakers() -> Result<(), String> {
     Ok(())
 }
 
+/// Proves a Tiny message's web addresses are links, in a plaintext row and in an opened encrypted
+/// one, with the spans on the right bytes after multibyte text and the address left as typed.
+/// The lab sets `TINYCLIENT_PROVE=linkify`. A build from before the feature ignores that and keeps
+/// serving, so the same driver fails there.
+pub(super) fn prove_linkify() -> Result<(), String> {
+    const ME: &str = "11111111-1111-1111-1111-111111111111";
+    let saved = Saved {
+        base_url: "http://127.0.0.1:9".to_owned(),
+        token: "t".to_owned(),
+        user_id: ME.to_owned(),
+        email: None,
+        display_name: "Ada".to_owned(),
+        role: "member".to_owned(),
+        plain_http_ok: false,
+        e2ee: None,
+    };
+    let text = "héllo 你好 docs: https://example.com/a%20b?q=1&r=2#top, and (www.example.org/x). Not mailto:a@example.com or `https://example.com/code`";
+    let want = ["https://example.com/a%20b?q=1&r=2#top", "www.example.org/x"];
+    let plain: WireMessage = serde_json::from_value(serde_json::json!({
+        "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "author_id": ME, "body": text, "created_at": "2024-01-02T03:04:05Z"
+    }))
+    .map_err(|err| err.to_string())?;
+    let sealed: WireMessage = serde_json::from_value(serde_json::json!({
+        "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "author_id": ME, "e2ee": true, "created_at": "2024-01-02T03:04:06Z"
+    }))
+    .map_err(|err| err.to_string())?;
+    let opened = e2ee::Opened { text: text.into(), ..e2ee::Opened::default() };
+    let reads = HashMap::from([(sealed.id.clone(), Read::Legacy(opened))]);
+    for (what, wire) in [("plaintext", &plain), ("encrypted", &sealed)] {
+        let message = map_message(&saved, &HashMap::new(), wire, &reads, &mut Vec::new()).ok_or(format!("the {what} row was dropped"))?;
+        let linked: Vec<(String, String)> = message
+            .spans
+            .iter()
+            .filter_map(|span| match &span.style {
+                protocol::Style::Link { url } => message.text.get(span.start as usize..span.end as usize).map(|shown| (shown.to_owned(), url.clone())),
+                _ => None,
+            })
+            .collect();
+        let got: Vec<&str> = linked.iter().map(|(shown, _)| shown.as_str()).collect();
+        if got != want {
+            return Err(format!("the {what} row linked {got:?}, not {want:?}"));
+        }
+        if linked[1].1 != "https://www.example.org/x" || linked[0].1 != want[0] {
+            return Err(format!("the {what} row opens {:?}", linked.iter().map(|(_, url)| url).collect::<Vec<_>>()));
+        }
+        if message.text != text {
+            return Err(format!("the {what} row's text was changed"));
+        }
+    }
+    Ok(())
+}
+
 /// Proves a ciphertext row with no `e2ee` flag is stored as undecryptable, not as blank plaintext.
 /// The lab sets `TINYCLIENT_PROVE=sealed-row`. A build from before the fix ignores that and keeps
 /// serving, so the same driver fails there.
@@ -2984,6 +3055,15 @@ mod tests {
     }
 
     #[test]
+    fn sealed_and_plain_sends_go_to_different_send_threads() {
+        let saved = saved("http://127.0.0.1:1");
+        let (sealed, plain) = (send_account(&saved, true), send_account(&saved, false));
+        assert_ne!(sealed, plain, "a sealed send that waits to join must not hold up a plain one");
+        assert_eq!(sealed.0, plain.0, "the same server");
+        assert_eq!(sealed.1, saved.user_id);
+    }
+
+    #[test]
     fn an_unrelated_or_invalid_direct_pair_is_not_published() {
         for (low, high) in [(PEER, "33333333"), (ME, ME), (ME, "bad/id"), ("", ME)] {
             let (_adapter, ctx) = open_ctx();
@@ -3015,6 +3095,21 @@ mod tests {
         let row = ctx.known("new-direct").unwrap().unwrap();
         assert_eq!((row.title.as_str(), row.peer.as_deref(), row.encryption, row.unread),
             ("Bea", Some(PEER), Encryption::EndToEnd, 2));
+    }
+
+    #[test]
+    fn web_addresses_in_a_message_become_links_and_an_edit_moves_them() {
+        assert_eq!(super::prove_linkify(), Ok(()));
+        let mut message = Message::plain("m", "Ada", "see https://a.example/x", 1, false);
+        super::relink(&mut message);
+        assert_eq!(message.spans.len(), 1);
+        message.text = "now a much longer line before https://b.example/y".to_owned();
+        super::relink(&mut message);
+        let [span] = &message.spans[..] else { panic!("{:?}", message.spans) };
+        assert_eq!(&message.text[span.start as usize..span.end as usize], "https://b.example/y");
+        message.text = "no address left".to_owned();
+        super::relink(&mut message);
+        assert!(message.spans.is_empty());
     }
 
     #[test]

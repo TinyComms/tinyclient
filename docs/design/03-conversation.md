@@ -132,7 +132,8 @@ All cards: no proxied image means a text-only card. No favicon. Clicking a card 
 ## 6. Dividers and scroll
 - **Day.** 36 tall: hairline, centered label 11.5 medium `text_faint` ("Today", "Yesterday", "Monday, October 12"), hairline. Not sticky.
 - **New.** 24 tall: 1 px `accent` line ending in a "NEW" tab (height 16, `accent` fill, 10.5 bold `on_accent`) at the right edge. Placed at the first
-  unread when the conversation opens and it stays there until I leave. On a day boundary it sits directly above the day divider.
+  unread when the conversation opens and it stays there until I leave. On a day boundary it sits directly above the day divider. A message
+  that arrives while I am at the bottom of the active window is read as it lands and gets no line.
 - **Jump to bottom.** Floats 12 above the composer, 20 from the right, once I am more than 200 px from the bottom. Idle: 32 px circle, `float`,
   `hairline`, chevron. With new messages: `accent` pill "3 new" 12.5 semibold `on_accent`. Shadow 0 6 20 black 40%. Click goes to the New divider if
   it is below the viewport, otherwise to the bottom.

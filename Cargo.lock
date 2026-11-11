@@ -8297,6 +8297,7 @@ name = "protocol"
 version = "0.2.66"
 dependencies = [
  "getrandom 0.3.4",
+ "idna",
  "interprocess",
  "serde",
  "serde_json",

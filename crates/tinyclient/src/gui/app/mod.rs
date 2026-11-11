@@ -438,7 +438,10 @@ impl Shell {
 
     fn update_alert_act(&mut self, cx: &mut Context<Self>) {
         match crate::update::shown() {
-            crate::update::Shown::Ready { .. } => cx.quit(),
+            crate::update::Shown::Ready { .. } => {
+                crate::update::reopen_after_quit();
+                cx.quit();
+            }
             crate::update::Shown::Available { page, .. } => {
                 if crate::update::install_into().is_some() {
                     self.off_thread(cx, || crate::update::pursue(crate::update::Policy::Install), |this, _, cx| {
@@ -565,6 +568,7 @@ impl Shell {
             autoplay: super::anim::autoplay(),
             tiny_members: self.tiny_state.members_open(),
             me: prefs::me(),
+            trusted_links: prefs::trusted_links(),
         }
     }
 

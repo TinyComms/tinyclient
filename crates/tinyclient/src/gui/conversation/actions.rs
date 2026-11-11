@@ -337,7 +337,7 @@ impl Pane {
             return;
         }
         // A menu or the picker belongs to a message: the toolbar stays with it.
-        if self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() || self.viewer.is_some() {
+        if self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() || self.link_ask.is_some() || self.viewer.is_some() {
             return;
         }
         #[cfg(feature = "gui-shot")]
@@ -361,7 +361,7 @@ impl Pane {
 
     /// A menu, picker, dialog, viewer or a window-level layer is up: no toolbar shows.
     pub(super) fn overlay_up(&self, cx: &Context<Self>) -> bool {
-        let own = self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() || self.viewer.is_some();
+        let own = self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() || self.link_ask.is_some() || self.viewer.is_some();
         own || self.shell.upgrade().is_some_and(|shell| {
             let shell = shell.read(cx);
             shell.layout_state.menu.is_some() || shell.layout_state.floating || shell.sidebar_state.switcher.is_some() || shell.pane_card_open(cx)
@@ -422,6 +422,8 @@ impl Pane {
         } else if self.confirm.is_some() {
             self.confirm = None;
             cx.notify();
+        } else if self.link_ask.is_some() {
+            self.close_link_ask(cx);
         } else if self.menu.is_some() || self.picker.is_some() {
             self.close_menu(cx);
             self.close_picker(cx);
@@ -1215,15 +1217,18 @@ impl Pane {
 
     pub(super) fn action_layers(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if crate::gui::phone::active() {
-            return [self.menu_sheet(window, cx), self.picker_sheet(window, cx), self.confirm_layer(window, cx)].into_iter().flatten().collect();
+            return [self.menu_sheet(window, cx), self.picker_sheet(window, cx), self.confirm_layer(window, cx), self.link_layer(window, cx)].into_iter().flatten().collect();
         }
-        [self.menu_layer(window, cx), self.picker_layer(window, cx), self.confirm_layer(window, cx)].into_iter().flatten().collect()
+        [self.menu_layer(window, cx), self.picker_layer(window, cx), self.confirm_layer(window, cx), self.link_layer(window, cx)].into_iter().flatten().collect()
     }
 
     /// Keys for whatever floats over the messages. True when the key was theirs.
     /// A menu takes Up, Down, Enter and Escape. Anything else, including Copy, is left alone.
     pub(super) fn action_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let key = event.keystroke.key.as_str();
+        if self.link_key(event, cx) {
+            return true;
+        }
         if let Some(message) = self.confirm.clone() {
             match key {
                 "enter" => self.delete(&message, true, window, cx),

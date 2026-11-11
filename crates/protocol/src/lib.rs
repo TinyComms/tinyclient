@@ -23,6 +23,7 @@ pub mod private;
 mod info;
 pub mod ipc;
 pub mod launch;
+pub mod link;
 mod message;
 mod play;
 mod record;
@@ -1800,6 +1801,11 @@ pub enum Request {
     },
     /// How the call's connection is doing now. Answers `CallStats`.
     CallStats,
+    /// A call may be asked for soon (a place that can call is open, or a call just ended):
+    /// chatd starts its call engine now so that joining finds it ready. Answers `Ok` at once;
+    /// it starts nothing that opens a microphone, camera or connection, and does nothing when
+    /// the engine is already ready or is part of the app itself.
+    CallWarm,
     /// The person chose to carry on the Tiny call without end-to-end encryption after the server
     /// turned it off (`SecurityMode::Blocked`). Answers `Ok`, or `Refused` in words when the call
     /// is not blocked or must stay end to end (`CallSecurity::required`).

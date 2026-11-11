@@ -33,6 +33,8 @@ pub fn prove_tiny_open_backfill() -> Result<(), String> {
 
 mod direct_prove;
 mod send_prove;
+#[cfg(test)]
+mod reuse_tests;
 
 /// The lab's tiny-send-identity proof. A send names the person at once and settles without the
 /// members list. See `send_prove`.
@@ -53,6 +55,11 @@ pub fn prove_sealed_preview() -> Result<(), String> {
 /// The lab's legacy-saved-speakers proof. See `messages::prove_legacy_saved_speakers`.
 pub fn prove_legacy_saved_speakers() -> Result<(), String> {
     messages::prove_legacy_saved_speakers()
+}
+
+/// The lab's linkify proof. See `messages::prove_linkify`.
+pub fn prove_linkify() -> Result<(), String> {
+    messages::prove_linkify()
 }
 
 /// The lab's keycap-reaction proof. See `messages::prove_keycap_reaction`.
@@ -1306,6 +1313,8 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
             // made, registered, key packages up. Never stops the account.
             e2ee::begin(&saved, ctx.commands.clone());
             messages::refresh(&ctx, &saved);
+            // Catch missed membership hints even when this server has no live socket.
+            e2ee::resume(&saved);
             serve_inbox(&ctx, &saved, &live, inbox);
             // The socket thread sleeps on the socket; this is how it hears the adapter stopped.
             live.wake();
