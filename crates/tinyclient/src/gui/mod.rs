@@ -814,6 +814,7 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
     let prefs = if shot_demo::on() { app::prefs::Prefs::default() } else { prefs };
     theme::set_text_step(prefs.text_step);
     app::prefs::set_choices(prefs.choices);
+    app::prefs::set_trusted_links(prefs.trusted_links.clone());
     anim::set_autoplay(prefs.autoplay);
     let application = application.with_assets(assets::Assets);
     // macOS delivers both launch and subsequent links as open-URL events. Keep them in

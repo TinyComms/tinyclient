@@ -23,6 +23,7 @@ pub mod private;
 mod info;
 pub mod ipc;
 pub mod launch;
+pub mod link;
 mod message;
 mod play;
 mod record;

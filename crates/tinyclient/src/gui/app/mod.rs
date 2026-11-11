@@ -565,6 +565,7 @@ impl Shell {
             autoplay: super::anim::autoplay(),
             tiny_members: self.tiny_state.members_open(),
             me: prefs::me(),
+            trusted_links: prefs::trusted_links(),
         }
     }
 

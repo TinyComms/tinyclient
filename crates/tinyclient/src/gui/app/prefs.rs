@@ -10,6 +10,7 @@ use super::super::anim::Autoplay;
 use super::super::layout;
 use super::super::settings::Section;
 use super::super::sidebar::Mode;
+use protocol::link::Trusted;
 use protocol::settings::Values;
 use protocol::{Key, Network};
 use std::sync::Mutex;
@@ -36,6 +37,10 @@ pub struct Choices {
     pub images: bool,
     /// G4: a newer release is downloaded and installed on quit. Off, the notice still appears.
     pub updates: bool,
+    /// PL: a click on a web link asks where it goes before the browser opens it.
+    pub confirm_links: bool,
+    /// PS: tracking parameters (`utm_*`, `fbclid`, ...) are taken out of a link as it opens.
+    pub strip_tracking: bool,
     /// The Settings section last shown. Written by its name, which stays when sections are
     /// added or moved; a name this build does not know opens Accounts.
     pub section: Section,
@@ -43,7 +48,7 @@ pub struct Choices {
 
 impl Default for Choices {
     fn default() -> Choices {
-        Choices { compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, updates: true, section: Section::Accounts }
+        Choices { compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, updates: true, confirm_links: true, strip_tracking: false, section: Section::Accounts }
     }
 }
 
@@ -57,8 +62,12 @@ static CHOICES: Mutex<Choices> = Mutex::new(Choices {
     emoticons: false,
     images: true,
     updates: true,
+    confirm_links: true,
+    strip_tracking: false,
     section: Section::Accounts,
 });
+// The domains this device was told not to ask about (`link_ok` lines), read on each click.
+static TRUSTED_LINKS: Mutex<Option<Trusted>> = Mutex::new(None);
 static VALUES: Mutex<Option<Values>> = Mutex::new(None);
 static ME: Mutex<Me> = Mutex::new(Me { name: String::new(), picture: String::new() });
 
@@ -88,6 +97,15 @@ pub fn set_me(me: Me) {
 
 pub fn choices() -> Choices {
     *CHOICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The domains links open for without asking, on this device.
+pub fn trusted_links() -> Trusted {
+    TRUSTED_LINKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().unwrap_or_default()
+}
+
+pub fn set_trusted_links(trusted: Trusted) {
+    *TRUSTED_LINKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(trusted);
 }
 
 pub fn set_choices(choices: Choices) {
@@ -137,6 +155,8 @@ pub struct Prefs {
     /// The Tiny server's member list is shown beside the pane.
     pub tiny_members: bool,
     pub me: Me,
+    /// Domains whose links open without the question (PL's "Don't ask again for ...").
+    pub trusted_links: Trusted,
 }
 
 impl Default for Prefs {
@@ -157,6 +177,7 @@ impl Default for Prefs {
             autoplay: Autoplay::Always,
             tiny_members: true,
             me: Me::default(),
+            trusted_links: Trusted::default(),
         }
     }
 }
@@ -245,6 +266,11 @@ pub fn parse(text: &str) -> Prefs {
             "emoticons" => prefs.choices.emoticons = fields.next() == Some("on"),
             "images" => prefs.choices.images = fields.next() != Some("click"),
             "updates" => prefs.choices.updates = fields.next() != Some("off"),
+            "confirm_links" => prefs.choices.confirm_links = fields.next() != Some("off"),
+            "strip_tracking" => prefs.choices.strip_tracking = fields.next() == Some("on"),
+            "link_ok" => {
+                prefs.trusted_links.add(fields.next().unwrap_or(""));
+            }
             // Each person's volume once lived here; chatd keeps it now (`CallGain`).
             "tiny_gain" => {}
             "tiny_members" => prefs.tiny_members = fields.next() != Some("off"),
@@ -289,7 +315,7 @@ pub fn write(prefs: &Prefs) -> String {
     text.push_str(&format!("details\t{}\t{}\n", word(prefs.details_channels), word(prefs.details_directs)));
     text.push_str(&format!("text\t{}\n", prefs.text_step));
     let (choices, default) = (prefs.choices, Choices::default());
-    let lines: [(&str, bool, &str); 9] = [
+    let lines: [(&str, bool, &str); 11] = [
         ("density", choices.compact != default.compact, "compact"),
         ("previews", choices.previews != default.previews, "off"),
         ("send", choices.command_return != default.command_return, "cmd-return"),
@@ -298,6 +324,8 @@ pub fn write(prefs: &Prefs) -> String {
         ("emoticons", choices.emoticons != default.emoticons, "on"),
         ("images", choices.images != default.images, "click"),
         ("updates", choices.updates != default.updates, "off"),
+        ("confirm_links", choices.confirm_links != default.confirm_links, "off"),
+        ("strip_tracking", choices.strip_tracking != default.strip_tracking, "on"),
         ("settings_section", choices.section != default.section, ""),
     ];
     for (name, changed, value) in lines {
@@ -308,6 +336,9 @@ pub fn write(prefs: &Prefs) -> String {
             "settings_section" => text.push_str(&format!("{name}\t{}\n", choices.section.word())),
             _ => text.push_str(&format!("{name}\t{value}\n")),
         }
+    }
+    for domain in prefs.trusted_links.iter() {
+        text.push_str(&format!("link_ok\t{}\n", clean(domain)));
     }
     for line in &prefs.kept {
         text.push_str(line);
@@ -364,11 +395,12 @@ mod tests {
             details_channels: true,
             details_directs: false,
             text_step: 2,
-            choices: Choices { compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, updates: false, section: Section::Audio },
+            choices: Choices { compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, updates: false, confirm_links: false, strip_tracking: true, section: Section::Audio },
             kept: Vec::new(),
             autoplay: Autoplay::Hover,
             tiny_members: false,
             me: Me { name: "Justin\tS".into(), picture: "me-17.png".into() },
+            trusted_links: Trusted::from_lines(["example.com", "example.co.uk"]),
         };
         let read = parse(&write(&saved));
         let me = Me { name: "Justin S".into(), picture: "me-17.png".into() };
@@ -407,7 +439,7 @@ mod tests {
     #[test]
     fn only_changed_choices_are_written_and_lines_from_a_newer_build_are_kept() {
         let text = write(&Prefs::default());
-        for name in ["density", "previews", "send", "open_at", "typing", "emoticons", "images", "settings_section"] {
+        for name in ["density", "previews", "send", "open_at", "typing", "emoticons", "images", "settings_section", "confirm_links", "strip_tracking", "link_ok"] {
             assert!(!text.contains(name), "{name} is at its default and not written");
         }
         let newer = "sidebar\t300\ntheme\tlight\nbounce\tonce\n";
