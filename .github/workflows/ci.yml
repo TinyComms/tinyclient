@@ -40,6 +40,7 @@ jobs:
           - os: macos-latest
             features: --features tinyclient/gui
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-rust
@@ -79,6 +80,7 @@ jobs:
         artifact: ${{ fromJSON(github.event_name == 'push' && '["linux-x86_64","linux-aarch64","macos","windows"]' || '["linux-x86_64"]') }}
     # Ubuntu 22.04 is the oldest glibc the release packages promise.
     runs-on: ${{ fromJSON('{"linux-x86_64":"ubuntu-22.04","linux-aarch64":"ubuntu-22.04-arm","macos":"macos-latest","windows":"windows-latest"}')[matrix.artifact] }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       # Linux aarch64 builds without a cache. It runs only on main, beside the longer macOS
