@@ -20,6 +20,7 @@ The whole gate is in `docs/quality-gate.md`; the lab's contract is `e2e/README.m
 - A `feature` or `fix` brings an `e2e/scenarios/<id>` in the same pull request. It drives the real app and fails on `main` without the change.
 - Do not paste your own screenshots as proof. The lab records each platform and posts `e2e-proof`.
 - Merging with `--admin` past a missing `e2e-proof` is not allowed once it is required.
+- GLM reviews every pull request (`docs/pr-review.md`) and posts inline findings and the check `Tiny Agents / Code Review`. It is advice, not a gate. Fix a finding or say in the thread why it is wrong; do not resolve it silently.
 
 The captain's check prints an `e2e:` line: the lab's recorded release suite on the exact `origin/main` SHA. When `e2e/gate.json` has `"release_proof": "enforce"`, a missing one is a `BLOCK`.
 

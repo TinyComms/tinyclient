@@ -1816,6 +1816,9 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
     if fresh {
         super::messages::publish(ctx, saved, &seat.names);
     }
+    // Both fresh ready and resume can follow a missed membership hint. UI list
+    // refreshes also call publish, so catch-up belongs here rather than there.
+    super::e2ee::resume(saved);
 }
 
 /// Who is in one room's call, with their names, as a voice channel's occupants. A call chatd

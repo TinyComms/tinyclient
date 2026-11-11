@@ -37,7 +37,12 @@ that account here (a new device) reads them. "Erase" deletes the directory and t
   starts the group if nobody has (`POST .../group`), applies the handshake feed in order (an Add
   for a device not yet verified makes it fetch that person's list and try once more), and commits
   what is pending, with the Welcome for every device it adds. It runs on `e2ee.handshake`, before
-  every send, and when a message is from an epoch ahead (once per read).
+  every send, and when a message is from an epoch ahead (once per read). After publishing the
+  conversation list at startup, and after socket resume, a background worker also revisits known
+  encrypted groups. This catches pending additions whose live hint was missed while offline,
+  including conversations with no messages. It retries after 35 and then 40 seconds for older
+  servers that batch membership changes, and requests a message backfill after successful sync.
+  Concurrent catch-up requests share one worker per device.
 - **Sending.** Never plaintext to an encrypted conversation: if this device is not ready, the send
   is an error. While the server lists an Add for someone with no device in the group yet, the send
   waits, syncing every 2 s, up to 45 s: the server signs Adds only after its commit batch

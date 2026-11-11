@@ -126,6 +126,11 @@ impl Server {
         let body: Value = serde_json::from_str(body).unwrap_or(Value::Null);
         let conversation = format!("/v1/e2ee/conversations/{CONVERSATION}");
         match method {
+            "GET" if matches!(path, "/v1/channels" | "/v1/rooms") => (200, json!([])),
+            "GET" if path == "/v1/directs" => (200, json!([{
+                "id": CONVERSATION, "e2ee": true,
+                "peer": {"user_id": if caller == ADA { BEA } else { ADA }, "display_name": "Peer"}
+            }])),
             "GET" if path == "/v1/capabilities" => (
                 200,
                 json!({ "features": ["e2ee_text"], "e2ee_text": "optional" }),
@@ -420,6 +425,67 @@ pub(crate) fn prove_first_encrypted_message() -> Result<(), String> {
 #[test]
 fn the_first_message_of_a_new_conversation_opens_for_the_other_person() {
     prove_first_encrypted_message().expect("first message opens for the other person");
+}
+
+#[test]
+fn resuming_after_publishing_conversations_settles_an_add_missed_while_offline() {
+    let fake = Fake::start(0);
+    let mut creator = device(&fake, ADA, "offline-creator");
+    creator.sync(CONVERSATION).unwrap();
+    assert_eq!(lock(&fake.server).epoch, Some(0));
+    // The creator is now offline. The new recipient can trigger a signed Add,
+    // but cannot commit it or join until the creator processes it.
+    let mut recipient = device(&fake, BEA, "waiting-recipient");
+    recipient.sync(CONVERSATION).unwrap();
+    assert!(!recipient.engine().unwrap().has_group(ConversationId::parse(CONVERSATION).unwrap()));
+    assert!(lock(&fake.server).pending.iter().any(|add| add.issued));
+
+    let creator_saved = creator.saved.clone();
+    let recipient_saved = recipient.saved.clone();
+    let creator = Arc::new(Mutex::new(creator));
+    let recipient = Arc::new(Mutex::new(recipient));
+    let registry_key = |saved: &Saved| (saved.base_url.clone(), saved.user_id.clone());
+    struct Registered(Vec<(String, String)>);
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            let mut registry = lock(devices());
+            for key in &self.0 {
+                registry.remove(key);
+            }
+        }
+    }
+    let _registered = Registered(vec![registry_key(&creator_saved), registry_key(&recipient_saved)]);
+    lock(devices()).insert(registry_key(&creator_saved), creator.clone());
+    lock(devices()).insert(registry_key(&recipient_saved), recipient.clone());
+    let context = |saved: &Saved| {
+        let hub = Arc::new(crate::hub::Hub::new(crate::store::Store::open(Path::new(":memory:")).unwrap()));
+        crate::adapters::local(protocol::AccountKey { network: protocol::Network::Tiny, account: saved.user_id.clone() }, hub)
+    };
+    let (_adapter, creator_ctx, _inbox) = context(&creator_saved);
+    // Navigation refreshes the list too, but must not start membership workers.
+    super::super::messages::publish(&creator_ctx, &creator_saved, &HashMap::new());
+    assert!(!lock(&creator).membership_nudge);
+    assert_eq!(lock(&fake.server).epoch, Some(0));
+    // Startup and socket ready/resume explicitly nudge after list publication.
+    resume(&creator_saved);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while lock(&fake.server).epoch == Some(0) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let committed = lock(&fake.server).epoch == Some(1);
+    if committed {
+        let (_adapter, ctx, _inbox) = context(&recipient_saved);
+        super::super::messages::publish(&ctx, &recipient_saved, &HashMap::new());
+        resume(&recipient_saved);
+        while !lock(&recipient).engine().unwrap().has_group(ConversationId::parse(CONVERSATION).unwrap()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let joined = lock(&recipient).engine().unwrap().has_group(ConversationId::parse(CONVERSATION).unwrap());
+    assert!(committed, "returning creator must commit the missed Add without opening or sending a message");
+    assert!(joined, "returning recipient must take its Welcome without a live hint");
+    let answer = lock(&recipient).post(CONVERSATION, "after-resume", Kind::Message, None, &Envelope::message("joined after reconnect"), &[]).unwrap();
+    assert_eq!(text(&fake.read(&mut lock(&creator)), &id_of(&answer)), "joined after reconnect");
 }
 
 /// A row that did not open because this device was not in the group yet (here, the sync of the
