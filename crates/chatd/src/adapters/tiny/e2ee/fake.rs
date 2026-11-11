@@ -428,7 +428,7 @@ fn the_first_message_of_a_new_conversation_opens_for_the_other_person() {
 }
 
 #[test]
-fn publishing_conversations_settles_an_add_missed_while_offline() {
+fn resuming_after_publishing_conversations_settles_an_add_missed_while_offline() {
     let fake = Fake::start(0);
     let mut creator = device(&fake, ADA, "offline-creator");
     creator.sync(CONVERSATION).unwrap();
@@ -445,6 +445,16 @@ fn publishing_conversations_settles_an_add_missed_while_offline() {
     let creator = Arc::new(Mutex::new(creator));
     let recipient = Arc::new(Mutex::new(recipient));
     let registry_key = |saved: &Saved| (saved.base_url.clone(), saved.user_id.clone());
+    struct Registered(Vec<(String, String)>);
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            let mut registry = lock(devices());
+            for key in &self.0 {
+                registry.remove(key);
+            }
+        }
+    }
+    let _registered = Registered(vec![registry_key(&creator_saved), registry_key(&recipient_saved)]);
     lock(devices()).insert(registry_key(&creator_saved), creator.clone());
     lock(devices()).insert(registry_key(&recipient_saved), recipient.clone());
     let context = |saved: &Saved| {
@@ -452,9 +462,12 @@ fn publishing_conversations_settles_an_add_missed_while_offline() {
         crate::adapters::local(protocol::AccountKey { network: protocol::Network::Tiny, account: saved.user_id.clone() }, hub)
     };
     let (_adapter, creator_ctx, _inbox) = context(&creator_saved);
-    // The normal list refresh after connection must drive membership even with
-    // no live handshake event and no messages sent or opened by the creator.
+    // Navigation refreshes the list too, but must not start membership workers.
     super::super::messages::publish(&creator_ctx, &creator_saved, &HashMap::new());
+    assert!(!lock(&creator).membership_nudge);
+    assert_eq!(lock(&fake.server).epoch, Some(0));
+    // Startup and socket ready/resume explicitly nudge after list publication.
+    resume(&creator_saved);
     let deadline = Instant::now() + Duration::from_secs(5);
     while lock(&fake.server).epoch == Some(0) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
@@ -463,13 +476,12 @@ fn publishing_conversations_settles_an_add_missed_while_offline() {
     if committed {
         let (_adapter, ctx, _inbox) = context(&recipient_saved);
         super::super::messages::publish(&ctx, &recipient_saved, &HashMap::new());
+        resume(&recipient_saved);
         while !lock(&recipient).engine().unwrap().has_group(ConversationId::parse(CONVERSATION).unwrap()) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
     let joined = lock(&recipient).engine().unwrap().has_group(ConversationId::parse(CONVERSATION).unwrap());
-    lock(devices()).remove(&registry_key(&creator_saved));
-    lock(devices()).remove(&registry_key(&recipient_saved));
     assert!(committed, "returning creator must commit the missed Add without opening or sending a message");
     assert!(joined, "returning recipient must take its Welcome without a live hint");
     let answer = lock(&recipient).post(CONVERSATION, "after-resume", Kind::Message, None, &Envelope::message("joined after reconnect"), &[]).unwrap();

@@ -18,16 +18,31 @@ Required recorded real-app scenario, using isolated profiles and invented accoun
 Run the same scenario on the base and branch on every platform. The base must
 fail at step 4 because connection/list refresh does not process the pending Add.
 The lab must record and publish these runs; no full GUI proof is claimed here.
-Platform UI automation and lab recordings are still pending, so this scenario
-does not currently certify the change and is not in the release suite.
+All platform drivers and recordings are explicitly deferred:
 
-The focused source regression uses real MLS devices and the actual conversation
-list publication path with an in-process server. It checks that the creator
+| Platform | Driver | Recording |
+| --- | --- | --- |
+| Linux | Deferred: no `drive.py` or `drive.linux.sh` | Not run |
+| Windows | Deferred: no `drive.py` or `drive.windows.ps1` | Not run |
+| Android | Deferred: no `drive.py` or `drive.android.sh` | Not run |
+| macOS | Deferred: no `drive.py` or `drive.macos.sh`; lab permissions/host blocked | Not run |
+| iOS | Deferred: no `drive.py` or `drive.ios.sh`; lab has no passing run | Not run |
+
+Linux, Windows and Android can record today, but this scenario still needs real-app
+UI automation for two isolated accounts and both cold-start and network-resume
+cases. The existing daemon proof drivers do not implement that interaction.
+`scenario.json` lists required coverage, not implemented support. There is nothing
+for the lab to execute for this scenario yet. Keep the PR draft; it cannot claim
+`e2e-proof` or satisfy the quality gate until those drivers and base/branch
+recordings exist. This scenario is not in the release suite.
+
+The focused source regression uses real MLS devices and conversation
+list publication followed by the explicit reconnect nudge with an in-process server. It checks that the creator
 commits the missed Add, that the recipient takes its Welcome without a live
 hint, and that the recipient's first message opens on the creator:
 
 ```sh
-cargo test --locked -p chatd --lib publishing_conversations_settles_an_add_missed_while_offline -- --nocapture
+cargo test --locked -p chatd --lib resuming_after_publishing_conversations_settles_an_add_missed_while_offline -- --nocapture
 ```
 
 For a behavioral base comparison, transplant the test and its fake server list

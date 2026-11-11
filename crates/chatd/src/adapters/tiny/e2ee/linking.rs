@@ -315,7 +315,8 @@ pub(super) fn nudge(device: Shared) {
                     }
                     match device.sync(&conversation) {
                         Ok(()) => device.reload(&BTreeSet::from([conversation])),
-                        Err(why) => tracing::warn!("chatd: Tiny e2ee: {conversation}: {why}"),
+                        // Cached groups can belong to rooms we have left or that were deleted.
+                        Err(why) => tracing::debug!("chatd: Tiny e2ee: {conversation}: {why}"),
                     }
                 }
             }
