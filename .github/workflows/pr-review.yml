@@ -17,6 +17,8 @@ name: pr-review
 # review itself is tried from its branch by dispatch (`gh workflow run pr-review.yml --ref
 # <branch> -f pr_number=N`), which uses the branch's copy of both files and its tooling.
 on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
   pull_request_target:
     types: [opened, reopened, ready_for_review, synchronize, labeled]
   issue_comment:
@@ -67,7 +69,7 @@ jobs:
       ${{
         github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'pull_request_target' && github.event.action == 'labeled' && github.event.label.name == 'agent:review') ||
-        (github.event_name == 'pull_request_target' && github.event.action != 'labeled' &&
+        (contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name) && github.event.action != 'labeled' &&
           github.event.pull_request.draft == false &&
           contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)) ||
         (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
@@ -83,6 +85,6 @@ jobs:
     with:
       pr_number: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
       # A dispatch tries the branch's own script and instructions; everything else trusts main.
-      tooling_ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || 'main' }}
+      tooling_ref: ${{ github.head_ref || (github.event_name == 'workflow_dispatch' && github.ref_name) || 'main' }}
     secrets:
       AI_API_KEY: ${{ secrets.AI_API_KEY }}
