@@ -57,6 +57,11 @@ pub fn prove_legacy_saved_speakers() -> Result<(), String> {
     messages::prove_legacy_saved_speakers()
 }
 
+/// The lab's linkify proof. See `messages::prove_linkify`.
+pub fn prove_linkify() -> Result<(), String> {
+    messages::prove_linkify()
+}
+
 /// The lab's keycap-reaction proof. See `messages::prove_keycap_reaction`.
 pub fn prove_keycap_reaction() -> Result<(), String> {
     messages::prove_keycap_reaction()

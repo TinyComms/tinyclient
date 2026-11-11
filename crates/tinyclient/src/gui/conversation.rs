@@ -11,6 +11,7 @@ mod emoji;
 mod header;
 mod icons;
 pub(in crate::gui) mod images;
+mod links;
 mod media;
 mod pages;
 mod player;
@@ -290,6 +291,8 @@ pub struct Pane {
     picker: Option<actions::Picking>,
     /// The message the delete dialog asks about.
     confirm: Option<Rc<Message>>,
+    /// The link a click asked about, until the person opens it or does not.
+    link_ask: Option<links::LinkAsk>,
     /// After an older page: the message that was on screen and how far below the top of the
     /// viewport it was, to put it back there once the rows above it can be measured.
     hold: Option<(String, f32)>,
@@ -381,6 +384,7 @@ impl Pane {
             menu: None,
             picker: None,
             confirm: None,
+            link_ask: None,
             hold: None,
             land: false,
             places: crate::gui::pane::Memory::default(),
@@ -499,6 +503,7 @@ impl Pane {
         self.menu = None;
         self.picker = None;
         self.confirm = None;
+        self.link_ask = None;
         self.hold = None;
         self.land = false;
         self.opening = false;
