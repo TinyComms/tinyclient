@@ -989,6 +989,8 @@ pub(crate) struct Device {
     /// Conversations where someone the server is adding has no device in the group yet, as the
     /// last sync saw them.
     joining: BTreeSet<String>,
+    /// Coalesce reconnect and device-link membership catch-up workers.
+    membership_nudge: bool,
     /// Conversations with a row that did not open because this device was not in the group, or
     /// not at its epoch, yet. Read again when the group's handshake next comes.
     unopened: BTreeSet<String>,
@@ -1139,6 +1141,14 @@ pub(crate) fn begin(saved: &Saved, commands: std::sync::mpsc::Sender<crate::adap
     let mut device = lock(&shared);
     device.commands = Some(commands);
     device.enrol();
+}
+
+/// Live hints can be missed while offline (or before enrollment finished). Once the
+/// conversation list is known, revisit its encrypted groups without waiting for a send.
+pub(crate) fn resume(saved: &Saved) {
+    if let Some(shared) = started(saved) {
+        linking::nudge(shared);
+    }
 }
 
 /// Signing out: the device is revoked on the server and its state forgotten here. What it opened
@@ -1417,6 +1427,7 @@ impl Device {
             files: HashMap::new(),
             checked: BTreeSet::new(),
             joining: BTreeSet::new(),
+            membership_nudge: false,
             unopened: BTreeSet::new(),
             linking: false,
             commands: None,

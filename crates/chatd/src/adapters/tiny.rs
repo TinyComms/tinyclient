@@ -1306,6 +1306,8 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
             // made, registered, key packages up. Never stops the account.
             e2ee::begin(&saved, ctx.commands.clone());
             messages::refresh(&ctx, &saved);
+            // Catch missed membership hints even when this server has no live socket.
+            e2ee::resume(&saved);
             serve_inbox(&ctx, &saved, &live, inbox);
             // The socket thread sleeps on the socket; this is how it hears the adapter stopped.
             live.wake();
