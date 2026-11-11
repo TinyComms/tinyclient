@@ -3,8 +3,9 @@
 
 Starts this build's mediad with TINYCLIENT_PROVE=high-band. That build exits 0
 only when the high band rejoins the reconstruction at the path's lag (an
-impulse's high-passed response peaks at impulse + RECON_DELAY, and a 10 kHz
-tone survives the whole Enhanced path). A build from before the rejoin ignores
+impulse's high-passed response peaks at impulse + RECON_DELAY, and the 10 kHz
+sparkle reaches the send at exactly the isolation's own gain, whatever the
+model decides about the voice under it). A build from before the rejoin ignores
 the variable and opens the audio engine, so this driver fails there; the
 intermediate build that rejoined the high band a frame late fails the lag.
 
