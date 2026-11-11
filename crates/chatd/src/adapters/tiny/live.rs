@@ -2817,11 +2817,11 @@ fn hear_busy(ctx: &Context, seat: &mut Seat, frame: &Value) {
     clear_direct(seat, direct_id);
 }
 
-/// Joins an accepted direct. Media is `d:{ring_id}`. The shell keeps the direct message's id.
 /// A direct call encodes like a seat in a default room: the voice-quality ladder over the
-/// server's room default of 64 kb/s, since a direct has no room row of its own to ask.
-const DIRECT_CALL_KBPS: u32 = 64;
+/// server's room default, since a direct has no room row of its own to ask.
+const DIRECT_CALL_KBPS: u32 = protocol::TINY_BITRATE_DEFAULT;
 
+/// Joins an accepted direct. Media is `d:{ring_id}`. The shell keeps the direct message's id.
 #[allow(clippy::too_many_arguments)]
 fn join_direct(
     ctx: &Context,
