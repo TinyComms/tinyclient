@@ -1,0 +1,69 @@
+name: pr-review-run
+
+# One GLM code review of one pull request. Reusable: pr-review.yml calls it for tinyclient, and any
+# other Tiny repository calls it by name (docs/pr-review.md says how to add one):
+#
+#   uses: TinyComms/tinyclient/.github/workflows/pr-review-run.yml@main
+#
+# The script and the review instructions are checked out of tinyclient at `tooling_ref`, never from
+# the pull request. The pull request is read through the API and nothing from it is run, so a
+# `pull_request_target` caller can hold the key and the write token without handing either to a
+# fork's code.
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: Pull request number
+        required: true
+        type: string
+      tooling_ref:
+        description: The tinyclient ref that holds the script and instructions
+        required: false
+        type: string
+        default: main
+    secrets:
+      AI_API_KEY:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: write
+
+jobs:
+  review:
+    name: Code review
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Advice, not a gate: an outage at the provider must not turn the pull request red. The result,
+    # including "unavailable", is posted as the check run `Tiny Agents / Code Review`.
+    continue-on-error: true
+    steps:
+      - name: Check out the review tooling
+        uses: actions/checkout@v5
+        with:
+          repository: TinyComms/tinyclient
+          ref: ${{ inputs.tooling_ref }}
+          path: .tiny-review
+          sparse-checkout: |
+            .github/scripts/pr-review.py
+            .github/review
+          persist-credentials: false
+      - name: Review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          # Unset means z.ai's coding endpoint and glm-5.3 (pr-review.py).
+          AI_BASE_URL: ${{ vars.AI_BASE_URL }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          python3 .tiny-review/.github/scripts/pr-review.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --pr "$PR_NUMBER" \
+            --instructions .tiny-review/.github/review/base.md \
+            --instructions ".tiny-review/.github/review/${repo_name}.md" \
+            --post

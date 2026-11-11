@@ -1,0 +1,88 @@
+name: pr-review
+
+# GLM reviews a pull request and posts what it finds as an inline review, a sticky comment and the
+# check `Tiny Agents / Code Review`. docs/pr-review.md has the whole picture. The work is in
+# pr-review-run.yml, which tinyserver calls too.
+#
+# Runs on:
+#   - a pull request from someone with write access, when it opens, is marked ready, or gets a push;
+#   - the `agent:review` label (the label is removed again, so it can be applied twice);
+#   - a `/review` comment by someone with write access;
+#   - a manual dispatch.
+# Drafts wait until they are ready. A pull request from a stranger is not reviewed on its own, so
+# an unknown account cannot spend the key; a maintainer asks with the label or the comment.
+#
+# `pull_request_target`, so the run holds the key and a write token and executes the default
+# branch's copy of this file, not the branch's. The branch is never checked out. A change to the
+# review itself is tried from its branch by dispatch (`gh workflow run pr-review.yml --ref
+# <branch> -f pr_number=N`), which uses the branch's copy of both files and its tooling.
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize, labeled]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: write
+
+jobs:
+  acknowledge:
+    name: Acknowledge
+    if: >-
+      ${{
+        (github.event_name == 'pull_request_target' && github.event.action == 'labeled' && github.event.label.name == 'agent:review') ||
+        (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+          startsWith(github.event.comment.body, '/review'))
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Take the label off, or react to the comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          set -uo pipefail
+          if [ "$EVENT_NAME" = pull_request_target ]; then
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/agent%3Areview" --silent || true
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" -f content=eyes --silent || true
+          fi
+
+  review:
+    name: Review
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'pull_request_target' && github.event.action == 'labeled' && github.event.label.name == 'agent:review') ||
+        (github.event_name == 'pull_request_target' && github.event.action != 'labeled' &&
+          github.event.pull_request.draft == false &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)) ||
+        (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+          startsWith(github.event.comment.body, '/review'))
+      }}
+    # Per pull request, and here rather than on the workflow: a comment that is not a command never
+    # reaches this job, so it cannot cancel a review in progress. A newer push replaces the run.
+    concurrency:
+      group: pr-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
+      cancel-in-progress: true
+    uses: ./.github/workflows/pr-review-run.yml
+    with:
+      pr_number: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
+      # A dispatch tries the branch's own script and instructions; everything else trusts main.
+      tooling_ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || 'main' }}
+    secrets:
+      AI_API_KEY: ${{ secrets.AI_API_KEY }}
