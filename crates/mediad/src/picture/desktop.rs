@@ -995,6 +995,18 @@ mod tests {
     }
 
     #[test]
+    fn a_call_that_ends_while_sharing_leaves_no_picture_of_the_screen_behind() {
+        let mut outgoing = Outgoing::default();
+        outgoing.screen_selfie.shoot(&screen());
+        outgoing.selfie.shoot(&screen());
+        let files = [outgoing.share_view().unwrap().path, outgoing.self_view().unwrap().path];
+        assert!(files.iter().all(|file| file.exists()));
+        // `Video::stop` ends the capture thread without turning the share off first.
+        drop(outgoing);
+        assert!(files.iter().all(|file| !file.exists()), "{files:?}");
+    }
+
+    #[test]
     fn openh264_is_fetched_from_cisco() {
         let name = library_name().unwrap_or("openh264-2.6.0-win64.dll");
         let url = library_url(name);
