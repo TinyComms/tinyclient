@@ -11,10 +11,11 @@ const START: usize = 3;
 /// The least and most ever held: 40 and 200 ms.
 const LEAST: usize = 2;
 const MOST: usize = 10;
-/// Ticks the jitter must stay under what is held before one packet less is held: 5 s. It takes
-/// that long for a passing lull to prove itself, and a depth that follows every lull goes up and
-/// down with it.
-const RELEASE: u32 = 250;
+/// Ticks the jitter must stay under what is held before one packet less is held: 3 s. The
+/// spread it is aimed by already remembers the last 10 s, so this only keeps the depth from
+/// hunting, which would change the delay of every other sentence; what a step down gives back,
+/// squeezing speech gives back unheard.
+const RELEASE: u32 = 150;
 /// Packets over which the shallowest the queue got shows what is spare: half a second. A burst
 /// arriving together is not spare; what has been sitting there the whole time is.
 const WATCH: u32 = 25;
@@ -144,13 +145,20 @@ impl Jitter {
         }
     }
 
-    /// The sender's jitter as measured now, once a tick. RFC 3550's figure is an average; a
-    /// packet lands up to about three times that behind, and then waits for the next tick. What
-    /// is held goes up the moment that asks for more, and comes down one packet at a time.
-    pub fn aim(&mut self, jitter_ms: u32) {
-        let wanted = (jitter_ms as usize * 3 + 20).div_ceil(20).clamp(LEAST, MOST);
-        if wanted >= self.target {
-            self.target = wanted;
+    /// The sender's jitter as measured now, once a tick: RFC 3550's average, and the spread of
+    /// its recent packets' delays (`Arrivals::spread_ms`), how late one in a hundred came. A
+    /// packet lands up to about three times the average behind, and the spread says how much
+    /// further the stragglers do, where Wi-Fi puts them; either way it then waits for the next
+    /// tick. What is held goes up the moment that asks for more, and comes down one packet at a
+    /// time.
+    pub fn aim(&mut self, jitter_ms: u32, spread_ms: u32) {
+        let wanted_ms = (jitter_ms as usize * 3 + 20).max(spread_ms as usize + 20);
+        let wanted = wanted_ms.div_ceil(20).clamp(LEAST, MOST);
+        // Calm only when one packet less would hold it with 10 ms to spare: a need that sits on
+        // a packet's edge would otherwise step the depth down and straight back up.
+        let fits_less = wanted_ms + 10 <= (self.target - 1) * 20;
+        if wanted >= self.target || !fits_less {
+            self.target = self.target.max(wanted);
             self.calm = 0;
         } else if self.due.is_some() {
             self.calm += 1;
@@ -543,25 +551,25 @@ mod tests {
     fn what_is_held_rises_at_once_and_falls_a_packet_at_a_time() {
         let mut jitter = Jitter::default();
         assert_eq!(jitter.target(), START);
-        jitter.aim(30);
+        jitter.aim(30, 0);
         assert_eq!(jitter.target(), 6, "90 ms of lateness and a tick");
-        jitter.aim(500);
+        jitter.aim(500, 0);
         assert_eq!(jitter.target(), MOST, "never over 200 ms");
         // Not playing: nothing is known yet that says it can come down.
         for _ in 0..RELEASE * 2 {
-            jitter.aim(0);
+            jitter.aim(0, 0);
         }
         assert_eq!(jitter.target(), MOST);
         fill(&mut jitter, &(0..12).collect::<Vec<u16>>());
         assert!(matches!(jitter.pop(), Pop::Packet(_)));
         for _ in 0..RELEASE - 1 {
-            jitter.aim(0);
+            jitter.aim(0, 0);
         }
         assert_eq!(jitter.target(), MOST, "still proving itself");
-        jitter.aim(0);
+        jitter.aim(0, 0);
         assert_eq!(jitter.target(), MOST - 1);
         for _ in 0..RELEASE * 20 {
-            jitter.aim(0);
+            jitter.aim(0, 0);
         }
         assert_eq!(jitter.target(), LEAST, "never under 40 ms");
     }
@@ -569,7 +577,7 @@ mod tests {
     #[test]
     fn a_spurt_fills_to_what_the_jitter_asks_for() {
         let mut jitter = Jitter::default();
-        jitter.aim(30);
+        jitter.aim(30, 0);
         fill(&mut jitter, &[1, 2, 3, 4, 5]);
         assert_eq!(jitter.pop(), Pop::Empty, "60 ms is not enough here");
         fill(&mut jitter, &[6]);
@@ -592,7 +600,7 @@ mod tests {
             let wobble = u64::from(seed >> 16) * 60 / 65_536;
             arrivals.arrived(u32::from(n) * 960, start + Duration::from_millis(u64::from(n) * 20 + wobble));
             jitter.insert(n, packet(n));
-            jitter.aim(arrivals.ms());
+            jitter.aim(arrivals.ms(), arrivals.spread_ms());
             jitter.pop();
             depths.push(jitter.target());
         }
