@@ -41,10 +41,12 @@ jobs:
         os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-22.04","macos-latest","windows-latest"]' || '["ubuntu-22.04","windows-latest"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
-    # The window's own tests build only with the gui feature. macOS runs them on main; with no
-    # Mac on a pull request, Linux does.
+    # The window's own tests build only with the gui feature. Linux runs them everywhere, since a
+    # pull request has no Mac, and on main too: main writes the cache a pull request restores,
+    # and a Linux build without the feature left every pull request compiling it cold (17
+    # minutes, not 1.5).
     env:
-      FEATURES: ${{ (matrix.os == 'macos-latest' || (matrix.os == 'ubuntu-22.04' && github.event_name == 'pull_request')) && '--features tinyclient/gui' || '' }}
+      FEATURES: ${{ matrix.os != 'windows-latest' && '--features tinyclient/gui' || '' }}
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-rust
