@@ -101,6 +101,11 @@ pub(crate) fn prove_selection_clamp() -> Result<(), &'static str> {
     conversation::prove_selection_clamp()
 }
 
+/// The lab's offline-send-kept driver. A message held for an offline account that never goes comes back to the field.
+pub(crate) fn prove_offline_send_kept() -> Result<(), &'static str> {
+    composer::prove_offline_send_kept()
+}
+
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 

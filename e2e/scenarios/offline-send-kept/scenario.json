@@ -1,0 +1,12 @@
+{
+  "id": "offline-send-kept",
+  "title": "A message sent while offline that never goes out comes back to the field instead of vanishing",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same composer keeps the text on a phone.",
+    "ios": "The phone proof build does not run the desktop window. The same composer keeps the text on a phone."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
