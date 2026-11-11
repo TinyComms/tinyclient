@@ -142,6 +142,9 @@ pub(super) fn text_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("pageup", PageUp, context),
         KeyBinding::new("pagedown", PageDown, context),
     ];
+    // Redo is also Ctrl+Y where the platform says so. On macOS that key is Emacs's yank.
+    #[cfg(not(target_os = "macos"))]
+    let bindings = bindings.into_iter().chain([KeyBinding::new("ctrl-y", Redo, context)]).collect();
     #[cfg(target_os = "macos")]
     let bindings = bindings.into_iter().chain([
         KeyBinding::new("cmd-left", LineStart, context),

@@ -69,6 +69,9 @@ pub const ROWS: &[Row] = &[
     row("P1", Privacy, "Let others see when I am typing", "Let others see when I am typing", &[], &["typing", "indicator", "privacy"]),
     row("P2", Privacy, "Let others see what I have read", "Let others see what I have read", &[], &["receipts", "read receipts", "seen", "privacy"]),
     row("P3", Privacy, "", "Load images and link previews automatically", &[], &["images", "pictures", "previews", "data", "tracking"]),
+    row("PL", Privacy, "Links", "Confirm before opening links", &[], &["link", "links", "url", "browser", "open", "phishing", "safe", "ask", "warn"]),
+    row("PS", Privacy, "Links", "Strip tracking parameters when opening", &[], &["tracking", "utm", "fbclid", "gclid", "link", "links", "privacy", "clean"]),
+    row("PF", Privacy, "Links", "Sites that open without asking", &[], &["link", "links", "trusted", "allow", "dont ask again", "forget", "domain"]),
     row("P4", Privacy, "", crate::host::KEEP_MESSAGES, &["7 days", "30 days", "90 days"], &["retention", "history", "delete", "days"]),
     row("PE", Privacy, "Calls", "Only join end-to-end encrypted calls", &[], &["encryption", "encrypted", "e2ee", "end to end", "tiny", "call", "downgrade", "privacy"]),
     row("V1", Audio, "Microphone", "Microphone", &[], &["input", "mic", "device", "headset"]),
@@ -182,6 +185,8 @@ pub fn absent(id: &str) -> bool {
         "G2" => !cfg!(target_os = "macos"),
         "SV" | "NL" => cfg!(target_os = "macos"),
         "N10" | "N11" => !cfg!(any(windows, target_os = "macos")),
+        // Nothing to forget until a link's "Don't ask again" has been used.
+        "PF" => crate::gui::app::prefs::trusted_links().is_empty(),
         _ => false,
     }
 }

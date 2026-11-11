@@ -376,6 +376,11 @@ impl SettingsWindow {
             Section::Privacy => {
                 let mut groups = self.per_account(window, cx);
                 groups.push(self.group(&["P3"], None, window, cx));
+                let trusted = prefs::trusted_links();
+                let link_rows: &[&str] = if trusted.is_empty() { &["PL", "PS"] } else { &["PL", "PS", "PF"] };
+                groups.push(self.group(link_rows, Some("Links"), window, cx).child(caption(
+                    "Before a link opens, you see the site it really goes to. Tracking parameters are the bits (utm_source, fbclid) that only tell the site where you clicked from.",
+                )));
                 groups.push(
                     self.group(&["P4"], None, window, cx)
                         .child(caption("Older messages are deleted here, never on the networks. Each conversation also keeps at most its newest 2,000.")),
@@ -625,6 +630,25 @@ impl SettingsWindow {
             "P3" => {
                 let second = (!choices.images).then(|| "Nothing is fetched until you click it.".to_owned());
                 self.switch_row(id, choices.images, true, second, |this, on, cx| this.choose(|c| c.images = on, cx), cx)
+            }
+            "PL" => self.switch_row(id, choices.confirm_links, true, None, |this, on, cx| this.choose(|c| c.confirm_links = on, cx), cx),
+            "PS" => self.switch_row(id, choices.strip_tracking, false, None, |this, on, cx| this.choose(|c| c.strip_tracking = on, cx), cx),
+            "PF" => {
+                let count = prefs::trusted_links().len();
+                let second = format!("{count} {}", if count == 1 { "site" } else { "sites" });
+                row(
+                    label,
+                    Some(second.into()),
+                    controls::touch(button("PF", ButtonKind::Secondary, "Forget all")).on_click(cx.listener(|this, _, _, cx| {
+                        prefs::set_trusted_links(Default::default());
+                        let _ = this.shell.update(cx, |shell, cx| {
+                            shell.save_prefs(cx);
+                            cx.notify();
+                        });
+                        cx.notify();
+                        cx.refresh_windows();
+                    })),
+                )
             }
             "PE" => {
                 let on = values.on(REQUIRE_CALL_E2EE);
@@ -1826,6 +1850,7 @@ impl SettingsWindow {
     fn reset_all(&mut self, cx: &mut Context<Self>) {
         let section = prefs::choices().section;
         prefs::set_choices(Choices { section, ..Choices::default() });
+        prefs::set_trusted_links(Default::default());
         theme::set_text_step(0);
         anim::set_autoplay(Autoplay::default());
         self.pending.clear();
