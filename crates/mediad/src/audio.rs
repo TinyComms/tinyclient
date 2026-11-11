@@ -428,6 +428,43 @@ impl System {
     fn device(&self, id: &str, input: bool) -> Option<cpal::Device> {
         self.devices(input).into_iter().find(|device| endpoint(device).is_some_and(|e| e.id == id))
     }
+
+    /// One side as the system lists it right now, devices and all, read once: choosing a device
+    /// and opening it then ask the system a single time instead of twice.
+    fn snapshot(&self, input: bool) -> Snapshot {
+        let mut listed: Vec<(Endpoint, cpal::Device)> = Vec::new();
+        for device in self.devices(input) {
+            if let Some(endpoint) = endpoint(&device) {
+                if !listed.iter().any(|(known, _)| known.id == endpoint.id) {
+                    listed.push((endpoint, device));
+                }
+            }
+        }
+        let default = if input { self.host.default_input_device() } else { self.host.default_output_device() };
+        Snapshot { listed, default: default.as_ref().and_then(endpoint).map(|e| e.id) }
+    }
+}
+
+/// What [`System::snapshot`] read: the endpoints to choose from, with the device behind each.
+struct Snapshot {
+    listed: Vec<(Endpoint, cpal::Device)>,
+    default: Option<String>,
+}
+
+impl Snapshot {
+    fn device(&self, id: &str) -> Option<&cpal::Device> {
+        self.listed.iter().find(|(endpoint, _)| endpoint.id == id).map(|(_, device)| device)
+    }
+}
+
+impl Host for Snapshot {
+    fn endpoints(&self, _input: bool) -> Vec<Endpoint> {
+        self.listed.iter().map(|(endpoint, _)| endpoint.clone()).collect()
+    }
+
+    fn default_id(&self, _input: bool) -> Option<String> {
+        self.default.clone()
+    }
 }
 
 /// What a device is, for choosing it. `None` for one that went while it was being read.
@@ -821,14 +858,15 @@ fn open_side<T>(
     let now = Instant::now();
     let mut avoid = backoff.avoid(now);
     let mut last = None;
+    let listing = system.snapshot(input);
     // A few tries: the chosen device, then stand-ins, each failure crossed off.
     for _ in 0..4 {
-        let Some(pick) = pick::resolve_on(system, choice, input, &avoid) else {
+        let Some(pick) = pick::resolve_on(&listing, choice, input, &avoid) else {
             break;
         };
         let id = pick.endpoint.id.clone();
-        let opened = match system.device(&id, input) {
-            Some(device) => open(&device),
+        let opened = match listing.device(&id) {
+            Some(device) => open(device),
             None => Err(if input { AudioError::NoMicrophone } else { AudioError::NoSpeaker }),
         };
         match opened {
@@ -1044,6 +1082,20 @@ impl Audio {
             backoff: Backoff::default(),
             sides,
         }
+    }
+
+    /// Opens the microphone and speaker for a call that is about to connect: the microphone is
+    /// opened and held stopped (no capture, no recording indicator) until the call's loop turns
+    /// it on, so nothing is heard before the call is up. The stand-ins a test asks for are as
+    /// [`Audio::open`] makes them.
+    pub fn open_waiting(want_input: Option<String>, want_output: Option<String>) -> Result<Audio, AudioError> {
+        if Audio::simulated() {
+            return Audio::open(want_input, want_output);
+        }
+        let mut audio = Audio::empty(want_input, want_output, (true, true));
+        let fresh = open_fresh(audio.want_input.as_deref(), audio.want_output.as_deref(), audio.sides, false, &mut audio.backoff, &audio.health)?;
+        drop(audio.install(fresh));
+        Ok(audio)
     }
 
     /// Opens only the microphone (`sides.0`) or only the speaker (`sides.1`), for a test.

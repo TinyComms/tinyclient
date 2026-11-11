@@ -35,6 +35,8 @@ fn environment() {
         std::env::set_var("TINYCLIENT_MEDIAD", test_mediad::path());
         std::env::set_var("TINYCLIENT_MEDIAD_AUDIO", "tone");
         std::env::set_var("TINYCLIENT_VOICE_PLAIN", "1");
+        // The tests count engines: one started ahead of a call is for the tests that want it.
+        std::env::set_var("TINYCLIENT_PREWARM", "off");
     });
 }
 
@@ -107,7 +109,12 @@ fn child_pids(parent: u32, name: &str) -> Vec<u32> {
     #[cfg(not(windows))]
     {
         let out = Command::new("pgrep").args(["-P", &parent.to_string(), name]).output().unwrap();
-        String::from_utf8(out.stdout).unwrap().lines().filter_map(|pid| pid.trim().parse().ok()).collect()
+        // A killed child nobody has waited for yet is a zombie: listed, but gone.
+        let running = |pid: &u32| {
+            let state = Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+            !String::from_utf8_lossy(&state.stdout).trim().is_empty() && !String::from_utf8_lossy(&state.stdout).trim().starts_with('Z')
+        };
+        String::from_utf8(out.stdout).unwrap().lines().filter_map(|pid| pid.trim().parse().ok()).filter(running).collect()
     }
 }
 
@@ -727,5 +734,93 @@ fn a_call_starts_muted_when_the_user_joins_muted_and_a_test_gives_way_to_it() {
     assert_eq!(mediads(), 1);
     assert!(hub.calls.end(&hub).is_some());
     until("no mediad", || mediads() == 0);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn an_engine_started_ahead_of_a_call_is_the_one_that_carries_it_and_a_dead_one_is_replaced() {
+    let _turn = alone();
+    let (hub, dir) = hub();
+    struct Off;
+    impl Drop for Off {
+        fn drop(&mut self) {
+            std::env::set_var("TINYCLIENT_PREWARM", "off");
+        }
+    }
+    let _off = Off;
+    std::env::remove_var("TINYCLIENT_PREWARM");
+    hub.calls.prewarm(&hub);
+    until("an engine ahead of the call", || mediads() == 1);
+    assert_eq!(hub.calls.describe(), (None, false), "nothing is a call yet");
+    let warm = mediad_pid();
+
+    assert!(hub.calls.start(&hub, lounge()).is_ok());
+    assert_eq!(mediads(), 1, "no second engine");
+    assert_eq!(mediad_pid(), warm, "the one started ahead carries the call");
+    let call = hub.calls.describe().0.unwrap();
+    assert_eq!(call.state, CallState::Connecting);
+    assert!(call.engine_linked);
+    assert!(hub.calls.end(&hub).is_some());
+    until("no engine", || mediads() == 0);
+
+    // One that died while it waited is replaced without the call noticing.
+    hub.calls.prewarm(&hub);
+    until("an engine ahead of the call", || mediads() == 1);
+    let dead = mediad_pid();
+    assert!(kill_pid(&dead));
+    until("the engine gone", || mediads() == 0);
+    assert!(hub.calls.start(&hub, lounge()).is_ok());
+    assert_eq!(mediads(), 1);
+    assert_ne!(mediad_pid(), dead);
+    assert!(hub.calls.end(&hub).is_some());
+    until("no engine", || mediads() == 0);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// What pressing Join does about the call engine: started inside the click, or taken from the
+/// one already running. What is asserted is the structure (which process carries the call, and
+/// that none is spawned for it); how long each took is only printed for people to read.
+#[test]
+fn the_click_takes_the_engine_started_ahead_instead_of_starting_one() {
+    let _turn = alone();
+    let (hub, dir) = hub();
+    struct Off;
+    impl Drop for Off {
+        fn drop(&mut self) {
+            std::env::set_var("TINYCLIENT_PREWARM", "off");
+        }
+    }
+    let _off = Off;
+    let median = |mut times: Vec<Duration>| {
+        times.sort();
+        times[times.len() / 2]
+    };
+    let mut cold = Vec::new();
+    let mut warm = Vec::new();
+    for _ in 0..5 {
+        std::env::set_var("TINYCLIENT_PREWARM", "off");
+        let began = Instant::now();
+        hub.calls.start(&hub, lounge()).unwrap();
+        cold.push(began.elapsed());
+        assert_eq!(mediads(), 1, "the click started the engine");
+        hub.calls.end(&hub);
+        until("no engine", || mediads() == 0);
+
+        std::env::remove_var("TINYCLIENT_PREWARM");
+        hub.calls.prewarm(&hub);
+        // Ready, and settings applied: the click comes well after the engine is up.
+        until("an engine ahead of the call", || mediads() == 1);
+        sleep(Duration::from_millis(500));
+        let ahead = mediad_pid();
+        let began = Instant::now();
+        hub.calls.start(&hub, lounge()).unwrap();
+        warm.push(began.elapsed());
+        assert_eq!(mediads(), 1, "the click spawned no second engine");
+        assert_eq!(mediad_pid(), ahead, "the call is carried by the engine started ahead");
+        hub.calls.end(&hub);
+        until("no engine", || mediads() == 0);
+    }
+    let (cold, warm) = (median(cold), median(warm));
+    eprintln!("start of a call, median of 5: engine started in the click {cold:?}, started ahead {warm:?}");
     let _ = std::fs::remove_dir_all(dir);
 }

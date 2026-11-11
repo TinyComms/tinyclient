@@ -19,7 +19,7 @@ use protocol::{
 use std::io::{self, BufReader};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
@@ -41,6 +41,11 @@ const CONNECT: Duration = Duration::from_secs(15);
 const RING: Duration = Duration::from_secs(60);
 /// How often a call's deadlines are looked at. Only while a mediad is running.
 const WATCH: Duration = Duration::from_millis(250);
+/// How long a mediad started ahead of a call waits for one before it goes.
+const WARM_FOR: Duration = Duration::from_secs(10 * 60);
+/// A join that takes longer than this from the click to media is logged as slow, with where the
+/// time went.
+const SLOW_JOIN: Duration = Duration::from_secs(3);
 /// Speakers remembered ahead of the roster that names them.
 const TALKING: usize = 64;
 /// A roster change this soon after joining is the roster arriving, not someone joining.
@@ -90,6 +95,26 @@ struct Live {
     room_bitrate: Option<u32>,
     /// How mediad last said the call is protected, before whom the user verified is applied.
     secured: Option<protocol::CallSecurity>,
+    /// A call has this mediad (`ActiveCall::adopt`, or a mediad started for one). Until then it
+    /// is an engine waiting: what it says (its device list, again at every hot-plug) is learned
+    /// but never drawn or announced as a call.
+    adopted: bool,
+}
+
+/// What is said to a mediad and what it answers, one request and reply at a time. It has a lock
+/// of its own so that asking mediad never holds the slot: a slow mediad must not hold every
+/// Status answer and every ring with it.
+struct Pipe {
+    stdin: Option<Box<dyn std::io::Write + Send>>,
+    /// Replies to requests, passed on by the thread that reads mediad's stdout.
+    replies: Receiver<MediaResponse>,
+}
+
+/// The way to ask a running mediad, held without the slot's lock.
+#[derive(Clone)]
+struct Handle {
+    pipe: Arc<Mutex<Pipe>>,
+    live: Arc<Mutex<Live>>,
 }
 
 /// The running mediad and the call it exists for. Dropping it ends the call.
@@ -97,11 +122,20 @@ struct ActiveCall {
     /// Tells this call from the next one, for the threads that outlive it.
     id: u64,
     child: MediaChild,
-    stdin: Option<Box<dyn std::io::Write + Send>>,
-    /// Replies to requests, passed on by the thread that reads mediad's stdout.
-    replies: Receiver<MediaResponse>,
+    pipe: Arc<Mutex<Pipe>>,
     /// The call as the shell sees it, also written by that thread as events arrive.
     live: Arc<Mutex<Live>>,
+}
+
+/// A mediad started before any call asked for it, with the session's settings already applied:
+/// it holds no device, no camera and no connection until a join gives it a call. It leaves with
+/// chatd (its input closes), or after [`WARM_FOR`] unused.
+struct Warm {
+    active: ActiveCall,
+    /// The settings it was given, so a call sends only what has changed since.
+    applied: Vec<MediaRequest>,
+    /// When it was started, or last asked for again.
+    since: Instant,
 }
 
 #[derive(Default)]
@@ -137,6 +171,19 @@ pub struct Calls {
     tiny_up: Mutex<Option<Failed>>,
     /// The mediad started for Settings' microphone test or test sound, outside a call.
     tester: Mutex<Option<Tester>>,
+    /// A mediad started ahead of the next call (`prewarm`).
+    warm: Mutex<Option<Warm>>,
+    /// A mediad is being started ahead of a call; another is not started beside it.
+    warming: AtomicBool,
+    /// Where the time of the join being made goes (`clicked`, `stage`).
+    timeline: Mutex<Option<Timeline>>,
+}
+
+/// The stages of one join, from the click. Only their names and times are kept.
+struct Timeline {
+    conversation: Key,
+    clicked: Instant,
+    stages: Vec<(&'static str, u64)>,
 }
 
 /// A mediad with no call (`mediad test`): it opens the microphone while the meter is on and the
@@ -245,6 +292,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         push_to_talk: false,
         room_bitrate: None,
         secured: None,
+        adopted: false,
     }
 }
 
@@ -254,6 +302,60 @@ fn input_mode(settings: &protocol::settings::Values, push_to_talk: bool) -> prot
         settings.push_to_talk()
     } else {
         settings.input_mode()
+    }
+}
+
+/// The key a mediad started ahead of any call carries (`warm_up`).
+fn nobody() -> Key {
+    Key { network: protocol::Network::Tiny, account: String::new(), id: String::new() }
+}
+
+fn conversation_is_nobody(key: &Key) -> bool {
+    *key == nobody()
+}
+
+/// Whether a call may start in `slot`: for a direct call, only from the ring that is showing,
+/// and never over a mediad that is running.
+fn admit(slot: &mut Slot, conversation: &Key, intent: Option<u64>) -> Result<(), CallError> {
+    if intent.is_some()
+        && !matches!(&*slot, Slot::Shown(live)
+            if Some(live.intent) == intent && live.call.conversation == *conversation && !matches!(live.call.state, CallState::Failed { .. }))
+    {
+        return Err(CallError::NoCall);
+    }
+    if slot.running().is_some() {
+        return Err(CallError::Active);
+    }
+    Ok(())
+}
+
+/// What a call starts with, from the user's settings. The order is the order it is told.
+fn session_requests(settings: &protocol::settings::Values) -> Vec<MediaRequest> {
+    let (input, output, camera) = (settings.device(INPUT), settings.device(OUTPUT), settings.device(CAMERA));
+    let mut wanted = vec![
+        MediaRequest::Tune(settings.tuning()),
+        MediaRequest::Input(input_mode(settings, false)),
+        MediaRequest::Processing(settings.processing()),
+        MediaRequest::Quality(settings.voice_quality()),
+        MediaRequest::Devices { input, output, camera },
+    ];
+    if let Some(guard) = protocol::log_policy::current() {
+        wanted.push(MediaRequest::LogLevel { level: guard.policy().level_word().to_owned() });
+    }
+    wanted
+}
+
+/// Tells a mediad `wanted`. A mediad that already has `applied` from before is told only what is
+/// different now; a new one is not told what it starts with anyway (the automatic devices, the
+/// log level it was started under). One that refuses a setting still carries the call.
+fn send_session(handle: &Handle, wanted: &[MediaRequest], applied: Option<&[MediaRequest]>) {
+    for request in wanted {
+        let had = applied.is_some_and(|applied| applied.contains(request));
+        let default = applied.is_none()
+            && matches!(request, MediaRequest::LogLevel { .. } | MediaRequest::Devices { input: None, output: None, camera: None });
+        if !had && !default {
+            let _ = handle.request(request);
+        }
     }
 }
 
@@ -334,6 +436,13 @@ impl Live {
             }
             _ => false,
         }
+    }
+
+    /// An event from mediad, taken in. The call to draw, when the event changes it and a call
+    /// has this mediad; an engine waiting for one draws and announces nothing.
+    fn hear(&mut self, event: MediaResponse) -> Option<Call> {
+        let draw = self.apply(event);
+        (draw && self.adopted).then(|| self.call.clone())
     }
 
     /// What an event from mediad does to the call. False when it changes nothing the shell draws.
@@ -542,6 +651,8 @@ impl ActiveCall {
         };
         let mut live = new_call(conversation, CallState::Connecting);
         live.call.engine_linked = engine_linked;
+        // A mediad started ahead of any call is started with no conversation (`warm_up`).
+        live.adopted = !conversation_is_nobody(&live.call.conversation);
         let live = Arc::new(Mutex::new(live));
         let (reply, replies) = channel();
 
@@ -576,18 +687,21 @@ impl ActiveCall {
                     };
                     let mut live = crate::hub::lock(&seen);
                     let conversation = live.call.conversation.clone();
-                    let draw = live.apply(frame);
-                    let call = draw.then(|| live.call.clone());
+                    let call = live.hear(frame);
+                    let adopted = live.adopted;
                     let state_now = live.call.state.clone();
                     drop(live);
                     // Outside the call lock. A drop while already reconnecting does not redraw, and
                     // still has to be resumed; the first connect is not one.
-                    if conversation.network == protocol::Network::Tiny {
+                    if adopted && conversation.network == protocol::Network::Tiny {
                         match notify {
                             Some(false) if matches!(state_now, CallState::Reconnecting) => {
                                 reader.calls.tiny_down(&conversation)
                             }
-                            Some(true) => reader.calls.tiny_up(&conversation),
+                            Some(true) => {
+                                reader.calls.joined(&conversation);
+                                reader.calls.tiny_up(&conversation)
+                            }
                             _ => {}
                         }
                     }
@@ -601,22 +715,26 @@ impl ActiveCall {
                 reader.calls.reap(&reader, id);
             })?;
 
-        let watcher = hub.clone();
-        std::thread::Builder::new()
-            .stack_size(256 * 1024)
-            .spawn(move || {
-                // Ends with the call it watches.
-                while watcher.calls.watch(&watcher, id) {
-                    sleep(WATCH);
-                }
-            })?;
         Ok(ActiveCall {
             id,
             child,
-            stdin,
-            replies,
+            pipe: Arc::new(Mutex::new(Pipe { stdin, replies })),
             live,
         })
+    }
+
+    /// Starts the clock on this call's deadlines. Only a call in the slot has any.
+    fn watch(hub: &Arc<Hub>, id: u64) {
+        let watcher = hub.clone();
+        let spawned = std::thread::Builder::new().stack_size(256 * 1024).spawn(move || {
+            // Ends with the call it watches.
+            while watcher.calls.watch(&watcher, id) {
+                sleep(WATCH);
+            }
+        });
+        if let Err(err) = spawned {
+            tracing::warn!("chatd: the call's clock did not start: {err}");
+        }
     }
 
     /// False once mediad has exited on its own.
@@ -624,10 +742,33 @@ impl ActiveCall {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    fn request(&mut self, request: &MediaRequest) -> io::Result<MediaResponse> {
-        let stdin = self.stdin.as_mut().expect("stdin is open until drop");
+    fn handle(&self) -> Handle {
+        Handle { pipe: self.pipe.clone(), live: self.live.clone() }
+    }
+
+    /// The call this mediad was started ahead of is now `conversation`'s. What it learned of
+    /// the system's devices stays; everything else about the call starts afresh.
+    fn adopt(&self, conversation: Key, intent: Option<u64>, muted: bool) {
+        let mut live = crate::hub::lock(&self.live);
+        let (engine_linked, inputs, outputs) = (live.call.engine_linked, std::mem::take(&mut live.call.inputs), std::mem::take(&mut live.call.outputs));
+        *live = new_call(conversation, CallState::Connecting);
+        live.adopted = true;
+        live.call.engine_linked = engine_linked;
+        (live.call.inputs, live.call.outputs) = (inputs, outputs);
+        live.call.muted = muted;
+        if let Some(intent) = intent {
+            live.intent = intent;
+        }
+    }
+}
+
+impl Handle {
+    fn request(&self, request: &MediaRequest) -> io::Result<MediaResponse> {
+        let mut pipe = crate::hub::lock(&self.pipe);
+        let stdin = pipe.stdin.as_mut().ok_or_else(|| io::Error::other(ENGINE_SILENT))?;
         write_frame(stdin, request)?;
-        let reply = self.replies.recv_timeout(REPLY).map_err(|_| io::Error::other(ENGINE_SILENT))?;
+        let reply = pipe.replies.recv_timeout(REPLY).map_err(|_| io::Error::other(ENGINE_SILENT))?;
+        drop(pipe);
         match reply {
             MediaResponse::Streams { video } => {
                 crate::hub::lock(&self.live).call.video = video.clone();
@@ -642,7 +783,7 @@ impl ActiveCall {
 impl Drop for ActiveCall {
     fn drop(&mut self) {
         // Closing stdin is the hang-up. Kill only if mediad ignores it.
-        self.stdin.take();
+        crate::hub::lock(&self.pipe).stdin.take();
         let deadline = Instant::now() + Duration::from_secs(2);
         while self.alive() {
             if Instant::now() > deadline {
@@ -662,6 +803,11 @@ impl Slot {
             return None;
         };
         active.alive().then_some(active)
+    }
+
+    /// The way to ask that mediad, to be used after the slot is let go of.
+    fn handle(&mut self) -> Option<Handle> {
+        self.running().map(|active| active.handle())
     }
 
     /// A call that failed needs no mediad: the failure stays, the process goes. Gives the mediad
@@ -804,44 +950,173 @@ impl Calls {
             drop(tester);
             hub.changed(Change::Meter { level: None });
         }
-        let (tuning, input, output, camera, muted, mode, processing, quality) = {
+        // The slot is looked at, and let go of: starting mediad and telling it the user's
+        // settings are slow, and nothing else may wait on the slot meanwhile.
+        admit(&mut crate::hub::lock(&self.slot), &conversation, intent)?;
+        let (wanted, muted) = {
             let settings = hub.settings();
-            let mode = input_mode(&settings, false);
-            (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT), settings.device(CAMERA), settings.on(JOIN_MUTED), mode, settings.processing(), settings.voice_quality())
+            (session_requests(&settings), settings.on(JOIN_MUTED))
         };
-        {
-            let mut slot = crate::hub::lock(&self.slot);
-            if intent.is_some() && !matches!(&*slot, Slot::Shown(live)
-                if Some(live.intent) == intent && live.call.conversation == conversation && !matches!(live.call.state, CallState::Failed { .. })) {
-                return Err(CallError::NoCall);
+        // A mediad started ahead of the call has its settings already; a cold start waits for
+        // the process.
+        let (active, applied) = match self.take_warm_waiting() {
+            Some(warm) => (warm.active, Some(warm.applied)),
+            None => {
+                let id = self.next.fetch_add(1, Ordering::Relaxed);
+                (ActiveCall::start(hub, id, conversation.clone()).map_err(CallError::Media)?, None)
             }
-            if slot.running().is_some() {
-                return Err(CallError::Active);
-            }
-            // The old mediad, if any, is reaped before the new one starts.
-            *slot = Slot::Idle;
-            let id = self.next.fetch_add(1, Ordering::Relaxed);
-            let mut active = ActiveCall::start(hub, id, conversation.clone()).map_err(CallError::Media)?;
-            if let Some(intent) = intent { crate::hub::lock(&active.live).intent = intent; }
-            // The user's defaults, before the voice session arrives: mediad opens the devices
-            // only once it holds one. A mediad that refuses them still carries the call.
-            crate::hub::lock(&active.live).call.muted = muted;
-            let _ = active.request(&MediaRequest::Tune(tuning));
-            let _ = active.request(&MediaRequest::Input(mode));
-            let _ = active.request(&MediaRequest::Processing(processing));
-            let _ = active.request(&MediaRequest::Quality(quality));
-            // V9: everyone on this account whose volume for me is not the default.
-            let gains = hub.settings().gains(&conversation.account());
-            for (user_id, percent, muted) in gains {
-                let _ = active.request(&MediaRequest::Gain { user_id, percent, muted });
-            }
-            if input.is_some() || output.is_some() || camera.is_some() {
-                let _ = active.request(&MediaRequest::Devices { input, output, camera });
-            }
-            *slot = Slot::Active(active);
+        };
+        active.adopt(conversation.clone(), intent, muted);
+        self.stage(&conversation, if applied.is_some() { "mediad_ready_warm" } else { "mediad_ready_cold" });
+        // The user's defaults, before the voice session arrives: mediad opens the devices
+        // only once it holds one. A mediad that refuses them still carries the call.
+        let handle = active.handle();
+        send_session(&handle, &wanted, applied.as_deref());
+        self.stage(&conversation, "settings_applied");
+        // V9: everyone on this account whose volume for me is not the default.
+        let gains = hub.settings().gains(&conversation.account());
+        for (user_id, percent, muted) in gains {
+            let _ = handle.request(&MediaRequest::Gain { user_id, percent, muted });
         }
+        let id = active.id;
+        let old = {
+            let mut slot = crate::hub::lock(&self.slot);
+            // Looked at again: the slot was free a moment ago, not necessarily now.
+            admit(&mut slot, &conversation, intent)?;
+            std::mem::replace(&mut *slot, Slot::Active(active))
+        };
+        // The old mediad, if any, is reaped outside the slot's lock: it can take two seconds.
+        drop(old);
+        ActiveCall::watch(hub, id);
         self.tell(hub);
         Ok(())
+    }
+
+    /// The mediad started ahead of this call. One that is still being started is waited for a
+    /// moment: it began before this call did, so it is ready before a new one would be.
+    fn take_warm_waiting(&self) -> Option<Warm> {
+        let deadline = Instant::now() + READY;
+        while self.warming.load(Ordering::SeqCst) && Instant::now() < deadline {
+            sleep(Duration::from_millis(2));
+        }
+        self.take_warm()
+    }
+
+    /// The mediad started ahead of this call, if one is still running.
+    fn take_warm(&self) -> Option<Warm> {
+        let mut warm = crate::hub::lock(&self.warm).take()?;
+        warm.active.alive().then_some(warm)
+    }
+
+    /// The person pressed Join, or answered: the clock of this join starts. Nothing here is
+    /// personal: stage names and milliseconds.
+    pub fn clicked(&self, conversation: &Key) {
+        tracing::info!(network = conversation.network.label(), "call join: clicked");
+        *crate::hub::lock(&self.timeline) = Some(Timeline { conversation: conversation.clone(), clicked: Instant::now(), stages: Vec::new() });
+    }
+
+    /// One stage of the join in `conversation` is done, `elapsed_ms` after the click. The stages
+    /// mediad reaches after this point it logs itself, from its own offer (`mediad.log`).
+    fn stage(&self, conversation: &Key, name: &'static str) {
+        let mut line = crate::hub::lock(&self.timeline);
+        let Some(timeline) = line.as_mut().filter(|timeline| timeline.conversation == *conversation) else {
+            return;
+        };
+        let elapsed_ms = timeline.clicked.elapsed().as_millis() as u64;
+        timeline.stages.push((name, elapsed_ms));
+        tracing::info!(stage = name, elapsed_ms, "call join");
+    }
+
+    /// Media is up: the join is over, and is told as a whole. Slow ones are a warning.
+    fn joined(&self, conversation: &Key) {
+        let mut line = crate::hub::lock(&self.timeline);
+        if !line.as_ref().is_some_and(|timeline| timeline.conversation == *conversation) {
+            return;
+        }
+        let Some(timeline) = line.take() else {
+            return;
+        };
+        drop(line);
+        let elapsed = timeline.clicked.elapsed();
+        let stages = timeline.stages.iter().map(|(name, ms)| format!("{name}={ms}")).collect::<Vec<_>>().join(" ");
+        let elapsed_ms = elapsed.as_millis() as u64;
+        if elapsed > SLOW_JOIN {
+            tracing::warn!(stage = "connected", elapsed_ms, stages = stages.as_str(), "call join was slow");
+        } else {
+            tracing::info!(stage = "connected", elapsed_ms, stages = stages.as_str(), "call join");
+        }
+    }
+
+    /// Starts a mediad ahead of the next call, so that joining finds one running with the
+    /// session's settings applied: a ring in or out, or the shell opening a place that can call.
+    /// It holds no sound device, camera or connection, and goes when chatd does or after
+    /// [`WARM_FOR`] unused. Without a mediad to start, on a phone (where mediad is part of this
+    /// process), or with `TINYCLIENT_PREWARM=off`, it does nothing. Returns at once.
+    pub fn prewarm(&self, hub: &Arc<Hub>) {
+        if protocol::media_host::in_process()
+            || std::env::var("TINYCLIENT_PREWARM").is_ok_and(|value| value == "off")
+            || !mediad_path().is_ok_and(|path| path.exists())
+        {
+            return;
+        }
+        {
+            let mut warm = crate::hub::lock(&self.warm);
+            if let Some(warm) = warm.as_mut() {
+                if warm.active.alive() {
+                    warm.since = Instant::now();
+                    return;
+                }
+            }
+        }
+        if self.warming.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let starter = hub.clone();
+        let spawned = std::thread::Builder::new().name("mediad-warm".into()).stack_size(256 * 1024).spawn(move || {
+            starter.calls.warm_up(&starter);
+            starter.calls.warming.store(false, Ordering::SeqCst);
+        });
+        if let Err(err) = spawned {
+            self.warming.store(false, Ordering::SeqCst);
+            tracing::warn!("chatd: the call engine was not started ahead of a call: {err}");
+        }
+    }
+
+    fn warm_up(&self, hub: &Arc<Hub>) {
+        // A call has its own mediad, and one test at a time holds the devices.
+        if crate::hub::lock(&self.slot).running().is_some() {
+            return;
+        }
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        let active = match ActiveCall::start(hub, id, nobody()) {
+            Ok(active) => active,
+            Err(err) => {
+                tracing::warn!("chatd: the call engine was not started ahead of a call: {err}");
+                return;
+            }
+        };
+        let wanted = session_requests(&hub.settings());
+        send_session(&active.handle(), &wanted, None);
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "call engine ready ahead of a call");
+        let old = crate::hub::lock(&self.warm).replace(Warm { active, applied: wanted, since: Instant::now() });
+        drop(old);
+        // Nobody asked for it in a while: it goes.
+        let keeper = hub.clone();
+        let _ = std::thread::Builder::new().name("mediad-warm-clock".into()).stack_size(128 * 1024).spawn(move || loop {
+            sleep(WARM_FOR);
+            let mut warm = crate::hub::lock(&keeper.calls.warm);
+            match warm.as_ref() {
+                Some(held) if held.active.id == id && held.since.elapsed() >= WARM_FOR => {
+                    let expired = warm.take();
+                    drop(warm);
+                    drop(expired);
+                    return;
+                }
+                Some(held) if held.active.id == id => {}
+                _ => return,
+            }
+        });
     }
 
     /// Whether a call is starting or up with its mediad: a test then uses that mediad.
@@ -855,7 +1130,8 @@ impl Calls {
             let settings = hub.settings();
             (settings.tuning(), settings.clone())
         };
-        if let Some(active) = crate::hub::lock(&self.slot).running() {
+        let running = crate::hub::lock(&self.slot).handle();
+        if let Some(active) = running {
             let push_to_talk = crate::hub::lock(&active.live).push_to_talk;
             let _ = active.request(&MediaRequest::Tune(tuning));
             let _ = active.request(&MediaRequest::Input(input_mode(&settings, push_to_talk)));
@@ -881,7 +1157,8 @@ impl Calls {
             return;
         };
         let level = MediaRequest::LogLevel { level: guard.policy().level_word().to_owned() };
-        if let Some(active) = crate::hub::lock(&self.slot).running() {
+        let running = crate::hub::lock(&self.slot).handle();
+        if let Some(active) = running {
             let _ = active.request(&level);
         }
         if let Some(tester) = crate::hub::lock(&self.tester).as_mut() {
@@ -897,7 +1174,8 @@ impl Calls {
             (settings.device(INPUT), settings.device(OUTPUT), settings.device(CAMERA))
         };
         let devices = MediaRequest::Devices { input, output, camera };
-        if let Some(active) = crate::hub::lock(&self.slot).running() {
+        let running = crate::hub::lock(&self.slot).handle();
+        if let Some(active) = running {
             let _ = active.request(&devices);
         }
         if let Some(tester) = crate::hub::lock(&self.tester).as_mut() {
@@ -964,7 +1242,8 @@ impl Calls {
     /// Settings' test sound, on the call speaker: in the call, or from a test mediad.
     pub fn test_sound(&self, hub: &Arc<Hub>) -> Result<(), CallError> {
         let test = MediaRequest::Cue { cue: Cue::Test };
-        if let Some(active) = crate::hub::lock(&self.slot).running() {
+        let running = crate::hub::lock(&self.slot).handle();
+        if let Some(active) = running {
             return active.request(&test).map(drop).map_err(CallError::Media);
         }
         let mut held = crate::hub::lock(&self.tester);
@@ -1010,6 +1289,8 @@ impl Calls {
             self.placed.store(id, Ordering::Relaxed);
         }
         self.tell(hub);
+        // The other side picking up is likely: the engine is started now, not at the answer.
+        self.prewarm(hub);
         let watcher = hub.clone();
         if let Err(err) = std::thread::Builder::new()
             .name("call-ring".into())
@@ -1157,12 +1438,15 @@ impl Calls {
     /// joined plays the leave chime first, while mediad can still store it.
     pub fn end(&self, hub: &Hub) -> Option<Key> {
         self.cue_if_joined(hub, None);
-        let ended = match std::mem::take(&mut *crate::hub::lock(&self.slot)) {
+        let slot = std::mem::take(&mut *crate::hub::lock(&self.slot));
+        let ended = match &slot {
             Slot::Idle => return None,
             Slot::Shown(live) => live.call.conversation.clone(),
             Slot::Active(active) => crate::hub::lock(&active.live).call.conversation.clone(),
         };
+        // The shell hears at once; the mediad is waited for after, off the slot's lock.
         self.tell(hub);
+        drop(slot);
         Some(ended)
     }
 
@@ -1248,7 +1532,9 @@ impl Calls {
     }
 
     pub fn request(&self, hub: &Hub, request: &MediaRequest) -> Result<MediaResponse, CallError> {
-        let reply = match crate::hub::lock(&self.slot).running() {
+        // The slot is let go of before mediad is asked: a slow answer holds only this request.
+        let running = crate::hub::lock(&self.slot).handle();
+        let reply = match running {
             Some(active) => active.request(request).map_err(CallError::Media)?,
             None => return Err(CallError::NoCall),
         };
@@ -1316,7 +1602,7 @@ impl Calls {
     /// Someone is calling. While a call is up, or we are already ringing out, the new ring waits
     /// beside it. It does not replace the call, and it does not start mediad. A second one while
     /// one is already waiting is dropped.
-    pub fn ring(&self, hub: &Hub, conversation: Key, from: &str) {
+    pub fn ring(&self, hub: &Arc<Hub>, conversation: Key, from: &str) {
         let state = CallState::RingingIn {
             from: from.to_owned(),
         };
@@ -1343,6 +1629,8 @@ impl Calls {
             *slot = Slot::Shown(Box::new(new_call(conversation, state)));
         }
         self.tell(hub);
+        // Answering is likely: the engine is started now, not at the answer.
+        self.prewarm(hub);
     }
 
     /// The caller gave up, or it was answered on another device.
@@ -1520,22 +1808,22 @@ impl Calls {
         });
         let request = MediaRequest::TinyOffer(offer);
         let answer = if direct {
-            let result = {
-                let mut slot = crate::hub::lock(&self.slot);
-                match slot.running() {
-                    Some(active) if {
-                        let live = crate::hub::lock(&active.live);
-                        live.call.conversation == *conversation && Some(live.intent) == intent
-                    } =>
-                        active.request(&request).map_err(CallError::Media),
-                    _ => Err(CallError::NoCall),
-                }
+            let running = crate::hub::lock(&self.slot).handle().filter(|active| {
+                let live = crate::hub::lock(&active.live);
+                live.call.conversation == *conversation && Some(live.intent) == intent
+            });
+            let result = match running {
+                Some(active) => active.request(&request).map_err(CallError::Media),
+                None => Err(CallError::NoCall),
             };
             self.tell(hub);
             result
         } else { self.request(hub, &request) };
         match answer {
-            Ok(MediaResponse::Offer { sdp }) => Ok(sdp),
+            Ok(MediaResponse::Offer { sdp }) => {
+                self.stage(conversation, "offer_built");
+                Ok(sdp)
+            }
             answer => {
                 let variant = match &answer {
                     Ok(frame) => frame.name(),
@@ -1556,6 +1844,7 @@ impl Calls {
 
     /// The server's answer to the last offer. From here the wait is for mediad to connect.
     pub fn tiny_answer(&self, hub: &Hub, conversation: &Key, sdp: String) {
+        self.stage(conversation, "answer_received");
         let known = self.update(hub, conversation, |live| {
             live.joining = true;
             live.since = Instant::now();
@@ -1628,8 +1917,8 @@ impl Calls {
             if !matches { return; }
             std::mem::take(&mut *slot)
         };
-        drop(ended);
         self.tell(hub);
+        drop(ended);
     }
 
     /// Ends the call if it is in `conversation`, in whatever state, without telling the
@@ -1649,8 +1938,8 @@ impl Calls {
             }
             std::mem::take(&mut *slot)
         };
-        drop(ended);
         self.tell(hub);
+        drop(ended);
         true
     }
 
@@ -1744,6 +2033,54 @@ mod tests {
             assert!(!media, "a stale offer never starts the engine for a new unaccepted ring");
             hub.calls.end(&hub);
         }
+    }
+
+    #[test]
+    fn an_engine_waiting_for_a_call_draws_and_announces_nothing_but_a_call_that_has_it_does() {
+        let devices = |name: &str| MediaResponse::DeviceList { inputs: vec![AudioDevice { name: name.into(), ..AudioDevice::default() }], outputs: Vec::new() };
+        let mut waiting = live(CallState::Connecting);
+        assert!(!waiting.adopted);
+        // The first list, and a hot-plug after it: learned, not drawn.
+        assert!(waiting.hear(devices("Mic")).is_none());
+        assert!(waiting.hear(devices("Headset")).is_none());
+        assert_eq!(waiting.call.inputs.len(), 1, "the list is still kept for the call that comes");
+        // A call takes it: the same event is drawn as before.
+        waiting.adopted = true;
+        assert!(waiting.hear(devices("Mic")).is_some());
+        assert!(waiting.hear(devices("Mic")).is_none(), "no change, nothing to draw");
+        // A cold start for a real conversation is a call from the first word; one for nobody is not.
+        assert!(conversation_is_nobody(&nobody()));
+        assert!(!conversation_is_nobody(&Key { network: Network::Tiny, account: "me".into(), id: "lounge".into() }));
+    }
+
+    #[test]
+    fn a_join_is_timed_from_the_click_for_its_own_conversation_and_told_once() {
+        let calls = Calls::default();
+        let key = Key { network: Network::Tiny, account: "me".into(), id: "lounge".into() };
+        let other = Key { id: "den".into(), ..key.clone() };
+        calls.stage(&key, "offer_built");
+        assert!(crate::hub::lock(&calls.timeline).is_none(), "no click, no timeline");
+        calls.clicked(&key);
+        calls.stage(&key, "offer_built");
+        calls.stage(&other, "answer_received");
+        assert_eq!(crate::hub::lock(&calls.timeline).as_ref().unwrap().stages.len(), 1, "another room's stage is not this join's");
+        calls.joined(&other);
+        assert!(crate::hub::lock(&calls.timeline).is_some());
+        calls.joined(&key);
+        assert!(crate::hub::lock(&calls.timeline).is_none(), "told once, then gone");
+    }
+
+    #[test]
+    fn a_direct_call_starts_only_from_the_ring_showing_and_nothing_starts_over_a_running_engine() {
+        let key = Key { network: Network::Tiny, account: "me".into(), id: "direct".into() };
+        let ring = new_call(key.clone(), CallState::RingingOut);
+        let intent = ring.intent;
+        let mut slot = Slot::Shown(Box::new(ring));
+        assert!(admit(&mut slot, &key, Some(intent)).is_ok());
+        assert!(matches!(admit(&mut slot, &key, Some(intent + 1)), Err(CallError::NoCall)), "a ring that is gone");
+        assert!(admit(&mut slot, &key, None).is_ok(), "a room join needs no ring");
+        let mut idle = Slot::Idle;
+        assert!(matches!(admit(&mut idle, &key, Some(intent)), Err(CallError::NoCall)));
     }
 
     #[test]

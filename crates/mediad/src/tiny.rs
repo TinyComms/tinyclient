@@ -88,6 +88,113 @@ const SILENT: Duration = Duration::from_secs(3);
 /// Video keeps its own hold. Bandwidth estimation from the server's TWCC feedback is what turns
 /// on str0m's pacer: a keyframe leaves spread out, and audio, which it does not pace, goes
 /// around it. It looks for more bandwidth only once there is video to spend it on.
+/// Where the time of a join goes inside mediad: one line per stage, once per offer, as
+/// milliseconds since the offer came in. chatd tells its own stages from the click
+/// (`call join` lines in `chatd.log`); these are the ones after the offer.
+pub mod stages {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    /// The stages, in the order a join reaches them; a stage is a bit of [`Clock::told`].
+    const NAMES: [&str; 7] = ["offer_built", "answer_applied", "ice_connected", "dtls_connected", "devices_open", "first_media_frame", "first_sealed_frame"];
+
+    /// The clock of one offer. The stages told are a bit set, so a stage already told costs one
+    /// relaxed load: `mark` is on the path of every packet and every 20 ms frame, for the whole call.
+    pub struct Clock {
+        told: AtomicU32,
+        began: Mutex<Option<Instant>>,
+    }
+
+    impl Clock {
+        pub const fn new() -> Clock {
+            Clock { told: AtomicU32::new(0), began: Mutex::new(None) }
+        }
+
+        /// A new offer: the clock starts and every stage may be told again.
+        pub fn begin(&self) {
+            *self.began.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+            self.told.store(0, Ordering::Release);
+        }
+
+        /// `name` happened; told the first time only. True when this call told it.
+        pub fn mark(&self, name: &'static str) -> bool {
+            let Some(bit) = NAMES.iter().position(|known| *known == name).map(|at| 1u32 << at) else {
+                return false;
+            };
+            if self.told.load(Ordering::Relaxed) & bit != 0 {
+                return false;
+            }
+            let Some(began) = *self.began.lock().unwrap_or_else(std::sync::PoisonError::into_inner) else {
+                return false;
+            };
+            if self.told.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+                return false;
+            }
+            tracing::info!(stage = name, since_offer_ms = began.elapsed().as_millis() as u64, "call join");
+            true
+        }
+    }
+
+    static OFFER: Clock = Clock::new();
+
+    pub fn begin() {
+        OFFER.begin();
+    }
+
+    pub fn mark(name: &'static str) {
+        OFFER.mark(name);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_stage_is_told_once_per_offer_and_a_told_one_never_takes_the_lock() {
+            let clock = std::sync::Arc::new(Clock::new());
+            assert!(!clock.mark("first_media_frame"), "no offer, no clock");
+            clock.begin();
+            assert!(clock.mark("first_media_frame"));
+            assert!(clock.mark("first_sealed_frame"));
+            assert!(!clock.mark("first_media_frame"), "told once");
+            assert!(!clock.mark("not_a_stage"));
+            // With the lock held, a stage already told must still return at once.
+            let held = clock.began.lock().unwrap();
+            let (done, finished) = std::sync::mpsc::channel();
+            let other = clock.clone();
+            std::thread::spawn(move || {
+                for _ in 0..1000 {
+                    other.mark("first_media_frame");
+                    other.mark("first_sealed_frame");
+                }
+                let _ = done.send(());
+            });
+            assert!(finished.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "a told stage waited for the lock");
+            drop(held);
+            // The next offer tells them all again.
+            clock.begin();
+            assert!(clock.mark("first_media_frame"));
+        }
+    }
+}
+
+/// The DTLS certificate every connection of this process uses. Making one is key generation,
+/// which was done inside each offer; it is made once, by [`warm_up`] while the process waits for
+/// its call. One certificate for the process is what a browser does for its tabs, and a
+/// connection is still keyed afresh by its own handshake.
+fn dtls_cert() -> Option<str0m::crypto::dtls::DtlsCert> {
+    static CERT: std::sync::OnceLock<Option<str0m::crypto::dtls::DtlsCert>> = std::sync::OnceLock::new();
+    CERT.get_or_init(|| str0m::crypto::from_feature_flags().dtls_provider.generate_certificate()).clone()
+}
+
+/// What a call needs ready, done on a thread of its own as soon as the process starts.
+pub fn warm_up() {
+    let started = Instant::now();
+    let _ = dtls_cert();
+    tracing::debug!(elapsed_ms = started.elapsed().as_millis() as u64, "mediad: certificate ready");
+}
+
 fn rtc_config() -> RtcConfig {
     let mut config = RtcConfig::new()
         .clear_codecs()
@@ -99,7 +206,10 @@ fn rtc_config() -> RtcConfig {
     config.codec_config().add_h264(H264_PT.into(), Some(H264_RTX_PT.into()), true, H264_PROFILE);
     config.set_max_stun_rto(STUN_MAX_RTO);
     config.set_max_stun_retransmits(STUN_RETRANSMITS);
-    config
+    match dtls_cert() {
+        Some(cert) => config.set_dtls_cert(cert),
+        None => config,
+    }
 }
 
 /// Padding on an RTX stream. str0m keeps 50 kb/s or more of it going on any line that has RTX,
@@ -216,6 +326,7 @@ pub struct Offer {
 
 impl Offer {
     pub fn new(spec: &TinyOffer) -> io::Result<Offer> {
+        stages::begin();
         let ip = local_ip(&spec.host);
         let (udp, tcp) = transports();
         let mut rtc = rtc_config().build(Instant::now());
@@ -274,6 +385,7 @@ impl Offer {
             flipped: None,
             answered: Instant::now(),
         };
+        stages::mark("offer_built");
         Ok(Offer { link, pending, sdp: offer.to_sdp_string() })
     }
 
@@ -287,6 +399,7 @@ impl Offer {
         let answer = SdpAnswer::from_sdp_string(answer).map_err(|err| format!("{err:?}"))?;
         self.link.rtc.sdp_api().accept_answer(self.pending, answer).map_err(|err| format!("{err:?}"))?;
         self.link.answered = Instant::now();
+        stages::mark("answer_applied");
         Ok(self.link)
     }
 }
@@ -483,6 +596,9 @@ struct Call {
     /// [`SILENT`] called this link lost. ICE never did, so ICE will not say if it came back.
     silenced: bool,
     audio: Option<Audio>,
+    /// The devices being opened on a thread of their own since the answer came in, so that
+    /// they are ready when media is ([`open_beside_connecting`]).
+    opening: Option<std::sync::mpsc::Receiver<Result<Audio, crate::audio::AudioError>>>,
     devices: Option<Devices>,
     microphone_unasked: bool,
     encoder: Encoder,
@@ -631,6 +747,7 @@ impl Call {
         match event {
             Event::Connected => {
                 tracing::info!(state = "dtls_connected", "media state");
+                stages::mark("dtls_connected");
                 self.up();
             }
             Event::IceConnectionStateChange(IceConnectionState::Checking) => {
@@ -639,6 +756,7 @@ impl Call {
             Event::IceConnectionStateChange(IceConnectionState::Disconnected) => self.fell(),
             Event::IceConnectionStateChange(IceConnectionState::Connected | IceConnectionState::Completed) => {
                 tracing::info!(state = "ice_connected", "media state");
+                stages::mark("ice_connected");
                 if self.lost.is_some() && self.audio.is_some() {
                     self.up();
                 }
@@ -686,6 +804,7 @@ impl Call {
                 }
             },
             Event::MediaData(data) => {
+                stages::mark("first_media_frame");
                 if self.unopened.len() >= HELD_IN {
                     self.unopened.pop_front();
                 }
@@ -749,8 +868,15 @@ impl Call {
             return;
         }
         if self.audio.is_none() {
-            let (input, output) = self.controls.take_chosen();
-            match Audio::open(input, output) {
+            // Opened beside ICE and DTLS when that worked, else now.
+            let opened = match self.opening.take().and_then(|opening| opening.recv().ok()) {
+                Some(opened) => opened,
+                None => {
+                    let (input, output) = self.controls.take_chosen();
+                    Audio::open(input, output)
+                }
+            };
+            match opened {
                 Ok(audio) => {
                     announce(&audio);
                     self.audio = Some(audio);
@@ -952,6 +1078,7 @@ impl Call {
             };
             let time = MediaTime::new(frame.tick * FRAME as u64, Frequency::FORTY_EIGHT_KHZ);
             let _ = writer.audio_level(frame.level, frame.voice).write(pt, Instant::now(), time, payload);
+            stages::mark("first_sealed_frame");
         }
     }
 
@@ -1329,6 +1456,28 @@ impl Call {
     }
 }
 
+/// Opens the sound devices on a thread of their own, from the moment the server's answer is in
+/// until ICE and DTLS have finished, which take their time on any network: the call used to open
+/// them only once media flowed. The microphone is opened stopped, so nothing is captured and no
+/// recording indicator shows before the call is up. The noise-suppression model is built here
+/// too. `None` when the thread did not start: the devices then open when media flows.
+fn open_beside_connecting(controls: &Arc<Controls>) -> Option<std::sync::mpsc::Receiver<Result<Audio, crate::audio::AudioError>>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let controls = controls.clone();
+    // `out::spawn`, not a bare thread: in process the thread must join this call's instance, or it
+    // reads the app's environment (not the call's) and opens whatever devices the app sees.
+    let spawned = out::spawn(std::thread::Builder::new().name("devices-open".to_owned()), move || {
+        let started = Instant::now();
+        let (input, output) = controls.take_chosen();
+        let opened = Audio::open_waiting(input, output);
+        tracing::debug!(elapsed_ms = started.elapsed().as_millis() as u64, ok = opened.is_ok(), "mediad: devices opened");
+        stages::mark("devices_open");
+        let _ = sender.send(opened);
+        crate::process::warm_isolation(controls.processing());
+    });
+    spawned.ok().map(|_| receiver)
+}
+
 /// Runs the call until chatd hangs up. A failure does not return (`out::fail` exits).
 pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
     // A phone's audio session, for as long as the call runs. Nothing on a desktop.
@@ -1364,6 +1513,7 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         heard: Instant::now(),
         silenced: false,
         audio: None,
+        opening: open_beside_connecting(&controls),
         devices: None,
         microphone_unasked,
         encoder,

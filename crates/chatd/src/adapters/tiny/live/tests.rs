@@ -755,6 +755,9 @@ fn with_mediad() {
         let mediad = crate::test_mediad::path();
         std::env::set_var("TINYCLIENT_MEDIAD", mediad);
         std::env::set_var("TINYCLIENT_MEDIAD_AUDIO", "tone");
+        // These tests start the engine themselves; one started ahead of a ring would also hold the
+        // file the next build of mediad replaces.
+        std::env::set_var("TINYCLIENT_PREWARM", "off");
     });
 }
 

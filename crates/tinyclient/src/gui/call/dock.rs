@@ -710,6 +710,7 @@ impl Shell {
     /// deafen and the voice settings are in the user panel right under it.
     fn call_compact(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
         let (state, color) = match call.state {
+            CallState::Joined if super::securing(call) => ("Securing…", theme::warning()),
             CallState::Joined if self.call_muted_talking(call) => ("You're muted", theme::danger()),
             // Coloured by the link, as the bars are: green, amber when fair, red when poor.
             CallState::Joined => match self.tiny_health().map(|health| health.grade()) {
