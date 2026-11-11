@@ -365,6 +365,15 @@ fn connecting_settled(worked: bool, chatd: Option<&Call>) -> bool {
     !worked || chatd.is_some_and(|call| !matches!(call.state, CallState::Failed { .. }))
 }
 
+/// The grace for the join in `kept` is up: drops the Connecting drawing if it is still that
+/// join's, and leaves a later join's alone. True when something was dropped.
+fn expire_connecting(connecting: &mut Option<Call>, kept: Option<&Key>) -> bool {
+    match (connecting.as_ref(), kept) {
+        (Some(call), Some(kept)) if call.conversation == *kept => connecting.take().is_some(),
+        _ => false,
+    }
+}
+
 /// What the dock draws: chatd's call, else what only this window knows. A join asked for just
 /// now is drawn over a failure still on show from the call before it, but never over a call
 /// that is live.
@@ -890,10 +899,12 @@ impl Shell {
             cx.notify();
             return;
         }
+        // Only the join this timer was armed for is let go of: a later one has its own.
+        let kept = self.call_state.connecting.as_ref().map(|call| call.conversation.clone());
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(2)).await;
             let _ = this.update(cx, |this, cx| {
-                if this.call_state.connecting.take().is_some() {
+                if expire_connecting(&mut this.call_state.connecting, kept.as_ref()) {
                     cx.notify();
                 }
             });
@@ -1337,6 +1348,23 @@ mod tests {
         assert!(connecting_settled(true, Some(&connecting)), "chatd has the call: its state is drawn");
         assert!(connecting_settled(false, None), "the ask failed: drop it at once");
         assert!(connecting_settled(false, Some(&connecting)));
+    }
+
+    #[test]
+    fn a_grace_that_runs_out_drops_only_the_join_it_was_armed_for() {
+        let (a, b) = (key("lounge"), key("den"));
+        let mut connecting = Some(bare_call(a.clone(), CallState::Connecting, false, false));
+        // A's grace runs out while A is still what is drawn: dropped.
+        assert!(expire_connecting(&mut connecting, Some(&a)));
+        assert!(connecting.is_none());
+        // B was joined within A's grace: A's expiry leaves B's drawing alone.
+        let mut connecting = Some(bare_call(b.clone(), CallState::Connecting, false, false));
+        assert!(!expire_connecting(&mut connecting, Some(&a)));
+        assert!(connecting.is_some());
+        // And B's own expiry drops it; nothing armed, nothing dropped.
+        assert!(expire_connecting(&mut connecting, Some(&b)));
+        let mut connecting = Some(bare_call(b, CallState::Connecting, false, false));
+        assert!(!expire_connecting(&mut connecting, None));
     }
 
     #[test]
