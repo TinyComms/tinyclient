@@ -92,24 +92,89 @@ const SILENT: Duration = Duration::from_secs(3);
 /// milliseconds since the offer came in. chatd tells its own stages from the click
 /// (`call join` lines in `chatd.log`); these are the ones after the offer.
 pub mod stages {
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
     use std::time::Instant;
 
-    static OFFER: Mutex<Option<(Instant, Vec<&'static str>)>> = Mutex::new(None);
+    /// The stages, in the order a join reaches them; a stage is a bit of [`Clock::told`].
+    const NAMES: [&str; 7] = ["offer_built", "answer_applied", "ice_connected", "dtls_connected", "devices_open", "first_media_frame", "first_sealed_frame"];
 
-    /// A new offer: the clock starts and every stage may be told again.
-    pub fn begin() {
-        *OFFER.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Instant::now(), Vec::new()));
+    /// The clock of one offer. The stages told are a bit set, so a stage already told costs one
+    /// relaxed load: `mark` is on the path of every packet and every 20 ms frame, for the whole call.
+    pub struct Clock {
+        told: AtomicU32,
+        began: Mutex<Option<Instant>>,
     }
 
-    /// `name` happened; told the first time only.
-    pub fn mark(name: &'static str) {
-        let mut offer = OFFER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((began, told)) = offer.as_mut() {
-            if !told.contains(&name) {
-                told.push(name);
-                tracing::info!(stage = name, since_offer_ms = began.elapsed().as_millis() as u64, "call join");
+    impl Clock {
+        pub const fn new() -> Clock {
+            Clock { told: AtomicU32::new(0), began: Mutex::new(None) }
+        }
+
+        /// A new offer: the clock starts and every stage may be told again.
+        pub fn begin(&self) {
+            *self.began.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+            self.told.store(0, Ordering::Release);
+        }
+
+        /// `name` happened; told the first time only. True when this call told it.
+        pub fn mark(&self, name: &'static str) -> bool {
+            let Some(bit) = NAMES.iter().position(|known| *known == name).map(|at| 1u32 << at) else {
+                return false;
+            };
+            if self.told.load(Ordering::Relaxed) & bit != 0 {
+                return false;
             }
+            let Some(began) = *self.began.lock().unwrap_or_else(std::sync::PoisonError::into_inner) else {
+                return false;
+            };
+            if self.told.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+                return false;
+            }
+            tracing::info!(stage = name, since_offer_ms = began.elapsed().as_millis() as u64, "call join");
+            true
+        }
+    }
+
+    static OFFER: Clock = Clock::new();
+
+    pub fn begin() {
+        OFFER.begin();
+    }
+
+    pub fn mark(name: &'static str) {
+        OFFER.mark(name);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_stage_is_told_once_per_offer_and_a_told_one_never_takes_the_lock() {
+            let clock = std::sync::Arc::new(Clock::new());
+            assert!(!clock.mark("first_media_frame"), "no offer, no clock");
+            clock.begin();
+            assert!(clock.mark("first_media_frame"));
+            assert!(clock.mark("first_sealed_frame"));
+            assert!(!clock.mark("first_media_frame"), "told once");
+            assert!(!clock.mark("not_a_stage"));
+            // With the lock held, a stage already told must still return at once.
+            let held = clock.began.lock().unwrap();
+            let (done, finished) = std::sync::mpsc::channel();
+            let other = clock.clone();
+            std::thread::spawn(move || {
+                for _ in 0..1000 {
+                    other.mark("first_media_frame");
+                    other.mark("first_sealed_frame");
+                }
+                let _ = done.send(());
+            });
+            assert!(finished.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "a told stage waited for the lock");
+            drop(held);
+            // The next offer tells them all again.
+            clock.begin();
+            assert!(clock.mark("first_media_frame"));
         }
     }
 }
