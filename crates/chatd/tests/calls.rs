@@ -35,6 +35,8 @@ fn environment() {
         std::env::set_var("TINYCLIENT_MEDIAD", test_mediad::path());
         std::env::set_var("TINYCLIENT_MEDIAD_AUDIO", "tone");
         std::env::set_var("TINYCLIENT_VOICE_PLAIN", "1");
+        // The tests count engines: one started ahead of a call is for the tests that want it.
+        std::env::set_var("TINYCLIENT_PREWARM", "off");
     });
 }
 
@@ -727,5 +729,45 @@ fn a_call_starts_muted_when_the_user_joins_muted_and_a_test_gives_way_to_it() {
     assert_eq!(mediads(), 1);
     assert!(hub.calls.end(&hub).is_some());
     until("no mediad", || mediads() == 0);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn an_engine_started_ahead_of_a_call_is_the_one_that_carries_it_and_a_dead_one_is_replaced() {
+    let _turn = alone();
+    let (hub, dir) = hub();
+    struct Off;
+    impl Drop for Off {
+        fn drop(&mut self) {
+            std::env::set_var("TINYCLIENT_PREWARM", "off");
+        }
+    }
+    let _off = Off;
+    std::env::remove_var("TINYCLIENT_PREWARM");
+    hub.calls.prewarm(&hub);
+    until("an engine ahead of the call", || mediads() == 1);
+    assert_eq!(hub.calls.describe(), (None, false), "nothing is a call yet");
+    let warm = mediad_pid();
+
+    assert!(hub.calls.start(&hub, lounge()).is_ok());
+    assert_eq!(mediads(), 1, "no second engine");
+    assert_eq!(mediad_pid(), warm, "the one started ahead carries the call");
+    let call = hub.calls.describe().0.unwrap();
+    assert_eq!(call.state, CallState::Connecting);
+    assert!(call.engine_linked);
+    assert!(hub.calls.end(&hub).is_some());
+    until("no engine", || mediads() == 0);
+
+    // One that died while it waited is replaced without the call noticing.
+    hub.calls.prewarm(&hub);
+    until("an engine ahead of the call", || mediads() == 1);
+    let dead = mediad_pid();
+    assert!(kill_pid(&dead));
+    until("the engine gone", || mediads() == 0);
+    assert!(hub.calls.start(&hub, lounge()).is_ok());
+    assert_eq!(mediads(), 1);
+    assert_ne!(mediad_pid(), dead);
+    assert!(hub.calls.end(&hub).is_some());
+    until("no engine", || mediads() == 0);
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -2465,6 +2465,10 @@ impl Chat {
                 Ok(_) => error(ErrorCode::Unsupported, "This call can't carry on without encryption."),
                 Err(err) => call_error(err),
             },
+            Request::CallWarm => {
+                self.hub.calls.prewarm(&self.hub);
+                Response::Ok
+            }
             Request::CallStats => match self.hub.calls.request(&self.hub, &MediaRequest::Stats) {
                 Ok(protocol::MediaResponse::Stats(stats)) => Response::CallStats { stats },
                 Ok(protocol::MediaResponse::Refused { detail }) => error(ErrorCode::Unsupported, detail),

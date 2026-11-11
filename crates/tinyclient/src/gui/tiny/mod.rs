@@ -186,6 +186,8 @@ pub struct State {
     /// A join or leave is with the server. It has its own quiet.
     call_busy: bool,
     call_epoch: u64,
+    /// When chatd was last told a call may come soon (`Request::CallWarm`).
+    warmed: Option<Instant>,
     /// What the server said no to, under the channel.
     call_error: Option<String>,
 
@@ -304,6 +306,7 @@ impl State {
             drawn_ahead: false,
             call_busy: false,
             call_epoch: 0,
+            warmed: None,
             call_error: None,
             channel: None,
             focus: None,
@@ -409,6 +412,9 @@ fn preferred_tiny(accounts: &[(AccountKey, Link)], current: Option<&AccountKey>)
 }
 
 /// A join in flight does not swallow a leave. The leave is the cancel.
+/// How often chatd is told a call may come soon, while a place that can call stays open.
+const WARM_EVERY: Duration = Duration::from_secs(4 * 60);
+
 pub(crate) fn call_accepts(busy: bool, leave: bool) -> bool {
     !busy || leave
 }
@@ -720,7 +726,11 @@ impl Shell {
             state.card = None;
         }
         let first = state.community.is_none();
+        let callable = community.allowed("community.calls.join") && !community.rooms.is_empty();
         state.community = Some(community);
+        if callable {
+            self.tiny_warm(cx);
+        }
         if first {
             self.tiny_settings_loaded(cx);
         }
@@ -893,6 +903,11 @@ impl Shell {
                 return;
             }
             this.tiny_state.call_busy = false;
+            if leave {
+                // The next call may follow; chatd's engine for this one is going.
+                this.tiny_state.warmed = None;
+                this.tiny_warm(cx);
+            }
             this.call_connecting_over(matches!(answer, Ok(Response::Ok)), cx);
             this.tiny_state.call_error = match answer {
                 Ok(Response::Ok) => None,
@@ -922,6 +937,17 @@ impl Shell {
             self.call_connecting_now(key, preset, cx);
         }
         self.call(Request::TinyCallJoin { account, room_id }, cx);
+    }
+
+    /// Tells chatd a call may come soon, so its call engine is started before the click. It
+    /// opens no microphone, camera or connection. Said again only when the last was a while ago:
+    /// chatd lets a ready engine go after ten minutes unused.
+    fn tiny_warm(&mut self, cx: &mut Context<Self>) {
+        if self.tiny_state.warmed.is_some_and(|at| at.elapsed() < WARM_EVERY) {
+            return;
+        }
+        self.tiny_state.warmed = Some(Instant::now());
+        self.off_thread(cx, || ask(&Request::CallWarm), |_, _, _| {});
     }
 
     pub(super) fn tiny_leave(&mut self, cx: &mut Context<Self>) {
