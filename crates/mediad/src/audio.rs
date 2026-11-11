@@ -17,7 +17,8 @@
 //!
 //! `TINYCLIENT_MEDIAD_AUDIO` replaces the devices for tests: `null` hears silence, `tone` hears a
 //! 440 Hz tone (`tone:550` another pitch, so two tones in one mix cannot cancel), `onset` hears that tone once a second, each time led in by 40 ms too quiet to
-//! count as speech, and none of them opens a device. `TINYCLIENT_MEDIAD_SINK` names a file that then takes
+//! count as speech, `unplugged` is a machine with no microphone at all, and none of them opens a
+//! device. `TINYCLIENT_MEDIAD_SINK` names a file that then takes
 //! what would have been played, as raw 48 kHz stereo `i16`.
 
 use crate::pick::{self, Backoff, Endpoint, Host, Pick};
@@ -528,10 +529,11 @@ fn devices_of(system: &dyn Host, input: bool) -> (Vec<AudioDevice>, String) {
 pub fn listing() -> Listing {
     if let Ok(kind) = crate::out::var("TINYCLIENT_MEDIAD_AUDIO").ok_or(()) {
         let stand_in = |name: &str| AudioDevice { id: name.to_owned(), name: name.to_owned(), default: true, auto: true, ..AudioDevice::default() };
+        let unplugged = kind == "unplugged";
         return Listing {
-            inputs: vec![stand_in(&kind)],
+            inputs: if unplugged { Vec::new() } else { vec![stand_in(&kind)] },
             outputs: vec![stand_in("null")],
-            default_input: kind,
+            default_input: if unplugged { String::new() } else { kind },
             default_output: "null".to_owned(),
         };
     }
@@ -740,9 +742,21 @@ pub struct InUse {
     pub notice: Option<String>,
 }
 
+/// What a call says while it has no microphone: it goes on, hearing and unheard.
+pub const UNHEARD: &str =
+    "No microphone is connected, so nobody can hear you. Plug one in, or choose another in Microphone and speaker.";
+pub const UNHEARD_FAULT: &str =
+    "The microphone didn't start, so nobody can hear you. Reconnect it or choose another in Microphone and speaker.";
+
 impl InUse {
     fn of(pick: &Pick) -> InUse {
         InUse { name: pick.endpoint.name.clone(), id: pick.endpoint.id.clone(), notice: pick::notice(pick) }
+    }
+
+    /// No microphone at all: none is listed, or none would open. `err` is which.
+    fn unheard(err: &AudioError) -> InUse {
+        let words = if matches!(err, AudioError::NoMicrophone) { UNHEARD } else { UNHEARD_FAULT };
+        InUse { name: String::new(), id: String::new(), notice: Some(words.to_owned()) }
     }
 }
 
@@ -798,6 +812,12 @@ impl Fresh {
             self.sink = None;
         }
         self
+    }
+
+    /// The microphone's side with nothing on it, said in words: `err` is why.
+    fn unheard(&mut self, err: &AudioError) {
+        self.source = Some(Source::Device(None));
+        self.input = Some(InUse::unheard(err));
     }
 }
 
@@ -900,6 +920,33 @@ pub(crate) fn open_fresh(
     Ok(fresh)
 }
 
+/// As [`open_fresh`], for a call whose microphone is gone or was never there: a microphone that
+/// is not listed or will not open, with nothing to stand in for it, does not stop the call. It
+/// goes on without one, heard by nobody and saying so, and the route check opens the next
+/// microphone that turns up. A speaker that will not open is still an error.
+pub(crate) fn open_call(
+    want_input: Option<&str>,
+    want_output: Option<&str>,
+    which: (bool, bool),
+    mic_running: bool,
+    backoff: &mut Backoff,
+    health: &Arc<Health>,
+) -> Result<Fresh, AudioError> {
+    let input = which.0.then(|| open_fresh(want_input, None, (true, false), mic_running, backoff, health));
+    let mut fresh = open_fresh(None, want_output, (false, which.1), mic_running, backoff, health)?;
+    match input {
+        Some(Ok(input)) => {
+            fresh.source = input.source;
+            fresh.input = input.input;
+        }
+        Some(Err(err)) => {
+            tracing::warn!("mediad: no microphone ({err:?}); the call goes on without one");
+            fresh.unheard(&err);
+        }
+        None => {}
+    }
+    Ok(fresh)
+}
 
 /// The microphone's side of a device, at its rate: the callback's end and the tick's.
 fn input_path(rate: u32, channels: usize, health: &Arc<Health>) -> (CaptureEnd, Input) {
@@ -1061,13 +1108,19 @@ impl Audio {
                 ("tone", _) => tone(440.),
                 (_, Some(hz)) => tone(hz),
                 ("onset", _) => Source::Onset { at: 0 },
+                // Only a call does without a microphone: a voice note or a test of one has nothing to hear.
+                ("unplugged", _) if sides == (true, false) => return Err(AudioError::NoMicrophone),
+                ("unplugged", _) => Source::Device(None),
                 _ => Source::Silence,
             };
             audio.sink = match crate::out::var_os("TINYCLIENT_MEDIAD_SINK") {
                 Some(path) => Sink::File(File::create(path).map_err(|e| AudioError::Speaker(e.to_string()))?),
                 None => Sink::Null,
             };
-            audio.input = InUse { name: kind.clone(), id: kind, notice: None };
+            audio.input = match audio.source {
+                Source::Device(_) => InUse::unheard(&AudioError::NoMicrophone),
+                _ => InUse { name: kind.clone(), id: kind, notice: None },
+            };
             audio.output = InUse { name: "null".to_owned(), id: "null".to_owned(), notice: None };
             return Ok(audio);
         }
@@ -1077,12 +1130,20 @@ impl Audio {
 
     /// Real devices, not the stand-ins a test asks for.
     pub(crate) fn on_devices(&self) -> bool {
-        matches!(self.source, Source::Device(_))
+        matches!(self.sink, Sink::Device(_))
+    }
+
+    /// A call with no microphone: nothing is captured and nobody hears us, until one turns up.
+    pub(crate) fn unheard(&self) -> bool {
+        self.sides.0 && matches!(self.source, Source::Device(None))
     }
 
     pub(crate) fn mic_running(&self) -> bool {
         match &self.source {
             Source::Device(Some(input)) => input.running,
+            // No microphone: one that turns up is opened paused, and the next tick starts it
+            // if it is wanted.
+            Source::Device(None) => false,
             _ => true,
         }
     }
@@ -1127,7 +1188,9 @@ impl Audio {
         if !self.on_devices() {
             return Ok(());
         }
-        let fresh = open_fresh(
+        // A call starts without a microphone if it has to; a test of one side wants that side.
+        let open = if self.sides == (true, true) { open_call } else { open_fresh };
+        let fresh = open(
             self.want_input.as_deref(),
             self.want_output.as_deref(),
             self.sides,
@@ -1173,7 +1236,8 @@ impl Audio {
         if self.stuck.1 {
             words.push(format!("{} isn't playing any sound. Switch device to fix it.", self.output.name));
         }
-        let stuck = self.stuck.0 || self.stuck.1;
+        // No microphone is said for as long as it lasts, as a silent one is.
+        let stuck = self.stuck.0 || self.stuck.1 || self.unheard();
         ((!words.is_empty()).then(|| words.join(" ")), stuck)
     }
 
@@ -1479,6 +1543,31 @@ impl VirtualMic {
     /// The system flagged a glitch (WASAPI's data discontinuity).
     pub(crate) fn xrun(&mut self) {
         on_error("microphone", &cpal::Error::new(cpal::ErrorKind::Xrun), &self.health.mic_glitches, &self.broken);
+    }
+
+    /// The device went away: the headset dropped, or was pulled out.
+    pub(crate) fn unplug(&mut self) {
+        on_error("microphone", &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable), &self.health.mic_glitches, &self.broken);
+    }
+}
+
+#[cfg(test)]
+impl Fresh {
+    /// What a reopen hands a call when no microphone is listed.
+    pub(crate) fn without_microphone() -> Fresh {
+        let mut fresh = Fresh { source: None, sink: None, input: None, output: None, backoff: Backoff::default() };
+        fresh.unheard(&AudioError::NoMicrophone);
+        fresh
+    }
+
+    /// A microphone that turned up, as a reopen opens it while none is running: paused.
+    pub(crate) fn virtual_mic(mic: (u32, usize), health: &Arc<Health>) -> (Fresh, VirtualMic) {
+        let (capture, mut input) = input_path(mic.0, mic.1, health);
+        input.running = false;
+        let broken = input.life.broken.clone();
+        let named = InUse { name: "virtual".to_owned(), id: "virtual".to_owned(), notice: None };
+        let fresh = Fresh { source: Some(Source::Device(Some(input))), sink: None, input: Some(named), output: None, backoff: Backoff::default() };
+        (fresh, VirtualMic { end: capture, health: health.clone(), broken })
     }
 }
 
@@ -1803,6 +1892,71 @@ mod tests {
         assert_eq!(audio.device_broken(), (false, false), "a glitch is not a broken device");
         on_error("microphone", &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable), &AtomicU64::new(0), &mic.broken);
         assert_eq!(audio.device_broken(), (true, false), "only the microphone's side");
+    }
+
+    /// The only microphone drops out of a call (a headset that lost its link). Before, nothing
+    /// could stand in, and that ended the call with "Plug in a microphone".
+    #[test]
+    fn a_call_that_loses_its_only_microphone_goes_on_unheard_and_says_so() {
+        let (mut audio, mut mic, mut speaker) = Audio::virtual_devices((48_000, 2), (48_000, 2));
+        mic.deliver(&[0.5; 4800]);
+        let mut frame = [0i16; FRAME_SAMPLES];
+        assert!(audio.capture(&mut frame));
+        assert_eq!(audio.notice(), (None, false));
+        mic.unplug();
+        assert_eq!(audio.device_broken(), (true, false));
+        // What the reopen hands over when no microphone is listed.
+        let fresh = Fresh::without_microphone();
+        assert_eq!(fresh.sides(), (true, false), "the speaker is not touched");
+        drop(audio.install(fresh));
+        assert!(audio.unheard());
+        assert_eq!(audio.device_broken(), (false, false), "nothing is left to reopen every tick");
+        assert!(!audio.mic_running(), "and nothing to judge as a stream that never ran");
+        assert!(!audio.capture(&mut frame), "nothing is captured, so nothing is sent");
+        assert_eq!(audio.notice(), (Some(UNHEARD.to_owned()), true), "said for as long as it lasts");
+        assert_eq!((audio.input.name.as_str(), audio.input.id.as_str()), ("", ""), "no device is named as in use");
+        // The call still plays what the others say.
+        for _ in 0..5 {
+            audio.play(&[8_000; FRAME_SAMPLES]);
+        }
+        let mut heard = [0f32; 960];
+        speaker.render(&mut heard);
+        assert!(heard.iter().any(|sample| sample.abs() > 0.1), "the speaker went quiet with the microphone");
+    }
+
+    /// The microphone comes back (the route check finds a device where there was none): it is
+    /// swapped in, and what it hears goes out again with no rejoin.
+    #[test]
+    fn a_microphone_that_comes_back_is_heard_again_without_a_rejoin() {
+        let (mut audio, _gone, _speaker) = Audio::virtual_devices((48_000, 2), (48_000, 2));
+        drop(audio.install(Fresh::without_microphone()));
+        let mut frame = [0i16; FRAME_SAMPLES];
+        assert!(!audio.capture(&mut frame));
+        let (fresh, mut mic) = Fresh::virtual_mic((44_100, 1), &audio.health());
+        // It is not the device open now (none is), so it is not dropped as the same one.
+        let fresh = fresh.unless_same((&audio.input.id, &audio.output.id), (false, false));
+        assert_eq!(fresh.sides(), (true, false));
+        drop(audio.install(fresh));
+        assert!(!audio.unheard());
+        assert_eq!(audio.notice(), (None, false), "the notice goes with the trouble");
+        // Opened paused; the next tick starts it, unless the call is muted.
+        assert!(!audio.mic_running());
+        audio.listen(true);
+        assert!(audio.mic_running());
+        mic.deliver(&[0.5; 2205]);
+        assert!(audio.capture(&mut frame), "the returned microphone is not captured");
+        assert!(frame[FRAME_SAMPLES - 1] > 16_000, "{}", frame[FRAME_SAMPLES - 1]);
+    }
+
+    /// A voice note or a microphone test wants the microphone itself: only a call goes on
+    /// without one.
+    #[test]
+    fn only_a_call_does_without_a_microphone() {
+        let call = Audio::empty(None, None, (true, true));
+        assert!(call.unheard());
+        let speaker_only = Audio::empty(None, None, (false, true));
+        assert!(!speaker_only.unheard(), "a side that was never opened is not a missing one");
+        assert_eq!(speaker_only.notice(), (None, false));
     }
 
     /// On a real machine: the automatic choice opens hardware, and both streams are seen

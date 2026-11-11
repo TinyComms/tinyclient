@@ -221,6 +221,7 @@ pub fn app_actions(cx: &mut App) {
     cx.on_action(|_: &About, cx| settings::open(settings::Section::About, cx));
     cx.on_action(|_: &CheckForUpdates, cx| {
         if matches!(crate::update::shown(), crate::update::Shown::Ready { .. }) {
+            crate::update::reopen_after_quit();
             cx.quit();
             return;
         }
