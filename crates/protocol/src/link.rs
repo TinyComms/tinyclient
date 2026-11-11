@@ -25,6 +25,11 @@ use url::{Host, Url};
 pub const LINK_LIMIT: usize = 8 * 1024;
 /// Most links one message gets. Further addresses stay text.
 pub const LINKS_PER_MESSAGE: usize = 64;
+/// Most candidates (`http://`, `https://`, `www.`) that turn out not to be links a message is
+/// searched through before it is left alone.
+const CANDIDATES: usize = 256;
+/// Most tries inside one run of non-space characters.
+const TRIES_PER_TOKEN: usize = 4;
 
 /// One address found in a text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,14 +136,26 @@ fn starts_here(before: Option<char>) -> bool {
 /// has no opening one inside it (so `(see https://a.example/x)` loses its `)` and
 /// `https://a.example/Rust_(language)` keeps it).
 fn trimmed(address: &str) -> &str {
+    // Bracket counts are taken once and kept up to date as characters go, so a token of
+    // thousands of closing brackets costs one pass, not one pass per bracket.
+    let count = |c: char| address.matches(c).count();
+    let (mut round, mut square, mut curly) = ((count('('), count(')')), (count('['), count(']')), (count('{'), count('}')));
     let mut end = address.len();
     while let Some(last) = address[..end].chars().next_back() {
-        let kept = &address[..end];
         let drop = match last {
             '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '*' | '\u{2026}' | '\u{3002}' => true,
-            ')' => kept.matches(')').count() > kept.matches('(').count(),
-            ']' => kept.matches(']').count() > kept.matches('[').count(),
-            '}' => kept.matches('}').count() > kept.matches('{').count(),
+            ')' if round.1 > round.0 => {
+                round.1 -= 1;
+                true
+            }
+            ']' if square.1 > square.0 => {
+                square.1 -= 1;
+                true
+            }
+            '}' if curly.1 > curly.0 => {
+                curly.1 -= 1;
+                true
+            }
             _ => false,
         };
         if !drop {
@@ -171,6 +188,7 @@ pub fn find(text: &str, skip: &[Range<usize>]) -> Vec<Found> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
+    let (mut failed, mut token_end, mut tries) = (0, 0, 0);
     while i < bytes.len() && out.len() < LINKS_PER_MESSAGE {
         if !matches!(bytes[i], b'h' | b'H' | b'w' | b'W') || !text.is_char_boundary(i) {
             i += 1;
@@ -218,7 +236,22 @@ pub fn find(text: &str, skip: &[Range<usize>]) -> Vec<Found> {
                 out.push(Found { range: range.clone(), url });
                 i = range.end.max(i + 1);
             }
-            None => i += 1,
+            None => {
+                // Peer text decides how often this runs: `www.!www.!…` is a candidate at every
+                // fourth byte of one token. A token gets a few tries, and a message gets
+                // [`CANDIDATES`]; each try costs a pass over the token and a parse.
+                failed += 1;
+                if failed >= CANDIDATES {
+                    break;
+                }
+                let end = i + token;
+                if end == token_end {
+                    tries += 1;
+                } else {
+                    (token_end, tries) = (end, 1);
+                }
+                i = if tries >= TRIES_PER_TOKEN { end.max(i + 1) } else { i + 1 };
+            }
         }
     }
     out
@@ -606,6 +639,29 @@ mod tests {
         assert!(urls(&long).is_empty());
         let fits = format!("https://example.com/{}", "a".repeat(LINK_LIMIT - 20));
         assert_eq!(urls(&fits).len(), 1);
+    }
+
+    #[test]
+    fn hostile_text_costs_a_bounded_amount_of_work() {
+        let started = std::time::Instant::now();
+        let spaced = "www.! ".repeat(3000);
+        let cases = [
+            "www.!".repeat(2000),
+            "www.!".repeat(1000),
+            "http://!".repeat(1000),
+            "https://!".repeat(900),
+            spaced,
+            format!("http://a.example/{}", ")".repeat(8000)),
+            format!("www.{}", "(".repeat(8000)),
+            format!("{}{}", "http://!".repeat(500), "x ".repeat(10)),
+        ];
+        for text in &cases {
+            let found = find(text, &[]);
+            assert!(found.len() <= 1, "{} links in a {} byte text", found.len(), text.len());
+        }
+        // A real link after the junk is still found when the junk is little.
+        assert_eq!(urls("www.! http://! https://real.example/ok"), ["https://real.example/ok"]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
     }
 
     #[test]

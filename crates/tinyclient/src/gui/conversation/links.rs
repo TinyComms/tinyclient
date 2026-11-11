@@ -30,6 +30,14 @@ impl LinkAsk {
     }
 }
 
+/// A `mailto:` link, which other networks put on an address. It opens the mail app as it is:
+/// no question, no tracking strip. Every other scheme that is not http or https stays refused.
+pub(super) fn is_mailto(url: &str) -> bool {
+    url.get(..7).is_some_and(|scheme| scheme.eq_ignore_ascii_case("mailto:"))
+        && url.len() <= 2048
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"')
+}
+
 /// Whether a link to `dest` opens without a question, given what the person chose.
 pub(super) fn opens_at_once(dest: &Destination, confirm: bool, trusted: bool) -> bool {
     // A lookalike or a "user@" address is always asked about: that is what the question is for.
@@ -40,6 +48,11 @@ pub(super) fn opens_at_once(dest: &Destination, confirm: bool, trusted: bool) ->
 impl Pane {
     /// A click on a link in a message. Anything that is not a web address does nothing.
     pub(super) fn open_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // An e-mail address Telegram or Slack made a link of: the mail app's, not a site.
+        if is_mailto(url) {
+            cx.open_url(url);
+            return;
+        }
         let Some(dest) = Destination::parse(url) else {
             return;
         };
@@ -221,6 +234,30 @@ mod tests {
         assert!(!opens_at_once(&plain, true, false), "the default asks");
         assert!(opens_at_once(&plain, true, true), "a trusted domain does not");
         assert!(opens_at_once(&plain, false, false), "with the question off nothing asks");
+    }
+
+    #[test]
+    fn mailto_passes_unchanged_and_every_other_non_web_scheme_is_still_dropped() {
+        for ok in ["mailto:a@example.com", "MAILTO:a@example.com?subject=Hi%20there&cc=b@example.com"] {
+            assert!(is_mailto(ok), "{ok}");
+            assert!(Destination::parse(ok).is_none(), "{ok} is not a web destination: no dialog, no strip");
+        }
+        for bad in [
+            "javascript:alert(1)",
+            "file:///c:/windows/system32",
+            "intent://x#Intent;scheme=http;end",
+            "tg://resolve?domain=x",
+            "ftp://example.com/",
+            "data:text/html,x",
+            "mailto:a b@example.com",
+            "mailto:a\u{0}@example.com",
+            "xmailto:a@example.com",
+            "mailto",
+            "",
+        ] {
+            assert!(!is_mailto(bad), "{bad:?}");
+            assert!(Destination::parse(bad).is_none(), "{bad:?}");
+        }
     }
 
     #[test]
