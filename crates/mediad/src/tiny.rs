@@ -732,6 +732,9 @@ impl Call {
             // The RTP clock is 48 kHz, as ours.
             stream.arrivals.arrived(data.time.numer() as u32, data.network_time);
             stream.heard |= opus[..] != SILENCE[..];
+            if opus[..] == SILENCE[..] {
+                stream.arrivals.paused();
+            }
             if !self.controls.deafened.load(Ordering::Relaxed) {
                 // The SFU writes a fresh sequence, so a lost frame is a hole in the RTP
                 // time and not in `seq_range`. The jitter buffer only sees sequence numbers.
@@ -1047,9 +1050,9 @@ impl Call {
                         out::send(&MediaResponse::Sending { share: false, camera: self.sending_camera });
                     }
                 }
-                Word::SelfView(painted) => out::send(&match painted {
-                    Some(painted) => MediaResponse::SelfView { path: painted.path.display().to_string(), width: painted.width, height: painted.height, generation: painted.generation },
-                    None => MediaResponse::SelfView { path: String::new(), width: 0, height: 0, generation: 0 },
+                Word::SelfView { share, painted } => out::send(&match painted {
+                    Some(painted) => MediaResponse::SelfView { path: painted.path.display().to_string(), width: painted.width, height: painted.height, generation: painted.generation, share },
+                    None => MediaResponse::SelfView { path: String::new(), width: 0, height: 0, generation: 0, share },
                 }),
                 Word::Failed { share: false, words } => {
                     if !self.camera_noted {
@@ -1313,9 +1316,8 @@ impl Call {
         if let Some(audio) = &mut self.audio {
             finish_cue(&self.controls, &mut self.cue, audio);
         }
-        for (mid, slot) in &self.slots {
-            let jitter = &slot.stream.jitter;
-            tracing::warn!("mediad: slot {mid}: {} lost ({} rebuilt), {} late", jitter.lost, slot.stream.rebuilt, jitter.late);
+        for (mid, slot) in &mut self.slots {
+            slot.stream.log_playout(&format_args!("slot {mid}"), true);
         }
         if let Some(audio) = &self.audio {
             media::sign_off(audio);

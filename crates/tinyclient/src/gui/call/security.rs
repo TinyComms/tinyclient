@@ -585,6 +585,7 @@ mod tests {
             security: Some(security),
             picture: None,
             self_view: None,
+            share_view: None,
         }
     }
 

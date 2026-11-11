@@ -1286,6 +1286,7 @@ mod tests {
             security: None,
             picture: None,
             self_view: None,
+            share_view: None,
         }
     }
 

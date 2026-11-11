@@ -1,0 +1,12 @@
+{
+  "id": "voice-playout",
+  "title": "A voice over Wi-Fi is carried on by libopus and paced, never looped or saturated",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not start desktop mediad. The same playout is in the library the phone links.",
+    "ios": "The phone proof build does not start desktop mediad. The same playout is in the library the phone links."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 45
+}

@@ -42,6 +42,7 @@ pub mod media;
 mod mf_encoder;
 pub mod ogg;
 pub mod opus;
+pub mod pace;
 pub mod picture;
 pub mod platform;
 pub mod out;

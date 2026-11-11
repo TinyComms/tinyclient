@@ -130,6 +130,16 @@ impl Outgoing {
         Ok((high, low))
     }
 
+    /// A phone paints no preview of its own camera or share for its call screen, so `Source` has
+    /// nothing to take from it.
+    pub fn self_view(&mut self) -> Option<Painted> {
+        None
+    }
+
+    pub fn share_view(&mut self) -> Option<Painted> {
+        None
+    }
+
     /// The button is off: a phone's camera light goes off with it.
     pub fn close_camera(&mut self) {
         self.camera = None;

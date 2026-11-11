@@ -2229,8 +2229,17 @@ impl Chat {
             Request::MarkAllRead { network } => self.mark_all_read(network),
             Request::Forget { conversation } => self.forget_conversation(conversation),
             Request::Send { conversation, client_id, text, reply_to, with } => {
+                let began = std::time::Instant::now();
+                if conversation.network == Network::Tiny {
+                    crate::sendtime::submitted(&client_id);
+                }
+                let logged = client_id.clone();
                 let message = self.new_message(&conversation, client_id, text, reply_to.as_deref(), &with);
-                self.send(conversation, message, reply_to, with)
+                let pending = began.elapsed();
+                let answer = self.send(conversation, message, reply_to, with);
+                let (took, row) = (began.elapsed().as_millis(), pending.as_millis());
+                tracing::info!(client_id = %logged, elapsed_ms = took as u64, pending_row_ms = row as u64, "chatd: send submitted");
+                answer
             }
             Request::CancelSend { conversation, client_id } => {
                 if let Err(refused) = self.unsent(&conversation, &client_id) {
@@ -3219,6 +3228,28 @@ mod tests {
         assert_eq!(pending.sender.id, "me-1");
         assert_eq!(pending.shown_sender(), "Ops Nick");
         assert_ne!(pending.sender.name, "Night Shift");
+    }
+
+    #[test]
+    fn a_tiny_pending_sender_is_found_by_the_user_id_and_never_by_the_email() {
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        // A Tiny account is keyed by the user id, and its own rows name that id as the sender.
+        let account = AccountKey { network: Network::Tiny, account: "user-1".into() };
+        store.set_account(&account, "tiny.example", "user-1").unwrap();
+        store
+            .upsert_conversation(&account, &ConversationRow::new("direct", ConversationKind::Direct, "Bea"))
+            .unwrap();
+        let direct = Key::new(&account, "direct");
+        let mut earlier = Message::plain("m1", "Ada Vale", "hi", 10, true);
+        earlier.sender.id = "user-1".into();
+        store.ingest(&direct, &earlier, false).unwrap();
+        let found = super::pending_self_sender(&store, &direct);
+        assert_eq!((found.id.as_str(), found.name.as_str()), ("user-1", "Ada Vale"));
+
+        // With the email stored as the account's own id nothing matches: the row read "You".
+        store.set_account(&account, "tiny.example", "ada@example.com").unwrap();
+        let lost = super::pending_self_sender(&store, &direct);
+        assert_eq!(lost.name, "You");
     }
 
     #[test]
