@@ -1,0 +1,12 @@
+{
+  "id": "update-quiet-close",
+  "title": "Closing the window with an update downloaded installs it and leaves tinyclient closed",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone build does not replace itself; the store owns its updates.",
+    "ios": "The phone build does not replace itself; the store owns its updates."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 120
+}

@@ -1376,9 +1376,9 @@ fn send(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String
         ctx.sent(&conversation_id, &client_id, outcome);
         return;
     }
-    let labelled = ctx.known(&conversation_id).ok().flatten().is_some_and(|row| row.encryption.is_sealed());
-    let user = if labelled { saved.user_id.clone() } else { format!("{}#plain", saved.user_id) };
-    let account = (saved.base_url.clone(), user);
+    // The same question the post asks, so a conversation the device knows is encrypted but the
+    // list has not labelled yet still goes to the sealed queue and never holds up the plain one.
+    let account = send_account(saved, sealed_here(ctx, saved, &conversation_id) == Ok(true));
     let (posting, saved) = (ctx.clone(), saved.clone());
     in_order(account, Box::new(move || {
         let _ = crate::sendtime::run(&client_id, || {
@@ -1389,6 +1389,12 @@ fn send(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String
             if sent { Ok(()) } else { Err(()) }
         });
     }));
+}
+
+/// The send thread an account's sends of one kind go to: sealed ones apart from plain ones.
+fn send_account(saved: &Saved, sealed: bool) -> (String, String) {
+    let user = if sealed { saved.user_id.clone() } else { format!("{}#plain", saved.user_id) };
+    (saved.base_url.clone(), user)
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -3046,6 +3052,15 @@ mod tests {
                     "a creation replay must not permit plaintext sending");
             }
         }
+    }
+
+    #[test]
+    fn sealed_and_plain_sends_go_to_different_send_threads() {
+        let saved = saved("http://127.0.0.1:1");
+        let (sealed, plain) = (send_account(&saved, true), send_account(&saved, false));
+        assert_ne!(sealed, plain, "a sealed send that waits to join must not hold up a plain one");
+        assert_eq!(sealed.0, plain.0, "the same server");
+        assert_eq!(sealed.1, saved.user_id);
     }
 
     #[test]

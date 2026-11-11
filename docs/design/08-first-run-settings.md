@@ -110,7 +110,7 @@ Withdrawn. The Settings window is `09-settings.md`.
 
 ## 8. Update available
 
-Updates download in the background and install on quit; no dialog, no toast. While one is waiting: a 6 `accent` dot on the rail's settings button with the tooltip "Update ready"; "Check for Updates…" becomes "Restart to Update"; About shows "Version 0.5.0 is ready. It installs when you quit." with quiet "Restart now". With automatic install off, the same dot and "Version 0.5.0 is available." with "Install". A failed update is said only in About: "Couldn't install 0.5.0. Will try again tomorrow."
+Updates download in the background and install on quit; no dialog, no toast. While one is waiting: a 6 `accent` dot on the rail's settings button with the tooltip "Update ready"; "Check for Updates…" becomes "Restart to Update"; About shows "Version 0.5.0 is ready. It installs when you quit." with quiet "Restart now". Restart installs it and opens tinyclient again; quitting or closing the window installs it and leaves tinyclient closed. With automatic install off, the same dot and "Version 0.5.0 is available." with "Install". A failed update is said only in About: "Couldn't install 0.5.0. Will try again tomorrow." That version is not downloaded again for 24 hours.
 
 ## New tokens
 

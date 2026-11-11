@@ -1,0 +1,12 @@
+{
+  "id": "no-microphone",
+  "title": "A call joins and stays up on a machine with no microphone, and says nobody can hear you",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not start desktop mediad. The same device code is in the library the phone links.",
+    "ios": "The phone proof build does not start desktop mediad. The same device code is in the library the phone links."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
