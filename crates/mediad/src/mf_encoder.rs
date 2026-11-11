@@ -16,7 +16,9 @@
 //! an empty [`Encoded`], which the share already treats as a skip; they leave on a later
 //! frame's pump. The first frame may wait the encoder's warmup for its bits; every later
 //! one waits a far shorter moment, so a driver that holds frames back never stalls the
-//! capture thread.
+//! capture thread. A driver that stops sending bits altogether is called hung after
+//! [`STALLED`], as an Err the share swaps OpenH264 in on, the way every other refusal of
+//! the hardware runs.
 //!
 //! The asks of the transform are narrowed to the [`Mft`] trait, and the transform comes
 //! from a [`Source`]: [`Hardware`] is the machine's own, and the tests hold fakes against
@@ -68,6 +70,11 @@ const ANSWER_WAIT: Duration = Duration::from_millis(120);
 const OUTPUT_WAIT: Duration = Duration::from_millis(10);
 /// How often the event queue is looked at while waiting for that answer.
 const POLL: Duration = Duration::from_millis(1);
+/// How long the transform may go without a byte out while frames are still offered,
+/// before it is called hung: an [`Encoded`] with no bytes is a skip, so a driver that
+/// stopped answering its queue would hold the share frozen forever, every frame a skip.
+/// The Err is what the share's failover swaps OpenH264 in on.
+const STALLED: Duration = Duration::from_secs(2);
 /// The NV12 stride promised to the encoder, the width rounded up as the hardware wants it.
 const STRIDE_ALIGN: usize = 16;
 /// The profiles the SFU is told to expect, as Media Foundation names them:
@@ -99,6 +106,11 @@ pub fn choose(probe: &Result<(), String>) -> Choice {
 /// next open.
 pub fn available() -> Result<(), String> {
     static AVAILABLE: OnceLock<Result<(), String>> = OnceLock::new();
+    // An answer held is the answer, with no probe: the frame loops ask this every frame
+    // while a slot is empty, and each call must be free once the machine has spoken.
+    if let Some(asked) = AVAILABLE.get() {
+        return asked.clone();
+    }
     match probe_thread() {
         Ok(answer) => AVAILABLE.get_or_init(|| answer).clone(),
         Err(why) => Err(why),
@@ -330,7 +342,7 @@ impl Source for Hardware {
         // `codec` is `None` when the MFT exposes no codec properties, which leaves a
         // keyframe ask and a bitrate move without their handle; the picture still encodes.
         let codec: Option<ICodecAPI> = transform.cast().ok();
-        Ok(Box::new(RealMft { transform, events, codec }))
+        Ok(Box::new(RealMft { transform, events, codec, tune_said: false }))
     }
 }
 
@@ -340,6 +352,9 @@ struct RealMft {
     transform: IMFTransform,
     events: IMFMediaEventGenerator,
     codec: Option<ICodecAPI>,
+    /// Whether a refused bitrate has been said, once: the ask comes back every frame
+    /// while the encoder holds the rate it has, and the log does not follow it there.
+    tune_said: bool,
 }
 
 /// SAFETY: the MFT is opened, driven, and dropped on one thread (the share's or the
@@ -499,9 +514,18 @@ impl Mft for RealMft {
         // SAFETY: the property is read through the codec handle this encoder holds, and
         // the variant outlives the call.
         match unsafe { codec.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &counted(bps)) } {
-            Ok(()) => true,
+            Ok(()) => {
+                self.tune_said = false;
+                true
+            }
             Err(err) => {
-                tracing::warn!("mediad: the hardware encoder refused a bitrate of {}: {err}", bps);
+                // The refused ask comes back on every frame that moves the rate, for the
+                // encoder keeps the rate it has: said once, the next frames stay silent,
+                // until a rate is taken again and a later refusal is worth its words.
+                if !self.tune_said {
+                    tracing::warn!("mediad: the hardware encoder refused a bitrate of {}: {err}", bps);
+                    self.tune_said = true;
+                }
                 false
             }
         }
@@ -511,10 +535,12 @@ impl Mft for RealMft {
         let Some(codec) = &self.codec else {
             return;
         };
-        // The property carries no value; setting it is the ask. An encoder without codec
+        // One is the ask: the docs say a nonzero value codes the next frame a keyframe
+        // and the ask resets itself after that one frame, where zero would leave the
+        // choice to the encoder, which is no ask at all. An encoder without codec
         // properties keeps its own keyframe pace.
-        // SAFETY: as in `tune`, with a property whose value is ignored.
-        if let Err(err) = unsafe { codec.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &counted(0)) } {
+        // SAFETY: as in `tune`, with a value the ask is read from.
+        if let Err(err) = unsafe { codec.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &counted(1)) } {
             tracing::debug!("mediad: the hardware encoder refused a keyframe: {err}");
         }
     }
@@ -549,6 +575,10 @@ pub struct Encoder {
     /// Whether a frame has gone in yet: the first may wait the encoder's warmup for its
     /// bits, every later one waits at most [`OUTPUT_WAIT`].
     fed: bool,
+    /// When the transform last handed bytes over: a driver that stays silent for
+    /// [`STALLED`] while frames are still offered is hung, and its words fail the encode,
+    /// which is what the share's failover swaps OpenH264 in on.
+    answered: Instant,
     /// COM and Media Foundation, held so they outlive the transform and are let go after
     /// it (the field after the transform's own).
     _platform: Platform,
@@ -586,7 +616,7 @@ impl Encoder {
         mft.set_input_type(width, height, stride, frame, fps)?;
         mft.configure(bps);
         mft.begin()?;
-        let mut encoder = Encoder { mft, width, height, stride, frame, fps, bps, wants_input: false, fed: false, _platform: platform };
+        let mut encoder = Encoder { mft, width, height, stride, frame, fps, bps, wants_input: false, fed: false, answered: Instant::now(), _platform: platform };
         // The first input slot is usually open before the first frame; wait a moment
         // for it, so the first frame of a share is fed at once and not dropped.
         let mut nothing = Vec::new();
@@ -604,7 +634,8 @@ impl Encoder {
     /// empty, like a skip; an encoded frame comes back marked when it is a keyframe, so
     /// the share sends it as one. After the first frame is in, the wait for a frame's own
     /// bits is bounded well under a frame's time, so the capture thread is never held
-    /// long.
+    /// long. A driver that sends no bits at all for [`STALLED`] while frames keep being
+    /// offered is called hung, as an Err: the share's failover takes OpenH264 on it.
     pub fn encode(&mut self, planes: &Planes, ask: &Ask) -> Result<Encoded, String> {
         if planes.width != self.width || planes.height != self.height {
             return Err(format!("The encoder was opened for {}×{} and handed {}×{}.", self.width, self.height, planes.width, planes.height));
@@ -641,6 +672,16 @@ impl Encoder {
         }
         if bytes.is_empty() {
             key = false;
+            // The frames are still being offered, and for [`STALLED`] not one of their
+            // bits has come out: a driver that stopped answering its queue would say
+            // every frame a skip forever, and the share would freeze looking skipped.
+            // Said as an Err, this is the swap to OpenH264's cue, the way every other
+            // failure of the hardware runs.
+            if self.answered.elapsed() >= STALLED {
+                return Err("the hardware encoder has sent no bits for two seconds, with frames going in.".to_owned());
+            }
+        } else {
+            self.answered = Instant::now();
         }
         Ok(Encoded { bytes, key })
     }
@@ -1190,5 +1231,23 @@ mod tests {
         if let Err(why) = answer {
             assert!(!why.is_empty(), "a refusal says why");
         }
+    }
+
+    /// A driver that stops sending bits is hung, not patient: before [`STALLED`] the
+    /// frames come back as the skips they are, and the silence past it, with frames still
+    /// being offered, is an Err — the words the share's failover swaps OpenH264 in on.
+    /// The fake holds the same silence a real driver hangs with: slots keep opening and
+    /// the frames go in, but nothing ever comes out.
+    #[test]
+    fn a_driver_that_goes_silent_is_called_hung_after_two_seconds_of_it() {
+        let mut encoder = opened(SharedFake::new(baseline_fake()));
+        let skip = encoder.encode(&planes(), &Ask::default()).expect("fresh silence is a skip, not a failure");
+        assert!(skip.bytes.is_empty(), "the empty frame before the stall goes out as a skip");
+        encoder.answered = Instant::now() - STALLED;
+        let Err(why) = encoder.encode(&planes(), &Ask::default()) else {
+            panic!("two seconds of silence with frames going in is a hung driver");
+        };
+        assert!(why.contains("no bits"), "{why}");
+        assert_eq!(choose(&Err(why)), Choice::OpenH264, "the words are the swap's cue");
     }
 }

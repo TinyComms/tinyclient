@@ -5,7 +5,8 @@ hardware and no network: the scenario drives the tests of
 `crates/mediad/src/mf_encoder.rs` and the fallback seam in `picture/desktop.rs` — the
 encoder selection, the fake-MFT seam that holds the open (the H.264 output type refused,
 a driver that kept Main/High or named no profile, a keyframe that only counts when the
-sample says `MFSampleExtension_CleanPoint`, the frame loop with its asks), the pure NV12
+sample says `MFSampleExtension_CleanPoint`, the frame loop with its asks, a driver that
+goes silent called hung after two seconds so the failover runs), the pure NV12
 and Annex B helpers, and the place a refusal of the hardware becomes the OpenH264
 fallback.
 

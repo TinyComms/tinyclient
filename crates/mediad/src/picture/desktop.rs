@@ -60,6 +60,10 @@ struct Coded {
     /// second does not say it a second a time.
     #[cfg(windows)]
     said: bool,
+    /// Whether the wait for OpenH264's takeover has been said once, so the frames skipped
+    /// while the download lands do not say it one a frame.
+    #[cfg(windows)]
+    said_skip: bool,
 }
 
 /// One of the two encoders behind [`Coded`]: the machine's own hardware, or Cisco's
@@ -154,7 +158,7 @@ impl Coded {
 
     #[cfg(windows)]
     fn with(backend: Backend, width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Coded {
-        Coded { backend, width, height, bps, fps, screen, said: false }
+        Coded { backend, width, height, bps, fps, screen, said: false, said_skip: false }
     }
 
     #[cfg(not(windows))]
@@ -203,7 +207,12 @@ impl Coded {
                             return self.backend.encode(planes, &forced);
                         }
                         Err(why) => {
-                            tracing::debug!("mediad: OpenH264 is not ready to take over ({why}); this frame is skipped.");
+                            // The download lands once; the frames it skips are not said
+                            // one a frame while it does.
+                            if !self.said_skip {
+                                tracing::debug!("mediad: OpenH264 is not ready to take over ({why}); this frame is skipped.");
+                                self.said_skip = true;
+                            }
                             return Ok(Encoded::default());
                         }
                     }
@@ -238,7 +247,12 @@ fn needs_openh264() -> bool {
         match mf_encoder::available() {
             Ok(()) => false,
             Err(why) => {
-                tracing::debug!("mediad: no Media Foundation encoder ({why}); OpenH264 stays the codec.");
+                // The answer is the machine's and does not change; the frames keep asking
+                // while a slot is empty, and the words are said on the first ask only.
+                static SAID: OnceLock<()> = OnceLock::new();
+                if SAID.set(()).is_ok() {
+                    tracing::debug!("mediad: no Media Foundation encoder ({why}); OpenH264 stays the codec.");
+                }
                 true
             }
         }

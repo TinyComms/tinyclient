@@ -28,6 +28,7 @@ run mf_encoder::tests::an_encoder_that_refuses_the_output_type_is_failed_in_its_
 run mf_encoder::tests::a_profile_other_than_the_baseline_promised_is_refused
 run mf_encoder::tests::a_frame_is_a_keyframe_only_when_the_sample_says_it_is_a_clean_point
 run mf_encoder::tests::an_open_encoder_takes_frames_and_holds_the_asks
+run mf_encoder::tests::a_driver_that_goes_silent_is_called_hung_after_two_seconds_of_it
 run mf_encoder::tests::a_closed_encoder_ends_its_stream
 run mf_encoder::tests::the_probe_answers_on_a_thread_of_its_own
 run mf_encoder::tests::nv12_is_the_y_plane_and_the_two_chroma_planes_interleaved
