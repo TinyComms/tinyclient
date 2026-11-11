@@ -596,6 +596,14 @@ impl Shell {
         })
     }
 
+    /// The same, but only chatd's own word: not a join this window drew as Connecting before
+    /// chatd had one. Mute, deafen and the stats poll speak to chatd's call, so they use this.
+    fn tiny_call_chatd(&self) -> Option<protocol::Call> {
+        let account = self.tiny_state.account.as_ref()?;
+        let call = self.snapshot.as_ref()?.call.clone()?;
+        (call.conversation.account() == *account && self.tiny_room(&call.conversation).is_some()).then_some(call)
+    }
+
     /// Where a made-up call of `--shot` goes: the room I sit in, else the first.
     #[cfg(feature = "gui-shot")]
     pub(super) fn tiny_shot_room(&self) -> Option<Key> {
@@ -647,6 +655,7 @@ impl Shell {
             self.tiny_state.clears_busy = None;
             self.tiny_state.call_epoch += 1;
             self.tiny_state.call_busy = false;
+            self.call_state.connecting = None;
         }
         self.tiny_state.account = Some(account.clone());
         if self.tiny_state.community.is_none() {
@@ -884,6 +893,7 @@ impl Shell {
                 return;
             }
             this.tiny_state.call_busy = false;
+            this.call_connecting_over(matches!(answer, Ok(Response::Ok)), cx);
             this.tiny_state.call_error = match answer {
                 Ok(Response::Ok) => None,
                 Ok(Response::Error { detail, .. }) => Some(detail),
@@ -904,6 +914,13 @@ impl Shell {
         };
         self.tiny_state.channel = Some(room_id.clone());
         self.call_asked();
+        // Connecting is drawn from the click, not from chatd's first word about the call: chatd
+        // has to start its engine first. The ask below answers with the real state or a refusal.
+        let key = Key { network: Network::Tiny, account: account.account.clone(), id: room_id.clone() };
+        if call_accepts(self.tiny_state.call_busy, false) {
+            let preset = self.tiny_state.preset;
+            self.call_connecting_now(key, preset, cx);
+        }
         self.call(Request::TinyCallJoin { account, room_id }, cx);
     }
 
@@ -911,13 +928,14 @@ impl Shell {
         let Some(account) = self.with_account() else {
             return;
         };
+        self.call_connecting_over(false, cx);
         self.call(Request::TinyCallLeave { account }, cx);
     }
 
     /// Mute, from the user panel or the channel's bar: the call's own while one is up, else
     /// what the next call starts with.
     pub(super) fn tiny_toggle_mute(&mut self, cx: &mut Context<Self>) {
-        if self.tiny_call().is_some() {
+        if self.tiny_call_chatd().is_some() {
             self.call_mute(cx);
             return;
         }
@@ -928,7 +946,7 @@ impl Shell {
     }
 
     pub(super) fn tiny_toggle_deafen(&mut self, cx: &mut Context<Self>) {
-        if self.tiny_call().is_some() {
+        if self.tiny_call_chatd().is_some() {
             self.call_deafen(cx);
             return;
         }
@@ -939,7 +957,7 @@ impl Shell {
 
     /// Mute and deafen as the panel draws them.
     pub(super) fn tiny_quiet(&self) -> (bool, bool) {
-        match self.tiny_call() {
+        match self.tiny_call_chatd() {
             Some(call) => (call.muted || call.deafened, call.deafened),
             None => self.tiny_state.preset,
         }
@@ -950,7 +968,7 @@ impl Shell {
     fn note_tiny_call(&mut self, cx: &mut Context<Self>) {
         // A call that failed or only rings has no connection to measure.
         let live = |call: &protocol::Call| !matches!(call.state, protocol::CallState::Failed { .. } | protocol::CallState::RingingIn { .. });
-        let call = self.tiny_call().filter(live).map(|call| call.conversation.clone());
+        let call = self.tiny_call_chatd().filter(live).map(|call| call.conversation.clone());
         if call.is_none() {
             self.tiny_state.applied = None;
             if self.tiny_state.stats_task.take().is_some() {

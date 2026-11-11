@@ -268,6 +268,10 @@ pub struct State {
     /// A call that could not be asked for at all: the microphone is not allowed. Drawn as any
     /// failed call is, and gone when dismissed or when the next call starts.
     local: Option<Call>,
+    /// The call just asked for (a join, an answer) while chatd has not yet said anything about
+    /// it: drawn as Connecting at once, and gone when chatd's own word arrives or the ask is
+    /// answered. Never acted on: mute, stats and the like speak only to chatd's call.
+    pub(in crate::gui) connecting: Option<Call>,
     /// "Now using ...", after the system moved the call to another device; or why a device in
     /// use is not the one chosen, or is not working (`Call::device_notice`).
     notice: Option<String>,
@@ -324,6 +328,47 @@ impl Subject {
 }
 
 /// The call the views draw: chatd's, or under `--shot` the one `TINYCLIENT_SHOT_CALL` names.
+/// A call as this window makes it up before chatd has one: nobody else in it, nothing open.
+fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -> Call {
+    Call {
+        conversation,
+        state,
+        participants: Vec::new(),
+        muted,
+        deafened,
+        joined: 0,
+        input: String::new(),
+        output: String::new(),
+        engine_linked: true,
+        video: Vec::new(),
+        speaking: false,
+        level: None,
+        output_level: None,
+        input_id: String::new(),
+        output_id: String::new(),
+        device_notice: None,
+        device_stuck: false,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        security: None,
+        picture: None,
+        self_view: None,
+        share_view: None,
+    }
+}
+
+/// What the dock draws: chatd's call, else what only this window knows. A join asked for just
+/// now is drawn over a failure still on show from the call before it, but never over a call
+/// that is live.
+fn drawn(chatd: Option<Call>, local: Option<&Call>, connecting: Option<&Call>) -> Option<Call> {
+    let failed = |call: &Call| matches!(call.state, CallState::Failed { .. });
+    match (chatd, connecting) {
+        (Some(call), Some(asked)) if failed(&call) => Some(asked.clone()),
+        (Some(call), _) => Some(call),
+        (None, _) => local.cloned().or_else(|| connecting.cloned()),
+    }
+}
+
 fn shown(snapshot: &Snapshot) -> Option<Call> {
     #[cfg(feature = "gui-shot")]
     if let Some(call) = shot::call(snapshot) {
@@ -520,6 +565,9 @@ impl Shell {
             Some(call) => {
                 // A call of chatd's own replaces anything said here about one that never began.
                 self.call_state.local = None;
+                if self.call_state.connecting.as_ref().is_some_and(|asked| asked.conversation == call.conversation && !matches!(call.state, CallState::Failed { .. })) {
+                    self.call_state.connecting = None;
+                }
                 self.call_state.ended = None;
                 let menus = matches!(call.state, CallState::RingingOut | CallState::Connecting | CallState::Joined);
                 if !menus {
@@ -808,7 +856,33 @@ impl Shell {
             }
             return Some(call);
         }
-        shown(snapshot).or_else(|| self.call_state.local.clone())
+        drawn(shown(snapshot), self.call_state.local.as_ref(), self.call_state.connecting.as_ref())
+    }
+
+    /// Draws a call just asked for as Connecting before chatd has said a word about it.
+    pub(in crate::gui) fn call_connecting_now(&mut self, conversation: Key, (muted, deafened): (bool, bool), cx: &mut Context<Self>) {
+        self.call_state.connecting = Some(bare_call(conversation, CallState::Connecting, muted, deafened));
+        cx.notify();
+    }
+
+    /// The ask for that call was answered: chatd's state is the truth now. An ask that worked
+    /// keeps the drawing a moment longer when chatd's call has not reached this window yet, so
+    /// the dock does not blink out between the two; one that failed drops it at once.
+    pub(in crate::gui) fn call_connecting_over(&mut self, worked: bool, cx: &mut Context<Self>) {
+        if !worked || self.call_now().is_some() {
+            self.call_state.connecting = None;
+            cx.notify();
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.call_state.connecting.take().is_some() {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn call_set(&mut self, muted: bool, deafened: bool, cx: &mut Context<Self>) {
@@ -854,8 +928,14 @@ impl Shell {
     pub(super) fn call_leave(&mut self, cx: &mut Context<Self>) {
         // What only this window shows goes without asking anyone.
         let state = &mut self.call_state;
-        if state.local.take().is_some() | state.ended.take().is_some() | state.confirm.take().is_some() {
+        let asked = state.connecting.take();
+        if state.local.take().is_some() | state.ended.take().is_some() | state.confirm.take().is_some() | asked.is_some() {
             cx.notify();
+        }
+        // A join that chatd has not yet shown is still on its way: cancelling it is the same ask
+        // as the Cancel button beside it.
+        if asked.is_some_and(|call| call.conversation.network == Network::Tiny) {
+            self.tiny_leave(cx);
         }
         match self.call_now().map(|call| &call.state) {
             None | Some(CallState::RingingIn { .. }) => {}
@@ -945,6 +1025,10 @@ impl Shell {
     /// it off the main thread: the system's prompt can stay up as long as the user likes.
     fn call_begin(&mut self, requests: Vec<Request>, conversation: Key, cx: &mut Context<Self>) {
         self.call_asked();
+        // Answering a ring starts mediad, which takes a moment: say so now, not when it is up.
+        if requests.iter().any(|request| matches!(request, Request::CallAccept)) {
+            self.call_state.connecting = Some(bare_call(conversation.clone(), CallState::Connecting, false, false));
+        }
         let state = &mut self.call_state;
         (state.error, state.local, state.ended) = (None, None, None);
         // A call asked for here opens full-screen on a phone.
@@ -970,6 +1054,7 @@ impl Shell {
             };
             let outcome = cx.background_executor().spawn(work).await;
             let _ = this.update(cx, |this, cx| {
+                this.call_connecting_over(matches!(outcome, Ok(())), cx);
                 match outcome {
                     Ok(()) => {}
                     Err(Some(refused)) => {
@@ -980,31 +1065,7 @@ impl Shell {
                     Err(None) => {
                         let reason = CallFailure::Audio;
                         let state = CallState::Failed { reason, detail: permission::DENIED.to_owned() };
-                        this.call_state.local = Some(Call {
-                            conversation,
-                            state,
-                            participants: Vec::new(),
-                            muted: false,
-                            deafened: false,
-                            joined: 0,
-                            input: String::new(),
-                            output: String::new(),
-                            engine_linked: true,
-                            video: Vec::new(),
-                            speaking: false,
-                            level: None,
-                            output_level: None,
-                            input_id: String::new(),
-                            output_id: String::new(),
-                            device_notice: None,
-                            device_stuck: false,
-                            inputs: Vec::new(),
-                            outputs: Vec::new(),
-                            security: None,
-                            picture: None,
-                            self_view: None,
-                            share_view: None,
-                        });
+                        this.call_state.local = Some(bare_call(conversation, state, false, false));
                     }
                 }
                 cx.notify();
@@ -1220,6 +1281,28 @@ pub(in crate::gui) fn shot_stats() -> Option<protocol::CallStats> {
 mod tests {
     use super::*;
     use protocol::Occupant;
+
+    fn key(id: &str) -> Key {
+        Key { network: Network::Tiny, account: "me".into(), id: id.into() }
+    }
+
+    #[test]
+    fn a_join_just_asked_for_is_drawn_connecting_until_chatd_has_a_call() {
+        let asked = bare_call(key("lounge"), CallState::Connecting, false, false);
+        let joined = bare_call(key("lounge"), CallState::Joined, false, false);
+        let old_failure = bare_call(key("den"), CallState::Failed { reason: CallFailure::Lost, detail: String::new() }, false, false);
+        assert_eq!(drawn(None, None, Some(&asked)).unwrap().state, CallState::Connecting);
+        assert_eq!(drawn(Some(old_failure), None, Some(&asked)).unwrap().conversation, key("lounge"), "a failure on show gives way to the join just asked for");
+        assert_eq!(drawn(Some(joined.clone()), None, Some(&asked)).unwrap().state, CallState::Joined, "a live call is never drawn over");
+        assert!(drawn(None, None, None).is_none());
+    }
+
+    #[test]
+    fn a_call_that_could_not_be_asked_for_wins_over_connecting() {
+        let denied = bare_call(key("lounge"), CallState::Failed { reason: CallFailure::Audio, detail: "no".into() }, false, false);
+        let asked = bare_call(key("lounge"), CallState::Connecting, false, false);
+        assert!(matches!(drawn(None, Some(&denied), Some(&asked)).unwrap().state, CallState::Failed { .. }));
+    }
 
     fn there(names: &[&str], total: u32) -> Occupants {
         let person = |name: &&str| Occupant {
