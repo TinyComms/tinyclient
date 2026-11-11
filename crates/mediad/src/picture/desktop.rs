@@ -56,14 +56,56 @@ struct Coded {
     fps: f32,
     #[cfg(windows)]
     screen: bool,
-    /// Whether the hardware's mid-share failure has been said once, so a failing frame a
-    /// second does not say it a second a time.
+    /// The software encoder on its way after the hardware failed mid-share: loaded and
+    /// opened on a thread of its own, and only looked for here.
     #[cfg(windows)]
-    said: bool,
-    /// Whether the wait for OpenH264's takeover has been said once, so the frames skipped
-    /// while the download lands do not say it one a frame.
-    #[cfg(windows)]
-    said_skip: bool,
+    takeover: Option<Takeover>,
+}
+
+/// OpenH264 taking a track over from hardware that failed mid-share. The load is a
+/// worker's whole job: the binary's file, the download when it is not on the disk yet,
+/// the wait for it, and the encoder's open. The capture thread only looks at the channel,
+/// which never waits, so no frame touches the disk or the network for the swap.
+#[cfg(windows)]
+struct Takeover(Receiver<Result<Backend, String>>);
+
+/// How long the takeover's worker waits for the download before it gives the track up.
+#[cfg(windows)]
+const TAKEOVER_WAIT: Duration = Duration::from_secs(30);
+
+#[cfg(windows)]
+impl Takeover {
+    /// Starts the worker and returns at once. `open` runs there, again while its answer is
+    /// [`CODEC_LATER`], and never on the thread that asked.
+    fn begin(mut open: impl FnMut() -> Result<Backend, String> + Send + 'static) -> Result<Takeover, String> {
+        let (found, arrival) = channel();
+        std::thread::Builder::new()
+            .name("openh264-takeover".into())
+            .spawn(move || {
+                let began = Instant::now();
+                let opened = loop {
+                    match open() {
+                        Err(words) if words == CODEC_LATER && began.elapsed() < TAKEOVER_WAIT => std::thread::sleep(Duration::from_millis(50)),
+                        Err(words) if words == CODEC_LATER => break Err(DOWNLOAD_FAILED.to_owned()),
+                        answer => break answer,
+                    }
+                };
+                // The track may have ended while this loaded; then nobody is asking.
+                let _ = found.send(opened);
+            })
+            .map_err(|err| format!("OpenH264 could not be started to take over from the hardware encoder: {err}"))?;
+        Ok(Takeover(arrival))
+    }
+
+    /// What has arrived, without waiting: nothing while it loads, then the encoder, or
+    /// why it will not come.
+    fn look(&self) -> Option<Result<Backend, String>> {
+        match self.0.try_recv() {
+            Ok(answer) => Some(answer),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err("OpenH264 could not take over from the hardware encoder.".to_owned())),
+        }
+    }
 }
 
 /// One of the two encoders behind [`Coded`]: the machine's own hardware, or Cisco's
@@ -158,7 +200,7 @@ impl Coded {
 
     #[cfg(windows)]
     fn with(backend: Backend, width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Coded {
-        Coded { backend, width, height, bps, fps, screen, said: false, said_skip: false }
+        Coded { backend, width, height, bps, fps, screen, takeover: None }
     }
 
     #[cfg(not(windows))]
@@ -181,45 +223,55 @@ impl Coded {
         Backend::open_h264(bps, fps, screen)
     }
 
+    #[cfg(not(windows))]
     fn encode(&mut self, planes: &Planes, ask: &Ask) -> Result<Encoded, String> {
-        // The hardware failing mid-share does not end the share: one frame's error swaps
-        // the backend to OpenH264, whose first frame is a keyframe, and the track keeps
-        // going. The swap itself may have to wait for the OpenH264 download; until it
-        // lands the frame is skipped and the next one tries again.
-        #[cfg(windows)]
-        if matches!(self.backend, Backend::MediaFoundation(_)) {
+        self.backend.encode(planes, ask)
+    }
+
+    #[cfg(windows)]
+    fn encode(&mut self, planes: &Planes, ask: &Ask) -> Result<Encoded, String> {
+        let (bps, fps, screen) = (self.bps, self.fps, self.screen);
+        self.encode_or(planes, ask, move || Backend::open_h264(bps, fps, screen))
+    }
+
+    /// One frame through the track's encoder. The hardware failing mid-share does not end
+    /// the share: its first error hands the track to OpenH264, and `software` is how that
+    /// is opened. Opening it can mean loading Cisco's binary and, on a machine that never
+    /// fetched it, downloading it, so `software` never runs here, on the capture thread:
+    /// it is handed to a [`Takeover`] worker once, and every frame until its encoder
+    /// arrives is skipped without asking the failed hardware again. The frame that finds
+    /// the encoder swaps it in and is forced to a keyframe. A software encoder that cannot
+    /// come fails the track in its own words, as it does when a share starts.
+    #[cfg(windows)]
+    fn encode_or(&mut self, planes: &Planes, ask: &Ask, software: impl FnMut() -> Result<Backend, String> + Send + 'static) -> Result<Encoded, String> {
+        if self.takeover.is_none() {
+            if !matches!(self.backend, Backend::MediaFoundation(_)) {
+                return self.backend.encode(planes, ask);
+            }
             match self.backend.encode(planes, ask) {
                 Ok(encoded) => return Ok(encoded),
                 Err(why) => {
-                    if !self.said {
-                        tracing::warn!("mediad: the Media Foundation encoder failed mid-share ({why}); OpenH264 takes over with a keyframe.");
-                        self.said = true;
-                    } else {
-                        tracing::debug!("mediad: the Media Foundation encoder failed again ({why}).");
-                    }
-                    match Backend::open_h264(self.bps, self.fps, self.screen) {
-                        Ok(fresh) => {
-                            self.backend = fresh;
-                            // The fresh encoder's first frame is a keyframe of its own; the
-                            // ask is forced besides, so one that was due is not lost to the
-                            // swap.
-                            let forced = Ask { key: true, ..*ask };
-                            return self.backend.encode(planes, &forced);
-                        }
-                        Err(why) => {
-                            // The download lands once; the frames it skips are not said
-                            // one a frame while it does.
-                            if !self.said_skip {
-                                tracing::debug!("mediad: OpenH264 is not ready to take over ({why}); this frame is skipped.");
-                                self.said_skip = true;
-                            }
-                            return Ok(Encoded::default());
-                        }
-                    }
+                    // Said once: the frames after this one find the takeover, not the hardware.
+                    tracing::warn!("mediad: the Media Foundation encoder failed mid-share ({why}); OpenH264 takes over with a keyframe.");
+                    self.takeover = Some(Takeover::begin(software)?);
                 }
             }
         }
-        self.backend.encode(planes, ask)
+        let Some(takeover) = &self.takeover else {
+            return Ok(Encoded::default());
+        };
+        match takeover.look() {
+            None => Ok(Encoded::default()),
+            Some(Ok(fresh)) => {
+                self.backend = fresh;
+                self.takeover = None;
+                // The fresh encoder's first frame is a keyframe of its own; the ask is
+                // forced besides, so one that was due is not lost to the swap.
+                let forced = Ask { key: true, ..*ask };
+                self.backend.encode(planes, &forced)
+            }
+            Some(Err(why)) => Err(why),
+        }
     }
 }
 
@@ -1127,6 +1179,66 @@ mod tests {
             panic!("the software answer is the track's");
         };
         assert!(why.contains("OpenH264"), "{why}");
+    }
+
+    /// The hardware failing mid-share hands the load of OpenH264 to a worker: the frame
+    /// that met the failure, and every frame after it, comes back at once as a skip while
+    /// the load (here held shut, as a download in progress is) has not answered, the load
+    /// is asked for once and never runs on the thread the frames are on, and the failed
+    /// hardware is not asked again. When the load answers that the codec cannot come, the
+    /// track fails in those words.
+    #[cfg(windows)]
+    #[test]
+    fn a_hardware_failure_mid_share_never_loads_openh264_on_the_frame_thread() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (hardware, given) = mf_encoder::tests::hung();
+        let mut coded = Coded::with(Backend::MediaFoundation(hardware), 4, 4, SHARE_BPS, 30., true);
+        let planes = i420(&[255u8; 4 * 4 * 4], 4, 4, 4, 4, false);
+
+        let frames = std::thread::current().id();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let loader = Arc::new(Mutex::new(None));
+        let (release, held) = channel::<()>();
+        let software = {
+            let (loads, loader) = (loads.clone(), loader.clone());
+            move || {
+                *loader.lock().unwrap() = Some(std::thread::current().id());
+                loads.fetch_add(1, Ordering::SeqCst);
+                // The download, for as long as the test holds it.
+                let _ = held.recv();
+                Err(DOWNLOAD_FAILED.to_owned())
+            }
+        };
+
+        let first = coded.encode_or(&planes, &Ask::default(), software).expect("the failing frame is a skip, not the end of the share");
+        assert!(first.bytes.is_empty() && !first.key);
+        let offered = given();
+        for _ in 0..5 {
+            let skipped = coded.encode_or(&planes, &Ask::default(), || panic!("the load is handed over once")).expect("a frame during the load is a skip");
+            assert!(skipped.bytes.is_empty());
+        }
+        assert_eq!(given(), offered, "the failed hardware is not offered another frame");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while loads.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "the load ran once");
+        let loader = loader.lock().unwrap().expect("the load said where it ran");
+        assert_ne!(loader, frames, "and not on the thread the frames are on");
+
+        // The load answers: this one could not get the codec.
+        release.send(()).unwrap();
+        let why = loop {
+            match coded.encode_or(&planes, &Ask::default(), || panic!("the load is handed over once")) {
+                Ok(skipped) => assert!(skipped.bytes.is_empty()),
+                Err(why) => break why,
+            }
+            assert!(Instant::now() < deadline, "the load's answer reaches the track");
+            std::thread::yield_now();
+        };
+        assert_eq!(why, DOWNLOAD_FAILED);
     }
 
     fn screen() -> Rgba {

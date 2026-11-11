@@ -847,7 +847,7 @@ fn annex_b(bytes: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -1107,6 +1107,16 @@ mod tests {
     /// slot already open.
     fn opened(shared: SharedFake) -> Encoder {
         Encoder::open_with(&FakeSource(shared), Platform::unstarted(), 4, 4, 2_500_000, 30., true).expect("the fake encoder opens")
+    }
+
+    /// An encoder whose driver has gone silent for [`STALLED`], so its next frame is the
+    /// Err the share's failover runs on, and a count of the frames it has been offered:
+    /// for the share's own test of that failover, in `picture::desktop`.
+    pub(crate) fn hung() -> (Encoder, impl Fn() -> usize) {
+        let shared = SharedFake::new(baseline_fake());
+        let mut encoder = opened(shared.clone());
+        encoder.answered = Instant::now() - STALLED;
+        (encoder, move || shared.with(|fake| fake.given.len()))
     }
 
     fn baseline_fake() -> FakeMft {
