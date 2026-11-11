@@ -36,6 +36,17 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     // The lab's missed-frame driver. A build without this opens the audio engine below and stays up.
+    // The lab's voice-playout driver. A build without this opens the audio engine below and
+    // stays up.
+    if env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("voice-playout") {
+        if let Err(err) = mediad::media::prove_voice_playout() {
+            eprintln!("voice-playout: {err}");
+            return ExitCode::from(1);
+        }
+        // What the driver looks for: any mediad exits 0 once its input closes.
+        eprintln!("voice-playout: proved");
+        return ExitCode::SUCCESS;
+    }
     if env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("missed-frame") {
         if let Err(err) = mediad::media::prove_missed_frame() {
             eprintln!("missed-frame: {err}");
@@ -47,6 +58,14 @@ fn main() -> ExitCode {
     if env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("bridge-image") {
         if let Err(err) = mediad::process::prove_bridge_image() {
             eprintln!("bridge-image: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    // The lab's high-band driver. A build without this opens the audio engine below and stays up.
+    if env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("high-band") {
+        if let Err(err) = mediad::process::prove_high_band() {
+            eprintln!("high-band: {err}");
             return ExitCode::from(1);
         }
         return ExitCode::SUCCESS;

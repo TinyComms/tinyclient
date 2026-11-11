@@ -1,0 +1,12 @@
+{
+  "id": "high-band-kept",
+  "title": "Enhanced noise keeps the microphone's band above its 7.2 kHz cut, joined at the path's lag",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not start desktop mediad. The same process check is in the library the phone links.",
+    "ios": "The phone proof build does not start desktop mediad. The same process check is in the library the phone links."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 45
+}

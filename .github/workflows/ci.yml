@@ -1,9 +1,16 @@
 name: CI
 
-# Pull requests, and pushes to main. A branch that also has a pull request used to run this
-# twice. Tests and the release build run together: each used to wait for the other, and the
-# release programs are what a later tag packages instead of compiling again. A pull request
-# packages Linux x86_64 only; main builds every release program, Linux aarch64 included.
+# A pull request gets the fast answer: Linux only, the tests split five ways, and nothing that
+# is not about the change. Pushes to main (and a manual dispatch, `gh workflow run ci.yml --ref
+# <branch>`) get everything: Linux, macOS and Windows, and every release program, which is what
+# a later tag packages instead of compiling again. Tests and the release build run together:
+# each used to wait for the other.
+#
+# What a pull request skips, and where it is caught instead:
+#   - macOS and Windows tests: main's push run, which a release waits for, and a dispatch.
+#   - the release build and packaging: unless the change touches packaging, Cargo.toml or
+#     Cargo.lock (the `changes` job), and always on main.
+#   - everything when only docs, the site, or the review and pr-gate tooling changed.
 on:
   push:
     branches: [main]
@@ -16,6 +23,11 @@ on:
       - "site/**"
       - "docs/**"
       - "**/*.md"
+      - ".github/review/**"
+      - ".github/scripts/**"
+      - ".github/workflows/pr-review*.yml"
+      - ".github/pull_request_template.md"
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -30,16 +42,17 @@ env:
   NEXTEST_PROFILE: ci
 
 jobs:
+  # The tests are CPU-bound (about 1,300 CPU-seconds), so they scale with runners: each shard builds
+  # (a warm cache makes that about a minute and a half) and runs its fifth (on main: third or half) of them.
+  # `hash` keeps a test in the same shard from run to run.
   test:
-    name: test (${{ matrix.os }})
+    name: test (${{ matrix.os }} ${{ matrix.shard }}/${{ matrix.shards }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-latest, windows-latest]
-        include:
-          - os: macos-latest
-            features: --features tinyclient/gui
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"ubuntu-22.04","shard":1,"shards":5,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":2,"shards":5,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":3,"shards":5,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":4,"shards":5,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":5,"shards":5,"features":"--features tinyclient/gui"}]' || '[{"os":"ubuntu-22.04","shard":1,"shards":3,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":2,"shards":3,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":3,"shards":3,"features":"--features tinyclient/gui"},{"os":"macos-latest","shard":1,"shards":2,"features":"--features tinyclient/gui"},{"os":"macos-latest","shard":2,"shards":2,"features":"--features tinyclient/gui"},{"os":"windows-latest","shard":1,"shards":2},{"os":"windows-latest","shard":2,"shards":2}]') }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-rust
@@ -58,27 +71,73 @@ jobs:
           cargo build --workspace --all-targets ${{ matrix.features }} --timings
           echo "TINYCLIENT_TEST_MEDIAD=$GITHUB_WORKSPACE/target/debug/mediad${{ runner.os == 'Windows' && '.exe' || '' }}" >> "$GITHUB_ENV"
       - name: Test
-        run: cargo nextest run --workspace ${{ matrix.features }}
-      # nextest does not run doc tests.
+        run: cargo nextest run --workspace ${{ matrix.features }} --partition hash:${{ matrix.shard }}/${{ matrix.shards }}
+      # nextest does not run doc tests. Linux's run in `extras`; the other platforms' run here, once.
       - name: Doc tests
+        if: matrix.shard == 1 && runner.os != 'Linux'
         run: cargo test --workspace --doc ${{ matrix.features }}
-      # The cfg(target_os = "ios"|"android") arms are not type-checked on this host; this proves
-      # the mobile feature does not disturb the desktop arms. It shares this job's cache.
+
+  # Linux's doc tests, and the check nothing else covers: the cfg(target_os = "ios"|"android") arms
+  # are not type-checked on this host; this proves the mobile feature does not disturb the desktop
+  # arms. It runs beside the test shards and shares their cache.
+  extras:
+    name: doc tests and mobile check
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: test
+      - name: Build test programs
+        run: |
+          cargo build --workspace --all-targets --features tinyclient/gui
+          echo "TINYCLIENT_TEST_MEDIAD=$GITHUB_WORKSPACE/target/debug/mediad" >> "$GITHUB_ENV"
+      - name: Doc tests
+        run: cargo test --workspace --doc --features tinyclient/gui
       - name: Window with the mobile feature enabled
-        if: runner.os == 'Linux'
         run: cargo check -p tinyclient --features "gui mobile"
+
+  # Whether the change reaches the release build or its packaging. Only a pull request asks.
+  changes:
+    name: what changed
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      packaging: ${{ steps.files.outputs.packaging }}
+    steps:
+      - id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '.[].filename')
+          if grep -qE '^(packaging/|\.github/actions/|\.github/workflows/ci\.yml$|Cargo\.toml$|Cargo\.lock$)' <<<"$files"; then
+            echo "packaging=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "packaging=false" >> "$GITHUB_OUTPUT"
+          fi
 
   package:
     name: package (${{ matrix.artifact }})
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.packaging == 'true') }}
     strategy:
       fail-fast: false
       matrix:
-        # A pull request packages Linux x86_64, which proves the release build and the packaging.
+        # A pull request that touches packaging packages Linux x86_64, which proves the release build
+        # and the packaging.
         # The others build only on main, which is what a tag reuses. On a pull request the macOS
         # build took a second macOS runner beside the tests and queued behind the phone jobs.
-        artifact: ${{ fromJSON(github.event_name == 'push' && '["linux-x86_64","linux-aarch64","macos","windows"]' || '["linux-x86_64"]') }}
+        artifact: ${{ fromJSON(github.event_name != 'pull_request' && '["linux-x86_64","linux-aarch64","macos","windows"]' || '["linux-x86_64"]') }}
     # Ubuntu 22.04 is the oldest glibc the release packages promise.
     runs-on: ${{ fromJSON('{"linux-x86_64":"ubuntu-22.04","linux-aarch64":"ubuntu-22.04-arm","macos":"macos-latest","windows":"windows-latest"}')[matrix.artifact] }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       # Linux aarch64 builds without a cache. It runs only on main, beside the longer macOS

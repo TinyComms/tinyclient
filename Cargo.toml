@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.65"
+version = "0.2.66"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -55,6 +55,13 @@ debug-assertions = false
 # It can go when presage can move past libsignal v0.97: that waits on davey, whose MLS stack
 # pins hax-lib 0.3.6 where libsignal v0.98 wants 0.3.7.
 [patch.crates-io]
+# unsafe-libopus 0.2.0 with one fix (vendor/unsafe-libopus, src/silk/PLC.rs and src/silk/CNG.rs,
+# marked "tinyclient patch"): c2rust expanded `silk_SAT16`'s lower bound, `(opus_int16)0x8000`, as
+# +32768 and dropped the cast, so every sample SILK concealment and comfort noise made was pinned
+# to full scale. Concealing a lost packet after a speech-mode (SILK or hybrid) one banged, and
+# mediad played a pitch loop instead, which is the "underwater" voice. libopus 1.3.1's
+# silk/PLC.c:374 and silk/CNG.c:176 are the reference. Drop this when a release fixes it.
+unsafe-libopus = { path = "vendor/unsafe-libopus" }
 # gpui_ce_wgpu 0.3.0 with one fix (vendor/gpui_ce_wgpu, `WgpuRenderer::destroy`, marked "tinyclient
 # patch"): it dropped the GPU resources but left the surface marked configured, so the next frame
 # after an Android app went to the background panicked ("GPU resources not available") and the
