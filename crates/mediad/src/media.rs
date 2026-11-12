@@ -111,7 +111,19 @@ pub(crate) struct Stream {
     /// for packets in mid-speech.
     since_logged: u32,
     standing_in: u32,
+    /// Frames played as they came since one was last stretched or squeezed.
+    unpaced: u32,
 }
+
+/// Frames played as they come after one that was stretched or squeezed: 40 ms, so one frame in
+/// three changes at most, as NetEq holds off between its own. A pitch period out of every frame
+/// is a voice at up to twice its speed with a splice every 20 ms, and one put into every frame
+/// is the same period over and over: after a stall that was twenty frames in a row, and it is
+/// heard as a robot.
+const PACE_REST: u32 = 2;
+/// With this much more queued than the buffer keeps, the delay matters more than the sound, and
+/// every other frame is squeezed: 160 ms, which a single stall on a clean link does not leave.
+const PACE_FAR: usize = 8 * FRAME_SAMPLES;
 
 /// Ticks between log lines about one voice's playout: 10 s. A line is written only when
 /// something had to be made up in that time.
@@ -181,6 +193,7 @@ impl Stream {
             logged: Playout::default(),
             since_logged: 0,
             standing_in: 0,
+            unpaced: PACE_REST,
         })
     }
 
@@ -304,10 +317,16 @@ impl Stream {
 
     /// Plays a frame just decoded a pitch period longer while the buffer is short of where it
     /// should be, and shorter while it holds more than it needs in mid-speech. Whether it did
-    /// either: the frame is in `pcm` then.
+    /// either: the frame is in `pcm` then. The frames after one that was changed play as they
+    /// are ([`PACE_REST`]).
     fn paced(&mut self, frame: &[i16]) -> bool {
         let queued = self.jitter.held() * FRAME_SAMPLES + self.pcm.len();
         let steady = self.jitter.target().saturating_sub(1) * FRAME_SAMPLES;
+        let rest = if queued > steady + 2 * FRAME_SAMPLES + PACE_FAR { PACE_REST / 2 } else { PACE_REST };
+        if self.unpaced < rest {
+            self.unpaced += 1;
+            return false;
+        }
         let paced = if queued < steady {
             pace::expand(frame).inspect(|_| self.playout.stretched += 1)
         } else if !self.jitter.hushed && queued > steady + 2 * FRAME_SAMPLES {
@@ -318,6 +337,7 @@ impl Stream {
         let Some(paced) = paced else {
             return false;
         };
+        self.unpaced = 0;
         self.pcm.extend(paced);
         true
     }
@@ -1543,6 +1563,42 @@ mod loss_tests {
             }
         }
         (out, stream)
+    }
+
+    /// What a live call's log showed on a clean link: nothing lost, eight packets in mid-word
+    /// held up 160 ms and then here together. The voice stalls once. Before: every frame on
+    /// the way into the stall was played a pitch period longer and every frame after it one
+    /// shorter, twenty and more in a row, which is a voice at up to twice its speed with a
+    /// splice in each frame: the "robot". Now a frame that was stretched or squeezed is
+    /// followed by frames played as they are, and the delay still comes back.
+    #[test]
+    fn a_stall_in_mid_speech_is_given_back_a_little_at_a_time() {
+        let packets = vowel_packets(160);
+        let mut stream = Stream::clocked().unwrap();
+        let (mut run, mut longest_run, mut last) = (0u32, 0u32, (0u64, 0u64));
+        for tick in 0..packets.len() {
+            // 40 to 47 come with 48; the rest on time.
+            let arriving = match tick {
+                40..=47 => 0..0,
+                48 => 40..49,
+                _ => tick..tick + 1,
+            };
+            for n in arriving {
+                stream.jitter.insert(n as u16, packets[n].clone());
+            }
+            stream.pull(&"stall");
+            let now = (stream.playout.played, stream.playout.stretched + stream.playout.squeezed);
+            let (frames, changed) = (now.0 - last.0, now.1 - last.1);
+            last = now;
+            assert!(changed <= 1, "{changed} frames changed in one tick, at {tick}");
+            run = if frames > 0 && changed == frames { run + 1 } else if frames > 0 { 0 } else { run };
+            longest_run = longest_run.max(run);
+        }
+        assert_eq!(stream.jitter.lost, 0, "nothing was lost");
+        assert!(stream.playout.waited >= 3, "the stall was heard as one: {:?}", stream.playout);
+        assert!(stream.playout.squeezed > 0, "the delay is given back in speech: {:?}", stream.playout);
+        assert!(longest_run <= 1, "{longest_run} ticks in a row played nothing as it came: {:?}", stream.playout);
+        assert!(stream.jitter.held() <= stream.jitter.target() + 1, "{} still queued against {}", stream.jitter.held(), stream.jitter.target());
     }
 
     /// The biggest step from one sample to the next, past the codec's start.
