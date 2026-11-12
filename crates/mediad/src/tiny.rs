@@ -553,6 +553,101 @@ fn after(tick_at: Instant, now: Instant) -> Instant {
     }
 }
 
+/// A tick, or a look at the sockets, this long after the one before is the loop running late:
+/// two ticks.
+const SLOW: Duration = Duration::from_millis(40);
+
+/// The longest this loop went between two ticks, between two looks at its sockets, and with
+/// nothing from them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Gaps {
+    ticks: Duration,
+    looks: Duration,
+    silent: Duration,
+}
+
+impl Gaps {
+    fn widen(&mut self, other: Gaps) {
+        self.ticks = self.ticks.max(other.ticks);
+        self.looks = self.looks.max(other.looks);
+        self.silent = self.silent.max(other.silent);
+    }
+}
+
+/// How this loop kept its own time. A voice stalls when its packets come late, and what held
+/// them up is the far end, the server, the network, or a loop here that did not get to its
+/// sockets: this says whether it was the last.
+#[derive(Debug, Default)]
+struct Turns {
+    /// When it last ticked, last looked at its sockets, and last got anything from them.
+    ticked: Option<Instant>,
+    looked: Option<Instant>,
+    gave: Option<Instant>,
+    /// The longest of each since the last tick, as the voices were told on it, and since the
+    /// log's last line.
+    recent: Gaps,
+    told: Gaps,
+    logged: Gaps,
+    /// A voice stalled since the log's last line.
+    stalled: bool,
+}
+
+impl Turns {
+    /// The sockets were looked at, and whether they had anything.
+    fn looked(&mut self, now: Instant, gave: bool) {
+        let mut gaps = Gaps::default();
+        if let Some(then) = self.looked.replace(now) {
+            gaps.looks = now.saturating_duration_since(then);
+        }
+        if gave {
+            if let Some(then) = self.gave.replace(now) {
+                gaps.silent = now.saturating_duration_since(then);
+            }
+        }
+        self.recent.widen(gaps);
+        self.logged.widen(gaps);
+    }
+
+    /// A tick runs. What its voices are told of the time since the one before: the longest
+    /// gaps that ended in it, and those still running.
+    fn tick(&mut self, now: Instant) -> Gaps {
+        let mut gaps = std::mem::take(&mut self.recent);
+        if let Some(then) = self.ticked.replace(now) {
+            gaps.ticks = now.saturating_duration_since(then);
+            self.logged.ticks = self.logged.ticks.max(gaps.ticks);
+        }
+        let running = |since: Option<Instant>| since.map_or(Duration::ZERO, |then| now.saturating_duration_since(then));
+        gaps.looks = gaps.looks.max(running(self.looked));
+        gaps.silent = gaps.silent.max(running(self.gave));
+        self.told = gaps;
+        gaps
+    }
+
+    /// The log's line is due, and the count starts again: the longest gaps since the last one,
+    /// when the loop ran late in them or a voice stalled.
+    fn line(&mut self) -> Option<Gaps> {
+        let gaps = std::mem::take(&mut self.logged);
+        let stalled = std::mem::take(&mut self.stalled);
+        (stalled || gaps.ticks >= SLOW || gaps.looks >= SLOW).then_some(gaps)
+    }
+}
+
+/// What the log says of the way the media goes: when a connection first has one, and when it
+/// changes. A voice over ICE-TCP waits behind every lost segment, which UDP does not.
+fn path_line(was: Option<CallPath>, now: CallPath) -> Option<String> {
+    let word = |path| match path {
+        CallPath::Udp => "udp",
+        CallPath::Tcp => "tcp",
+        CallPath::Relay => "a relay",
+        CallPath::Unknown => "a path not known",
+    };
+    match was {
+        Some(was) if was == now => None,
+        Some(was) => Some(format!("mediad: the call's media goes over {} now, and went over {} before", word(now), word(was))),
+        None => Some(format!("mediad: the call's media goes over {}", word(now))),
+    }
+}
+
 /// Voice frames held at most while the encryption is busy, each way: half a second of one
 /// voice. Past it the oldest is dropped, as a frame with no keys is.
 const HELD: usize = 25;
@@ -612,6 +707,10 @@ struct Call {
     processor: Processor,
     limiter: Limiter,
     meter: Meter,
+    /// The loop's own time, for the log.
+    turns: Turns,
+    /// The way the media goes, as the log was last told on this connection.
+    path_said: Option<CallPath>,
     /// The picture's threads. This loop only moves their bytes.
     video: Video,
     /// What the path can take, from TWCC feedback. `None` until this connection has said.
@@ -696,6 +795,7 @@ impl Call {
         self.video_bytes = 0;
         self.desired = 0;
         self.padding_dropped = None;
+        self.path_said = None;
         self.video.reset();
         self.shown = None;
         // The new link has not been announced dead. A death of the one we just left already was.
@@ -774,6 +874,9 @@ impl Call {
                         Protocol::Udp => CallPath::Udp,
                         _ => CallPath::Tcp,
                     };
+                    if let Some(line) = path_line(self.path_said.replace(self.meter.path), self.meter.path) {
+                        tracing::warn!("{line}");
+                    }
                 }
             }
             // What the server sees of our microphone: its FEC is planned for that loss, and it
@@ -847,7 +950,8 @@ impl Call {
                 continue;
             };
             let stream = &mut slot.stream;
-            stream.last_packet = Instant::now();
+            let now = Instant::now();
+            stream.last_packet = now;
             // The RTP clock is 48 kHz, as ours.
             stream.arrivals.arrived(data.time.numer() as u32, data.network_time);
             stream.heard |= opus[..] != SILENCE[..];
@@ -857,6 +961,7 @@ impl Call {
             if !self.controls.deafened.load(Ordering::Relaxed) {
                 // The SFU writes a fresh sequence, so a lost frame is a hole in the RTP
                 // time and not in `seq_range`. The jitter buffer only sees sequence numbers.
+                stream.took(now.saturating_duration_since(data.network_time));
                 stream.jitter.insert(frame_sequence(data.time.numer()), opus);
             }
         }
@@ -1303,12 +1408,17 @@ impl Call {
         let ear: Ear = self.controls.ear();
         let ducked = ear.ducking(self.slots.values().map(|slot| (slot.user.as_str(), slot.stream.speaking())));
         let mut mix = [0i32; FRAME_SAMPLES];
+        let since = self.turns.told;
         for (mid, slot) in &mut self.slots {
             let loud = if deafened {
                 slot.stream.drop_audio();
                 slot.stream.heard
             } else {
-                match slot.stream.pull(&format_args!("slot {mid}")) {
+                slot.stream.looked(since.looks, since.silent);
+                let stalls = slot.stream.gaps;
+                let frame = slot.stream.pull(&format_args!("slot {mid}"));
+                self.turns.stalled |= slot.stream.gaps != stalls;
+                match frame {
                     Some(frame) => {
                         slot.stream.mix_into(&mut mix, &frame, ear.factor(&slot.user, ducked));
                         level(&frame) >= VOICE
@@ -1406,7 +1516,18 @@ impl Call {
                         // did not read.
                         self.heard += now.saturating_duration_since(due);
                     }
+                    self.turns.tick(now);
                     self.tick();
+                    if self.ticks.is_multiple_of(10 * SECOND) {
+                        if let Some(gaps) = self.turns.line() {
+                            tracing::warn!(
+                                "mediad: the call's loop, last 10 s: at most {} ms between two ticks, {} ms between two looks at its sockets, and {} ms with nothing from them",
+                                gaps.ticks.as_millis(),
+                                gaps.looks.as_millis(),
+                                gaps.silent.as_millis(),
+                            );
+                        }
+                    }
                     self.watch_link(now);
                     if self.ticks.is_multiple_of(SECOND) {
                         self.overdue();
@@ -1430,9 +1551,11 @@ impl Call {
                     out::fail(CallFailure::Engine, ENGINE);
                 }
             }
+            let queued = self.packets.len();
             for event in &events {
                 self.receive(event.token(), event.is_writable());
             }
+            self.turns.looked(Instant::now(), self.packets.len() > queued);
             if self.packets.is_empty() && self.link.rtc.is_alive() {
                 let _ = self.link.rtc.handle_input(Input::Timeout(Instant::now()));
             }
@@ -1526,6 +1649,8 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         processor: Processor::new(),
         limiter: Limiter::default(),
         meter: Meter::own_path(CallPath::Unknown),
+        turns: Turns::default(),
+        path_said: None,
         video: Video::new(controls.clone()),
         estimate: None,
         rates: Rates::default(),
@@ -1584,6 +1709,45 @@ mod tests {
         assert_eq!(after(start, start + 5 * TICK), start + TICK, "a short slip catches up one tick at a time");
         let late = start + 7 * TICK;
         assert_eq!(after(start, late), late + TICK, "past the bound the missed ticks are gone");
+    }
+
+    /// The loop's longest gaps go to the voices tick by tick, with what is still running, and
+    /// to the log every 10 s, when it ran late or a voice stalled.
+    #[test]
+    fn the_loop_keeps_its_longest_gaps_for_the_voices_and_for_the_log() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let ms = Duration::from_millis;
+        let mut turns = Turns::default();
+        assert_eq!(turns.tick(at(0)), Gaps::default(), "nothing before the first");
+        turns.looked(at(5), true);
+        turns.looked(at(18), false);
+        assert_eq!(turns.tick(at(20)), Gaps { ticks: ms(20), looks: ms(13), silent: ms(15) });
+        assert_eq!(turns.told, Gaps { ticks: ms(20), looks: ms(13), silent: ms(15) }, "kept for the voices");
+        // Held up for 180 ms: no tick and no look at the sockets.
+        assert_eq!(turns.tick(at(200)), Gaps { ticks: ms(180), looks: ms(182), silent: ms(195) }, "what is still running counts");
+        turns.looked(at(201), true);
+        assert_eq!(turns.tick(at(220)), Gaps { ticks: ms(20), looks: ms(183), silent: ms(196) }, "and whole once it ends");
+        assert_eq!(turns.tick(at(240)), Gaps { ticks: ms(20), looks: ms(39), silent: ms(39) }, "which is told once");
+        turns.looked(at(245), true);
+        assert_eq!(turns.line(), Some(Gaps { ticks: ms(180), looks: ms(183), silent: ms(196) }), "the log has the longest of its 10 s");
+        for n in 13..=20 {
+            turns.looked(at(n * 20 - 10), true);
+            turns.tick(at(n * 20));
+        }
+        assert_eq!(turns.line(), None, "a loop on time, with no voice stalled, has no line");
+        turns.stalled = true;
+        turns.looked(at(410), true);
+        turns.tick(at(420));
+        assert_eq!(turns.line(), Some(Gaps { ticks: ms(20), looks: ms(20), silent: ms(20) }), "a voice stalled: the line says the loop was on time");
+        assert_eq!(turns.line(), None, "once");
+    }
+
+    #[test]
+    fn the_way_the_media_goes_is_told_once_and_again_when_it_changes() {
+        assert_eq!(path_line(None, CallPath::Udp).as_deref(), Some("mediad: the call's media goes over udp"));
+        assert_eq!(path_line(Some(CallPath::Udp), CallPath::Udp), None);
+        assert_eq!(path_line(Some(CallPath::Udp), CallPath::Tcp).as_deref(), Some("mediad: the call's media goes over tcp now, and went over udp before"));
     }
 
     #[test]
