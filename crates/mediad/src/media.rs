@@ -98,7 +98,12 @@ pub(crate) struct Stream {
     /// The voice was cut off in mid-speech, waiting for a packet.
     stalled: bool,
     /// Times it was, and the packet came.
-    gaps: u64,
+    pub(crate) gaps: u64,
+    /// The stall it is in now, as far as it has gone, and the stalls behind it.
+    stall: Stall,
+    pub(crate) stalls: Stalls,
+    /// What the call's loop saw of this voice since the last tick.
+    since: Since,
     /// The gain the last frame ended at (`hear`), so the next one starts from it.
     gain: Option<f32>,
     pub(crate) arrivals: Arrivals,
@@ -128,6 +133,89 @@ const PACE_FAR: usize = 8 * FRAME_SAMPLES;
 /// Ticks between log lines about one voice's playout: 10 s. A line is written only when
 /// something had to be made up in that time.
 const PLAYOUT_LOG: u32 = 500;
+
+/// Stalls of one voice that get a line each between two of those: a link that stalls more often
+/// gets a count, so a bad one cannot fill the log, or write to it on every tick.
+const STALL_LINES: u32 = 3;
+
+/// One stall in mid-speech: nothing was queued while a packet was due, something stood in for
+/// the voice, and then the packets came. How they came says where they were held up: on the way
+/// here, or in this process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stall {
+    /// How long something stood in for the voice.
+    pub stood_in_ms: u32,
+    /// The most of its packets that came between two ticks, up to the tick that ended it.
+    pub lump: u32,
+    /// The longest one of those packets took from the call's loop taking it in to the jitter
+    /// buffer.
+    pub held_ms: u32,
+    /// The longest the call's loop went between two looks at its sockets while it lasted, and
+    /// the longest they gave it nothing, from anyone; and whether the loop said so at all (a
+    /// Tiny call's does).
+    pub looked_ms: u32,
+    pub silent_ms: u32,
+    pub watched: bool,
+}
+
+impl Stall {
+    /// One more tick of it: what came since the tick before.
+    fn tick(&mut self, since: &Since) {
+        let ms = |time: Duration| time.as_millis().min(u128::from(u32::MAX)) as u32;
+        self.lump = self.lump.max(since.packets);
+        self.held_ms = self.held_ms.max(ms(since.held));
+        self.looked_ms = self.looked_ms.max(ms(since.looked));
+        self.silent_ms = self.silent_ms.max(ms(since.silent));
+        self.watched |= since.watched;
+    }
+}
+
+/// What the call's loop saw between two ticks: this voice's packets, the longest one of them
+/// waited in this process, and the loop's own longest time between two looks at its sockets and
+/// with nothing from them.
+#[derive(Debug, Clone, Copy, Default)]
+struct Since {
+    packets: u32,
+    held: Duration,
+    looked: Duration,
+    silent: Duration,
+    /// The loop said those two.
+    watched: bool,
+}
+
+/// The stalls of one voice since its last playout line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Stalls {
+    /// Those that got a line of their own, and those that did not.
+    written: u32,
+    folded: u32,
+    /// The longest stand-in among those that did not.
+    folded_ms: u32,
+    /// The last one to end, over the call.
+    pub(crate) last: Option<Stall>,
+}
+
+impl Stalls {
+    /// A stall ended. Whether it gets a line of its own.
+    fn ended(&mut self, stall: Stall) -> bool {
+        self.last = Some(stall);
+        if self.written < STALL_LINES {
+            self.written += 1;
+            return true;
+        }
+        self.folded += 1;
+        self.folded_ms = self.folded_ms.max(stall.stood_in_ms);
+        false
+    }
+
+    /// The playout line is due, and the count starts again: how many stalls got no line since
+    /// the last one, and the longest of them, when there were any.
+    fn turn(&mut self) -> Option<(u32, u32)> {
+        let folded = (self.folded, self.folded_ms);
+        *self = Stalls { last: self.last, ..Stalls::default() };
+        (folded.0 > 0).then_some(folded)
+    }
+}
 
 /// What one voice's playout did. Each of these is heard, one way or another: the log says how
 /// often, so a call that sounded wrong can be lined up with what happened.
@@ -186,6 +274,9 @@ impl Stream {
             rebuilt: 0,
             stalled: false,
             gaps: 0,
+            stall: Stall::default(),
+            stalls: Stalls::default(),
+            since: Since::default(),
             gain: None,
             arrivals: Arrivals::default(),
             reported: Counts::default(),
@@ -219,6 +310,22 @@ impl Stream {
         }
     }
 
+    /// A packet of this voice went into the jitter buffer, `held` after the call's loop took it
+    /// in: what came between the two had it that long, as the encryption does when it is busy.
+    pub(crate) fn took(&mut self, held: Duration) {
+        self.since.packets += 1;
+        self.since.held = self.since.held.max(held);
+    }
+
+    /// The call's loop, since the last tick: the longest it went between two looks at its
+    /// sockets, and the longest they gave it nothing. A stall says both, so one made here can
+    /// be told from one the packets arrived with.
+    pub(crate) fn looked(&mut self, looked: Duration, silent: Duration) {
+        self.since.looked = looked;
+        self.since.silent = silent;
+        self.since.watched = true;
+    }
+
     /// Deafened: nothing is played, and nothing is kept to play later.
     pub(crate) fn drop_audio(&mut self) {
         self.jitter.clear();
@@ -230,6 +337,12 @@ impl Stream {
     pub(crate) fn pull(&mut self, who: &dyn std::fmt::Display) -> Option<Vec<i16>> {
         let mut pcm = [0i16; MAX_FRAME * CHANNELS];
         self.jitter.aim(self.arrivals.ms(), self.arrivals.spread_ms());
+        // A stall is measured from the tick it starts on to the tick that ends it.
+        let since = std::mem::take(&mut self.since);
+        if !self.stalled {
+            self.stall = Stall::default();
+        }
+        self.stall.tick(&since);
         let mut stood_in = false;
         while self.pcm.len() < FRAME_SAMPLES {
             let decoded = match self.jitter.pop() {
@@ -237,6 +350,7 @@ impl Stream {
                     if std::mem::take(&mut self.stalled) {
                         self.gaps += 1;
                         self.jitter.deepen();
+                        self.stall_over(who);
                     }
                     let decoded = self.played(&packet, &mut pcm);
                     // More is queued than this voice calls for. A quiet frame can go whole.
@@ -315,6 +429,28 @@ impl Stream {
         (self.pcm.len() >= FRAME_SAMPLES).then(|| self.pcm.drain(..FRAME_SAMPLES).collect())
     }
 
+    /// The packets a stall waited for are here. It is told once, with what says where they were
+    /// held up: a loop that looked at its sockets all along and got nothing was not the one that
+    /// kept them. More than [`STALL_LINES`] between two playout lines are counted there instead.
+    fn stall_over(&mut self, who: &dyn std::fmt::Display) {
+        let stall = Stall { stood_in_ms: self.standing_in * 20, ..self.stall };
+        if !self.stalls.ended(stall) {
+            return;
+        }
+        if !stall.watched {
+            tracing::warn!("mediad: {who} stalled in mid-speech: stood in for {} ms, then {} packets came at once", stall.stood_in_ms, stall.lump);
+            return;
+        }
+        tracing::warn!(
+            "mediad: {who} stalled in mid-speech: stood in for {} ms, then {} packets came at once; meanwhile this loop went at most {} ms between two looks at its sockets, they gave nothing for {} ms, and a packet waited at most {} ms here before the buffer",
+            stall.stood_in_ms,
+            stall.lump,
+            stall.looked_ms,
+            stall.silent_ms,
+            stall.held_ms,
+        );
+    }
+
     /// Plays a frame just decoded a pitch period longer while the buffer is short of where it
     /// should be, and shorter while it holds more than it needs in mid-speech. Whether it did
     /// either: the frame is in `pcm` then. The frames after one that was changed play as they
@@ -349,6 +485,9 @@ impl Stream {
         self.since_logged = 0;
         self.logged = self.playout;
         self.playout.longest = 0;
+        if let Some((more, longest_ms)) = self.stalls.turn() {
+            tracing::warn!("mediad: {who} stalled {more} more times than the {STALL_LINES} told one by one, the longest for {longest_ms} ms");
+        }
         if !whole && done.waited + done.concealed + done.looped == 0 {
             return;
         }
@@ -589,6 +728,103 @@ pub fn prove_voice_playout() -> Result<(), String> {
     }
     if call.held > call.target + 1 {
         return fail("the stall's backlog was still queued in mid-speech");
+    }
+    Ok(())
+}
+
+/// What [`stalled_call`] heard.
+#[derive(Debug)]
+pub struct StalledCall {
+    pub playout: Playout,
+    pub lost: u64,
+    /// The stalls that ended, and the last of them as the log has it.
+    pub stalls: u64,
+    pub stall: Option<Stall>,
+    /// The most frames in one tick that were played longer or shorter than they came, and the
+    /// most ticks in a row that played nothing as it came.
+    pub changed_at_once: u64,
+    pub changed_in_a_row: u32,
+    pub held: usize,
+    pub target: usize,
+}
+
+/// What a live call's log showed on a clean link: three seconds of a voiced vowel, nothing lost,
+/// and eight packets in mid-word held up 160 ms and then here together, with the one after
+/// them. Ticks are 20 ms; each takes what has arrived by then and plays a frame.
+pub fn stalled_call() -> Option<StalledCall> {
+    const FRAMES: usize = 160;
+    let mut encoder = Encoder::voice()?;
+    let mut packets = Vec::new();
+    for f in 0..FRAMES {
+        let mut pcm = [0i16; FRAME_SAMPLES];
+        for (n, pair) in pcm.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
+            let t = (f * FRAME + n) as f64 / 48_000.;
+            let swell = 0.6 + 0.4 * (t * 3. * std::f64::consts::TAU).sin();
+            let voice: f64 = (1..=10).map(|k| (t * 140. * k as f64 * std::f64::consts::TAU).sin() / k as f64).sum();
+            pair.fill((voice * swell * 4_000.) as i16);
+        }
+        let mut packet = [0u8; 1275];
+        let len = encoder.encode(&pcm, &mut packet)?;
+        packets.push(packet[..len].to_vec());
+    }
+    let mut stream = Stream::clocked()?;
+    let (mut run, mut changed_in_a_row, mut changed_at_once, mut last) = (0u32, 0u32, 0u64, (0u64, 0u64));
+    for tick in 0..FRAMES {
+        // 40 to 47 come with 48; the rest on time.
+        let arriving = match tick {
+            40..=47 => 0..0,
+            48 => 40..49,
+            _ => tick..tick + 1,
+        };
+        for n in arriving {
+            stream.took(Duration::ZERO);
+            stream.jitter.insert(n as u16, packets[n].clone());
+        }
+        // The loop that read them was on time all along: its socket had nothing to give it.
+        stream.looked(TICK, if tick == 48 { 9 * TICK } else { TICK });
+        stream.pull(&"stall");
+        let now = (stream.playout.played, stream.playout.stretched + stream.playout.squeezed);
+        let (frames, changed) = (now.0 - last.0, now.1 - last.1);
+        last = now;
+        changed_at_once = changed_at_once.max(changed);
+        run = if frames > 0 && changed == frames { run + 1 } else if frames > 0 { 0 } else { run };
+        changed_in_a_row = changed_in_a_row.max(run);
+    }
+    Some(StalledCall {
+        playout: stream.playout,
+        lost: stream.jitter.lost,
+        stalls: stream.gaps,
+        stall: stream.stalls.last,
+        changed_at_once,
+        changed_in_a_row,
+        held: stream.jitter.held(),
+        target: stream.jitter.target(),
+    })
+}
+
+/// The lab's voice-stall driver: a voice held up for a moment in mid-word and then here in a
+/// lump is given its delay back a frame at a time, never as a run of squeezed frames, and the
+/// stall is measured once, with what says where it was held up.
+pub fn prove_voice_stall() -> Result<(), String> {
+    let call = stalled_call().ok_or("the codec did not start")?;
+    let fail = |what: &str| Err(format!("{what}: {call:?}"));
+    if call.lost > 0 {
+        return fail("a late packet was taken for a lost one");
+    }
+    if call.playout.waited < 3 {
+        return fail("the stall was not heard as one, so nothing was proved");
+    }
+    if call.changed_at_once > 1 || call.changed_in_a_row > 1 {
+        return fail("the backlog was squeezed out frame after frame");
+    }
+    if call.playout.squeezed == 0 || call.held > call.target + 1 {
+        return fail("the stall's backlog was still queued in mid-speech");
+    }
+    let Some(stall) = call.stall.filter(|_| call.stalls == 1) else {
+        return fail("one stall was not measured once");
+    };
+    if stall.stood_in_ms < 60 || stall.lump != 9 || !stall.watched || stall.looked_ms != 20 || stall.silent_ms != 180 {
+        return fail("the stall was not measured as it happened");
     }
     Ok(())
 }
@@ -1599,6 +1835,67 @@ mod loss_tests {
         assert!(stream.playout.squeezed > 0, "the delay is given back in speech: {:?}", stream.playout);
         assert!(longest_run <= 1, "{longest_run} ticks in a row played nothing as it came: {:?}", stream.playout);
         assert!(stream.jitter.held() <= stream.jitter.target() + 1, "{} still queued against {}", stream.jitter.held(), stream.jitter.target());
+    }
+
+    /// The lab's stall, as its driver runs it: paced, and measured once.
+    #[test]
+    fn a_stall_and_its_lump_are_paced_and_measured_once() {
+        eprintln!("{:?}", stalled_call());
+        prove_voice_stall().unwrap();
+    }
+
+    /// A stall is one line however many ticks it lasts, and it says what the loop saw while it
+    /// lasted: the lump the packets came in, the longest any of them waited here, and the
+    /// longest the loop went without looking at its sockets or getting anything from them.
+    #[test]
+    fn a_stall_is_measured_once_from_the_tick_it_starts_to_the_tick_that_ends_it() {
+        let packets = vowel_packets(80);
+        let mut stream = Stream::clocked().unwrap();
+        let ms = Duration::from_millis;
+        for tick in 0..packets.len() {
+            let arriving = match tick {
+                // Five held up 100 ms, in a loop that did not look at its sockets for 90 of them.
+                30..=34 => 0..0,
+                35 => 30..36,
+                _ => tick..tick + 1,
+            };
+            for n in arriving {
+                stream.took(ms(if n == 33 { 7 } else { 1 }));
+                stream.jitter.insert(n as u16, packets[n].clone());
+            }
+            match tick {
+                35 => stream.looked(ms(90), ms(120)),
+                // Before the stall and after it: none of this is the stall's.
+                10 | 60 => stream.looked(ms(400), ms(400)),
+                _ => stream.looked(ms(20), ms(20)),
+            }
+            stream.pull(&"measured");
+            if tick < 35 {
+                assert_eq!(stream.stalls.last, None, "nothing is told while it lasts, at {tick}");
+            }
+        }
+        assert_eq!(stream.gaps, 1, "one stall: {:?}", stream.playout);
+        assert_eq!(stream.stalls.written, 1, "and one line");
+        let stall = stream.stalls.last.expect("the stall ended");
+        assert_eq!(stall.stood_in_ms, stream.playout.longest * 20, "{stall:?}");
+        assert!((40..=100).contains(&stall.stood_in_ms), "{stall:?}");
+        assert_eq!((stall.lump, stall.held_ms, stall.looked_ms, stall.silent_ms), (6, 7, 90, 120));
+        assert!(stall.watched, "the loop said how it kept its time");
+    }
+
+    /// A link that stalls again and again writes three lines between two playout lines and
+    /// counts the rest, with the longest of them; the next ten seconds start again.
+    #[test]
+    fn stalls_past_the_third_in_ten_seconds_are_counted_not_written() {
+        let stall = |stood_in_ms| Stall { stood_in_ms, ..Stall::default() };
+        let mut stalls = Stalls::default();
+        let written: Vec<bool> = [60, 80, 100, 240, 120, 40].into_iter().map(|ms| stalls.ended(stall(ms))).collect();
+        assert_eq!(written, [true, true, true, false, false, false]);
+        assert_eq!(stalls.turn(), Some((3, 240)), "the rest are one count, with the longest");
+        assert_eq!(stalls.last, Some(stall(40)), "the last one is kept");
+        assert_eq!(stalls.turn(), None, "nothing more to say of them");
+        assert!(stalls.ended(stall(60)), "the next ten seconds have their own lines");
+        assert_eq!(stalls.turn(), None, "one that had its line is not counted again");
     }
 
     /// The biggest step from one sample to the next, past the codec's start.

@@ -47,6 +47,16 @@ fn main() -> ExitCode {
         eprintln!("voice-playout: proved");
         return ExitCode::SUCCESS;
     }
+    // The lab's voice-stall driver. A build without this opens the audio engine below and stays up.
+    if env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("voice-stall") {
+        if let Err(err) = mediad::media::prove_voice_stall() {
+            eprintln!("voice-stall: {err}");
+            return ExitCode::from(1);
+        }
+        // What the driver looks for: any mediad exits 0 once its input closes.
+        eprintln!("voice-stall: proved");
+        return ExitCode::SUCCESS;
+    }
     if env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("missed-frame") {
         if let Err(err) = mediad::media::prove_missed_frame() {
             eprintln!("missed-frame: {err}");
