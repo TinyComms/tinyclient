@@ -1,0 +1,13 @@
+{
+  "id": "openh264-download-retry",
+  "title": "A failed OpenH264 download is tried again, says what failed and how to retry, and a good download is kept across starts",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "A phone encodes through its own platform encoder and never downloads OpenH264.",
+    "ios": "A phone encodes through its own platform encoder and never downloads OpenH264."
+  },
+  "needs": [],
+  "release": false,
+  "driver": "run.sh",
+  "proof_scope": "the retry count and pauses, the words a failure says, where the codec is cached, and a broken cached file being removed, unit-level; a blocked download on a real call needs a network that drops Cisco's host"
+}

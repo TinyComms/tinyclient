@@ -1076,18 +1076,6 @@ fn start_download(path: PathBuf) {
 /// Cisco's OpenH264 2.6.0 for this machine. A download in progress is [`CODEC_LATER`], not a
 /// failure, and this never blocks on the network. A failed download says its words, and the
 /// next share or camera that is turned on starts a new download.
-///
-/// A later day, Windows could leave the download out altogether: the system's own Media
-/// Foundation ships an H.264 encoder on every machine that has a GPU driver. The shape it
-/// would take: `MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE)` lists what is
-/// there; one encoder opens as an async `IMFTransform` taking NV12 in (the capture's BGRA is
-/// turned into NV12 instead of today's I420, and the encoder runs on the GPU) and H.264 out;
-/// `ICodecAPI` sets `CODECAPI_AVEncCommonRateControlMode` to CBR, points
-/// `CODECAPI_AVEncCommonMeanBitRate` at the ask's bps, and answers an `Ask.key` with
-/// `CODECAPI_AVEncVideoForceKeyFrame`. `Coded::open` would pick that first and fall back to
-/// this download when `MFTEnumEx` finds nothing or the transform fails to open. macOS's
-/// VideoToolbox fills the same hole; Android's phone already encodes through MediaCodec. No
-/// Cisco download, and no redistribution question at all, since the OS's own encoder is used.
 fn load_api() -> Result<OpenH264API, String> {
     let path = library_path()?;
     if let Some(api) = open_cached(&path) {
