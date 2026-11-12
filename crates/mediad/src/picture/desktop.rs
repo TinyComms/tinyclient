@@ -1399,9 +1399,9 @@ mod tests {
     fn the_codec_is_cached_where_a_restart_finds_it() {
         let tmp = std::env::temp_dir();
         let local = cache_dir(Some("C:\\Users\\ada".into()), None, tmp.clone());
-        assert_eq!(local, PathBuf::from("C:\\Users\\ada\\tinyclient"));
+        assert_eq!(local, PathBuf::from("C:\\Users\\ada").join("tinyclient"));
         let home = cache_dir(None, Some("/home/ada".into()), tmp.clone());
-        assert_eq!(home, PathBuf::from("/home/ada/.cache/tinyclient"));
+        assert_eq!(home, PathBuf::from("/home/ada").join(".cache").join("tinyclient"));
         assert_eq!(cache_dir(None, None, tmp.clone()), tmp.join("tinyclient"), "the temp folder is the last resort");
     }
 
