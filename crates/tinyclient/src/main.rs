@@ -214,6 +214,15 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    // The lab's push-to-talk-release driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("push-to-talk-release") {
+        if let Err(err) = gui::prove_push_to_talk_release() {
+            eprintln!("push-to-talk-release: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     // The lab's health-grade driver. A build without this opens the window below and stays up.
     #[cfg(feature = "gui")]
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("health-grade") {

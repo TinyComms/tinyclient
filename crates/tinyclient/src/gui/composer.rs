@@ -337,6 +337,11 @@ fn back_words(reason: &str) -> (String, Tone) {
     (format!("Not sent. {reason} Your text is kept."), Tone::Offline)
 }
 
+/// The lab's push-to-talk-release driver (`rec::prove_push_to_talk_release`).
+pub(crate) fn prove_push_to_talk_release() -> Result<(), &'static str> {
+    rec::prove_push_to_talk_release()
+}
+
 /// The lab's offline-send-kept driver. Two messages are sent while their accounts are offline.
 /// One link returns: that message is sent once and is never put back. The other stays down
 /// past the window: what was typed is back in the empty field, once, and is held no longer.
@@ -511,6 +516,15 @@ pub struct Composer {
     anchors: Rc<Anchors>,
     /// The recording of this conversation, as chatd said it (`Change::Recording`).
     recording: Option<Rec>,
+    /// The mic held down (push-to-talk), and the conversation the hold began in: the next
+    /// release stops that one's recording after the grace, wherever the composer has gone since.
+    holding: Option<Key>,
+    /// One timer, alive only between that release and the end of the release grace. A press
+    /// inside the grace drops it, so the recording a new press starts is not stopped by it.
+    release: Option<Task<()>>,
+    /// The conversation a stop is owed to: the mic was let go before chatd said its recording
+    /// runs, so the stop is sent when it does (`rec::on_owed_stop`). The next press clears it.
+    owed_stop: Option<Key>,
     /// The facts of the note that arrived (`Recorded`): a send is sent with them, and this
     /// composer answers a removed chip with them.
     note: Option<Rec>,
@@ -598,6 +612,9 @@ impl Composer {
             send_menu: false,
             anchors: Rc::new(Anchors::default()),
             recording: None,
+            holding: None,
+            release: None,
+            owed_stop: None,
             note: None,
             held_files: crate::tiny_attach::Holds::default(),
             pending_file: None,
@@ -2130,7 +2147,8 @@ impl Composer {
 
     /// A 28 pt icon button on the card, its bounds kept for what it opens.
     /// The mic on the card. A recording under way shows a stop square in its place, and the next
-    /// press stops it: the gate (`Controls::voice`) decides it is on the card at all.
+    /// press stops it — or, with push-to-talk on, holding records and letting go stops it once
+    /// the release grace has run. The gate (`Controls::voice`) decides it is on the card at all.
     fn mic_button(&self, on: bool, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
         if !on {
             return None;
@@ -2139,32 +2157,96 @@ impl Composer {
             .recording
             .as_ref()
             .is_some_and(|recording| Some(&recording.conversation) == self.target.as_ref().map(|target| &target.key) && matches!(recording.state, RecordState::Active));
-        let (icon, words) = match hot {
-            true => ("icons/square.svg", "Stop recording"),
-            false => ("icons/mic.svg", "Record a voice message"),
+        let push = crate::gui::app::prefs::values().on(protocol::settings::PUSH_TO_TALK);
+        let (icon, words) = match (hot, push) {
+            (true, true) => ("icons/square.svg", "Release to stop recording"),
+            (true, false) => ("icons/square.svg", "Stop recording"),
+            (false, true) => ("icons/mic.svg", "Hold to record"),
+            (false, false) => ("icons/mic.svg", "Record a voice message"),
         };
-        Some(
-            self.card_button("mic", Some(icon), false, None)
-                .tooltip(tip(words, None))
-                // The button says what the next press does.
-                .map(|button| match hot {
-                    true => button.bg(theme::danger_soft()),
-                    false => button,
-                })
-                .on_click(cx.listener(|this, _, _, cx| this.record_pressed(cx))),
-        )
+        let button = self
+            .card_button("mic", Some(icon), false, None)
+            .tooltip(tip(words, None))
+            // A recording's dot is its own: the button says what the next press does.
+            .map(|button| match hot {
+                true => button.bg(theme::danger_soft()),
+                false => button,
+            });
+        // Push-to-talk listens on the press and on the release, in or out of the button: a hold
+        // ends wherever the finger lets go. A release with no hold behind it does nothing. A
+        // keyboard has no hold to give, so Enter or Space on the mic is the press that records
+        // and the press that stops, as it is with push-to-talk off.
+        Some(if push {
+            button
+                .on_mouse_down(gpui::MouseButton::Left, cx.listener(Self::mic_held_down))
+                .on_mouse_up(gpui::MouseButton::Left, cx.listener(Self::mic_released))
+                .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(Self::mic_released))
+                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                    if event.is_keyboard() {
+                        this.record_pressed(cx);
+                    }
+                }))
+        } else {
+            button.on_click(cx.listener(|this, _, _, cx| this.record_pressed(cx)))
+        })
+    }
+
+    /// The conversation a recording may start for now, if there is one.
+    fn record_target(&self) -> Option<Key> {
+        self.target
+            .as_ref()
+            .filter(|target| target.locked().is_none())
+            .filter(|_| live())
+            .map(|target| target.key.clone())
     }
 
     /// The mic. The first press on a conversation records, the next stops; everything else is
     /// chatd's, told back as `Change::Recording`.
     fn record_pressed(&mut self, cx: &mut Context<Self>) {
-        let Some(target) = self.target.as_ref().filter(|target| target.locked().is_none()).map(|target| target.key.clone()) else {
+        self.owed_stop = None;
+        let Some(target) = self.record_target() else {
             return;
         };
-        if !live() {
-            return;
-        }
         ask_later(cx, Request::Record(rec::on_press(&self.recording, &target)), |_, _| {});
+    }
+
+    /// Push-to-talk, the press: record now. A press inside the previous release's grace drops
+    /// that pending stop, so the recording this press starts is not the one it ends.
+    fn mic_held_down(&mut self, _: &gpui::MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.release = None;
+        self.owed_stop = None;
+        let Some(target) = self.record_target() else {
+            return;
+        };
+        ask_later(cx, Request::Record(rec::on_hold_down(&target)), |_, _| {});
+        self.holding = Some(target);
+    }
+
+    /// Push-to-talk, the release: the stop waits out the release grace, so the word's tail is
+    /// kept with the rest. A release where no hold began is any click's, not the mic's.
+    fn mic_released(&mut self, _: &gpui::MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(held) = self.holding.take() else {
+            return;
+        };
+        let ms = u64::from(crate::gui::app::prefs::values().number(protocol::settings::PTT_RELEASE_MS).min(1000));
+        self.release = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(ms)).await;
+            let _ = this.update(cx, |this, cx| this.mic_grace_over(held, cx));
+        }));
+    }
+
+    /// The grace ran out: stop the recording of the conversation the hold began in (`held`),
+    /// while it still runs. It is that one whatever is open by now: a composer that moved on
+    /// during the grace neither leaves it running nor stops another's. The start is asked for
+    /// later and said back later still, so a quick tap ends its grace with nothing running yet:
+    /// the stop is owed then, and `recording_changed` pays it. A note that arrived already (a
+    /// quick word, or a failure) settles that debt without a stop.
+    fn mic_grace_over(&mut self, held: Key, cx: &mut Context<Self>) {
+        self.release = None;
+        match rec::on_hold_up(&self.recording, &held) {
+            Some(request) => ask_later(cx, Request::Record(request), |_, _| {}),
+            None => self.owed_stop = Some(held),
+        }
     }
 
     /// `Change::Recording`: the recording on show here, and a finished note staged as a chip so
@@ -2172,6 +2254,16 @@ impl Composer {
     /// recording in rather than taking the file with it.
     fn recording_changed(&mut self, recording: &Option<Rec>, cx: &mut Context<Self>) {
         self.recording = recording.clone();
+        if let Some(owed) = self.owed_stop.clone() {
+            match rec::on_owed_stop(recording, &owed) {
+                rec::Owed::Stop => {
+                    self.owed_stop = None;
+                    ask_later(cx, Request::Record(protocol::RecordRequest::Stop), |_, _| {});
+                }
+                rec::Owed::Paid => self.owed_stop = None,
+                rec::Owed::Wait => {}
+            }
+        }
         let on = recording.as_ref().filter(|recording| self.target.as_ref().is_some_and(|target| target.key == recording.conversation));
         cx.notify();
         let Some(recording) = on else { return };
@@ -2385,7 +2477,7 @@ impl Composer {
         let unlocked = target.locked().is_none();
         let text = self.input.read(cx).text().to_owned();
         let note = || attach::sending_note(target.key.network, &target.can, &self.tray, &text).map(|words| (words, Tone::Note));
-        let recording = rec::foot(&self.recording, &target.key, playing::now_ms());
+        let recording = rec::foot(&self.recording, &target.key, playing::now_ms(), crate::gui::app::prefs::values().on(protocol::settings::PUSH_TO_TALK));
         let said = self.caption.clone().or(recording).or_else(note).or_else(|| (unlocked && target.link == Link::Offline).then(offline));
         let hosts = if self.controls().link_chip && unlocked { niceties::link_hosts(&text) } else { Vec::new() };
         let chip = niceties::preview_words(&hosts, self.no_preview).map(|words| {

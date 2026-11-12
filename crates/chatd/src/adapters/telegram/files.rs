@@ -137,7 +137,7 @@ impl Files {
                     return;
                 }
                 // A row's picture whose row scrolled away waits for it to come back,
-                // unfetched.
+                // unfetched — still counted, so the resume cannot spend the same turn twice.
                 if want.watched && want.row.as_deref().is_none_or(|row| !row_shown(&account, row)) {
                     parked.push((Instant::now(), want));
                     continue;
