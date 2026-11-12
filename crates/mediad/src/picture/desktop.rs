@@ -1,9 +1,13 @@
-//! The desktop's pictures: OpenH264 (Cisco's binary, fetched at run time), nokhwa's camera
-//! (Media Foundation, AVFoundation, V4L2), and the screen through GDI, Core Graphics, the X11
+//! The desktop's pictures: a share or camera encoded first by the machine's own hardware
+//! through Media Foundation (`mf_encoder`, Windows), else by OpenH264 (Cisco's binary,
+//! fetched at run time), which decodes whatever arrives either way. nokhwa's camera (Media
+//! Foundation, AVFoundation, V4L2), and the screen through GDI, Core Graphics, the X11
 //! root, or the Linux desktop portal. Moved here from `picture.rs`, which keeps what phones share.
 
 use super::*;
 use crate::rt;
+#[cfg(windows)]
+use crate::mf_encoder;
 use openh264::decoder::{Decoder, DecoderConfig};
 use openh264::encoder::{BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, Level, Profile, RateControlMode, UsageType};
 use openh264::formats::YUVSource;
@@ -41,21 +45,88 @@ impl YUVSource for Planes {
 }
 
 struct Coded {
-    encoder: Encoder,
+    backend: Backend,
     width: u32,
     height: u32,
-    /// What the encoder holds now.
+    /// What the track asked at open: what a mid-share failover sets the software encoder
+    /// up with. Windows only: the failover is.
+    #[cfg(windows)]
     bps: u32,
+    #[cfg(windows)]
     fps: f32,
-    /// OpenH264 sets up on the first frame, and takes no options before that.
-    begun: bool,
+    #[cfg(windows)]
+    screen: bool,
+    /// The software encoder on its way after the hardware failed mid-share: loaded and
+    /// opened on a thread of its own, and only looked for here.
+    #[cfg(windows)]
+    takeover: Option<Takeover>,
 }
 
-impl Coded {
-    /// `bps` is also the most this encoder ever spends: [`Coded::tune`] only goes under it, and
-    /// so is `fps`. A share's encoder is level 5.1, which holds 1440p at 60, and spreads its work
-    /// over threads: one thread could not encode 1080p inside a frame at 60.
-    fn open(width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Result<Coded, String> {
+/// OpenH264 taking a track over from hardware that failed mid-share. The load is a
+/// worker's whole job: the binary's file, the download when it is not on the disk yet,
+/// the wait for it, and the encoder's open. The capture thread only looks at the channel,
+/// which never waits, so no frame touches the disk or the network for the swap.
+#[cfg(windows)]
+struct Takeover(Receiver<Result<Backend, String>>);
+
+/// How long the takeover's worker waits for the download before it gives the track up.
+#[cfg(windows)]
+const TAKEOVER_WAIT: Duration = Duration::from_secs(30);
+
+#[cfg(windows)]
+impl Takeover {
+    /// Starts the worker and returns at once. `open` runs there, again while its answer is
+    /// [`CODEC_LATER`], and never on the thread that asked.
+    fn begin(mut open: impl FnMut() -> Result<Backend, String> + Send + 'static) -> Result<Takeover, String> {
+        let (found, arrival) = channel();
+        std::thread::Builder::new()
+            .name("openh264-takeover".into())
+            .spawn(move || {
+                let began = Instant::now();
+                let opened = loop {
+                    match open() {
+                        Err(words) if words == CODEC_LATER && began.elapsed() < TAKEOVER_WAIT => std::thread::sleep(Duration::from_millis(50)),
+                        Err(words) if words == CODEC_LATER => break Err(DOWNLOAD_FAILED.to_owned()),
+                        answer => break answer,
+                    }
+                };
+                // The track may have ended while this loaded; then nobody is asking.
+                let _ = found.send(opened);
+            })
+            .map_err(|err| format!("OpenH264 could not be started to take over from the hardware encoder: {err}"))?;
+        Ok(Takeover(arrival))
+    }
+
+    /// What has arrived, without waiting: nothing while it loads, then the encoder, or
+    /// why it will not come.
+    fn look(&self) -> Option<Result<Backend, String>> {
+        match self.0.try_recv() {
+            Ok(answer) => Some(answer),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err("OpenH264 could not take over from the hardware encoder.".to_owned())),
+        }
+    }
+}
+
+/// One of the two encoders behind [`Coded`]: the machine's own hardware, or Cisco's
+/// OpenH264 when that could not be set up.
+enum Backend {
+    /// Windows Media Foundation's hardware encoders (NVIDIA, Intel, AMD), which take no
+    /// download and hardly any CPU.
+    #[cfg(windows)]
+    MediaFoundation(mf_encoder::Encoder),
+    /// The downloaded Cisco binary. It sets up on its first frame, and takes no options
+    /// before that.
+    OpenH264 { encoder: Encoder, begun: bool, bps: u32, fps: f32 },
+}
+
+impl Backend {
+    /// The OpenH264 fallback, opened the way it always was: `bps` is also the most this
+    /// encoder ever spends: [`Backend::encode`] only tunes under it, and so is `fps`. A
+    /// share's encoder is level 5.1, which holds 1440p at 60, and spreads its work over
+    /// threads: one thread could not encode 1080p inside a frame at 60. The size itself is
+    /// the first frame's, not the opener's.
+    fn open_h264(bps: u32, fps: f32, screen: bool) -> Result<Backend, String> {
         let api = load_api()?;
         let threads = if screen { std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8) as u16 } else { 1 };
         let config = EncoderConfig::new()
@@ -70,47 +141,176 @@ impl Coded {
             .complexity(if screen && fps > 30. { Complexity::Low } else { Complexity::Medium })
             .num_threads(threads);
         let encoder = Encoder::with_api_config(api, config).map_err(|err| err.to_string())?;
-        Ok(Coded { encoder, width, height, bps, fps, begun: false })
+        Ok(Backend::OpenH264 { encoder, begun: false, bps, fps })
     }
 
-    /// The rate and frame rate asked for, if they moved and the encoder can take them.
-    fn tune(&mut self, ask: &Ask) {
-        if !self.begun {
-            return;
-        }
-        if ask.bps != self.bps && ask.bps > 0 {
-            let mut info = SBitrateInfo { iLayer: SPATIAL_LAYER_ALL, iBitrate: ask.bps as i32 };
-            // SAFETY: OpenH264 reads this option as an `SBitrateInfo`, which outlives the call,
-            // and copies it. The encoder set up on its first frame.
-            let refused = unsafe { self.encoder.raw_api().set_option(ENCODER_OPTION_BITRATE, (&raw mut info).cast()) };
-            if refused == 0 {
-                self.bps = ask.bps;
-            } else {
-                tracing::warn!("mediad: the encoder refused a bitrate of {}: {refused}", ask.bps);
-            }
-        }
-        if ask.fps != self.fps && ask.fps > 0. {
-            let mut fps = ask.fps;
-            // SAFETY: as above, with a float, which is what this option is read as.
-            let refused = unsafe { self.encoder.raw_api().set_option(ENCODER_OPTION_FRAME_RATE, (&raw mut fps).cast()) };
-            if refused == 0 {
-                self.fps = ask.fps;
-            }
-        }
-    }
-
+    /// One frame in, one out. The rate and frame rate asked for, if they moved and the
+    /// encoder can take them. A keyframe is asked for when `ask` says so: with the
+    /// hardware, ahead of the frame, through the codec properties; with OpenH264, on the
+    /// encoder it holds.
     fn encode(&mut self, planes: &Planes, ask: &Ask) -> Result<Encoded, String> {
-        self.tune(ask);
-        if ask.key && self.begun {
-            self.encoder.force_intra_frame();
+        match self {
+            #[cfg(windows)]
+            Backend::MediaFoundation(encoder) => encoder.encode(planes, ask),
+            Backend::OpenH264 { encoder, begun, bps, fps } => {
+                if *begun {
+                    if ask.bps != *bps && ask.bps > 0 {
+                        let mut info = SBitrateInfo { iLayer: SPATIAL_LAYER_ALL, iBitrate: ask.bps as i32 };
+                        // SAFETY: OpenH264 reads this option as an `SBitrateInfo`, which outlives the call,
+                        // and copies it. The encoder set up on its first frame.
+                        let refused = unsafe { encoder.raw_api().set_option(ENCODER_OPTION_BITRATE, (&raw mut info).cast()) };
+                        if refused == 0 {
+                            *bps = ask.bps;
+                        } else {
+                            tracing::warn!("mediad: the encoder refused a bitrate of {}: {refused}", ask.bps);
+                        }
+                    }
+                    if ask.fps != *fps && ask.fps > 0. {
+                        let mut rate = ask.fps;
+                        // SAFETY: as above, with a float, which is what this option is read as.
+                        let refused = unsafe { encoder.raw_api().set_option(ENCODER_OPTION_FRAME_RATE, (&raw mut rate).cast()) };
+                        if refused == 0 {
+                            *fps = ask.fps;
+                        }
+                    }
+                }
+                if ask.key && *begun {
+                    encoder.force_intra_frame();
+                }
+                let stamp = Timestamp::from_millis(ask.at.as_millis() as u64);
+                let encoded = encoder.encode_at(planes, stamp).map_err(|err| err.to_string())?;
+                let key = matches!(encoded.frame_type(), FrameType::IDR | FrameType::I);
+                let bytes = encoded.to_vec();
+                *begun = true;
+                Ok(Encoded { bytes, key })
+            }
         }
-        let stamp = Timestamp::from_millis(ask.at.as_millis() as u64);
-        let encoded = self.encoder.encode_at(planes, stamp).map_err(|err| err.to_string())?;
-        let key = matches!(encoded.frame_type(), FrameType::IDR | FrameType::I);
-        let bytes = encoded.to_vec();
-        self.begun = true;
-        Ok(Encoded { bytes, key })
     }
+}
+
+impl Coded {
+    /// `bps` is also the most this encoder ever spends: a tune only goes under it, and so
+    /// is `fps`. A share's encoder is level 5.1, which holds 1440p at 60. The machine's own
+    /// hardware takes the job first when Windows lists an encoder for it ([`mf_encoder`]);
+    /// OpenH264, downloaded at run time, takes every other machine and every refusal, with
+    /// the words it has always had.
+    fn open(width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Result<Coded, String> {
+        Ok(Coded::with(Self::backend(width, height, bps, fps, screen)?, width, height, bps, fps, screen))
+    }
+
+    #[cfg(windows)]
+    fn with(backend: Backend, width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Coded {
+        Coded { backend, width, height, bps, fps, screen, takeover: None }
+    }
+
+    #[cfg(not(windows))]
+    fn with(backend: Backend, width: u32, height: u32, _bps: u32, _fps: f32, _screen: bool) -> Coded {
+        Coded { backend, width, height }
+    }
+
+    /// The machine's own hardware when Windows lists one, else OpenH264. The one place a
+    /// refusal of the hardware becomes the software encoder.
+    #[cfg(windows)]
+    fn backend(width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Result<Backend, String> {
+        if mf_encoder::choose(&mf_encoder::available()) == mf_encoder::Choice::MediaFoundation {
+            return settle(mf_encoder::Encoder::open(width, height, bps, fps, screen), || Backend::open_h264(bps, fps, screen));
+        }
+        Backend::open_h264(bps, fps, screen)
+    }
+
+    #[cfg(not(windows))]
+    fn backend(width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Result<Backend, String> {
+        Backend::open_h264(bps, fps, screen)
+    }
+
+    #[cfg(not(windows))]
+    fn encode(&mut self, planes: &Planes, ask: &Ask) -> Result<Encoded, String> {
+        self.backend.encode(planes, ask)
+    }
+
+    #[cfg(windows)]
+    fn encode(&mut self, planes: &Planes, ask: &Ask) -> Result<Encoded, String> {
+        let (bps, fps, screen) = (self.bps, self.fps, self.screen);
+        self.encode_or(planes, ask, move || Backend::open_h264(bps, fps, screen))
+    }
+
+    /// One frame through the track's encoder. The hardware failing mid-share does not end
+    /// the share: its first error hands the track to OpenH264, and `software` is how that
+    /// is opened. Opening it can mean loading Cisco's binary and, on a machine that never
+    /// fetched it, downloading it, so `software` never runs here, on the capture thread:
+    /// it is handed to a [`Takeover`] worker once, and every frame until its encoder
+    /// arrives is skipped without asking the failed hardware again. The frame that finds
+    /// the encoder swaps it in and is forced to a keyframe. A software encoder that cannot
+    /// come fails the track in its own words, as it does when a share starts.
+    #[cfg(windows)]
+    fn encode_or(&mut self, planes: &Planes, ask: &Ask, software: impl FnMut() -> Result<Backend, String> + Send + 'static) -> Result<Encoded, String> {
+        if self.takeover.is_none() {
+            if !matches!(self.backend, Backend::MediaFoundation(_)) {
+                return self.backend.encode(planes, ask);
+            }
+            match self.backend.encode(planes, ask) {
+                Ok(encoded) => return Ok(encoded),
+                Err(why) => {
+                    // Said once: the frames after this one find the takeover, not the hardware.
+                    tracing::warn!("mediad: the Media Foundation encoder failed mid-share ({why}); OpenH264 takes over with a keyframe.");
+                    self.takeover = Some(Takeover::begin(software)?);
+                }
+            }
+        }
+        let Some(takeover) = &self.takeover else {
+            return Ok(Encoded::default());
+        };
+        match takeover.look() {
+            None => Ok(Encoded::default()),
+            Some(Ok(fresh)) => {
+                self.backend = fresh;
+                self.takeover = None;
+                // The fresh encoder's first frame is a keyframe of its own; the ask is
+                // forced besides, so one that was due is not lost to the swap.
+                let forced = Ask { key: true, ..*ask };
+                self.backend.encode(planes, &forced)
+            }
+            Some(Err(why)) => Err(why),
+        }
+    }
+}
+
+/// The encoder the hardware gave, else the software one, with the refusal's words said in
+/// the log. The one place an open of the hardware becomes the fallback, whatever the
+/// refusal was: no encoder, a refused type, or a driver that would put a profile other
+/// than the baseline on the wire.
+#[cfg(windows)]
+fn settle(first: Result<mf_encoder::Encoder, String>, software: impl FnOnce() -> Result<Backend, String>) -> Result<Backend, String> {
+    match first {
+        Ok(encoder) => Ok(Backend::MediaFoundation(encoder)),
+        Err(why) => {
+            tracing::warn!("mediad: the Media Foundation encoder could not be set up ({why}); OpenH264 takes over.");
+            software()
+        }
+    }
+}
+
+/// Whether the OpenH264 binary is wanted before this track's first frame: on Windows the
+/// machine's own hardware may take the job, and then no download is needed. A decode still
+/// wants the binary whatever the send side chose, so `warm` runs on regardless.
+fn needs_openh264() -> bool {
+    #[cfg(windows)]
+    {
+        match mf_encoder::available() {
+            Ok(()) => false,
+            Err(why) => {
+                // The answer is the machine's and does not change; the frames keep asking
+                // while a slot is empty, and the words are said on the first ask only.
+                static SAID: OnceLock<()> = OnceLock::new();
+                if SAID.set(()).is_ok() {
+                    tracing::debug!("mediad: no Media Foundation encoder ({why}); OpenH264 stays the codec.");
+                }
+                true
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    true
 }
 
 /// The encoder for one track at this size: the one it has, or a new one, which starts with a
@@ -234,8 +434,8 @@ impl Cost {
 impl Outgoing {
     /// One share frame, or why the screen could not be read.
     pub fn share(&mut self, ask: Ask) -> Result<Encoded, String> {
-        // A capture is wasted until the codec loads.
-        if self.share.is_none() {
+        // A capture is wasted until the codec loads, and the hardware needs no load at all.
+        if self.share.is_none() && needs_openh264() {
             load_api()?;
         }
         let quality = super::share_quality();
@@ -266,7 +466,7 @@ impl Outgoing {
     /// The camera's two layers, high then low, or why the camera could not be read. A layer with
     /// no `Ask` is stopped: nothing is spent on it and it comes back empty.
     pub fn camera(&mut self, high: Option<Ask>, low: Option<Ask>) -> Result<(Encoded, Encoded), String> {
-        if self.high.is_none() || self.low.is_none() {
+        if (self.high.is_none() || self.low.is_none()) && needs_openh264() {
             load_api()?;
         }
         let began = Instant::now();
@@ -967,6 +1167,80 @@ pub fn probe_camera() -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// A refusal of the hardware settles on the software encoder, and the software
+    /// encoder's own answer is what the track gets: the hardware's words are said in the
+    /// log, and what comes back from the fallback is passed on whole, a refusal included.
+    /// The hardware opening is the one-line arm above it.
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_hardware_encoder_settles_on_the_software_one() {
+        let refused = Err("the hardware encoder encodes H.264 profile 100, not the baseline the SFU takes.".to_owned());
+        let Err(why) = settle(refused, || Err("OpenH264 could not be downloaded. The call stays a voice call.".to_owned())) else {
+            panic!("the software answer is the track's");
+        };
+        assert!(why.contains("OpenH264"), "{why}");
+    }
+
+    /// The hardware failing mid-share hands the load of OpenH264 to a worker: the frame
+    /// that met the failure, and every frame after it, comes back at once as a skip while
+    /// the load (here held shut, as a download in progress is) has not answered, the load
+    /// is asked for once and never runs on the thread the frames are on, and the failed
+    /// hardware is not asked again. When the load answers that the codec cannot come, the
+    /// track fails in those words.
+    #[cfg(windows)]
+    #[test]
+    fn a_hardware_failure_mid_share_never_loads_openh264_on_the_frame_thread() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (hardware, given) = mf_encoder::tests::hung();
+        let mut coded = Coded::with(Backend::MediaFoundation(hardware), 4, 4, SHARE_BPS, 30., true);
+        let planes = i420(&[255u8; 4 * 4 * 4], 4, 4, 4, 4, false);
+
+        let frames = std::thread::current().id();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let loader = Arc::new(Mutex::new(None));
+        let (release, held) = channel::<()>();
+        let software = {
+            let (loads, loader) = (loads.clone(), loader.clone());
+            move || {
+                *loader.lock().unwrap() = Some(std::thread::current().id());
+                loads.fetch_add(1, Ordering::SeqCst);
+                // The download, for as long as the test holds it.
+                let _ = held.recv();
+                Err(DOWNLOAD_FAILED.to_owned())
+            }
+        };
+
+        let first = coded.encode_or(&planes, &Ask::default(), software).expect("the failing frame is a skip, not the end of the share");
+        assert!(first.bytes.is_empty() && !first.key);
+        let offered = given();
+        for _ in 0..5 {
+            let skipped = coded.encode_or(&planes, &Ask::default(), || panic!("the load is handed over once")).expect("a frame during the load is a skip");
+            assert!(skipped.bytes.is_empty());
+        }
+        assert_eq!(given(), offered, "the failed hardware is not offered another frame");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while loads.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "the load ran once");
+        let loader = loader.lock().unwrap().expect("the load said where it ran");
+        assert_ne!(loader, frames, "and not on the thread the frames are on");
+
+        // The load answers: this one could not get the codec.
+        release.send(()).unwrap();
+        let why = loop {
+            match coded.encode_or(&planes, &Ask::default(), || panic!("the load is handed over once")) {
+                Ok(skipped) => assert!(skipped.bytes.is_empty()),
+                Err(why) => break why,
+            }
+            assert!(Instant::now() < deadline, "the load's answer reaches the track");
+            std::thread::yield_now();
+        };
+        assert_eq!(why, DOWNLOAD_FAILED);
+    }
+
     fn screen() -> Rgba {
         Rgba { width: 1920, height: 1080, pixels: vec![200; 1920 * 1080 * 4], bgra: true }
     }
@@ -1017,12 +1291,13 @@ mod tests {
     }
 
     /// A camera, or a screen, through real OpenH264: `cargo test -p mediad --lib -- --ignored`
-    /// on a machine that has the binary.
+    /// on a machine that has the binary. The software backend is opened by name, so a machine
+    /// with a hardware encoder still tests OpenH264 here.
     #[test]
     #[ignore = "needs the OpenH264 binary, which is not in the tree"]
     fn frames_survive_the_real_codec_in_bitrate_mode_and_the_rate_moves() {
         let (width, height) = (640usize, 360usize);
-        let mut outgoing = Coded::open(width as u32, height as u32, CAMERA_HIGH_BPS, FULL_FPS, false).unwrap();
+        let mut outgoing = Backend::open_h264(CAMERA_HIGH_BPS, FULL_FPS, false).unwrap();
         let mut incoming = Incoming::default();
         let (mut key, mut bytes_high, mut bytes_low) = (false, 0usize, 0usize);
         for n in 0..90usize {
