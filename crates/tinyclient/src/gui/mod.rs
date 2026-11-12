@@ -62,6 +62,28 @@ pub(crate) fn prove_health_grade() -> Result<(), &'static str> {
     }
 }
 
+/// The lab's compact-call-health driver. The Video tab's history holds video's own rates, and
+/// holds nothing for the seconds no video ran.
+pub(crate) fn prove_compact_call_health() -> Result<(), &'static str> {
+    let mut samples = std::collections::VecDeque::new();
+    let mut stats = protocol::CallStats { rtt_ms: 40, receive_kbps: 900, ..Default::default() };
+    let now = std::time::Instant::now();
+    call::health::push_chart(&mut samples, &stats, now);
+    stats.video = Some(protocol::VideoStats { send_kbps: 440, receive_kbps: 800, ..Default::default() });
+    call::health::push_chart(&mut samples, &stats, now + std::time::Duration::from_secs(1));
+    stats.video = None;
+    call::health::push_chart(&mut samples, &stats, now + std::time::Duration::from_secs(2));
+    let video: Vec<_> = samples.iter().map(|sample| sample.video_kbps).collect();
+    if video != [None, Some((440, 800)), None] {
+        return Err("the Video tab's history did not keep video's own rates");
+    }
+    if samples.iter().all(|sample| sample.rtt_ms == 40 && sample.recv_kbps == 900) {
+        Ok(())
+    } else {
+        Err("video samples changed the Connection tab's history")
+    }
+}
+
 /// The lab's cancel-join driver. A leave is accepted while a join is still in flight.
 pub(crate) fn prove_cancel_join() -> Result<(), &'static str> {
     if tiny::call_accepts(true, true) && !tiny::call_accepts(true, false) {
