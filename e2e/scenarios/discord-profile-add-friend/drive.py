@@ -94,13 +94,14 @@ def tap(point, path):
         pyautogui.click(x, y)
 
 
-try:
-    # Fail closed unless the fixture's invented stranger is the visible profile.
-    path, lines = expect('01-stranger-profile', ['Casimir Thorne', 'Add friend'], ['Cancel request'])
-    tap(find(lines, 'Add friend'), path)
-    path, lines = expect('02-request-sent', ['Request sent', 'Cancel request'], ['Add friend'])
-    tap(find(lines, 'Cancel request'), path)
-    expect('03-request-cancelled', ['Add friend'], ['Cancel request', 'Request sent'])
-except Exception as error:
-    print(error, file=sys.stderr)
-    sys.exit(1)
+if __name__ == '__main__':
+    try:
+        # Fail closed unless the fixture's invented stranger is the visible profile.
+        path, lines = expect('01-stranger-profile', ['Casimir Thorne', 'Add friend'], ['Cancel request'])
+        tap(find(lines, 'Add friend'), path)
+        path, lines = expect('02-request-sent', ['Request sent', 'Cancel request'], ['Add friend'])
+        tap(find(lines, 'Cancel request'), path)
+        expect('03-request-cancelled', ['Add friend'], ['Cancel request', 'Request sent'])
+    except Exception as error:
+        print(error, file=sys.stderr)
+        sys.exit(1)

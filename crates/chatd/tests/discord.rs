@@ -1061,6 +1061,27 @@ fn my_picture_is_the_accounts_from_ready_and_follows_a_change_to_it() {
 }
 
 #[test]
+fn friend_request_acceptance_renders_from_history_and_live_events() {
+    let accepted = json!({
+        "id": "1300000010000000020", "channel_id": "3001", "type": 67,
+        "author": {"id": "2001", "username": "mara", "global_name": "Mara Okafor", "discriminator": "0"},
+        "content": "", "timestamp": "2026-10-13T08:15:00.000000+00:00"
+    });
+    let world = World::launch(&[], |discord| discord.script("/channels/3001/messages", 200, json!([accepted])));
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    let history = wait("friend acceptance from history", || world.messages("3001").into_iter()
+        .find(|message| message.id == "1300000010000000020"));
+    assert_eq!(history.kind, MessageKind::System);
+    assert_eq!(history.text, "Mara O accepted your friend request.");
+
+    let id = world.incoming("3001", None, "", json!({"type": 67}));
+    let live = wait("live friend acceptance", || world.messages("3001").into_iter().find(|message| message.id == id));
+    assert_eq!(live.kind, MessageKind::System);
+    assert_eq!(live.text, format!("{} accepted your friend request.", live.sender.name));
+    assert!(!live.text.contains("cannot show"));
+}
+
+#[test]
 fn messages_map_to_the_one_model_and_follow_live_events() {
     let world = World::start();
     let dm = "3001";
