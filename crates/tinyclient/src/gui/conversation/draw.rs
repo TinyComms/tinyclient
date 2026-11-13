@@ -1850,10 +1850,7 @@ impl Pane {
         // A thread does not open inside a thread.
         let thread = message.thread.as_ref().filter(|_| !self.is_thread())?;
         let replies = if thread.replies == 1 { "1 reply".to_owned() } else { format!("{} replies", thread.replies) };
-        let last = match age(now(), thread.last).as_str() {
-            "now" => "Last reply just now".to_owned(),
-            ago => format!("Last reply {ago} ago"),
-        };
+        let last = last_reply_label(now(), thread.last);
         // The latest repliers, overlapped, each ringed in the color behind them.
         // Placed by hand: each a ringed 24 pt disc, 19 pt on from the one before.
         let shown = thread.participants.len().min(protocol::THREAD_FACES);
@@ -1902,7 +1899,7 @@ impl Pane {
             .when(thread.participants.is_empty(), |line| line.child(icon(Icon::Thread, 14., theme::accent_text())))
             .when(!thread.participants.is_empty(), |line| line.child(faces))
             .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::accent_text()).child(replies))
-            .child(div().type_small().text_color(theme::text_faint()).child(last))
+            .children(last.map(|last| div().type_small().text_color(theme::text_faint()).child(last)))
             .children(unread);
         Some(div().flex().child(line).into_any_element())
     }
@@ -2126,6 +2123,14 @@ fn own_face(
     message.sender.avatar.clone().or_else(account).or_else(shown)
 }
 
+/// Some networks supply a reply count before they supply a timestamp for the last reply.
+fn last_reply_label(now: i64, last: i64) -> Option<String> {
+    (last > 0).then(|| match age(now, last).as_str() {
+        "now" => "Last reply just now".to_owned(),
+        ago => format!("Last reply {ago} ago"),
+    })
+}
+
 /// A view count the way Telegram's apps say it: "987", "12.4K", "1.2M". The number is cut,
 /// not rounded, so a count never reads as more than Telegram said.
 fn views_short(views: u32) -> String {
@@ -2178,6 +2183,14 @@ mod tests {
         assert_eq!(views_short(999_999), "999.9K");
         assert_eq!(views_short(1_000_000), "1M");
         assert_eq!(views_short(1_200_000), "1.2M");
+    }
+
+    #[test]
+    fn the_last_reply_label_requires_a_known_timestamp() {
+        let now = 1_794_553_200;
+        assert_eq!(last_reply_label(now, 0), None);
+        assert_eq!(last_reply_label(now, now - 20).as_deref(), Some("Last reply just now"));
+        assert_eq!(last_reply_label(now, now - 7200).as_deref(), Some("Last reply 2h ago"));
     }
 
     #[test]

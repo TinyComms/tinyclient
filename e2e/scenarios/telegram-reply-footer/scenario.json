@@ -1,0 +1,14 @@
+{
+  "id": "telegram-reply-footer",
+  "title": "A Telegram post with an unknown reply time still shows its reply link",
+  "platforms": ["macos"],
+  "not_applicable": {
+    "windows": "This visual assertion uses the macOS lab's window text reader. The shared footer is also covered by the Rust regression test.",
+    "linux": "This visual assertion uses the macOS lab's window text reader. The shared footer is also covered by the Rust regression test.",
+    "android": "The lab's phone demo build bypasses the scripted Telegram wire.",
+    "ios": "The lab's phone demo build bypasses the scripted Telegram wire."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 40
+}

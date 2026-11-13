@@ -222,7 +222,7 @@ pub struct ThreadSummary {
     /// The thread's conversation id: what the thread pane asks `Messages` for.
     pub id: String,
     pub replies: u32,
-    /// Unix seconds of the newest reply.
+    /// Unix seconds of the newest reply, or 0 when its timestamp is unknown.
     pub last: i64,
     /// The latest people to reply, newest first, at most [`THREAD_FACES`], for their pictures.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
