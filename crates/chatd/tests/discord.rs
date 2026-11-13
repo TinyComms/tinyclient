@@ -224,7 +224,13 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             (204, Value::Null)
         }
         ("PUT", ["users", "@me", "relationships", person]) => {
-            let kind = seen.body["type"].as_u64().unwrap_or(1);
+            let kind = seen.body["type"].as_u64().unwrap_or_else(|| {
+                if seen.headers.get("x-context-properties").is_some_and(|value| {
+                    base64::engine::general_purpose::STANDARD.decode(value).ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .is_some_and(|context| context["location"] == "User Profile")
+                }) { 4 } else { 1 }
+            });
             let user = json!({"id": person, "username": "asker", "global_name": "Asker", "discriminator": "0", "avatar": null});
             shared.push("RELATIONSHIP_ADD", json!({"id": person, "type": kind, "nickname": null, "user": user}));
             (204, Value::Null)
@@ -2239,6 +2245,29 @@ fn reactions_follow_the_channels_permissions_and_what_they_refuse_never_reaches_
     assert_eq!(react("4101", &full, "🍎"), Response::Ok);
     assert_eq!(react("4105", &said, "👍"), Response::Ok);
     assert_eq!(reacted(), 2);
+}
+
+#[test]
+fn profile_friend_request_is_outgoing_and_can_be_cancelled() {
+    let world = World::start();
+    settled(&world);
+    let request = |action| world.ask(Request::Relate { person: world.key("2999"), action });
+    assert!(matches!(world.ask(Request::Relate { person: world.key("1000"), action: RelateAction::Add }), Response::Error { .. }));
+    assert!(world.discord.requests_to("PUT", "/users/@me/relationships/1000").is_empty());
+    assert_eq!(request(RelateAction::Add), Response::Ok);
+    wait("outgoing friend request", || world.people(Some(Relation::Outgoing), None).iter()
+        .any(|person| person.key.id == "2999").then_some(()));
+    let sent = world.discord.requests_to("PUT", "/users/@me/relationships/2999");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].body, json!({}));
+    assert!(matches!(request(RelateAction::Add), Response::Error { .. }));
+    assert_eq!(world.discord.requests_to("PUT", "/users/@me/relationships/2999").len(), 1);
+    assert_eq!(request(RelateAction::Cancel), Response::Ok);
+    assert!(world.people(Some(Relation::Outgoing), None).iter().all(|person| person.key.id != "2999"));
+
+    world.discord.script("/users/@me/relationships/2999", 400, json!({"message": "Requests disabled", "code": 80000}));
+    assert!(matches!(request(RelateAction::Add), Response::Error { .. }));
+    assert!(world.people(Some(Relation::Outgoing), None).iter().all(|person| person.key.id != "2999"));
 }
 
 #[test]

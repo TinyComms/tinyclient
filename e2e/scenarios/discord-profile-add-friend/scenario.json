@@ -1,0 +1,14 @@
+{
+  "id": "discord-profile-add-friend",
+  "title": "Send and cancel a friend request from a Discord profile",
+  "platforms": [
+    "windows",
+    "macos",
+    "linux",
+    "android",
+    "ios"
+  ],
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

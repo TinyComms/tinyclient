@@ -636,6 +636,7 @@ impl Demo {
             }
             Command::Relate { person_id, action, reply } => {
                 let relation = match action {
+                    RelateAction::Add => Relation::Outgoing,
                     RelateAction::Accept => Relation::Friend,
                     RelateAction::Block => Relation::Blocked,
                     RelateAction::Ignore | RelateAction::Cancel | RelateAction::Remove => Relation::None,

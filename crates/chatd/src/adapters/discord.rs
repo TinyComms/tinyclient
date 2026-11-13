@@ -650,15 +650,22 @@ impl Discord {
         self.ctx.deleted(channel, message).map_err(|err| Refusal::Refused(err.to_string()))
     }
 
-    /// Answers, withdraws or ends a friendship, or blocks. One request, and only ever here:
+    /// Sends or answers a friend request, withdraws or ends a friendship, or blocks. One request:
     /// managing friends is what Discord's anti-abuse system watches most closely.
     ///
     /// The bodies and the context header are the web client's as the community documents them,
     /// unconfirmed against a real account.
     fn relate(&self, person: &str, action: RelateAction) -> Result<(), Refusal> {
+        if action == RelateAction::Add {
+            let state = crate::hub::lock(&self.state);
+            if person == state.me || state.relations.get(person).is_some_and(|relation| *relation != Relation::None) {
+                return Err(Refusal::Refused("A friend request cannot be sent to this person.".into()));
+            }
+        }
         let path = format!("/users/@me/relationships/{person}");
         let context = |location: &str| base64::engine::general_purpose::STANDARD.encode(json!({"location": location}).to_string());
         let (method, body, location, becomes) = match action {
+            RelateAction::Add => ("PUT", Some(json!({})), "User Profile", Relation::Outgoing),
             RelateAction::Accept => ("PUT", Some(json!({})), "Friends", Relation::Friend),
             RelateAction::Block => ("PUT", Some(json!({"type": 2})), "ContextMenu", Relation::Blocked),
             RelateAction::Ignore | RelateAction::Cancel | RelateAction::Remove => ("DELETE", None, "Friends", Relation::None),

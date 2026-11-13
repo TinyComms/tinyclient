@@ -709,6 +709,7 @@ impl Shell {
 
 fn relate_failed(action: RelateAction, name: &str) -> String {
     match action {
+        RelateAction::Add => format!("Can't send a friend request to {name}"),
         RelateAction::Accept => format!("Can't accept {name}"),
         RelateAction::Ignore => format!("Can't ignore {name}"),
         RelateAction::Cancel => format!("Can't cancel the request to {name}"),

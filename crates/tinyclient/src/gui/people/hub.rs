@@ -628,6 +628,7 @@ pub trait Leaves {
 impl Leaves for RelateAction {
     fn leaves(self, before: Relation) -> Relation {
         match self {
+            RelateAction::Add => Relation::Outgoing,
             RelateAction::Accept => Relation::Friend,
             RelateAction::Ignore | RelateAction::Cancel | RelateAction::Remove => match before {
                 Relation::Blocked => Relation::Blocked,
@@ -816,7 +817,8 @@ mod tests {
 
     #[test]
     fn an_action_the_network_agreed_to_changes_what_the_person_is() {
-        use RelateAction::{Accept, Block, Cancel, Ignore, Remove};
+        use RelateAction::{Accept, Add, Block, Cancel, Ignore, Remove};
+        assert_eq!(Add.leaves(Relation::None), Relation::Outgoing);
         assert_eq!(Accept.leaves(Relation::Incoming), Relation::Friend);
         assert_eq!(Ignore.leaves(Relation::Incoming), Relation::None);
         assert_eq!(Cancel.leaves(Relation::Outgoing), Relation::None);
