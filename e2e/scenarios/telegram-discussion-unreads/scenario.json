@@ -1,0 +1,12 @@
+{
+  "id": "telegram-discussion-unreads",
+  "title": "Leaving a Telegram discussion group clears its badge and keeps direct replies",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "The lab's phone demo build bypasses chatd and cannot run the scripted Telegram wire.",
+    "ios": "The lab's phone demo build bypasses chatd and cannot run the scripted Telegram wire."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 40
+}

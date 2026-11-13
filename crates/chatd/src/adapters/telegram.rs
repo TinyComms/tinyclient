@@ -241,6 +241,13 @@ impl Account {
             return;
         }
         let learned = self.dir().learn(users, chats);
+        for chat in chats {
+            match chat {
+                tl::enums::Chat::Channel(channel) if !channel.min => self.wire.channel_membership(channel.id, !channel.left),
+                tl::enums::Chat::ChannelForbidden(channel) => self.wire.channel_membership(channel.id, false),
+                _ => {}
+            }
+        }
         for (key, note) in &learned.notes {
             self.ctx.set_note(key, note);
         }

@@ -162,17 +162,20 @@ pub(super) fn set_mute(account: &Account, conversation: &str, notify: Notify) ->
 
 /// Leaves a group or a channel; history stays on Telegram for the others.
 pub(super) fn leave(account: &Account, conversation: &str) -> Result<(), Fault> {
-    let answer = match Who::parse(conversation) {
-        Some((Who::Group(chat_id), None)) => account.ask(&tl::functions::messages::DeleteChatUser {
+    let Some((who, None)) = Who::parse(conversation) else {
+        return Err(invalid("PEER_NOT_A_GROUP"));
+    };
+    let answer = match who {
+        Who::Group(chat_id) => account.ask(&tl::functions::messages::DeleteChatUser {
             revoke_history: false,
             chat_id,
             user_id: tl::enums::InputUser::UserSelf,
         })?,
-        Some((who @ Who::Channel(_), None)) => account.ask(&tl::functions::channels::LeaveChannel { channel: account.input_channel(who)? })?,
+        Who::Channel(_) => account.ask(&tl::functions::channels::LeaveChannel { channel: account.input_channel(who)? })?,
         _ => return Err(invalid("PEER_NOT_A_GROUP")),
     };
     super::live::answered(account, &answer);
-    let _ = account.ctx.conversation_gone(conversation);
+    super::live::left(account, who);
     Ok(())
 }
 

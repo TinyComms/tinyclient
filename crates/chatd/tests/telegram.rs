@@ -1171,6 +1171,64 @@ fn a_sent_comment_lands_in_the_thread_and_the_posts_count_rises_under_its_own_id
 }
 
 #[test]
+fn a_discussion_group_stops_counting_unread_after_leaving_on_another_device() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments");
+    world.until("the post's comment section", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+    world.messages("c9001_5");
+    world.until("the comments to be writable", || world.conversation("c9001_5").filter(|row| !row.read_only));
+    world.send("c9001_5", "8001", "My comment on the first post", None);
+    world.until("the comment to be sent", || world.messages("c9001_5").into_iter().find(|m| m.state == SendState::Sent && m.outgoing));
+
+    world.steer("discussion-membership joined");
+    world.steer("discussion-comment 80 81");
+    world.until("unread activity in the joined group", || world.conversation("c9003").filter(|row| row.unread == 1));
+
+    world.steer("discussion-membership left");
+    world.steer("discussion-comment 80 84");
+    world.steer("discussion-reply");
+    let reply = world.arrived("u1271266957", "83");
+    assert_eq!(reply.sender.name, "Tobin Reyes");
+    assert!(reply.mentions_me);
+    assert_eq!(reply.forwarded.unwrap().link, "https://t.me/c/9003/82");
+    assert_eq!(world.conversation("u1271266957").map(|row| (row.unread, row.read_only)), Some((1, true)));
+    assert!(world.conversation("c9003").is_none(), "the group row came back");
+    assert!(world.message("u7001", "83").is_none(), "the notification was copied into Saved Messages");
+}
+
+#[test]
+fn a_nested_comment_lands_on_the_open_post_without_an_unread_badge_for_a_nonmember() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("comments");
+    world.until("the post's comment section", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
+    world.messages("c9001_5");
+    world.until("the discussion to be resolved", || world.conversation("c9001_5").filter(|row| !row.read_only));
+    world.watch(Watching { conversation: Some(key("c9001_5")), ..Watching::default() });
+    world.steer("discussion-comment 60 85");
+    let reply = world.arrived("c9001_5", "85");
+    assert_eq!(reply.text, "A new discussion comment");
+    assert_eq!(world.conversation("c9001_5").unwrap().unread, 0);
+    assert!(world.conversation("c9003").is_none());
+}
+
+#[test]
+fn a_cached_unread_group_left_while_offline_does_not_keep_its_badge_on_reconnect() {
+    let world = World::seed(Some(SESSION), "30", &[], |store| {
+        let group = key("c9003");
+        let row = chatd::store::ConversationRow::new("c9003", ConversationKind::Group, "Field Notes chat");
+        store.upsert_conversation(&group.account(), &row).unwrap();
+        store.set_counts(&group, 3, 0, None, t0()).unwrap();
+        store.set_name(&group.account(), "peer:c9003", "9003009\tField Notes chat").unwrap();
+    });
+    world.connected();
+    assert_eq!(world.called("GetChannels [9003]"), 1);
+    assert!(world.conversation("c9003").is_none());
+    assert!(world.conversation("c9001").is_some());
+}
+
+#[test]
 fn a_comments_reactions_document_is_asked_and_its_file_lands_for_the_chip_like_a_normal_messages_does() {
     let world = World::signed_in();
     world.connected();

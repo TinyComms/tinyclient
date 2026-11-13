@@ -907,6 +907,10 @@ impl Context {
         self.hub.store().conversation(&self.key(conversation_id))
     }
 
+    pub(crate) fn unread_telegram_groups(&self, limit: u32) -> rusqlite::Result<Vec<String>> {
+        self.hub.store().unread_telegram_groups(&self.account, limit)
+    }
+
     /// Remembers the newest message id the network named, without a preview. "Mark as read"
     /// before history has loaded acks this id.
     pub fn note_newest(&self, conversation_id: &str, message_id: &str) -> Stores {

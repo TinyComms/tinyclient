@@ -34,7 +34,10 @@ fn placed(account: &Account, raw: &tl::enums::Message) -> Option<(String, Mapped
     } else {
         None
     };
-    if !ensure.is_none_or(|(who, topic)| ensure_row(account, who, topic)) {
+    if !match ensure {
+        Some((who, topic)) => ensure_row(account, who, topic),
+        None => matches!(account.ctx.known(&conversation), Ok(Some(_))),
+    } {
         return None;
     }
     finish(account, &conversation, &mut mapped, &HashMap::new());
@@ -46,6 +49,14 @@ fn message(account: &Account, raw: &tl::enums::Message, edit: bool) {
     let Some((conversation, mut mapped)) = placed(account, raw) else {
         return;
     };
+    let watching = account.ctx.watching();
+    let open = watching.conversation.as_ref().is_some_and(|open| open.account() == account.ctx.account && open.id == conversation);
+    let member = sync::member(account, mapped.peer);
+    // Nonmembers can view comments. Only the thread on screen gets its live copy;
+    // Telegram sends a separate @replies message for anything that needs their attention.
+    if !member && !open {
+        return;
+    }
     // An edit of something never stored is not news: it would count as a new unread message.
     if edit && !matches!(account.ctx.stored_message(&conversation, &mapped.message.id), Ok(Some(_))) {
         return;
@@ -63,11 +74,14 @@ fn message(account: &Account, raw: &tl::enums::Message, edit: bool) {
             mapped.message.views = stored.views;
         }
     }
-    let _ = account.ctx.message(&conversation, &mapped.message);
+    if member {
+        let _ = account.ctx.message(&conversation, &mapped.message);
+    } else {
+        let _ = account.ctx.history(&conversation, std::slice::from_ref(&mapped.message));
+    }
     // What it shows is fetched only when the user is looking at the conversation; otherwise
     // opening it fetches the page it is on.
-    let watching = account.ctx.watching();
-    if watching.conversation.as_ref().is_some_and(|open| open.account() == account.ctx.account && open.id == conversation) {
+    if open {
         sync::reaction_emoji(account, &conversation, std::slice::from_ref(&mapped.message));
         sync::text_emoji(account, &conversation, std::slice::from_ref(&mapped.message));
         account.files.want(mapped.wants);
@@ -177,6 +191,17 @@ pub(super) fn apply(account: &Account, update: &Update) {
             read(account, &conversation, seen.max_id, seen.still_unread_count);
         }
         Update::ReadChannelInbox(seen) => read(account, &Who::Channel(seen.channel_id).text(), seen.max_id, seen.still_unread_count),
+        Update::ChatParticipantDelete(changed) if changed.user_id == account.me => left(account, Who::Group(changed.chat_id)),
+        Update::ChannelParticipant(changed) if changed.user_id == account.me => {
+            use tl::enums::ChannelParticipant;
+            if match &changed.new_participant {
+                None | Some(ChannelParticipant::Left(_)) => true,
+                Some(ChannelParticipant::Banned(banned)) => banned.left || matches!(&banned.banned_rights, tl::enums::ChatBannedRights::Rights(rights) if rights.view_messages),
+                _ => false,
+            } {
+                left(account, Who::Channel(changed.channel_id));
+            }
+        }
         // Telegram's second tick: the other side read my messages up to here.
         Update::ReadHistoryOutbox(seen) => {
             let who = Who::of(&seen.peer);
@@ -240,6 +265,14 @@ pub(super) fn apply(account: &Account, update: &Update) {
     }
 }
 
+pub(super) fn left(account: &Account, who: Who) {
+    account.dir().left(who);
+    if let Who::Channel(id) = who {
+        account.wire.channel_membership(id, false);
+    }
+    sync::remove_chat(account, who);
+}
+
 /// Applies what a request of ours changed, from its own answer: the caller reports the change
 /// before it answers the shell. The same updates also arrive in order with the rest, where
 /// recording them again changes nothing.
@@ -269,7 +302,7 @@ pub(super) fn sent(account: &Account, conversation: &str, who: Who, text: &str, 
         let me = Who::User(account.me);
         message.sender = protocol::Sender { id: me.text(), name: account.dir().name(me), ..protocol::Sender::default() };
         message.spans = content::spans(text, short.entities.as_deref().unwrap_or(&[]));
-        let mut mapped = Mapped { peer: who, id: short.id, topic: None, reply, message, wants: Vec::new() };
+        let mut mapped = Mapped { peer: who, id: short.id, topic: None, discussion_top: None, reply, message, wants: Vec::new() };
         finish(account, conversation, &mut mapped, &HashMap::new());
         return Some(mapped.message);
     }

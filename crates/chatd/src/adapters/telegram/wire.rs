@@ -111,6 +111,8 @@ pub trait Wire: Send + Sync {
     fn invoke(&self, dc: Option<i32>, body: Vec<u8>) -> Result<Vec<u8>, Fault>;
     /// The events, once: whoever takes them is the only reader.
     fn events(&self) -> Option<Receiver<Event>>;
+    /// Whether the update stream may catch up on this channel on its own.
+    fn channel_membership(&self, _id: i64, _member: bool) {}
     /// The datacenter the account lives in.
     fn home(&self) -> i32;
     /// The account turned out to live elsewhere (a sign-in was redirected).
