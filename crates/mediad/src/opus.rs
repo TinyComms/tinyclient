@@ -31,9 +31,10 @@ const LOSS_ATTACK: f32 = 0.5;
 const LOSS_RELEASE: f32 = 0.05;
 
 /// The bitrates a speaker steps down through while the server keeps missing packets, in percent
-/// of the room's, and the least it goes: below this there is no room for in-band FEC.
+/// of the room's, and the least it goes: below this, with in-band FEC planned for the loss
+/// that brought it here, libopus gives up the top of the voice's band to pay for the copies.
 const RUNGS: [i32; 3] = [100, 75, 50];
-const RUNGS_FLOOR: i32 = 16_000;
+const RUNGS_FLOOR: i32 = 24_000;
 /// Smoothed loss over this for `DOWN_AFTER` reports, one a second, is a step down; under
 /// `UP_BELOW` for `UP_AFTER`, a step back up. Wide apart, so the rate does not hunt.
 const DOWN_ABOVE: f32 = 0.08;
@@ -647,13 +648,26 @@ mod tests {
     #[test]
     fn the_ladder_keeps_under_the_room_and_over_the_floor() {
         let mut encoder = Encoder::voice().unwrap();
-        encoder.set_bitrate(Some(20_000));
+        encoder.set_bitrate(Some(32_000));
         rates(&mut encoder, &[0.2; 30]);
         assert_eq!(encoder.bitrate(), RUNGS_FLOOR);
         encoder.set_bitrate(Some(12_000));
         assert_eq!(encoder.bitrate(), 12_000, "a room under the floor is still the room");
         encoder.set_bitrate(Some(96_000));
         assert_eq!(encoder.bitrate(), 48_000, "the step down holds in a new room");
+    }
+
+    /// The ladder's last rung in an ordinary room is 24 kb/s, not 16: with FEC planned for
+    /// heavy loss, libopus at 16 kb/s gives up the top of the band to pay for the copies.
+    #[test]
+    fn the_ladder_stops_at_24_kbps() {
+        let mut ladder = Ladder::default();
+        for _ in 0..60 {
+            ladder.report(0.3);
+        }
+        assert_eq!(ladder.rung, RUNGS.len() - 1);
+        assert_eq!((ladder.rate(32_000), ladder.rate(40_000), ladder.rate(64_000)), (24_000, 24_000, 32_000));
+        assert_eq!(ladder.rate(20_000), 20_000, "a room under the floor is still the room");
     }
 
     #[test]
