@@ -6,7 +6,7 @@
     "android": "The phone proof build does not run the desktop window. The same mute mark is what the phone's list rows draw.",
     "ios": "The phone proof build does not run the desktop window. The same mute mark is what the phone's list rows draw."
   },
-  "needs": ["server"],
+  "needs": [],
   "release": false,
   "max_still_seconds": 60
 }

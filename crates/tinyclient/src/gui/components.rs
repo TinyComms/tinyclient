@@ -164,7 +164,7 @@ pub enum BadgeLook {
 
 /// The mute mark of a two-line row (`03` §4): a muted Telegram row draws the bell-off beside
 /// its quiet count, always when muted, count or not. The other networks keep the row dim
-/// only — their glyph lives on hover and in the row's menu (`01` §2, `02` F6).
+/// only — their glyph lives on hover and in the row's menu (`01` §2, `02` R8).
 pub fn mute_mark(conversation: &Conversation) -> Option<&'static str> {
     (conversation.muted && conversation.key.network == Network::Telegram).then_some("icons/bell-off.svg")
 }

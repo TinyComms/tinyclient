@@ -406,9 +406,13 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .child(line_one)
-                    .child(div().h(theme::line(16.)).flex_none().overflow_hidden().flex().items_center().gap(px(6.)).child(self.line_two(c, look, tone.preview)).children(badge))
-                    // The bell sits with the count it qualifies (`03` §4), faint as the row is.
-                    .children(mute_mark(c).map(|icon| glyph(icon, 12., faint))),
+                    .child(
+                        div().h(theme::line(16.)).flex_none().overflow_hidden().flex().items_center().gap(px(6.))
+                            .child(self.line_two(c, look, tone.preview))
+                            // The bell sits with the count it qualifies (`03` §4), faint as the row is.
+                            .children(mute_mark(c).map(|icon| glyph(icon, 12., faint)))
+                            .children(badge),
+                    ),
             );
         let (picked, menu_row) = (c.clone(), c.clone());
         list_row(row_id(id, &c.key), theme::row_height(theme::ROW_TWO), selected, focused, content)
