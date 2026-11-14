@@ -257,6 +257,8 @@ impl GuildInfo {
 struct Tree {
     groups: Vec<Group>,
     rows: Vec<ConversationRow>,
+    /// A forum's posts: recorded, but with no place in the tree (`polish/01` §3).
+    posts: Vec<ConversationRow>,
     counts: Vec<(String, u32, u32, Option<String>, i64, Option<String>)>,
 }
 
@@ -345,6 +347,15 @@ impl Discord {
             }
             rows.push(row);
         }
+        // A forum's posts are never tree rows (`polish/01` §3): the topics drill and the
+        // landing read them under the forum, so they are recorded without a place in it.
+        let forums: HashSet<&str> = guild
+            .channels
+            .iter()
+            .filter(|channel| matches!(channel.kind, model::FORUM | model::MEDIA_FORUM))
+            .map(|channel| channel.id.as_str())
+            .collect();
+        let mut posts = Vec::new();
         let mut under: HashMap<&str, i32> = HashMap::new();
         for thread in &guild.threads {
             let archived = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.archived);
@@ -354,12 +365,8 @@ impl Discord {
             if archived || !thread.is_thread() {
                 continue;
             }
-            let nth = under.entry(thread.parent_id.as_deref().unwrap_or("")).or_insert(0);
-            *nth = (*nth + 1).min(99);
             let name = thread.name.clone().unwrap_or_else(|| "Thread".to_owned());
-            rows.push(ConversationRow {
-                group: group.clone(),
-                position: position + *nth,
+            let row = ConversationRow {
                 parent: thread.parent_id.clone(),
                 // A thread started from a message has that message's id.
                 root: Some(thread.id.clone()),
@@ -369,9 +376,21 @@ impl Discord {
                     ..Filing::default()
                 }),
                 ..ConversationRow::new(&thread.id, ConversationKind::Thread, name)
+            };
+            // The server's own channels hold the tree places; a post takes none.
+            counts.push(standing(thread, None));
+            if forums.contains(thread.parent_id.as_deref().unwrap_or("")) {
+                posts.push(row);
+                continue;
+            }
+            let nth = under.entry(thread.parent_id.as_deref().unwrap_or("")).or_insert(0);
+            *nth = (*nth + 1).min(99);
+            rows.push(ConversationRow {
+                group: group.clone(),
+                position: position + *nth,
+                ..row
             });
             info.remember(&thread.id, thread.parent_id.as_deref());
-            counts.push(standing(thread, None));
         }
         let used: HashSet<&str> = rows.iter().filter_map(|row| row.group.as_deref()).collect();
         let categories = guild.channels.iter().filter(|channel| channel.kind == model::CATEGORY);
@@ -384,6 +403,7 @@ impl Discord {
         Tree {
             groups: groups.collect(),
             rows,
+            posts,
             counts,
         }
     }
@@ -393,6 +413,11 @@ impl Discord {
     fn plant(&self, guild: &Guild, info: &mut GuildInfo, me: &str, read: &HashMap<String, ReadState>) -> rusqlite::Result<()> {
         let tree = self.tree(guild, info, me, read);
         self.ctx.tree(&guild.id, &tree.groups, &tree.rows)?;
+        // A post is told alone: it holds no place in the tree, so the tree's replacement
+        // would not keep it.
+        for post in &tree.posts {
+            self.ctx.conversation(post)?;
+        }
         let now = now();
         // CONTRACT: unread state and mute are written a row at a time, each its own commit.
         // The first connect of an account with 3,000 channels is some 6,000 of them and takes
@@ -1136,7 +1161,7 @@ impl Discord {
     }
 
     /// A thread we are in, or one already listed, under its channel. An archived one leaves the
-    /// tree but keeps its messages.
+    /// tree but keeps its messages; a forum's post is recorded, and was never a tree row.
     pub(super) fn thread_changed(&self, thread: Channel, joined: bool) -> Result<(), Failure> {
         let known = self.ctx.known(&thread.id)?;
         if known.is_none() && !joined && thread.member.is_none() {
@@ -1161,11 +1186,14 @@ impl Discord {
             }),
             ..ConversationRow::new(&thread.id, ConversationKind::Thread, name)
         };
-        let archived = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.archived);
+        // An archived thread leaves the tree, and a forum's posts were never in it
+        // (`polish/01` §3): both stay recorded, read by their parent.
+        let in_tree = !thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.archived)
+            && parent.kind != ConversationKind::Forum;
         if let Some(guild) = &parent.space {
             self.ctx.set_note(&format!("guild:{}", thread.id), guild);
         }
-        if !archived {
+        if in_tree {
             row.space = parent.space.clone();
             row.group = parent.group.clone();
             row.position = parent.position + 1;
@@ -1179,7 +1207,7 @@ impl Discord {
             let note = format!("threads:{guild}");
             let before = self.ctx.note(&note).unwrap_or_default();
             let mut listed: Vec<&str> = before.split(',').filter(|id| !id.is_empty() && *id != thread.id).collect();
-            if !archived {
+            if in_tree {
                 listed.push(&thread.id);
             }
             let listed = listed.join(",");
