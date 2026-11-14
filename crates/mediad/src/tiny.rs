@@ -97,7 +97,10 @@ pub mod stages {
     use std::time::Instant;
 
     /// The stages, in the order a join reaches them; a stage is a bit of [`Clock::told`].
-    const NAMES: [&str; 7] = ["offer_built", "answer_applied", "ice_connected", "dtls_connected", "devices_open", "first_media_frame", "first_sealed_frame"];
+    /// `keys_ready` is an end-to-end encrypted call's alone: its group has keys, and until then
+    /// nothing of ours is sent and nothing of theirs is played.
+    const NAMES: [&str; 8] =
+        ["offer_built", "answer_applied", "ice_connected", "dtls_connected", "devices_open", "first_media_frame", "keys_ready", "first_sealed_frame"];
 
     /// The clock of one offer. The stages told are a bit set, so a stage already told costs one
     /// relaxed load: `mark` is on the path of every packet and every 20 ms frame, for the whole call.
@@ -157,6 +160,7 @@ pub mod stages {
             clock.begin();
             assert!(clock.mark("first_media_frame"));
             assert!(clock.mark("first_sealed_frame"));
+            assert!(clock.mark("keys_ready"), "the keys of an encrypted call are a stage of their own");
             assert!(!clock.mark("first_media_frame"), "told once");
             assert!(!clock.mark("not_a_stage"));
             // With the lock held, a stage already told must still return at once.
@@ -677,7 +681,34 @@ struct Unsealed {
 /// One receive slot: whose voice it carries, and that voice on its way to the mix.
 struct Slot {
     user: String,
+    /// `user` as the call's encryption knows them, worked out when the slot is named.
+    id: Option<u64>,
     stream: Stream,
+}
+
+impl Slot {
+    fn named(user: String, stream: Stream) -> Slot {
+        Slot { id: crate::e2ee::slot_id(&user), user, stream }
+    }
+
+    /// One opened frame of this voice, with the RTP time and arrival it came with.
+    fn hear(&mut self, time: u64, arrived: Instant, opus: Vec<u8>, deafened: bool) {
+        let stream = &mut self.stream;
+        let now = Instant::now();
+        stream.last_packet = now;
+        // The RTP clock is 48 kHz, as ours.
+        stream.arrivals.arrived(time as u32, arrived);
+        stream.heard |= opus[..] != SILENCE[..];
+        if opus[..] == SILENCE[..] {
+            stream.arrivals.paused();
+        }
+        if !deafened {
+            // The SFU writes a fresh sequence, so a lost frame is a hole in the RTP
+            // time and not in `seq_range`. The jitter buffer only sees sequence numbers.
+            stream.took(now.saturating_duration_since(arrived));
+            stream.jitter.insert(frame_sequence(time), opus);
+        }
+    }
 }
 
 struct Call {
@@ -831,10 +862,13 @@ impl Call {
         }
         for (mid, user) in held {
             match self.slots.get_mut(&mid) {
-                Some(slot) => slot.user = user,
+                Some(slot) => {
+                    slot.id = crate::e2ee::slot_id(&user);
+                    slot.user = user;
+                }
                 None => {
                     if let Some(stream) = Stream::clocked() {
-                        self.slots.insert(mid, Slot { user, stream });
+                        self.slots.insert(mid, Slot::named(user, stream));
                     }
                 }
             }
@@ -932,9 +966,10 @@ impl Call {
 
     /// Voice in, as far as the encryption will take it now.
     fn open_voice(&mut self) {
+        let deafened = self.controls.deafened.load(Ordering::Relaxed);
         while let Some(data) = self.unopened.front() {
-            let mid = data.mid.to_string();
-            if !self.slots.contains_key(&mid) {
+            let mid: &str = &data.mid;
+            if !self.slots.contains_key(mid) {
                 // Audio before the map that names its speaker: heard, and named later.
                 if self.slots.len() >= SLOTS {
                     self.unopened.pop_front();
@@ -944,37 +979,42 @@ impl Call {
                     self.unopened.pop_front();
                     continue;
                 };
-                self.slots.insert(mid.clone(), Slot { user: String::new(), stream });
+                self.slots.insert(mid.to_owned(), Slot::named(String::new(), stream));
             }
-            let Some(slot) = self.slots.get_mut(&mid) else {
+            let Some(id) = self.slots.get(mid).map(|slot| slot.id) else {
                 self.unopened.pop_front();
                 continue;
             };
             // End-to-end encryption's half of the frame transform: what does not open with
-            // its sender's key is dropped here, before the jitter buffer.
-            let Some(opened) = self.controls.try_e2ee(|e2ee| e2ee.open(&slot.user, &data.data)) else {
+            // its sender's key is dropped here, before the jitter buffer, or kept a moment for
+            // the keys of an epoch its sender reached first.
+            let (time, arrived) = (data.time.numer(), data.network_time);
+            let Some((late, opened)) = self.controls.try_e2ee(|e2ee| (e2ee.take_late(), e2ee.open_or_hold(id, &data.data, time, arrived))) else {
                 return;
             };
             let Some(data) = self.unopened.pop_front() else {
                 return;
             };
-            let Some(opus) = opened else {
-                continue;
-            };
-            let stream = &mut slot.stream;
-            let now = Instant::now();
-            stream.last_packet = now;
-            // The RTP clock is 48 kHz, as ours.
-            stream.arrivals.arrived(data.time.numer() as u32, data.network_time);
-            stream.heard |= opus[..] != SILENCE[..];
-            if opus[..] == SILENCE[..] {
-                stream.arrivals.paused();
+            self.hear_late(late, deafened);
+            if let (Some(opus), Some(slot)) = (opened, self.slots.get_mut(&*data.mid)) {
+                slot.hear(time, arrived, opus, deafened);
             }
-            if !self.controls.deafened.load(Ordering::Relaxed) {
-                // The SFU writes a fresh sequence, so a lost frame is a hole in the RTP
-                // time and not in `seq_range`. The jitter buffer only sees sequence numbers.
-                stream.took(now.saturating_duration_since(data.network_time));
-                stream.jitter.insert(frame_sequence(data.time.numer()), opus);
+        }
+    }
+
+    /// Frames a commit just opened are played though nobody speaks after them.
+    fn late_voice(&mut self) {
+        if let Some(late) = self.controls.try_e2ee(|e2ee| e2ee.take_late()) {
+            self.hear_late(late, self.controls.deafened.load(Ordering::Relaxed));
+        }
+    }
+
+    /// Frames that opened late go to their speaker's buffer at their own RTP time, so they are
+    /// played in their place or, past it, not at all.
+    fn hear_late(&mut self, late: Vec<crate::e2ee::Late>, deafened: bool) {
+        for late in late {
+            if let Some(slot) = self.slots.values_mut().find(|slot| slot.id == Some(late.id)) {
+                slot.hear(late.time, late.arrived, late.opus, deafened);
             }
         }
     }
@@ -1509,6 +1549,7 @@ impl Call {
             }
             self.seal_voice();
             self.open_voice();
+            self.late_voice();
             self.picture_step();
             // A connection str0m has given up on waits for the next one, or for the bound.
             let timeout = match self.drain() {

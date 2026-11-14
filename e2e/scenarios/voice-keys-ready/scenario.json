@@ -1,0 +1,12 @@
+{
+  "id": "voice-keys-ready",
+  "title": "An encrypted call's log says when its keys came and what the wait for them cost",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "This headless probe starts desktop mediad processes. The same encryption is in the library the phone links.",
+    "ios": "This headless probe starts desktop mediad processes. The same encryption is in the library the phone links."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 120
+}
