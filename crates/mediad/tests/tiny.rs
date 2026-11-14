@@ -1091,3 +1091,52 @@ fn a_transport_only_room_says_so_and_is_heard_in_clear() {
     leave(people, sinks);
     let _ = std::fs::remove_dir_all(keys);
 }
+
+/// The log of an end-to-end encrypted join says when the group's keys came, as a stage of the
+/// join, and what the wait for them cost each way: a call that is silent at its start can be
+/// told from one where nobody spoke. `e2e/scenarios/voice-keys-ready` runs this.
+#[test]
+fn an_encrypted_join_logs_when_its_keys_came_and_what_the_wait_cost() {
+    let sfu = Sfu::start();
+    let mut relay = Relay { mls: mls::Server::new(), epoch: 0 };
+    let names = ["ada", "bea"];
+    let sinks: Vec<PathBuf> = names.iter().map(|name| sink(&format!("keys-{name}"))).collect();
+    let keys = std::env::temp_dir().join(format!("tc-tiny-keys-{}", std::process::id()));
+    let mut people: Vec<Mediad> = sinks.iter().zip(["tone:440", "tone:550"]).map(|(sink, tone)| Mediad::saying(tone, "udp", sink)).collect();
+    let mut slots = Vec::new();
+    for (name, mediad) in names.iter().zip(&mut people) {
+        let e2ee = TinyE2ee { room_id: ROOM.into(), identity: keys.join(name).to_string_lossy().into_owned(), required: false };
+        let offer = mediad.offer_with(name, Some(e2ee));
+        let (answer, mids) = sfu.join(name, &offer);
+        done(mediad, MediaRequest::TinyAnswer { sdp: answer });
+        done(mediad, MediaRequest::TinyRoster { user_ids: names.iter().map(|name| name.to_string()).collect() });
+        slots.push(mids);
+    }
+    let (ada, rest) = people.split_first_mut().unwrap();
+    let bea = &mut rest[0];
+    for (mediad, user, mids) in [(&mut *ada, "bea", &slots[0]), (&mut *bea, "ada", &slots[1])] {
+        done(mediad, MediaRequest::TinySlots { audio: vec![TinySlot { mid: mids[0].clone(), user_id: user.into() }] });
+        mediad.event("Connected", |event| matches!(event, MediaResponse::Connected { .. }));
+    }
+    // Both talk for a while with no keys: held back, and counted.
+    relay.start(ada);
+    let bea_package = relay.start(bea);
+    sleep(Duration::from_millis(400));
+    assert_eq!(sfu.sealed("ada") + sfu.sealed("bea"), 0, "nothing is sealed before there are keys");
+    let add_bea = relay.mls.add_message(&bea_package, mediad::e2ee::group_id(ROOM), 0);
+    relay.batch(&mut [&mut *ada], &[add_bea], &mut [&mut *bea]);
+    wait_for("each plays the other's tone", || (4000. ..7000.).contains(&played_level(&sinks[0], 0.5)) && (4000. ..7000.).contains(&played_level(&sinks[1], 0.5)));
+    for mediad in [&*ada, &*bea] {
+        let log = mediad.dir.join("logs").join("mediad.log");
+        let said = |what: &str| std::fs::read_to_string(&log).unwrap_or_default().lines().find(|line| line.contains(what)).map(str::to_owned);
+        wait_for("the keys' stage and the wait in the log", || said("keys_ready").is_some() && said("keys ready; frames dropped").is_some());
+        let cost = said("keys ready; frames dropped").unwrap();
+        println!("{}\n{cost}", said("keys_ready").unwrap());
+        // Each talked into the wait, so each held frames back, and says how many.
+        let sent: u32 = cost.split("sent=").nth(1).and_then(|rest| rest.split_whitespace().next()).and_then(|count| count.parse().ok()).expect("a count");
+        assert!(sent > 0, "{cost}");
+    }
+    println!("voice-keys-proof: the join's log has the keys_ready stage and the frames the wait for keys cost");
+    leave(people, sinks);
+    let _ = std::fs::remove_dir_all(keys);
+}

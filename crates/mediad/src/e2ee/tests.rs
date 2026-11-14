@@ -523,3 +523,182 @@ fn a_poisoned_lock_fails_the_call_in_words() {
     assert_eq!(alone.status.code(), Some(2), "{alone:?}");
     assert!(String::from_utf8_lossy(&alone.stdout).contains(BROKEN), "{alone:?}");
 }
+
+fn ops(e2ee: &mut E2ee) -> Vec<String> {
+    sent(e2ee).iter().map(|frame| frame["op"].as_str().unwrap().to_owned()).collect()
+}
+
+/// Sealed by nobody: it ends as a sealed frame does and opens with no key.
+const JUNK: [u8; 14] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0xfa, 0xfa];
+
+#[test]
+fn pictures_that_do_not_open_never_rebuild_the_group() {
+    let (_, mut ada, mut bea, _) = three();
+    let junk = [0, 0, 0, 1, 0x65, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0xfa, 0xfa];
+    for _ in 0..TOLERANCE * 2 {
+        assert_eq!(bea.open_video(ADA, &junk), None);
+    }
+    assert!(sent(&mut bea).is_empty(), "a picture that will not open is not a broken group");
+    assert_eq!(bea.security().mode, SecurityMode::EndToEnd);
+    let sealed = ada.seal(TONE).unwrap();
+    assert_eq!(bea.open(ADA, &sealed).as_deref(), Some(TONE));
+}
+
+/// The tolerance is each sender's own: Cy being heard does not hide that Ada is not.
+#[test]
+fn one_voice_that_stops_opening_rebuilds_the_group_whoever_else_is_heard() {
+    let (_, _, mut bea, mut cy) = three();
+    for _ in 0..TOLERANCE {
+        assert_eq!(bea.open(ADA, &JUNK), None);
+        let fine = cy.seal(TONE).unwrap();
+        assert_eq!(bea.open(CY, &fine).as_deref(), Some(TONE));
+    }
+    assert!(sent(&mut bea).is_empty(), "within the tolerance");
+    assert_eq!(bea.open(ADA, &JUNK), None);
+    assert_eq!(ops(&mut bea), ["invalid", "key_package"]);
+}
+
+/// The server's proposals and chatd's roster come by two roads. Proposals that get here first
+/// wait for the roster that names who they add, and no longer.
+#[test]
+fn proposals_that_come_before_the_roster_are_committed_when_it_names_who_they_add() {
+    let server = mls::Server::new();
+    let group = group_id(ROOM);
+    let (mut ada, mut bea, mut cy) = (app(ADA), app(BEA), app(CY));
+    ada.roster(vec![ADA.into()]);
+    start(&server, &mut ada);
+    let (bea_package, cy_package) = (start(&server, &mut bea), start(&server, &mut cy));
+    let batch = [server.add_message(&bea_package, group, 0), server.add_message(&cy_package, group, 0)];
+    ada.frame(&json!({"type": "call.e2ee", "op": "proposals", "epoch": 0, "data": b64(&mls::append(&batch))}).to_string());
+    assert!(sent(&mut ada).is_empty(), "nobody the call does not have is committed");
+    ada.roster(vec![ADA.into(), BEA.into()]);
+    assert!(sent(&mut ada).is_empty(), "Cy is still not in the call");
+    ada.roster(vec![ADA.into(), BEA.into(), CY.into()]);
+    let commit = only(&mut ada, "commit");
+    assert_eq!(commit["epoch"], 0);
+    deliver(&mut ada, "commit", 0, &bytes(&commit, "data"));
+    deliver(&mut bea, "welcome", 1, &bytes(&commit, "welcome"));
+    deliver(&mut cy, "welcome", 1, &bytes(&commit, "welcome"));
+    let sealed = ada.seal(TONE).unwrap();
+    assert_eq!(bea.open(ADA, &sealed).as_deref(), Some(TONE));
+    assert_eq!(cy.open(ADA, &sealed).as_deref(), Some(TONE));
+    ada.roster(vec![ADA.into(), BEA.into(), CY.into()]);
+    assert!(sent(&mut ada).is_empty(), "taken once");
+}
+
+/// Cy is being removed, and Ada has applied the commit Bea has not yet: what Ada says now is
+/// sealed under an epoch Bea reaches when `commit` gets to her.
+fn ahead() -> (E2ee, E2ee, Vec<u8>) {
+    let (server, mut ada, mut bea, _) = three();
+    let remove = [server.remove_message(2, group_id(ROOM), 2)];
+    let commit = bytes(&proposals(&mut ada, &remove, 2), "data");
+    proposals(&mut bea, &remove, 2);
+    deliver(&mut ada, "commit", 2, &commit);
+    (ada, bea, commit)
+}
+
+#[test]
+fn a_frame_sealed_under_the_next_epoch_is_played_once_its_commit_is_applied() {
+    let (mut ada, mut bea, commit) = ahead();
+    let frames: Vec<Vec<u8>> = (0..3).map(|_| ada.seal(TONE).unwrap()).collect();
+    let arrived = Instant::now();
+    for (at, sealed) in frames.iter().enumerate() {
+        assert_eq!(bea.open_or_hold(slot_id(ADA), sealed, 960 * at as u64, arrived), None, "no key for it yet");
+    }
+    assert!(bea.take_late().is_empty(), "nothing opens before the commit");
+    deliver(&mut bea, "commit", 2, &commit);
+    let late = bea.take_late();
+    let times: Vec<u64> = late.iter().map(|late| late.time).collect();
+    assert_eq!(times, [0, 960, 1920], "each with its own RTP time, in order");
+    assert!(late.iter().all(|late| late.id == user_id(ADA) && late.arrived == arrived && late.opus == TONE));
+    assert!(bea.take_late().is_empty(), "played once");
+    // What comes after opens as ever, and the wait was not held against the group.
+    let next = ada.seal(TONE).unwrap();
+    assert_eq!(bea.open_or_hold(slot_id(ADA), &next, 2880, Instant::now()).as_deref(), Some(TONE));
+    assert!(bea.failures.is_empty());
+}
+
+#[test]
+fn a_held_frame_is_dropped_when_its_commit_comes_after_the_hold() {
+    let (mut ada, mut bea, commit) = ahead();
+    let sealed = ada.seal(TONE).unwrap();
+    let long_ago = Instant::now().checked_sub(HOLD + Duration::from_millis(50)).unwrap();
+    assert_eq!(bea.open_or_hold(slot_id(ADA), &sealed, 0, long_ago), None);
+    deliver(&mut bea, "commit", 2, &commit);
+    assert!(bea.take_late().is_empty(), "too old to play");
+    assert!(bea.held.is_empty(), "and not kept");
+}
+
+#[test]
+fn held_frames_are_bounded_for_each_sender_and_never_played_in_clear_or_for_another() {
+    let (mut ada, mut bea, commit) = ahead();
+    let now = Instant::now();
+    for at in 0..HELD as u64 * 3 {
+        let sealed = ada.seal(TONE).unwrap();
+        assert_eq!(bea.open_or_hold(slot_id(ADA), &sealed, 960 * at, now), None);
+        // Named for the wrong sender, in clear, or for nobody: held or not, never played.
+        assert_eq!(bea.open_or_hold(slot_id(CY), &sealed, 960 * at, now), None);
+        assert_eq!(bea.open_or_hold(slot_id(ADA), TONE, 960 * at, now), None);
+        assert_eq!(bea.open_or_hold(None, &sealed, 960 * at, now), None);
+    }
+    assert_eq!(bea.held.iter().filter(|held| held.id == user_id(ADA)).count(), HELD);
+    assert!(bea.held.len() <= HELD * 2, "{}", bea.held.len());
+    deliver(&mut bea, "commit", 2, &commit);
+    let late = bea.take_late();
+    let times: Vec<u64> = late.iter().map(|late| late.time).collect();
+    let newest: Vec<u64> = (HELD as u64 * 2..HELD as u64 * 3).map(|at| 960 * at).collect();
+    assert_eq!(times, newest, "the newest of Ada's, and nothing under Cy's name");
+    assert!(late.iter().all(|late| late.id == user_id(ADA)));
+}
+
+/// A joiner hears what was said between the commit that added it and its welcome, and the wait
+/// for keys is counted: what it could not send, and what it could not play.
+#[test]
+fn the_wait_for_keys_is_counted_each_way_and_ends_when_the_group_is_ready() {
+    let server = mls::Server::new();
+    let group = group_id(ROOM);
+    let (mut ada, mut bea) = (app(ADA), app(BEA));
+    assert_eq!(bea.seal(TONE), None, "waiting for the server");
+    start(&server, &mut ada);
+    let bea_package = start(&server, &mut bea);
+    assert_eq!(bea.seal(TONE), None, "a group with no keys yet");
+    assert_eq!(bea.seal(&SILENCE).as_deref(), Some(&SILENCE[..]));
+    let commit = proposals(&mut ada, &[server.add_message(&bea_package, group, 0)], 0);
+    deliver(&mut ada, "commit", 0, &bytes(&commit, "data"));
+    let (first, second) = (ada.seal(TONE).unwrap(), ada.seal(TONE).unwrap());
+    assert_eq!(bea.open(ADA, &first), None, "not kept: dropped");
+    assert_eq!(bea.open_or_hold(slot_id(ADA), &second, 960, Instant::now()), None);
+    assert_eq!(bea.keyless, (2, 2));
+    assert!(!bea.keyed);
+    deliver(&mut bea, "welcome", 1, &bytes(&commit, "welcome"));
+    assert!(bea.keyed, "said once the group has keys");
+    assert_eq!(bea.keyless, (0, 0), "and the count starts again");
+    let late = bea.take_late();
+    assert_eq!((late.len(), late[0].time, &late[0].opus[..]), (1, 960, TONE));
+    assert!(ada.keyed && ada.keyless == (0, 0));
+}
+
+#[test]
+fn proposals_wait_for_the_roster_only_so_long_and_only_so_many() {
+    let server = mls::Server::new();
+    let (mut ada, mut bea) = (app(ADA), app(BEA));
+    ada.roster(vec![ADA.into()]);
+    start(&server, &mut ada);
+    let add = mls::append(&[server.add_message(&start(&server, &mut bea), group_id(ROOM), 0)]);
+    let frame = json!({"type": "call.e2ee", "op": "proposals", "epoch": 0, "data": b64(&add)}).to_string();
+    for _ in 0..KEPT * 2 {
+        ada.frame(&frame);
+    }
+    assert_eq!(ada.kept.len(), KEPT);
+    ada.kept.truncate(1);
+    ada.kept[0].2 = Instant::now().checked_sub(KEEP + Duration::from_secs(1)).unwrap();
+    ada.roster(vec![ADA.into(), BEA.into()]);
+    assert!(sent(&mut ada).is_empty(), "too late: the server has built the group again by now");
+    assert!(ada.kept.is_empty());
+    // A new group forgets what waited for the old one.
+    ada.roster(vec![ADA.into()]);
+    ada.frame(&frame);
+    assert_eq!(ada.kept.len(), 1);
+    start(&server, &mut ada);
+    assert!(ada.kept.is_empty());
+}
