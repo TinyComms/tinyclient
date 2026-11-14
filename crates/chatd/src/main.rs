@@ -82,6 +82,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-exit:0");
         return Ok(());
     }
+    // The lab's encrypted-reaction driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("tiny-e2ee-reaction") {
+        if let Err(err) = chatd::adapters::tiny::prove_encrypted_reaction() {
+            eprintln!("tiny-e2ee-reaction: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
     // The lab's linkify driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("linkify") {
         if let Err(err) = chatd::adapters::tiny::prove_linkify() {

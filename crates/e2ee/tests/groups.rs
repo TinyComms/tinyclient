@@ -1,10 +1,10 @@
 mod common;
 
 use common::*;
-use e2ee::envelope::Kind;
+use e2ee::envelope::{Envelope, Kind};
 use e2ee::groups::{ProposalKind, RejectReason};
 use e2ee::identity::{DeviceKey, DeviceRecord};
-use e2ee::{Claimed, Error, UserId};
+use e2ee::{Claimed, ConversationId, Error, UserId};
 
 #[test]
 fn three_devices_add_remove_and_epoch_change() {
@@ -329,6 +329,50 @@ fn edits_are_bound_to_their_kind_target_and_author() {
             &e2ee::Envelope::message("x")
         )
         .is_err());
+
+    // A reaction names the conversation it was posted to in its authenticated data, whatever
+    // group a repair made it ride in (`encrypt_in` names another conversation than the group's
+    // own, exactly as a repaired reaction does). A receiver is refused when the two disagree.
+    let elsewhere = ConversationId::random().unwrap();
+    let reaction = Envelope {
+        text: "\u{1f44d}".into(),
+        reply_to: Some("msg-1".into()),
+        on: true,
+        ..Envelope::default()
+    };
+    let bound = world.clients[a]
+        .engine
+        .encrypt_in(conv, &elsewhere, Kind::Reaction, None, &reaction)
+        .unwrap();
+    // A receiver is refused when the conversation claimed for it disagrees, and a refusal
+    // spends no key: the same ciphertext then still opens for the conversation it names.
+    let err = world.clients[b].engine.decrypt_in(
+        conv,
+        Some(&conv),
+        &bound.ciphertext,
+        &Claimed {
+            author: Some(alice),
+            device: None,
+            kind: Kind::Reaction,
+            target_id: None,
+        },
+    );
+    assert!(matches!(err, Err(Error::AadMismatch)), "{err:?}");
+    let opened = world.clients[b]
+        .engine
+        .decrypt_in(
+            conv,
+            Some(&elsewhere),
+            &bound.ciphertext,
+            &Claimed {
+                author: Some(alice),
+                device: None,
+                kind: Kind::Reaction,
+                target_id: None,
+            },
+        )
+        .unwrap();
+    assert!(opened.envelope.on && opened.envelope.reply_to.as_deref() == Some("msg-1"));
 }
 
 #[test]

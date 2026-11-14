@@ -91,13 +91,22 @@ fn with_padding(
     Ok(changed)
 }
 
-fn aad(kind: Kind, target_id: Option<&str>) -> Vec<u8> {
+/// The authenticated data of an application message: the label, the kind, then the target id,
+/// and when `conversation` is set, a `0x00` and that conversation id after it — the same words
+/// the server checks a ciphertext against. A reaction always names its conversation, so a
+/// ciphertext cannot be replayed onto another one that keeps the same group; the server demands
+/// exactly this (`docs/e2ee-text.md`, section 8).
+fn aad_for(kind: Kind, target_id: Option<&str>, conversation: Option<&ConversationId>) -> Vec<u8> {
     let mut aad = Vec::new();
     aad.extend_from_slice(AAD_LABEL);
     aad.push(0);
     aad.extend_from_slice(kind.as_str().as_bytes());
     aad.push(0);
     aad.extend_from_slice(target_id.unwrap_or("").as_bytes());
+    if let Some(conversation) = conversation {
+        aad.push(0);
+        aad.extend_from_slice(conversation.to_string().as_bytes());
+    }
     aad
 }
 
@@ -151,8 +160,9 @@ impl Incoming {
 }
 
 impl Engine {
-    /// Encrypts a message (`Kind::Message`, no target) or an edit (`Kind::Edit`, the id of the
-    /// message it edits) for the conversation's group, in its current epoch.
+    /// Encrypts a message (`Kind::Message`, no target), an edit (`Kind::Edit`, the id of the
+    /// message it edits), or a reaction (`Kind::Reaction`, no target: the emoji and the message
+    /// it lands on are in the envelope), for the conversation's group, in its current epoch.
     ///
     /// Refused while a Remove is pending (this device's own removal included), while any
     /// proposal is pending (commit them first: [`Engine::commit_pending`]), and while a commit of
@@ -165,9 +175,36 @@ impl Engine {
         target_id: Option<&str>,
         envelope: &Envelope,
     ) -> Result<Sealed> {
+        self.encrypting(conv, (kind == Kind::Reaction).then_some(&conv), kind, target_id, envelope)
+    }
+
+    /// [`Engine::encrypt`] with the authenticated data naming `bind` instead of `conv`. A
+    /// reaction ciphertext is made in the group this conversation serves now, while the server
+    /// checks it against the conversation it was posted to (`docs/e2ee-text.md`, section 8):
+    /// after a repair the two ids differ, and a reaction can then never be replayed onto
+    /// another conversation that shares the group.
+    pub fn encrypt_in(
+        &mut self,
+        conv: ConversationId,
+        bind: &ConversationId,
+        kind: Kind,
+        target_id: Option<&str>,
+        envelope: &Envelope,
+    ) -> Result<Sealed> {
+        self.encrypting(conv, Some(bind), kind, target_id, envelope)
+    }
+
+    fn encrypting(
+        &mut self,
+        conv: ConversationId,
+        bind: Option<&ConversationId>,
+        kind: Kind,
+        target_id: Option<&str>,
+        envelope: &Envelope,
+    ) -> Result<Sealed> {
         self.repair_outbound_allowed(conv)?;
-        if (kind == Kind::Edit) != target_id.is_some() {
-            return Err(Error::Malformed("edit target"));
+        if (kind == Kind::Edit) != target_id.is_some() || (kind == Kind::Reaction && target_id.is_some()) {
+            return Err(Error::Malformed(kind.as_str()));
         }
         self.usable(conv)?;
         self.load_group(conv)?;
@@ -206,7 +243,8 @@ impl Engine {
                 return Err(Error::mls(error));
             }
         }
-        group.set_aad(aad(kind, target_id));
+        let authenticated = aad_for(kind, target_id, bind);
+        group.set_aad(authenticated);
         let message = group
             .create_message(&*provider, &identity.key, &plaintext)
             .map_err(Error::mls);
@@ -243,10 +281,27 @@ impl Engine {
         ciphertext: &[u8],
         claimed: &Claimed<'_>,
     ) -> Result<Incoming> {
+        self.decrypt_in(
+            conv,
+            (claimed.kind == Kind::Reaction).then_some(&conv),
+            ciphertext,
+            claimed,
+        )
+    }
+
+    /// [`Engine::decrypt`] with the authenticated data expected to name `bind`: a reaction
+    /// ciphertext always names the conversation it was posted to, whatever group serves it now.
+    pub fn decrypt_in(
+        &mut self,
+        conv: ConversationId,
+        bind: Option<&ConversationId>,
+        ciphertext: &[u8],
+        claimed: &Claimed<'_>,
+    ) -> Result<Incoming> {
         // Existing callers keep the lenient save: a receive that also writes opened history must
         // use [`Engine::decrypt_committed`] so a failed durable commit cannot leave only a consumed
         // ratchet.
-        let (incoming, checkpoint) = self.decrypt_open(conv, ciphertext, claimed)?;
+        let (incoming, checkpoint) = self.decrypt_open(conv, bind, ciphertext, claimed)?;
         drop(checkpoint);
         self.persist(false)?;
         Ok(incoming)
@@ -268,7 +323,8 @@ impl Engine {
     where
         F: FnOnce(&Incoming) -> Result<()>,
     {
-        let (incoming, checkpoint) = self.decrypt_open(conv, ciphertext, claimed)?;
+        let (incoming, checkpoint) =
+            self.decrypt_open(conv, (claimed.kind == Kind::Reaction).then_some(&conv), ciphertext, claimed)?;
         if let Err(error) = commit(&incoming) {
             self.provider.restore(checkpoint);
             self.groups.remove(&conv);
@@ -284,6 +340,7 @@ impl Engine {
     fn decrypt_open(
         &mut self,
         conv: ConversationId,
+        bind: Option<&ConversationId>,
         ciphertext: &[u8],
         claimed: &Claimed<'_>,
     ) -> Result<(Incoming, crate::provider::Checkpoint)> {
@@ -363,7 +420,11 @@ impl Engine {
             {
                 return Err(Error::SenderMismatch);
             }
-            if processed.aad() != aad(claimed.kind, claimed.target_id).as_slice() {
+            let binding = match claimed.kind {
+                Kind::Reaction => Some(bind.copied().unwrap_or(conv)),
+                Kind::Message | Kind::Edit => None,
+            };
+            if processed.aad() != aad_for(claimed.kind, claimed.target_id, binding.as_ref()).as_slice() {
                 return Err(Error::AadMismatch);
             }
             let mls::ProcessedMessageContent::ApplicationMessage(application) =
@@ -420,7 +481,7 @@ impl Engine {
         let group = groups.get_mut(&conv).ok_or(Error::NoGroup)?;
         let checkpoint = provider.checkpoint();
         let plaintext = Zeroizing::new(envelope.encode(Kind::Message)?);
-        group.set_aad(aad(Kind::Message, None));
+        group.set_aad(aad_for(Kind::Message, None, None));
         let message = group
             .create_message(&*provider, signer, &plaintext)
             .map_err(Error::mls)
