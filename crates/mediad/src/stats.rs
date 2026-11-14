@@ -241,9 +241,12 @@ impl Meter {
     pub fn second(&mut self, voices: impl Iterator<Item = Counts>) -> CallStats {
         let (mut received, mut lost, mut rebuilt, mut jitter) = (0, 0, 0, 0);
         let (mut steadiest, mut heard) = (u32::MAX, 0);
+        // The least any voice lost: with two or more heard, that much was lost on our own path.
+        let mut least = f32::MAX;
         for voice in voices {
             if voice.received > 0 {
                 steadiest = steadiest.min(voice.jitter_ms);
+                least = least.min(voice.lost as f32 / (voice.received + voice.lost) as f32);
                 heard += 1;
             }
             received += voice.received;
@@ -260,7 +263,7 @@ impl Meter {
         let expected = received + lost;
         let per_mille = |lost: u64| (lost * 1000).checked_div(expected).map_or(0, |permille| permille.min(1000) as u16);
         let (loss, jitter, measured) = if self.own_path {
-            let loss = self.path_loss.take();
+            let loss = self.path_loss.take().into_iter().chain((heard >= 2).then_some(least)).reduce(f32::max);
             let shared = (heard >= 2).then_some(steadiest);
             let jitter = self.uplink_jitter.take().into_iter().chain(shared).max();
             let permille = loss.map_or(0, |loss| (loss * 1000.).round().clamp(0., 1000.) as u16);
@@ -382,6 +385,19 @@ mod tests {
         let stats = meter.second([awful(90)].into_iter());
         assert_eq!((stats.loss_permille, stats.jitter_ms, stats.link_measured), (0, 0, true));
         assert_eq!(stats.voice_loss_permille, 200, "their trouble still reaches the hints about them");
+    }
+
+    /// With no video the server's own count of what reached us cannot be used, so what every
+    /// voice lost is our path's. One voice alone cannot tell whose loss it is.
+    #[test]
+    fn loss_every_voice_shares_is_mine() {
+        let mut meter = Meter::own_path(CallPath::Udp);
+        let lost = |lost| Counts { received: 100 - lost, lost, ..Counts::default() };
+        assert_eq!(meter.second([lost(20), lost(5)].into_iter()).loss_permille, 50);
+        let alone = meter.second([lost(20)].into_iter());
+        assert_eq!((alone.loss_permille, alone.link_measured), (0, false));
+        meter.path_loss(Some(0.1), None);
+        assert_eq!(meter.second([lost(20), lost(5)].into_iter()).loss_permille, 100, "the worse of the two");
     }
 
     #[test]

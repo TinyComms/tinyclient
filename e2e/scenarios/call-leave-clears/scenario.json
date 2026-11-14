@@ -1,0 +1,12 @@
+{
+  "id": "call-leave-clears",
+  "title": "Leaving a call clears it from the window, and its engine's last word does not put it back",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window.",
+    "ios": "The phone proof build does not run the desktop window."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

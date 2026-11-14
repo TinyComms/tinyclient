@@ -249,6 +249,15 @@ fn egress_loss(fraction: Option<f32>, dropped: Option<Instant>, now: Instant) ->
     fraction.filter(|_| dropped.is_none_or(|at| now.saturating_duration_since(at) > EGRESS_LOSS_SPAN))
 }
 
+/// What TWCC says we missed of what the server sent, when that can be believed. With no video
+/// for us the server holds back 255 of every 256 padding packets str0m has already numbered
+/// (tinyserver's `drain`), so alone in a room a clean path read as losing 99.6 %. While a
+/// picture is shown the server probes and they all come. Until then what every voice lost
+/// stands in ([`Meter::second`]).
+fn ingress_loss(fraction: Option<f32>, pictured: bool) -> Option<f32> {
+    fraction.filter(|_| pictured)
+}
+
 /// The jitter buffer's sequence for an RTP timestamp at 48 kHz. One 20 ms frame is 960.
 fn frame_sequence(timestamp: u64) -> u16 {
     (timestamp / FRAME as u64) as u16
@@ -911,7 +920,8 @@ impl Call {
                 let pair = stats.selected_candidate_pair.as_ref();
                 self.meter.round_trip(pair.and_then(|pair| pair.current_round_trip_time), stats.rtt);
                 let egress = egress_loss(stats.egress_loss_fraction, self.padding_dropped, Instant::now());
-                self.meter.path_loss(egress, stats.ingress_loss_fraction);
+                let ingress = ingress_loss(stats.ingress_loss_fraction, self.watching && self.shown.is_some());
+                self.meter.path_loss(egress, ingress);
                 let sent = video::Sent { media: stats.bytes_tx, video: self.video_bytes, estimate: self.estimate, loss: egress, rtt: stats.rtt };
                 self.uplink.heard(sent, Instant::now());
                 // Only host candidates are offered: the path is UDP or ICE-TCP, never a relay.
@@ -1805,6 +1815,15 @@ mod tests {
         assert_eq!(egress_loss(Some(0.1), Some(ago(1100)), now), Some(0.1), "a second of real sends");
         assert_eq!(egress_loss(Some(0.1), None, now), Some(0.1), "none ever dropped");
         assert_eq!(egress_loss(None, None, now), None);
+    }
+
+    /// Alone in a room the server sends one padding packet in 256 of those it numbered, and
+    /// the count of what we missed read 99.6 %.
+    #[test]
+    fn ingress_loss_counts_only_while_a_picture_is_shown() {
+        assert_eq!(ingress_loss(Some(255. / 256.), false), None, "padding held back, not lost");
+        assert_eq!(ingress_loss(Some(0.02), true), Some(0.02), "the server sends all it numbers");
+        assert_eq!(ingress_loss(None, true), None);
     }
 
     #[test]
