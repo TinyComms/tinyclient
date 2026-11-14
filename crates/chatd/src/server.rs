@@ -2353,7 +2353,17 @@ impl Chat {
             Request::TinyRoomRename { account, room_id, name } => adapters::tiny::rename_room(account, room_id, name),
             Request::TinyRoomDelete { account, room_id } => adapters::tiny::delete_room(account, room_id),
             Request::TinyCallJoin { account, room_id } => self.tiny_join(account, room_id),
-            Request::TinyCallLeave { account } => self.tiny_call(&account, "community.calls.join", &[], |reply| adapters::tiny::live::Ask::Leave { reply }),
+            Request::TinyCallLeave { account } => {
+                // Leaving is the person's own to do: the call ends here first, and the shell
+                // hears at once, before the server is asked or when it cannot be.
+                let left = self.hub.calls.end_in(&self.hub, &account);
+                match self.tiny_call(&account, "community.calls.join", &[], |reply| adapters::tiny::live::Ask::Leave { reply }) {
+                    // Hung up here. A server that was not told lets the seat go itself, or is
+                    // told when its socket is back (`seat_kept`).
+                    Response::Error { .. } if left => Response::Ok,
+                    answer => answer,
+                }
+            }
             Request::TinyCallKick { account, room_id, user_id } => {
                 let ids = [room_id.clone(), user_id.clone()];
                 self.tiny_call(&account, "community.calls.kick", &ids, |reply| adapters::tiny::live::Ask::Kick { room_id, user_id, reply })

@@ -119,6 +119,18 @@ pub(super) fn as_heard(seat: &TinySeat, me: bool, call: Option<&Call>) -> TinySe
     seat
 }
 
+/// The room with my seat added, when my call is up in it and the room does not list me yet (the
+/// call joins before the server says who is seated). `None` when it lists me already. Without
+/// it the stage had no tile to draw and was a blank, scrolling area.
+fn with_me(room: &TinyRoom, me: &str) -> Option<TinyRoom> {
+    if room.participants.iter().any(|seat| seat.user_id == me) {
+        return None;
+    }
+    let mut room = room.clone();
+    room.participants.push(TinySeat { user_id: me.to_owned(), ..TinySeat::default() });
+    Some(room)
+}
+
 /// Push to talk, as the pill over the call bar says it: the key to hold, or that it is held.
 #[derive(Debug, PartialEq, Eq)]
 enum Talk {
@@ -231,13 +243,14 @@ impl Shell {
         let call = self.tiny_call_here(room);
         let banner = call.as_ref().and_then(|call| self.tiny_call_banner(room, call, cx));
         let up = call.as_ref().is_some_and(|call| !matches!(call.state, CallState::Failed { .. }));
-        // Under a call that is up here the stage is never "nobody is here": chatd lists my seat
-        // while the server's word catches up, and the grid shows it.
+        // Under a call that is up here the stage is never "nobody is here", nor a grid of no
+        // tiles: my seat is drawn from the call while the server's word of it catches up.
         let seated_here = call.as_ref().is_some_and(|call| matches!(call.state, CallState::Joined | CallState::Reconnecting));
+        let seated = seated_here.then(|| with_me(room, page.me)).flatten();
         let stage: AnyElement = if room.participants.is_empty() && !seated_here {
             self.tiny_empty_stage(page, room, cx)
         } else {
-            self.tiny_stage(page, room, call.as_ref(), cx)
+            self.tiny_stage(page, seated.as_ref().unwrap_or(room), call.as_ref(), cx)
         };
         let bar = if room.participants.is_empty() && !mine && !up { None } else { Some(self.tiny_call_bar(page, room, mine || up, call.as_ref(), cx)) };
         div().size_full().flex().flex_col().children(banner).child(stage).children(bar).into_any_element()
@@ -1144,6 +1157,15 @@ mod tests {
 
     fn seat(user_id: &str) -> TinySeat {
         TinySeat { user_id: user_id.into(), ..TinySeat::default() }
+    }
+
+    #[test]
+    fn a_call_up_in_a_room_that_does_not_list_me_yet_still_has_my_tile() {
+        let mut room = TinyRoom::new("general", "General");
+        let seated = with_me(&room, "me").expect("my seat is added");
+        assert_eq!(seated.participants, [seat("me")], "the stage has a tile to draw");
+        room.participants = vec![seat("bea"), seat("me")];
+        assert!(with_me(&room, "me").is_none(), "the server's own word of my seat is the one drawn");
     }
 
     #[test]

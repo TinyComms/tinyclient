@@ -99,6 +99,9 @@ struct Live {
     /// is an engine waiting: what it says (its device list, again at every hot-plug) is learned
     /// but never drawn or announced as a call.
     adopted: bool,
+    /// The call left the slot (hang-up, leave) while its mediad was still saying its last. What
+    /// it says from then on is of a call that is over, and is not drawn.
+    over: bool,
 }
 
 /// What is said to a mediad and what it answers, one request and reply at a time. It has a lock
@@ -293,6 +296,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         room_bitrate: None,
         secured: None,
         adopted: false,
+        over: false,
     }
 }
 
@@ -442,7 +446,7 @@ impl Live {
     /// has this mediad; an engine waiting for one draws and announces nothing.
     fn hear(&mut self, event: MediaResponse) -> Option<Call> {
         let draw = self.apply(event);
-        (draw && self.adopted).then(|| self.call.clone())
+        (draw && self.adopted && !self.over).then(|| self.call.clone())
     }
 
     /// What an event from mediad does to the call. False when it changes nothing the shell draws.
@@ -666,51 +670,7 @@ impl ActiveCall {
                         let _ = reply.send(frame);
                         continue;
                     }
-                    if let MediaResponse::DeviceList { inputs, outputs } = &frame {
-                        learn_devices(&reader, inputs, outputs);
-                    }
-                    // A frame for the server: the adapter of the call's account sends it.
-                    if let MediaResponse::TinyE2ee { frame } = &frame {
-                        let conversation = crate::hub::lock(&seen).call.conversation.clone();
-                        reader.calls.signal(&conversation, frame.clone());
-                        continue;
-                    }
-                    if let MediaResponse::TinyRenegotiate { sdp } = &frame {
-                        let conversation = crate::hub::lock(&seen).call.conversation.clone();
-                        reader.calls.offer(&conversation, sdp.clone());
-                        continue;
-                    }
-                    let notify = match &frame {
-                        MediaResponse::Interrupted => Some(false),
-                        MediaResponse::Connected { .. } => Some(true),
-                        _ => None,
-                    };
-                    let mut live = crate::hub::lock(&seen);
-                    let conversation = live.call.conversation.clone();
-                    let call = live.hear(frame);
-                    let adopted = live.adopted;
-                    let state_now = live.call.state.clone();
-                    drop(live);
-                    // Outside the call lock. A drop while already reconnecting does not redraw, and
-                    // still has to be resumed; the first connect is not one.
-                    if adopted && conversation.network == protocol::Network::Tiny {
-                        match notify {
-                            Some(false) if matches!(state_now, CallState::Reconnecting) => {
-                                reader.calls.tiny_down(&conversation)
-                            }
-                            Some(true) => {
-                                reader.calls.joined(&conversation);
-                                reader.calls.tiny_up(&conversation)
-                            }
-                            _ => {}
-                        }
-                    }
-                    if let Some(call) = call {
-                        reader.changed(Change::Call {
-                            call: Some(call),
-                            ring: reader.calls.aside(),
-                        });
-                    }
+                    heard(&reader, &seen, frame);
                 }
                 reader.calls.reap(&reader, id);
             })?;
@@ -780,8 +740,70 @@ impl Handle {
     }
 }
 
+/// Something mediad said that is no reply, taken into its call `seen` and passed on: to the
+/// shell when it changes what is drawn, to the call's adapter when it is for the network.
+fn heard(hub: &Hub, seen: &Mutex<Live>, frame: MediaResponse) {
+    if let MediaResponse::DeviceList { inputs, outputs } = &frame {
+        learn_devices(hub, inputs, outputs);
+    }
+    // mediad says its last while it shuts down (I stopped speaking, most often). The call was
+    // hung up: nothing of it is sent, joined again or drawn.
+    if crate::hub::lock(seen).over {
+        return;
+    }
+    // A frame for the server: the adapter of the call's account sends it.
+    if let MediaResponse::TinyE2ee { frame } = &frame {
+        let conversation = crate::hub::lock(seen).call.conversation.clone();
+        hub.calls.signal(&conversation, frame.clone());
+        return;
+    }
+    if let MediaResponse::TinyRenegotiate { sdp } = &frame {
+        let conversation = crate::hub::lock(seen).call.conversation.clone();
+        hub.calls.offer(&conversation, sdp.clone());
+        return;
+    }
+    let notify = match &frame {
+        MediaResponse::Interrupted => Some(false),
+        MediaResponse::Connected { .. } => Some(true),
+        _ => None,
+    };
+    let mut live = crate::hub::lock(seen);
+    let conversation = live.call.conversation.clone();
+    let call = live.hear(frame);
+    let adopted = live.adopted && !live.over;
+    let state_now = live.call.state.clone();
+    drop(live);
+    // Outside the call lock. A drop while already reconnecting does not redraw, and
+    // still has to be resumed; the first connect is not one.
+    if adopted && conversation.network == protocol::Network::Tiny {
+        match notify {
+            Some(false) if matches!(state_now, CallState::Reconnecting) => hub.calls.tiny_down(&conversation),
+            Some(true) => {
+                hub.calls.joined(&conversation);
+                hub.calls.tiny_up(&conversation)
+            }
+            _ => {}
+        }
+    }
+    if let Some(call) = call {
+        draw(hub, seen, call);
+    }
+}
+
+/// Tells the shell the call a mediad just changed. A hang-up may have taken the slot and told
+/// the shell between that change and this telling, and the shell keeps the last it hears: what
+/// the slot holds now is said after, so a call that is over does not stay drawn.
+fn draw(hub: &Hub, seen: &Mutex<Live>, call: Call) {
+    hub.changed(Change::Call { call: Some(call), ring: hub.calls.aside() });
+    if crate::hub::lock(seen).over {
+        hub.calls.tell(hub);
+    }
+}
+
 impl Drop for ActiveCall {
     fn drop(&mut self) {
+        // Whatever took it from the slot, its last words are of a call that is over.
+        crate::hub::lock(&self.live).over = true;
         // Closing stdin is the hang-up. Kill only if mediad ignores it.
         crate::hub::lock(&self.pipe).stdin.take();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -808,6 +830,14 @@ impl Slot {
     /// The way to ask that mediad, to be used after the slot is let go of.
     fn handle(&mut self) -> Option<Handle> {
         self.running().map(|active| active.handle())
+    }
+
+    /// This call has left the slot: its mediad's last words are not drawn (`Live::over`). Said
+    /// before the shell is told the slot is empty, so nothing of the call follows that.
+    fn over(&self) {
+        if let Slot::Active(active) = self {
+            crate::hub::lock(&active.live).over = true;
+        }
     }
 
     /// A call that failed needs no mediad: the failure stays, the process goes. Gives the mediad
@@ -1439,6 +1469,7 @@ impl Calls {
     pub fn end(&self, hub: &Hub) -> Option<Key> {
         self.cue_if_joined(hub, None);
         let slot = std::mem::take(&mut *crate::hub::lock(&self.slot));
+        slot.over();
         let ended = match &slot {
             Slot::Idle => return None,
             Slot::Shown(live) => live.call.conversation.clone(),
@@ -1917,6 +1948,7 @@ impl Calls {
             if !matches { return; }
             std::mem::take(&mut *slot)
         };
+        ended.over();
         self.tell(hub);
         drop(ended);
     }
@@ -1938,9 +1970,24 @@ impl Calls {
             }
             std::mem::take(&mut *slot)
         };
+        ended.over();
         self.tell(hub);
         drop(ended);
         true
+    }
+
+    /// Ends the call `account` is in, when the person leaves it from that account's own page:
+    /// here and at once, whatever its network then answers. A ring is not a call to leave. True
+    /// if there was one.
+    pub fn end_in(&self, hub: &Hub, account: &protocol::AccountKey) -> bool {
+        let (call, _) = self.describe();
+        let Some(call) = call.filter(|call| call.conversation.account() == *account) else {
+            return false;
+        };
+        if matches!(call.state, CallState::RingingIn { .. } | CallState::RingingOut) {
+            return false;
+        }
+        self.end_if(hub, &call.conversation)
     }
 
     /// Stores the leave chime before mediad is dropped. Hang-up closes its input, and a cue
@@ -1993,6 +2040,49 @@ fn learn_devices(hub: &Hub, inputs: &[AudioDevice], outputs: &[AudioDevice]) {
     }
 }
 
+/// The lab's call-leave-clears driver. Leaving a call tells the shell there is none, and what
+/// its mediad says while shutting down does not put the call back on screen: read through
+/// this build's own hub, the way the shell reads it. A build from before the fix told the
+/// shell of the call again, and it stayed drawn with nobody in it.
+pub fn prove_call_leave_clears() -> Result<(), String> {
+    let store = crate::store::Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?;
+    let hub = Hub::new(store);
+    let told = |since: u64| {
+        let (_, _, changes) = hub.wait(since, Duration::ZERO);
+        changes.into_iter().rev().find_map(|change| match change {
+            Change::Call { call, .. } => Some(call),
+            _ => None,
+        })
+    };
+    let conversation = Key { network: protocol::Network::Tiny, account: "me".into(), id: "general".into() };
+    let mut call = new_call(conversation, CallState::Joined);
+    call.adopted = true;
+    call.me = "me".into();
+    let seen = Mutex::new(call);
+    let speaking = |on| MediaResponse::Speaking { user_id: "me".into(), speaking: on };
+
+    let since = hub.seq();
+    heard(&hub, &seen, speaking(true));
+    if !matches!(told(since), Some(Some(_))) {
+        return Err("a call that is up was not drawn as it changed".to_owned());
+    }
+    // The hang-up: the slot is empty and the shell is told. Then mediad's last word comes.
+    crate::hub::lock(&seen).over = true;
+    hub.calls.tell(&hub);
+    let since = hub.seq();
+    heard(&hub, &seen, speaking(false));
+    if told(since).is_some() {
+        return Err("mediad's last word told the shell of a call that is over".to_owned());
+    }
+    // The hang-up fell between that word being taken in and its telling.
+    let stale = crate::hub::lock(&seen).call.clone();
+    draw(&hub, &seen, stale);
+    if told(since) != Some(None) {
+        return Err("the shell was left with a call that is over".to_owned());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2009,6 +2099,82 @@ mod tests {
 
     fn person(id: &str) -> Participant {
         Participant { id: id.into(), name: id.to_uppercase(), ..Participant::default() }
+    }
+
+    /// mediad says a last word while it shuts down (who stopped speaking, its devices). After a
+    /// hang-up took the call from the slot, that word would put a call that is over back on
+    /// screen, where it stayed with nobody in it.
+    #[test]
+    fn what_mediad_says_after_a_hang_up_is_not_drawn() {
+        let mut call = live(CallState::Joined);
+        call.adopted = true;
+        call.me = "me".into();
+        let speaking = |on| MediaResponse::Speaking { user_id: "me".into(), speaking: on };
+        assert!(call.hear(speaking(true)).is_some(), "a call that is up draws who speaks");
+        call.over = true;
+        assert!(call.hear(speaking(false)).is_none(), "one that is over draws nothing");
+    }
+
+    fn memory_hub() -> Hub {
+        Hub::new(crate::store::Store::open(std::path::Path::new(":memory:")).unwrap())
+    }
+
+    /// The call the shell was last told of, among what changed after `since`.
+    fn told(hub: &Hub, since: u64) -> Option<Option<Call>> {
+        let (_, _, changes) = hub.wait(since, Duration::ZERO);
+        changes.into_iter().rev().find_map(|change| match change {
+            Change::Call { call, .. } => Some(call),
+            _ => None,
+        })
+    }
+
+    /// Leaving a room alone in it: the slot is emptied and the shell told, then mediad, shutting
+    /// down, says I stopped speaking. That word must not tell the shell of the call again.
+    #[test]
+    fn the_last_words_of_a_mediad_hung_up_on_do_not_put_its_call_back() {
+        let hub = memory_hub();
+        let mut call = live(CallState::Joined);
+        call.adopted = true;
+        call.me = "me".into();
+        call.call.speaking = true;
+        let seen = Mutex::new(call);
+        let speaking = |on| MediaResponse::Speaking { user_id: "me".into(), speaking: on };
+
+        let since = hub.seq();
+        heard(&hub, &seen, speaking(false));
+        assert!(matches!(told(&hub, since), Some(Some(_))), "a call that is up is drawn as it changes");
+
+        // What `Calls::end` and `end_if` do with an empty slot behind them.
+        crate::hub::lock(&seen).over = true;
+        hub.calls.tell(&hub);
+        let since = hub.seq();
+        heard(&hub, &seen, speaking(true));
+        assert_eq!(told(&hub, since), None, "nothing is told of a call that is over");
+
+        // The hang-up fell between mediad's word being taken in and its telling.
+        let stale = crate::hub::lock(&seen).call.clone();
+        draw(&hub, &seen, stale);
+        assert_eq!(told(&hub, since), Some(None), "the shell is left with the empty slot");
+    }
+
+    /// Leave on a server's page ends the call there without the server: any state but a ring.
+    #[test]
+    fn leaving_from_the_page_ends_that_accounts_call_and_no_other() {
+        let hub = memory_hub();
+        let show = |state| *crate::hub::lock(&hub.calls.slot) = Slot::Shown(Box::new(live(state)));
+        let here = live(CallState::Joined).call.conversation.account();
+        let other = protocol::AccountKey { account: "someone else".into(), ..here.clone() };
+
+        show(CallState::Joined);
+        assert!(!hub.calls.end_in(&hub, &other), "another account's call stays");
+        assert!(hub.calls.describe().0.is_some());
+        let since = hub.seq();
+        assert!(hub.calls.end_in(&hub, &here));
+        assert_eq!(told(&hub, since), Some(None), "the shell hears at once");
+
+        show(CallState::RingingOut);
+        assert!(!hub.calls.end_in(&hub, &here), "a ring is not left from the page");
+        assert!(hub.calls.describe().0.is_some());
     }
 
     #[test]
