@@ -3,7 +3,7 @@
 //! one the name, its context and the time, line two what happened last and one badge.
 
 use super::row_id;
-use crate::gui::components::{glyph, list_row, pair_or, row_badge, row_tone, tint_from, topic_fill, Avatar, Shape};
+use crate::gui::components::{badge_look, glyph, list_row, mute_mark, pair_or, row_badge, row_tone, tint_from, topic_fill, Avatar, Shape};
 use crate::gui::layout::Menu;
 use crate::gui::people::presence;
 use crate::gui::state::Shell;
@@ -406,7 +406,9 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .child(line_one)
-                    .child(div().h(theme::line(16.)).flex_none().overflow_hidden().flex().items_center().gap(px(6.)).child(self.line_two(c, look, tone.preview)).children(badge)),
+                    .child(div().h(theme::line(16.)).flex_none().overflow_hidden().flex().items_center().gap(px(6.)).child(self.line_two(c, look, tone.preview)).children(badge))
+                    // The bell sits with the count it qualifies (`03` §4), faint as the row is.
+                    .children(mute_mark(c).map(|icon| glyph(icon, 12., faint))),
             );
         let (picked, menu_row) = (c.clone(), c.clone());
         list_row(row_id(id, &c.key), theme::row_height(theme::ROW_TWO), selected, focused, content)
@@ -437,6 +439,35 @@ impl Shell {
             .children(trailing);
         list_row(id, theme::row_height(theme::ROW_ONE), false, focused, content)
     }
+}
+
+/// The lab's telegram-mute-bell driver (`03` §4): a muted Telegram row draws the bell-off beside
+/// its quiet count, always when muted, count or not, and a muted row of another network stays
+/// dim only. These are the two reads `chat_row` draws its line two from.
+pub(crate) fn prove_telegram_mute_bell() -> Result<(), &'static str> {
+    let of = |network: Network, unread: u32| {
+        let key = Key { network, account: "me".into(), id: "c".into() };
+        let mut row = Conversation::new(key, ConversationKind::Group, "Fernhill");
+        row.muted = true;
+        row.unread = unread;
+        row
+    };
+    let telegram = of(Network::Telegram, 3);
+    if mute_mark(&telegram) != Some("icons/bell-off.svg") {
+        return Err("a muted Telegram row draws no bell-off");
+    }
+    if badge_look(&telegram) != crate::gui::components::BadgeLook::Quiet(3) {
+        return Err("a muted Telegram row's unread is not drawn quiet");
+    }
+    // Muted with nothing to read: the bell stays, the count slot collapses.
+    if mute_mark(&of(Network::Telegram, 0)) != Some("icons/bell-off.svg") {
+        return Err("a muted Telegram row with no unread still draws no bell-off");
+    }
+    let discord = of(Network::Discord, 7);
+    if mute_mark(&discord).is_some() || badge_look(&discord) != crate::gui::components::BadgeLook::None {
+        return Err("a muted row of another network is not dim only");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
