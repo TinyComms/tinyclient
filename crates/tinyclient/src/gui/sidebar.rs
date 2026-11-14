@@ -955,10 +955,11 @@ impl Shell {
         if row.kind == ConversationKind::Forum && matches!(row.key.network, Network::Telegram | Network::Discord) {
             self.drill(home::Drill::Topics(Rc::new(row.clone())), cx);
             // The topics drill reads what the store holds; opening the forum asks once for
-            // the landing, which is also what reads the topics from the network. Telegram
-            // lands on the newest unread topic, else General (`03` §2); Discord lands on its
-            // newest activity post (`01` §3, N14). The network catching up behind a later
-            // open cannot loop a change back into a request.
+            // the landing. Telegram lists its topics only on demand, and lands on the newest
+            // unread topic, else General (`03` §2); Discord's posts came on the socket, so
+            // the ask is answered from the store and lands on the newest activity post
+            // (`01` §3, N14). The network catching up behind a later open cannot loop a
+            // change back into a request.
             let forum = row.key.clone();
             // Only this visit may choose the landing. Opening another forum (including this
             // same one again), picking a topic, or leaving the drill supersedes its reply.

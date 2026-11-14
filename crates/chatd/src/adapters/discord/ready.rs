@@ -341,8 +341,10 @@ impl Discord {
             };
             placed.insert(&channel.id, (row.group.clone(), row.position));
             info.remember(&channel.id, channel.parent_id.as_deref());
-            // A voice channel's chat and a forum's newest post are not "unread" in the tree.
-            if matches!(row.kind, ConversationKind::Channel | ConversationKind::Announcement) {
+            // A voice channel's chat is not "unread" in the tree. A forum's own marker is:
+            // its posts hold no row to carry a badge, so the forum itself counts them, and a
+            // collapsed category never hides something that needs me (`polish/01` §2).
+            if matches!(row.kind, ConversationKind::Channel | ConversationKind::Announcement | ConversationKind::Forum) {
                 counts.push(standing(channel, Some(info.joined)));
             }
             rows.push(row);

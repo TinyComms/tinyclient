@@ -49,6 +49,7 @@
       {"id": "4102", "last_message_id": "1300000000000000200", "mention_count": 0, "flags": 1},
       {"id": "4104", "last_message_id": "1300000000000000250", "mention_count": 0, "flags": 1},
       {"id": "4105", "last_message_id": "1300000000000000350", "mention_count": 0, "flags": 1},
+      {"id": "4106", "last_message_id": "1300000000000000600", "mention_count": 0, "flags": 0},
       {"id": "4601", "last_message_id": "1300000000000000900", "mention_count": 0, "flags": 0},
       {"id": "5001", "last_message_id": 0, "mention_count": 0, "flags": 1},
       {"id": "1000", "read_state_type": 1, "last_acked_id": "55", "badge_count": 3}
@@ -137,7 +138,7 @@
           {"id": "4000", "type": 0, "allow": "0", "deny": "1024"},
           {"id": "4010", "type": 0, "allow": "1024", "deny": "0"}
         ]},
-        {"id": "4106", "type": 15, "name": "help", "position": 4, "parent_id": "4100", "last_message_id": "1300000000000000600", "permission_overwrites": []},
+        {"id": "4106", "type": 15, "name": "help", "position": 4, "parent_id": "4100", "last_message_id": "1300080000000000000", "permission_overwrites": []},
         {"id": "4201", "type": 2, "name": "Lounge", "position": 0, "parent_id": "4200", "bitrate": 64000, "user_limit": 12, "permission_overwrites": []},
         {"id": "4202", "type": 13, "name": "Town hall", "position": 1, "parent_id": "4200", "bitrate": 64000, "user_limit": 0, "permission_overwrites": []},
         {"id": "4105", "type": 0, "name": "rules", "position": 0, "parent_id": null, "last_message_id": "1300000000000000400", "permission_overwrites": []},

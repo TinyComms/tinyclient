@@ -648,7 +648,7 @@ pub fn attach(hub: &Arc<Hub>) -> Vec<(AccountKey, Adapter)> {
 /// before the change lands on the newest unread post instead, and the proof fails there.
 pub fn prove_discord_forum_landing() -> Result<(), String> {
     let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
-    let mut store = Store::open(&dir.path().join("store.db")).map_err(|err| err.to_string())?;
+    let mut store = Store::open(&dir.path().join("chat.sqlite")).map_err(|err| err.to_string())?;
     seed(&mut store, dir.path(), Mode::default()).map_err(|err| err.to_string())?;
     let account = discord::account();
 

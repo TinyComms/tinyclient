@@ -1573,9 +1573,9 @@ impl Store {
 
     /// The topic of a forum that opening it lands on, as a page of one. Telegram lands on the
     /// newest unread (a mention counts as unread here, as everywhere), else General, its own
-    /// first topic (`polish/03` §2). Discord lists a forum's posts active first (`polish/01` §3,
-    /// N14), so its landing is the newest-activity post, read or not. Empty until a read of the
-    /// topics has left rows.
+    /// first topic (`polish/03` §2), once its topics were asked of the network. Discord's posts
+    /// leave the rows at READY (`polish/01` §3, N14), so its landing reads them here and is the
+    /// newest-activity post, read or not. Empty until those rows exist.
     pub fn landing(&self, forum: &Key) -> rusqlite::Result<(Vec<Conversation>, u32)> {
         let belongs = "c.network = ?1 AND c.account = ?2 AND c.parent = ?3 AND NOT c.hidden";
         let sql = |where_more: &str| format!("{CONVERSATION} WHERE {belongs} {where_more} LIMIT 1");

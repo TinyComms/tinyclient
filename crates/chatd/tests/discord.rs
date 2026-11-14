@@ -1058,6 +1058,81 @@ fn a_forum_opens_on_the_newest_activity_post_and_its_posts_are_no_tree_rows() {
     // in the topics drill and the landing.
     let (_, rows) = world.tree("4000");
     assert_eq!(ids(&rows), ["4105", "4101", "4500", "4102", "4104", "4106", "4201", "4202"]);
+    // The forum row itself carries its posts' unread, so a collapsed category never hides
+    // something that needs me (`polish/01` §2): read up to 600, its posts have gone past it.
+    let forum = rows.iter().find(|row| row.key.id == "4106").unwrap();
+    assert_eq!((forum.unread, forum.mentions), (1, 0), "{forum:?}");
+}
+
+#[test]
+fn a_post_arriving_while_connected_is_recorded_under_its_forum_never_as_a_row() {
+    let world = World::start();
+    // A post of the help forum opens while we are connected, and its starter message follows
+    // it, as Discord sends them.
+    world.discord.push("THREAD_CREATE", json!({
+        "id": "4603", "type": 11, "name": "Resprayed fence post, same lichen?", "parent_id": "4106", "owner_id": "2002",
+        "last_message_id": "1300080000000000100", "message_count": 1, "member_count": 2,
+        "thread_metadata": {"archived": false, "auto_archive_duration": 1440, "archive_timestamp": "2024-10-22T00:00:00+00:00", "locked": false},
+        "member": {"flags": 1, "join_timestamp": "2024-10-22T00:00:00+00:00", "muted": false}
+    }));
+    world.incoming("4603", Some("4000"), "That is the same post from March. Still Lecanora, still fine.", json!({}));
+
+    // It is read under the forum: the topics drill lists it by its activity, and the landing
+    // is its own newest activity, though the tree never grows a row for it (`polish/01` §3).
+    let drill = || world.ask(Request::Topics { forum: world.key("4106"), offset: 0, limit: 10, landing: false });
+    let posts = wait("the post recorded under the forum", || match drill() {
+        Response::Conversations { conversations, total, .. } if conversations.len() == 3 && total == 3 => Some(conversations),
+        _ => None,
+    });
+    assert_eq!(ids(&posts), ["4603", "4602", "4601"], "{posts:?}");
+    let landing = Request::Topics { forum: world.key("4106"), offset: 0, limit: 1, landing: true };
+    let Response::Conversations { conversations, .. } = world.ask(landing) else {
+        panic!("no landing");
+    };
+    assert_eq!(ids(&conversations), ["4603"]);
+    let (_, rows) = world.tree("4000");
+    assert_eq!(ids(&rows), ["4105", "4101", "4500", "4102", "4104", "4106", "4201", "4202"]);
+}
+
+#[test]
+fn a_post_the_tree_used_to_list_loses_its_place_at_the_next_connect_and_keeps_its_messages() {
+    let mut world = World::start();
+    // A message in the post, stored while the build before this one still had it in the tree.
+    let said = world.incoming("4601", Some("4000"), "Bench plank, creek side, yellow rim.", json!({}));
+    wait("the post's message", || (!world.messages("4601").is_empty()).then_some(()));
+
+    // The build before left the post standing in the tree and its id in the note. The store is
+    // bent to that shape while chatd is over, the way an upgrade finds it.
+    let _ = world.child.kill();
+    let _ = world.child.wait();
+    let _ = std::fs::remove_file(world.dir.join("chat.sock"));
+    let db = rusqlite::Connection::open(world.dir.join("chat.sqlite")).unwrap();
+    let placed = db
+        .execute(
+            "UPDATE conversation SET space = '4000', section = '4100', position = 46
+              WHERE network = 'discord' AND account = '1000' AND id = '4601'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(placed, 1, "the post's row is in the store");
+    db.execute(
+        "INSERT OR REPLACE INTO name (network, account, id, value) VALUES ('discord', '1000', 'threads:4000', '4500,4601')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    world.child = world.spawn();
+    wait("chatd to open its socket again", || ChatStream::connect(&world.dir.join("chat.sock")).ok());
+    wait("the account to connect again", || (world.link() == Link::Connected).then_some(()));
+
+    // The next READY took the place away, and kept the post and what it holds.
+    let (_, rows) = world.tree("4000");
+    assert_eq!(ids(&rows), ["4105", "4101", "4500", "4102", "4104", "4106", "4201", "4202"]);
+    let post = world.conversation("4601");
+    assert_eq!((post.kind, post.parent.as_deref()), (ConversationKind::Thread, Some("4106")));
+    assert_eq!(post.group, None, "the tree place is gone");
+    let kept = world.messages("4601");
+    assert_eq!(kept.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(), [said.as_str()]);
 }
 
 #[test]
