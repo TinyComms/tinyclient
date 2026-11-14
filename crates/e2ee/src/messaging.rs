@@ -91,8 +91,9 @@ fn with_padding(
     Ok(changed)
 }
 
-/// `aad`, and when `conversation` is set, a `0x00` and that conversation id after it — the same
-/// words the server checks a ciphertext against. A reaction always names its conversation, so a
+/// The authenticated data of an application message: the label, the kind, then the target id,
+/// and when `conversation` is set, a `0x00` and that conversation id after it — the same words
+/// the server checks a ciphertext against. A reaction always names its conversation, so a
 /// ciphertext cannot be replayed onto another one that keeps the same group; the server demands
 /// exactly this (`docs/e2ee-text.md`, section 8).
 fn aad_for(kind: Kind, target_id: Option<&str>, conversation: Option<&ConversationId>) -> Vec<u8> {
