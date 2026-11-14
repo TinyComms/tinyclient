@@ -1407,8 +1407,6 @@ mod tests {
         let group = active.group_id.to_string();
         let user = device.saved.user_id.clone();
         let own_id = device.engine().unwrap().device_id().to_string();
-        let user = device.saved.user_id.clone();
-        let own_id = device.engine().unwrap().device_id().to_string();
         fn row<'a>(
             id: &'a str,
             generation: u64,

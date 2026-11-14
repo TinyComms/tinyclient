@@ -498,7 +498,66 @@ pub(crate) struct KeptReaction {
     pub message: String,
     pub emoji: String,
     pub on: bool,
+    /// The server's list position of the blob, so blobs the server no longer lists still fold
+    /// in the order they were posted. Absent in older caches.
+    #[serde(default)]
+    pub seq: i64,
 }
+
+/// The fold of one conversation, as it persists in the sealed cache under `reactionfold`:
+/// the newest blob `seq` folded, every blob folded, the pairs the store still owes, and who
+/// is on each reaction. Without it a restart would have to re-open every historical blob,
+/// and forward secrecy has already spent those keys. The maps are keyed by
+/// `message` + unit separator + `emoji`: serde_json takes string keys only.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FoldState {
+    at: i64,
+    seen: BTreeSet<String>,
+    /// The pairs the store still owes, with how often they were kept; a pair no message ever
+    /// claims is dropped after a bounded number of keeps.
+    pending: BTreeMap<String, u32>,
+    on: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl FoldState {
+    fn key(message: &str, emoji: &str) -> String {
+        format!("{message}\u{1f}{emoji}")
+    }
+
+    fn split(key: &str) -> Option<(String, String)> {
+        let (message, emoji) = key.split_once('\u{1f}')?;
+        Some((message.to_owned(), emoji.to_owned()))
+    }
+}
+
+/// The fold in memory: the persisted state, plus the per-process retry budget of blobs that
+/// could not open yet.
+#[derive(Default)]
+struct Fold {
+    state: FoldState,
+    retry: BTreeMap<String, u32>,
+}
+
+/// How one blob folded. `Passed` lets the cursor move past it; `Retry` holds the cursor
+/// there until the blob opens or its tries run out.
+enum Folded {
+    Changed((String, String)),
+    Passed,
+    Retry(String),
+}
+
+/// Why a reaction blob did not open. `Gone` means this device will never read the group it
+/// was made for; `Retry` means not now, and the blob is tried again.
+enum Unopened {
+    Gone,
+    Retry(String),
+}
+
+/// A blob is retried this many folds before it is given up for this process.
+const MAX_REACTION_RETRIES: u32 = 3;
+
+/// An owed pair is kept this many settles before it is dropped for this process.
+const MAX_OWED_KEEPS: u32 = 10;
 
 /// What one encrypted reaction blob came to, once folded: where it landed, what it said, and
 /// the count and ownership as this device folds everyone.
@@ -508,24 +567,6 @@ pub(crate) struct ReactionLanded {
     pub emoji: String,
     pub count: u32,
     pub mine: bool,
-}
-
-/// The encrypted reactions of one conversation folded so far: the newest blob `seq` the list
-/// pass folded in, every blob folded (an echo never folds twice), and who is on each reaction.
-#[derive(Default)]
-struct Fold {
-    at: i64,
-    seen: BTreeSet<String>,
-    /// (message, emoji) the store still owes: their message was not stored when they folded.
-    pending: BTreeSet<(String, String)>,
-    on: BTreeMap<(String, String), BTreeSet<String>>,
-}
-
-/// Why a reaction blob did not open. `Gone` marks it seen — this device will never read the
-/// group it was made for; `Retry` leaves it for the next fold.
-enum Unopened {
-    Gone,
-    Retry(String),
 }
 
 /// An attachment of an opened message: enough to fetch and open it again.
@@ -626,6 +667,9 @@ struct Cache {
     /// The reactions this device itself posted, by blob id (`reaction.` rows): a device cannot
     /// open the ciphertext it made, so its own echo folds from these.
     kept: BTreeMap<String, KeptReaction>,
+    /// The fold as it persisted (`reactionfold` row), so a restart continues from where the
+    /// device left off instead of re-opening every blob.
+    fold: Option<FoldState>,
 }
 
 impl Cache {
@@ -633,6 +677,7 @@ impl Cache {
         let path = dir.join(format!("cache-{conv}.log"));
         let mut rows = HashMap::new();
         let mut kept = BTreeMap::new();
+        let mut fold = None;
         if let Ok(text) = std::fs::read_to_string(&path) {
             for line in text.lines() {
                 let Some((id, blob)) = line.split_once(' ') else {
@@ -645,7 +690,14 @@ impl Cache {
                 let Ok(plain) = e2ee::store::open_cache_value(key, id.as_bytes(), &blob) else {
                     continue;
                 };
-                // A message row, or a reaction this device itself posted (`reaction.` rows).
+                // A message row, a reaction this device itself posted (`reaction.` rows), or
+                // the fold itself (`reactionfold`).
+                if id == "reactionfold" {
+                    if let Ok(state) = serde_json::from_slice::<FoldState>(&plain) {
+                        fold = Some(state);
+                    }
+                    continue;
+                }
                 if let Some(blob_id) = id.strip_prefix("reaction.") {
                     if let Ok(kept_reaction) = serde_json::from_slice::<KeptReaction>(&plain) {
                         kept.insert(blob_id.to_owned(), kept_reaction);
@@ -662,6 +714,7 @@ impl Cache {
             rows,
             pending: HashMap::new(),
             kept,
+            fold,
         }
     }
 
@@ -694,6 +747,15 @@ impl Cache {
             .and_then(|dir| dir.sync_all()).map_err(|err| err.to_string())?;
         self.rows.insert(id.to_owned(), opened);
         Ok(())
+    }
+
+    /// Persists the fold, sealed, so a restart continues from this cursor. The last line of
+    /// an id wins on load, like every row of this file.
+    fn set_fold(&mut self, key: &CacheKey, state: &FoldState) {
+        if let Err(err) = self.write_sealed(key, "reactionfold", state) {
+            tracing::warn!("chatd: Tiny e2ee: the reaction fold could not be kept: {err}");
+        }
+        self.fold = Some(state.clone());
     }
 
     /// Keeps what this device itself reacted, durably: the echo folds from it, and so does the
@@ -1102,11 +1164,8 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// One reaction blob, folded: who is on (message, emoji) changes.
-fn apply(fold: &mut Fold, message: &str, emoji: &str, who: &str, on: bool) {
-    let entry = fold
-        .on
-        .entry((message.to_owned(), emoji.to_owned()))
-        .or_default();
+fn apply(fold: &mut FoldState, message: &str, emoji: &str, who: &str, on: bool) {
+    let entry = fold.on.entry(FoldState::key(message, emoji)).or_default();
     if on {
         entry.insert(who.to_owned());
     } else {
@@ -2761,12 +2820,20 @@ impl Device {
             match status {
                 200 | 201 => {
                     let id = answer.get("id").and_then(Value::as_str).unwrap_or("");
+                    let seq = answer.get("seq").and_then(Value::as_i64).unwrap_or(0);
                     let kept = KeptReaction {
                         message: message_id.to_owned(),
                         emoji: emoji.to_owned(),
                         on,
+                        seq,
                     };
-                    self.keep_reacted(conversation_id, id, kept);
+                    if super::safe_id(id) {
+                        self.keep_reacted(conversation_id, id, kept);
+                    } else {
+                        // The answer names no blob: nothing can be kept or folded, and the
+                        // echo will have to open it like anyone else's (and fail, kindly).
+                        tracing::warn!("chatd: Tiny e2ee: {conversation_id}: the server answered a reaction without an id");
+                    }
                     return Ok(self.reaction_of(conversation_id, message_id, emoji));
                 }
                 409 if matches!(
@@ -2811,12 +2878,21 @@ impl Device {
     }
 
     /// The reactions the store still owes (their message was not stored when they folded),
-    /// taken off the pending set and resolved against the fold as it stands now.
-    pub(crate) fn take_reaction_pending(&mut self, conversation_id: &str) -> Vec<ReactionLanded> {
-        let pairs: Vec<(String, String)> = match self.folds.get_mut(conversation_id) {
-            Some(fold) => std::mem::take(&mut fold.pending).into_iter().collect(),
-            None => return Vec::new(),
-        };
+    /// resolved against the fold as it stands now. They stay owed until
+    /// [`Device::settle_reactions`] says otherwise.
+    pub(crate) fn owed_reactions(&mut self, conversation_id: &str) -> Vec<ReactionLanded> {
+        self.fold(conversation_id);
+        let pairs: Vec<(String, String)> = self
+            .folds
+            .get(conversation_id)
+            .map(|fold| {
+                fold.state
+                    .pending
+                    .keys()
+                    .filter_map(|key| FoldState::split(key))
+                    .collect()
+            })
+            .unwrap_or_default();
         pairs
             .into_iter()
             .filter_map(|(message, emoji)| {
@@ -2825,14 +2901,62 @@ impl Device {
             .collect()
     }
 
-    /// Remembers the reactions the store still owed and could not show yet, to hand back when
-    /// their message lands or the next page does.
-    pub(crate) fn keep_reaction_pending(&mut self, conversation_id: &str, pairs: &[(String, String)]) {
-        if pairs.is_empty() {
-            return;
+    /// Settles what the store did with the owed pairs: applied ones leave the set, failed ones
+    /// stay, and a pair nothing ever claims is dropped after a bounded number of keeps.
+    pub(crate) fn settle_reactions(
+        &mut self,
+        conversation_id: &str,
+        applied: &[(String, String)],
+        failed: &[(String, String)],
+    ) {
+        {
+            let fold = self.fold(conversation_id);
+            for pair in applied {
+                fold.state.pending.remove(&FoldState::key(&pair.0, &pair.1));
+            }
+            for pair in failed {
+                let key = FoldState::key(&pair.0, &pair.1);
+                let kept = fold.state.pending.entry(key.clone()).or_insert(0);
+                *kept += 1;
+                if *kept >= MAX_OWED_KEEPS {
+                    tracing::debug!("chatd: Tiny e2ee: {conversation_id}: a reaction for {pair:?} was never stored; it is dropped");
+                    fold.state.pending.remove(&key);
+                }
+            }
         }
-        if let Some(fold) = self.folds.get_mut(conversation_id) {
-            fold.pending.extend(pairs.iter().cloned());
+        self.persist_fold(conversation_id);
+    }
+
+    /// The fold of this conversation: seeded from what persisted in the sealed cache the first
+    /// time it is needed, so a restart continues from this device's cursor instead of trying
+    /// to re-open blobs whose keys are long spent.
+    fn fold(&mut self, conversation_id: &str) -> &mut Fold {
+        if !self.folds.contains_key(conversation_id) {
+            let state = self
+                .cache(conversation_id)
+                .and_then(|cache| cache.fold.clone())
+                .unwrap_or_default();
+            self.folds
+                .insert(conversation_id.to_owned(), Fold { state, retry: BTreeMap::new() });
+        }
+        self.folds.get_mut(conversation_id).expect("just inserted")
+    }
+
+    /// Writes the fold of this conversation to the sealed cache, cursor, seen set, owed pairs
+    /// and all. Nothing happens when there is no cache to write to (not enrolled): the fold
+    /// then lives in memory only, as before.
+    fn persist_fold(&mut self, conversation_id: &str) {
+        let Some(state) = self.folds.get(conversation_id).map(|fold| fold.state.clone()) else {
+            return;
+        };
+        let key = if self.cache(conversation_id).is_some() {
+            self.cache_key.clone()
+        } else {
+            None
+        };
+        let Some(key) = key else { return };
+        if let Some(cache) = self.cache(conversation_id) {
+            cache.set_fold(&key, &state);
         }
     }
 
@@ -2844,7 +2968,7 @@ impl Device {
         emoji: &str,
     ) -> Option<ReactionLanded> {
         let fold = self.folds.get(conversation_id)?;
-        let who = fold.on.get(&(message_id.to_owned(), emoji.to_owned()))?;
+        let who = fold.state.on.get(&FoldState::key(message_id, emoji))?;
         Some(ReactionLanded {
             message: message_id.to_owned(),
             emoji: emoji.to_owned(),
@@ -2854,14 +2978,12 @@ impl Device {
     }
 
     /// Folds the server's reaction list from where the fold stands, and returns every
-    /// (message, emoji) it changed. Builds the fold the first time: the list, oldest first,
-    /// a page at a time — this device's own blobs folding from what it kept, in list order —
-    /// then what it kept that the server no longer lists (swept), oldest id first.
+    /// (message, emoji) it changed. The list is folded oldest first, a page at a time; this
+    /// device's own blobs fold from what it kept, in list order; blobs the server no longer
+    /// lists (swept) fold last, in the order they were posted.
     fn fold_reactions(&mut self, conversation_id: &str) -> Vec<(String, String)> {
         let mut changed: Vec<(String, String)> = Vec::new();
-        if !self.folds.contains_key(conversation_id) {
-            self.folds.insert(conversation_id.to_owned(), Fold::default());
-        }
+        self.fold(conversation_id);
         changed.extend(self.fold_list(conversation_id));
         let kept: Vec<(String, KeptReaction)> = self
             .cache(conversation_id)
@@ -2873,32 +2995,47 @@ impl Device {
                     .collect()
             })
             .unwrap_or_default();
+        // What this device itself reacted that the server no longer lists: its word still
+        // stands, applied after everything the list said, in posting order.
+        let mut swept: Vec<(i64, String, KeptReaction)> = kept
+            .into_iter()
+            .filter(|(id, _)| {
+                self.folds
+                    .get(conversation_id)
+                    .is_some_and(|fold| !fold.state.seen.contains(id))
+            })
+            .map(|(id, kept)| (kept.seq, id, kept))
+            .collect();
+        swept.sort_by_key(|(seq, id, _)| (*seq, id.clone()));
         let mut seen_pairs = std::collections::BTreeSet::new();
-        for (id, kept) in kept {
+        for (_, id, kept) in &swept {
             let pair = (kept.message.clone(), kept.emoji.clone());
             if seen_pairs.contains(&pair) {
                 continue;
             }
             if let Some(fold) = self.folds.get_mut(conversation_id) {
-                if fold.seen.contains(&id) {
-                    continue;
-                }
-                // What this device itself reacted that the server no longer lists: its word
-                // still stands, applied after everything the list said.
                 changed.push(pair.clone());
                 seen_pairs.insert(pair);
-                apply(fold, &kept.message, &kept.emoji, &self.saved.user_id, kept.on);
-                fold.seen.insert(id);
+                apply(&mut fold.state, &kept.message, &kept.emoji, &self.saved.user_id, kept.on);
+                fold.state.seen.insert(id.clone());
             }
+        }
+        if !changed.is_empty() || !swept.is_empty() {
+            self.persist_fold(conversation_id);
         }
         changed
     }
 
-    /// The list pass of a fold: every blob after the fold's newest `seq`, a page at a time.
+    /// The list pass of a fold: every blob after the fold's cursor, a page at a time. The
+    /// cursor moves row by row and stops at the first blob that cannot open yet — it is
+    /// retried on the next fold, never skipped, and everything behind it stays folded.
     fn fold_list(&mut self, conversation_id: &str) -> Vec<(String, String)> {
         let mut changed: Vec<(String, String)> = Vec::new();
         for _ in 0..PASSES {
-            let after = self.folds.get(conversation_id).map_or(0, |fold| fold.at);
+            let after = self
+                .folds
+                .get(conversation_id)
+                .map_or(0, |fold| fold.state.at);
             let Ok((status, answer)) = self.ask(
                 "GET",
                 &format!(
@@ -2914,18 +3051,40 @@ impl Device {
             let rows = answer.as_array().cloned().unwrap_or_default();
             let full = rows.len() >= 100;
             let mut newest = after;
+            let mut stalled = false;
             for row in &rows {
-                newest = newest.max(row.get("seq").and_then(Value::as_i64).unwrap_or(0));
+                let seq = row.get("seq").and_then(Value::as_i64).unwrap_or(0);
                 let id = row.get("id").and_then(Value::as_str).unwrap_or("");
                 let ciphertext = row.get("ciphertext").and_then(Value::as_str).and_then(unb64);
-                if let (Some(id), Some(ciphertext)) = (non_empty(id), ciphertext) {
-                    changed.extend(self.fold_one(conversation_id, id, ciphertext));
+                let Some(id) = non_empty(id) else {
+                    // The row says nothing this device can file, so nothing is marked folded.
+                    tracing::debug!("chatd: Tiny e2ee: {conversation_id}: a reaction row without an id is skipped");
+                    continue;
+                };
+                let Some(ciphertext) = ciphertext else {
+                    tracing::debug!("chatd: Tiny e2ee: {conversation_id}: a reaction row without ciphertext is skipped");
+                    continue;
+                };
+                match self.fold_one(conversation_id, id, ciphertext) {
+                    Folded::Changed(pair) => {
+                        newest = newest.max(seq);
+                        changed.push(pair);
+                    }
+                    Folded::Passed => newest = newest.max(seq),
+                    Folded::Retry(why) => {
+                        tracing::debug!(
+                            "chatd: Tiny e2ee: {conversation_id}: a reaction did not open: {why}; the cursor waits for it"
+                        );
+                        stalled = true;
+                        break;
+                    }
                 }
             }
             if let Some(fold) = self.folds.get_mut(conversation_id) {
-                fold.at = newest;
+                fold.state.at = newest;
             }
-            if !full {
+            self.persist_fold(conversation_id);
+            if stalled || !full {
                 break;
             }
         }
@@ -2933,19 +3092,10 @@ impl Device {
     }
 
     /// Folds one reaction blob. Kept with this device's own posts when it made it; otherwise
-    /// opened. `None` when it was folded before or said nothing this device can read.
-    fn fold_one(
-        &mut self,
-        conversation_id: &str,
-        id: &str,
-        ciphertext: Vec<u8>,
-    ) -> Option<(String, String)> {
-        if self
-            .folds
-            .get(conversation_id)
-            .is_none_or(|fold| fold.seen.contains(id))
-        {
-            return None;
+    /// opened. A blob that cannot open yet holds the cursor for a bounded number of folds.
+    fn fold_one(&mut self, conversation_id: &str, id: &str, ciphertext: Vec<u8>) -> Folded {
+        if self.fold(conversation_id).state.seen.contains(id) {
+            return Folded::Passed;
         }
         let kept = self
             .cache(conversation_id)
@@ -2954,32 +3104,66 @@ impl Device {
             (kept.message, kept.emoji, kept.on, self.saved.user_id.clone())
         } else {
             match self.open_reaction(conversation_id, &ciphertext) {
-                Ok(incoming) => (
-                    incoming.envelope.reply_to.clone()?,
-                    incoming.envelope.text.clone(),
-                    incoming.envelope.on,
-                    incoming.sender.user.to_string(),
-                ),
+                Ok(incoming) => {
+                    let Some(reply_to) = incoming
+                        .envelope
+                        .reply_to
+                        .filter(|id| super::safe_id(id))
+                    else {
+                        // A reaction that names no safe message is never useful.
+                        tracing::debug!("chatd: Tiny e2ee: {conversation_id}: a reaction without a safe target is dropped");
+                        self.fold(conversation_id).state.seen.insert(id.to_owned());
+                        return Folded::Passed;
+                    };
+                    if !super::messages::unicode_emoji(&incoming.envelope.text) {
+                        tracing::debug!("chatd: Tiny e2ee: {conversation_id}: a reaction that is not an emoji is dropped");
+                        self.fold(conversation_id).state.seen.insert(id.to_owned());
+                        return Folded::Passed;
+                    }
+                    (
+                        reply_to,
+                        incoming.envelope.text,
+                        incoming.envelope.on,
+                        incoming.sender.user.to_string(),
+                    )
+                }
                 Err(Unopened::Gone) => {
                     // This device will never read the group the blob was made for.
                     if let Some(fold) = self.folds.get_mut(conversation_id) {
-                        fold.seen.insert(id.to_owned());
+                        fold.state.seen.insert(id.to_owned());
                     }
-                    return None;
+                    return Folded::Passed;
                 }
                 Err(Unopened::Retry(why)) => {
-                    tracing::debug!("chatd: Tiny e2ee: {conversation_id}: a reaction did not open: {why}");
-                    return None;
+                    if self.retried(conversation_id, id) {
+                        return Folded::Passed;
+                    }
+                    return Folded::Retry(why);
                 }
             }
         };
-        let mut changed = None;
-        if let Some(fold) = self.folds.get_mut(conversation_id) {
-            apply(fold, &message, &emoji, &who, on);
-            fold.seen.insert(id.to_owned());
-            changed = Some((message, emoji));
+        let fold = self.fold(conversation_id);
+        apply(&mut fold.state, &message, &emoji, &who, on);
+        fold.state.seen.insert(id.to_owned());
+        fold.retry.remove(id);
+        Folded::Changed((message, emoji))
+    }
+
+    /// Counts the tries of a blob that cannot open yet, and gives up on it for this process
+    /// after a bounded number, so it cannot hold the cursor forever.
+    fn retried(&mut self, conversation_id: &str, id: &str) -> bool {
+        let fold = self.fold(conversation_id);
+        let tries = fold.retry.entry(id.to_owned()).or_insert(0);
+        *tries += 1;
+        if *tries >= MAX_REACTION_RETRIES {
+            tracing::debug!(
+                "chatd: Tiny e2ee: {conversation_id}: a reaction did not open after {tries} tries; it is left for a later restart"
+            );
+            fold.state.seen.insert(id.to_owned());
+            fold.retry.remove(id);
+            return true;
         }
-        changed
+        false
     }
 
     /// Keeps what this device itself reacted, in the conversation's sealed cache, and folds it
@@ -2995,10 +3179,13 @@ impl Device {
         if let Some(cache) = self.cache(conversation_id) {
             cache.keep_reacted(&key, blob_id, &kept);
         }
-        if let Some(fold) = self.folds.get_mut(conversation_id) {
-            apply(fold, &kept.message, &kept.emoji, &self.saved.user_id, kept.on);
-            fold.seen.insert(blob_id.to_owned());
+        {
+            let who = self.saved.user_id.clone();
+            let fold = self.fold(conversation_id);
+            apply(&mut fold.state, &kept.message, &kept.emoji, &who, kept.on);
+            fold.state.seen.insert(blob_id.to_owned());
         }
+        self.persist_fold(conversation_id);
     }
 
     /// Opens one reaction ciphertext in the group this conversation serves now, authenticated

@@ -277,14 +277,17 @@ pub(crate) fn on_live(
                     let _ = std::thread::Builder::new().name("tiny-e2ee".into()).spawn(move || {
                         let mut device = device.lock().unwrap_or_else(|err| err.into_inner());
                         let mut landed = device.heard_reaction(&conversation_id);
-                        landed.extend(device.take_reaction_pending(&conversation_id));
-                        let mut owed = Vec::new();
+                        landed.extend(device.owed_reactions(&conversation_id));
+                        let (mut applied, mut owed) = (Vec::new(), Vec::new());
                         for reaction in &landed {
-                            if !apply_reaction(&ctx, &conversation_id, reaction) {
-                                owed.push((reaction.message.clone(), reaction.emoji.clone()));
+                            let pair = (reaction.message.clone(), reaction.emoji.clone());
+                            if apply_reaction(&ctx, &conversation_id, reaction) {
+                                applied.push(pair);
+                            } else {
+                                owed.push(pair);
                             }
                         }
-                        device.keep_reaction_pending(&conversation_id, &owed);
+                        device.settle_reactions(&conversation_id, &applied, &owed);
                     });
                 }
             }
@@ -1365,17 +1368,20 @@ fn owe_reactions(ctx: &Context, saved: &Saved, conversation_id: &str) {
         return;
     };
     let mut device = device.lock().unwrap_or_else(|err| err.into_inner());
-    let owed = device.take_reaction_pending(conversation_id);
-    if owed.is_empty() {
+    let landed = device.owed_reactions(conversation_id);
+    if landed.is_empty() {
         return;
     }
-    let mut failed = Vec::new();
-    for reaction in &owed {
-        if !apply_reaction(ctx, conversation_id, reaction) {
-            failed.push((reaction.message.clone(), reaction.emoji.clone()));
+    let (mut applied, mut owed) = (Vec::new(), Vec::new());
+    for reaction in &landed {
+        let pair = (reaction.message.clone(), reaction.emoji.clone());
+        if apply_reaction(ctx, conversation_id, reaction) {
+            applied.push(pair);
+        } else {
+            owed.push(pair);
         }
     }
-    device.keep_reaction_pending(conversation_id, &failed);
+    device.settle_reactions(conversation_id, &applied, &owed);
 }
 
 fn read_updated(ctx: &Context, saved: &Saved, frame: &Value) {
@@ -1433,14 +1439,17 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
                 if let Some(device) = e2ee::started(saved) {
                     let mut device = device.lock().unwrap_or_else(|err| err.into_inner());
                     let mut landed = device.reaction_changes(conversation_id);
-                    landed.extend(device.take_reaction_pending(conversation_id));
-                    let mut owed = Vec::new();
+                    landed.extend(device.owed_reactions(conversation_id));
+                    let (mut applied, mut owed) = (Vec::new(), Vec::new());
                     for reaction in &landed {
-                        if !apply_reaction(ctx, conversation_id, reaction) {
-                            owed.push((reaction.message.clone(), reaction.emoji.clone()));
+                        let pair = (reaction.message.clone(), reaction.emoji.clone());
+                        if apply_reaction(ctx, conversation_id, reaction) {
+                            applied.push(pair);
+                        } else {
+                            owed.push(pair);
                         }
                     }
-                    device.keep_reaction_pending(conversation_id, &owed);
+                    device.settle_reactions(conversation_id, &applied, &owed);
                 }
             }
             Ok(())
@@ -1658,10 +1667,20 @@ fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, 
                 });
             match result {
                 Ok((device, landed)) => {
-                    drop(device);
-                    if let Some(landed) = landed {
-                        apply_reaction(ctx, conversation_id, &landed);
+                    {
+                        let mut locked = device.lock().unwrap_or_else(|err| err.into_inner());
+                        let mut owed = Vec::new();
+                        if let Some(landed) = &landed {
+                            if !apply_reaction(ctx, conversation_id, landed) {
+                                // The message is not stored yet (a reaction from a
+                                // notification, say): the fold already knows, so keep the
+                                // pair owed for when the message lands.
+                                owed.push((landed.message.clone(), landed.emoji.clone()));
+                            }
+                        }
+                        locked.settle_reactions(conversation_id, &[], &owed);
                     }
+                    drop(device);
                     let _ = reply.send(Ok(()));
                 }
                 Err(why) => {
@@ -2045,7 +2064,7 @@ fn media_kind(kind: &str, mime: &str) -> MediaKind {
 
 /// Unicode emoji only. A shortcode, a word, or a path is not one. A keycap is one, though it
 /// starts with an ASCII digit (1️⃣ is `1`, U+FE0F, U+20E3), and tinyserver takes it.
-fn unicode_emoji(emoji: &str) -> bool {
+pub(crate) fn unicode_emoji(emoji: &str) -> bool {
     let mut textual = false;
     if emoji.is_empty() {
         return false;
