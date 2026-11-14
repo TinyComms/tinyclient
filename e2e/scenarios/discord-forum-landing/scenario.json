@@ -1,0 +1,12 @@
+{
+  "id": "discord-forum-landing",
+  "title": "A Discord forum opens on its newest-activity post, and its posts are no rows of the server tree",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window.",
+    "ios": "The phone proof build does not run the desktop window."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

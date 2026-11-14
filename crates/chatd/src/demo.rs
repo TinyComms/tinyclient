@@ -80,8 +80,8 @@ use crate::hub::Hub;
 use crate::store::{ConversationRow, PersonRow, Store, Stored};
 use png::Art;
 use protocol::{
-    AccountKey, Activity, Capabilities, Key, Link, MediaFile, MediaKind, MentionKind, Message, Network, Occupants,
-    Presence, Relation, SendState, Sender, Span, Style,
+    AccountKey, Activity, Capabilities, ConversationKind, Key, Link, MediaFile, MediaKind, MentionKind, Message, Network,
+    Occupants, Presence, Relation, SendState, Sender, Span, Style,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -640,4 +640,51 @@ pub fn attach(hub: &Arc<Hub>) -> Vec<(AccountKey, Adapter)> {
         tracing::warn!("chatd: demo: {err}");
     }
     adapters
+}
+
+/// The lab's discord-forum-landing driver. Opening a Discord forum lands on its
+/// newest-activity post, read or not, and its posts hold no row of the server tree — read
+/// from the real demo data the way the shell reads it, through the real store. A build from
+/// before the change lands on the newest unread post instead, and the proof fails there.
+pub fn prove_discord_forum_landing() -> Result<(), String> {
+    let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+    let mut store = Store::open(&dir.path().join("chat.sqlite")).map_err(|err| err.to_string())?;
+    seed(&mut store, dir.path(), Mode::default()).map_err(|err| err.to_string())?;
+    let account = discord::account();
+
+    // The help forum is a row of Moss & Lichen's tree, as the server serves it.
+    let space = Key::new(&account, discord::MOSS);
+    let tree = store.tree(&space, 0, 500).map_err(|err| err.to_string())?.ok_or("no tree for the demo's Moss & Lichen")?;
+    let row = tree
+        .conversations
+        .iter()
+        .find(|row| row.kind == ConversationKind::Forum)
+        .ok_or("the help forum is not a row of the server tree")?;
+    let forum = Key::new(&account, row.key.id.clone());
+
+    // Opening it lands on the newest activity: the read crustose post, though the slime
+    // mould post still counts as unread. Telegram's rule (newest unread) picks the other one.
+    let (landing, _) = store.landing(&forum).map_err(|err| err.to_string())?;
+    let land = landing.first().ok_or("the help forum has no landing")?;
+    if land.parent.as_deref() != Some(forum.id.as_str()) || land.title != "What is this crustose lichen on my fence post?" {
+        return Err(format!("the landing was {}, not the newest activity under the forum", land.title));
+    }
+
+    // The topics drill lists the posts by their activity, with the count on the unread one.
+    let (posts, total) = store.topics(&forum, 0, 10).map_err(|err| err.to_string())?;
+    if total != 2 || posts.len() != 2 {
+        return Err(format!("the topics drill held {}/{}, not both posts", posts.len(), total));
+    }
+    if posts[0].title != "What is this crustose lichen on my fence post?" || posts[1].title != "Mystery slime mould on bench wood" {
+        return Err("the topics drill did not list the posts by their activity".to_owned());
+    }
+    if posts[0].unread != 0 || posts[1].unread != 1 {
+        return Err(format!("the posts' counts were {}, {}, not 0, 1", posts[0].unread, posts[1].unread));
+    }
+
+    // And no post is a row of the tree: the forum is the one row its posts answer under.
+    if tree.conversations.iter().any(|row| posts.iter().any(|post| post.key.id == row.key.id)) {
+        return Err("a post of the help forum is a row of the server tree".to_owned());
+    }
+    Ok(())
 }

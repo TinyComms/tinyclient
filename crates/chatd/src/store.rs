@@ -1571,17 +1571,24 @@ impl Store {
         Ok((rows, total))
     }
 
-    /// The topic of a forum that opening it lands on, as a page of one: the newest unread
-    /// (a mention counts as unread here, as everywhere), else General, Telegram's own first
-    /// topic (`polish/03` §2). Empty until a read of the topics has left rows.
+    /// The topic of a forum that opening it lands on, as a page of one. Telegram lands on the
+    /// newest unread (a mention counts as unread here, as everywhere), else General, its own
+    /// first topic (`polish/03` §2), once its topics were asked of the network. Discord's posts
+    /// leave the rows at READY (`polish/01` §3, N14), so its landing reads them here and is the
+    /// newest-activity post, read or not. Empty until those rows exist.
     pub fn landing(&self, forum: &Key) -> rusqlite::Result<(Vec<Conversation>, u32)> {
         let belongs = "c.network = ?1 AND c.account = ?2 AND c.parent = ?3 AND NOT c.hidden";
         let sql = |where_more: &str| format!("{CONVERSATION} WHERE {belongs} {where_more} LIMIT 1");
         let key = params![word(&forum.network), forum.account, forum.id];
-        let unread = self.db.query_row(&sql("AND (c.unread > 0 OR c.mentions > 0) ORDER BY c.updated DESC, c.id"), key, conversation_from).optional()?;
-        let topic = match unread {
-            Some(topic) => Some(topic),
-            None => self.db.query_row(&sql("AND c.root = '1'"), key, conversation_from).optional()?,
+        let topic = match forum.network {
+            Network::Discord => self.db.query_row(&sql("ORDER BY c.updated DESC, c.id"), key, conversation_from).optional()?,
+            _ => {
+                let unread = self.db.query_row(&sql("AND (c.unread > 0 OR c.mentions > 0) ORDER BY c.updated DESC, c.id"), key, conversation_from).optional()?;
+                match unread {
+                    Some(topic) => Some(topic),
+                    None => self.db.query_row(&sql("AND c.root = '1'"), key, conversation_from).optional()?,
+                }
+            }
         };
         Ok((topic.iter().cloned().collect(), u32::from(topic.is_some())))
     }

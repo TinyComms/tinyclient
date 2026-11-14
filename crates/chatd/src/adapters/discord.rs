@@ -1096,6 +1096,10 @@ impl Discord {
                 }
             }
             Command::OpenSpace(space) => self.open_space(&space),
+            // Opening a forum asks Discord nothing: its posts arrive on the socket as threads,
+            // so the store the landing reads is as current as the link. Telegram needs this
+            // ask because it lists a forum's topics only on demand.
+            Command::OpenForum { reply, .. } => drop(reply.send(Ok(()))),
             Command::MarkRead { conversation_id, message_id } => self.mark_read(&conversation_id, &message_id),
             Command::AckBulk { reads } => {
                 if let Err(refused) = self.ack_bulk(&reads) {
