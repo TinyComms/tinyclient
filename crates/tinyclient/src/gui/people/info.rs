@@ -486,6 +486,24 @@ impl InfoPane {
         if !lone && (actions.more || actions.message || actions.request || actions.call.is_some()) {
             top = top.child(self.person_actions(person, &actions, &seen, more_in_row, cx).mt(px(16.)));
         }
+        let is_self = self.scene.accounts.iter().any(|own| own.key == person.key.account() && own.me == person.key.id);
+        if let Some((action, label)) = facts::friendship_action(person).filter(|_| !is_self) {
+            let who = person.clone();
+            let friendship = button("info-friendship", ButtonKind::Secondary, label).w_full();
+            let friendship = if seen.online {
+                friendship.on_click(cx.listener(move |this, _, _, cx| {
+                    let who = who.clone();
+                    this.with_shell(cx, move |shell, cx| shell.relate(&who, action, cx));
+                }))
+            } else {
+                friendship.opacity(0.4).cursor_default()
+                    .tooltip(tip(format!("{} is offline", person.key.network.label()), None))
+            };
+            if person.relation == protocol::Relation::Outgoing {
+                top = top.children(draw::soft_line("Request sent".to_owned()));
+            }
+            top = top.child(friendship.mt(px(12.)));
+        }
         if actions.notifications {
             if let Some(row) = self.row.clone() {
                 let on = self.notify_of(&row, None) != Notify::Nothing;

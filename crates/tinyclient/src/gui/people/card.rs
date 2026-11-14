@@ -289,6 +289,24 @@ impl Floating {
             .when(actions.message || actions.request || actions.call.is_some(), |top| {
                 top.child(self.card_actions(person, &actions, cx).mt(px(16.)))
             });
+        let is_self = self.scene.accounts.iter().any(|own| own.key == person.key.account() && own.me == person.key.id);
+        if let Some((action, label)) = facts::friendship_action(person).filter(|_| !is_self) {
+            let who = person.clone();
+            let friendship = button("card-friendship", ButtonKind::Secondary, label).w_full();
+            let friendship = if seen.online {
+                friendship.on_click(cx.listener(move |this, _, _, cx| {
+                    let who = who.clone();
+                    this.shell_do(cx, move |shell, cx| shell.relate(&who, action, cx));
+                }))
+            } else {
+                friendship.opacity(0.4).cursor_default()
+                    .tooltip(crate::gui::components::tip(format!("{} is offline", person.key.network.label()), None))
+            };
+            if person.relation == protocol::Relation::Outgoing {
+                top = top.children(draw::soft_line("Request sent".to_owned()));
+            }
+            top = top.child(friendship.mt(px(12.)));
+        }
         if let Some(heads_up) = facts::heads_up(person, profile, seen.online) {
             let words = facts::heads_up_words(&heads_up, &person.name, network, crate::view::now());
             top = top.child(draw::heads_up_line(&words).mt(px(12.)));

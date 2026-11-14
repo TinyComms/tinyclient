@@ -864,6 +864,8 @@ pub struct SharedItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelateAction {
+    /// Send a friend request.
+    Add,
     /// Accept their friend request.
     Accept,
     /// Dismiss their friend request without telling them.

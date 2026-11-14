@@ -619,10 +619,7 @@ impl Pane {
             .min_w_0()
             .flex()
             .flex_col()
-            .children(head.then(|| {
-                let header = self.header(message, in_header);
-                self.author_tap(header, "author-name", message, cx)
-            }))
+            .children(head.then(|| self.header(message, in_header, cx)))
             .child(sent)
             .children(self.views_line(message))
             .children(self.reactions(message, window, cx))
@@ -697,16 +694,19 @@ impl Pane {
         div().w_full().when(head && !root, |row| row.pt(px(8.))).child(inner).into_any_element()
     }
 
-    /// On a phone a tap on who said it, their face or their name, opens their Profile page, as
-    /// a click on an @mention does. Mine and an app's open nothing; the desktop draws them as is.
+    /// Discord sender names open the same profile as @mentions. On phones, other networks
+    /// also let a person open someone else's profile from their name or face.
     fn author_tap(&self, part: Div, what: &'static str, message: &Message, cx: &mut Context<Self>) -> AnyElement {
-        let person = self.person(&message.sender.id).filter(|_| self.metrics == Metrics::PHONE && !message.outgoing && !message.sender.bot);
+        let discord_name = what == "author-name" && self.key().is_some_and(|key| key.network == protocol::Network::Discord);
+        let person = self.person(&message.sender.id).filter(|_| discord_name || (self.metrics == Metrics::PHONE && !message.outgoing && !message.sender.bot));
         let Some(person) = person else {
             return part.into_any_element();
         };
         part.id(name_id(what, &message.id))
             .cursor_pointer()
+            .when(what == "author-name", |name| name.hover(|style| style.underline()))
             .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
                 let (person, at) = (person.clone(), window.mouse_position());
                 let _ = this.shell.update(cx, |shell, cx| shell.open_profile(person, at, cx));
             }))
@@ -784,7 +784,7 @@ impl Pane {
     }
 
     /// The head line: who, when, and the marks a message carries.
-    fn header(&self, message: &Message, receipt: Option<Receipt>) -> Div {
+    fn header(&self, message: &Message, receipt: Option<Receipt>, cx: &mut Context<Self>) -> Div {
         let name = message.shown_sender().to_owned();
         let phone = self.metrics == Metrics::PHONE;
         let tag = |words: &'static str| {
@@ -812,7 +812,7 @@ impl Pane {
                     .flex()
                     .items_baseline()
                     .gap(px(8.))
-                    .child(
+                    .child(self.author_tap(
                         div()
                             .relative()
                             .min_w_0()
@@ -821,7 +821,10 @@ impl Pane {
                             .when(phone, |name| name.text_size(px(tokens_phone::scaled(15.))).line_height(px(tokens_phone::scaled(20.))))
                             .font_weight(theme::SEMIBOLD)
                             .child(name),
-                    )
+                        "author-name",
+                        message,
+                        cx,
+                    ))
                     .child(
                         div()
                             .flex_none()

@@ -104,6 +104,18 @@ pub fn actions(person: &Person, seen: &Seen, surface: Surface) -> Actions {
     }
 }
 
+/// A profile offers a request only to active Discord people without a relationship.
+pub fn friendship_action(person: &Person) -> Option<(protocol::RelateAction, &'static str)> {
+    if person.key.network != Network::Discord || person.bot || person.mark == Some(Mark::Deactivated) {
+        return None;
+    }
+    match person.relation {
+        Relation::None => Some((protocol::RelateAction::Add, "Add friend")),
+        Relation::Outgoing => Some((protocol::RelateAction::Cancel, "Cancel request")),
+        _ => None,
+    }
+}
+
 /// The one heads-up line, by severity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeadsUp {
@@ -871,6 +883,25 @@ mod tests {
     }
 
     const DM: Seen = Seen { native_calls: false, in_their_dm: true, direct: Some((CallSupport::Native, false)), online: true };
+
+    #[test]
+    fn friendship_buttons_follow_discord_relationship_state() {
+        use protocol::RelateAction;
+        assert_eq!(friendship_action(&person(Network::Discord, Relation::None)), Some((RelateAction::Add, "Add friend")));
+        assert_eq!(friendship_action(&person(Network::Discord, Relation::Outgoing)), Some((RelateAction::Cancel, "Cancel request")));
+        for relation in [Relation::Friend, Relation::Incoming, Relation::Blocked, Relation::Contact] {
+            assert_eq!(friendship_action(&person(Network::Discord, relation)), None);
+        }
+        for network in [Network::Tiny, Network::Slack, Network::Teams, Network::Telegram, Network::Signal] {
+            assert_eq!(friendship_action(&person(network, Relation::None)), None);
+        }
+        let mut bot = person(Network::Discord, Relation::None);
+        bot.bot = true;
+        assert_eq!(friendship_action(&bot), None);
+        bot.bot = false;
+        bot.mark = Some(Mark::Deactivated);
+        assert_eq!(friendship_action(&bot), None);
+    }
 
     #[test]
     fn inside_their_dm_there_is_no_message_button_and_mute_is_the_switch() {

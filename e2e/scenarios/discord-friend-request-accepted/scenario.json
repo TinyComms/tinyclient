@@ -1,0 +1,14 @@
+{
+  "id": "discord-friend-request-accepted",
+  "title": "Discord friend request acceptance displays a readable system message",
+  "platforms": [
+    "windows",
+    "macos",
+    "linux",
+    "android",
+    "ios"
+  ],
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

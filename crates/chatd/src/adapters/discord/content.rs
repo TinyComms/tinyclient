@@ -691,6 +691,7 @@ fn system_line(kind: u8, who: &str, content: &str, mentioned: &str) -> Option<St
         29 => format!("{who} is now a speaker."),
         31 => format!("{who} changed the Stage topic: {content}"),
         46 => "A poll has closed.".to_owned(),
+        67 => format!("{who} accepted your friend request."),
         _ => return Some(String::new()),
     })
 }
@@ -968,6 +969,26 @@ mod tests {
     fn styled<'a>(rich: &'a Rich, style: &Style) -> Vec<&'a str> {
         let matching = rich.spans.iter().filter(|span| span.style == *style);
         matching.map(|span| &rich.text[span.start as usize..span.end as usize]).collect()
+    }
+
+    #[test]
+    fn friend_request_acceptance_is_a_system_message() {
+        let account = AccountKey { network: protocol::Network::Discord, account: "test".into() };
+        let posted: Posted = serde_json::from_value(serde_json::json!({
+            "id": "100", "channel_id": "200", "type": 67, "content": "",
+            "author": {"id": "300", "username": "casimir", "global_name": "Casimir Thorne"}
+        })).unwrap();
+        let mut place = Place { account: &account, me: "400", guild: None, names: &Nobody, author: None };
+        let (decoded, _) = message(&posted, &place);
+        assert_eq!(decoded.kind, MessageKind::System);
+        assert_eq!(decoded.text, "Casimir Thorne accepted your friend request.");
+        place.author = Some("Cas".into());
+        let (decoded, _) = message(&posted, &place);
+        assert_eq!(decoded.text, "Cas accepted your friend request.");
+        assert!(decoded.spans.is_empty());
+
+        let unknown = Posted { kind: Some(255), ..posted };
+        assert!(matches!(message(&unknown, &place).0.kind, MessageKind::Unsupported { .. }));
     }
 
     #[test]
