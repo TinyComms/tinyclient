@@ -6,7 +6,8 @@ use super::sync::{self, conversation_of, ensure_row, finish};
 use super::{filing, presence, Account, Options, TYPING_SHOWN};
 use grammers_tl_types as tl;
 use protocol::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 use tl::enums::Update;
 
 /// The conversation a peer's update is about; in a forum, the thread of the topic it names,
@@ -44,8 +45,125 @@ fn placed(account: &Account, raw: &tl::enums::Message) -> Option<(String, Mapped
     Some((conversation, mapped))
 }
 
-/// A message arrived, or one changed.
+const PENDING_CHATS: usize = 100;
+const PENDING_MESSAGES: usize = 32;
+const CHAT_RETRY: Duration = Duration::from_secs(3);
+const CHAT_RETRY_MAX: Duration = Duration::from_secs(120);
+
+struct PendingChat {
+    peer: Who,
+    messages: VecDeque<Box<tl::enums::Message>>,
+    next: Instant,
+    retry: Duration,
+}
+
+/// Live messages waiting for their chat's dialog and notification settings. These carry over
+/// a reconnect, where Telegram may resume the update stream after the messages it already sent.
+#[derive(Default)]
+pub(super) struct PendingChats {
+    chats: VecDeque<PendingChat>,
+    flood_until: Option<Instant>,
+}
+
+pub(super) fn pending_deadline(account: &Account) -> Option<Instant> {
+    let pending = account.pending();
+    let next = pending.chats.iter().map(|chat| chat.next).min()?;
+    Some(next.max(pending.flood_until.unwrap_or(next)))
+}
+
+pub(super) fn flood_until(account: &Account) -> Option<Instant> {
+    account.pending().flood_until.filter(|until| Instant::now() < *until)
+}
+
+pub(super) fn pause_for_flood(account: &Account, fault: &super::Fault) {
+    if let Some(until) = fault.flood().and_then(|seconds| Instant::now().checked_add(Duration::from_secs(seconds))) {
+        let mut pending = account.pending();
+        pending.flood_until = Some(pending.flood_until.unwrap_or(until).max(until));
+    }
+}
+
+pub(super) fn retry_pending(account: &Account) {
+    let now = Instant::now();
+    let peer = {
+        let pending = account.pending();
+        if pending.flood_until.is_some_and(|until| now < until) {
+            return;
+        }
+        pending.chats.iter().find(|chat| chat.next <= now).map(|chat| chat.peer)
+    };
+    let Some(peer) = peer else { return };
+    let result = sync::recover_live_chat(account, peer);
+    if let Err(fault) = &result {
+        pause_for_flood(account, fault);
+    }
+    let mut pending = account.pending();
+    let Some(at) = pending.chats.iter().position(|chat| chat.peer == peer) else { return };
+    match result {
+        Ok(Some(through)) => {
+            let Some(chat) = pending.chats.remove(at) else { return };
+            drop(pending);
+            {
+                let mut live = account.live();
+                live.recovered_through.retain(|(who, _)| *who != peer);
+                if live.recovered_through.len() >= PENDING_CHATS {
+                    live.recovered_through.pop_front();
+                }
+                live.recovered_through.push_back((peer, through));
+            }
+            for raw in chat.messages {
+                // Telegram's dialog already counted these. An update that arrived after the
+                // snapshot still counts live. A read on another device also comes with the dialog.
+                deliver_message(account, &raw, false, raw.id() <= through);
+            }
+        }
+        _ if sync::membership(account, peer) == Some(false) => {
+            pending.chats.remove(at);
+        }
+        _ => {
+            if let Some(mut chat) = pending.chats.remove(at) {
+                chat.next = Instant::now() + chat.retry;
+                chat.retry = (chat.retry * 2).min(CHAT_RETRY_MAX);
+                pending.chats.push_back(chat);
+            }
+        }
+    }
+}
+
+/// Queue an arriving update until we know the chat belongs here and how to notify for it.
 fn message(account: &Account, raw: &tl::enums::Message, edit: bool) {
+    let Some(peer) = sync::message_peer(raw) else { return };
+    let membership = sync::membership(account, peer);
+    if !matches!(peer, Who::User(_)) && membership != Some(false) {
+        let needs_dialog = membership.is_none() || !matches!(account.ctx.known(&peer.text()), Ok(Some(_)));
+        let mut pending = account.pending();
+        if let Some(chat) = pending.chats.iter_mut().find(|chat| chat.peer == peer) {
+            if let Some(held) = chat.messages.iter_mut().find(|held| held.id() == raw.id()) {
+                **held = raw.clone();
+            } else if !edit {
+                if chat.messages.len() >= PENDING_MESSAGES {
+                    chat.messages.pop_front();
+                }
+                chat.messages.push_back(Box::new(raw.clone()));
+            }
+            return;
+        }
+        if needs_dialog {
+            if !edit {
+                if pending.chats.len() >= PENDING_CHATS {
+                    pending.chats.pop_front();
+                }
+                pending.chats.push_back(PendingChat {
+                    peer, messages: VecDeque::from([Box::new(raw.clone())]), next: Instant::now(), retry: CHAT_RETRY,
+                });
+            }
+            return;
+        }
+    }
+    let covered_by_dialog = account.live().recovered_through.iter().any(|(who, through)| *who == peer && raw.id() <= *through);
+    deliver_message(account, raw, edit, covered_by_dialog);
+}
+
+fn deliver_message(account: &Account, raw: &tl::enums::Message, edit: bool, covered_by_dialog: bool) {
     let Some((conversation, mut mapped)) = placed(account, raw) else {
         return;
     };
@@ -74,8 +192,15 @@ fn message(account: &Account, raw: &tl::enums::Message, edit: bool) {
             mapped.message.views = stored.views;
         }
     }
-    if member {
+    // A recovered dialog counted the chat's own messages, and a recovered forum's topics were
+    // read with it. A comment's thread was not read again, so a comment still counts here.
+    let forum = account.dir().get(mapped.peer).is_some_and(|known| known.forum);
+    let counted = covered_by_dialog && (forum || conversation == mapped.peer.text());
+    if member && !counted {
         let _ = account.ctx.message(&conversation, &mapped.message);
+    } else if member && past_read(account, &conversation, raw.id()) {
+        // Counted already, but not yet read anywhere: a mention in it still notifies.
+        let _ = account.ctx.counted_message(&conversation, &mapped.message);
     } else {
         let _ = account.ctx.history(&conversation, std::slice::from_ref(&mapped.message));
     }
@@ -86,6 +211,11 @@ fn message(account: &Account, raw: &tl::enums::Message, edit: bool) {
         sync::text_emoji(account, &conversation, std::slice::from_ref(&mapped.message));
         account.files.want(mapped.wants);
     }
+}
+
+/// The message is newer than the conversation's read marker, or the conversation has none.
+fn past_read(account: &Account, conversation: &str, id: i32) -> bool {
+    account.ctx.read_up_to(conversation).and_then(|read| read.parse::<i32>().ok()).is_none_or(|read| id > read)
 }
 
 fn typing(account: &Account, conversation: String, from: Who, action: &tl::enums::SendMessageAction) {
@@ -156,6 +286,11 @@ pub(super) fn apply(account: &Account, update: &Update) {
         // messages seen since this connection began are found; an older one goes when its
         // conversation is next opened and the page shows it missing.
         Update::DeleteMessages(gone) => {
+            for chat in &mut account.pending().chats {
+                if matches!(chat.peer, Who::Group(_)) {
+                    chat.messages.retain(|message| !gone.messages.contains(&message.id()));
+                }
+            }
             for id in &gone.messages {
                 if let Some(conversation) = account.placed(None, *id) {
                     let _ = account.ctx.deleted(&conversation, &id.to_string());
@@ -164,6 +299,9 @@ pub(super) fn apply(account: &Account, update: &Update) {
         }
         Update::DeleteChannelMessages(gone) => {
             let who = Who::Channel(gone.channel_id);
+            if let Some(chat) = account.pending().chats.iter_mut().find(|chat| chat.peer == who) {
+                chat.messages.retain(|message| !gone.messages.contains(&message.id()));
+            }
             let forum = account.dir().get(who).is_some_and(|known| known.forum);
             for id in &gone.messages {
                 let conversation = if forum { account.placed(Some(who), *id) } else { Some(who.text()) };
@@ -267,6 +405,8 @@ pub(super) fn apply(account: &Account, update: &Update) {
 
 pub(super) fn left(account: &Account, who: Who) {
     account.dir().left(who);
+    account.pending().chats.retain(|chat| chat.peer != who);
+    account.live().recovered_through.retain(|(peer, _)| *peer != who);
     if let Who::Channel(id) = who {
         account.wire.channel_membership(id, false);
     }

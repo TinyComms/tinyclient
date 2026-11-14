@@ -196,6 +196,10 @@ struct Live {
     sticker_sets: Option<Vec<(i64, i64, String)>>,
     /// Scheduled sends shown until Telegram sends them: the chat, the text, the placeholder.
     scheduled: VecDeque<(String, String, String)>,
+    /// The next slice of cached unread channels to check after sign-on.
+    unread_check: Option<Instant>,
+    /// Unread snapshots from recovered dialogs already include messages up to these IDs.
+    recovered_through: VecDeque<(Who, i32)>,
     /// Telegram's reaction emoji, and whether each needs Premium, once asked (`react`).
     reactions: Option<Vec<(String, bool)>>,
 }
@@ -217,6 +221,9 @@ pub(super) struct Account {
     name: String,
     dir: Mutex<Directory>,
     live: Mutex<Live>,
+    pending: Arc<Mutex<live::PendingChats>>,
+    /// Scrolling and recovery may advance a dialog list from different threads.
+    dialog_pages: Mutex<()>,
     files: files::Files,
 }
 
@@ -227,6 +234,10 @@ impl Account {
 
     fn live(&self) -> MutexGuard<'_, Live> {
         self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn pending(&self) -> MutexGuard<'_, live::PendingChats> {
+        self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// One request, with Telegram's flood waits honored.
@@ -349,7 +360,8 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     std::thread::Builder::new()
         .name("telegram-events".into())
         .spawn(move || {
-            keep_connected(&socket_ctx, || connect(&socket_ctx, &saved, &held));
+            let pending = Arc::default();
+            keep_connected(&socket_ctx, || connect(&socket_ctx, &saved, &held, &pending));
             held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
         })
         .map_err(|err| err.to_string())?;
@@ -383,7 +395,12 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
 }
 
 /// One connection, from opening the wire to losing it.
-fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) -> Failure {
+fn connect(
+    ctx: &Context,
+    saved: &Saved,
+    current: &Mutex<Option<Arc<Account>>>,
+    pending: &Arc<Mutex<live::PendingChats>>,
+) -> Failure {
     let wire = match open(Some(saved)) {
         Ok(wire) => wire,
         Err(why) => return Failure::Dropped(why),
@@ -399,6 +416,8 @@ fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) 
         name: saved.name.clone(),
         dir: Mutex::new(Directory::new(saved.user)),
         live: Mutex::default(),
+        pending: pending.clone(),
+        dialog_pages: Mutex::default(),
     });
     // A long flood wait at sign-on is told on the account and waited out here, in full.
     let ready = loop {
@@ -442,17 +461,24 @@ fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) 
     account.here();
     let mut said = Instant::now();
     let ended = loop {
-        let wait = HERE_EVERY.saturating_sub(said.elapsed());
+        if said.elapsed() >= HERE_EVERY {
+            account.here();
+            said = Instant::now();
+        }
+        live::retry_pending(&account);
+        sync::retry_unread_channels(&account);
+        let wait = [
+            Some(said + HERE_EVERY),
+            live::pending_deadline(&account),
+            account.live().unread_check,
+        ].into_iter().flatten().min().unwrap_or(said + HERE_EVERY).saturating_duration_since(Instant::now());
         match events.recv_timeout(wait) {
             Ok(Event::Update { update, users, chats }) => {
                 account.learn(&users, &chats);
                 live::apply(&account, &update);
             }
             Ok(Event::Closed(why)) => break why,
-            Err(RecvTimeoutError::Timeout) => {
-                account.here();
-                said = Instant::now();
-            }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break "the connection closed".to_owned(),
         }
         if ctx.stopped() {

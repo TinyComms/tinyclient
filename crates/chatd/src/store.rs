@@ -1360,16 +1360,16 @@ impl Store {
             .optional()
     }
 
-    /// Cached Telegram supergroups still contributing unread counts. The adapter verifies
+    /// Cached Telegram channels and supergroups still contributing unread counts. The adapter verifies
     /// membership for rows its paged dialog list did not confirm.
-    pub(crate) fn unread_telegram_groups(&self, account: &AccountKey, limit: u32) -> rusqlite::Result<Vec<String>> {
+    pub(crate) fn unread_telegram_channels(&self, account: &AccountKey, after: &str, limit: u32) -> rusqlite::Result<Vec<String>> {
         let mut query = self.db.prepare(
             "SELECT id FROM conversation WHERE network = 'telegram' AND account = ?1
-                 AND kind IN ('group', 'forum') AND id GLOB 'c[0-9]*' AND parent = '' AND NOT hidden
-                 AND (unread > 0 OR mentions > 0)
-             ORDER BY updated DESC, id LIMIT ?2",
+                 AND kind IN ('channel', 'group', 'forum') AND id GLOB 'c[0-9]*' AND parent = '' AND NOT hidden
+                 AND (unread > 0 OR mentions > 0) AND id > ?2
+             ORDER BY id LIMIT ?3",
         )?;
-        let rows = query.query_map(params![account.account, limit], |row| row.get(0))?;
+        let rows = query.query_map(params![account.account, after, limit], |row| row.get(0))?;
         rows.collect()
     }
 

@@ -354,7 +354,8 @@ impl Directory {
             return;
         };
         if let Ok(hash) = hash.parse::<i64>() {
-            self.map.entry(who).or_insert_with(|| Known { hash: Some(hash), name: name.to_owned(), ..Known::default() });
+            let known = self.map.entry(who).or_insert_with(|| Known { name: name.to_owned(), ..Known::default() });
+            known.hash.get_or_insert(hash);
         }
     }
 

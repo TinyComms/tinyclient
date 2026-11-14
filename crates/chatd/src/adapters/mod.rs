@@ -780,8 +780,19 @@ impl Context {
     /// set `mentions_me` by the network's own rules, mute and suppress settings included. If it
     /// carries the `client_id` of a message we are sending, it replaces that one.
     pub fn message(&self, conversation_id: &str, message: &Message) -> Stores {
+        self.live_message(conversation_id, message, true)
+    }
+
+    /// A message heard on the socket that the network's own unread count already includes,
+    /// because its counts were read after the message arrived. It is stored without counting
+    /// again, and announced as `message` announces a new one.
+    pub fn counted_message(&self, conversation_id: &str, message: &Message) -> Stores {
+        self.live_message(conversation_id, message, false)
+    }
+
+    fn live_message(&self, conversation_id: &str, message: &Message, count: bool) -> Stores {
         let conversation = self.key(conversation_id);
-        let stored = self.hub.store().ingest(&conversation, message, true)?;
+        let stored = self.hub.store().ingest(&conversation, message, count)?;
         if stored == Stored::New && !message.outgoing {
             self.typing_stopped(conversation_id, &message.sender.id);
             // After the row counted it, so a notification's read check sees it unread.
@@ -907,8 +918,8 @@ impl Context {
         self.hub.store().conversation(&self.key(conversation_id))
     }
 
-    pub(crate) fn unread_telegram_groups(&self, limit: u32) -> rusqlite::Result<Vec<String>> {
-        self.hub.store().unread_telegram_groups(&self.account, limit)
+    pub(crate) fn unread_telegram_channels(&self, after: &str, limit: u32) -> rusqlite::Result<Vec<String>> {
+        self.hub.store().unread_telegram_channels(&self.account, after, limit)
     }
 
     /// Remembers the newest message id the network named, without a preview. "Mark as read"

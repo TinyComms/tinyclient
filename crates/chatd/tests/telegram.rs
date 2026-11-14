@@ -1080,12 +1080,12 @@ fn asking_a_channel_posts_comments_reads_the_discussion_group_under_the_post() {
     let comments: Vec<(String, String, String)> =
         world.messages("c9001_5").into_iter().map(|comment| (comment.id, comment.sender.name, comment.text)).collect();
     let said: Vec<(&str, &str, &str)> = comments.iter().map(|comment| (comment.0.as_str(), comment.1.as_str(), comment.2.as_str())).collect();
-    assert_eq!(said, [("50", "Tobin Reyes", "On my way up front?"), ("51", "Odalys Brandt", "Yes, at the hut now.")]);
+    assert_eq!(said, [("61", "Tobin Reyes", "On my way up front?"), ("62", "Odalys Brandt", "Yes, at the hut now.")]);
     assert_eq!(world.called("GetReplies c9001_5"), 1, "{:#?}", world.calls());
     assert_eq!(world.called("GetHistory c9001_5"), 0);
 
     // The newest comment's time rides the post's footer, as "last reply", once the page was
-    // read: the section itself names no date. Comment 51 went 40 seconds before the fake's clock start.
+    // read: the section itself names no date. Comment 62 went 40 seconds before the fake's clock start.
     let fresh = world.until("the footer's last reply", || {
         world.message("c9001", "5").filter(|post| post.thread.as_ref().is_some_and(|section| section.last == t0() - 40))
     });
@@ -1125,10 +1125,10 @@ fn a_comment_posted_in_the_thread_is_told_as_a_reply_to_the_posts_echo_in_the_di
     world.steer("comments");
     world.until("the post's comments count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
     world.messages("c9001_5");
-    world.until("the discussion to be asked", || (world.called("GetDiscussionMessage c9001_5") == 1).then_some(()));
+    world.until("the discussion to be resolved", || world.conversation("c9001_5").filter(|row| !row.read_only));
 
-    // The send is Telegram's own for the discussion group: not the channel, and under the
-    // echo of the post itself, the way the phone's apps write a comment.
+    // Telegram lists the newer comment (62) before the forwarded post (60). The send must
+    // answer the post's echo, which anchors the discussion in the group.
     world.send("c9001_5", "9002", "Sunset push", None);
     world.until("the comment to be told", || {
         world.calls().contains(&"SendMessage c9003_60 Sunset push".to_owned()).then_some(())
@@ -1229,6 +1229,121 @@ fn a_cached_unread_group_left_while_offline_does_not_keep_its_badge_on_reconnect
 }
 
 #[test]
+fn a_partial_update_for_a_joined_group_outside_the_dialogs_uses_its_saved_access_hash() {
+    let world = World::seed(Some(SESSION), "30", &[], |store| {
+        store.set_name(&account(), "peer:c9006", "9006009\tWeather desk").unwrap();
+    });
+    world.connected();
+    assert!(world.conversation("c9006").is_none());
+
+    world.steer("off-page-group");
+    assert_eq!(world.arrived("c9006", "101").text, "The wind has picked up.");
+    assert_eq!(world.conversation("c9006").unwrap().unread, 1);
+    assert_eq!(world.called("GetPeerDialogs c9006"), 1);
+    assert_eq!(world.called("ResolveUsername weatherdesk"), 0);
+}
+
+#[test]
+fn a_partial_update_for_a_public_group_can_resolve_its_username_without_a_saved_hash() {
+    let world = World::signed_in();
+    world.connected();
+    assert!(world.conversation("c9006").is_none());
+
+    world.steer("off-page-group");
+    assert_eq!(world.arrived("c9006", "101").text, "The wind has picked up.");
+    assert_eq!(world.conversation("c9006").unwrap().unread, 1);
+    assert_eq!(world.called("ResolveUsername weatherdesk"), 1);
+}
+
+#[test]
+fn recovering_a_muted_group_retries_a_flood_wait_and_counts_held_messages_once() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("off-page-group 101 muted flood");
+    world.until("Telegram to defer the dialog lookup", || (world.called("GetPeerDialogs c9006 flood") == 1).then_some(()));
+    assert!(world.conversation("c9006").is_none());
+    world.steer("off-page-group 102 muted");
+    // No new update is needed to trigger the retry after the flood wait.
+    world.arrived("c9006", "101");
+    world.arrived("c9006", "102");
+    let row = world.conversation("c9006").unwrap();
+    assert!(row.muted && row.archived);
+    assert_eq!((row.unread, row.mentions), (2, 0));
+    assert_eq!(row.badge(), protocol::Badge::None);
+    assert_eq!(world.called("GetPeerDialogs c9006"), 2);
+}
+
+#[test]
+fn a_private_group_without_a_hash_is_recovered_from_the_remaining_dialogs() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_MANY", "500"), ("TINYCLIENT_TELEGRAM_PRIVATE_OFF_PAGE", "1")]);
+    world.connected();
+    assert!(world.conversation("c9006").is_none());
+    let before = world.called("GetDialogs 0");
+    world.steer("off-page-group");
+    world.arrived("c9006", "101");
+    assert_eq!(world.conversation("c9006").unwrap().unread, 1);
+    assert_eq!(world.called("GetDialogs 0"), before + 1);
+    assert_eq!(world.called("ResolveUsername weatherdesk"), 0);
+}
+
+#[test]
+fn an_update_queued_during_dialog_recovery_does_not_double_count_the_snapshot() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("off-page-group 101 burst");
+    world.arrived("c9006", "101");
+    world.arrived("c9006", "102");
+    assert_eq!(world.conversation("c9006").unwrap().unread, 2);
+    world.steer("off-page-group 103");
+    world.arrived("c9006", "103");
+    assert_eq!(world.conversation("c9006").unwrap().unread, 3);
+}
+
+#[test]
+fn a_private_broadcast_and_an_invalid_peer_do_not_block_reconnect_cleanup_of_other_chats() {
+    let world = World::seed(Some(SESSION), "30", &[], |store| {
+        for (id, kind, title, note) in [
+            ("c9003", ConversationKind::Group, "Field Notes chat", "9003009\tField Notes chat"),
+            ("c9004", ConversationKind::Channel, "Old broadcasts", "9004009\tOld broadcasts"),
+            ("c9005", ConversationKind::Channel, "Needs verification", "9005009\tNeeds verification"),
+        ] {
+            let row = chatd::store::ConversationRow::new(id, kind, title);
+            store.upsert_conversation(&account(), &row).unwrap();
+            store.set_counts(&key(id), 3, 1, None, t0()).unwrap();
+            store.set_name(&account(), &format!("peer:{id}"), note).unwrap();
+        }
+    });
+    world.connected();
+    assert_eq!(world.called("GetChannels [9003, 9004, 9005]"), 1);
+    assert!(world.conversation("c9003").is_none());
+    assert!(world.conversation("c9004").is_none());
+    let unresolved = world.conversation("c9005").unwrap();
+    assert_eq!((unresolved.unread, unresolved.mentions), (3, 1));
+    assert!(world.conversation("c9001").is_some());
+}
+
+#[test]
+fn unread_cleanup_resumes_past_one_hundred_peers_after_reconnect_and_retries_a_failed_range() {
+    let world = World::seed(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_MEMBERSHIP_FAULT", "1")], |store| {
+        for id in (20_000..20_100).chain([9_004]) {
+            let row = chatd::store::ConversationRow::new(format!("c{id}"), ConversationKind::Channel, "Cached channel");
+            store.upsert_conversation(&account(), &row).unwrap();
+            store.set_counts(&key(&row.id), 3, 1, None, t0()).unwrap();
+            store.set_name(&account(), &format!("peer:{}", row.id), &format!("{}\tCached channel", id * 1_000 + 9)).unwrap();
+        }
+    });
+    world.connected();
+    assert_eq!(world.called("GetChannels [20000,"), 1);
+    assert!(world.conversation("c9004").is_some());
+    world.steer("drop");
+    world.until("the next connection to retry the older channel after its flood wait", || {
+        (world.called("GetChannels [9004]") >= 2 && world.conversation("c9004").is_none()).then_some(())
+    });
+    assert_eq!(world.called("GetChannels [20000,"), 1);
+    assert_eq!(world.conversation("c20000").unwrap().unread, 3);
+}
+
+#[test]
 fn a_comments_reactions_document_is_asked_and_its_file_lands_for_the_chip_like_a_normal_messages_does() {
     let world = World::signed_in();
     world.connected();
@@ -1243,7 +1358,7 @@ fn a_comments_reactions_document_is_asked_and_its_file_lands_for_the_chip_like_a
     // the chip draws (`e<document id>`), the plain one keeping its glyph.
     world.messages("c9001_5");
     let reacted = world.until("the comment's reactions", || {
-        world.message("c9001_5", "51").filter(|comment| !comment.reactions.is_empty())
+        world.message("c9001_5", "62").filter(|comment| !comment.reactions.is_empty())
     });
     let seen: Vec<(&str, &str)> = reacted.reactions.iter().map(|reaction| (reaction.emoji.as_str(), reaction.file.as_ref().map_or("", |file| file.id.as_str()))).collect();
     assert_eq!(seen, vec![("👍", ""), (":emoji:", "e5002")]);
@@ -1277,7 +1392,7 @@ fn a_reaction_told_for_a_comment_lands_on_the_thread_while_it_is_open() {
     // asked for the chip, as a normal message's reaction is.
     world.steer("comment-react-live");
     let reacted = world.until("the reaction on the comment", || {
-        world.message("c9001_5", "51").filter(|comment| !comment.reactions.is_empty())
+        world.message("c9001_5", "62").filter(|comment| !comment.reactions.is_empty())
     });
     let seen: Vec<(&str, u32)> = reacted.reactions.iter().map(|reaction| (reaction.emoji.as_str(), reaction.count)).collect();
     assert_eq!(seen, vec![("👍", 2), (":emoji:", 1)]);
