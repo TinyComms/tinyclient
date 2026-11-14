@@ -90,8 +90,20 @@ fn a_reaction_round_trips_with_its_target_and_its_word() {
         ..add.clone()
     };
     assert!(with_attachment.encode(Kind::Reaction).is_err());
-    let without_target = Envelope { reply_to: None, ..add };
+    let without_target = Envelope { reply_to: None, ..add.clone() };
     assert!(without_target.encode(Kind::Reaction).is_err());
+    // And the decoder is as strict as the encoder: no target, no word, or an attachment
+    // along, is not a reaction.
+    let no_target = r#"{"v":1,"text":"👍"}"#;
+    assert!(Envelope::decode(Kind::Reaction, no_target.as_bytes()).is_err());
+    let no_word = r#"{"v":1,"text":"👍","reply_to":"m1"}"#;
+    assert!(Envelope::decode(Kind::Reaction, no_word.as_bytes()).is_err());
+    let with_attachment_json = format!(
+        r#"{{"v":1,"text":"👍","reply_to":"m1","on":true,"attachments":[{{"id":"a","key":"{}","name":"a.png","mime":"image/png","bytes":1,"sha256":"{}"}}]}}"#,
+        STANDARD.encode([7u8; 32]),
+        STANDARD.encode([9u8; 32]),
+    );
+    assert!(Envelope::decode(Kind::Reaction, with_attachment_json.as_bytes()).is_err());
     // A message never carries the reaction's word.
     let message = Envelope::message("hello");
     let bytes = message.encode(Kind::Message).unwrap();

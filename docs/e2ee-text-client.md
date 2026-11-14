@@ -168,7 +168,8 @@ and the recovery key.
   conversation is a ciphertext of its own (`POST /v1/e2ee/conversations/{id}/reactions`, spec v1):
   the emoji and the message it lands on are only inside the ciphertext, each device folds every
   blob it can open, and what this device itself posted is kept in the sealed cache so its own
-  echo folds without MLS. Counts are this device's fold, not the server's word.
+  echo folds without MLS. Counts are this device's fold, not the server's word: a conversation
+  that went through plaintext clients shows their chips replaced by the fold.
 - GIFs and other files are not re-encoded; video metadata is not stripped.
 - A safety number is per pair of people; there is no QR verification, and no inline notice in the
   conversation when a verified person's devices change (it shows in Encryption).

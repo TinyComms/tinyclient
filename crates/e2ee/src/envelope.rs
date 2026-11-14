@@ -192,7 +192,8 @@ impl Envelope {
         Ok(bytes)
     }
 
-    /// Decodes plaintext received for `kind`.
+    /// Decodes plaintext received for `kind`. A reaction must carry `reply_to`, `on` and no
+    /// attachments, exactly as [`Envelope::encode`] wrote it.
     pub fn decode(kind: Kind, bytes: &[u8]) -> Result<Envelope> {
         if bytes.len() > MAX_ENVELOPE_BYTES {
             return Err(Error::TooLarge("message"));
@@ -208,6 +209,11 @@ impl Envelope {
         }
         if wire.reply_to.as_ref().is_some_and(|id| id.len() > MAX_ID) {
             return Err(Error::TooLarge("reply_to"));
+        }
+        if kind == Kind::Reaction
+            && (wire.reply_to.is_none() || wire.on.is_none() || !wire.attachments.is_empty())
+        {
+            return Err(Error::Malformed("reaction"));
         }
         let attachments = wire
             .attachments
@@ -235,7 +241,7 @@ impl Envelope {
         let (reply_to, sent_at, on) = match kind {
             Kind::Message => (wire.reply_to, wire.sent_at, false),
             Kind::Edit => (None, None, false),
-            Kind::Reaction => (wire.reply_to, None, wire.on.unwrap_or(false)),
+            Kind::Reaction => (wire.reply_to, None, wire.on.expect("checked above")),
         };
         Ok(Envelope {
             text: wire.text,

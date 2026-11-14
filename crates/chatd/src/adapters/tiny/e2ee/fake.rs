@@ -372,10 +372,14 @@ impl Server {
     }
 
     /// What the real server's `POST /v1/e2ee/conversations/{id}/reactions` holds: the same
-    /// epoch and membership checks, and the ciphertext must carry the reaction's authenticated
-    /// data (`docs/e2ee-text.md`, section 8). The blob is otherwise opaque.
+    /// epoch, membership and client id checks, and the ciphertext must carry the reaction's
+    /// authenticated data (`docs/e2ee-text.md`, section 8). The blob is otherwise opaque.
     fn reaction(&mut self, caller: &str, body: &Value) -> (u16, Value) {
         let device = body["device_id"].as_str().unwrap_or("").to_owned();
+        let client = body["client_id"].as_str().unwrap_or("");
+        if client.is_empty() || client.len() > 64 || client.chars().any(|c| c.is_control()) {
+            return (400, json!({ "error": "invalid" }));
+        }
         if body["epoch"].as_u64() != self.epoch {
             return (409, json!({ "error": "stale_epoch" }));
         }
@@ -743,7 +747,7 @@ fn encrypted_reaction_round_trip() -> Result<(), String> {
         other => return Err(format!("Bea folds {other:?} from the list, not one thumbs-up of Ada's")),
     }
     // The event says nothing new once the list fold has it.
-    if !bea.heard_reaction(CONVERSATION, &frame).is_empty() {
+    if !bea.heard_reaction(CONVERSATION).is_empty() {
         return Err("the echo of a folded blob changed Bea's fold twice".into());
     }
 
@@ -789,9 +793,20 @@ fn encrypted_reaction_round_trip() -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let _ = bea.heard_reaction(CONVERSATION, &frame);
+    let _ = bea.heard_reaction(CONVERSATION);
     if bea.reaction_of(CONVERSATION, &first, "\u{1f44d}").is_some_and(|landed| landed.count > 0) {
         return Err("Bea still folds the thumbs-up after it was taken back".into());
+    }
+
+    // A restart folds again: the list in the server's order, own blobs from what was kept.
+    // Taking the reaction back before the restart must stay taken back.
+    lock(&ada).folds.clear();
+    let landed = lock(&ada).reaction_changes(CONVERSATION);
+    if landed.iter().any(|landed| landed.message == first && landed.count > 0) {
+        return Err(format!("a restart folded {landed:?} back onto the message"));
+    }
+    if lock(&ada).reaction_of(CONVERSATION, &first, "\u{1f44d}").is_some_and(|landed| landed.count > 0) {
+        return Err("a restart resurrected the taken-back reaction".into());
     }
     Ok(())
 }

@@ -714,8 +714,37 @@ impl Device {
 mod tests {
     use super::super::*;
     use super::{run, Job};
+    use openmls::prelude::tls_codec::DeserializeBytes as _;
+    use openmls::prelude::{MlsMessageIn, ProtocolMessage};
 
     const CONV: &str = "22222222-2222-2222-2222-222222222222";
+
+    /// What the real server checks of a reaction ciphertext: a PrivateMessage application
+    /// message of `group`, whose authenticated data names `reaction` and the conversation it
+    /// was posted to — after a repair the group is the binding's and not the conversation,
+    /// and both words must hold at once (`crates/api/src/e2ee_text/mls.rs`,
+    /// `check_ciphertext`, `app_reaction` route).
+    fn reaction_is_bound_for(group: &ConversationId, body: &Value) -> bool {
+        let Some(data) = unb64(body["ciphertext"].as_str().unwrap_or("")) else {
+            return false;
+        };
+        let Ok(message) = MlsMessageIn::tls_deserialize_exact_bytes(&data) else {
+            return false;
+        };
+        let Ok(protocol) = message.try_into_protocol_message() else {
+            return false;
+        };
+        let ProtocolMessage::PrivateMessage(private) = &protocol else {
+            return false;
+        };
+        let mut aad = b"tiny-e2ee-v1 msg".to_vec();
+        aad.push(0);
+        aad.extend_from_slice(b"reaction");
+        aad.push(0);
+        aad.push(0);
+        aad.extend_from_slice(CONV.as_bytes());
+        protocol.group_id().as_slice() == group.as_bytes() && private.aad() == aad.as_slice()
+    }
 
     struct Remote {
         key: Vec<u8>,
@@ -794,11 +823,21 @@ mod tests {
                 if state.refuse_posts {
                     (503, json!({"error":"unavailable"}))
                 } else {
-                    (201, json!({"id":format!("message{}", state.messages)}))
+                    (201, json!({"id":format!("00000000-0000-4000-8000-{:012}", state.messages)}))
                 }
             } else if request.contains("/reactions ") {
-                state.messages += 1;
-                (201, json!({"id": format!("blob{}", state.messages), "created": true}))
+                let body: Value =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap_or(Value::Null);
+                let client = body["client_id"].as_str().unwrap_or("");
+                if client.is_empty() || client.len() > 64 || client.chars().any(|c| c.is_control()) {
+                    (400, json!({ "error": "invalid" }))
+                } else if !reaction_is_bound_for(&group, &body) {
+                    (400, json!({ "error": "bad_e2ee" }))
+                } else {
+                    state.messages += 1;
+                    let id = format!("00000000-0000-4000-8000-{:012}", 500 + state.messages);
+                    (201, json!({ "id": id, "created": true }))
+                }
             } else {
                 (200, json!({}))
             };
@@ -1325,59 +1364,74 @@ mod tests {
         let (mut device, requests) = modern_device("accepted-roundtrip", true);
         remote(&mut device, requests.clone());
         lock(&requests).clear();
-        device
-            .post(
-                CONV,
-                "old",
-                Kind::Message,
-                None,
-                &Envelope::message("before"),
-                &[],
-            )
-            .unwrap();
+        let id_of = |answer: &Value| answer.get("id").and_then(Value::as_str).unwrap().to_owned();
+        let old = id_of(
+            &device
+                .post(
+                    CONV,
+                    "old",
+                    Kind::Message,
+                    None,
+                    &Envelope::message("before"),
+                    &[],
+                )
+                .unwrap(),
+        );
         device.submit_repair(CONV).unwrap();
         let active = device.active(CONV).unwrap();
         assert_eq!(active.generation, 1);
         assert_ne!(active.group_id.to_string(), CONV);
-        device
-            .post(
-                CONV,
-                "new",
-                Kind::Message,
-                None,
-                &Envelope::message("after"),
-                &[],
-            )
-            .unwrap();
+        let new = id_of(
+            &device
+                .post(
+                    CONV,
+                    "new",
+                    Kind::Message,
+                    None,
+                    &Envelope::message("after"),
+                    &[],
+                )
+                .unwrap(),
+        );
         device
             .post(
                 CONV,
                 "edit",
                 Kind::Edit,
-                Some("message1"),
+                Some(&old),
                 &Envelope::message("edited"),
                 &[],
             )
             .unwrap();
-        device.react(CONV, "message1", "👍", true).unwrap();
+        device.react(CONV, &old, "👍", true).unwrap();
         let group = active.group_id.to_string();
         let user = device.saved.user_id.clone();
         let own_id = device.engine().unwrap().device_id().to_string();
-        let row = |id: &'static str, generation, group_id| Row {
-            id,
-            author_id: &user,
-            kind: "message",
-            ciphertext: None,
-            epoch: 0,
-            generation: Some(generation),
-            group_id: Some(group_id),
-            device_id: &own_id,
-            target_id: None,
-            client_id: None,
-            created_at: "",
-        };
+        let user = device.saved.user_id.clone();
+        let own_id = device.engine().unwrap().device_id().to_string();
+        fn row<'a>(
+            id: &'a str,
+            generation: u64,
+            group_id: &'a str,
+            user: &'a str,
+            own_id: &'a str,
+        ) -> Row<'a> {
+            Row {
+                id,
+                author_id: user,
+                kind: "message",
+                ciphertext: None,
+                epoch: 0,
+                generation: Some(generation),
+                group_id: Some(group_id),
+                device_id: own_id,
+                target_id: None,
+                client_id: None,
+                created_at: "",
+            }
+        }
         let edit = Row {
-            id: "message3",
+            id: "00000000-0000-4000-8000-000000000003",
             author_id: &user,
             kind: "edit",
             ciphertext: None,
@@ -1385,19 +1439,19 @@ mod tests {
             generation: Some(1),
             group_id: Some(&group),
             device_id: &own_id,
-            target_id: Some("message1"),
+            target_id: Some(&old),
             client_id: None,
             created_at: "",
         };
         let read = device.read(
             CONV,
-            &[row("message1", 0, CONV), row("message2", 1, &group), edit],
+            &[row(&old, 0, CONV, &user, &own_id), row(&new, 1, &group, &user, &own_id), edit],
         );
         assert!(
-            matches!(read.get("message1"), Some(Read::Opened(opened)) if opened.text == "edited")
+            matches!(read.get(&old), Some(Read::Opened(opened)) if opened.text == "edited")
         );
         assert!(
-            matches!(read.get("message2"), Some(Read::Opened(opened)) if opened.text == "after")
+            matches!(read.get(&new), Some(Read::Opened(opened)) if opened.text == "after")
         );
         let requests = lock(&requests);
         let payloads: Vec<Value> = requests
@@ -1414,7 +1468,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 1, 1, 1]
         );
-        assert_eq!(payloads[2]["target_id"], "message1");
+        assert_eq!(payloads[2]["target_id"], Value::String(old.clone()));
+        assert_eq!(payloads[3]["client_id"].as_str().map(str::len), Some(38), "inside the server's 64 characters for a client id");
     }
 
     #[test]

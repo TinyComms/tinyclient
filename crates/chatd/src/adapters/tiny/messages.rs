@@ -256,6 +256,7 @@ pub(crate) fn on_live(
                 } else {
                     deliver(ctx, saved, names, &conversation, &wire);
                 }
+                owe_reactions(ctx, saved, &conversation);
             }
         }
         "message.deleted" => {
@@ -267,16 +268,23 @@ pub(crate) fn on_live(
         }
         "reaction.updated" => merge_reaction(ctx, saved, frame),
         // The sealed kind: a reaction blob in an encrypted conversation, opaque to the server.
-        // Off the socket's thread: it asks the server for the list behind it.
+        // Off the socket's thread: the event only says the server's list moved; the list folds.
         "e2ee.reaction" => {
             let conversation_id = field(frame, "conversation_id");
             if super::safe_id(conversation_id) {
                 if let Some(device) = e2ee::started(saved) {
-                    let (conversation_id, frame, ctx) = (conversation_id.to_owned(), frame.clone(), ctx.clone());
+                    let (conversation_id, ctx) = (conversation_id.to_owned(), ctx.clone());
                     let _ = std::thread::Builder::new().name("tiny-e2ee".into()).spawn(move || {
-                        for landed in device.lock().unwrap_or_else(|err| err.into_inner()).heard_reaction(&conversation_id, &frame) {
-                            apply_reaction(&ctx, &conversation_id, &landed);
+                        let mut device = device.lock().unwrap_or_else(|err| err.into_inner());
+                        let mut landed = device.heard_reaction(&conversation_id);
+                        landed.extend(device.take_reaction_pending(&conversation_id));
+                        let mut owed = Vec::new();
+                        for reaction in &landed {
+                            if !apply_reaction(&ctx, &conversation_id, reaction) {
+                                owed.push((reaction.message.clone(), reaction.emoji.clone()));
+                            }
                         }
+                        device.keep_reaction_pending(&conversation_id, &owed);
                     });
                 }
             }
@@ -1326,13 +1334,14 @@ fn merge_reaction(ctx: &Context, saved: &Saved, frame: &Value) {
 }
 
 /// One folded encrypted reaction, onto the stored message it landed on: the count and
-/// ownership as this device folds everyone's blobs.
-fn apply_reaction(ctx: &Context, conversation_id: &str, landed: &e2ee::ReactionLanded) {
+/// ownership as this device folds everyone's blobs. `False` when the message is not stored
+/// (yet): the fold keeps the pair owed, and it is applied when the message lands.
+fn apply_reaction(ctx: &Context, conversation_id: &str, landed: &e2ee::ReactionLanded) -> bool {
     if !super::safe_id(&landed.message) || !unicode_emoji(&landed.emoji) {
-        return;
+        return false;
     }
     let Ok(Some(mut message)) = ctx.stored_message(conversation_id, &landed.message) else {
-        return;
+        return false;
     };
     let at = message.reactions.iter().position(|have| have.emoji == landed.emoji);
     if landed.count == 0 {
@@ -1346,6 +1355,27 @@ fn apply_reaction(ctx: &Context, conversation_id: &str, landed: &e2ee::ReactionL
         message.reactions.push(Reaction { emoji: landed.emoji.clone(), file: None, count: landed.count, mine: landed.mine });
     }
     let _ = ctx.message(conversation_id, &message);
+    true
+}
+
+/// Applies the folded reactions a message's arrival still owed: a blob can fold before the
+/// message it lands on is stored.
+fn owe_reactions(ctx: &Context, saved: &Saved, conversation_id: &str) {
+    let Some(device) = e2ee::started(saved) else {
+        return;
+    };
+    let mut device = device.lock().unwrap_or_else(|err| err.into_inner());
+    let owed = device.take_reaction_pending(conversation_id);
+    if owed.is_empty() {
+        return;
+    }
+    let mut failed = Vec::new();
+    for reaction in &owed {
+        if !apply_reaction(ctx, conversation_id, reaction) {
+            failed.push((reaction.message.clone(), reaction.emoji.clone()));
+        }
+    }
+    device.keep_reaction_pending(conversation_id, &failed);
 }
 
 fn read_updated(ctx: &Context, saved: &Saved, frame: &Value) {
@@ -1397,12 +1427,20 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
                 ctx.history(conversation_id, &messages).map_err(|err| err.to_string())?;
             }
             // The reactions of an encrypted conversation are not rows of this page; the folded
-            // ones that changed while this device was away are asked for now.
+            // ones that changed while this device was away are asked for now, with anything a
+            // page before this one still owed.
             if sealed_here(ctx, saved, conversation_id) == Ok(true) {
                 if let Some(device) = e2ee::started(saved) {
-                    for landed in device.lock().unwrap_or_else(|err| err.into_inner()).reaction_changes(conversation_id) {
-                        apply_reaction(ctx, conversation_id, &landed);
+                    let mut device = device.lock().unwrap_or_else(|err| err.into_inner());
+                    let mut landed = device.reaction_changes(conversation_id);
+                    landed.extend(device.take_reaction_pending(conversation_id));
+                    let mut owed = Vec::new();
+                    for reaction in &landed {
+                        if !apply_reaction(ctx, conversation_id, reaction) {
+                            owed.push((reaction.message.clone(), reaction.emoji.clone()));
+                        }
                     }
+                    device.keep_reaction_pending(conversation_id, &owed);
                 }
             }
             Ok(())
