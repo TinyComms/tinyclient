@@ -1,0 +1,12 @@
+{
+  "id": "voice-freeze-held",
+  "title": "A link that keeps freezing for a moment is heard to stall once: the delay that rides the next freeze out is kept, not squeezed away",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not start desktop mediad. The same playout is in the library the phone links.",
+    "ios": "The phone proof build does not start desktop mediad. The same playout is in the library the phone links."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 45
+}

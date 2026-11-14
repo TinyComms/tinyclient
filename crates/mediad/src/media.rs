@@ -9,7 +9,7 @@ use crate::cue::Playing;
 use crate::hear::{self, Ear, Limiter};
 use crate::process::Processor;
 use crate::stats::{Arrivals, Counts, Meter};
-use crate::dave::{Dave, Outgoing};
+use crate::dave::{Dave, Held, Outgoing, Refused};
 use crate::jitter::{Jitter, Pop};
 use crate::opus::{Decoder, Encoder, MAX_FRAME};
 use crate::pace;
@@ -17,6 +17,7 @@ use crate::permission::{microphone, Microphone};
 use crate::discord_video;
 use crate::rtp::{Cipher, Sender, PAYLOAD_TYPE, SILENCE};
 use crate::session::Controls;
+use crate::tiny::Turns;
 use crate::{out, CHANNELS, FRAME, FRAME_SAMPLES};
 use protocol::{CallFailure, CallPath, MediaResponse};
 use std::collections::{HashMap, VecDeque};
@@ -118,6 +119,8 @@ pub(crate) struct Stream {
     standing_in: u32,
     /// Frames played as they came since one was last stretched or squeezed.
     unpaced: u32,
+    /// Frames in a row that found the buffer a packet short of what it keeps.
+    short: u32,
 }
 
 /// Frames played as they come after one that was stretched or squeezed: 40 ms, so one frame in
@@ -126,9 +129,17 @@ pub(crate) struct Stream {
 /// is the same period over and over: after a stall that was twenty frames in a row, and it is
 /// heard as a robot.
 const PACE_REST: u32 = 2;
+/// And after one that was squeezed while only a little more is queued than the buffer keeps:
+/// 160 ms, so one pitch period in nine frames goes, a twentieth faster at most. One frame in
+/// three was up to a sixth faster for a second or two, and that is heard as hurry.
+const SQUEEZE_REST: u32 = 8;
 /// With this much more queued than the buffer keeps, the delay matters more than the sound, and
-/// every other frame is squeezed: 160 ms, which a single stall on a clean link does not leave.
+/// one frame in three is squeezed: 160 ms, which a single stall on a clean link does not leave.
 const PACE_FAR: usize = 8 * FRAME_SAMPLES;
+/// Frames in a row the buffer has to be a packet short before one is stretched: half a second.
+/// A freeze on its way through what is kept for it is over by then, and a packet that came a
+/// tick late is here; stretching for either only has to be squeezed back out.
+const SHORT: u32 = 25;
 
 /// Ticks between log lines about one voice's playout: 10 s. A line is written only when
 /// something had to be made up in that time.
@@ -285,6 +296,7 @@ impl Stream {
             since_logged: 0,
             standing_in: 0,
             unpaced: PACE_REST,
+            short: 0,
         })
     }
 
@@ -349,7 +361,7 @@ impl Stream {
                 Pop::Packet(packet) => {
                     if std::mem::take(&mut self.stalled) {
                         self.gaps += 1;
-                        self.jitter.deepen();
+                        self.jitter.deepen(self.standing_in);
                         self.stall_over(who);
                     }
                     let decoded = self.played(&packet, &mut pcm);
@@ -451,21 +463,24 @@ impl Stream {
         );
     }
 
-    /// Plays a frame just decoded a pitch period longer while the buffer is short of where it
-    /// should be, and shorter while it holds more than it needs in mid-speech. Whether it did
-    /// either: the frame is in `pcm` then. The frames after one that was changed play as they
-    /// are ([`PACE_REST`]).
+    /// Plays a frame just decoded a pitch period longer once the buffer has stayed a packet
+    /// short of where it should be ([`SHORT`]), and shorter while it holds two packets more
+    /// than it keeps in mid-speech. What it keeps counts what a stall taught, so the backlog a
+    /// freeze leaves stays for the next one. Whether it did either: the frame is in `pcm` then.
+    /// The frames after one that was changed play as they are ([`PACE_REST`], [`SQUEEZE_REST`]).
     fn paced(&mut self, frame: &[i16]) -> bool {
         let queued = self.jitter.held() * FRAME_SAMPLES + self.pcm.len();
         let steady = self.jitter.target().saturating_sub(1) * FRAME_SAMPLES;
-        let rest = if queued > steady + 2 * FRAME_SAMPLES + PACE_FAR { PACE_REST / 2 } else { PACE_REST };
+        self.short = if queued + FRAME_SAMPLES <= steady { self.short + 1 } else { 0 };
+        let over = queued.saturating_sub(steady + 2 * FRAME_SAMPLES);
+        let rest = if over > 0 && over <= PACE_FAR { SQUEEZE_REST } else { PACE_REST };
         if self.unpaced < rest {
             self.unpaced += 1;
             return false;
         }
-        let paced = if queued < steady {
+        let paced = if self.short >= SHORT {
             pace::expand(frame).inspect(|_| self.playout.stretched += 1)
-        } else if !self.jitter.hushed && queued > steady + 2 * FRAME_SAMPLES {
+        } else if !self.jitter.hushed && over > 0 {
             pace::accelerate(frame).inspect(|_| self.playout.squeezed += 1)
         } else {
             None
@@ -492,7 +507,7 @@ impl Stream {
             return;
         }
         tracing::warn!(
-            "mediad: {who} playout, {}: {} played, {} waited for, {} lost made up by libopus and {} by the pitch loop, {} stretched, {} squeezed, {} quiet dropped; longest stand-in {} ms; holding {} ms (spread {} ms, jitter {} ms); over the call {} lost ({} rebuilt), {} late",
+            "mediad: {who} playout, {}: {} played, {} waited for, {} lost made up by libopus and {} by the pitch loop, {} stretched, {} squeezed, {} quiet dropped; longest stand-in {} ms; holding {} ms (spread {} ms, jitter {} ms, stalls {} ms); over the call {} lost ({} rebuilt), {} late",
             if whole { "call" } else { "last 10 s" },
             done.played,
             done.waited,
@@ -505,6 +520,7 @@ impl Stream {
             self.jitter.target() * 20,
             self.arrivals.spread_ms(),
             self.arrivals.ms(),
+            self.jitter.stalls() * 20,
             self.jitter.lost,
             self.rebuilt,
             self.jitter.late,
@@ -803,8 +819,9 @@ pub fn stalled_call() -> Option<StalledCall> {
 }
 
 /// The lab's voice-stall driver: a voice held up for a moment in mid-word and then here in a
-/// lump is given its delay back a frame at a time, never as a run of squeezed frames, and the
-/// stall is measured once, with what says where it was held up.
+/// lump is never played as a run of squeezed frames; what the stall left queued is what the
+/// buffer keeps for the next one, and no more. The stall is measured once, with what says
+/// where it was held up.
 pub fn prove_voice_stall() -> Result<(), String> {
     let call = stalled_call().ok_or("the codec did not start")?;
     let fail = |what: &str| Err(format!("{what}: {call:?}"));
@@ -817,14 +834,128 @@ pub fn prove_voice_stall() -> Result<(), String> {
     if call.changed_at_once > 1 || call.changed_in_a_row > 1 {
         return fail("the backlog was squeezed out frame after frame");
     }
-    if call.playout.squeezed == 0 || call.held > call.target + 1 {
-        return fail("the stall's backlog was still queued in mid-speech");
+    if call.held > call.target + 1 {
+        return fail("more was queued after the stall than the buffer keeps for the next one");
     }
     let Some(stall) = call.stall.filter(|_| call.stalls == 1) else {
         return fail("one stall was not measured once");
     };
     if stall.stood_in_ms < 60 || stall.lump != 9 || !stall.watched || stall.looked_ms != 20 || stall.silent_ms != 180 {
         return fail("the stall was not measured as it happened");
+    }
+    Ok(())
+}
+
+/// What [`freezing_call`] heard.
+#[derive(Debug, Default)]
+pub struct FrozenCall {
+    pub playout: Playout,
+    pub lost: u64,
+    /// Ticks something stood in for the voice: before the first freeze, then at each freeze.
+    pub stood_in: Vec<u64>,
+    /// Frames squeezed, and stretched, in each 10 s.
+    pub squeezed: Vec<u64>,
+    pub stretched: Vec<u64>,
+    /// Samples of plain silence played while something stood in.
+    pub silent: u64,
+    /// What was queued, on average, in ms; and what the buffer aimed for at the end, in packets.
+    pub delay_ms: f64,
+    pub target: usize,
+    /// What was played, one channel.
+    pub heard: Vec<i16>,
+}
+
+/// A link that freezes: `packets` sent 20 ms apart through one receive stream, nothing lost,
+/// each `late(n)` ms late; and every `every` packets, none for `freeze` ticks and then all of
+/// them at once. Ticks are 20 ms; each takes what has arrived by then and plays a frame.
+pub fn freezing_call(packets: &[Vec<u8>], every: usize, freeze: usize, late: impl Fn(usize) -> u64) -> Option<FrozenCall> {
+    let at = |n: usize| {
+        if every > 0 && n >= every && n % every < freeze {
+            return ((n - n % every + freeze) * 20) as u64;
+        }
+        n as u64 * 20 + late(n)
+    };
+    let mut order: Vec<usize> = (0..packets.len()).collect();
+    order.sort_by_key(|&n| (at(n), n));
+    let mut stream = Stream::clocked()?;
+    let start = Instant::now();
+    let mut call = FrozenCall::default();
+    let (mut next, mut queued, mut frames) = (0, 0f64, 0u32);
+    let count = |counts: &mut Vec<u64>, at: usize, more: u64| {
+        counts.resize(counts.len().max(at + 1), 0);
+        counts[at] += more;
+    };
+    for tick in 0..packets.len() {
+        while next < order.len() && at(order[next]) <= tick as u64 * 20 {
+            let n = order[next];
+            stream.arrivals.arrived(n as u32 * 960, start + Duration::from_millis(at(n)));
+            stream.took(Duration::ZERO);
+            stream.jitter.insert(n as u16, packets[n].clone());
+            next += 1;
+        }
+        let before = stream.playout;
+        let frame = stream.pull(&"freeze");
+        let waited = stream.playout.waited - before.waited;
+        count(&mut call.stood_in, tick.checked_div(every).unwrap_or(0), waited);
+        count(&mut call.squeezed, tick / 500, stream.playout.squeezed - before.squeezed);
+        count(&mut call.stretched, tick / 500, stream.playout.stretched - before.stretched);
+        let Some(frame) = frame else {
+            call.heard.extend([0; FRAME]);
+            continue;
+        };
+        if waited > 0 {
+            call.silent += frame.as_chunks::<CHANNELS>().0.iter().filter(|pair| **pair == [0; CHANNELS]).count() as u64;
+        }
+        queued += (stream.jitter.held() * FRAME + stream.pcm.len() / CHANNELS) as f64 / 48.;
+        frames += 1;
+        call.heard.extend(frame.iter().step_by(CHANNELS));
+    }
+    call.playout = stream.playout;
+    call.lost = stream.jitter.lost;
+    call.delay_ms = queued / f64::from(frames.max(1));
+    call.target = stream.jitter.target();
+    Some(call)
+}
+
+/// A voiced vowel as a Tiny call sends it: 140 Hz and ten harmonics, swelling and fading three
+/// times a second.
+fn vowel(frames: usize) -> Option<Vec<Vec<u8>>> {
+    let mut encoder = Encoder::voice()?;
+    (0..frames)
+        .map(|f| {
+            let mut pcm = [0i16; FRAME_SAMPLES];
+            for (n, pair) in pcm.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
+                let t = (f * FRAME + n) as f64 / 48_000.;
+                let swell = 0.6 + 0.4 * (t * 3. * std::f64::consts::TAU).sin();
+                let voice: f64 = (1..=10).map(|k| (t * 140. * k as f64 * std::f64::consts::TAU).sin() / k as f64).sum();
+                pair.fill((voice * swell * 4_000.) as i16);
+            }
+            let mut packet = [0u8; 1275];
+            let len = encoder.encode(&pcm, &mut packet)?;
+            Some(packet[..len].to_vec())
+        })
+        .collect()
+}
+
+/// The lab's voice-freeze-held driver: half a minute of speech over a link that stands still
+/// for 220 ms every 5 s and then delivers the lot. The first freeze is heard, the second may
+/// be, and no other; and the delay that carries them is not squeezed away in between.
+pub fn prove_voice_freeze() -> Result<(), String> {
+    let packets = vowel(1_500).ok_or("the codec did not start")?;
+    let mut call = freezing_call(&packets, 250, 11, |_| 0).ok_or("the codec did not start")?;
+    call.heard.clear();
+    let fail = |what: &str| Err(format!("{what}: {call:?}"));
+    if call.lost > 0 {
+        return fail("a late packet was taken for a lost one");
+    }
+    if call.stood_in.len() < 6 || call.stood_in[1] < 3 {
+        return fail("the first freeze was not heard as one, so nothing was proved");
+    }
+    if call.stood_in[3..].iter().any(|&ticks| ticks > 0) {
+        return fail("a freeze after the second was a drop-out too");
+    }
+    if call.squeezed.iter().any(|&frames| frames > 4) {
+        return fail("the delay kept for the next freeze was squeezed away");
     }
     Ok(())
 }
@@ -918,7 +1049,8 @@ pub(crate) fn listen(controls: &Controls, audio: &mut Audio, processor: &mut Pro
     // The meter in the device menu stays live while muted, so the microphone can be tried.
     audio.listen(!muted || controls.metering());
     let captured = audio.capture(frame);
-    processor.set(controls.processing());
+    // A microphone that suppresses noise itself runs with ours off.
+    processor.set_for(controls.processing(), &audio.input.name);
     if captured {
         // Mic volume before DSP so AGC/NS see the level the user chose, and the meter matches.
         crate::process::apply_input_gain(frame, controls.tuning().input);
@@ -955,6 +1087,35 @@ pub fn failure(err: AudioError) -> (CallFailure, String) {
     (CallFailure::Audio, detail.to_owned())
 }
 
+/// The most datagrams taken off the socket ahead of one tick: a flood does not hold the tick up.
+const LUMP: usize = 256;
+
+/// Other people's frames that never reached a jitter buffer, by what stopped them, since the
+/// log's last line. The playout counts each as a lost packet and cannot say why.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Drops {
+    /// The transport's encryption did not open the packet.
+    transport: u32,
+    /// The end-to-end encryption did not open the frame.
+    dave: u32,
+    /// The gateway did not say in time whose it was.
+    unnamed: u32,
+}
+
+impl Drops {
+    /// The log's line, when anything was dropped, and the count starts again. `when` is
+    /// "last 10 s", or the call's end.
+    fn line(&mut self, when: &str) -> Option<String> {
+        let drops = std::mem::take(self);
+        (drops != Drops::default()).then(|| {
+            format!(
+                "mediad: voice frames dropped before playout, {when}: {} the transport encryption did not open, {} the end-to-end encryption did not open, {} from a sender not named in time",
+                drops.transport, drops.dave, drops.unnamed
+            )
+        })
+    }
+}
+
 struct Loop {
     setup: Setup,
     encoder: Encoder,
@@ -971,6 +1132,11 @@ struct Loop {
     limiter: Limiter,
     meter: Meter,
     pictures: discord_video::Drive,
+    /// How the loop kept its own time, as a Tiny call's says it.
+    turns: Turns,
+    drops: Drops,
+    /// Frames of senders the gateway has not named yet.
+    held: Held,
 }
 
 impl Loop {
@@ -988,6 +1154,7 @@ impl Loop {
             return;
         }
         let Ok(packet) = self.setup.opener.unseal(datagram) else {
+            self.drops.transport += 1;
             return;
         };
         if packet.ssrc == self.setup.ssrc {
@@ -1009,31 +1176,63 @@ impl Loop {
             stream.heard |= packet.payload != SILENCE;
             return;
         }
-        let user = self
+        let user: Option<u64> = self
             .setup
             .users
             .lock()
             .unwrap()
             .get(&packet.ssrc)
             .and_then(|id| id.parse().ok());
-        let mut again = Vec::new();
-        let frame = self
-            .setup
-            .dave
-            .lock()
-            .unwrap()
-            .decrypt(user, &packet.payload, &mut again);
-        if !again.is_empty() {
-            let _ = self.setup.report.send(FromMedia::Dave(again));
+        // What waited for the sender's name goes first, then this one.
+        let mut sealed = if user.is_some() { self.held.take(packet.ssrc) } else { VecDeque::new() };
+        if user.is_none() && self.held.any(packet.ssrc) {
+            self.drops.unnamed += self.held.keep(packet.ssrc, stream.last_packet, packet.sequence, packet.payload);
+        } else {
+            sealed.push_back((stream.last_packet, packet.sequence, packet.payload));
         }
-        if let Some(frame) = frame {
+        let mut again = Vec::new();
+        let mut dave = self.setup.dave.lock().unwrap();
+        for (taken, sequence, payload) in sealed {
+            let frame = match dave.open(user, &payload, &mut again) {
+                Ok(frame) => frame,
+                Err(Refused::NoUser) => {
+                    self.drops.unnamed += self.held.keep(packet.ssrc, taken, sequence, payload);
+                    continue;
+                }
+                Err(Refused::Failed) => {
+                    self.drops.dave += 1;
+                    continue;
+                }
+            };
             stream.heard |= frame != SILENCE;
             if frame == SILENCE {
                 // Discord's five silence frames before a pause: how long it lasts is not lateness.
                 stream.arrivals.paused();
             }
-            stream.jitter.insert(packet.sequence, frame);
+            stream.took(taken.elapsed());
+            stream.jitter.insert(sequence, frame);
         }
+        drop(dave);
+        if !again.is_empty() {
+            let _ = self.setup.report.send(FromMedia::Dave(again));
+        }
+    }
+
+    /// Takes in what waits in the socket, without waiting for more. True if there was anything.
+    fn drain(&mut self, datagram: &mut [u8]) -> bool {
+        if self.setup.socket.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let mut gave = false;
+        for _ in 0..LUMP {
+            let Ok(len) = self.setup.socket.recv(datagram) else {
+                break;
+            };
+            gave = true;
+            self.receive(&datagram[..len]);
+        }
+        let _ = self.setup.socket.set_nonblocking(false);
+        gave
     }
 
     fn send(&mut self, opus: &[u8]) {
@@ -1098,12 +1297,17 @@ impl Loop {
         let ducked = ear.ducking(self.streams.iter().map(|(ssrc, stream)| (who(ssrc), stream.speaking())));
         let mut mix = [0i32; FRAME_SAMPLES];
         let mut changed = Vec::new();
+        let since = self.turns.told;
         for (ssrc, stream) in &mut self.streams {
             let loud = if deafened {
                 stream.drop_audio();
                 stream.heard
             } else {
-                match stream.pull(&format_args!("ssrc {ssrc}")) {
+                stream.looked(since.looks, since.silent);
+                let stalls = stream.gaps;
+                let frame = stream.pull(&format_args!("ssrc {ssrc}"));
+                self.turns.stalled |= stream.gaps != stalls;
+                match frame {
                     Some(frame) => {
                         stream.mix_into(&mut mix, &frame, ear.factor(who(ssrc), ducked));
                         level(&frame) >= VOICE
@@ -1139,6 +1343,7 @@ impl Loop {
                 self.meter.probe(self.keepalive);
             }
         }
+        self.drops.unnamed += self.held.expire(Instant::now());
         self.setup.audio.log_glitches();
         self.meter.troubles = self.setup.audio.troubles();
         let stats = self.meter.second(self.streams.values_mut().map(Stream::counts));
@@ -1155,44 +1360,13 @@ impl Loop {
         let mut datagram = [0u8; 2048];
         let mut next = Instant::now() + TICK;
         while !self.setup.stop.load(Ordering::Relaxed) && !crate::out::over() {
-            let now = Instant::now();
-            if now < next {
-                let _ = self
-                    .setup
-                    .socket
-                    .set_read_timeout(Some((next - now).max(Duration::from_micros(200))));
-                match self.setup.socket.recv(&mut datagram) {
-                    Ok(len) => self.receive(&datagram[..len]),
-                    Err(err)
-                        if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-                    // An ICMP error surfaces here once per packet we sent; it is not ours to act on.
-                    Err(_) => std::thread::sleep(Duration::from_millis(1)),
-                }
-                continue;
+            match self.turn(next, &mut datagram) {
+                Some(at) => next = at,
+                None => break,
             }
-            next += TICK;
-            if now > next + 5 * TICK {
-                // The machine slept or stalled: do not replay the missed ticks.
-                next = now + TICK;
-            }
-            self.ticks += 1;
-            let input = self.capture();
-            let output = self.play();
-            self.pictures.tick(&self.setup.dave, &self.setup.socket, &self.setup.report);
-            if self.ticks.is_multiple_of(5)
-                && self.setup.controls.metering()
-                && (input, output) != self.levels
-            {
-                self.levels = (input, output);
-                out::send(&MediaResponse::Levels { input, output });
-            }
-            if self.ticks.is_multiple_of(SECOND) && !self.housekeeping() {
-                break;
-            }
-            if let Err((reason, detail)) = self.devices.service(&mut self.setup.audio, &self.setup.controls, self.ticks) {
-                let _ = self.setup.report.send(FromMedia::Fatal(reason, detail));
-                break;
-            }
+        }
+        if let Some(line) = self.drops.line("at the call's end") {
+            tracing::warn!("{line}");
         }
         if self.gate.talking() {
             for _ in 0..TRAIL {
@@ -1206,6 +1380,224 @@ impl Loop {
             stream.log_playout(&format_args!("ssrc {ssrc}"), true);
         }
         sign_off(&self.setup.audio);
+    }
+}
+
+impl Loop {
+    /// One turn of the loop: waits on the socket for the tick due at `next`, or runs it. When
+    /// the tick after is due, or `None` when the call is over.
+    fn turn(&mut self, mut next: Instant, datagram: &mut [u8]) -> Option<Instant> {
+        let now = Instant::now();
+        if now < next {
+            let _ = self
+                .setup
+                .socket
+                .set_read_timeout(Some((next - now).max(Duration::from_micros(200))));
+            let gave = match self.setup.socket.recv(datagram) {
+                Ok(len) => {
+                    self.receive(&datagram[..len]);
+                    true
+                }
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => false,
+                // An ICMP error surfaces here once per packet we sent; it is not ours to act on.
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    false
+                }
+            };
+            self.turns.looked(Instant::now(), gave);
+            return Some(next);
+        }
+        // A tick that ran long leaves ticks to catch up, one after another with no wait
+        // between them, and the packets of that time in the socket. They are taken in ahead of
+        // each tick: or those ticks find nothing to play, and the packets come in a lump.
+        let gave = self.drain(datagram);
+        self.turns.looked(Instant::now(), gave);
+        next += TICK;
+        if now > next + 5 * TICK {
+            // The machine slept or stalled: do not replay the missed ticks.
+            next = now + TICK;
+        }
+        self.ticks += 1;
+        self.turns.tick(now);
+        let input = self.capture();
+        let output = self.play();
+        self.pictures.tick(&self.setup.dave, &self.setup.socket, &self.setup.report);
+        if self.ticks.is_multiple_of(5)
+            && self.setup.controls.metering()
+            && (input, output) != self.levels
+        {
+            self.levels = (input, output);
+            out::send(&MediaResponse::Levels { input, output });
+        }
+        if self.ticks.is_multiple_of(10 * SECOND) {
+            self.turns.log();
+            if let Some(line) = self.drops.line("last 10 s") {
+                tracing::warn!("{line}");
+            }
+        }
+        if self.ticks.is_multiple_of(SECOND) && !self.housekeeping() {
+            return None;
+        }
+        if let Err((reason, detail)) = self.devices.service(&mut self.setup.audio, &self.setup.controls, self.ticks) {
+            let _ = self.setup.report.send(FromMedia::Fatal(reason, detail));
+            return None;
+        }
+        Some(next)
+    }
+}
+
+#[cfg(test)]
+mod discord_tests {
+    use super::*;
+    use crate::rtp::AES_GCM;
+
+    const THEIRS: u32 = 2222;
+
+    /// A Discord call's loop on stand-in devices, and the far end of its socket: the voice
+    /// server, sending as the member 111 on `THEIRS`.
+    fn call() -> (Loop, UdpSocket, Sender) {
+        let (near, far) = (UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap());
+        near.connect(far.local_addr().unwrap()).unwrap();
+        far.connect(near.local_addr().unwrap()).unwrap();
+        let cipher = Cipher::new(AES_GCM, &[7; 32]).unwrap();
+        let controls = Arc::new(Controls::default());
+        let videos = Arc::new(Mutex::new(HashMap::new()));
+        let announced = Arc::new(AtomicBool::new(false));
+        let setup = Setup {
+            socket: near,
+            sender: Sender::new(cipher.clone(), 1111, 0, 0),
+            opener: cipher.clone(),
+            ssrc: 1111,
+            user_id: "222".to_owned(),
+            dave: Arc::new(Mutex::new(Dave::new(222, 900))),
+            users: Arc::default(),
+            controls: controls.clone(),
+            report: mpsc::channel().0,
+            audio: Audio::virtual_devices((48_000, 1), (48_000, 2)).0,
+            stop: Arc::default(),
+            microphone_unasked: false,
+            pipe: None,
+            videos: videos.clone(),
+            announced: announced.clone(),
+        };
+        let state = Loop {
+            setup,
+            pictures: discord_video::Drive::new(controls, "222".to_owned(), videos, announced, None, false, true),
+            encoder: Encoder::new().unwrap(),
+            streams: HashMap::new(),
+            gate: Gate::default(),
+            ticks: 0,
+            keepalive: 0,
+            levels: (0, 0),
+            cue: None,
+            devices: Devices::start(false),
+            processor: Processor::new(),
+            limiter: Limiter::default(),
+            meter: Meter::new(CallPath::Udp),
+            turns: Turns::default(),
+            drops: Drops::default(),
+            held: Held::default(),
+        };
+        (state, far, Sender::new(cipher, THEIRS, 0, 0))
+    }
+
+    /// The datagram of the member's next frame.
+    fn packet(sender: &mut Sender, frame: &[u8]) -> Vec<u8> {
+        let datagram = sender.seal(frame).unwrap();
+        sender.advance(FRAME as u32);
+        datagram
+    }
+
+    fn received(state: &Loop) -> u64 {
+        state.streams.get(&THEIRS).map_or(0, |stream| stream.jitter.received)
+    }
+
+    /// What ran late was a tick, and three more are due at once. The packets of that time are
+    /// in the socket. They were left there until the ticks had caught up, each tick finding
+    /// nothing to play, and then came in a lump.
+    #[test]
+    fn what_waits_in_the_socket_is_taken_in_ahead_of_every_tick_that_is_late() {
+        let (mut state, far, mut sender) = call();
+        let mut datagram = [0u8; 2048];
+        let voice = [0x78, 1, 2, 3, 4, 5, 6, 7];
+        for _ in 0..4 {
+            far.send(&packet(&mut sender, &voice)).unwrap();
+        }
+        thread::sleep(Duration::from_millis(30));
+        let late = Instant::now() - 3 * TICK;
+        let next = state.turn(late, &mut datagram).unwrap();
+        assert_eq!((state.ticks, received(&state)), (1, 4), "all four, before the tick");
+        assert_eq!(next, late + TICK, "and the next tick is late as well");
+
+        far.send(&packet(&mut sender, &voice)).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        state.turn(next, &mut datagram).unwrap();
+        assert_eq!((state.ticks, received(&state)), (2, 5), "a tick catching up looks too");
+        assert!(state.turns.told.looks >= Duration::from_millis(30), "the voices are told how long the loop did not look: {:?}", state.turns.told);
+        assert_eq!(state.drops, Drops::default());
+        state.devices.stop();
+    }
+
+    /// The gateway names the sender after its first packets: none of them is lost, and they
+    /// go to the playout in order.
+    #[test]
+    fn the_first_frames_of_a_sender_named_a_moment_later_are_played() {
+        let (mut state, _far, mut sender) = call();
+        let (mut theirs, ours) = crate::dave::tests::grouped(7);
+        state.setup.dave = Arc::new(Mutex::new(ours));
+        for n in 0..5u8 {
+            let sealed = theirs.encrypt(&[0x78, n, 2, 3, 4, 5, 6, 7]).unwrap();
+            state.receive(&packet(&mut sender, &sealed));
+        }
+        assert_eq!(received(&state), 0, "nothing opens without the sender's name");
+        state.setup.users.lock().unwrap().insert(THEIRS, "111".to_owned());
+        let sealed = theirs.encrypt(&[0x78, 5, 2, 3, 4, 5, 6, 7]).unwrap();
+        state.receive(&packet(&mut sender, &sealed));
+        assert_eq!(received(&state), 6);
+        assert_eq!(state.drops, Drops::default());
+        assert_eq!(state.streams[&THEIRS].jitter.lost, 0);
+        state.devices.stop();
+    }
+
+    /// Each frame that never reaches the playout is counted by what stopped it, and the log
+    /// has a line only when there was one.
+    #[test]
+    fn frames_dropped_before_playout_are_counted_by_reason() {
+        let (mut state, _far, mut sender) = call();
+        assert_eq!(state.drops.line("last 10 s"), None, "nothing dropped, no line");
+        let (mut theirs, ours) = crate::dave::tests::grouped(7);
+        state.setup.dave = Arc::new(Mutex::new(ours));
+
+        // Not sealed with the transport's key.
+        let mut broken = packet(&mut sender, &[0x78, 1, 2, 3]);
+        broken[14] ^= 1;
+        state.receive(&broken);
+        assert_eq!(state.drops, Drops { transport: 1, dave: 0, unnamed: 0 });
+
+        // Nobody names the sender: 15 frames wait, and the oldest give way to the rest.
+        for n in 0..18u8 {
+            let sealed = theirs.encrypt(&[0x78, n, 2, 3]).unwrap();
+            state.receive(&packet(&mut sender, &sealed));
+        }
+        assert_eq!(state.drops, Drops { transport: 1, dave: 0, unnamed: 3 });
+        // And those wait 300 ms, not for ever.
+        assert_eq!(state.held.expire(Instant::now() + Duration::from_secs(1)), 15);
+
+        // Named, and not a frame of the group: sealed with another group's keys.
+        state.setup.users.lock().unwrap().insert(THEIRS, "111".to_owned());
+        let (mut stranger, _) = crate::dave::tests::grouped(7);
+        let sealed = stranger.encrypt(&[0x78, 9, 2, 3]).unwrap();
+        state.receive(&packet(&mut sender, &sealed));
+        assert_eq!(state.drops, Drops { transport: 1, dave: 1, unnamed: 3 });
+        assert_eq!(received(&state), 0);
+
+        assert_eq!(
+            state.drops.line("last 10 s").as_deref(),
+            Some("mediad: voice frames dropped before playout, last 10 s: 1 the transport encryption did not open, 1 the end-to-end encryption did not open, 3 from a sender not named in time")
+        );
+        assert_eq!(state.drops.line("last 10 s"), None, "once");
+        state.devices.stop();
     }
 }
 
@@ -1275,6 +1667,9 @@ pub fn run(mut setup: Setup) -> Audio {
         processor: Processor::new(),
         limiter: Limiter::default(),
         meter: Meter::new(CallPath::Udp),
+        turns: Turns::default(),
+        drops: Drops::default(),
+        held: Held::default(),
     };
     state.run();
     state.devices.stop();
@@ -1769,21 +2164,7 @@ mod loss_tests {
     /// Two seconds and more of a voiced vowel: 140 Hz and ten harmonics, swelling and fading
     /// three times a second, as a Tiny call's encoder sends it.
     fn vowel_packets(frames: usize) -> Vec<Vec<u8>> {
-        let mut encoder = Encoder::voice().unwrap();
-        (0..frames)
-            .map(|f| {
-                let mut pcm = [0i16; FRAME_SAMPLES];
-                for (n, pair) in pcm.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
-                    let t = (f * FRAME + n) as f64 / 48_000.;
-                    let swell = 0.6 + 0.4 * (t * 3. * std::f64::consts::TAU).sin();
-                    let voice: f64 = (1..=10).map(|k| (t * 140. * k as f64 * std::f64::consts::TAU).sin() / k as f64).sum();
-                    pair.fill((voice * swell * 4_000.) as i16);
-                }
-                let mut packet = [0u8; 1275];
-                let len = encoder.encode(&pcm, &mut packet).unwrap();
-                packet[..len].to_vec()
-            })
-            .collect()
+        vowel(frames).unwrap()
     }
 
     /// Plays `packets` through a receive stream, losing those `lost` says, one tick each.
@@ -1806,9 +2187,10 @@ mod loss_tests {
     /// the way into the stall was played a pitch period longer and every frame after it one
     /// shorter, twenty and more in a row, which is a voice at up to twice its speed with a
     /// splice in each frame: the "robot". Now a frame that was stretched or squeezed is
-    /// followed by frames played as they are, and the delay still comes back.
+    /// followed by frames played as they are, and what the stall left queued is kept for the
+    /// next one instead of being squeezed out.
     #[test]
-    fn a_stall_in_mid_speech_is_given_back_a_little_at_a_time() {
+    fn a_stall_in_mid_speech_is_never_a_run_of_squeezed_frames() {
         let packets = vowel_packets(160);
         let mut stream = Stream::clocked().unwrap();
         let (mut run, mut longest_run, mut last) = (0u32, 0u32, (0u64, 0u64));
@@ -1832,7 +2214,7 @@ mod loss_tests {
         }
         assert_eq!(stream.jitter.lost, 0, "nothing was lost");
         assert!(stream.playout.waited >= 3, "the stall was heard as one: {:?}", stream.playout);
-        assert!(stream.playout.squeezed > 0, "the delay is given back in speech: {:?}", stream.playout);
+        assert!(stream.playout.squeezed <= 1, "what the stall left is kept for the next one: {:?}", stream.playout);
         assert!(longest_run <= 1, "{longest_run} ticks in a row played nothing as it came: {:?}", stream.playout);
         assert!(stream.jitter.held() <= stream.jitter.target() + 1, "{} still queued against {}", stream.jitter.held(), stream.jitter.target());
     }
@@ -1842,6 +2224,129 @@ mod loss_tests {
     fn a_stall_and_its_lump_are_paced_and_measured_once() {
         eprintln!("{:?}", stalled_call());
         prove_voice_stall().unwrap();
+    }
+
+    /// What the calls that sounded bad showed: the far link stands still for 220 ms every 5 s
+    /// and then delivers the lot, nothing lost. Before: every freeze was a 180 ms drop-out, and
+    /// the two seconds after it played up to a sixth faster, which also threw away the delay that
+    /// would have carried the next one. Now the first freeze is the lesson, and the rest are
+    /// not heard.
+    #[test]
+    fn a_link_that_keeps_freezing_is_heard_to_stall_once() {
+        let mut call = freezing_call(&vowel_packets(3_000), 250, 11, |_| 0).unwrap();
+        call.heard.clear();
+        eprintln!("{call:?}");
+        assert_eq!(call.lost, 0, "nothing was lost");
+        assert!(call.stood_in[1] >= 3, "the first freeze is heard: {:?}", call.stood_in);
+        assert!(call.stood_in[3..].iter().all(|&ticks| ticks == 0), "a freeze after the second was heard: {:?}", call.stood_in);
+        assert!(call.squeezed.iter().all(|&frames| frames <= 4), "the delay it needs was squeezed away: {:?}", call.squeezed);
+        assert!(call.target * 20 <= 300, "holding {} ms for a 220 ms freeze", call.target * 20);
+    }
+
+    /// A link that never freezes pays for none of that: it holds what it held before, and
+    /// nothing is played longer or shorter.
+    #[test]
+    fn a_link_that_never_freezes_keeps_its_short_delay_and_plays_as_it_comes() {
+        let packets = vowel_packets(1_500);
+        for (name, late) in [("on time", 0), ("up to 30 ms late", 31)] {
+            let mut seed = 5u32;
+            let lateness: Vec<u64> = (0..packets.len())
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    u64::from(seed >> 16) * late / 65_536
+                })
+                .collect();
+            let mut call = freezing_call(&packets, 0, 0, |n| lateness[n]).unwrap();
+            call.heard.clear();
+            eprintln!("{name}: {call:?}");
+            assert!(call.target * 20 <= if late == 0 { 60 } else { 100 }, "{name}: holding {} ms", call.target * 20);
+            let paced = call.playout.stretched + call.playout.squeezed;
+            assert!(paced <= if late == 0 { 0 } else { 6 }, "{name}: {paced} frames stretched or squeezed in 30 s: {:?}", call.playout);
+        }
+    }
+
+    /// Half a minute of something like speech: syllables a fifth of a second long on a pitch
+    /// that wanders, each with a vowel's formants, a hiss before every third, and a breath
+    /// between sentences. No recording of a real voice is in the repository.
+    fn speech_packets(frames: usize) -> Vec<Vec<u8>> {
+        const VOWELS: [[f64; 3]; 5] = [[730., 1090., 2440.], [270., 2290., 3010.], [300., 870., 2240.], [530., 1840., 2480.], [660., 1720., 2410.]];
+        let mut encoder = Encoder::voice().unwrap();
+        let (mut phase, mut seed, mut hiss) = (0f64, 9u32, 0f64);
+        (0..frames)
+            .map(|f| {
+                let mut pcm = [0i16; FRAME_SAMPLES];
+                for (n, pair) in pcm.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
+                    let t = (f * FRAME + n) as f64 / 48_000.;
+                    let (said, syllable) = (t % 3.3, ((t % 3.3) / 0.22) as usize);
+                    let within = said - syllable as f64 * 0.22;
+                    let pitch = 125. + 25. * (t * 0.4 * std::f64::consts::TAU).sin() + 12. * (syllable % 4) as f64;
+                    phase = (phase + pitch * std::f64::consts::TAU / 48_000.) % std::f64::consts::TAU;
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let noise = f64::from((seed >> 16) as i16) / 32_768.;
+                    let white = noise - hiss;
+                    hiss = noise;
+                    let vowel = VOWELS[(syllable * 3 + (t / 3.3) as usize) % VOWELS.len()];
+                    let voiced: f64 = (1..=(3_600. / pitch) as usize)
+                        .map(|k| {
+                            let at = k as f64 * pitch;
+                            let weight: f64 = vowel.iter().map(|formant| (-((at - formant) / 140.).powi(2)).exp()).sum();
+                            (phase * k as f64).sin() * (weight + 0.06 / k as f64)
+                        })
+                        .sum();
+                    // A soft start and a longer fall, never quite to nothing inside a sentence.
+                    let shape = (within / 0.02).min(1.) * ((0.21 - within) / 0.06).clamp(0.08, 1.);
+                    let sample = if said >= 2.9 {
+                        0.
+                    } else if syllable % 3 == 2 && within < 0.05 {
+                        white * 1_200.
+                    } else {
+                        voiced * shape * 2_500.
+                    };
+                    pair.fill(sample.clamp(-30_000., 30_000.) as i16);
+                }
+                let mut packet = [0u8; 1275];
+                let len = encoder.encode(&pcm, &mut packet).unwrap();
+                packet[..len].to_vec()
+            })
+            .collect()
+    }
+
+    /// The same freezing link with something like speech on it, to listen to: with
+    /// `VOICE_FREEZE_WAV` set, what was played goes there as a 48 kHz WAV. Its counts are
+    /// printed either way (`--ignored --nocapture`).
+    #[test]
+    #[ignore = "a recording to listen to and its numbers; run with --ignored"]
+    fn the_freezing_link_as_it_sounds() {
+        let packets = speech_packets(1_500);
+        let clean = freezing_call(&packets, 0, 0, |_| 0).unwrap();
+        let call = freezing_call(&packets, 250, 11, |_| 0).unwrap();
+        println!(
+            "30 s, 220 ms freeze every 5 s: stand-in {} ms (per freeze, ms: {:?}), plain silence in it {:.0} ms, {} frames squeezed, {} stretched, {} quiet dropped, mean delay {:.0} ms, which is {:.0} ms more than the {:.0} ms of the same link without freezes; holding {} ms at the end; {} lost",
+            call.playout.waited * 20,
+            call.stood_in[1..].iter().map(|ticks| ticks * 20).collect::<Vec<_>>(),
+            call.silent as f64 / 48.,
+            call.playout.squeezed,
+            call.playout.stretched,
+            call.playout.shed,
+            call.delay_ms,
+            call.delay_ms - clean.delay_ms,
+            clean.delay_ms,
+            call.target * 20,
+            call.lost,
+        );
+        let Some(path) = std::env::var_os("VOICE_FREEZE_WAV") else {
+            return;
+        };
+        let data = call.heard.len() as u32 * 2;
+        let mut wav = Vec::with_capacity(44 + data as usize);
+        wav.extend(b"RIFF");
+        wav.extend((36 + data).to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        wav.extend([16u32.to_le_bytes(), 0x0001_0001u32.to_le_bytes(), 48_000u32.to_le_bytes(), 96_000u32.to_le_bytes(), 0x0010_0002u32.to_le_bytes()].concat());
+        wav.extend(b"data");
+        wav.extend(data.to_le_bytes());
+        wav.extend(call.heard.iter().flat_map(|sample| sample.to_le_bytes()));
+        std::fs::write(path, wav).unwrap();
     }
 
     /// A stall is one line however many ticks it lasts, and it says what the loop saw while it
@@ -2042,7 +2547,8 @@ mod receive_tests {
             "the tail steps from {from} to {}",
             tail[0]
         );
-        let ended = (0..2).map(|_| stream.pull(&format_args!("speaker")).expect("the ending frame")).last().unwrap();
+        // A spurt that stops on a loud frame may be a stall: its stand-in takes 140 ms to fade.
+        let ended = (0..6).map(|_| stream.pull(&format_args!("speaker")).expect("the ending frame")).last().unwrap();
         assert_eq!(ended[ended.len() - 1], 0, "the tail ends at silence");
         assert_eq!((stream.jitter.lost, stream.gaps), (0, 0), "nothing was lost, and nothing came back");
     }

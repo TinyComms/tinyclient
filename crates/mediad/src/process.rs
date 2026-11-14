@@ -19,6 +19,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use crate::hear::Limiter;
 use crate::{CHANNELS, FRAME, FRAME_SAMPLES, RATE};
 use hush_vani::{Hush, HushStream};
 use protocol::{AudioProcessing, NoiseMode};
@@ -69,6 +70,15 @@ const HIGH_BAND_FLOOR: f32 = 1e-4;
 /// How far the high band's gain moves toward the newest hop's ratio, per hop (two per
 /// frame): a syllable moves it within tens of milliseconds, a hop of model flutter does not.
 const HIGH_BAND_RATE: f32 = 0.25;
+/// The most voice isolation takes away, in dB: under it the model's output is mixed with
+/// what it was given. Unlimited, it gates the room to nothing between words (44 dB down
+/// in the tests' scene) and what is left wanders 1.7 dB from one 10 ms hop to the next,
+/// against the room's own 0.3: a voice under water. Held to 15 the room stays as a steady
+/// floor (0.36 dB), the band over the cut stops pumping shut (3 dB of wander in its gain,
+/// from 24), and the voice loses 2 dB less. Each 3 dB less here gives the voice under a
+/// decibel more and the room 3; from 18 up the floor starts to wander again in a quiet
+/// room (`isolation_limits_measured`).
+pub const ISOLATION_LIMIT_DB: f32 = 15.;
 
 pub struct Processor {
     /// High-pass, echo cancellation, and WebRTC noise suppression when that is the mode.
@@ -78,6 +88,8 @@ pub struct Processor {
     gain: Option<sonora::AudioProcessing>,
     hush: Option<HushStream>,
     band: Band,
+    /// Holds what is sent under full scale.
+    limiter: Limiter,
     /// What is in force, so a repeat of the same choice changes nothing.
     chosen: Option<AudioProcessing>,
 }
@@ -95,6 +107,8 @@ struct Band {
     /// The high band's gain, following the isolation's own, smoothed over hops. Starts
     /// neutral, so a quiet start hands the band through instead of chasing a silence.
     high_gain: f32,
+    /// The least that gain goes: the isolation's own limit, as a factor. 0 without one.
+    floor: f32,
 }
 
 impl Default for Processor {
@@ -111,6 +125,7 @@ impl Default for Band {
             hp_hist: [0.; TAPS - 1],
             hp_ring: [0.; FRAME],
             high_gain: 1.,
+            floor: 0.,
         }
     }
 }
@@ -171,6 +186,30 @@ fn hush_model() -> Option<Arc<Hush>> {
         }
     }
     held.clone()
+}
+
+/// Virtual microphones that take the noise out before we hear them, by what their names
+/// hold, in lower case. Voice isolation on top of one suppresses twice, and the second
+/// pass works on the first one's residue. A voice changer (Voicemod) is not one.
+const SUPPRESSING_MICS: [&str; 4] = ["krisp", "nvidia broadcast", "rtx voice", "steelseries sonar"];
+
+/// Whether a microphone of this name takes the noise out itself.
+pub fn suppresses(device: &str) -> bool {
+    let name = device.to_lowercase();
+    SUPPRESSING_MICS.iter().any(|known| name.contains(known))
+}
+
+/// The user's choice as it runs on the microphone named `device`: with noise off on one
+/// that suppresses itself, echo cancellation and gain as chosen.
+pub fn for_device(chosen: Option<AudioProcessing>, device: &str) -> Option<AudioProcessing> {
+    let chosen = chosen?;
+    if chosen.noise != NoiseMode::Off && suppresses(device) {
+        return Some(AudioProcessing {
+            noise: NoiseMode::Off,
+            ..chosen
+        });
+    }
+    Some(chosen)
 }
 
 /// Builds the voice-isolation model now if `chosen` will want it.
@@ -250,17 +289,25 @@ impl Processor {
             gain: None,
             hush: None,
             band: Band::default(),
+            limiter: Limiter::default(),
             chosen: None,
         }
     }
 
     /// Takes the user's choice. All off, or `None`, turns processing off.
     pub fn set(&mut self, chosen: Option<AudioProcessing>) {
+        self.set_limited(chosen, Some(ISOLATION_LIMIT_DB));
+    }
+
+    /// The same, with voice isolation held to `limit` dB. `None` is unlimited.
+    fn set_limited(&mut self, chosen: Option<AudioProcessing>, limit: Option<f32>) {
         if chosen == self.chosen {
             return;
         }
         self.chosen = chosen;
         self.band = Band::default();
+        self.limiter = Limiter::default();
+        self.band.floor = limit.map_or(0., |db| 10f32.powf(-db / 20.));
         let Some(chosen) = chosen else {
             self.front = None;
             self.gain = None;
@@ -270,10 +317,35 @@ impl Processor {
         let hush = (chosen.noise == NoiseMode::Enhanced).then(|| hush_model().map(HushStream::new));
         let isolated = hush.as_ref().is_some_and(Option::is_some);
         self.hush = hush.flatten();
+        if let Some(hush) = &mut self.hush {
+            hush.set_atten_lim_db(limit);
+        }
         self.front = wants_front(chosen).then(|| apm(front_config(chosen, isolated)));
         // Gain after isolation only. Other modes keep it inside `front`, where WebRTC runs it
         // after its own suppressor.
         self.gain = (isolated && chosen.auto_gain).then(|| apm(gain_config()));
+    }
+
+    /// Takes the user's choice for the microphone named `device`: one that suppresses noise
+    /// itself runs with ours off ([`for_device`]), and the log says so once.
+    pub fn set_for(&mut self, chosen: Option<AudioProcessing>, device: &str) {
+        let run = for_device(chosen, device);
+        if run != chosen && run != self.chosen {
+            tracing::info!("mediad: {device} already suppresses noise; noise suppression is off for this microphone");
+        }
+        self.set(run);
+    }
+
+    /// The processed frame, on its way to the encoder. Gain and the rejoined bands can
+    /// add up past full scale, and a clamp there is the crackle of clipping: the limiter
+    /// the speaker's mix goes through turns a peak down smoothly instead. Under its
+    /// ceiling the frame passes as it is, 1 ms late.
+    fn send(&mut self, done: &[f32; FRAME], frame: &mut [i16; FRAME_SAMPLES]) {
+        let mut sums = [0i32; FRAME_SAMPLES];
+        for (pair, sample) in sums.as_chunks_mut::<CHANNELS>().0.iter_mut().zip(done) {
+            pair.fill((sample * 32767.) as i32);
+        }
+        self.limiter.run(&sums, frame);
     }
 
     pub fn active(&self) -> bool {
@@ -329,9 +401,7 @@ impl Processor {
             let source = done;
             run_blocks(apm, &source, &mut done);
         }
-        for (pair, sample) in frame.as_chunks_mut::<CHANNELS>().0.iter_mut().zip(done) {
-            pair.fill((sample.clamp(-1., 1.) * 32767.) as i16);
-        }
+        self.send(&done, frame);
     }
 
     /// How much echo the canceller is taking away now, in dB, once it knows.
@@ -415,8 +485,9 @@ impl Band {
         let end = KEEP + FRAME;
         self.up_hist.copy_from_slice(&window[end - KEEP..end]);
         // The high band's gain: per hop, the ratio of isolated to original low-band energy,
-        // smoothed and clamped to muting. The model never has reason to lift the sparkle
-        // above the original, only to let a voice's through. Under the floor it holds:
+        // smoothed and clamped between the isolation's limit and one. The model never has
+        // reason to lift the sparkle above the original, only to let a voice's through, and
+        // the band is not taken further down than the band below it. Under the floor it holds:
         // silence judges nothing. With the model passing the band (`isolated == noisy`)
         // the ratio is exactly one and the gain stays exactly neutral, which is what the
         // bridge tests rely on.
@@ -429,7 +500,7 @@ impl Band {
         {
             let noisy_rms = rms(heard);
             if noisy_rms >= HIGH_BAND_FLOOR {
-                let ratio = (rms(kept) / noisy_rms).clamp(0., 1.);
+                let ratio = (rms(kept) / noisy_rms).clamp(self.floor, 1.);
                 gain += HIGH_BAND_RATE * (ratio - gain);
             }
         }
@@ -575,6 +646,64 @@ pub fn prove_high_band() -> Result<(), &'static str> {
     let sparkle = bin_level(&heard, 10_000.);
     if (sparkle - expected).abs() > 0.25 * expected + 0.002 {
         return Err("the sparkle above the cut does not follow the isolation's gain");
+    }
+    Ok(())
+}
+
+/// The lab's isolation driver: with Enhanced chosen, as a call sets it, a steady hiss comes
+/// down by about [`ISOLATION_LIMIT_DB`] and stays as a floor, and a synthetic voice the
+/// model would mute loses no more than that either. Before the limit both went to nothing:
+/// the room gated to silence between words, and whatever the model doubted went with it.
+pub fn prove_isolation_limit() -> Result<(), &'static str> {
+    fn down(signal: impl Fn(usize, f32) -> f32) -> f64 {
+        let mut processor = Processor::new();
+        processor.set(Some(AudioProcessing {
+            echo_cancellation: false,
+            auto_gain: false,
+            noise: NoiseMode::Enhanced,
+        }));
+        let mut seed: u32 = 7;
+        let (mut heard, mut sent) = (0f64, 0f64);
+        // Three seconds; the model settles over the first.
+        for n in 0..150 {
+            let mut frame = [0i16; FRAME_SAMPLES];
+            for (s, pair) in frame.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (seed >> 8) as f32 / (1 << 24) as f32 * 2. - 1.;
+                pair.fill((signal(n * FRAME + s, noise) * 32767.) as i16);
+            }
+            let before = frame;
+            processor.capture(&mut frame);
+            if n > 50 {
+                heard += before.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>();
+                sent += frame.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>();
+            }
+        }
+        10. * (heard / sent.max(1.)).log10()
+    }
+    // WebRTC's high-pass in front takes 3.1 dB off white noise on its own, off the top of
+    // the band, and nothing to speak of off the voice's.
+    let limit = f64::from(ISOLATION_LIMIT_DB);
+    let hiss = down(|_, noise| noise * 0.05) - 3.1;
+    if hiss > limit + 2. {
+        return Err("a steady hiss went down further than the isolation's limit");
+    }
+    if hiss < limit - 2. {
+        return Err("a steady hiss did not come down to the isolation's limit");
+    }
+    // Harmonics with a wobbling pitch, gated like syllables: unlimited, the model takes
+    // tens of decibels off them.
+    let voice = down(|at, _| {
+        let t = at as f32 / RATE as f32;
+        let f0 = 140. + 30. * (t * std::f32::consts::TAU * 3.).sin();
+        let gate = if (t * 4.) as u32 % 3 == 2 { 0. } else { 1. };
+        let sum: f32 = (1..=8)
+            .map(|k| (t * std::f32::consts::TAU * f0 * k as f32).sin() / k as f32)
+            .sum();
+        0.1 * gate * sum
+    });
+    if voice > limit + 2. {
+        return Err("a voice the model doubts lost more than the isolation's limit");
     }
     Ok(())
 }
@@ -750,11 +879,11 @@ mod tests {
         assert!(reduced > 6., "the hiss is only {reduced:.1} dB quieter");
     }
 
-    /// Enhanced (voice isolation) brings steady hiss down across the band. The model
-    /// silences the band it owns, and the high band above its 7.2 kHz cut follows the
-    /// isolation's gain, so what reaches the send is quiet fullband, the way the WebRTC
-    /// fallback suppresses. Measured over the whole band on purpose: the high band used to
-    /// slip through untouched, which a below-the-cut bin would not have seen.
+    /// Enhanced (voice isolation) brings steady hiss down across the band, as far as its
+    /// limit. The model turns down the band it owns, and the high band above its 7.2 kHz
+    /// cut follows the isolation's gain, so what reaches the send is quieter fullband, the
+    /// way the WebRTC fallback suppresses. Measured over the whole band on purpose: the high
+    /// band used to slip through untouched, which a below-the-cut bin would not have seen.
     #[test]
     fn enhanced_noise_brings_steady_hiss_down() {
         let mut seed: u32 = 7;
@@ -778,9 +907,12 @@ mod tests {
             }
         }
         let reduced = db(rms(&heard) / rms(&sent).max(1.));
+        // WebRTC's high-pass in front takes 3.1 dB off white noise on its own, off the top
+        // of the band.
+        let limit = f64::from(ISOLATION_LIMIT_DB) + 3.1;
         assert!(
-            reduced > 15.,
-            "enhanced hiss is only {reduced:.1} dB quieter"
+            (limit - 2.0..limit + 2.).contains(&reduced),
+            "enhanced hiss is {reduced:.1} dB quieter, not about {limit:.1}"
         );
     }
 
@@ -1023,7 +1155,9 @@ mod tests {
     }
 
     /// The microphone test's stand-in is a 440 Hz tone at the same peak the device
-    /// stand-in uses. Standard leaves it in the meter's band. Enhanced takes it down.
+    /// stand-in uses. Standard leaves it in the meter's band. Enhanced takes it down by
+    /// its limit, read here before automatic gain: gain after it brings a lone tone back
+    /// toward speech level, as it does a voice.
     #[test]
     fn standard_keeps_the_test_tone_and_enhanced_takes_it_down() {
         fn tone() -> Vec<[i16; FRAME_SAMPLES]> {
@@ -1042,9 +1176,9 @@ mod tests {
         }
         // The probe reports the loudest frame of each tenth of a second, and it does
         // not feed the speaker back while the meter runs without loopback.
-        fn meter(noise: NoiseMode, frames: &[[i16; FRAME_SAMPLES]]) -> Vec<u8> {
+        fn meter(noise: NoiseMode, gain: bool, frames: &[[i16; FRAME_SAMPLES]]) -> Vec<u8> {
             let mut processor = Processor::new();
-            processor.set(on(true, noise, true));
+            processor.set(on(true, noise, gain));
             let mut levels = Vec::new();
             let mut loudest = 0u8;
             for (n, frame) in frames.iter().enumerate() {
@@ -1059,8 +1193,8 @@ mod tests {
             levels
         }
         let frames = tone();
-        let standard = meter(NoiseMode::Standard, &frames);
-        let enhanced = meter(NoiseMode::Enhanced, &frames);
+        let standard = meter(NoiseMode::Standard, true, &frames);
+        let enhanced = meter(NoiseMode::Enhanced, false, &frames);
         assert!(
             standard.iter().all(|level| (60..90).contains(level)),
             "standard: {standard:?}"
@@ -1069,5 +1203,387 @@ mod tests {
             enhanced.iter().any(|level| *level < 50),
             "enhanced left the tone up: {enhanced:?}"
         );
+    }
+
+    /// The demo's voice message, six seconds of a person speaking, as 48 kHz mono.
+    fn speech() -> Vec<f32> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../chatd/src/demo/photos/voice-ines.opus");
+        let mut source = crate::decode::Source::open(&path).expect("the demo's voice message");
+        let mut stereo = Vec::new();
+        while source.read(&mut stereo).expect("it decodes") {}
+        stereo
+            .as_chunks::<CHANNELS>()
+            .0
+            .iter()
+            .map(|pair| (pair[0] + pair[1]) / 2.)
+            .collect()
+    }
+
+    /// Two seconds of a room, the voice in that room, two more of the room: a steady hiss
+    /// at about -40 dBFS, tilted toward the lows like a fan. Gives where the voice starts
+    /// and ends.
+    fn scene() -> (Vec<f32>, usize, usize) {
+        scene_at(0.03)
+    }
+
+    fn scene_at(room: f32) -> (Vec<f32>, usize, usize) {
+        let said = speech();
+        let lead = RATE as usize * 2;
+        let len = (lead * 2 + said.len()) / FRAME * FRAME;
+        let mut seed: u32 = 29;
+        let mut low = 0f32;
+        let mut input: Vec<f32> = (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (seed >> 8) as f32 / (1 << 24) as f32 * 2. - 1.;
+                low = 0.5 * low + 0.5 * noise;
+                low * room
+            })
+            .collect();
+        for (sample, voice) in input[lead..].iter_mut().zip(&said) {
+            *sample += voice;
+        }
+        (input, lead, lead + said.len())
+    }
+
+    /// `input` through the microphone's processing as a call runs it.
+    fn through(input: &[f32], chosen: Option<AudioProcessing>) -> Vec<f32> {
+        let mut processor = Processor::new();
+        processor.set(chosen);
+        run(&mut processor, input)
+    }
+
+    /// The same, with isolation held to `limit` instead of the call's own.
+    fn through_limited(input: &[f32], chosen: Option<AudioProcessing>, limit: Option<f32>) -> Vec<f32> {
+        let mut processor = Processor::new();
+        processor.set_limited(chosen, limit);
+        run(&mut processor, input)
+    }
+
+    fn run(processor: &mut Processor, input: &[f32]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(input.len());
+        for piece in input.as_chunks::<FRAME>().0 {
+            let pcm: Vec<i16> = piece
+                .iter()
+                .map(|s| (s.clamp(-1., 1.) * 32767.) as i16)
+                .collect();
+            let mut frame = stereo(&pcm);
+            processor.capture(&mut frame);
+            out.extend(
+                frame
+                    .iter()
+                    .step_by(CHANNELS)
+                    .map(|&s| f32::from(s) / 32768.),
+            );
+        }
+        out
+    }
+
+    fn fir(samples: &[f32], coeff: &[f32; TAPS]) -> Vec<f32> {
+        (0..samples.len())
+            .map(|n| {
+                coeff
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| n >= *k)
+                    .map(|(k, tap)| tap * samples[n - k])
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn level_db(samples: &[f32]) -> f64 {
+        db(f64::from(super::rms(samples)).max(1e-9))
+    }
+
+    /// The spread (standard deviation, dB) of a signal's level from one 10 ms hop to the next.
+    fn spread(levels: &[f64]) -> f64 {
+        let mean = levels.iter().sum::<f64>() / levels.len() as f64;
+        (levels.iter().map(|l| (l - mean).powi(2)).sum::<f64>() / levels.len() as f64).sqrt()
+    }
+
+    /// What isolation did to the scene: how far the room alone went down (dB), how much its
+    /// level wanders hop to hop once it has (dB), how far the band under the cut moved while
+    /// the voice spoke (dB) and the most any hop of it lost (dB), and how much the gain on
+    /// the band over the cut wanders there (dB).
+    #[derive(Debug)]
+    struct Heard {
+        room_down: f64,
+        room_spread: f64,
+        voice_moved: f64,
+        voice_deepest: f64,
+        high_spread: f64,
+    }
+
+    fn heard(input: &[f32], out: &[f32], from: usize, to: usize) -> Heard {
+        let second = RATE as usize;
+        // The room alone: the last second and a half, long after the last word.
+        let tail = input.len() - second * 3 / 2..input.len();
+        let hops = |samples: &[f32]| -> Vec<f64> {
+            samples.as_chunks::<BLOCK>().0.iter().map(|hop| level_db(hop)).collect()
+        };
+        let low_in = fir(&input[from..to], lowpass());
+        let low_out = fir(&out[from + RECON_DELAY..to + RECON_DELAY], lowpass());
+        // Hops with something of the voice in them: over the room by 10 dB.
+        let room = level_db(&input[tail.clone()]);
+        let voice_deepest = hops(&low_in)
+            .iter()
+            .zip(hops(&low_out))
+            .filter(|(before, _)| **before > room + 10.)
+            .map(|(before, after)| before - after)
+            .fold(0f64, f64::max);
+        // The band over the cut, hop by hop, with the output brought back by the path's lag.
+        let high_in = fir(&input[from..to], highpass());
+        let high_out = fir(&out[from + RECON_DELAY..to + RECON_DELAY], highpass());
+        let gains: Vec<f64> = hops(&high_in)
+            .iter()
+            .zip(hops(&high_out))
+            .map(|(before, after)| after - before)
+            .collect();
+        Heard {
+            room_down: level_db(&input[tail.clone()]) - level_db(&out[tail.clone()]),
+            room_spread: spread(&hops(&out[tail])),
+            voice_moved: level_db(&low_out) - level_db(&low_in),
+            voice_deepest,
+            high_spread: spread(&gains),
+        }
+    }
+
+    /// Voice isolation is held to its limit. The room between words stays as a steady floor
+    /// that far down, where it used to be gated to nothing and let back in warbling, and no
+    /// hop of the voice loses more than the limit either, where soft syllables and the ends
+    /// of words used to go with the room. That pair is the voice under water.
+    #[test]
+    fn isolation_is_held_to_its_limit() {
+        let (input, from, to) = scene();
+        let out = through(&input, on(false, NoiseMode::Enhanced, false));
+        let heard = heard(&input, &out, from, to);
+        let limit = f64::from(ISOLATION_LIMIT_DB);
+        // WebRTC's high-pass in front takes a little of a fan's rumble on its own.
+        assert!(
+            (limit - 3.0..=limit + 2.).contains(&heard.room_down),
+            "the room went down {:.1} dB, not the limit's {limit}: {heard:?}",
+            heard.room_down
+        );
+        assert!(
+            heard.room_spread < 0.8,
+            "the floor wanders {:.2} dB hop to hop: {heard:?}",
+            heard.room_spread
+        );
+        assert!(
+            heard.voice_deepest < limit + 3.,
+            "a hop of the voice lost {:.1} dB: {heard:?}",
+            heard.voice_deepest
+        );
+        assert!(
+            heard.voice_moved > -limit / 2.,
+            "the voice's band moved {:.1} dB: {heard:?}",
+            heard.voice_moved
+        );
+        // The band over the cut rides the same limit, so it no longer pumps shut.
+        assert!(
+            heard.high_spread < limit / 2.,
+            "the band over the cut pumps {:.1} dB: {heard:?}",
+            heard.high_spread
+        );
+    }
+
+    #[test]
+    fn a_microphone_that_suppresses_is_known_by_its_name() {
+        for name in [
+            "Krisp Microphone (Krisp Audio)",
+            "Microphone (NVIDIA Broadcast)",
+            "Microphone (NVIDIA RTX Voice)",
+            "SteelSeries Sonar - Microphone (SteelSeries Sonar Virtual Audio Device)",
+            "krisp microphone",
+            "MICROPHONE (NVIDIA BROADCAST)",
+        ] {
+            assert!(suppresses(name), "{name}");
+        }
+        for name in [
+            "",
+            "Microphone (Realtek(R) Audio)",
+            "Microphone (Voicemod Virtual Audio Device (WDM))",
+            "Microphone (NVIDIA High Definition Audio)",
+            "Headset (SteelSeries Arctis 7)",
+            "MacBook Pro Microphone",
+        ] {
+            assert!(!suppresses(name), "{name}");
+        }
+    }
+
+    /// On such a microphone the choice runs with noise off, and keeps echo and gain.
+    #[test]
+    fn a_suppressing_microphone_runs_with_noise_off_and_keeps_the_rest() {
+        let chosen = on(true, NoiseMode::Enhanced, true);
+        assert_eq!(for_device(chosen, "Krisp Microphone (Krisp Audio)"), on(true, NoiseMode::Off, true));
+        assert_eq!(for_device(on(false, NoiseMode::High, false), "Microphone (NVIDIA Broadcast)"), on(false, NoiseMode::Off, false));
+        assert_eq!(for_device(chosen, "Microphone (Realtek(R) Audio)"), chosen);
+        assert_eq!(for_device(None, "Krisp Microphone (Krisp Audio)"), None);
+        let mut processor = Processor::new();
+        processor.set_for(chosen, "Krisp Microphone (Krisp Audio)");
+        assert!(processor.active() && processor.hush.is_none(), "echo and gain stay, isolation does not");
+    }
+
+    /// What leaves for the encoder over full scale is turned down smoothly. A clamp there
+    /// flattens every peak, which is the crackle of clipping.
+    #[test]
+    fn a_peak_over_full_scale_is_turned_down_not_flattened() {
+        let mut processor = Processor::new();
+        let mut sent = Vec::new();
+        let mut phase = 0f32;
+        for _ in 0..10 {
+            let mut done = [0f32; FRAME];
+            for sample in &mut done {
+                *sample = phase.sin() * 1.5;
+                phase += 300. * std::f32::consts::TAU / RATE as f32;
+            }
+            let mut frame = [0i16; FRAME_SAMPLES];
+            processor.send(&done, &mut frame);
+            sent.extend(frame.iter().step_by(CHANNELS).copied());
+        }
+        let settled = &sent[FRAME * 2..];
+        let peak = settled.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        let flat = settled.iter().filter(|s| s.unsigned_abs() >= 32_700).count();
+        assert!(peak > 20_000 && flat == 0, "peak {peak}, {flat} samples at full scale");
+        // Under the ceiling it passes as it is, a millisecond late.
+        let mut processor = Processor::new();
+        let mut done = [0f32; FRAME];
+        for (n, sample) in done.iter_mut().enumerate() {
+            *sample = (n as f32 * 0.05).sin() * 0.5;
+        }
+        let mut frame = [0i16; FRAME_SAMPLES];
+        processor.send(&done, &mut frame);
+        assert_eq!(frame[2 * 148], (done[100] * 32767.) as i16);
+    }
+
+    fn wav(path: &std::path::Path, samples: &[f32]) {
+        let data: Vec<u8> = samples
+            .iter()
+            .flat_map(|s| ((s.clamp(-1., 1.) * 32767.) as i16).to_le_bytes())
+            .collect();
+        let mut file = Vec::with_capacity(44 + data.len());
+        file.extend_from_slice(b"RIFF");
+        file.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        file.extend_from_slice(b"WAVEfmt ");
+        for field in [16u32, 0x0001_0001, RATE, RATE * 2, 0x0010_0002] {
+            file.extend_from_slice(&field.to_le_bytes());
+        }
+        file.extend_from_slice(b"data");
+        file.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        file.extend_from_slice(&data);
+        std::fs::write(path, file).expect("the proof folder is writable");
+    }
+
+    /// The listening proof: the scene through a call's default processing (echo
+    /// cancellation, automatic gain, Enhanced) as it was, unlimited, and as it is, to
+    /// `before.wav` and `after.wav` in `ISOLATION_PROOF_DIR`, with what each measures. With
+    /// `HUSH_SAMPLE` naming the model crate's own `sample_raw.wav` (a person in noise,
+    /// 16 kHz), that goes through too.
+    #[test]
+    #[ignore = "writes the listening proof; set ISOLATION_PROOF_DIR"]
+    fn render_isolation_proof() {
+        let dir = std::path::PathBuf::from(std::env::var("ISOLATION_PROOF_DIR").expect("ISOLATION_PROOF_DIR"));
+        let chosen = Some(AudioProcessing::default());
+        let limit = Some(ISOLATION_LIMIT_DB);
+        let (input, from, to) = scene();
+        let (before, after) = (through_limited(&input, chosen, None), through(&input, chosen));
+        wav(&dir.join("input.wav"), &input);
+        wav(&dir.join("before.wav"), &before);
+        wav(&dir.join("after.wav"), &after);
+        let tail: Vec<f64> = input[input.len() - RATE as usize * 3 / 2..]
+            .as_chunks::<BLOCK>()
+            .0
+            .iter()
+            .map(|hop| level_db(hop))
+            .collect();
+        let mut lines = vec![
+            "Input: the demo's voice message (crates/chatd/src/demo/photos/voice-ines.opus, a synthesized voice:".to_owned(),
+            "a pulse train through vowel formants) in a synthesized steady room hiss at -40 dBFS, with two seconds".to_owned(),
+            "of the room alone before and after. 48 kHz mono. before = isolation unlimited, as on origin/main;".to_owned(),
+            format!("after = isolation held to {ISOLATION_LIMIT_DB} dB, as on this branch."),
+            String::new(),
+            "room down: how far the room alone (last 1.5 s) came down, dB. Negative: louder than it went in.".to_owned(),
+            format!("room spread: standard deviation of its level from one 10 ms hop to the next, dB (the input's own: {:.2}).", spread(&tail)),
+            "voice band: level change under 7.2 kHz while the voice speaks, dB.".to_owned(),
+            "high band: standard deviation, and variance, of the gain on the band over 7.2 kHz while the voice".to_owned(),
+            "speaks, hop to hop, dB and dB^2.".to_owned(),
+            String::new(),
+        ];
+        let mut line = |name: &str, out: &[f32]| {
+            let heard = heard(&input, out, from, to);
+            lines.push(format!(
+                "{name}: room down {:.1} dB, room spread {:.2} dB, voice band {:+.1} dB, high band {:.1} dB ({:.1} dB^2)",
+                heard.room_down,
+                heard.room_spread,
+                heard.voice_moved,
+                heard.high_spread,
+                heard.high_spread.powi(2)
+            ));
+        };
+        line("before.wav (echo, gain, Enhanced unlimited)", &before);
+        line("after.wav  (echo, gain, Enhanced limited)  ", &after);
+        let bare = on(false, NoiseMode::Enhanced, false);
+        line("isolation alone, unlimited (no gain)       ", &through_limited(&input, bare, None));
+        line("isolation alone, limited (no gain)         ", &through_limited(&input, bare, limit));
+        if let Ok(path) = std::env::var("HUSH_SAMPLE") {
+            let bytes = std::fs::read(path).expect("the model's sample");
+            let narrow: Vec<f32> = bytes[44..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|b| [f32::from(i16::from_le_bytes(*b)) / 32768.; CHANNELS])
+                .collect();
+            let mut wide = Vec::new();
+            crate::audio::Resampler::new(16_000, RATE).push(&narrow, &mut wide);
+            let real: Vec<f32> = wide.iter().step_by(CHANNELS).copied().collect();
+            let real = &real[..real.len() / FRAME * FRAME];
+            let (before, after) = (through_limited(real, chosen, None), through(real, chosen));
+            wav(&dir.join("real-input.wav"), real);
+            wav(&dir.join("real-before.wav"), &before);
+            wav(&dir.join("real-after.wav"), &after);
+            // No clean reference for a recording: its quietest and loudest fifths of hops.
+            let fifths = |samples: &[f32]| {
+                let mut levels: Vec<f64> = samples[RATE as usize..].as_chunks::<BLOCK>().0.iter().map(|hop| level_db(hop)).collect();
+                levels.sort_by(f64::total_cmp);
+                let fifth = levels.len() / 5;
+                let mean = |part: &[f64]| part.iter().sum::<f64>() / part.len() as f64;
+                (mean(&levels[..fifth]), mean(&levels[levels.len() - fifth..]), spread(&levels[..fifth]))
+            };
+            lines.push(String::new());
+            lines.push("A person speaking in noise (hush-vani 0.1.2's sample_raw.wav, 16 kHz, resampled; not in this repo),".to_owned());
+            lines.push("after the first second: mean level of the quietest and the loudest fifth of 10 ms hops, dBFS,".to_owned());
+            lines.push("and the spread of the quietest fifth, dB.".to_owned());
+            for (name, out) in [("real-input.wav ", real), ("real-before.wav", &before[..]), ("real-after.wav ", &after[..])] {
+                let (quiet, loud, wander) = fifths(out);
+                lines.push(format!("{name}: quietest fifth {quiet:.1} dBFS (spread {wander:.1} dB), loudest fifth {loud:.1} dBFS"));
+            }
+        }
+        std::fs::write(dir.join("metrics.txt"), lines.join("\n") + "\n").expect("the proof folder is writable");
+        println!("{}", lines.join("\n"));
+    }
+
+    /// The lab's `isolation-bounded` driver proves the same on the shipped binary.
+    #[test]
+    fn the_isolation_proof_holds() {
+        assert_eq!(prove_isolation_limit(), Ok(()));
+    }
+
+    /// The numbers behind [`ISOLATION_LIMIT_DB`] (`--ignored --nocapture`).
+    #[test]
+    #[ignore = "a measurement, for the numbers"]
+    fn isolation_limits_measured() {
+        let said = speech();
+        println!("voice {:.1} dBFS, peak {:.2}", level_db(&said), said.iter().fold(0f32, |p, s| p.max(s.abs())));
+        for (room, agc) in [(0.03, false), (0.005, false), (0.0005, false), (0.005, true)] {
+            let (input, from, to) = scene_at(room);
+            let own: Vec<f64> = input[..RATE as usize].as_chunks::<BLOCK>().0.iter().map(|hop| level_db(hop)).collect();
+            println!("room {:.1} dBFS, its own spread {:.2} dB", level_db(&input[..RATE as usize]), spread(&own));
+            for limit in [None, Some(6.), Some(9.), Some(12.), Some(15.), Some(18.), Some(24.)] {
+                let out = through_limited(&input, on(false, NoiseMode::Enhanced, agc), limit);
+                println!("agc {agc} limit {limit:?}: {:?}", heard(&input, &out, from, to));
+            }
+        }
     }
 }

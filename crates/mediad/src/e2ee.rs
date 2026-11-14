@@ -29,11 +29,12 @@
 use crate::rtp::SILENCE;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use davey::errors::ProcessProposalsError;
 use davey::{Codec, DaveSession, MediaType, ProposalsOperationType, SigningKeyPair};
 use protocol::{CallFailure, CallSecurity, SecureMember, SecurityMode, TinyE2ee};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU16;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -42,9 +43,19 @@ use std::time::{Duration, Instant};
 pub const VERSION: u16 = 1;
 /// Every sealed frame ends with this, as in DAVE.
 const MARKER: [u8; 2] = [0xfa, 0xfa];
-/// Frames in a row from people in the group that may fail to open before our group is taken to
-/// be broken and rebuilt: three seconds of one voice.
+/// Voice frames in a row from one person in the group that may fail to open before our group is
+/// taken to be broken and rebuilt: three seconds of that voice.
 const TOLERANCE: u32 = 150;
+/// How long a frame that did not open is kept for the next epoch's keys. Who sealed it switches
+/// to them the moment they apply a commit, and that commit may reach us a little later.
+const HOLD: Duration = Duration::from_millis(200);
+/// The most frames kept so for one sender, and for a full room.
+const HELD: usize = 10;
+const HELD_ALL: usize = HELD * 12;
+/// Proposals refused for adding someone the roster does not name yet, and how long they wait for
+/// the roster that does. The server gives a batch 10 s before it builds the group again.
+const KEPT: usize = 4;
+const KEEP: Duration = Duration::from_secs(5);
 /// At most one rebuild of our own this often, whatever the frames say.
 const RECOVER_EVERY: Duration = Duration::from_secs(10);
 /// The most one `call.e2ee` payload may be, decoded, either way.
@@ -60,6 +71,12 @@ fn hashed(prefix: &[u8], id: &str) -> u64 {
 /// The MLS identity of a user on the server: their credential holds these 8 bytes.
 pub fn user_id(user: &str) -> u64 {
     hashed(b"tiny-e2ee-v1 user ", user)
+}
+
+/// A slot's sender as the group knows them, worked out once when the slot is named and not for
+/// every frame. `None` while nobody is named for it.
+pub fn slot_id(user: &str) -> Option<u64> {
+    (!user.is_empty()).then(|| user_id(user))
 }
 
 /// The MLS group of a room's call.
@@ -171,6 +188,23 @@ enum Mode {
     Blocked,
 }
 
+/// A frame that did not open, kept for [`HOLD`] with what the caller needs to play it late.
+struct Held {
+    id: u64,
+    frame: Vec<u8>,
+    time: u64,
+    arrived: Instant,
+}
+
+/// A held frame that opened once the next epoch's keys came: whose it is, and the RTP time and
+/// arrival it came with, so it goes into the jitter buffer where it belongs.
+pub struct Late {
+    pub id: u64,
+    pub time: u64,
+    pub arrived: Instant,
+    pub opus: Vec<u8>,
+}
+
 pub struct E2ee {
     me: String,
     room: String,
@@ -185,8 +219,18 @@ pub struct E2ee {
     roster: Vec<String>,
     /// Who in the room cannot encrypt end to end, as the server said when it turned it off.
     unsupported: Vec<String>,
-    failures: u32,
+    /// Voice frames in a row that did not open, by sender.
+    failures: HashMap<u64, u32>,
     recovered: Option<Instant>,
+    /// Frames that did not open, oldest first, and those of them that opened late.
+    held: VecDeque<Held>,
+    late: Vec<Late>,
+    /// Proposals waiting for the roster: the payload, its epoch, and when it came.
+    kept: Vec<(Vec<u8>, u64, Instant)>,
+    /// Frames dropped for want of keys since the keys were last said to be ready: ours, theirs.
+    keyless: (u32, u32),
+    /// This group's keys were said to be ready.
+    keyed: bool,
     /// Safety numbers made so far, by the member's MLS id and key.
     safety: HashMap<(u64, Vec<u8>), String>,
     /// `call.e2ee` frames for the server.
@@ -206,8 +250,13 @@ impl Default for E2ee {
             session: None,
             roster: Vec::new(),
             unsupported: Vec::new(),
-            failures: 0,
+            failures: HashMap::new(),
             recovered: None,
+            held: VecDeque::new(),
+            late: Vec::new(),
+            kept: Vec::new(),
+            keyless: (0, 0),
+            keyed: false,
             safety: HashMap::new(),
             outbox: Vec::new(),
             told: None,
@@ -222,7 +271,8 @@ impl E2ee {
         self.me = me.to_owned();
         self.session = None;
         self.unsupported.clear();
-        self.failures = 0;
+        self.forget();
+        self.keyless = (0, 0);
         match e2ee {
             Some(e2ee) => {
                 if self.identity.is_none() {
@@ -246,9 +296,24 @@ impl E2ee {
         self.identity = Some(key);
     }
 
-    /// Everyone in the room's call now.
+    /// What was kept for a group that is no more: nothing of it is played or committed.
+    fn forget(&mut self) {
+        self.failures.clear();
+        self.held.clear();
+        self.late.clear();
+        self.kept.clear();
+        self.keyed = false;
+    }
+
+    /// Everyone in the room's call now. Proposals that came before the roster naming who they
+    /// add are taken again.
     pub fn roster(&mut self, user_ids: Vec<String>) {
         self.roster = user_ids;
+        for (payload, epoch, came) in std::mem::take(&mut self.kept) {
+            if came.elapsed() <= KEEP {
+                self.propose(&payload, epoch, came);
+            }
+        }
     }
 
     fn send(&mut self, op: &str, mut fields: Value) {
@@ -288,12 +353,13 @@ impl E2ee {
                     self.mode = Mode::Blocked;
                 }
                 self.session = None;
+                self.forget();
                 let ids = frame.get("user_ids").and_then(Value::as_array).into_iter().flatten();
                 self.unsupported = ids.filter_map(Value::as_str).take(64).map(str::to_owned).collect();
             }
             "proposals" => {
                 if let Some(payload) = decode(&frame, "data") {
-                    self.proposals(&payload, epoch);
+                    self.propose(&payload, epoch, Instant::now());
                 }
             }
             "commit" => {
@@ -330,7 +396,9 @@ impl E2ee {
     fn start(&mut self, sender: &[u8]) {
         self.mode = Mode::Group;
         self.unsupported.clear();
-        self.failures = 0;
+        self.failures.clear();
+        self.kept.clear();
+        self.keyed = false;
         let (Some(identity), Some(version)) = (&self.identity, NonZeroU16::new(VERSION)) else {
             return;
         };
@@ -356,8 +424,10 @@ impl E2ee {
     }
 
     /// Members to add or remove: commit them, unless the server proposes someone who is not
-    /// in the call.
-    fn proposals(&mut self, payload: &[u8], epoch: u64) {
+    /// in the call. The roster comes from chatd by another road and may be behind the server's
+    /// proposals, so those wait for it ([`KEEP`], [`KEPT`]) instead of leaving the batch to the
+    /// server's clock. `came` is when the server sent them.
+    fn propose(&mut self, payload: &[u8], epoch: u64, came: Instant) {
         let expected: Vec<u64> = self.roster.iter().map(|user| user_id(user)).collect();
         let (Some(session), Some((&kind, proposals))) = (&mut self.session, payload.split_first()) else {
             return;
@@ -376,13 +446,23 @@ impl E2ee {
                 self.send("commit", fields);
             }
             Ok(None) => {}
+            Err(ProcessProposalsError::UnexpectedUser(_)) if self.kept.len() < KEPT => {
+                tracing::info!("mediad: e2ee: proposals add someone the roster does not name yet; they wait for it");
+                self.kept.push((payload.to_vec(), epoch, came));
+            }
             Err(err) => tracing::warn!("mediad: e2ee: proposals refused: {err}"),
         }
     }
 
     fn applied(&mut self, applied: Option<Result<(), String>>, what: &str) {
         match applied {
-            Some(Ok(())) => self.failures = 0,
+            Some(Ok(())) => {
+                self.failures.clear();
+                // The proposals of the epoch this one replaced are no use now.
+                self.kept.clear();
+                self.reopen();
+                self.keys();
+            }
             Some(Err(err)) => {
                 tracing::warn!("mediad: e2ee: the {what} could not be applied: {err}");
                 self.recover();
@@ -391,13 +471,61 @@ impl E2ee {
         }
     }
 
+    /// New keys: frames held for them are opened, in the order they came. One that is too old,
+    /// or still does not open, is dropped as any frame that does not open is.
+    fn reopen(&mut self) {
+        let Some(session) = self.session.as_mut().filter(|session| session.is_ready()) else {
+            return;
+        };
+        for held in std::mem::take(&mut self.held) {
+            if held.arrived.elapsed() > HOLD {
+                continue;
+            }
+            if self.late.len() >= HELD_ALL {
+                break;
+            }
+            if let Ok(opus) = session.decrypt(held.id, MediaType::AUDIO, &held.frame) {
+                self.failures.remove(&held.id);
+                self.late.push(Late { id: held.id, time: held.time, arrived: held.arrived, opus });
+            }
+        }
+    }
+
+    /// The group has keys: said once for each group, as a stage of the join the first time, with
+    /// what the wait for them cost. A frame that opened late after all was not dropped.
+    fn keys(&mut self) {
+        if self.keyed || !self.ready() {
+            return;
+        }
+        self.keyed = true;
+        crate::tiny::stages::mark("keys_ready");
+        let (sent, heard) = std::mem::take(&mut self.keyless);
+        let heard = heard.saturating_sub(self.late.len() as u32);
+        tracing::info!(sent, heard, "mediad: e2ee: keys ready; frames dropped while there were none");
+    }
+
+    /// Frames that opened late, for the caller to play. Empty nearly always.
+    pub fn take_late(&mut self) -> Vec<Late> {
+        std::mem::take(&mut self.late)
+    }
+
+    /// Keeps a frame that did not open for the next epoch's keys: [`HELD`] of one sender,
+    /// [`HOLD`] long.
+    fn hold(&mut self, held: Held) {
+        self.held.retain(|old| old.arrived.elapsed() <= HOLD);
+        if self.held.iter().filter(|old| old.id == held.id).count() >= HELD || self.held.len() >= HELD_ALL {
+            let oldest = self.held.iter().position(|old| old.id == held.id).unwrap_or(0);
+            self.held.remove(oldest);
+        }
+        self.held.push_back(held);
+    }
+
     /// Our group cannot follow: tell the server, and come back in with a fresh key package.
     fn recover(&mut self) {
         let Some(sender) = self.session.as_ref().and_then(|_| self.external_sender()) else {
             return;
         };
         self.recovered = Some(Instant::now());
-        self.failures = 0;
         self.send("invalid", json!({}));
         self.start(&sender);
     }
@@ -418,10 +546,15 @@ impl E2ee {
     pub fn seal(&mut self, opus: &[u8]) -> Option<Vec<u8>> {
         match self.mode {
             Mode::Transport => Some(opus.to_vec()),
-            Mode::Waiting | Mode::Blocked => None,
+            Mode::Blocked => None,
+            Mode::Waiting => {
+                self.keyless.0 += 1;
+                None
+            }
             Mode::Group if opus == SILENCE => Some(opus.to_vec()),
             Mode::Group => {
                 if !self.ready() {
+                    self.keyless.0 += 1;
                     return None;
                 }
                 match self.session.as_mut()?.encrypt_opus(opus) {
@@ -458,7 +591,8 @@ impl E2ee {
 
     /// `user`'s picture as the decoder wants it, or `None` to drop it. The same rules as
     /// [`E2ee::open`]: clear media is dropped in an end-to-end call, and a sealed frame is
-    /// dropped in a transport-only call.
+    /// dropped in a transport-only call. One that does not open does not count against the voice
+    /// tolerance: a picture that will not open is not a broken group.
     pub fn open_video(&mut self, user: &str, frame: &[u8]) -> Option<Vec<u8>> {
         let sealed = frame.ends_with(&MARKER);
         match self.mode {
@@ -469,57 +603,66 @@ impl E2ee {
         if !sealed || user.is_empty() || !self.ready() {
             return None;
         }
-        match self.session.as_mut()?.decrypt(user_id(user), MediaType::VIDEO, frame) {
-            Ok(picture) => {
-                self.failures = 0;
-                Some(picture)
-            }
-            Err(_) => {
-                self.failures += 1;
-                let calm = self.recovered.is_none_or(|at| at.elapsed() > RECOVER_EVERY);
-                if self.failures > TOLERANCE && calm {
-                    tracing::warn!("mediad: e2ee: pictures stopped opening; rebuilding our group");
-                    self.recover();
-                }
-                None
-            }
-        }
+        self.session.as_mut()?.decrypt(user_id(user), MediaType::VIDEO, frame).ok()
     }
 
     /// `user`'s frame as the decoder wants it, or `None` to drop it: in an end-to-end call, one
     /// that does not open with their key; in a transport-only call, one sealed for a group we
     /// are no longer in.
     pub fn open(&mut self, user: &str, frame: &[u8]) -> Option<Vec<u8>> {
+        self.open_at(slot_id(user), frame, None)
+    }
+
+    /// [`E2ee::open`] for the slot of sender `id` ([`slot_id`]), with the frame's RTP time and
+    /// when it arrived. A sealed frame that does not open now is kept for [`HOLD`]: if the next
+    /// commit or welcome brings its key, it comes out of [`E2ee::take_late`].
+    pub fn open_or_hold(&mut self, id: Option<u64>, frame: &[u8], time: u64, arrived: Instant) -> Option<Vec<u8>> {
+        self.open_at(id, frame, Some((time, arrived)))
+    }
+
+    fn open_at(&mut self, id: Option<u64>, frame: &[u8], at: Option<(u64, Instant)>) -> Option<Vec<u8>> {
         if frame == SILENCE {
             return Some(frame.to_vec());
         }
         let sealed = frame.ends_with(&MARKER);
         match self.mode {
             Mode::Transport => return (!sealed).then(|| frame.to_vec()),
-            Mode::Waiting | Mode::Blocked => return None,
+            Mode::Blocked => return None,
+            Mode::Waiting => {
+                self.keyless.1 += 1;
+                return None;
+            }
             Mode::Group => {}
+        }
+        let ready = self.ready();
+        if !ready {
+            self.keyless.1 += 1;
         }
         // Clear audio in an end-to-end call is the server speaking, or someone who is not in
         // the group: never played.
-        if !sealed || user.is_empty() || !self.ready() {
-            return None;
-        }
-        let opened = self.session.as_mut()?.decrypt(user_id(user), MediaType::AUDIO, frame);
-        match opened {
-            Ok(opus) => {
-                self.failures = 0;
-                Some(opus)
-            }
-            Err(_) => {
-                self.failures += 1;
-                let calm = self.recovered.is_none_or(|at| at.elapsed() > RECOVER_EVERY);
-                if self.failures > TOLERANCE && calm {
-                    tracing::warn!("mediad: e2ee: frames stopped opening; rebuilding our group");
-                    self.recover();
-                }
-                None
+        let id = id.filter(|_| sealed)?;
+        if ready {
+            if let Ok(opus) = self.session.as_mut()?.decrypt(id, MediaType::AUDIO, frame) {
+                self.failures.remove(&id);
+                return Some(opus);
             }
         }
+        if let Some((time, arrived)) = at {
+            self.hold(Held { id, frame: frame.to_vec(), time, arrived });
+        }
+        if ready {
+            if self.failures.len() >= SAFETY_KEPT {
+                self.failures.clear();
+            }
+            let failures = self.failures.entry(id).or_insert(0);
+            *failures += 1;
+            let calm = self.recovered.is_none_or(|at| at.elapsed() > RECOVER_EVERY);
+            if *failures > TOLERANCE && calm {
+                tracing::warn!("mediad: e2ee: a voice stopped opening; rebuilding our group");
+                self.recover();
+            }
+        }
+        None
     }
 
     /// Members whose safety number is not made yet: their MLS id and key, with ours. Making one

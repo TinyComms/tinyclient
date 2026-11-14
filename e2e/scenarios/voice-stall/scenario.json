@@ -1,6 +1,6 @@
 {
   "id": "voice-stall",
-  "title": "A voice that stalled in mid-word is given its delay back a frame at a time, and the stall is measured",
+  "title": "A voice that stalled in mid-word is never played as a run of squeezed frames, and the stall is measured",
   "platforms": ["windows", "linux", "macos"],
   "not_applicable": {
     "android": "The phone proof build does not start desktop mediad. The same playout is in the library the phone links.",
