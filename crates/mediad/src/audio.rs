@@ -47,9 +47,16 @@ const PLAYOUT_MAX: f32 = 0.25;
 /// The microphone's, at 48 kHz, past which the oldest is dropped (with a crossfade).
 const CAPTURE_MAX: usize = FRAME_SAMPLES * 10;
 /// What each side's drift control keeps at the lowest point of each second, in ms: the
-/// microphone's before a frame is taken (a frame and 10 ms), the speaker's before one is added.
-/// Three 20 ms ticks, so one late tick cannot run the speaker dry.
-const CAPTURE_LOW_MS: f64 = 30.;
+/// microphone's before a frame is taken (a frame and 30 ms), the speaker's before one is added.
+/// Three 20 ms ticks, so one late tick cannot run the speaker dry. The microphone's is also
+/// what its ring fills to before the first frame goes, and again after it ran dry.
+///
+/// At 50 a device callback 30 ms late still finds its frame, with 10 ms over for the drift
+/// control's own wander; 40 would leave nothing over. At 30, as it was, a callback more than
+/// 10 ms late was a hole in what is sent, which no FEC rebuilds. It costs 20 ms of delay.
+const CAPTURE_LOW_MS: f64 = 50.;
+/// The same in interleaved samples at 48 kHz.
+const CAPTURE_FILL: usize = (RATE as f64 * CAPTURE_LOW_MS / 1000.) as usize * CHANNELS;
 const PLAYOUT_LOW_MS: f64 = 60.;
 /// The deepest the speaker's cushion grows, what each underrun adds to it, and the ticks without
 /// one (a minute) after which it gives that back.
@@ -684,6 +691,9 @@ struct Input {
     running: bool,
     /// A frame has come out since the microphone (re)started: a tick without one is a gap.
     started: bool,
+    /// The ring is filling to its low point: at the start, and after a tick found it dry.
+    /// Taking the next frame the moment there is one would leave nothing for a late callback.
+    filling: bool,
     /// 48 kHz frames still to fade in after (re)starting, so the first word does not click.
     fade_in: usize,
     life: Life,
@@ -960,6 +970,7 @@ fn input_path(rate: u32, channels: usize, health: &Arc<Health>) -> (CaptureEnd, 
         drift: Drift::new(CAPTURE_LOW_MS),
         running: true,
         started: false,
+        filling: true,
         fade_in: fade_frames(RATE),
         life,
     };
@@ -1254,6 +1265,7 @@ impl Audio {
                 input.running = on;
                 input.ring.skip(usize::MAX);
                 input.started = false;
+                input.filling = true;
                 input.fade_in = fade_frames(RATE);
                 input.drift.restart();
                 self.captured.clear();
@@ -1300,21 +1312,27 @@ impl Audio {
                         break;
                     }
                 }
+                if self.captured.len() > CAPTURE_MAX {
+                    // The tick stalled for a long while: what is older is delay nobody wants.
+                    trim_front(&mut self.captured, CAPTURE_FILL + FRAME_SAMPLES, fade_frames(RATE));
+                    self.skips += 1;
+                }
+                let wanted = if input.filling { CAPTURE_FILL } else { FRAME_SAMPLES };
+                if self.captured.len() < wanted {
+                    // A dry ring is a hole now, and it fills back to its low point before the
+                    // next frame goes: one hole, not one for every late callback after it.
+                    self.gaps += u64::from(input.started);
+                    input.filling = true;
+                    return false;
+                }
+                // A tick that waits on a refill says nothing about the device's clock.
                 if input.started {
                     let held = (self.captured.len() / CHANNELS) as f64 * 1000. / f64::from(RATE);
                     if let Some(adjust) = input.drift.observe(held) {
                         input.resampler.adjust(adjust);
                     }
                 }
-                if self.captured.len() > CAPTURE_MAX {
-                    // The tick stalled for a long while: what is older is delay nobody wants.
-                    trim_front(&mut self.captured, FRAME_SAMPLES * 2, fade_frames(RATE));
-                    self.skips += 1;
-                }
-                if self.captured.len() < FRAME_SAMPLES {
-                    self.gaps += u64::from(input.started);
-                    return false;
-                }
+                input.filling = false;
                 input.started = true;
                 // The first frame after (re)starting fades in.
                 let fade = input.fade_in.max(1) as f32;
@@ -1872,13 +1890,86 @@ mod tests {
     #[test]
     fn a_microphone_frame_fades_in_after_starting() {
         let (mut audio, mut mic, _) = Audio::virtual_devices((48_000, 1), (48_000, 2));
-        mic.deliver(&[0.5; 2400]);
+        mic.deliver(&[0.5; 3000]);
         let mut frame = [0i16; FRAME_SAMPLES];
         assert!(audio.capture(&mut frame));
         assert!(frame[2].abs() < 100 && frame[2] < frame[200] && frame[200] < frame[600], "{:?}", &frame[..8]);
         assert!((16_000..16_500).contains(&frame[FRAME_SAMPLES - 1]), "{}", frame[FRAME_SAMPLES - 1]);
         assert!(audio.capture(&mut frame));
         assert!(frame[0] > 16_000, "only the first: {}", frame[0]);
+    }
+
+    /// The tick against a microphone that calls back every 10 ms, each time just after the
+    /// tick looked, so the ring is at its lowest when it does. `stalls` are (from, for,
+    /// lost), in ms: the device's thread is held up, and what was due in that time comes at
+    /// once when it is let go, or never if the device dropped it. Gives when each tick that
+    /// found no frame was, in ms.
+    fn late(seconds: u32, stalls: &[(u32, u32, bool)]) -> Vec<u32> {
+        let (mut audio, mut mic, _) = Audio::virtual_devices((48_000, 2), (48_000, 2));
+        let period = [0.1f32; 960];
+        let mut frame = [0i16; FRAME_SAMPLES];
+        let (mut gaps, mut started, mut owed) = (Vec::new(), false, 0);
+        for now in 0..seconds * 1000 {
+            if now % 20 == 0 {
+                if audio.capture(&mut frame) {
+                    started = true;
+                } else if started {
+                    gaps.push(now);
+                }
+            }
+            if now % 10 == 1 {
+                match stalls.iter().find(|(from, len, _)| (*from..from + len).contains(&now)) {
+                    Some((_, _, true)) => {}
+                    Some(_) => owed += 1,
+                    None => {
+                        for _ in 0..=std::mem::take(&mut owed) {
+                            mic.deliver(&period);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(audio.troubles().gaps, gaps.len() as u64);
+        gaps
+    }
+
+    /// A device callback 30 ms late is an ordinary thing on a busy machine. It leaves no
+    /// hole in what is sent: a second into the call, and once the drift control has settled.
+    /// (Before, the ring kept a frame and 10 ms, and each of these was a hole.)
+    #[test]
+    fn a_callback_30_ms_late_leaves_no_gap() {
+        let gaps = late(23, &[(1_001, 30, false), (20_001, 30, false), (21_001, 30, false), (22_001, 30, false)]);
+        assert_eq!(gaps, [0u32; 0]);
+    }
+
+    /// A stall too long for the ring is a hole, once: the ring fills back to its low point
+    /// before the next frame goes, so within a second the stream is whole and takes a late
+    /// callback again, whether what the device held up came late or was lost.
+    #[test]
+    fn after_a_long_stall_the_microphone_is_whole_again_within_a_second() {
+        for (stalled, lost) in [(60, false), (60, true), (40, true)] {
+            let gaps = late(23, &[(20_001, stalled, lost), (21_001, 30, false), (22_001, 30, false)]);
+            assert!(
+                gaps.len() <= 5 && gaps.iter().all(|at| (20_000..20_200).contains(at)),
+                "{stalled} ms, lost {lost}: {gaps:?}"
+            );
+        }
+    }
+
+    /// The same after the microphone is stopped and started (mute and unmute).
+    #[test]
+    fn a_microphone_started_again_waits_for_its_cushion() {
+        let (mut audio, mut mic, _) = Audio::virtual_devices((48_000, 2), (48_000, 2));
+        let mut frame = [0i16; FRAME_SAMPLES];
+        mic.deliver(&[0.1; 9600]);
+        assert!(audio.capture(&mut frame));
+        audio.listen(false);
+        audio.listen(true);
+        mic.deliver(&[0.1; 2880]);
+        assert!(!audio.capture(&mut frame), "30 ms is under the low point");
+        mic.deliver(&[0.1; 2880]);
+        assert!(audio.capture(&mut frame));
+        assert_eq!(audio.troubles().gaps, 0, "waiting to start is not a gap");
     }
 
     #[test]
@@ -1899,7 +1990,7 @@ mod tests {
     #[test]
     fn a_call_that_loses_its_only_microphone_goes_on_unheard_and_says_so() {
         let (mut audio, mut mic, mut speaker) = Audio::virtual_devices((48_000, 2), (48_000, 2));
-        mic.deliver(&[0.5; 4800]);
+        mic.deliver(&[0.5; 7200]);
         let mut frame = [0i16; FRAME_SAMPLES];
         assert!(audio.capture(&mut frame));
         assert_eq!(audio.notice(), (None, false));
@@ -1943,7 +2034,7 @@ mod tests {
         assert!(!audio.mic_running());
         audio.listen(true);
         assert!(audio.mic_running());
-        mic.deliver(&[0.5; 2205]);
+        mic.deliver(&[0.5; 3308]);
         assert!(audio.capture(&mut frame), "the returned microphone is not captured");
         assert!(frame[FRAME_SAMPLES - 1] > 16_000, "{}", frame[FRAME_SAMPLES - 1]);
     }

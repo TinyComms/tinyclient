@@ -112,7 +112,8 @@ pub fn run() {
         // What the speaker plays this tick: the microphone, for the loopback, and a cue on top.
         let mut played = [0i16; FRAME_SAMPLES];
         let mut play = false;
-        processor.set(controls.processing());
+        // As a call runs it: a microphone that suppresses noise itself is metered with ours off.
+        processor.set_for(controls.processing(), microphone.as_ref().map_or("", |audio| audio.input.name.as_str()));
         if metering.is_some() {
             if microphone.is_none() && !Audio::simulated() && microphone_access() == Some(Microphone::Denied) {
                 out::fail(protocol::CallFailure::Audio, media::MICROPHONE_DENIED);
