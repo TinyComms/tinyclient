@@ -2,7 +2,7 @@
 //! service messages to one grey line, and whatever tinyclient cannot draw to a named line with a
 //! link into Telegram's own app. Nothing here asks the network anything.
 
-use super::peers::{message_link, thread_id, Directory, Who};
+use super::peers::{is_replies, message_link, thread_id, Directory, Who};
 use grammers_tl_types as tl;
 use protocol::{
     Attachment, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview, Reaction, Sender, Span,
@@ -34,6 +34,8 @@ pub struct Mapped {
     pub id: i32,
     /// The forum topic its reply header names. `None` in a forum means the General topic.
     pub topic: Option<i32>,
+    /// The root of a discussion thread, distinct from the comment this message answers.
+    pub discussion_top: Option<i32>,
     /// The message it answers, when it is a reply and not just a post in a topic.
     pub reply: Option<i32>,
     pub message: Message,
@@ -478,19 +480,26 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 peer,
                 id: service.id,
                 topic: topic_of(service.reply_to.as_ref()).0,
+                discussion_top: None,
                 reply: None,
                 message,
                 wants: Vec::new(),
             })
         }
         tl::enums::Message::Message(raw) => {
-            let peer = Who::of(&raw.peer_id);
+            let mut peer = Who::of(&raw.peer_id);
             // No author: in a direct chat it is one of the two; a channel's post is the channel's.
             let from = match (&raw.from_id, peer) {
                 (Some(from), _) => Who::of(from),
                 (None, Who::User(_)) if raw.out => Who::User(dir.me),
                 (None, peer) => peer,
             };
+            // Telegram addresses @replies copies to our own peer. They are personal
+            // notifications, and must never land in Saved Messages or the source group.
+            let replies = is_replies(from) && (peer == Who::User(dir.me) || peer == from);
+            if replies {
+                peer = from;
+            }
             let outgoing = raw.out || (from == Who::User(dir.me) && peer == Who::User(dir.me));
             let mut message = Message::plain(raw.id.to_string(), "", raw.message.clone(), i64::from(raw.date), outgoing);
             // The message's own timer: Telegram stops serving it at `date + ttl_period`, and
@@ -520,6 +529,21 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 }
             }
             message.forwarded = raw.fwd_from.as_ref().map(|header| Box::new(forwarded(dir, header)));
+            if replies {
+                message.mentions_me = true;
+                if let (Some(tl::enums::MessageFwdHeader::Header(forward)), Some(tl::enums::MessageReplyHeader::Header(reply))) =
+                    (&raw.fwd_from, &raw.reply_to)
+                {
+                    if let Some(author) = forward.from_id.as_ref().map(Who::of) {
+                        message.sender = sender(dir, author);
+                    }
+                    if let (Some(group), Some(id), Some(source)) =
+                        (reply.reply_to_peer_id.as_ref().map(Who::of), forward.saved_from_msg_id, &mut message.forwarded)
+                    {
+                        source.link = message_link(group, dir.get(group), id);
+                    }
+                }
+            }
             let mut wants = Vec::new();
             match &raw.media {
                 None | Some(MessageMedia::Empty) => {}
@@ -561,11 +585,16 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 }
             }
             let (topic, reply) = topic_of(raw.reply_to.as_ref());
+            let discussion_top = match &raw.reply_to {
+                Some(tl::enums::MessageReplyHeader::Header(header)) if !header.forum_topic => header.reply_to_top_id,
+                _ => None,
+            };
             Some(Mapped {
                 peer,
                 id: raw.id,
                 topic,
-                reply,
+                discussion_top,
+                reply: if replies { None } else { reply },
                 message,
                 wants,
             })

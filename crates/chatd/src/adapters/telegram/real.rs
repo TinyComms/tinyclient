@@ -20,6 +20,7 @@ use grammers_session::types::{ChannelState, DcOption, PeerAuth, PeerId, PeerInfo
 use grammers_session::updates::UpdatesLike;
 use grammers_session::{BoxFuture, Session, SessionData};
 use grammers_tl_types as tl;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -47,6 +48,7 @@ impl std::error::Error for Poisoned {}
 pub struct Vault {
     data: Mutex<SessionData>,
     me: Mutex<Option<PeerInfo>>,
+    nonmembers: Mutex<HashSet<PeerId>>,
     /// A key was made, or the home moved, since the session was last written out.
     unsaved: AtomicBool,
 }
@@ -83,6 +85,7 @@ impl Vault {
         Vault {
             data: Mutex::new(data),
             me: Mutex::new(me),
+            nonmembers: Mutex::default(),
             unsaved: AtomicBool::new(false),
         }
     }
@@ -161,6 +164,12 @@ impl Session for Vault {
             let me = self.me.lock().map_err(|_| Poisoned)?.clone();
             if peer == PeerId::self_user() || me.as_ref().is_some_and(|me| me.id() == peer) {
                 return Ok(me);
+            }
+            // grammers checks this lookup before asking for a channel difference. Without a
+            // peer it stops tracking the channel, which also stops polling public groups
+            // after we leave. The adapter still holds the access hash for reading comments.
+            if self.nonmembers.lock().map_err(|_| Poisoned)?.contains(&peer) {
+                return Ok(None);
             }
             Ok(self.data()?.peer_infos.get(&peer).cloned())
         })
@@ -263,7 +272,15 @@ fn named(peers: &PeerMap) -> (Vec<tl::enums::User>, Vec<tl::enums::Chat>) {
         match peer {
             Peer::User(user) => users.push(user.raw.clone()),
             Peer::Group(group) => chats.push(group.raw.clone()),
-            Peer::Channel(channel) => chats.push(tl::enums::Chat::Channel(channel.raw.clone())),
+            Peer::Channel(channel) => {
+                let mut raw = channel.raw.clone();
+                // grammers represents a forbidden broadcast as a channel with date 0.
+                // Its synthetic left flag is false, which is not a membership signal.
+                if raw.date == 0 && raw.stories_unavailable {
+                    raw.left = true;
+                }
+                chats.push(tl::enums::Chat::Channel(raw));
+            }
         }
     }
     (users, chats)
@@ -348,6 +365,20 @@ impl Wire for Real {
 
     fn events(&self) -> Option<Receiver<Event>> {
         self.events.lock().ok()?.take()
+    }
+
+    fn channel_membership(&self, id: i64, member: bool) {
+        let (Some(peer), Ok(mut nonmembers)) = (PeerId::channel(id), self.vault.nonmembers.lock()) else {
+            return;
+        };
+        if member {
+            nonmembers.remove(&peer);
+        } else {
+            if nonmembers.len() >= PEERS_KEPT && !nonmembers.contains(&peer) {
+                nonmembers.clear();
+            }
+            nonmembers.insert(peer);
+        }
     }
 
     fn home(&self) -> i32 {

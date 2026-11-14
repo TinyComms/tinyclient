@@ -10,6 +10,11 @@ use grammers_tl_types as tl;
 use protocol::Mark;
 use std::collections::HashMap;
 
+/// Telegram's @replies peer, on the production network and the test network.
+pub fn is_replies(who: Who) -> bool {
+    matches!(who, Who::User(1_271_266_957 | 708_513))
+}
+
 /// Most peers held in memory. Past this the directory starts over; hashes are also kept as
 /// notes in the store, so nothing becomes unreachable.
 const KEPT: usize = 8_192;
@@ -81,6 +86,8 @@ pub struct Known {
     /// A channel proper: only its owners post.
     pub broadcast: bool,
     pub forum: bool,
+    /// Membership from a full chat description. A partial channel does not say.
+    pub member: Option<bool>,
     /// We may read but not write: a channel we do not run, a group we were removed from.
     pub read_only: bool,
     /// The picture's id and the datacenter that serves it. 0 for none.
@@ -186,6 +193,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
             let (photo, photo_dc) = chat_photo(&chat.photo);
             let known = Known {
                 name: chat.title.clone(),
+                member: Some(!chat.left && !chat.deactivated),
                 read_only: chat.left || chat.deactivated || member_cannot_send(chat.creator, chat.admin_rights.is_some(), chat.default_banned_rights.as_ref(), None),
                 photo,
                 photo_dc,
@@ -194,7 +202,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
             (Who::Group(chat.id), known)
         }
         Chat::Forbidden(chat) => {
-            let known = Known { name: chat.title.clone(), read_only: true, ..Known::default() };
+            let known = Known { name: chat.title.clone(), member: Some(false), read_only: true, ..Known::default() };
             (Who::Group(chat.id), known)
         }
         Chat::Channel(channel) => {
@@ -214,6 +222,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 handle: first_username(&channel.username, &channel.usernames),
                 broadcast: channel.broadcast,
                 forum: channel.forum,
+                member: (!channel.min).then_some(!channel.left),
                 read_only: channel.left || restricted,
                 photo,
                 photo_dc,
@@ -227,6 +236,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 hash: Some(channel.access_hash),
                 name: channel.title.clone(),
                 broadcast: channel.broadcast,
+                member: Some(false),
                 read_only: true,
                 ..Known::default()
             };
@@ -312,18 +322,30 @@ impl Directory {
             if known.hash.is_none() {
                 known.hash = before.and_then(|before| before.hash);
             }
+            if matches!(chat, tl::enums::Chat::Channel(channel) if channel.min) {
+                known.member = before.and_then(|before| before.member);
+                if let Some(before) = before {
+                    known.read_only = before.read_only;
+                }
+            }
             if before == Some(&known) {
                 continue;
             }
             if before.map(|before| before.hash) != Some(known.hash) {
                 learned.notes.extend(known.note().map(|note| (note_key(who), note)));
             }
-            if before.is_some() {
+            if before.is_some() || known.member == Some(false) {
                 learned.chats.push(who);
             }
             self.map.insert(who, known);
         }
         learned
+    }
+
+    pub fn left(&mut self, who: Who) {
+        let known = self.map.entry(who).or_default();
+        known.member = Some(false);
+        known.read_only = true;
     }
 
     /// A peer remembered only as a note from an earlier run.

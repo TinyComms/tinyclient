@@ -3,7 +3,7 @@
 
 use super::content::{self, Mapped, Want};
 use super::filing::{self, Cursor, Facts, Filed};
-use super::peers::{thread_id, Known, Who};
+use super::peers::{is_replies, thread_id, Known, Who};
 use super::wire::Fault;
 use super::{presence, Account, PAGE};
 use crate::store::{ConversationRow, Filing, PreviewLine, preview_text};
@@ -63,6 +63,7 @@ pub(super) fn is_muted(account: &Account, who: Who, settings: &tl::enums::PeerNo
 /// What kind of row a peer is.
 fn kind(who: Who, known: &Known) -> ConversationKind {
     match who {
+        who if is_replies(who) => ConversationKind::Group,
         Who::User(_) => ConversationKind::Direct,
         Who::Group(_) => ConversationKind::Group,
         Who::Channel(_) if known.forum => ConversationKind::Forum,
@@ -82,6 +83,11 @@ fn row(account: &Account, who: Who, known: &Known) -> ConversationRow {
     // the user stars it.
     row.listed = !(matches!(who, Who::Channel(_)) && known.broadcast);
     match who {
+        who if is_replies(who) => {
+            row.title = "Replies".to_owned();
+            row.read_only = true;
+            row.bot = false;
+        }
         Who::User(id) if id == account.me => {
             // Saved Messages: the user's own notes, with no presence and no call.
             row.title = "Saved Messages".to_owned();
@@ -108,6 +114,9 @@ fn row(account: &Account, who: Who, known: &Known) -> ConversationRow {
 /// Records a conversation the store does not have yet: a chat that was not among those read at
 /// sign-on, a person the user is about to write to. True once it is there.
 pub(super) fn ensure_row(account: &Account, who: Who, topic: Option<i32>) -> bool {
+    if !member(account, who) {
+        return false;
+    }
     let id = match topic {
         Some(topic) => thread_id(who, topic),
         None => who.text(),
@@ -115,10 +124,10 @@ pub(super) fn ensure_row(account: &Account, who: Who, topic: Option<i32>) -> boo
     if matches!(account.ctx.known(&id), Ok(Some(_))) {
         return true;
     }
-    if account.input(who).is_err() && !matches!(who, Who::Group(_)) {
+    if account.input(who).is_err() && !is_replies(who) && !matches!(who, Who::Group(_)) {
         return false;
     }
-    let Some(known) = account.dir().get(who).cloned() else {
+    let Some(known) = account.dir().get(who).cloned().or_else(|| is_replies(who).then(Known::default)) else {
         return false;
     };
     let fresh = |account: &Account| {
@@ -154,16 +163,44 @@ pub(super) fn ensure_row(account: &Account, who: Who, topic: Option<i32>) -> boo
 /// A group or channel was renamed, or its picture or our rights in it changed. Its filing is
 /// left as stored.
 pub(super) fn refresh_row(account: &Account, who: Who) {
-    let Ok(Some(stored)) = account.ctx.known(&who.text()) else {
+    let Some(known) = account.dir().get(who).cloned() else {
         return;
     };
-    let Some(known) = account.dir().get(who).cloned() else {
+    if known.member == Some(false) {
+        remove_chat(account, who);
+        return;
+    }
+    let Ok(Some(stored)) = account.ctx.known(&who.text()) else {
         return;
     };
     let mut fresh = row(account, who, &known);
     fresh.position = stored.position;
     fresh.topic = stored.topic;
     let _ = account.ctx.conversation(&fresh);
+}
+
+/// A group is allowed to count unread only when Telegram has confirmed membership.
+/// Knowing its access hash is enough to read comments, but says nothing about membership.
+pub(super) fn member(account: &Account, who: Who) -> bool {
+    matches!(who, Who::User(_)) || account.dir().get(who).is_some_and(|known| known.member == Some(true))
+}
+
+pub(super) fn remove_chat(account: &Account, who: Who) {
+    {
+        let mut live = account.live();
+        let filed = &mut live.filed;
+        filed.facts.remove(&who);
+        for list in filed.order.iter_mut().chain(filed.pins.iter_mut()) {
+            list.retain(|held| *held != who);
+        }
+        if filed.open.is_some_and(|(held, _)| held == who) {
+            filed.open = None;
+        }
+    }
+    let id = who.text();
+    if matches!(account.ctx.known(&id), Ok(Some(_))) {
+        let _ = account.ctx.conversation_gone(&id);
+    }
 }
 
 /// What this account may send, from what Telegram says of it: Premium raises the file size and
@@ -218,7 +255,27 @@ pub(super) fn sign_on(account: &Arc<Account>) -> Result<(), Fault> {
     // An earlier build kept every chat in one invented Space. The rows read just now have left
     // it; what is left (chats past the newest 500) goes with it, and comes back on scroll.
     let _ = account.ctx.spaces(&[]);
+    verify_unread_groups(account);
     contacts(account)
+}
+
+/// A group left while this client was offline may be missing from the new dialog list.
+/// Confirm older unread rows without treating a capped dialog list as proof of leaving.
+fn verify_unread_groups(account: &Account) {
+    let groups = account.ctx.unread_telegram_groups(500).unwrap_or_default();
+    let id: Vec<_> = groups.iter()
+        .filter_map(|id| Who::parse(id).map(|(who, _)| who))
+        .filter(|who| account.dir().get(*who).and_then(|known| known.member).is_none())
+        .filter_map(|who| account.input_channel(who).ok())
+        .take(100)
+        .collect();
+    if id.is_empty() {
+        return;
+    }
+    // This is a bounded cache repair. It should not hold sign-in through a flood wait.
+    if let Ok(chats) = super::wire::call(account.wire.as_ref(), &tl::functions::channels::GetChannels { id }) {
+        account.learn(&[], &chats.chats());
+    }
 }
 
 /// Telegram's caching hash over a list of numbers (`core.telegram.org/api/offsets`, "Hash
@@ -473,6 +530,9 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     let Some(known) = account.dir().get(who).cloned() else {
         return;
     };
+    if known.member == Some(false) {
+        return;
+    }
     let is_muted = muted(account, who, &dialog.notify_settings);
     let unread = (dialog.unread_count.max(0) as u32).max(u32::from(dialog.unread_mark));
     let filing = {
@@ -962,9 +1022,9 @@ fn discussion(account: &Account, channel: Who, post: i32) -> Result<(Who, i32), 
     account.learn(&found.users, &found.chats);
     // How many comments the user has not read comes with the discussion, not with the post.
     comment_unread(account, channel, post, found.unread_count);
-    // The answer leads with the post itself, standing in the group: the id in it is what
-    // a send answers, and the group it stands in is where a send goes.
-    let Some((group, echo)) = found.messages.iter().find_map(|message| match message {
+    // The answer is newest first, so the forwarded post that starts the thread comes last.
+    // Its id is what a send answers, in the group that holds the thread.
+    let Some((group, echo)) = found.messages.iter().rev().find_map(|message| match message {
         tl::enums::Message::Message(echo) => Some((Who::of(&echo.peer_id), echo.id)),
         _ => None,
     }) else {
@@ -972,7 +1032,7 @@ fn discussion(account: &Account, channel: Who, post: i32) -> Result<(Who, i32), 
     };
     let mut live = account.live();
     if live.discussion.len() >= DISCUSSIONS {
-        live.discussion.clear();
+        live.discussion.pop_front();
     }
     live.discussion.push_back((thread, group, echo));
     Ok((group, echo))
@@ -1013,7 +1073,18 @@ fn comment_row(account: &Account, thread: &str, channel: Who, post: i32) {
 /// names the echo its reply answers. `None` leaves the message with the group's own id,
 /// for a conversation of the group itself.
 fn comments_thread(account: &Account, mapped: &Mapped) -> Option<String> {
-    echo_thread(account, mapped.peer, mapped.reply)
+    if let Some(top) = mapped.discussion_top {
+        return echo_thread(account, mapped.peer, Some(top));
+    }
+    let reply = mapped.reply?;
+    // A send may be echoed without a top id. If it answers a comment we already
+    // placed, it belongs with that comment. Only use threads of a linked post here.
+    echo_thread(account, mapped.peer, Some(reply)).or_else(|| {
+        let placed = account.placed(Some(mapped.peer), reply)?;
+        account.live().discussion.iter()
+            .any(|(thread, group, _)| *thread == placed && *group == mapped.peer)
+            .then_some(placed)
+    })
 }
 
 /// The comments thread of the discussion group an update belongs to: the thread that was

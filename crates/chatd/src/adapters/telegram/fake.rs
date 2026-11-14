@@ -50,6 +50,7 @@ const TOOLS: i32 = 31;
 const JIGS: i32 = 55;
 /// Telegram's own account, a bot, an account Telegram flags as a scam, and one it flags an impostor.
 const SERVICE: i64 = 777_000;
+const REPLIES: i64 = 1_271_266_957;
 const BOT: i64 = 7004;
 const SCAM: i64 = 7005;
 const FAKE: i64 = 7006;
@@ -181,10 +182,14 @@ fn chats() -> Vec<tl::enums::Chat> {
             notes
         }),
         tl::enums::Chat::Channel(a_channel(WORKSHOP, "Workshop", false, true, "")),
-        // The discussion group the channel's post's comments are written into: a megagroup,
-        // learned whole from the answers that name it, so its hash ready for a send.
-        tl::enums::Chat::Channel(a_channel(CHATTERS, "Field Notes chat", false, false, "")),
     ]
+}
+
+fn discussion_group(left: bool) -> tl::types::Channel {
+    let mut group = a_channel(CHATTERS, "Field Notes chat", false, false, "");
+    group.left = left;
+    group.has_link = true;
+    group
 }
 
 fn message(peer: Who, id: i32, from: i64, date: i32, text: &str) -> tl::types::Message {
@@ -679,7 +684,7 @@ fn discussion_answer(place: &str, unread: i32) -> Result<Vec<u8>, Fault> {
         read_inbox_max_id: Some(0),
         read_outbox_max_id: None,
         unread_count: unread,
-        chats: chats(),
+        chats: vec![discussion_group(true).into()],
         users: users(),
     };
     answer(tl::enums::messages::DiscussionMessage::Message(found))
@@ -866,6 +871,21 @@ fn update(update: tl::enums::Update) -> Event {
     Event::Update { update: Box::new(update), users: users(), chats: chats() }
 }
 
+/// An update about the discussion group, with the membership description Telegram supplied.
+fn discussion_update(update: tl::enums::Update, left: bool, min: bool) -> Event {
+    let mut group = discussion_group(left);
+    group.min = min;
+    if min {
+        group.access_hash = None;
+    }
+    let mut users = users();
+    let mut replies = user(REPLIES, "Replies", "", "replies");
+    replies.bot = true;
+    replies.bot_info_version = Some(1);
+    users.push(replies.into());
+    Event::Update { update: Box::new(update), users, chats: vec![tl::enums::Chat::Channel(group)] }
+}
+
 impl World {
     /// One line from the test: what Telegram then says unasked.
     fn steer(&mut self, line: &str) -> Vec<Event> {
@@ -994,6 +1014,39 @@ impl World {
                     saved_peer_id: None,
                     reactions: comment_reactions().into(),
                 }.into())]
+            }
+            "discussion-membership" => {
+                let left = words.next() != Some("joined");
+                vec![discussion_update(tl::types::UpdateChannel { channel_id: CHATTERS }.into(), left, false)]
+            }
+            // The other post (root 80) has activity even though our only comment was
+            // under root 60. A partial chat in the update does not refresh membership.
+            "discussion-comment" => {
+                let root = words.next().and_then(|id| id.parse().ok()).unwrap_or(ECHO);
+                let id = words.next().and_then(|id| id.parse().ok()).unwrap_or(81);
+                let mut said = message(Who::Channel(CHATTERS), id, TOBIN, crate::hub::now() as i32, "A new discussion comment");
+                let mut reply: tl::types::MessageReplyHeader = blank(&[&put(0u32)]);
+                reply.reply_to_msg_id = Some(root - 1);
+                reply.reply_to_top_id = Some(root);
+                said.reply_to = Some(reply.into());
+                vec![discussion_update(tl::types::UpdateNewChannelMessage { message: said.into(), pts: 0, pts_count: 0 }.into(), false, true)]
+            }
+            // Telegram sends both a source update and a personal copy addressed to self.
+            "discussion-reply" => {
+                let source = self.steer("discussion-comment 60 82");
+                let mut copy = message(Who::User(ME), 83, REPLIES, crate::hub::now() as i32, "A reply to your comment");
+                let mut reply: tl::types::MessageReplyHeader = blank(&[&put(0u32)]);
+                reply.reply_to_msg_id = Some(59);
+                reply.reply_to_top_id = Some(ECHO);
+                reply.reply_to_peer_id = Some(Who::Channel(CHATTERS).peer());
+                copy.reply_to = Some(reply.into());
+                let mut forward: tl::types::MessageFwdHeader = blank(&[&put(0u32), &put(t0())]);
+                forward.from_id = Some(Who::User(TOBIN).peer());
+                forward.saved_from_peer = Some(Who::Channel(CHATTERS).peer());
+                forward.saved_from_msg_id = Some(82);
+                copy.fwd_from = Some(forward.into());
+                self.store(None, { let mut stored = copy.clone(); stored.peer_id = Who::User(REPLIES).peer(); stored });
+                source.into_iter().chain([discussion_update(tl::types::UpdateNewMessage { message: copy.into(), pts: 0, pts_count: 0 }.into(), false, true)]).collect()
             }
             "edit" => {
                 let mut message = message(odalys, 13, ODALYS, t0() + 10, "Café at the dock, seven sharp");
@@ -1499,6 +1552,15 @@ impl World {
                 return answer(tl::enums::messages::PeerDialogs::Dialogs(tl::types::messages::PeerDialogs { dialogs, messages: Vec::new(), chats: chats(), users: users(), state: state.into() }));
             }
             return Err(rpc(400, "PEER_ID_INVALID", None));
+        }
+        if let Some(request) = asked::<f::channels::GetChannels>(body) {
+            let ids: Vec<_> = request.id.into_iter().filter_map(|input| match input {
+                tl::enums::InputChannel::Channel(channel) => Some(channel.channel_id),
+                _ => None,
+            }).collect();
+            self.log(&format!("GetChannels {ids:?}"));
+            let chats = chats().into_iter().chain([discussion_group(true).into()]).filter(|chat| ids.contains(&chat.id())).collect();
+            return answer(tl::enums::messages::Chats::Chats(tl::types::messages::Chats { chats }));
         }
         if let Some(request) = asked::<f::contacts::GetContacts>(body) {
             // As Telegram does: the list unchanged since the hash it was asked with is not sent.

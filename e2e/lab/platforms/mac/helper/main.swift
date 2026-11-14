@@ -16,6 +16,7 @@
 //                                       Frame time is seconds since R was written (R holds the epoch).
 //   key   --pid P --combo alt-down      post a key press (modifiers: cmd alt ctrl shift) to P only
 //   click --pid P --x X --y Y           post a click at X,Y points inside P's first window
+//   text  --pid P --out F              read visible text from P's first window into F
 import AppKit
 import AVFoundation
 import CoreGraphics
@@ -23,6 +24,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import ScreenCaptureKit
+import Vision
 
 setvbuf(stdout, nil, _IOLBF, 0)
 setvbuf(stderr, nil, _IOLBF, 0)
@@ -68,6 +70,24 @@ func status() {
     let screen = CGPreflightScreenCaptureAccess()
     let ax = AXIsProcessTrusted()
     say("{\"screen_recording\": \(screen), \"accessibility\": \(ax)}")
+}
+
+@available(macOS 14.0, *)
+func windowText(pid: pid_t) async throws -> [String] {
+    guard let target = windows(of: pid).first else { return [] }
+    let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+    guard let window = content.windows.first(where: { $0.windowID == target.id && $0.owningApplication?.processID == pid }) else {
+        return []
+    }
+    let config = SCStreamConfiguration()
+    config.width = Int(window.frame.width) * 2
+    config.height = Int(window.frame.height) * 2
+    let filter = SCContentFilter(desktopIndependentWindow: window)
+    let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+    let request = VNRecognizeTextRequest()
+    request.usesLanguageCorrection = false
+    try VNImageRequestHandler(cgImage: image).perform([request])
+    return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
 }
 
 // MARK: input, to one process only
@@ -266,6 +286,27 @@ case "status":
 case "windows":
     guard let p = option("pid").flatMap({ Int32($0) }) else { die("--pid", 64) }
     for w in windows(of: p) { say("{\"id\": \(w.id), \"x\": \(w.bounds.origin.x), \"y\": \(w.bounds.origin.y), \"w\": \(w.bounds.width), \"h\": \(w.bounds.height)}") }
+case "text":
+    guard #available(macOS 14.0, *) else { die("Window text requires macOS 14", 77) }
+    guard let p = option("pid").flatMap({ Int32($0) }), let out = option("out") else { die("--pid --out", 64) }
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    Task {
+        let url = URL(fileURLWithPath: out)
+        let encoder = JSONEncoder()
+        do {
+            guard CGPreflightScreenCaptureAccess() else {
+                try encoder.encode("Screen Recording is not granted to TinyLabHelper").write(to: url, options: .atomic)
+                exit(77)
+            }
+            try await encoder.encode(windowText(pid: p)).write(to: url, options: .atomic)
+            exit(0)
+        } catch {
+            try? encoder.encode("Could not read the window: \(error)").write(to: url, options: .atomic)
+            exit(1)
+        }
+    }
+    app.run()
 case "key":
     guard let p = option("pid").flatMap({ Int32($0) }), let combo = option("combo") else { die("--pid --combo", 64) }
     guard AXIsProcessTrusted() else { die("Accessibility is not granted to TinyLabHelper", 77) }

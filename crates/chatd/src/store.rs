@@ -1360,6 +1360,19 @@ impl Store {
             .optional()
     }
 
+    /// Cached Telegram supergroups still contributing unread counts. The adapter verifies
+    /// membership for rows its paged dialog list did not confirm.
+    pub(crate) fn unread_telegram_groups(&self, account: &AccountKey, limit: u32) -> rusqlite::Result<Vec<String>> {
+        let mut query = self.db.prepare(
+            "SELECT id FROM conversation WHERE network = 'telegram' AND account = ?1
+                 AND kind IN ('group', 'forum') AND id GLOB 'c[0-9]*' AND parent = '' AND NOT hidden
+                 AND (unread > 0 OR mentions > 0)
+             ORDER BY updated DESC, id LIMIT ?2",
+        )?;
+        let rows = query.query_map(params![account.account, limit], |row| row.get(0))?;
+        rows.collect()
+    }
+
     /// Whether a space already holds text channels, directs, and/or voice rooms. Directs sort
     /// after channels by position, so a paged tree read can miss them.
     pub fn space_text_kinds(&self, space: &Key) -> rusqlite::Result<(bool, bool, bool)> {
