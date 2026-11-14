@@ -3,7 +3,7 @@
 
 use super::png::Art;
 use super::{Fallible, Listed, Seeder, Who};
-use crate::store::{ConversationRow, SpaceRow};
+use crate::store::{ConversationRow, Filing, SpaceRow};
 use protocol::{
     AccountKey, CallSupport, ConversationKind, Group, Key, MediaKind, Network, Occupant, Occupants,
     Presence, Relation,
@@ -346,6 +346,28 @@ fn moss(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Fallibl
         };
         s.counts(&conversation, unread, mentions, read)?;
         s.store.set_muted(&conversation, muted)?;
+    }
+
+    // The help forum's posts: Discord lists a forum's posts active first (`polish/01` §3), so
+    // opening it lands on the newest activity — the read crustose post, though the slime mould
+    // one still counts as unread — and no post is a row of the tree.
+    let help = id_of("id-help");
+    for (id, title, who, minutes, unread, text) in [
+        ("460000000000000001", "Mystery slime mould on bench wood", WREN, 90, 1,
+         "Found on an old bench plank by the creek. Yellow at first, and it crept a hand width overnight. Photos tomorrow in better light."),
+        ("460000000000000002", "What is this crustose lichen on my fence post?", INES, 12, 0,
+         "The grey rim with the pale discs reads like a Lecanora. A spore sketch, or a drop of iodine, would settle it."),
+    ] {
+        let post = s.conversation(account, ConversationRow {
+            parent: Some(help.id.clone()),
+            filing: Some(Filing {
+                followed: true,
+                ..Filing::default()
+            }),
+            ..ConversationRow::new(id, Thread, title)
+        })?;
+        s.say(&post, &cast[who], minutes, text)?;
+        s.counts(&post, unread, 0, None)?;
     }
     Ok(())
 }
