@@ -1,21 +1,32 @@
 //! One sender's packets, put back in order and handed out one every 20 ms. How many are held
-//! follows that sender's measured jitter: at once when it rises, and slowly when it falls. Extra
-//! delay goes where nobody hears it, by refilling less at the start of a spurt and dropping quiet
-//! frames during one; the voice is never played faster.
+//! follows that sender's measured jitter: at once when it rises, and slowly when it falls. A link
+//! that stood still and then delivered the lot is remembered apart from that, for a minute: the
+//! jitter does not see such a freeze, and the next one comes. Extra delay goes where nobody
+//! hears it, by refilling less at the start of a spurt and dropping quiet frames during one.
 
 use std::collections::BTreeMap;
 
 /// Packets held before playing starts, until the sender's jitter says otherwise: 60 ms rides out
 /// ordinary reordering.
 const START: usize = 3;
-/// The least and most ever held: 40 and 200 ms.
+/// The least and most ever held: 40 and 400 ms.
 const LEAST: usize = 2;
-const MOST: usize = 10;
+const MOST: usize = 20;
 /// Ticks the jitter must stay under what is held before one packet less is held: 3 s. The
 /// spread it is aimed by already remembers the last 10 s, so this only keeps the depth from
 /// hunting, which would change the delay of every other sentence; what a step down gives back,
 /// squeezing speech gives back unheard.
 const RELEASE: u32 = 150;
+/// A stall this long (60 ms) is the link standing still, and what it took to ride out is kept.
+/// A shorter one is a packet that ran late: one packet more, given back as any other.
+const FREEZE: u32 = 3;
+/// Ticks of speech a stall's depth is kept for after it was last needed: 60 s. A link that
+/// freezes does it again, and every freeze unlearned is a drop-out in mid-word.
+const KEEP: u32 = 3_000;
+/// Ticks between one packet less of it and the next, once that time is up: 5 s.
+const EASE: u32 = 250;
+/// Packets left in speech at which that depth was needed again: a freeze used it up.
+const NEEDED: usize = 2;
 /// Packets over which the shallowest the queue got shows what is spare: half a second. A burst
 /// arriving together is not spare; what has been sitting there the whole time is.
 const WATCH: u32 = 25;
@@ -75,6 +86,10 @@ pub struct Jitter {
     target: usize,
     /// Ticks in a row that less than `target` would have done.
     calm: u32,
+    /// Packets a stall showed this link's freezes take, and the ticks of speech since that
+    /// many were last needed.
+    stalls: usize,
+    unneeded: u32,
     /// The shallowest the queue has been in this watch, over `seen` packets.
     low: usize,
     seen: u32,
@@ -102,6 +117,8 @@ impl Default for Jitter {
             spurt: false,
             target: START,
             calm: 0,
+            stalls: 0,
+            unneeded: 0,
             low: usize::MAX,
             seen: 0,
             spare: 0,
@@ -127,7 +144,16 @@ impl Jitter {
     pub fn insert(&mut self, sequence: u16, payload: Vec<u8>) {
         let mut unwrapped = self.unwrap(sequence);
         if self.newest.is_some_and(|newest| (unwrapped - newest).abs() > RESTART) {
-            *self = Jitter { late: self.late, lost: self.lost, received: self.received, target: self.target, clocked: self.clocked, ..Jitter::default() };
+            *self = Jitter {
+                late: self.late,
+                lost: self.lost,
+                received: self.received,
+                target: self.target,
+                stalls: self.stalls,
+                unneeded: self.unneeded,
+                clocked: self.clocked,
+                ..Jitter::default()
+            };
             unwrapped = i64::from(sequence);
         }
         if self.due.is_some_and(|due| unwrapped < due) {
@@ -150,13 +176,15 @@ impl Jitter {
     /// packet lands up to about three times the average behind, and the spread says how much
     /// further the stragglers do, where Wi-Fi puts them; either way it then waits for the next
     /// tick. What is held goes up the moment that asks for more, and comes down one packet at a
-    /// time.
+    /// time. Neither measure sees a link that stands still and then delivers the lot
+    /// (`stats::LUMP`), so what a stall taught is held whatever they say.
     pub fn aim(&mut self, jitter_ms: u32, spread_ms: u32) {
+        self.ease();
         let wanted_ms = (jitter_ms as usize * 3 + 20).max(spread_ms as usize + 20);
-        let wanted = wanted_ms.div_ceil(20).clamp(LEAST, MOST);
+        let wanted = wanted_ms.div_ceil(20).max(self.stalls).clamp(LEAST, MOST);
         // Calm only when one packet less would hold it with 10 ms to spare: a need that sits on
         // a packet's edge would otherwise step the depth down and straight back up.
-        let fits_less = wanted_ms + 10 <= (self.target - 1) * 20;
+        let fits_less = wanted_ms + 10 <= (self.target - 1) * 20 && self.stalls < self.target;
         if wanted >= self.target || !fits_less {
             self.target = self.target.max(wanted);
             self.calm = 0;
@@ -169,16 +197,42 @@ impl Jitter {
         }
     }
 
-    /// The voice stalled waiting for a packet: however calm the average, what is held was not
-    /// enough.
-    pub fn deepen(&mut self) {
-        self.target = (self.target + 1).min(MOST);
+    /// The voice stalled waiting for a packet, and something stood in for it for `stood` ticks:
+    /// however calm the average, what is held was not enough. Called as the first packet after
+    /// it is taken. A freeze let go of all it held up at once, and holding that many rides the
+    /// next one out: they are here, so the step up waits for nothing. On a link known to
+    /// freeze, a short stall is a freeze that ran a little longer.
+    pub fn deepen(&mut self, stood: u32) {
+        if stood >= FREEZE || self.stalls > 0 {
+            let held = self.packets.len() + 1;
+            self.stalls = held.max(self.stalls + stood as usize).min(MOST);
+            self.unneeded = 0;
+        }
+        self.target = (self.target + 1).max(self.stalls).min(MOST);
         self.calm = 0;
+    }
+
+    /// One more tick of speech in which what a stall taught was not needed. After [`KEEP`] of
+    /// them it goes, a packet at a time.
+    fn ease(&mut self) {
+        if self.stalls == 0 || self.due.is_none() {
+            return;
+        }
+        self.unneeded += 1;
+        if self.unneeded >= KEEP {
+            self.stalls -= 1;
+            self.unneeded = KEEP - EASE;
+        }
     }
 
     /// Packets to hold now.
     pub fn target(&self) -> usize {
         self.target
+    }
+
+    /// Of those, the packets held because the link stalled: none on one that has not.
+    pub fn stalls(&self) -> usize {
+        self.stalls
     }
 
     /// Packets waiting now.
@@ -196,6 +250,11 @@ impl Jitter {
 
     /// Notes how deep the queue is as a packet is about to leave it.
     fn watch(&mut self) {
+        // Nearly dry in mid-speech, with a stall's depth held: a freeze just used it. A depth of
+        // a packet or two more than any link has says nothing by running low.
+        if !self.hushed && self.packets.len() <= NEEDED && self.stalls > 2 * NEEDED {
+            self.unneeded = 0;
+        }
         self.low = self.low.min(self.packets.len());
         self.seen += 1;
         if self.seen >= WATCH {
@@ -554,13 +613,13 @@ mod tests {
         jitter.aim(30, 0);
         assert_eq!(jitter.target(), 6, "90 ms of lateness and a tick");
         jitter.aim(500, 0);
-        assert_eq!(jitter.target(), MOST, "never over 200 ms");
+        assert_eq!(jitter.target(), MOST, "never over 400 ms");
         // Not playing: nothing is known yet that says it can come down.
         for _ in 0..RELEASE * 2 {
             jitter.aim(0, 0);
         }
         assert_eq!(jitter.target(), MOST);
-        fill(&mut jitter, &(0..12).collect::<Vec<u16>>());
+        fill(&mut jitter, &(0..22).collect::<Vec<u16>>());
         assert!(matches!(jitter.pop(), Pop::Packet(_)));
         for _ in 0..RELEASE - 1 {
             jitter.aim(0, 0);
@@ -582,6 +641,68 @@ mod tests {
         assert_eq!(jitter.pop(), Pop::Empty, "60 ms is not enough here");
         fill(&mut jitter, &[6]);
         assert_eq!(jitter.pop(), Pop::Packet(packet(1)));
+    }
+
+    /// A stall of 180 ms is learned in one step, kept for a minute of speech, and then let go
+    /// a packet every 5 s. A packet that only ran late costs one packet for 3 s, as it always did.
+    #[test]
+    fn a_stall_is_held_for_a_minute_and_a_late_packet_is_not() {
+        let mut jitter = Jitter::default();
+        fill(&mut jitter, &(0..12).collect::<Vec<u16>>());
+        assert!(matches!(jitter.pop(), Pop::Packet(_)));
+        jitter.deepen(2);
+        assert_eq!((jitter.target(), jitter.stalls()), (START + 1, 0));
+        for _ in 0..RELEASE {
+            jitter.aim(0, 0);
+        }
+        assert_eq!(jitter.target(), START);
+        jitter.deepen(9);
+        assert_eq!((jitter.target(), jitter.stalls()), (START + 9, START + 9), "all of it at once");
+        for _ in 0..KEEP - 1 {
+            jitter.aim(0, 0);
+        }
+        assert_eq!(jitter.target(), START + 9, "a minute on");
+        for _ in 0..EASE {
+            jitter.aim(0, 0);
+        }
+        assert_eq!(jitter.target(), START + 8, "one packet less, within 5 s of that");
+        for _ in 0..EASE * 12 {
+            jitter.aim(0, 0);
+        }
+        assert_eq!((jitter.target(), jitter.stalls()), (LEAST, 0), "and in the end it is forgotten");
+        jitter.deepen(500);
+        assert_eq!(jitter.target(), MOST, "never over 400 ms");
+    }
+
+    /// A link that goes on freezing never unlearns it: each freeze the queue rode out, nearly to
+    /// the bottom, starts the minute again. When the freezes stop, the minute runs out.
+    #[test]
+    fn a_freeze_the_queue_rode_out_keeps_what_the_first_one_taught() {
+        let mut jitter = Jitter::default();
+        fill(&mut jitter, &(0..12).collect::<Vec<u16>>());
+        assert!(matches!(jitter.pop(), Pop::Packet(_)));
+        jitter.deepen(9);
+        let mut next = 12u16;
+        for tick in 0..KEEP * 3 + EASE {
+            // 220 ms of nothing every 5 s, then all of it; and none after two minutes.
+            match (tick < KEEP * 2, tick % 250) {
+                (true, 0..=10) => {}
+                (true, 11) => {
+                    fill(&mut jitter, &(next..next + 12).collect::<Vec<u16>>());
+                    next += 12;
+                }
+                _ => {
+                    fill(&mut jitter, &[next]);
+                    next += 1;
+                }
+            }
+            jitter.aim(0, 0);
+            assert!(matches!(jitter.pop(), Pop::Packet(_)), "ran dry at {tick}");
+            if tick < KEEP * 2 {
+                assert_eq!(jitter.target(), START + 9, "at {tick}");
+            }
+        }
+        assert!(jitter.target() < START + 9, "still holding {} packets a minute after the last freeze", jitter.target());
     }
 
     /// A minute of arrivals up to 60 ms late at random, measured as the call measures them. The

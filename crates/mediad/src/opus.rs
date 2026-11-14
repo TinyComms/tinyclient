@@ -225,6 +225,8 @@ pub struct Decoder {
     pub looped: u64,
     /// Ticks in a row [`Decoder::stand_in`] has carried the voice on for a packet not here yet.
     standing: u32,
+    /// The gain that stand-in ended at: the packet that comes fades in from it.
+    stood: Option<f32>,
 }
 
 unsafe impl Send for Decoder {}
@@ -246,6 +248,7 @@ impl Decoder {
             concealed: 0,
             looped: 0,
             standing: 0,
+            stood: None,
         })
     }
 
@@ -309,6 +312,7 @@ impl Decoder {
     /// refuses to conceal.
     fn conceal(&mut self, samples: usize, pcm: &mut [i16]) -> usize {
         self.misses += 1;
+        self.stood = None;
         if let Some(decoded) = self.plc(samples, pcm) {
             self.concealed += 1;
             return decoded;
@@ -342,7 +346,8 @@ impl Decoder {
     /// loss does. Only after a quiet frame, where nothing is heard either way, does
     /// [`Decoder::late`] fade out instead.
     ///
-    /// It fades to silence over 60 ms, as the voice would at the end of a sentence cut short: a
+    /// It fades to silence over 140 ms: a link that stands still for a moment in mid-word is back
+    /// by then, and a fade as short as the end of a sentence's leaves most of the stall silent. A
     /// packet that has not come by then may never, and libopus would ring on for as long as it
     /// is asked.
     pub(crate) fn stand_in(&mut self, samples: usize, pcm: &mut [i16]) -> usize {
@@ -350,14 +355,16 @@ impl Decoder {
             Some(decoded) => {
                 self.concealed += 1;
                 let out = &mut pcm[..decoded * CHANNELS];
-                let (from, span) = (self.standing as f32, (FADE_FRAMES * decoded) as f32);
+                let (from, span) = (self.standing as f32, (STAND_FRAMES * decoded) as f32);
+                let mut gain = 1.;
                 for (n, pair) in out.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
-                    let gain = (1. - (from * decoded as f32 + n as f32 + 1.) / span).max(0.);
+                    gain = (1. - (from * decoded as f32 + n as f32 + 1.) / span).max(0.);
                     for sample in pair {
                         *sample = (f32::from(*sample) * gain) as i16;
                     }
                 }
                 self.standing += 1;
+                self.stood = Some(gain);
                 self.record(out);
                 decoded
             }
@@ -429,9 +436,21 @@ impl Decoder {
     }
 
     /// A real frame came out, into `pcm`: crossfaded from the concealment it follows, if any,
-    /// so speaking again after a loss does not click either.
+    /// so speaking again after a loss does not click either. After a stand-in it comes up from
+    /// the gain that had faded to: libopus goes on from its own concealment, which it did not
+    /// fade as far, and what was played of that may be silence by now.
     fn resume(&mut self, pcm: &mut [i16]) {
         self.standing = 0;
+        let stood = self.stood.take();
+        if let Some(from) = stood.filter(|_| !self.concealing) {
+            let fade = RESUME.min(pcm.len() / CHANNELS);
+            for (n, pair) in pcm.as_chunks_mut::<CHANNELS>().0[..fade].iter_mut().enumerate() {
+                let gain = from + (1. - from) * (n + 1) as f32 / (fade + 1) as f32;
+                for sample in pair {
+                    *sample = (f32::from(*sample) * gain) as i16;
+                }
+            }
+        }
         if self.concealing {
             let frames = pcm.len() / CHANNELS;
             let fade = RESUME.min(frames);
@@ -478,6 +497,8 @@ impl Drop for Decoder {
 const RESUME: usize = 240;
 /// Lost or late packets the concealment fades to nothing over: 60 ms.
 const FADE_FRAMES: usize = 3;
+/// Ticks a stand-in for a packet not here yet fades to nothing over: 140 ms.
+const STAND_FRAMES: usize = 7;
 
 /// The pitch period of a stereo frame, in frames: the lag between 2.5 and 16 ms (400 down to
 /// 62.5 Hz) at which the frame best matches itself. Unvoiced sound has none worth the name and
@@ -748,6 +769,65 @@ mod tests {
             decoder.late(FRAME, &mut pcm);
         }
         assert_eq!(peak(&pcm[..FRAME * CHANNELS]), 0, "and then it is silence");
+    }
+
+    /// A decoder in the middle of a voice with breath in it, sent as music is (hybrid packets),
+    /// and the packet that comes next.
+    fn mid_voice() -> (Decoder, Vec<u8>) {
+        let (mut encoder, mut decoder) = (Encoder::new().unwrap(), Decoder::new().unwrap());
+        let mut seed = 3u32;
+        let source: Vec<i16> = (0..11 * FRAME)
+            .flat_map(|n| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let t = n as f64 / f64::from(RATE) * std::f64::consts::TAU;
+                let sample = (t * 440.).sin() * 6000. + (t * 3_000.).sin() * 2000. + f64::from((seed >> 16) as i16) / 16.;
+                [sample as i16; 2]
+            })
+            .collect();
+        let mut pcm = vec![0i16; MAX_FRAME * CHANNELS];
+        let mut packet = [0u8; 1500];
+        let mut len = 0;
+        for (n, frame) in source.chunks(FRAME * CHANNELS).enumerate() {
+            len = encoder.encode(frame, &mut packet).unwrap();
+            if n < 10 {
+                decoder.decode(Some(&packet[..len]), 0, &mut pcm).unwrap();
+            }
+        }
+        (decoder, packet[..len].to_vec())
+    }
+
+    /// A link that freezes for 180 ms is not the end of a sentence. Fading in 60 ms cut short
+    /// what libopus still had to give; over 140 ms it is heard for as long as libopus carries it.
+    #[test]
+    fn a_stand_in_is_still_heard_after_sixty_milliseconds_and_ends_in_silence() {
+        let (mut decoder, _) = mid_voice();
+        let mut pcm = vec![0i16; MAX_FRAME * CHANNELS];
+        let levels: Vec<u16> = (0..STAND_FRAMES + 1)
+            .map(|_| {
+                let made = decoder.stand_in(FRAME, &mut pcm);
+                peak(&pcm[..made * CHANNELS])
+            })
+            .collect();
+        assert!(levels[3] > 100, "silence 60 ms into a stall: {levels:?}");
+        assert!(levels.windows(2).all(|pair| pair[1] <= pair[0]), "it only fades: {levels:?}");
+        assert_eq!(levels[STAND_FRAMES], 0, "a packet that never comes is not rung on for: {levels:?}");
+    }
+
+    /// The packet that ends a long stall comes after silence. It used to start a tenth of the
+    /// way up, a step from nothing in the middle of a word.
+    #[test]
+    fn speech_after_a_stand_in_that_reached_silence_fades_in() {
+        let (mut decoder, next) = mid_voice();
+        let mut pcm = vec![0i16; MAX_FRAME * CHANNELS];
+        for _ in 0..STAND_FRAMES + 2 {
+            decoder.stand_in(FRAME, &mut pcm);
+        }
+        assert_eq!(peak(&pcm[..FRAME * CHANNELS]), 0);
+        decoder.decode(Some(&next), 0, &mut pcm).unwrap();
+        let start = peak(&pcm[..12 * CHANNELS]);
+        assert!(start < 300, "the first quarter of a millisecond back peaks at {start}");
+        let rest = peak(&pcm[RESUME * CHANNELS..FRAME * CHANNELS]);
+        assert!(rest > 1_000, "and the voice is back after 5 ms: {rest}");
     }
 
     /// At 12 kbit/s libopus sends speech-mode (SILK) packets, as a low-bitrate voice channel

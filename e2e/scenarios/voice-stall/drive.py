@@ -3,9 +3,10 @@
 
 Starts this build's mediad with TINYCLIENT_PROVE=voice-stall. That build plays three seconds
 of speech through a receive stream on a clean link: nothing lost, eight packets in mid-word
-held up 160 ms and then arriving together. It exits 0 only when the backlog was given back
-with no two frames in a row squeezed, nothing was taken for lost, and the stall was measured
-once (how long something stood in, the lump, and what the loop saw of its sockets), saying
+held up 160 ms and then arriving together. It exits 0 only when no two frames in a row were
+squeezed, no more stayed queued than the buffer now keeps, nothing was taken for lost, and
+the stall was measured once (how long something stood in, the lump, and what the loop saw
+of its sockets), saying
 "voice-stall: proved" on stderr. A build from before the fix ignores the variable and never
 says it, so this driver fails there.
 
