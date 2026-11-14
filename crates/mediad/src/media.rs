@@ -9,7 +9,7 @@ use crate::cue::Playing;
 use crate::hear::{self, Ear, Limiter};
 use crate::process::Processor;
 use crate::stats::{Arrivals, Counts, Meter};
-use crate::dave::{Dave, Outgoing};
+use crate::dave::{Dave, Held, Outgoing, Refused};
 use crate::jitter::{Jitter, Pop};
 use crate::opus::{Decoder, Encoder, MAX_FRAME};
 use crate::pace;
@@ -17,6 +17,7 @@ use crate::permission::{microphone, Microphone};
 use crate::discord_video;
 use crate::rtp::{Cipher, Sender, PAYLOAD_TYPE, SILENCE};
 use crate::session::Controls;
+use crate::tiny::Turns;
 use crate::{out, CHANNELS, FRAME, FRAME_SAMPLES};
 use protocol::{CallFailure, CallPath, MediaResponse};
 use std::collections::{HashMap, VecDeque};
@@ -955,6 +956,35 @@ pub fn failure(err: AudioError) -> (CallFailure, String) {
     (CallFailure::Audio, detail.to_owned())
 }
 
+/// The most datagrams taken off the socket ahead of one tick: a flood does not hold the tick up.
+const LUMP: usize = 256;
+
+/// Other people's frames that never reached a jitter buffer, by what stopped them, since the
+/// log's last line. The playout counts each as a lost packet and cannot say why.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Drops {
+    /// The transport's encryption did not open the packet.
+    transport: u32,
+    /// The end-to-end encryption did not open the frame.
+    dave: u32,
+    /// The gateway did not say in time whose it was.
+    unnamed: u32,
+}
+
+impl Drops {
+    /// The log's line, when anything was dropped, and the count starts again. `when` is
+    /// "last 10 s", or the call's end.
+    fn line(&mut self, when: &str) -> Option<String> {
+        let drops = std::mem::take(self);
+        (drops != Drops::default()).then(|| {
+            format!(
+                "mediad: voice frames dropped before playout, {when}: {} the transport encryption did not open, {} the end-to-end encryption did not open, {} from a sender not named in time",
+                drops.transport, drops.dave, drops.unnamed
+            )
+        })
+    }
+}
+
 struct Loop {
     setup: Setup,
     encoder: Encoder,
@@ -971,6 +1001,11 @@ struct Loop {
     limiter: Limiter,
     meter: Meter,
     pictures: discord_video::Drive,
+    /// How the loop kept its own time, as a Tiny call's says it.
+    turns: Turns,
+    drops: Drops,
+    /// Frames of senders the gateway has not named yet.
+    held: Held,
 }
 
 impl Loop {
@@ -988,6 +1023,7 @@ impl Loop {
             return;
         }
         let Ok(packet) = self.setup.opener.unseal(datagram) else {
+            self.drops.transport += 1;
             return;
         };
         if packet.ssrc == self.setup.ssrc {
@@ -1009,31 +1045,63 @@ impl Loop {
             stream.heard |= packet.payload != SILENCE;
             return;
         }
-        let user = self
+        let user: Option<u64> = self
             .setup
             .users
             .lock()
             .unwrap()
             .get(&packet.ssrc)
             .and_then(|id| id.parse().ok());
-        let mut again = Vec::new();
-        let frame = self
-            .setup
-            .dave
-            .lock()
-            .unwrap()
-            .decrypt(user, &packet.payload, &mut again);
-        if !again.is_empty() {
-            let _ = self.setup.report.send(FromMedia::Dave(again));
+        // What waited for the sender's name goes first, then this one.
+        let mut sealed = if user.is_some() { self.held.take(packet.ssrc) } else { VecDeque::new() };
+        if user.is_none() && self.held.any(packet.ssrc) {
+            self.drops.unnamed += self.held.keep(packet.ssrc, stream.last_packet, packet.sequence, packet.payload);
+        } else {
+            sealed.push_back((stream.last_packet, packet.sequence, packet.payload));
         }
-        if let Some(frame) = frame {
+        let mut again = Vec::new();
+        let mut dave = self.setup.dave.lock().unwrap();
+        for (taken, sequence, payload) in sealed {
+            let frame = match dave.open(user, &payload, &mut again) {
+                Ok(frame) => frame,
+                Err(Refused::NoUser) => {
+                    self.drops.unnamed += self.held.keep(packet.ssrc, taken, sequence, payload);
+                    continue;
+                }
+                Err(Refused::Failed) => {
+                    self.drops.dave += 1;
+                    continue;
+                }
+            };
             stream.heard |= frame != SILENCE;
             if frame == SILENCE {
                 // Discord's five silence frames before a pause: how long it lasts is not lateness.
                 stream.arrivals.paused();
             }
-            stream.jitter.insert(packet.sequence, frame);
+            stream.took(taken.elapsed());
+            stream.jitter.insert(sequence, frame);
         }
+        drop(dave);
+        if !again.is_empty() {
+            let _ = self.setup.report.send(FromMedia::Dave(again));
+        }
+    }
+
+    /// Takes in what waits in the socket, without waiting for more. True if there was anything.
+    fn drain(&mut self, datagram: &mut [u8]) -> bool {
+        if self.setup.socket.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let mut gave = false;
+        for _ in 0..LUMP {
+            let Ok(len) = self.setup.socket.recv(datagram) else {
+                break;
+            };
+            gave = true;
+            self.receive(&datagram[..len]);
+        }
+        let _ = self.setup.socket.set_nonblocking(false);
+        gave
     }
 
     fn send(&mut self, opus: &[u8]) {
@@ -1098,12 +1166,17 @@ impl Loop {
         let ducked = ear.ducking(self.streams.iter().map(|(ssrc, stream)| (who(ssrc), stream.speaking())));
         let mut mix = [0i32; FRAME_SAMPLES];
         let mut changed = Vec::new();
+        let since = self.turns.told;
         for (ssrc, stream) in &mut self.streams {
             let loud = if deafened {
                 stream.drop_audio();
                 stream.heard
             } else {
-                match stream.pull(&format_args!("ssrc {ssrc}")) {
+                stream.looked(since.looks, since.silent);
+                let stalls = stream.gaps;
+                let frame = stream.pull(&format_args!("ssrc {ssrc}"));
+                self.turns.stalled |= stream.gaps != stalls;
+                match frame {
                     Some(frame) => {
                         stream.mix_into(&mut mix, &frame, ear.factor(who(ssrc), ducked));
                         level(&frame) >= VOICE
@@ -1139,6 +1212,7 @@ impl Loop {
                 self.meter.probe(self.keepalive);
             }
         }
+        self.drops.unnamed += self.held.expire(Instant::now());
         self.setup.audio.log_glitches();
         self.meter.troubles = self.setup.audio.troubles();
         let stats = self.meter.second(self.streams.values_mut().map(Stream::counts));
@@ -1155,44 +1229,13 @@ impl Loop {
         let mut datagram = [0u8; 2048];
         let mut next = Instant::now() + TICK;
         while !self.setup.stop.load(Ordering::Relaxed) && !crate::out::over() {
-            let now = Instant::now();
-            if now < next {
-                let _ = self
-                    .setup
-                    .socket
-                    .set_read_timeout(Some((next - now).max(Duration::from_micros(200))));
-                match self.setup.socket.recv(&mut datagram) {
-                    Ok(len) => self.receive(&datagram[..len]),
-                    Err(err)
-                        if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-                    // An ICMP error surfaces here once per packet we sent; it is not ours to act on.
-                    Err(_) => std::thread::sleep(Duration::from_millis(1)),
-                }
-                continue;
+            match self.turn(next, &mut datagram) {
+                Some(at) => next = at,
+                None => break,
             }
-            next += TICK;
-            if now > next + 5 * TICK {
-                // The machine slept or stalled: do not replay the missed ticks.
-                next = now + TICK;
-            }
-            self.ticks += 1;
-            let input = self.capture();
-            let output = self.play();
-            self.pictures.tick(&self.setup.dave, &self.setup.socket, &self.setup.report);
-            if self.ticks.is_multiple_of(5)
-                && self.setup.controls.metering()
-                && (input, output) != self.levels
-            {
-                self.levels = (input, output);
-                out::send(&MediaResponse::Levels { input, output });
-            }
-            if self.ticks.is_multiple_of(SECOND) && !self.housekeeping() {
-                break;
-            }
-            if let Err((reason, detail)) = self.devices.service(&mut self.setup.audio, &self.setup.controls, self.ticks) {
-                let _ = self.setup.report.send(FromMedia::Fatal(reason, detail));
-                break;
-            }
+        }
+        if let Some(line) = self.drops.line("at the call's end") {
+            tracing::warn!("{line}");
         }
         if self.gate.talking() {
             for _ in 0..TRAIL {
@@ -1206,6 +1249,224 @@ impl Loop {
             stream.log_playout(&format_args!("ssrc {ssrc}"), true);
         }
         sign_off(&self.setup.audio);
+    }
+}
+
+impl Loop {
+    /// One turn of the loop: waits on the socket for the tick due at `next`, or runs it. When
+    /// the tick after is due, or `None` when the call is over.
+    fn turn(&mut self, mut next: Instant, datagram: &mut [u8]) -> Option<Instant> {
+        let now = Instant::now();
+        if now < next {
+            let _ = self
+                .setup
+                .socket
+                .set_read_timeout(Some((next - now).max(Duration::from_micros(200))));
+            let gave = match self.setup.socket.recv(datagram) {
+                Ok(len) => {
+                    self.receive(&datagram[..len]);
+                    true
+                }
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => false,
+                // An ICMP error surfaces here once per packet we sent; it is not ours to act on.
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    false
+                }
+            };
+            self.turns.looked(Instant::now(), gave);
+            return Some(next);
+        }
+        // A tick that ran long leaves ticks to catch up, one after another with no wait
+        // between them, and the packets of that time in the socket. They are taken in ahead of
+        // each tick: or those ticks find nothing to play, and the packets come in a lump.
+        let gave = self.drain(datagram);
+        self.turns.looked(Instant::now(), gave);
+        next += TICK;
+        if now > next + 5 * TICK {
+            // The machine slept or stalled: do not replay the missed ticks.
+            next = now + TICK;
+        }
+        self.ticks += 1;
+        self.turns.tick(now);
+        let input = self.capture();
+        let output = self.play();
+        self.pictures.tick(&self.setup.dave, &self.setup.socket, &self.setup.report);
+        if self.ticks.is_multiple_of(5)
+            && self.setup.controls.metering()
+            && (input, output) != self.levels
+        {
+            self.levels = (input, output);
+            out::send(&MediaResponse::Levels { input, output });
+        }
+        if self.ticks.is_multiple_of(10 * SECOND) {
+            self.turns.log();
+            if let Some(line) = self.drops.line("last 10 s") {
+                tracing::warn!("{line}");
+            }
+        }
+        if self.ticks.is_multiple_of(SECOND) && !self.housekeeping() {
+            return None;
+        }
+        if let Err((reason, detail)) = self.devices.service(&mut self.setup.audio, &self.setup.controls, self.ticks) {
+            let _ = self.setup.report.send(FromMedia::Fatal(reason, detail));
+            return None;
+        }
+        Some(next)
+    }
+}
+
+#[cfg(test)]
+mod discord_tests {
+    use super::*;
+    use crate::rtp::AES_GCM;
+
+    const THEIRS: u32 = 2222;
+
+    /// A Discord call's loop on stand-in devices, and the far end of its socket: the voice
+    /// server, sending as the member 111 on `THEIRS`.
+    fn call() -> (Loop, UdpSocket, Sender) {
+        let (near, far) = (UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap());
+        near.connect(far.local_addr().unwrap()).unwrap();
+        far.connect(near.local_addr().unwrap()).unwrap();
+        let cipher = Cipher::new(AES_GCM, &[7; 32]).unwrap();
+        let controls = Arc::new(Controls::default());
+        let videos = Arc::new(Mutex::new(HashMap::new()));
+        let announced = Arc::new(AtomicBool::new(false));
+        let setup = Setup {
+            socket: near,
+            sender: Sender::new(cipher.clone(), 1111, 0, 0),
+            opener: cipher.clone(),
+            ssrc: 1111,
+            user_id: "222".to_owned(),
+            dave: Arc::new(Mutex::new(Dave::new(222, 900))),
+            users: Arc::default(),
+            controls: controls.clone(),
+            report: mpsc::channel().0,
+            audio: Audio::virtual_devices((48_000, 1), (48_000, 2)).0,
+            stop: Arc::default(),
+            microphone_unasked: false,
+            pipe: None,
+            videos: videos.clone(),
+            announced: announced.clone(),
+        };
+        let state = Loop {
+            setup,
+            pictures: discord_video::Drive::new(controls, "222".to_owned(), videos, announced, None, false, true),
+            encoder: Encoder::new().unwrap(),
+            streams: HashMap::new(),
+            gate: Gate::default(),
+            ticks: 0,
+            keepalive: 0,
+            levels: (0, 0),
+            cue: None,
+            devices: Devices::start(false),
+            processor: Processor::new(),
+            limiter: Limiter::default(),
+            meter: Meter::new(CallPath::Udp),
+            turns: Turns::default(),
+            drops: Drops::default(),
+            held: Held::default(),
+        };
+        (state, far, Sender::new(cipher, THEIRS, 0, 0))
+    }
+
+    /// The datagram of the member's next frame.
+    fn packet(sender: &mut Sender, frame: &[u8]) -> Vec<u8> {
+        let datagram = sender.seal(frame).unwrap();
+        sender.advance(FRAME as u32);
+        datagram
+    }
+
+    fn received(state: &Loop) -> u64 {
+        state.streams.get(&THEIRS).map_or(0, |stream| stream.jitter.received)
+    }
+
+    /// What ran late was a tick, and three more are due at once. The packets of that time are
+    /// in the socket. They were left there until the ticks had caught up, each tick finding
+    /// nothing to play, and then came in a lump.
+    #[test]
+    fn what_waits_in_the_socket_is_taken_in_ahead_of_every_tick_that_is_late() {
+        let (mut state, far, mut sender) = call();
+        let mut datagram = [0u8; 2048];
+        let voice = [0x78, 1, 2, 3, 4, 5, 6, 7];
+        for _ in 0..4 {
+            far.send(&packet(&mut sender, &voice)).unwrap();
+        }
+        thread::sleep(Duration::from_millis(30));
+        let late = Instant::now() - 3 * TICK;
+        let next = state.turn(late, &mut datagram).unwrap();
+        assert_eq!((state.ticks, received(&state)), (1, 4), "all four, before the tick");
+        assert_eq!(next, late + TICK, "and the next tick is late as well");
+
+        far.send(&packet(&mut sender, &voice)).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        state.turn(next, &mut datagram).unwrap();
+        assert_eq!((state.ticks, received(&state)), (2, 5), "a tick catching up looks too");
+        assert!(state.turns.told.looks >= Duration::from_millis(30), "the voices are told how long the loop did not look: {:?}", state.turns.told);
+        assert_eq!(state.drops, Drops::default());
+        state.devices.stop();
+    }
+
+    /// The gateway names the sender after its first packets: none of them is lost, and they
+    /// go to the playout in order.
+    #[test]
+    fn the_first_frames_of_a_sender_named_a_moment_later_are_played() {
+        let (mut state, _far, mut sender) = call();
+        let (mut theirs, ours) = crate::dave::tests::grouped(7);
+        state.setup.dave = Arc::new(Mutex::new(ours));
+        for n in 0..5u8 {
+            let sealed = theirs.encrypt(&[0x78, n, 2, 3, 4, 5, 6, 7]).unwrap();
+            state.receive(&packet(&mut sender, &sealed));
+        }
+        assert_eq!(received(&state), 0, "nothing opens without the sender's name");
+        state.setup.users.lock().unwrap().insert(THEIRS, "111".to_owned());
+        let sealed = theirs.encrypt(&[0x78, 5, 2, 3, 4, 5, 6, 7]).unwrap();
+        state.receive(&packet(&mut sender, &sealed));
+        assert_eq!(received(&state), 6);
+        assert_eq!(state.drops, Drops::default());
+        assert_eq!(state.streams[&THEIRS].jitter.lost, 0);
+        state.devices.stop();
+    }
+
+    /// Each frame that never reaches the playout is counted by what stopped it, and the log
+    /// has a line only when there was one.
+    #[test]
+    fn frames_dropped_before_playout_are_counted_by_reason() {
+        let (mut state, _far, mut sender) = call();
+        assert_eq!(state.drops.line("last 10 s"), None, "nothing dropped, no line");
+        let (mut theirs, ours) = crate::dave::tests::grouped(7);
+        state.setup.dave = Arc::new(Mutex::new(ours));
+
+        // Not sealed with the transport's key.
+        let mut broken = packet(&mut sender, &[0x78, 1, 2, 3]);
+        broken[14] ^= 1;
+        state.receive(&broken);
+        assert_eq!(state.drops, Drops { transport: 1, dave: 0, unnamed: 0 });
+
+        // Nobody names the sender: 15 frames wait, and the oldest give way to the rest.
+        for n in 0..18u8 {
+            let sealed = theirs.encrypt(&[0x78, n, 2, 3]).unwrap();
+            state.receive(&packet(&mut sender, &sealed));
+        }
+        assert_eq!(state.drops, Drops { transport: 1, dave: 0, unnamed: 3 });
+        // And those wait 300 ms, not for ever.
+        assert_eq!(state.held.expire(Instant::now() + Duration::from_secs(1)), 15);
+
+        // Named, and not a frame of the group: sealed with another group's keys.
+        state.setup.users.lock().unwrap().insert(THEIRS, "111".to_owned());
+        let (mut stranger, _) = crate::dave::tests::grouped(7);
+        let sealed = stranger.encrypt(&[0x78, 9, 2, 3]).unwrap();
+        state.receive(&packet(&mut sender, &sealed));
+        assert_eq!(state.drops, Drops { transport: 1, dave: 1, unnamed: 3 });
+        assert_eq!(received(&state), 0);
+
+        assert_eq!(
+            state.drops.line("last 10 s").as_deref(),
+            Some("mediad: voice frames dropped before playout, last 10 s: 1 the transport encryption did not open, 1 the end-to-end encryption did not open, 3 from a sender not named in time")
+        );
+        assert_eq!(state.drops.line("last 10 s"), None, "once");
+        state.devices.stop();
     }
 }
 
@@ -1275,6 +1536,9 @@ pub fn run(mut setup: Setup) -> Audio {
         processor: Processor::new(),
         limiter: Limiter::default(),
         meter: Meter::new(CallPath::Udp),
+        turns: Turns::default(),
+        drops: Drops::default(),
+        held: Held::default(),
     };
     state.run();
     state.devices.stop();

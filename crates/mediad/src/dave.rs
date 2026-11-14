@@ -9,7 +9,9 @@
 use crate::rtp::SILENCE;
 use davey::{Codec, DaveSession, MediaType, ProposalsOperationType};
 use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU16;
+use std::time::{Duration, Instant};
 
 /// The highest version this build speaks.
 pub const MAX_VERSION: u16 = davey::DAVE_PROTOCOL_VERSION;
@@ -34,6 +36,57 @@ const EXPIRY_DOWNGRADE: u32 = 24;
 const TOLERANCE: u32 = 36;
 /// Every end-to-end encrypted frame ends with this.
 const MARKER: [u8; 2] = [0xfa, 0xfa];
+/// Frames kept for a sender nobody has named yet, and how long: 300 ms of a voice.
+const HELD: usize = 15;
+const HELD_FOR: Duration = Duration::from_millis(300);
+
+/// Why a frame was not opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// The group has keys, and the gateway has not said yet whose frame this is.
+    NoUser,
+    /// It did not decrypt, or it is unencrypted and no transition allows that.
+    Failed,
+}
+
+/// The frames of senders nobody has named yet. The gateway says whose an SSRC is a moment
+/// after its first packets, and a frame of an encrypted call opens only with its sender's
+/// keys: dropped, the first syllable is gone.
+#[derive(Default)]
+pub struct Held(HashMap<u32, VecDeque<(Instant, u16, Vec<u8>)>>);
+
+impl Held {
+    /// Something of `ssrc` waits, so what follows waits behind it.
+    pub fn any(&self, ssrc: u32) -> bool {
+        self.0.get(&ssrc).is_some_and(|queue| !queue.is_empty())
+    }
+
+    /// Keeps one frame, taken in at `at`. How many gave way to it: 1 when the queue was full.
+    pub fn keep(&mut self, ssrc: u32, at: Instant, sequence: u16, frame: Vec<u8>) -> u32 {
+        let queue = self.0.entry(ssrc).or_default();
+        queue.push_back((at, sequence, frame));
+        let over = queue.len().saturating_sub(HELD);
+        queue.drain(..over);
+        over as u32
+    }
+
+    /// The sender has a name: its frames, oldest first, with when each was taken in.
+    pub fn take(&mut self, ssrc: u32) -> VecDeque<(Instant, u16, Vec<u8>)> {
+        self.0.remove(&ssrc).unwrap_or_default()
+    }
+
+    /// Drops what has waited too long at `now`, and says how many that was.
+    pub fn expire(&mut self, now: Instant) -> u32 {
+        let mut dropped = 0;
+        self.0.retain(|_, queue| {
+            let old = queue.iter().take_while(|(at, ..)| now.saturating_duration_since(*at) > HELD_FOR).count();
+            queue.drain(..old);
+            dropped += old as u32;
+            !queue.is_empty()
+        });
+        dropped
+    }
+}
 
 /// What the gateway must send for us.
 #[derive(Debug, PartialEq)]
@@ -56,6 +109,8 @@ pub struct Dave {
     reinitializing: bool,
     last_transition: Option<u16>,
     failures: u32,
+    /// Seconds a member's unencrypted frames are still accepted after the group changed.
+    window: u32,
 }
 
 fn ready(transition: u16) -> Outgoing {
@@ -75,6 +130,19 @@ impl Dave {
             reinitializing: false,
             last_transition: None,
             failures: 0,
+            window: EXPIRY,
+        }
+    }
+
+    /// For `seconds` from now, members' unencrypted frames are taken as they are. A sender
+    /// goes on unencrypted until a transition is executed, and its frames in flight a moment
+    /// longer. davey's decryptors start with this off, and `set_passthrough_mode(true, _)`
+    /// ignores its expiry and leaves it on for good: only turning it off counts down, and
+    /// only from on.
+    fn pass_for(&mut self, seconds: u32) {
+        if let Some(session) = &mut self.session {
+            session.set_passthrough_mode(true, None);
+            session.set_passthrough_mode(false, Some(seconds));
         }
     }
 
@@ -148,9 +216,7 @@ impl Dave {
             return Vec::new();
         }
         if version == 0 {
-            if let Some(session) = &mut self.session {
-                session.set_passthrough_mode(true, Some(EXPIRY_DOWNGRADE));
-            }
+            self.pass_for(EXPIRY_DOWNGRADE);
         }
         vec![ready(transition)]
     }
@@ -166,11 +232,10 @@ impl Dave {
         let before = std::mem::replace(&mut self.version, version);
         if before != version && version == 0 {
             self.downgraded = true;
-        } else if transition > 0 && self.downgraded {
+        } else if transition > 0 {
             self.downgraded = false;
-            if let Some(session) = &mut self.session {
-                session.set_passthrough_mode(true, Some(EXPIRY));
-            }
+            // Senders encrypt from now on. What they sent before is still on its way.
+            self.pass_for(self.window);
         }
         self.reinitializing = false;
         self.last_transition = Some(transition);
@@ -233,6 +298,8 @@ impl Dave {
     /// The group moved to a new epoch under `transition`.
     fn joined_epoch(&mut self, transition: u16) -> Vec<Outgoing> {
         self.failures = 0;
+        // Until the transition is executed the others may not encrypt yet.
+        self.pass_for(self.window);
         if transition == 0 {
             self.reinitializing = false;
             self.last_transition = Some(0);
@@ -321,23 +388,29 @@ impl Dave {
     /// decrypted, or it is encrypted and there are no keys for it yet. `again` holds what the
     /// gateway must send when too many frames failed and the group has to be rebuilt.
     pub fn decrypt(&mut self, user_id: Option<u64>, frame: &[u8], again: &mut Vec<Outgoing>) -> Option<Vec<u8>> {
+        self.open(user_id, frame, again).ok()
+    }
+
+    /// [`Dave::decrypt`], saying why a frame was dropped: one with no sender named yet may
+    /// open once the gateway names it.
+    pub fn open(&mut self, user_id: Option<u64>, frame: &[u8], again: &mut Vec<Outgoing>) -> Result<Vec<u8>, Refused> {
         if frame == SILENCE {
-            return Some(frame.to_vec());
+            return Ok(frame.to_vec());
         }
-        let sealed = frame.ends_with(&MARKER);
+        let clear = || if frame.ends_with(&MARKER) { Err(Refused::Failed) } else { Ok(frame.to_vec()) };
         let session = match &mut self.session {
             Some(session) if session.is_ready() => session,
             // No group: clear frames are all there can be. A sealed one is not Opus.
-            _ => return (!sealed).then(|| frame.to_vec()),
+            _ => return clear(),
         };
-        let user_id = user_id?;
+        let user_id = user_id.ok_or(Refused::NoUser)?;
         if self.version == 0 && !session.can_passthrough(user_id) {
-            return (!sealed).then(|| frame.to_vec());
+            return clear();
         }
         match session.decrypt(user_id, MediaType::AUDIO, frame) {
             Ok(opus) => {
                 self.failures = 0;
-                Some(opus)
+                Ok(opus)
             }
             Err(_) => {
                 if !self.reinitializing && self.pending.is_none() {
@@ -348,14 +421,14 @@ impl Dave {
                         }
                     }
                 }
-                None
+                Err(Refused::Failed)
             }
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     mod mls {
@@ -375,7 +448,15 @@ mod tests {
     /// Two members brought into one group the way the voice gateway does it: `first` is alone,
     /// the server proposes `second`, `first` commits, the server announces the commit under
     /// `transition` and welcomes `second`.
-    fn grouped(transition: u16) -> (Dave, Dave) {
+    pub(crate) fn grouped(transition: u16) -> (Dave, Dave) {
+        let (mut first, mut second) = welcomed(transition);
+        first.execute_transition(transition);
+        second.execute_transition(transition);
+        (first, second)
+    }
+
+    /// The same, up to the commit and the welcome: the transition is announced, not executed.
+    fn welcomed(transition: u16) -> (Dave, Dave) {
         let server = mls::Server::new();
         let (mut first, mut second) = (Dave::new(111, CHANNEL), Dave::new(222, CHANNEL));
         binary(first.start(1), KEY_PACKAGE);
@@ -391,9 +472,82 @@ mod tests {
         let expected = if transition == 0 { Vec::new() } else { ready };
         assert_eq!(first.commit(&announce(&commit)), expected);
         assert_eq!(second.welcome(&announce(&welcome)), expected);
-        first.execute_transition(transition);
-        second.execute_transition(transition);
         (first, second)
+    }
+
+    /// What Discord's log showed at a join: the member already there goes on sending
+    /// unencrypted until the transition is executed, and a moment after. Those frames are
+    /// their voice, not loss.
+    #[test]
+    fn an_unencrypted_frame_just_after_the_welcome_is_played() {
+        let (_, mut second) = welcomed(7);
+        let mut again = Vec::new();
+        assert_eq!(second.decrypt(Some(111), TONE, &mut again).as_deref(), Some(TONE), "before the transition is executed");
+        second.execute_transition(7);
+        assert_eq!(second.decrypt(Some(111), TONE, &mut again).as_deref(), Some(TONE), "and just after");
+        assert!(again.is_empty());
+    }
+
+    /// The window closes: once the group is settled, a member's unencrypted frame is refused.
+    #[test]
+    fn an_unencrypted_frame_long_after_the_transition_is_refused() {
+        let (mut first, mut second) = welcomed(7);
+        second.window = 1;
+        second.execute_transition(7);
+        first.execute_transition(7);
+        let mut again = Vec::new();
+        assert_eq!(second.open(Some(111), TONE, &mut again).as_deref(), Ok(TONE));
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(second.open(Some(111), TONE, &mut again), Err(Refused::Failed));
+        let sealed = first.encrypt(TONE).unwrap();
+        assert_eq!(second.open(Some(111), &sealed, &mut again).as_deref(), Ok(TONE), "encrypted frames go on opening");
+    }
+
+    /// Coming back from a downgrade opens the same window, and it closes too. It was left
+    /// open for the rest of the call.
+    #[test]
+    fn coming_back_from_a_downgrade_does_not_accept_unencrypted_frames_for_good() {
+        let (_, mut second) = grouped(4);
+        second.window = 1;
+        second.prepare_transition(5, 0);
+        second.execute_transition(5);
+        second.prepare_transition(6, 1);
+        second.execute_transition(6);
+        assert!(second.session.as_ref().unwrap().can_passthrough(111));
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(!second.session.as_ref().unwrap().can_passthrough(111));
+    }
+
+    /// The gateway names a sender a moment after its first packets. Those are kept, in order,
+    /// and open once it does.
+    #[test]
+    fn frames_of_a_sender_not_yet_named_are_kept_and_open_once_it_is() {
+        let (mut first, mut second) = grouped(7);
+        let (mut held, mut again, start) = (Held::default(), Vec::new(), Instant::now());
+        for n in 0..5u16 {
+            let sealed = first.encrypt(&[TONE, &[n as u8]].concat()).unwrap();
+            assert_eq!(second.open(None, &sealed, &mut again), Err(Refused::NoUser));
+            assert_eq!(held.keep(2222, start + Duration::from_millis(20) * u32::from(n), n, sealed), 0);
+        }
+        assert!(held.any(2222) && !held.any(3333));
+        assert_eq!(held.expire(start + Duration::from_millis(200)), 0);
+        let opened: Vec<(u16, Vec<u8>)> = held.take(2222).into_iter().map(|(_, n, sealed)| (n, second.open(Some(111), &sealed, &mut again).unwrap())).collect();
+        assert_eq!(opened, (0..5u16).map(|n| (n, [TONE, &[n as u8]].concat())).collect::<Vec<_>>());
+        assert!(!held.any(2222) && again.is_empty());
+    }
+
+    #[test]
+    fn frames_kept_for_a_sender_are_bounded_in_number_and_in_time() {
+        let (mut held, start) = (Held::default(), Instant::now());
+        let at = |n: u16| start + Duration::from_millis(20) * u32::from(n);
+        let gave_way: u32 = (0..20u16).map(|n| held.keep(2222, at(n), n, vec![n as u8])).sum();
+        assert_eq!(gave_way, 5, "fifteen are kept");
+        // At 520 ms the frames taken in before 220 ms have waited too long: 5 to 10.
+        assert_eq!(held.expire(start + Duration::from_millis(520)), 6);
+        assert_eq!(held.take(2222).into_iter().map(|(_, n, _)| n).collect::<Vec<_>>(), (11..20).collect::<Vec<_>>());
+        held.keep(2222, at(0), 0, vec![0]);
+        assert_eq!(held.expire(start + Duration::from_secs(5)), 1);
+        assert!(!held.any(2222));
     }
 
     #[test]
