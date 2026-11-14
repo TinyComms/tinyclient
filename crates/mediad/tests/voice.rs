@@ -1563,3 +1563,46 @@ fn dave_two_members_exchange_end_to_end_encrypted_audio() {
     assert!(is_the_tone(loudest), "played level {loudest}");
     let _ = std::fs::remove_file(played_to);
 }
+
+/// Joining a Discord call someone is already talking in, as the log of a real one showed it:
+/// the member there commits and welcomes us, and goes on sending unencrypted until the
+/// transition is executed. Those frames are their voice. They were dropped as loss.
+#[test]
+fn dave_a_member_still_unencrypted_while_we_join_is_heard() {
+    use davey::{DaveSession, ProposalsOperationType};
+    let mut fake = Fake::new();
+    let played_to = sink("dave-join");
+    let mut mediad = Mediad::start("null", Some(&played_to));
+    mediad.join(&fake.endpoint(), Dave { max_version: 1, required: true });
+    let mut peer = fake.accept();
+    fake.handshake(&mut peer, &[AES], 1, 30_000);
+    assert_eq!(mediad.connected(), (OUR_SSRC, 1));
+
+    // The member there holds the group. The server proposes mediad to it.
+    let server = mls::Server::new();
+    let package = peer.expect_binary(26);
+    peer.send_binary(25, &server.package());
+    let version = std::num::NonZeroU16::new(1).unwrap();
+    let mut them = DaveSession::new(version, 222, CHANNEL, None).unwrap();
+    them.set_external_sender(&server.package()).unwrap();
+    them.create_key_package().unwrap();
+    let proposals = server.add(&package, CHANNEL, 0);
+    let made = them.process_proposals(ProposalsOperationType::APPEND, &proposals[1..], Some(&[111, 222])).unwrap().unwrap();
+    them.process_commit(&made.commit).unwrap();
+    peer.send(11, json!({ "user_ids": [THEM] }));
+    peer.send(5, json!({ "user_id": THEM, "ssrc": THEIR_SSRC, "speaking": 1 }));
+    peer.send_binary(30, &[&7u16.to_be_bytes()[..], &made.welcome.unwrap()].concat());
+    assert_eq!(peer.expect(23), json!({ "transition_id": 7 }));
+
+    // Announced and not executed: a second of the member's voice, not yet encrypted.
+    let frames = tone_frames(50);
+    let tone: Vec<(u16, &[u8])> = frames.iter().enumerate().map(|(n, frame)| (n as u16, &frame[..])).collect();
+    fake.talk(&tone);
+    mediad.speaking(THEM, true);
+    peer.send(22, json!({ "transition_id": 7 }));
+
+    assert_eq!(mediad.hang_up().0.code(), Some(0));
+    let loudest = played(&played_to).chunks(960 * 2 * 20).map(rms).fold(0., f64::max);
+    assert!(is_the_tone(loudest), "played level {loudest}");
+    let _ = std::fs::remove_file(played_to);
+}

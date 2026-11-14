@@ -560,10 +560,10 @@ const SLOW: Duration = Duration::from_millis(40);
 /// The longest this loop went between two ticks, between two looks at its sockets, and with
 /// nothing from them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Gaps {
-    ticks: Duration,
-    looks: Duration,
-    silent: Duration,
+pub(crate) struct Gaps {
+    pub(crate) ticks: Duration,
+    pub(crate) looks: Duration,
+    pub(crate) silent: Duration,
 }
 
 impl Gaps {
@@ -578,7 +578,7 @@ impl Gaps {
 /// them up is the far end, the server, the network, or a loop here that did not get to its
 /// sockets: this says whether it was the last.
 #[derive(Debug, Default)]
-struct Turns {
+pub(crate) struct Turns {
     /// When it last ticked, last looked at its sockets, and last got anything from them.
     ticked: Option<Instant>,
     looked: Option<Instant>,
@@ -586,15 +586,15 @@ struct Turns {
     /// The longest of each since the last tick, as the voices were told on it, and since the
     /// log's last line.
     recent: Gaps,
-    told: Gaps,
+    pub(crate) told: Gaps,
     logged: Gaps,
     /// A voice stalled since the log's last line.
-    stalled: bool,
+    pub(crate) stalled: bool,
 }
 
 impl Turns {
     /// The sockets were looked at, and whether they had anything.
-    fn looked(&mut self, now: Instant, gave: bool) {
+    pub(crate) fn looked(&mut self, now: Instant, gave: bool) {
         let mut gaps = Gaps::default();
         if let Some(then) = self.looked.replace(now) {
             gaps.looks = now.saturating_duration_since(then);
@@ -610,7 +610,7 @@ impl Turns {
 
     /// A tick runs. What its voices are told of the time since the one before: the longest
     /// gaps that ended in it, and those still running.
-    fn tick(&mut self, now: Instant) -> Gaps {
+    pub(crate) fn tick(&mut self, now: Instant) -> Gaps {
         let mut gaps = std::mem::take(&mut self.recent);
         if let Some(then) = self.ticked.replace(now) {
             gaps.ticks = now.saturating_duration_since(then);
@@ -629,6 +629,18 @@ impl Turns {
         let gaps = std::mem::take(&mut self.logged);
         let stalled = std::mem::take(&mut self.stalled);
         (stalled || gaps.ticks >= SLOW || gaps.looks >= SLOW).then_some(gaps)
+    }
+
+    /// Every 10 s: writes that line, when there is one.
+    pub(crate) fn log(&mut self) {
+        if let Some(gaps) = self.line() {
+            tracing::warn!(
+                "mediad: the call's loop, last 10 s: at most {} ms between two ticks, {} ms between two looks at its sockets, and {} ms with nothing from them",
+                gaps.ticks.as_millis(),
+                gaps.looks.as_millis(),
+                gaps.silent.as_millis(),
+            );
+        }
     }
 }
 
@@ -1519,14 +1531,7 @@ impl Call {
                     self.turns.tick(now);
                     self.tick();
                     if self.ticks.is_multiple_of(10 * SECOND) {
-                        if let Some(gaps) = self.turns.line() {
-                            tracing::warn!(
-                                "mediad: the call's loop, last 10 s: at most {} ms between two ticks, {} ms between two looks at its sockets, and {} ms with nothing from them",
-                                gaps.ticks.as_millis(),
-                                gaps.looks.as_millis(),
-                                gaps.silent.as_millis(),
-                            );
-                        }
+                        self.turns.log();
                     }
                     self.watch_link(now);
                     if self.ticks.is_multiple_of(SECOND) {
