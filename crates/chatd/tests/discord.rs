@@ -1026,6 +1026,41 @@ fn ready_fills_spaces_trees_people_and_unread_state() {
 }
 
 #[test]
+fn a_forum_opens_on_the_newest_activity_post_and_its_posts_are_no_tree_rows() {
+    let world = World::start();
+    // Discord lists a forum's posts active first (polish/01 §3, N14): opening the help forum
+    // lands on the post with the newest activity, read or not — here the read "Iterating",
+    // though "Sorting" still sits unread. Telegram's own rule (newest unread, else General)
+    // would have picked the other post.
+    let landing = || Request::Topics { forum: world.key("4106"), offset: 0, limit: 1, landing: true };
+    let Response::Conversations { conversations, .. } = world.ask(landing()) else {
+        panic!("no landing");
+    };
+    assert_eq!(conversations.len(), 1, "{conversations:?}");
+    assert_eq!(
+        (conversations[0].key.id.as_str(), conversations[0].title.as_str(), conversations[0].parent.as_deref()),
+        ("4602", "Iterating a Vec in place", Some("4106")),
+        "the landing is the newest activity, not the newest unread"
+    );
+    // Opening the forum asked Discord nothing: its posts arrive on the socket as threads.
+    assert!(world.discord.requests_to("GET", "/channels/4106/").is_empty());
+
+    // What the topics drill lists: the posts by their activity, a count on the unread one.
+    let drill = Request::Topics { forum: world.key("4106"), offset: 0, limit: 10, landing: false };
+    let Response::Conversations { conversations: posts, total, .. } = world.ask(drill) else {
+        panic!("no posts");
+    };
+    assert_eq!((total, posts.len()), (2, 2), "{posts:?}");
+    assert_eq!(ids(&posts), ["4602", "4601"]);
+    assert_eq!((posts[0].unread, posts[1].unread), (0, 1));
+
+    // Never posts as tree rows (polish/01 §3): the help forum is one row, its posts live only
+    // in the topics drill and the landing.
+    let (_, rows) = world.tree("4000");
+    assert_eq!(ids(&rows), ["4105", "4101", "4500", "4102", "4104", "4106", "4201", "4202"]);
+}
+
+#[test]
 fn my_picture_is_the_accounts_from_ready_and_follows_a_change_to_it() {
     let world = World::start();
     let mine = || match world.ask(Request::Status) {
