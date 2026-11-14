@@ -5,7 +5,7 @@ Files, images, emoji, GIFs, stickers, voice, formatting and mentions, per networ
 `composer/*`, `input.rs`, `conversation/emoji.rs`; each adapter's `send`. Tags: **[C]** in our code,
 **[W]** confirmed on the web (sources at the end), **[U]** unconfirmed, check on a live session.
 This file reverses the cut of the GIF picker and of stickers in `stories.md` and `03`; voice
-recording stays out of v1.
+recording is in on Telegram and nowhere else.
 
 ## 1. What is there today
 
@@ -136,7 +136,7 @@ recording stays out of v1.
 | 19 | send a Telegram sticker from my packs | Sticker message; no Lottie/WebM code linked | P1 |
 | 20 | attach a file in a Teams chat | It lands in OneDrive "Microsoft Teams Chat Files" and opens for the other person | P1 |
 | 21 | send a Discord sticker; mention a role or user group; schedule a Slack or Telegram message (server-side) | Each visible in the official app | P2 |
-| 22 | hold to record a Telegram voice note | Recorded and encoded in `mediad` (it already has Opus), which exits after; chatd uploads the `.ogg` path | P2 |
+| 22 | record a Telegram voice note on the composer's mic (press, or hold with push-to-talk on) | Built. Recorded and encoded in `mediad` (it already has Opus), which exits after; chatd uploads the `.ogg` path | P2 |
 | — | GIFs on Slack/Teams until their client API is captured; slash commands (a `/` message on Discord or Slack shows "Commands run in the official app; this posts as text"); `/remind`; Teams Urgent and Loop; Telegram polls, location, self-destruct; animated sticker playback; inline images in the field | | cut |
 
 ## 7. What the contract needs

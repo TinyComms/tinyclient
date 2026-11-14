@@ -49,7 +49,7 @@ Ranked by how fast its absence sends someone back. P0 = not a real client withou
 | 13 | Message search within a network | P1 | Daily for C, weekly for the others. |
 | 14 | Seven networks at a usable depth | P1 | Seven networks sign in. Depth still differs; a gap is a handoff, not a hidden row. |
 | 15 | Voice messages play; stickers and GIFs display; pins; Telegram folders; set my own status | P1 | Expected by B and D, not on the critical path. |
-| 16 | Record a voice message, vote in a poll, scheduled send, saved items | P2 | The GIF and sticker picker is in. Recording a voice message, polls, scheduled send, and saved items are still authoring extras. |
+| 16 | Record a voice message, vote in a poll, scheduled send, saved items | P2 | The GIF and sticker picker is in, and a Telegram voice message records on the composer's mic (press, or hold with push-to-talk on). Polls, scheduled send, and saved items are still authoring extras. |
 
 ## Stories
 
@@ -83,7 +83,7 @@ These are part of the goal. They are not in the product yet, so each one opens i
 | Commerce, discovery, Premium, Nitro | Open in the official app |
 | Password, 2FA, billing, and the network's own privacy screens | Open in the official app. Mutes, presence, and the local settings in `09` are here. |
 | Telegram secret chats | grammers does not carry them. Say so on the row. |
-| Scheduled send, recording a voice message | Not in the composer. Playing a voice message is in the message. |
+| Scheduled send | Not in the composer. Voice messages play, and Telegram records one on the composer's mic. |
 | Light theme, open at login | Search says so. Dark only. No login item. |
 
 A downloaded noise-suppression model is a non-goal. The Voice switch that turns suppression on is already a setting.

@@ -40,11 +40,11 @@ The order is an estimate of daily use, not measured data.
 | 16 | Forwarded / shared messages | P1 | A nested card with the origin's name. |
 | 17 | System lines (joined, call started, pinned) | P1 | One grey centered line. |
 | 18 | Stickers | P1 static; APNG and GIF animated, Lottie, TGS and WebM cut | APNG and GIF play like GIFs. Lottie and WebM renderers are weight for little use. |
-| 19 | Voice messages | P1 | Play button, waveform, duration. Needs an Ogg/Opus decoder; macOS does not play Ogg natively. |
+| 19 | Voice messages | P1 | Play button, waveform, duration. Needs an Ogg/Opus decoder; macOS does not play Ogg natively. A Telegram voice message records on the composer's mic. |
 | 20 | Spoilers | P1 | Hidden until clicked. |
 | 21 | Pins | P2 | |
 | 22 | Polls, location, contacts, tables, headings | P2 | Placeholder line until then. |
-| — | Recording a voice message, slash commands, bot buttons and forms, canvases, scheduled send, edit history, read receipts per message | cut | The GIF and sticker picker is in. Buttons are `MessageKind::Unsupported` plus "Open in {network}". |
+| — | Slash commands, bot buttons and forms, canvases, scheduled send, edit history, read receipts per message | cut | The GIF and sticker picker is in. Buttons are `MessageKind::Unsupported` plus "Open in {network}". |
 
 ## Stories
 
