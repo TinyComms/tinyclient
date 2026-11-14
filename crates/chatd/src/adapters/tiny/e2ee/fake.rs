@@ -9,8 +9,8 @@ use super::*;
 use e2ee::identity::DeviceKey;
 use openmls::prelude::tls_codec::{DeserializeBytes as _, Serialize as _};
 use openmls::prelude::{
-    ExternalProposal, GroupEpoch, GroupId, KeyPackageIn, MlsMessageOut, ProtocolVersion,
-    SenderExtensionIndex,
+    ExternalProposal, GroupEpoch, GroupId, KeyPackageIn, MlsMessageIn, MlsMessageOut,
+    ProtocolMessage, ProtocolVersion, SenderExtensionIndex,
 };
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::OpenMlsProvider as _;
@@ -48,6 +48,10 @@ struct Server {
     pending: Vec<Add>,
     feed: Vec<Handshake>,
     messages: Vec<Value>,
+    /// Every request line, as "METHOD path", for tests that assert what was not asked.
+    seen: Vec<String>,
+    /// Sealed reaction blobs, in `seq` order.
+    blobs: Vec<Value>,
 }
 
 struct Fake {
@@ -69,6 +73,8 @@ impl Fake {
             pending: Vec::new(),
             feed: Vec::new(),
             messages: Vec::new(),
+            seen: Vec::new(),
+            blobs: Vec::new(),
         }));
         let serving = server.clone();
         let base = crate::adapters::tiny::serve(move |request| {
@@ -125,6 +131,7 @@ impl Server {
             .unwrap_or_default();
         let body: Value = serde_json::from_str(body).unwrap_or(Value::Null);
         let conversation = format!("/v1/e2ee/conversations/{CONVERSATION}");
+        self.seen.push(format!("{method} {path}"));
         match method {
             "GET" if matches!(path, "/v1/channels" | "/v1/rooms") => (200, json!([])),
             "GET" if path == "/v1/directs" => (200, json!([{
@@ -204,6 +211,21 @@ impl Server {
             "POST" if path == format!("{conversation}/commit") => self.commit(&body),
             "POST" if path == format!("/v1/conversations/{CONVERSATION}/messages") => {
                 self.post(&caller, &body)
+            }
+            // What the real server says to a plaintext reaction on an encrypted message.
+            "PUT" | "DELETE" if path.starts_with("/v1/messages/") && path.ends_with("/reactions") => {
+                (400, json!({ "error": "e2ee_required" }))
+            }
+            "POST" if path == format!("{conversation}/reactions") => self.reaction(&caller, &body),
+            "GET" if path == format!("{conversation}/reactions") => {
+                let after: i64 = param("after").parse().unwrap_or(0);
+                let rows: Vec<Value> = self
+                    .blobs
+                    .iter()
+                    .filter(|row| row["seq"].as_i64().unwrap_or(0) > after)
+                    .cloned()
+                    .collect();
+                (200, Value::Array(rows))
             }
             _ => (404, json!({ "error": "not_found" })),
         }
@@ -348,6 +370,75 @@ impl Server {
         self.messages.push(json!({ "id": id, "author_id": caller, "ciphertext": body["ciphertext"], "epoch": body["epoch"], "device_id": device, "client_id": body["client_id"] }));
         (201, json!({ "id": id }))
     }
+
+    /// What the real server's `POST /v1/e2ee/conversations/{id}/reactions` holds: the same
+    /// epoch and membership checks, and the ciphertext must carry the reaction's authenticated
+    /// data (`docs/e2ee-text.md`, section 8). The blob is otherwise opaque.
+    fn reaction(&mut self, caller: &str, body: &Value) -> (u16, Value) {
+        let device = body["device_id"].as_str().unwrap_or("").to_owned();
+        if body["epoch"].as_u64() != self.epoch {
+            return (409, json!({ "error": "stale_epoch" }));
+        }
+        if !self.leaves.iter().any(|(_, leaf)| *leaf == device) {
+            return (403, json!({ "error": "not_in_group" }));
+        }
+        let Some(data) = unb64(body["ciphertext"].as_str().unwrap_or("")) else {
+            return (400, json!({ "error": "bad_e2ee" }));
+        };
+        let Ok(message) = MlsMessageIn::tls_deserialize_exact_bytes(&data) else {
+            return (400, json!({ "error": "bad_e2ee" }));
+        };
+        let Ok(protocol) = message.try_into_protocol_message() else {
+            return (400, json!({ "error": "bad_e2ee" }));
+        };
+        let epoch = body["epoch"].as_u64().unwrap_or(0);
+        let private = match &protocol {
+            ProtocolMessage::PrivateMessage(private) => private,
+            _ => return (400, json!({ "error": "bad_e2ee" })),
+        };
+        if protocol.group_id().as_slice() != uuid(CONVERSATION).unwrap()
+            || protocol.epoch().as_u64() != epoch
+            || private.aad() != reaction_aad(CONVERSATION).as_slice()
+        {
+            return (400, json!({ "error": "bad_e2ee" }));
+        }
+        if let Some(kept) = self.blobs.iter().find(|row| {
+            row["device_id"] == body["device_id"] && row["client_id"] == body["client_id"]
+        }) {
+            return (
+                200,
+                json!({
+                    "id": kept["id"], "ciphertext": kept["ciphertext"], "epoch": kept["epoch"],
+                    "created_at": "2026-11-05T00:00:00Z", "seq": kept["seq"], "created": false
+                }),
+            );
+        }
+        let id = format!("00000000-0000-4000-8000-{:012}", 1000 + self.blobs.len() + 1);
+        let seq = self.blobs.len() as i64 + 1;
+        self.blobs.push(json!({
+            "id": id, "author_id": caller, "device_id": device, "client_id": body["client_id"],
+            "ciphertext": body["ciphertext"], "epoch": epoch, "seq": seq
+        }));
+        (
+            201,
+            json!({
+                "id": id, "ciphertext": body["ciphertext"], "epoch": epoch,
+                "created_at": "2026-11-05T00:00:00Z", "seq": seq, "created": true
+            }),
+        )
+    }
+}
+
+/// The authenticated data the real server demands of a reaction ciphertext: the message label,
+/// the `reaction` kind, no target, then the conversation (`crates/api/src/e2ee_text/mls.rs`).
+fn reaction_aad(conversation: &str) -> Vec<u8> {
+    let mut aad = b"tiny-e2ee-v1 msg".to_vec();
+    aad.push(0);
+    aad.extend_from_slice(b"reaction");
+    aad.push(0);
+    aad.push(0);
+    aad.extend_from_slice(conversation.as_bytes());
+    aad
 }
 
 /// A device of `user` against the fake, in a directory of its own, with keys of its own.
@@ -521,4 +612,125 @@ fn a_message_that_did_not_open_for_want_of_the_group_is_read_again_when_it_arriv
     );
     assert!(matches!(inbox.try_recv(), Ok(crate::adapters::Command::Backfill(id)) if id == CONVERSATION),
         "later handshakes also refresh rows for linked-device catch-up");
+}
+
+/// Lab prove: a reaction in an encrypted conversation goes out sealed and lands on the message
+/// when its echo comes back. The lab sets `TINYCLIENT_PROVE=tiny-e2ee-reaction`.
+pub(crate) fn prove_encrypted_reaction() -> Result<(), String> {
+    encrypted_reaction_round_trip().map_err(|err| format!("sealed reaction: {err}"))
+}
+
+fn encrypted_reaction_round_trip() -> Result<(), String> {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "react-ada");
+    let mut bea = device(&fake, BEA, "react-bea");
+    ada.sync(CONVERSATION).map_err(|err| format!("Ada joins: {err}"))?;
+    bea.sync(CONVERSATION).map_err(|err| format!("Bea joins: {err}"))?;
+    ada.sync(CONVERSATION).map_err(|err| format!("Ada settles the join: {err}"))?;
+
+    // The adapter path, against the device this session started.
+    let saved_ada = ada.saved.clone();
+    let ada: Shared = Arc::new(Mutex::new(ada));
+    let registry_key = |saved: &Saved| (saved.base_url.clone(), saved.user_id.clone());
+    struct Registered(Vec<(String, String)>);
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            let mut registry = lock(devices());
+            for key in &self.0 {
+                registry.remove(key);
+            }
+        }
+    }
+    let _registered = Registered(vec![registry_key(&saved_ada)]);
+    lock(devices()).insert(registry_key(&saved_ada), ada.clone());
+    let context = |saved: &Saved| {
+        let hub = Arc::new(crate::hub::Hub::new(crate::store::Store::open(Path::new(":memory:")).unwrap()));
+        crate::adapters::local(protocol::AccountKey { network: protocol::Network::Tiny, account: saved.user_id.clone() }, hub)
+    };
+    let (_adapter, ctx, _inbox) = context(&saved_ada);
+    let live = super::super::live::Live::new().map_err(|err| err.to_string())?;
+    let serve = |ctx: &crate::adapters::Context, command: crate::adapters::Command| {
+        super::super::messages::serve(ctx, &saved_ada, &live, command)
+    };
+
+    // Ada says hello, through the adapter, so the message is in the store.
+    serve(
+        &ctx,
+        crate::adapters::Command::Send {
+            conversation_id: CONVERSATION.to_owned(),
+            client_id: "c-1".to_owned(),
+            text: "hello Bea".to_owned(),
+            reply_to: None,
+        },
+    );
+    let first = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let rows = lock(&fake.server).messages.clone();
+            if let Some(row) = rows.first() {
+                let id = row["id"].as_str().unwrap().to_owned();
+                if ctx.stored_message(CONVERSATION, &id).map_err(|err| err.to_string())?.is_some() {
+                    break id;
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("the first message never landed".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    // Bea opens it, so what follows is about the reaction and not about the message.
+    let read = fake.read(&mut bea);
+    if text(&read, &first) != "hello Bea" {
+        return Err("Bea did not open the first message".into());
+    }
+
+    // Ada reacts. The sealed path must ask the server's encrypted reactions route, never the
+    // plaintext one it refuses.
+    let (reply, answer) = std::sync::mpsc::channel();
+    serve(
+        &ctx,
+        crate::adapters::Command::React {
+            conversation_id: CONVERSATION.to_owned(),
+            message_id: first.clone(),
+            emoji: "\u{1f44d}".to_owned(),
+            on: true,
+            reply,
+        },
+    );
+    let outcome = answer
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "the reaction was never answered".to_owned())?;
+    outcome.map_err(|refusal| format!("the reaction was refused: {refusal:?}"))?;
+    let blob = lock(&fake.server).blobs.first().cloned().ok_or("no reaction blob was stored")?;
+    if lock(&fake.server).seen.iter().any(|seen| {
+        seen.starts_with("PUT /v1/messages/") || seen.starts_with("DELETE /v1/messages/")
+    }) {
+        return Err("the plaintext reactions route was asked".into());
+    }
+
+    // The echo lands it on the message, for Ada and for Bea.
+    let frame = json!({
+        "conversation_id": CONVERSATION,
+        "id": blob["id"],
+        "ciphertext": blob["ciphertext"],
+        "epoch": blob["epoch"],
+        "created_at": "2026-11-05T00:00:00Z",
+    });
+    super::super::messages::on_live(&ctx, &saved_ada, &HashMap::new(), "e2ee.reaction", &frame);
+    let seen = ctx.stored_message(CONVERSATION, &first)
+        .map_err(|err| err.to_string())?
+        .ok_or("the first message was lost")?;
+    let shown: Vec<(&str, u32, bool)> = seen.reactions.iter().map(|have| (have.emoji.as_str(), have.count, have.mine)).collect();
+    if shown != [("\u{1f44d}", 1, true)] {
+        return Err(format!("Ada's message shows {shown:?}, not the thumbs-up"));
+    }
+    Ok(())
+}
+
+/// A reaction in an encrypted conversation is sealed, lands, and echoes back.
+#[test]
+fn a_reaction_in_an_encrypted_conversation_is_sealed_and_lands() {
+    prove_encrypted_reaction().expect("a sealed reaction lands and echoes back");
 }
