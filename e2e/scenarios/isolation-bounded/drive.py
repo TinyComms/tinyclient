@@ -4,8 +4,8 @@
 Starts this build's mediad with TINYCLIENT_PROVE=isolation-bounded. That build exits 0
 only when, with Enhanced chosen the way a call sets it, a steady hiss comes down by about
 the isolation's limit and stays, and a synthetic voice the model would mute loses no more
-than that either. A build from before the limit ignores the variable and opens the audio
-engine, so this driver fails there.
+than that either, saying "isolation-bounded: proved" on stderr. A build from before the
+limit ignores the variable and never says it, so this driver fails there.
 
 Env from the lab: E2E_OUT, E2E_T0, E2E_APP_DIR.
 """
@@ -73,7 +73,11 @@ def main():
             proc.kill()
             proc.wait(timeout=5)
             code = None
-    step("Enhanced noise turns the room down to a floor, and a doubted voice no further", code == 0)
+    # Any mediad exits 0 once its input closes, so the exit code alone proves nothing: this
+    # build says so when the proof passed.
+    with open(os.path.join(OUT, "app.err.log"), encoding="utf-8", errors="replace") as err:
+        proved = "isolation-bounded: proved" in err.read()
+    step("Enhanced noise turns the room down to a floor, and a doubted voice no further", code == 0 and proved)
     return 1 if FAILED else 0
 
 

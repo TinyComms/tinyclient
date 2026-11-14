@@ -80,12 +80,14 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
-    // The lab's isolation-bounded driver. A build without this opens the audio engine below and stays up.
+    // The lab's isolation-bounded driver.
     if env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("isolation-bounded") {
         if let Err(err) = mediad::process::prove_isolation_limit() {
             eprintln!("isolation-bounded: {err}");
             return ExitCode::from(1);
         }
+        // What the driver looks for: any mediad exits 0 once its input closes.
+        eprintln!("isolation-bounded: proved");
         return ExitCode::SUCCESS;
     }
     let _log = protocol::log_policy::install("mediad", protocol::log_policy::LogPolicy::from_env());

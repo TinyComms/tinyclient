@@ -5,8 +5,9 @@ and `E2E_OUT` pointing to an evidence directory, then run `python drive.py`.
 
 This is a **headless DSP regression**, not native window or phone UI proof.
 It starts the real mediad process with `TINYCLIENT_PROVE=isolation-bounded`;
-that build runs `mediad::process::prove_isolation_limit` and exits 0 only
-when both hold, with Enhanced chosen the way a call sets it:
+that build runs `mediad::process::prove_isolation_limit` and exits 0 saying
+`isolation-bounded: proved` on stderr only when both hold, with Enhanced
+chosen the way a call sets it:
 
 - Three seconds of steady hiss come down by the isolation's limit
   (`ISOLATION_LIMIT_DB`, within 2 dB, after the 3.1 dB WebRTC's high-pass
@@ -18,9 +19,9 @@ when both hold, with Enhanced chosen the way a call sets it:
   off anything it doubts is a voice, the ends of words included.
 
 With the base there is no limit and no proof hook: the variable is ignored,
-mediad opens the audio engine and stays up, and the driver fails at its
-45 second deadline. With this branch it exits zero in a few seconds, no
-devices opened.
+mediad exits when it finds its input closed, never says `proved`, and the
+driver fails. With this branch it says so in a few seconds, no devices
+opened.
 
 The same assertions run as
 `cargo test -p mediad --lib the_isolation_proof_holds`, and
