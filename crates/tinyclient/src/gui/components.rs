@@ -162,6 +162,13 @@ pub enum BadgeLook {
     Dot,
 }
 
+/// The mute mark of a two-line row (`03` §4): a muted Telegram row draws the bell-off beside
+/// its quiet count, always when muted, count or not. The other networks keep the row dim
+/// only — their glyph lives on hover and in the row's menu (`01` §2, `02` R8).
+pub fn mute_mark(conversation: &Conversation) -> Option<&'static str> {
+    (conversation.muted && conversation.key.network == Network::Telegram).then_some("icons/bell-off.svg")
+}
+
 pub fn badge_look(conversation: &Conversation) -> BadgeLook {
     // A one-to-one DM is all to me, so its mentions are its count; elsewhere a mention is the pill.
     let pill = conversation.mentions > 0 && (conversation.kind != ConversationKind::Direct || conversation.muted);
@@ -699,6 +706,21 @@ mod tests {
         };
         assert_eq!(badge_look(&elsewhere(ConversationKind::Group, 7, 0, true)), None);
         assert_eq!(badge_look(&elsewhere(ConversationKind::Channel, 5, 1, true)), Mention(1));
+    }
+
+    #[test]
+    fn a_muted_telegram_row_draws_the_bell_off_and_the_other_networks_stay_dim_only() {
+        // `03` §4: the bell-off is always on a muted Telegram row, count or not.
+        assert_eq!(mute_mark(&row(ConversationKind::Group, 7, 0, true)), Some("icons/bell-off.svg"));
+        assert_eq!(mute_mark(&row(ConversationKind::Direct, 0, 0, true)), Some("icons/bell-off.svg"));
+        assert_eq!(mute_mark(&row(ConversationKind::Channel, 5, 1, true)), Some("icons/bell-off.svg"));
+        assert_eq!(mute_mark(&row(ConversationKind::Group, 7, 0, false)), None);
+        // Discord keeps its rows dim only; the bell lives on hover and in the menu (`01` §2, D7).
+        let elsewhere = |kind, unread: u32, mentions: u32, muted: bool| {
+            let key = Key { network: Network::Discord, account: "me".into(), id: "c".into() };
+            Conversation { unread, mentions, muted, ..Conversation::new(key, kind, "Fernhill") }
+        };
+        assert_eq!(mute_mark(&elsewhere(ConversationKind::Group, 7, 0, true)), None);
     }
 }
 

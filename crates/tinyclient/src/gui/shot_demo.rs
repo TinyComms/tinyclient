@@ -121,6 +121,10 @@ fn slack() -> AccountKey {
     AccountKey { network: Network::Slack, account: "T0HARBOR".into() }
 }
 
+fn telegram() -> AccountKey {
+    AccountKey { network: Network::Telegram, account: "robin".into() }
+}
+
 fn account(key: AccountKey, name: &str, attention: u32, unread: bool, presence: Presence) -> AccountStatus {
     AccountStatus {
         key,
@@ -164,6 +168,7 @@ const PEOPLE: &[Who] = &[
     Who { id: "halvard", name: "Halvard Eide", network: Network::Tiny, presence: Presence::Online, photo: Some("avatar-halvard-eide.jpg"), status: "", title: "" },
     Who { id: "ana", name: "Ana Ruiz", network: Network::Tiny, presence: Presence::Dnd, photo: Some("avatar-ana-ruiz.jpg"), status: "Focus time", title: "" },
     Who { id: "rosa", name: "Grandma Rosa", network: Network::Tiny, presence: Presence::Offline, photo: Some("avatar-grandma-rosa.jpg"), status: "", title: "" },
+    Who { id: "nadia", name: "Nadia Sokolova", network: Network::Telegram, presence: Presence::Offline, photo: None, status: "", title: "" },
 ];
 
 fn account_of(network: Network) -> AccountKey {
@@ -393,6 +398,13 @@ fn build() -> Fixture {
     yusuf.unread = 2;
     said(&mut yusuf, "yusuf", "sending the trail cam clips now 📹");
 
+    // A muted Telegram row: the bell-off beside its quiet count (`03` §4).
+    let tg = telegram();
+    let mut nadia = direct(&tg, "dm-nadia", "nadia", ago(35));
+    nadia.muted = true;
+    nadia.unread = 3;
+    said(&mut nadia, "nadia", "The ferry timetable moved, we take the 7:40 now");
+
     let mut platform = in_space(row(&s, "c-platform", ConversationKind::Channel, "platform", ago(70)), harbor, "Harbor Labs", "eng", "Engineering", 0);
     platform.topic = "Infra, deploys and the on-call rota".into();
     platform.unread = 3;
@@ -473,7 +485,7 @@ fn build() -> Fixture {
     said(&mut random, "theo", "who left the oat milk out");
 
     let inbox_rows = vec![
-        carpool_row, yusuf, platform, priya, lobby, ana, lichen, cams, imogen, design, rosa, kofi, theo, showcase,
+        carpool_row, yusuf, nadia, platform, priya, lobby, ana, lichen, cams, imogen, design, rosa, kofi, theo, showcase,
     ];
     let inbox: Vec<Key> = inbox_rows.iter().map(|row| row.key.clone()).collect();
     let mut rows = inbox_rows;
@@ -521,6 +533,7 @@ fn build() -> Fixture {
                 ("kofi", "Ooh, those little cups are lovely", 20),
                 ("dita", "@Robin is this Cladonia or just very confused moss?", 0),
             ],
+            "dm-nadia" => vec![("nadia", "The ferry timetable moved, we take the 7:40 now", 0)],
             "c-trailcams" => vec![
                 ("yusuf", "Cam 3 moved to the oak by the creek", 600),
                 ("kofi", "night shot of the marten again, third time this week", 0),
@@ -626,6 +639,8 @@ fn build() -> Fixture {
         account(d.clone(), ME_NAME, 3, true, Presence::Online),
         account(s.clone(), "Harbor Labs", 1, true, Presence::Idle),
         account(t.clone(), "Premier", 1, true, Presence::Online),
+        // Muted Telegram rows never raise the rail, so the account sits at 0.
+        account(tg.clone(), "Telegram", 0, false, Presence::Online),
     ];
     Fixture { accounts, spaces, groups, rows, inbox, messages }
 }
@@ -1276,11 +1291,16 @@ mod tests {
     #[test]
     fn the_demo_has_its_shape() {
         let fixture = build();
-        assert_eq!(fixture.accounts.len(), 3);
-        assert_eq!(fixture.inbox.len(), 14);
+        assert_eq!(fixture.accounts.len(), 4);
+        assert_eq!(fixture.inbox.len(), 15);
         let mentions = fixture.rows.iter().filter(|r| r.mentions > 0).count();
         assert_eq!(mentions, 2);
-        assert_eq!(fixture.rows.iter().filter(|r| fixture.inbox.contains(&r.key) && r.muted).count(), 1);
+        assert_eq!(fixture.rows.iter().filter(|r| fixture.inbox.contains(&r.key) && r.muted).count(), 2);
+        // The seeded muted Telegram row: the bell-off beside its quiet count (`03` §4).
+        let nadia = fixture.rows.iter().find(|r| r.key.id == "dm-nadia").unwrap();
+        assert!(nadia.muted && nadia.unread == 3 && nadia.key.network == Network::Telegram);
+        assert_eq!(crate::gui::components::mute_mark(nadia), Some("icons/bell-off.svg"));
+        assert_eq!(crate::gui::components::badge_look(nadia), crate::gui::components::BadgeLook::Quiet(3));
         let carpool = fixture.messages.iter().find(|(k, _)| k.id == "g-carpool").unwrap();
         assert!(carpool.1.len() >= 25);
         assert!(fixture.rows.iter().any(|r| r.badge() == Badge::Dot));

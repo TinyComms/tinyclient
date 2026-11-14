@@ -1,0 +1,12 @@
+{
+  "id": "telegram-mute-bell",
+  "title": "A muted Telegram row draws its bell-off beside its quiet count",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same mute mark is what the phone's list rows draw.",
+    "ios": "The phone proof build does not run the desktop window. The same mute mark is what the phone's list rows draw."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
