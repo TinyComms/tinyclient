@@ -51,6 +51,8 @@ fn envelope_strategy() -> impl Strategy<Value = Envelope> {
             reply_to,
             attachments,
             sent_at,
+            // A message or an edit never carries the reaction's word.
+            on: false,
         })
 }
 

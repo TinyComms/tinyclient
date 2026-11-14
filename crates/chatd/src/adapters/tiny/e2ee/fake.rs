@@ -719,12 +719,79 @@ fn encrypted_reaction_round_trip() -> Result<(), String> {
         "created_at": "2026-11-05T00:00:00Z",
     });
     super::super::messages::on_live(&ctx, &saved_ada, &HashMap::new(), "e2ee.reaction", &frame);
-    let seen = ctx.stored_message(CONVERSATION, &first)
-        .map_err(|err| err.to_string())?
-        .ok_or("the first message was lost")?;
-    let shown: Vec<(&str, u32, bool)> = seen.reactions.iter().map(|have| (have.emoji.as_str(), have.count, have.mine)).collect();
-    if shown != [("\u{1f44d}", 1, true)] {
-        return Err(format!("Ada's message shows {shown:?}, not the thumbs-up"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let seen = ctx.stored_message(CONVERSATION, &first)
+            .map_err(|err| err.to_string())?
+            .ok_or("the first message was lost")?;
+        let shown: Vec<(String, u32, bool)> = seen.reactions.iter().map(|have| (have.emoji.clone(), have.count, have.mine)).collect();
+        if shown == [("\u{1f44d}".to_owned(), 1, true)] {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("Ada's message shows {shown:?}, not the thumbs-up"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Bea folds the same reaction from the server's list alone, as she would after being away:
+    // the blob opens for her, and it is not hers.
+    let landed = bea.reaction_changes(CONVERSATION);
+    let bea_sees = landed.iter().find(|landed| landed.message == first && landed.emoji == "\u{1f44d}");
+    match bea_sees {
+        Some(landed) if landed.count == 1 && !landed.mine => {}
+        other => return Err(format!("Bea folds {other:?} from the list, not one thumbs-up of Ada's")),
+    }
+    // The event says nothing new once the list fold has it.
+    if !bea.heard_reaction(CONVERSATION, &frame).is_empty() {
+        return Err("the echo of a folded blob changed Bea's fold twice".into());
+    }
+
+    // Taking it back is another sealed blob, and the echo takes it off the message.
+    let (reply, answer) = std::sync::mpsc::channel();
+    serve(
+        &ctx,
+        crate::adapters::Command::React {
+            conversation_id: CONVERSATION.to_owned(),
+            message_id: first.clone(),
+            emoji: "\u{1f44d}".to_owned(),
+            on: false,
+            reply,
+        },
+    );
+    let outcome = answer
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "taking the reaction back was never answered".to_owned())?;
+    outcome.map_err(|refusal| format!("taking the reaction back was refused: {refusal:?}"))?;
+    let blob = lock(&fake.server).blobs.last().cloned().ok_or("no blob for taking the reaction back")?;
+    let frame = json!({
+        "conversation_id": CONVERSATION,
+        "id": blob["id"],
+        "ciphertext": blob["ciphertext"],
+        "epoch": blob["epoch"],
+        "created_at": "2026-11-05T00:00:00Z",
+    });
+    super::super::messages::on_live(&ctx, &saved_ada, &HashMap::new(), "e2ee.reaction", &frame);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let shown = ctx.stored_message(CONVERSATION, &first)
+            .map_err(|err| err.to_string())?
+            .ok_or("the first message was lost")?
+            .reactions
+            .iter()
+            .map(|have| (have.emoji.clone(), have.count))
+            .collect::<Vec<_>>();
+        if shown.is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("taking the reaction back left {shown:?} on the message"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = bea.heard_reaction(CONVERSATION, &frame);
+    if bea.reaction_of(CONVERSATION, &first, "\u{1f44d}").is_some_and(|landed| landed.count > 0) {
+        return Err("Bea still folds the thumbs-up after it was taken back".into());
     }
     Ok(())
 }

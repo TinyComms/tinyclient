@@ -48,6 +48,7 @@ fn a_message_and_an_edit_round_trip() {
         reply_to: Some("m1".into()),
         attachments: vec![attachment(1), attachment(2)],
         sent_at: Some(1_730_000_000_000),
+        on: false,
     };
     let bytes = envelope.encode(Kind::Message).unwrap();
     assert_eq!(Envelope::decode(Kind::Message, &bytes).unwrap(), envelope);
@@ -66,6 +67,43 @@ fn a_message_and_an_edit_round_trip() {
     let from_message = envelope.encode(Kind::Message).unwrap();
     let decoded = Envelope::decode(Kind::Edit, &from_message).unwrap();
     assert_eq!((decoded.reply_to, decoded.sent_at), (None, None));
+}
+
+#[test]
+fn a_reaction_round_trips_with_its_target_and_its_word() {
+    let add = Envelope {
+        text: "\u{1f44d}".into(),
+        reply_to: Some("m1".into()),
+        on: true,
+        ..Envelope::default()
+    };
+    let bytes = add.encode(Kind::Reaction).unwrap();
+    let decoded = Envelope::decode(Kind::Reaction, &bytes).unwrap();
+    assert_eq!(decoded, add);
+    // Taking it back is the same shape with the word off.
+    let bytes = Envelope { on: false, ..add.clone() }.encode(Kind::Reaction).unwrap();
+    assert!(String::from_utf8(bytes.clone()).unwrap().contains(r#""on":false"#));
+    assert!(!Envelope::decode(Kind::Reaction, &bytes).unwrap().on);
+    // A reaction carries no attachments and no sent time, and needs its target.
+    let with_attachment = Envelope {
+        attachments: vec![attachment(1)],
+        ..add.clone()
+    };
+    assert!(with_attachment.encode(Kind::Reaction).is_err());
+    let without_target = Envelope { reply_to: None, ..add };
+    assert!(without_target.encode(Kind::Reaction).is_err());
+    // A message never carries the reaction's word.
+    let message = Envelope::message("hello");
+    let bytes = message.encode(Kind::Message).unwrap();
+    assert!(!String::from_utf8(bytes).unwrap().contains("on"));
+    assert!(!Envelope::decode(Kind::Message, &message.encode(Kind::Message).unwrap()).unwrap().on);
+}
+
+#[test]
+fn the_reaction_kind_is_the_word_the_server_stores() {
+    assert_eq!(Kind::Reaction.as_str(), "reaction");
+    assert_eq!(Kind::parse("reaction").unwrap(), Kind::Reaction);
+    assert!(Kind::parse("reactionx").is_err());
 }
 
 #[test]

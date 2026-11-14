@@ -43,37 +43,6 @@ pub(super) fn row_metadata(row: &Value) -> Result<(Option<u64>, Option<&str>), S
 }
 
 impl Device {
-    pub(crate) fn react_generation(
-        &mut self,
-        id: &str,
-        message: &str,
-        emoji: &str,
-        on: bool,
-    ) -> Result<(), String> {
-        for _ in 0..PASSES {
-            self.sync(id)?;
-            let active = self.active(id)?;
-            let mut body = json!({ "emoji": emoji });
-            self.generation_body(&mut body, active.generation);
-            let (status, answer) = self.ask(
-                if on { "PUT" } else { "DELETE" },
-                &format!("/v1/messages/{message}/reactions"),
-                Some(body),
-            )?;
-            if matches!(status, 200 | 201 | 204) {
-                return Ok(());
-            }
-            if status == 409 && answer["error"] == "generation_changed" {
-                self.discover_generations(id)?;
-                continue;
-            }
-            return Err(
-                super::super::explain(status, &answer, super::super::Missing::Plain).to_owned(),
-            );
-        }
-        Err("Encryption is still updating. Try again shortly.".to_owned())
-    }
-
     pub(super) fn active(&mut self, id: &str) -> Result<GroupGeneration, String> {
         let conversation = outer(id)?;
         if self.generations
@@ -828,7 +797,8 @@ mod tests {
                     (201, json!({"id":format!("message{}", state.messages)}))
                 }
             } else if request.contains("/reactions ") {
-                (204, json!({}))
+                state.messages += 1;
+                (201, json!({"id": format!("blob{}", state.messages), "created": true}))
             } else {
                 (200, json!({}))
             };
@@ -1389,9 +1359,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        device
-            .react_generation(CONV, "message1", "👍", true)
-            .unwrap();
+        device.react(CONV, "message1", "👍", true).unwrap();
         let group = active.group_id.to_string();
         let user = device.saved.user_id.clone();
         let own_id = device.engine().unwrap().device_id().to_string();

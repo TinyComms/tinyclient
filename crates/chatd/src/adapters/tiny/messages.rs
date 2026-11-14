@@ -266,6 +266,21 @@ pub(crate) fn on_live(
             }
         }
         "reaction.updated" => merge_reaction(ctx, saved, frame),
+        // The sealed kind: a reaction blob in an encrypted conversation, opaque to the server.
+        // Off the socket's thread: it asks the server for the list behind it.
+        "e2ee.reaction" => {
+            let conversation_id = field(frame, "conversation_id");
+            if super::safe_id(conversation_id) {
+                if let Some(device) = e2ee::started(saved) {
+                    let (conversation_id, frame, ctx) = (conversation_id.to_owned(), frame.clone(), ctx.clone());
+                    let _ = std::thread::Builder::new().name("tiny-e2ee".into()).spawn(move || {
+                        for landed in device.lock().unwrap_or_else(|err| err.into_inner()).heard_reaction(&conversation_id, &frame) {
+                            apply_reaction(&ctx, &conversation_id, &landed);
+                        }
+                    });
+                }
+            }
+        }
         "read.updated" => read_updated(ctx, saved, frame),
         "server.updated" => ctx.capabilities(account_caps(saved)),
         // The group of an encrypted conversation changed, this device's key packages ran low, or
@@ -300,6 +315,7 @@ pub(crate) fn live_kind(kind: &str) -> bool {
             | "message.edited"
             | "message.deleted"
             | "reaction.updated"
+            | "e2ee.reaction"
             | "read.updated"
             | "e2ee.handshake"
             | "e2ee.keys_low"
@@ -1309,6 +1325,29 @@ fn merge_reaction(ctx: &Context, saved: &Saved, frame: &Value) {
     let _ = ctx.message(conversation_id, &message);
 }
 
+/// One folded encrypted reaction, onto the stored message it landed on: the count and
+/// ownership as this device folds everyone's blobs.
+fn apply_reaction(ctx: &Context, conversation_id: &str, landed: &e2ee::ReactionLanded) {
+    if !super::safe_id(&landed.message) || !unicode_emoji(&landed.emoji) {
+        return;
+    }
+    let Ok(Some(mut message)) = ctx.stored_message(conversation_id, &landed.message) else {
+        return;
+    };
+    let at = message.reactions.iter().position(|have| have.emoji == landed.emoji);
+    if landed.count == 0 {
+        if let Some(at) = at {
+            message.reactions.remove(at);
+        }
+    } else if let Some(at) = at {
+        message.reactions[at].count = landed.count;
+        message.reactions[at].mine = landed.mine;
+    } else {
+        message.reactions.push(Reaction { emoji: landed.emoji.clone(), file: None, count: landed.count, mine: landed.mine });
+    }
+    let _ = ctx.message(conversation_id, &message);
+}
+
 fn read_updated(ctx: &Context, saved: &Saved, frame: &Value) {
     let conversation_id = field(frame, "conversation_id");
     let message_id = field(frame, "message_id");
@@ -1356,6 +1395,15 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
             }
             if !messages.is_empty() {
                 ctx.history(conversation_id, &messages).map_err(|err| err.to_string())?;
+            }
+            // The reactions of an encrypted conversation are not rows of this page; the folded
+            // ones that changed while this device was away are asked for now.
+            if sealed_here(ctx, saved, conversation_id) == Ok(true) {
+                if let Some(device) = e2ee::started(saved) {
+                    for landed in device.lock().unwrap_or_else(|err| err.into_inner()).reaction_changes(conversation_id) {
+                        apply_reaction(ctx, conversation_id, &landed);
+                    }
+                }
             }
             Ok(())
         }
@@ -1561,9 +1609,27 @@ fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, 
     }
     match sealed_here(ctx, saved, conversation_id) {
         Ok(true) => {
-            let result = e2ee::started(saved).ok_or("Encryption isn't set up on this device.".to_owned())
-                .and_then(|shared| shared.lock().unwrap_or_else(|err| err.into_inner()).react_generation(conversation_id, message_id, emoji, on));
-            let _ = reply.send(result.map_err(Refusal::Refused));
+            let result = e2ee::started(saved)
+                .ok_or(NOT_SET_UP.to_owned())
+                .and_then(|shared| {
+                    let landed = shared
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .react(conversation_id, message_id, emoji, on)?;
+                    Ok((shared, landed))
+                });
+            match result {
+                Ok((device, landed)) => {
+                    drop(device);
+                    if let Some(landed) = landed {
+                        apply_reaction(ctx, conversation_id, &landed);
+                    }
+                    let _ = reply.send(Ok(()));
+                }
+                Err(why) => {
+                    let _ = reply.send(Err(Refusal::Refused(why)));
+                }
+            }
             return;
         }
         Ok(false) => {}

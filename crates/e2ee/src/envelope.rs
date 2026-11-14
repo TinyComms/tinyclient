@@ -28,11 +28,13 @@ const MAX_NAME: usize = 255;
 const MAX_MIME: usize = 127;
 const VERSION: u64 = 1;
 
-/// Which row of the server's table a ciphertext is: a message, or an edit of one.
+/// Which row of the server's table a ciphertext is: a message, an edit of one, or a reaction to
+/// one. A reaction names its message only inside the ciphertext.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Message,
     Edit,
+    Reaction,
 }
 
 impl Kind {
@@ -40,6 +42,7 @@ impl Kind {
         match self {
             Kind::Message => "message",
             Kind::Edit => "edit",
+            Kind::Reaction => "reaction",
         }
     }
 
@@ -47,6 +50,7 @@ impl Kind {
         match text {
             "message" => Ok(Kind::Message),
             "edit" => Ok(Kind::Edit),
+            "reaction" => Ok(Kind::Reaction),
             _ => Err(Error::Malformed("kind")),
         }
     }
@@ -80,6 +84,9 @@ pub struct Envelope {
     /// Milliseconds since the Unix epoch, as the sender's clock said. Messages only. Unverified:
     /// the server's `created_at` is the order.
     pub sent_at: Option<i64>,
+    /// A reaction only: `true` adds it, `false` takes it back. A reaction's `text` is the emoji
+    /// and its `reply_to` the message it lands on; the server never sees either.
+    pub on: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -107,6 +114,9 @@ struct Wire {
     attachments: Vec<WireAttachment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sent_at: Option<i64>,
+    /// Reactions only, and always written there: absent means nothing on a message or an edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    on: Option<bool>,
 }
 
 fn decode_b32(text: &str, what: &'static str) -> Result<[u8; 32]> {
@@ -123,11 +133,21 @@ impl Envelope {
         }
     }
 
-    /// Encodes for `kind`. An edit carries `v`, `text` and `attachments` only.
+    /// Encodes for `kind`. An edit carries `v`, `text` and `attachments` only; a reaction
+    /// carries `v`, `text`, `reply_to` and `on`.
     pub fn encode(&self, kind: Kind) -> Result<Vec<u8>> {
         if self.attachments.len() > MAX_ATTACHMENTS {
             return Err(Error::TooLarge("attachment list"));
         }
+        if kind == Kind::Reaction
+            && (self.reply_to.is_none() || self.text.is_empty() || !self.attachments.is_empty())
+        {
+            return Err(Error::Malformed("reaction"));
+        }
+        let on = match kind {
+            Kind::Reaction => Some(self.on),
+            Kind::Message | Kind::Edit => None,
+        };
         let attachments = self
             .attachments
             .iter()
@@ -153,10 +173,9 @@ impl Envelope {
         let wire = Wire {
             v: VERSION,
             text: self.text.clone(),
-            reply_to: if kind == Kind::Message {
-                self.reply_to.clone()
-            } else {
-                None
+            reply_to: match kind {
+                Kind::Message | Kind::Reaction => self.reply_to.clone(),
+                Kind::Edit => None,
             },
             attachments,
             sent_at: if kind == Kind::Message {
@@ -164,6 +183,7 @@ impl Envelope {
             } else {
                 None
             },
+            on,
         };
         let bytes = serde_json::to_vec(&wire).map_err(|_| Error::Malformed("envelope"))?;
         if bytes.len() > MAX_ENVELOPE_BYTES {
@@ -212,15 +232,17 @@ impl Envelope {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let (reply_to, sent_at) = match kind {
-            Kind::Message => (wire.reply_to, wire.sent_at),
-            Kind::Edit => (None, None),
+        let (reply_to, sent_at, on) = match kind {
+            Kind::Message => (wire.reply_to, wire.sent_at, false),
+            Kind::Edit => (None, None, false),
+            Kind::Reaction => (wire.reply_to, None, wire.on.unwrap_or(false)),
         };
         Ok(Envelope {
             text: wire.text,
             reply_to,
             attachments,
             sent_at,
+            on,
         })
     }
 }
