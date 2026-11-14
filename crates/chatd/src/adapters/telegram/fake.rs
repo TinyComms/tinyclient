@@ -42,9 +42,14 @@ const NOTES: i64 = 9001;
 const WORKSHOP: i64 = 9002;
 /// "Field Notes chat", the channel's linked discussion group: where its post's comments live.
 const CHATTERS: i64 = 9003;
+const LEFT_BROADCAST: i64 = 9004;
+const INVALID_CHANNEL: i64 = 9005;
+const OFF_PAGE_GROUP: i64 = 9006;
+const OFF_PAGE_HANDLE: &str = "weatherdesk";
 /// The post's echo in the discussion group: the message a send answers, and the id the echo
 /// test looks for (`GetDiscussionMessage` names it for the open, the send for its reply).
 const ECHO: i32 = 60;
+const NEWEST_COMMENT: i32 = ECHO + 2;
 const TOOLS: i32 = 31;
 /// The forum's newest topic, active after "Tools": the one opening the forum lands on.
 const JIGS: i32 = 55;
@@ -190,6 +195,10 @@ fn discussion_group(left: bool) -> tl::types::Channel {
     group.left = left;
     group.has_link = true;
     group
+}
+
+fn off_page_group() -> tl::types::Channel {
+    a_channel(OFF_PAGE_GROUP, "Weather desk", false, false, OFF_PAGE_HANDLE)
 }
 
 fn message(peer: Who, id: i32, from: i64, date: i32, text: &str) -> tl::types::Message {
@@ -340,6 +349,12 @@ struct World {
     drafts: HashMap<(Who, Option<i32>), String>,
     /// Comments under the channel's post that the test says are unread.
     comments_unread: i32,
+    discussion_left: bool,
+    off_page_muted: bool,
+    off_page_flood: bool,
+    off_page_burst: bool,
+    off_page_private: bool,
+    membership_fault_sent: bool,
     /// A post in the muted channel that names the user: the mention count rides the dialog,
     /// so it lands with the next reading of the chats.
     channel_mention: bool,
@@ -363,6 +378,19 @@ fn key(peer: Who, topic: Option<i32>) -> String {
 }
 
 impl World {
+    fn off_page_dialog(&self) -> tl::enums::Dialog {
+        let who = Who::Channel(OFF_PAGE_GROUP);
+        let held = self.messages.get(&who.text());
+        let top = held.and_then(|messages| messages.last_key_value()).map_or(100, |(id, _)| *id);
+        let unread = held.map_or(0, |messages| messages.len() as i32);
+        let folder = self.off_page_muted.then_some(1);
+        let tl::enums::Dialog::Dialog(mut row) = dialog(who, top, 100, 100, unread, false, folder) else { unreachable!() };
+        if self.off_page_muted {
+            row.notify_settings = settings(Some(i32::MAX));
+        }
+        row.into()
+    }
+
     fn new(signed_in: bool) -> World {
         let mut world = World {
             signed_in,
@@ -379,6 +407,12 @@ impl World {
             exclude_read: false,
             drafts: HashMap::new(),
             comments_unread: 0,
+            discussion_left: true,
+            off_page_muted: false,
+            off_page_flood: false,
+            off_page_burst: false,
+            off_page_private: held_at_wire("TINYCLIENT_TELEGRAM_PRIVATE_OFF_PAGE"),
+            membership_fault_sent: false,
             channel_mention: false,
             topic_reads: HashMap::new(),
             calls: protocol::support_dir().join("telegram.calls"),
@@ -665,7 +699,7 @@ fn all_drafts(world: &World) -> Result<Vec<u8>, Fault> {
 /// answers, learned when the thread is opened. `unread` is how many of its comments the
 /// account has not read, as the test steers that.
 #[inline(never)]
-fn discussion_answer(place: &str, unread: i32) -> Result<Vec<u8>, Fault> {
+fn discussion_answer(place: &str, unread: i32, left: bool) -> Result<Vec<u8>, Fault> {
     if place != key(Who::Channel(NOTES), Some(5)) {
         return Err(rpc(400, "MESSAGE_ID_INVALID", None));
     }
@@ -678,13 +712,17 @@ fn discussion_answer(place: &str, unread: i32) -> Result<Vec<u8>, Fault> {
     from.from_id = Some(Who::Channel(NOTES).peer());
     from.channel_post = Some(5);
     echo.fwd_from = Some(from.into());
+    let mut comment = message(Who::Channel(CHATTERS), NEWEST_COMMENT, ODALYS, t0() - 40, "Yes, at the hut now.");
+    let mut reply: tl::types::MessageReplyHeader = blank(&[&put(0u32)]);
+    reply.reply_to_msg_id = Some(ECHO);
+    comment.reply_to = Some(reply.into());
     let found = tl::types::messages::DiscussionMessage {
-        messages: vec![echo.into()],
-        max_id: Some(51),
+        messages: vec![comment.into(), echo.into()],
+        max_id: Some(NEWEST_COMMENT),
         read_inbox_max_id: Some(0),
         read_outbox_max_id: None,
         unread_count: unread,
-        chats: vec![discussion_group(true).into()],
+        chats: vec![discussion_group(left).into()],
         users: users(),
     };
     answer(tl::enums::messages::DiscussionMessage::Message(found))
@@ -998,10 +1036,10 @@ impl World {
             // A comment gains reactions, as the thread's next page carries them: the page
             // answer is all that changes, nothing is told on the update stream.
             "comment-react" => {
-                let mut comment = message(Who::Channel(CHATTERS), 51, ODALYS, t0() - 40, "Yes, at the hut now.");
+                let mut comment = message(Who::Channel(CHATTERS), NEWEST_COMMENT, ODALYS, t0() - 40, "Yes, at the hut now.");
                 comment.reactions = Some(comment_reactions().into());
                 // The thread's page is kept under the post's id, as `getReplies` counts it.
-                self.messages.entry(key(Who::Channel(NOTES), Some(5))).or_default().insert(51, comment.into());
+                self.messages.entry(key(Who::Channel(NOTES), Some(5))).or_default().insert(NEWEST_COMMENT, comment.into());
                 Vec::new()
             }
             // The same while the thread is open: Telegram says the reaction of a comment on
@@ -1009,7 +1047,7 @@ impl World {
             "comment-react-live" => {
                 vec![update(tl::types::UpdateMessageReactions {
                     peer: Who::Channel(CHATTERS).peer(),
-                    msg_id: 51,
+                    msg_id: NEWEST_COMMENT,
                     top_msg_id: Some(ECHO),
                     saved_peer_id: None,
                     reactions: comment_reactions().into(),
@@ -1017,7 +1055,32 @@ impl World {
             }
             "discussion-membership" => {
                 let left = words.next() != Some("joined");
+                self.discussion_left = left;
                 vec![discussion_update(tl::types::UpdateChannel { channel_id: CHATTERS }.into(), left, false)]
+            }
+            // This member's group was absent from the sign-on dialogs. The incoming message
+            // names it only as a min peer, with an optional public username.
+            "off-page-group" => {
+                let who = Who::Channel(OFF_PAGE_GROUP);
+                let id = words.next().and_then(|id| id.parse().ok()).unwrap_or(101);
+                let said = message(who, id, TOBIN, crate::hub::now() as i32, "The wind has picked up.");
+                for option in words {
+                    match option {
+                        "muted" => self.off_page_muted = true,
+                        "flood" => self.off_page_flood = true,
+                        "burst" => self.off_page_burst = true,
+                        _ => {}
+                    }
+                }
+                self.store(None, said.clone());
+                let mut group = off_page_group();
+                group.min = true;
+                group.access_hash = None;
+                if self.off_page_private {
+                    group.username = None;
+                }
+                let update = tl::types::UpdateNewChannelMessage { message: said.into(), pts: 0, pts_count: 0 };
+                vec![Event::Update { update: Box::new(update.into()), users: users(), chats: vec![group.into()] }]
             }
             // The other post (root 80) has activity even though our only comment was
             // under root 60. A partial chat in the update does not refresh membership.
@@ -1029,6 +1092,9 @@ impl World {
                 reply.reply_to_msg_id = Some(root - 1);
                 reply.reply_to_top_id = Some(root);
                 said.reply_to = Some(reply.into());
+                if !self.discussion_left {
+                    self.store(None, said.clone());
+                }
                 vec![discussion_update(tl::types::UpdateNewChannelMessage { message: said.into(), pts: 0, pts_count: 0 }.into(), false, true)]
             }
             // Telegram sends both a source update and a personal copy addressed to self.
@@ -1209,7 +1275,7 @@ impl World {
                 // A comment is a message of the discussion group, which `getReplies` answers
                 // for the post itself, so it is kept under the post's thread here.
                 let thread = self.messages.entry(key(Who::Channel(NOTES), Some(5))).or_default();
-                for (id, from, date, text) in [(50, TOBIN, t0() - 100, "On my way up front?"), (51, ODALYS, t0() - 40, "Yes, at the hut now.")] {
+                for (id, from, date, text) in [(ECHO + 1, TOBIN, t0() - 100, "On my way up front?"), (NEWEST_COMMENT, ODALYS, t0() - 40, "Yes, at the hut now.")] {
                     thread.insert(id, message(Who::Channel(CHATTERS), id, from, date, text).into());
                 }
                 vec![update(tl::types::UpdateEditChannelMessage { message: post.into(), pts: 0, pts_count: 0 }.into())]
@@ -1483,6 +1549,10 @@ impl World {
                     // The impostor's chat sits past the crowd, so the paging tests' rows land
                     // where their arithmetic says: five pages end at crowd chat 492 exactly.
                     all.push((dialog(Who::User(FAKE), 7, 7, 7, 0, false, None), Who::User(FAKE), Who::User(FAKE).text()));
+                    if self.off_page_private {
+                        let who = Who::Channel(OFF_PAGE_GROUP);
+                        all.push((self.off_page_dialog(), who, who.text()));
+                    }
                     if lost_pin() {
                         // The pinned chat is no longer in the pages at all.
                         all.retain(|held| held.1 != Who::Group(CREW));
@@ -1501,9 +1571,15 @@ impl World {
                 drafted(self, &mut dialog, *who);
                 dialog
             }).collect();
+            let mut chats = chats();
+            if page.iter().any(|(_, who, _)| *who == Who::Channel(OFF_PAGE_GROUP)) {
+                let mut group = off_page_group();
+                group.username = None;
+                chats.push(group.into());
+            }
             return answer(match more {
-                true => tl::enums::messages::Dialogs::Slice(tl::types::messages::DialogsSlice { count: all.len() as i32, dialogs, messages, chats: chats(), users: users() }),
-                false => tl::enums::messages::Dialogs::Dialogs(tl::types::messages::Dialogs { dialogs, messages, chats: chats(), users: users() }),
+                true => tl::enums::messages::Dialogs::Slice(tl::types::messages::DialogsSlice { count: all.len() as i32, dialogs, messages, chats, users: users() }),
+                false => tl::enums::messages::Dialogs::Dialogs(tl::types::messages::Dialogs { dialogs, messages, chats, users: users() }),
             });
         }
         if asked::<f::messages::GetDialogFilters>(body).is_some() {
@@ -1530,6 +1606,15 @@ impl World {
                 tl::enums::InputDialogPeer::Peer(dialog) => Some(input_who(&dialog.peer)),
                 _ => None,
             }).collect();
+            if peers.contains(&Who::Channel(OFF_PAGE_GROUP)) && std::mem::take(&mut self.off_page_flood) {
+                self.log("GetPeerDialogs c9006 flood");
+                return Err(rpc(420, "FLOOD_WAIT", Some(1)));
+            }
+            if peers.contains(&Who::Channel(OFF_PAGE_GROUP)) && std::mem::take(&mut self.off_page_burst) {
+                for event in self.steer("off-page-group 102") {
+                    let _ = events.send(event);
+                }
+            }
             let (read, unread) = self.crew();
             let found = peers.iter().filter_map(|who| {
                 let dialog = match who {
@@ -1537,19 +1622,31 @@ impl World {
                     Who::User(ODALYS) => dialog(*who, 12, 11, 12, 1, false, None),
                     Who::User(TOBIN) => dialog(*who, 31, 31, 31, 0, false, None),
                     Who::Channel(NOTES) => dialog(*who, 5, 0, 5, 1, false, None),
+                    Who::Channel(OFF_PAGE_GROUP) => self.off_page_dialog(),
+                    Who::Channel(CHATTERS) if !self.discussion_left => {
+                        let top = self.messages.get(&who.text()).and_then(|messages| messages.last_key_value()).map_or(ECHO, |(id, _)| *id);
+                        dialog(*who, top, ECHO, ECHO, i32::from(top > ECHO), false, None)
+                    }
                     _ => return None,
                 };
                 Some((who.clone().text(), dialog))
             }).collect::<Vec<_>>();
             self.log(&format!("GetPeerDialogs {}", found.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>().join(" ")));
             if !found.is_empty() {
+                let mut chats = chats();
+                if peers.contains(&Who::Channel(OFF_PAGE_GROUP)) {
+                    chats.push(off_page_group().into());
+                }
+                if peers.contains(&Who::Channel(CHATTERS)) {
+                    chats.push(discussion_group(self.discussion_left).into());
+                }
                 let dialogs = found.into_iter().map(|(_, mut dialog)| {
                     let who = Who::of(&dialog.peer());
                     drafted(self, &mut dialog, who);
                     dialog
                 }).collect();
                 let state = tl::types::updates::State { pts: 1, qts: 0, date: t0(), seq: 1, unread_count: 0 };
-                return answer(tl::enums::messages::PeerDialogs::Dialogs(tl::types::messages::PeerDialogs { dialogs, messages: Vec::new(), chats: chats(), users: users(), state: state.into() }));
+                return answer(tl::enums::messages::PeerDialogs::Dialogs(tl::types::messages::PeerDialogs { dialogs, messages: Vec::new(), chats, users: users(), state: state.into() }));
             }
             return Err(rpc(400, "PEER_ID_INVALID", None));
         }
@@ -1559,7 +1656,19 @@ impl World {
                 _ => None,
             }).collect();
             self.log(&format!("GetChannels {ids:?}"));
-            let chats = chats().into_iter().chain([discussion_group(true).into()]).filter(|chat| ids.contains(&chat.id())).collect();
+            if ids.contains(&LEFT_BROADCAST) && held_at_wire("TINYCLIENT_TELEGRAM_MEMBERSHIP_FAULT") && !self.membership_fault_sent {
+                self.membership_fault_sent = true;
+                return Err(rpc(420, "FLOOD_WAIT", Some(1)));
+            }
+            if ids.contains(&LEFT_BROADCAST) {
+                return Err(rpc(406, "CHANNEL_PRIVATE", None));
+            }
+            if ids.contains(&INVALID_CHANNEL) {
+                return Err(rpc(400, "CHANNEL_INVALID", None));
+            }
+            let chats = chats().into_iter()
+                .chain([discussion_group(self.discussion_left).into(), off_page_group().into()])
+                .filter(|chat| ids.contains(&chat.id())).collect();
             return answer(tl::enums::messages::Chats::Chats(tl::types::messages::Chats { chats }));
         }
         if let Some(request) = asked::<f::contacts::GetContacts>(body) {
@@ -1596,7 +1705,7 @@ impl World {
         if let Some(request) = asked::<f::messages::GetDiscussionMessage>(body) {
             let place = key(input_who(&request.peer), Some(request.msg_id));
             self.log(&format!("GetDiscussionMessage {place}"));
-            return discussion_answer(&place, self.comments_unread);
+            return discussion_answer(&place, self.comments_unread, self.discussion_left);
         }
         // A channel's posts and how many saw each: Telegram answers one entry for every id it
         // was asked, in the order it was asked, and the post here has its count.
@@ -1979,6 +2088,13 @@ impl World {
         }
         if let Some(request) = asked::<f::contacts::ResolveUsername>(body) {
             self.log(&format!("ResolveUsername {}", request.username));
+            if request.username == OFF_PAGE_HANDLE {
+                let group = off_page_group();
+                let found = tl::types::contacts::ResolvedPeer {
+                    peer: Who::Channel(group.id).peer(), chats: vec![group.into()], users: Vec::new(),
+                };
+                return Some(answer(tl::enums::contacts::ResolvedPeer::Peer(found)));
+            }
             return Some(resolve_username(&request.username));
         }
         if let Some(request) = asked::<f::messages::GetInlineBotResults>(body) {

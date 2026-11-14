@@ -4,12 +4,12 @@
 use super::content::{self, Mapped, Want};
 use super::filing::{self, Cursor, Facts, Filed};
 use super::peers::{is_replies, thread_id, Known, Who};
-use super::wire::Fault;
-use super::{presence, Account, PAGE};
+use super::wire::{self, Fault};
+use super::{live, presence, Account, PAGE};
 use crate::store::{ConversationRow, Filing, PreviewLine, preview_text};
 use grammers_tl_types as tl;
 use protocol::{CallSupport, Capabilities, Card, ConversationKind, EmojiScope, MediaFile, MediaKind, Message, Relation, ReplyTo, Span, Special, Style, Watching};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,6 +32,11 @@ const ADS_FRESH: Duration = Duration::from_secs(300);
 /// Rows whose newest message is fetched for one `Previews`, and the pause between them.
 const PREVIEWS: usize = 20;
 const PREVIEW_PACE: Duration = Duration::from_secs(1);
+/// Cap the number of requests needed to isolate bad peers in the reconnect batch.
+const MEMBERSHIP_BATCH_REQUESTS: usize = 24;
+const UNREAD_CHECK_PAGE: u32 = 100;
+const UNREAD_CHECK_CURSOR: &str = "membership:unread-cursor";
+const UNREAD_CHECK_PAUSE: Duration = Duration::from_secs(2);
 /// Telegram's own account, which sends login codes.
 pub(super) const SERVICE: i64 = 777_000;
 
@@ -182,7 +187,106 @@ pub(super) fn refresh_row(account: &Account, who: Who) {
 /// A group is allowed to count unread only when Telegram has confirmed membership.
 /// Knowing its access hash is enough to read comments, but says nothing about membership.
 pub(super) fn member(account: &Account, who: Who) -> bool {
-    matches!(who, Who::User(_)) || account.dir().get(who).is_some_and(|known| known.member == Some(true))
+    membership(account, who) == Some(true)
+}
+
+pub(super) fn membership(account: &Account, who: Who) -> Option<bool> {
+    if matches!(who, Who::User(_)) {
+        return Some(true);
+    }
+    account.dir().get(who).and_then(|known| known.member)
+}
+
+pub(super) fn message_peer(message: &tl::enums::Message) -> Option<Who> {
+    match message {
+        tl::enums::Message::Message(message) => Some(Who::of(&message.peer_id)),
+        tl::enums::Message::Service(message) => Some(Who::of(&message.peer_id)),
+        tl::enums::Message::Empty(_) => None,
+    }
+}
+
+/// The dialog supplies counts, read position, archive and notification settings before any
+/// held messages are written. Its top message is the boundary of that unread snapshot.
+pub(super) fn recover_live_chat(account: &Account, who: Who) -> Result<Option<i32>, Fault> {
+    if membership(account, who) == Some(false) {
+        return Ok(None);
+    }
+    let peer = match account.input(who) {
+        Ok(peer) => peer,
+        Err(_) => {
+            let username = account.dir().get(who).map(|known| known.handle.clone()).filter(|name| !name.is_empty());
+            if let Some(username) = username {
+                let request = tl::functions::contacts::ResolveUsername { username, referer: None };
+                match wire::call(account.wire.as_ref(), &request) {
+                    Ok(tl::enums::contacts::ResolvedPeer::Peer(found)) if Who::of(&found.peer) == who => {
+                        account.learn(&found.users, &found.chats);
+                    }
+                    Err(fault) if !fault.is("USERNAME_NOT_OCCUPIED") && !fault.is("USERNAME_INVALID") => return Err(fault),
+                    _ => {}
+                }
+            }
+            // A private min peer may have no usable hash. Continue the dialog lists with
+            // their ordinary cursors, where a joined group is addressable by Telegram.
+            if account.input(who).is_err() {
+                for list in 0..2 {
+                    advance_dialogs(account, list, false)?;
+                    if account.input(who).is_ok() {
+                        break;
+                    }
+                }
+            }
+            let Ok(peer) = account.input(who) else { return Ok(None) };
+            peer
+        }
+    };
+    if membership(account, who) == Some(false) {
+        return Ok(None);
+    }
+    let request = tl::functions::messages::GetPeerDialogs {
+        peers: vec![tl::types::InputDialogPeer { peer }.into()],
+    };
+    let found = match wire::call(account.wire.as_ref(), &request) {
+        Ok(tl::enums::messages::PeerDialogs::Dialogs(found)) => found,
+        Err(fault) if fault.is("CHANNEL_PRIVATE") => {
+            super::live::left(account, who);
+            return Ok(None);
+        }
+        Err(fault) => return Err(fault),
+    };
+    account.learn(&found.users, &found.chats);
+    let Some(dialog) = found.dialogs.iter().find_map(|dialog| match dialog {
+        tl::enums::Dialog::Dialog(dialog) if Who::of(&dialog.peer) == who => Some(dialog),
+        _ => None,
+    }) else { return Ok(None) };
+    if !member(account, who) {
+        return Ok(None);
+    }
+    let newest = found.messages.iter().find(|message| {
+        message.id() == dialog.top_message && message_peer(message) == Some(who)
+    });
+    let through = record(account, usize::from(dialog.folder_id == Some(1)), dialog, newest)
+        .map_err(|error| Fault::Net(error.to_string()))?;
+    if through.is_none() {
+        return Ok(None);
+    }
+    if account.dir().get(who).is_some_and(|known| known.forum) {
+        topics(account, who)?;
+    }
+    Ok(through)
+}
+
+fn fetch_channel_membership(account: &Account, peers: &[(Who, tl::enums::InputChannel)]) -> Result<(), Fault> {
+    let request = tl::functions::channels::GetChannels { id: peers.iter().map(|(_, input)| input.clone()).collect() };
+    match wire::call(account.wire.as_ref(), &request) {
+        Ok(found) => account.learn(&[], &found.chats()),
+        Err(fault) => match peers {
+            // Only a single-peer error identifies the channel the user has left. CHANNEL_INVALID
+            // can also be an unusable reference, so it does not establish nonmembership.
+            [(who, _)] if fault.is("CHANNEL_PRIVATE") => super::live::left(account, *who),
+            _ => return Err(fault),
+        },
+    }
+    Ok(())
 }
 
 pub(super) fn remove_chat(account: &Account, who: Who) {
@@ -255,27 +359,79 @@ pub(super) fn sign_on(account: &Arc<Account>) -> Result<(), Fault> {
     // An earlier build kept every chat in one invented Space. The rows read just now have left
     // it; what is left (chats past the newest 500) goes with it, and comes back on scroll.
     let _ = account.ctx.spaces(&[]);
-    verify_unread_groups(account);
+    account.live().unread_check = Some(Instant::now());
+    retry_unread_channels(account);
     contacts(account)
 }
 
-/// A group left while this client was offline may be missing from the new dialog list.
+/// A channel or supergroup left while we were offline may be missing from the new dialog list.
 /// Confirm older unread rows without treating a capped dialog list as proof of leaving.
-fn verify_unread_groups(account: &Account) {
-    let groups = account.ctx.unread_telegram_groups(500).unwrap_or_default();
-    let id: Vec<_> = groups.iter()
-        .filter_map(|id| Who::parse(id).map(|(who, _)| who))
-        .filter(|who| account.dir().get(*who).and_then(|known| known.member).is_none())
-        .filter_map(|who| account.input_channel(who).ok())
-        .take(100)
-        .collect();
-    if id.is_empty() {
+pub(super) fn retry_unread_channels(account: &Account) {
+    let now = Instant::now();
+    if !account.live().unread_check.is_some_and(|next| next <= now) {
         return;
     }
-    // This is a bounded cache repair. It should not hold sign-in through a flood wait.
-    if let Ok(chats) = super::wire::call(account.wire.as_ref(), &tl::functions::channels::GetChannels { id }) {
-        account.learn(&[], &chats.chats());
+    if let Some(until) = live::flood_until(account) {
+        account.live().unread_check = Some(until);
+        return;
     }
+    account.live().unread_check = None;
+    let after = account.ctx.note(UNREAD_CHECK_CURSOR).unwrap_or_default();
+    let rows = match account.ctx.unread_telegram_channels(&after, UNREAD_CHECK_PAGE) {
+        Ok(rows) => rows,
+        Err(_) => {
+            account.live().unread_check = Some(now + UNREAD_CHECK_PAUSE);
+            return;
+        }
+    };
+    let peers: Vec<_> = rows.iter()
+        .filter_map(|id| Who::parse(id).filter(|(_, topic)| topic.is_none()).map(|(who, _)| who))
+        .filter(|who| membership(account, *who).is_none())
+        .filter_map(|who| account.input_channel(who).ok().map(|input| (who, input)))
+        .collect();
+    // Process ordered ranges so the store's cursor can resume at the first unfinished
+    // range after a transient error, a request budget, or a reconnect.
+    let mut batches = VecDeque::from([peers.as_slice()]);
+    let mut delay = UNREAD_CHECK_PAUSE;
+    for _ in 0..MEMBERSHIP_BATCH_REQUESTS {
+        let Some(batch) = batches.pop_front() else { break };
+        if batch.is_empty() {
+            break;
+        }
+        match fetch_channel_membership(account, batch) {
+            Ok(()) => {}
+            Err(fault) if fault.is("CHANNEL_PRIVATE") || fault.is("CHANNEL_INVALID") => {
+                if batch.len() > 1 {
+                    let (first, rest) = batch.split_at(batch.len() / 2);
+                    batches.push_front(rest);
+                    batches.push_front(first);
+                    continue;
+                }
+            }
+            Err(fault) => {
+                live::pause_for_flood(account, &fault);
+                delay = Duration::from_secs(fault.flood().unwrap_or(5)).max(delay);
+                batches.push_front(batch);
+                break;
+            }
+        }
+        if let Some((last, _)) = batch.last() {
+            account.ctx.set_note(UNREAD_CHECK_CURSOR, &last.text());
+        }
+        if account.ctx.stopped() {
+            return;
+        }
+    }
+    if batches.is_empty() && rows.len() < UNREAD_CHECK_PAGE as usize {
+        account.ctx.set_note(UNREAD_CHECK_CURSOR, "");
+        return;
+    }
+    if batches.is_empty() {
+        if let Some(last) = rows.last() {
+            account.ctx.set_note(UNREAD_CHECK_CURSOR, last);
+        }
+    }
+    account.live().unread_check = Instant::now().checked_add(delay);
 }
 
 /// Telegram's caching hash over a list of numbers (`core.telegram.org/api/offsets`, "Hash
@@ -337,7 +493,7 @@ struct Page {
 /// One page of a list, and where the next page starts, if Telegram has one.
 type PageRead = (Page, Option<Cursor>);
 
-fn page(account: &Account, folder: Option<i32>, offset: (i32, i32, tl::enums::InputPeer)) -> Result<Page, Fault> {
+fn page(account: &Account, folder: Option<i32>, offset: (i32, i32, tl::enums::InputPeer), patient: bool) -> Result<Page, Fault> {
     let request = tl::functions::messages::GetDialogs {
         exclude_pinned: false,
         folder_id: folder,
@@ -347,7 +503,8 @@ fn page(account: &Account, folder: Option<i32>, offset: (i32, i32, tl::enums::In
         limit: 100,
         hash: 0,
     };
-    let (dialogs, messages, chats, users, more) = match account.ask(&request)? {
+    let answer = if patient { account.ask(&request) } else { wire::call(account.wire.as_ref(), &request) }?;
+    let (dialogs, messages, chats, users, more) = match answer {
         tl::enums::messages::Dialogs::Dialogs(all) => (all.dialogs, all.messages, all.chats, all.users, false),
         tl::enums::messages::Dialogs::Slice(slice) => {
             let more = slice.dialogs.len() >= 100;
@@ -381,6 +538,7 @@ fn page(account: &Account, folder: Option<i32>, offset: (i32, i32, tl::enums::In
 /// nothing is grouped. A page is written while the one after it is asked for, so the lists
 /// paint what exists as it exists, and the boot does not wait for the writing it need not.
 pub(super) fn dialogs(account: &Arc<Account>) -> Result<(), Fault> {
+    let _pages = account.dialog_pages.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let rules = match filing::ask_rules(account) {
         Ok(rules) => rules,
         Err(fault) if fault.flood().is_some() || fault.signed_out() => return Err(fault),
@@ -395,7 +553,7 @@ pub(super) fn dialogs(account: &Arc<Account>) -> Result<(), Fault> {
         while caught < most {
             let read = match inflight.take() {
                 Some(landed) => landed.recv().unwrap_or_else(|_| Err(Fault::Net("the page ask ended".into()))),
-                None => fetch_page(account, list, offset),
+                None => fetch_page(account, list, offset, true),
             };
             let (mut page, next) = read?;
             caught += 1;
@@ -456,7 +614,7 @@ fn pinned_missing(account: &Account) {
                             tl::enums::Message::Service(before) => before.id == dialog.top_message,
                             tl::enums::Message::Empty(_) => false,
                         });
-                    record(account, list, &dialog, newest);
+                    let _ = record(account, list, &dialog, newest);
                 }
             }
         }
@@ -466,22 +624,27 @@ fn pinned_missing(account: &Account) {
 /// One page of a list (0 the main list, 1 the archive) from `offset`, read whole and written
 /// whole, as the scrolling list reads it. Answers where the next page starts, if Telegram has
 /// one.
-fn read_page(account: &Account, list: usize, offset: Option<Cursor>) -> Result<Option<Cursor>, Fault> {
-    let (mut page, next) = fetch_page(account, list, offset)?;
+fn advance_dialogs(account: &Account, list: usize, patient: bool) -> Result<(), Fault> {
+    let _pages = account.dialog_pages.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let offset = account.live().filed.ends[list];
+    if offset.is_none() {
+        return Ok(());
+    }
+    let (mut page, next) = fetch_page(account, list, offset, patient)?;
     record_page(account, list, &mut page, next);
-    Ok(next)
+    Ok(())
 }
 
 /// One page read (0 the main list, 1 the archive) from `offset`, with nothing written yet:
 /// its dialogs in the order Telegram gave, and where the next page starts, if Telegram has
 /// one. The next page is asked before this one is written, so the sign-on is not chained to
 /// the writing of every page it asked for.
-fn fetch_page(account: &Account, list: usize, offset: Option<Cursor>) -> Result<PageRead, Fault> {
+fn fetch_page(account: &Account, list: usize, offset: Option<Cursor>, patient: bool) -> Result<PageRead, Fault> {
     let start = match offset {
         Some((date, id, who)) => (date, id, account.input(who).unwrap_or(tl::enums::InputPeer::Empty)),
         None => (0, 0, tl::enums::InputPeer::Empty),
     };
-    let page = page(account, Some(list as i32), start)?;
+    let page = page(account, Some(list as i32), start, patient)?;
     let next = page.dialogs.last().and_then(|dialog| {
         let who = Who::of(&dialog.peer);
         let date = match page.newest.get(&(who, dialog.top_message)) {
@@ -503,10 +666,10 @@ fn ask_page(account: &Arc<Account>, list: usize, offset: Option<Cursor>) -> Rece
     let spare = sent.clone();
     let speak = account.clone();
     let asked = std::thread::Builder::new().name("telegram-pages".into()).spawn(move || {
-        let _ = sent.send(fetch_page(&speak, list, offset));
+        let _ = sent.send(fetch_page(&speak, list, offset, true));
     });
     if asked.is_err() {
-        let _ = spare.send(fetch_page(account, list, offset));
+        let _ = spare.send(fetch_page(account, list, offset, true));
     }
     landed
 }
@@ -517,21 +680,21 @@ fn record_page(account: &Account, list: usize, page: &mut Page, next: Option<Cur
     for dialog in std::mem::take(&mut page.dialogs) {
         let who = Who::of(&dialog.peer);
         let newest = page.newest.remove(&(who, dialog.top_message));
-        record(account, list, &dialog, newest.as_ref());
+        let _ = record(account, list, &dialog, newest.as_ref());
     }
     account.live().filed.ends[list] = next;
 }
 
 /// One dialog to the store: its row with its filing, its newest message, counts, mute and
 /// whether the other side has read my last message.
-fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Option<&tl::enums::Message>) {
+fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Option<&tl::enums::Message>) -> rusqlite::Result<Option<i32>> {
     let who = Who::of(&dialog.peer);
     let id = who.text();
     let Some(known) = account.dir().get(who).cloned() else {
-        return;
+        return Ok(None);
     };
     if known.member == Some(false) {
-        return;
+        return Ok(None);
     }
     let is_muted = muted(account, who, &dialog.notify_settings);
     let unread = (dialog.unread_count.max(0) as u32).max(u32::from(dialog.unread_mark));
@@ -550,9 +713,8 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     };
     let mut fresh = row(account, who, &known);
     fresh.filing = Some(filing);
-    if account.ctx.conversation(&fresh).is_err() {
-        return;
-    }
+    account.ctx.conversation(&fresh)?;
+    account.ctx.muted(&id, is_muted)?;
     let mut updated = 0;
     // The dialog list carries each chat's newest message: that is its preview, for free.
     if let Some(mapped) = newest.and_then(|newest| content::map(&account.dir(), newest)) {
@@ -580,7 +742,7 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     let mut unread = unread;
     let mut mentions = dialog.unread_mentions_count.max(0) as u32;
     let mut read = (dialog.read_inbox_max_id > 0).then(|| dialog.read_inbox_max_id.to_string());
-    let mut counted = true;
+    let mut through = Some(dialog.top_message);
     if let Some(up_to) = account.ctx.read_up_to(&id) {
         let mine = up_to.parse::<i32>().ok();
         let theirs = read.as_deref().and_then(|value| value.parse::<i32>().ok());
@@ -591,15 +753,15 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
                     unread = (fresh.unread_count.max(0) as u32).max(u32::from(fresh.unread_mark));
                     mentions = fresh.unread_mentions_count.max(0) as u32;
                     read = (fresh.read_inbox_max_id > 0).then(|| fresh.read_inbox_max_id.to_string());
+                    through = Some(fresh.top_message);
                 }
-                None => counted = false,
+                None => through = None,
             }
         }
     }
-    if counted {
-        let _ = account.ctx.counts(&id, unread, mentions, read.as_deref(), updated);
+    if through.is_some() {
+        account.ctx.counts(&id, unread, mentions, read.as_deref(), updated)?;
     }
-    let _ = account.ctx.muted(&id, is_muted);
     // The cloud draft rides the dialog: what the phone left on this chat shows on its row as
     // "Draft:", and a draft the phone dropped is dropped here too. An empty one clears.
     let draft_text = match &dialog.draft {
@@ -611,6 +773,7 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     if dialog.read_outbox_max_id > 0 && who != Who::User(account.me) && !known.broadcast {
         let _ = account.ctx.seen(&id, &dialog.read_outbox_max_id.to_string());
     }
+    Ok(through)
 }
 
 /// One dialog as the network counts it right now, what a read told again leaves.
@@ -695,8 +858,8 @@ pub(super) fn on_screen(account: &Account, watching: &Watching) {
             let tail = &order[order.len().saturating_sub(NEAR_END)..];
             live.filed.ends[list].filter(|_| rows.iter().any(|who| tail.contains(who)))
         };
-        if let Some(next) = next {
-            if let Err(fault) = read_page(account, list, Some(next)) {
+        if next.is_some() {
+            if let Err(fault) = advance_dialogs(account, list, true) {
                 tracing::warn!("chatd: Telegram: more chats: {fault}");
             }
         }

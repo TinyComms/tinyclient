@@ -272,18 +272,19 @@ fn named(peers: &PeerMap) -> (Vec<tl::enums::User>, Vec<tl::enums::Chat>) {
         match peer {
             Peer::User(user) => users.push(user.raw.clone()),
             Peer::Group(group) => chats.push(group.raw.clone()),
-            Peer::Channel(channel) => {
-                let mut raw = channel.raw.clone();
-                // grammers represents a forbidden broadcast as a channel with date 0.
-                // Its synthetic left flag is false, which is not a membership signal.
-                if raw.date == 0 && raw.stories_unavailable {
-                    raw.left = true;
-                }
-                chats.push(tl::enums::Chat::Channel(raw));
-            }
+            Peer::Channel(channel) => chats.push(named_broadcast(channel.raw.clone())),
         }
     }
     (users, chats)
+}
+
+fn named_broadcast(mut raw: tl::types::Channel) -> tl::enums::Chat {
+    // grammers represents a forbidden broadcast as a channel with date 0.
+    // Its synthetic left flag is false, which is not a membership signal.
+    if raw.date == 0 && raw.stories_unavailable {
+        raw.left = true;
+    }
+    raw.into()
 }
 
 /// Follows the account's updates, in order and with gaps filled by the library, until the
@@ -423,6 +424,31 @@ impl Wire for Real {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grammers_forbidden_broadcasts_are_learned_as_nonmembers() {
+        let pool = SenderPool::new(Arc::new(Vault::new(None)), 1);
+        let client = Client::new(pool.handle);
+        let forbidden = tl::types::ChannelForbidden {
+            broadcast: true,
+            megagroup: false,
+            monoforum: false,
+            id: 9004,
+            access_hash: 4,
+            title: "Old broadcasts".into(),
+            until_date: None,
+        };
+        let channel = grammers_client::peer::Channel::from_raw(&client, forbidden.into());
+        let mut joined = channel.raw.clone();
+        joined.date = 1_790_000_000;
+        joined.left = false;
+        let mut dir = super::super::peers::Directory::new(7001);
+        let who = super::super::peers::Who::Channel(9004);
+        dir.learn(&[], &[named_broadcast(joined)]);
+        assert_eq!(dir.get(who).unwrap().member, Some(true));
+        dir.learn(&[], &[named_broadcast(channel.raw)]);
+        assert_eq!(dir.get(who).unwrap().member, Some(false));
+    }
 
     #[test]
     fn a_session_comes_back_with_its_keys_and_home() {
