@@ -598,6 +598,153 @@ fn a_row_scrolled_away_before_its_picture_waits_unfetched_and_is_fetched_once_it
     });
 }
 
+/// The photo `photo-pages` writes into Trail crew: its thumbnail is one piece.
+const CREW_THUMB: &str = "GetFile photo 6020 m";
+
+/// An ask for a piece of the thumbnail of a photo post `photo-pages` wrote into Field Notes
+/// (`p7100m` up). Each is two pieces.
+fn channel_thumb(call: &str) -> bool {
+    call.starts_with("GetFile photo 71") && call.contains(" m at ")
+}
+
+/// The shell drawing these files on screen asks for them, as `fetch_wanted` does.
+fn on_screen(world: &World, ids: &[&str]) {
+    let ids = ids.iter().map(|id| (*id).to_owned()).collect();
+    match world.ask(Request::Fetch { account: account(), ids, size: Some(320), retry: false }) {
+        Response::Media { .. } => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+/// How many pieces of the channel's thumbnails Telegram was asked for from the `since`th call
+/// to the first that starts with `line`, and how many after it.
+fn channel_thumbs_around(world: &World, since: usize, line: &str) -> (usize, usize) {
+    let calls = world.calls();
+    let at = calls.iter().position(|call| call.starts_with(line)).unwrap_or_else(|| panic!("{line} in {calls:#?}"));
+    let count = |calls: &[String]| calls.iter().filter(|call| channel_thumb(call)).count();
+    (count(&calls[since.min(at)..at]), count(&calls[at + 1..]))
+}
+
+/// At most what was being fetched when a picture was asked for, and the one after it if the
+/// ask landed just as that began: two thumbnails of two pieces.
+const IN_FLIGHT: usize = 4;
+
+/// Waits until every piece of the `many` channel thumbnails has been asked for, so the order
+/// they went in is whole.
+fn all_channel_thumbs(world: &World, many: usize) {
+    world.within(Duration::from_secs(60), "every channel thumbnail", || {
+        (world.calls().iter().filter(|call| channel_thumb(call)).count() >= 2 * many).then_some(())
+    });
+}
+
+/// Opens Field Notes with `many` photo posts no thumbnail of which is on disk, and waits for
+/// the first of them to be fetched: the rest wait their turn behind it.
+fn channel_fetching(many: u32) -> World {
+    let world = World::signed_in();
+    world.connected();
+    world.steer(&format!("photo-pages {many}"));
+    world.messages("c9001");
+    world.until("the channel's first thumbnail", || world.calls().iter().any(|call| channel_thumb(call)).then_some(()));
+    world
+}
+
+#[test]
+fn the_pictures_on_screen_are_fetched_before_those_still_waiting_from_a_channel_left_or_off_screen() {
+    let world = channel_fetching(12);
+    // Scrolled up to the oldest post, whose thumbnail the page named last: it goes next.
+    let scrolled = world.calls().len();
+    on_screen(&world, &["p7100m"]);
+    world.within(Duration::from_secs(60), "the oldest post's thumbnail", || (world.called("GetFile photo 7100 m") > 0).then_some(()));
+
+    // Trail crew opened while the channel's thumbnails still wait: the photo it shows goes
+    // ahead of them, and three asks for it are one download.
+    world.messages("g8001");
+    world.until("the group's photo", || world.message("g8001", "90"));
+    let opened = world.calls().len();
+    for _ in 0..3 {
+        on_screen(&world, &["p6020m"]);
+    }
+    world.within(Duration::from_secs(60), "the group's thumbnail", || (world.called(CREW_THUMB) > 0).then_some(()));
+
+    // Every thumbnail still comes in the end, each once, and the ones on screen came next.
+    all_channel_thumbs(&world, 12);
+    let (waited, after) = channel_thumbs_around(&world, scrolled, "GetFile photo 7100 m at 0");
+    assert!(waited <= IN_FLIGHT && after > 0, "the oldest post's thumbnail waited behind {waited} pieces: {:#?}", world.calls());
+    let (waited, after) = channel_thumbs_around(&world, opened, CREW_THUMB);
+    assert!(waited <= IN_FLIGHT && after > 0, "the group's thumbnail waited behind {waited} pieces: {:#?}", world.calls());
+    for at in 0..12 {
+        assert_eq!(world.called(&format!("GetFile photo {} m at 0", 7_100 + at)), 1, "{:#?}", world.calls());
+    }
+    assert_eq!(world.called(CREW_THUMB), 1, "{:#?}", world.calls());
+    let landed = world.message("g8001", "90").and_then(|message| message.attachments[0].thumb.clone()).and_then(|thumb| thumb.path);
+    assert_eq!(std::fs::metadata(landed.expect("the group's thumbnail on disk")).unwrap().len(), include_bytes!("../src/adapters/telegram/fake_crew_m.jpg").len() as u64);
+}
+
+#[test]
+fn a_picture_asked_for_before_its_page_is_read_goes_ahead_once_the_page_names_it() {
+    let world = channel_fetching(12);
+    // The group's photo is on screen from what the store had, before its page is read again:
+    // nothing here knows yet where it is.
+    on_screen(&world, &["p6020m"]);
+    sleep(Duration::from_millis(300));
+    assert_eq!(world.called(CREW_THUMB), 0);
+    world.messages("g8001");
+    world.within(Duration::from_secs(60), "the group's thumbnail", || (world.called(CREW_THUMB) > 0).then_some(()));
+    all_channel_thumbs(&world, 12);
+    // From the moment its page was read, it waited only for what was being fetched.
+    let calls = world.calls();
+    let read = calls.iter().position(|call| call.starts_with("GetHistory g8001")).unwrap_or_else(|| panic!("{calls:#?}"));
+    let (waited, after) = channel_thumbs_around(&world, read, CREW_THUMB);
+    assert!(waited <= IN_FLIGHT && after > 0, "the group's thumbnail waited behind {waited} pieces: {calls:#?}");
+}
+
+#[test]
+fn the_original_the_viewer_waits_on_goes_before_the_pictures_on_screen() {
+    let world = channel_fetching(12);
+    world.messages("g8001");
+    world.until("the group's photo", || world.message("g8001", "90"));
+    // Telegram asks for a pause on the next piece: nothing is fetched while both are asked for,
+    // so their order is the line's and not the order they arrived in.
+    world.steer("flood-file 2");
+    world.until("Telegram to ask for a pause", || world.calls().iter().any(|call| call.ends_with(" refused 2")).then_some(()));
+    let paused = Instant::now();
+    // The group's photo on screen, then the viewer opened on the channel's newest post.
+    on_screen(&world, &["p6020m"]);
+    on_screen(&world, &["p7111y"]);
+    assert!(paused.elapsed() < Duration::from_millis(1_500), "asked for after the pause: {:?}", paused.elapsed());
+    world.within(Duration::from_secs(60), "the group's thumbnail", || (world.called(CREW_THUMB) > 0).then_some(()));
+    all_channel_thumbs(&world, 12);
+    // After the file that was paused: the original, in two pieces, then the group's photo, then
+    // the rest of the channel.
+    let calls = world.calls();
+    let refused = calls.iter().position(|call| call.ends_with(" refused 2")).unwrap();
+    let paused_file = calls[refused].trim_end_matches(" refused 2").to_owned() + " at ";
+    let next: Vec<&str> = calls[refused + 1..].iter().map(String::as_str).filter(|call| call.starts_with("GetFile") && !call.starts_with(&paused_file)).take(4).collect();
+    assert_eq!(&next[..3], ["GetFile photo 7111 y at 0", "GetFile photo 7111 y at 262144", "GetFile photo 6020 m at 0"], "{calls:#?}");
+    assert!(channel_thumb(next[3]), "{calls:#?}");
+}
+
+#[test]
+fn a_flood_wait_on_a_picture_on_screen_holds_every_file_until_it_has_passed() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("photo-pages 3");
+    world.steer("flood-file 2");
+    world.messages("g8001");
+    world.until("the group's photo", || world.message("g8001", "90"));
+    on_screen(&world, &["p6020m"]);
+    world.until("Telegram to ask for a pause", || (world.called("GetFile photo 6020 m refused 2") == 1).then_some(()));
+    let refused = Instant::now();
+    // The channel opened during the pause: its thumbnails wait for it to pass too.
+    world.messages("c9001");
+    world.until("the group's thumbnail after the pause", || (world.called("GetFile photo 6020 m at 0") == 1).then_some(()));
+    assert!(refused.elapsed() >= Duration::from_millis(1_700), "asked again after {:?}", refused.elapsed());
+    let calls = world.calls();
+    let at = |line: &str| calls.iter().position(|call| call == line).unwrap_or_else(|| panic!("{line} in {calls:#?}"));
+    assert!(calls[at("GetFile photo 6020 m refused 2") + 1..at("GetFile photo 6020 m at 0")].iter().all(|call| !call.starts_with("GetFile")), "{calls:#?}");
+    world.until("the channel's thumbnails after it", || world.calls().iter().any(|call| channel_thumb(call)).then_some(()));
+}
+
 #[test]
 fn a_chats_list_paints_what_it_has_while_the_pages_arrive() {
     // Five pages of the main list at sign-on; every page after the first is held at the wire.
@@ -752,10 +899,10 @@ fn a_thumbnail_gone_from_disk_is_never_marked_failed_and_telegram_keeps_it_again
     }
     assert!(!world.stderr().contains("does not serve files from that address"), "{}", world.stderr());
 
-    // Telegram keeps it again when it next reads the message: here, an update that carries it.
-    // (Opening the chat reads its page again too, once that page is a minute old.)
-    world.steer("photo");
+    // Telegram knows where it is, and the shell asked for it because it is on screen: it is
+    // fetched again at once, ahead of what is not on screen, with no page read again for it.
     world.until("Telegram to keep it again", || asked("p6014m").and_then(|file| file.path));
+    assert_eq!(world.called("GetFile photo 6014 m"), 4, "fetched once more, in its two pieces: {:#?}", world.calls());
 }
 
 #[test]

@@ -5,6 +5,16 @@
 //! A picture asked for as a row's (`Watch` says which rows are on screen) waits, unfetched,
 //! once the row has scrolled away, and goes back in line when it is on screen again.
 //!
+//! The line has three parts. An original the viewer is waiting on goes first. Then the
+//! pictures messages show (a photo's thumbnail, a video's or a sticker's still) that the shell
+//! asked for because they are on screen (`Command::Wanted`), the latest asked first. Then
+//! everything else, in the order pages named it, with rows' pictures that came back on screen
+//! at its front. So a channel opened after another does not wait behind the first one's
+//! pictures, nor behind its own that are not on screen yet. A picture the shell asks for before
+//! a page has named it here goes ahead once a page does. A picker's tiles keep their turn: a
+//! picker asks for a whole tab at once. The file being fetched is never cut short, and the
+//! line never holds more than [`WAITING`]: past it, the last a page named is let go first.
+//!
 // CONTRACT: an adapter has no way to hand the media cache a file. This does what the cache does
 // when one lands (`Store::register_media`, `Store::media_landed`, `Change::Media`) and nothing
 // else. A file is registered only once it is on disk, so the cache never tries the address
@@ -47,9 +57,15 @@ const LARGEST_FILE: u64 = 200 * 1024 * 1024;
 /// Bytes asked for at a time for such a file, which the user is waiting on: the most Telegram
 /// gives in one piece, at the same pace as everything else.
 const FILE_PIECE: i32 = 1024 * 1024;
-/// Originals whose place is remembered until the viewer asks for one. Past this they are
-/// forgotten, and come back when a page that shows them is read again.
-const HELD: usize = 4_096;
+/// Files whose place is remembered until the shell asks for one: originals, and the pictures
+/// messages show, about two for each photo. At most this many; the latest half always stays.
+/// One forgotten comes back when a page that shows it is read again.
+const HELD: usize = 8_192;
+/// A file the shell asked for before any page named it here is still taken as asked for when
+/// a page names it this soon after.
+const EARLY_FOR: Duration = Duration::from_secs(30);
+/// Files asked for before any page named them, remembered at most; the latest half always stays.
+const EARLY: usize = 512;
 
 enum Job {
     /// The connection files are fetched over from now on.
@@ -57,6 +73,9 @@ enum Job {
     Fetch(Box<Want>),
     /// The viewer is waiting on it: it goes before every row's picture.
     First(Box<Want>),
+    /// A picture a message shows, which the shell asked for at that moment because it was on
+    /// screen: it goes before every picture that is not, the latest asked first.
+    Seen(Box<Want>, Instant),
     /// What is on screen changed: rows that came back put their pictures back in line.
     Look,
 }
@@ -65,8 +84,185 @@ pub struct Files {
     ctx: Context,
     jobs: Sender<Job>,
     waiting: Arc<AtomicUsize>,
-    /// Where each original is, by its id, until the shell asks for it.
-    held: Mutex<HashMap<String, Want>>,
+    held: Mutex<Held>,
+}
+
+/// What the shell may ask for by id, and what it asked for before it was known here.
+struct Held {
+    /// Where each original and each picture a message shows is, by its id.
+    places: Recent<Want>,
+    /// Files the shell asked for that no page had named yet, with when it asked.
+    early: Recent<Instant>,
+}
+
+impl Default for Held {
+    fn default() -> Held {
+        Held { places: Recent::new(HELD / 2), early: Recent::new(EARLY / 2) }
+    }
+}
+
+impl Held {
+    /// A page named these files. The places of originals are kept and, on a conversation's
+    /// page (`messages`), those of the pictures its messages show: such a picture the shell
+    /// asked for a moment ago goes ahead as if it were asked now. Answers the jobs that go
+    /// ahead, and what waits its turn. An original waits for the viewer.
+    fn named(&mut self, wants: Vec<Want>, messages: bool) -> (Vec<Job>, Vec<Want>) {
+        let (mut ahead, mut rest) = (Vec::new(), Vec::new());
+        for want in wants {
+            let picture = messages && message_picture(&want);
+            if want.original || picture {
+                self.places.insert(want.file.id.clone(), want.clone());
+            }
+            let asked = self.early.remove(&want.file.id).filter(|at| at.elapsed() < EARLY_FOR);
+            match asked {
+                Some(_) if want.original => ahead.push(Job::First(Box::new(want))),
+                Some(at) if picture => ahead.push(Job::Seen(Box::new(want), at)),
+                _ if want.original => {}
+                _ => rest.push(want),
+            }
+        }
+        (ahead, rest)
+    }
+
+    /// The shell asked for these at `at`: the jobs for those whose place is known. One no page
+    /// has named here yet is remembered a while, and goes ahead if a page names it soon after.
+    fn asked(&mut self, ids: &[String], at: Instant) -> Vec<Job> {
+        let mut jobs = Vec::new();
+        for id in ids {
+            match self.places.get(id) {
+                Some(want) => {
+                    let want = Box::new(want.clone());
+                    jobs.push(if want.original { Job::First(want) } else { Job::Seen(want, at) });
+                }
+                None => self.early.insert(id.clone(), at),
+            }
+        }
+        jobs
+    }
+}
+
+/// Values by id that forget the oldest first. Once the newer half is full it becomes the older
+/// half, and the older half before it is let go: the latest `half` always stay, and never more
+/// than twice that.
+struct Recent<T> {
+    half: usize,
+    newer: HashMap<String, T>,
+    older: HashMap<String, T>,
+}
+
+impl<T> Recent<T> {
+    fn new(half: usize) -> Recent<T> {
+        Recent { half, newer: HashMap::new(), older: HashMap::new() }
+    }
+
+    fn get(&self, id: &str) -> Option<&T> {
+        self.newer.get(id).or_else(|| self.older.get(id))
+    }
+
+    fn insert(&mut self, id: String, value: T) {
+        self.older.remove(&id);
+        if self.newer.len() >= self.half && !self.newer.contains_key(&id) {
+            self.older = std::mem::take(&mut self.newer);
+        }
+        self.newer.insert(id, value);
+    }
+
+    fn remove(&mut self, id: &str) -> Option<T> {
+        let newer = self.newer.remove(id);
+        let older = self.older.remove(id);
+        newer.or(older)
+    }
+}
+
+/// A picture a message shows in its row: a photo's thumbnail, a video's, a GIF's or a
+/// sticker's still. Not an avatar or a custom emoji, which lists ask for by the hundred whether
+/// they are in sight or not.
+fn message_picture(want: &Want) -> bool {
+    !want.original && want.file.kind == MediaKind::Image
+}
+
+/// What waits its turn, in the order it goes.
+#[derive(Default)]
+struct Line {
+    /// Originals the viewer is waiting on, the latest asked first.
+    first: VecDeque<Box<Want>>,
+    /// Pictures the shell asked for while they were on screen, with when, the latest first.
+    seen: VecDeque<(Instant, Box<Want>)>,
+    /// Everything else, in the order pages named it.
+    rest: VecDeque<Box<Want>>,
+}
+
+impl Line {
+    fn len(&self) -> usize {
+        self.first.len() + self.seen.len() + self.rest.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn pop(&mut self) -> Option<Box<Want>> {
+        self.first.pop_front().or_else(|| self.seen.pop_front().map(|(_, want)| want)).or_else(|| self.rest.pop_front())
+    }
+
+    /// A page named it: at the back, or, if it is waiting already, where it waits, with the
+    /// reference this page carried. `true` when it was waiting, so one fewer is counted.
+    fn fetch(&mut self, want: Box<Want>) -> bool {
+        let id = &want.file.id;
+        let waiting = self.first.iter_mut().chain(self.seen.iter_mut().map(|(_, held)| held)).chain(self.rest.iter_mut()).find(|held| held.file.id == *id);
+        match waiting {
+            Some(held) => {
+                // A reference runs out; the newest page's is the one that works.
+                held.location = want.location;
+                held.dc = want.dc;
+                true
+            }
+            None => {
+                self.rest.push_back(want);
+                false
+            }
+        }
+    }
+
+    /// The viewer asked for it: first of all. `true` when it was waiting already.
+    fn first(&mut self, want: Box<Want>) -> bool {
+        let before = self.first.len();
+        self.first.retain(|held| held.file.id != want.file.id);
+        let waiting = self.first.len() < before;
+        self.first.push_front(want);
+        waiting
+    }
+
+    /// The shell asked for it at `at` because it was on screen: ahead of everything but the
+    /// viewer's originals and what was asked for later. `true` when it was waiting already.
+    fn seen(&mut self, want: Box<Want>, mut at: Instant) -> bool {
+        let id = &want.file.id;
+        let mut waiting = false;
+        if let Some(found) = self.seen.iter().position(|(_, held)| held.file.id == *id) {
+            if let Some((asked, _)) = self.seen.remove(found) {
+                at = at.max(asked);
+            }
+            waiting = true;
+        }
+        if let Some(found) = self.rest.iter().position(|held| held.file.id == *id) {
+            self.rest.remove(found);
+            waiting = true;
+        }
+        // After what was asked at the same moment, so one ask keeps its own order.
+        let place = self.seen.iter().position(|(asked, _)| *asked < at).unwrap_or(self.seen.len());
+        self.seen.insert(place, (at, want));
+        waiting
+    }
+
+    /// Lets go of what is past `most`: the last a page named first, then what was asked for
+    /// earliest. It is named again when its conversation is next read. Answers how many went.
+    fn trim(&mut self, most: usize) -> usize {
+        let mut gone = 0;
+        while self.len() > most && (self.rest.pop_back().is_some() || self.seen.pop_back().is_some()) {
+            gone += 1;
+        }
+        gone
+    }
 }
 
 impl Files {
@@ -80,14 +276,14 @@ impl Files {
             let mut account = Weak::new();
             // Datacenters this connection's sign-in has been carried to.
             let mut carried = HashSet::new();
-            let mut queue: VecDeque<Box<Want>> = VecDeque::new();
+            let mut line = Line::default();
             // Rows' pictures asked for and since scrolled away, with when each was parked.
             let mut parked: Vec<(Instant, Box<Want>)> = Vec::new();
             let mut gone = false;
             loop {
                 // Everything sent so far is read before the next fetch, so an original the
-                // viewer asked for does not wait behind the rows' pictures.
-                let next = if !queue.is_empty() {
+                // viewer asked for, or a picture on screen, does not wait behind the rest.
+                let next = if !line.is_empty() {
                     inbox.try_recv().ok()
                 } else if parked.is_empty() {
                     match inbox.recv() {
@@ -115,15 +311,32 @@ impl Files {
                             account = to;
                             carried.clear();
                         }
-                        Job::Fetch(want) => queue.push_back(want),
-                        Job::First(want) => queue.push_front(want),
-                        Job::Look => rows_back(&account, &mut parked, &mut queue, &counted),
+                        Job::Fetch(want) => {
+                            if line.fetch(want) {
+                                counted.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                        Job::First(want) => {
+                            if line.first(want) {
+                                counted.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                        Job::Seen(want, at) => {
+                            if line.seen(want, at) {
+                                counted.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                        Job::Look => rows_back(&account, &mut parked, &mut line.rest, &counted),
                     }
+                    // What the shell asks for is never refused at the door, so the line keeps
+                    // its own limit, parked pictures counted.
+                    let let_go = line.trim(WAITING.saturating_sub(parked.len()));
+                    counted.fetch_sub(let_go, Ordering::Relaxed);
                     continue;
                 }
-                // Nothing new at the wire: rows that came back go first, then the queue.
-                rows_back(&account, &mut parked, &mut queue, &counted);
-                let Some(want) = queue.pop_front() else {
+                // Nothing new at the wire: rows that came back go ahead of the rest, then the line.
+                rows_back(&account, &mut parked, &mut line.rest, &counted);
+                let Some(want) = line.pop() else {
                     // The wire is gone and nothing is left to fetch: the thread ends,
                     // whatever still waits for a row.
                     if gone {
@@ -176,27 +389,33 @@ impl Files {
         let _ = self.jobs.send(Job::Look);
     }
 
-    /// Queues what rows on screen show, and keeps the originals' places for [`Files::asked`].
-    /// Nothing is fetched twice: a file already on disk is passed over when its turn comes.
-    /// What came inside the message (a stripped preview, a cached size) is kept at once, here:
-    /// it asks Telegram nothing, so it never waits in line behind the downloads it stands in for.
+    /// Queues what a conversation's page shows, and keeps the places of originals and of the
+    /// pictures its messages show for [`Files::asked`]: such a picture the shell asked for before
+    /// this goes ahead as if it were asked now. Nothing is fetched twice: a file waiting already
+    /// keeps its one place, and a file already on disk is passed over when its turn comes. What
+    /// came inside the message (a stripped preview, a cached size) is kept at once, here: it asks
+    /// Telegram nothing, so it never waits in line behind the downloads it stands in for.
     pub fn want(&self, wants: Vec<Want>) {
-        let (originals, wants): (Vec<Want>, Vec<Want>) = wants.into_iter().partition(|want| want.original);
-        let (inline, wants): (Vec<Want>, Vec<Want>) = wants.into_iter().partition(|want| want.inline.is_some());
+        self.queue(wants, true);
+    }
+
+    /// Queues a picker's tiles, and keeps the originals' places. A tile keeps its turn when the
+    /// shell asks for it: a picker asks for its whole tab at once, in sight or not.
+    pub fn want_tiles(&self, wants: Vec<Want>) {
+        self.queue(wants, false);
+    }
+
+    fn queue(&self, wants: Vec<Want>, messages: bool) {
+        let (inline, wants): (Vec<Want>, Vec<Want>) = wants.into_iter().partition(|want| want.inline.is_some() && !want.original);
         for want in inline {
             let bytes = want.inline.as_deref().unwrap_or_default();
             if let Err(fault) = keep(&self.ctx, &want, |out| write_inline(out, bytes)) {
                 tracing::warn!("chatd: Telegram: file {}: {fault}", want.file.id);
             }
         }
-        if !originals.is_empty() {
-            let mut held = crate::hub::lock(&self.held);
-            if held.len() + originals.len() > HELD {
-                held.clear();
-            }
-            held.extend(originals.into_iter().map(|want| (want.file.id.clone(), want)));
-        }
-        for want in wants {
+        let (ahead, rest) = crate::hub::lock(&self.held).named(wants, messages);
+        self.ahead(ahead);
+        for want in rest {
             if self.waiting.fetch_add(1, Ordering::Relaxed) >= WAITING {
                 self.waiting.fetch_sub(1, Ordering::Relaxed);
                 return;
@@ -205,19 +424,24 @@ impl Files {
         }
     }
 
-    /// The shell asked for these files, which the media cache does not know: the originals
-    /// among them are fetched next. Answers how many were.
+    /// The shell asked for these files, which the media cache does not know, or knows only as
+    /// a file Telegram kept that has since left the disk. An original among them is fetched
+    /// next; a picture a message shows goes ahead of every picture not on screen. One no page
+    /// has named yet goes ahead when a page does (`Held::asked`). Answers how many were known.
     pub fn asked(&self, ids: &[String]) -> usize {
-        let found: Vec<Want> = {
-            let held = crate::hub::lock(&self.held);
-            ids.iter().filter_map(|id| held.get(id).cloned()).collect()
-        };
-        let count = found.len();
-        for want in found {
-            self.waiting.fetch_add(1, Ordering::Relaxed);
-            let _ = self.jobs.send(Job::First(Box::new(want)));
-        }
+        let jobs = crate::hub::lock(&self.held).asked(ids, Instant::now());
+        let count = jobs.len();
+        self.ahead(jobs);
         count
+    }
+
+    /// Sends what the shell asked for: never refused here, however many wait. The fetching
+    /// thread keeps the line to [`WAITING`] by letting go of what matters least (`Line::trim`).
+    fn ahead(&self, jobs: Vec<Job>) {
+        for job in jobs {
+            self.waiting.fetch_add(1, Ordering::Relaxed);
+            let _ = self.jobs.send(job);
+        }
     }
 }
 
@@ -233,9 +457,10 @@ fn row_shown(account: &Account, row: &str) -> bool {
     watching.rows.iter().any(shown) || watching.conversation.as_ref().is_some_and(|open| shown(open))
 }
 
-/// Rows that came back put their pictures back in line, at its front, in the order they
-/// were parked; what is still away stays parked, and what has waited too long goes: the
-/// shell asks again if the row is still there.
+/// Rows that came back put their pictures back in line, at the front of what is waiting its
+/// turn (`queue`, the line's `rest`: behind the viewer's originals and the pictures the shell
+/// asked for on screen), in the order they were parked; what is still away stays parked, and
+/// what has waited too long goes: the shell asks again if the row is still there.
 fn rows_back(account: &Weak<Account>, parked: &mut Vec<(Instant, Box<Want>)>, queue: &mut VecDeque<Box<Want>>, counted: &AtomicUsize) {
     // A parked picture still occupies its place among the waiting files. Release it only
     // when it is discarded, or when the queue takes it to fetch after its row returns.
@@ -443,5 +668,186 @@ mod tests {
         assert!(queue.is_empty());
         rows_back(&Weak::new(), &mut parked, &mut queue, &counted);
         assert_eq!(counted.load(Ordering::Relaxed), 1);
+    }
+
+    /// A file of `kind` named `id`, with `reference` as its file reference.
+    fn file(id: &str, kind: MediaKind, original: bool, reference: u8) -> Box<Want> {
+        Box::new(Want {
+            file: protocol::MediaFile::new(id, kind),
+            dc: 4,
+            location: tl::types::InputPhotoFileLocation {
+                id: 1, access_hash: 0, file_reference: vec![reference], thumb_size: "m".into(),
+            }.into(),
+            inline: None,
+            row: None,
+            watched: false,
+            original,
+        })
+    }
+
+    fn thumb(id: &str) -> Box<Want> {
+        file(id, MediaKind::Image, false, 1)
+    }
+
+    fn order(mut line: Line) -> Vec<String> {
+        std::iter::from_fn(|| line.pop()).map(|want| want.file.id).collect()
+    }
+
+    #[test]
+    fn a_picture_on_screen_goes_ahead_of_the_rest_and_behind_the_original_the_viewer_waits_on() {
+        let mut line = Line::default();
+        // The channel left: its page's pictures, in the order they were named.
+        for id in ["a1", "a2", "a3"] {
+            assert!(!line.fetch(thumb(id)));
+        }
+        // The channel opened now: its page goes behind them, and its picture on screen ahead.
+        assert!(!line.fetch(thumb("b1")));
+        assert!(!line.fetch(thumb("b2")));
+        assert!(line.seen(thumb("b2"), Instant::now()), "it was waiting: counted once");
+        assert!(!line.first(file("original", MediaKind::Image, true, 1)));
+        assert_eq!(order(line), ["original", "b2", "a1", "a2", "a3", "b1"]);
+    }
+
+    #[test]
+    fn the_latest_asked_goes_first_and_what_was_asked_together_keeps_its_order() {
+        let mut line = Line::default();
+        let then = Instant::now();
+        let now = then + Duration::from_millis(5);
+        // The first channel's pictures on screen, asked for together.
+        assert!(!line.seen(thumb("a1"), then));
+        assert!(!line.seen(thumb("a2"), then));
+        // The next channel's, asked for later: ahead of them.
+        assert!(!line.seen(thumb("b1"), now));
+        assert!(!line.seen(thumb("b2"), now));
+        // A page naming a picture asked for before is taken at when it was asked.
+        assert!(!line.seen(thumb("early"), then));
+        assert_eq!(order(line), ["b1", "b2", "a1", "a2", "early"]);
+    }
+
+    #[test]
+    fn a_file_named_or_asked_for_again_keeps_one_place_with_the_newest_reference() {
+        let mut line = Line::default();
+        let at = Instant::now();
+        assert!(!line.fetch(thumb("a1")));
+        assert!(!line.seen(thumb("b1"), at));
+        // Named again by a newer page: where it waits, with that page's reference.
+        assert!(line.fetch(file("a1", MediaKind::Image, false, 2)));
+        assert!(line.fetch(file("b1", MediaKind::Image, false, 3)));
+        // Asked for twice: one place, the later ask's, with the place `want` last kept for it.
+        assert!(line.seen(file("b1", MediaKind::Image, false, 4), at + Duration::from_millis(1)));
+        // The viewer asked twice: one place, first.
+        assert!(!line.first(file("original", MediaKind::Image, true, 1)));
+        assert!(line.first(file("original", MediaKind::Image, true, 1)));
+        let reference = |want: &Want| match &want.location {
+            tl::enums::InputFileLocation::InputPhotoFileLocation(photo) => photo.file_reference.clone(),
+            _ => Vec::new(),
+        };
+        let mut taken = Vec::new();
+        while let Some(want) = line.pop() {
+            taken.push((want.file.id.clone(), reference(&want)));
+        }
+        assert_eq!(taken, [("original".into(), vec![1]), ("b1".into(), vec![4]), ("a1".into(), vec![2])]);
+    }
+
+    #[test]
+    fn past_its_limit_the_line_lets_go_of_the_last_named_then_the_earliest_asked() {
+        let mut line = Line::default();
+        let then = Instant::now();
+        for id in ["a1", "a2", "a3"] {
+            line.fetch(thumb(id));
+        }
+        line.seen(thumb("b1"), then);
+        line.seen(thumb("b2"), then + Duration::from_millis(1));
+        line.first(file("original", MediaKind::Image, true, 1));
+        assert_eq!(line.trim(6), 0);
+        assert_eq!(line.trim(4), 2);
+        assert_eq!(line.trim(2), 2, "then what was asked for earliest");
+        // The viewer's original is never let go for the limit.
+        assert_eq!(line.trim(0), 1);
+        assert_eq!(order(line), ["original"]);
+    }
+
+    #[test]
+    fn what_is_remembered_keeps_the_latest_half_and_a_name_read_again_stays() {
+        let mut recent = Recent::new(2);
+        let held = |recent: &Recent<u8>| ["a", "b", "c", "d", "e"].into_iter().filter(|id| recent.get(id).is_some()).collect::<Vec<_>>();
+        for (id, value) in [("a", 1), ("b", 1), ("c", 1), ("d", 1)] {
+            recent.insert(id.to_owned(), value);
+        }
+        // a and b moved to the older half when c came; nothing is let go yet.
+        assert_eq!(held(&recent), ["a", "b", "c", "d"]);
+        // Named again, a is one of the latest: it does not go with its old half. The newer half
+        // was full, so it became the older one, and b went.
+        recent.insert("a".to_owned(), 2);
+        assert_eq!(held(&recent), ["a", "c", "d"]);
+        assert_eq!(recent.get("a"), Some(&2));
+        recent.insert("e".to_owned(), 1);
+        assert_eq!(held(&recent), ["a", "c", "d", "e"]);
+        // Never fewer than the latest two, never more than four.
+        recent.insert("b".to_owned(), 1);
+        assert_eq!(held(&recent), ["a", "b", "e"]);
+        assert_eq!(recent.remove("a"), Some(2));
+        assert_eq!(held(&recent), ["b", "e"]);
+    }
+
+    /// Jobs as (kind, file).
+    fn jobs(jobs: Vec<Job>) -> Vec<(&'static str, String)> {
+        jobs.into_iter().map(|job| match job {
+            Job::Fetch(want) => ("fetch", want.file.id),
+            Job::First(want) => ("first", want.file.id),
+            Job::Seen(want, _) => ("seen", want.file.id),
+            Job::Attach(_) => ("attach", String::new()),
+            Job::Look => ("look", String::new()),
+        }).collect()
+    }
+
+    /// What a page naming these sends ahead, and what waits its turn: a conversation's page,
+    /// or a picker's (`messages` false).
+    fn named_by(held: &mut Held, wants: Vec<Box<Want>>, messages: bool) -> (Vec<(&'static str, String)>, Vec<String>) {
+        let (ahead, rest) = held.named(wants.into_iter().map(|want| *want).collect(), messages);
+        (jobs(ahead), rest.into_iter().map(|want| want.file.id).collect())
+    }
+
+    fn named(held: &mut Held, wants: Vec<Box<Want>>) -> (Vec<(&'static str, String)>, Vec<String>) {
+        named_by(held, wants, true)
+    }
+
+    fn ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_picture_the_shell_asks_for_before_its_page_is_read_goes_ahead_when_it_is() {
+        let mut held = Held::default();
+        // On screen from the store before the page is read again: nothing is known of them.
+        assert!(held.asked(&ids(&["p2m", "a5"]), Instant::now()).is_empty());
+        // The picture asked for goes ahead, past any limit on what waits; an avatar keeps its
+        // turn; the original waits for the viewer.
+        let page = vec![thumb("p1m"), thumb("p2m"), file("a5", MediaKind::Avatar, false, 1), file("p2y", MediaKind::Image, true, 1)];
+        assert_eq!(named(&mut held, page), (vec![("seen", "p2m".into())], ids(&["p1m", "a5"])));
+        // Asked for now that the page is known: a message's picture goes ahead, an original
+        // first, and an avatar is not a message's picture.
+        assert_eq!(jobs(held.asked(&ids(&["p1m", "p2y", "a5"]), Instant::now())), [("seen", "p1m".into()), ("first", "p2y".into())]);
+        // An ask answered from what was known is not remembered: a page read again soon after
+        // takes its turn, and only the one asked for early went ahead, once.
+        assert_eq!(named(&mut held, vec![thumb("p1m"), thumb("p2m")]), (vec![], ids(&["p1m", "p2m"])));
+    }
+
+    #[test]
+    fn a_pickers_tiles_keep_their_turn_however_the_shell_asks() {
+        let mut held = Held::default();
+        // The picker asks for its whole tab, some before the catalog was read.
+        assert!(held.asked(&ids(&["d1m"]), Instant::now()).is_empty());
+        let tab = vec![thumb("d1m"), thumb("d2m"), file("d2", MediaKind::Gif, true, 1)];
+        assert_eq!(named_by(&mut held, tab, false), (vec![], ids(&["d1m", "d2m"])));
+        // Asked for again once the catalog is known: still nothing goes ahead but an original.
+        assert_eq!(jobs(held.asked(&ids(&["d2m", "d2"]), Instant::now())), [("first", "d2".into())]);
+    }
+
+    #[test]
+    fn an_ask_goes_ahead_only_while_it_is_recent() {
+        let mut held = Held::default();
+        held.asked(&["p1m".into()], Instant::now() - EARLY_FOR);
+        assert_eq!(named(&mut held, vec![thumb("p1m")]), (vec![], vec!["p1m".to_owned()]));
     }
 }

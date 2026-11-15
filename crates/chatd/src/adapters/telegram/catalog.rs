@@ -72,7 +72,8 @@ fn item(account: &Account, document: &tl::enums::Document, pack: &str) -> Option
             }
         }
     }
-    account.files.want(wants);
+    // A picker's tile, not a message's picture: it keeps its turn when the picker asks for it.
+    account.files.want_tiles(wants);
     let id = format!("d{}", document.id);
     remember(
         account,

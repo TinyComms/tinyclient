@@ -108,7 +108,10 @@ for the network, one account per server, and `TinyLocalServers` reads those orig
   `Change::Media`. A file that could not be fetched says why in `failed`, in plain words, and is
   not fetched again until `Fetch` says `retry` or the adapter registers a fresh address. A file
   Telegram fetched over its own session is never marked failed by the cache: once gone from
-  disk it is simply not fetched, until Telegram keeps it again when it next reads the message.
+  disk it is not fetched by the cache. Telegram fetches it again when the shell asks for it
+  while it is on screen (`Command::Wanted`), or when it next reads the message. Telegram's own
+  files come one at a time: what the viewer waits on, then the pictures messages show on screen,
+  the latest asked first, then the rest (`adapters/telegram/files.rs`).
   `Fetch.size` is the longest side, in device pixels, of the whole picture at the scale it is
   drawn (for a cropped tile, the uncropped picture; points times the screen's scale). An adapter
   registers a file once at the size a row normally shows (`Context::media`) and then the other

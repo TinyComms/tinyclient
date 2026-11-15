@@ -413,8 +413,9 @@ pub enum Command {
     /// The shell asked for these files and the media cache knows none of them, or knows them
     /// only by Telegram's name for a file it kept, since gone from disk. An adapter that fetches
     /// files over its own session (Telegram, Messages) fetches those that are its own, such as
-    /// the original a picture's viewer opened, and records each as the cache would. Others
-    /// ignore it.
+    /// the original a picture's viewer opened, and records each as the cache would. Telegram
+    /// also takes it as what is on screen: a picture a message shows goes ahead of those that
+    /// are not, even one no page has named yet. Others ignore it.
     Wanted(Vec<String>),
     /// The link that opens this conversation's call in the official app.
     Handoff { conversation_id: String, reply: Reply<String> },
