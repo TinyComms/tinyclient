@@ -681,6 +681,77 @@ fn a_pin_or_a_folder_change_is_told_row_by_row_and_never_rereads_the_chats() {
     assert_eq!(added, ["GetPinnedDialogs 0"], "one request for all three changes");
     assert_eq!(world.called("GetDialogs"), 2);
 }
+
+#[test]
+fn a_photos_stripped_preview_is_on_disk_while_its_thumbnail_is_still_downloading() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_FILE_HOLD", "1")]);
+    world.connected();
+    let on_disk = |id: &str| match world.ask(Request::Fetch { account: account(), ids: vec![id.into()], size: None, retry: false }) {
+        Response::Media { mut files } => files.pop().and_then(|file| file.path),
+        other => panic!("{other:?}"),
+    };
+    // Posted while the chat is closed; opening it reads the page and wants what its rows show.
+    world.steer("photo-preview");
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    let posted = world.arrived("u7002", "24");
+    let attachment = &posted.attachments[0];
+    let preview = attachment.preview.as_ref().expect("the photo carries its stripped thumbnail");
+    assert_eq!((preview.id.as_str(), preview.kind, preview.width, preview.height), ("p6016i", MediaKind::Image, 40, 30));
+    assert_eq!(attachment.thumb.as_ref().map(|thumb| thumb.id.as_str()), Some("p6016m"));
+
+    // The row's size is asked of Telegram, which holds it; the preview is on disk regardless.
+    world.until("the thumbnail asked for", || (world.called("GetFile photo 6016 m") > 0).then_some(()));
+    let kept = world.until("the preview on disk", || on_disk("p6016i"));
+    let jpeg = std::fs::read(&kept).unwrap();
+    assert_eq!((&jpeg[..2], &jpeg[jpeg.len() - 2..]), (&[0xff, 0xd8][..], &[0xff, 0xd9][..]), "a whole JPEG");
+    assert!(on_disk("p6016m").is_none(), "the thumbnail is still held at the wire");
+    assert_eq!(world.called("GetFile photo 6016 i"), 0, "nothing is asked for the preview");
+    // The stored message names where its preview is, for the next page read.
+    let stored = world.message("u7002", "24").unwrap();
+    assert_eq!(stored.attachments[0].preview.as_ref().and_then(|file| file.path.as_deref()), Some(kept.as_str()));
+
+    // Let go, the thumbnail lands beside it; the preview stays for the next open.
+    world.steer("file-go");
+    let thumb = world.until("the thumbnail on disk", || on_disk("p6016m"));
+    let served = include_bytes!("../src/adapters/telegram/fake_ridge_m.jpg");
+    assert_eq!(std::fs::read(&thumb).unwrap(), served);
+    assert_eq!(on_disk("p6016i").as_deref(), Some(kept.as_str()));
+}
+
+#[test]
+fn a_thumbnail_gone_from_disk_is_never_marked_failed_and_telegram_keeps_it_again() {
+    let world = World::signed_in();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.until("history", || world.message("u7002", "12"));
+    let asked = |id: &str| match world.ask(Request::Fetch { account: account(), ids: vec![id.into()], size: None, retry: false }) {
+        Response::Media { mut files } => files.pop(),
+        other => panic!("{other:?}"),
+    };
+    world.steer("photo");
+    world.arrived("u7002", "14");
+    let landed = world.until("the thumbnail on disk", || asked("p6014m").and_then(|file| file.path));
+    // The cache evicted it, or something else deleted it: the row stays, the file is gone.
+    std::fs::remove_file(&landed).unwrap();
+
+    // The shell asks for it again. Only Telegram can fetch it: the cache must not try the
+    // address it was kept under, which would mark it failed while Telegram brings it back.
+    let again = asked("p6014m").expect("still known");
+    assert_eq!((again.path.as_deref(), again.failed.as_deref()), (None, None));
+    let deadline = Instant::now() + Duration::from_millis(1_500);
+    while Instant::now() < deadline {
+        let seen = asked("p6014m").expect("still known");
+        assert!(seen.failed.is_none(), "marked failed: {seen:?}");
+        sleep(Duration::from_millis(100));
+    }
+    assert!(!world.stderr().contains("does not serve files from that address"), "{}", world.stderr());
+
+    // Telegram keeps it again when it next reads the message: here, an update that carries it.
+    // (Opening the chat reads its page again too, once that page is a minute old.)
+    world.steer("photo");
+    world.until("Telegram to keep it again", || asked("p6014m").and_then(|file| file.path));
+}
+
 #[test]
 fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
     let world = World::signed_in();
@@ -727,6 +798,8 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
     assert_eq!((attachment.file.id.as_str(), attachment.file.kind, attachment.file.width, attachment.file.height), ("p6014y", MediaKind::Image, 1_280, 960));
     let thumb = attachment.thumb.as_ref().unwrap();
     assert_eq!((thumb.id.as_str(), thumb.width, thumb.height), ("p6014m", 320, 240));
+    // Its stripped thumbnail names a size and no picture: there is no preview to draw.
+    assert!(attachment.preview.is_none(), "{attachment:?}");
     let landed = world.until("the thumbnail on disk", || {
         match world.ask(Request::Fetch { account: account(), ids: vec!["p6014m".into()], size: None, retry: false }) {
             Response::Media { mut files } => files.pop().and_then(|file| file.path),

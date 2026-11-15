@@ -2680,7 +2680,7 @@ impl Store {
             "SELECT path, bytes, failed FROM media WHERE network = ?1 AND account = ?2 AND id = ?3",
         )?;
         let files = items.iter_mut().filter_map(|item| item.attachment.as_mut());
-        for file in files.flat_map(|attachment| std::iter::once(&mut attachment.file).chain(&mut attachment.thumb)) {
+        for file in files.flat_map(|attachment| std::iter::once(&mut attachment.file).chain(&mut attachment.thumb).chain(&mut attachment.preview)) {
             let known: Option<(Option<String>, i64, Option<String>)> = path
                 .query_row(params![word(&conversation.network), conversation.account, file.id], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -3095,17 +3095,18 @@ impl Store {
         Ok(cleared)
     }
 
-    /// Forgets every recorded failure that `passing` says was a moment's trouble rather than
-    /// the file's own: an older chatd recorded those too, and a file is not left unfetched for
+    /// Forgets every recorded failure that `passing` says, from its reason and the file's
+    /// address, was not the file's own: a moment's trouble, which an older chatd recorded too,
+    /// or a try at an address only the adapter can fetch. A file is not left unfetched for
     /// them. Answers how many were forgotten.
-    pub fn media_forgive(&mut self, passing: impl Fn(&str) -> bool) -> rusqlite::Result<usize> {
+    pub fn media_forgive(&mut self, passing: impl Fn(&str, &str) -> bool) -> rusqlite::Result<usize> {
         let tx = self.db.transaction()?;
-        let failed: Vec<(String, String, String, String)> = tx
-            .prepare("SELECT network, account, id, failed FROM media WHERE failed IS NOT NULL")?
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+        let failed: Vec<(String, String, String, String, String)> = tx
+            .prepare("SELECT network, account, id, failed, url FROM media WHERE failed IS NOT NULL")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let mut forgiven = 0;
-        for (network, account, id, why) in failed.iter().filter(|(.., why)| passing(why)) {
+        for (network, account, id, why, _) in failed.iter().filter(|(.., why, url)| passing(why, url)) {
             forgiven += tx.execute(
                 "UPDATE media SET failed = NULL WHERE network = ?1 AND account = ?2 AND id = ?3 AND failed = ?4",
                 params![network, account, id, why],
@@ -4334,12 +4335,21 @@ mod tests {
         let failed = |store: &Store, id: &str| store.media(&account, &[id.to_owned()]).unwrap().pop().unwrap().0.failed;
         assert!(failed(&store, "a").is_some());
 
-        let passing = |why: &str| why.starts_with("The download failed:");
+        let passing = |why: &str, _: &str| why.starts_with("The download failed:");
         assert_eq!(store.media_forgive(passing).unwrap(), 1);
         assert_eq!(failed(&store, "a"), None);
         assert_eq!(failed(&store, "b").as_deref(), Some("The file is no longer there (404)."));
         assert_eq!(failed(&store, "c"), None);
         assert_eq!(store.media_forgive(passing).unwrap(), 0);
+
+        // A file an adapter kept itself, which an older chatd then tried to fetch on its own.
+        let kept = (MediaFile::new("p1m", protocol::MediaKind::Image), "tg://file/p1m".to_owned());
+        store.register_media(&account, &[kept]).unwrap();
+        store.media_failed(&account, "p1m", "Telegram does not serve files from that address.").unwrap();
+        let theirs = |why: &str, url: &str| passing(why, url) || url.starts_with("tg://");
+        assert_eq!(store.media_forgive(theirs).unwrap(), 1);
+        assert_eq!(failed(&store, "p1m"), None);
+        assert_eq!(failed(&store, "b").as_deref(), Some("The file is no longer there (404)."));
     }
 
     #[test]
