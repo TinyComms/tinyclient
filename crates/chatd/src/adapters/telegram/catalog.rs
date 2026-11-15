@@ -59,7 +59,8 @@ fn item(account: &Account, document: &tl::enums::Document, pack: &str) -> Option
         _ => None,
     });
     let animated = matches!(document.mime_type.as_str(), "application/x-tgsticker" | "video/webm" | "video/mp4" | "image/gif");
-    account.files.want(wants);
+    // A picker's tile, not a message's picture: it keeps its turn when the picker asks for it.
+    account.files.want_tiles(wants);
     let id = format!("d{}", document.id);
     remember(
         account,

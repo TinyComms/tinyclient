@@ -21,7 +21,8 @@
 //! - A file Telegram kept over its own session is registered under a name no host serves
 //!   (`tg://file/<id>`). Once it is gone from disk the cache does not try that name and does not
 //!   mark the file failed: it stays not fetched yet until Telegram keeps it again, when it next
-//!   reads the message, or at once for an original the viewer opened (`Command::Wanted`).
+//!   reads the message, or at once when the shell asks for it on screen: an original the viewer
+//!   opened, or a picture a message shows (`Command::Wanted`).
 //! - A file is streamed to a part file through one buffer and renamed when whole. Its size is
 //!   capped by kind, from the headers and again while it arrives.
 //! - [`CACHE_BYTES`] on disk in all; least recently used goes first (`Store::media_on_disk`),

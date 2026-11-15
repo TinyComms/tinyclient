@@ -6,9 +6,9 @@
 //! scratch directory (`adapters/script.rs`): `telegram.signin.ctl` while signing in (`scan`,
 //! `scan-password`), `telegram.ctl` once signed in (`incoming`, `photo`, `react`, `edit`,
 //! `delete`, `ttl`, `ttl-gone`, `topic`, `comments`, `typing`, `typing-stop`, `read`, `status`,
-//! `poll`, `voice`, `forward`, `flood-send N`, `revoke`, `photo-preview`, and the holds of
-//! `TINYCLIENT_TELEGRAM_HOLD`, `TINYCLIENT_TELEGRAM_PEER_HOLD` and
-//! `TINYCLIENT_TELEGRAM_FILE_HOLD` through `dialogs-go`, `peer-go` and `file-go`). Every
+//! `poll`, `voice`, `forward`, `flood-send N`, `flood-file N`, `photo-pages N`, `revoke`,
+//! `photo-preview`, and the holds of `TINYCLIENT_TELEGRAM_HOLD`, `TINYCLIENT_TELEGRAM_PEER_HOLD`
+//! and `TINYCLIENT_TELEGRAM_FILE_HOLD` through `dialogs-go`, `peer-go` and `file-go`). Every
 //! request it is sent is appended to `telegram.calls`, one line each, so a test can see what
 //! the network would have heard.
 //!
@@ -306,6 +306,25 @@ fn photo(id: i64) -> tl::enums::Photo {
 /// than one piece so the adapter has to ask twice.
 pub const FILE_BYTES: usize = 256 * 1024 + 9;
 
+/// The posts `photo-pages` writes into the channel are photos from this id up, each served as
+/// [`FILE_BYTES`] like any other file.
+const PAGE_PHOTOS: i64 = 7_100;
+/// The photo `photo-pages` writes into the group. Its row's size is a real picture, a field of
+/// magenta across a green band, so a test can see it land on screen.
+const CREW_PHOTO: i64 = 6_020;
+const CREW_PHOTO_M: &[u8] = include_bytes!("fake_crew_m.jpg");
+
+fn crew_photo() -> tl::enums::Photo {
+    let tl::enums::Photo::Photo(mut kept) = photo(CREW_PHOTO) else { unreachable!() };
+    kept.sizes[1] = tl::types::PhotoSize { r#type: "m".to_owned(), w: 320, h: 240, size: CREW_PHOTO_M.len() as i32 }.into();
+    kept.into()
+}
+
+fn is_crew_thumb(location: &tl::enums::InputFileLocation) -> bool {
+    matches!(location, tl::enums::InputFileLocation::InputPhotoFileLocation(photo) if photo.id == CREW_PHOTO && photo.thumb_size == "m")
+}
+
+
 /// A photo whose row's size is a real picture, sent with the stripped thumbnail Telegram puts
 /// inside a message: what `photo-preview` posts. Orange beside blue, under fine dark stripes the
 /// stripped thumbnail is too small to keep, so a test can tell the two apart on screen.
@@ -359,6 +378,8 @@ struct World {
     password_owed: bool,
     /// The next send is refused with a flood wait of this many seconds, once.
     flood_send: Option<u32>,
+    /// The next `upload.GetFile` is refused with a flood wait of this many seconds, once.
+    flood_file: Option<u32>,
     revoked: bool,
     /// Tobin was added to the Family folder (`folder`).
     family_grew: bool,
@@ -426,6 +447,7 @@ impl World {
             phone: None,
             password_owed: false,
             flood_send: None,
+            flood_file: None,
             revoked: false,
             family_grew: false,
             lost_reads: false,
@@ -1412,6 +1434,26 @@ impl World {
                 self.flood_send = words.next().and_then(|seconds| seconds.parse().ok());
                 Vec::new()
             }
+            "flood-file" => {
+                self.flood_file = words.next().and_then(|seconds| seconds.parse().ok());
+                Vec::new()
+            }
+            // N photo posts in the channel and one photo in the group, where the next page read
+            // finds them, with no update: as posts made while the app was closed, their
+            // thumbnails are asked for only once a page names them.
+            "photo-pages" => {
+                let many: i32 = words.next().and_then(|many| many.parse().ok()).unwrap_or(20);
+                let media = |photo| Some(tl::types::MessageMediaPhoto { spoiler: false, live_photo: false, photo: Some(photo), ttl_seconds: None, video: None }.into());
+                for at in 0..many {
+                    let mut post = message(Who::Channel(NOTES), 200 + at, 0, t0() - 3_600 + at, &format!("Ridge photo {}", at + 1));
+                    post.media = media(photo(PAGE_PHOTOS + i64::from(at)));
+                    self.store(None, post);
+                }
+                let mut shared = message(Who::Group(CREW), 90, TOBIN, t0() - 1_800, "The pass this morning");
+                shared.media = media(crew_photo());
+                self.store(None, shared);
+                Vec::new()
+            }
             // The group's read never reached here, as when the tell went out while the link was
             // down: its dialog counts unread again until that read is told again.
             "lost-read" => {
@@ -1953,12 +1995,17 @@ impl World {
                 tl::enums::InputFileLocation::InputDocumentFileLocation(document) => format!("document {} {}", document.id, document.thumb_size).trim_end().to_owned(),
                 _ => "other".to_owned(),
             };
+            if let Some(seconds) = self.flood_file.take() {
+                self.log(&format!("GetFile {what} refused {seconds}"));
+                return Err(rpc(420, "FLOOD_WAIT", Some(seconds)));
+            }
             self.log(&format!("GetFile {what} at {}", request.offset));
             let held = match &request.location {
                 tl::enums::InputFileLocation::InputDocumentFileLocation(document) if document.id == 5001 || document.id == 5002 => {
                     packed(br#"{"tg":"the topic's icon"}"#)
                 }
                 location if is_ridge_thumb(location) => piece_of(RIDGE_M, request.offset, request.limit),
+                location if is_crew_thumb(location) => piece_of(CREW_PHOTO_M, request.offset, request.limit),
                 _ => file_piece(request.offset, request.limit),
             };
             let piece = tl::types::upload::File { r#type: tl::enums::storage::FileType::FileJpeg, mtime: t0(), bytes: held };
