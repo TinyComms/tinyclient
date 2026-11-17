@@ -226,11 +226,15 @@ impl World {
     }
 
     fn send(&self, conversation: &str, client_id: &str, text: &str) -> Message {
+        self.send_reply(conversation, client_id, text, None)
+    }
+
+    fn send_reply(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>) -> Message {
         let asked = Request::Send {
             conversation: key(conversation),
             client_id: client_id.into(),
             text: text.into(),
-            reply_to: None,
+            reply_to: reply_to.map(str::to_owned),
             with: Default::default(),
         };
         match self.ask(asked) {
@@ -887,4 +891,84 @@ fn scrolling_back_reads_every_message_and_then_stops_asking() {
         "a third scroll asked the phone again: {:?}",
         world.calls()
     );
+}
+
+#[test]
+fn an_rcs_reply_quotes_the_original_and_an_sms_reply_stays_plain() {
+    let world = World::linked();
+    world.connected();
+    world.steer("rcs grace");
+    world.until("the RCS label", || {
+        world.conversation(GRACE).filter(|row| row.topic == "RCS message")
+    });
+    world.steer("incoming grace See you at seven");
+    let original = world.arrived(GRACE, "See you at seven");
+
+    let _ = world.send_reply(GRACE, "reply-1", "On my way", Some(&original.id));
+    let sent = world.until("the reply to land", || {
+        world.messages(GRACE).into_iter().find(|message| {
+            message.text == "On my way" && message.state == SendState::Sent
+        })
+    });
+    let quote = sent.reply_to.expect("the sent reply keeps its quote");
+    assert_eq!(quote.id, original.id);
+    assert_eq!(quote.snippet, "See you at seven");
+    assert_eq!(quote.sender, "Grace Ombra");
+    world.heard(&format!("reply {GRACE} {}", original.id));
+    world.heard(&format!("send {GRACE} On my way"));
+
+    world.steer(&format!("quote grace {} I'll be there", original.id));
+    let heard = world.arrived(GRACE, "I'll be there");
+    let heard_quote = heard.reply_to.expect("the incoming reply shows its quote");
+    assert_eq!(heard_quote.id, original.id);
+    assert_eq!(heard_quote.snippet, "See you at seven");
+    assert_eq!(heard_quote.sender, "Grace Ombra");
+
+    let dir = world.dir.join("outbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("note.txt");
+    std::fs::write(&path, b"hello").unwrap();
+    match world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "reply-file".into(),
+        text: "the notes".into(),
+        reply_to: Some(original.id.clone()),
+        with: Outgoing {
+            files: vec![OutgoingFile {
+                path: path.to_string_lossy().into_owned(),
+                name: "note.txt".into(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+            }],
+            ..Outgoing::default()
+        },
+    }) {
+        Response::Sent { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    world.heard(&format!("file {GRACE} note.txt 5 the notes"));
+    world.heard(&format!("reply {GRACE} {}", original.id));
+    let filed = world.until("the file reply to land", || {
+        world.messages(GRACE).into_iter().find(|message| {
+            message.text == "the notes" && message.state == SendState::Sent
+        })
+    });
+    assert_eq!(filed.reply_to.as_ref().map(|quote| quote.id.as_str()), Some(original.id.as_str()));
+
+    world.steer("sms grace");
+    world.until("the text label", || {
+        world.conversation(GRACE).filter(|row| row.topic == "Text message")
+    });
+    let before = world.calls().iter().filter(|call| call.starts_with("reply ")).count();
+    let _ = world.send_reply(GRACE, "reply-sms", "Still coming", Some(&original.id));
+    let plain = world.until("the SMS send to land", || {
+        world.messages(GRACE).into_iter().find(|message| {
+            message.text == "Still coming" && message.state == SendState::Sent
+        })
+    });
+    assert!(plain.reply_to.is_none(), "an SMS send kept a quote the phone cannot carry: {plain:?}");
+    world.heard(&format!("send {GRACE} Still coming"));
+    let after = world.calls().iter().filter(|call| call.starts_with("reply ")).count();
+    assert_eq!(after, before, "an SMS chat was handed a reply reference: {:?}", world.calls());
 }

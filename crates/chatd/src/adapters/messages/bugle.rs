@@ -510,7 +510,7 @@ fn oldest_cursor(chats: &[Chat]) -> Option<Cursor> {
     Some(Cursor { id: oldest.id.clone(), millis: oldest.updated.saturating_mul(1000) })
 }
 
-fn send_request(conversation: &str, text: &str, tmp: &str, mine: &str) -> Vec<u8> {
+fn send_request(conversation: &str, text: &str, tmp: &str, mine: &str, reply: Option<&str>) -> Vec<u8> {
     let mut content = Buf::new();
     content.text(1, text);
     let mut info = Buf::new();
@@ -528,6 +528,12 @@ fn send_request(conversation: &str, text: &str, tmp: &str, mine: &str) -> Vec<u8
     req.text(2, conversation);
     req.msg(3, &payload.0);
     req.text(5, tmp);
+    // `SendMessageRequest.reply`, field 8: `ReplyPayload.messageID`. Absent on a plain send.
+    if let Some(id) = reply.filter(|id| !id.is_empty()) {
+        let mut quoted = Buf::new();
+        quoted.text(1, id);
+        req.msg(8, &quoted.0);
+    }
     req.0
 }
 
@@ -796,6 +802,7 @@ fn send_media_request(
     name: &str,
     mime: &str,
     size: u64,
+    reply: Option<&str>,
 ) -> Vec<u8> {
     let mut media = Buf::new();
     media.text(2, media_id);
@@ -825,6 +832,11 @@ fn send_media_request(
     req.text(2, conversation);
     req.msg(3, &payload.0);
     req.text(5, tmp);
+    if let Some(id) = reply.filter(|id| !id.is_empty()) {
+        let mut quoted = Buf::new();
+        quoted.text(1, id);
+        req.msg(8, &quoted.0);
+    }
     req.0
 }
 
@@ -958,6 +970,8 @@ pub struct Note {
     pub wire: u64,
     /// This update only turns encryption between the phones on or off. It is not a message.
     pub phones: Option<bool>,
+    /// `ReplyMessage.messageID`, field 21.1. Empty when this message is not a reply.
+    pub reply: String,
 }
 
 /// What the other side did with one of my messages, as far as the phone knows.
@@ -1014,6 +1028,13 @@ pub fn wire_tag(wire: u64, carrier: u64) -> &'static str {
         4 => "RCS",
         _ => "",
     }
+}
+
+/// A reply reference is only sent in an RCS conversation (`Conversation.type` 2). SMS, MMS,
+/// and a chat the phone has not typed stay plain: a reference there can make the phone refuse
+/// the message.
+pub fn allows_reply(carrier: u64) -> bool {
+    carrier == 2
 }
 
 /// Typing and read ticks exist on RCS. An SMS chat (carrier 1) has neither. Unknown stays on:
@@ -1502,10 +1523,10 @@ impl Session {
             .unwrap_or_default()
     }
 
-    pub fn send(&self, conversation: &str, text: &str) -> Result<String, String> {
+    pub fn send(&self, conversation: &str, text: &str, reply: Option<&str>) -> Result<String, String> {
         let mine = self.mine_of(conversation);
         let tmp = uuid();
-        let bytes = self.rpc(3, &send_request(conversation, text, &tmp, &mine), 2)?;
+        let bytes = self.rpc(3, &send_request(conversation, text, &tmp, &mine, reply), 2)?;
         refused(&bytes)?;
         Ok(tmp)
     }
@@ -1518,6 +1539,7 @@ impl Session {
         caption: &str,
         path: &str,
         name: &str,
+        reply: Option<&str>,
     ) -> Result<String, String> {
         let named = if name.is_empty() { "file" } else { name };
         let meta =
@@ -1548,6 +1570,7 @@ impl Session {
                 named,
                 &mime,
                 plain.len() as u64,
+                reply,
             ),
             2,
         )?;
@@ -2301,6 +2324,9 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             }
         }
         let reactions = decode_reactions(&msg);
+        let reply = field(&msg, 21)
+            .map(|field| field_text(&fields(&field.bytes), 1))
+            .unwrap_or_default();
         if text.is_empty()
             && file
             && pieces
@@ -2331,9 +2357,55 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             status,
             wire,
             phones: None,
+            reply,
         });
     }
     notes
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-reply`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub(super) fn prove_message_reply() -> Result<(), String> {
+    if allows_reply(1) || allows_reply(0) || !allows_reply(2) {
+        return Err("a reply was allowed outside an RCS chat".into());
+    }
+    let asked = fields(&send_request("rcs-chat", "On my way", "tmp-1", "me", Some("m-orig")));
+    let quoted = fields(&field_bytes(&asked, 8));
+    if field_text(&quoted, 1) != "m-orig" {
+        return Err("the send dropped the message it answers".into());
+    }
+    let plain = fields(&send_request("sms-chat", "On my way", "tmp-2", "me", None));
+    if field(&plain, 8).is_some() {
+        return Err("a plain send carried a reply".into());
+    }
+    let media = fields(&send_media_request(
+        "rcs-chat",
+        "",
+        "tmp-3",
+        "me",
+        "media-1",
+        &[1; 32],
+        "a.png",
+        "image/png",
+        4,
+        Some("m-orig"),
+    ));
+    if field_text(&fields(&field_bytes(&media, 8)), 1) != "m-orig" {
+        return Err("the file send dropped the message it answers".into());
+    }
+    let mut target = Buf::new();
+    target.text(1, "m-orig");
+    let mut message = Buf::new();
+    message.text(1, "m-reply");
+    message.text(7, "rcs-chat");
+    message.msg(21, &target.0);
+    let mut wrap = Buf::new();
+    wrap.msg(1, &message.0);
+    let notes = decode_messages(&wrap.0);
+    if notes.first().map(|note| note.reply.as_str()) != Some("m-orig") {
+        return Err("an incoming reply lost the message it answers".into());
+    }
+    Ok(())
 }
 
 /// The lab sets `TINYCLIENT_PROVE=messages-history`. A build from before this ignores that
@@ -2555,6 +2627,11 @@ mod tests {
         answer.msg(1, &thumbnail("p-alan", &[]));
         answer.msg(1, &thumbnail("p-odd", b"<html>"));
         assert_eq!(decode_thumbnails(&answer.0), [("p-grace".to_owned(), jpeg.to_vec())]);
+    }
+
+    #[test]
+    fn an_rcs_reply_names_the_message_it_answers_and_an_sms_send_does_not() {
+        prove_message_reply().unwrap();
     }
 
     #[test]

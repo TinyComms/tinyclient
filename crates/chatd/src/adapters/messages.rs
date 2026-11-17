@@ -16,7 +16,7 @@ use crate::store::{ConversationRow, PersonRow};
 use bugle::Chat;
 use protocol::{
     Attachment, Capabilities, Change, ConversationKind, MediaFile, MediaKind, Message, MessageKind,
-    Reaction, ReactionSet, Relation, SendState,
+    Reaction, ReactionSet, Relation, ReplyTo, SendState,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -120,13 +120,14 @@ trait Drive: Send + Sync {
     fn older_chats(&self) -> Result<Vec<Chat>, String>;
     /// True when the last inbox page was full and named a later one.
     fn inbox_continues(&self) -> bool;
-    fn send(&self, conversation: &str, text: &str) -> Result<String, String>;
+    fn send(&self, conversation: &str, text: &str, reply: Option<&str>) -> Result<String, String>;
     fn send_file(
         &self,
         conversation: &str,
         caption: &str,
         path: &str,
         name: &str,
+        reply: Option<&str>,
     ) -> Result<String, String>;
     fn react(&self, message: &str, emoji: &str, on: bool) -> Result<(), String>;
     fn fetch(
@@ -167,8 +168,8 @@ impl Drive for LiveDrive {
     fn inbox_continues(&self) -> bool {
         self.inner.inbox_continues()
     }
-    fn send(&self, conversation: &str, text: &str) -> Result<String, String> {
-        self.inner.send(conversation, text)
+    fn send(&self, conversation: &str, text: &str, reply: Option<&str>) -> Result<String, String> {
+        self.inner.send(conversation, text, reply)
     }
     fn send_file(
         &self,
@@ -176,8 +177,9 @@ impl Drive for LiveDrive {
         caption: &str,
         path: &str,
         name: &str,
+        reply: Option<&str>,
     ) -> Result<String, String> {
-        self.inner.send_file(conversation, caption, path, name)
+        self.inner.send_file(conversation, caption, path, name, reply)
     }
     fn react(&self, message: &str, emoji: &str, on: bool) -> Result<(), String> {
         self.inner.react(message, emoji, on)
@@ -280,6 +282,12 @@ pub fn prove_message_history() -> Result<(), String> {
     bugle::prove_message_history()
 }
 
+/// The lab sets `TINYCLIENT_PROVE=messages-reply`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_message_reply() -> Result<(), String> {
+    bugle::prove_message_reply()
+}
+
 /// The lab sets `TINYCLIENT_PROVE=messages-phone-quiet`. A build from before this ignores that
 /// and keeps serving, so the same driver fails there.
 pub fn prove_phone_quiet() -> Result<(), String> {
@@ -330,6 +338,8 @@ struct WaitingSend {
     path: String,
     name: String,
     since: i64,
+    /// The message this one answers, when the chat is RCS. Empty otherwise.
+    reply: Option<String>,
 }
 
 /// How far one conversation has been read this session. `started` means the phone said there
@@ -634,7 +644,7 @@ fn apply(account: &Account, event: Event) {
                 let chat = remember(account, &[chat]);
                 let _ = account.ctx.conversation(&row(&chat[0]));
             }
-            show(account, &note);
+            show(account, &note, &[]);
             nudge(account);
         }
         Event::Typing {
@@ -662,12 +672,12 @@ fn apply(account: &Account, event: Event) {
     }
 }
 
-fn show(account: &Account, note: &bugle::Note) {
+fn show(account: &Account, note: &bugle::Note, page: &[bugle::Note]) {
     if let Some(on) = note.phones {
         seal(account, &note.conversation, on);
         return;
     }
-    let _ = account.ctx.message(&note.conversation, &message(account, note));
+    let _ = account.ctx.message(&note.conversation, &message(account, note, page));
     let tag = bugle::wire_tag(note.wire, carrier_of(account, &note.conversation));
     if !tag.is_empty() {
         let mut line = Message::plain(format!("{}:kind", note.id), String::new(), tag, note.sent, false);
@@ -677,7 +687,7 @@ fn show(account: &Account, note: &bugle::Note) {
     receipt(account, &note.conversation, note);
 }
 
-fn message(account: &Account, note: &bugle::Note) -> Message {
+fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Message {
     let outgoing = note.outgoing || note.author == account.me;
     let name = if outgoing {
         account.name.clone()
@@ -699,6 +709,9 @@ fn message(account: &Account, note: &bugle::Note) -> Message {
         outgoing,
     );
     message.sender.id = author.to_owned();
+    if !note.reply.is_empty() {
+        message.reply_to = Some(quoted(account, &note.conversation, &note.reply, page));
+    }
     let mut shown = Vec::new();
     for (index, piece) in note.pieces.iter().enumerate() {
         if piece.inline.is_empty() && piece.media_id.is_empty() {
@@ -774,6 +787,48 @@ fn message(account: &Account, note: &bugle::Note) -> Message {
         }
     }
     message
+}
+
+/// The one line a reply shows. The store has the sender and the snippet. A message on the same
+/// page that is not stored yet is read from that page, so a quote is not blank until a reload.
+fn quoted(account: &Account, conversation: &str, id: &str, page: &[bugle::Note]) -> ReplyTo {
+    if let Some(stored) = account.ctx.stored_message(conversation, id).ok().flatten() {
+        let person = (!stored.sender.id.is_empty()).then(|| account.ctx.key(&stored.sender.id));
+        return ReplyTo {
+            snippet: if stored.deleted {
+                String::new()
+            } else {
+                stored.text.chars().take(120).collect()
+            },
+            id: stored.id,
+            sender: stored.sender.name,
+            person,
+            deleted: stored.deleted,
+        };
+    }
+    if let Some(note) = page.iter().find(|note| note.id == id && note.phones.is_none()) {
+        let outgoing = note.outgoing || note.author == account.me;
+        let sender = if outgoing {
+            account.name.clone()
+        } else {
+            note.name.clone()
+        };
+        let person_id = if outgoing { account.me.as_str() } else { note.author.as_str() };
+        return ReplyTo {
+            id: id.to_owned(),
+            sender,
+            snippet: note.text.chars().take(120).collect(),
+            person: (!person_id.is_empty()).then(|| account.ctx.key(person_id)),
+            deleted: false,
+        };
+    }
+    ReplyTo {
+        id: id.to_owned(),
+        sender: String::new(),
+        snippet: String::new(),
+        person: None,
+        deleted: false,
+    }
 }
 
 fn kind_of(mime: &str) -> MediaKind {
@@ -974,14 +1029,14 @@ fn serve(account: &Arc<Account>, command: Command) {
             conversation_id,
             client_id,
             text,
-            ..
-        } => post_text(account, &conversation_id, &client_id, text),
+            reply_to,
+        } => post_text(account, &conversation_id, &client_id, text, reply_to),
         Command::SendWith {
             conversation_id,
             client_id,
             text,
+            reply_to,
             with,
-            ..
         } => match with.files.as_slice() {
             [file] => {
                 warn_mms(account, &conversation_id, &client_id);
@@ -1001,9 +1056,10 @@ fn serve(account: &Arc<Account>, command: Command) {
                     text,
                     file.path.clone(),
                     name,
+                    reply_to,
                 );
             }
-            [] => post_text(account, &conversation_id, &client_id, text),
+            [] => post_text(account, &conversation_id, &client_id, text, reply_to),
             _ => ctx.sent(
                 &conversation_id,
                 &client_id,
@@ -1167,7 +1223,7 @@ fn fetch_back(account: &Account, conversation: &str, mut cursor: Option<String>,
         match ask_history(account, conversation, asked.as_deref()) {
             Ok(notes) => {
                 for note in &notes {
-                    show(account, note);
+                    show(account, note, &notes);
                 }
                 mark_up(account);
                 let moved = note_span(account, conversation, &notes, asked.as_deref());
@@ -1362,7 +1418,7 @@ fn hold(account: &Account, item: WaitingSend) {
     account.ctx.sent(&conversation, &client_id, Err(WAITING.to_owned()));
 }
 
-fn post_text(account: &Account, conversation: &str, client_id: &str, text: String) {
+fn post_text(account: &Account, conversation: &str, client_id: &str, text: String, reply: Option<String>) {
     let item = WaitingSend {
         conversation: conversation.to_owned(),
         client_id: client_id.to_owned(),
@@ -1370,6 +1426,7 @@ fn post_text(account: &Account, conversation: &str, client_id: &str, text: Strin
         path: String::new(),
         name: String::new(),
         since: crate::hub::now(),
+        reply: carried_reply(account, conversation, reply),
     };
     post(account, item);
 }
@@ -1381,6 +1438,7 @@ fn post_file(
     text: String,
     path: String,
     name: String,
+    reply: Option<String>,
 ) {
     let item = WaitingSend {
         conversation: conversation.to_owned(),
@@ -1389,8 +1447,14 @@ fn post_file(
         path,
         name,
         since: crate::hub::now(),
+        reply: carried_reply(account, conversation, reply),
     };
     post(account, item);
+}
+
+/// The reply reference, only when this chat is RCS. Anywhere else it is left off the request.
+fn carried_reply(account: &Account, conversation: &str, reply: Option<String>) -> Option<String> {
+    reply.filter(|id| !id.is_empty() && bugle::allows_reply(carrier_of(account, conversation)))
 }
 
 fn post(account: &Account, item: WaitingSend) {
@@ -1413,18 +1477,26 @@ fn post(account: &Account, item: WaitingSend) {
 }
 
 fn ask(account: &Account, item: &WaitingSend) -> Result<Message, String> {
+    let reply = item.reply.as_deref();
     if item.path.is_empty() {
         return account
             .drive
-            .send(&item.conversation, &item.text)
-            .map(|id| outgoing(account, id, item.text.clone()));
+            .send(&item.conversation, &item.text, reply)
+            .map(|id| with_reply(account, outgoing(account, id, item.text.clone()), item));
     }
     let bytes = std::fs::read(&item.path).unwrap_or_default();
     let mime = bugle::mime_of(&item.name, &bytes);
     account
         .drive
-        .send_file(&item.conversation, &item.text, &item.path, &item.name)
-        .map(|id| with_file(account, id, item.text.clone(), &item.name, mime, &bytes))
+        .send_file(&item.conversation, &item.text, &item.path, &item.name, reply)
+        .map(|id| with_reply(account, with_file(account, id, item.text.clone(), &item.name, mime, &bytes), item))
+}
+
+fn with_reply(account: &Account, mut message: Message, item: &WaitingSend) -> Message {
+    if let Some(id) = item.reply.as_deref() {
+        message.reply_to = Some(quoted(account, &item.conversation, id, &[]));
+    }
+    message
 }
 
 fn with_file(
