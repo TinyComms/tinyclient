@@ -1682,6 +1682,11 @@ fn download_headers(agent: &str, token: &str, cookie: &str, private: bool) -> Ve
     headers
 }
 
+/// What the slack-call-cards driver checks, with no workspace and no socket.
+pub(crate) fn prove_call_cards() -> Result<(), String> {
+    message::prove_call_cards()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

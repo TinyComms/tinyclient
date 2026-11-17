@@ -7,7 +7,7 @@ use protocol::{
     Attachment, Card, Forwarded, MediaFile, MediaKind, Message, MessageKind, Preview, Reaction,
     Sender, Style, ThreadSummary, CARD_FIELDS, THREAD_FACES, WAVEFORM_LIMIT,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// Subtypes Slack words itself as one line about the conversation: "@Ana has joined the channel".
 const SYSTEM: &[&str] = &[
@@ -65,6 +65,147 @@ fn huddle(room: &Value) -> String {
     } else {
         "A huddle started".to_owned()
     }
+}
+
+/// An old Slack call (`sh_room_created`) uses the same room clock as a huddle.
+fn legacy_call(room: &Value) -> String {
+    let (start, end) = (room["date_start"].as_i64().unwrap_or(0), room["date_end"].as_i64().unwrap_or(0));
+    if room["has_ended"] == true || end > 0 {
+        match (end - start) / 60 {
+            minutes if start > 0 && minutes > 0 => format!("A call happened · {minutes} min"),
+            _ => "A call happened".to_owned(),
+        }
+    } else {
+        "A call started".to_owned()
+    }
+}
+
+/// The app a `call` block names. Slack's delivered block puts `media_backend_type` on `call`
+/// or on `call.v1` (Calls API). `app_name` is used when the block already spells it.
+fn meeting_app(block: &Value) -> String {
+    let v1 = &block["call"]["v1"];
+    let raw = first(&[&v1["app_name"], &v1["media_backend_type"], &block["call"]["media_backend_type"]]).unwrap_or("");
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "zoom" => "Zoom".to_owned(),
+        "google_meet" | "google-meet" | "meet" => "Google Meet".to_owned(),
+        "microsoft_teams" | "microsoft-teams" | "teams" | "ms_teams" => "Microsoft Teams".to_owned(),
+        "webex" | "cisco_webex" | "cisco-webex" => "Webex".to_owned(),
+        "" => "Meeting".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+/// "Zoom meeting · 3 people", or "Ended · 25 min" once `date_end` is set.
+fn meeting_line(app: &str, v1: &Value) -> String {
+    let start = v1["date_start"].as_i64().unwrap_or(0);
+    let end = v1["date_end"].as_i64().unwrap_or(0);
+    if v1["has_ended"] == true || end > 0 {
+        let minutes = if start > 0 && end > start { (end - start) / 60 } else { 0 };
+        return if minutes > 0 { format!("Ended · {minutes} min") } else { "Ended".to_owned() };
+    }
+    let people = v1["active_participants"].as_array().map(Vec::len).unwrap_or(0);
+    let kind = if app == "Meeting" { "Meeting".to_owned() } else { format!("{app} meeting") };
+    match people {
+        0 => kind,
+        1 => format!("{kind} · 1 person"),
+        count => format!("{kind} · {count} people"),
+    }
+}
+
+/// A Join link for `call.v1.join_url`. Only a web address: the meeting app opens that.
+fn join_link(app: &str, v1: &Value) -> Option<Preview> {
+    let url = v1["join_url"].as_str()?;
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return None;
+    }
+    Some(Preview {
+        url: url.to_owned(),
+        site: app.to_owned(),
+        title: "Join".to_owned(),
+        description: String::new(),
+        image: None,
+    })
+}
+
+/// The first `call` block that Slack has filled in (`call.v1`). None when the block is only
+/// a `call_id` with nothing to show.
+fn meeting_from(blocks: &[Value]) -> Option<(Card, Option<Preview>)> {
+    let block = blocks.iter().find(|block| block["type"] == "call")?;
+    let v1 = &block["call"]["v1"];
+    if !v1.is_object() {
+        return None;
+    }
+    let app = meeting_app(block);
+    let card = Card {
+        title: first(&[&v1["name"]]).unwrap_or("Call").to_owned(),
+        text: meeting_line(&app, v1),
+        ..Card::default()
+    };
+    Some((card, join_link(&app, v1)))
+}
+
+/// What the slack-call-cards driver checks, with no workspace and no socket.
+pub(super) fn prove_call_cards() -> Result<(), String> {
+    let started = 1_700_000_000_i64;
+    let zoom = json!({
+        "blocks": [{
+            "type": "call", "call_id": "R0ZOOM",
+            "call": {
+                "media_backend_type": "zoom",
+                "v1": {
+                    "name": "Standup", "join_url": "https://zoom.us/j/123456789", "date_start": started,
+                    "active_participants": [{}, {}, {}],
+                },
+            },
+        }],
+    });
+    let (card, join) = meeting_from(zoom["blocks"].as_array().unwrap()).ok_or("a Zoom call was not a card")?;
+    if card.title != "Standup" || card.text != "Zoom meeting · 3 people" {
+        return Err(format!("Zoom card was {} / {}", card.title, card.text));
+    }
+    let join = join.ok_or("a Zoom call had no Join link")?;
+    if join.title != "Join" || join.url != "https://zoom.us/j/123456789" {
+        return Err(format!("Join was {} {}", join.title, join.url));
+    }
+    let ended = json!({
+        "blocks": [{
+            "type": "call",
+            "call": { "media_backend_type": "google_meet", "v1": { "name": "Planning", "date_start": started, "date_end": started + 25 * 60 } },
+        }],
+    });
+    let (card, _) = meeting_from(ended["blocks"].as_array().unwrap()).ok_or("an ended call was not a card")?;
+    if card.text != "Ended · 25 min" {
+        return Err(format!("ended call said {}", card.text));
+    }
+    let teams = json!({
+        "blocks": [{
+            "type": "call",
+            "call": { "v1": { "media_backend_type": "microsoft_teams", "name": "Review", "date_start": started, "active_participants": [{}] } },
+        }],
+    });
+    let (card, _) = meeting_from(teams["blocks"].as_array().unwrap()).ok_or("a Teams call was not a card")?;
+    if card.text != "Microsoft Teams meeting · 1 person" {
+        return Err(format!("Teams call said {}", card.text));
+    }
+    let webex = json!({
+        "blocks": [{ "type": "call", "call": { "v1": { "media_backend_type": "webex", "name": "Sync", "date_start": started } } }],
+    });
+    let (card, _) = meeting_from(webex["blocks"].as_array().unwrap()).ok_or("a Webex call was not a card")?;
+    if card.text != "Webex meeting" {
+        return Err(format!("Webex call said {}", card.text));
+    }
+    if meeting_from(&[json!({"type": "call", "call_id": "R0"})]).is_some() {
+        return Err("a call id with no v1 invented a card".to_owned());
+    }
+    let room = json!({"date_start": started, "date_end": started + 25 * 60, "has_ended": true});
+    let line = legacy_call(&room);
+    if line != "A call happened · 25 min" {
+        return Err(format!("an old call said {line}"));
+    }
+    if huddle(&room) != "A huddle happened · 25 min" {
+        return Err("a huddle was renamed".to_owned());
+    }
+    Ok(())
 }
 
 impl Names for Slack {
@@ -492,7 +633,8 @@ impl Slack {
         let mut rich = Rich::new(self);
         let system = subtype.is_some_and(|subtype| SYSTEM.contains(&subtype));
         if event["room"].is_object() {
-            rich.text = huddle(&event["room"]);
+            // `sh_room_created` is an old Slack call. A huddle uses the same room object.
+            rich.text = if subtype == Some("sh_room_created") { legacy_call(&event["room"]) } else { huddle(&event["room"]) };
         } else if !event["blocks"].as_array().is_some_and(|blocks| rich.blocks(blocks)) {
             rich.mrkdwn(event["text"].as_str().unwrap_or(""));
         }
@@ -512,6 +654,15 @@ impl Slack {
                     None => self.card(card, &mut rich),
                 },
                 None => self.card(card, &mut rich),
+            }
+        }
+        if framed.is_none() {
+            if let Some(blocks) = event["blocks"].as_array() {
+                if let Some((mut card, join)) = meeting_from(blocks) {
+                    card.title = self.words(&card.title);
+                    framed = Some(Box::new(card));
+                    previews.extend(join);
+                }
             }
         }
         for file in event["files"].as_array().into_iter().flatten() {

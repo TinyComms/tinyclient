@@ -568,6 +568,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-messages-delete:0");
         return Ok(());
     }
+    // The lab's slack-call-cards driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("slack-call-cards") {
+        if let Err(err) = chatd::adapters::prove_slack_call_cards() {
+            eprintln!("slack-call-cards: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-slack-call-cards:0");
+        return Ok(());
+    }
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());
     protocol::crash::install_panic_hook("chatd");
     let dir = protocol::support_dir();

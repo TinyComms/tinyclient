@@ -197,6 +197,8 @@ impl<'a> Rich<'a> {
                     self.text.push_str(&format!("[image: {}]", label.unwrap_or("untitled")));
                 }
                 "divider" => {}
+                // A meeting card (`call`). Drawn as a card with a Join link, not as buttons.
+                "call" => {}
                 _ => self.undrawn = true,
             }
         }
