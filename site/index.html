@@ -272,15 +272,16 @@
   <div class="wrap">
     <p class="kicker center reveal">Privacy</p>
     <h2 id="flow-title" class="center reveal">Your messages go to the network. Nowhere&nbsp;else.</h2>
+    <p class="lede center reveal">tinyclient sends us nothing: no telemetry, no analytics, no crash upload. It leaves out the usage tracking the official apps carry,&nbsp;too.</p>
     <figure class="flow reveal" id="flow">
       <svg class="fl-defs" width="0" height="0" aria-hidden="true" focusable="false"><defs><symbol id="fl-lock" viewBox="0 0 14 16"><path class="fl-lock-shackle" d="M3.5 7V4.8a3.5 3.5 0 0 1 7 0V7"/><rect class="fl-lock-body" x="1.5" y="7" width="11" height="8" rx="2"/></symbol></defs></svg>
-<svg class="fl fl-wide" viewBox="0 0 960 500" role="img" aria-labelledby="fl-title fl-desc">
+<svg class="fl fl-wide" viewBox="0 0 960 544" role="img" aria-labelledby="fl-title fl-desc">
 <title id="fl-title">Where your messages go</title>
-<desc id="fl-desc">On your computer, the tinyclient window talks to chatd over a local socket. chatd is always on, keeps messages and media on your disk and sessions in the system keychain, and connects directly, over encrypted connections, to Slack, Discord, Telegram, Microsoft Teams, Signal and Android Messages. mediad starts only during a call, or to play a sound, and connects to Discord's voice servers or to a Tiny server you run; tinyclient-login starts only to sign in and shows the network's own sign-in page. There is no tinyclient server in between.</desc>
-<g class="fl-ghost"><rect x="628" y="6" width="190" height="40" rx="10"/><text class="fl-s" x="723" y="31" text-anchor="middle">tinyclient server</text><path class="fl-strike" d="M640 40 L806 12"/></g>
-<text class="fl-f fl-ghost-note" x="723" y="60" text-anchor="middle">NONE. NOTHING IN BETWEEN.</text>
-<rect class="fl-zone" x="16" y="74" width="680" height="410" rx="18"/><text class="fl-f" x="38" y="102">YOUR COMPUTER</text>
-<rect class="fl-zone-out" x="744" y="74" width="200" height="410" rx="18"/><text class="fl-f" x="764" y="100">THE NETWORKS</text>
+<desc id="fl-desc">On your computer, the tinyclient window talks to chatd over a local socket. chatd is always on, keeps messages and media on your disk and sessions in the system keychain, and connects directly, over encrypted connections, to Slack, Discord, Telegram, Microsoft Teams, Signal, Android Messages, and any Tiny server you add, which its owner runs. mediad starts only during a call, or to play a sound, and connects to Discord's voice servers or to a Tiny server you run; tinyclient-login starts only to sign in and shows the network's own sign-in page. Nothing goes to the tinyclient project: no telemetry, no analytics and no crash upload, and none of the usage tracking the official apps carry.</desc>
+<g class="fl-ghost"><rect x="560" y="6" width="290" height="40" rx="10"/><text class="fl-s" x="705" y="31" text-anchor="middle">telemetry · analytics · crash upload</text><path class="fl-strike" d="M572 40 L838 12"/></g>
+<text class="fl-f fl-ghost-note" x="705" y="60" text-anchor="middle">NONE. NOTHING IS SENT TO US.</text>
+<rect class="fl-zone" x="16" y="74" width="680" height="454" rx="18"/><text class="fl-f" x="38" y="102">YOUR COMPUTER</text>
+<rect class="fl-zone-out" x="744" y="74" width="200" height="454" rx="18"/><text class="fl-f" x="764" y="100">THE NETWORKS</text>
 <path class="fl-wire" d="M220 260 H290"/>
 <text class="fl-lbl" x="255" y="248" text-anchor="middle">socket</text>
 <path class="fl-wire" d="M390 330 V380"/>
@@ -290,6 +291,7 @@
 <path class="fl-wire fl-tls" d="M490 260 C 610 260, 640 309, 764 309"/>
 <path class="fl-wire fl-tls" d="M490 260 C 610 260, 640 353, 764 353"/>
 <path class="fl-wire fl-tls" d="M490 260 C 610 260, 640 397, 764 397"/>
+<path class="fl-wire fl-tls" d="M490 260 C 610 260, 640 441, 764 441"/>
 <g class="fl-node"><rect x="40" y="214" width="180" height="92" rx="12"/><circle class="fl-dot r" cx="56" cy="230" r="3.5"/><circle class="fl-dot y" cx="67" cy="230" r="3.5"/><circle class="fl-dot g" cx="78" cy="230" r="3.5"/><text class="fl-t" x="58" y="266">tinyclient</text><text class="fl-s" x="58" y="288">the window</text></g>
 <rect class="fl-ring" x="290" y="190" width="200" height="140" rx="12"/>
 <g class="fl-node fl-core"><rect x="290" y="190" width="200" height="140" rx="12"/><circle class="fl-live" cx="470" cy="210" r="4"/><text class="fl-t" x="310" y="224">chatd</text><text class="fl-s" x="310" y="248">Always on. One adapter</text><text class="fl-s" x="310" y="268">per network you use.</text><text class="fl-f" x="310" y="310">NO AUDIO · NO WEB VIEWS</text></g>
@@ -301,13 +303,15 @@
 <g class="fl-net"><rect x="764" y="292" width="166" height="34" rx="9"/><image href="assets/networks/microsoft-teams.svg" x="774" y="300" width="18" height="18"/><text class="fl-s fl-on" x="800" y="314">Microsoft Teams</text></g>
 <g class="fl-net"><rect x="764" y="336" width="166" height="34" rx="9"/><image href="assets/networks/signal.svg" x="774" y="344" width="18" height="18"/><text class="fl-s fl-on" x="800" y="358">Signal</text></g>
 <g class="fl-net"><rect x="764" y="380" width="166" height="34" rx="9"/><image href="assets/networks/messages.svg" x="774" y="388" width="18" height="18"/><text class="fl-s fl-on" x="800" y="402">Messages</text></g>
-<g class="fl-net fl-net-signin"><rect x="764" y="424" width="166" height="34" rx="9"/><text class="fl-s fl-on" x="776" y="446">Sign-in page</text></g>
+<g class="fl-net"><rect x="764" y="424" width="166" height="34" rx="9"/><image href="assets/networks/tiny.svg" x="774" y="432" width="18" height="18"/><text class="fl-s fl-on" x="800" y="446">Tiny server</text></g>
+<g class="fl-net fl-net-signin"><rect x="764" y="468" width="166" height="34" rx="9"/><text class="fl-s fl-on" x="776" y="490">Sign-in page</text></g>
 <g class="fl-lockat"><use href="#fl-lock" x="721" y="169" width="14" height="16"/></g>
 <g class="fl-lockat"><use href="#fl-lock" x="721" y="213" width="14" height="16"/></g>
 <g class="fl-lockat"><use href="#fl-lock" x="721" y="257" width="14" height="16"/></g>
 <g class="fl-lockat"><use href="#fl-lock" x="721" y="301" width="14" height="16"/></g>
 <g class="fl-lockat"><use href="#fl-lock" x="721" y="345" width="14" height="16"/></g>
 <g class="fl-lockat"><use href="#fl-lock" x="721" y="389" width="14" height="16"/></g>
+<g class="fl-lockat"><use href="#fl-lock" x="721" y="433" width="14" height="16"/></g>
 <path class="fl-pkt fl-sock" pathLength="100" d="M220 260 H290"/>
 <path class="fl-pkt fl-sock back" pathLength="100" d="M220 260 H290"/>
 <path class="fl-pkt n-slack d0" pathLength="100" d="M490 260 C 610 260, 640 177, 764 177"/>
@@ -322,6 +326,8 @@
 <path class="fl-pkt back n-signal b4" pathLength="100" d="M490 260 C 610 260, 640 353, 764 353"/>
 <path class="fl-pkt n-messages d5" pathLength="100" d="M490 260 C 610 260, 640 397, 764 397"/>
 <path class="fl-pkt back n-messages b5" pathLength="100" d="M490 260 C 610 260, 640 397, 764 397"/>
+<path class="fl-pkt n-tiny d6" pathLength="100" d="M490 260 C 610 260, 640 441, 764 441"/>
+<path class="fl-pkt back n-tiny b6" pathLength="100" d="M490 260 C 610 260, 640 441, 764 441"/>
 <g class="fl-eph fl-call">
 <path class="fl-wire fl-temp" d="M490 220 H514 V135 H540"/><path class="fl-wire fl-tls" d="M684 135 C 720 135, 728 131, 764 131"/>
 <g class="fl-node fl-temp-node"><rect x="540" y="100" width="144" height="70" rx="12"/><text class="fl-t sm" x="556" y="128">mediad</text><text class="fl-s" x="556" y="150">during a call</text>
@@ -335,16 +341,16 @@
 <path class="fl-pkt fl-voice" pathLength="100" d="M684 135 C 720 135, 728 131, 764 131"/><path class="fl-pkt fl-voice back" pathLength="100" d="M684 135 C 720 135, 728 131, 764 131"/>
 </g>
 <g class="fl-eph fl-signin">
-<path class="fl-wire fl-temp" d="M490 300 H514 V427 H540"/><path class="fl-wire fl-tls" d="M684 427 C 720 427, 728 441, 764 441"/>
-<g class="fl-node fl-temp-node"><rect x="540" y="392" width="144" height="70" rx="12"/><text class="fl-t xs" x="554" y="420">tinyclient-login</text><text class="fl-s" x="554" y="442">only to sign in</text></g>
-<g class="fl-lockat"><use href="#fl-lock" x="721" y="429" width="14" height="16"/></g>
-<path class="fl-pkt fl-login" pathLength="100" d="M684 427 C 720 427, 728 441, 764 441"/><path class="fl-pkt fl-login back" pathLength="100" d="M684 427 C 720 427, 728 441, 764 441"/>
+<path class="fl-wire fl-temp" d="M490 300 H514 V471 H540"/><path class="fl-wire fl-tls" d="M684 471 C 720 471, 728 485, 764 485"/>
+<g class="fl-node fl-temp-node"><rect x="540" y="436" width="144" height="70" rx="12"/><text class="fl-t xs" x="554" y="464">tinyclient-login</text><text class="fl-s" x="554" y="486">only to sign in</text></g>
+<g class="fl-lockat"><use href="#fl-lock" x="721" y="473" width="14" height="16"/></g>
+<path class="fl-pkt fl-login" pathLength="100" d="M684 471 C 720 471, 728 485, 764 485"/><path class="fl-pkt fl-login back" pathLength="100" d="M684 471 C 720 471, 728 485, 764 485"/>
 </g>
 </svg>
-<svg class="fl fl-narrow" viewBox="0 0 360 726" role="img" aria-labelledby="fl-title-n fl-desc-n">
+<svg class="fl fl-narrow" viewBox="0 0 360 770" role="img" aria-labelledby="fl-title-n fl-desc-n">
 <title id="fl-title-n">Where your messages go</title>
-<desc id="fl-desc-n">The tinyclient window talks to chatd on your computer. chatd keeps your messages on your disk and your sessions in the keychain, and connects directly and encrypted to Slack, Discord, Telegram, Microsoft Teams, Signal and Android Messages. A call starts mediad; a sign-in starts tinyclient-login. A Tiny server is yours, if you add one. There is no tinyclient server in between.</desc>
-<g class="fl-ghost"><rect x="96" y="6" width="168" height="36" rx="10"/><text class="fl-s" x="180" y="29" text-anchor="middle">tinyclient server</text><path class="fl-strike" d="M108 36 L252 12"/></g>
+<desc id="fl-desc-n">The tinyclient window talks to chatd on your computer. chatd keeps your messages on your disk and your sessions in the keychain, and connects directly and encrypted to Slack, Discord, Telegram, Microsoft Teams, Signal, Android Messages, and any Tiny server you add, which its owner runs. A call starts mediad; a sign-in starts tinyclient-login. Nothing goes to the tinyclient project: no telemetry, no analytics and no crash upload.</desc>
+<g class="fl-ghost"><rect x="56" y="6" width="248" height="36" rx="10"/><text class="fl-s" x="180" y="29" text-anchor="middle">telemetry · analytics · crash upload</text><path class="fl-strike" d="M68 36 L292 12"/></g>
 <rect class="fl-zone" x="6" y="58" width="348" height="420" rx="16"/><text class="fl-f" x="24" y="84">YOUR COMPUTER</text>
 <path class="fl-wire" d="M98 168 V204"/>
 <path class="fl-wire" d="M98 300 V336"/>
@@ -361,7 +367,7 @@
 <rect class="fl-bar w4" x="324" y="124" width="3" height="20" rx="1.5"/>
 </g></g>
 <g class="fl-eph fl-signin"><path class="fl-wire fl-temp" d="M262 300 V336"/><g class="fl-node fl-temp-node"><rect x="190" y="336" width="148" height="68" rx="12"/><text class="fl-t xs" x="202" y="364">tinyclient-login</text><text class="fl-s" x="202" y="386">only to sign in</text></g></g>
-<rect class="fl-zone-out" x="6" y="500" width="348" height="222" rx="16"/><text class="fl-f" x="24" y="526">THE NETWORKS</text>
+<rect class="fl-zone-out" x="6" y="500" width="348" height="266" rx="16"/><text class="fl-f" x="24" y="526">THE NETWORKS</text>
 <g class="fl-lockat"><use href="#fl-lock" x="175" y="481" width="14" height="16"/></g>
 <g class="fl-net"><rect x="22" y="540" width="152" height="34" rx="9"/><image href="assets/networks/slack.svg" x="32" y="548" width="18" height="18"/><text class="fl-s fl-on" x="58" y="562">Slack</text></g>
 <g class="fl-net"><rect x="186" y="540" width="152" height="34" rx="9"/><image href="assets/networks/discord.svg" x="196" y="548" width="18" height="18"/><text class="fl-s fl-on" x="222" y="562">Discord</text></g>
@@ -371,6 +377,7 @@
 <g class="fl-net fl-net-call"><rect x="186" y="628" width="152" height="34" rx="9"/><image href="assets/networks/discord.svg" x="196" y="636" width="18" height="18"/><text class="fl-s fl-on" x="222" y="650">Discord voice</text></g>
 <g class="fl-net fl-net-signin"><rect x="22" y="672" width="152" height="34" rx="9"/><text class="fl-s fl-on" x="34" y="694">Sign-in page</text></g>
 <g class="fl-net"><rect x="186" y="672" width="152" height="34" rx="9"/><image href="assets/networks/messages.svg" x="196" y="680" width="18" height="18"/><text class="fl-s fl-on" x="222" y="694">Messages</text></g>
+<g class="fl-net"><rect x="22" y="716" width="152" height="34" rx="9"/><image href="assets/networks/tiny.svg" x="32" y="724" width="18" height="18"/><text class="fl-s fl-on" x="58" y="738">Tiny server</text></g>
 <path class="fl-pkt fl-sock" pathLength="100" d="M98 168 V204"/><path class="fl-pkt fl-sock back" pathLength="100" d="M98 168 V204"/>
 <path class="fl-pkt n-slack d0" pathLength="100" d="M182 300 V500"/>
 <path class="fl-pkt back n-slack b0" pathLength="100" d="M182 300 V500"/>
@@ -386,8 +393,8 @@
       <figcaption class="flow-cap"><span class="fl-key"><i class="k-solid"></i>always running</span><span class="fl-key"><i class="k-dash"></i>only while needed</span><span class="fl-key"><svg viewBox="0 0 14 16" aria-hidden="true"><use href="#fl-lock"/></svg>encrypted to the network</span></figcaption>
     </figure>
     <ul class="trio">
-      <li><span class="tico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/><path d="M2 2l20 20"/></svg></span>No tinyclient server</li>
-      <li><span class="tico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/><path d="M2 2l20 20"/></svg></span>No telemetry</li>
+      <li><span class="tico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/><path d="M2 2l20 20"/></svg></span>Nothing sent to us</li>
+      <li><span class="tico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/><path d="M2 2l20 20"/></svg></span>No telemetry or analytics</li>
       <li><span class="tico" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M17 6l3 3M14 9l2 2"/></svg></span>Keys in your keychain</li>
     </ul>
     <p class="more center"><a href="docs/privacy.html">How we handle your data →</a></p>
