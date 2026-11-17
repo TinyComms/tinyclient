@@ -1120,3 +1120,36 @@ fn a_text_deleted_on_the_phone_leaves_and_delete_reaches_the_phone() {
         Some(_) => None,
     });
 }
+
+#[test]
+fn a_video_is_a_video_and_a_voice_note_has_a_waveform() {
+    chatd::adapters::messages::prove_message_media().expect("a video and a voice note");
+    let world = World::linked();
+    world.connected();
+
+    world.steer("video grace");
+    let clip = world.arrived(GRACE, "clip");
+    let video = &clip.attachments[0];
+    assert_eq!(video.file.kind, MediaKind::Video);
+    assert_eq!(video.duration, 2);
+    assert!(video.thumb.is_none());
+    assert!(video.waveform.is_empty());
+    assert!(video.file.path.is_some());
+
+    world.steer("poster grace");
+    let poster = world.arrived(GRACE, "poster");
+    let shown = &poster.attachments[0];
+    assert_eq!(shown.file.kind, MediaKind::Video);
+    let thumb = shown.thumb.as_ref().expect("the still is the poster");
+    assert_eq!(thumb.kind, MediaKind::Image);
+    assert!(thumb.path.is_some());
+    assert!(shown.file.path.is_none());
+
+    world.steer("voice grace");
+    let voice = world.arrived(GRACE, "voice");
+    let note = &voice.attachments[0];
+    assert_eq!(note.file.kind, MediaKind::Audio);
+    assert_eq!(note.mime, "audio/amr");
+    assert_eq!(note.duration, 1);
+    assert!(note.waveform.iter().any(|bar| *bar != 0));
+}
