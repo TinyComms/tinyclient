@@ -465,6 +465,7 @@ impl MemberList {
                         .text_color(if away { theme::text_faint() } else if phone { theme::text() } else { theme::text_soft() })
                         .child(person.name.clone()),
                 )
+                .when(person.title == "Owner", |row| row.child(div().flex_none().type_small().text_color(theme::text_faint()).child("Owner")))
                 .when(person.bot, |row| row.child(super::list::bot_tag())),
         )
     }

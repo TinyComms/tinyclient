@@ -191,6 +191,60 @@ struct Resumable {
     url: String,
 }
 
+/// One group DM. `recipients` are the other people. A named group keeps its title when they change.
+pub(super) struct GroupDm {
+    pub owner: String,
+    pub recipients: Vec<String>,
+    pub named: bool,
+}
+
+/// Everyone in a group, in list order: the other people, then us. The owner is the second value.
+pub(super) fn group_seats(me: &str, owner: &str, recipients: &[String]) -> Vec<(String, bool)> {
+    let mut ids: Vec<String> = recipients.iter().filter(|id| !id.is_empty() && id.as_str() != me).cloned().collect();
+    if !me.is_empty() {
+        ids.push(me.to_owned());
+    }
+    ids.into_iter().map(|id| (id.clone(), !owner.is_empty() && id == owner)).collect()
+}
+
+/// `TINYCLIENT_PROVE=discord-group-members`. A four-person group lists four, and one leaving leaves three.
+pub(super) fn prove_group_dm() -> Result<(), String> {
+    let four = ["2001".to_owned(), "2002".to_owned(), "2006".to_owned()];
+    let seats = group_seats("1000", "2001", &four);
+    if seats.len() != 4 || !seats[0].1 || seats[3].0 != "1000" {
+        return Err("a four-person group lists the others and then us, and marks the owner".to_owned());
+    }
+    let three = ["2001".to_owned(), "2002".to_owned()];
+    if group_seats("1000", "2001", &three).len() == 3 {
+        Ok(())
+    } else {
+        Err("someone leaving leaves three".to_owned())
+    }
+}
+
+/// A stored row with a new title, keeping what a group DM was already showing.
+pub(super) fn renamed(known: &protocol::Conversation, title: &str) -> crate::store::ConversationRow {
+    let mut row = crate::store::ConversationRow::new(&known.key.id, known.kind, title);
+    row.space = known.space.clone();
+    row.group = known.group.clone();
+    row.position = known.position;
+    row.avatar = known.avatar.as_ref().map(|file| file.id.clone());
+    row.peer = known.peer.clone();
+    row.call = known.call;
+    row.topic = known.topic.clone();
+    row.parent = known.parent.clone();
+    row.root = known.root.clone();
+    row.read_only = known.read_only;
+    row.private = known.private;
+    row.bot = known.bot;
+    row.meeting = known.meeting;
+    row.special = known.special;
+    row.mark = known.mark;
+    row.opted_out = known.opted_out;
+    row.limit = known.limit;
+    row
+}
+
 /// Everything the adapter remembers. All of it is bounded by what the user owns or has on screen.
 #[derive(Default)]
 struct State {
@@ -206,6 +260,8 @@ struct State {
     directs: HashMap<String, String>,
     /// Every direct and group conversation's id, to apply a changed mute setting to.
     privates: HashSet<String>,
+    /// Group DMs by channel id: who is in them, for the member list.
+    groups: HashMap<String, GroupDm>,
     quiet_directs: Quiet,
     /// Friends' presence, replayed after a resume because chatd forgets it when the link drops.
     presence: HashMap<String, (Presence, String)>,

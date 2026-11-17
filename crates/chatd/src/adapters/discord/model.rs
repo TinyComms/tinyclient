@@ -294,6 +294,9 @@ pub struct Channel {
     pub recipients: Vec<User>,
     #[serde(default)]
     pub recipient_ids: Vec<String>,
+    /// Who owns a group DM.
+    #[serde(default)]
+    pub owner_id: Option<String>,
     #[serde(default)]
     pub icon: Option<String>,
     #[serde(default)]
