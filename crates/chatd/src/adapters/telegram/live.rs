@@ -467,10 +467,9 @@ pub(super) fn apply(account: &Account, update: &Update) {
                 }
             }
         }
-        // Outside a channel a deletion names the messages and not their chat.
-        // CONTRACT: the store cannot be asked which conversation holds a message, so only
-        // messages seen since this connection began are found; an older one goes when its
-        // conversation is next opened and the page shows it missing.
+        // Outside a channel a deletion names the messages and not their chat. The chat is
+        // the one this connection saw, or the note written when the message arrived, which
+        // outlives a reconnect. A channel that is not a forum names itself.
         Update::DeleteMessages(gone) => {
             for chat in &mut account.pending().chats {
                 if matches!(chat.peer, Who::Group(_)) {
@@ -482,6 +481,7 @@ pub(super) fn apply(account: &Account, update: &Update) {
                     if !drop_member(account, &conversation, *id) {
                         let _ = account.ctx.deleted(&conversation, &id.to_string());
                     }
+                    account.forget_placed(None, *id);
                 }
             }
         }
@@ -496,6 +496,9 @@ pub(super) fn apply(account: &Account, update: &Update) {
                 if let Some(conversation) = conversation {
                     if !drop_member(account, &conversation, *id) {
                         let _ = account.ctx.deleted(&conversation, &id.to_string());
+                    }
+                    if forum {
+                        account.forget_placed(Some(who), *id);
                     }
                 }
             }

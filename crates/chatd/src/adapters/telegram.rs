@@ -359,12 +359,14 @@ impl Account {
         self.dir().input_channel(who).ok_or_else(|| Fault::Rpc { code: 400, name: "CHANNEL_INVALID".to_owned(), value: None })
     }
 
-    /// Remembers where a message is.
+    /// Remembers where a message is, in this connection and in a note that outlives it.
     fn place(&self, who: Who, message: i32, conversation: &str) {
         // A channel that is not a forum says where its messages are by itself.
         if matches!(who, Who::Channel(_)) && !conversation.contains('_') {
             return;
         }
+        let channel = matches!(who, Who::Channel(_)).then(|| who.text());
+        self.ctx.set_note(&message_note(channel.as_deref(), message), conversation);
         let mut live = self.live();
         if live.placed.len() >= PLACED {
             live.placed.pop_front();
@@ -373,12 +375,34 @@ impl Account {
     }
 
     fn placed(&self, who: Option<Who>, message: i32) -> Option<String> {
-        let live = self.live();
-        let found = live.placed.iter().rev().find(|((peer, id), _)| *id == message && match who {
-            Some(who) => *peer == who,
-            None => !matches!(peer, Who::Channel(_)),
+        let memory = {
+            let live = self.live();
+            live.placed.iter().rev().find(|((peer, id), _)| *id == message && match who {
+                Some(who) => *peer == who,
+                None => !matches!(peer, Who::Channel(_)),
+            }).map(|(_, conversation)| conversation.clone())
+        };
+        let channel = match who {
+            Some(Who::Channel(_)) => who.map(|who| who.text()),
+            _ => None,
+        };
+        remembered(memory.as_deref(), self.ctx.note(&message_note(channel.as_deref(), message)).as_deref())
+    }
+
+    /// The id was deleted, so a later message must not inherit its chat.
+    fn forget_placed(&self, who: Option<Who>, message: i32) {
+        let channel = match who {
+            Some(Who::Channel(_)) => who.map(|who| who.text()),
+            _ => None,
+        };
+        self.ctx.set_note(&message_note(channel.as_deref(), message), "");
+        let mut live = self.live();
+        live.placed.retain(|((peer, id), _)| {
+            !(*id == message && match who {
+                Some(who) => *peer == who,
+                None => !matches!(peer, Who::Channel(_)),
+            })
         });
-        found.map(|(_, conversation)| conversation.clone())
     }
 
     /// Writes the session out again when a key was made for another datacenter. The stored
@@ -409,6 +433,41 @@ impl Account {
 
 fn refused(fault: Fault) -> Refusal {
     Refusal::Refused(fault.words())
+}
+
+/// The note a message's conversation is kept under. A private chat and a basic group share
+/// one id space, so the id is enough. A channel's ids are its own.
+pub(super) fn message_note(who: Option<&str>, message: i32) -> String {
+    match who {
+        Some(who) => format!("tg-msg:{who}:{message}"),
+        None => format!("tg-msg:{message}"),
+    }
+}
+
+/// The conversation a message was seen in. This connection wins. An empty note was cleared.
+pub(super) fn remembered(memory: Option<&str>, note: Option<&str>) -> Option<String> {
+    let kept = |place: Option<&str>| place.filter(|place| !place.is_empty()).map(str::to_owned);
+    kept(memory).or_else(|| kept(note))
+}
+
+/// The lab's telegram-delete-placed driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_delete_placed() -> Result<(), String> {
+    if message_note(None, 13) != "tg-msg:13" {
+        return Err("a private message is remembered by its id".to_owned());
+    }
+    if message_note(Some("c9002"), 41) != "tg-msg:c9002:41" {
+        return Err("a channel message is remembered with its channel".to_owned());
+    }
+    if remembered(None, Some("u7002")).as_deref() != Some("u7002") {
+        return Err("a note finds the chat after a reconnect".to_owned());
+    }
+    if remembered(Some("u7002"), Some("")).as_deref() != Some("u7002") {
+        return Err("this connection's place wins over a cleared note".to_owned());
+    }
+    if remembered(None, Some("")).is_some() {
+        return Err("a cleared note is not a chat".to_owned());
+    }
+    Ok(())
 }
 
 /// A user's last-seen as the contract's presence. Where Telegram hides the time ("recently",
@@ -934,6 +993,11 @@ fn delete(account: &Account, conversation: &str, message: &str) -> Result<(), Fa
         }
     }
     let _ = account.ctx.deleted(conversation, message);
+    let noted = match who {
+        Who::Channel(_) => Some(who),
+        _ => None,
+    };
+    account.forget_placed(noted, id);
     Ok(())
 }
 
