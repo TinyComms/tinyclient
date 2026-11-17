@@ -765,10 +765,10 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     // The cloud draft rides the dialog: what the phone left on this chat shows on its row as
     // "Draft:", and a draft the phone dropped is dropped here too. An empty one clears.
     let draft_text = match &dialog.draft {
-        Some(tl::enums::DraftMessage::Message(draft)) => draft.message.as_str(),
-        _ => "",
+        Some(tl::enums::DraftMessage::Message(draft)) => content::draft_text(&draft.message, draft.entities.as_deref()),
+        _ => String::new(),
     };
-    let _ = account.ctx.draft(&id, draft_text);
+    let _ = account.ctx.draft(&id, &draft_text);
     // ✓✓: the other side read my messages up to here. Not for my own notes or a broadcast.
     if dialog.read_outbox_max_id > 0 && who != Who::User(account.me) && !known.broadcast {
         let _ = account.ctx.seen(&id, &dialog.read_outbox_max_id.to_string());

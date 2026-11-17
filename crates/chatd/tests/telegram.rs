@@ -2164,3 +2164,31 @@ fn conversation_search_keeps_the_telegram_forum_topic_scope() {
     assert_eq!(hits[0].message_id, "41");
     assert_eq!(world.called("SearchText c9002 wrench topic=Some(31)"), 1);
 }
+
+#[test]
+fn markers_are_sent_as_entities_and_an_edit_keeps_the_bold() {
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+    world.send("u7002", "5321", "**hi** _there_", None);
+    let sent = world.until("the marked message", || {
+        world.messages("u7002").into_iter().find(|message| message.text == "hi there" && message.state == SendState::Sent)
+    });
+    assert_eq!(ranges(&sent), vec![("hi", &Style::Bold), ("there", &Style::Italic)]);
+    assert!(
+        world.calls().iter().any(|call| call.contains("SendMessage u7002 hi there") && call.contains("bold:0+2") && call.contains("italic:3+5")),
+        "{:?}",
+        world.calls()
+    );
+    assert_eq!(
+        world.ask(Request::Edit { conversation: key("u7002"), message_id: sent.id.clone(), text: "hi there".into() }),
+        Response::Ok
+    );
+    let edited = world.until("the edit to keep the bold", || world.message("u7002", &sent.id).filter(|message| message.edited));
+    assert!(ranges(&edited).iter().any(|(text, style)| *text == "hi" && **style == Style::Bold));
+    assert!(
+        world.calls().iter().any(|call| call.contains(&format!("EditMessage u7002 {}", sent.id)) && call.contains("bold:0+2")),
+        "{:?}",
+        world.calls()
+    );
+}

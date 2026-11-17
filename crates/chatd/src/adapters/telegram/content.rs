@@ -130,6 +130,349 @@ pub fn spans(text: &str, entities: &[MessageEntity]) -> Vec<Span> {
     spans
 }
 
+/// Where `byte` sits in UTF-16 units. Both halves of a pair share a byte, so the first is used.
+fn utf16_index(map: &[u32], byte: u32) -> Option<i32> {
+    let index = map.iter().position(|&at| at == byte)?;
+    i32::try_from(index).ok()
+}
+
+fn span_fits(text: &str, span: &Span) -> bool {
+    let start = span.start as usize;
+    let end = span.end as usize;
+    end <= text.len() && start < end && text.is_char_boundary(start) && text.is_char_boundary(end)
+}
+
+/// Styled ranges as Telegram's entities. Offsets are UTF-16 units, the way Telegram counts.
+/// A span that does not sit on the text is dropped.
+pub fn entities_of(text: &str, spans: &[Span]) -> Vec<MessageEntity> {
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    let map = utf16_map(text);
+    let mut entities = Vec::with_capacity(spans.len());
+    for span in spans {
+        if !span_fits(text, span) {
+            continue;
+        }
+        let (Some(offset), Some(end)) = (utf16_index(&map, span.start), utf16_index(&map, span.end)) else {
+            continue;
+        };
+        let length = end - offset;
+        if length <= 0 {
+            continue;
+        }
+        let entity = match &span.style {
+            Style::Bold => tl::types::MessageEntityBold { offset, length }.into(),
+            Style::Italic => tl::types::MessageEntityItalic { offset, length }.into(),
+            Style::Underline => tl::types::MessageEntityUnderline { offset, length }.into(),
+            Style::Strike => tl::types::MessageEntityStrike { offset, length }.into(),
+            Style::Code => tl::types::MessageEntityCode { offset, length }.into(),
+            Style::CodeBlock { language } => tl::types::MessageEntityPre { offset, length, language: language.clone() }.into(),
+            Style::Quote => tl::types::MessageEntityBlockquote { collapsed: false, offset, length }.into(),
+            Style::Spoiler => tl::types::MessageEntitySpoiler { offset, length }.into(),
+            Style::Link { url } => tl::types::MessageEntityTextUrl { offset, length, url: url.clone() }.into(),
+            Style::Mention { kind: MentionKind::User, id } => {
+                let Some(user_id) = id.strip_prefix('u').and_then(|id| id.parse().ok()) else {
+                    continue;
+                };
+                tl::types::MessageEntityMentionName { offset, length, user_id }.into()
+            }
+            Style::Emoji { file } => {
+                let Some(document_id) = file.id.strip_prefix('e').and_then(|id| id.parse().ok()) else {
+                    continue;
+                };
+                tl::types::MessageEntityCustomEmoji { offset, length, document_id }.into()
+            }
+            _ => continue,
+        };
+        entities.push(entity);
+    }
+    entities
+}
+
+/// Spans already stored on a message, kept where they still sit on `plain`. An edit that
+/// carries no markers sends these, so saving a formatted message does not wipe it.
+pub fn with_stored(plain: &str, stored: &[Span]) -> Option<Vec<MessageEntity>> {
+    let kept: Vec<Span> = stored.iter().filter(|span| span_fits(plain, span)).cloned().collect();
+    let entities = entities_of(plain, &kept);
+    (!entities.is_empty()).then_some(entities)
+}
+
+/// The text a send or a draft tells Telegram, and the entities for its markers. Telegram
+/// does not read `**` itself, so the markers are taken out and named.
+pub fn outgoing(text: &str) -> (String, Option<Vec<MessageEntity>>) {
+    let (plain, spans) = from_markers(text);
+    let entities = entities_of(&plain, &spans);
+    (plain, (!entities.is_empty()).then_some(entities))
+}
+
+/// A draft's text as the composer shows it. Entities that arrived with it become markers,
+/// which is what a later send turns back into entities.
+pub fn draft_text(message: &str, entities: Option<&[MessageEntity]>) -> String {
+    match entities {
+        Some(entities) if !entities.is_empty() => to_markers(message, &spans(message, entities)),
+        _ => message.to_owned(),
+    }
+}
+
+/// One line for the scripted wire's log. Empty when there are no entities, so a plain send
+/// stays the line it always was.
+pub fn entity_note(entities: &[MessageEntity]) -> String {
+    let mut note = String::new();
+    for entity in entities {
+        let (offset, length) = place(entity);
+        match entity {
+            MessageEntity::Bold(_) => note.push_str(&format!(" bold:{offset}+{length}")),
+            MessageEntity::Italic(_) => note.push_str(&format!(" italic:{offset}+{length}")),
+            MessageEntity::Underline(_) => note.push_str(&format!(" underline:{offset}+{length}")),
+            MessageEntity::Strike(_) => note.push_str(&format!(" strike:{offset}+{length}")),
+            MessageEntity::Code(_) => note.push_str(&format!(" code:{offset}+{length}")),
+            MessageEntity::Pre(pre) => note.push_str(&format!(" pre:{offset}+{length}:{}", pre.language)),
+            MessageEntity::Blockquote(quote) => {
+                note.push_str(&format!(" quote:{offset}+{length}"));
+                if quote.collapsed {
+                    note.push_str(":collapsed");
+                }
+            }
+            MessageEntity::Spoiler(_) => note.push_str(&format!(" spoiler:{offset}+{length}")),
+            MessageEntity::TextUrl(link) => note.push_str(&format!(" link:{offset}+{length}:{}", link.url)),
+            _ => {}
+        }
+    }
+    note
+}
+
+/// Markers the composer shows, turned into spans on the text with those markers taken out.
+pub fn from_markers(text: &str) -> (String, Vec<Span>) {
+    if !text.contains(['*', '_', '`', '~', '|', '[', '>']) {
+        return (text.to_owned(), Vec::new());
+    }
+    parse_markers(text, None)
+}
+
+/// Markers put back around `text`, so a draft that arrived as entities is still bold here.
+pub fn to_markers(text: &str, spans: &[Span]) -> String {
+    let mut events: Vec<(usize, u8, i32, i32, String)> = Vec::new();
+    for (index, span) in spans.iter().enumerate() {
+        let Some((open, close)) = marker_of(span) else {
+            continue;
+        };
+        let start = span.start as usize;
+        let end = span.end as usize;
+        if !span_fits(text, span) {
+            continue;
+        }
+        let len = (end - start) as i32;
+        let at = i32::try_from(index).unwrap_or(0);
+        events.push((start, 1, -len, -at, open));
+        if !close.is_empty() {
+            events.push((end, 0, len, at, close));
+        }
+    }
+    if events.is_empty() {
+        return text.to_owned();
+    }
+    events.sort_by(|left, right| {
+        left.0.cmp(&right.0).then(left.1.cmp(&right.1)).then(left.2.cmp(&right.2)).then(left.3.cmp(&right.3))
+    });
+    let mut out = String::new();
+    let mut at = 0;
+    for (pos, _, _, _, bit) in events {
+        if pos < at || pos > text.len() {
+            continue;
+        }
+        out.push_str(&text[at..pos]);
+        out.push_str(&bit);
+        at = pos;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+fn marker_of(span: &Span) -> Option<(String, String)> {
+    Some(match &span.style {
+        Style::Bold => ("**".to_owned(), "**".to_owned()),
+        Style::Italic => ("_".to_owned(), "_".to_owned()),
+        Style::Underline => ("__".to_owned(), "__".to_owned()),
+        Style::Strike => ("~~".to_owned(), "~~".to_owned()),
+        Style::Code => ("`".to_owned(), "`".to_owned()),
+        Style::Spoiler => ("||".to_owned(), "||".to_owned()),
+        Style::CodeBlock { language } => (format!("```{language}\n"), "\n```".to_owned()),
+        Style::Quote => ("> ".to_owned(), String::new()),
+        Style::Link { url } => ("[".to_owned(), format!("]({url})")),
+        _ => return None,
+    })
+}
+
+fn parse_markers(text: &str, mut prev: Option<char>) -> (String, Vec<Span>) {
+    let mut out = String::new();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        let line_start = i == 0 || text.as_bytes()[i - 1] == b'\n';
+        if let Some((lang, body, used)) = code_block(rest) {
+            push_plain(&mut out, &mut spans, body, Style::CodeBlock { language: lang });
+            i += used;
+            prev = body.chars().next_back();
+            continue;
+        }
+        if let Some((body, used)) = inline_code(rest) {
+            push_plain(&mut out, &mut spans, body, Style::Code);
+            i += used;
+            prev = body.chars().next_back();
+            continue;
+        }
+        if let Some((label, url, used)) = text_link(rest) {
+            let start = out.len() as u32;
+            absorb(&mut out, &mut spans, label);
+            if (out.len() as u32) > start {
+                spans.push(Span { start, end: out.len() as u32, style: Style::Link { url } });
+            }
+            i += used;
+            prev = out.chars().next_back();
+            continue;
+        }
+        if let Some((style, body, used)) = wrapped(rest, prev) {
+            let start = out.len() as u32;
+            absorb(&mut out, &mut spans, body);
+            if (out.len() as u32) > start {
+                spans.push(Span { start, end: out.len() as u32, style });
+            }
+            i += used;
+            prev = out.chars().next_back();
+            continue;
+        }
+        if line_start && rest.starts_with("> ") {
+            let line = &rest[2..];
+            let end = line.find('\n').unwrap_or(line.len());
+            let start = out.len() as u32;
+            absorb(&mut out, &mut spans, &line[..end]);
+            if (out.len() as u32) > start {
+                spans.push(Span { start, end: out.len() as u32, style: Style::Quote });
+            }
+            i += 2 + end;
+            prev = out.chars().next_back();
+            continue;
+        }
+        let ch = rest.chars().next().unwrap_or('\u{FFFD}');
+        out.push(ch);
+        i += ch.len_utf8();
+        prev = Some(ch);
+    }
+    (out, spans)
+}
+
+fn absorb(out: &mut String, spans: &mut Vec<Span>, body: &str) {
+    let (plain, inner) = parse_markers(body, None);
+    let base = out.len() as u32;
+    out.push_str(&plain);
+    for mut span in inner {
+        span.start += base;
+        span.end += base;
+        spans.push(span);
+    }
+}
+
+fn push_plain(out: &mut String, spans: &mut Vec<Span>, body: &str, style: Style) {
+    if body.is_empty() {
+        return;
+    }
+    let start = out.len() as u32;
+    out.push_str(body);
+    spans.push(Span { start, end: out.len() as u32, style });
+}
+
+fn code_block(text: &str) -> Option<(String, &str, usize)> {
+    if !text.starts_with("```") {
+        return None;
+    }
+    let rest = &text[3..];
+    let nl = rest.find('\n')?;
+    let lang = rest[..nl].trim().to_owned();
+    let after = &rest[nl + 1..];
+    let end = after.find("```")?;
+    let body = after[..end].strip_suffix('\n').unwrap_or(&after[..end]);
+    Some((lang, body, 3 + nl + 1 + end + 3))
+}
+
+fn inline_code(text: &str) -> Option<(&str, usize)> {
+    if !text.starts_with('`') || text.starts_with("```") {
+        return None;
+    }
+    let rest = &text[1..];
+    let close = rest.find('`')?;
+    if close == 0 || rest[..close].contains('\n') {
+        return None;
+    }
+    Some((&rest[..close], close + 2))
+}
+
+fn text_link(text: &str) -> Option<(&str, String, usize)> {
+    if !text.starts_with('[') {
+        return None;
+    }
+    let rest = &text[1..];
+    let label_end = rest.find("](")?;
+    if label_end == 0 || rest[..label_end].contains('\n') {
+        return None;
+    }
+    let after = &rest[label_end + 2..];
+    let url_end = after.find(')')?;
+    if url_end == 0 || after[..url_end].contains(char::is_whitespace) {
+        return None;
+    }
+    Some((&rest[..label_end], after[..url_end].to_owned(), 1 + label_end + 2 + url_end + 1))
+}
+
+fn wrapped(text: &str, prev: Option<char>) -> Option<(Style, &str, usize)> {
+    let pairs: &[(&str, Style, bool)] = &[
+        ("||", Style::Spoiler, false),
+        ("~~", Style::Strike, false),
+        ("**", Style::Bold, false),
+        ("__", Style::Underline, false),
+        ("_", Style::Italic, true),
+        ("*", Style::Italic, true),
+    ];
+    for (marker, style, word) in pairs {
+        if !text.starts_with(marker) {
+            continue;
+        }
+        if *word && (prev.is_some_and(|ch| ch.is_alphanumeric()) || (*marker == "*" && text.starts_with("**")) || (*marker == "_" && text.starts_with("__"))) {
+            continue;
+        }
+        let rest = &text[marker.len()..];
+        if !rest.chars().next().is_some_and(|ch| !ch.is_whitespace()) {
+            continue;
+        }
+        let close = find_close(rest, marker, *word)?;
+        let body = &rest[..close];
+        if body.is_empty() {
+            continue;
+        }
+        return Some((style.clone(), body, marker.len() * 2 + close));
+    }
+    None
+}
+
+fn find_close(text: &str, marker: &str, word: bool) -> Option<usize> {
+    let mut at = 0;
+    while let Some(rel) = text[at..].find(marker) {
+        let close = at + rel;
+        if close == 0 {
+            at += marker.len();
+            continue;
+        }
+        let before_ok = text[..close].chars().next_back().is_some_and(|ch| !ch.is_whitespace());
+        let after_ok = !word || text[close + marker.len()..].chars().next().is_none_or(|ch| !ch.is_alphanumeric());
+        if before_ok && after_ok {
+            return Some(close);
+        }
+        at = close + marker.len();
+    }
+    None
+}
+
 /// A voice message's loudness: Telegram packs 5-bit values end to end; the contract wants a
 /// byte a bar.
 pub fn waveform(packed: &[u8]) -> Vec<u8> {
@@ -696,5 +1039,35 @@ mod tests {
         // An emoji of another network is not a Telegram document, so it names no id to ask for.
         message.spans[0].style = Style::Emoji { file: MediaFile::new("emoji:7001", MediaKind::Emoji) };
         assert!(text_emoji_ids(&message).is_empty());
+    }
+
+    #[test]
+    fn spans_round_trip_through_entities_over_text_with_emoji() {
+        // "né" is 2 units and 3 bytes; the flag is 4 units and 8 bytes; the crab 2 units, 4 bytes.
+        let text = "né 🇵🇹 🦀 code";
+        let entities = vec![
+            bold(0, 2),
+            tl::types::MessageEntityItalic { offset: 3, length: 4 }.into(),
+            tl::types::MessageEntityCode { offset: 11, length: 4 }.into(),
+            tl::types::MessageEntityTextUrl { offset: 8, length: 2, url: "https://crab.example".into() }.into(),
+            tl::types::MessageEntitySpoiler { offset: 0, length: 2 }.into(),
+        ];
+        let once = spans(text, &entities);
+        let back = entities_of(text, &once);
+        let twice = spans(text, &back);
+        assert_eq!(twice, once, "entities are the inverse of spans, in UTF-16 units");
+    }
+
+    #[test]
+    fn markers_become_the_spans_telegram_will_keep() {
+        let (plain, styled) = from_markers("**hi** _there_");
+        assert_eq!(plain, "hi there");
+        let said: Vec<(&str, &Style)> = styled.iter().map(|span| (&plain[span.start as usize..span.end as usize], &span.style)).collect();
+        assert_eq!(said, vec![("hi", &Style::Bold), ("there", &Style::Italic)]);
+        let entities = entities_of(&plain, &styled);
+        assert_eq!(place(&entities[0]), (0, 2));
+        assert!(matches!(entities[0], MessageEntity::Bold(_)));
+        assert_eq!(place(&entities[1]), (3, 5));
+        assert!(matches!(entities[1], MessageEntity::Italic(_)));
     }
 }

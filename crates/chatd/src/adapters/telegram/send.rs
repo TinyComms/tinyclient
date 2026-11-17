@@ -80,11 +80,13 @@ fn made(account: &Account, conversation: &str, target: &Target, text: &str, opts
 fn send_pick(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, pick: &str, opts: Options) -> Result<Message, Fault> {
     let target = target(account, conversation, reply_to)?;
     let random = random_id(client_id);
+    let (plain, entities) = super::content::outgoing(text);
     let (answer, caption) = match catalog::find(account, pick).ok_or_else(|| Fault::Rpc { code: 400, name: "PICK_EXPIRED".to_owned(), value: None })? {
         Pick::Document(id) => {
             remember_random(account, random, client_id);
             let media = tl::types::InputMediaDocument { spoiler: false, id: id.into(), video_cover: None, video_timestamp: None, ttl_seconds: None, query: None };
-            (account.ask(&send_media(&target, media.into(), text, random, opts))?, text)
+            let answer = account.ask(&send_media(&target, media.into(), &plain, entities, random, opts))?;
+            (answer, plain.as_str())
         }
         Pick::Inline { query_id, result } => {
             // A bot's result carries no caption: words typed with it go first, on their own.
@@ -113,7 +115,14 @@ fn send_pick(account: &Account, conversation: &str, client_id: &str, text: &str,
     made(account, conversation, &target, caption, opts, &answer)
 }
 
-fn send_media(target: &Target, media: tl::enums::InputMedia, caption: &str, random_id: i64, opts: Options) -> tl::functions::messages::SendMedia {
+fn send_media(
+    target: &Target,
+    media: tl::enums::InputMedia,
+    caption: &str,
+    entities: Option<Vec<tl::enums::MessageEntity>>,
+    random_id: i64,
+    opts: Options,
+) -> tl::functions::messages::SendMedia {
     tl::functions::messages::SendMedia {
         silent: opts.silent,
         background: false,
@@ -128,7 +137,7 @@ fn send_media(target: &Target, media: tl::enums::InputMedia, caption: &str, rand
         message: caption.to_owned(),
         random_id,
         reply_markup: None,
-        entities: None,
+        entities,
         schedule_date: opts.schedule,
         schedule_repeat_period: None,
         send_as: None,
@@ -151,13 +160,15 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
     let target = target(account, conversation, reply_to).map_err(words)?;
     let premium = account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium);
     let limit = if premium { 4_096 } else { 1_024 };
+    let (plain, entities) = super::content::outgoing(text);
     // A caption longer than Telegram takes goes first as a message of its own.
-    let caption = if text.chars().count() > limit {
+    let caption = if plain.chars().count() > limit {
         super::send_text(account, conversation, &format!("{client_id}1"), text, reply_to, opts).map_err(words)?;
         ""
     } else {
-        text
+        plain.as_str()
     };
+    let entities = (!caption.is_empty()).then_some(entities).flatten();
     let mut uploaded = Vec::with_capacity(up.files().len());
     for at in 0..up.files().len() {
         // `voice` is only set for a send of one file: a voice message is one file.
@@ -170,7 +181,7 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
         let Some(one) = uploaded.pop() else {
             return Err("Nothing was sent.".to_owned());
         };
-        let answer = account.ask(&send_media(&target, one.media, caption, random, opts)).map_err(words)?;
+        let answer = account.ask(&send_media(&target, one.media, caption, entities.clone(), random, opts)).map_err(words)?;
         return made(account, conversation, &target, caption, opts, &answer).map_err(words);
     }
     // Albums: pictures and videos together, documents together, ten at most each. The caption
@@ -184,8 +195,9 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
             if let [one] = album {
                 let item_random = if index == 0 { random } else { random_id(&format!("{client_id}:{index}")) };
                 let shown = if index == 0 { caption } else { "" };
+                let caption_entities = (index == 0).then(|| entities.clone()).flatten();
                 index += 1;
-                let answer = account.ask(&send_media(&target, one.media.clone(), shown, item_random, opts)).map_err(words)?;
+                let answer = account.ask(&send_media(&target, one.media.clone(), shown, caption_entities, item_random, opts)).map_err(words)?;
                 match first {
                     None => first = Some(made(account, conversation, &target, shown, opts, &answer).map_err(words)?),
                     Some(_) => live::answered(account, &answer),
@@ -204,7 +216,7 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
                     media,
                     random_id: item_random,
                     message: if index == 0 { caption.to_owned() } else { String::new() },
-                    entities: None,
+                    entities: (index == 0).then(|| entities.clone()).flatten(),
                 }));
                 index += 1;
                 up.check()?;

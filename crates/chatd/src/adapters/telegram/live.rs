@@ -377,10 +377,10 @@ pub(super) fn apply(account: &Account, update: &Update) {
                 sync::echo_thread(account, who, drafted.top_msg_id).unwrap_or_else(|| who.text())
             };
             let text = match &drafted.draft {
-                tl::enums::DraftMessage::Message(draft) => draft.message.as_str(),
-                _ => "",
+                tl::enums::DraftMessage::Message(draft) => content::draft_text(&draft.message, draft.entities.as_deref()),
+                _ => String::new(),
             };
-            let _ = account.ctx.draft(&id, text);
+            let _ = account.ctx.draft(&id, &text);
         }
         Update::NotifySettings(settings) => match &settings.peer {
             tl::enums::NotifyPeer::Peer(peer) => {
