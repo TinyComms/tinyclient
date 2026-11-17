@@ -1,0 +1,12 @@
+{
+  "id": "telegram-dice",
+  "title": "A Telegram dice roll shows its value, and sending the emoji rolls",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same roll text is what a dice message maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same roll text is what a dice message maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
