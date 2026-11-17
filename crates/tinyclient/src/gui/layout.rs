@@ -1088,8 +1088,8 @@ impl Shell {
             .child(menu_item("own-add", Some("icons/plus.svg"), "Add an account", None).on_click(cx.listener(|this, _, _, cx| this.open_menu(Menu::Add, cx))))
     }
 
-    /// The add popover: networks not signed in, another Slack workspace, another Tiny server,
-    /// then what comes later.
+    /// The add popover: networks not signed in, another Slack workspace, another Telegram
+    /// account, another Tiny server, then what comes later.
     fn add_menu(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
         popover().p(px(4.)).w(px(300.)).flex().flex_col().children(self.add_rows(snapshot, cx))
     }
@@ -1146,6 +1146,8 @@ impl Shell {
                 add(network, network.label(), "Sign in", true);
             } else if network == Network::Slack {
                 add(network, "Add a Slack workspace", "Sign in to another workspace", true);
+            } else if network == Network::Telegram {
+                add(network, "Add another Telegram account", "Sign in to another account", true);
             } else if network == Network::Tiny {
                 add(network, "Add a Tiny server", "Join with a code", true);
             }

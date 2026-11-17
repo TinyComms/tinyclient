@@ -4,7 +4,7 @@
 //! scratch directory with `TINYCLIENT_TELEGRAM_FAKE` set, never from a real session.
 //!
 //! scratch directory (`adapters/script.rs`): `telegram.signin.ctl` while signing in (`scan`,
-//! `scan-password`), `telegram.ctl` once signed in (`incoming`, `photo`, `react`, `edit`,
+//! `scan-other`, `scan-password`), `telegram.ctl` once signed in (`incoming`, `photo`, `react`, `edit`,
 //! `delete`, `ttl`, `ttl-gone`, `topic`, `comments`, `typing`, `typing-stop`, `read`, `status`,
 //! `poll`, `voice`, `forward`, `flood-send N`, `revoke`, and the holds of
 //! `TINYCLIENT_TELEGRAM_HOLD` and `TINYCLIENT_TELEGRAM_PEER_HOLD` through `dialogs-go` and
@@ -369,6 +369,11 @@ struct World {
     /// A post in the muted channel that names the user: the mention count rides the dialog,
     /// so it lands with the next reading of the chats.
     channel_mention: bool,
+    /// Whose session this wire is. The invented account is Mira unless a saved session says.
+    me: i64,
+    me_name: String,
+    /// The next scan signs in a second invented account, not Mira.
+    as_other: bool,
     /// How far the account read each forum topic, as its last `ReadDiscussion` said.
     topic_reads: HashMap<(Who, i32), i32>,
     calls: PathBuf,
@@ -425,6 +430,9 @@ impl World {
             off_page_private: held_at_wire("TINYCLIENT_TELEGRAM_PRIVATE_OFF_PAGE"),
             membership_fault_sent: false,
             channel_mention: false,
+            me: ME,
+            me_name: String::new(),
+            as_other: false,
             topic_reads: HashMap::new(),
             calls: protocol::support_dir().join("telegram.calls"),
             dialogs_go: false,
@@ -568,13 +576,27 @@ impl World {
         }
     }
 
+    fn self_user(&self) -> tl::types::User {
+        let (id, first, last) = if self.as_other {
+            (7_101, "Lea".to_owned(), "Hart".to_owned())
+        } else if self.me != ME && self.me != 0 {
+            let mut parts = self.me_name.splitn(2, ' ');
+            (self.me, parts.next().unwrap_or("Account").to_owned(), parts.next().unwrap_or("").to_owned())
+        } else {
+            return user(ME, "Mira", "Kessler", "mira_k");
+        };
+        let mut person = user(id, &first, &last, "");
+        person.is_self = true;
+        person
+    }
+
     fn me(&self) -> tl::enums::auth::Authorization {
         tl::types::auth::Authorization {
             setup_password_required: false,
             otherwise_relogin_days: None,
             tmp_sessions: None,
             future_auth_token: None,
-            user: user(ME, "Mira", "Kessler", "mira_k").into(),
+            user: self.self_user().into(),
         }
         .into()
     }
@@ -876,12 +898,18 @@ pub struct Fake {
 }
 
 impl Fake {
-    pub fn open(signed_in: bool) -> Fake {
+    pub fn open(saved: Option<&super::Saved>) -> Fake {
+        let signed_in = saved.is_some();
         let name = if signed_in { "telegram.ctl" } else { "telegram.signin.ctl" };
         let control = script::control(name);
         let (events, heard) = channel();
+        let mut world = World::new(signed_in);
+        if let Some(saved) = saved {
+            world.me = saved.user;
+            world.me_name = saved.name.clone();
+        }
         let fake = Fake {
-            world: Arc::new(Mutex::new(World::new(signed_in))),
+            world: Arc::new(Mutex::new(world)),
             events,
             heard: Mutex::new(Some(heard)),
             closed: Arc::default(),
@@ -971,6 +999,11 @@ impl World {
         let mut words = line.split_whitespace();
         match words.next().unwrap_or("") {
             "scan" => {
+                self.scanned = Some(false);
+                vec![update(tl::enums::Update::LoginToken)]
+            }
+            "scan-other" => {
+                self.as_other = true;
                 self.scanned = Some(false);
                 vec![update(tl::enums::Update::LoginToken)]
             }
@@ -1541,7 +1574,7 @@ impl World {
         }
         if asked::<f::users::GetUsers>(body).is_some() {
             self.log("GetUsers");
-            return answer(vec![tl::enums::User::from(user(ME, "Mira", "Kessler", "mira_k"))]);
+            return answer(vec![tl::enums::User::from(self.self_user())]);
         }
         if asked::<f::account::GetNotifySettings>(body).is_some() {
             self.log("GetNotifySettings");
