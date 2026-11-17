@@ -1222,18 +1222,22 @@ fn outgoing(account: &Account, id: String, text: String) -> Message {
 
 /// The second tick or the read mark, when the phone says one of my messages has it.
 /// `id` is the shell's id when this computer asked for the copy, otherwise the phone's.
+/// A delivered or read copy leaves the outbox even when this chat does not draw ticks.
 fn receipt(account: &Account, conversation: &str, note: &bugle::Note, id: &str) {
-    if !bugle::shows_receipts(carrier_of(account, conversation)) {
-        return;
-    }
     if !(note.outgoing || note.author == account.me) {
         return;
     }
-    let _ = match bugle::receipt(note.status) {
-        Some(bugle::Receipt::Delivered) => account.ctx.delivered(conversation, id),
-        Some(bugle::Receipt::Read) => account.ctx.seen(conversation, id),
-        None => Ok(()),
-    };
+    let mark = bugle::receipt(note.status);
+    if bugle::shows_receipts(carrier_of(account, conversation)) {
+        let _ = match mark {
+            Some(bugle::Receipt::Delivered) => account.ctx.delivered(conversation, id),
+            Some(bugle::Receipt::Read) => account.ctx.seen(conversation, id),
+            None => Ok(()),
+        };
+    }
+    if mark.is_some() {
+        settle_map(&mut outbox_mut(account), id, note.status);
+    }
 }
 
 fn backfill(account: &Account, conversation: &str) {
@@ -1613,7 +1617,19 @@ fn keep_copy(account: &Account, client_id: &str, relay_id: &str) {
     keep_copy_map(&mut outbox_mut(account), client_id, relay_id);
 }
 
+/// Sent copies with no receipt yet. A failure stays, so Try again can find the phone's copy.
+const OUTBOX_CAP: usize = 64;
+
 fn keep_copy_map(outbox: &mut HashMap<String, Attempt>, client_id: &str, relay_id: &str) {
+    if !outbox.contains_key(client_id) && outbox.len() >= OUTBOX_CAP {
+        if let Some(drop_id) = outbox
+            .iter()
+            .find(|(_, attempt)| matches!(attempt.progress, Some(bugle::Progress::Sent)))
+            .map(|(id, _)| id.clone())
+        {
+            outbox.remove(&drop_id);
+        }
+    }
     outbox.insert(
         client_id.to_owned(),
         Attempt {
@@ -1703,6 +1719,12 @@ fn claim_map(outbox: &mut HashMap<String, Attempt>, note: &bugle::Note) -> Optio
     attempt.progress = Some(bugle::progress(note.status));
     attempt.detail = note.detail.clone();
     Some(client_id.clone())
+}
+
+fn settle_map(outbox: &mut HashMap<String, Attempt>, client_id: &str, status: u64) {
+    if bugle::receipt(status).is_some() {
+        outbox.remove(client_id);
+    }
 }
 
 fn outbox_mut(account: &Account) -> std::sync::MutexGuard<'_, HashMap<String, Attempt>> {
@@ -1877,5 +1899,69 @@ fn continue_inbox(account: &Arc<Account>) {
         }
         Err(why) if phone_quiet(&why) => lost_phone(account),
         Err(why) => tracing::warn!("chatd: Messages: {why}"),
+    }
+}
+
+#[cfg(test)]
+mod outbox_tests {
+    use super::{claim_map, keep_copy_map, settle_map, Attempt};
+
+    fn note(id: &str, tmp: &str, status: u64) -> crate::adapters::messages::bugle::Note {
+        crate::adapters::messages::bugle::Note {
+            id: id.into(),
+            tmp: tmp.into(),
+            status,
+            ..crate::adapters::messages::bugle::Note::default()
+        }
+    }
+
+    #[test]
+    fn a_delivered_or_read_copy_leaves_and_a_failure_stays() {
+        let mut outbox = std::collections::HashMap::new();
+        keep_copy_map(&mut outbox, "c-ok", "relay-ok");
+        let id = claim_map(&mut outbox, &note("phone-ok", "relay-ok", 2)).unwrap();
+        settle_map(&mut outbox, &id, 2);
+        assert!(outbox.get("c-ok").is_none(), "a delivered copy stayed in the outbox");
+
+        keep_copy_map(&mut outbox, "c-read", "relay-read");
+        let id = claim_map(&mut outbox, &note("phone-read", "relay-read", 11)).unwrap();
+        settle_map(&mut outbox, &id, 11);
+        assert!(outbox.get("c-read").is_none(), "a read copy stayed in the outbox");
+
+        keep_copy_map(&mut outbox, "c-fail", "relay-fail");
+        let id = claim_map(&mut outbox, &note("phone-fail", "relay-fail", 13)).unwrap();
+        settle_map(&mut outbox, &id, 13);
+        let kept = outbox.get("c-fail").expect("Try again lost the phone's failed copy");
+        assert_eq!(kept.phone_id, "phone-fail");
+        assert!(matches!(kept.progress, Some(super::bugle::Progress::Failed(_))));
+        assert_eq!(id, "c-fail");
+    }
+
+    #[test]
+    fn a_full_outbox_drops_a_sent_copy_and_keeps_a_failure() {
+        let mut sent = std::collections::HashMap::<String, Attempt>::new();
+        for n in 0..64 {
+            let client = format!("c-{n}");
+            let relay = format!("relay-{n}");
+            keep_copy_map(&mut sent, &client, &relay);
+            claim_map(&mut sent, &note(&format!("phone-{n}"), &relay, 1));
+        }
+        keep_copy_map(&mut sent, "c-new", "relay-new");
+        assert_eq!(sent.len(), 64);
+        assert!(sent.contains_key("c-new"));
+        let still_sent = sent.values().filter(|attempt| matches!(attempt.progress, Some(super::bugle::Progress::Sent))).count();
+        assert_eq!(still_sent, 63);
+
+        let mut failed = std::collections::HashMap::new();
+        for n in 0..64 {
+            let client = format!("f-{n}");
+            let relay = format!("relay-f-{n}");
+            keep_copy_map(&mut failed, &client, &relay);
+            claim_map(&mut failed, &note(&format!("phone-f-{n}"), &relay, 13));
+        }
+        keep_copy_map(&mut failed, "f-new", "relay-f-new");
+        assert_eq!(failed.len(), 65, "a failed copy was dropped to make room");
+        assert!(failed.contains_key("f-new"));
+        assert_eq!(failed.keys().filter(|id| *id != "f-new").count(), 64);
     }
 }

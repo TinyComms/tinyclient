@@ -2406,6 +2406,9 @@ fn decode_reactions(msg: &[Field]) -> Vec<Mark> {
     marks
 }
 
+/// Phone status text shown under a failed row. Same bound as a forwarded title.
+const DETAIL_CAP: usize = 200;
+
 fn decode_messages(bytes: &[u8]) -> Vec<Note> {
     let list = fields(bytes);
     let mut notes = Vec::new();
@@ -2425,11 +2428,13 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
         let status_fields = fields(&field_bytes(&msg, 4));
         let status = field_int(&status_fields, 2);
         let said = field_text(&status_fields, 5);
-        let detail = if said.is_empty() {
+        let mut detail = if said.is_empty() {
             field_text(&status_fields, 4)
         } else {
             said
         };
+        // Drawn under a failed row, not as the message. `Message::bound` does not clip it.
+        protocol::clip(&mut detail, DETAIL_CAP);
         let tmp = field_text(&msg, 12);
         // A tombstone is the only published word that the phones turned encryption on or off.
         if let Some(on) = between_phones(status) {
@@ -2826,6 +2831,40 @@ mod tests {
         assert_eq!(progress(2), Progress::Sent);
         assert!(matches!(progress(99), Progress::Failed(_)));
         assert!(matches!(progress(24), Progress::Failed(_)));
+    }
+
+    #[test]
+    fn a_long_status_line_is_clipped_before_the_note_is_built() {
+        let long = "x".repeat(500);
+        let decode = |field: u32| {
+            let mut status = Buf::new();
+            status.int(2, 13);
+            status.text(field, &long);
+            let mut message = Buf::new();
+            message.text(1, "phone-1");
+            message.text(7, "c1");
+            message.msg(4, &status.0);
+            let mut wrap = Buf::new();
+            wrap.msg(1, &message.0);
+            decode_messages(&wrap.0)
+        };
+        let from_text = decode(5);
+        assert_eq!(from_text.len(), 1);
+        assert_eq!(from_text[0].detail.chars().count(), 200);
+        let from_err = decode(4);
+        assert_eq!(from_err[0].detail.chars().count(), 200);
+        let mut both = Buf::new();
+        both.int(2, 13);
+        both.text(4, &long);
+        both.text(5, "phone said this");
+        let mut message = Buf::new();
+        message.text(1, "phone-1");
+        message.text(7, "c1");
+        message.msg(4, &both.0);
+        let mut wrap = Buf::new();
+        wrap.msg(1, &message.0);
+        let notes = decode_messages(&wrap.0);
+        assert_eq!(notes[0].detail, "phone said this");
     }
 
     #[test]
