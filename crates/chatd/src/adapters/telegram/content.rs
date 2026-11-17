@@ -819,6 +819,35 @@ fn plain(text: &tl::enums::TextWithEntities) -> &str {
     &text.text
 }
 
+/// A checklist as text. The title is an ordinary line. Each item is a list line, checked
+/// when a completion names its id. Read-only: ticking stays in Telegram.
+fn checklist(media: &tl::types::MessageMediaToDo) -> (String, Vec<Span>) {
+    let tl::enums::TodoList::List(list) = &media.todo;
+    let done = |id: i32| {
+        media.completions.as_ref().is_some_and(|all| {
+            all.iter().any(|one| {
+                let tl::enums::TodoCompletion::Completion(one) = one;
+                one.id == id
+            })
+        })
+    };
+    let mut text = plain(&list.title).to_owned();
+    let mut spans = Vec::new();
+    for item in &list.list {
+        let tl::enums::TodoItem::Item(item) = item;
+        let mark = if done(item.id) { "\u{2611}" } else { "\u{2610}" };
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        let start = text.len() as u32;
+        text.push_str(mark);
+        text.push(' ');
+        text.push_str(plain(&item.title));
+        spans.push(Span { start, end: text.len() as u32, style: Style::ListItem { ordered: false, depth: 0 } });
+    }
+    (text, spans)
+}
+
 /// What stands in for media tinyclient cannot draw. Never empty.
 fn unsupported(media: &MessageMedia) -> Option<String> {
     Some(match media {
@@ -835,7 +864,6 @@ fn unsupported(media: &MessageMedia) -> Option<String> {
         MessageMedia::Story(_) => "Story".to_owned(),
         MessageMedia::Giveaway(_) | MessageMedia::GiveawayResults(_) => "Giveaway".to_owned(),
         MessageMedia::PaidMedia(_) => "Paid media".to_owned(),
-        MessageMedia::ToDo(_) => "Checklist".to_owned(),
         MessageMedia::VideoStream(_) => "Live stream".to_owned(),
         MessageMedia::Unsupported => "A message this version of tinyclient cannot show".to_owned(),
         // A photo or document that has run out (a self-destructing one, once seen).
@@ -1414,6 +1442,12 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                         _ => dice.emoticon.clone(),
                     };
                 }
+                // The title, then each item on its own list line. A done item is checked.
+                Some(MessageMedia::ToDo(media)) => {
+                    let (text, spans) = checklist(media);
+                    message.text = text;
+                    message.spans = spans;
+                }
                 Some(media) => {
                     if let Some(label) = unsupported(media) {
                         // The caption follows the label; its styles no longer line up, so they go.
@@ -1555,6 +1589,59 @@ pub(super) fn line_for(reply: i32, known: Option<&(String, String, String)>, not
         line.sender = note.author.clone();
     }
     line
+}
+
+/// The lab's telegram-checklist check. Three items, the middle one done.
+pub(super) fn prove_checklist() -> Result<(), String> {
+    let raw = sample_checklist()?;
+    let mapped = map(&Directory::new(7_001), &raw).ok_or("the checklist maps")?;
+    if !mapped.wants.is_empty() {
+        return Err("a checklist fetches nothing".into());
+    }
+    if mapped.message.kind != MessageKind::Normal {
+        return Err("a checklist is the list, not a box that opens Telegram".into());
+    }
+    let text = "Packing\n\u{2610} Passport\n\u{2611} Tickets\n\u{2610} Charger";
+    if mapped.message.text != text {
+        return Err(format!("a three-item list with one done reads as the items, got {}", mapped.message.text));
+    }
+    let item = |line: &str| {
+        let start = text.find(line).ok_or("the item is in the text")? as u32;
+        Ok::<Span, &str>(Span { start, end: start + line.len() as u32, style: Style::ListItem { ordered: false, depth: 0 } })
+    };
+    let expected = vec![
+        item("\u{2610} Passport").map_err(str::to_owned)?,
+        item("\u{2611} Tickets").map_err(str::to_owned)?,
+        item("\u{2610} Charger").map_err(str::to_owned)?,
+    ];
+    if mapped.message.spans != expected {
+        return Err("each item is its own list line, and the done one is checked".into());
+    }
+    Ok(())
+}
+
+fn sample_checklist() -> Result<tl::enums::Message, String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let words = |text: &str| tl::types::TextWithEntities { text: text.to_owned(), entities: Vec::new() }.into();
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    7i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    message.from_id = Some(Who::User(7_002).peer());
+    let item = |id: i32, title: &str| tl::types::TodoItem { id, title: words(title) }.into();
+    let list = tl::types::TodoList {
+        others_can_append: false,
+        others_can_complete: true,
+        title: words("Packing"),
+        list: vec![item(1, "Passport"), item(2, "Tickets"), item(3, "Charger")],
+    };
+    let done = tl::types::TodoCompletion { id: 2, completed_by: Who::User(7_002).peer(), date: 1_700_000_100 };
+    message.media = Some(tl::types::MessageMediaToDo { todo: list.into(), completions: Some(vec![done.into()]) }.into());
+    Ok(message.into())
 }
 
 /// The topic and the answered message a reply header names. In a forum a post that answers
@@ -2815,5 +2902,10 @@ mod tests {
         assert_eq!(attachment.file.id, "d6412m");
         assert!(attachment.thumb.as_ref().is_some_and(|thumb| thumb.id == "d6412m"));
         assert!(wants.iter().all(|want| want.file.id == "d6412m"));
+    }
+
+    #[test]
+    fn a_checklist_lists_its_items_and_marks_the_one_that_is_done() {
+        prove_checklist().unwrap();
     }
 }
