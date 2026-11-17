@@ -389,9 +389,36 @@ impl Discord {
         named.collect()
     }
 
+    /// A group DM's people, from READY. Nothing is asked of Discord. `None` when this is not one.
+    fn group_list(&self, channel: &str, offset: u32, limit: u32) -> Option<Members> {
+        let (seats, names, relations, presence) = {
+            let state = self.state.lock().unwrap();
+            let group = state.groups.get(channel)?;
+            let seats = super::group_seats(&state.me, &group.owner, &group.recipients);
+            let names: HashMap<String, String> = seats.iter().filter_map(|(id, _)| state.users.get(id).map(|name| (id.clone(), name.clone()))).collect();
+            let relations: HashMap<String, Relation> = seats.iter().filter_map(|(id, _)| state.relations.get(id).map(|relation| (id.clone(), *relation))).collect();
+            let presence: HashMap<String, Presence> = seats.iter().filter_map(|(id, _)| state.presence.get(id).map(|(presence, _)| (id.clone(), *presence))).collect();
+            (seats, names, relations, presence)
+        };
+        let count = seats.len() as u32;
+        let members = seats.into_iter().skip(offset as usize).take(limit as usize).map(|(id, owner)| {
+            let mut person = Person::new(self.ctx.key(&id), names.get(&id).cloned().unwrap_or_default());
+            person.relation = relations.get(&id).copied().unwrap_or(Relation::None);
+            person.presence = presence.get(&id).copied().unwrap_or(Presence::Unknown);
+            if owner {
+                person.title = "Owner".to_owned();
+            }
+            person
+        }).collect();
+        Some(Members { pending: false, sections: vec![MemberSection { name: "Members".into(), count }], members })
+    }
+
     /// Reads the current cache immediately. Only Watch controls the live viewport;
     /// a cache miss is pending data, never a request that blocks later scrolling.
     pub(super) fn members(&self, channel: String, offset: u32, limit: u32, reply: Reply<Members>) {
+        if let Some(list) = self.group_list(&channel, offset, limit) {
+            return answer(reply, Ok(list));
+        }
         let conversation = self.ctx.known(&channel).ok().flatten();
         let guild = conversation.as_ref().and_then(|conversation| self.guild_of(conversation));
         let in_tree = conversation.as_ref().is_some_and(|conversation| conversation.space.is_some());

@@ -26,6 +26,11 @@ pub fn prove_discord_nitro_length() -> Result<(), String> {
 pub fn prove_discord_voice_bitrate() -> Result<(), String> {
     discord::prove_voice_bitrate()
 }
+
+/// `TINYCLIENT_PROVE=discord-group-members`. A group DM's list is its other people plus us.
+pub fn prove_discord_group_dm() -> Result<(), String> {
+    discord::prove_group_dm()
+}
 mod recovery;
 pub mod net;
 mod script;
@@ -1017,6 +1022,11 @@ impl Context {
     /// Rows of a conversation's member list were added, removed or moved.
     pub fn members_changed(&self, conversation_id: &str) {
         self.hub.changed(Change::Members { conversation: self.key(conversation_id) });
+    }
+
+    /// The info pane's cached count is no longer true.
+    pub fn info_stale(&self, conversation_id: &str) {
+        self.hub.infos.forget(&self.key(conversation_id));
     }
 
     /// What is held about a person's presence now, for a member row built here.

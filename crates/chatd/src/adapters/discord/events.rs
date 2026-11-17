@@ -14,6 +14,12 @@ use std::sync::atomic::Ordering;
 const TYPING_SECONDS: i64 = 10;
 
 #[derive(Deserialize)]
+struct RecipientChange {
+    channel_id: String,
+    user: User,
+}
+
+#[derive(Deserialize)]
 struct Removed {
     #[serde(default)]
     id: String,
@@ -141,6 +147,8 @@ impl Discord {
             "MESSAGE_REACTION_REMOVE" => self.reacted(from_str(data)?, false)?,
             "MESSAGE_REACTION_REMOVE_ALL" | "MESSAGE_REACTION_REMOVE_EMOJI" => self.unreacted(from_str(data)?)?,
             "CHANNEL_CREATE" | "CHANNEL_UPDATE" => self.channel_changed(from_str(data)?)?,
+            "CHANNEL_RECIPIENT_ADD" => self.recipient(from_str(data)?, true)?,
+            "CHANNEL_RECIPIENT_REMOVE" => self.recipient(from_str(data)?, false)?,
             "CHANNEL_DELETE" | "THREAD_DELETE" => self.channel_deleted(from_str(data)?)?,
             "THREAD_CREATE" | "THREAD_UPDATE" => self.thread_changed(from_str(data)?, false)?,
             "THREAD_LIST_SYNC" => {
@@ -216,6 +224,51 @@ impl Discord {
             "CALL_DELETE" => self.call_deleted(from_str(data)?),
             _ => {}
         }
+        Ok(())
+    }
+
+    /// Someone joined or left a group DM. The list and an unnamed title follow. A named group keeps its name.
+    fn recipient(&self, change: RecipientChange, add: bool) -> Result<(), Failure> {
+        let id = change.user.id.clone();
+        if id.is_empty() {
+            return Ok(());
+        }
+        let (channel, title) = {
+            let mut state = self.state.lock().unwrap();
+            if add {
+                state.users.insert(id.clone(), change.user.name().to_owned());
+            }
+            let me = state.me.clone();
+            let (named, recipients) = {
+                let Some(group) = state.groups.get_mut(&change.channel_id) else {
+                    return Ok(());
+                };
+                if id != me {
+                    if add && !group.recipients.iter().any(|have| have == &id) {
+                        group.recipients.push(id.clone());
+                    }
+                    if !add {
+                        group.recipients.retain(|have| have != &id);
+                    }
+                }
+                (group.named, group.recipients.clone())
+            };
+            let title = (!named).then(|| {
+                let names = recipients.iter().filter_map(|id| state.users.get(id).map(String::as_str));
+                names.collect::<Vec<_>>().join(", ")
+            });
+            (change.channel_id.clone(), title)
+        };
+        if add {
+            self.ctx.people(&[change.user.person(None)])?;
+        }
+        if let Some(title) = title {
+            if let Some(known) = self.ctx.known(&channel)? {
+                self.ctx.conversation(&super::renamed(&known, &title))?;
+            }
+        }
+        self.ctx.info_stale(&channel);
+        self.ctx.members_changed(&channel);
         Ok(())
     }
 

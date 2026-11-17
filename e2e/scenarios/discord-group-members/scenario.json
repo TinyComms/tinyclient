@@ -1,0 +1,8 @@
+{
+  "id": "discord-group-members",
+  "title": "A Discord group DM lists its people, and someone leaving leaves the list",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

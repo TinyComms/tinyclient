@@ -208,6 +208,7 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                             .hover(|row| row.bg(theme::hover()))
                             .child(face)
                             .child(div().min_w_0().truncate().type_ui().child(person.name.clone()))
+                            .children((person.title == "Owner").then(|| div().flex_none().type_small().text_color(theme::text_faint()).child("Owner")))
                             .children((!word.is_empty()).then(|| div().flex_none().type_small().text_color(theme::text_faint()).child(format!("· {word}"))))
                             .on_mouse_down(MouseButton::Left, cx.listener(move |pane, event: &gpui::MouseDownEvent, _, cx| {
                                 let (key, at) = (key.clone(), event.position);

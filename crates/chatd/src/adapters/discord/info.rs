@@ -200,9 +200,14 @@ impl Discord {
             Some(None) => Notify::All,
             None => state.quiet_directs.notify(channel, None, now()),
         };
+        let members = match known.kind {
+            ConversationKind::Direct => Some(2),
+            ConversationKind::Group => state.groups.get(channel).map(|group| super::group_seats(&state.me, &group.owner, &group.recipients).len() as u32),
+            _ => None,
+        };
         Ok(ConversationAbout {
             description: topic.unwrap_or(known.topic),
-            members: (known.kind == ConversationKind::Direct).then_some(2),
+            members,
             created: Some(model::seconds(channel)).filter(|created| *created > 1_420_070_400),
             notify,
             ..ConversationAbout::default()

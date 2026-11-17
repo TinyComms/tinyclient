@@ -3242,6 +3242,87 @@ fn account_with_premium(premium: u8) -> World {
     world
 }
 
+/// A group DM's member list is the other people plus us, from READY, with the owner's mark.
+/// Someone leaving drops them from the list and from an unnamed title. Someone joining
+/// puts them back, and that title gains their name.
+#[test]
+fn a_group_dm_lists_its_people_and_drops_one_who_leaves() {
+    let world = World::launch(&[], |shared| {
+        let mut ready: Value = serde_json::from_str(&shared.ready.lock().unwrap()).unwrap();
+        ready["private_channels"].as_array_mut().unwrap().push(json!({
+            "id": "3010",
+            "type": 3,
+            "recipient_ids": ["2001", "2002", "2006"],
+            "owner_id": "2001",
+            "last_message_id": "1300000000000000310"
+        }));
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    wait("friends' presence", || {
+        world.people(Some(Relation::Friend), None).iter().any(|person| person.presence == Presence::Online).then_some(())
+    });
+
+    let listed = match world.ask(Request::Members { conversation: world.key("3010"), offset: 0, limit: 50 }) {
+        Response::Members { pending, members, .. } => {
+            assert!(!pending);
+            members
+        }
+        other => panic!("{other:?}"),
+    };
+    let shown: Vec<(&str, &str, &str)> = listed.iter().map(|person| (person.key.id.as_str(), person.name.as_str(), person.title.as_str())).collect();
+    assert_eq!(
+        shown,
+        [("2001", "Mara O", "Owner"), ("2002", "Dev Patel", ""), ("2006", "Sam Whitlock", ""), ("1000", "Justin", "")]
+    );
+    assert_eq!(listed[0].presence, Presence::Online);
+    assert_eq!(listed[1].presence, Presence::Idle);
+    assert_eq!(listed[2].presence, Presence::Unknown);
+    let info = match world.ask(Request::ConversationInfo { conversation: world.key("3010") }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(info.members, Some(4));
+    assert_eq!(world.conversation("3010").title, "Mara O, Dev Patel, Sam Whitlock");
+
+    world.discord.push(
+        "CHANNEL_RECIPIENT_REMOVE",
+        json!({"channel_id": "3010", "user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0"}}),
+    );
+    let left = wait("Sam to leave the group", || {
+        match world.ask(Request::Members { conversation: world.key("3010"), offset: 0, limit: 50 }) {
+            Response::Members { members, .. } if members.len() == 3 => Some(members),
+            _ => None,
+        }
+    });
+    assert_eq!(left.iter().map(|person| person.key.id.as_str()).collect::<Vec<_>>(), ["2001", "2002", "1000"]);
+    let info = match world.ask(Request::ConversationInfo { conversation: world.key("3010") }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(info.members, Some(3));
+    assert_eq!(world.conversation("3010").title, "Mara O, Dev Patel");
+
+    world.discord.push(
+        "CHANNEL_RECIPIENT_ADD",
+        json!({"channel_id": "3010", "user": {"id": "2010", "username": "nia", "global_name": "Nia Cole", "discriminator": "0"}}),
+    );
+    let joined = wait("Nia to join the group", || {
+        match world.ask(Request::Members { conversation: world.key("3010"), offset: 0, limit: 50 }) {
+            Response::Members { members, .. } if members.len() == 4 => Some(members),
+            _ => None,
+        }
+    });
+    assert_eq!(joined.iter().map(|person| person.key.id.as_str()).collect::<Vec<_>>(), ["2001", "2002", "2010", "1000"]);
+    assert_eq!(joined.iter().find(|person| person.key.id == "2010").map(|person| person.name.as_str()), Some("Nia Cole"));
+    let info = match world.ask(Request::ConversationInfo { conversation: world.key("3010") }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(info.members, Some(4));
+    assert_eq!(world.conversation("3010").title, "Mara O, Dev Patel, Nia Cole");
+}
+
 fn polished() -> World {
     let world = World::launch(&[], |shared| *shared.ready.lock().unwrap() = polished_ready());
     wait("the account to connect", || (world.link() == Link::Connected).then_some(()));

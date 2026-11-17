@@ -655,6 +655,15 @@ impl Discord {
                     row.avatar = Some(file.id.clone());
                     files.push((file, url));
                 }
+                // A create or update can carry recipient ids and no user objects. Resolving
+                // nobody must not replace the list READY already recorded.
+                if !recipients.is_empty() {
+                    state.groups.insert(channel.id.clone(), super::GroupDm {
+                        owner: channel.owner_id.clone().unwrap_or_default(),
+                        recipients: recipients.iter().map(|user| user.id.clone()).collect(),
+                        named: channel.name.as_deref().is_some_and(|name| !name.is_empty()),
+                    });
+                }
             }
         }
         state.privates.insert(channel.id.clone());
@@ -676,6 +685,7 @@ impl Discord {
     /// which is where the account's picture is read from. The row goes first, so the status
     /// the name announces already has the picture.
     pub(super) fn myself(&self, user: &User) -> rusqlite::Result<()> {
+        self.state.lock().unwrap().users.insert(user.id.clone(), user.name().to_owned());
         self.ctx.media(&[user.avatar()])?;
         self.ctx.people(&[user.person(None)])?;
         self.ctx.describe(user.name(), &user.id)
@@ -805,10 +815,12 @@ impl Discord {
             });
             state.me = me.clone();
             state.users = names;
+            state.users.insert(me.clone(), ready.user.name().to_owned());
             state.rows = kept;
             state.relations = relations.iter().cloned().collect();
             state.directs.clear();
             state.privates.clear();
+            state.groups.clear();
             state.presence.clear();
             state.doing.clear();
             state.guilds.clear();
