@@ -72,6 +72,7 @@ impl Fault {
                 // A length or a count past the free plan. `MESSAGE_TOO_LONG` and
                 // `REACTIONS_TOO_MANY` are named above and are not this.
                 name if name.ends_with("_TOO_MUCH") => "This needs Telegram Premium.".to_owned(),
+                "SECRET_CHAT" => super::secret::PHONE.to_owned(),
                 other => format!("Telegram refused this ({other})."),
             },
             Fault::Net(_) => "Telegram did not answer.".to_owned(),
@@ -191,5 +192,11 @@ mod tests {
         assert!(!long.words().contains("needs Telegram Premium"), "{}", long.words());
         let many = Fault::Rpc { code: 400, name: "REACTIONS_TOO_MANY".into(), value: None };
         assert!(!many.words().contains("needs Telegram Premium"), "{}", many.words());
+    }
+
+    #[test]
+    fn a_secret_chat_says_it_only_works_in_the_phone_apps() {
+        let fault = Fault::Rpc { code: 400, name: "SECRET_CHAT".into(), value: None };
+        assert!(fault.words().contains("phone apps"), "{}", fault.words());
     }
 }

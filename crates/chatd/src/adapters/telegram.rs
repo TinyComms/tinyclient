@@ -11,11 +11,11 @@
 //! | Idle memory | +2.8 MB footprint loaded with no parameters set: a floor. With its database and a connection it could not be measured without an app id; the docs' estimate is 20 to 50 MB. | +0.2 MB footprint, +1.2 MB RSS over an empty process, measured connected to a datacenter with the key exchange done. |
 //! | Second cache | Its own SQLite beside ours: every message stored twice. | None: messages go to chatd's store as they arrive. |
 //! | Maintained | By Telegram. | One maintainer plus contributors; archived on GitHub 2026-02-10 and moved to Codeberg, where it is active: 0.10.0 on 2026-07-02, schema layer bumped 2026-10-10, commits the day this was written. |
-//! | Covers | Everything, secret chats and call signalling included. | Phone login and 2FA as methods; QR login, folders, topics, reactions, typing, read state and files through its raw request call, which reaches the whole schema. No secret chats, no calls. |
+//! | Covers | Everything, secret chats and call signalling included. | Phone login and 2FA as methods; QR login, folders, topics, reactions, typing, read state and files through its raw request call, which reaches the whole schema. A secret chat is a row that says it stays in Telegram's phone apps. No calls. |
 //!
 //! grammers wins on the two things this app is about, weight and one cache, and it is the only
 //! one of the two that can be built on the machine tinyclient is developed on. What it costs: a
-//! schema change at Telegram waits on one maintainer, secret chats are out, and calls (a later
+//! schema change at Telegram waits on one maintainer, secret-chat messages are not carried, and calls (a later
 //! stage, tgcalls either way) will need their signalling written here. If grammers is ever
 //! abandoned, everything above `wire::Wire` speaks Telegram's schema, not grammers, so the
 //! transport can be replaced without touching the mapping.
@@ -63,6 +63,7 @@ mod peers;
 mod premium;
 pub(crate) mod react;
 mod real;
+mod secret;
 mod send;
 pub mod signin;
 mod sync;
@@ -1215,6 +1216,11 @@ pub fn prove_telegram_mute_until() -> Result<(), String> {
         return Err("a mute until a later time is not muted".into());
     }
     Ok(())
+}
+
+/// The lab's telegram-secret-chat driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_secret_chat() -> Result<(), String> {
+    secret::prove()
 }
 
 /// The lab's telegram-dice driver. A build without this stays up and the driver fails.

@@ -2495,3 +2495,45 @@ fn a_second_sign_in_keeps_the_telegram_account_already_there() {
     };
     assert_eq!(conversation.key, lea_key("u7002"));
 }
+
+#[test]
+fn a_secret_chat_is_a_row_that_says_it_stays_in_the_phone_apps() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("secret");
+    let row = world.until("the secret chat", || world.conversation("e42"));
+    assert_eq!(row.title, "Odalys Brandt");
+    assert!(row.read_only);
+    assert_eq!(row.encryption, protocol::Encryption::Unknown);
+    assert!(row.preview.contains("Odalys Brandt") && row.preview.contains("phone apps"), "{}", row.preview);
+    assert!(row.topic.contains("phone apps"), "{}", row.topic);
+    assert!(row.kind == ConversationKind::Direct);
+    let listed = world.home(None, Shelf::Main).into_iter().any(|row| row.key.id == "e42");
+    assert!(listed, "the secret chat is a row on the list");
+    let notice = world.until("the notice", || {
+        world.messages("e42").into_iter().find(|message| message.kind == MessageKind::System)
+    });
+    assert!(notice.text.contains("phone apps"), "{}", notice.text);
+    assert!(!world.calls().iter().any(|call| call.contains("AcceptEncryption")), "{:?}", world.calls());
+    // The row is read-only, so the composer never reaches Telegram. The notice on the row is
+    // what says the chat stays in the phone apps.
+    let refused = world.ask(Request::Send {
+        conversation: key("e42"),
+        client_id: "5301".into(),
+        text: "hello".into(),
+        reply_to: None,
+        with: Default::default(),
+    });
+    let Response::Error { code: ErrorCode::Refused, detail } = refused else {
+        panic!("{refused:?}");
+    };
+    assert!(detail.contains("Odalys Brandt"), "{detail}");
+    assert!(
+        !world.calls().iter().any(|call| call.contains("AcceptEncryption") || call.contains("RequestEncryption") || call.contains("DiscardEncryption")),
+        "{:?}",
+        world.calls()
+    );
+    world.steer("secret-gone");
+    world.until("the row to leave", || world.conversation("e42").is_none().then_some(()));
+    assert!(!world.home(None, Shelf::Main).iter().any(|row| row.key.id == "e42"));
+}
