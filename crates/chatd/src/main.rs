@@ -416,6 +416,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-premium:0");
         return Ok(());
     }
+    // The lab's telegram-invoices driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-invoices") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_invoices() {
+            eprintln!("telegram-invoices: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-invoices:0");
+        return Ok(());
+    }
     // The lab's telegram-member-sections driver. A build without this stays up and the driver fails.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-member-sections") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_member_sections() {

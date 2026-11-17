@@ -5,7 +5,7 @@
 use super::peers::{is_replies, message_link, thread_id, Directory, Who};
 use grammers_tl_types as tl;
 use protocol::{
-    Attachment, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview, Reaction, Sender, Span,
+    Attachment, Card, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview, Reaction, Sender, Span,
     Style, ThreadSummary,
 };
 use tl::enums::{DocumentAttribute, MessageAction, MessageEntity, MessageMedia, PhotoSize};
@@ -815,6 +815,93 @@ fn unsupported(media: &MessageMedia) -> Option<String> {
     })
 }
 
+/// Stars, as a count. One is singular.
+fn stars(amount: i64) -> String {
+    if amount == 1 {
+        "1 Star".to_owned()
+    } else {
+        format!("{amount} Stars")
+    }
+}
+
+/// How many decimal places the currency's minor unit has. Stars are not a currency here.
+fn minor_digits(currency: &str) -> u32 {
+    match currency.to_ascii_uppercase().as_str() {
+        "BHD" | "IQD" | "JOD" | "KWD" | "LYD" | "OMR" | "TND" => 3,
+        "BIF" | "CLP" | "DJF" | "GNF" | "ISK" | "JPY" | "KMF" | "KRW" | "PYG" | "RWF" | "UGX" | "UYI" | "VND" | "VUV" | "XAF" | "XOF" | "XPF" => 0,
+        _ => 2,
+    }
+}
+
+/// A price in the network's own words: `USD 5.00`, `50 Stars`. Empty when there is no currency.
+fn price_of(currency: &str, amount: i64) -> Option<String> {
+    if currency.is_empty() {
+        return None;
+    }
+    if currency.eq_ignore_ascii_case("XTR") {
+        return Some(stars(amount));
+    }
+    let digits = minor_digits(currency);
+    let scale = 10i64.pow(digits);
+    let sign = if amount < 0 { "-" } else { "" };
+    let amount = amount.abs();
+    let code = currency.to_ascii_uppercase();
+    let (whole, frac) = (amount / scale, amount % scale);
+    Some(if digits == 0 {
+        format!("{sign}{code} {whole}")
+    } else {
+        format!("{sign}{code} {whole}.{frac:0width$}", width = digits as usize)
+    })
+}
+
+/// The card for an invoice or a paid-media preview. The message stays a hand-off: paying and
+/// buying Stars stay in Telegram's own app, and no card number is read or stored here.
+fn detail_card(media: &MessageMedia) -> Option<Card> {
+    match media {
+        MessageMedia::Invoice(invoice) => {
+            let mut card = Card {
+                title: invoice.title.clone(),
+                text: invoice.description.clone(),
+                footer: if invoice.receipt_msg_id.is_some() {
+                    "Paid · Open in Telegram".to_owned()
+                } else {
+                    "Open in Telegram".to_owned()
+                },
+                ..Card::default()
+            };
+            if let Some(price) = price_of(&invoice.currency, invoice.total_amount) {
+                card.fields.push(("Price".to_owned(), price));
+            }
+            if invoice.test {
+                card.fields.push(("Mode".to_owned(), "Test".to_owned()));
+            }
+            Some(card)
+        }
+        MessageMedia::PaidMedia(paid) => {
+            let video = paid.extended_media.iter().any(|one| {
+                matches!(one, tl::enums::MessageExtendedMedia::Preview(preview) if preview.video_duration.is_some())
+            });
+            let unlocked = paid.extended_media.iter().any(|one| matches!(one, tl::enums::MessageExtendedMedia::Media(_)));
+            let text = if unlocked {
+                "Unlocked.".to_owned()
+            } else if video {
+                "Locked video. The preview stays blurred until it is paid for.".to_owned()
+            } else {
+                "Locked. The preview stays blurred until it is paid for.".to_owned()
+            };
+            let mut card = Card {
+                title: "Paid media".to_owned(),
+                text,
+                footer: "Open in Telegram".to_owned(),
+                ..Card::default()
+            };
+            card.fields.push(("Price".to_owned(), stars(paid.stars_amount)));
+            Some(card)
+        }
+        _ => None,
+    }
+}
+
 fn reactions(reactions: &tl::enums::MessageReactions) -> Vec<Reaction> {
     let tl::enums::MessageReactions::Reactions(reactions) = reactions;
     let one = |count: &tl::enums::ReactionCount| {
@@ -995,13 +1082,13 @@ fn action(dir: &Directory, who: &str, action: &MessageAction) -> (String, bool) 
         A::PinMessage => named(format!("{who} pinned a message")),
         A::HistoryClear => named("History was cleared".to_owned()),
         A::GameScore(game) => named(format!("{who} scored {}", game.score)),
-        A::PaymentSent(paid) => named(match paid.currency.is_empty() {
-            true => format!("{who} sent a payment"),
-            false => format!("{who} sent a payment ({})", paid.currency),
+        A::PaymentSent(paid) => named(match price_of(&paid.currency, paid.total_amount) {
+            Some(price) => format!("{who} sent a payment of {price}"),
+            None => format!("{who} sent a payment"),
         }),
-        A::PaymentRefunded(paid) => named(match paid.currency.is_empty() {
-            true => "A payment was refunded".to_owned(),
-            false => format!("A {} payment was refunded", paid.currency),
+        A::PaymentRefunded(paid) => named(match price_of(&paid.currency, paid.total_amount) {
+            Some(price) => format!("A payment of {price} was refunded"),
+            None => "A payment was refunded".to_owned(),
         }),
         A::PhoneCall(call) => {
             let kind = if call.video { "Video call" } else { "Call" };
@@ -1232,6 +1319,11 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                         message.spans.clear();
                         message.kind = MessageKind::Unsupported { link: message_link(peer, dir.get(peer), raw.id) };
                     }
+                    // An invoice or paid preview is still a hand-off, and also a card: title,
+                    // description and price. Paying stays in Telegram's own app.
+                    if let Some(card) = detail_card(media) {
+                        message.card = Some(Box::new(card));
+                    }
                 }
             }
             let (topic, reply) = topic_of(raw.reply_to.as_ref());
@@ -1362,6 +1454,71 @@ pub(super) fn prove_service_lines() -> Result<(), String> {
         MessageKind::Unsupported { link }
             if unknown.message.text.contains("cannot show yet") && link.contains("user_id=7002") && link.contains("message_id=22") => {}
         _ => return Err(format!("an unnamed action opens in Telegram, got {}", unknown.message.text)),
+    }
+    Ok(())
+}
+
+/// The lab's telegram-invoices check. An invoice and a paid preview are cards with a price,
+/// and a payment names its amount. A build from before this has no card.
+pub(super) fn prove_invoices() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    9i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    message.media = Some(
+        tl::types::MessageMediaInvoice {
+            shipping_address_requested: false,
+            test: false,
+            title: "Ridge map".into(),
+            description: "The weekend route".into(),
+            photo: None,
+            receipt_msg_id: None,
+            currency: "USD".into(),
+            total_amount: 500,
+            start_param: String::new(),
+            extended_media: None,
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &message.into()).ok_or("the invoice maps")?;
+    let card = mapped.message.card.ok_or("an invoice is a card")?;
+    if card.title != "Ridge map" || card.fields.first().map(|field| field.1.as_str()) != Some("USD 5.00") {
+        return Err(format!("the invoice card has no price, got {}", card.title));
+    }
+    match mapped.message.kind {
+        MessageKind::Unsupported { ref link } if link.contains("message_id=9") => {}
+        _ => return Err("an invoice does not open in Telegram".into()),
+    }
+    let mut paid = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    paid.id = 10;
+    paid.media = Some(
+        tl::types::MessageMediaPaidMedia {
+            stars_amount: 50,
+            extended_media: vec![tl::types::MessageExtendedMediaPreview { w: Some(320), h: Some(240), thumb: None, video_duration: None }.into()],
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &paid.into()).ok_or("the paid media maps")?;
+    let card = mapped.message.card.ok_or("paid media is a card")?;
+    if card.fields.first().map(|field| field.1.as_str()) != Some("50 Stars") || !card.text.to_lowercase().contains("blur") {
+        return Err(format!("the paid preview is unnamed, got {}", card.text));
+    }
+    let sent = tl::types::MessageActionPaymentSent {
+        recurring_init: false,
+        recurring_used: false,
+        currency: "XTR".into(),
+        total_amount: 50,
+        invoice_slug: None,
+        subscription_until_date: None,
+    };
+    let (line, known) = action(&Directory::new(1), "Ada", &sent.into());
+    if !known || line != "Ada sent a payment of 50 Stars" {
+        return Err(format!("a Star payment is unnamed, got {line}"));
     }
     Ok(())
 }
@@ -1513,6 +1670,68 @@ mod tests {
 
     fn said(action: MessageAction) -> String {
         super::action(&Directory::new(1), "Ada", &action).0
+    }
+
+    fn blank_message() -> tl::types::Message {
+        use grammers_tl_types::{Deserializable, Serializable};
+        let mut bytes = Vec::new();
+        0u32.serialize(&mut bytes);
+        0u32.serialize(&mut bytes);
+        9i32.serialize(&mut bytes);
+        Who::User(7_002).peer().serialize(&mut bytes);
+        1_700_000_000i32.serialize(&mut bytes);
+        String::new().serialize(&mut bytes);
+        let mut message = tl::types::Message::from_bytes(&bytes).expect("a blank message reads back");
+        message.from_id = Some(Who::User(7_002).peer());
+        message
+    }
+
+    #[test]
+    fn an_invoice_and_paid_media_are_cards_with_a_price_and_a_hand_off() {
+        let mut invoice = blank_message();
+        invoice.media = Some(
+            tl::types::MessageMediaInvoice {
+                shipping_address_requested: false,
+                test: false,
+                title: "Ridge map".into(),
+                description: "The weekend route".into(),
+                photo: None,
+                receipt_msg_id: None,
+                currency: "USD".into(),
+                total_amount: 500,
+                start_param: String::new(),
+                extended_media: None,
+            }
+            .into(),
+        );
+        let mapped = map(&Directory::new(7_001), &invoice.into()).expect("the invoice maps");
+        let card = mapped.message.card.expect("an invoice is a card");
+        assert_eq!(card.title, "Ridge map");
+        assert_eq!(card.text, "The weekend route");
+        assert_eq!(card.fields, vec![("Price".into(), "USD 5.00".into())]);
+        assert!(matches!(mapped.message.kind, MessageKind::Unsupported { ref link } if link.contains("message_id=9")));
+
+        let mut paid = blank_message();
+        paid.id = 10;
+        paid.media = Some(
+            tl::types::MessageMediaPaidMedia {
+                stars_amount: 50,
+                extended_media: vec![tl::types::MessageExtendedMediaPreview {
+                    w: Some(1_280),
+                    h: Some(720),
+                    thumb: None,
+                    video_duration: Some(8),
+                }
+                .into()],
+            }
+            .into(),
+        );
+        let mapped = map(&Directory::new(7_001), &paid.into()).expect("the paid media maps");
+        let card = mapped.message.card.expect("paid media is a card");
+        assert_eq!(card.title, "Paid media");
+        assert!(card.text.to_lowercase().contains("lock") || card.text.to_lowercase().contains("blur"), "{}", card.text);
+        assert_eq!(card.fields, vec![("Price".into(), "50 Stars".into())]);
+        assert!(matches!(mapped.message.kind, MessageKind::Unsupported { .. }));
     }
 
     /// Every `MessageAction` of the pinned grammers schema. A new variant fails this build
@@ -1708,7 +1927,16 @@ mod tests {
             invoice_slug: None,
             subscription_until_date: None,
         };
-        assert_eq!(said(paid.into()), "Ada sent a payment (USD)");
+        assert_eq!(said(paid.into()), "Ada sent a payment of USD 5.00");
+        let stars = tl::types::MessageActionPaymentSent {
+            recurring_init: false,
+            recurring_used: false,
+            currency: "XTR".into(),
+            total_amount: 50,
+            invoice_slug: None,
+            subscription_until_date: None,
+        };
+        assert_eq!(said(stars.into()), "Ada sent a payment of 50 Stars");
         let refunded = tl::types::MessageActionPaymentRefunded {
             peer: Who::User(7_002).peer(),
             currency: "USD".into(),
@@ -1716,7 +1944,15 @@ mod tests {
             payload: None,
             charge: tl::types::PaymentCharge { id: "c".into(), provider_charge_id: "p".into() }.into(),
         };
-        assert_eq!(said(refunded.into()), "A USD payment was refunded");
+        assert_eq!(said(refunded.into()), "A payment of USD 5.00 was refunded");
+        let stars_back = tl::types::MessageActionPaymentRefunded {
+            peer: Who::User(7_002).peer(),
+            currency: "XTR".into(),
+            total_amount: 1,
+            payload: None,
+            charge: tl::types::PaymentCharge { id: "c".into(), provider_charge_id: "p".into() }.into(),
+        };
+        assert_eq!(said(stars_back.into()), "A payment of 1 Star was refunded");
         assert_eq!(said(tl::types::MessageActionGiveawayLaunch { stars: None }.into()), "Ada started a giveaway");
         let results = tl::types::MessageActionGiveawayResults { stars: false, winners_count: 3, unclaimed_count: 0 };
         assert_eq!(said(results.into()), "A giveaway finished with 3 winners");
