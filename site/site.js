@@ -39,6 +39,75 @@
     }
   }
 
+  // 2b. Shortcuts are written as on macOS. On Windows and Linux, show the keys the app shows
+  // there: the same rule as crates/tinyclient/src/gui/shortcuts.rs. Command is Ctrl, Option is
+  // Alt, Control+Command is Ctrl+Alt, and the modifiers read Ctrl, Alt, Shift. Super and the
+  // Windows key are never used: they stay with the desktop.
+  if (os === "windows" || os === "linux") {
+    var systemName = os === "windows" ? "Windows" : "Linux";
+    var order = ["Ctrl", "Alt", "Shift"];
+    var native = function (mods) {
+      // mods: the macOS modifiers of one chord, by name.
+      var has = {};
+      for (var m = 0; m < mods.length; m++) has[mods[m]] = true;
+      var out = {};
+      if (has.Command) out.Ctrl = true;
+      if (has.Control) { if (has.Command) out.Alt = true; else out.Ctrl = true; }
+      if (has.Option) out.Alt = true;
+      if (has.Shift) out.Shift = true;
+      return order.filter(function (name) { return out[name]; });
+    };
+
+    // Keycaps: <kbd>⇧</kbd><kbd>⌘</kbd><kbd>M</kbd>, chords separated by <i>/</i>.
+    var glyphs = { "⌘": "Command", "⌃": "Control", "⌥": "Option", "⇧": "Shift" };
+    var groups = document.querySelectorAll(".keys");
+    for (var g = 0; g < groups.length; g++) {
+      var chord = [];
+      var flush = function (before) {
+        var mods = [], rest = [];
+        for (var c = 0; c < chord.length; c++) {
+          var name = glyphs[chord[c].textContent];
+          if (name) mods.push(name); else rest.push(chord[c]);
+        }
+        var names = native(mods);
+        for (var c2 = 0; c2 < chord.length; c2++) chord[c2].remove();
+        for (var n = 0; n < names.length; n++) {
+          var cap = document.createElement("kbd");
+          cap.textContent = names[n];
+          groups[g].insertBefore(cap, before);
+        }
+        for (var r = 0; r < rest.length; r++) groups[g].insertBefore(rest[r], before);
+        chord = [];
+      };
+      var kids = Array.prototype.slice.call(groups[g].children);
+      for (var x = 0; x < kids.length; x++) {
+        if (kids[x].tagName === "KBD") chord.push(kids[x]); else flush(kids[x]);
+      }
+      flush(null);
+    }
+
+    // Written out: Shift+Command+M, D, H. Command++ is the plus key; Return is Enter.
+    var spelled = function (text) {
+      return text.replace(/((?:(?:Control|Command|Option|Shift)\+)+)(\+|Return)?/g, function (all, mods, key) {
+        var names = native(mods.split("+").filter(Boolean));
+        var last = key === "+" ? "Plus" : key === "Return" ? "Enter" : "";
+        return names.join("+") + "+" + last;
+      });
+    };
+    var tables = document.querySelectorAll("[data-keys-table]");
+    for (var t = 0; t < tables.length; t++) {
+      var heading = tables[t].querySelector("[data-keys-system]");
+      if (heading) heading.textContent = systemName;
+      var cells = tables[t].querySelectorAll("tbody td:last-child");
+      for (var d = 0; d < cells.length; d++) cells[d].textContent = spelled(cells[d].textContent);
+    }
+
+    var onlyMac = document.querySelectorAll("[data-keys-mac]");
+    for (var o = 0; o < onlyMac.length; o++) onlyMac[o].remove();
+    var labelled = document.querySelectorAll("[data-keys-label]");
+    for (var l = 0; l < labelled.length; l++) labelled[l].setAttribute("aria-label", labelled[l].getAttribute("data-keys-label") + systemName);
+  }
+
   // 3. The hero screenshots: arrows, tabs, keyboard and auto-advance on top of a scroll-snap
   // strip that works by itself (swipe and scroll are the browser's own).
   (function () {
