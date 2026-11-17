@@ -27,6 +27,9 @@ const FILE_CAP: u64 = 100 * 1024 * 1024;
 const NETWORK: &str = "Bugle";
 /// How long one request waits for the phone to answer on the long-poll.
 const PHONE: Duration = Duration::from_secs(20);
+/// What a request says when that wait runs out. The relay itself can still be up.
+pub const PHONE_QUIET: &str =
+    "Your phone isn't responding. Keep Messages open, and the phone online.";
 
 type AesCtr = Ctr128BE<Aes256>;
 type HmacSha = Hmac<Sha256>;
@@ -1119,7 +1122,7 @@ impl Session {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .retain(|waiter| waiter.request != request);
-                Err("Your phone isn't responding. Keep Messages open, and the phone online.".into())
+                Err(PHONE_QUIET.into())
             }
         }
     }
