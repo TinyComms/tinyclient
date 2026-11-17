@@ -7,25 +7,68 @@
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 
-const CHUNK: usize = 32 * 1024;
+pub(super) const CHUNK: usize = 32 * 1024;
 const LOG2_CHUNK: u8 = 15;
 
-pub fn pack(key: &[u8], plain: &[u8]) -> Result<Vec<u8>, String> {
-    let cipher = cipher(key)?;
-    let mut out = vec![0u8, LOG2_CHUNK];
-    if plain.is_empty() {
-        return Ok(out);
+/// Seals plaintext as it arrives. A full chunk stays held until another follows, because only
+/// the last chunk is marked last.
+pub(super) struct Packer {
+    cipher: Aes256Gcm,
+    held: Vec<u8>,
+    index: u32,
+    out: Vec<u8>,
+}
+
+impl Packer {
+    pub(super) fn open(key: &[u8]) -> Result<Packer, String> {
+        Ok(Packer {
+            cipher: cipher(key)?,
+            held: Vec::new(),
+            index: 0,
+            out: vec![0, LOG2_CHUNK],
+        })
     }
-    let last = plain.len().div_ceil(CHUNK) - 1;
-    for (index, chunk) in plain.chunks(CHUNK).enumerate() {
+
+    /// One chunk, at most [`CHUNK`] bytes. A shorter chunk is the last one.
+    pub(super) fn push(&mut self, chunk: &[u8]) -> Result<(), String> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        if chunk.len() > CHUNK || (!self.held.is_empty() && self.held.len() != CHUNK) {
+            return Err("Messages could not seal that file.".into());
+        }
+        if !self.held.is_empty() {
+            self.seal(false)?;
+        }
+        self.held.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    pub(super) fn finish(mut self) -> Result<Vec<u8>, String> {
+        if !self.held.is_empty() {
+            self.seal(true)?;
+        }
+        Ok(self.out)
+    }
+
+    fn seal(&mut self, last: bool) -> Result<(), String> {
         let mut nonce = [0u8; 12];
-        getrandom::fill(&mut nonce)
-            .map_err(|_| "Messages could not make a media key.".to_owned())?;
-        let sealed = seal_chunk(&cipher, &nonce, chunk, index == last, index as u32)?;
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&sealed);
+        getrandom::fill(&mut nonce).map_err(|_| "Messages could not make a media key.".to_owned())?;
+        let sealed = seal_chunk(&self.cipher, &nonce, &self.held, last, self.index)?;
+        self.out.extend_from_slice(&nonce);
+        self.out.extend_from_slice(&sealed);
+        self.held.clear();
+        self.index += 1;
+        Ok(())
     }
-    Ok(out)
+}
+
+pub fn pack(key: &[u8], plain: &[u8]) -> Result<Vec<u8>, String> {
+    let mut packer = Packer::open(key)?;
+    for chunk in plain.chunks(CHUNK) {
+        packer.push(chunk)?;
+    }
+    packer.finish()
 }
 
 pub fn unpack(key: &[u8], packed: &[u8]) -> Result<Vec<u8>, String> {
