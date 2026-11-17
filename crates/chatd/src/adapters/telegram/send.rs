@@ -181,7 +181,7 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
     let words = |fault: Fault| fault.words();
     let target = target(account, conversation, reply_to).map_err(words)?;
     let premium = account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium);
-    let limit = if premium { 4_096 } else { 1_024 };
+    let limit = account.live().limits.caption(premium) as usize;
     let (plain, entities) = super::prepared(account, conversation, text);
     // A caption longer than Telegram takes goes first as a message of its own.
     let caption = if plain.chars().count() > limit {

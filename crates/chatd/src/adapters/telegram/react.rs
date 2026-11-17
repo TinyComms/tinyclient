@@ -123,7 +123,13 @@ pub(super) fn rules(account: &Account, conversation: &str) -> Result<ReactionRul
             }
         }
     };
-    Ok(rules_of(&standard(account)?, allowed, premium, limit))
+    let mut rules = rules_of(&standard(account)?, allowed, premium, limit);
+    let limits = account.live().limits.clone();
+    rules.mine = limits.reactions(premium);
+    if limit.is_none() {
+        rules.distinct = limits.reactions_distinct;
+    }
+    Ok(rules)
 }
 
 /// Gives or takes back a reaction. Telegram takes the whole set of ours on the message, so

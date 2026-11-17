@@ -1,0 +1,12 @@
+{
+  "id": "telegram-premium",
+  "title": "Telegram Premium is named, and a send that needs it says so",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same Premium words are what a refusal maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same Premium words are what a refusal maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

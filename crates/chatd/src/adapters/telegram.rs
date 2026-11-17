@@ -58,6 +58,7 @@ mod filing;
 mod info;
 mod live;
 mod peers;
+mod premium;
 pub(crate) mod react;
 mod real;
 mod send;
@@ -206,6 +207,8 @@ struct Live {
     recovered_through: VecDeque<(Who, i32)>,
     /// Telegram's reaction emoji, and whether each needs Premium, once asked (`react`).
     reactions: Option<Vec<(String, bool)>>,
+    /// File, caption and reaction limits from `help.getAppConfig`, or the documented defaults.
+    limits: premium::Limits,
 }
 
 /// Telegram's own send options, which Telegram carries out.
@@ -912,7 +915,8 @@ fn save_draft(account: &Account, conversation: &str, text: &str) {
 
 fn person(account: &Account, who: Who, relation: Relation) -> Person {
     let dir = account.dir();
-    let row = peers::person_row(who, &dir.get(who).cloned().unwrap_or_default());
+    let known = dir.get(who).cloned().unwrap_or_default();
+    let row = peers::shown_person(account.me, who, &known);
     Person {
         key: account.ctx.key(&row.id),
         presence: account.ctx.presence_of(&row.id),
@@ -921,7 +925,7 @@ fn person(account: &Account, who: Who, relation: Relation) -> Person {
         avatar: row.avatar.map(|id| protocol::MediaFile::new(id, protocol::MediaKind::Avatar)),
         bot: row.bot,
         relation,
-        status: String::new(),
+        status: row.status,
         link: row.link,
         ..Person::new(account.ctx.key(&row.id), "")
     }
@@ -1081,6 +1085,11 @@ pub fn prove_telegram_custom_emoji() -> Result<(), String> {
 /// The lab's telegram-service-lines driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_service_lines() -> Result<(), String> {
     content::prove_service_lines()
+}
+
+/// The lab's telegram-premium driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_premium() -> Result<(), String> {
+    premium::prove()
 }
 
 /// The lab's telegram-dice driver. A build without this stays up and the driver fails.

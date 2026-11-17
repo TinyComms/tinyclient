@@ -113,7 +113,9 @@ fn user(id: i64, first: &str, last: &str, username: &str) -> tl::types::User {
     if id == TOBIN {
         user.status = Some(tl::enums::UserStatus::Recently(blank(&[&put(0u32)])));
     }
-    user.premium = id == ME && std::env::var("TINYCLIENT_TELEGRAM_PREMIUM").ok().as_deref() == Some("1");
+    let peer = std::env::var("TINYCLIENT_TELEGRAM_PEER_PREMIUM").ok();
+    let id_text = id.to_string();
+    user.premium = (id == ME && std::env::var("TINYCLIENT_TELEGRAM_PREMIUM").ok().as_deref() == Some("1")) || peer.as_deref() == Some(id_text.as_str());
     user.verified = id == SERVICE;
     user.bot = id == BOT || id == GIF_BOT;
     // A bot's flag is shared with its info version, which must then be there.
@@ -615,6 +617,27 @@ impl World {
         let messages = all.into_iter().skip(from).take(limit.max(0) as usize).cloned().collect();
         tl::types::messages::Messages { messages, topics: Vec::new(), chats: chats(), users: users() }.into()
     }
+}
+
+/// `help.getAppConfig`, with the documented defaults. `TINYCLIENT_TELEGRAM_CAPTION` replaces
+/// the free caption so a test can see the config applied.
+fn app_config() -> tl::enums::help::AppConfig {
+    let caption = std::env::var("TINYCLIENT_TELEGRAM_CAPTION").ok().and_then(|value| value.parse().ok()).unwrap_or(1_024.0);
+    let num = |key: &str, value: f64| -> tl::enums::JsonobjectValue {
+        tl::types::JsonObjectValue { key: key.to_owned(), value: tl::types::JsonNumber { value }.into() }.into()
+    };
+    let config = tl::types::JsonObject {
+        value: vec![
+            num("caption_length_limit_default", caption),
+            num("caption_length_limit_premium", 4_096.0),
+            num("upload_max_fileparts_default", 4_000.0),
+            num("upload_max_fileparts_premium", 8_000.0),
+            num("reactions_user_max_default", 1.0),
+            num("reactions_user_max_premium", 3.0),
+            num("reactions_uniq_max", 11.0),
+        ],
+    };
+    tl::enums::help::AppConfig::Config(tl::types::help::AppConfig { hash: 1, config: config.into() })
 }
 
 fn rpc(code: i32, name: &str, value: Option<u32>) -> Fault {
@@ -1813,6 +1836,9 @@ impl World {
             if request.message == "refuse me" {
                 return Err(rpc(403, "CHAT_WRITE_FORBIDDEN", None));
             }
+            if request.message == "premium file" {
+                return Err(rpc(403, "PREMIUM_ACCOUNT_REQUIRED", None));
+            }
             let (topic, reply) = match &request.reply_to {
                 Some(tl::enums::InputReplyTo::Message(reply)) if peer == Who::Channel(WORKSHOP) => (Some(reply.top_msg_id.unwrap_or(reply.reply_to_msg_id)), None),
                 Some(tl::enums::InputReplyTo::Message(reply)) => (None, Some(reply.reply_to_msg_id)),
@@ -1976,6 +2002,10 @@ impl World {
             full.about = Some("Maps, mostly.".to_owned());
             let found = tl::types::users::UserFull { full_user: full.into(), chats: Vec::new(), users: users() };
             return answer(tl::enums::users::UserFull::Full(found));
+        }
+        if asked::<f::help::GetAppConfig>(body).is_some() {
+            self.log("GetAppConfig");
+            return answer(app_config());
         }
         if let Some(answered) = self.panes(body, events) {
             return answered;
