@@ -5,6 +5,7 @@
 //! Built only with the `signal` feature. Untested against a live account: no test can reach
 //! Signal without a real phone to link from (see `tests/signal.rs` for what is proven).
 
+use super::style::{self, Mark, Range};
 use super::vault::{self, Vault};
 use super::wire::{Body, Contact, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
@@ -20,8 +21,9 @@ use presage::libsignal_service::configuration::SignalServers;
 use presage::manager::{Registered, RegistrationData};
 use presage::model::messages::Received;
 use presage::proto::{
-    body_range::AssociatedValue, data_message, receipt_message, sync_message, typing_message, DataMessage, EditMessage, GroupContextV2,
-    ReceiptMessage, SyncMessage, TypingMessage,
+    body_range::{AssociatedValue, Style as RangeStyle},
+    data_message, receipt_message, sync_message, typing_message, BodyRange, DataMessage, EditMessage, GroupContextV2, ReceiptMessage,
+    SyncMessage, TypingMessage,
 };
 use presage::store::ContentsStore;
 use presage::Manager;
@@ -361,28 +363,45 @@ impl Session {
         }
     }
 
-    /// The words of a message: mentions read as names, and what is not drawn here named.
+    /// One body range, with a mention's name already resolved.
+    async fn range_of(&mut self, range: &BodyRange) -> Option<Range> {
+        let start = range.start.unwrap_or(0);
+        let length = range.length.unwrap_or(0);
+        match &range.associated_value {
+            Some(AssociatedValue::MentionAci(aci)) => Some(self.mention(start, aci).await),
+            Some(AssociatedValue::MentionAciBinary(bytes)) => {
+                let aci = aci_of(bytes)?;
+                Some(self.mention(start, &aci).await)
+            }
+            Some(AssociatedValue::Style(style)) => mark_of(*style).map(|style| Range::Style { start, length, style }),
+            None => None,
+        }
+    }
+
+    async fn mention(&mut self, start: u32, aci: &str) -> Range {
+        let name = if aci == self.me { "you".to_owned() } else { self.name_of(aci).await };
+        let label = if name.is_empty() { "@Signal user".to_owned() } else { format!("@{name}") };
+        Range::Mention { start, aci: aci.to_owned(), label }
+    }
+
+    async fn ranges_of(&mut self, ranges: &[BodyRange]) -> Vec<Range> {
+        let mut out = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            if let Some(range) = self.range_of(range).await {
+                out.push(range);
+            }
+        }
+        out
+    }
+
+    /// The words of a message: mentions read as names, styles kept, and what is not drawn here named.
     async fn text(&mut self, message: &DataMessage, author: &str, sent: u64) -> Text {
-        let mut text = message.body.clone().unwrap_or_default();
-        let mut mentions_me = false;
-        let mut mentions: Vec<(u32, String)> = Vec::new();
-        for range in &message.body_ranges {
-            if let Some(AssociatedValue::MentionAci(aci)) = &range.associated_value {
-                mentions_me |= *aci == self.me;
-                mentions.push((range.start.unwrap_or(0), aci.clone()));
-            }
-        }
-        if !mentions.is_empty() {
-            mentions.sort();
-            let mut names = Vec::new();
-            for (_, aci) in &mentions {
-                let name = if *aci == self.me { "you".to_owned() } else { self.name_of(aci).await };
-                names.push(if name.is_empty() { "@Signal user".to_owned() } else { format!("@{name}") });
-            }
-            // Each mention is one U+FFFC in the body, in order.
-            let mut named = names.into_iter();
-            text = text.chars().map(|c| if c == '\u{FFFC}' { named.next().unwrap_or_default() } else { c.to_string() }).collect();
-        }
+        let body = message.body.clone().unwrap_or_default();
+        let ranges = self.ranges_of(&message.body_ranges).await;
+        let styled = style::apply(&body, &ranges, &self.me);
+        let text = styled.text;
+        let mentions_me = styled.mentions_me;
+        let spans = styled.spans;
         let unsupported = if let Some(attachment) = message.attachments.first() {
             let kind = attachment.content_type.as_deref().unwrap_or("");
             Some(match kind.split('/').next() {
@@ -404,13 +423,17 @@ impl Session {
         } else {
             None
         };
-        let quote = message.quote.as_ref().map(|quote| Quote {
-            sent: quote.id.unwrap_or(0),
-            author: quote.author_aci.clone().unwrap_or_default(),
-            text: quote.text.clone().unwrap_or_default(),
-        });
+        let quote = match message.quote.as_ref() {
+            Some(quote) => {
+                let qbody = quote.text.clone().unwrap_or_default();
+                let qranges = self.ranges_of(&quote.body_ranges).await;
+                let quoted = style::apply(&qbody, &qranges, &self.me);
+                Some(Quote { sent: quote.id.unwrap_or(0), author: quote.author_aci.clone().unwrap_or_default(), text: quoted.text, spans: quoted.spans })
+            }
+            None => None,
+        };
         let name = if author == self.me { String::new() } else { self.name_of(author).await };
-        Text { author: author.to_owned(), name, sent, text, quote, mentions_me, unsupported: unsupported.map(str::to_owned) }
+        Text { author: author.to_owned(), name, sent, text, quote, mentions_me, unsupported: unsupported.map(str::to_owned), spans }
     }
 
     /// One data message, from someone (`outgoing` false) or from us on another device.
@@ -464,8 +487,8 @@ impl Session {
             }
             ContentBody::EditMessage(EditMessage { target_sent_timestamp, data_message: Some(message) }) => {
                 let peer = self.peer(message.group_v2.as_ref(), &sender).await;
-                let text = self.text(&message, &sender, sent).await.text;
-                self.tell(Event::Edited { peer, author: sender, target: target_sent_timestamp.unwrap_or(0), text });
+                let styled = self.text(&message, &sender, sent).await;
+                self.tell(Event::Edited { peer, author: sender, target: target_sent_timestamp.unwrap_or(0), text: styled.text, spans: styled.spans });
             }
             ContentBody::SynchronizeMessage(sync) => self.sync(sync).await,
             ContentBody::ReceiptMessage(ReceiptMessage { r#type, timestamp }) => {
@@ -500,8 +523,8 @@ impl Session {
             }
             if let Some(EditMessage { target_sent_timestamp, data_message: Some(message) }) = &sent.edit_message {
                 let peer = self.peer(message.group_v2.as_ref(), destination.as_deref().unwrap_or(&me)).await;
-                let text = self.text(message, &me, 0).await.text;
-                self.tell(Event::Edited { peer, author: me, target: target_sent_timestamp.unwrap_or(0), text });
+                let styled = self.text(message, &me, 0).await;
+                self.tell(Event::Edited { peer, author: me, target: target_sent_timestamp.unwrap_or(0), text: styled.text, spans: styled.spans });
             }
         }
         if !sync.read.is_empty() {
@@ -653,12 +676,14 @@ impl Session {
         let at = now_ms();
         let group_v2 = self.group_context(to)?;
         let content = match body {
-            Body::Text { text, quote } => ContentBody::DataMessage(DataMessage {
+            Body::Text { text, quote, ranges } => ContentBody::DataMessage(DataMessage {
                 body: Some(text),
+                body_ranges: proto_ranges(&ranges),
                 quote: quote.map(|quote| data_message::Quote {
                     id: Some(quote.sent),
                     author_aci: Some(quote.author),
-                    text: Some(quote.text),
+                    text: Some(quote.text.clone()),
+                    body_ranges: proto_ranges(&span_ranges(&quote.text, &quote.spans)),
                     r#type: Some(data_message::quote::Type::Normal.into()),
                     ..Default::default()
                 }),
@@ -681,9 +706,15 @@ impl Session {
                 group_v2,
                 ..Default::default()
             }),
-            Body::Edit { target, text } => ContentBody::EditMessage(EditMessage {
+            Body::Edit { target, text, ranges } => ContentBody::EditMessage(EditMessage {
                 target_sent_timestamp: Some(target),
-                data_message: Some(DataMessage { body: Some(text), timestamp: Some(at), group_v2, ..Default::default() }),
+                data_message: Some(DataMessage {
+                    body: Some(text),
+                    body_ranges: proto_ranges(&ranges),
+                    timestamp: Some(at),
+                    group_v2,
+                    ..Default::default()
+                }),
             }),
         };
         self.deliver(to, content, at).await?;
@@ -733,6 +764,45 @@ impl Session {
         vault::remove(self.vault.path());
         Ok(())
     }
+}
+
+fn span_ranges(text: &str, spans: &[protocol::Span]) -> Vec<Range> {
+    style::marks(text, spans).into_iter().map(|(start, length, style)| Range::Style { start, length, style }).collect()
+}
+
+fn proto_ranges(ranges: &[Range]) -> Vec<BodyRange> {
+    ranges
+        .iter()
+        .filter_map(|range| {
+            let Range::Style { start, length, style } = range else {
+                return None;
+            };
+            let style = match style {
+                Mark::Bold => RangeStyle::Bold,
+                Mark::Italic => RangeStyle::Italic,
+                Mark::Strike => RangeStyle::Strikethrough,
+                Mark::Monospace => RangeStyle::Monospace,
+                Mark::Spoiler => RangeStyle::Spoiler,
+            };
+            Some(BodyRange { start: Some(*start), length: Some(*length), associated_value: Some(AssociatedValue::Style(style as i32)) })
+        })
+        .collect()
+}
+
+fn mark_of(style: i32) -> Option<Mark> {
+    match RangeStyle::try_from(style) {
+        Ok(RangeStyle::Bold) => Some(Mark::Bold),
+        Ok(RangeStyle::Italic) => Some(Mark::Italic),
+        Ok(RangeStyle::Spoiler) => Some(Mark::Spoiler),
+        Ok(RangeStyle::Strikethrough) => Some(Mark::Strike),
+        Ok(RangeStyle::Monospace) => Some(Mark::Monospace),
+        _ => None,
+    }
+}
+
+fn aci_of(bytes: &[u8]) -> Option<String> {
+    let bytes: [u8; 16] = bytes.try_into().ok()?;
+    Some(Uuid::from_bytes(bytes).to_string())
 }
 
 /// Links this computer to an account, as Signal Desktop is linked.

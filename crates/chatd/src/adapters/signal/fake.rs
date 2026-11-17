@@ -150,7 +150,7 @@ fn steer(line: &str) -> Vec<Event> {
                 "photo" => text.unsupported = Some("Photo".into()),
                 "quote" => {
                     let quoted = next().parse().unwrap_or(0);
-                    text.quote = Some(Quote { sent: quoted, author: ME.into(), text: String::new() });
+                    text.quote = Some(Quote { sent: quoted, author: ME.into(), text: String::new(), spans: Vec::new() });
                     text.text = rest(line, 4);
                 }
                 "mention" => {
@@ -174,7 +174,7 @@ fn steer(line: &str) -> Vec<Event> {
             };
             let target = next().parse().unwrap_or(0);
             match command {
-                "edit" => vec![Event::Edited { peer: direct(author), author: author.into(), target, text: rest(line, 3) }],
+                "edit" => vec![Event::Edited { peer: direct(author), author: author.into(), target, text: rest(line, 3), spans: Vec::new() }],
                 _ => vec![Event::Deleted { peer: direct(author), author: author.into(), target }],
             }
         }
@@ -218,6 +218,22 @@ fn describe(to: &Peer) -> String {
     to.conversation()
 }
 
+/// Style ranges on a send, empty when there are none so an unstyled send reads as before.
+fn noted(ranges: &[super::style::Range]) -> String {
+    let parts: Vec<String> = ranges
+        .iter()
+        .filter_map(|range| match range {
+            super::style::Range::Style { start, length, style } => Some(format!("{style:?}:{start}+{length}")),
+            super::style::Range::Mention { .. } => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ranges={}", parts.join(","))
+    }
+}
+
 impl Wire for Fake {
     fn events(&self) -> Option<Receiver<Event>> {
         self.heard.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
@@ -233,10 +249,12 @@ impl Wire for Fake {
             return Err(Fault::Net("closed".into()));
         }
         let line = match &body {
-            Body::Text { text, quote: Some(quote) } => format!("send {} text {text} (answering {}-{})", describe(to), quote.sent, quote.author),
-            Body::Text { text, quote: None } => format!("send {} text {text}", describe(to)),
+            Body::Text { text, quote: Some(quote), ranges } => {
+                format!("send {} text {text}{} (answering {}-{})", describe(to), noted(ranges), quote.sent, quote.author)
+            }
+            Body::Text { text, quote: None, ranges } => format!("send {} text {text}{}", describe(to), noted(ranges)),
             Body::React { author, target, emoji, remove } => format!("send {} react {target}-{author} {emoji} remove={remove}", describe(to)),
-            Body::Edit { target, text } => format!("send {} edit {target} {text}", describe(to)),
+            Body::Edit { target, text, ranges } => format!("send {} edit {target} {text}{}", describe(to), noted(ranges)),
             Body::Delete { target } => format!("send {} delete {target}", describe(to)),
         };
         record(&line);

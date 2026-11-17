@@ -34,6 +34,7 @@
 mod fake;
 #[cfg(feature = "signal")]
 mod real;
+mod style;
 pub mod signin;
 #[cfg(feature = "signal")]
 mod vault;
@@ -42,7 +43,7 @@ mod wire;
 use super::{keep_connected, serve_commands, About, Command, Context, Failure, Refusal, Signed};
 use crate::session;
 use crate::store::{ConversationRow, PersonRow};
-use protocol::{Contact, ContactKind, ConversationKind, Link, Message, MessageKind, Reaction, Relation, ReplyTo};
+use protocol::{Contact, ContactKind, ConversationKind, Link, Message, MessageKind, Reaction, Relation, ReplyTo, Span};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::Receiver;
@@ -455,15 +456,18 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
     } else {
         text.name.clone()
     };
-    let words = match (&text.unsupported, text.text.is_empty()) {
-        (Some(what), true) => what.clone(),
-        (Some(what), false) => format!("{what}: {}", text.text),
-        (None, _) => text.text.clone(),
+    let (words, shift) = match (&text.unsupported, text.text.is_empty()) {
+        (Some(what), true) => (what.clone(), None),
+        (Some(what), false) => (format!("{what}: {}", text.text), Some(format!("{what}: ").len() as u32)),
+        (None, _) => (text.text.clone(), Some(0)),
     };
     let sent = i64::try_from(text.sent / 1_000).unwrap_or(0);
     let mut message = Message::plain(wire::message_id(text.sent, author), name, words, sent, outgoing);
     message.sender.id = author.to_owned();
     message.mentions_me = text.mentions_me && !outgoing;
+    if let Some(shift) = shift {
+        message.spans = text.spans.iter().map(|span| Span { start: span.start + shift, end: span.end + shift, style: span.style.clone() }).collect();
+    }
     if text.unsupported.is_some() {
         message.kind = MessageKind::Unsupported { link: String::new() };
     }
@@ -473,10 +477,11 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
 
 fn reply_to(account: &Account, quote: &Quote) -> ReplyTo {
     let sender = if quote.author == account.me { account.name.clone() } else { account.live().name(&quote.author) };
+    let snippet = crate::store::without_spoilers(&quote.text, &quote.spans);
     ReplyTo {
         id: wire::message_id(quote.sent, &quote.author),
         sender,
-        snippet: quote.text.chars().take(200).collect(),
+        snippet: snippet.chars().take(200).collect(),
         person: Some(account.ctx.key(&quote.author)),
         deleted: false,
     }
@@ -551,10 +556,11 @@ fn apply(account: &Account, event: Event) {
             }
             let _ = ctx.message(&conversation, &message);
         }
-        Event::Edited { peer, author, target, text } => {
+        Event::Edited { peer, author, target, text, spans } => {
             let conversation = peer.conversation();
             if let Ok(Some(mut message)) = ctx.stored_message(&conversation, &wire::message_id(target, &author)) {
                 message.text = text;
+                message.spans = spans;
                 message.edited = true;
                 let _ = ctx.message(&conversation, &message);
             }
@@ -808,16 +814,19 @@ fn target(message_id: &str) -> Result<(u64, String), Fault> {
 
 fn send_text(account: &Account, conversation: &str, text: &str, reply_to: Option<&str>) -> Result<Message, Fault> {
     let to = peer(conversation)?;
+    let (plain, ranges) = style::parse(text);
+    let spans = style::spans(&plain, &ranges);
     let quote = match reply_to.map(target).transpose()? {
         Some((sent, author)) => {
-            let text = account.ctx.stored_message(conversation, &wire::message_id(sent, &author)).ok().flatten().map_or_else(String::new, |m| m.text);
-            Some(Quote { sent, author, text })
+            let stored = account.ctx.stored_message(conversation, &wire::message_id(sent, &author)).ok().flatten();
+            let (text, spans) = stored.map_or_else(|| (String::new(), Vec::new()), |message| (message.text, message.spans));
+            Some(Quote { sent, author, text, spans })
         }
         None => None,
     };
-    let sent = account.wire.send(&to, Body::Text { text: text.to_owned(), quote: quote.clone() })?;
+    let sent = account.wire.send(&to, Body::Text { text: plain.clone(), quote: quote.clone(), ranges })?;
     account.live().sent(sent, conversation);
-    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: text.to_owned(), quote, ..Text::default() };
+    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: plain, spans, quote, ..Text::default() };
     Ok(message(account, &words, true))
 }
 
@@ -844,13 +853,21 @@ fn own(account: &Account, message_id: &str) -> Result<u64, Fault> {
 fn edit(account: &Account, conversation: &str, message_id: &str, text: &str) -> Result<(), Fault> {
     let to = peer(conversation)?;
     let sent = own(account, message_id)?;
-    account.wire.send(&to, Body::Edit { target: sent, text: text.to_owned() })?;
+    let (plain, ranges) = style::parse(text);
+    let spans = style::spans(&plain, &ranges);
+    account.wire.send(&to, Body::Edit { target: sent, text: plain.clone(), ranges })?;
     if let Ok(Some(mut message)) = account.ctx.stored_message(conversation, message_id) {
-        message.text = text.to_owned();
+        message.text = plain;
+        message.spans = spans;
         message.edited = true;
         let _ = account.ctx.message(conversation, &message);
     }
     Ok(())
+}
+
+/// The lab's signal-text-styles driver. A build without this keeps running.
+pub fn prove_signal_styles() -> Result<(), String> {
+    style::prove()
 }
 
 fn delete(account: &Account, conversation: &str, message_id: &str) -> Result<(), Fault> {

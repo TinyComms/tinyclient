@@ -569,3 +569,29 @@ fn note_to_self_from_the_phone_has_its_own_label() {
     });
     assert_eq!(world.messages(ME).len(), 1, "renaming must preserve messages");
 }
+
+#[test]
+fn styled_text_is_sent_as_ranges_and_a_spoiler_stays_out_of_the_preview() {
+    let world = World::linked();
+    world.connected();
+    world.steer(&format!("incoming grace {} hello", T0 + 1_000));
+    world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    world.send(GRACE, "5001", "**Hold** ||the plan||", None);
+    let styled = world.arrived(GRACE, &id(FIRST_SENT, ME));
+    assert_eq!(styled.text, "Hold the plan");
+    let bold = styled.spans.iter().any(|span| span.style == protocol::Style::Bold && styled.text.get(span.start as usize..span.end as usize) == Some("Hold"));
+    let hidden = styled.spans.iter().any(|span| span.style == protocol::Style::Spoiler && styled.text.get(span.start as usize..span.end as usize) == Some("the plan"));
+    assert!(bold && hidden, "{:?}", styled.spans);
+    world.heard(&format!("send {GRACE} text Hold the plan ranges=Bold:0+4,Spoiler:5+8"));
+    let preview = world.conversation(GRACE).unwrap().preview;
+    assert!(!preview.contains("plan"), "{preview}");
+    world.send(GRACE, "5002", "ok", Some(&styled.id));
+    let answered = world.arrived(GRACE, &id(FIRST_SENT + 1_000, ME));
+    assert_eq!(answered.reply_to.as_ref().map(|reply| reply.snippet.as_str()), Some("Hold Spoiler"));
+    assert_eq!(world.ask(Request::Edit { conversation: key(GRACE), message_id: styled.id, text: "~~no~~".into() }), Response::Ok);
+    world.heard(&format!("send {GRACE} edit {FIRST_SENT} no ranges=Strike:0+2"));
+    let edited = world.until("the strike", || {
+        world.messages(GRACE).into_iter().find(|message| message.text == "no" && message.spans.iter().any(|span| span.style == protocol::Style::Strike))
+    });
+    assert_eq!(edited.text.get(edited.spans[0].start as usize..edited.spans[0].end as usize), Some("no"));
+}
