@@ -8,7 +8,7 @@
 //! - A thread's `createdat` and `creator` properties, read off the thread description.
 
 use super::{escaped, id_of, millis, thread_of, Body, Fault, Teams};
-use crate::adapters::ConversationAbout;
+use crate::adapters::{ConversationAbout, SpaceAbout};
 use protocol::{ConversationKind, Notify};
 use serde_json::{json, Value};
 
@@ -49,6 +49,23 @@ impl Teams {
             notify,
             external: if properties["sharedChannel"] == true || properties["threadType"] == "sharedChannel" { "Shared channel".to_owned() } else { String::new() },
             ..ConversationAbout::default()
+        })
+    }
+
+    /// A team's info, from its own thread. The team's id is that thread (General).
+    pub(super) fn space_info(&self, space: &str) -> Result<SpaceAbout, Fault> {
+        let described = self.described(space)?;
+        let properties = &described["properties"];
+        let text = |name: &str| properties[name].as_str().unwrap_or("").trim().to_owned();
+        let me = self.me();
+        let role = described["members"].as_array().into_iter().flatten().find(|member| member["id"].as_str() == Some(me.as_str()));
+        let role = role.and_then(|member| member["role"].as_str()).and_then(super::people::role_label);
+        let members = described["members"].as_array().map(|members| members.len() as u32);
+        Ok(SpaceAbout {
+            description: text("description"),
+            members,
+            roles: role.map(str::to_owned).into_iter().collect(),
+            ..SpaceAbout::default()
         })
     }
 

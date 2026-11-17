@@ -1255,13 +1255,14 @@ fn people_are_searched_watched_and_called_through_the_official_app() {
     assert_eq!(world.ask(set), Response::Ok);
     assert_eq!(world.fake.calls("PUT", "/presence/v1/me/forceavailability/").pop().unwrap().json(), json!({"availability": "DoNotDisturb"}));
 
-    // The member list of a channel, bots marked.
+    // The team's roster: owners, members and guests, in that order. A bot stays a member.
     let Response::Members { members, sections, .. } = world.ask(Request::Members { conversation: key(GENERAL), offset: 0, limit: 50 }) else {
         panic!("no members");
     };
-    assert_eq!(sections[0].count, 4);
+    let named: Vec<(&str, u32)> = sections.iter().map(|section| (section.name.as_str(), section.count)).collect();
+    assert_eq!(named, [("Owners", 1), ("Members", 3), ("Guests", 1)]);
     let listed: Vec<(&str, bool)> = members.iter().map(|member| (member.name.as_str(), member.bot)).collect();
-    assert_eq!(listed, [("Me Myself", false), ("Ana Ruiz", false), ("Ben Okafor", false), ("Deploy Bot", true)]);
+    assert_eq!(listed, [("Me Myself", false), ("Ana Ruiz", false), ("Ben Okafor", false), ("Deploy Bot", true), ("Dee Park", false)]);
 
     // Calls and meetings are the official app's: a link, never a call here.
     let link = |conversation: &str| match world.ask(Request::Handoff { conversation: key(conversation) }) {
@@ -1275,6 +1276,22 @@ fn people_are_searched_watched_and_called_through_the_official_app() {
         format!("msteams:/l/channel/19%3Aplatform0general%40thread.tacv2/General?groupId=e0873025-0000-4000-8000-00000000beef&tenantId={HOME}")
     );
     assert!(matches!(world.ask(Request::CallStart { conversation: key(CHAT_ANA) }), Response::Error { .. }), "a Teams call is never carried here");
+}
+
+#[test]
+fn a_team_answers_space_info_from_its_own_thread() {
+    let world = World::start();
+    world.ready();
+
+    let Response::SpaceInfo { info } = world.ask(Request::SpaceInfo { space: key(GENERAL) }) else {
+        panic!("no space info");
+    };
+    assert_eq!(info.space.name.as_str(), "Platform");
+    assert_eq!(info.description.as_str(), "How the platform ships");
+    assert_eq!(info.members, Some(5));
+    assert_eq!(info.roles, ["Owner"]);
+    let fetched = world.fake.calls("GET", &format!("/v1/threads/{GENERAL}"));
+    assert_eq!(fetched.len(), 1, "the team's thread is read once");
 }
 
 #[test]
@@ -1309,7 +1326,7 @@ fn mentions_missed_while_closed_info_mute_seen_hidden_chats_and_files_through_on
     let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: key(GENERAL) }) else {
         panic!("no info");
     };
-    assert_eq!((info.members, info.notify), (Some(4), protocol::Notify::All));
+    assert_eq!((info.description.as_str(), info.members, info.notify), ("How the platform ships", Some(5), protocol::Notify::All));
 
     // Mute is set on Teams, then shown.
     assert_eq!(world.ask(Request::SetMute { conversation: grp1.clone(), notify: protocol::Notify::Nothing, until: None }), Response::Ok);

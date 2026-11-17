@@ -132,6 +132,11 @@ pub fn prove_shared_file() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// The lab's teams-team-info driver. A build without this returns to the server and stays up.
+pub fn prove_team_info() -> Result<(), String> {
+    people::prove_team_roster()
+}
 mod people;
 mod push;
 mod send;
@@ -919,6 +924,9 @@ impl Teams {
             }
             Command::ConversationInfo { conversation_id, reply } => {
                 let _ = reply.send(self.conversation_info(&conversation_id).map_err(refuse));
+            }
+            Command::SpaceInfo { space_id, reply } => {
+                let _ = reply.send(self.space_info(&space_id).map_err(refuse));
             }
             Command::SetMute { conversation_id, notify, until: _, reply } => {
                 let _ = reply.send(self.set_mute(&conversation_id, notify).map_err(refuse));
