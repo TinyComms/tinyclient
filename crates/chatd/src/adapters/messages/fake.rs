@@ -5,13 +5,14 @@
 //! `incoming WHO TEXT…`, `group WHO TEXT…`, `photo WHO`, `caption WHO TEXT…`,
 //! `file WHO NAME`, `remote WHO`, `react WHO TEXT`, `quote WHO ID TEXT…`,
 //! `typing WHO`, `typing-stop WHO`,
-//! `refuse WORDS…`, `drop`, `unlinked`, `silent`, `answer`.
+//! `refuse WORDS…`, `drop`, `unlinked`, `silent`, `answer`,
+//! `revoke`, `revoke-offline`, `auth`.
 //! `silent` makes the phone stop answering sends, history, and files. `answer` clears that
 //! and tells the adapter the phone is back.
 //! WHO is `grace` or `alan`.
 
 use super::{Drive, Event, Saved};
-use crate::adapters::messages::bugle::{Chat, Mark, Note, Piece, MESSAGE_PAGE, PHONE_QUIET};
+use crate::adapters::messages::bugle::{Chat, Mark, Note, Piece, MESSAGE_PAGE, PHONE_QUIET, UNPAIRED};
 use crate::adapters::script;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -50,6 +51,19 @@ pub struct Fake {
 
 impl Fake {
     pub fn open(_saved: &Saved) -> Fake {
+        let revoked = protocol::support_dir().join("messages.revoked");
+        if revoked.is_file() {
+            let _ = std::fs::remove_file(&revoked);
+            record("connect");
+            let (events, heard) = channel();
+            let _ = events.send(Event::Ended(UNPAIRED.to_owned()));
+            return Fake {
+                events,
+                heard: Mutex::new(Some(heard)),
+                closed: Arc::new(AtomicBool::new(true)),
+                refuse: Arc::default(),
+            };
+        }
         let (events, heard) = channel();
         let _ = events.send(Event::Ready);
         let _ = events.send(Event::Chats(vec![
@@ -372,6 +386,13 @@ fn steer(line: &str) -> Vec<Event> {
         }
         "drop" => vec![Event::Closed("the connection dropped".into())],
         "unlinked" => vec![Event::Ended("This device was removed in Messages.".into())],
+        "revoke" => vec![Event::Ended(UNPAIRED.to_owned())],
+        "revoke-offline" => {
+            let path = protocol::support_dir().join("messages.revoked");
+            let _ = std::fs::write(path, b"1");
+            vec![Event::Closed("the connection dropped".into())]
+        }
+        "auth" => vec![Event::Closed("Messages refused the request (403).".into())],
         "sms" | "rcs" | "sealed" => {
             let Some((author, name)) = who(words.next().unwrap_or("")) else {
                 return Vec::new();

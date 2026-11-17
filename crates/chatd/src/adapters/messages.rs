@@ -310,6 +310,12 @@ pub fn prove_phone_quiet() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab sets `TINYCLIENT_PROVE=messages-unpaired`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_messages_unpaired() -> Result<(), String> {
+    bugle::prove_unpaired()
+}
+
 pub fn reaction_rules() -> protocol::ReactionRules {
     protocol::ReactionRules {
         set: ReactionSet::Any,
@@ -398,7 +404,10 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     std::thread::Builder::new()
         .name("messages-link".into())
         .spawn(move || {
-            keep_connected(&socket_ctx, || connect(&socket_ctx, &socket_saved, &held));
+            let mut gate = bugle::Gate::default();
+            keep_connected(&socket_ctx, || {
+                connect(&socket_ctx, &socket_saved, &held, &mut gate)
+            });
             held.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
@@ -438,10 +447,15 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     Ok(())
 }
 
-fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) -> Failure {
+fn connect(
+    ctx: &Context,
+    saved: &Saved,
+    current: &Mutex<Option<Arc<Account>>>,
+    gate: &mut bugle::Gate,
+) -> Failure {
     let drive = match open(saved) {
         Ok(drive) => drive,
-        Err(why) => return Failure::Dropped(why),
+        Err(why) => return gate.fail(&why),
     };
     let Some(events) = drive.events() else {
         return Failure::Dropped("Messages has no events".to_owned());
@@ -484,7 +498,7 @@ fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) 
         match events.recv() {
             Ok(Event::Ready) => {
                 if let Err(why) = account.drive.refresh() {
-                    break Failure::Dropped(why);
+                    break gate.fail(&why);
                 }
                 // Further inbox pages run on the command thread. This loop has to stay free to
                 // read the phone.
@@ -492,10 +506,10 @@ fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) 
                     let _ = account.ctx.commands.send(Command::OpenHome);
                 }
             }
-            Ok(Event::Closed(why)) => break Failure::Dropped(why),
+            Ok(Event::Closed(why)) => break gate.fail(&why),
             Ok(Event::Ended(why)) => break Failure::SignedOut(why),
             Ok(event) => apply(&account, event),
-            Err(_) => break Failure::Dropped("the connection closed".to_owned()),
+            Err(_) => break gate.fail("the connection closed"),
         }
         if ctx.stopped() {
             break Failure::Dropped("stopped".to_owned());
