@@ -1992,6 +1992,61 @@ fn the_panes_ask_telegram_once_each_and_counts_are_telegrams_own() {
 }
 
 #[test]
+fn a_photo_album_is_one_message() {
+    let world = World::signed_in();
+    world.connected();
+    // The album has to be in the chat before the first open. A newest-page read is not asked
+    // again for a minute, so a later steer would sit unread.
+    world.steer("album");
+    let ids = world.until("four photos in history are one grid", || {
+        let messages = world.messages("u7002");
+        let album = messages.iter().find(|message| message.text == "Ridge in four" && message.attachments.len() == 4)?;
+        if album.id != "40" || messages.iter().any(|message| matches!(message.id.as_str(), "41" | "42" | "43")) {
+            return None;
+        }
+        Some(album.attachments.iter().map(|file| file.file.id.clone()).collect::<Vec<_>>())
+    });
+    assert_eq!(ids, vec!["p6040y", "p6041y", "p6042y", "p6043y"]);
+
+    world.ask(Request::Watch(Watching { conversation: Some(key("u7002")), ..Watching::default() }));
+    world.steer("album-live");
+    let live = world.until("four photos arriving are one grid", || {
+        world.message("u7002", "60").filter(|message| message.attachments.len() == 4 && message.text == "Ridge in four")
+    });
+    assert!(world.message("u7002", "61").is_none());
+    assert!(world.message("u7002", "62").is_none());
+    assert!(world.message("u7002", "63").is_none());
+    assert_eq!(live.attachments.iter().map(|file| file.file.id.as_str()).collect::<Vec<_>>(), ["p6060y", "p6061y", "p6062y", "p6063y"]);
+
+    world.steer("album-drop");
+    world.until("removing one photo leaves the grid", || {
+        world.message("u7002", "60").filter(|message| message.attachments.len() == 3 && message.text == "Ridge in four")
+    });
+
+    world.steer("album-react");
+    let reacted = world.until("a reaction on one photo lands on the grid", || {
+        world.message("u7002", "60").filter(|message| message.reactions.iter().any(|reaction| reaction.emoji == "👍"))
+    });
+    assert_eq!(reacted.attachments.len(), 3);
+}
+
+#[test]
+fn an_album_cut_by_a_page_is_still_one_grid() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("album-split");
+    let album = world.until("an album split by a page boundary is still one grid", || {
+        world.messages("u7002").into_iter().find(|message| {
+            message.attachments.len() == 4 && message.text == "Ridge in four" && message.id == "98"
+        })
+    });
+    assert_eq!(album.attachments.iter().map(|file| file.file.id.as_str()).collect::<Vec<_>>(), ["p6098y", "p6099y", "p6100y", "p6101y"]);
+    assert!(world.message("u7002", "99").is_none());
+    assert!(world.message("u7002", "100").is_none());
+    assert!(world.message("u7002", "101").is_none());
+}
+
+#[test]
 fn pickers_and_sending_with_files_options_and_picks() {
     let world = World::signed_in();
     world.connected();
@@ -2061,6 +2116,13 @@ fn pickers_and_sending_with_files_options_and_picks() {
     let album = send("8106", "trip", protocol::Outgoing { files: with, ..Default::default() });
     assert_eq!(album.state, SendState::Sent);
     assert_eq!((world.called("UploadMedia photo"), world.called("SendMultiMedia u7002 kept-photo,kept-photo")), (2, 1));
+    let album = world.until("two photos sent together are one grid", || {
+        world.messages("u7002").into_iter().find(|message| {
+            message.client_id.as_deref() == Some("8106") && message.attachments.len() == 2 && message.text == "trip"
+        })
+    });
+    assert_eq!(album.attachments.len(), 2);
+    assert_eq!(world.messages("u7002").iter().filter(|message| message.client_id.as_deref() == Some("8106")).count(), 1);
     // The album is the message, and shows as sent once it lands; the document goes after it.
     world.until("the document after the album", || (world.called("SendMedia u7002 file:application/pdf") > 0).then_some(()));
     assert_eq!(world.called("SendMedia u7002 file:application/pdf"), 1);

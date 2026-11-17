@@ -294,6 +294,20 @@ fn drafted(world: &World, dialog: &mut tl::enums::Dialog, who: Who) {
     plain.draft = Some(draft_message(text));
 }
 
+/// One photo of an album. The caption lives on the first item; the rest share its grouped id.
+fn album_photo(peer: Who, id: i32, from: i64, date: i32, text: &str, photo_id: i64, group: i64) -> tl::types::Message {
+    let mut message = message(peer, id, from, date, text);
+    message.media = Some(tl::types::MessageMediaPhoto {
+        spoiler: false,
+        live_photo: false,
+        photo: Some(photo(photo_id)),
+        ttl_seconds: None,
+        video: None,
+    }.into());
+    message.grouped_id = Some(group);
+    message
+}
+
 fn photo(id: i64) -> tl::enums::Photo {
     tl::types::Photo {
         has_stickers: false,
@@ -552,6 +566,8 @@ impl World {
     fn deliver(&mut self, events: &Sender<Event>, peer: Who, topic: Option<i32>, reply: Option<i32>, items: Vec<(i64, String, Option<tl::enums::MessageMedia>, Option<Vec<tl::enums::MessageEntity>>)>, schedule: Option<i32>) -> Result<Vec<u8>, Fault> {
         // What was sent clears the chat's draft, on this device and everywhere.
         self.drafts.remove(&(peer, topic));
+        // Two or more items are one album. Telegram stamps each with the same grouped id.
+        let group = (items.len() > 1).then_some(8_000_000 + i64::from(self.next + 1));
         let mut all = Vec::new();
         for (random_id, text, media, entities) in items {
             self.next += 1;
@@ -559,6 +575,7 @@ impl World {
             let mut sent = message(peer, id, ME, schedule.unwrap_or(crate::hub::now() as i32), &text);
             sent.media = media;
             sent.entities = entities;
+            sent.grouped_id = group;
             if let Some(reply_to_msg_id) = reply {
                 let mut header: tl::types::MessageReplyHeader = blank(&[&put(0u32)]);
                 header.reply_to_msg_id = Some(reply_to_msg_id);
@@ -1112,6 +1129,61 @@ impl World {
                 message.media = Some(tl::types::MessageMediaPhoto { spoiler: false, live_photo: false, photo: Some(ridge()), ttl_seconds: None, video: None }.into());
                 self.store(None, message.clone());
                 vec![new(message)]
+            }
+            // Four photos already in the chat, one grouped id, caption on the first. No update:
+            // opening the chat reads them as history.
+            "album" => {
+                for (id, photo_id, text) in [(40, 6_040, "Ridge in four"), (41, 6_041, ""), (42, 6_042, ""), (43, 6_043, "")] {
+                    self.store(None, album_photo(odalys, id, ODALYS, t0() + 200 + id, text, photo_id, 900));
+                }
+                Vec::new()
+            }
+            // The same four arriving while the chat is open.
+            "album-live" => {
+                let mut events = Vec::new();
+                for (id, photo_id, text) in [(60, 6_060, "Ridge in four"), (61, 6_061, ""), (62, 6_062, ""), (63, 6_063, "")] {
+                    let message = album_photo(odalys, id, ODALYS, t0() + 300 + id, text, photo_id, 901);
+                    self.store(None, message.clone());
+                    events.push(new(message));
+                }
+                events
+            }
+            // One photo of the live album is deleted. The grid stays, one picture smaller.
+            "album-drop" => {
+                if let Some(held) = self.messages.get_mut(&odalys.text()) {
+                    held.remove(&62);
+                }
+                vec![update(tl::types::UpdateDeleteMessages { messages: vec![62], pts: 0, pts_count: 1 }.into())]
+            }
+            // A reaction on a photo that is not the caption still belongs to the grid.
+            "album-react" => {
+                let count = |emoticon: &str, count, mine: bool| {
+                    tl::enums::ReactionCount::Count(tl::types::ReactionCount {
+                        chosen_order: mine.then_some(0),
+                        reaction: tl::types::ReactionEmoji { emoticon: emoticon.to_owned() }.into(),
+                        count,
+                    })
+                };
+                let reactions = tl::types::MessageReactions {
+                    min: false,
+                    can_see_list: true,
+                    reactions_as_tags: false,
+                    results: vec![count("👍", 1, false)],
+                    recent_reactions: None,
+                    top_reactors: None,
+                };
+                vec![update(tl::types::UpdateMessageReactions { peer: odalys.peer(), msg_id: 61, top_msg_id: None, saved_peer_id: None, reactions: reactions.into() }.into())]
+            }
+            // A full page ends on the newest photo of an album. The other three are older than
+            // that page, so a reader that stops at the page boundary shows one photo.
+            "album-split" => {
+                for id in 102..=150 {
+                    self.store(None, message(odalys, id, ODALYS, t0() + id, "a later note"));
+                }
+                for (id, photo_id, text) in [(98, 6_098, "Ridge in four"), (99, 6_099, ""), (100, 6_100, ""), (101, 6_101, "")] {
+                    self.store(None, album_photo(odalys, id, ODALYS, t0() + id, text, photo_id, 902));
+                }
+                Vec::new()
             }
             "react" => {
                 let count = |emoticon: &str, count, mine: bool| {

@@ -726,8 +726,9 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     // The dialog list carries each chat's newest message: that is its preview, for free.
     if let Some(mapped) = newest.and_then(|newest| content::map(&account.dir(), newest)) {
         updated = mapped.message.sent;
-        if known.forum {
-            // A forum's newest message belongs to one of its topics; the row shows its line.
+        // A forum's newest message belongs to one of its topics. An album's newest item is
+        // one photo of the grid: the row shows the line, and opening the chat reads the rest.
+        if known.forum || mapped.group.is_some() {
             let line = PreviewLine {
                 id: mapped.message.id.clone(),
                 text: mapped.message.text.clone(),
@@ -899,6 +900,27 @@ pub(super) fn previews(account: &Account, ids: &[String]) {
             let dir = account.dir();
             raw.iter().filter_map(|message| content::map(&dir, message)).collect()
         };
+        // One photo of an album is not the grid. A group already seen is folded into it.
+        // One that is not yet seen stays a list line until the chat is opened.
+        if mapped.len() == 1 && mapped[0].group.is_some() {
+            let known = live::written_id(account, mapped[0].id).is_some();
+            if known {
+                if let Some(folded) = mapped.pop().and_then(|part| live::fold(account, id, part)) {
+                    let _ = account.ctx.history(id, std::slice::from_ref(&folded.message));
+                }
+            } else if let Some(one) = mapped.first() {
+                let line = PreviewLine {
+                    id: one.message.id.clone(),
+                    text: one.message.text.clone(),
+                    sender: one.message.sender.name.clone(),
+                    mine: one.message.outgoing,
+                    sent: one.message.sent,
+                    expires_at: one.message.expires_at,
+                };
+                let _ = account.ctx.preview(id, &line);
+            }
+            continue;
+        }
         for one in &mut mapped {
             finish(account, id, one, &HashMap::new());
         }
@@ -1100,24 +1122,28 @@ pub(super) enum Around<'a> {
     At(&'a str),
 }
 
-/// Fills in what a reply answers from what is already known: the same page, or the store.
-fn quote(account: &Account, conversation: &str, page: &HashMap<i32, (String, String, String)>, reply: i32) -> ReplyTo {
-    let id = reply.to_string();
-    let known = page.get(&reply).cloned().or_else(|| {
-        let stored = account.ctx.stored_message(conversation, &id).ok().flatten()?;
+/// The answered message when it is already known: the same page, or the store.
+fn known_reply(account: &Account, conversation: &str, page: &HashMap<i32, (String, String, String)>, reply: i32) -> Option<(String, String, String)> {
+    page.get(&reply).cloned().or_else(|| {
+        let stored = account.ctx.stored_message(conversation, &reply.to_string()).ok().flatten()?;
         Some((stored.sender.id, stored.sender.name, stored.text))
-    });
-    match known {
-        Some((person, sender, text)) => ReplyTo {
-            id,
-            sender,
-            snippet: text.chars().take(120).collect(),
-            person: (!person.is_empty()).then(|| account.ctx.key(&person)),
-            deleted: false,
-        },
-        // Not on this page and never stored: the row says who and what once it is.
-        None => ReplyTo { id, sender: String::new(), snippet: String::new(), person: None, deleted: false },
+    })
+}
+
+/// The reply line, including a partial quote or a reply that points at another chat.
+fn reply_line(account: &Account, conversation: &str, page: &HashMap<i32, (String, String, String)>, reply: i32, note: Option<&content::ReplyNote>) -> ReplyTo {
+    let elsewhere = note.is_some_and(|note| note.elsewhere);
+    let known = if elsewhere { None } else { known_reply(account, conversation, page, reply) };
+    let mut line = content::line_for(reply, known.as_ref(), note);
+    let person = if elsewhere {
+        note.and_then(|note| (!note.author_id.is_empty()).then(|| note.author_id.clone()))
+    } else {
+        known.and_then(|(person, _, _)| (!person.is_empty()).then_some(person))
+    };
+    if let Some(person) = person {
+        line.person = Some(account.ctx.key(&person));
     }
+    line
 }
 
 /// Where a message belongs: its chat, in a forum the thread of its topic, and in a
@@ -1140,8 +1166,10 @@ pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped,
         // answering another comment in the thread names that one.
         let anchor = account.live().discussion.iter().any(|(held, _, echo)| *held == conversation && *echo == reply);
         if !anchor {
-            mapped.message.reply_to = Some(quote(account, conversation, page, reply));
+            mapped.message.reply_to = Some(reply_line(account, conversation, page, reply, mapped.reply_note.as_ref()));
         }
+    } else if mapped.reply_note.as_ref().is_some_and(|note| note.story) {
+        mapped.message.reply_to = Some(reply_line(account, conversation, page, 0, mapped.reply_note.as_ref()));
     }
     // A pin names the message it points at. The words are filled once that message is known.
     content::quote_pin(&mut mapped.message);
@@ -1298,6 +1326,54 @@ pub(super) fn comment_unread(account: &Account, channel: Who, root: i32, unread:
     let _ = account.ctx.history(&channel.text(), std::slice::from_ref(&post));
 }
 
+fn raw_id(message: &tl::enums::Message) -> i32 {
+    match message {
+        tl::enums::Message::Message(message) => message.id,
+        tl::enums::Message::Service(message) => message.id,
+        tl::enums::Message::Empty(message) => message.id,
+    }
+}
+
+/// A full page can start or end in the middle of an album. Telegram keeps at most ten items
+/// in one, so one short read on that edge brings the rest. A short page is already whole.
+fn complete_group(account: &Account, who: Who, topic: Option<i32>, raw: &mut Vec<tl::enums::Message>, older: bool) {
+    if (raw.len() as i32) < PAGE {
+        return;
+    }
+    let Some(edge) = (if older { raw.last() } else { raw.first() }) else {
+        return;
+    };
+    let Some(group) = content::grouped_id(edge) else {
+        return;
+    };
+    let edge_id = raw_id(edge);
+    let edge_text = edge_id.to_string();
+    let around = if older { Around::Before(&edge_text) } else { Around::After(&edge_text) };
+    let extra = match fetch(account, who, topic, &around, 9) {
+        Ok(extra) => extra,
+        Err(fault) => {
+            tracing::warn!("chatd: Telegram: album: {fault}");
+            return;
+        }
+    };
+    let mut taken = Vec::new();
+    for message in extra {
+        let id = raw_id(&message);
+        if id == edge_id || raw.iter().any(|have| raw_id(have) == id) {
+            continue;
+        }
+        if content::grouped_id(&message) == Some(group) {
+            taken.push(message);
+        }
+    }
+    if older {
+        raw.extend(taken);
+    } else if !taken.is_empty() {
+        taken.append(raw);
+        *raw = taken;
+    }
+}
+
 /// One request for a page of a conversation's messages, newest first as Telegram answers.
 fn fetch(account: &Account, who: Who, topic: Option<i32>, around: &Around, limit: i32) -> Result<Vec<tl::enums::Message>, Fault> {
     let peer = account.input(who)?;
@@ -1359,40 +1435,79 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
         }
         live.after.push_back((conversation.to_owned(), (*after).to_owned(), Instant::now()));
     }
-    let raw = match fetch(account, who, topic, &around, PAGE) {
+    let mut raw = match fetch(account, who, topic, &around, PAGE) {
         Ok(raw) => raw,
         Err(fault) => {
             tracing::warn!("chatd: Telegram: history: {fault}");
             return None;
         }
     };
-    let mut mapped: Vec<Mapped> = {
+    if (raw.len() as i32) >= PAGE {
+        complete_group(account, who, topic, &mut raw, true);
+        if !matches!(around, Around::Newest) {
+            complete_group(account, who, topic, &mut raw, false);
+        }
+    }
+    let mapped: Vec<Mapped> = {
         let dir = account.dir();
         raw.iter().filter_map(|message| content::map(&dir, message)).collect()
     };
-    let page: HashMap<i32, (String, String, String)> =
-        mapped.iter().map(|one| (one.id, (one.message.sender.id.clone(), one.message.sender.name.clone(), one.message.text.clone()))).collect();
+    live::remember(account, conversation, &mapped);
+    let mut grouped = content::group_albums(mapped);
+    for one in &mut grouped {
+        if let Some(reply) = one.reply {
+            if let Some(written) = live::written_id(account, reply) {
+                if written != reply && written != one.id {
+                    one.reply = Some(written);
+                }
+            }
+        }
+        if one.group.is_some() && one.message.client_id.is_none() {
+            if let Ok(Some(stored)) = account.ctx.stored_message(conversation, &one.message.id) {
+                one.message.client_id = stored.client_id;
+            }
+        }
+    }
+    let mut page: HashMap<i32, (String, String, String)> = HashMap::new();
+    for one in &grouped {
+        let entry = (one.message.sender.id.clone(), one.message.sender.name.clone(), one.message.text.clone());
+        page.insert(one.id, entry.clone());
+        for member in &one.members {
+            page.insert(*member, entry.clone());
+        }
+    }
     let mut wants = Vec::new();
     let mut authors = HashSet::new();
-    for one in &mut mapped {
+    for one in &mut grouped {
         finish(account, conversation, one, &page);
+        for member in &one.members {
+            if *member != one.id {
+                account.place(one.peer, *member, conversation);
+            }
+        }
         wants.append(&mut one.wants);
         if let Some((author, None)) = Who::parse(&one.message.sender.id) {
             authors.insert(author);
         }
     }
-    let mut messages: Vec<Message> = mapped.into_iter().map(|one| one.message).collect();
+    let mut messages: Vec<Message> = grouped.iter().map(|one| one.message.clone()).collect();
     // A broadcast channel's posts show how many saw them. One ask covers the page, and the
     // count is written with the posts below rather than fetched again for each.
     if topic.is_none() && account.dir().get(who).is_some_and(|known| known.broadcast) {
         views(account, who, &mut messages);
     }
     // The newest page is whole: a stored message inside its range that Telegram no longer
-    // lists was deleted while we were away.
-    if let (Around::Newest, Some(newest), Some(oldest)) = (&around, messages.first(), messages.last()) {
-        let stored = account.ctx.stored_ids(conversation, &oldest.id, &newest.id, 200).unwrap_or_default();
-        for gone in stored.iter().filter(|id| !page.contains_key(&id.parse::<i32>().unwrap_or(-1))) {
-            let _ = account.ctx.deleted(conversation, gone);
+    // lists was deleted while we were away. An album keeps one id, so a photo that used to
+    // be its own row and now belongs to that grid is deleted too.
+    if let Around::Newest = &around {
+        let mut ids: Vec<i32> = raw.iter().map(raw_id).collect();
+        ids.sort_unstable();
+        if let (Some(oldest), Some(newest)) = (ids.first(), ids.last()) {
+            let kept: HashSet<i32> = grouped.iter().map(|one| one.id).collect();
+            let stored = account.ctx.stored_ids(conversation, &oldest.to_string(), &newest.to_string(), 200).unwrap_or_default();
+            for gone in stored.into_iter().filter(|id| id.parse::<i32>().ok().is_none_or(|id| !kept.contains(&id))) {
+                let _ = account.ctx.deleted(conversation, &gone);
+            }
         }
     }
     let _ = account.ctx.history(conversation, &messages);

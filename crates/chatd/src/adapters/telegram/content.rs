@@ -5,9 +5,10 @@
 use super::peers::{is_replies, message_link, thread_id, Directory, Who};
 use grammers_tl_types as tl;
 use protocol::{
-    Attachment, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview, Reaction, Sender, Span,
+    Attachment, Card, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview, Reaction, ReplyTo, Sender, Span,
     Style, ThreadSummary,
 };
+use std::collections::HashSet;
 use tl::enums::{DocumentAttribute, MessageAction, MessageEntity, MessageMedia, PhotoSize};
 
 /// A file a message shows, and where Telegram keeps it.
@@ -29,6 +30,25 @@ pub struct Want {
     pub original: bool,
 }
 
+/// What a reply header says besides the id of the message it answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ReplyNote {
+    /// The part that was quoted. Empty when Telegram did not send the words.
+    pub quote: String,
+    /// Who wrote it, when the header names them.
+    pub author: String,
+    /// `u<id>` when that author is a user. Empty when the name is all Telegram sent.
+    pub author_id: String,
+    /// The answered message is in another chat, so an id in this one is a different message.
+    pub elsewhere: bool,
+    /// The other chat's name, when the directory knows it.
+    pub place: String,
+    /// A reply to a story. The line says "Story" and [`ReplyNote::story_id`] is what it points at.
+    pub story: bool,
+    pub story_id: i32,
+}
+
+#[derive(Clone)]
 pub struct Mapped {
     pub peer: Who,
     pub id: i32,
@@ -38,10 +58,17 @@ pub struct Mapped {
     pub discussion_top: Option<i32>,
     /// The message it answers, when it is a reply and not just a post in a topic.
     pub reply: Option<i32>,
+    /// A partial quote, a reply in another chat, or a reply to a story.
+    pub reply_note: Option<ReplyNote>,
     pub message: Message,
     /// What it shows inline (thumbnails and stills), and the originals of its pictures, which
     /// are only fetched when the viewer asks.
     pub wants: Vec<Want>,
+    /// Telegram's `grouped_id`. Items that share one are a single album.
+    pub group: Option<i64>,
+    /// Every Telegram message id folded into this row, including [`Mapped::id`]. Empty when
+    /// the row is one message.
+    pub members: Vec<i32>,
 }
 
 /// Byte offsets for UTF-16 offsets: entry `n` is where the `n`th UTF-16 unit of `text` starts.
@@ -900,6 +927,93 @@ fn unsupported(media: &MessageMedia) -> Option<String> {
     })
 }
 
+/// Stars, as a count. One is singular.
+fn stars(amount: i64) -> String {
+    if amount == 1 {
+        "1 Star".to_owned()
+    } else {
+        format!("{amount} Stars")
+    }
+}
+
+/// How many decimal places the currency's minor unit has. Stars are not a currency here.
+fn minor_digits(currency: &str) -> u32 {
+    match currency.to_ascii_uppercase().as_str() {
+        "BHD" | "IQD" | "JOD" | "KWD" | "LYD" | "OMR" | "TND" => 3,
+        "BIF" | "CLP" | "DJF" | "GNF" | "ISK" | "JPY" | "KMF" | "KRW" | "PYG" | "RWF" | "UGX" | "UYI" | "VND" | "VUV" | "XAF" | "XOF" | "XPF" => 0,
+        _ => 2,
+    }
+}
+
+/// A price in the network's own words: `USD 5.00`, `50 Stars`. Empty when there is no currency.
+fn price_of(currency: &str, amount: i64) -> Option<String> {
+    if currency.is_empty() {
+        return None;
+    }
+    if currency.eq_ignore_ascii_case("XTR") {
+        return Some(stars(amount));
+    }
+    let digits = minor_digits(currency);
+    let scale = 10i64.pow(digits);
+    let sign = if amount < 0 { "-" } else { "" };
+    let amount = amount.abs();
+    let code = currency.to_ascii_uppercase();
+    let (whole, frac) = (amount / scale, amount % scale);
+    Some(if digits == 0 {
+        format!("{sign}{code} {whole}")
+    } else {
+        format!("{sign}{code} {whole}.{frac:0width$}", width = digits as usize)
+    })
+}
+
+/// The card for an invoice or a paid-media preview. The message stays a hand-off: paying and
+/// buying Stars stay in Telegram's own app, and no card number is read or stored here.
+fn detail_card(media: &MessageMedia) -> Option<Card> {
+    match media {
+        MessageMedia::Invoice(invoice) => {
+            let mut card = Card {
+                title: invoice.title.clone(),
+                text: invoice.description.clone(),
+                footer: if invoice.receipt_msg_id.is_some() {
+                    "Paid · Open in Telegram".to_owned()
+                } else {
+                    "Open in Telegram".to_owned()
+                },
+                ..Card::default()
+            };
+            if let Some(price) = price_of(&invoice.currency, invoice.total_amount) {
+                card.fields.push(("Price".to_owned(), price));
+            }
+            if invoice.test {
+                card.fields.push(("Mode".to_owned(), "Test".to_owned()));
+            }
+            Some(card)
+        }
+        MessageMedia::PaidMedia(paid) => {
+            let video = paid.extended_media.iter().any(|one| {
+                matches!(one, tl::enums::MessageExtendedMedia::Preview(preview) if preview.video_duration.is_some())
+            });
+            let unlocked = paid.extended_media.iter().any(|one| matches!(one, tl::enums::MessageExtendedMedia::Media(_)));
+            let text = if unlocked {
+                "Unlocked.".to_owned()
+            } else if video {
+                "Locked video. The preview stays blurred until it is paid for.".to_owned()
+            } else {
+                "Locked. The preview stays blurred until it is paid for.".to_owned()
+            };
+            let mut card = Card {
+                title: "Paid media".to_owned(),
+                text,
+                footer: "Open in Telegram".to_owned(),
+                ..Card::default()
+            };
+            card.fields.push(("Price".to_owned(), stars(paid.stars_amount)));
+            Some(card)
+        }
+        _ => None,
+    }
+}
+
 fn reactions(reactions: &tl::enums::MessageReactions) -> Vec<Reaction> {
     let tl::enums::MessageReactions::Reactions(reactions) = reactions;
     let one = |count: &tl::enums::ReactionCount| {
@@ -1080,13 +1194,13 @@ fn action(dir: &Directory, who: &str, action: &MessageAction) -> (String, bool) 
         A::PinMessage => named(format!("{who} pinned a message")),
         A::HistoryClear => named("History was cleared".to_owned()),
         A::GameScore(game) => named(format!("{who} scored {}", game.score)),
-        A::PaymentSent(paid) => named(match paid.currency.is_empty() {
-            true => format!("{who} sent a payment"),
-            false => format!("{who} sent a payment ({})", paid.currency),
+        A::PaymentSent(paid) => named(match price_of(&paid.currency, paid.total_amount) {
+            Some(price) => format!("{who} sent a payment of {price}"),
+            None => format!("{who} sent a payment"),
         }),
-        A::PaymentRefunded(paid) => named(match paid.currency.is_empty() {
-            true => "A payment was refunded".to_owned(),
-            false => format!("A {} payment was refunded", paid.currency),
+        A::PaymentRefunded(paid) => named(match price_of(&paid.currency, paid.total_amount) {
+            Some(price) => format!("A payment of {price} was refunded"),
+            None => "A payment was refunded".to_owned(),
         }),
         A::PhoneCall(call) => {
             let kind = if call.video { "Video call" } else { "Call" };
@@ -1211,8 +1325,11 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 topic,
                 discussion_top: None,
                 reply: pin.then_some(reply).flatten(),
+                reply_note: None,
                 message,
                 wants: Vec::new(),
+                group: None,
+                members: Vec::new(),
             })
         }
         tl::enums::Message::Message(raw) => {
@@ -1317,6 +1434,11 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                         message.spans.clear();
                         message.kind = MessageKind::Unsupported { link: message_link(peer, dir.get(peer), raw.id) };
                     }
+                    // An invoice or paid preview is still a hand-off, and also a card: title,
+                    // description and price. Paying stays in Telegram's own app.
+                    if let Some(card) = detail_card(media) {
+                        message.card = Some(Box::new(card));
+                    }
                 }
             }
             let (topic, reply) = topic_of(raw.reply_to.as_ref());
@@ -1324,17 +1446,124 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 Some(tl::enums::MessageReplyHeader::Header(header)) if !header.forum_topic => header.reply_to_top_id,
                 _ => None,
             };
+            let reply_note = if replies { None } else { reply_note(dir, peer, raw.reply_to.as_ref()) };
             Some(Mapped {
                 peer,
                 id: raw.id,
                 topic,
                 discussion_top,
                 reply: if replies { None } else { reply },
+                reply_note,
                 message,
                 wants,
+                group: raw.grouped_id.filter(|id| *id != 0),
+                members: Vec::new(),
             })
         }
     }
+}
+
+fn user_id(who: Who) -> String {
+    match who {
+        Who::User(_) => who.text(),
+        _ => String::new(),
+    }
+}
+
+fn reply_author(dir: &Directory, header: &tl::enums::MessageFwdHeader) -> (String, String) {
+    let tl::enums::MessageFwdHeader::Header(header) = header;
+    let id = header.from_id.as_ref().map(Who::of).map(user_id).unwrap_or_default();
+    if let Some(name) = header.from_name.as_ref().filter(|name| !name.is_empty()) {
+        return (name.clone(), id);
+    }
+    if let Some(who) = header.from_id.as_ref().map(Who::of) {
+        let name = dir.name(who);
+        if name != "Unknown" {
+            return (name, id);
+        }
+        if let Some(author) = header.post_author.as_ref().filter(|name| !name.is_empty()) {
+            return (author.clone(), id);
+        }
+        return (String::new(), id);
+    }
+    if let Some(author) = header.post_author.as_ref().filter(|name| !name.is_empty()) {
+        return (author.clone(), String::new());
+    }
+    (String::new(), String::new())
+}
+
+/// The quote, the other chat, or the story a reply header names. `None` when the line is
+/// just the answered message in this chat.
+fn reply_note(dir: &Directory, peer: Who, header: Option<&tl::enums::MessageReplyHeader>) -> Option<ReplyNote> {
+    match header? {
+        tl::enums::MessageReplyHeader::Header(header) => {
+            let quote = header.quote_text.clone().filter(|text| text.chars().any(|c| !c.is_whitespace())).unwrap_or_default();
+            let other = header.reply_to_peer_id.as_ref().map(Who::of).filter(|who| *who != peer);
+            let (author, author_id) = header.reply_from.as_ref().map(|from| reply_author(dir, from)).unwrap_or_default();
+            let place = other
+                .map(|who| {
+                    let name = dir.name(who);
+                    if name == "Unknown" { String::new() } else { name }
+                })
+                .unwrap_or_default();
+            let elsewhere = other.is_some();
+            if quote.is_empty() && author.is_empty() && !elsewhere {
+                return None;
+            }
+            Some(ReplyNote { quote, author, author_id, elsewhere, place, story: false, story_id: 0 })
+        }
+        tl::enums::MessageReplyHeader::MessageReplyStoryHeader(story) => {
+            let who = Who::of(&story.peer);
+            let name = dir.name(who);
+            let author = if name == "Unknown" { String::new() } else { name };
+            Some(ReplyNote {
+                quote: String::new(),
+                author,
+                author_id: user_id(who),
+                elsewhere: who != peer,
+                place: String::new(),
+                story: true,
+                story_id: story.story_id,
+            })
+        }
+    }
+}
+
+/// The reply line. `known` is the answered message in this chat: its sender id, name, and text.
+/// A partial quote replaces the start of that text. A reply in another chat does not use it.
+pub(super) fn line_for(reply: i32, known: Option<&(String, String, String)>, note: Option<&ReplyNote>) -> ReplyTo {
+    let elsewhere = note.is_some_and(|note| note.elsewhere);
+    let story_id = note.and_then(|note| note.story.then_some(note.story_id));
+    let id = story_id.map(|id| id.to_string()).unwrap_or_else(|| reply.to_string());
+    let mut line = match known.filter(|_| !elsewhere && story_id.is_none()) {
+        Some((_, sender, text)) => ReplyTo {
+            id,
+            sender: sender.clone(),
+            snippet: text.chars().take(120).collect(),
+            person: None,
+            deleted: false,
+        },
+        None => ReplyTo { id, sender: String::new(), snippet: String::new(), person: None, deleted: false },
+    };
+    let Some(note) = note else {
+        return line;
+    };
+    if note.story {
+        line.snippet = "Story".to_owned();
+        if !note.author.is_empty() {
+            line.sender = note.author.clone();
+        }
+        return line;
+    }
+    if !note.quote.is_empty() {
+        line.snippet = note.quote.chars().take(120).collect();
+    } else if note.elsewhere {
+        line.snippet = if note.place.is_empty() { "Another chat".to_owned() } else { format!("In {}", note.place) };
+    }
+    if (note.elsewhere || line.sender.is_empty()) && !note.author.is_empty() {
+        line.sender = note.author.clone();
+    }
+    line
 }
 
 /// The topic and the answered message a reply header names. In a forum a post that answers
@@ -1348,6 +1577,94 @@ fn topic_of(header: Option<&tl::enums::MessageReplyHeader>) -> (Option<i32>, Opt
         (true, None, top) => (top, None),
         (false, _, reply) => (None, reply),
     }
+}
+
+/// Telegram's album id, when this message is one item of a group.
+pub fn grouped_id(raw: &tl::enums::Message) -> Option<i64> {
+    match raw {
+        tl::enums::Message::Message(message) => message.grouped_id.filter(|id| *id != 0),
+        _ => None,
+    }
+}
+
+fn merged_reactions(parts: &[&Mapped]) -> Vec<Reaction> {
+    let mut out = Vec::new();
+    for part in parts {
+        for reaction in &part.message.reactions {
+            let same = |have: &Reaction| {
+                have.emoji == reaction.emoji && have.file.as_ref().map(|file| file.id.as_str()) == reaction.file.as_ref().map(|file| file.id.as_str())
+            };
+            if let Some(have) = out.iter_mut().find(|have| same(have)) {
+                have.count = have.count.saturating_add(reaction.count);
+                have.mine |= reaction.mine;
+            } else {
+                out.push(reaction.clone());
+            }
+        }
+    }
+    out
+}
+
+/// One album from its items. The row's id is the lowest Telegram id. The caption is the first
+/// item that has words. Pictures stay in the order Telegram sent them.
+pub fn merge_album(parts: &[Mapped]) -> Mapped {
+    let mut ordered: Vec<&Mapped> = parts.iter().collect();
+    ordered.sort_by_key(|part| part.id);
+    let primary = ordered[0];
+    let caption = ordered.iter().copied().find(|part| !part.message.text.is_empty()).unwrap_or(primary);
+    let mut merged = caption.clone();
+    let members: Vec<i32> = ordered.iter().map(|part| part.id).collect();
+    let member_ids: HashSet<i32> = members.iter().copied().collect();
+    merged.peer = primary.peer;
+    merged.id = primary.id;
+    merged.topic = primary.topic;
+    merged.group = primary.group.or(caption.group);
+    merged.discussion_top = ordered.iter().find_map(|part| part.discussion_top);
+    merged.members = members;
+    merged.message.id = primary.id.to_string();
+    merged.message.sent = ordered.iter().map(|part| part.message.sent).max().unwrap_or(merged.message.sent);
+    merged.message.attachments = ordered.iter().flat_map(|part| part.message.attachments.clone()).collect();
+    merged.wants = ordered.iter().flat_map(|part| part.wants.clone()).collect();
+    merged.message.reactions = merged_reactions(&ordered);
+    merged.message.edited = ordered.iter().any(|part| part.message.edited);
+    merged.message.pinned = ordered.iter().any(|part| part.message.pinned);
+    merged.message.mentions_me = ordered.iter().any(|part| part.message.mentions_me);
+    if merged.message.client_id.is_none() {
+        merged.message.client_id = ordered.iter().find_map(|part| part.message.client_id.clone());
+    }
+    // A reply that names another item of this same album is not a reply to a different message.
+    if merged.reply.is_some_and(|reply| member_ids.contains(&reply)) {
+        merged.reply = None;
+        merged.reply_note = None;
+        merged.message.reply_to = None;
+    }
+    if merged.reply.is_none() {
+        if let Some(part) = ordered.iter().find(|part| part.reply.is_some_and(|reply| !member_ids.contains(&reply))) {
+            merged.reply = part.reply;
+            merged.reply_note = part.reply_note.clone();
+            merged.message.reply_to = part.message.reply_to.clone();
+        }
+    }
+    merged
+}
+
+/// Newest first, as a page arrives. An album takes the seat of its newest item. Items that
+/// share no group stay where they were.
+pub fn group_albums(items: Vec<Mapped>) -> Vec<Mapped> {
+    let mut emitted = HashSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for item in &items {
+        let Some(group) = item.group else {
+            out.push(item.clone());
+            continue;
+        };
+        if !emitted.insert((item.peer, group)) {
+            continue;
+        }
+        let parts: Vec<Mapped> = items.iter().filter(|one| one.peer == item.peer && one.group == Some(group)).cloned().collect();
+        out.push(merge_album(&parts));
+    }
+    out
 }
 
 /// The lab's telegram-dice check. A roll of 5 reads as the emoji and the value.
@@ -1368,6 +1685,148 @@ pub(super) fn prove_dice_roll() -> Result<(), String> {
         return Err(format!("a dice of 5 reads as the emoji and the value, got {}", mapped.message.text));
     }
     Ok(())
+}
+
+fn album_item(id: i32, text: &str, group: i64, photo_id: i64) -> tl::enums::Message {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    id.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    text.to_owned().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).expect("a blank message reads back");
+    message.from_id = Some(Who::User(7_002).peer());
+    message.grouped_id = Some(group);
+    message.media = Some(tl::types::MessageMediaPhoto {
+        spoiler: false,
+        live_photo: false,
+        photo: Some(tl::types::Photo {
+            has_stickers: false,
+            id: photo_id,
+            access_hash: 1,
+            file_reference: vec![1],
+            date: 1_700_000_000,
+            sizes: vec![tl::types::PhotoSize { r#type: "y".to_owned(), w: 800, h: 600, size: 10 }.into()],
+            video_sizes: None,
+            dc_id: 2,
+        }.into()),
+        ttl_seconds: None,
+        video: None,
+    }.into());
+    message.into()
+}
+
+/// The lab's telegram-album check. Four items that share a grouped id are one message.
+pub(super) fn prove_album() -> Result<(), String> {
+    let dir = Directory::new(7_001);
+    let raws: Vec<tl::enums::Message> = (0..4).map(|at| album_item(40 + at, if at == 0 { "Ridge in four" } else { "" }, 900, 6_040 + i64::from(at))).collect();
+    let mapped: Vec<Mapped> = raws.iter().filter_map(|raw| map(&dir, raw)).collect();
+    if mapped.len() != 4 {
+        return Err(format!("four album items map, got {}", mapped.len()));
+    }
+    let mut newest_first = mapped.clone();
+    newest_first.reverse();
+    let grouped = group_albums(newest_first);
+    let one = grouped.first().ok_or("an album groups")?;
+    if grouped.len() != 1 || one.id != 40 || one.message.text != "Ridge in four" || one.message.attachments.len() != 4 {
+        return Err(format!(
+            "an album is one grid, got {} messages, id {}, text {}, {} attachments",
+            grouped.len(),
+            one.id,
+            one.message.text,
+            one.message.attachments.len()
+        ));
+    }
+    let mut grown = Vec::new();
+    for part in &mapped {
+        grown.push(part.clone());
+        let merged = merge_album(&grown);
+        if merged.message.attachments.len() != grown.len() || merged.id != 40 || merged.message.text != "Ridge in four" {
+            return Err("an album grows into one grid as its photos arrive".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// The lab's telegram-quote check. A partial quote is the reply line, and a reply in another
+/// chat shows that quote rather than a message in this chat that happens to share the id.
+pub(super) fn prove_quote() -> Result<(), String> {
+    let dir = Directory::new(1);
+    let whole = "Meet at the gate and bring the rope tomorrow, then wait";
+    let known = ("u7002".to_owned(), "Bea".to_owned(), whole.to_owned());
+    let partial = map(&dir, &quote_message(Some("bring the rope"), None, None)).ok_or("a reply maps")?;
+    let line = line_for(4, Some(&known), partial.reply_note.as_ref());
+    if line.sender != "Bea" || line.snippet != "bring the rope" {
+        return Err(format!("a partial quote did not replace the message, got {} / {}", line.sender, line.snippet));
+    }
+    let cross = map(&dir, &quote_message(Some("only this part"), Some(Who::Channel(90).peer()), Some("Nia"))).ok_or("a cross-chat reply maps")?;
+    let line = line_for(4, Some(&known), cross.reply_note.as_ref());
+    if line.sender != "Nia" || line.snippet != "only this part" || line.snippet.contains("Meet at the gate") {
+        return Err(format!("a reply in another chat did not keep its quote, got {} / {}", line.sender, line.snippet));
+    }
+    let story = tl::types::MessageReplyStoryHeader { peer: Who::User(7_004).peer(), story_id: 15 }.into();
+    let told = map(&dir, &quote_message_header(story)).ok_or("a story reply maps")?;
+    let line = line_for(0, None, told.reply_note.as_ref());
+    if line.id != "15" || line.snippet != "Story" {
+        return Err(format!("a story reply was not named, got {} / {}", line.id, line.snippet));
+    }
+    Ok(())
+}
+
+fn quote_message(text: Option<&str>, peer: Option<tl::enums::Peer>, from_name: Option<&str>) -> tl::enums::Message {
+    let reply_from = from_name.map(|name| {
+        tl::types::MessageFwdHeader {
+            imported: false,
+            saved_out: false,
+            from_id: None,
+            from_name: Some(name.to_owned()),
+            date: 1_700_000_000,
+            channel_post: None,
+            post_author: None,
+            saved_from_peer: None,
+            saved_from_msg_id: None,
+            saved_from_id: None,
+            saved_from_name: None,
+            saved_date: None,
+            psa_type: None,
+        }
+        .into()
+    });
+    let header = tl::types::MessageReplyHeader {
+        reply_to_scheduled: false,
+        forum_topic: false,
+        quote: text.is_some(),
+        reply_to_ephemeral: false,
+        reply_to_msg_id: Some(4),
+        reply_to_peer_id: peer,
+        reply_from,
+        reply_media: None,
+        reply_to_top_id: None,
+        quote_text: text.map(str::to_owned),
+        quote_entities: None,
+        quote_offset: Some(9),
+        todo_item_id: None,
+        poll_option: None,
+    };
+    quote_message_header(header.into())
+}
+
+fn quote_message_header(reply_to: tl::enums::MessageReplyHeader) -> tl::enums::Message {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    9i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).expect("a blank message reads back");
+    message.message = "On my way".to_owned();
+    message.reply_to = Some(reply_to);
+    message.from_id = Some(Who::User(7_003).peer());
+    message.into()
 }
 
 /// The lab's telegram-service-lines check. A premium gift is named, a pin quotes the message
@@ -1447,6 +1906,71 @@ pub(super) fn prove_service_lines() -> Result<(), String> {
         MessageKind::Unsupported { link }
             if unknown.message.text.contains("cannot show yet") && link.contains("user_id=7002") && link.contains("message_id=22") => {}
         _ => return Err(format!("an unnamed action opens in Telegram, got {}", unknown.message.text)),
+    }
+    Ok(())
+}
+
+/// The lab's telegram-invoices check. An invoice and a paid preview are cards with a price,
+/// and a payment names its amount. A build from before this has no card.
+pub(super) fn prove_invoices() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    9i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    message.media = Some(
+        tl::types::MessageMediaInvoice {
+            shipping_address_requested: false,
+            test: false,
+            title: "Ridge map".into(),
+            description: "The weekend route".into(),
+            photo: None,
+            receipt_msg_id: None,
+            currency: "USD".into(),
+            total_amount: 500,
+            start_param: String::new(),
+            extended_media: None,
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &message.into()).ok_or("the invoice maps")?;
+    let card = mapped.message.card.ok_or("an invoice is a card")?;
+    if card.title != "Ridge map" || card.fields.first().map(|field| field.1.as_str()) != Some("USD 5.00") {
+        return Err(format!("the invoice card has no price, got {}", card.title));
+    }
+    match mapped.message.kind {
+        MessageKind::Unsupported { ref link } if link.contains("message_id=9") => {}
+        _ => return Err("an invoice does not open in Telegram".into()),
+    }
+    let mut paid = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    paid.id = 10;
+    paid.media = Some(
+        tl::types::MessageMediaPaidMedia {
+            stars_amount: 50,
+            extended_media: vec![tl::types::MessageExtendedMediaPreview { w: Some(320), h: Some(240), thumb: None, video_duration: None }.into()],
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &paid.into()).ok_or("the paid media maps")?;
+    let card = mapped.message.card.ok_or("paid media is a card")?;
+    if card.fields.first().map(|field| field.1.as_str()) != Some("50 Stars") || !card.text.to_lowercase().contains("blur") {
+        return Err(format!("the paid preview is unnamed, got {}", card.text));
+    }
+    let sent = tl::types::MessageActionPaymentSent {
+        recurring_init: false,
+        recurring_used: false,
+        currency: "XTR".into(),
+        total_amount: 50,
+        invoice_slug: None,
+        subscription_until_date: None,
+    };
+    let (line, known) = action(&Directory::new(1), "Ada", &sent.into());
+    if !known || line != "Ada sent a payment of 50 Stars" {
+        return Err(format!("a Star payment is unnamed, got {line}"));
     }
     Ok(())
 }
@@ -1677,6 +2201,68 @@ mod tests {
         super::action(&Directory::new(1), "Ada", &action).0
     }
 
+    fn blank_message() -> tl::types::Message {
+        use grammers_tl_types::{Deserializable, Serializable};
+        let mut bytes = Vec::new();
+        0u32.serialize(&mut bytes);
+        0u32.serialize(&mut bytes);
+        9i32.serialize(&mut bytes);
+        Who::User(7_002).peer().serialize(&mut bytes);
+        1_700_000_000i32.serialize(&mut bytes);
+        String::new().serialize(&mut bytes);
+        let mut message = tl::types::Message::from_bytes(&bytes).expect("a blank message reads back");
+        message.from_id = Some(Who::User(7_002).peer());
+        message
+    }
+
+    #[test]
+    fn an_invoice_and_paid_media_are_cards_with_a_price_and_a_hand_off() {
+        let mut invoice = blank_message();
+        invoice.media = Some(
+            tl::types::MessageMediaInvoice {
+                shipping_address_requested: false,
+                test: false,
+                title: "Ridge map".into(),
+                description: "The weekend route".into(),
+                photo: None,
+                receipt_msg_id: None,
+                currency: "USD".into(),
+                total_amount: 500,
+                start_param: String::new(),
+                extended_media: None,
+            }
+            .into(),
+        );
+        let mapped = map(&Directory::new(7_001), &invoice.into()).expect("the invoice maps");
+        let card = mapped.message.card.expect("an invoice is a card");
+        assert_eq!(card.title, "Ridge map");
+        assert_eq!(card.text, "The weekend route");
+        assert_eq!(card.fields, vec![("Price".into(), "USD 5.00".into())]);
+        assert!(matches!(mapped.message.kind, MessageKind::Unsupported { ref link } if link.contains("message_id=9")));
+
+        let mut paid = blank_message();
+        paid.id = 10;
+        paid.media = Some(
+            tl::types::MessageMediaPaidMedia {
+                stars_amount: 50,
+                extended_media: vec![tl::types::MessageExtendedMediaPreview {
+                    w: Some(1_280),
+                    h: Some(720),
+                    thumb: None,
+                    video_duration: Some(8),
+                }
+                .into()],
+            }
+            .into(),
+        );
+        let mapped = map(&Directory::new(7_001), &paid.into()).expect("the paid media maps");
+        let card = mapped.message.card.expect("paid media is a card");
+        assert_eq!(card.title, "Paid media");
+        assert!(card.text.to_lowercase().contains("lock") || card.text.to_lowercase().contains("blur"), "{}", card.text);
+        assert_eq!(card.fields, vec![("Price".into(), "50 Stars".into())]);
+        assert!(matches!(mapped.message.kind, MessageKind::Unsupported { .. }));
+    }
+
     /// Every `MessageAction` of the pinned grammers schema. A new variant fails this build
     /// until it is named here, which is how an upgrade is noticed. The fallback line stays.
     fn listed(action: &MessageAction) -> &'static str {
@@ -1870,7 +2456,16 @@ mod tests {
             invoice_slug: None,
             subscription_until_date: None,
         };
-        assert_eq!(said(paid.into()), "Ada sent a payment (USD)");
+        assert_eq!(said(paid.into()), "Ada sent a payment of USD 5.00");
+        let stars = tl::types::MessageActionPaymentSent {
+            recurring_init: false,
+            recurring_used: false,
+            currency: "XTR".into(),
+            total_amount: 50,
+            invoice_slug: None,
+            subscription_until_date: None,
+        };
+        assert_eq!(said(stars.into()), "Ada sent a payment of 50 Stars");
         let refunded = tl::types::MessageActionPaymentRefunded {
             peer: Who::User(7_002).peer(),
             currency: "USD".into(),
@@ -1878,7 +2473,15 @@ mod tests {
             payload: None,
             charge: tl::types::PaymentCharge { id: "c".into(), provider_charge_id: "p".into() }.into(),
         };
-        assert_eq!(said(refunded.into()), "A USD payment was refunded");
+        assert_eq!(said(refunded.into()), "A payment of USD 5.00 was refunded");
+        let stars_back = tl::types::MessageActionPaymentRefunded {
+            peer: Who::User(7_002).peer(),
+            currency: "XTR".into(),
+            total_amount: 1,
+            payload: None,
+            charge: tl::types::PaymentCharge { id: "c".into(), provider_charge_id: "p".into() }.into(),
+        };
+        assert_eq!(said(stars_back.into()), "A payment of 1 Star was refunded");
         assert_eq!(said(tl::types::MessageActionGiveawayLaunch { stars: None }.into()), "Ada started a giveaway");
         let results = tl::types::MessageActionGiveawayResults { stars: false, winners_count: 3, unclaimed_count: 0 };
         assert_eq!(said(results.into()), "A giveaway finished with 3 winners");
@@ -1951,5 +2554,86 @@ mod tests {
             }
             MessageKind::System | MessageKind::Normal => panic!("an unnamed action needs a link into Telegram"),
         }
+    }
+
+    fn text_message(text: &str, reply_to: Option<tl::enums::MessageReplyHeader>) -> tl::enums::Message {
+        use grammers_tl_types::{Deserializable, Serializable};
+        let mut bytes = Vec::new();
+        0u32.serialize(&mut bytes);
+        0u32.serialize(&mut bytes);
+        9i32.serialize(&mut bytes);
+        Who::User(7_002).peer().serialize(&mut bytes);
+        1_700_000_000i32.serialize(&mut bytes);
+        String::new().serialize(&mut bytes);
+        let mut message = tl::types::Message::from_bytes(&bytes).expect("a blank message reads back");
+        message.message = text.to_owned();
+        message.reply_to = reply_to;
+        message.from_id = Some(Who::User(7_003).peer());
+        message.into()
+    }
+
+    fn quoted(text: Option<&str>, peer: Option<tl::enums::Peer>, from_name: Option<&str>) -> tl::enums::MessageReplyHeader {
+        let reply_from = from_name.map(|name| {
+            tl::types::MessageFwdHeader {
+                imported: false,
+                saved_out: false,
+                from_id: None,
+                from_name: Some(name.to_owned()),
+                date: 1_700_000_000,
+                channel_post: None,
+                post_author: None,
+                saved_from_peer: None,
+                saved_from_msg_id: None,
+                saved_from_id: None,
+                saved_from_name: None,
+                saved_date: None,
+                psa_type: None,
+            }
+            .into()
+        });
+        tl::types::MessageReplyHeader {
+            reply_to_scheduled: false,
+            forum_topic: false,
+            quote: text.is_some(),
+            reply_to_ephemeral: false,
+            reply_to_msg_id: Some(4),
+            reply_to_peer_id: peer,
+            reply_from,
+            reply_media: None,
+            reply_to_top_id: None,
+            quote_text: text.map(str::to_owned),
+            quote_entities: None,
+            quote_offset: Some(9),
+            todo_item_id: None,
+            poll_option: None,
+        }
+        .into()
+    }
+
+    #[test]
+    fn a_partial_quote_is_the_reply_line_and_another_chat_keeps_its_own_words() {
+        let dir = Directory::new(1);
+        let whole = "Meet at the gate and bring the rope tomorrow, then wait";
+        let partial = map(&dir, &text_message("On my way", Some(quoted(Some("bring the rope"), None, None)))).expect("a reply maps");
+        let known = ("u7002".to_owned(), "Bea".to_owned(), whole.to_owned());
+        let line = line_for(4, Some(&known), partial.reply_note.as_ref());
+        assert_eq!(line.sender, "Bea");
+        assert_eq!(line.snippet, "bring the rope");
+        assert_ne!(line.snippet, whole.chars().take(120).collect::<String>());
+
+        let other = Who::Channel(90).peer();
+        let cross = map(&dir, &text_message("On my way", Some(quoted(Some("only this part"), Some(other), Some("Nia"))))).expect("a cross-chat reply maps");
+        let note = cross.reply_note.as_ref().expect("the header's quote is kept");
+        assert!(note.elsewhere);
+        let line = line_for(4, Some(&known), Some(note));
+        assert_eq!(line.sender, "Nia");
+        assert_eq!(line.snippet, "only this part");
+        assert!(!line.snippet.contains("Meet at the gate"));
+
+        let story = tl::types::MessageReplyStoryHeader { peer: Who::User(7_004).peer(), story_id: 15 }.into();
+        let told = map(&dir, &text_message("seen", Some(story))).expect("a story reply maps");
+        let line = line_for(0, None, told.reply_note.as_ref());
+        assert_eq!(line.id, "15");
+        assert_eq!(line.snippet, "Story");
     }
 }

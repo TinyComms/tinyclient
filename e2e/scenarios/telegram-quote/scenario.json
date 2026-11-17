@@ -1,0 +1,12 @@
+{
+  "id": "telegram-quote",
+  "title": "A Telegram reply shows the quoted part, including a reply from another chat",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same reply line is what a quoted message maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same reply line is what a quoted message maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
