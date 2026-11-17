@@ -1078,6 +1078,11 @@ pub fn prove_telegram_custom_emoji() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's telegram-service-lines driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_service_lines() -> Result<(), String> {
+    content::prove_service_lines()
+}
+
 /// The lab's telegram-dice driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_dice() -> Result<(), String> {
     content::prove_dice_roll()?;
