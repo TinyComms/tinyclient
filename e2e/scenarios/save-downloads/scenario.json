@@ -1,0 +1,12 @@
+{
+  "id": "save-downloads",
+  "title": "Save to Downloads finds the real folder when HOME is unset",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. Saving a picture there uses the same folder helper.",
+    "ios": "The phone proof build does not run the desktop window. Saving a picture there uses the same folder helper."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
