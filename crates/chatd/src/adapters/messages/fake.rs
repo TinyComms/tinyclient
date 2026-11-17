@@ -62,6 +62,8 @@ impl Fake {
                 heard: Mutex::new(Some(heard)),
                 closed: Arc::new(AtomicBool::new(true)),
                 refuse: Arc::default(),
+                quiet: Arc::default(),
+                sent: AtomicU32::new(0),
             };
         }
         let (events, heard) = channel();
