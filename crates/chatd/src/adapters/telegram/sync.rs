@@ -1138,6 +1138,8 @@ pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped,
             mapped.message.reply_to = Some(quote(account, conversation, page, reply));
         }
     }
+    // A pin names the message it points at. The words are filled once that message is known.
+    content::quote_pin(&mut mapped.message);
     account.place(mapped.peer, mapped.id, conversation);
     comment_thread(account, conversation, mapped);
 }
