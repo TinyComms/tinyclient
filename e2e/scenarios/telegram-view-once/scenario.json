@@ -1,0 +1,12 @@
+{
+  "id": "telegram-view-once",
+  "title": "A view-once Telegram photo stays locked and is not fetched",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same locked row is what a view-once photo maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same locked row is what a view-once photo maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

@@ -411,6 +411,11 @@ fn refused(fault: Fault) -> Refusal {
     Refusal::Refused(fault.words())
 }
 
+/// The lab's telegram-view-once driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_view_once() -> Result<(), String> {
+    content::prove_view_once()
+}
+
 /// A user's last-seen as the contract's presence. Where Telegram hides the time ("recently",
 /// "within a week") the person is not known to be offline, so nothing is claimed.
 pub(super) fn presence(status: Option<&tl::enums::UserStatus>) -> Presence {
