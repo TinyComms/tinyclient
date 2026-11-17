@@ -43,7 +43,7 @@ fn record(line: &str) {
         .append(true)
         .open(path)
     {
-        let _ = writeln!(file, "{line}");
+        let _ = file.write_all(format!("{line}\n").as_bytes());
     }
 }
 
@@ -236,6 +236,11 @@ fn scripted_page(conversation: &str, before: Option<&str>) -> Vec<Note> {
         .map(|n| {
             let mut line = note(GRACE, "Grace Ombra", GRACE, &format!("m-{n:04}"), &format!("line {n}"), false, Vec::new(), Vec::new());
             line.sent = 1_700_000_000 + n;
+            // The 90th-newest line. A photo here is older than the first page, so a shared
+            // search that only saw that page would miss it.
+            if n == 11 {
+                line.pieces = vec![photo_piece(true)];
+            }
             line
         })
         .collect()

@@ -5,7 +5,7 @@
 use protocol::{
     read_frame, write_frame, AccountKey, Change, ChatStream, ConversationKind, Encryption, Key,
     Link, MediaKind, Message, MessageKind, Network, Outgoing, OutgoingFile, Page, ReactionSet,
-    Request, Response, SendState, SignInInput, SignInStep,
+    Request, Response, SendState, SharedKind, SignInInput, SignInStep,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -785,20 +785,7 @@ fn a_quiet_phone_holds_a_text_until_the_phone_answers() {
     world.connected();
     world.steer("silent");
     world.heard("silent");
-    let _ = world.messages(GRACE);
-    world.until("the phone banner while the relay stays up", || {
-        let (accounts, _) = world.status();
-        accounts.into_iter().find(|status| status.key.account == ME).and_then(|status| {
-            (status.link == Link::Connected
-                && status.required == chatd::adapters::messages::CANT_REACH)
-                .then_some(())
-        })
-    });
-    assert!(
-        world.calls().iter().all(|call| !call.starts_with("history ")),
-        "a quiet phone was asked for history: {:?}",
-        world.calls()
-    );
+    let while_quiet = world.calls().iter().filter(|call| call.starts_with("history ")).count();
     let pending = world.send(GRACE, "held-1", "On my way.");
     assert!(matches!(pending.state, SendState::Pending), "{pending:?}");
     let waiting = |text: &str| {
@@ -810,6 +797,20 @@ fn a_quiet_phone_holds_a_text_until_the_phone_answers() {
     world.until("the first text to wait", || waiting("On my way."));
     world.send(GRACE, "held-2", "Still here.");
     world.until("the second text to wait", || waiting("Still here."));
+    world.until("the phone banner while the relay stays up", || {
+        let (accounts, _) = world.status();
+        accounts.into_iter().find(|status| status.key.account == ME).and_then(|status| {
+            (status.link == Link::Connected
+                && status.required == chatd::adapters::messages::CANT_REACH)
+                .then_some(())
+        })
+    });
+    assert_eq!(
+        world.calls().iter().filter(|call| call.starts_with("history ")).count(),
+        while_quiet,
+        "a quiet phone was asked for history: {:?}",
+        world.calls()
+    );
     assert!(
         world.calls().iter().all(|call| !call.starts_with("send ")),
         "a quiet phone was asked to send: {:?}",
@@ -820,8 +821,15 @@ fn a_quiet_phone_holds_a_text_until_the_phone_answers() {
         let calls = world.calls();
         let first = calls.iter().position(|call| call == "send phone-grace On my way.")?;
         let second = calls.iter().position(|call| call == "send phone-grace Still here.")?;
-        let history = calls.iter().position(|call| call == "history phone-grace")?;
-        (first < second && second < history).then_some(())
+        let between = calls.iter().enumerate().any(|(index, call)| {
+            index > first && index < second && call.starts_with("history ")
+        });
+        let later = calls
+            .iter()
+            .enumerate()
+            .any(|(index, call)| index > second && call.starts_with("history "));
+        let earlier = calls.iter().take(first).any(|call| call.starts_with("history "));
+        (first < second && !between && (later || earlier)).then_some(())
     });
     world.until("both texts to be sent", || {
         let messages = world.messages(GRACE);
@@ -850,10 +858,10 @@ fn scrolling_back_reads_every_message_and_then_stops_asking() {
     };
     let first = world.until("the newest forty", || {
         let lines = world.lines();
-        (lines.len() == 40).then_some(lines)
+        (lines.len() >= 40).then_some(lines)
     });
     let _ = world.before(&oldest(&first));
-    world.until("the next forty", || (world.lines().len() == 80).then_some(()));
+    world.until("the next forty", || (world.lines().len() >= 80).then_some(()));
     let mid = world.lines();
     let _ = world.before(&oldest(&mid));
     let all = world.until("all one hundred", || {
@@ -874,7 +882,7 @@ fn scrolling_back_reads_every_message_and_then_stops_asking() {
     let asked = world
         .calls()
         .iter()
-        .filter(|call| call.starts_with("history "))
+        .filter(|call| call.starts_with("history phone-grace"))
         .count();
     let _ = world.before(&oldest(&all));
     world.ask(Request::Typing {
@@ -884,7 +892,7 @@ fn scrolling_back_reads_every_message_and_then_stops_asking() {
     let after = world
         .calls()
         .iter()
-        .filter(|call| call.starts_with("history "))
+        .filter(|call| call.starts_with("history phone-grace"))
         .count();
     assert_eq!(
         after, asked,
@@ -1119,4 +1127,56 @@ fn a_text_deleted_on_the_phone_leaves_and_delete_reaches_the_phone() {
         None => Some(()),
         Some(_) => None,
     });
+}
+
+#[test]
+fn an_older_line_is_found_without_opening_the_chat() {
+    let world = World::many();
+    world.connected();
+    let hit = |query: &str, conversation: Option<Key>| match world.ask(Request::SearchMessages {
+        conversation,
+        network: Some(Network::Messages),
+        space: None,
+        query: query.into(),
+        limit: 10,
+    }) {
+        Response::MessageHits { hits } => hits.into_iter().any(|hit| hit.message_id == "m-0011"),
+        _ => false,
+    };
+    world.until("the 90th-newest line", || {
+        hit("line 11", Some(key(GRACE))).then_some(())
+    });
+    assert!(
+        hit("line 11", None),
+        "the account search missed the older line: {:?}",
+        world.calls()
+    );
+    world.heard("history phone-grace m-0021");
+    let mut since = Instant::now();
+    let mut seen = world.calls().len();
+    world.until("the fill to stop", || {
+        let now = world.calls().len();
+        if now != seen {
+            seen = now;
+            since = Instant::now();
+            return None;
+        }
+        (since.elapsed() > Duration::from_millis(500)).then_some(())
+    });
+    match world.ask(Request::Shared {
+        conversation: key(GRACE),
+        kind: SharedKind::Media,
+        before: None,
+        limit: 20,
+        search: true,
+    }) {
+        Response::Shared { items, complete, .. } => {
+            assert!(complete, "a finished chat was not the whole list");
+            assert!(
+                items.iter().any(|item| item.message_id == "m-0011"),
+                "the older photo was not in the shared list: {items:?}"
+            );
+        }
+        other => panic!("the shared list was not served: {other:?}"),
+    }
 }
