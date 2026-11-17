@@ -1,0 +1,12 @@
+{
+  "id": "telegram-large-files",
+  "title": "A large Telegram file and a CDN file can be downloaded",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same ceiling and checksum are what a download maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same ceiling and checksum are what a download maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

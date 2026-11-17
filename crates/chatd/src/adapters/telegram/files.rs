@@ -16,10 +16,14 @@ use super::{Account, Context};
 use crate::adapters::net;
 use crate::blobs;
 use crate::hub::now;
+use aes::Aes256;
+use cipher::{KeyIvInit, StreamCipher};
+use ctr::Ctr128BE;
 use grammers_tl_types as tl;
 use protocol::{Change, Key, MediaKind};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, channel, Sender};
@@ -40,10 +44,14 @@ const PARKED_LOOK: Duration = Duration::from_secs(1);
 const PARKED_FOR: Duration = Duration::from_secs(600);
 /// The largest picture fetched for a row.
 const LARGEST: u64 = 2 * 1024 * 1024;
-/// The largest original fetched for the viewer, whatever Telegram says it is.
+/// What an explicit picture used to stop at. An open or a save is no longer held to it.
 const LARGEST_ORIGINAL: u64 = 64 * 1024 * 1024;
-/// The largest voice message, audio file or video fetched to be played or opened.
+/// What an explicit file used to stop at. An open or a save is no longer held to it.
 const LARGEST_FILE: u64 = 200 * 1024 * 1024;
+/// The most an explicit open or save will keep. Telegram serves up to 4 GB from a Premium sender.
+const KEEP_LARGEST: u64 = 4 * 1024 * 1024 * 1024;
+/// Telegram's pieces start on this boundary, and a resumed part does too.
+const PIECE_ALIGN: u64 = 4_096;
 /// Bytes asked for at a time for such a file, which the user is waiting on: the most Telegram
 /// gives in one piece, at the same pace as everything else.
 const FILE_PIECE: i32 = 1024 * 1024;
@@ -271,16 +279,29 @@ fn fetch(account: &Account, want: &Want, carried: &mut HashSet<i32>) -> Result<(
     let path = blobs::path_of(&media_dir(), &ctx.account, &want.file.id);
     let part = path.with_extension("part");
     std::fs::create_dir_all(blobs::dir_under(&media_dir(), &ctx.account)).map_err(local)?;
-    let mut out = std::fs::File::create(&part).map_err(local)?;
+    // A file already started continues from the part. An inline picture is whole in one write.
+    let (mut out, start) = if want.inline.is_some() {
+        (std::fs::File::create(&part).map_err(local)?, 0)
+    } else {
+        // Read as well as write: a CDN piece is checked against its checksum before the next one.
+        let start = resume_len(&part);
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&part).map_err(local)?;
+        file.seek(SeekFrom::Start(start)).map_err(local)?;
+        (file, start)
+    };
     let written = match &want.inline {
         Some(bytes) => out.write_all(bytes).map(|()| bytes.len() as u64).map_err(local),
-        None => download(account, want, carried, &mut out),
+        None => download(account, want, carried, start, &mut out),
     };
     drop(out);
     let bytes = match written {
         Ok(bytes) => bytes,
         Err(fault) => {
-            let _ = std::fs::remove_file(&part);
+            // A checksum failure is not a place to continue from. Anything else leaves the
+            // part, and the next ask carries on from its length.
+            if fault.to_string().contains("did not match") {
+                let _ = std::fs::remove_file(&part);
+            }
             return Err(fault);
         }
     };
@@ -326,14 +347,89 @@ fn fetch(account: &Account, want: &Want, carried: &mut HashSet<i32>) -> Result<(
     Ok(())
 }
 
-/// The pieces of one file, in order, from the datacenter that holds it.
-fn download(account: &Account, want: &Want, carried: &mut HashSet<i32>, out: &mut std::fs::File) -> Result<u64, Fault> {
+/// How far this fetch may go. A file the user opened or saved is kept up to Telegram's own
+/// largest. A picture fetched for a row stays small.
+pub(super) fn most_bytes(original: bool, bytes: u64) -> u64 {
+    if !original {
+        return LARGEST;
+    }
+    if bytes == 0 {
+        return KEEP_LARGEST;
+    }
+    bytes.saturating_add(bytes / 8).saturating_add(FILE_PIECE as u64).clamp(LARGEST, KEEP_LARGEST)
+}
+
+/// A partial download continues from the last whole piece. A torn tail is cut so the next
+/// request starts where Telegram's pieces do.
+fn resume_len(part: &std::path::Path) -> u64 {
+    let len = std::fs::metadata(part).map(|meta| meta.len()).unwrap_or(0);
+    let aligned = len - (len % PIECE_ALIGN);
+    if aligned != len {
+        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(part) {
+            let _ = file.set_len(aligned);
+        }
+    }
+    aligned
+}
+
+fn too_large(want: &Want) -> Fault {
+    let name = if want.file.kind == MediaKind::Image { "picture" } else { "file" };
+    let why = if want.original {
+        format!("the {name} is larger than tinyclient can keep")
+    } else {
+        format!("the {name} is larger than tinyclient downloads on its own")
+    };
+    Fault::Net(why)
+}
+
+fn mismatched() -> Fault {
+    Fault::Net("Telegram's copy of this file did not match.".to_owned())
+}
+
+type AesCtr = Ctr128BE<Aes256>;
+
+/// The counter Telegram's CDN uses: the redirect's IV plus `offset / 16`, big-endian.
+pub(super) fn cdn_iv(iv: &[u8; 16], offset: u64) -> [u8; 16] {
+    let block = u128::from_be_bytes(*iv).wrapping_add(u128::from(offset / 16));
+    block.to_be_bytes()
+}
+
+/// AES-256-CTR over one CDN piece. The same call encrypts and decrypts.
+pub(in crate::adapters::telegram) fn cdn_apply(key: &[u8], iv: &[u8; 16], offset: u64, bytes: &mut [u8]) -> Result<(), Fault> {
+    if key.len() != 32 {
+        return Err(mismatched());
+    }
+    let counter = cdn_iv(iv, offset);
+    let mut cipher = AesCtr::new(key.into(), counter.as_slice().into());
+    let skip = (offset % 16) as usize;
+    if skip != 0 {
+        let mut junk = vec![0u8; skip];
+        cipher.apply_keystream(&mut junk);
+    }
+    cipher.apply_keystream(bytes);
+    Ok(())
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+fn hash_end(hash: &tl::types::FileHash) -> u64 {
+    (hash.offset.max(0) as u64).saturating_add(hash.limit.max(0) as u64)
+}
+
+/// The pieces of one file, in order, from the datacenter that holds it. `start` is the part
+/// already on disk.
+fn download(account: &Account, want: &Want, carried: &mut HashSet<i32>, start: u64, out: &mut std::fs::File) -> Result<u64, Fault> {
     let wire = account.wire.as_ref();
     let home = wire.home();
     let dc = (want.dc != 0 && want.dc != home).then_some(want.dc);
     if let Some(dc) = dc {
         // A file kept elsewhere is asked of that datacenter, which first has to be told who we
-        // are: the home datacenter vouches once per connection.
+        // are: the home datacenter vouches once per connection. A CDN redirect is not this
+        // datacenter, and a CDN does not take that voucher.
         if !carried.contains(&dc) {
             let tl::enums::auth::ExportedAuthorization::Authorization(pass) =
                 account.ask(&tl::functions::auth::ExportAuthorization { dc_id: dc })?;
@@ -342,12 +438,12 @@ fn download(account: &Account, want: &Want, carried: &mut HashSet<i32>, out: &mu
         }
     }
     // A picture's pieces stay small; a file the user pressed play on comes in the largest.
-    let (limit, most) = match (want.original, want.file.kind) {
-        (true, MediaKind::Image) => (PIECE, (want.file.bytes + want.file.bytes / 8).clamp(LARGEST, LARGEST_ORIGINAL)),
-        (true, _) => (FILE_PIECE, (want.file.bytes + want.file.bytes / 8).clamp(LARGEST, LARGEST_FILE)),
-        (false, _) => (PIECE, LARGEST),
+    let limit = match (want.original, want.file.kind) {
+        (true, MediaKind::Image) | (false, _) => PIECE,
+        (true, _) => FILE_PIECE,
     };
-    let mut offset = 0i64;
+    let most = most_bytes(want.original, want.file.bytes);
+    let mut offset = start as i64;
     loop {
         // Pictures for a scrolled list are many small requests: paced, never back to back, the
         // way a busy client still stays well under Telegram's flood limits.
@@ -356,7 +452,7 @@ fn download(account: &Account, want: &Want, carried: &mut HashSet<i32>, out: &mu
         }
         let request = tl::functions::upload::GetFile {
             precise: false,
-            cdn_supported: false,
+            cdn_supported: true,
             location: want.location.clone(),
             offset,
             limit,
@@ -372,19 +468,151 @@ fn download(account: &Account, want: &Want, carried: &mut HashSet<i32>, out: &mu
             },
             Ok(piece) => piece,
         };
-        let tl::enums::upload::File::File(piece) = piece else {
-            return Err(Fault::Net("Telegram keeps this file where tinyclient cannot fetch it yet".to_owned()));
-        };
-        out.write_all(&piece.bytes).map_err(|err| Fault::Net(err.to_string()))?;
-        offset += piece.bytes.len() as i64;
-        if (piece.bytes.len() as i32) < limit {
-            return Ok(offset as u64);
-        }
-        // An original may be as large as Telegram says it is; a row's picture never needs more.
-        if offset as u64 > most {
-            return Err(Fault::Net("the picture is larger than it should be".to_owned()));
+        match piece {
+            tl::enums::upload::File::File(piece) => {
+                out.write_all(&piece.bytes).map_err(|err| Fault::Net(err.to_string()))?;
+                offset += piece.bytes.len() as i64;
+                if (piece.bytes.len() as i32) < limit {
+                    return Ok(offset as u64);
+                }
+                if offset as u64 > most {
+                    return Err(too_large(want));
+                }
+            }
+            tl::enums::upload::File::CdnRedirect(redirect) => {
+                return download_cdn(account, &redirect, offset as u64, most, want, out);
+            }
         }
     }
+}
+
+fn flatten_hashes(hashes: Vec<tl::enums::FileHash>) -> Vec<tl::types::FileHash> {
+    hashes.into_iter().map(|hash| match hash { tl::enums::FileHash::Hash(hash) => hash }).collect()
+}
+
+/// The ranges the home datacenter says this CDN file covers. The CDN is not asked: it is the
+/// thing the hashes check.
+fn cdn_hash_list(account: &Account, token: &[u8], redirected: &[tl::enums::FileHash]) -> Result<Vec<tl::types::FileHash>, Fault> {
+    let asked = account.ask(&tl::functions::upload::GetCdnFileHashes { file_token: token.to_vec(), offset: 0 })?;
+    let hashes = flatten_hashes(asked);
+    if !hashes.is_empty() {
+        return Ok(hashes);
+    }
+    let hashes = flatten_hashes(redirected.to_vec());
+    if hashes.is_empty() { Err(mismatched()) } else { Ok(hashes) }
+}
+
+fn check_hashes(out: &mut std::fs::File, hashes: &[tl::types::FileHash], end: u64) -> Result<(), Fault> {
+    out.flush().map_err(|err| Fault::Net(err.to_string()))?;
+    let pos = out.stream_position().map_err(|err| Fault::Net(err.to_string()))?;
+    for hash in hashes {
+        let from = hash.offset.max(0) as u64;
+        let span = hash.limit.max(0) as u64;
+        if span == 0 || from.saturating_add(span) > end {
+            continue;
+        }
+        let mut buf = vec![0u8; span as usize];
+        out.seek(SeekFrom::Start(from)).map_err(|err| Fault::Net(err.to_string()))?;
+        out.read_exact(&mut buf).map_err(|_| mismatched())?;
+        if sha256(&buf).as_slice() != hash.hash.as_slice() {
+            return Err(mismatched());
+        }
+    }
+    out.seek(SeekFrom::Start(pos)).map_err(|err| Fault::Net(err.to_string()))?;
+    Ok(())
+}
+
+fn download_cdn(
+    account: &Account,
+    redirect: &tl::types::upload::FileCdnRedirect,
+    start: u64,
+    most: u64,
+    want: &Want,
+    out: &mut std::fs::File,
+) -> Result<u64, Fault> {
+    let key: [u8; 32] = redirect.encryption_key.as_slice().try_into().map_err(|_| mismatched())?;
+    let iv: [u8; 16] = redirect.encryption_iv.as_slice().try_into().map_err(|_| mismatched())?;
+    let hashes = cdn_hash_list(account, &redirect.file_token, &redirect.file_hashes)?;
+    let wire = account.wire.as_ref();
+    let limit = FILE_PIECE;
+    let mut offset = start;
+    let mut reuploaded = false;
+    loop {
+        if account.ctx.pause(PACE) {
+            return Err(Fault::Net("stopped".to_owned()));
+        }
+        let request = tl::functions::upload::GetCdnFile {
+            file_token: redirect.file_token.clone(),
+            offset: offset as i64,
+            limit,
+        };
+        // The CDN datacenter is not signed into. It answers `getCdnFile` and nothing else.
+        let piece = match wire::call_in(wire, Some(redirect.dc_id), &request)? {
+            tl::enums::upload::CdnFile::File(file) => file.bytes,
+            tl::enums::upload::CdnFile::ReuploadNeeded(need) if !reuploaded => {
+                reuploaded = true;
+                let _ = account.ask(&tl::functions::upload::ReuploadCdnFile {
+                    file_token: redirect.file_token.clone(),
+                    request_token: need.request_token,
+                })?;
+                continue;
+            }
+            tl::enums::upload::CdnFile::ReuploadNeeded(_) => return Err(mismatched()),
+        };
+        if piece.is_empty() {
+            if hashes.iter().any(|hash| hash.limit > 0 && hash_end(hash) > offset) {
+                return Err(mismatched());
+            }
+            return Ok(offset);
+        }
+        let mut plain = piece;
+        cdn_apply(&key, &iv, offset, &mut plain)?;
+        out.write_all(&plain).map_err(|err| Fault::Net(err.to_string()))?;
+        let end = offset + plain.len() as u64;
+        check_hashes(out, &hashes, end)?;
+        offset = end;
+        if (plain.len() as i32) < limit {
+            if hashes.iter().any(|hash| hash.limit > 0 && hash_end(hash) > offset) {
+                return Err(mismatched());
+            }
+            return Ok(offset);
+        }
+        if offset > most {
+            return Err(too_large(want));
+        }
+    }
+}
+
+/// The lab's telegram-large-files check. A 300 MB file the user opened is not stopped at
+/// 200 MB, an automatic fetch still is, and a CDN piece decrypts to the bytes its checksum names.
+pub(super) fn prove_large_files() -> Result<(), String> {
+    let big = 300 * 1024 * 1024;
+    let cap = most_bytes(true, big);
+    if cap < big || cap <= LARGEST_FILE {
+        return Err(format!("a 300 MB file the user opened is capped at {cap}"));
+    }
+    if most_bytes(false, big) != LARGEST {
+        return Err("an automatic fetch is still capped".into());
+    }
+    if most_bytes(true, 80 * 1024 * 1024) <= LARGEST_ORIGINAL {
+        return Err("an opened picture is still held to 64 MB".into());
+    }
+    let key = [3u8; 32];
+    let iv = [5u8; 16];
+    let plain: [u8; 32] = std::array::from_fn(|at| (at as u8).wrapping_add(1));
+    let mut hidden = plain;
+    cdn_apply(&key, &iv, 0, &mut hidden).map_err(|err| err.to_string())?;
+    let mut back = hidden;
+    cdn_apply(&key, &iv, 0, &mut back).map_err(|err| err.to_string())?;
+    if back != plain || sha256(&back) != sha256(&plain) {
+        return Err("a CDN file did not decrypt to its checksum".into());
+    }
+    let mut tail = hidden[16..].to_vec();
+    cdn_apply(&key, &iv, 16, &mut tail).map_err(|err| err.to_string())?;
+    if tail.as_slice() != &plain[16..] {
+        return Err("a CDN piece past the first block did not decrypt".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -413,5 +641,27 @@ mod tests {
         assert!(queue.is_empty());
         rows_back(&Weak::new(), &mut parked, &mut queue, &counted);
         assert_eq!(counted.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn an_opened_file_may_pass_the_old_ceiling_and_a_row_fetch_may_not() {
+        let big = 300 * 1024 * 1024;
+        let cap = most_bytes(true, big);
+        assert!(cap >= big && cap > LARGEST_FILE, "{cap}");
+        assert_eq!(most_bytes(false, big), LARGEST);
+        assert!(most_bytes(true, 80 * 1024 * 1024) > LARGEST_ORIGINAL);
+    }
+
+    #[test]
+    fn a_torn_part_resumes_on_a_piece_boundary() {
+        let path = std::env::temp_dir().join(format!(
+            "tinyclient-part-{}-{}.part",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, vec![1u8; 5_000]).unwrap();
+        assert_eq!(resume_len(&path), 4_096);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4_096);
+        let _ = std::fs::remove_file(&path);
     }
 }

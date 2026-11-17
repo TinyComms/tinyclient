@@ -460,6 +460,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-stickers:0");
         return Ok(());
     }
+    // The lab's telegram-large-files driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-large-files") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_large_files() {
+            eprintln!("telegram-large-files: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-large-files:0");
+        return Ok(());
+    }
     // The lab's telegram-dice driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-dice") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_dice() {

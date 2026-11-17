@@ -2495,3 +2495,53 @@ fn a_second_sign_in_keeps_the_telegram_account_already_there() {
     };
     assert_eq!(conversation.key, lea_key("u7002"));
 }
+
+fn fetch_path(world: &World, id: &str) -> Option<String> {
+    match world.ask(Request::Fetch { account: account(), ids: vec![id.into()], size: None, retry: false }) {
+        Response::Media { mut files } => files.pop().and_then(|file| file.path),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_cdn_file_is_decrypted_and_its_checksum_matches() {
+    let world = World::signed_in();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.until("history", || world.message("u7002", "12"));
+    world.steer("cdn-file");
+    let message = world.arrived("u7002", "30");
+    let plain = b"ridge file from the cdn";
+    let file = &message.attachments[0].file;
+    assert_eq!((file.id.as_str(), file.kind, file.bytes), ("d9300", MediaKind::File, plain.len() as u64));
+    let landed = world.until("the cdn file on disk", || fetch_path(&world, "d9300"));
+    let bytes = std::fs::read(&landed).unwrap();
+    assert_eq!(bytes, plain);
+    let calls = world.calls();
+    let at = |name: &str| calls.iter().position(|call| call == name).unwrap_or_else(|| panic!("{name} missing in {calls:#?}"));
+    let asked = at("GetFile document 9300 at 0");
+    let hashes = at("GetCdnFileHashes");
+    let again = at("CdnReuploadNeeded");
+    let reupload = at("ReuploadCdnFile");
+    assert!(asked < hashes && hashes < again && again < reupload, "{calls:#?}");
+    assert_eq!(calls.iter().filter(|call| *call == "GetCdnFile").count(), 2, "{calls:#?}");
+    assert_eq!(world.called("ExportAuthorization 5"), 0, "{calls:#?}");
+}
+
+#[test]
+fn a_dropped_large_file_resumes_from_the_part() {
+    let world = World::signed_in();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.until("history", || world.message("u7002", "12"));
+    world.steer("big-file");
+    let message = world.arrived("u7002", "31");
+    assert_eq!(message.attachments[0].file.id, "d9400");
+    assert_eq!(message.attachments[0].file.bytes, (1024 * 1024 + 64) as u64);
+    let landed = world.until("the resumed file on disk", || fetch_path(&world, "d9400"));
+    let bytes = std::fs::read(&landed).unwrap();
+    let expected: Vec<u8> = (0..(1024 * 1024 + 64)).map(|at| (at % 251) as u8).collect();
+    assert_eq!(bytes, expected);
+    assert_eq!(world.called("GetFile document 9400 at 0"), 1, "{:#?}", world.calls());
+    assert!(world.called("GetFile document 9400 at 1048576") >= 1, "{:#?}", world.calls());
+}
