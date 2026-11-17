@@ -552,10 +552,11 @@ fn cursor_message(cursor: &Cursor) -> Vec<u8> {
     buf.0
 }
 
-fn list_request(count: u64, before: Option<&Cursor>) -> Vec<u8> {
+/// `ListConversationsRequest.folder`: inbox, archive, and spam & blocked.
+fn list_request(count: u64, folder: u64, before: Option<&Cursor>) -> Vec<u8> {
     let mut buf = Buf::new();
     buf.int(2, count);
-    buf.int(4, 1); // INBOX
+    buf.int(4, folder);
     if let Some(cursor) = before {
         buf.msg(5, &cursor_message(cursor));
     }
@@ -578,6 +579,62 @@ fn delete_conversation_request(conversation: &str) -> Vec<u8> {
     let mut req = Buf::new();
     req.int(2, 1);
     req.text(3, conversation);
+    req.msg(6, &data.0);
+    req.0
+}
+
+/// Where a `Conversation.status` sits. The layout's cross-country folder has no shelf here,
+/// so it stays off the lists, the same as a deleted chat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Place {
+    Main,
+    Archive,
+    Request,
+    Hidden,
+}
+
+pub(super) fn place(status: u64) -> Place {
+    match status {
+        2 | 4 => Place::Archive,
+        5 | 6 => Place::Request,
+        3 | 7 | 8 => Place::Hidden,
+        _ => Place::Main,
+    }
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-folders`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub(super) fn prove_message_folders() -> Result<(), String> {
+    for folder in [1u64, 2, 5] {
+        let got = field_int(&fields(&list_request(50, folder, None)), 4);
+        if got != folder {
+            return Err(format!("the list asked for folder {got}, not {folder}"));
+        }
+    }
+    if place(1) != Place::Main || place(0) != Place::Main {
+        return Err("an open chat left the main list".into());
+    }
+    if place(2) != Place::Archive || place(4) != Place::Archive {
+        return Err("an archived chat was not filed on the archive".into());
+    }
+    if place(5) != Place::Request || place(6) != Place::Request {
+        return Err("spam or a blocked chat was not filed as a request".into());
+    }
+    if place(3) != Place::Hidden || place(7) != Place::Hidden || place(8) != Place::Hidden {
+        return Err("a deleted chat stayed on a list".into());
+    }
+    Ok(())
+}
+
+fn block_request(conversation: &str) -> Vec<u8> {
+    let mut data = Buf::new();
+    data.text(1, conversation);
+    let mut extra = Buf::new();
+    extra.int(2, 1);
+    let mut req = Buf::new();
+    req.int(2, 7); // BLOCK
+    req.text(3, conversation);
+    req.msg(5, &extra.0);
     req.msg(6, &data.0);
     req.0
 }
@@ -1039,8 +1096,9 @@ pub struct Chat {
     /// A tombstone said the phones encrypt the chat. A later conversation update does not
     /// clear it: the conversation message has no such field.
     pub phones: bool,
-    /// Conversation status DELETED (field 12 is 3): the phone no longer has this chat.
-    pub gone: bool,
+    /// `Conversation.status`, field 12. 0 when the phone did not say, which keeps the status
+    /// already stored. 3 is DELETED.
+    pub status: u64,
 }
 
 /// One photo or file on a message. Bytes are already opened when the phone sent them inline.
@@ -1172,7 +1230,7 @@ pub(super) fn prove_messages_delete() -> Result<(), String> {
     let mut list = Buf::new();
     list.msg(2, &conv.0);
     let chats = decode_chats(&list.0);
-    if chats.len() != 1 || !chats[0].gone {
+    if chats.len() != 1 || chats[0].status != 3 {
         return Err("a chat deleted on the phone was kept".into());
     }
     Ok(())
@@ -1644,10 +1702,27 @@ impl Session {
 
     pub fn refresh(&self) -> Result<(), String> {
         self.activate()?;
-        let first = self.rpc(1, &list_request(CHAT_PAGE, None), 16)?;
+        // The first list after pairing is the annotation. Archive and spam use the ordinary call.
+        let first = self.rpc(1, &list_request(CHAT_PAGE, 1, None), 16)?;
         let chats = decode_chats(&first);
         self.note_inbox(&first, &chats);
-        self.store_chats(chats, true);
+        self.apply_chats(chats);
+        for folder in [2u64, 5] {
+            match self.rpc(1, &list_request(CHAT_PAGE, folder, None), 2) {
+                Ok(page) => self.apply_chats(decode_chats(&page)),
+                Err(why) if why == PHONE_QUIET => return Err(why),
+                Err(why) => tracing::warn!("chatd: Messages: {why}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Block the conversation. The published request is `BLOCK` with the conversation id, and
+    /// the same id again in the delete-shaped data the phone expects. Reporting spam is a
+    /// different action and is not sent from here.
+    pub fn block(&self, conversation: &str) -> Result<(), String> {
+        let bytes = self.rpc(15, &block_request(conversation), 2)?;
+        refused(&bytes)?;
         Ok(())
     }
 
@@ -1670,7 +1745,7 @@ impl Session {
             self.finish_inbox();
             return Ok(Vec::new());
         };
-        let bytes = self.rpc(1, &list_request(CHAT_PAGE, Some(&cursor)), 2)?;
+        let bytes = self.rpc(1, &list_request(CHAT_PAGE, 1, Some(&cursor)), 2)?;
         let chats = decode_chats(&bytes);
         let next = decode_cursor(&bytes).or_else(|| oldest_cursor(&chats));
         let moved = next.as_ref().is_some_and(|next| next.id != cursor.id || next.millis != cursor.millis);
@@ -1679,7 +1754,7 @@ impl Session {
         } else {
             self.note_inbox(&bytes, &chats);
         }
-        self.store_chats(chats.clone(), false);
+        self.apply_chats(chats.clone());
         Ok(chats)
     }
 
@@ -1707,25 +1782,13 @@ impl Session {
         }
     }
 
-    fn store_chats(&self, chats: Vec<Chat>, replace: bool) {
-        if chats.is_empty() {
-            return;
+    fn apply_chats(&self, chats: Vec<Chat>) {
+        let sent = keep_chats(&self.live, chats);
+        if !sent.is_empty() {
+            let _ = self
+                .events
+                .send(crate::adapters::messages::Event::Chats(sent));
         }
-        {
-            let mut live = self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            if replace {
-                live.chats = chats.clone();
-            } else {
-                for chat in &chats {
-                    if let Some(had) = live.chats.iter_mut().find(|had| had.id == chat.id) {
-                        *had = chat.clone();
-                    } else {
-                        live.chats.push(chat.clone());
-                    }
-                }
-            }
-        }
-        let _ = self.events.send(crate::adapters::messages::Event::Chats(chats));
     }
 
     fn mine_of(&self, conversation: &str) -> String {
@@ -2015,6 +2078,29 @@ fn wait_or_stop(stop: &std::sync::atomic::AtomicBool, pause: Duration) {
     }
 }
 
+/// A later list or update adds to the chats already held. A status of 0 means this message
+/// did not say, so the one already stored stays. Replacing the whole list would drop the inbox
+/// when the archive page arrives, and would put an archived chat back when an update omits it.
+fn keep_chats(live: &Mutex<Live>, incoming: Vec<Chat>) -> Vec<Chat> {
+    if incoming.is_empty() {
+        return Vec::new();
+    }
+    let mut held = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut sent = Vec::with_capacity(incoming.len());
+    for mut chat in incoming {
+        if let Some(slot) = held.chats.iter_mut().find(|had| had.id == chat.id) {
+            if chat.status == 0 {
+                chat.status = slot.status;
+            }
+            *slot = chat.clone();
+        } else {
+            held.chats.push(chat.clone());
+        }
+        sent.push(chat);
+    }
+    sent
+}
+
 /// True when this poll failed before its own close, so the next wait should grow.
 /// Refresh, connect, and a refused status return true. The stream's own close returns false.
 fn poll(
@@ -2257,12 +2343,9 @@ fn on_payload(
     }
     match action {
         1 => {
-            let chats = decode_chats(&plain);
-            if !chats.is_empty() {
-                live.lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .chats = chats.clone();
-                let _ = events.send(crate::adapters::messages::Event::Chats(chats));
+            let sent = keep_chats(live, decode_chats(&plain));
+            if !sent.is_empty() {
+                let _ = events.send(crate::adapters::messages::Event::Chats(sent));
             }
         }
         16 => on_updates(&plain, live, events),
@@ -2308,12 +2391,9 @@ fn on_pair(message: &[u8], live: &Mutex<Live>, paired: &Option<Sender<Saved>>) -
 fn on_updates(bytes: &[u8], live: &Mutex<Live>, events: &Sender<crate::adapters::messages::Event>) {
     let list = fields(bytes);
     if let Some(conversations) = field(&list, 2) {
-        let chats = decode_chats(&conversations.bytes);
-        if !chats.is_empty() {
-            live.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .chats = chats.clone();
-            let _ = events.send(crate::adapters::messages::Event::Chats(chats));
+        let sent = keep_chats(live, decode_chats(&conversations.bytes));
+        if !sent.is_empty() {
+            let _ = events.send(crate::adapters::messages::Event::Chats(sent));
         }
     }
     if let Some(messages) = field(&list, 3) {
@@ -2354,9 +2434,8 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
         let mut title = field_text(&conv, 2);
         let group = field_int(&conv, 10) != 0;
         let unread = field_int(&conv, 6) != 0;
-        // ConversationStatus: 3 is DELETED.
-        let gone = field_int(&conv, 12) == 3;
         let carrier = field_int(&conv, 22);
+        let status = field_int(&conv, 12);
         let mut mine = field_text(&conv, 11);
         let mut peer = String::new();
         for person in conv.iter().filter(|field| field.number == 20) {
@@ -2403,7 +2482,7 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
             carrier,
             updated: unix_seconds(field_int(&conv, 5) as i64),
             phones: false,
-            gone,
+            status,
         });
     }
     chats
@@ -2736,7 +2815,7 @@ pub(super) fn prove_message_history() -> Result<(), String> {
     if field(&first, 5).is_some() {
         return Err("the newest history page sent a cursor".into());
     }
-    let inbox = fields(&list_request(CHAT_PAGE, Some(&cursor)));
+    let inbox = fields(&list_request(CHAT_PAGE, 1, Some(&cursor)));
     if field_int(&inbox, 2) != CHAT_PAGE || field_int(&inbox, 4) != 1 {
         return Err("the inbox request lost its page or its folder".into());
     }
@@ -2868,6 +2947,21 @@ mod tests {
     #[test]
     fn a_history_page_carries_the_message_it_starts_after() {
         prove_message_history().unwrap();
+    }
+
+    #[test]
+    fn an_archived_conversation_keeps_its_status_and_each_folder_is_asked() {
+        prove_message_folders().unwrap();
+        let mut conv = Buf::new();
+        conv.text(1, "c-archive");
+        conv.text(2, "Old");
+        conv.int(12, 2);
+        let mut list = Buf::new();
+        list.msg(2, &conv.0);
+        let chats = decode_chats(&list.0);
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].status, 2);
+        assert_eq!(place(2), Place::Archive);
     }
 
     #[test]

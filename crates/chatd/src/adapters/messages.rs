@@ -12,11 +12,11 @@ pub mod signin;
 use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, Signed};
 use crate::blobs;
 use crate::session;
-use crate::store::{ConversationRow, PersonRow};
+use crate::store::{ConversationRow, Filing, PersonRow};
 use bugle::Chat;
 use protocol::{
     Attachment, Capabilities, Change, ConversationKind, MediaFile, MediaKind, Message, MessageKind,
-    Reaction, ReactionSet, Relation, ReplyTo, SendState,
+    Reaction, ReactionSet, RelateAction, Relation, ReplyTo, SendState, Special,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -152,6 +152,7 @@ trait Drive: Send + Sync {
     fn typing(&self, conversation: &str) -> Result<(), String>;
     fn delete_message(&self, message: &str) -> Result<(), String>;
     fn delete_conversation(&self, conversation: &str) -> Result<(), String>;
+    fn block(&self, conversation: &str) -> Result<(), String>;
     fn close(&self);
 }
 
@@ -228,6 +229,9 @@ impl Drive for LiveDrive {
     }
     fn delete_conversation(&self, conversation: &str) -> Result<(), String> {
         self.inner.delete_conversation(conversation)
+    }
+    fn block(&self, conversation: &str) -> Result<(), String> {
+        self.inner.block(conversation)
     }
     fn close(&self) {
         self.inner.close();
@@ -317,6 +321,12 @@ pub fn prove_message_reply() -> Result<(), String> {
 
 /// The lab sets `TINYCLIENT_PROVE=messages-phone-quiet`. A build from before this ignores that
 /// and keeps serving, so the same driver fails there.
+/// The lab sets `TINYCLIENT_PROVE=messages-folders`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_message_folders() -> Result<(), String> {
+    bugle::prove_message_folders()
+}
+
 pub fn prove_phone_quiet() -> Result<(), String> {
     if !phone_quiet(bugle::PHONE_QUIET) {
         return Err("a quiet phone was not recognised".into());
@@ -609,7 +619,43 @@ fn row(chat: &Chat) -> ConversationRow {
     // The shell already draws this line. It is not `Encryption::EndToEnd`: those words would
     // claim this computer checked the keys, and the paired browser is a separate hop.
     row.topic = bugle::composer_label(chat.carrier, chat.phones);
+    let mut filing = Filing::default();
+    match bugle::place(chat.status) {
+        bugle::Place::Archive => filing.archived = true,
+        bugle::Place::Request => row.special = Special::Request,
+        bugle::Place::Hidden => filing.hidden = true,
+        bugle::Place::Main => {}
+    }
+    row.filing = Some(filing);
     row
+}
+
+/// File a chat under a status the phone just confirmed, such as blocked.
+fn file_as(account: &Account, id: &str, status: u64) {
+    let chat = {
+        let held = account
+            .chats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut chat = held.get(id).cloned().unwrap_or_else(|| Chat {
+            id: id.to_owned(),
+            title: "Messages".into(),
+            group: false,
+            unread: false,
+            mine: String::new(),
+            peer: String::new(),
+            carrier: 0,
+            updated: 0,
+            phones: false,
+            status,
+        });
+        chat.status = status;
+        chat
+    };
+    let chat = remember(account, std::slice::from_ref(&chat));
+    if let Some(chat) = chat.first() {
+        let _ = account.ctx.conversation(&row(chat));
+    }
 }
 
 fn carrier_of(account: &Account, id: &str) -> u64 {
@@ -634,6 +680,10 @@ fn remember(account: &Account, incoming: &[Chat]) -> Vec<Chat> {
         let mut chat = chat.clone();
         if let Some(had) = held.get(&chat.id) {
             chat.phones = chat.phones || had.phones;
+            // 0 means this update did not say. An archived chat must not bounce back to the inbox.
+            if chat.status == 0 {
+                chat.status = had.status;
+            }
         }
         held.insert(chat.id.clone(), chat.clone());
         kept.push(chat);
@@ -657,7 +707,7 @@ fn seal(account: &Account, conversation: &str, on: bool) {
             carrier: 0,
             updated: 0,
             phones: false,
-            gone: false,
+            status: 0,
         });
         chat.phones = on;
         chat.clone()
@@ -677,7 +727,7 @@ fn apply(account: &Account, event: Event) {
                 }
             }
             for chat in &chats {
-                if chat.gone {
+                if chat.status == 3 {
                     let _ = account.ctx.conversation_gone(&chat.id);
                     continue;
                 }
@@ -729,7 +779,7 @@ fn apply(account: &Account, event: Event) {
                     carrier: 0,
                     updated: 0,
                     phones: false,
-                    gone: false,
+                    status: 0,
                 };
                 let chat = remember(account, &[chat]);
                 let _ = account.ctx.conversation(&row(&chat[0]));
@@ -1241,6 +1291,19 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(answer);
         }
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
+        Command::Relate {
+            person_id,
+            action,
+            reply,
+        } => {
+            let answer = match action {
+                RelateAction::Block => account.drive.block(&person_id).map(|_| {
+                    file_as(account, &person_id, 6);
+                }),
+                _ => Err("Messages cannot do that.".into()),
+            };
+            let _ = reply.send(answer.map_err(Refusal::Refused));
+        }
         Command::Handoff { reply, .. } => {
             let _ = reply.send(Ok("https://messages.google.com/web/".to_owned()));
         }

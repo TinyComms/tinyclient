@@ -5,7 +5,7 @@
 use protocol::{
     read_frame, write_frame, AccountKey, Change, ChatStream, ConversationKind, Encryption, Key,
     Link, MediaKind, Message, MessageKind, Network, Outgoing, OutgoingFile, Page, ReactionSet,
-    Request, Response, SendState, SignInInput, SignInStep,
+    RelateAction, Request, Response, SendState, Shelf, SignInInput, SignInStep, Special,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 const ME: &str = "phone-ada";
 const GRACE: &str = "phone-grace";
+const ALAN: &str = "phone-alan";
 const CLUB: &str = "phone-club";
 const SESSION: &str = r#"{"account":"phone-ada","name":"Ada Quill"}"#;
 
@@ -189,6 +190,29 @@ impl World {
             Response::Conversation { conversation } => Some(conversation),
             _ => None,
         }
+    }
+
+    fn home(&self, shelf: Shelf) -> Vec<protocol::Conversation> {
+        match self.ask(Request::Home {
+            network: Network::Messages,
+            account: Some(account()),
+            folder: None,
+            shelf,
+            offset: 0,
+            limit: 200,
+        }) {
+            Response::Conversations { conversations, .. } => conversations,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn attention(&self) -> u32 {
+        self.status()
+            .0
+            .iter()
+            .find(|status| status.key == account())
+            .map(|status| status.attention)
+            .unwrap_or(0)
     }
 
     fn messages(&self, conversation: &str) -> Vec<Message> {
@@ -609,6 +633,70 @@ fn a_mov_is_sent_as_a_video() {
         ),
         (MediaKind::Video, "video/quicktime")
     );
+}
+
+#[test]
+fn an_archived_chat_leaves_the_main_list_and_spam_does_not_notify() {
+    let world = World::linked();
+    world.connected();
+    assert!(world.home(Shelf::Main).iter().any(|row| row.key.id == GRACE));
+
+    world.steer("archive grace");
+    world.until("Grace on the archive shelf", || {
+        world
+            .home(Shelf::Archive)
+            .iter()
+            .any(|row| row.key.id == GRACE)
+            .then_some(())
+    });
+    assert!(world.home(Shelf::Main).iter().all(|row| row.key.id != GRACE));
+    // A later update that does not repeat the status must not put the chat back.
+    world.steer("again grace");
+    world.until("a status-less update kept the archive", || {
+        world
+            .conversation(GRACE)
+            .filter(|row| row.archived && row.title == "Grace Ombra still")
+    });
+    assert!(world.home(Shelf::Main).iter().all(|row| row.key.id != GRACE));
+
+    let attention = world.attention();
+    world.steer("spam alan");
+    world.until("Alan behind requests", || {
+        world
+            .home(Shelf::Requests)
+            .iter()
+            .any(|row| row.key.id == ALAN)
+            .then_some(())
+    });
+    assert!(world.home(Shelf::Main).iter().all(|row| row.key.id != ALAN));
+    world.steer("incoming alan a blocked note");
+    world.arrived(ALAN, "a blocked note");
+    let spam = world.conversation(ALAN).expect("the spam chat");
+    assert_eq!(spam.special, Special::Request);
+    assert_eq!(
+        world.attention(),
+        attention,
+        "a spam chat raises no badge and posts no notification"
+    );
+}
+
+#[test]
+fn blocking_a_person_asks_the_phone() {
+    let world = World::linked();
+    world.connected();
+    match world.ask(Request::Relate {
+        person: key(GRACE),
+        action: RelateAction::Block,
+    }) {
+        Response::Ok => {}
+        other => panic!("{other:?}"),
+    }
+    world.heard(&format!("block {GRACE}"));
+    let blocked = world.until("Grace off the main list", || {
+        world.conversation(GRACE).filter(|row| row.special == Special::Request)
+    });
+    assert!(blocked.special == Special::Request);
+    assert!(world.home(Shelf::Main).iter().all(|row| row.key.id != GRACE));
 }
 
 #[test]
