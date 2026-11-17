@@ -918,6 +918,13 @@ impl Shell {
         Conversation::new(key.clone(), protocol::ConversationKind::Channel, title)
     }
 
+    /// ⌥⌘U: the open conversation's newest message becomes unread.
+    pub(super) fn mark_open_unread(&mut self, cx: &mut Context<Self>) {
+        if let Some(conversation) = self.open.clone() {
+            self.mark_conversation_unread(conversation, cx);
+        }
+    }
+
     /// `shift-esc`: the open conversation is read up to its newest message.
     pub(super) fn mark_open_read(&mut self, cx: &mut Context<Self>) {
         if let Some(conversation) = self.open.clone() {

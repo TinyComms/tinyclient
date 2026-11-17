@@ -272,6 +272,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     key("Conversation", "Next Unread", "⌥⇧↓"),
     key("Conversation", "Previous Unread", "⌥⇧↑"),
     key("Conversation", "Mark as Read", "⇧Esc"),
+    key("Conversation", "Mark Unread", "⌥⌘U"),
     key("Conversation", "Show Details", "⌥⌘I"),
     key("Conversation", "Start Call", "⇧⌘C"),
     key("Conversation", "Open in App", "⌥⌘O"),

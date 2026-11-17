@@ -281,6 +281,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-discord-nitro-length:0");
         return Ok(());
     }
+    // The lab's discord-mark-unread driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-mark-unread") {
+        if let Err(err) = chatd::adapters::prove_discord_mark_unread() {
+            eprintln!("discord-mark-unread: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-discord-mark-unread:0");
+        return Ok(());
+    }
     // The lab's discord-group-members driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-group-members") {
         if let Err(err) = chatd::adapters::prove_discord_group_dm() {

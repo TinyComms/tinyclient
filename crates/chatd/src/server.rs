@@ -1048,6 +1048,32 @@ impl Chat {
         }
     }
 
+    /// The user moved their own marker back. `message_id` is the first unread message, or empty
+    /// for the newest one stored. The network is told even when receipts are off: this syncs the
+    /// user's marker to their other devices, and it is not a receipt the other person sees.
+    fn mark_unread(&self, conversation: Key, message_id: String) -> Response {
+        match self.hub.store().mark_unread(&conversation, &message_id) {
+            Ok(Some((marker, mentions))) => {
+                if !marker.is_empty() {
+                    let account = conversation.account();
+                    self.command(
+                        &account,
+                        Command::MarkUnread {
+                            conversation_id: conversation.id.clone(),
+                            message_id: marker,
+                            mentions,
+                        },
+                    );
+                }
+                self.hub.changed(Change::Conversation { conversation });
+                self.hub.changed(Change::Status);
+                Response::Ok
+            }
+            Ok(None) => Response::Ok,
+            Err(err) => internal(err),
+        }
+    }
+
     /// Every badge goes. Discord hears one bulk ack per account; the other networks hear the
     /// read they already know. A message request is read here and not announced.
     fn mark_all_read(&self, network: Option<Network>) -> Response {
@@ -2228,6 +2254,7 @@ impl Chat {
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
             Request::MarkRead { conversation, message_id } => self.mark_read(conversation, message_id),
+            Request::MarkUnread { conversation, message_id } => self.mark_unread(conversation, message_id),
             Request::MarkAllRead { network } => self.mark_all_read(network),
             Request::Forget { conversation } => self.forget_conversation(conversation),
             Request::Send { conversation, client_id, text, reply_to, with } => {

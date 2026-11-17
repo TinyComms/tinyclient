@@ -207,6 +207,34 @@ pub(super) fn group_seats(me: &str, owner: &str, recipients: &[String]) -> Vec<(
     ids.into_iter().map(|id| (id.clone(), !owner.is_empty() && id == owner)).collect()
 }
 
+/// The body of a deliberate unread. The web client sends these two fields and nothing else:
+/// the message in the path is the last one that still counts as read.
+pub(super) fn manual_ack_body(mentions: u32) -> serde_json::Value {
+    json!({"manual": true, "mention_count": mentions})
+}
+
+/// An older acknowledgement puts the badge back only when the other device asked to.
+/// A repeat of a marker we already passed (a blocked DM whose ack was refused) stays ignored.
+pub(super) fn older_ack_applies(manual: bool) -> bool {
+    manual
+}
+
+/// `TINYCLIENT_PROVE=discord-mark-unread`. The manual ack body is the one Discord expects, and
+/// an older ack moves the marker only when it is manual.
+pub(super) fn prove_mark_unread() -> Result<(), String> {
+    let body = manual_ack_body(2);
+    if body["manual"] != true || body["mention_count"] != 2 {
+        return Err("a manual unread ack is manual with the mention count".to_owned());
+    }
+    if body.get("token").is_some() || body.get("last_viewed").is_some() {
+        return Err("a manual unread ack carries no read token".to_owned());
+    }
+    if older_ack_applies(false) || !older_ack_applies(true) {
+        return Err("only a manual ack may move the marker backwards".to_owned());
+    }
+    Ok(())
+}
+
 /// `TINYCLIENT_PROVE=discord-group-members`. A four-person group lists four, and one leaving leaves three.
 pub(super) fn prove_group_dm() -> Result<(), String> {
     let four = ["2001".to_owned(), "2002".to_owned(), "2006".to_owned()];
@@ -897,6 +925,24 @@ impl Discord {
         }
     }
 
+    /// Moves the marker back to `message`, the last one that still counts as read. A forward
+    /// ack held for this channel is dropped so the pacer does not read it again.
+    fn mark_unread(&self, channel: &str, message: &str, mentions: u32) {
+        if message.is_empty() {
+            return;
+        }
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(ack) = state.acks.get_mut(channel) {
+                ack.held = None;
+            }
+        }
+        let body = manual_ack_body(mentions);
+        if let Err(refused) = self.call("POST", &format!("/channels/{channel}/messages/{message}/ack"), Some(body)) {
+            self.log("mark unread", refused);
+        }
+    }
+
     /// Discord's "mark inbox read": one request, up to 50 channels. `reads` is `(channel, message)`.
     fn ack_bulk(&self, reads: &[(String, String)]) -> Result<(), Refused> {
         for chunk in reads.chunks(50) {
@@ -1226,6 +1272,7 @@ impl Discord {
             // ask because it lists a forum's topics only on demand.
             Command::OpenForum { reply, .. } => drop(reply.send(Ok(()))),
             Command::MarkRead { conversation_id, message_id } => self.mark_read(&conversation_id, &message_id),
+            Command::MarkUnread { conversation_id, message_id, mentions } => self.mark_unread(&conversation_id, &message_id, mentions),
             Command::AckBulk { reads } => {
                 if let Err(refused) = self.ack_bulk(&reads) {
                     self.log("mark read", refused);

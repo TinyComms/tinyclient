@@ -882,6 +882,16 @@ impl Shell {
                             }))
                             .into_any_element(),
                     );
+                } else {
+                    let unread = conversation.key.clone();
+                    items.push(
+                        menu_item("mark-unread", Some("icons/mail.svg"), "Mark as unread", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.mark_conversation_unread(unread.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
                 }
                 if conversation.kind == ConversationKind::Direct {
                     let closed = conversation.key.clone();
@@ -1004,6 +1014,9 @@ impl Shell {
         if row.unread > 0 || row.mentions > 0 {
             let read = key.clone();
             items.push(act("row-read", "icons/check.svg", "Mark as read".into(), Box::new(move |this, cx| this.mark_read(read.clone(), cx))));
+        } else {
+            let unread = key.clone();
+            items.push(act("row-unread", "icons/mail.svg", "Mark as unread".into(), Box::new(move |this, cx| this.mark_conversation_unread(unread.clone(), cx))));
         }
         let starred = row.starred;
         let star = key.clone();
