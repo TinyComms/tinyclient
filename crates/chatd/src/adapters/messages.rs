@@ -371,6 +371,12 @@ pub fn prove_messages_failed_send() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab sets `TINYCLIENT_PROVE=messages-unread`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_messages_unread() -> Result<(), String> {
+    bugle::prove_messages_unread()
+}
+
 pub fn reaction_rules() -> protocol::ReactionRules {
     protocol::ReactionRules {
         set: ReactionSet::Any,
@@ -460,6 +466,8 @@ struct Account {
     phone: Mutex<Phone>,
     /// Texts asked of the phone on this connection, by the shell's client id.
     outbox: Mutex<HashMap<String, Attempt>>,
+    /// Newest message seen, so a chat read on the phone can move the marker there.
+    newest: Mutex<HashMap<String, (String, i64)>>,
 }
 
 pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<(), String> {
@@ -541,6 +549,7 @@ fn connect(
         span: Mutex::default(),
         phone: Mutex::default(),
         outbox: Mutex::default(),
+        newest: Mutex::default(),
     });
     ctx.capabilities(Capabilities {
         max_file_bytes: 100 * 1024 * 1024,
@@ -684,8 +693,9 @@ fn apply(account: &Account, event: Event) {
                 // A picture fetched earlier stays the row's when the row is recorded again.
                 let avatar = account.ctx.avatar_of(&chat.id);
                 let _ = account.ctx.conversation(&ConversationRow { avatar: avatar.clone(), ..row(chat) });
-                if chat.unread {
-                    let _ = account.ctx.counts(&chat.id, 1, 0, None, 0);
+                // The flag is not a count. True leaves what the messages added. False clears.
+                if bugle::flag_count(chat.unread) == Some(0) {
+                    clear_read(account, &chat.id);
                 }
                 if !chat.group {
                     people.push(PersonRow {
@@ -735,6 +745,12 @@ fn apply(account: &Account, event: Event) {
                 let _ = account.ctx.conversation(&row(&chat[0]));
             }
             show(account, &note, &[]);
+            if note.status != 300
+                && note.phones.is_none()
+                && bugle::tombstone(note.status).is_none()
+            {
+                saw(account, &note);
+            }
             nudge(account);
         }
         Event::Typing {
@@ -760,6 +776,45 @@ fn apply(account: &Account, event: Event) {
         }
         Event::Ready | Event::Closed(_) | Event::Ended(_) => {}
     }
+}
+
+fn saw(account: &Account, note: &bugle::Note) {
+    if note.id.is_empty() {
+        return;
+    }
+    let mut newest = account
+        .newest
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let keep = newest
+        .get(&note.conversation)
+        .is_none_or(|(_, sent)| note.sent >= *sent);
+    if keep {
+        newest.insert(note.conversation.clone(), (note.id.clone(), note.sent));
+    }
+}
+
+fn clear_read(account: &Account, conversation: &str) {
+    let newest = account
+        .newest
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(conversation)
+        .cloned();
+    let Some((id, sent)) = newest.or_else(|| {
+        let id = account.ctx.newest(conversation).ok().flatten()?;
+        let sent = account
+            .ctx
+            .known(conversation)
+            .ok()
+            .flatten()
+            .map(|row| row.updated)
+            .unwrap_or(0);
+        Some((id, sent))
+    }) else {
+        return;
+    };
+    let _ = account.ctx.counts(conversation, 0, 0, Some(&id), sent);
 }
 
 fn show(account: &Account, note: &bugle::Note, page: &[bugle::Note]) {

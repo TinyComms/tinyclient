@@ -309,7 +309,7 @@ fn a_paired_phone_lists_its_chats_and_a_text_arrives() {
     let club = world.conversation(CLUB).unwrap();
     assert_eq!(
         (club.kind, club.title.as_str(), club.unread),
-        (ConversationKind::Group, "Bridge club", 1)
+        (ConversationKind::Group, "Bridge club", 0)
     );
     let grace = world.conversation(GRACE).unwrap();
     assert_eq!(
@@ -1119,4 +1119,27 @@ fn a_text_deleted_on_the_phone_leaves_and_delete_reaches_the_phone() {
         None => Some(()),
         Some(_) => None,
     });
+}
+
+#[test]
+fn three_texts_count_as_three_and_a_chat_read_on_the_phone_clears() {
+    let world = World::linked();
+    world.connected();
+    let club = world.conversation(CLUB).unwrap();
+    assert_eq!(club.unread, 0, "a flag with no messages was shown as a count");
+    for text in ["a", "bb", "ccc"] {
+        world.steer(&format!("incoming grace {text}"));
+        world.arrived(GRACE, text);
+    }
+    assert_eq!(world.conversation(GRACE).unwrap().unread, 3);
+    world.steer("hold grace");
+    let held = world.until("the unread flag", || {
+        world.conversation(GRACE).filter(|row| row.title == "Held")
+    });
+    assert_eq!(held.unread, 3, "the unread flag replaced the count with 1");
+    world.steer("read grace");
+    let read = world.until("the chat read on the phone", || {
+        world.conversation(GRACE).filter(|row| row.title == "Read")
+    });
+    assert_eq!(read.unread, 0);
 }

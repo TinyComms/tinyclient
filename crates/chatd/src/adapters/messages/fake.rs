@@ -537,6 +537,28 @@ fn steer(line: &str) -> Vec<Event> {
                 gone: true,
             }])]
         }
+        "hold" | "read" => {
+            let Some((author, _)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let unread = command == "hold";
+            vec![Event::Chats(vec![Chat {
+                id: author.into(),
+                title: if unread { "Held".into() } else { "Read".into() },
+                group: false,
+                unread,
+                mine: ME.into(),
+                peer: if author == GRACE {
+                    GRACE_PARTICIPANT.into()
+                } else {
+                    String::new()
+                },
+                carrier: 0,
+                updated: 0,
+                phones: false,
+                gone: false,
+            }])]
+        }
         _ => Vec::new(),
     }
 }

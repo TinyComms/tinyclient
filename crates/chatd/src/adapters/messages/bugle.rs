@@ -2305,37 +2305,132 @@ fn on_pair(message: &[u8], live: &Mutex<Live>, paired: &Option<Sender<Saved>>) -
     false
 }
 
+/// Messages, then the conversation row, then typing. A read flag in the same batch must not
+/// land before the messages it already includes, or the count flickers.
+pub(super) fn update_field_order() -> [u64; 3] {
+    [3, 2, 4]
+}
+
+/// Field 6 is a bool, not a count. True leaves whatever the messages added. False means the
+/// phone has read the chat, so the badge is cleared. A direct or group row cannot show a dot.
+pub(super) fn flag_count(unread: bool) -> Option<u32> {
+    if unread { None } else { Some(0) }
+}
+
 fn on_updates(bytes: &[u8], live: &Mutex<Live>, events: &Sender<crate::adapters::messages::Event>) {
     let list = fields(bytes);
-    if let Some(conversations) = field(&list, 2) {
-        let chats = decode_chats(&conversations.bytes);
-        if !chats.is_empty() {
-            live.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .chats = chats.clone();
-            let _ = events.send(crate::adapters::messages::Event::Chats(chats));
+    for number in update_field_order() {
+        match number {
+            3 => {
+                if let Some(messages) = field(&list, 3) {
+                    for note in decode_messages(&messages.bytes) {
+                        let _ = events.send(crate::adapters::messages::Event::Message(note));
+                    }
+                }
+            }
+            2 => {
+                if let Some(conversations) = field(&list, 2) {
+                    let chats = decode_chats(&conversations.bytes);
+                    if !chats.is_empty() {
+                        live.lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .chats = chats.clone();
+                        let _ = events.send(crate::adapters::messages::Event::Chats(chats));
+                    }
+                }
+            }
+            4 => {
+                if let Some(typing) = field(&list, 4) {
+                    let data = fields(&field_bytes(&fields(&typing.bytes), 2));
+                    let conversation = field_text(&data, 1);
+                    let user = fields(&field_bytes(&data, 2));
+                    let who = field_text(&user, 2);
+                    let started = field_int(&data, 3) == 1;
+                    if !conversation.is_empty() {
+                        let _ = events.send(crate::adapters::messages::Event::Typing {
+                            conversation,
+                            by: who.clone(),
+                            name: who,
+                            started,
+                        });
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    if let Some(messages) = field(&list, 3) {
-        for note in decode_messages(&messages.bytes) {
-            let _ = events.send(crate::adapters::messages::Event::Message(note));
-        }
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-unread`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub(super) fn prove_messages_unread() -> Result<(), String> {
+    if update_field_order() != [3, 2, 4] {
+        return Err("a batch applies the conversation before its messages".into());
     }
-    if let Some(typing) = field(&list, 4) {
-        let data = fields(&field_bytes(&fields(&typing.bytes), 2));
-        let conversation = field_text(&data, 1);
-        let user = fields(&field_bytes(&data, 2));
-        let who = field_text(&user, 2);
-        let started = field_int(&data, 3) == 1;
-        if !conversation.is_empty() {
-            let _ = events.send(crate::adapters::messages::Event::Typing {
-                conversation,
-                by: who.clone(),
-                name: who,
-                started,
-            });
-        }
+    if flag_count(true).is_some() {
+        return Err("an unread flag was published as a count".into());
     }
+    if flag_count(false) != Some(0) {
+        return Err("a chat read on the phone was not cleared".into());
+    }
+    let mut bare = Buf::new();
+    bare.text(1, "club");
+    bare.text(2, "Club");
+    bare.int(6, 1);
+    bare.int(10, 1);
+    let mut list = Buf::new();
+    list.msg(2, &bare.0);
+    let flagged = decode_chats(&list.0);
+    if flagged.len() != 1 || !flagged[0].unread {
+        return Err("the unread flag was not read".into());
+    }
+    let mut quiet = 0u32;
+    if let Some(set) = flag_count(flagged[0].unread) {
+        quiet = set;
+    }
+    if quiet != 0 {
+        return Err("a flag with no messages became a count".into());
+    }
+    let mut notes = Buf::new();
+    for (id, words) in [("m1", "a"), ("m2", "bb"), ("m3", "ccc")] {
+        let mut message = Buf::new();
+        message.text(1, id);
+        message.text(7, "club");
+        let mut body = Buf::new();
+        body.text(1, words);
+        let mut info = Buf::new();
+        info.msg(2, &body.0);
+        message.msg(10, &info.0);
+        notes.msg(1, &message.0);
+    }
+    let arrived = decode_messages(&notes.0);
+    if arrived.len() != 3 {
+        return Err(format!("{} messages decoded, not 3", arrived.len()));
+    }
+    let mut count = arrived.len() as u32;
+    if let Some(set) = flag_count(true) {
+        count = set;
+    }
+    if count != 3 {
+        return Err(format!("three texts counted as {count}"));
+    }
+    let mut read = Buf::new();
+    read.text(1, "club");
+    read.text(2, "Club");
+    read.int(6, 0);
+    let mut read_list = Buf::new();
+    read_list.msg(2, &read.0);
+    let cleared = decode_chats(&read_list.0);
+    if cleared.first().is_some_and(|chat| chat.unread) {
+        return Err("a read chat still looked unread".into());
+    }
+    if let Some(set) = flag_count(false) {
+        count = set;
+    }
+    if count != 0 {
+        return Err("a chat read on the phone kept its count".into());
+    }
+    Ok(())
 }
 
 fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
@@ -3142,5 +3237,10 @@ mod tests {
     #[test]
     fn a_deleted_message_and_a_deleted_chat_are_read_from_the_published_fields() {
         prove_messages_delete().unwrap();
+    }
+
+    #[test]
+    fn an_unread_flag_is_not_a_count_and_a_read_chat_clears() {
+        prove_messages_unread().unwrap();
     }
 }
