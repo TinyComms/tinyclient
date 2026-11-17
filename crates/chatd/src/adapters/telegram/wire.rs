@@ -67,6 +67,7 @@ impl Fault {
                 "PEER_ID_INVALID" | "CHANNEL_INVALID" | "CHANNEL_PRIVATE" | "USER_ID_INVALID" => {
                     "Telegram no longer lets this account reach that chat.".to_owned()
                 }
+                "PARTICIPANTS_HIDDEN" => "This group hides its member list.".to_owned(),
                 "PREMIUM_ACCOUNT_REQUIRED" => "This needs Telegram Premium.".to_owned(),
                 // A length or a count past the free plan. `MESSAGE_TOO_LONG` and
                 // `REACTIONS_TOO_MANY` are named above and are not this.

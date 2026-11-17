@@ -57,6 +57,7 @@ mod files;
 mod filing;
 mod info;
 mod live;
+mod members;
 mod peers;
 mod premium;
 pub(crate) mod react;
@@ -66,11 +67,11 @@ pub mod signin;
 mod sync;
 mod wire;
 
-use super::{keep_connected, serve_commands, Command, Context, Failure, Members, Refusal, Signed};
+use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, Signed};
 use crate::session;
 use grammers_tl_types as tl;
 use peers::{Directory, Who};
-use protocol::{Link, MemberSection, Person, Presence, Relation};
+use protocol::{Link, Person, Presence, Relation};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -209,6 +210,8 @@ struct Live {
     reactions: Option<Vec<(String, bool)>>,
     /// File, caption and reaction limits from `help.getAppConfig`, or the documented defaults.
     limits: premium::Limits,
+    /// One conversation's member list, so the next page does not ask Telegram again.
+    roster: Option<members::Held>,
 }
 
 /// Telegram's own send options, which Telegram carries out.
@@ -615,10 +618,12 @@ fn serve(account: &Arc<Account>, command: Command) {
                     account.learn(&found.users, &[]);
                 }
             }
+            // A channel on screen is searched too. The contact search above already stands.
+            members::search_open(account, &query);
             ctx.searched(&query);
         }
         Command::Members { conversation_id, offset, limit, reply } => {
-            let _ = reply.send(members(account, &conversation_id, offset, limit).map_err(refused));
+            let _ = reply.send(members::list(account, &conversation_id, offset, limit).map_err(refused));
         }
         Command::StartDirect { person_id, reply } => {
             // Nothing reaches the other person: the chat exists on Telegram once a message does.
@@ -913,9 +918,11 @@ fn save_draft(account: &Account, conversation: &str, text: &str) {
     }
 }
 
-fn person(account: &Account, who: Who, relation: Relation) -> Person {
-    let dir = account.dir();
-    let known = dir.get(who).cloned().unwrap_or_default();
+fn person(account: &Account, who: Who, relation: Relation, rank: &str) -> Person {
+    let known = {
+        let dir = account.dir();
+        dir.get(who).cloned().unwrap_or_default()
+    };
     let row = peers::shown_person(account.me, who, &known);
     Person {
         key: account.ctx.key(&row.id),
@@ -927,65 +934,10 @@ fn person(account: &Account, who: Who, relation: Relation) -> Person {
         relation,
         status: row.status,
         link: row.link,
+        // The title Telegram gave them in this chat. Status stays the Premium badge.
+        title: rank.to_owned(),
         ..Person::new(account.ctx.key(&row.id), "")
     }
-}
-
-fn members(account: &Account, conversation: &str, offset: u32, limit: u32) -> Result<Members, Fault> {
-    let invalid = || Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None };
-    let (who, _) = Who::parse(conversation).ok_or_else(invalid)?;
-    let relation = |account: &Account, id: i64| match account.dir().get(Who::User(id)).is_some_and(|known| known.contact) {
-        true => Relation::Contact,
-        false => Relation::None,
-    };
-    let (total, ids): (u32, Vec<i64>) = match who {
-        Who::User(id) => (2, [account.me, id].into_iter().skip(offset as usize).take(limit as usize).collect()),
-        Who::Group(chat_id) => {
-            let tl::enums::messages::ChatFull::Full(full) = account.ask(&tl::functions::messages::GetFullChat { chat_id })?;
-            account.learn(&full.users, &full.chats);
-            let listed = match &full.full_chat {
-                tl::enums::ChatFull::Full(chat) => match &chat.participants {
-                    tl::enums::ChatParticipants::Participants(list) => list.participants.iter().map(|one| match one {
-                        tl::enums::ChatParticipant::Participant(one) => one.user_id,
-                        tl::enums::ChatParticipant::Creator(one) => one.user_id,
-                        tl::enums::ChatParticipant::Admin(one) => one.user_id,
-                    }).collect(),
-                    tl::enums::ChatParticipants::Forbidden(_) => Vec::new(),
-                },
-                tl::enums::ChatFull::ChannelFull(_) => Vec::new(),
-            };
-            let listed: Vec<i64> = listed;
-            (listed.len() as u32, listed.into_iter().skip(offset as usize).take(limit as usize).collect())
-        }
-        Who::Channel(_) => {
-            let request = tl::functions::channels::GetParticipants {
-                channel: account.input_channel(who)?,
-                filter: tl::enums::ChannelParticipantsFilter::ChannelParticipantsRecent,
-                offset: offset as i32,
-                limit: limit as i32,
-                hash: 0,
-            };
-            match account.ask(&request)? {
-                tl::enums::channels::ChannelParticipants::Participants(page) => {
-                    account.learn(&page.users, &page.chats);
-                    let ids = page.participants.iter().filter_map(|one| match one {
-                        tl::enums::ChannelParticipant::Participant(one) => Some(one.user_id),
-                        tl::enums::ChannelParticipant::ParticipantSelf(one) => Some(one.user_id),
-                        tl::enums::ChannelParticipant::Creator(one) => Some(one.user_id),
-                        tl::enums::ChannelParticipant::Admin(one) => Some(one.user_id),
-                        _ => None,
-                    });
-                    (page.count.max(0) as u32, ids.collect())
-                }
-                tl::enums::channels::ChannelParticipants::NotModified => (0, Vec::new()),
-            }
-        }
-    };
-    Ok(Members {
-        pending: false,
-        sections: vec![MemberSection { name: "Members".to_owned(), count: total }],
-        members: ids.into_iter().map(|id| person(account, Who::User(id), relation(account, id))).collect(),
-    })
 }
 
 /// Composer text as Telegram should receive it: markers become entities, and a custom emoji
@@ -1090,6 +1042,11 @@ pub fn prove_telegram_service_lines() -> Result<(), String> {
 /// The lab's telegram-premium driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_premium() -> Result<(), String> {
     premium::prove()
+}
+
+/// The lab's telegram-member-sections driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_member_sections() -> Result<(), String> {
+    members::prove()
 }
 
 /// The lab's telegram-dice driver. A build without this stays up and the driver fails.
