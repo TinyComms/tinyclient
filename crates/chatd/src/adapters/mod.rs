@@ -21,6 +21,11 @@ mod discord;
 pub fn prove_discord_nitro_length() -> Result<(), String> {
     discord::prove_nitro_length()
 }
+
+/// `TINYCLIENT_PROVE=discord-voice-bitrate`. A voice channel is encoded at its own bitrate.
+pub fn prove_discord_voice_bitrate() -> Result<(), String> {
+    discord::prove_voice_bitrate()
+}
 mod recovery;
 pub mod net;
 mod script;

@@ -577,6 +577,18 @@ mod tests {
     }
 
     #[test]
+    fn a_discord_encoder_reports_the_channel_rate() {
+        let mut encoder = Encoder::new().unwrap();
+        assert_eq!(encoder.bitrate(), 64_000, "a Discord call starts at 64 kb/s");
+        encoder.set_bitrate(Some(32_000));
+        assert_eq!(encoder.bitrate(), 32_000, "the channel's rate replaces it");
+        encoder.set_bitrate(Some(384_000));
+        assert_eq!(encoder.bitrate(), 384_000);
+        encoder.set_bitrate(Some(8_000));
+        assert_eq!(encoder.bitrate(), 8_000);
+    }
+
+    #[test]
     fn a_tone_survives_encode_and_decode() {
         let (mut encoder, mut decoder) = (Encoder::new().unwrap(), Decoder::new().unwrap());
         let source = tone(10);

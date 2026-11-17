@@ -2142,6 +2142,31 @@ fn calls_ring_in_and_voice_channels_are_joined_on_the_gateway() {
 }
 
 #[test]
+fn a_32_kbps_voice_channel_asks_mediad_for_32() {
+    let world = World::start();
+    let ready: Value = serde_json::from_str(READY).unwrap();
+    let mut lounge = ready["guilds"][0]["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|channel| channel["id"] == "4201")
+        .unwrap()
+        .clone();
+    lounge["guild_id"] = json!("4000");
+    lounge["bitrate"] = json!(32_000);
+    lounge["user_limit"] = json!(4);
+    world.discord.push("CHANNEL_UPDATE", lounge);
+    wait("the channel update to land", || (world.conversation("4201").limit == 4).then_some(()));
+    world.ask(Request::CallStart { conversation: world.key("4201") });
+    wait("the join", || world.discord.frames_of(4).pop());
+    let log = world.dir.join("logs").join("chatd.log");
+    wait("mediad to be asked for 32 kb/s", || {
+        let text = std::fs::read_to_string(&log).ok()?;
+        text.contains("discord voice bitrate kbps=32").then_some(())
+    });
+}
+
+#[test]
 fn a_voice_channel_lists_its_people_friends_first_then_by_name() {
     let world = World::start();
     let in_voice = || match world.ask(Request::InVoice { network: Some(Network::Discord) }) {

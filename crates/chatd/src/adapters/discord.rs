@@ -63,6 +63,34 @@ fn too_long(premium: u8, text: &str) -> Option<String> {
     (text.chars().count() > limit).then(|| format!("Message too long: Discord allows {limit} characters."))
 }
 
+/// The lab's discord-voice-bitrate driver. A 32 kb/s channel is sent at 32, and the other
+/// bounds stay put. A build from before the fix ignores the variable and stays up.
+pub(super) fn prove_voice_bitrate() -> Result<(), String> {
+    use protocol::VoiceQuality::*;
+    if voice::voice_kbps(32_000, false, Standard) != 32 {
+        return Err("a 32 kb/s channel is sent at 32".to_owned());
+    }
+    if voice::voice_kbps(8_000, false, Standard) != 8 {
+        return Err("8 kb/s stays 8".to_owned());
+    }
+    if voice::voice_kbps(384_000, false, High) != 384 {
+        return Err("a boosted channel stays at 384".to_owned());
+    }
+    if voice::voice_kbps(96_000, false, DataSaver) != 32 {
+        return Err("data saver caps the channel".to_owned());
+    }
+    if voice::voice_kbps(8_000, false, DataSaver) != 8 {
+        return Err("data saver does not lift a quiet channel".to_owned());
+    }
+    if voice::voice_kbps(0, true, Standard) != 64 {
+        return Err("a direct call stays at 64".to_owned());
+    }
+    if voice::voice_kbps(512_000, false, Standard) != 510 {
+        return Err("libopus stereo caps at 510".to_owned());
+    }
+    Ok(())
+}
+
 /// The lab's discord-nitro-length driver. `send`, `edit` and `send_with` all ask [`too_long`].
 /// A build from before the fix ignores the variable and stays up.
 pub(super) fn prove_nitro_length() -> Result<(), String> {
