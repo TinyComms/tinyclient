@@ -8,6 +8,8 @@
 
 # UAT and design screenshots are outputs, not sources.
 /reports/
+/_proof/
+/target-wt/
 
 # Local build credentials (Telegram's app id and hash) for the release's own builds.
 /telegram.env
