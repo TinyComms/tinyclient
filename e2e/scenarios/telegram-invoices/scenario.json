@@ -1,0 +1,12 @@
+{
+  "id": "telegram-invoices",
+  "title": "An invoice and paid media show their price, and a payment names its amount",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same card is what an invoice maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same card is what an invoice maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

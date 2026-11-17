@@ -1156,6 +1156,11 @@ pub fn prove_telegram_accounts() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's telegram-invoices driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_invoices() -> Result<(), String> {
+    content::prove_invoices()
+}
+
 /// The lab's telegram-member-sections driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_member_sections() -> Result<(), String> {
     members::prove()
