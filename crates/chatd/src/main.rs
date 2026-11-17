@@ -263,6 +263,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-exit:0");
         return Ok(());
     }
+    // The lab's discord-voice-bitrate driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-voice-bitrate") {
+        if let Err(err) = chatd::adapters::prove_discord_voice_bitrate() {
+            eprintln!("discord-voice-bitrate: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-discord-voice-bitrate:0");
+        return Ok(());
+    }
     // The lab's discord-nitro-length driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-nitro-length") {
         if let Err(err) = chatd::adapters::prove_discord_nitro_length() {

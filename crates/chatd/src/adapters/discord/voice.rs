@@ -7,7 +7,7 @@ use super::model::{self, VoiceState};
 use super::rest::Refused;
 use super::Discord;
 use protocol::{
-    CallFailure, CallSupport, ConversationKind, Dave, MediaRequest, Network, Occupant, Participant, Relation, VoiceJoin, Watching,
+    CallFailure, CallSupport, ConversationKind, Dave, MediaRequest, Network, Occupant, Participant, Relation, VoiceJoin, VoiceQuality, Watching,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -39,6 +39,30 @@ pub(super) fn support(kind: u8) -> CallSupport {
         model::VOICE => CallSupport::Native,
         model::STAGE => CallSupport::Handoff,
         _ => CallSupport::None,
+    }
+}
+
+/// Discord's own default, in kb/s. A direct or group call stays here.
+const DIRECT_KBPS: u32 = 64;
+/// The quietest voice channel Discord publishes, and libopus stereo's ceiling.
+const CHANNEL_KBPS: std::ops::RangeInclusive<u32> = 8..=510;
+
+/// Encode target in kb/s. `channel_bps` is the voice channel's bitrate in bits per second,
+/// 0 when it did not say. A direct call ignores it and stays at 64 (32 on data saver).
+/// A channel is sent at the rate Discord set: a quality preset caps that rate and never
+/// raises it. Not [`VoiceQuality::apply_room`], which clamps a Tiny room to 16–128.
+pub(super) fn voice_kbps(channel_bps: u32, direct: bool, quality: VoiceQuality) -> u32 {
+    if direct {
+        return match quality {
+            VoiceQuality::DataSaver => DIRECT_KBPS.min(32),
+            VoiceQuality::Standard | VoiceQuality::High => DIRECT_KBPS,
+        };
+    }
+    let kbps = if channel_bps == 0 { DIRECT_KBPS } else { channel_bps / 1_000 };
+    let kbps = kbps.clamp(*CHANNEL_KBPS.start(), *CHANNEL_KBPS.end());
+    match quality {
+        VoiceQuality::DataSaver => kbps.min(32),
+        VoiceQuality::Standard | VoiceQuality::High => kbps,
     }
 }
 
@@ -161,6 +185,8 @@ struct Joining {
     /// Our camera is on. Discord is told with the voice state, and mediad tells it again on the
     /// voice gateway once a video SSRC exists.
     video: bool,
+    /// The kb/s last handed to mediad, so the same rate is not sent again.
+    told_kbps: Option<u32>,
 }
 
 /// A Go Live leg we have asked for and not yet given up. The voice call stays up beside it.
@@ -493,6 +519,7 @@ impl Discord {
             (call.conversation.clone(), join)
         };
         self.ctx.voice(&join.0, join.1);
+        self.tell_bitrate();
         // A stream's events can arrive before this session id does.
         self.flush_stream(false);
         self.flush_stream(true);
@@ -578,6 +605,7 @@ impl Discord {
                 saw_ringing: false,
                 answered: false,
                 video: false,
+                told_kbps: None,
             });
             ring
         };
@@ -590,6 +618,7 @@ impl Discord {
         // Whoever is already there, before anyone's state changes.
         self.roster();
         self.occupancy(BTreeSet::from([conversation_id.to_owned()]));
+        self.tell_bitrate();
         if !ring {
             return;
         }
@@ -730,8 +759,48 @@ impl Discord {
         self.occupancy(BTreeSet::from([event.channel_id]));
     }
 
+    /// The voice channel's bitrate, in bits per second, from the note kept at connect.
+    fn channel_bps(&self, guild: &str, channel: &str) -> u32 {
+        let Some(note) = self.ctx.note(&format!("kept:{guild}")) else {
+            return 0;
+        };
+        let kept: Vec<model::Kept> = serde_json::from_str(&note).unwrap_or_default();
+        kept.into_iter().find(|row| row.id == channel).map(|row| row.bitrate).unwrap_or(0)
+    }
+
+    /// Asks mediad for this call's encode rate. The same rate is not sent twice. Nothing is
+    /// sent until mediad is up, so a join that races the process is retried from `voice_tick`.
+    fn tell_bitrate(&self) {
+        let quality = self.ctx.hub.settings().voice_quality();
+        let (conversation, guild, already) = {
+            let state = self.state.lock().unwrap();
+            let Some(call) = state.voice.call.as_ref() else {
+                return;
+            };
+            (call.conversation.clone(), call.guild.clone(), call.told_kbps)
+        };
+        let direct = guild.is_none();
+        let bps = guild.as_deref().map(|guild| self.channel_bps(guild, &conversation)).unwrap_or(0);
+        let kbps = voice_kbps(bps, direct, quality);
+        if already == Some(kbps) || !self.ctx.in_call(&conversation) {
+            return;
+        }
+        self.ctx.tell_media(&conversation, MediaRequest::Bitrate { kbps });
+        self.ctx.tell_media(&conversation, MediaRequest::Quality(quality));
+        tracing::info!("discord voice bitrate kbps={kbps}");
+        let mut state = self.state.lock().unwrap();
+        if let Some(call) = state.voice.call.as_mut().filter(|call| call.conversation == conversation) {
+            call.told_kbps = Some(kbps);
+        }
+    }
+
     /// Gives up on a join Discord never answered. True while one is waiting.
     pub(super) fn voice_tick(&self) -> bool {
+        // A channel bitrate or a quality preset can change while the call is up. This does not
+        // keep the socket waking: once the session is reported, the wait stays idle.
+        if self.state.lock().unwrap().voice.call.is_some() {
+            self.tell_bitrate();
+        }
         let late = {
             let mut state = self.state.lock().unwrap();
             let Some(call) = &state.voice.call else {
@@ -1145,8 +1214,25 @@ mod tests {
             saw_ringing: false,
             answered: false,
             video: false,
+            told_kbps: None,
         });
         assert!(voice.watched("901", Some("82")), "the call we are in, wherever it is");
+    }
+
+    #[test]
+    fn the_channel_bitrate_is_what_is_sent_and_a_direct_call_stays_at_64() {
+        use VoiceQuality::*;
+        assert_eq!(voice_kbps(32_000, false, Standard), 32);
+        assert_eq!(voice_kbps(8_000, false, Standard), 8);
+        assert_eq!(voice_kbps(384_000, false, High), 384);
+        assert_eq!(voice_kbps(32_000, false, High), 32, "high does not raise a channel");
+        assert_eq!(voice_kbps(96_000, false, DataSaver), 32);
+        assert_eq!(voice_kbps(8_000, false, DataSaver), 8, "data saver does not lift a quiet channel");
+        assert_eq!(voice_kbps(0, false, Standard), 64, "a channel that did not say stays at 64");
+        assert_eq!(voice_kbps(512_000, false, Standard), 510);
+        assert_eq!(voice_kbps(32_000, true, Standard), 64);
+        assert_eq!(voice_kbps(32_000, true, High), 64);
+        assert_eq!(voice_kbps(0, true, DataSaver), 32);
     }
 
     #[test]
