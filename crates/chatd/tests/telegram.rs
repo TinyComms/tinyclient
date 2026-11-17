@@ -9,8 +9,8 @@
 
 use protocol::{
     read_frame, write_frame, AccountKey, Change, CodeVia, Conversation, ConversationKind, ErrorCode, Key, Link,
-    MediaKind, MentionKind, Message, MessageKind, Network, Page, Presence, Relation, Request, Response, SendState,
-    SignInInput, SignInProblem, SignInStep, Style, Watching, Shelf, Special, Mark, ReactionSet,
+    EmojiScope, MediaKind, MentionKind, Message, MessageKind, Network, Page, Presence, Relation, Request, Response,
+    SendState, SignInInput, SignInProblem, SignInStep, Style, Watching, Shelf, Special, Mark, ReactionSet,
 };
 use std::io::Write;
 use protocol::ChatStream;
@@ -52,6 +52,11 @@ impl World {
     /// chatd with the account already signed in.
     fn signed_in() -> World {
         World::start(Some(SESSION), "30")
+    }
+
+    /// The same account with Telegram Premium, which is what custom emoji may be sent as.
+    fn premium() -> World {
+        World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_PREMIUM", "1")])
     }
 
     /// Signed in to an account with this many more chats, each with a person of its own.
@@ -116,6 +121,7 @@ impl World {
             .env_remove("TINYCLIENT_SESSION_SLACK")
             .env_remove("TINYCLIENT_SESSION_TELEGRAM")
             .env_remove("TINYCLIENT_TELEGRAM_MANY")
+            .env_remove("TINYCLIENT_TELEGRAM_PREMIUM")
             .stderr(Stdio::from(log));
         for (name, value) in env {
             command.env(name, value);
@@ -2190,5 +2196,83 @@ fn markers_are_sent_as_entities_and_an_edit_keeps_the_bold() {
         world.calls().iter().any(|call| call.contains(&format!("EditMessage u7002 {}", sent.id)) && call.contains("bold:0+2")),
         "{:?}",
         world.calls()
+    );
+}
+
+#[test]
+fn a_premium_account_lists_its_emoji_packs_and_sending_one_names_the_document() {
+    let world = World::premium();
+    world.connected();
+    let (accounts, _) = world.status();
+    assert_eq!(accounts[0].can.custom_emoji, EmojiScope::All);
+    let Response::Catalog { items, .. } = world.ask(Request::Catalog {
+        account: account(),
+        kind: protocol::CatalogKind::Emoji,
+        space: None,
+        query: String::new(),
+        cursor: None,
+    }) else {
+        panic!("no catalog");
+    };
+    let faces = items.iter().find(|item| item.pack == "Faces").expect("the installed pack");
+    assert_eq!((faces.id.as_str(), faces.name.as_str()), ("e6402", "\u{2B50}"));
+    assert!(items.iter().any(|item| item.id == "e6403" && item.pack == "Recent"), "{items:?}");
+    world.send("u7002", "4901", "go :\u{2B50}:", None);
+    // A later history read keeps the text and the span. It does not keep the pending id.
+    let sent = world.until("the custom emoji to be sent", || {
+        world.messages("u7002").into_iter().find(|message| message.text == "go \u{2B50}" && message.state == SendState::Sent)
+    });
+    assert_eq!(sent.text, "go \u{2B50}");
+    assert!(
+        ranges(&sent).iter().any(|(text, style)| *text == "\u{2B50}" && matches!(style, Style::Emoji { file } if file.id == "e6402")),
+        "{:?}",
+        ranges(&sent)
+    );
+    assert!(
+        world.calls().iter().any(|call| call.contains("SendMessage u7002 go \u{2B50}") && call.contains("emoji:3+1:6402")),
+        "{:#?}",
+        world.calls()
+    );
+
+    // Without Premium the same pack is listed, and it is sent only in Saved Messages.
+    let plain = World::signed_in();
+    plain.connected();
+    let Response::Catalog { items, .. } = plain.ask(Request::Catalog {
+        account: account(),
+        kind: protocol::CatalogKind::Emoji,
+        space: None,
+        query: String::new(),
+        cursor: None,
+    }) else {
+        panic!("no catalog");
+    };
+    assert!(items.iter().any(|item| item.id == "e6402"), "{items:?}");
+    plain.send("u7002", "4902", "go :\u{2B50}:", None);
+    let fallback = plain.until("the fallback in another chat", || {
+        plain.messages("u7002").into_iter().find(|message| message.text == "go \u{2B50}" && message.state == SendState::Sent)
+    });
+    assert!(
+        !ranges(&fallback).iter().any(|(_, style)| matches!(style, Style::Emoji { .. })),
+        "{:?}",
+        ranges(&fallback)
+    );
+    assert!(
+        plain.calls().iter().any(|call| call.contains("SendMessage u7002 go \u{2B50}") && !call.contains("emoji:")),
+        "{:#?}",
+        plain.calls()
+    );
+    plain.send("u7001", "4903", "go :\u{2B50}:", None);
+    let saved = plain.until("the emoji in Saved Messages", || {
+        plain.messages("u7001").into_iter().find(|message| message.text == "go \u{2B50}" && message.state == SendState::Sent)
+    });
+    assert!(
+        ranges(&saved).iter().any(|(text, style)| *text == "\u{2B50}" && matches!(style, Style::Emoji { file } if file.id == "e6402")),
+        "{:?}",
+        ranges(&saved)
+    );
+    assert!(
+        plain.calls().iter().any(|call| call.contains("SendMessage u7001 go \u{2B50}") && call.contains("emoji:3+1:6402")),
+        "{:#?}",
+        plain.calls()
     );
 }

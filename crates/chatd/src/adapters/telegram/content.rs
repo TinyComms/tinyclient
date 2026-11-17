@@ -206,6 +206,146 @@ pub fn outgoing(text: &str) -> (String, Option<Vec<MessageEntity>>) {
     (plain, (!entities.is_empty()).then_some(entities))
 }
 
+/// A custom emoji the catalog offered, remembered by the label the composer inserts (`:alt:`).
+#[derive(Debug, Clone)]
+pub(super) struct EmojiLabel {
+    pub label: String,
+    pub document_id: i64,
+    pub fallback: String,
+    /// The same label was offered for two documents, so a send cannot know which.
+    pub ambiguous: bool,
+}
+
+struct EmojiSwap {
+    old_start: i32,
+    old_len: i32,
+    new_len: i32,
+    document_id: i64,
+}
+
+fn utf16_len(text: &str) -> i32 {
+    text.chars().map(|c| c.len_utf16() as i32).sum()
+}
+
+fn usable_labels(labels: &[EmojiLabel]) -> Vec<&EmojiLabel> {
+    let mut usable = Vec::new();
+    for label in labels {
+        if label.ambiguous || label.label.is_empty() || label.fallback.is_empty() {
+            continue;
+        }
+        let clash = labels.iter().any(|other| other.label == label.label && other.document_id != label.document_id);
+        if clash || usable.iter().any(|held: &&EmojiLabel| held.label == label.label) {
+            continue;
+        }
+        usable.push(label);
+    }
+    usable.sort_by(|left, right| right.label.len().cmp(&left.label.len()).then(left.label.cmp(&right.label)));
+    usable
+}
+
+/// `:alt:` labels the catalog remembered, swapped for the fallback glyph. When `allow` is
+/// set, each swap is also a custom-emoji entity. A label that covers an existing entity is
+/// dropped; entities after a swap move by how much the text shrank or grew.
+pub(super) fn apply_emoji(plain: &str, entities: Vec<MessageEntity>, labels: &[EmojiLabel], allow: bool) -> (String, Vec<MessageEntity>) {
+    let usable = usable_labels(labels);
+    if usable.is_empty() || !plain.contains(':') {
+        return (plain.to_owned(), entities);
+    }
+    let mut out = String::with_capacity(plain.len());
+    let mut swaps = Vec::new();
+    let mut from = 0usize;
+    let mut old_utf16 = 0i32;
+    while from < plain.len() {
+        let rest = &plain[from..];
+        let mut best: Option<(usize, usize)> = None;
+        for (index, label) in usable.iter().enumerate() {
+            if let Some(at) = rest.find(&label.label) {
+                let earlier = match best {
+                    Some((prev, _)) => at < prev,
+                    None => true,
+                };
+                if earlier {
+                    best = Some((at, index));
+                }
+            }
+        }
+        let Some((at, index)) = best else {
+            out.push_str(rest);
+            break;
+        };
+        let label = &usable[index];
+        out.push_str(&rest[..at]);
+        old_utf16 += utf16_len(&rest[..at]);
+        let old_len = utf16_len(&label.label);
+        let new_len = utf16_len(&label.fallback);
+        out.push_str(&label.fallback);
+        if old_len > 0 {
+            swaps.push(EmojiSwap { old_start: old_utf16, old_len, new_len, document_id: label.document_id });
+        }
+        old_utf16 += old_len;
+        from += at + label.label.len();
+    }
+    (out, shift_for_emoji(entities, &swaps, allow))
+}
+
+fn delta_before(swaps: &[EmojiSwap], at: i32) -> i32 {
+    swaps.iter().filter(|swap| swap.old_start + swap.old_len <= at).map(|swap| swap.new_len - swap.old_len).sum()
+}
+
+fn shift_for_emoji(entities: Vec<MessageEntity>, swaps: &[EmojiSwap], allow: bool) -> Vec<MessageEntity> {
+    if swaps.is_empty() {
+        return entities;
+    }
+    let mut out = Vec::new();
+    for entity in entities {
+        let (offset, length) = place(&entity);
+        if length <= 0 {
+            continue;
+        }
+        let end = offset + length;
+        let overlaps = swaps.iter().any(|swap| offset < swap.old_start + swap.old_len && end > swap.old_start);
+        if overlaps {
+            continue;
+        }
+        let delta = delta_before(swaps, offset);
+        match retarget(&entity, offset + delta, length) {
+            Some(next) => out.push(next),
+            None if delta == 0 => out.push(entity),
+            None => {}
+        }
+    }
+    if allow {
+        for swap in swaps {
+            if swap.new_len <= 0 {
+                continue;
+            }
+            let offset = swap.old_start + delta_before(swaps, swap.old_start);
+            out.push(tl::types::MessageEntityCustomEmoji { offset, length: swap.new_len, document_id: swap.document_id }.into());
+        }
+    }
+    out
+}
+
+/// The same entity at a new UTF-16 offset. Kinds a send does not produce stay as they are
+/// when nothing moved, and are dropped when it did.
+fn retarget(entity: &MessageEntity, offset: i32, length: i32) -> Option<MessageEntity> {
+    use MessageEntity as E;
+    Some(match entity {
+        E::Bold(_) => tl::types::MessageEntityBold { offset, length }.into(),
+        E::Italic(_) => tl::types::MessageEntityItalic { offset, length }.into(),
+        E::Underline(_) => tl::types::MessageEntityUnderline { offset, length }.into(),
+        E::Strike(_) => tl::types::MessageEntityStrike { offset, length }.into(),
+        E::Code(_) => tl::types::MessageEntityCode { offset, length }.into(),
+        E::Pre(pre) => tl::types::MessageEntityPre { offset, length, language: pre.language.clone() }.into(),
+        E::Blockquote(quote) => tl::types::MessageEntityBlockquote { collapsed: quote.collapsed, offset, length }.into(),
+        E::Spoiler(_) => tl::types::MessageEntitySpoiler { offset, length }.into(),
+        E::TextUrl(link) => tl::types::MessageEntityTextUrl { offset, length, url: link.url.clone() }.into(),
+        E::MentionName(named) => tl::types::MessageEntityMentionName { offset, length, user_id: named.user_id }.into(),
+        E::CustomEmoji(emoji) => tl::types::MessageEntityCustomEmoji { offset, length, document_id: emoji.document_id }.into(),
+        _ => return None,
+    })
+}
+
 /// A draft's text as the composer shows it. Entities that arrived with it become markers,
 /// which is what a later send turns back into entities.
 pub fn draft_text(message: &str, entities: Option<&[MessageEntity]>) -> String {
@@ -236,6 +376,7 @@ pub fn entity_note(entities: &[MessageEntity]) -> String {
             }
             MessageEntity::Spoiler(_) => note.push_str(&format!(" spoiler:{offset}+{length}")),
             MessageEntity::TextUrl(link) => note.push_str(&format!(" link:{offset}+{length}:{}", link.url)),
+            MessageEntity::CustomEmoji(emoji) => note.push_str(&format!(" emoji:{offset}+{length}:{}", emoji.document_id)),
             _ => {}
         }
     }

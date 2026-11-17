@@ -317,6 +317,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-markers:0");
         return Ok(());
     }
+    // The lab's telegram-custom-emoji driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-custom-emoji") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_custom_emoji() {
+            eprintln!("telegram-custom-emoji: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-custom-emoji:0");
+        return Ok(());
+    }
     // The lab's telegram-dice driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-dice") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_dice() {
