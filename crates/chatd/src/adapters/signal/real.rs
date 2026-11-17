@@ -7,9 +7,10 @@
 
 use super::vault::{self, Vault};
 use super::wire::{Body, Contact, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
-use super::Saved;
+use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
 use presage::libsignal_service::content::ContentBody;
+use presage::libsignal_service::groups_v2::{AccessRequired, Role};
 use presage::libsignal_service::prelude::{Content, GroupMasterKey, GroupSecretParams, PushService, ServiceCredentials, ServiceError, Uuid};
 use presage::libsignal_service::profile_name::ProfileName;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
@@ -18,6 +19,7 @@ use presage::libsignal_service::utils::TryIntoE164;
 use presage::libsignal_service::websocket::Identified;
 use presage::libsignal_service::configuration::SignalServers;
 use presage::manager::{Registered, RegistrationData};
+use presage::model::groups::Group;
 use presage::model::messages::Received;
 use presage::proto::{
     body_range::AssociatedValue, data_message, receipt_message, sync_message, typing_message, DataMessage, EditMessage, GroupContextV2,
@@ -25,7 +27,7 @@ use presage::proto::{
 };
 use presage::store::ContentsStore;
 use presage::Manager;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -75,6 +77,65 @@ fn hex(bytes: &[u8]) -> String {
 /// the group and stays in the vault.
 fn group_id(master_key: &[u8; 32]) -> String {
     hex(&GroupSecretParams::derive_from_master_key(GroupMasterKey::new(*master_key)).get_group_identifier())
+}
+
+/// The stored group, as a change compares it. Presage fetched this; the message's unsigned change is not read.
+fn snap_of(group: &Group) -> GroupSnap {
+    let mut members: Vec<MemberSnap> = group
+        .members
+        .iter()
+        .map(|member| MemberSnap { id: member.aci.service_id_string(), admin: member.role == Role::Administrator })
+        .collect();
+    members.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut pending: Vec<String> = group.pending_members.iter().map(|member| member.uuid.to_string()).collect();
+    pending.sort();
+    let mut requesting: Vec<String> = group.requesting_members.iter().map(|member| member.aci.service_id_string()).collect();
+    requesting.sort();
+    let link = group.access_control.as_ref().is_some_and(|access| access.add_from_invite_link == AccessRequired::Any);
+    GroupSnap {
+        title: group.title.clone(),
+        description: group.description.clone().unwrap_or_default(),
+        timer_secs: group.disappearing_messages_timer.as_ref().map(|timer| timer.duration).unwrap_or(0),
+        avatar: group.avatar.clone(),
+        members,
+        pending,
+        requesting,
+        link,
+    }
+}
+
+/// Ids whose membership, role, invite or request changed. A rename does not name a person.
+fn people_who_changed(before: &GroupSnap, after: &GroupSnap) -> Vec<String> {
+    let was: HashMap<&str, bool> = before.members.iter().map(|member| (member.id.as_str(), member.admin)).collect();
+    let now: HashMap<&str, bool> = after.members.iter().map(|member| (member.id.as_str(), member.admin)).collect();
+    let mut ids: Vec<&str> = Vec::new();
+    for id in now.keys() {
+        if was.get(id) != now.get(id) {
+            ids.push(*id);
+        }
+    }
+    for id in was.keys() {
+        if !now.contains_key(id) {
+            ids.push(*id);
+        }
+    }
+    let members_now: HashSet<&str> = now.keys().copied().collect();
+    let pending: HashSet<&str> = before.pending.iter().map(String::as_str).collect();
+    for id in &after.pending {
+        if !pending.contains(id.as_str()) && !members_now.contains(id.as_str()) {
+            ids.push(id);
+        }
+    }
+    let asking: HashSet<&str> = before.requesting.iter().map(String::as_str).collect();
+    for id in &after.requesting {
+        if !asking.contains(id.as_str()) {
+            ids.push(id);
+        }
+    }
+    let mut owned: Vec<String> = ids.into_iter().map(str::to_owned).collect();
+    owned.sort();
+    owned.dedup();
+    owned
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime, String> {
@@ -151,7 +212,7 @@ impl Real {
                     };
                     let aci = manager.registration_data().service_ids.aci.to_string();
                     let name = own_name(&mut manager).await.unwrap_or(fallback);
-                    let mut wire = Session { manager, vault, me: aci.clone(), events, names: HashMap::new(), groups: HashMap::new() };
+                    let mut wire = Session { manager, vault, me: aci.clone(), events, names: HashMap::new(), groups: HashMap::new(), known: GroupRevisions::default() };
                     let _ = ready.send(Ok((aci, name)));
                     wire.first_run().await;
                     wire.groups_changed().await;
@@ -259,6 +320,8 @@ struct Session {
     names: HashMap<String, String>,
     /// Groups by public id: their master keys.
     groups: HashMap<String, [u8; 32]>,
+    /// Last revision applied for a group, and the snapshot behind it. The first one is not announced.
+    known: GroupRevisions,
 }
 
 impl Session {
@@ -297,7 +360,7 @@ impl Session {
             .collect()
     }
 
-    /// The groups as stored, told whole, and their keys remembered.
+    /// The groups as stored, told whole. A snapshot remembers what is there and does not announce a change.
     async fn groups_changed(&mut self) {
         let Ok(groups) = self.vault.group_keys() else {
             return;
@@ -305,8 +368,12 @@ impl Session {
         let mut told = Vec::new();
         for (key, group) in groups {
             let id = group_id(&key);
+            let revision = group.revision;
+            let snap = snap_of(&group);
+            let member = snap.members.iter().any(|member| member.id == self.me);
             self.groups.insert(id.clone(), key);
-            told.push(GroupInfo { id, title: group.title, description: group.description.unwrap_or_default(), members: group.members.len() as u32 });
+            self.known.seed(id.clone(), revision, snap);
+            told.push(GroupInfo { id, title: group.title, description: group.description.unwrap_or_default(), members: group.members.len() as u32, member });
         }
         self.tell(Event::Groups(told));
     }
@@ -346,19 +413,62 @@ impl Session {
     }
 
     /// Where a data message belongs: its group, or the person.
+    /// A newer revision is read from the stored group. The unsigned change on the message is not trusted.
     async fn peer(&mut self, group: Option<&GroupContextV2>, person: &str) -> Peer {
         let key = group.and_then(|group| group.master_key.as_deref()).and_then(|key| <[u8; 32]>::try_from(key).ok());
         match key {
             Some(key) => {
                 let id = group_id(&key);
-                if !self.groups.contains_key(&id) {
+                if !self.known.contains(&id) {
                     self.groups.insert(id.clone(), key);
                     self.groups_changed().await;
+                    return Peer::Group(id);
+                }
+                if let Some(revision) = group.and_then(|group| group.revision) {
+                    self.note_group_change(&id, &key, revision).await;
                 }
                 Peer::Group(id)
             }
             None => Peer::Direct(person.to_owned()),
         }
+    }
+
+    /// The stored group moved forward. One system line per change, and the row fields the adapter applies.
+    async fn note_group_change(&mut self, id: &str, key: &[u8; 32], revision: u32) {
+        if !self.known.should_check(id, revision) {
+            return;
+        }
+        // Presage has already fetched this revision into the vault. The message's group_change bytes are not read.
+        let Some(group) = self.vault.group_keys().ok().and_then(|groups| groups.into_iter().find(|(stored, _)| stored == key).map(|(_, group)| group)) else {
+            return;
+        };
+        let stored_revision = group.revision;
+        let after = snap_of(&group);
+        let Some(before) = self.known.advance(id, stored_revision, after.clone()) else {
+            return;
+        };
+        let me = self.me.clone();
+        let mut names = HashMap::new();
+        for person in people_who_changed(&before, &after) {
+            if person == me {
+                continue;
+            }
+            let name = self.name_of(&person).await;
+            names.insert(person, name);
+        }
+        let delta = group_delta(&before, &after, &me, |person| names.get(person).cloned().unwrap_or_default());
+        if delta.lines.is_empty() {
+            return;
+        }
+        self.tell(Event::GroupChanged {
+            peer: Peer::Group(id.to_owned()),
+            by: String::new(),
+            changes: delta.lines,
+            title: delta.title,
+            description: delta.description,
+            left: delta.left,
+            rejoined: delta.rejoined,
+        });
     }
 
     /// The words of a message: mentions read as names, and what is not drawn here named.
@@ -431,7 +541,7 @@ impl Session {
             self.tell(Event::Deleted { peer, author: author.to_owned(), target: delete.target_sent_timestamp.unwrap_or(0) });
             return;
         }
-        // Timer changes, profile key updates and group changes carry nothing to show.
+        // A group change is noticed in `peer`, from the stored group. What remains here with no words is a timer or a profile key.
         let empty = message.body.as_deref().unwrap_or("").is_empty();
         let carries = !message.attachments.is_empty() || message.sticker.is_some() || !message.contact.is_empty() || message.payment.is_some() || message.gift_badge.is_some();
         if empty && !carries {
@@ -783,7 +893,7 @@ impl Linker for RealLinker {
         let name = local.block_on(&runtime, own_name(&mut manager)).unwrap_or_default();
         // Closed before the user saw it finish: undone, never left on the account.
         if cancelled.load(Ordering::Relaxed) {
-            let mut session = Session { manager, vault: store.clone(), me: aci, events: channel().0, names: HashMap::new(), groups: HashMap::new() };
+            let mut session = Session { manager, vault: store.clone(), me: aci, events: channel().0, names: HashMap::new(), groups: HashMap::new(), known: GroupRevisions::default() };
             let _ = local.block_on(&runtime, session.unlink());
             drop(session);
             vault::remove(&pending);

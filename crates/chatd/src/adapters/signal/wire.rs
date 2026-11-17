@@ -74,6 +74,8 @@ pub struct GroupInfo {
     pub title: String,
     pub description: String,
     pub members: u32,
+    /// Whether this account is currently a member of the group.
+    pub member: bool,
 }
 
 /// The earlier message a message answers.
@@ -105,8 +107,23 @@ pub struct Text {
 pub enum Event {
     /// The contacts the phone shared, whole.
     Contacts(Vec<Contact>),
-    /// The groups the account is in, whole.
+    /// The groups the account is in, whole. This is a snapshot: it does not say what changed.
     Groups(Vec<GroupInfo>),
+    /// One group changed after that snapshot. `changes` is one system line each.
+    GroupChanged {
+        peer: Peer,
+        /// Who did it, when the change names them. Empty when it does not.
+        by: String,
+        changes: Vec<String>,
+        /// Set when the name changed, so the row can take it without reading the line.
+        title: Option<String>,
+        /// Set when the description changed.
+        description: Option<String>,
+        /// This account is no longer a member.
+        left: bool,
+        /// This account was added back to the group.
+        rejoined: bool,
+    },
     /// A message from someone else, or one we sent from another device (`outgoing`).
     Message { peer: Peer, text: Text, outgoing: bool },
     /// A message was edited. `target` is when it was first sent.

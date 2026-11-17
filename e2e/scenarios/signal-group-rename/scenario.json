@@ -1,0 +1,12 @@
+{
+  "id": "signal-group-rename",
+  "title": "A renamed Signal group takes the new name and one system line",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same group rename is what this desktop run checks.",
+    "ios": "The phone proof build does not run desktop chatd. The same group rename is what this desktop run checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

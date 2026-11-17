@@ -67,6 +67,196 @@ const SENT_KEPT: usize = 1_024;
 const REACTIONS_KEPT: usize = 4_096;
 /// What a person with no name we know is called.
 const NO_NAME: &str = "Signal user";
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis() as u64)
+}
+
+/// One member, as a group change compares them. `admin` is Signal's administrator role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberSnap {
+    pub id: String,
+    pub admin: bool,
+}
+
+/// The parts of a group a change can show. Built from the stored group, never from an unsigned change.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupSnap {
+    pub title: String,
+    pub description: String,
+    pub timer_secs: u32,
+    pub avatar: String,
+    pub members: Vec<MemberSnap>,
+    pub pending: Vec<String>,
+    pub requesting: Vec<String>,
+    /// Anyone with the link may join.
+    pub link: bool,
+}
+
+/// What changed between two snapshots of one group.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupDelta {
+    pub lines: Vec<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub left: bool,
+    pub rejoined: bool,
+}
+
+/// Tracks the last revision applied for each group. The first snapshot is recorded silently;
+/// stale or duplicate revisions are skipped; a newer revision yields its prior snapshot once.
+#[derive(Debug, Default)]
+pub struct GroupRevisions {
+    known: HashMap<String, (u32, GroupSnap)>,
+}
+
+impl GroupRevisions {
+    pub fn contains(&self, id: &str) -> bool {
+        self.known.contains_key(id)
+    }
+
+    /// Records the initial snapshot for a group without announcing a change.
+    /// Does not overwrite an already-tracked group.
+    pub fn seed(&mut self, id: String, revision: u32, snap: GroupSnap) {
+        self.known.entry(id).or_insert((revision, snap));
+    }
+
+    /// True only when `id` is tracked and `revision` is strictly newer than the last applied one.
+    pub fn should_check(&self, id: &str, revision: u32) -> bool {
+        self.known.get(id).is_some_and(|(known_rev, _)| revision > *known_rev)
+    }
+
+    /// Advances `id` to `stored_revision` and returns the prior snapshot if `stored_revision`
+    /// is strictly newer than the last applied one.
+    pub fn advance(&mut self, id: &str, stored_revision: u32, after: GroupSnap) -> Option<GroupSnap> {
+        let known_rev = self.known.get(id)?.0;
+        if stored_revision <= known_rev {
+            return None;
+        }
+        let (_, before) = self.known.insert(id.to_owned(), (stored_revision, after))?;
+        Some(before)
+    }
+}
+
+fn person(id: &str, me: &str, name: &impl Fn(&str) -> String) -> String {
+    if id == me {
+        "You".to_owned()
+    } else {
+        let named = name(id);
+        if named.is_empty() { "Someone".to_owned() } else { named }
+    }
+}
+
+fn duration(secs: u32) -> String {
+    if secs >= 86_400 && secs.is_multiple_of(86_400) {
+        let days = secs / 86_400;
+        format!("{days} day{}", if days == 1 { "" } else { "s" })
+    } else if secs >= 3_600 && secs.is_multiple_of(3_600) {
+        let hours = secs / 3_600;
+        format!("{hours} hour{}", if hours == 1 { "" } else { "s" })
+    } else if secs >= 60 && secs.is_multiple_of(60) {
+        let minutes = secs / 60;
+        format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
+    } else {
+        format!("{secs} seconds")
+    }
+}
+
+/// The lines and the row fields for one group revision. The first snapshot of a connection is not
+/// passed here: a connect has no "before", so it shows the current name and no system lines.
+pub fn group_delta(before: &GroupSnap, after: &GroupSnap, me: &str, name: impl Fn(&str) -> String) -> GroupDelta {
+    let mut lines = Vec::new();
+    let title = (before.title != after.title).then(|| {
+        lines.push(format!("The group name is now {}", after.title));
+        after.title.clone()
+    });
+    let description = (before.description != after.description).then(|| {
+        if after.description.is_empty() {
+            lines.push("The group description was cleared".to_owned());
+        } else {
+            lines.push(format!("The group description is now {}", after.description));
+        }
+        after.description.clone()
+    });
+    if before.avatar != after.avatar {
+        lines.push("The group photo changed".to_owned());
+    }
+    if before.timer_secs != after.timer_secs {
+        if after.timer_secs == 0 {
+            lines.push("Disappearing messages are off".to_owned());
+        } else {
+            lines.push(format!("Disappearing messages are set to {}", duration(after.timer_secs)));
+        }
+    }
+    if before.link != after.link {
+        lines.push(if after.link { "The group link is on".to_owned() } else { "The group link is off".to_owned() });
+    }
+    let was: HashMap<&str, bool> = before.members.iter().map(|member| (member.id.as_str(), member.admin)).collect();
+    let now: HashMap<&str, bool> = after.members.iter().map(|member| (member.id.as_str(), member.admin)).collect();
+    let mut joined: Vec<&str> = now.keys().copied().filter(|id| !was.contains_key(id)).collect();
+    joined.sort_unstable();
+    let mut rejoined = false;
+    for id in joined {
+        if id == me {
+            rejoined = true;
+        }
+        lines.push(format!("{} joined the group", person(id, me, &name)));
+    }
+    let mut stayed: Vec<&str> = now.keys().copied().filter(|id| was.get(id).is_some_and(|admin| *admin != now[id])).collect();
+    stayed.sort_unstable();
+    for id in stayed {
+        let admin = now[id];
+        let line = if id == me {
+            if admin { "You are now an admin".to_owned() } else { "You are no longer an admin".to_owned() }
+        } else if admin {
+            format!("{} is now an admin", person(id, me, &name))
+        } else {
+            format!("{} is no longer an admin", person(id, me, &name))
+        };
+        lines.push(line);
+    }
+    let mut gone: Vec<&str> = was.keys().copied().filter(|id| !now.contains_key(id)).collect();
+    gone.sort_unstable();
+    let mut left = false;
+    for id in gone {
+        if id == me {
+            left = true;
+            lines.push("You are no longer in this group".to_owned());
+        } else {
+            lines.push(format!("{} is no longer in the group", person(id, me, &name)));
+        }
+    }
+    let pending: HashSet<&str> = before.pending.iter().map(String::as_str).collect();
+    let mut invited: Vec<&str> = after.pending.iter().map(String::as_str).filter(|id| !pending.contains(id) && !now.contains_key(id)).collect();
+    invited.sort_unstable();
+    for id in invited {
+        lines.push(format!("{} was invited", person(id, me, &name)));
+    }
+    let asking: HashSet<&str> = before.requesting.iter().map(String::as_str).collect();
+    let mut requests: Vec<&str> = after.requesting.iter().map(String::as_str).filter(|id| !asking.contains(id)).collect();
+    requests.sort_unstable();
+    for id in requests {
+        lines.push(format!("{} asked to join", person(id, me, &name)));
+    }
+    GroupDelta { lines, title, description, left, rejoined }
+}
+
+/// The lab driver for `signal-group-rename`. A build that drops a rename fails.
+pub fn prove_signal_group_rename() -> Result<(), String> {
+    let before = GroupSnap { title: "Bridge club".into(), ..GroupSnap::default() };
+    let after = GroupSnap { title: "Wednesday club".into(), ..GroupSnap::default() };
+    let delta = group_delta(&before, &after, "me", |_| String::new());
+    if delta.title.as_deref() != Some("Wednesday club") || delta.lines != ["The group name is now Wednesday club"] || delta.left {
+        return Err("a renamed group must take the new name and one line".into());
+    }
+    let member = GroupSnap { members: vec![MemberSnap { id: "me".into(), admin: false }], ..GroupSnap::default() };
+    let left = group_delta(&member, &GroupSnap::default(), "me", |_| String::new());
+    if !left.left || left.lines != ["You are no longer in this group"] {
+        return Err("leaving the group must say so".into());
+    }
+    Ok(())
+}
+
 /// Most pictures asked of Signal for one change to what is on screen.
 const PICTURES: usize = 25;
 /// Marks a `SetPresence` status that is really an edit of our own profile. A status a person
@@ -519,8 +709,34 @@ fn apply(account: &Account, event: Event) {
                 let peer = Peer::Group(group.id.clone());
                 let mut row = row(&peer, &group.title);
                 row.topic = group.description.chars().take(300).collect();
+                row.read_only = !group.member;
                 row.avatar = ctx.avatar_of(&row.id);
                 let _ = ctx.conversation(&row);
+            }
+        }
+        Event::GroupChanged { peer, changes, title, description, left, rejoined, .. } => {
+            let id = peer.conversation();
+            let known = ctx.known(&id).ok().flatten();
+            if title.is_some() || description.is_some() || left || rejoined {
+                let title = title.unwrap_or_else(|| known.as_ref().map(|row| row.title.clone()).unwrap_or_default());
+                let mut row = row(&peer, &title);
+                row.topic = description.unwrap_or_else(|| known.as_ref().map(|row| row.topic.clone()).unwrap_or_default()).chars().take(300).collect();
+                // A later rename does not put a removed member back, while re-adding clears read-only.
+                row.read_only = if left {
+                    true
+                } else if rejoined {
+                    false
+                } else {
+                    known.as_ref().is_some_and(|row| row.read_only)
+                };
+                row.avatar = ctx.avatar_of(&row.id);
+                let _ = ctx.conversation(&row);
+            }
+            let sent_ms = now_ms();
+            for (at, line) in changes.iter().enumerate() {
+                let mut message = Message::plain(format!("signal-system-{sent_ms}-{at}"), String::new(), line.clone(), (sent_ms / 1_000) as i64, false);
+                message.kind = MessageKind::System;
+                let _ = ctx.message(&id, &message);
             }
         }
         Event::Message { peer, text, outgoing } => {
@@ -941,5 +1157,44 @@ mod tests {
         assert_eq!((name.as_deref(), about.as_deref(), emoji.as_deref()), (Some("Ada"), Some("New about"), Some("")));
         assert!(profile_edit("Lunch").is_none());
         assert!(prove_signal_own_profile().is_ok());
+    }
+
+    #[test]
+    fn group_revisions_gate_connect_stale_duplicate_and_newer() {
+        let mut revisions = GroupRevisions::default();
+        let initial = GroupSnap { title: "Bridge club".into(), ..GroupSnap::default() };
+        assert!(!revisions.contains("g1"));
+        assert!(!revisions.should_check("g1", 1));
+        assert_eq!(revisions.advance("g1", 1, initial.clone()), None);
+
+        // First snapshot is seeded silently and not overwritten by a second seed.
+        revisions.seed("g1".into(), 5, initial.clone());
+        assert!(revisions.contains("g1"));
+        let renamed = GroupSnap { title: "Wednesday club".into(), ..GroupSnap::default() };
+        revisions.seed("g1".into(), 6, renamed.clone());
+
+        // Stale and duplicate revisions are skipped.
+        assert!(!revisions.should_check("g1", 4));
+        assert!(!revisions.should_check("g1", 5));
+        assert_eq!(revisions.advance("g1", 4, renamed.clone()), None);
+        assert_eq!(revisions.advance("g1", 5, renamed.clone()), None);
+
+        // A newer revision is announced once, then skipped on repeat.
+        assert!(revisions.should_check("g1", 6));
+        let before = revisions.advance("g1", 6, renamed.clone()).expect("newer revision");
+        assert_eq!(before, initial);
+        assert!(!revisions.should_check("g1", 6));
+        assert_eq!(revisions.advance("g1", 6, renamed), None);
+    }
+
+    #[test]
+    fn rejoining_a_group_sets_rejoined_and_clears_left() {
+        let out = GroupSnap::default();
+        let inside = GroupSnap { members: vec![MemberSnap { id: "me".into(), admin: false }], ..GroupSnap::default() };
+        let left = group_delta(&inside, &out, "me", |_| String::new());
+        assert!(left.left && !left.rejoined);
+        let back = group_delta(&out, &inside, "me", |_| String::new());
+        assert!(!back.left && back.rejoined);
+        assert_eq!(back.lines, ["You joined the group"]);
     }
 }
