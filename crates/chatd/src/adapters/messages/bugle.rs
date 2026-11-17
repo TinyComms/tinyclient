@@ -621,6 +621,13 @@ fn send_request(conversation: &str, text: &str, tmp: &str, mine: &str, reply: Op
     req.0
 }
 
+fn resend_request(message: &str) -> Vec<u8> {
+    let mut buf = Buf::new();
+    // ResendMessageRequest.messageID (field 2).
+    buf.text(2, message);
+    buf.0
+}
+
 fn refused(bytes: &[u8]) -> Result<(), String> {
     let list = fields(bytes);
     let status = field_int(&list, 3);
@@ -1050,6 +1057,10 @@ pub struct Note {
     pub reactions: Vec<Mark>,
     /// The phone's word on the message (`MessageStatus.status`, field 4.2).
     pub status: u64,
+    /// `Message.tmpID` (field 12): the id this computer used when it asked the phone to send.
+    pub tmp: String,
+    /// `MessageStatus.statusText` (field 4.5), or `errMsg` (field 4.4) when the phone sent no text.
+    pub detail: String,
     /// `Message.type`, field 11. 0 when the phone did not say.
     pub wire: u64,
     /// This update only turns encryption between the phones on or off. It is not a message.
@@ -1066,13 +1077,37 @@ pub enum Receipt {
 }
 
 /// Bugle's `MessageStatusType` for my messages: 2 is OUTGOING_DELIVERED, 11 OUTGOING_DISPLAYED
-/// (read). 1 is OUTGOING_COMPLETE, sent and no more; the failures (8, 9, 13, 17–19, 21, 22, 24,
-/// 27) are left as sent, since a retry here could not reach the phone's copy.
+/// (read). 1 is OUTGOING_COMPLETE and 14 is OUTGOING_NOT_DELIVERED_YET: both have left this
+/// computer. A failure is not sent.
 pub fn receipt(status: u64) -> Option<Receipt> {
     match status {
         2 => Some(Receipt::Delivered),
         11 => Some(Receipt::Read),
         _ => None,
+    }
+}
+
+/// Whether one of my messages is on its way, sent, or refused by the phone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    Sent,
+    Pending,
+    Failed(&'static str),
+}
+
+/// Maps Bugle's `MessageStatusType` for an outgoing message. Codes 100 and above are incoming
+/// and are not passed here. A code this build does not know is a failure, never a success.
+pub fn progress(status: u64) -> Progress {
+    match status {
+        1 | 2 | 11 | 14 => Progress::Sent,
+        0 | 3 | 4 | 5 | 6 | 7 | 10 | 15 | 16 | 20 => Progress::Pending,
+        8 => Progress::Failed("Not sent. No service."),
+        9 => Progress::Failed("That number is invalid."),
+        13 => Progress::Failed("That message is too large."),
+        17 => Progress::Failed("The other person can't receive this."),
+        19 | 22 => Progress::Failed("The other person couldn't open this."),
+        21 => Progress::Failed("The other person can't receive an encrypted text."),
+        _ => Progress::Failed("Not sent."),
     }
 }
 
@@ -1614,12 +1649,25 @@ impl Session {
             .unwrap_or_default()
     }
 
-    pub fn send(&self, conversation: &str, text: &str, reply: Option<&str>) -> Result<String, String> {
+    pub fn send(
+        &self,
+        conversation: &str,
+        text: &str,
+        reply: Option<&str>,
+        noted: &mut dyn FnMut(&str),
+    ) -> Result<String, String> {
         let mine = self.mine_of(conversation);
         let tmp = uuid();
+        noted(&tmp);
         let bytes = self.rpc(3, &send_request(conversation, text, &tmp, &mine, reply), 2)?;
         refused(&bytes)?;
         Ok(tmp)
+    }
+
+    /// Asks the phone to send again the copy it already has (`RESEND_MESSAGE`, action 25).
+    pub fn resend(&self, message: &str) -> Result<(), String> {
+        let bytes = self.rpc(25, &resend_request(message), 2)?;
+        refused(&bytes)
     }
 
     /// Encrypts the file, uploads it, and asks the phone to send it. A large photo may leave as
@@ -1631,6 +1679,7 @@ impl Session {
         path: &str,
         name: &str,
         reply: Option<&str>,
+        noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
         let named = if name.is_empty() { "file" } else { name };
         let meta =
@@ -1649,6 +1698,7 @@ impl Session {
         let media_id = self.upload(&packed, &mime)?;
         let mine = self.mine_of(conversation);
         let tmp = uuid();
+        noted(&tmp);
         let bytes = self.rpc(
             3,
             &send_media_request(
@@ -2356,6 +2406,9 @@ fn decode_reactions(msg: &[Field]) -> Vec<Mark> {
     marks
 }
 
+/// Phone status text shown under a failed row. Same bound as a forwarded title.
+const DETAIL_CAP: usize = 200;
+
 fn decode_messages(bytes: &[u8]) -> Vec<Note> {
     let list = fields(bytes);
     let mut notes = Vec::new();
@@ -2372,7 +2425,17 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             }
             continue;
         }
-        let status = field_int(&fields(&field_bytes(&msg, 4)), 2);
+        let status_fields = fields(&field_bytes(&msg, 4));
+        let status = field_int(&status_fields, 2);
+        let said = field_text(&status_fields, 5);
+        let mut detail = if said.is_empty() {
+            field_text(&status_fields, 4)
+        } else {
+            said
+        };
+        // Drawn under a failed row, not as the message. `Message::bound` does not clip it.
+        protocol::clip(&mut detail, DETAIL_CAP);
+        let tmp = field_text(&msg, 12);
         // A tombstone is the only published word that the phones turned encryption on or off.
         if let Some(on) = between_phones(status) {
             notes.push(Note {
@@ -2470,6 +2533,8 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             pieces,
             reactions,
             status,
+            tmp,
+            detail,
             wire,
             phones: None,
             reply,
@@ -2741,6 +2806,65 @@ mod tests {
         let notes = decode_messages(&wrap.0);
         let said: Vec<Option<Receipt>> = notes.iter().map(|note| receipt(note.status)).collect();
         assert_eq!(said, [None, Some(Receipt::Delivered), Some(Receipt::Read), None]);
+    }
+
+    #[test]
+    fn a_failure_status_names_the_temporary_id_and_is_not_sent() {
+        let mut status = Buf::new();
+        status.int(2, 13);
+        let mut message = Buf::new();
+        message.text(1, "phone-1");
+        message.text(7, "c1");
+        message.text(12, "tmp-1");
+        message.msg(4, &status.0);
+        let mut wrap = Buf::new();
+        wrap.msg(1, &message.0);
+        let notes = decode_messages(&wrap.0);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, "phone-1");
+        assert_eq!(notes[0].tmp, "tmp-1");
+        assert_eq!(progress(notes[0].status), Progress::Failed("That message is too large."));
+        assert_eq!(progress(5), Progress::Pending);
+        assert_eq!(progress(8), Progress::Failed("Not sent. No service."));
+        assert_eq!(progress(9), Progress::Failed("That number is invalid."));
+        assert_eq!(progress(1), Progress::Sent);
+        assert_eq!(progress(2), Progress::Sent);
+        assert!(matches!(progress(99), Progress::Failed(_)));
+        assert!(matches!(progress(24), Progress::Failed(_)));
+    }
+
+    #[test]
+    fn a_long_status_line_is_clipped_before_the_note_is_built() {
+        let long = "x".repeat(500);
+        let decode = |field: u32| {
+            let mut status = Buf::new();
+            status.int(2, 13);
+            status.text(field, &long);
+            let mut message = Buf::new();
+            message.text(1, "phone-1");
+            message.text(7, "c1");
+            message.msg(4, &status.0);
+            let mut wrap = Buf::new();
+            wrap.msg(1, &message.0);
+            decode_messages(&wrap.0)
+        };
+        let from_text = decode(5);
+        assert_eq!(from_text.len(), 1);
+        assert_eq!(from_text[0].detail.chars().count(), 200);
+        let from_err = decode(4);
+        assert_eq!(from_err[0].detail.chars().count(), 200);
+        let mut both = Buf::new();
+        both.int(2, 13);
+        both.text(4, &long);
+        both.text(5, "phone said this");
+        let mut message = Buf::new();
+        message.text(1, "phone-1");
+        message.text(7, "c1");
+        message.msg(4, &both.0);
+        let mut wrap = Buf::new();
+        wrap.msg(1, &message.0);
+        let notes = decode_messages(&wrap.0);
+        assert_eq!(notes[0].detail, "phone said this");
     }
 
     #[test]

@@ -344,6 +344,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-messages-reply:0");
         return Ok(());
     }
+    // The lab's messages-failed-send driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-failed-send") {
+        if let Err(err) = chatd::adapters::messages::prove_messages_failed_send() {
+            eprintln!("messages-failed-send: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-failed-send:0");
+        return Ok(());
+    }
     // The lab's teams-reactions driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("teams-reactions") {
         if let Err(err) = chatd::adapters::prove_teams_reactions() {

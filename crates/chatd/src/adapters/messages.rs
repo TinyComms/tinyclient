@@ -120,7 +120,13 @@ trait Drive: Send + Sync {
     fn older_chats(&self) -> Result<Vec<Chat>, String>;
     /// True when the last inbox page was full and named a later one.
     fn inbox_continues(&self) -> bool;
-    fn send(&self, conversation: &str, text: &str, reply: Option<&str>) -> Result<String, String>;
+    fn send(
+        &self,
+        conversation: &str,
+        text: &str,
+        reply: Option<&str>,
+        noted: &mut dyn FnMut(&str),
+    ) -> Result<String, String>;
     fn send_file(
         &self,
         conversation: &str,
@@ -128,7 +134,10 @@ trait Drive: Send + Sync {
         path: &str,
         name: &str,
         reply: Option<&str>,
+        noted: &mut dyn FnMut(&str),
     ) -> Result<String, String>;
+    /// Asks the phone to send again a copy it already has.
+    fn resend(&self, message: &str) -> Result<(), String>;
     fn react(&self, message: &str, emoji: &str, on: bool) -> Result<(), String>;
     fn fetch(
         &self,
@@ -168,8 +177,14 @@ impl Drive for LiveDrive {
     fn inbox_continues(&self) -> bool {
         self.inner.inbox_continues()
     }
-    fn send(&self, conversation: &str, text: &str, reply: Option<&str>) -> Result<String, String> {
-        self.inner.send(conversation, text, reply)
+    fn send(
+        &self,
+        conversation: &str,
+        text: &str,
+        reply: Option<&str>,
+        noted: &mut dyn FnMut(&str),
+    ) -> Result<String, String> {
+        self.inner.send(conversation, text, reply, noted)
     }
     fn send_file(
         &self,
@@ -178,8 +193,12 @@ impl Drive for LiveDrive {
         path: &str,
         name: &str,
         reply: Option<&str>,
+        noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
-        self.inner.send_file(conversation, caption, path, name, reply)
+        self.inner.send_file(conversation, caption, path, name, reply, noted)
+    }
+    fn resend(&self, message: &str) -> Result<(), String> {
+        self.inner.resend(message)
     }
     fn react(&self, message: &str, emoji: &str, on: bool) -> Result<(), String> {
         self.inner.react(message, emoji, on)
@@ -316,6 +335,28 @@ pub fn prove_messages_unpaired() -> Result<(), String> {
     bugle::prove_unpaired()
 }
 
+/// The lab checks that a phone failure is not shown as sent. A build without this stays up.
+pub fn prove_messages_failed_send() -> Result<(), String> {
+    if bugle::progress(13) != bugle::Progress::Failed("That message is too large.") {
+        return Err("a too-large text was not failed".into());
+    }
+    if bugle::progress(5) != bugle::Progress::Pending {
+        return Err("a text still sending was marked sent".into());
+    }
+    if bugle::progress(8) != bugle::Progress::Failed("Not sent. No service.") {
+        return Err("a text with no service was marked sent".into());
+    }
+    if !matches!(bugle::progress(99), bugle::Progress::Failed(_))
+        || !matches!(bugle::progress(24), bugle::Progress::Failed(_))
+    {
+        return Err("an unknown failure was marked sent".into());
+    }
+    if bugle::progress(2) != bugle::Progress::Sent {
+        return Err("a delivered text was not sent".into());
+    }
+    Ok(())
+}
+
 pub fn reaction_rules() -> protocol::ReactionRules {
     protocol::ReactionRules {
         set: ReactionSet::Any,
@@ -366,6 +407,17 @@ struct Due {
     find: Option<String>,
 }
 
+/// One text this computer asked the phone to send, keyed by the shell's client id.
+#[derive(Clone)]
+struct Attempt {
+    relay_id: String,
+    /// The phone's id for that copy. It starts as the temporary id and changes when the phone
+    /// names a different one.
+    phone_id: String,
+    progress: Option<bugle::Progress>,
+    detail: String,
+}
+
 /// Work the phone did not answer. The relay can still be up: that is [`CANT_REACH`], not offline.
 #[derive(Default)]
 struct Phone {
@@ -392,6 +444,8 @@ struct Account {
     /// Per conversation, the oldest page read this session.
     span: Mutex<HashMap<String, Span>>,
     phone: Mutex<Phone>,
+    /// Texts asked of the phone on this connection, by the shell's client id.
+    outbox: Mutex<HashMap<String, Attempt>>,
 }
 
 pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<(), String> {
@@ -472,6 +526,7 @@ fn connect(
         chats: Mutex::default(),
         span: Mutex::default(),
         phone: Mutex::default(),
+        outbox: Mutex::default(),
     });
     ctx.capabilities(Capabilities {
         max_file_bytes: 100 * 1024 * 1024,
@@ -691,14 +746,36 @@ fn show(account: &Account, note: &bugle::Note, page: &[bugle::Note]) {
         seal(account, &note.conversation, on);
         return;
     }
-    let _ = account.ctx.message(&note.conversation, &message(account, note, page));
+    let mut shown = message(account, note, page);
+    if note.outgoing || note.author == account.me {
+        shown.state = state_of(note);
+        if let Some(client_id) = claim(account, note) {
+            if shown.attachments.is_empty() || shown.text.is_empty() || shown.reply_to.is_none() {
+                if let Ok(Some(had)) = account.ctx.stored_message(&note.conversation, &client_id) {
+                    if shown.attachments.is_empty() {
+                        shown.attachments = had.attachments;
+                    }
+                    if shown.text.is_empty() {
+                        shown.text = had.text;
+                    }
+                    if shown.reply_to.is_none() {
+                        shown.reply_to = had.reply_to;
+                    }
+                }
+            }
+            shown.id = client_id.clone();
+            shown.client_id = Some(client_id);
+        }
+    }
+    let id = shown.id.clone();
+    let _ = account.ctx.message(&note.conversation, &shown);
     let tag = bugle::wire_tag(note.wire, carrier_of(account, &note.conversation));
     if !tag.is_empty() {
         let mut line = Message::plain(format!("{}:kind", note.id), String::new(), tag, note.sent, false);
         line.kind = MessageKind::System;
         let _ = account.ctx.history(&note.conversation, &[line]);
     }
-    receipt(account, &note.conversation, note);
+    receipt(account, &note.conversation, note, &id);
 }
 
 fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Message {
@@ -1144,18 +1221,23 @@ fn outgoing(account: &Account, id: String, text: String) -> Message {
 }
 
 /// The second tick or the read mark, when the phone says one of my messages has it.
-fn receipt(account: &Account, conversation: &str, note: &bugle::Note) {
-    if !bugle::shows_receipts(carrier_of(account, conversation)) {
-        return;
-    }
+/// `id` is the shell's id when this computer asked for the copy, otherwise the phone's.
+/// A delivered or read copy leaves the outbox even when this chat does not draw ticks.
+fn receipt(account: &Account, conversation: &str, note: &bugle::Note, id: &str) {
     if !(note.outgoing || note.author == account.me) {
         return;
     }
-    let _ = match bugle::receipt(note.status) {
-        Some(bugle::Receipt::Delivered) => account.ctx.delivered(conversation, &note.id),
-        Some(bugle::Receipt::Read) => account.ctx.seen(conversation, &note.id),
-        None => Ok(()),
-    };
+    let mark = bugle::receipt(note.status);
+    if bugle::shows_receipts(carrier_of(account, conversation)) {
+        let _ = match mark {
+            Some(bugle::Receipt::Delivered) => account.ctx.delivered(conversation, id),
+            Some(bugle::Receipt::Read) => account.ctx.seen(conversation, id),
+            None => Ok(()),
+        };
+    }
+    if mark.is_some() {
+        settle_map(&mut outbox_mut(account), id, note.status);
+    }
 }
 
 fn backfill(account: &Account, conversation: &str) {
@@ -1492,18 +1574,161 @@ fn post(account: &Account, item: WaitingSend) {
 
 fn ask(account: &Account, item: &WaitingSend) -> Result<Message, String> {
     let reply = item.reply.as_deref();
-    if item.path.is_empty() {
-        return account
-            .drive
-            .send(&item.conversation, &item.text, reply)
-            .map(|id| with_reply(account, outgoing(account, id, item.text.clone()), item));
+    if let Some(copy) = phone_copy(account, &item.client_id) {
+        mark_pending(account, &item.client_id);
+        account.drive.resend(&copy)?;
+        return Ok(finish(account, &item.client_id, carried(account, item)));
     }
-    let bytes = std::fs::read(&item.path).unwrap_or_default();
-    let mime = bugle::mime_of(&item.name, &bytes);
-    account
-        .drive
-        .send_file(&item.conversation, &item.text, &item.path, &item.name, reply)
-        .map(|id| with_reply(account, with_file(account, id, item.text.clone(), &item.name, mime, &bytes), item))
+    let sent = if item.path.is_empty() {
+        account.drive.send(&item.conversation, &item.text, reply, &mut |id| {
+            keep_copy(account, &item.client_id, id);
+        })
+    } else {
+        account.drive.send_file(
+            &item.conversation,
+            &item.text,
+            &item.path,
+            &item.name,
+            reply,
+            &mut |id| keep_copy(account, &item.client_id, id),
+        )
+    };
+    if sent.is_err() {
+        forget(account, &item.client_id);
+    }
+    let message = sent.map(|_| carried(account, item))?;
+    Ok(finish(account, &item.client_id, message))
+}
+
+/// The shell's id stays the stored row. The phone's id is only for a later retry.
+fn carried(account: &Account, item: &WaitingSend) -> Message {
+    let id = item.client_id.clone();
+    let message = if item.path.is_empty() {
+        outgoing(account, id, item.text.clone())
+    } else {
+        let bytes = std::fs::read(&item.path).unwrap_or_default();
+        let mime = bugle::mime_of(&item.name, &bytes);
+        with_file(account, id, item.text.clone(), &item.name, mime, &bytes)
+    };
+    with_reply(account, message, item)
+}
+
+fn keep_copy(account: &Account, client_id: &str, relay_id: &str) {
+    keep_copy_map(&mut outbox_mut(account), client_id, relay_id);
+}
+
+/// Sent copies with no receipt yet. A failure stays, so Try again can find the phone's copy.
+const OUTBOX_CAP: usize = 64;
+
+fn keep_copy_map(outbox: &mut HashMap<String, Attempt>, client_id: &str, relay_id: &str) {
+    if !outbox.contains_key(client_id) && outbox.len() >= OUTBOX_CAP {
+        if let Some(drop_id) = outbox
+            .iter()
+            .find(|(_, attempt)| matches!(attempt.progress, Some(bugle::Progress::Sent)))
+            .map(|(id, _)| id.clone())
+        {
+            outbox.remove(&drop_id);
+        }
+    }
+    outbox.insert(
+        client_id.to_owned(),
+        Attempt {
+            relay_id: relay_id.to_owned(),
+            phone_id: relay_id.to_owned(),
+            progress: None,
+            detail: String::new(),
+        },
+    );
+}
+
+fn mark_pending(account: &Account, client_id: &str) {
+    if let Some(attempt) = outbox_mut(account).get_mut(client_id) {
+        attempt.progress = Some(bugle::Progress::Pending);
+        attempt.detail.clear();
+    }
+}
+
+fn forget(account: &Account, client_id: &str) {
+    outbox_mut(account).remove(client_id);
+}
+
+fn phone_copy(account: &Account, client_id: &str) -> Option<String> {
+    outbox_mut(account).get(client_id).map(|attempt| {
+        if attempt.phone_id.is_empty() {
+            attempt.relay_id.clone()
+        } else {
+            attempt.phone_id.clone()
+        }
+    })
+}
+
+/// A status that arrived while the send was still on the wire wins over the ack.
+fn finish(account: &Account, client_id: &str, mut message: Message) -> Message {
+    if let Some(state) = terminal(account, client_id) {
+        message.state = state;
+    }
+    message
+}
+
+fn terminal(account: &Account, client_id: &str) -> Option<SendState> {
+    let outbox = outbox_mut(account);
+    let attempt = outbox.get(client_id)?;
+    match attempt.progress? {
+        bugle::Progress::Pending => None,
+        bugle::Progress::Sent => Some(SendState::Sent),
+        bugle::Progress::Failed(words) => Some(SendState::Failed {
+            reason: if attempt.detail.is_empty() {
+                words.to_owned()
+            } else {
+                attempt.detail.clone()
+            },
+        }),
+    }
+}
+
+fn state_of(note: &bugle::Note) -> SendState {
+    match bugle::progress(note.status) {
+        bugle::Progress::Sent => SendState::Sent,
+        bugle::Progress::Pending => SendState::Pending,
+        bugle::Progress::Failed(words) => SendState::Failed {
+            reason: if note.detail.is_empty() {
+                words.to_owned()
+            } else {
+                note.detail.clone()
+            },
+        },
+    }
+}
+
+fn hits(attempt: &Attempt, value: &str) -> bool {
+    !value.is_empty() && (value == attempt.relay_id || value == attempt.phone_id)
+}
+
+/// The shell id of a text this computer sent, when the phone's note names that copy.
+fn claim(account: &Account, note: &bugle::Note) -> Option<String> {
+    claim_map(&mut outbox_mut(account), note)
+}
+
+fn claim_map(outbox: &mut HashMap<String, Attempt>, note: &bugle::Note) -> Option<String> {
+    let (client_id, attempt) = outbox
+        .iter_mut()
+        .find(|(_, attempt)| hits(attempt, &note.tmp) || hits(attempt, &note.id))?;
+    if !note.id.is_empty() {
+        attempt.phone_id = note.id.clone();
+    }
+    attempt.progress = Some(bugle::progress(note.status));
+    attempt.detail = note.detail.clone();
+    Some(client_id.clone())
+}
+
+fn settle_map(outbox: &mut HashMap<String, Attempt>, client_id: &str, status: u64) {
+    if bugle::receipt(status).is_some() {
+        outbox.remove(client_id);
+    }
+}
+
+fn outbox_mut(account: &Account) -> std::sync::MutexGuard<'_, HashMap<String, Attempt>> {
+    account.outbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn with_reply(account: &Account, mut message: Message, item: &WaitingSend) -> Message {
@@ -1674,5 +1899,69 @@ fn continue_inbox(account: &Arc<Account>) {
         }
         Err(why) if phone_quiet(&why) => lost_phone(account),
         Err(why) => tracing::warn!("chatd: Messages: {why}"),
+    }
+}
+
+#[cfg(test)]
+mod outbox_tests {
+    use super::{claim_map, keep_copy_map, settle_map, Attempt};
+
+    fn note(id: &str, tmp: &str, status: u64) -> crate::adapters::messages::bugle::Note {
+        crate::adapters::messages::bugle::Note {
+            id: id.into(),
+            tmp: tmp.into(),
+            status,
+            ..crate::adapters::messages::bugle::Note::default()
+        }
+    }
+
+    #[test]
+    fn a_delivered_or_read_copy_leaves_and_a_failure_stays() {
+        let mut outbox = std::collections::HashMap::new();
+        keep_copy_map(&mut outbox, "c-ok", "relay-ok");
+        let id = claim_map(&mut outbox, &note("phone-ok", "relay-ok", 2)).unwrap();
+        settle_map(&mut outbox, &id, 2);
+        assert!(outbox.get("c-ok").is_none(), "a delivered copy stayed in the outbox");
+
+        keep_copy_map(&mut outbox, "c-read", "relay-read");
+        let id = claim_map(&mut outbox, &note("phone-read", "relay-read", 11)).unwrap();
+        settle_map(&mut outbox, &id, 11);
+        assert!(outbox.get("c-read").is_none(), "a read copy stayed in the outbox");
+
+        keep_copy_map(&mut outbox, "c-fail", "relay-fail");
+        let id = claim_map(&mut outbox, &note("phone-fail", "relay-fail", 13)).unwrap();
+        settle_map(&mut outbox, &id, 13);
+        let kept = outbox.get("c-fail").expect("Try again lost the phone's failed copy");
+        assert_eq!(kept.phone_id, "phone-fail");
+        assert!(matches!(kept.progress, Some(super::bugle::Progress::Failed(_))));
+        assert_eq!(id, "c-fail");
+    }
+
+    #[test]
+    fn a_full_outbox_drops_a_sent_copy_and_keeps_a_failure() {
+        let mut sent = std::collections::HashMap::<String, Attempt>::new();
+        for n in 0..64 {
+            let client = format!("c-{n}");
+            let relay = format!("relay-{n}");
+            keep_copy_map(&mut sent, &client, &relay);
+            claim_map(&mut sent, &note(&format!("phone-{n}"), &relay, 1));
+        }
+        keep_copy_map(&mut sent, "c-new", "relay-new");
+        assert_eq!(sent.len(), 64);
+        assert!(sent.contains_key("c-new"));
+        let still_sent = sent.values().filter(|attempt| matches!(attempt.progress, Some(super::bugle::Progress::Sent))).count();
+        assert_eq!(still_sent, 63);
+
+        let mut failed = std::collections::HashMap::new();
+        for n in 0..64 {
+            let client = format!("f-{n}");
+            let relay = format!("relay-f-{n}");
+            keep_copy_map(&mut failed, &client, &relay);
+            claim_map(&mut failed, &note(&format!("phone-f-{n}"), &relay, 13));
+        }
+        keep_copy_map(&mut failed, "f-new", "relay-f-new");
+        assert_eq!(failed.len(), 65, "a failed copy was dropped to make room");
+        assert!(failed.contains_key("f-new"));
+        assert_eq!(failed.keys().filter(|id| *id != "f-new").count(), 64);
     }
 }
