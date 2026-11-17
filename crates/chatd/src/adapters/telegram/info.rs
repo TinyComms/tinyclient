@@ -24,6 +24,10 @@ pub(super) fn profile(account: &Account, person_id: &str) -> Result<About, Fault
     let tl::enums::users::UserFull::Full(full) = account.ask(&tl::functions::users::GetFullUser { id })?;
     account.learn(&full.users, &full.chats);
     let tl::enums::UserFull::Full(user) = full.full_user;
+    if user.blocked {
+        account.set_user_blocked(user_id, true);
+        let _ = account.ctx.relation(person_id, protocol::Relation::Blocked);
+    }
     let mut about = About { bio: user.about.unwrap_or_default(), mutual_total: user.common_chats_count.max(0) as u32, ..About::default() };
     let this = full.users.iter().find_map(|found| match found {
         tl::enums::User::User(found) if found.id == user_id => Some(found),

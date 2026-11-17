@@ -415,6 +415,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-exit:0");
         return Ok(());
     }
+    // The lab's telegram-block-contact driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-block-contact") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_block_contact() {
+            eprintln!("telegram-block-contact: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-block-contact:0");
+        return Ok(());
+    }
     // The lab's telegram-markers driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-markers") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_markers() {

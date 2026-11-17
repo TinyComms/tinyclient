@@ -27,7 +27,7 @@ use super::wire::{Event, Fault, Wire};
 use crate::adapters::script;
 use grammers_crypto::two_factor_auth::calculate_2fa;
 use grammers_tl_types as tl;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -390,6 +390,8 @@ struct World {
     as_other: bool,
     /// How far the account read each forum topic, as its last `ReadDiscussion` said.
     topic_reads: HashMap<(Who, i32), i32>,
+    /// Users `contacts.block` has blocked. `getBlocked` and `userFull.blocked` read this.
+    blocked: HashSet<i64>,
     calls: PathBuf,
     /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
     dialogs_go: bool,
@@ -448,6 +450,7 @@ impl World {
             me_name: String::new(),
             as_other: false,
             topic_reads: HashMap::new(),
+            blocked: HashSet::new(),
             calls: protocol::support_dir().join("telegram.calls"),
             dialogs_go: false,
             peer_go: false,
@@ -1264,6 +1267,16 @@ impl World {
                 self.store(None, message.clone());
                 vec![update(tl::types::UpdateEditMessage { message: message.into(), pts: 0, pts_count: 0 }.into())]
             }
+            "peer-blocked" => {
+                let id = words.next().and_then(|id| id.parse().ok()).unwrap_or(ODALYS);
+                let blocked = words.next() != Some("off");
+                if blocked {
+                    self.blocked.insert(id);
+                } else {
+                    self.blocked.remove(&id);
+                }
+                vec![update(tl::types::UpdatePeerBlocked { blocked, blocked_my_stories_from: false, peer_id: Who::User(id).peer() }.into())]
+            }
             "delete" => {
                 if let Some(held) = self.messages.get_mut(&odalys.text()) {
                     held.remove(&13);
@@ -1826,6 +1839,51 @@ impl World {
             let found = tl::types::contacts::Contacts { contacts, saved_count: 1, users: vec![user(ODALYS, "Odalys", "Brandt", "odalys").into()] };
             return answer(tl::enums::contacts::Contacts::Contacts(found));
         }
+        if asked::<f::contacts::GetBlocked>(body).is_some() {
+            self.log(&format!("contacts.getBlocked {}", self.blocked.len()));
+            let blocked: Vec<tl::enums::PeerBlocked> = self.blocked.iter().map(|id| {
+                tl::enums::PeerBlocked::Blocked(tl::types::PeerBlocked { peer_id: Who::User(*id).peer(), date: t0() })
+            }).collect();
+            let users = self.blocked.iter().map(|id| user(*id, "Blocked", "", "").into()).collect();
+            let found = tl::types::contacts::Blocked { blocked, chats: Vec::new(), users };
+            return answer(tl::enums::contacts::Blocked::Blocked(found));
+        }
+        if let Some(request) = asked::<f::contacts::Block>(body) {
+            let who = input_who(&request.id);
+            if let Who::User(id) = who {
+                self.blocked.insert(id);
+            }
+            self.log(&format!("contacts.block {}", who.text()));
+            return answer(true);
+        }
+        if let Some(request) = asked::<f::contacts::Unblock>(body) {
+            let who = input_who(&request.id);
+            if let Who::User(id) = who {
+                self.blocked.remove(&id);
+            }
+            self.log(&format!("contacts.unblock {}", who.text()));
+            return answer(true);
+        }
+        if let Some(request) = asked::<f::contacts::AddContact>(body) {
+            let id = match &request.id {
+                tl::enums::InputUser::User(user) => user.user_id,
+                _ => 0,
+            };
+            self.log(&format!("contacts.addContact u{id} {} {}", request.first_name, request.last_name));
+            let mut one = user(id, &request.first_name, &request.last_name, "");
+            one.contact = true;
+            let made = tl::types::Updates { updates: Vec::new(), users: vec![one.into()], chats: Vec::new(), date: t0(), seq: 0 };
+            return answer(tl::enums::Updates::Updates(made));
+        }
+        if let Some(request) = asked::<f::contacts::DeleteContacts>(body) {
+            let ids: Vec<String> = request.id.iter().map(|user| match user {
+                tl::enums::InputUser::User(user) => format!("u{}", user.user_id),
+                _ => "u0".to_owned(),
+            }).collect();
+            self.log(&format!("contacts.deleteContacts {}", ids.join(" ")));
+            let made = tl::types::Updates { updates: Vec::new(), users: Vec::new(), chats: Vec::new(), date: t0(), seq: 0 };
+            return answer(tl::enums::Updates::Updates(made));
+        }
         if let Some(request) = asked::<f::contacts::Search>(body) {
             self.log(&format!("contacts.Search {}", request.q));
             let found = tl::types::contacts::Found {
@@ -2108,6 +2166,7 @@ impl World {
             let peer_settings: tl::types::PeerSettings = blank(&[&put(0u32)]);
             let mut full: tl::types::UserFull = blank(&[&put(0u32), &put(0u32), &put(id), &put(tl::enums::PeerSettings::from(peer_settings)), &put(settings(None)), &put(1i32)]);
             full.about = Some("Maps, mostly.".to_owned());
+            full.blocked = self.blocked.contains(&id);
             let found = tl::types::users::UserFull { full_user: full.into(), chats: Vec::new(), users: users() };
             return answer(tl::enums::users::UserFull::Full(found));
         }

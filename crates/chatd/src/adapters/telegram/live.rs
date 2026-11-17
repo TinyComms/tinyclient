@@ -557,6 +557,15 @@ pub(super) fn apply(account: &Account, update: &Update) {
             reactions(account, &conversation, message, &reacted.reactions);
         }
         // A draft typed (or cleared) on the phone while we are here, or ours echoed back.
+        Update::PeerBlocked(changed) => {
+            let who = Who::of(&changed.peer_id);
+            if let Who::User(id) = who {
+                account.set_user_blocked(id, changed.blocked);
+                let contact = account.dir().get(who).is_some_and(|known| known.contact);
+                let relation = super::block_choice(!changed.blocked, contact).1;
+                let _ = account.ctx.relation(&who.text(), relation);
+            }
+        }
         Update::DraftMessage(drafted) => {
             let who = Who::of(&drafted.peer);
             let id = if account.dir().get(who).is_some_and(|known| known.forum) {

@@ -367,7 +367,39 @@ pub(super) fn sign_on(account: &Arc<Account>) -> Result<(), Fault> {
     let _ = account.ctx.spaces(&[]);
     account.live().unread_check = Some(Instant::now());
     retry_unread_channels(account);
-    contacts(account)
+    contacts(account)?;
+    blocked_list(account)
+}
+
+/// People this account has blocked. Recorded one at a time so the contact list `contacts`
+/// just wrote is left as it is.
+fn blocked_list(account: &Account) -> Result<(), Fault> {
+    let mut offset = 0i32;
+    loop {
+        let page = account.ask(&tl::functions::contacts::GetBlocked { my_stories_from: false, offset, limit: 100 })?;
+        let list = page.blocked();
+        let total = match &page {
+            tl::enums::contacts::Blocked::Slice(page) => page.count,
+            tl::enums::contacts::Blocked::Blocked(_) => list.len() as i32,
+        };
+        account.learn(&page.users(), &page.chats());
+        if list.is_empty() {
+            break;
+        }
+        for one in &list {
+            let tl::enums::PeerBlocked::Blocked(one) = one;
+            let who = Who::of(&one.peer_id);
+            if let Who::User(id) = who {
+                account.set_user_blocked(id, true);
+            }
+            let _ = account.ctx.relation(&who.text(), Relation::Blocked);
+        }
+        offset += list.len() as i32;
+        if offset >= total || offset >= 500 {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// A channel or supergroup left while we were offline may be missing from the new dialog list.
