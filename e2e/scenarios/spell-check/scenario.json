@@ -1,0 +1,12 @@
+{
+  "id": "spell-check",
+  "title": "A misspelled word in a message is marked, and a code span is not",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same check is what a phone composer uses.",
+    "ios": "The phone proof build does not run the desktop window. The same check is what a phone composer uses."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

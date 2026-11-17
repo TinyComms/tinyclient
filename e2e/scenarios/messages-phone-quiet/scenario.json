@@ -1,0 +1,12 @@
+{
+  "id": "messages-phone-quiet",
+  "title": "Google Messages says when the phone is not answering, and a text waits for it",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "The phone proof build does not run this chatd check.",
+    "ios": "The phone proof build does not run this chatd check."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

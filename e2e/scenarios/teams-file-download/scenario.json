@@ -1,0 +1,12 @@
+{
+  "id": "teams-file-download",
+  "title": "A shared Teams file is fetched through Graph",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same share-address check is what this desktop run covers.",
+    "ios": "The phone proof build does not run desktop chatd. The same share-address check is what this desktop run covers."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

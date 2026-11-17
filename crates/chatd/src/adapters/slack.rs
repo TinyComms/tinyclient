@@ -18,6 +18,7 @@ mod send;
 mod text;
 mod tree;
 
+pub(crate) use info::prove_connect_names;
 use super::net::{address, browser, redact, Socket};
 use super::{keep_connected, serve_commands, About, Command, Context, Download, Failure, Refusal, Signed};
 use people::{Roster, User};
@@ -180,6 +181,7 @@ fn reason(fault: Fault) -> String {
             // The documented answer when the session's kind of token is not the one a method
             // takes. Slack's own search is one such: its web client may use an internal call.
             "not_allowed_token_type" => "Slack's own search isn't reachable with this session.",
+            "external_email" => return info::EXTERNAL_EMAIL.to_owned(),
             error if error.starts_with("restricted_action") => "This workspace does not let you post here.",
             error => return format!("Slack refused ({error})."),
         },
@@ -1607,7 +1609,15 @@ impl Slack {
 
     /// The card in a `users.info` answer, kept for the hour no other is asked for.
     fn keep_about(&self, person: &str, user: &Value) -> About {
-        let about = about_of(user);
+        let mut about = about_of(user);
+        // The organisation, only when that team's name is already known. Opening the card
+        // does not look the team up: this is the one place a message's sender is recorded.
+        let team = user["team_id"].as_str().unwrap_or("");
+        if !team.is_empty() && team != self.session.team_id {
+            if let Some(name) = self.ctx.note(&info::team_note(team)).filter(|name| !name.is_empty()) {
+                about.fields.push(("Organisation".to_owned(), name));
+            }
+        }
         self.state().abouts.insert(person.to_owned(), about.clone());
         about
     }

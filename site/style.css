@@ -976,7 +976,7 @@ caption {
 }
 
 .docs-nav { font-size: 14px; }
-.docs-nav-inner { position: sticky; top: 92px; }
+.docs-nav-inner { position: sticky; top: 92px; max-height: calc(100vh - 108px); overflow-y: auto; }
 .docs-nav h2 {
   font-size: 12px;
   font-weight: 600;
@@ -996,7 +996,7 @@ caption {
 
 @media (max-width: 860px) {
   .docs { grid-template-columns: minmax(0, 1fr); gap: 0; padding-top: 24px; }
-  .docs-nav-inner { position: static; }
+  .docs-nav-inner { position: static; max-height: none; overflow: visible; }
   .docs-nav ul { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
   .docs-nav a { border: 1px solid var(--line); }
   .docs-nav h2 { margin-left: 0; }
@@ -1121,6 +1121,7 @@ caption {
 /* ---------- Landing, short form (main session) ---------- */
 .center { text-align: center; }
 .actions.center { justify-content: center; }
+.ts-actions { margin-top: 36px; }
 .hero .pitch { font-size: clamp(22px, 3vw, 30px); line-height: 1.25; color: var(--text); max-width: none; letter-spacing: -0.01em; text-wrap: balance; }
 .hero .platforms a { color: var(--muted, var(--faint)); }
 .hero .platforms a:hover { color: var(--text); }
@@ -1319,6 +1320,7 @@ caption {
 .fl-pkt.n-teams { stroke: #7b83eb; }
 .fl-pkt.n-signal { stroke: #3a76f0; }
 .fl-pkt.n-messages { stroke: #1a73e8; }
+.fl-pkt.n-tiny { stroke: var(--accent); }
 .fl-pkt.fl-login { stroke: var(--soft); }
 
 .flow-cap { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px 22px; margin-top: 14px; font-size: 13px; color: var(--faint); }
@@ -1338,6 +1340,7 @@ caption {
   .fl-pkt.d3 { animation-delay: 2.9s; } .fl-pkt.b3 { animation-delay: .5s; }
   .fl-pkt.d4 { animation-delay: 3.8s; } .fl-pkt.b4 { animation-delay: 1.4s; }
   .fl-pkt.d5 { animation-delay: 4.6s; } .fl-pkt.b5 { animation-delay: 2.2s; }
+  .fl-pkt.d6 { animation-delay: 1.6s; } .fl-pkt.b6 { animation-delay: 4.0s; }
   .fl-pkt.fl-voice { animation-duration: 1.2s; animation-timing-function: linear; }
   .fl-pkt.fl-voice.back { animation-delay: .6s; }
   .fl-pkt.fl-login { animation-duration: 2.4s; }

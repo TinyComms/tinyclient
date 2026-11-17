@@ -41,6 +41,8 @@ pub struct Choices {
     pub confirm_links: bool,
     /// PS: tracking parameters (`utm_*`, `fbclid`, ...) are taken out of a link as it opens.
     pub strip_tracking: bool,
+    /// M6: misspellings in the message being typed are underlined.
+    pub spell: bool,
     /// The Settings section last shown. Written by its name, which stays when sections are
     /// added or moved; a name this build does not know opens Accounts.
     pub section: Section,
@@ -48,7 +50,7 @@ pub struct Choices {
 
 impl Default for Choices {
     fn default() -> Choices {
-        Choices { compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, updates: true, confirm_links: true, strip_tracking: false, section: Section::Accounts }
+        Choices { compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, updates: true, confirm_links: true, strip_tracking: false, spell: true, section: Section::Accounts }
     }
 }
 
@@ -64,6 +66,7 @@ static CHOICES: Mutex<Choices> = Mutex::new(Choices {
     updates: true,
     confirm_links: true,
     strip_tracking: false,
+    spell: true,
     section: Section::Accounts,
 });
 // The domains this device was told not to ask about (`link_ok` lines), read on each click.
@@ -268,6 +271,7 @@ pub fn parse(text: &str) -> Prefs {
             "updates" => prefs.choices.updates = fields.next() != Some("off"),
             "confirm_links" => prefs.choices.confirm_links = fields.next() != Some("off"),
             "strip_tracking" => prefs.choices.strip_tracking = fields.next() == Some("on"),
+            "spell" => prefs.choices.spell = fields.next() != Some("off"),
             "link_ok" => {
                 prefs.trusted_links.add(fields.next().unwrap_or(""));
             }
@@ -315,7 +319,7 @@ pub fn write(prefs: &Prefs) -> String {
     text.push_str(&format!("details\t{}\t{}\n", word(prefs.details_channels), word(prefs.details_directs)));
     text.push_str(&format!("text\t{}\n", prefs.text_step));
     let (choices, default) = (prefs.choices, Choices::default());
-    let lines: [(&str, bool, &str); 11] = [
+    let lines: [(&str, bool, &str); 12] = [
         ("density", choices.compact != default.compact, "compact"),
         ("previews", choices.previews != default.previews, "off"),
         ("send", choices.command_return != default.command_return, "cmd-return"),
@@ -326,6 +330,7 @@ pub fn write(prefs: &Prefs) -> String {
         ("updates", choices.updates != default.updates, "off"),
         ("confirm_links", choices.confirm_links != default.confirm_links, "off"),
         ("strip_tracking", choices.strip_tracking != default.strip_tracking, "on"),
+        ("spell", choices.spell != default.spell, "off"),
         ("settings_section", choices.section != default.section, ""),
     ];
     for (name, changed, value) in lines {
@@ -395,7 +400,7 @@ mod tests {
             details_channels: true,
             details_directs: false,
             text_step: 2,
-            choices: Choices { compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, updates: false, confirm_links: false, strip_tracking: true, section: Section::Audio },
+            choices: Choices { compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, updates: false, confirm_links: false, strip_tracking: true, spell: false, section: Section::Audio },
             kept: Vec::new(),
             autoplay: Autoplay::Hover,
             tiny_members: false,
@@ -439,7 +444,7 @@ mod tests {
     #[test]
     fn only_changed_choices_are_written_and_lines_from_a_newer_build_are_kept() {
         let text = write(&Prefs::default());
-        for name in ["density", "previews", "send", "open_at", "typing", "emoticons", "images", "settings_section", "confirm_links", "strip_tracking", "link_ok"] {
+        for name in ["density", "previews", "send", "open_at", "typing", "emoticons", "images", "settings_section", "confirm_links", "strip_tracking", "link_ok", "spell"] {
             assert!(!text.contains(name), "{name} is at its default and not written");
         }
         let newer = "sidebar\t300\ntheme\tlight\nbounce\tonce\n";

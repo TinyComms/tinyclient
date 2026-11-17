@@ -1,0 +1,12 @@
+{
+  "id": "schedule-send",
+  "title": "The send menu can hand a network a time, and only when that network schedules",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same schedule times are in the phone composer.",
+    "ios": "The phone proof build does not run the desktop window. The same schedule times are in the phone composer."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

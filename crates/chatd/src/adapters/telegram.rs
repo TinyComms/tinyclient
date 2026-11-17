@@ -57,7 +57,9 @@ mod files;
 mod filing;
 mod info;
 mod live;
+mod members;
 mod peers;
+mod premium;
 pub(crate) mod react;
 mod real;
 mod send;
@@ -65,11 +67,11 @@ pub mod signin;
 mod sync;
 mod wire;
 
-use super::{keep_connected, serve_commands, Command, Context, Failure, Members, Refusal, Signed};
+use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, Signed};
 use crate::session;
 use grammers_tl_types as tl;
 use peers::{Directory, Who};
-use protocol::{Link, MemberSection, Person, Presence, Relation};
+use protocol::{Link, Person, Presence, Relation};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -194,6 +196,10 @@ struct Live {
     picks: VecDeque<(String, catalog::Pick)>,
     /// The installed sticker packs, from the first page of the Stickers tab.
     sticker_sets: Option<Vec<(i64, i64, String)>>,
+    /// The installed custom-emoji packs, kept apart from stickers so one tab does not blank the other.
+    emoji_sets: Option<Vec<(i64, i64, String)>>,
+    /// `:alt:` labels the emoji tab offered, newest last, so a send can name the document.
+    emoji_labels: VecDeque<content::EmojiLabel>,
     /// Scheduled sends shown until Telegram sends them: the chat, the text, the placeholder.
     scheduled: VecDeque<(String, String, String)>,
     /// The next slice of cached unread channels to check after sign-on.
@@ -202,6 +208,10 @@ struct Live {
     recovered_through: VecDeque<(Who, i32)>,
     /// Telegram's reaction emoji, and whether each needs Premium, once asked (`react`).
     reactions: Option<Vec<(String, bool)>>,
+    /// File, caption and reaction limits from `help.getAppConfig`, or the documented defaults.
+    limits: premium::Limits,
+    /// One conversation's member list, so the next page does not ask Telegram again.
+    roster: Option<members::Held>,
 }
 
 /// Telegram's own send options, which Telegram carries out.
@@ -608,10 +618,12 @@ fn serve(account: &Arc<Account>, command: Command) {
                     account.learn(&found.users, &[]);
                 }
             }
+            // A channel on screen is searched too. The contact search above already stands.
+            members::search_open(account, &query);
             ctx.searched(&query);
         }
         Command::Members { conversation_id, offset, limit, reply } => {
-            let _ = reply.send(members(account, &conversation_id, offset, limit).map_err(refused));
+            let _ = reply.send(members::list(account, &conversation_id, offset, limit).map_err(refused));
         }
         Command::StartDirect { person_id, reply } => {
             // Nothing reaches the other person: the chat exists on Telegram once a message does.
@@ -759,6 +771,7 @@ fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str,
     let reply = reply_to.and_then(|id| id.parse::<i32>().ok());
     let random = random_id(client_id);
     remember_random(account, random, client_id);
+    let (plain, entities) = prepared(account, conversation, text);
     let request = tl::functions::messages::SendMessage {
         no_webpage: opts.no_webpage,
         silent: opts.silent,
@@ -770,10 +783,10 @@ fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str,
         allow_paid_floodskip: false,
         peer,
         reply_to: reply_header(reply, topic),
-        message: text.to_owned(),
+        message: plain.clone(),
         random_id: random,
         reply_markup: None,
-        entities: None,
+        entities,
         schedule_date: opts.schedule,
         schedule_repeat_period: None,
         send_as: None,
@@ -784,23 +797,30 @@ fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str,
         rich_message: None,
     };
     let answer = account.ask(&request)?;
-    live::answered_scheduled(account, conversation, text, opts, &answer)
-        .or_else(|| live::sent(account, conversation, who, text, reply, &answer))
+    live::answered_scheduled(account, conversation, &plain, opts, &answer)
+        .or_else(|| live::sent(account, conversation, who, &plain, reply, &answer))
         .ok_or_else(|| Fault::Net("Telegram accepted the message but did not name it".to_owned()))
 }
 
 fn edit(account: &Account, conversation: &str, message: &str, text: &str) -> Result<(), Fault> {
     let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
     let ((who, _), id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
+    let (plain, mut entities) = content::outgoing(text);
+    if entities.is_none() {
+        if let Ok(Some(stored)) = account.ctx.stored_message(conversation, message) {
+            entities = content::with_stored(&plain, &stored.spans);
+        }
+    }
+    let (plain, entities) = dress(account, conversation, plain, entities);
     let request = tl::functions::messages::EditMessage {
         no_webpage: false,
         invert_media: false,
         peer: account.input(who)?,
         id,
-        message: Some(text.to_owned()),
+        message: Some(plain),
         media: None,
         reply_markup: None,
-        entities: None,
+        entities,
         schedule_date: None,
         schedule_repeat_period: None,
         quick_reply_shortcut_id: None,
@@ -879,14 +899,15 @@ fn save_draft(account: &Account, conversation: &str, text: &str) {
     let Ok(peer) = account.input(who) else {
         return;
     };
+    let (plain, entities) = prepared(account, conversation, text);
     let request = tl::functions::messages::SaveDraft {
         no_webpage: false,
         invert_media: false,
         // In a forum the draft belongs to the topic it was typed in.
         reply_to: reply_header(None, topic),
         peer,
-        message: text.to_owned(),
-        entities: None,
+        message: plain,
+        entities,
         media: None,
         effect: None,
         suggested_post: None,
@@ -897,9 +918,12 @@ fn save_draft(account: &Account, conversation: &str, text: &str) {
     }
 }
 
-fn person(account: &Account, who: Who, relation: Relation) -> Person {
-    let dir = account.dir();
-    let row = peers::person_row(who, &dir.get(who).cloned().unwrap_or_default());
+fn person(account: &Account, who: Who, relation: Relation, rank: &str) -> Person {
+    let known = {
+        let dir = account.dir();
+        dir.get(who).cloned().unwrap_or_default()
+    };
+    let row = peers::shown_person(account.me, who, &known);
     Person {
         key: account.ctx.key(&row.id),
         presence: account.ctx.presence_of(&row.id),
@@ -908,65 +932,131 @@ fn person(account: &Account, who: Who, relation: Relation) -> Person {
         avatar: row.avatar.map(|id| protocol::MediaFile::new(id, protocol::MediaKind::Avatar)),
         bot: row.bot,
         relation,
-        status: String::new(),
+        status: row.status,
         link: row.link,
+        // The title Telegram gave them in this chat. Status stays the Premium badge.
+        title: rank.to_owned(),
         ..Person::new(account.ctx.key(&row.id), "")
     }
 }
 
-fn members(account: &Account, conversation: &str, offset: u32, limit: u32) -> Result<Members, Fault> {
-    let invalid = || Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None };
-    let (who, _) = Who::parse(conversation).ok_or_else(invalid)?;
-    let relation = |account: &Account, id: i64| match account.dir().get(Who::User(id)).is_some_and(|known| known.contact) {
-        true => Relation::Contact,
-        false => Relation::None,
-    };
-    let (total, ids): (u32, Vec<i64>) = match who {
-        Who::User(id) => (2, [account.me, id].into_iter().skip(offset as usize).take(limit as usize).collect()),
-        Who::Group(chat_id) => {
-            let tl::enums::messages::ChatFull::Full(full) = account.ask(&tl::functions::messages::GetFullChat { chat_id })?;
-            account.learn(&full.users, &full.chats);
-            let listed = match &full.full_chat {
-                tl::enums::ChatFull::Full(chat) => match &chat.participants {
-                    tl::enums::ChatParticipants::Participants(list) => list.participants.iter().map(|one| match one {
-                        tl::enums::ChatParticipant::Participant(one) => one.user_id,
-                        tl::enums::ChatParticipant::Creator(one) => one.user_id,
-                        tl::enums::ChatParticipant::Admin(one) => one.user_id,
-                    }).collect(),
-                    tl::enums::ChatParticipants::Forbidden(_) => Vec::new(),
-                },
-                tl::enums::ChatFull::ChannelFull(_) => Vec::new(),
-            };
-            let listed: Vec<i64> = listed;
-            (listed.len() as u32, listed.into_iter().skip(offset as usize).take(limit as usize).collect())
-        }
-        Who::Channel(_) => {
-            let request = tl::functions::channels::GetParticipants {
-                channel: account.input_channel(who)?,
-                filter: tl::enums::ChannelParticipantsFilter::ChannelParticipantsRecent,
-                offset: offset as i32,
-                limit: limit as i32,
-                hash: 0,
-            };
-            match account.ask(&request)? {
-                tl::enums::channels::ChannelParticipants::Participants(page) => {
-                    account.learn(&page.users, &page.chats);
-                    let ids = page.participants.iter().filter_map(|one| match one {
-                        tl::enums::ChannelParticipant::Participant(one) => Some(one.user_id),
-                        tl::enums::ChannelParticipant::ParticipantSelf(one) => Some(one.user_id),
-                        tl::enums::ChannelParticipant::Creator(one) => Some(one.user_id),
-                        tl::enums::ChannelParticipant::Admin(one) => Some(one.user_id),
-                        _ => None,
-                    });
-                    (page.count.max(0) as u32, ids.collect())
-                }
-                tl::enums::channels::ChannelParticipants::NotModified => (0, Vec::new()),
-            }
-        }
-    };
-    Ok(Members {
-        pending: false,
-        sections: vec![MemberSection { name: "Members".to_owned(), count: total }],
-        members: ids.into_iter().map(|id| person(account, Who::User(id), relation(account, id))).collect(),
-    })
+/// Composer text as Telegram should receive it: markers become entities, and a custom emoji
+/// the catalog offered (`:alt:`) becomes that emoji's fallback glyph.
+fn prepared(account: &Account, conversation: &str, text: &str) -> (String, Option<Vec<tl::enums::MessageEntity>>) {
+    let (plain, entities) = content::outgoing(text);
+    dress(account, conversation, plain, entities)
+}
+
+fn dress(
+    account: &Account,
+    conversation: &str,
+    plain: String,
+    entities: Option<Vec<tl::enums::MessageEntity>>,
+) -> (String, Option<Vec<tl::enums::MessageEntity>>) {
+    if !plain.contains(':') {
+        return (plain, entities);
+    }
+    let labels: Vec<content::EmojiLabel> = account.live().emoji_labels.iter().cloned().collect();
+    if labels.is_empty() {
+        return (plain, entities);
+    }
+    let allow = custom_allowed(account, conversation);
+    let (plain, entities) = content::apply_emoji(&plain, entities.unwrap_or_default(), &labels, allow);
+    (plain, (!entities.is_empty()).then_some(entities))
+}
+
+/// Premium may send a custom emoji in any chat. Anyone may send one in Saved Messages.
+/// Everywhere else only the fallback glyph goes out.
+fn custom_allowed(account: &Account, conversation: &str) -> bool {
+    if account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium) {
+        return true;
+    }
+    matches!(Who::parse(conversation), Some((Who::User(id), _)) if id == account.me)
+}
+
+/// The lab's telegram-markers driver. A build without this returns to the server below and stays up.
+pub fn prove_telegram_markers() -> Result<(), String> {
+    let text = "né 🇵🇹 🦀 code";
+    let entities = vec![
+        tl::types::MessageEntityBold { offset: 0, length: 2 }.into(),
+        tl::types::MessageEntityItalic { offset: 3, length: 4 }.into(),
+        tl::types::MessageEntityTextUrl { offset: 8, length: 2, url: "https://crab.example".into() }.into(),
+    ];
+    let once = content::spans(text, &entities);
+    let twice = content::spans(text, &content::entities_of(text, &once));
+    if twice != once {
+        return Err("styled ranges did not survive a trip through Telegram entities".into());
+    }
+    let (plain, styled) = content::from_markers("**hi** _there_");
+    if plain != "hi there" {
+        return Err(format!("markers were left in the text: {plain}"));
+    }
+    let bold = styled.iter().any(|span| matches!(span.style, protocol::Style::Bold) && span.start == 0 && span.end == 2);
+    let italic = styled.iter().any(|span| matches!(span.style, protocol::Style::Italic) && span.start == 3 && span.end == 8);
+    if !bold || !italic {
+        return Err("bold and italic did not land on the words".into());
+    }
+    let kept = content::with_stored(&plain, &styled).ok_or("an edit with no markers dropped the bold")?;
+    let still = content::spans(&plain, &kept);
+    if !still.iter().any(|span| matches!(span.style, protocol::Style::Bold) && span.start == 0 && span.end == 2) {
+        return Err("the bold run was not kept on edit".into());
+    }
+    Ok(())
+}
+
+/// The lab's telegram-custom-emoji driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_custom_emoji() -> Result<(), String> {
+    let labels = vec![content::EmojiLabel {
+        label: ":\u{2B50}:".to_owned(),
+        document_id: 6_402,
+        fallback: "\u{2B50}".to_owned(),
+        ambiguous: false,
+    }];
+    let (plain, entities) = content::outgoing("**go** :\u{2B50}:");
+    let (plain, entities) = content::apply_emoji(&plain, entities.unwrap_or_default(), &labels, true);
+    if plain != "go \u{2B50}" {
+        return Err(format!("the fallback did not replace the label: {plain}"));
+    }
+    let bold = entities.iter().any(|entity| matches!(entity, tl::enums::MessageEntity::Bold(bold) if bold.offset == 0 && bold.length == 2));
+    let emoji = entities.iter().any(|entity| {
+        matches!(entity, tl::enums::MessageEntity::CustomEmoji(emoji) if emoji.document_id == 6_402 && emoji.offset == 3 && emoji.length == 1)
+    });
+    if !bold || !emoji {
+        return Err("the custom emoji was not named on the send".into());
+    }
+    let (plain, entities) = content::apply_emoji("go :\u{2B50}:", Vec::new(), &labels, false);
+    if plain != "go \u{2B50}" {
+        return Err(format!("a chat without Premium did not keep the fallback: {plain}"));
+    }
+    if entities.iter().any(|entity| matches!(entity, tl::enums::MessageEntity::CustomEmoji(_))) {
+        return Err("a chat without Premium kept the custom emoji".into());
+    }
+    Ok(())
+}
+
+/// The lab's telegram-service-lines driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_service_lines() -> Result<(), String> {
+    content::prove_service_lines()
+}
+
+/// The lab's telegram-premium driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_premium() -> Result<(), String> {
+    premium::prove()
+}
+
+/// The lab's telegram-member-sections driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_member_sections() -> Result<(), String> {
+    members::prove()
+}
+
+/// The lab's telegram-dice driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_dice() -> Result<(), String> {
+    content::prove_dice_roll()?;
+    if send::dice_emoticon("\u{1F3B2}") != Some("\u{1F3B2}") {
+        return Err("a lone dice emoji is sent as a roll".into());
+    }
+    if send::dice_emoticon("\u{1F3B2} please").is_some() {
+        return Err("words around a dice emoji stay ordinary text".into());
+    }
+    Ok(())
 }

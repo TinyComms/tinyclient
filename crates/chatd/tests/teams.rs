@@ -47,6 +47,8 @@ const CHAT_DEE: &str = "19:00000000-0000-4000-8000-0000000000aa_00000000-0000-40
 /// The post in General the fixtures hang a reply chain off.
 const ROOT: &str = "1760000200200";
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\nnot really";
+/// What the fake returns for a shared spreadsheet, so a fetch can be told from a sign-in page.
+const SHEET: &[u8] = b"PK\x03\x04shared-file";
 
 /// One request the fake received.
 #[derive(Clone, Debug)]
@@ -300,6 +302,13 @@ impl Fake {
             }
             "/presence/v1/presence/getpresence/" if bearer("presence") => ok(self.fixture("presence").unwrap()),
             "/presence/v1/me/forceavailability/" if bearer("presence") => ok(json!({})),
+            // A shared file's bytes. The cache asks Graph's shares route; this stands in for it.
+            _ if call.method == "GET" && path.contains("/shares/u!") && path.ends_with("/driveItem/content") => Reply {
+                status: "200 OK",
+                headers: Vec::new(),
+                kind: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                body: SHEET.to_vec(),
+            },
             _ if path.starts_with("/graph/") && bearer("graph") => self.graph(call, &path["/graph".len()..]),
             _ if path.starts_with("/upload/") => self.upload(call),
             _ if path.starts_with("/ams/") || path.contains("/profilepicturev2") => Reply {
@@ -836,7 +845,7 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
     let ids: Vec<&str> = page.iter().map(|message| message.id.as_str()).collect();
     assert_eq!(
         ids,
-        ["1760000050050", "1760000100100", "1760000200200", "1760000250250", "1760000260260", "1760000300300"],
+        ["1760000050050", "1760000100100", "1760000200200", "1760000250250", "1760000260260", "1760000300300", "1760000310310"],
         "the deleted post and the replies are not in the channel's own page"
     );
     let by = |id: &str| page.iter().find(|message| message.id == id).unwrap();
@@ -887,6 +896,23 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
     let attached = &shared.attachments[0];
     assert_eq!((attached.name.as_str(), attached.file.kind, attached.file.bytes), ("Q4 plan.xlsx", MediaKind::File, 48_211));
     assert!(ranges(shared).contains(&("Q4 plan.xlsx", &Style::Link { url: "https://contoso.sharepoint.com/:x:/s/Platform/EaBcDeF".into() })));
+    // Asking for the file fetches it through Graph's shares route. The name stays a link.
+    let share = "https://contoso.sharepoint.com/:x:/s/Platform/EaBcDeF";
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(share.as_bytes());
+    let content = format!("/v1.0/shares/u!{encoded}/driveItem/content");
+    let file_id = attached.file.id.clone();
+    let fetched = world.until("the shared file to be fetched or refused", || {
+        let asked = Request::Fetch { retry: false, size: None, account: general.account(), ids: vec![file_id.clone()] };
+        match world.ask(asked) {
+            Response::Media { files } => files.into_iter().find(|file| file.id == file_id && (file.path.is_some() || file.failed.is_some())),
+            _ => None,
+        }
+    });
+    let Some(path) = fetched.path else {
+        panic!("{}", fetched.failed.unwrap_or_else(|| "the shared file was not fetched".to_owned()));
+    };
+    assert_eq!(std::fs::read(path).unwrap(), SHEET);
+    assert_eq!(world.fake.calls("GET", &content).len(), 1);
 
     // A card is named and linked into the official app, never blank.
     let card = by("1760000300300");
@@ -895,6 +921,14 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
         panic!("{:?}", card.kind);
     };
     assert_eq!(link, &format!("https://teams.microsoft.com/l/message/19%3Aplatform0general%40thread.tacv2/1760000300300?tenantId={HOME}"));
+
+    // A Loop component is named and linked to its file, not left as a blank card.
+    let looped = by("1760000310310");
+    assert_eq!(looped.text, "Loop component · Sprint checklist");
+    let MessageKind::Unsupported { link } = &looped.kind else {
+        panic!("{:?}", looped.kind);
+    };
+    assert_eq!(link, "https://contoso.sharepoint.com/:fl:/g/personal/ana/EaBcDeF");
 
     // The post's replies are a thread: counted on the post, read in a conversation of its own
     // that names its channel and its post.
@@ -1070,15 +1104,32 @@ fn sending_editing_reacting_deleting_and_reading_go_to_teams() {
     assert_eq!(world.ask(react("👍", false)), Response::Ok);
     let taken = world.until("the reaction to be taken back", || world.fake.calls("DELETE", &path("/messages/1760000500500/properties")).pop());
     assert_eq!(taken.json(), json!({"emotions": {"key": "like"}}));
-    // Teams takes the emoji it has a key for here; one it has none for is refused before
-    // Teams hears of it.
+    // A skin tone stays on the catalog's tone base (`yes`), not the plain `like` key.
+    assert_eq!(world.ask(react("👍🏽", true)), Response::Ok);
+    let toned = world.until("the toned reaction to reach Teams", || {
+        world.fake.calls("PUT", &path("/messages/1760000500500/properties")).into_iter().rev().find(|call| call.json()["emotions"]["key"].as_str() == Some("yes-tone3"))
+    });
+    assert!(toned.json()["emotions"]["value"].as_u64().is_some());
+    // Squid is in the catalog, so it goes out under that key.
+    assert_eq!(world.ask(react("🦑", true)), Response::Ok);
+    let squid = world.until("the squid reaction to reach Teams", || {
+        world.fake.calls("PUT", &path("/messages/1760000500500/properties")).into_iter().rev().find(|call| call.json()["emotions"]["key"].as_str() == Some("1f991_squid"))
+    });
+    assert_eq!(squid.json()["emotions"]["key"].as_str(), Some("1f991_squid"));
     let Response::Reactions { rules, .. } = world.ask(Request::Reactions { conversation: ana.clone() }) else {
         panic!("no rules");
     };
-    assert_eq!((rules.set, &rules.only[..6]), (protocol::ReactionSet::Only, &["👍", "❤️", "😆", "😮", "🙁", "😠"].map(String::from)[..]));
-    let unkeyed = world.ask(react("🦑", true));
-    assert_eq!(unkeyed, Response::Error { code: protocol::ErrorCode::Refused, detail: "That reaction isn't allowed here.".to_owned() });
-    assert_eq!(world.fake.calls("PUT", &path("/messages/1760000500500/properties")).len(), 1, "only the 👍 went");
+    assert_eq!(rules.set, protocol::ReactionSet::Any);
+    assert!(rules.tones);
+    assert!(rules.only.is_empty());
+    // One the catalog cannot name is refused, and Teams is not asked.
+    let before = world.fake.calls("PUT", &path("/messages/1760000500500/properties")).len();
+    let unkeyed = world.ask(react("\u{e000}", true));
+    assert_eq!(
+        unkeyed,
+        Response::Error { code: protocol::ErrorCode::Refused, detail: "Teams refused (400: tinyclient does not know Teams' name for that emoji yet).".to_owned() }
+    );
+    assert_eq!(world.fake.calls("PUT", &path("/messages/1760000500500/properties")).len(), before);
 
     // Mark read: the read marker, at that message.
     assert_eq!(world.ask(Request::MarkRead { conversation: ana.clone(), message_id: sent.id.clone() }), Response::Ok);

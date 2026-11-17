@@ -9,8 +9,8 @@
 
 use protocol::{
     read_frame, write_frame, AccountKey, Change, CodeVia, Conversation, ConversationKind, ErrorCode, Key, Link,
-    MediaKind, MentionKind, Message, MessageKind, Network, Page, Presence, Relation, Request, Response, SendState,
-    SignInInput, SignInProblem, SignInStep, Style, Watching, Shelf, Special, Mark, ReactionSet,
+    EmojiScope, MediaKind, MentionKind, Message, MessageKind, Network, Page, Presence, Relation, Request, Response,
+    SendState, SignInInput, SignInProblem, SignInStep, Style, Watching, Shelf, Special, Mark, ReactionSet,
 };
 use std::io::Write;
 use protocol::ChatStream;
@@ -52,6 +52,11 @@ impl World {
     /// chatd with the account already signed in.
     fn signed_in() -> World {
         World::start(Some(SESSION), "30")
+    }
+
+    /// The same account with Telegram Premium, which is what custom emoji may be sent as.
+    fn premium() -> World {
+        World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_PREMIUM", "1")])
     }
 
     /// Signed in to an account with this many more chats, each with a person of its own.
@@ -116,6 +121,7 @@ impl World {
             .env_remove("TINYCLIENT_SESSION_SLACK")
             .env_remove("TINYCLIENT_SESSION_TELEGRAM")
             .env_remove("TINYCLIENT_TELEGRAM_MANY")
+            .env_remove("TINYCLIENT_TELEGRAM_PREMIUM")
             .stderr(Stdio::from(log));
         for (name, value) in env {
             command.env(name, value);
@@ -1711,7 +1717,84 @@ fn sending_editing_deleting_and_reacting_wait_for_telegram() {
     let Response::Members { members, sections, .. } = world.ask(Request::Members { conversation: key("g8001"), offset: 0, limit: 50 }) else {
         panic!("no members");
     };
-    assert_eq!((sections[0].count, members.len(), members[1].name.as_str(), members[1].relation), (3, 3, "Odalys Brandt", Relation::Contact));
+    assert_eq!(
+        (sections.len(), sections[0].name.as_str(), sections[0].count, members.len(), members[0].name.as_str(), members[0].relation),
+        (1, "Members", 3, 3, "Odalys Brandt", Relation::Contact),
+    );
+}
+
+#[test]
+fn a_supergroup_lists_its_owner_admins_and_bots_and_a_search_filters() {
+    let world = World::signed_in();
+    world.connected();
+    let Response::Members { members, sections, .. } = world.ask(Request::Members { conversation: key("c9002"), offset: 0, limit: 50 }) else {
+        panic!("no members");
+    };
+    let names: Vec<&str> = sections.iter().map(|section| section.name.as_str()).collect();
+    assert_eq!(names, ["Owner", "Admins", "Bots"]);
+    assert_eq!(sections.iter().map(|section| section.count).collect::<Vec<_>>(), [1, 2, 1]);
+    assert_eq!(
+        members.iter().map(|person| (person.name.as_str(), person.title.as_str(), person.bot)).collect::<Vec<_>>(),
+        [("Mira Kessler", "", false), ("Odalys Brandt", "Quartermaster", false), ("Tobin Reyes", "Guide", false), ("Trail Bot", "", true)],
+    );
+    let calls = world.calls();
+    assert!(calls.iter().any(|call| call == "GetParticipants c9002 admins"), "{calls:#?}");
+    assert!(calls.iter().any(|call| call == "GetParticipants c9002 bots"), "{calls:#?}");
+
+    world.watch(Watching { conversation: Some(key("c9002")), ..Watching::default() });
+    world.ask(Request::People { network: Some(Network::Telegram), relation: None, query: Some("nia".into()), offset: 0, limit: 20 });
+    world.until("the member search", || world.calls().iter().any(|call| call == "GetParticipants c9002 search nia").then_some(()));
+    let found = world.until("the member the search named", || match world.ask(Request::People {
+        network: Some(Network::Telegram), relation: None, query: Some("nia".into()), offset: 0, limit: 20,
+    }) {
+        Response::People { people, .. } => people.into_iter().find(|person| person.key.id == "u7012"),
+        _ => None,
+    });
+    assert_eq!(found.name, "Nia Pell");
+}
+
+#[test]
+fn a_group_that_hides_its_members_says_so() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_HIDDEN", "1")]);
+    world.connected();
+    assert_eq!(
+        world.ask(Request::Members { conversation: key("c9002"), offset: 0, limit: 50 }),
+        Response::Error { code: ErrorCode::Refused, detail: "This group hides its member list.".into() },
+    );
+}
+
+#[test]
+fn a_free_account_is_told_when_a_send_needs_premium_and_reads_its_limits() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_CAPTION", "2048"), ("TINYCLIENT_TELEGRAM_PEER_PREMIUM", "7002")]);
+    world.connected();
+    let (accounts, _) = world.status();
+    assert_eq!(accounts[0].name, "Mira Kessler");
+    assert_eq!(accounts[0].can.caption_limit, 2_048);
+    assert_eq!(accounts[0].can.max_file_bytes, 2_000 * 1024 * 1024);
+
+    world.send("u7002", "5002", "premium file", None);
+    let failed = world.until("the premium refusal", || {
+        world.messages("u7002").into_iter().find(|message| matches!(message.state, SendState::Failed { .. }))
+    });
+    assert_eq!(failed.state, SendState::Failed { reason: "This needs Telegram Premium.".into() });
+
+    let people = world.until("the contacts", || {
+        let asked = Request::People { network: Some(Network::Telegram), relation: Some(Relation::Contact), query: None, offset: 0, limit: 50 };
+        match world.ask(asked) {
+            Response::People { people, .. } if !people.is_empty() => Some(people),
+            _ => None,
+        }
+    });
+    assert_eq!((people[0].name.as_str(), people[0].status.as_str()), ("Odalys Brandt", "Telegram Premium"));
+
+    let me = world.until("our row", || match world.ask(Request::People {
+        network: Some(Network::Telegram), relation: None, query: Some("Mira".into()), offset: 0, limit: 20,
+    }) {
+        Response::People { people, .. } => people.into_iter().find(|person| person.key.id == "u7001"),
+        _ => None,
+    });
+    assert_eq!(me.link, "tg://premium_offer");
+    assert!(me.status.is_empty(), "our own status text stays ours to set");
 }
 
 #[test]
@@ -2236,4 +2319,112 @@ fn conversation_search_keeps_the_telegram_forum_topic_scope() {
     assert_eq!(hits[0].conversation, key("c9002_31"));
     assert_eq!(hits[0].message_id, "41");
     assert_eq!(world.called("SearchText c9002 wrench topic=Some(31)"), 1);
+}
+
+#[test]
+fn markers_are_sent_as_entities_and_an_edit_keeps_the_bold() {
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+    world.send("u7002", "5321", "**hi** _there_", None);
+    let sent = world.until("the marked message", || {
+        world.messages("u7002").into_iter().find(|message| message.text == "hi there" && message.state == SendState::Sent)
+    });
+    assert_eq!(ranges(&sent), vec![("hi", &Style::Bold), ("there", &Style::Italic)]);
+    assert!(
+        world.calls().iter().any(|call| call.contains("SendMessage u7002 hi there") && call.contains("bold:0+2") && call.contains("italic:3+5")),
+        "{:?}",
+        world.calls()
+    );
+    assert_eq!(
+        world.ask(Request::Edit { conversation: key("u7002"), message_id: sent.id.clone(), text: "hi there".into() }),
+        Response::Ok
+    );
+    let edited = world.until("the edit to keep the bold", || world.message("u7002", &sent.id).filter(|message| message.edited));
+    assert!(ranges(&edited).iter().any(|(text, style)| *text == "hi" && **style == Style::Bold));
+    assert!(
+        world.calls().iter().any(|call| call.contains(&format!("EditMessage u7002 {}", sent.id)) && call.contains("bold:0+2")),
+        "{:?}",
+        world.calls()
+    );
+}
+
+#[test]
+fn a_premium_account_lists_its_emoji_packs_and_sending_one_names_the_document() {
+    let world = World::premium();
+    world.connected();
+    let (accounts, _) = world.status();
+    assert_eq!(accounts[0].name, "Mira Kessler · Premium");
+    assert_eq!(accounts[0].can.max_file_bytes, 4_000 * 1024 * 1024);
+    assert_eq!(accounts[0].can.custom_emoji, EmojiScope::All);
+    let Response::Catalog { items, .. } = world.ask(Request::Catalog {
+        account: account(),
+        kind: protocol::CatalogKind::Emoji,
+        space: None,
+        query: String::new(),
+        cursor: None,
+    }) else {
+        panic!("no catalog");
+    };
+    let faces = items.iter().find(|item| item.pack == "Faces").expect("the installed pack");
+    assert_eq!((faces.id.as_str(), faces.name.as_str()), ("e6402", "\u{2B50}"));
+    assert!(items.iter().any(|item| item.id == "e6403" && item.pack == "Recent"), "{items:?}");
+    world.send("u7002", "4901", "go :\u{2B50}:", None);
+    // A later history read keeps the text and the span. It does not keep the pending id.
+    let sent = world.until("the custom emoji to be sent", || {
+        world.messages("u7002").into_iter().find(|message| message.text == "go \u{2B50}" && message.state == SendState::Sent)
+    });
+    assert_eq!(sent.text, "go \u{2B50}");
+    assert!(
+        ranges(&sent).iter().any(|(text, style)| *text == "\u{2B50}" && matches!(style, Style::Emoji { file } if file.id == "e6402")),
+        "{:?}",
+        ranges(&sent)
+    );
+    assert!(
+        world.calls().iter().any(|call| call.contains("SendMessage u7002 go \u{2B50}") && call.contains("emoji:3+1:6402")),
+        "{:#?}",
+        world.calls()
+    );
+
+    // Without Premium the same pack is listed, and it is sent only in Saved Messages.
+    let plain = World::signed_in();
+    plain.connected();
+    let Response::Catalog { items, .. } = plain.ask(Request::Catalog {
+        account: account(),
+        kind: protocol::CatalogKind::Emoji,
+        space: None,
+        query: String::new(),
+        cursor: None,
+    }) else {
+        panic!("no catalog");
+    };
+    assert!(items.iter().any(|item| item.id == "e6402"), "{items:?}");
+    plain.send("u7002", "4902", "go :\u{2B50}:", None);
+    let fallback = plain.until("the fallback in another chat", || {
+        plain.messages("u7002").into_iter().find(|message| message.text == "go \u{2B50}" && message.state == SendState::Sent)
+    });
+    assert!(
+        !ranges(&fallback).iter().any(|(_, style)| matches!(style, Style::Emoji { .. })),
+        "{:?}",
+        ranges(&fallback)
+    );
+    assert!(
+        plain.calls().iter().any(|call| call.contains("SendMessage u7002 go \u{2B50}") && !call.contains("emoji:")),
+        "{:#?}",
+        plain.calls()
+    );
+    plain.send("u7001", "4903", "go :\u{2B50}:", None);
+    let saved = plain.until("the emoji in Saved Messages", || {
+        plain.messages("u7001").into_iter().find(|message| message.text == "go \u{2B50}" && message.state == SendState::Sent)
+    });
+    assert!(
+        ranges(&saved).iter().any(|(text, style)| *text == "\u{2B50}" && matches!(style, Style::Emoji { file } if file.id == "e6402")),
+        "{:?}",
+        ranges(&saved)
+    );
+    assert!(
+        plain.calls().iter().any(|call| call.contains("SendMessage u7001 go \u{2B50}") && call.contains("emoji:3+1:6402")),
+        "{:#?}",
+        plain.calls()
+    );
 }

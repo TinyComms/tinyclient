@@ -9,34 +9,24 @@ use protocol::{
 };
 use serde_json::{json, Value};
 
-/// Reaction keys and the emoji they are, from Teams' own emoji catalog: the six every client
-/// offers first, then the ones people reach for. A key shaped `1f389_partypopper` says its own
-/// emoji and needs no entry to be read, only to be sent.
-const REACTIONS: &[(&str, &str)] = &[
-    ("like", "👍"), ("heart", "❤️"), ("laugh", "😆"), ("surprised", "😮"), ("sad", "🙁"), ("angry", "😠"),
-    ("cry", "😢"), ("cwl", "😂"), ("1f389_partypopper", "🎉"), ("praying", "🙏"), ("1f440_eyes", "👀"),
-    ("fire", "🔥"), ("2705_whiteheavycheckmark", "✅"), ("sarcastic", "👏"), ("smileeyes", "😊"),
-    ("wink", "😉"), ("hearteyes", "😍"), ("think", "🤔"), ("1f4af_hundredpointssymbol", "💯"),
-    ("launch", "🚀"), ("no", "👎"), ("rofl", "🤣"), ("cool", "😎"), ("loudlycrying", "😭"),
-    ("party", "🥳"), ("1f44b_wavinghand", "👋"), ("muscle", "💪"), ("2728_sparkles", "✨"),
-    ("star", "⭐"), ("274c_crossmark", "❌"), ("handshake", "🤝"), ("ok", "👌"), ("shrug", "🤷"),
-    ("salute", "🫡"), ("skull", "💀"), ("coffee", "☕"), ("yes", "👍"),
-];
-
-/// What reactions a Teams conversation takes: the emoji Teams has a key for here, and nothing
-/// custom. Teams names a reaction by a key of its catalog (`like`, `1f389_partypopper`), and
-/// one outside the table has no key chatd can spell; a reaction already on a message brought
-/// its own key and can be added to. Teams lets a person give several; no limit on them or on
-/// different emoji is documented, so none is set.
+/// What reactions a Teams conversation takes. The catalog in `emoji` names every
+/// emoji Teams has a key for, so this is not a short list. A skin tone is sent as
+/// `key-toneN` and stays. A reaction already on a message brought its own key and
+/// can be added to even when the catalog has no name for it. Teams lets a person
+/// give several; no limit on them or on different emoji is documented, so none is set.
 pub(crate) fn reaction_rules() -> protocol::ReactionRules {
-    let mut only: Vec<String> = Vec::with_capacity(REACTIONS.len());
-    for (_, emoji) in REACTIONS {
-        if !only.iter().any(|held| held == emoji) {
-            only.push((*emoji).to_owned());
-        }
+    protocol::ReactionRules { set: protocol::ReactionSet::Any, tones: true, ..protocol::ReactionRules::default() }
+}
+
+/// The lab's teams-reactions driver. Every catalog emoji maps to a key and back,
+/// and a skin tone is `key-toneN`.
+pub(crate) fn prove_reactions() -> Result<(), String> {
+    super::emoji::prove_catalog()?;
+    let rules = reaction_rules();
+    if rules.set != protocol::ReactionSet::Any || !rules.tones || !rules.only.is_empty() {
+        return Err("Teams reactions are still a short list, or a skin tone would be dropped".to_owned());
     }
-    // Plain only: chatd sends a toned one as its plain key, so the tone would not stay.
-    protocol::ReactionRules { set: protocol::ReactionSet::Only, only, ..protocol::ReactionRules::default() }
+    Ok(())
 }
 
 /// An emoji without the marks that do not change which one it is.
@@ -46,26 +36,12 @@ fn bare_emoji(emoji: &str) -> String {
 
 /// The emoji a reaction key is. A key Teams added since reads as `:key:`.
 fn emoji_of(key: &str) -> String {
-    let (key, tone) = key.split_once("-tone").map_or((key, None), |(key, tone)| (key, tone.parse::<u32>().ok()));
-    let known = REACTIONS.iter().find(|(known, _)| *known == key).map(|(_, emoji)| (*emoji).to_owned());
-    let spelled = || {
-        let points = key.split_once('_')?.0;
-        let read: Option<String> = points.split('-').map(|hex| u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)).collect();
-        read.filter(|read| !read.is_empty() && points.len() >= 4)
-    };
-    let Some(mut emoji) = known.or_else(spelled) else {
-        return format!(":{key}:");
-    };
-    if let Some(tone) = tone.filter(|tone| (1..=5).contains(tone)).and_then(|tone| char::from_u32(0x1f3fa + tone)) {
-        emoji.push(tone);
-    }
-    emoji
+    super::emoji::emoji_of(key)
 }
 
-/// The key Teams knows an emoji by, for the ones in the table.
-fn key_of(emoji: &str) -> Option<&'static str> {
-    let wanted = bare_emoji(emoji);
-    REACTIONS.iter().find(|(_, known)| bare_emoji(known) == wanted).map(|(key, _)| *key)
+/// The key Teams knows an emoji by, including a skin tone's `-toneN`.
+fn key_of(emoji: &str) -> Option<String> {
+    super::emoji::reaction_key(emoji)
 }
 
 /// The person id at the end of `https://…/v1/users/ME/contacts/8:orgid:…`, or the id itself.
@@ -118,6 +94,95 @@ fn inside<'a>(xml: &'a str, name: &str) -> Vec<&'a str> {
     found
 }
 
+/// Microsoft Graph names a Loop component `application/vnd.microsoft.card.fluidEmbedCard`.
+/// Its file address is `componentUrl` inside `content`. The chat service keeps that card
+/// in `properties.cards`, the same place as an adaptive card.
+const FLUID_CARD: &str = "application/vnd.microsoft.card.fluidEmbedCard";
+
+/// A Loop component read out of a card list: the row's title, and the file to open.
+struct LoopCard {
+    title: String,
+    url: String,
+}
+
+/// The first Loop component in a card list. An adaptive card is not one.
+fn loop_card(cards: &[Value]) -> Option<LoopCard> {
+    cards.iter().find_map(|card| {
+        let kind = card.get("contentType").and_then(Value::as_str).unwrap_or("");
+        let app = card.get("teamsAppId").and_then(Value::as_str).unwrap_or("");
+        if kind != FLUID_CARD && app != "FluidEmbedCard" {
+            return None;
+        }
+        let content = match card.get("content") {
+            Some(Value::String(text)) => serde_json::from_str::<Value>(text).unwrap_or(Value::Null),
+            Some(other) => other.clone(),
+            None => Value::Null,
+        };
+        let url = content
+            .get("componentUrl")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|url| url.starts_with("https://"))
+            .unwrap_or("")
+            .to_owned();
+        let title = card.get("name").and_then(Value::as_str).map(str::trim).filter(|name| !name.is_empty()).unwrap_or("").to_owned();
+        Some(LoopCard { title, url })
+    })
+}
+
+/// `Loop component` or `Loop component · <title>` when the card names itself.
+fn loop_label(title: &str) -> String {
+    let title = title.trim();
+    if title.is_empty() {
+        "Loop component".to_owned()
+    } else {
+        format!("Loop component · {}", title.chars().take(200).collect::<String>())
+    }
+}
+
+/// The lab's teams-loop-component driver. A fluid embed card is labelled and linked to its
+/// file. An adaptive card stays an ordinary card. A file address that is not https is dropped.
+pub(crate) fn prove_loop_component() -> Result<(), String> {
+    let url = "https://contoso.sharepoint.com/:fl:/g/personal/ana/EaBcDeF";
+    let named = json!([{
+        "contentType": FLUID_CARD,
+        "teamsAppId": "FluidEmbedCard",
+        "name": "Sprint checklist",
+        "content": json!({"componentUrl": url, "sourceType": "Compose"}).to_string(),
+    }]);
+    let found = loop_card(named.as_array().unwrap()).ok_or_else(|| "a Loop component is still read as an ordinary card".to_owned())?;
+    if found.url != url {
+        return Err(format!("a Loop component does not link to its file: {}", found.url));
+    }
+    if loop_label(&found.title) != "Loop component · Sprint checklist" {
+        return Err(format!("a Loop component reads as {}", loop_label(&found.title)));
+    }
+    let bare = json!([{
+        "contentType": FLUID_CARD,
+        "content": json!({"componentUrl": "https://contoso.sharepoint.com/personal/ana/standup.loop", "sourceType": "Compose"}).to_string(),
+    }]);
+    let bare = loop_card(bare.as_array().unwrap()).ok_or_else(|| "a Loop component without a name was dropped".to_owned())?;
+    if loop_label(&bare.title) != "Loop component" || !bare.url.ends_with(".loop") {
+        return Err("a Loop component without a name was not labelled".to_owned());
+    }
+    let adaptive = json!([{
+        "contentType": "application/vnd.microsoft.card.adaptive",
+        "content": "{\"type\":\"AdaptiveCard\",\"body\":[{\"type\":\"TextBlock\",\"text\":\"Build\"}]}",
+    }]);
+    if loop_card(adaptive.as_array().unwrap()).is_some() {
+        return Err("an adaptive card was labelled as a Loop component".to_owned());
+    }
+    let plain = json!([{
+        "contentType": FLUID_CARD,
+        "content": "{\"componentUrl\": \"http://contoso.sharepoint.com/x.loop\", \"sourceType\": \"Compose\"}",
+    }]);
+    let plain = loop_card(plain.as_array().unwrap()).ok_or_else(|| "a Loop component with a non-https file was dropped".to_owned())?;
+    if !plain.url.is_empty() {
+        return Err("a Loop component kept a file address that is not https".to_owned());
+    }
+    Ok(())
+}
+
 /// The first title or text a card carries, looked for a few levels down.
 fn card_title(card: &Value, depth: u8) -> Option<String> {
     if depth == 0 {
@@ -159,6 +224,16 @@ fn call_line(content: &str) -> String {
         }
     } else {
         "A call started".to_owned()
+    }
+}
+
+/// How a shared file is shown. A picture or a video is the row; anything else is a document.
+pub(super) fn shared_kind(name: &str) -> MediaKind {
+    let ext = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => MediaKind::Image,
+        "mp4" | "mov" | "webm" => MediaKind::Video,
+        _ => MediaKind::File,
     }
 }
 
@@ -403,21 +478,28 @@ impl Teams {
             let named = [&shared["fileName"], &shared["title"]].into_iter().filter_map(Value::as_str).find(|name| !name.is_empty()).unwrap_or("File");
             let sizes = [&shared["fileSize"], &shared["size"], &info["fileSize"]];
             let key = Some(id_of(&shared["id"])).filter(|key| !key.is_empty()).unwrap_or_else(|| id_of(&shared["itemid"]));
+            let kind = shared_kind(named);
             let file = MediaFile {
                 bytes: sizes.into_iter().find_map(Value::as_u64).unwrap_or(0),
-                ..MediaFile::new(format!("file:{id}:{}", escaped(&key)), MediaKind::File)
+                ..MediaFile::new(format!("file:{id}:{}", escaped(&key)), kind)
             };
-            media.push((file.clone(), url.to_owned()));
-            message.attachments.push(Attachment::new(named, file));
-            // CONTRACT: an `Attachment` has nowhere to say "open this in the browser", and a
-            // SharePoint file answers only to a token for SharePoint, which the media cache is
-            // not given. So the file is listed, and its name is also a link that opens it.
-            if !parsed.text.is_empty() {
-                parsed.text.push('\n');
+            // The cache fetches Graph's content address. The sharing address stays the link.
+            media.push((file.clone(), super::graph_content(&self.graph, url)));
+            let shown = matches!(kind, MediaKind::Image | MediaKind::Video);
+            message.attachments.push(Attachment {
+                thumb: (kind == MediaKind::Image).then(|| file.clone()),
+                ..Attachment::new(named, file)
+            });
+            // A picture or a video is the row. A document keeps its name as a link, so it can
+            // still open in the browser.
+            if !shown {
+                if !parsed.text.is_empty() {
+                    parsed.text.push('\n');
+                }
+                let start = parsed.text.len() as u32;
+                parsed.text.push_str(named);
+                parsed.spans.push(Span { start, end: parsed.text.len() as u32, style: Style::Link { url: url.to_owned() } });
             }
-            let start = parsed.text.len() as u32;
-            parsed.text.push_str(named);
-            parsed.spans.push(Span { start, end: parsed.text.len() as u32, style: Style::Link { url: url.to_owned() } });
         }
         if let Err(err) = self.ctx.media(&media) {
             tracing::warn!("chatd: Teams: {err}");
@@ -447,6 +529,18 @@ impl Teams {
             message.kind = MessageKind::Unsupported {
                 link: format!("{TEAMS}/l/meetup-join/{}/0", escaped(conversation)),
             };
+        } else if let Some(component) = loop_card(&cards) {
+            // A Loop component names itself and opens its file. Live editing is not drawn.
+            let label = loop_label(&component.title);
+            if message.text.is_empty() {
+                message.text = label;
+                message.spans.clear();
+            } else {
+                message.text.push('\n');
+                message.text.push_str(&label);
+            }
+            let link = if component.url.is_empty() { self.message_link(conversation, &id) } else { component.url };
+            message.kind = MessageKind::Unsupported { link };
         } else if parsed.card || !cards.is_empty() || kind == "RichText/Media_Card" {
             let title = cards.iter().find_map(|card| card_title(card, 6));
             if message.text.is_empty() {
@@ -864,7 +958,7 @@ impl Teams {
 
     pub(super) fn react(&self, conversation: &str, id: &str, emoji: &str, on: bool) -> Result<(), Fault> {
         let learned = || self.ctx.note(&format!("r:{}", bare_emoji(emoji)));
-        let Some(key) = key_of(emoji).map(str::to_owned).or_else(learned) else {
+        let Some(key) = key_of(emoji).or_else(learned) else {
             return Err(Fault::Refused {
                 status: 400,
                 message: "tinyclient does not know Teams' name for that emoji yet".to_owned(),
@@ -919,9 +1013,32 @@ mod tests {
         assert_eq!(emoji_of("1f389_partypopper"), "🎉");
         assert_eq!(emoji_of("1f9d1-200d-1f4bb_technologist"), "🧑\u{200d}💻");
         assert_eq!(emoji_of("like-tone3"), "👍🏽");
-        assert_eq!(emoji_of("oreoyum"), ":oreoyum:");
-        assert_eq!((key_of("👍"), key_of("👍🏽"), key_of("❤"), key_of("🎉")), (Some("like"), Some("like"), Some("heart"), Some("1f389_partypopper")));
-        assert_eq!(key_of("🦑"), None);
+        assert_eq!(emoji_of("oreoyum"), "(oreoyum)");
+        assert_eq!(key_of("👍").as_deref(), Some("like"));
+        assert_eq!(key_of("👍🏽").as_deref(), Some("yes-tone3"));
+        assert_eq!(key_of("❤").as_deref(), Some("cactuslove"));
+        assert_eq!(key_of("❤️").as_deref(), Some("heart"));
+        assert_eq!(key_of("🎉").as_deref(), Some("1f389_partypopper"));
+        assert_eq!(key_of("🦑").as_deref(), Some("1f991_squid"));
+    }
+
+    #[test]
+    fn a_catalog_emoji_and_a_skin_tone_use_teams_keys() {
+        prove_reactions().unwrap();
+    }
+
+    #[test]
+    fn a_fluid_embed_card_is_a_loop_component() {
+        prove_loop_component().unwrap();
+    }
+
+    #[test]
+    fn a_shared_picture_is_shown_and_a_document_stays_a_file() {
+        assert_eq!(shared_kind("board.png"), MediaKind::Image);
+        assert_eq!(shared_kind("board.JPEG"), MediaKind::Image);
+        assert_eq!(shared_kind("walk.mp4"), MediaKind::Video);
+        assert_eq!(shared_kind("Q4 plan.xlsx"), MediaKind::File);
+        assert_eq!(shared_kind("notes"), MediaKind::File);
     }
 
     #[test]

@@ -307,24 +307,26 @@ pub(super) fn remove_chat(account: &Account, who: Who) {
     }
 }
 
-/// What this account may send, from what Telegram says of it: Premium raises the file size and
-/// the caption, and allows custom emoji.
-fn capabilities(premium: bool) -> Capabilities {
+/// What this account may send, from what Telegram says of it. Premium raises the file size
+/// and the caption. Custom emoji are listed for every account; a send names the document
+/// only with Premium, or in Saved Messages (`prepared`). The numbers are `help.getAppConfig`
+/// when it answered, otherwise the documented defaults.
+fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities {
     Capabilities {
-        // 2 GB, 4 GB with Premium: 4,000 parts of 512 KB, 8,000 with Premium.
-        max_file_bytes: if premium { 4_000 * 1024 * 1024 } else { 2_000 * 1024 * 1024 },
+        max_file_bytes: limits.file(premium),
         max_files: 10,
-        caption_limit: if premium { 4_096 } else { 1_024 },
+        caption_limit: limits.caption(premium),
         spoiler: true,
         as_file: true,
         gifs: true,
         stickers: true,
         search: true,
-        custom_emoji: if premium { EmojiScope::All } else { EmojiScope::None },
+        custom_emoji: EmojiScope::All,
         silent: true,
         schedule: true,
         suppress_embeds: true,
         reply_ping: false,
+        text_limit: 0,
         // Telegram lets a message be edited for 48 hours (unverified for every chat kind).
         edit_window: 48 * 3_600,
         file_scan: false,
@@ -340,12 +342,16 @@ pub(super) fn sign_on(account: &Arc<Account>) -> Result<(), Fault> {
     account.ask(&tl::functions::updates::GetState {})?;
     let me = account.ask(&tl::functions::users::GetUsers { id: vec![tl::enums::InputUser::UserSelf] })?;
     account.learn(&me, &[]);
+    let limits = super::premium::read(account);
+    account.live().limits = limits.clone();
     let (name, premium) = {
         let dir = account.dir();
         (dir.name(Who::User(account.me)), dir.get(Who::User(account.me)).is_some_and(|known| known.premium))
     };
-    let _ = account.ctx.describe(&name, &Who::User(account.me).text());
-    account.ctx.capabilities(capabilities(premium));
+    // Settings shows the account name. The plan is part of it when this account is Premium.
+    let shown = if premium { format!("{name} · Premium") } else { name };
+    let _ = account.ctx.describe(&shown, &Who::User(account.me).text());
+    account.ctx.capabilities(capabilities(premium, &limits));
     let kinds = [
         tl::enums::InputNotifyPeer::InputNotifyUsers,
         tl::enums::InputNotifyPeer::InputNotifyChats,
@@ -475,7 +481,8 @@ fn contacts(account: &Account) -> Result<(), Fault> {
             continue;
         };
         let id = Who::User(user.id).text();
-        account.ctx.presence(&id, presence(user.status.as_ref()), "", true);
+        let badge = super::premium::badge(user.premium, user.id == account.me);
+        account.ctx.presence(&id, presence(user.status.as_ref()), badge, true);
         owned.push((id, Relation::Contact));
     }
     let _ = account.ctx.relations(&owned);
@@ -765,10 +772,10 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     // The cloud draft rides the dialog: what the phone left on this chat shows on its row as
     // "Draft:", and a draft the phone dropped is dropped here too. An empty one clears.
     let draft_text = match &dialog.draft {
-        Some(tl::enums::DraftMessage::Message(draft)) => draft.message.as_str(),
-        _ => "",
+        Some(tl::enums::DraftMessage::Message(draft)) => content::draft_text(&draft.message, draft.entities.as_deref()),
+        _ => String::new(),
     };
-    let _ = account.ctx.draft(&id, draft_text);
+    let _ = account.ctx.draft(&id, &draft_text);
     // ✓✓: the other side read my messages up to here. Not for my own notes or a broadcast.
     if dialog.read_outbox_max_id > 0 && who != Who::User(account.me) && !known.broadcast {
         let _ = account.ctx.seen(&id, &dialog.read_outbox_max_id.to_string());
@@ -1136,6 +1143,8 @@ pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped,
             mapped.message.reply_to = Some(quote(account, conversation, page, reply));
         }
     }
+    // A pin names the message it points at. The words are filled once that message is known.
+    content::quote_pin(&mut mapped.message);
     account.place(mapped.peer, mapped.id, conversation);
     comment_thread(account, conversation, mapped);
 }

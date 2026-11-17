@@ -321,8 +321,9 @@ pub(super) fn apply(account: &Account, update: &Update) {
         }
         Update::UserStatus(status) => {
             let who = Who::User(status.user_id);
-            let owned = account.dir().get(who).is_some_and(|known| known.contact);
-            account.ctx.presence(&who.text(), presence(Some(&status.status)), "", owned || status.user_id == account.me);
+            let (owned, premium) = account.dir().get(who).map(|known| (known.contact, known.premium)).unwrap_or((false, false));
+            let badge = super::premium::badge(premium, status.user_id == account.me);
+            account.ctx.presence(&who.text(), presence(Some(&status.status)), badge, owned || status.user_id == account.me);
         }
         Update::ReadHistoryInbox(seen) => {
             let conversation = place(account, Who::of(&seen.peer), seen.top_msg_id);
@@ -377,10 +378,10 @@ pub(super) fn apply(account: &Account, update: &Update) {
                 sync::echo_thread(account, who, drafted.top_msg_id).unwrap_or_else(|| who.text())
             };
             let text = match &drafted.draft {
-                tl::enums::DraftMessage::Message(draft) => draft.message.as_str(),
-                _ => "",
+                tl::enums::DraftMessage::Message(draft) => content::draft_text(&draft.message, draft.entities.as_deref()),
+                _ => String::new(),
             };
-            let _ = account.ctx.draft(&id, text);
+            let _ = account.ctx.draft(&id, &text);
         }
         Update::NotifySettings(settings) => match &settings.peer {
             tl::enums::NotifyPeer::Peer(peer) => {

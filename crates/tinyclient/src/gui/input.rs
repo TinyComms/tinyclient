@@ -14,7 +14,8 @@ use gpui::{
     CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
     FocusHandle, Focusable, Font, GlobalElementId, Hsla, KeyBinding, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollWheelEvent,
-    CaretPosition, SharedString, ShapedText, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
+    CaretPosition, FontStyle, FontWeight, SharedString, ShapedText, StrikethroughStyle, Style, TextAlign, TextRun, UTF16Selection,
+    UnderlineStyle, Window,
 };
 use std::ops::Range;
 use std::rc::Rc;
@@ -77,6 +78,13 @@ actions!(
         SubmitAlt,
         PageUp,
         PageDown,
+        FormatBold,
+        FormatItalic,
+        FormatUnderline,
+        FormatStrike,
+        FormatCode,
+        FormatQuote,
+        FormatSpoiler,
     ]
 );
 
@@ -399,7 +407,22 @@ pub struct TextInput {
     in_grid: bool,
     /// Ranges drawn as mentions. The holder keeps them in step with the text.
     highlights: Vec<Range<usize>>,
-    edit_menu: Option<(Point<Pixels>, bool, bool)>,
+    /// Misspellings in a composer field. Empty unless [`TextInput::set_checking`] is on.
+    misses: Vec<super::spell::Miss>,
+    /// Bumped on each edit so a check that finished late does not paint over a newer draft.
+    spell_generation: u64,
+    checking: bool,
+    edit_menu: Option<EditMenu>,
+    /// Discord drafts paint markdown in place. Other fields keep the plain marker dimming.
+    format_discord: bool,
+}
+
+#[derive(Clone)]
+struct EditMenu {
+    at: Point<Pixels>,
+    can_paste: bool,
+    has_image: bool,
+    miss: Option<super::spell::Miss>,
 }
 
 impl TextInput {
@@ -435,8 +458,34 @@ impl TextInput {
             grid: false,
             in_grid: false,
             highlights: Vec::new(),
+            misses: Vec::new(),
+            spell_generation: 0,
+            checking: false,
             edit_menu: None,
+            format_discord: false,
         }
+    }
+
+    /// Paint Discord markdown while this draft is open. Off for every other field.
+    pub fn set_format_discord(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.format_discord != on {
+            self.format_discord = on;
+            cx.notify();
+        }
+    }
+
+    pub fn selection(&self) -> Range<usize> {
+        self.editor.selection()
+    }
+
+    /// The selection bar and the format keys share this.
+    pub fn format_with(&mut self, kind: super::composer::format::Kind, cx: &mut Context<Self>) {
+        self.apply_format(kind, cx);
+    }
+
+    /// Underline misspellings. Only the composer asks for this.
+    pub fn set_checking(&mut self, on: bool) {
+        self.checking = on;
     }
 
     pub fn text(&self) -> &str {
@@ -461,6 +510,7 @@ impl TextInput {
         self.scroll = px(0.);
         self.is_selecting = false;
         cx.notify();
+        self.schedule_spell(cx);
     }
 
     pub fn cursor(&self) -> usize {
@@ -515,6 +565,44 @@ impl TextInput {
     fn edited(&mut self, cx: &mut Context<Self>) {
         self.edit_menu = None;
         cx.emit(InputEvent::Changed);
+        cx.notify();
+        self.schedule_spell(cx);
+    }
+
+    /// Ask the system checker off this thread, and only after a short pause, so a frame never waits.
+    fn schedule_spell(&mut self, cx: &mut Context<Self>) {
+        let on = self.checking && self.editor.is_multiline() && !self.secret && super::app::prefs::choices().spell;
+        self.spell_generation = self.spell_generation.wrapping_add(1);
+        self.misses.clear();
+        if !on {
+            return;
+        }
+        let text = self.editor.text().to_owned();
+        let caret = self.editor.cursor();
+        let extra = self.highlights.clone();
+        let generation = self.spell_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
+            let still = this.update(cx, |this, _| this.spell_generation == generation).unwrap_or(false);
+            if !still {
+                return;
+            }
+            let checked = text.clone();
+            let misses = cx.background_executor().spawn(async move { super::spell::check(&checked, caret, &extra) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.spell_generation != generation || this.editor.text() != text {
+                    return;
+                }
+                this.misses = misses;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn forget_word(&mut self, word: &str, cx: &mut Context<Self>) {
+        let text = self.editor.text().to_owned();
+        self.misses.retain(|miss| !text.get(miss.range.clone()).is_some_and(|got| got.eq_ignore_ascii_case(word)));
         cx.notify();
     }
 
@@ -762,6 +850,53 @@ impl TextInput {
         window.show_character_palette();
     }
 
+    fn apply_format(&mut self, kind: super::composer::format::Kind, cx: &mut Context<Self>) {
+        if !self.format_discord || self.secret {
+            return;
+        }
+        let (text, range) = super::composer::format::apply(self.editor.text(), self.editor.selection(), kind);
+        if text == self.editor.text() {
+            return;
+        }
+        let end = self.editor.text().len();
+        self.editor.replace(0..end, &text);
+        self.editor.select(range);
+        self.edited(cx);
+    }
+
+    fn format_bold(&mut self, _: &FormatBold, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_format(super::composer::format::Kind::Bold, cx);
+    }
+
+    fn format_italic(&mut self, _: &FormatItalic, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_format(super::composer::format::Kind::Italic, cx);
+    }
+
+    /// ⌘U is also Attach File. A field that is not a Discord draft gives the key back.
+    fn format_underline(&mut self, _: &FormatUnderline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.format_discord {
+            self.apply_format(super::composer::format::Kind::Underline, cx);
+        } else {
+            window.dispatch_action(Box::new(crate::gui::AttachFile), cx);
+        }
+    }
+
+    fn format_strike(&mut self, _: &FormatStrike, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_format(super::composer::format::Kind::Strike, cx);
+    }
+
+    fn format_code(&mut self, _: &FormatCode, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_format(super::composer::format::Kind::Code, cx);
+    }
+
+    fn format_quote(&mut self, _: &FormatQuote, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_format(super::composer::format::Kind::Quote, cx);
+    }
+
+    fn format_spoiler(&mut self, _: &FormatSpoiler, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_format(super::composer::format::Kind::Spoiler, cx);
+    }
+
     /// Finder files first, then a picture that came with no text, else text: a browser's copy
     /// carries both a picture and its words, and stays words.
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
@@ -781,6 +916,15 @@ impl TextInput {
             Pasted::Image(image) => cx.emit(InputPaste::Image(image)),
             Pasted::Text => {
                 if let Some(text) = item.text() {
+                    if self.format_discord && !self.secret {
+                        if let Some((next, range)) = super::composer::format::mask_link(self.editor.text(), self.editor.selection(), &text) {
+                            let end = self.editor.text().len();
+                            self.editor.replace(0..end, &next);
+                            self.editor.select(range);
+                            self.edited(cx);
+                            return;
+                        }
+                    }
                     self.editor.insert(&text);
                     self.edited(cx);
                 }
@@ -842,13 +986,15 @@ impl TextInput {
         let can_paste = !matches!(paste, Pasted::Nothing);
         let has_image = !matches!(paste, Pasted::Image(_))
             && entries.iter().any(|entry| matches!(entry, ClipboardEntry::Image(_)));
-        self.edit_menu = Some((event.position, can_paste, has_image));
+        let miss = self.misses.iter().find(|miss| miss.range.start <= offset && offset <= miss.range.end).cloned();
+        self.edit_menu = Some(EditMenu { at: event.position, can_paste, has_image, miss });
         cx.stop_propagation();
         cx.notify();
     }
 
     fn draw_edit_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (at, can_paste, has_image) = self.edit_menu?;
+        let edit = self.edit_menu.clone()?;
+        let (at, can_paste, has_image) = (edit.at, edit.can_paste, edit.has_image);
         let selected = !self.editor.selection().is_empty();
         let item = |id, label, shortcut, enabled| {
             if enabled { menu_item(id, None, label, shortcut) } else { menu_item_disabled(id, None, label, shortcut) }
@@ -880,13 +1026,43 @@ impl TextInput {
             this.select_all(&SelectAll, window, cx);
             cx.notify();
         })));
-        let menu = menu().id("input-edit-menu").w(px(200.)).occlude()
+        let spell = edit.miss.as_ref().map(|miss| self.spell_rows(miss, cx)).unwrap_or_default();
+        let mut menu = menu().id("input-edit-menu").w(px(200.)).occlude()
             // Menu clicks must not move the caret or replace the field's selection.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| { this.edit_menu = None; cx.notify(); }))
-            .child(cut).child(copy).child(paste).children(picture).child(menu_separator()).child(all);
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| { this.edit_menu = None; cx.notify(); }));
+        if !spell.is_empty() {
+            menu = menu.children(spell).child(menu_separator());
+        }
+        let menu = menu.child(cut).child(copy).child(paste).children(picture).child(menu_separator()).child(all);
         Some(deferred(anchored().position(at).snap_to_window().child(menu)).priority(2).into_any_element())
+    }
+
+    fn spell_rows(&self, miss: &super::spell::Miss, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let entries = super::spell::menu_entries(&miss.suggestions);
+        let suggestions = entries.len().saturating_sub(2);
+        let word = self.editor.text().get(miss.range.clone()).unwrap_or("").to_owned();
+        let mut rows = Vec::new();
+        for (index, label) in entries.into_iter().enumerate() {
+            let range = miss.range.clone();
+            let word = word.clone();
+            let kept = label.clone();
+            rows.push(
+                menu_item(SharedString::from(format!("input-spell-{index}")), None, label, None)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.edit_menu = None;
+                        if index < suggestions {
+                            this.replace(range.clone(), &kept, cx);
+                        } else {
+                            super::spell::allow(&word, index == suggestions);
+                            this.forget_word(&word, cx);
+                        }
+                    }))
+                    .into_any_element(),
+            );
+        }
+        rows
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1139,21 +1315,27 @@ impl Shaping {
             (display.text.clone(), false)
         };
         let marked = input.editor.marked().filter(|_| !placeholder).map(|range| display.painted(range.start)..display.painted(range.end));
-        let run = |len: usize, color: Hsla, underlined: bool| TextRun {
+        let squiggle: Hsla = theme::danger().into_color();
+        let run = |len: usize, font: Font, color: Hsla, background: Option<Hsla>, underline: Option<bool>, strike: bool| TextRun {
             len,
-            font: self.font.clone(),
+            font,
             color,
-            background_color: None,
-            underline: underlined.then_some(UnderlineStyle {
-                color: Some(color),
+            background_color: background,
+            underline: underline.map(|wavy| UnderlineStyle {
+                color: Some(if wavy { squiggle } else { color }),
                 thickness: px(1.),
-                wavy: false,
+                wavy: wavy && super::spell::wavy(),
             }),
-            strikethrough: None,
+            strikethrough: strike.then(|| StrikethroughStyle { thickness: px(1.), color: Some(color) }),
             letter_spacing: None,
         };
         let faint: Hsla = theme::text_faint().into_color();
         let mention: Hsla = theme::accent_text().into_color();
+        let code_wash: Hsla = theme::field().into_color();
+        let spoiler_wash: Hsla = theme::segment().into_color();
+        let quote_wash: Hsla = theme::accent_wash().into_color();
+        let formatting = input.format_discord && !input.secret;
+        let styled = if formatting && !content.is_empty() { super::composer::format::paint(content) } else { Vec::new() };
         let mut lines = Vec::new();
         let mut rows = Vec::new();
         let mut line_start = 0;
@@ -1165,8 +1347,26 @@ impl Shaping {
                 (true, Some(room)) => fitted(line, room, self, window),
                 _ => line.to_owned(),
             };
-            // Cut points where the color or the underline changes.
-            let dim = if placeholder || !input.editor.is_multiline() { Vec::new() } else { markup(&line) };
+            // Cut points where the color or the underline changes. A Discord draft uses the
+            // markdown reader instead of the plain marker dimming, so a fence can cross lines.
+            let preview = formatting && !placeholder;
+            let dim = if placeholder || !input.editor.is_multiline() || preview { Vec::new() } else { markup(&line) };
+            let looks: Vec<super::composer::format::Look> = if preview {
+                styled
+                    .iter()
+                    .filter_map(|look| {
+                        let start = look.range.start.saturating_sub(line_start).min(line.len());
+                        let end = look.range.end.saturating_sub(line_start).min(line.len());
+                        (start < end && line.is_char_boundary(start) && line.is_char_boundary(end)).then(|| {
+                            let mut sliced = look.clone();
+                            sliced.range = start..end;
+                            sliced
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let marked = marked.as_ref().map(|marked| {
                 marked.start.saturating_sub(line_start).min(line.len())
                     ..marked.end.saturating_sub(line_start).min(line.len())
@@ -1175,24 +1375,65 @@ impl Shaping {
                 range.start.saturating_sub(line_start).min(line.len())..range.end.saturating_sub(line_start).min(line.len())
             };
             let named: Vec<Range<usize>> = if placeholder || input.secret { Vec::new() } else { input.highlights.iter().map(within).collect() };
+            let spell_on = input.checking && super::app::prefs::choices().spell;
+            let misses: Vec<Range<usize>> = if placeholder || !spell_on {
+                Vec::new()
+            } else {
+                input.misses.iter().map(|miss| within(&miss.range)).filter(|range| range.start < range.end && line.is_char_boundary(range.start) && line.is_char_boundary(range.end)).collect()
+            };
             let mut cuts = vec![0, line.len()];
             cuts.extend(dim.iter().flat_map(|range| [range.start, range.end]));
+            cuts.extend(looks.iter().flat_map(|look| [look.range.start, look.range.end]));
             cuts.extend(named.iter().flat_map(|range| [range.start, range.end]).filter(|cut| line.is_char_boundary(*cut)));
+            cuts.extend(misses.iter().flat_map(|range| [range.start, range.end]));
             cuts.extend(marked.iter().flat_map(|range| [range.start, range.end]));
             cuts.sort_unstable();
             cuts.dedup();
             let runs: Vec<TextRun> = cuts
                 .windows(2)
                 .map(|cut| {
-                    let dimmed = placeholder || dim.iter().any(|range| range.start <= cut[0] && cut[1] <= range.end);
-                    let underlined = marked.as_ref().is_some_and(|range| range.start <= cut[0] && cut[1] <= range.end);
+                    let look = looks.iter().find(|look| look.range.start <= cut[0] && cut[1] <= look.range.end);
+                    let dimmed = placeholder || dim.iter().any(|range| range.start <= cut[0] && cut[1] <= range.end) || look.is_some_and(|look| look.marker);
+                    let composed = marked.as_ref().is_some_and(|range| range.start <= cut[0] && cut[1] <= range.end);
+                    let missed = misses.iter().any(|range| range.start <= cut[0] && cut[1] <= range.end);
                     let named = named.iter().any(|range| range.start <= cut[0] && cut[1] <= range.end);
-                    let color = match (dimmed, named) {
+                    let mut font = self.font.clone();
+                    let mut background = None;
+                    let mut strike = false;
+                    let mut format_underline = false;
+                    let mut link = false;
+                    if let Some(look) = look.filter(|look| !look.marker) {
+                        if look.bold {
+                            font.weight = FontWeight::SEMIBOLD;
+                        }
+                        if look.italic {
+                            font.style = FontStyle::Italic;
+                        }
+                        if look.code {
+                            font.family = theme::MONO.into();
+                            background = Some(code_wash);
+                        }
+                        if look.spoiler {
+                            background = Some(spoiler_wash);
+                        }
+                        if look.quote && background.is_none() {
+                            background = Some(quote_wash);
+                        }
+                        format_underline = look.underline;
+                        strike = look.strike;
+                        link = look.link;
+                    }
+                    let mut color = match (dimmed, named) {
                         (true, _) => faint,
                         (false, true) => mention,
                         (false, false) => self.color,
                     };
-                    run(cut[1] - cut[0], color, underlined)
+                    if link && !named && !dimmed {
+                        color = mention;
+                    }
+                    // A composition underline stays straight. A misspelling is the wavy one.
+                    let underline = if composed { Some(false) } else if missed { Some(true) } else if format_underline { Some(false) } else { None };
+                    run(cut[1] - cut[0], font, color, background, underline, strike)
                 })
                 .collect();
             let wrap = room.filter(|_| !placeholder && input.editor.is_multiline());
@@ -1272,6 +1513,7 @@ struct PrepaintState {
     shaping: Shaping,
     cursor: Option<PaintQuad>,
     selection: Vec<PaintQuad>,
+    quotes: Vec<PaintQuad>,
     thumb: Option<PaintQuad>,
     scroll: (Pixels, Pixels),
 }
@@ -1400,6 +1642,22 @@ impl Element for TextElement {
                 )
             })
             .collect();
+        let quotes = if input.format_discord {
+            let source = input.editor.text();
+            laid.rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| super::composer::format::line_quoted(source, row.line_start))
+                .map(|(ix, _)| {
+                    fill(
+                        Bounds::new(point(origin.x, origin.y + line_height * ix as f32), size(px(2.), line_height)),
+                        theme::accent_text(),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let total = line_height * laid.rows.len() as f32;
         let thumb = (multiline && total > bounds.size.height).then(|| {
             let length = (bounds.size.height * (bounds.size.height / total)).max(px(16.));
@@ -1416,6 +1674,7 @@ impl Element for TextElement {
             shaping: shaping.clone(),
             cursor,
             selection: selected,
+            quotes,
             thumb,
             scroll: (scroll_x, scroll_y),
         }
@@ -1441,6 +1700,9 @@ impl Element for TextElement {
         window.with_content_mask(Some(gpui::ContentMask { bounds, fade_out: Default::default() }), |window| {
             for selection in prepaint.selection.drain(..) {
                 window.paint_quad(selection);
+            }
+            for quote in prepaint.quotes.drain(..) {
+                window.paint_quad(quote);
             }
             let mut row = 0;
             for line in &laid.lines {
@@ -1509,6 +1771,13 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::select_doc_end))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::show_character_palette))
+            .on_action(cx.listener(Self::format_bold))
+            .on_action(cx.listener(Self::format_italic))
+            .on_action(cx.listener(Self::format_underline))
+            .on_action(cx.listener(Self::format_strike))
+            .on_action(cx.listener(Self::format_code))
+            .on_action(cx.listener(Self::format_quote))
+            .on_action(cx.listener(Self::format_spoiler))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))

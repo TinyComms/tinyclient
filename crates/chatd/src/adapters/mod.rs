@@ -16,6 +16,16 @@
 //! message edited, deleted or reacted to only by the command the shell's request became.
 
 mod discord;
+
+/// `TINYCLIENT_PROVE=discord-nitro-length`. Nitro's 4,000-character limit, shared by every send path.
+pub fn prove_discord_nitro_length() -> Result<(), String> {
+    discord::prove_nitro_length()
+}
+
+/// `TINYCLIENT_PROVE=discord-voice-bitrate`. A voice channel is encoded at its own bitrate.
+pub fn prove_discord_voice_bitrate() -> Result<(), String> {
+    discord::prove_voice_bitrate()
+}
 mod recovery;
 pub mod net;
 mod script;
@@ -1560,6 +1570,26 @@ pub fn prove_failed_start_offline() -> Result<(), String> {
         Link::Offline => Ok(()),
         other => Err(format!("link was {other:?}, not Offline")),
     }
+}
+
+/// The lab's teams-reactions driver. See `teams::prove_reactions`.
+pub fn prove_teams_reactions() -> Result<(), String> {
+    teams::prove_reactions()
+}
+
+/// The lab's teams-file-download driver. See `teams::prove_shared_file`.
+pub fn prove_teams_shared_file() -> Result<(), String> {
+    teams::prove_shared_file()
+}
+
+/// The lab's teams-loop-component driver. See `teams::prove_loop_component`.
+pub fn prove_teams_loop_component() -> Result<(), String> {
+    teams::prove_loop_component()
+}
+
+/// The lab's slack-connect-org driver. See `slack::prove_connect_names`.
+pub fn prove_slack_connect_org() -> Result<(), String> {
+    slack::prove_connect_names()
 }
 
 /// An adapter with no network behind it, for whatever serves an account inside chatd (the

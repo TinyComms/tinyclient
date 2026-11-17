@@ -66,6 +66,7 @@ pub const ROWS: &[Row] = &[
     row("M3", Messages, "", "Show when others are typing", &[], &["typing", "indicator"]),
     row("M4", Messages, "", "Convert emoticons to emoji", &[], &["smiley", "emoji", "emoticon", ":)"]),
     row("M5", Messages, "", "Play GIFs and animated stickers", &["Automatically", "On hover", "Never"], &["gif", "animated", "autoplay", "sticker", "motion", "animation"]),
+    row("M6", Messages, "", "Check spelling", &[], &["spell", "spelling", "spellcheck", "dictionary", "underline"]),
     row("P1", Privacy, "Let others see when I am typing", "Let others see when I am typing", &[], &["typing", "indicator", "privacy"]),
     row("P2", Privacy, "Let others see what I have read", "Let others see what I have read", &[], &["receipts", "read receipts", "seen", "privacy"]),
     row("P3", Privacy, "", "Load images and link previews automatically", &[], &["images", "pictures", "previews", "data", "tracking"]),
@@ -120,7 +121,6 @@ pub const NOT_YET: &[(&str, &str)] = &[
     ("theme", "tinyclient is dark only for now."),
     ("light", "tinyclient is dark only for now."),
     ("dark mode", "tinyclient is dark only for now."),
-    ("spell", "tinyclient has no spell checking yet."),
     ("touch id", "tinyclient has no lock yet."),
     ("menu bar", crate::host::NO_TRAY_ICON),
     ("accent", "tinyclient keeps one accent colour."),
@@ -351,10 +351,12 @@ mod tests {
         assert!(search("proxy").is_empty());
         assert_eq!(not_yet("proxy"), Some("tinyclient has no proxy setting yet."));
         // The words people reach for, not only the names in the product doc.
-        for words in ["launch", "start at login", "autostart", "reactions", "spell"] {
+        for words in ["launch", "start at login", "autostart", "reactions"] {
             assert!(search(words).is_empty(), "{words} finds a row");
             assert!(not_yet(words).is_some(), "{words} gets no line");
         }
+        assert!(search("spell").iter().any(|row| row.id == "M6"), "spell finds Check spelling");
+        assert_eq!(not_yet("spell"), None);
         // Sounds of your own are built now: the words reach the row that adds one.
         assert_eq!(not_yet("custom sound"), None);
         assert_eq!(not_yet("sound file"), None);

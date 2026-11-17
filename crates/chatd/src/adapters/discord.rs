@@ -49,8 +49,68 @@ const SEARCH_PATIENCE: Duration = Duration::from_secs(25);
 const WARM: usize = 5;
 /// A page of history, as the web client asks for it.
 const PAGE: usize = 50;
-/// Discord's own limit on a message.
+/// Discord's own limit on a message. Nitro (`premium_type` 2) is twice this.
 const LONGEST: usize = 2000;
+
+/// Characters one message may hold. Nitro is 4,000. Every other plan, including Nitro Basic,
+/// stays at 2,000. A server's boosts are not part of this.
+pub(super) fn message_limit(premium: u8) -> usize {
+    if premium == 2 { 2 * LONGEST } else { LONGEST }
+}
+
+fn too_long(premium: u8, text: &str) -> Option<String> {
+    let limit = message_limit(premium);
+    (text.chars().count() > limit).then(|| format!("Message too long: Discord allows {limit} characters."))
+}
+
+/// The lab's discord-voice-bitrate driver. A 32 kb/s channel is sent at 32, and the other
+/// bounds stay put. A build from before the fix ignores the variable and stays up.
+pub(super) fn prove_voice_bitrate() -> Result<(), String> {
+    use protocol::VoiceQuality::*;
+    if voice::voice_kbps(32_000, false, Standard) != 32 {
+        return Err("a 32 kb/s channel is sent at 32".to_owned());
+    }
+    if voice::voice_kbps(8_000, false, Standard) != 8 {
+        return Err("8 kb/s stays 8".to_owned());
+    }
+    if voice::voice_kbps(384_000, false, High) != 384 {
+        return Err("a boosted channel stays at 384".to_owned());
+    }
+    if voice::voice_kbps(96_000, false, DataSaver) != 32 {
+        return Err("data saver caps the channel".to_owned());
+    }
+    if voice::voice_kbps(8_000, false, DataSaver) != 8 {
+        return Err("data saver does not lift a quiet channel".to_owned());
+    }
+    if voice::voice_kbps(0, true, Standard) != 64 {
+        return Err("a direct call stays at 64".to_owned());
+    }
+    if voice::voice_kbps(512_000, false, Standard) != 510 {
+        return Err("libopus stereo caps at 510".to_owned());
+    }
+    Ok(())
+}
+
+/// The lab's discord-nitro-length driver. `send`, `edit` and `send_with` all ask [`too_long`].
+/// A build from before the fix ignores the variable and stays up.
+pub(super) fn prove_nitro_length() -> Result<(), String> {
+    if message_limit(2) != 4000 || [0, 1, 3].iter().any(|plan| message_limit(*plan) != 2000) {
+        return Err("nitro is 4000 characters and every other plan stays at 2000".to_owned());
+    }
+    let three = "n".repeat(3000);
+    if too_long(2, &three).is_some() {
+        return Err("nitro accepts 3000 characters".to_owned());
+    }
+    match too_long(0, &three) {
+        Some(why) if why.contains("2000") => {}
+        other => return Err(format!("a free account refuses 3000 locally, got {other:?}")),
+    }
+    match too_long(2, &"n".repeat(4001)) {
+        Some(why) if why.contains("4000") => Ok(()),
+        other => Err(format!("nitro refuses 4001, got {other:?}")),
+    }
+}
+
 /// At most one typing signal per conversation in this long.
 const TYPING_EVERY: Duration = Duration::from_secs(8);
 /// Most addresses Discord renews in one request.
@@ -630,8 +690,9 @@ impl Discord {
 
     /// Replaces the text of one of our messages. The store changes with Discord's answer.
     fn edit(&self, channel: &str, message: &str, text: &str) -> Result<(), Refusal> {
-        if text.chars().count() > LONGEST {
-            return Err(Refusal::Refused(format!("Message too long: Discord allows {LONGEST} characters.")));
+        let premium = self.state.lock().unwrap().premium;
+        if let Some(why) = too_long(premium, text) {
+            return Err(Refusal::Refused(why));
         }
         let path = format!("/channels/{channel}/messages/{message}");
         let edited = self.call("PATCH", &path, Some(json!({"content": text}))).map_err(refusal)?;
@@ -820,8 +881,9 @@ impl Discord {
     }
 
     fn send(&self, channel: &str, client_id: &str, text: &str, reply_to: Option<&str>) -> Result<Message, String> {
-        if text.chars().count() > LONGEST {
-            return Err(format!("Message too long: Discord allows {LONGEST} characters."));
+        let premium = self.state.lock().unwrap().premium;
+        if let Some(why) = too_long(premium, text) {
+            return Err(why);
         }
         let conversation = self.ctx.known(channel).map_err(|err| err.to_string())?;
         let conversation = conversation.ok_or_else(|| "This conversation is gone.".to_owned())?;

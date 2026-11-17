@@ -278,6 +278,9 @@ pub struct Channel {
     /// The most who may be in it at once (a voice channel), 0 when it has no limit.
     #[serde(default, deserialize_with = "nullable")]
     pub user_limit: u32,
+    /// A voice channel's encode rate, in bits per second. 0 when the channel did not say.
+    #[serde(default, deserialize_with = "nullable")]
+    pub bitrate: u32,
     #[serde(default)]
     pub parent_id: Option<String>,
     #[serde(default)]
@@ -326,6 +329,9 @@ pub struct Kept {
     /// A voice channel's occupant limit, 0 when it has none.
     #[serde(rename = "l", default, skip_serializing_if = "no_limit")]
     pub limit: u32,
+    /// A voice channel's encode rate, in bits per second. 0 when it was not stored.
+    #[serde(rename = "b", default, skip_serializing_if = "no_limit")]
+    pub bitrate: u32,
     #[serde(rename = "u", default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     #[serde(rename = "t", default, skip_serializing_if = "Option::is_none")]
@@ -348,6 +354,7 @@ impl Kept {
             name: channel.name.clone(),
             position: channel.position,
             limit: channel.user_limit,
+            bitrate: channel.bitrate,
             parent: channel.parent_id.clone(),
             topic: channel.topic.clone().filter(|topic| !topic.is_empty()),
             overwrites: overwrites.map(|over| (over.id.clone(), over.member, over.allow, over.deny)).collect(),
@@ -362,6 +369,7 @@ impl Kept {
             name: self.name,
             position: self.position,
             user_limit: self.limit,
+            bitrate: self.bitrate,
             parent_id: self.parent,
             topic: self.topic,
             permission_overwrites: overwrites.collect(),
@@ -1048,6 +1056,18 @@ mod tests {
         // The example id from Discord's documentation, created 2016-04-30 11:18:25 UTC.
         assert_eq!(seconds("175928847299117063"), 1_462_015_105);
         assert_eq!(iso_seconds("2016-04-30T11:18:25.796000+00:00"), Some(1_462_015_105));
+    }
+
+    #[test]
+    fn a_voice_channel_keeps_its_bitrate() {
+        let channel: Channel = serde_json::from_str(r#"{"id":"4201","type":2,"bitrate":32000}"#).unwrap();
+        assert_eq!(channel.bitrate, 32_000);
+        assert_eq!(Kept::of(&channel).channel().bitrate, 32_000);
+        let missing: Channel = serde_json::from_str(r#"{"id":"1","type":0}"#).unwrap();
+        assert_eq!(missing.bitrate, 0);
+        let stored = serde_json::to_string(&Kept::of(&channel)).unwrap();
+        let back: Kept = serde_json::from_str(&stored).unwrap();
+        assert_eq!(back.bitrate, 32_000);
     }
 
     #[test]

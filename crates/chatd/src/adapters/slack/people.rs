@@ -535,6 +535,10 @@ impl Slack {
     /// The direct conversation with a person, opened on Slack if there was none. Opening sends
     /// nothing to them.
     pub(super) fn start_direct(&self, person: &str) -> Result<String, Fault> {
+        // An address is an invitation Slack sends, not a conversation this session can open.
+        if person.contains('@') {
+            return Err(Fault::Slack("external_email".to_owned()));
+        }
         let opened = self.api("conversations.open", &[("users", person), ("return_im", "true")])?;
         let Some(id) = opened["channel"]["id"].as_str() else {
             return Err(Fault::Net("conversations.open: no channel".to_owned()));

@@ -32,10 +32,13 @@ mod colon;
 mod complete;
 mod controls;
 pub(super) mod edit;
+pub(super) mod format;
 mod hold;
+mod length;
 mod mention;
 mod niceties;
 mod rec;
+mod schedule;
 // The picker is the composer's and the reactions'; it lives in `gui/picker`.
 #[path = "picker/mod.rs"]
 pub(in crate::gui) mod picker;
@@ -45,7 +48,7 @@ mod typing;
 pub use typing::preview as typing_preview;
 
 use super::components::place::{max_height, placed, Layer, Place};
-use super::components::{button, glyph, menu, menu_item, tip, ButtonKind};
+use super::components::{button, glyph, menu, menu_item, menu_item_disabled, menu_label, menu_separator, tip, ButtonKind};
 use super::input::{InputEvent, InputKey, InputList, InputPaste, PickEmoji, PickGifs, SubmitSilently, TextInput};
 use super::people::{ask_later, Hub};
 use super::playing;
@@ -383,6 +386,12 @@ pub(crate) fn prove_offline_send_kept() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The lab's schedule-send driver. A network that schedules gets an hour, tomorrow, and Monday.
+/// One that does not is refused, and a time that has passed is not sent now.
+pub(crate) fn prove_schedule_send() -> Result<(), &'static str> {
+    schedule::prove()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Reply {
     id: String,
@@ -513,6 +522,10 @@ pub struct Composer {
     /// Member counts learned for the confirm: (members, online).
     counts: HashMap<Key, (Option<u32>, Option<u32>)>,
     send_menu: bool,
+    /// The day whose hours are open in the send menu. None: the presets and the days.
+    schedule_day: Option<schedule::Day>,
+    /// A time the send menu chose, kept while a confirm asks how many people a broadcast reaches.
+    schedule_at: Option<i64>,
     anchors: Rc<Anchors>,
     /// The recording of this conversation, as chatd said it (`Change::Recording`).
     recording: Option<Rec>,
@@ -538,7 +551,11 @@ pub struct Composer {
 
 impl Composer {
     fn new(shell: WeakEntity<Shell>, hub: Hub, thread: bool, cx: &mut Context<Self>) -> Composer {
-        let input = cx.new(|cx| TextInput::multiline(placeholder("", thread), cx));
+        let input = cx.new(|cx| {
+            let mut field = TextInput::multiline(placeholder("", thread), cx);
+            field.set_checking(true);
+            field
+        });
         cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
             InputEvent::Submit => this.send(false, cx),
             InputEvent::Changed => this.typed(cx),
@@ -610,6 +627,8 @@ impl Composer {
             armed: None,
             counts: HashMap::new(),
             send_menu: false,
+            schedule_day: None,
+            schedule_at: None,
             anchors: Rc::new(Anchors::default()),
             recording: None,
             holding: None,
@@ -641,7 +660,9 @@ impl Composer {
     /// typed here is saved and waits for the next visit. `stored` is the draft on the
     /// conversation's row, which is what a conversation not visited before opens with.
     fn aim(&mut self, target: Target, stored: &str, cx: &mut Context<Self>) {
+        let discord = target.key.network == Network::Discord;
         if self.target.as_ref() == Some(&target) && self.offered == stored {
+            self.input.update(cx, |input, cx| input.set_format_discord(discord, cx));
             return;
         }
         let moved = self.target.as_ref().map(|old| &old.key) != Some(&target.key);
@@ -680,7 +701,10 @@ impl Composer {
             });
         }
         let silent = controls(target.key.network, &target.can, false).silent;
-        self.input.update(cx, |input, _| input.set_alt_submits(silent));
+        self.input.update(cx, |input, cx| {
+            input.set_alt_submits(silent);
+            input.set_format_discord(discord, cx);
+        });
         self.target = Some(target);
         cx.notify();
     }
@@ -690,6 +714,9 @@ impl Composer {
     fn leave(&mut self, cx: &mut Context<Self>) {
         self.end_edit(cx);
         self.save_draft(cx);
+        self.send_menu = false;
+        self.schedule_day = None;
+        self.schedule_at = None;
         self.draft_timer = None;
         self.close_picker(cx);
         self.chip_menu = None;
@@ -812,8 +839,10 @@ impl Composer {
             self.colon_dismissed = Some(colon.trigger.start);
         } else if self.armed.take().is_some() {
             self.caption = None;
+            self.schedule_at = None;
         } else if self.chip_menu.take().is_some() || self.send_menu {
             self.send_menu = false;
+            self.schedule_day = None;
         } else if self.editing.is_some() {
             self.end_edit(cx);
         } else if self.reply.take().is_none() {
@@ -829,36 +858,57 @@ impl Composer {
 
     // Sending.
 
-    /// Return, or Option-Return for `silent`. chatd answers as soon as the message is stored
-    /// as pending, and the row comes from that; the text and chips leave only then, so a
-    /// refused send loses nothing. When the account is offline chatd stores nothing, and the
-    /// shell holds a text message instead; files wait for the connection in the tray.
+    /// Return, or Option-Return for `silent`. A time kept in `schedule_at` is the moment the
+    /// network sends it; an ordinary Return leaves that unset. chatd answers as soon as the
+    /// message is stored as pending, and the row comes from that; the text and chips leave
+    /// only then, so a refused send loses nothing. When the account is offline chatd stores
+    /// nothing, and the shell holds a text message instead; files wait for the connection in
+    /// the tray.
     pub fn send(&mut self, silent: bool, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone() else {
+            self.schedule_at = None;
             return;
         };
-        if self.sending || self.scan_blocks(&target.key) || target.locked().is_some() {
+        // A member count for a broadcast is already in flight. Leave the chosen time for it.
+        if self.sending {
+            return;
+        }
+        if self.scan_blocks(&target.key) || target.locked().is_some() {
+            self.schedule_at = None;
             return;
         }
         if self.editing.is_some() {
+            self.schedule_at = None;
             self.save_edit(&target, cx);
             return;
         }
         self.follow_text(cx);
         self.send_menu = false;
+        self.schedule_day = None;
         let field = self.input.read(cx).text().to_owned();
         if field.trim().is_empty() && self.tray.is_empty() {
+            if self.schedule_at.take().is_some() {
+                self.caption = Some(("Write a message to schedule.".to_owned(), Tone::Refused));
+                cx.notify();
+            }
             return;
         }
         if let Some(why) = attach::blocker(&self.tray) {
+            self.schedule_at = None;
             self.caption = Some((why, Tone::Refused));
             cx.notify();
             return;
         }
         if !live() {
+            self.schedule_at = None;
             return;
         }
         let network = target.key.network;
+        let emoticons = super::app::prefs::choices().emoticons;
+        let wired = length::wire_text(&field, &self.tokens, network, emoticons);
+        let Some(as_file) = self.stage_over_limit(&field, &wired, &target, cx) else {
+            return;
+        };
         let confirmed = self.armed.as_ref().is_some_and(|armed| *armed == field);
         // A role or user group reaches people no count here says: it always asks first.
         let mut roles: Vec<String> = Vec::new();
@@ -867,8 +917,8 @@ impl Composer {
                 roles.push(token.label.clone());
             }
         }
-        let broadcast = niceties::broadcast(&field, network).is_some();
-        if !confirmed && (broadcast || !roles.is_empty()) {
+        let broadcast = !as_file && niceties::broadcast(&field, network).is_some();
+        if !as_file && !confirmed && (broadcast || !roles.is_empty()) {
             let count = match (broadcast, self.counts.get(&target.key).copied()) {
                 (false, _) => None,
                 (true, None) => {
@@ -888,6 +938,15 @@ impl Composer {
         let reply_to = self.reply.as_ref().map(|reply| reply.id.clone());
         let files: Vec<OutgoingFile> = self.tray.iter().filter_map(Staged::outgoing).collect();
         let voice = rec::sent_as(&self.note, &files);
+        let chosen = self.schedule_at.take();
+        let schedule = match schedule::for_send(controls.schedule, chosen, now()) {
+            Ok(at) => at,
+            Err(why) => {
+                self.caption = Some((why.to_owned(), Tone::Refused));
+                cx.notify();
+                return;
+            }
+        };
         let with = protocol::Outgoing {
             files,
             voice: voice.clone(),
@@ -895,12 +954,16 @@ impl Composer {
             suppress_embeds: self.no_preview && controls.link_chip && !hosts.is_empty(),
             ping: reply_to.is_none() || !controls.ping || !self.ping_off.contains(&target.key.account()),
             pick: None,
-            schedule: None,
+            schedule,
         };
-        let (mut shown, mut wire) = (field.trim().to_owned(), mention::wire(&field, &self.tokens, network).trim().to_owned());
-        if super::app::prefs::choices().emoticons {
-            (shown, wire) = (niceties::emoticons(&shown), niceties::emoticons(&wire));
-        }
+        let (shown, wire) = match as_file {
+            true => (String::new(), String::new()),
+            false => {
+                let shown = field.trim().to_owned();
+                let shown = if emoticons { niceties::emoticons(&shown) } else { shown };
+                (shown, wired)
+            }
+        };
         let out = Outgoing {
             key: target.key.clone(),
             shown,
@@ -989,6 +1052,8 @@ impl Composer {
                 this.counts.insert(key, counts);
                 if still_here {
                     this.send(silent, cx);
+                } else {
+                    this.schedule_at = None;
                 }
             });
         });
@@ -1006,6 +1071,51 @@ impl Composer {
         self.armed = Some(field);
         self.caption = Some((words, Tone::Warning));
         cx.notify();
+    }
+
+    /// `None` when this Return only offered to send the text as a file, or that file could not
+    /// be written. `Some(true)` when message.txt is in the tray and the body should go out empty.
+    fn stage_over_limit(&mut self, field: &str, wired: &str, target: &Target, cx: &mut Context<Self>) -> Option<bool> {
+        let counted = wired.chars().count();
+        if !length::over(counted, target.can.text_limit) {
+            return Some(false);
+        }
+        if self.armed.as_ref().is_some_and(|armed| armed == field) {
+            match self.message_file(wired, &target.can, target.key.network) {
+                Some(chip) => {
+                    self.tray.push(chip);
+                    self.armed = None;
+                    Some(true)
+                }
+                None => {
+                    self.caption = Some(("Could not write message.txt.".to_owned(), Tone::Refused));
+                    cx.notify();
+                    None
+                }
+            }
+        } else {
+            self.arm(field.to_owned(), length::line(counted, target.can.text_limit).unwrap_or_default(), cx);
+            None
+        }
+    }
+
+    /// The wire text as message.txt in the outbox, the same place a paste lands.
+    fn message_file(&mut self, text: &str, can: &Capabilities, network: Network) -> Option<Staged> {
+        let dir = attach::outbox();
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = attach::free_path(&dir, "message.txt");
+        if std::fs::write(&path, text.as_bytes()).is_err() {
+            return None;
+        }
+        let id = self.next_chip;
+        self.next_chip += 1;
+        let mut chip = Staged::new(id, path.clone(), Found::File(text.len() as u64), can, network);
+        chip.owned = true;
+        if chip.refused.is_some() {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        Some(chip)
     }
 
     fn sent(&mut self, out: Outgoing, files: bool,
@@ -1756,10 +1866,16 @@ impl Composer {
             return;
         }
         let key = target.key.clone();
+        let wire = length::wire_text(&field, &self.tokens, key.network, false);
+        if let Some(words) = length::edit_refusal(wire.chars().count(), target.can.text_limit) {
+            self.caption = Some((words, Tone::Refused));
+            cx.notify();
+            return;
+        }
         let request = Request::Edit {
             conversation: key.clone(),
             message_id: id.clone(),
-            text: mention::wire(&field, &self.tokens, key.network).trim().to_owned(),
+            text: wire,
         };
         self.sending = true;
         cx.notify();
@@ -2047,6 +2163,65 @@ impl Composer {
                 button("composer-sign-in", ButtonKind::Primary, label)
                     .on_click(cx.listener(|this, _, _, cx| this.sign_in(cx)))
             }))
+    }
+
+    /// Bold, italic, and the rest, while a Discord draft has a selection. A click does not
+    /// steal focus from the field: the card's own press would, so the button stops it.
+    fn format_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let discord = self.target.as_ref().is_some_and(|target| target.key.network == Network::Discord);
+        if !discord || self.input.read(cx).selection().is_empty() {
+            return None;
+        }
+        let phone = crate::gui::phone::active();
+        let buttons = [
+            (format::Kind::Bold, "format-bold", "B", "Bold", "⌘B"),
+            (format::Kind::Italic, "format-italic", "I", "Italic", "⌘I"),
+            (format::Kind::Underline, "format-underline", "U", "Underline", "⌘U"),
+            (format::Kind::Strike, "format-strike", "S", "Strikethrough", "⌘⇧X"),
+            (format::Kind::Code, "format-code", "</>", "Code", "⌘⇧E"),
+            (format::Kind::Quote, "format-quote", ">", "Quote", "⌘⇧Q"),
+            (format::Kind::Spoiler, "format-spoiler", "||", "Spoiler", "⌘⇧P"),
+        ];
+        let mut bar = div()
+            .h(px(if phone { 40. } else { 32. }))
+            .flex_none()
+            .px(px(8.))
+            .gap(px(2.))
+            .border_b_1()
+            .border_color(theme::hairline())
+            .flex()
+            .items_center()
+            .type_small()
+            .text_color(theme::text());
+        for (kind, id, label, name, shortcut) in buttons {
+            bar = bar.child(
+                div()
+                    .id(id)
+                    .h(px(if phone { 32. } else { 22. }))
+                    .min_w(px(if phone { 32. } else { 22. }))
+                    .px(px(4.))
+                    .flex_none()
+                    .rounded(px(theme::R_CONTROL))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::hover()))
+                    .when(kind == format::Kind::Bold, |button| button.font_weight(theme::SEMIBOLD))
+                    .when(kind == format::Kind::Italic, |button| button.italic())
+                    .when(kind == format::Kind::Underline, |button| button.underline())
+                    .when(kind == format::Kind::Strike, |button| button.line_through())
+                    .tooltip(tip(name, Some(shortcut)))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.input.update(cx, |input, cx| input.format_with(kind, cx));
+                        this.focus_next = true;
+                        cx.notify();
+                    }))
+                    .child(label),
+            );
+        }
+        Some(bar)
     }
 
     /// The 32 pt bar inside the card that says what Return will do: reply, or save an edit.
@@ -2389,7 +2564,9 @@ impl Composer {
             .on_mouse_down(
                 gpui::MouseButton::Right,
                 cx.listener(|this, _, _, cx| {
-                    this.send_menu = this.controls().silent;
+                    let controls = this.controls();
+                    this.schedule_day = None;
+                    this.send_menu = schedule::send_menu_for(controls.silent, controls.schedule);
                     cx.notify();
                 }),
             )
@@ -2464,6 +2641,7 @@ impl Composer {
             .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| window.focus(&focus, cx))
             .children(self.mode_bar(cx))
             .children(self.tray(window, cx))
+            .children(self.format_bar(cx))
             .child(row)
     }
 
@@ -2478,7 +2656,21 @@ impl Composer {
         let text = self.input.read(cx).text().to_owned();
         let note = || attach::sending_note(target.key.network, &target.can, &self.tray, &text).map(|words| (words, Tone::Note));
         let recording = rec::foot(&self.recording, &target.key, playing::now_ms(), crate::gui::app::prefs::values().on(protocol::settings::PUSH_TO_TALK));
-        let said = self.caption.clone().or(recording).or_else(note).or_else(|| (unlocked && target.link == Link::Offline).then(offline));
+        let length_note = || {
+            // An edit cannot become a file, so the offer is only for a new message. Emoticons
+            // count only where the send would convert them.
+            let editing = self.editing.is_some();
+            let emoticons = !editing && super::app::prefs::choices().emoticons;
+            let counted = length::wire_text(&text, &self.tokens, target.key.network, emoticons).chars().count();
+            if editing {
+                if let Some(words) = length::edit_refusal(counted, target.can.text_limit) {
+                    return Some((words, Tone::Refused));
+                }
+            }
+            let tone = if length::over(counted, target.can.text_limit) { Tone::Warning } else { Tone::Note };
+            length::line(counted, target.can.text_limit).map(|words| (words, tone))
+        };
+        let said = self.caption.clone().or(recording).or_else(length_note).or_else(note).or_else(|| (unlocked && target.link == Link::Offline).then(offline));
         let hosts = if self.controls().link_chip && unlocked { niceties::link_hosts(&text) } else { Vec::new() };
         let chip = niceties::preview_words(&hosts, self.no_preview).map(|words| {
             let suppressed = self.no_preview;
@@ -2623,22 +2815,84 @@ impl Composer {
         Some(placed("composer-picker", place, Layer::Popover, window, panel))
     }
 
-    /// Right-click on Send: what else Return can do here.
+    /// A time from the send menu. The field is sent with it, or the menu stays if the send
+    /// only asked for a confirm.
+    fn choose_schedule(&mut self, at: i64, cx: &mut Context<Self>) {
+        self.schedule_at = Some(at);
+        self.send_menu = false;
+        self.schedule_day = None;
+        self.send(false, cx);
+    }
+
+    /// Right-click on Send: send quietly, or hand the network a time when it schedules.
     fn send_menu_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.send_menu {
             return None;
         }
         let anchor = self.anchors.send.get()?;
-        let items = menu()
-            .w(px(260.))
-            .child(menu_item("send-silently", Some("icons/bell-off.svg"), "Send without notification", Some("⌥↩")).on_click(cx.listener(|this, _, _, cx| {
-                this.send_menu = false;
-                this.send(true, cx);
-            })))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.send_menu = false;
+        let controls = self.controls();
+        if !schedule::send_menu_for(controls.silent, controls.schedule) {
+            return None;
+        }
+        let now = now();
+        let mut items = menu().w(px(260.));
+        if let Some(day) = self.schedule_day {
+            items = items.child(menu_item("schedule-back", Some("icons/calendar.svg"), "Schedule", None).on_click(cx.listener(|this, _, _, cx| {
+                this.schedule_day = None;
                 cx.notify();
-            }));
+            })));
+            let hours = schedule::hours(now, day);
+            if hours.is_empty() {
+                items = items.child(menu_item_disabled("schedule-none", None, "No time left that day", None));
+            }
+            for (index, moment) in hours.into_iter().enumerate() {
+                let at = moment.at;
+                items = items.child(menu_item(schedule::hour_id(index), Some("icons/calendar.svg"), moment.label, None).on_click(
+                    cx.listener(move |this, _, _, cx| this.choose_schedule(at, cx)),
+                ));
+            }
+        } else {
+            if controls.silent {
+                items = items.child(menu_item("send-silently", Some("icons/bell-off.svg"), "Send without notification", Some("⌥↩")).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.send_menu = false;
+                        this.schedule_day = None;
+                        this.schedule_at = None;
+                        this.send(true, cx);
+                    }),
+                ));
+            }
+            if controls.schedule {
+                let presets = schedule::presets(now);
+                if controls.silent && !presets.is_empty() {
+                    items = items.child(menu_separator());
+                }
+                for (index, moment) in presets.into_iter().enumerate() {
+                    let at = moment.at;
+                    items = items.child(menu_item(schedule::preset_id(index), Some("icons/calendar.svg"), moment.label, None).on_click(
+                        cx.listener(move |this, _, _, cx| this.choose_schedule(at, cx)),
+                    ));
+                }
+                let days = schedule::days(now);
+                if !days.is_empty() {
+                    items = items.child(menu_label("Pick a day"));
+                    for (index, day) in days.into_iter().enumerate() {
+                        let label = schedule::day_label(now, day);
+                        items = items.child(menu_item(schedule::day_id(index), None, label, None).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.schedule_day = Some(day);
+                                cx.notify();
+                            },
+                        )));
+                    }
+                }
+            }
+        }
+        let items = items.on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            this.send_menu = false;
+            this.schedule_day = None;
+            cx.notify();
+        }));
         Some(placed("send-menu", Place::Above(anchor), Layer::Menu, window, items))
     }
 

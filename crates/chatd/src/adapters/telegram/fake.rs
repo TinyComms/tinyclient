@@ -17,7 +17,8 @@
 //! (9001, muted, with a sponsored message) with a linked discussion group "Field Notes chat"
 //! (9003, which the comments on its post come from, heard of at `getDiscussionMessage`); a
 //! forum "Workshop" (9002) with topics General, "Tools" (31) and "Jigs" (55, the newest
-//! unread). The phone +1 555 010 0142
+//! unread). Workshop's member list is its owner, two admins and its bot. A search there for
+//! Nia Pell (7012) names her; she is not otherwise in the account. The phone +1 555 010 0142
 //! signs in with the code 24680; +1 555 010 0199 also wants the password "correct horse".
 //! Username resolution serves only `gif` and `forest_wren`; `flood_wait` returns a flood wait,
 //! and every other name returns USERNAME_NOT_OCCUPIED.
@@ -58,6 +59,8 @@ const JIGS: i32 = 55;
 const SERVICE: i64 = 777_000;
 const REPLIES: i64 = 1_271_266_957;
 const BOT: i64 = 7004;
+/// Named only by a member search of Workshop. Not in `users()`, so a contact search never finds her.
+const NIA: i64 = 7012;
 const SCAM: i64 = 7005;
 const FAKE: i64 = 7006;
 /// The `@gif` bot.
@@ -114,6 +117,9 @@ fn user(id: i64, first: &str, last: &str, username: &str) -> tl::types::User {
     if id == TOBIN {
         user.status = Some(tl::enums::UserStatus::Recently(blank(&[&put(0u32)])));
     }
+    let peer = std::env::var("TINYCLIENT_TELEGRAM_PEER_PREMIUM").ok();
+    let id_text = id.to_string();
+    user.premium = (id == ME && std::env::var("TINYCLIENT_TELEGRAM_PREMIUM").ok().as_deref() == Some("1")) || peer.as_deref() == Some(id_text.as_str());
     user.verified = id == SERVICE;
     user.bot = id == BOT || id == GIF_BOT;
     // A bot's flag is shared with its info version, which must then be there.
@@ -267,7 +273,12 @@ fn dialog(peer: Who, top: i32, read: i32, outbox: i32, unread: i32, pinned: bool
 
 /// Telegram's word for the text a chat's draft holds, written by its own date.
 fn draft_message(text: &str) -> tl::enums::DraftMessage {
-    let draft: tl::types::DraftMessage = blank(&[&put(0u32), &put(text.to_owned()), &put(t0())]);
+    draft_with(text, None)
+}
+
+fn draft_with(text: &str, entities: Option<Vec<tl::enums::MessageEntity>>) -> tl::enums::DraftMessage {
+    let mut draft: tl::types::DraftMessage = blank(&[&put(0u32), &put(text.to_owned()), &put(t0())]);
+    draft.entities = entities;
     draft.into()
 }
 
@@ -530,15 +541,16 @@ impl World {
 
     /// What a send makes: each item a message of ours with the id Telegram gives it, told on the
     /// update stream and in the answer, or scheduled for later.
-    fn deliver(&mut self, events: &Sender<Event>, peer: Who, topic: Option<i32>, reply: Option<i32>, items: Vec<(i64, String, Option<tl::enums::MessageMedia>)>, schedule: Option<i32>) -> Result<Vec<u8>, Fault> {
+    fn deliver(&mut self, events: &Sender<Event>, peer: Who, topic: Option<i32>, reply: Option<i32>, items: Vec<(i64, String, Option<tl::enums::MessageMedia>, Option<Vec<tl::enums::MessageEntity>>)>, schedule: Option<i32>) -> Result<Vec<u8>, Fault> {
         // What was sent clears the chat's draft, on this device and everywhere.
         self.drafts.remove(&(peer, topic));
         let mut all = Vec::new();
-        for (random_id, text, media) in items {
+        for (random_id, text, media, entities) in items {
             self.next += 1;
             let id = self.next;
             let mut sent = message(peer, id, ME, schedule.unwrap_or(crate::hub::now() as i32), &text);
             sent.media = media;
+            sent.entities = entities;
             if let Some(reply_to_msg_id) = reply {
                 let mut header: tl::types::MessageReplyHeader = blank(&[&put(0u32)]);
                 header.reply_to_msg_id = Some(reply_to_msg_id);
@@ -634,6 +646,27 @@ impl World {
         let messages = all.into_iter().skip(from).take(limit.max(0) as usize).cloned().collect();
         tl::types::messages::Messages { messages, topics: Vec::new(), chats: chats(), users: users() }.into()
     }
+}
+
+/// `help.getAppConfig`, with the documented defaults. `TINYCLIENT_TELEGRAM_CAPTION` replaces
+/// the free caption so a test can see the config applied.
+fn app_config() -> tl::enums::help::AppConfig {
+    let caption = std::env::var("TINYCLIENT_TELEGRAM_CAPTION").ok().and_then(|value| value.parse().ok()).unwrap_or(1_024.0);
+    let num = |key: &str, value: f64| -> tl::enums::JsonobjectValue {
+        tl::types::JsonObjectValue { key: key.to_owned(), value: tl::types::JsonNumber { value }.into() }.into()
+    };
+    let config = tl::types::JsonObject {
+        value: vec![
+            num("caption_length_limit_default", caption),
+            num("caption_length_limit_premium", 4_096.0),
+            num("upload_max_fileparts_default", 4_000.0),
+            num("upload_max_fileparts_premium", 8_000.0),
+            num("reactions_user_max_default", 1.0),
+            num("reactions_user_max_premium", 3.0),
+            num("reactions_uniq_max", 11.0),
+        ],
+    };
+    tl::enums::help::AppConfig::Config(tl::types::help::AppConfig { hash: 1, config: config.into() })
 }
 
 fn rpc(code: i32, name: &str, value: Option<u32>) -> Fault {
@@ -840,10 +873,16 @@ fn saved_draft(world: &mut World, request: tl::functions::messages::SaveDraft, e
         Some(tl::enums::InputReplyTo::Message(reply)) => Some(reply.top_msg_id.unwrap_or(reply.reply_to_msg_id)),
         _ => None,
     };
-    world.log(&format!("SaveDraft {} {}", key(peer, topic), request.message));
+    let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
+    world.log(&format!("SaveDraft {} {}{noted}", key(peer, topic), request.message));
     let draft = request.message.clone();
     world.drafts.insert((peer, topic), draft.clone());
-    let echo = tl::types::UpdateDraftMessage { peer: peer.peer(), top_msg_id: topic, saved_peer_id: None, draft: draft_message(&draft) };
+    let echo = tl::types::UpdateDraftMessage {
+        peer: peer.peer(),
+        top_msg_id: topic,
+        saved_peer_id: None,
+        draft: draft_with(&draft, request.entities.clone()),
+    };
     let _ = events.send(update(echo.into()));
     answer(true)
 }
@@ -1771,6 +1810,11 @@ impl World {
             // The animated icon's own id (5002) is what Telegram names an animated emoji:
             // no still thumbnail, and the file itself is its Lottie play.
             let documents: Vec<tl::enums::Document> = request.document_id.iter().map(|&id| {
+                // Installed and recent custom emoji carry the alt the picker shows.
+                if id == 6_402 || id == 6_403 {
+                    let alt = if id == 6_402 { "\u{2B50}" } else { "\u{2605}" };
+                    return custom_emoji(id, alt).into();
+                }
                 let animated = id == 5002;
                 tl::enums::Document::Document(tl::types::Document {
                     id,
@@ -1842,6 +1886,9 @@ impl World {
             if request.message == "refuse me" {
                 return Err(rpc(403, "CHAT_WRITE_FORBIDDEN", None));
             }
+            if request.message == "premium file" {
+                return Err(rpc(403, "PREMIUM_ACCOUNT_REQUIRED", None));
+            }
             let (topic, reply) = match &request.reply_to {
                 Some(tl::enums::InputReplyTo::Message(reply)) if peer == Who::Channel(WORKSHOP) => (Some(reply.top_msg_id.unwrap_or(reply.reply_to_msg_id)), None),
                 Some(tl::enums::InputReplyTo::Message(reply)) => (None, Some(reply.reply_to_msg_id)),
@@ -1855,19 +1902,22 @@ impl World {
                 true => key(peer, reply),
                 false => key(peer, topic),
             };
-            self.log(&format!("SendMessage {said} {}{options}", request.message));
-            return self.deliver(events, peer, topic, reply, vec![(request.random_id, request.message, None)], request.schedule_date);
+            let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
+            self.log(&format!("SendMessage {said} {}{noted}{options}", request.message));
+            return self.deliver(events, peer, topic, reply, vec![(request.random_id, request.message, None, request.entities)], request.schedule_date);
         }
         if let Some(request) = asked::<f::messages::EditMessage>(body) {
             let peer = input_who(&request.peer);
-            self.log(&format!("EditMessage {} {}", peer.text(), request.id));
+            let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
+            self.log(&format!("EditMessage {} {}{noted}", peer.text(), request.id));
             let Some(tl::enums::Message::Message(mut edited)) = self.messages.get(&peer.text()).and_then(|held| held.get(&request.id)).cloned() else {
                 return Err(rpc(400, "MESSAGE_ID_INVALID", None));
             };
             if !edited.out {
                 return Err(rpc(403, "MESSAGE_AUTHOR_REQUIRED", None));
             }
-            edited.message = request.message.unwrap_or_default();
+            edited.message = request.message.clone().unwrap_or_default();
+            edited.entities = request.entities.clone();
             edited.edit_date = Some(crate::hub::now() as i32);
             self.store(None, edited.clone());
             return answer(updates(vec![tl::types::UpdateEditMessage { message: edited.into(), pts: 0, pts_count: 0 }.into()]));
@@ -2004,10 +2054,85 @@ impl World {
             let found = tl::types::users::UserFull { full_user: full.into(), chats: Vec::new(), users: users() };
             return answer(tl::enums::users::UserFull::Full(found));
         }
+        if asked::<f::help::GetAppConfig>(body).is_some() {
+            self.log("GetAppConfig");
+            return answer(app_config());
+        }
         if let Some(answered) = self.panes(body, events) {
             return answered;
         }
         Err(rpc(400, "METHOD_NOT_IN_THE_SCRIPT", None))
+    }
+
+    /// `channels.getParticipants`. Workshop has an owner, two admins and a bot. A search for
+    /// Nia names her and nobody else. Any other channel answers with an empty page.
+    fn roster(&mut self, body: &[u8]) -> Option<Result<Vec<u8>, Fault>> {
+        use tl::functions as f;
+        let request = asked::<f::channels::GetParticipants>(body)?;
+        let tl::enums::InputChannel::Channel(channel) = &request.channel else {
+            return Some(Err(rpc(400, "CHANNEL_INVALID", None)));
+        };
+        let id = channel.channel_id;
+        let asked_for = match &request.filter {
+            tl::enums::ChannelParticipantsFilter::ChannelParticipantsAdmins => "admins".to_owned(),
+            tl::enums::ChannelParticipantsFilter::ChannelParticipantsBots => "bots".to_owned(),
+            tl::enums::ChannelParticipantsFilter::ChannelParticipantsRecent => "recent".to_owned(),
+            tl::enums::ChannelParticipantsFilter::ChannelParticipantsSearch(search) => format!("search {}", search.q.trim()),
+            _ => "other".to_owned(),
+        };
+        let logged = if asked_for == "search " {
+            format!("GetParticipants c{id} search")
+        } else {
+            format!("GetParticipants c{id} {asked_for}")
+        };
+        self.log(&logged);
+        let rights = || {
+            let rights: tl::types::ChatAdminRights = blank(&[&put(0u32)]);
+            rights
+        };
+        let creator = |user_id| {
+            tl::enums::ChannelParticipant::from(tl::types::ChannelParticipantCreator { user_id, admin_rights: rights().into(), rank: None })
+        };
+        let admin = |user_id, rank: &str| {
+            tl::enums::ChannelParticipant::from(tl::types::ChannelParticipantAdmin {
+                can_edit: false,
+                is_self: false,
+                user_id,
+                inviter_id: None,
+                promoted_by: ME,
+                date: t0() - 1_000,
+                admin_rights: rights().into(),
+                rank: Some(rank.to_owned()),
+            })
+        };
+        let member = |user_id| {
+            tl::enums::ChannelParticipant::from(tl::types::ChannelParticipant {
+                user_id,
+                date: t0() - 500,
+                subscription_until_date: None,
+                rank: None,
+            })
+        };
+        let (participants, users): (Vec<tl::enums::ChannelParticipant>, Vec<tl::enums::User>) = if id != WORKSHOP {
+            (Vec::new(), Vec::new())
+        } else if asked_for == "admins" {
+            (vec![creator(ME), admin(TOBIN, "Guide"), admin(ODALYS, "Quartermaster")], users())
+        } else if asked_for == "bots" {
+            (vec![member(BOT)], users())
+        } else if asked_for == "recent" {
+            (vec![creator(ME), admin(TOBIN, "Guide"), admin(ODALYS, "Quartermaster"), member(BOT)], users())
+        } else if asked_for.eq_ignore_ascii_case("search nia") {
+            (vec![member(NIA)], vec![user(NIA, "Nia", "Pell", "").into()])
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let page = tl::types::channels::ChannelParticipants {
+            count: participants.len() as i32,
+            participants,
+            chats: chats(),
+            users,
+        };
+        Some(answer(tl::enums::channels::ChannelParticipants::Participants(page)))
     }
 
     /// The requests of the panes, the pickers and sending with files.
@@ -2083,10 +2208,18 @@ impl World {
                 full.available_reactions = Some(tl::types::ChatReactionsAll { allow_custom: false }.into());
                 full.reactions_limit = Some(2);
             }
-            full.participants_count = Some(1_204);
+            // Field Notes stays a large channel. Workshop's count is the four people its
+            // member list holds, so no empty Members tail is drawn behind them.
+            full.participants_count = Some(if channel.channel_id == WORKSHOP { 4 } else { 1_204 });
+            if channel.channel_id == WORKSHOP && std::env::var("TINYCLIENT_TELEGRAM_HIDDEN").ok().as_deref() == Some("1") {
+                full.participants_hidden = true;
+            }
             full.online_count = Some(230);
             let found = tl::types::messages::ChatFull { full_chat: full.into(), chats: chats(), users: users() };
             return Some(answer(tl::enums::messages::ChatFull::Full(found)));
+        }
+        if let Some(answered) = self.roster(body) {
+            return Some(answered);
         }
         if let Some(request) = asked::<f::channels::GetParticipant>(body) {
             let who = input_who(&request.participant);
@@ -2173,7 +2306,7 @@ impl World {
             let peer = input_who(&request.peer);
             self.log(&format!("SendInlineBotResult {} {} {}", peer.text(), request.query_id, request.id));
             let media = document_media(gif(6_300));
-            return Some(self.deliver(events, peer, None, None, vec![(request.random_id, String::new(), Some(media))], request.schedule_date));
+            return Some(self.deliver(events, peer, None, None, vec![(request.random_id, String::new(), Some(media), None)], request.schedule_date));
         }
         if asked::<f::messages::GetAllStickers>(body).is_some() {
             self.log("GetAllStickers");
@@ -2182,7 +2315,34 @@ impl World {
             let found = tl::types::messages::AllStickers { hash: 1, sets: vec![set.into()] };
             return Some(answer(tl::enums::messages::AllStickers::Stickers(found)));
         }
-        if asked::<f::messages::GetStickerSet>(body).is_some() {
+        if asked::<f::messages::GetEmojiStickers>(body).is_some() {
+            self.log("GetEmojiStickers");
+            let mut set: tl::types::StickerSet = blank(&[&put(0u32), &put(910i64), &put(911i64), &put("Faces".to_owned()), &put("faces".to_owned()), &put(1i32), &put(1i32)]);
+            set.installed_date = Some(t0());
+            let found = tl::types::messages::AllStickers { hash: 1, sets: vec![set.into()] };
+            return Some(answer(tl::enums::messages::AllStickers::Stickers(found)));
+        }
+        if asked::<f::messages::GetRecentReactions>(body).is_some() {
+            self.log("GetRecentReactions");
+            let found = tl::types::messages::Reactions {
+                hash: 1,
+                reactions: vec![tl::types::ReactionCustomEmoji { document_id: 6_403 }.into()],
+            };
+            return Some(answer(tl::enums::messages::Reactions::Reactions(found)));
+        }
+        if let Some(request) = asked::<f::messages::GetStickerSet>(body) {
+            let emoji = matches!(&request.stickerset, tl::enums::InputStickerSet::Id(set) if set.id == 910);
+            if emoji {
+                self.log("GetStickerSet emoji");
+                let set: tl::types::StickerSet = blank(&[&put(0u32), &put(910i64), &put(911i64), &put("Faces".to_owned()), &put("faces".to_owned()), &put(1i32), &put(1i32)]);
+                let found = tl::types::messages::StickerSet {
+                    set: set.into(),
+                    packs: Vec::new(),
+                    keywords: Vec::new(),
+                    documents: vec![custom_emoji(6_402, "\u{2B50}").into()],
+                };
+                return Some(answer(tl::enums::messages::StickerSet::Set(found)));
+            }
             self.log("GetStickerSet");
             let set: tl::types::StickerSet = blank(&[&put(0u32), &put(900i64), &put(901i64), &put("Hiking".to_owned()), &put("hiking".to_owned()), &put(2i32), &put(1i32)]);
             let found = tl::types::messages::StickerSet { set: set.into(), packs: Vec::new(), keywords: Vec::new(), documents: vec![sticker(6_400).into(), sticker(6_401).into()] };
@@ -2206,8 +2366,9 @@ impl World {
             let (kind, media) = held_media(&request.media, self.next + 2_000);
             let options = [("silent", request.silent), ("scheduled", request.schedule_date.is_some())];
             let options: String = options.iter().filter(|(_, on)| *on).map(|(name, _)| format!(" [{name}]")).collect();
-            self.log(&format!("SendMedia {} {kind} {}{options}", peer.text(), request.message));
-            return Some(self.deliver(events, peer, None, None, vec![(request.random_id, request.message, Some(media))], request.schedule_date));
+            let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
+            self.log(&format!("SendMedia {} {kind} {}{noted}{options}", peer.text(), request.message));
+            return Some(self.deliver(events, peer, None, None, vec![(request.random_id, request.message, Some(media), request.entities)], request.schedule_date));
         }
         if let Some(request) = asked::<f::messages::SendMultiMedia>(body) {
             let peer = input_who(&request.peer);
@@ -2217,7 +2378,7 @@ impl World {
                 let tl::enums::InputSingleMedia::Media(one) = one;
                 let (kind, media) = held_media(&one.media, self.next + 3_000 + at as i32);
                 kinds.push(kind);
-                items.push((one.random_id, one.message.clone(), Some(media)));
+                items.push((one.random_id, one.message.clone(), Some(media), one.entities.clone()));
             }
             self.log(&format!("SendMultiMedia {} {}", peer.text(), kinds.join(",")));
             return Some(self.deliver(events, peer, None, None, items, request.schedule_date));
@@ -2253,6 +2414,28 @@ fn gif(id: i64) -> tl::types::Document {
             }
             .into(),
         ],
+    }
+}
+
+/// A custom emoji document: the alt is what the picker shows and what a send falls back to.
+fn custom_emoji(id: i64, alt: &str) -> tl::types::Document {
+    tl::types::Document {
+        id,
+        access_hash: id + 1,
+        file_reference: vec![9],
+        date: t0(),
+        mime_type: "image/webp".to_owned(),
+        size: 4_096,
+        thumbs: Some(vec![tl::types::PhotoSize { r#type: "m".to_owned(), w: 128, h: 128, size: 2_000 }.into()]),
+        video_thumbs: None,
+        dc_id: 2,
+        attributes: vec![tl::types::DocumentAttributeCustomEmoji {
+            free: false,
+            text_color: false,
+            alt: alt.to_owned(),
+            stickerset: tl::types::InputStickerSetId { id: 910, access_hash: 911 }.into(),
+        }
+        .into()],
     }
 }
 
@@ -2360,6 +2543,10 @@ fn held_media(media: &tl::enums::InputMedia, id: i32) -> (String, tl::enums::Mes
             (kind, media)
         }
         tl::enums::InputMedia::Photo(one) => (if one.spoiler { "kept-photo+spoiler" } else { "kept-photo" }.to_owned(), photo(one.spoiler)),
+        tl::enums::InputMedia::Dice(one) => (
+            format!("dice:{}", one.emoticon),
+            tl::types::MessageMediaDice { value: 5, emoticon: one.emoticon.clone(), game_outcome: None }.into(),
+        ),
         tl::enums::InputMedia::Document(one) => match &one.id {
             tl::enums::InputDocument::Document(kept) if kept.id == 6_200 => ("gif".to_owned(), document_media(gif(6_200))),
             tl::enums::InputDocument::Document(kept) if kept.id >= 6_400 && kept.id < 6_500 => ("sticker".to_owned(), document_media(sticker(kept.id))),

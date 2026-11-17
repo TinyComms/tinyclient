@@ -130,6 +130,490 @@ pub fn spans(text: &str, entities: &[MessageEntity]) -> Vec<Span> {
     spans
 }
 
+/// Where `byte` sits in UTF-16 units. Both halves of a pair share a byte, so the first is used.
+fn utf16_index(map: &[u32], byte: u32) -> Option<i32> {
+    let index = map.iter().position(|&at| at == byte)?;
+    i32::try_from(index).ok()
+}
+
+fn span_fits(text: &str, span: &Span) -> bool {
+    let start = span.start as usize;
+    let end = span.end as usize;
+    end <= text.len() && start < end && text.is_char_boundary(start) && text.is_char_boundary(end)
+}
+
+/// Styled ranges as Telegram's entities. Offsets are UTF-16 units, the way Telegram counts.
+/// A span that does not sit on the text is dropped.
+pub fn entities_of(text: &str, spans: &[Span]) -> Vec<MessageEntity> {
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    let map = utf16_map(text);
+    let mut entities = Vec::with_capacity(spans.len());
+    for span in spans {
+        if !span_fits(text, span) {
+            continue;
+        }
+        let (Some(offset), Some(end)) = (utf16_index(&map, span.start), utf16_index(&map, span.end)) else {
+            continue;
+        };
+        let length = end - offset;
+        if length <= 0 {
+            continue;
+        }
+        let entity = match &span.style {
+            Style::Bold => tl::types::MessageEntityBold { offset, length }.into(),
+            Style::Italic => tl::types::MessageEntityItalic { offset, length }.into(),
+            Style::Underline => tl::types::MessageEntityUnderline { offset, length }.into(),
+            Style::Strike => tl::types::MessageEntityStrike { offset, length }.into(),
+            Style::Code => tl::types::MessageEntityCode { offset, length }.into(),
+            Style::CodeBlock { language } => tl::types::MessageEntityPre { offset, length, language: language.clone() }.into(),
+            Style::Quote => tl::types::MessageEntityBlockquote { collapsed: false, offset, length }.into(),
+            Style::Spoiler => tl::types::MessageEntitySpoiler { offset, length }.into(),
+            Style::Link { url } => tl::types::MessageEntityTextUrl { offset, length, url: url.clone() }.into(),
+            Style::Mention { kind: MentionKind::User, id } => {
+                let Some(user_id) = id.strip_prefix('u').and_then(|id| id.parse().ok()) else {
+                    continue;
+                };
+                tl::types::MessageEntityMentionName { offset, length, user_id }.into()
+            }
+            Style::Emoji { file } => {
+                let Some(document_id) = file.id.strip_prefix('e').and_then(|id| id.parse().ok()) else {
+                    continue;
+                };
+                tl::types::MessageEntityCustomEmoji { offset, length, document_id }.into()
+            }
+            _ => continue,
+        };
+        entities.push(entity);
+    }
+    entities
+}
+
+/// Spans already stored on a message, kept where they still sit on `plain`. An edit that
+/// carries no markers sends these, so saving a formatted message does not wipe it.
+pub fn with_stored(plain: &str, stored: &[Span]) -> Option<Vec<MessageEntity>> {
+    let kept: Vec<Span> = stored.iter().filter(|span| span_fits(plain, span)).cloned().collect();
+    let entities = entities_of(plain, &kept);
+    (!entities.is_empty()).then_some(entities)
+}
+
+/// The text a send or a draft tells Telegram, and the entities for its markers. Telegram
+/// does not read `**` itself, so the markers are taken out and named.
+pub fn outgoing(text: &str) -> (String, Option<Vec<MessageEntity>>) {
+    let (plain, spans) = from_markers(text);
+    let entities = entities_of(&plain, &spans);
+    (plain, (!entities.is_empty()).then_some(entities))
+}
+
+/// A custom emoji the catalog offered, remembered by the label the composer inserts (`:alt:`).
+#[derive(Debug, Clone)]
+pub(super) struct EmojiLabel {
+    pub label: String,
+    pub document_id: i64,
+    pub fallback: String,
+    /// The same label was offered for two documents, so a send cannot know which.
+    pub ambiguous: bool,
+}
+
+struct EmojiSwap {
+    old_start: i32,
+    old_len: i32,
+    new_len: i32,
+    document_id: i64,
+}
+
+fn utf16_len(text: &str) -> i32 {
+    text.chars().map(|c| c.len_utf16() as i32).sum()
+}
+
+fn usable_labels(labels: &[EmojiLabel]) -> Vec<&EmojiLabel> {
+    let mut usable = Vec::new();
+    for label in labels {
+        if label.ambiguous || label.label.is_empty() || label.fallback.is_empty() {
+            continue;
+        }
+        let clash = labels.iter().any(|other| other.label == label.label && other.document_id != label.document_id);
+        if clash || usable.iter().any(|held: &&EmojiLabel| held.label == label.label) {
+            continue;
+        }
+        usable.push(label);
+    }
+    usable.sort_by(|left, right| right.label.len().cmp(&left.label.len()).then(left.label.cmp(&right.label)));
+    usable
+}
+
+/// `:alt:` labels the catalog remembered, swapped for the fallback glyph. When `allow` is
+/// set, each swap is also a custom-emoji entity. A label that covers an existing entity is
+/// dropped; entities after a swap move by how much the text shrank or grew.
+pub(super) fn apply_emoji(plain: &str, entities: Vec<MessageEntity>, labels: &[EmojiLabel], allow: bool) -> (String, Vec<MessageEntity>) {
+    let usable = usable_labels(labels);
+    if usable.is_empty() || !plain.contains(':') {
+        return (plain.to_owned(), entities);
+    }
+    let mut out = String::with_capacity(plain.len());
+    let mut swaps = Vec::new();
+    let mut from = 0usize;
+    let mut old_utf16 = 0i32;
+    while from < plain.len() {
+        let rest = &plain[from..];
+        let mut best: Option<(usize, usize)> = None;
+        for (index, label) in usable.iter().enumerate() {
+            if let Some(at) = rest.find(&label.label) {
+                let earlier = match best {
+                    Some((prev, _)) => at < prev,
+                    None => true,
+                };
+                if earlier {
+                    best = Some((at, index));
+                }
+            }
+        }
+        let Some((at, index)) = best else {
+            out.push_str(rest);
+            break;
+        };
+        let label = &usable[index];
+        out.push_str(&rest[..at]);
+        old_utf16 += utf16_len(&rest[..at]);
+        let old_len = utf16_len(&label.label);
+        let new_len = utf16_len(&label.fallback);
+        out.push_str(&label.fallback);
+        if old_len > 0 {
+            swaps.push(EmojiSwap { old_start: old_utf16, old_len, new_len, document_id: label.document_id });
+        }
+        old_utf16 += old_len;
+        from += at + label.label.len();
+    }
+    (out, shift_for_emoji(entities, &swaps, allow))
+}
+
+fn delta_before(swaps: &[EmojiSwap], at: i32) -> i32 {
+    swaps.iter().filter(|swap| swap.old_start + swap.old_len <= at).map(|swap| swap.new_len - swap.old_len).sum()
+}
+
+fn shift_for_emoji(entities: Vec<MessageEntity>, swaps: &[EmojiSwap], allow: bool) -> Vec<MessageEntity> {
+    if swaps.is_empty() {
+        return entities;
+    }
+    let mut out = Vec::new();
+    for entity in entities {
+        let (offset, length) = place(&entity);
+        if length <= 0 {
+            continue;
+        }
+        let end = offset + length;
+        let overlaps = swaps.iter().any(|swap| offset < swap.old_start + swap.old_len && end > swap.old_start);
+        if overlaps {
+            continue;
+        }
+        let delta = delta_before(swaps, offset);
+        match retarget(&entity, offset + delta, length) {
+            Some(next) => out.push(next),
+            None if delta == 0 => out.push(entity),
+            None => {}
+        }
+    }
+    if allow {
+        for swap in swaps {
+            if swap.new_len <= 0 {
+                continue;
+            }
+            let offset = swap.old_start + delta_before(swaps, swap.old_start);
+            out.push(tl::types::MessageEntityCustomEmoji { offset, length: swap.new_len, document_id: swap.document_id }.into());
+        }
+    }
+    out
+}
+
+/// The same entity at a new UTF-16 offset. Kinds a send does not produce stay as they are
+/// when nothing moved, and are dropped when it did.
+fn retarget(entity: &MessageEntity, offset: i32, length: i32) -> Option<MessageEntity> {
+    use MessageEntity as E;
+    Some(match entity {
+        E::Bold(_) => tl::types::MessageEntityBold { offset, length }.into(),
+        E::Italic(_) => tl::types::MessageEntityItalic { offset, length }.into(),
+        E::Underline(_) => tl::types::MessageEntityUnderline { offset, length }.into(),
+        E::Strike(_) => tl::types::MessageEntityStrike { offset, length }.into(),
+        E::Code(_) => tl::types::MessageEntityCode { offset, length }.into(),
+        E::Pre(pre) => tl::types::MessageEntityPre { offset, length, language: pre.language.clone() }.into(),
+        E::Blockquote(quote) => tl::types::MessageEntityBlockquote { collapsed: quote.collapsed, offset, length }.into(),
+        E::Spoiler(_) => tl::types::MessageEntitySpoiler { offset, length }.into(),
+        E::TextUrl(link) => tl::types::MessageEntityTextUrl { offset, length, url: link.url.clone() }.into(),
+        E::MentionName(named) => tl::types::MessageEntityMentionName { offset, length, user_id: named.user_id }.into(),
+        E::CustomEmoji(emoji) => tl::types::MessageEntityCustomEmoji { offset, length, document_id: emoji.document_id }.into(),
+        _ => return None,
+    })
+}
+
+/// A draft's text as the composer shows it. Entities that arrived with it become markers,
+/// which is what a later send turns back into entities.
+pub fn draft_text(message: &str, entities: Option<&[MessageEntity]>) -> String {
+    match entities {
+        Some(entities) if !entities.is_empty() => to_markers(message, &spans(message, entities)),
+        _ => message.to_owned(),
+    }
+}
+
+/// One line for the scripted wire's log. Empty when there are no entities, so a plain send
+/// stays the line it always was.
+pub fn entity_note(entities: &[MessageEntity]) -> String {
+    let mut note = String::new();
+    for entity in entities {
+        let (offset, length) = place(entity);
+        match entity {
+            MessageEntity::Bold(_) => note.push_str(&format!(" bold:{offset}+{length}")),
+            MessageEntity::Italic(_) => note.push_str(&format!(" italic:{offset}+{length}")),
+            MessageEntity::Underline(_) => note.push_str(&format!(" underline:{offset}+{length}")),
+            MessageEntity::Strike(_) => note.push_str(&format!(" strike:{offset}+{length}")),
+            MessageEntity::Code(_) => note.push_str(&format!(" code:{offset}+{length}")),
+            MessageEntity::Pre(pre) => note.push_str(&format!(" pre:{offset}+{length}:{}", pre.language)),
+            MessageEntity::Blockquote(quote) => {
+                note.push_str(&format!(" quote:{offset}+{length}"));
+                if quote.collapsed {
+                    note.push_str(":collapsed");
+                }
+            }
+            MessageEntity::Spoiler(_) => note.push_str(&format!(" spoiler:{offset}+{length}")),
+            MessageEntity::TextUrl(link) => note.push_str(&format!(" link:{offset}+{length}:{}", link.url)),
+            MessageEntity::CustomEmoji(emoji) => note.push_str(&format!(" emoji:{offset}+{length}:{}", emoji.document_id)),
+            _ => {}
+        }
+    }
+    note
+}
+
+/// Markers the composer shows, turned into spans on the text with those markers taken out.
+pub fn from_markers(text: &str) -> (String, Vec<Span>) {
+    if !text.contains(['*', '_', '`', '~', '|', '[', '>']) {
+        return (text.to_owned(), Vec::new());
+    }
+    parse_markers(text, None)
+}
+
+/// Markers put back around `text`, so a draft that arrived as entities is still bold here.
+pub fn to_markers(text: &str, spans: &[Span]) -> String {
+    let mut events: Vec<(usize, u8, i32, i32, String)> = Vec::new();
+    for (index, span) in spans.iter().enumerate() {
+        let Some((open, close)) = marker_of(span) else {
+            continue;
+        };
+        let start = span.start as usize;
+        let end = span.end as usize;
+        if !span_fits(text, span) {
+            continue;
+        }
+        let len = (end - start) as i32;
+        let at = i32::try_from(index).unwrap_or(0);
+        events.push((start, 1, -len, -at, open));
+        if !close.is_empty() {
+            events.push((end, 0, len, at, close));
+        }
+    }
+    if events.is_empty() {
+        return text.to_owned();
+    }
+    events.sort_by(|left, right| {
+        left.0.cmp(&right.0).then(left.1.cmp(&right.1)).then(left.2.cmp(&right.2)).then(left.3.cmp(&right.3))
+    });
+    let mut out = String::new();
+    let mut at = 0;
+    for (pos, _, _, _, bit) in events {
+        if pos < at || pos > text.len() {
+            continue;
+        }
+        out.push_str(&text[at..pos]);
+        out.push_str(&bit);
+        at = pos;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+fn marker_of(span: &Span) -> Option<(String, String)> {
+    Some(match &span.style {
+        Style::Bold => ("**".to_owned(), "**".to_owned()),
+        Style::Italic => ("_".to_owned(), "_".to_owned()),
+        Style::Underline => ("__".to_owned(), "__".to_owned()),
+        Style::Strike => ("~~".to_owned(), "~~".to_owned()),
+        Style::Code => ("`".to_owned(), "`".to_owned()),
+        Style::Spoiler => ("||".to_owned(), "||".to_owned()),
+        Style::CodeBlock { language } => (format!("```{language}\n"), "\n```".to_owned()),
+        Style::Quote => ("> ".to_owned(), String::new()),
+        Style::Link { url } => ("[".to_owned(), format!("]({url})")),
+        _ => return None,
+    })
+}
+
+fn parse_markers(text: &str, mut prev: Option<char>) -> (String, Vec<Span>) {
+    let mut out = String::new();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        let line_start = i == 0 || text.as_bytes()[i - 1] == b'\n';
+        if let Some((lang, body, used)) = code_block(rest) {
+            push_plain(&mut out, &mut spans, body, Style::CodeBlock { language: lang });
+            i += used;
+            prev = body.chars().next_back();
+            continue;
+        }
+        if let Some((body, used)) = inline_code(rest) {
+            push_plain(&mut out, &mut spans, body, Style::Code);
+            i += used;
+            prev = body.chars().next_back();
+            continue;
+        }
+        if let Some((label, url, used)) = text_link(rest) {
+            let start = out.len() as u32;
+            absorb(&mut out, &mut spans, label);
+            if (out.len() as u32) > start {
+                spans.push(Span { start, end: out.len() as u32, style: Style::Link { url } });
+            }
+            i += used;
+            prev = out.chars().next_back();
+            continue;
+        }
+        if let Some((style, body, used)) = wrapped(rest, prev) {
+            let start = out.len() as u32;
+            absorb(&mut out, &mut spans, body);
+            if (out.len() as u32) > start {
+                spans.push(Span { start, end: out.len() as u32, style });
+            }
+            i += used;
+            prev = out.chars().next_back();
+            continue;
+        }
+        if line_start && rest.starts_with("> ") {
+            let line = &rest[2..];
+            let end = line.find('\n').unwrap_or(line.len());
+            let start = out.len() as u32;
+            absorb(&mut out, &mut spans, &line[..end]);
+            if (out.len() as u32) > start {
+                spans.push(Span { start, end: out.len() as u32, style: Style::Quote });
+            }
+            i += 2 + end;
+            prev = out.chars().next_back();
+            continue;
+        }
+        let ch = rest.chars().next().unwrap_or('\u{FFFD}');
+        out.push(ch);
+        i += ch.len_utf8();
+        prev = Some(ch);
+    }
+    (out, spans)
+}
+
+fn absorb(out: &mut String, spans: &mut Vec<Span>, body: &str) {
+    let (plain, inner) = parse_markers(body, None);
+    let base = out.len() as u32;
+    out.push_str(&plain);
+    for mut span in inner {
+        span.start += base;
+        span.end += base;
+        spans.push(span);
+    }
+}
+
+fn push_plain(out: &mut String, spans: &mut Vec<Span>, body: &str, style: Style) {
+    if body.is_empty() {
+        return;
+    }
+    let start = out.len() as u32;
+    out.push_str(body);
+    spans.push(Span { start, end: out.len() as u32, style });
+}
+
+fn code_block(text: &str) -> Option<(String, &str, usize)> {
+    if !text.starts_with("```") {
+        return None;
+    }
+    let rest = &text[3..];
+    let nl = rest.find('\n')?;
+    let lang = rest[..nl].trim().to_owned();
+    let after = &rest[nl + 1..];
+    let end = after.find("```")?;
+    let body = after[..end].strip_suffix('\n').unwrap_or(&after[..end]);
+    Some((lang, body, 3 + nl + 1 + end + 3))
+}
+
+fn inline_code(text: &str) -> Option<(&str, usize)> {
+    if !text.starts_with('`') || text.starts_with("```") {
+        return None;
+    }
+    let rest = &text[1..];
+    let close = rest.find('`')?;
+    if close == 0 || rest[..close].contains('\n') {
+        return None;
+    }
+    Some((&rest[..close], close + 2))
+}
+
+fn text_link(text: &str) -> Option<(&str, String, usize)> {
+    if !text.starts_with('[') {
+        return None;
+    }
+    let rest = &text[1..];
+    let label_end = rest.find("](")?;
+    if label_end == 0 || rest[..label_end].contains('\n') {
+        return None;
+    }
+    let after = &rest[label_end + 2..];
+    let url_end = after.find(')')?;
+    if url_end == 0 || after[..url_end].contains(char::is_whitespace) {
+        return None;
+    }
+    Some((&rest[..label_end], after[..url_end].to_owned(), 1 + label_end + 2 + url_end + 1))
+}
+
+fn wrapped(text: &str, prev: Option<char>) -> Option<(Style, &str, usize)> {
+    let pairs: &[(&str, Style, bool)] = &[
+        ("||", Style::Spoiler, false),
+        ("~~", Style::Strike, false),
+        ("**", Style::Bold, false),
+        ("__", Style::Underline, false),
+        ("_", Style::Italic, true),
+        ("*", Style::Italic, true),
+    ];
+    for (marker, style, word) in pairs {
+        if !text.starts_with(marker) {
+            continue;
+        }
+        if *word && (prev.is_some_and(|ch| ch.is_alphanumeric()) || (*marker == "*" && text.starts_with("**")) || (*marker == "_" && text.starts_with("__"))) {
+            continue;
+        }
+        let rest = &text[marker.len()..];
+        if !rest.chars().next().is_some_and(|ch| !ch.is_whitespace()) {
+            continue;
+        }
+        let close = find_close(rest, marker, *word)?;
+        let body = &rest[..close];
+        if body.is_empty() {
+            continue;
+        }
+        return Some((style.clone(), body, marker.len() * 2 + close));
+    }
+    None
+}
+
+fn find_close(text: &str, marker: &str, word: bool) -> Option<usize> {
+    let mut at = 0;
+    while let Some(rel) = text[at..].find(marker) {
+        let close = at + rel;
+        if close == 0 {
+            at += marker.len();
+            continue;
+        }
+        let before_ok = text[..close].chars().next_back().is_some_and(|ch| !ch.is_whitespace());
+        let after_ok = !word || text[close + marker.len()..].chars().next().is_none_or(|ch| !ch.is_alphanumeric());
+        if before_ok && after_ok {
+            return Some(close);
+        }
+        at = close + marker.len();
+    }
+    None
+}
+
 /// A voice message's loudness: Telegram packs 5-bit values end to end; the contract wants a
 /// byte a bar.
 pub fn waveform(packed: &[u8]) -> Vec<u8> {
@@ -503,49 +987,195 @@ fn duration_words(seconds: i32) -> String {
     }
 }
 
-/// A service message as one line. `who` did it; "You" when it was us.
-fn action(dir: &Directory, who: &str, action: &MessageAction) -> String {
+/// The first line of a pinned message, short enough for the grey line. A quote mark in it
+/// becomes an apostrophe so the line keeps one pair of quotes.
+fn first_words(text: &str) -> String {
+    let line = text.lines().next().unwrap_or("").trim().replace('"', "'");
+    let mut words: String = line.chars().take(40).collect();
+    if line.chars().count() > 40 {
+        words.push('…');
+    }
+    words
+}
+
+fn pin_line(who: &str, snippet: &str) -> String {
+    let words = first_words(snippet);
+    if words.is_empty() {
+        format!("{who} pinned a message")
+    } else {
+        format!("{who} pinned \"{words}\"")
+    }
+}
+
+/// Once the pinned message is known (this page, or the store), its first words replace the
+/// bare "pinned a message". A line that already quotes something is left as it is.
+pub(super) fn quote_pin(message: &mut Message) {
+    if message.kind != MessageKind::System {
+        return;
+    }
+    let Some(who) = message.text.strip_suffix(" pinned a message") else {
+        return;
+    };
+    let Some(snippet) = message.reply_to.as_ref().map(|reply| reply.snippet.clone()) else {
+        return;
+    };
+    let who = who.to_owned();
+    message.text = pin_line(&who, &snippet);
+}
+
+fn count_words(n: i32, one: &str, many: &str) -> String {
+    let n = n.max(0);
+    if n == 1 { format!("1 {one}") } else { format!("{n} {many}") }
+}
+
+/// How long a message now stays, from Telegram's `period` in seconds.
+fn kept_for(period: i32) -> String {
+    if period <= 0 {
+        return "off".to_owned();
+    }
+    let period = period as u32;
+    let (n, one, many) = if period.is_multiple_of(604_800) {
+        (period / 604_800, "week", "weeks")
+    } else if period.is_multiple_of(86_400) {
+        (period / 86_400, "day", "days")
+    } else if period.is_multiple_of(3_600) {
+        (period / 3_600, "hour", "hours")
+    } else if period.is_multiple_of(60) {
+        (period / 60, "minute", "minutes")
+    } else {
+        (period, "second", "seconds")
+    };
+    count_words(n as i32, one, many)
+}
+
+fn header_quote(header: Option<&tl::enums::MessageReplyHeader>) -> Option<String> {
+    let tl::enums::MessageReplyHeader::Header(header) = header? else {
+        return None;
+    };
+    header.quote_text.clone().filter(|text| !text.trim().is_empty())
+}
+
+/// A service message as one line, and whether the line names the event. `who` did it; "You"
+/// when it was us. An unnamed event stays the fallback: the caller gives it a link into Telegram.
+fn action(dir: &Directory, who: &str, action: &MessageAction) -> (String, bool) {
     let name = |id: i64| if id == dir.me { "you".to_owned() } else { dir.name(Who::User(id)) };
     let names = |ids: &[i64]| ids.iter().map(|id| name(*id)).collect::<Vec<_>>().join(", ");
+    let days = |n: i32| count_words(n, "day", "days");
     use MessageAction as A;
+    let named = |line: String| (line, true);
     match action {
-        A::ChatCreate(a) => format!("{who} created the group \"{}\"", a.title),
-        A::ChannelCreate(a) => format!("\"{}\" was created", a.title),
-        A::ChatEditTitle(a) => format!("{who} renamed this to \"{}\"", a.title),
-        A::ChatEditPhoto(_) => format!("{who} changed the picture"),
-        A::ChatDeletePhoto => format!("{who} removed the picture"),
-        A::ChatAddUser(a) if a.users.len() == 1 && name(a.users[0]) == who.to_lowercase() => format!("{who} joined"),
-        A::ChatAddUser(a) => format!("{who} added {}", names(&a.users)),
-        A::ChatDeleteUser(a) if name(a.user_id) == who.to_lowercase() || dir.name(Who::User(a.user_id)) == who => format!("{who} left"),
-        A::ChatDeleteUser(a) => format!("{who} removed {}", name(a.user_id)),
-        A::ChatJoinedByLink(_) => format!("{who} joined with an invite link"),
-        A::ChatJoinedByRequest => format!("{who} was let in"),
-        A::ChatMigrateTo(_) | A::ChannelMigrateFrom(_) => "This group was upgraded to a supergroup".to_owned(),
-        A::PinMessage => format!("{who} pinned a message"),
-        A::HistoryClear => "History was cleared".to_owned(),
+        A::ChatCreate(a) => named(format!("{who} created the group \"{}\"", a.title)),
+        A::ChannelCreate(a) => named(format!("\"{}\" was created", a.title)),
+        A::ChatEditTitle(a) => named(format!("{who} renamed this to \"{}\"", a.title)),
+        A::ChatEditPhoto(_) => named(format!("{who} changed the picture")),
+        A::ChatDeletePhoto => named(format!("{who} removed the picture")),
+        A::ChatAddUser(a) if a.users.len() == 1 && name(a.users[0]) == who.to_lowercase() => named(format!("{who} joined")),
+        A::ChatAddUser(a) => named(format!("{who} added {}", names(&a.users))),
+        A::ChatDeleteUser(a) if name(a.user_id) == who.to_lowercase() || dir.name(Who::User(a.user_id)) == who => named(format!("{who} left")),
+        A::ChatDeleteUser(a) => named(format!("{who} removed {}", name(a.user_id))),
+        A::ChatJoinedByLink(_) => named(format!("{who} joined with an invite link")),
+        A::ChatJoinedByRequest => named(format!("{who} was let in")),
+        A::ChatMigrateTo(_) => named("This group was upgraded to a supergroup".to_owned()),
+        A::ChannelMigrateFrom(migrated) => named(format!("This group was upgraded from \"{}\"", migrated.title)),
+        A::PinMessage => named(format!("{who} pinned a message")),
+        A::HistoryClear => named("History was cleared".to_owned()),
+        A::GameScore(game) => named(format!("{who} scored {}", game.score)),
+        A::PaymentSent(paid) => named(match paid.currency.is_empty() {
+            true => format!("{who} sent a payment"),
+            false => format!("{who} sent a payment ({})", paid.currency),
+        }),
+        A::PaymentRefunded(paid) => named(match paid.currency.is_empty() {
+            true => "A payment was refunded".to_owned(),
+            false => format!("A {} payment was refunded", paid.currency),
+        }),
         A::PhoneCall(call) => {
             let kind = if call.video { "Video call" } else { "Call" };
-            match call.duration {
+            named(match call.duration {
                 Some(seconds) => format!("{kind}, {}", duration_words(seconds)),
                 None => format!("{kind}, not answered"),
-            }
+            })
         }
-        A::GroupCall(call) => match call.duration {
+        A::GroupCall(call) => named(match call.duration {
             Some(seconds) => format!("Video chat ended, {}", duration_words(seconds)),
             None => format!("{who} started a video chat"),
-        },
-        A::ScreenshotTaken => format!("{who} took a screenshot"),
-        A::ContactSignUp => format!("{who} joined Telegram"),
-        A::TopicCreate(topic) => format!("{who} created the topic \"{}\"", topic.title),
-        A::TopicEdit(edit) => match (&edit.title, edit.closed) {
+        }),
+        A::InviteToGroupCall(invite) => named(match invite.users.as_slice() {
+            [] => format!("{who} invited you to the video chat"),
+            users => format!("{who} invited {} to the video chat", names(users)),
+        }),
+        A::GroupCallScheduled(_) => named(format!("{who} scheduled a video chat")),
+        A::ScreenshotTaken => named(format!("{who} took a screenshot")),
+        A::ContactSignUp => named(format!("{who} joined Telegram")),
+        A::TopicCreate(topic) => named(format!("{who} created the topic \"{}\"", topic.title)),
+        A::TopicEdit(edit) => named(match (&edit.title, edit.closed) {
             (Some(title), _) => format!("{who} renamed the topic to \"{title}\""),
             (None, Some(true)) => format!("{who} closed the topic"),
             (None, Some(false)) => format!("{who} reopened the topic"),
             (None, None) => format!("{who} changed the topic"),
-        },
-        A::SetMessagesTtl(_) => format!("{who} changed how long messages are kept"),
-        A::CustomAction(custom) => custom.message.clone(),
-        _ => format!("{who} changed something tinyclient cannot show yet"),
+        }),
+        A::SetMessagesTtl(ttl) => named(match ttl.period {
+            0 => format!("{who} turned the auto-delete timer off"),
+            period => format!("{who} set messages to auto-delete after {}", kept_for(period)),
+        }),
+        A::SetChatTheme(_) => named(format!("{who} changed the chat theme")),
+        A::SetChatWallPaper(paper) => named(if paper.same {
+            format!("{who} set the same wallpaper")
+        } else {
+            format!("{who} changed the wallpaper")
+        }),
+        A::SuggestProfilePhoto(_) => named(format!("{who} suggested a profile photo")),
+        A::CustomAction(custom) => named(custom.message.clone()),
+        A::BotAllowed(allowed) => named(if allowed.attach_menu {
+            format!("{who} added this bot from the attachment menu")
+        } else if let Some(domain) = &allowed.domain {
+            format!("{who} allowed this bot to message you on {domain}")
+        } else {
+            format!("{who} allowed this bot to message you")
+        }),
+        A::WebViewDataSent(sent) => named(match first_words(&sent.text).as_str() {
+            "" => format!("{who} sent data from a mini app"),
+            text => format!("{who} sent data from \"{text}\""),
+        }),
+        A::GiftPremium(gift) => named(format!("{who} gifted Telegram Premium for {}", days(gift.days))),
+        A::GiftCode(gift) => named(if gift.via_giveaway {
+            format!("A giveaway sent a Premium gift code for {}", days(gift.days))
+        } else {
+            format!("{who} sent a Premium gift code for {}", days(gift.days))
+        }),
+        A::GiftStars(gift) => named(format!(
+            "{who} gifted {}",
+            if gift.stars == 1 { "1 Star".to_owned() } else { format!("{} Stars", gift.stars) }
+        )),
+        A::StarGift(gift) => named(if gift.refunded {
+            "A gift was refunded".to_owned()
+        } else if gift.converted {
+            format!("{who} converted a gift into Stars")
+        } else if gift.name_hidden {
+            "Someone sent a gift".to_owned()
+        } else {
+            format!("{who} sent a gift")
+        }),
+        A::GiveawayLaunch(launch) => named(if launch.stars.is_some() {
+            format!("{who} started a Stars giveaway")
+        } else {
+            format!("{who} started a giveaway")
+        }),
+        A::GiveawayResults(results) => named(format!("A giveaway finished with {}", count_words(results.winners_count, "winner", "winners"))),
+        A::BoostApply(boost) => named(if boost.boosts == 1 {
+            format!("{who} boosted this channel")
+        } else {
+            format!("{who} applied {}", count_words(boost.boosts, "boost", "boosts"))
+        }),
+        A::RequestedPeer(shared) => named(match shared.peers.len() {
+            0 | 1 => format!("{who} shared a chat"),
+            n => format!("{who} shared {n} chats"),
+        }),
+        A::TodoCompletions(todo) => named(if !todo.completed.is_empty() {
+            format!("{who} checked off {}", count_words(todo.completed.len() as i32, "item", "items"))
+        } else {
+            format!("{who} marked {} not done", count_words(todo.incompleted.len() as i32, "item", "items"))
+        }),
+        _ => (format!("{who} changed something tinyclient cannot show yet"), false),
     }
 }
 
@@ -558,15 +1188,29 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             let from = service.from_id.as_ref().map_or(peer, Who::of);
             let outgoing = service.out || from == Who::User(dir.me);
             let who = if outgoing { "You".to_owned() } else { dir.name(from) };
-            let mut message = Message::plain(service.id.to_string(), "", action(dir, &who, &service.action), i64::from(service.date), outgoing);
+            let (topic, reply) = topic_of(service.reply_to.as_ref());
+            let (mut text, known) = action(dir, &who, &service.action);
+            let pin = matches!(service.action, MessageAction::PinMessage);
+            if pin {
+                if let Some(words) = header_quote(service.reply_to.as_ref()) {
+                    text = pin_line(&who, &words);
+                }
+            }
+            let mut message = Message::plain(service.id.to_string(), "", text, i64::from(service.date), outgoing);
             message.sender = sender(dir, from);
-            message.kind = MessageKind::System;
+            // A named event is the grey line. One this build does not word opens in Telegram,
+            // the same way a poll or a story does.
+            message.kind = if known {
+                MessageKind::System
+            } else {
+                MessageKind::Unsupported { link: message_link(peer, dir.get(peer), service.id) }
+            };
             Some(Mapped {
                 peer,
                 id: service.id,
-                topic: topic_of(service.reply_to.as_ref()).0,
+                topic,
                 discussion_top: None,
-                reply: None,
+                reply: pin.then_some(reply).flatten(),
                 message,
                 wants: Vec::new(),
             })
@@ -655,8 +1299,14 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                         });
                     }
                 }
-                // The dice is its own emoji; the roll is animated in Telegram's app only.
-                Some(MessageMedia::Dice(dice)) => message.text = dice.emoticon.clone(),
+                // The value is the roll everyone sees. Zero means it is still spinning, so the
+                // row is the emoji alone until Telegram names the result.
+                Some(MessageMedia::Dice(dice)) => {
+                    message.text = match dice.value {
+                        1.. => format!("{} {}", dice.emoticon, dice.value),
+                        _ => dice.emoticon.clone(),
+                    };
+                }
                 Some(media) => {
                     if let Some(label) = unsupported(media) {
                         // The caption follows the label; its styles no longer line up, so they go.
@@ -700,9 +1350,111 @@ fn topic_of(header: Option<&tl::enums::MessageReplyHeader>) -> (Option<i32>, Opt
     }
 }
 
+/// The lab's telegram-dice check. A roll of 5 reads as the emoji and the value.
+pub(super) fn prove_dice_roll() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    7i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    message.from_id = Some(Who::User(7_002).peer());
+    message.media = Some(tl::types::MessageMediaDice { value: 5, emoticon: "\u{1F3B2}".into(), game_outcome: None }.into());
+    let mapped = map(&Directory::new(7_001), &message.into()).ok_or("the roll maps")?;
+    if mapped.message.text != "\u{1F3B2} 5" || !mapped.wants.is_empty() {
+        return Err(format!("a dice of 5 reads as the emoji and the value, got {}", mapped.message.text));
+    }
+    Ok(())
+}
+
+/// The lab's telegram-service-lines check. A premium gift is named, a pin quotes the message
+/// it points at, and an action this build does not word opens in Telegram.
+pub(super) fn prove_service_lines() -> Result<(), String> {
+    let premium = tl::types::MessageActionGiftPremium {
+        currency: "USD".into(),
+        amount: 500,
+        days: 30,
+        crypto_currency: None,
+        crypto_amount: None,
+        message: None,
+    };
+    let (line, known) = action(&Directory::new(1), "Ada", &premium.into());
+    if !known || line != "Ada gifted Telegram Premium for 30 days" {
+        return Err(format!("a premium gift is named, got {line}"));
+    }
+    let header = tl::types::MessageReplyHeader {
+        reply_to_scheduled: false,
+        forum_topic: false,
+        quote: true,
+        reply_to_ephemeral: false,
+        reply_to_msg_id: Some(4),
+        reply_to_peer_id: None,
+        reply_from: None,
+        reply_media: None,
+        reply_to_top_id: None,
+        quote_text: Some("Bring the rope".into()),
+        quote_entities: None,
+        quote_offset: None,
+        todo_item_id: None,
+        poll_option: None,
+    };
+    let service = tl::types::MessageService {
+        out: false,
+        mentioned: false,
+        media_unread: false,
+        reactions_are_possible: false,
+        silent: false,
+        post: false,
+        legacy: false,
+        id: 8,
+        from_id: Some(Who::User(7_002).peer()),
+        peer_id: Who::User(7_002).peer(),
+        saved_peer_id: None,
+        reply_to: Some(header.into()),
+        date: 1_700_000_000,
+        action: MessageAction::PinMessage,
+        reactions: None,
+        ttl_period: None,
+    };
+    let dir = Directory::new(1);
+    let pinned = map(&dir, &service.into()).ok_or("a pin maps")?;
+    if pinned.message.text != "Unknown pinned \"Bring the rope\"" || pinned.reply != Some(4) || pinned.message.kind != MessageKind::System {
+        return Err(format!("a pin quotes its message, got {}", pinned.message.text));
+    }
+    let unnamed = tl::types::MessageService {
+        out: false,
+        mentioned: false,
+        media_unread: false,
+        reactions_are_possible: false,
+        silent: false,
+        post: false,
+        legacy: false,
+        id: 22,
+        from_id: Some(Who::User(7_002).peer()),
+        peer_id: Who::User(7_002).peer(),
+        saved_peer_id: None,
+        reply_to: None,
+        date: 1_700_000_000,
+        action: MessageAction::Empty,
+        reactions: None,
+        ttl_period: None,
+    };
+    let unknown = map(&dir, &unnamed.into()).ok_or("an unnamed action maps")?;
+    match &unknown.message.kind {
+        MessageKind::Unsupported { link }
+            if unknown.message.text.contains("cannot show yet") && link.contains("user_id=7002") && link.contains("message_id=22") => {}
+        _ => return Err(format!("an unnamed action opens in Telegram, got {}", unknown.message.text)),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grammers_tl_types::Deserializable;
 
     fn bold(offset: i32, length: i32) -> MessageEntity {
         tl::types::MessageEntityBold { offset, length }.into()
@@ -858,5 +1610,346 @@ mod tests {
         // An emoji of another network is not a Telegram document, so it names no id to ask for.
         message.spans[0].style = Style::Emoji { file: MediaFile::new("emoji:7001", MediaKind::Emoji) };
         assert!(text_emoji_ids(&message).is_empty());
+    }
+
+    #[test]
+    fn spans_round_trip_through_entities_over_text_with_emoji() {
+        // "né" is 2 units and 3 bytes; the flag is 4 units and 8 bytes; the crab 2 units, 4 bytes.
+        let text = "né 🇵🇹 🦀 code";
+        let entities = vec![
+            bold(0, 2),
+            tl::types::MessageEntityItalic { offset: 3, length: 4 }.into(),
+            tl::types::MessageEntityCode { offset: 11, length: 4 }.into(),
+            tl::types::MessageEntityTextUrl { offset: 8, length: 2, url: "https://crab.example".into() }.into(),
+            tl::types::MessageEntitySpoiler { offset: 0, length: 2 }.into(),
+        ];
+        let once = spans(text, &entities);
+        let back = entities_of(text, &once);
+        let twice = spans(text, &back);
+        assert_eq!(twice, once, "entities are the inverse of spans, in UTF-16 units");
+    }
+
+    #[test]
+    fn markers_become_the_spans_telegram_will_keep() {
+        let (plain, styled) = from_markers("**hi** _there_");
+        assert_eq!(plain, "hi there");
+        let said: Vec<(&str, &Style)> = styled.iter().map(|span| (&plain[span.start as usize..span.end as usize], &span.style)).collect();
+        assert_eq!(said, vec![("hi", &Style::Bold), ("there", &Style::Italic)]);
+        let entities = entities_of(&plain, &styled);
+        assert_eq!(place(&entities[0]), (0, 2));
+        assert!(matches!(entities[0], MessageEntity::Bold(_)));
+        assert_eq!(place(&entities[1]), (3, 5));
+        assert!(matches!(entities[1], MessageEntity::Italic(_)));
+    }
+
+    fn dice_message(value: i32) -> tl::enums::Message {
+        use grammers_tl_types::{Deserializable, Serializable};
+        let mut bytes = Vec::new();
+        0u32.serialize(&mut bytes);
+        0u32.serialize(&mut bytes);
+        7i32.serialize(&mut bytes);
+        Who::User(7_002).peer().serialize(&mut bytes);
+        1_700_000_000i32.serialize(&mut bytes);
+        String::new().serialize(&mut bytes);
+        let mut message = tl::types::Message::from_bytes(&bytes).expect("a blank message reads back");
+        message.from_id = Some(Who::User(7_002).peer());
+        message.media = Some(
+            tl::types::MessageMediaDice {
+                value,
+                emoticon: "\u{1F3B2}".into(),
+                game_outcome: None,
+            }
+            .into(),
+        );
+        message.into()
+    }
+
+    #[test]
+    fn a_dice_roll_keeps_its_value() {
+        let rolled = map(&Directory::new(7_001), &dice_message(5)).expect("the roll maps");
+        assert!(rolled.wants.is_empty());
+        assert_eq!(rolled.message.text, "\u{1F3B2} 5");
+        let spinning = map(&Directory::new(7_001), &dice_message(0)).expect("a roll still spinning maps");
+        assert_eq!(spinning.message.text, "\u{1F3B2}");
+    }
+
+    fn said(action: MessageAction) -> String {
+        super::action(&Directory::new(1), "Ada", &action).0
+    }
+
+    /// Every `MessageAction` of the pinned grammers schema. A new variant fails this build
+    /// until it is named here, which is how an upgrade is noticed. The fallback line stays.
+    fn listed(action: &MessageAction) -> &'static str {
+        use MessageAction as A;
+        match action {
+            A::Empty => "empty",
+            A::ChatCreate(_) => "chat_create",
+            A::ChatEditTitle(_) => "chat_edit_title",
+            A::ChatEditPhoto(_) => "chat_edit_photo",
+            A::ChatDeletePhoto => "chat_delete_photo",
+            A::ChatAddUser(_) => "chat_add_user",
+            A::ChatDeleteUser(_) => "chat_delete_user",
+            A::ChatJoinedByLink(_) => "chat_joined_by_link",
+            A::ChannelCreate(_) => "channel_create",
+            A::ChatMigrateTo(_) => "chat_migrate_to",
+            A::ChannelMigrateFrom(_) => "channel_migrate_from",
+            A::PinMessage => "pin",
+            A::HistoryClear => "history_clear",
+            A::GameScore(_) => "game_score",
+            A::PaymentSentMe(_) => "payment_sent_me",
+            A::PaymentSent(_) => "payment_sent",
+            A::PhoneCall(_) => "phone_call",
+            A::ScreenshotTaken => "screenshot",
+            A::CustomAction(_) => "custom",
+            A::BotAllowed(_) => "bot_allowed",
+            A::SecureValuesSentMe(_) => "secure_values_sent_me",
+            A::SecureValuesSent(_) => "secure_values_sent",
+            A::ContactSignUp => "contact_sign_up",
+            A::GeoProximityReached(_) => "geo_proximity",
+            A::GroupCall(_) => "group_call",
+            A::InviteToGroupCall(_) => "invite_to_group_call",
+            A::SetMessagesTtl(_) => "ttl",
+            A::GroupCallScheduled(_) => "group_call_scheduled",
+            A::SetChatTheme(_) => "chat_theme",
+            A::ChatJoinedByRequest => "joined_by_request",
+            A::WebViewDataSentMe(_) => "web_view_sent_me",
+            A::WebViewDataSent(_) => "web_view_sent",
+            A::GiftPremium(_) => "gift_premium",
+            A::TopicCreate(_) => "topic_create",
+            A::TopicEdit(_) => "topic_edit",
+            A::SuggestProfilePhoto(_) => "suggest_photo",
+            A::RequestedPeer(_) => "requested_peer",
+            A::SetChatWallPaper(_) => "wallpaper",
+            A::GiftCode(_) => "gift_code",
+            A::GiveawayLaunch(_) => "giveaway_launch",
+            A::GiveawayResults(_) => "giveaway_results",
+            A::BoostApply(_) => "boost",
+            A::RequestedPeerSentMe(_) => "requested_peer_sent_me",
+            A::PaymentRefunded(_) => "payment_refunded",
+            A::GiftStars(_) => "gift_stars",
+            A::PrizeStars(_) => "prize_stars",
+            A::StarGift(_) => "star_gift",
+            A::StarGiftUnique(_) => "star_gift_unique",
+            A::PaidMessagesRefunded(_) => "paid_messages_refunded",
+            A::PaidMessagesPrice(_) => "paid_messages_price",
+            A::ConferenceCall(_) => "conference_call",
+            A::TodoCompletions(_) => "todo_completions",
+            A::TodoAppendTasks(_) => "todo_append",
+            A::SuggestedPostApproval(_) => "suggested_post_approval",
+            A::SuggestedPostSuccess(_) => "suggested_post_success",
+            A::SuggestedPostRefund(_) => "suggested_post_refund",
+            A::GiftTon(_) => "gift_ton",
+            A::SuggestBirthday(_) => "suggest_birthday",
+            A::StarGiftPurchaseOffer(_) => "star_gift_offer",
+            A::StarGiftPurchaseOfferDeclined(_) => "star_gift_offer_declined",
+            A::NewCreatorPending(_) => "new_creator_pending",
+            A::ChangeCreator(_) => "change_creator",
+            A::NoForwardsToggle(_) => "no_forwards_toggle",
+            A::NoForwardsRequest(_) => "no_forwards_request",
+            A::PollAppendAnswer(_) => "poll_append",
+            A::PollDeleteAnswer(_) => "poll_delete",
+            A::ManagedBotCreated(_) => "managed_bot",
+        }
+    }
+
+    fn service(id: i32, action: MessageAction, reply_to: Option<tl::enums::MessageReplyHeader>) -> tl::enums::Message {
+        tl::types::MessageService {
+            out: false,
+            mentioned: false,
+            media_unread: false,
+            reactions_are_possible: false,
+            silent: false,
+            post: false,
+            legacy: false,
+            id,
+            from_id: Some(Who::User(7_002).peer()),
+            peer_id: Who::User(7_002).peer(),
+            saved_peer_id: None,
+            reply_to,
+            date: 1_700_000_000,
+            action,
+            reactions: None,
+            ttl_period: None,
+        }
+        .into()
+    }
+
+    fn star_gift() -> MessageAction {
+        use grammers_tl_types::Serializable;
+        let mut bytes = Vec::new();
+        0u32.serialize(&mut bytes);
+        0x313a9547u32.serialize(&mut bytes);
+        0u32.serialize(&mut bytes);
+        1i64.serialize(&mut bytes);
+        0x36f8c871u32.serialize(&mut bytes);
+        2i64.serialize(&mut bytes);
+        10i64.serialize(&mut bytes);
+        5i64.serialize(&mut bytes);
+        tl::types::MessageActionStarGift::from_bytes(&bytes).expect("a star gift reads back").into()
+    }
+
+    fn wallpaper(same: bool) -> MessageAction {
+        use grammers_tl_types::Serializable;
+        let mut bytes = Vec::new();
+        (u32::from(same)).serialize(&mut bytes);
+        0xa437c3edu32.serialize(&mut bytes);
+        9i64.serialize(&mut bytes);
+        0u32.serialize(&mut bytes);
+        3i64.serialize(&mut bytes);
+        String::new().serialize(&mut bytes);
+        0x36f8c871u32.serialize(&mut bytes);
+        2i64.serialize(&mut bytes);
+        tl::types::MessageActionSetChatWallPaper::from_bytes(&bytes).expect("a wallpaper reads back").into()
+    }
+
+    fn pin_header(quote: Option<&str>) -> tl::enums::MessageReplyHeader {
+        tl::types::MessageReplyHeader {
+            reply_to_scheduled: false,
+            forum_topic: false,
+            quote: quote.is_some(),
+            reply_to_ephemeral: false,
+            reply_to_msg_id: Some(4),
+            reply_to_peer_id: None,
+            reply_from: None,
+            reply_media: None,
+            reply_to_top_id: None,
+            quote_text: quote.map(str::to_owned),
+            quote_entities: None,
+            quote_offset: None,
+            todo_item_id: None,
+            poll_option: None,
+        }
+        .into()
+    }
+
+    #[test]
+    fn every_message_action_of_this_layer_is_listed() {
+        assert_eq!(listed(&MessageAction::Empty), "empty");
+        assert_eq!(listed(&MessageAction::PinMessage), "pin");
+        assert!(said(MessageAction::Empty).contains("cannot show yet"));
+    }
+
+    #[test]
+    fn service_lines_name_the_event_and_a_pin_quotes_its_message() {
+        let premium = tl::types::MessageActionGiftPremium {
+            currency: "USD".into(),
+            amount: 500,
+            days: 30,
+            crypto_currency: None,
+            crypto_amount: None,
+            message: None,
+        };
+        assert_eq!(said(premium.into()), "Ada gifted Telegram Premium for 30 days");
+        let code = tl::types::MessageActionGiftCode {
+            via_giveaway: false,
+            unclaimed: false,
+            boost_peer: None,
+            days: 90,
+            slug: "code".into(),
+            currency: None,
+            amount: None,
+            crypto_currency: None,
+            crypto_amount: None,
+            message: None,
+        };
+        assert_eq!(said(code.into()), "Ada sent a Premium gift code for 90 days");
+        let stars = tl::types::MessageActionGiftStars {
+            currency: "USD".into(),
+            amount: 100,
+            stars: 50,
+            crypto_currency: None,
+            crypto_amount: None,
+            transaction_id: None,
+        };
+        assert_eq!(said(stars.into()), "Ada gifted 50 Stars");
+        let paid = tl::types::MessageActionPaymentSent {
+            recurring_init: false,
+            recurring_used: false,
+            currency: "USD".into(),
+            total_amount: 500,
+            invoice_slug: None,
+            subscription_until_date: None,
+        };
+        assert_eq!(said(paid.into()), "Ada sent a payment (USD)");
+        let refunded = tl::types::MessageActionPaymentRefunded {
+            peer: Who::User(7_002).peer(),
+            currency: "USD".into(),
+            total_amount: 500,
+            payload: None,
+            charge: tl::types::PaymentCharge { id: "c".into(), provider_charge_id: "p".into() }.into(),
+        };
+        assert_eq!(said(refunded.into()), "A USD payment was refunded");
+        assert_eq!(said(tl::types::MessageActionGiveawayLaunch { stars: None }.into()), "Ada started a giveaway");
+        let results = tl::types::MessageActionGiveawayResults { stars: false, winners_count: 3, unclaimed_count: 0 };
+        assert_eq!(said(results.into()), "A giveaway finished with 3 winners");
+        assert_eq!(said(tl::types::MessageActionBoostApply { boosts: 1 }.into()), "Ada boosted this channel");
+        assert_eq!(said(tl::types::MessageActionSetChatTheme { theme: tl::types::ChatTheme { emoticon: "x".into() }.into() }.into()), "Ada changed the chat theme");
+        assert_eq!(
+            said(tl::types::MessageActionSuggestProfilePhoto { photo: tl::types::PhotoEmpty { id: 1 }.into() }.into()),
+            "Ada suggested a profile photo"
+        );
+        let call = tl::types::InputGroupCall { id: 1, access_hash: 2 }.into();
+        assert_eq!(
+            said(tl::types::MessageActionInviteToGroupCall { call, users: vec![9] }.into()),
+            "Ada invited Unknown to the video chat"
+        );
+        let call = tl::types::InputGroupCall { id: 1, access_hash: 2 }.into();
+        assert_eq!(said(tl::types::MessageActionGroupCallScheduled { call, schedule_date: 1_700_000_000 }.into()), "Ada scheduled a video chat");
+        assert_eq!(said(tl::types::MessageActionGameScore { game_id: 1, score: 40 }.into()), "Ada scored 40");
+        assert_eq!(
+            said(tl::types::MessageActionRequestedPeer { button_id: 1, peers: vec![Who::User(9).peer()] }.into()),
+            "Ada shared a chat"
+        );
+        assert_eq!(said(tl::types::MessageActionWebViewDataSent { text: "Checkout".into() }.into()), "Ada sent data from \"Checkout\"");
+        let allowed = tl::types::MessageActionBotAllowed {
+            attach_menu: false,
+            from_request: false,
+            domain: None,
+            app: None,
+        };
+        assert_eq!(said(allowed.into()), "Ada allowed this bot to message you");
+        assert_eq!(
+            said(tl::types::MessageActionChannelMigrateFrom { title: "Ridge".into(), chat_id: 3 }.into()),
+            "This group was upgraded from \"Ridge\""
+        );
+        assert_eq!(
+            said(tl::types::MessageActionTodoCompletions { completed: vec![1], incompleted: vec![] }.into()),
+            "Ada checked off 1 item"
+        );
+        assert_eq!(
+            said(tl::types::MessageActionSetMessagesTtl { period: 86_400, auto_setting_from: None }.into()),
+            "Ada set messages to auto-delete after 1 day"
+        );
+        assert_eq!(said(star_gift()), "Ada sent a gift");
+        assert_eq!(said(wallpaper(false)), "Ada changed the wallpaper");
+        assert_eq!(said(wallpaper(true)), "Ada set the same wallpaper");
+
+        let mut quoted = Message::plain("8", "", "Ada pinned a message", 0, false);
+        quoted.kind = MessageKind::System;
+        quoted.reply_to = Some(protocol::ReplyTo {
+            id: "4".into(),
+            sender: "Bea".into(),
+            snippet: "Bring the rope tomorrow and the map from the hut please".into(),
+            person: None,
+            deleted: false,
+        });
+        quote_pin(&mut quoted);
+        assert_eq!(quoted.text, "Ada pinned \"Bring the rope tomorrow and the map from…\"");
+
+        let dir = Directory::new(1);
+        let pinned = map(&dir, &service(8, MessageAction::PinMessage, Some(pin_header(Some("Bring the rope"))))).expect("a pin maps");
+        assert_eq!(pinned.message.text, "Unknown pinned \"Bring the rope\"");
+        assert_eq!(pinned.reply, Some(4));
+        assert!(matches!(pinned.message.kind, MessageKind::System));
+
+        let unknown = map(&dir, &service(22, MessageAction::Empty, None)).expect("an unknown action maps");
+        assert!(unknown.message.text.contains("cannot show yet"));
+        match unknown.message.kind {
+            MessageKind::Unsupported { link } => {
+                assert!(link.contains("user_id=7002"), "{link}");
+                assert!(link.contains("message_id=22"), "{link}");
+            }
+            MessageKind::System | MessageKind::Normal => panic!("an unnamed action needs a link into Telegram"),
+        }
     }
 }

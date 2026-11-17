@@ -1,0 +1,12 @@
+{
+  "id": "telegram-markers",
+  "title": "Bold, italic, code, spoilers and links typed in a Telegram chat are sent as formatting",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same marker check is what a phone send would keep.",
+    "ios": "The phone proof build does not run desktop chatd. The same marker check is what a phone send would keep."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

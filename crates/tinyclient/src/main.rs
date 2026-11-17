@@ -160,6 +160,14 @@ fn main() -> ExitCode {
         println!("tinyclient {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
+    // The lab's save-downloads driver. A build without this opens the window below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("save-downloads") {
+        if let Err(err) = host::prove_save_downloads() {
+            eprintln!("save-downloads: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     // The lab's no-console driver. A build without this opens the window below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("no-console") {
         let swap = update::windows_swap_args(std::path::Path::new("apply.ps1"));
@@ -273,6 +281,33 @@ fn main() -> ExitCode {
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-mute-bell") {
         if let Err(err) = gui::prove_telegram_mute_bell() {
             eprintln!("telegram-mute-bell: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    // The lab's spell-check driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("spell-check") {
+        if let Err(err) = gui::prove_spell_check() {
+            eprintln!("spell-check: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    // The lab's schedule-send driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("schedule-send") {
+        if let Err(err) = gui::prove_schedule_send() {
+            eprintln!("schedule-send: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    // The lab's discord-format driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-format") {
+        if let Err(err) = gui::prove_discord_format() {
+            eprintln!("discord-format: {err}");
             return ExitCode::from(1);
         }
         return ExitCode::SUCCESS;

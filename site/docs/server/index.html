@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Tiny server · Tiny server docs</title>
+<meta name="description" content="What a Tiny server is, what works today, and where to start: joining one, running one, and what it can read.">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://tinyclient.io/docs/server/">
+<link rel="ai-catalog" href="/.well-known/ai-catalog.json">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../../style.css">
+<script src="../../site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../" aria-label="tinyclient home"><img src="../../favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="../" aria-current="page">Docs</a>
+      <a href="../../tinyserver.html">Tiny server</a>
+      <a class="hide-sm" href="../privacy.html">Privacy</a>
+      <a class="dc" href="https://discord.gg/kJHK7BNvJP" aria-label="Discord"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
+      <a class="gh" href="https://github.com/TinyComms/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    <div class="docs-nav-inner">
+      <h2>Documentation</h2>
+      <ul>
+          <li><a href="../index.html">Getting started</a></li>
+          <li><a href="../using.html">Using tinyclient</a></li>
+          <li><a href="../build.html">Build from source</a></li>
+          <li><a href="../architecture.html">Architecture</a></li>
+          <li><a href="../performance.html">Size &amp; performance</a></li>
+          <li><a href="../privacy.html">Privacy &amp; security</a></li>
+          <li><a href="../networks.html">Networks &amp; terms</a></li>
+          <li><a href="../contributing.html">Contributing</a></li>
+      </ul>
+      <h2>Tiny server</h2>
+      <ul>
+          <li><a href="index.html" aria-current="page">Overview</a></li>
+          <li><a href="join.html">Join &amp; use a server</a></li>
+          <li><a href="run.html">Run a server</a></li>
+          <li><a href="sign-in.html">Sign-in &amp; passkeys</a></li>
+          <li><a href="calls.html">Calls &amp; media</a></li>
+          <li><a href="manage.html">Manage a community</a></li>
+          <li><a href="operate.html">Operate &amp; upgrade</a></li>
+          <li><a href="encryption.html">End-to-end encryption</a></li>
+          <li><a href="privacy.html">Server privacy</a></li>
+      </ul>
+      <h2 class="ext">On GitHub</h2>
+      <ul class="ext">
+          <li><a href="https://github.com/TinyComms/tinyserver">tinyserver source</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/blob/main/deploy/README.md">Deployment reference</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/tree/main/docs">Design documents</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main" class="prose">
+    <h1>Tiny server</h1>
+    <p class="lede">A self-hosted server for one community, with tinyclient as its app: text channels, direct messages, voice rooms and one picture.</p>
+
+    <p>tinyserver is open source under the MIT license and written in Rust. One deployment is one community. Its owner runs it; the tinyclient project does not host it, does not take its credentials, and does not carry its messages. <a href="../../tinyserver.html">See it in pictures</a>, or read the <a href="https://github.com/TinyComms/tinyserver">source on GitHub</a>.</p>
+    <div class="callout">
+      <p><strong>The project is early</strong>, and it has had no independent security review. Each page here says what is not built and what is not tested.</p>
+    </div>
+
+    <h2 id="start">Where to start</h2>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Where to start">
+      <table>
+        <thead><tr><th scope="col">You want to</th><th scope="col">Read</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Join a server someone invited you to</th><td><a href="join.html">Join and use a server</a></td></tr>
+          <tr><th scope="row">Start a server for your people</th><td><a href="run.html">Run a server</a>, then <a href="calls.html#port">open the media port</a></td></tr>
+          <tr><th scope="row">Decide how members sign in</th><td><a href="sign-in.html">Sign-in and passkeys</a></td></tr>
+          <tr><th scope="row">Set up roles, channels and invites</th><td><a href="manage.html">Manage a community</a></td></tr>
+          <tr><th scope="row">Keep it running</th><td><a href="operate.html">Operate and upgrade</a></td></tr>
+          <tr><th scope="row">Know what the server can read</th><td><a href="privacy.html">Server privacy and security</a> and <a href="encryption.html">End-to-end encryption</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="what">What a server does</h2>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="What a server does">
+      <table>
+        <thead><tr><th scope="col">Area</th><th scope="col">What works today</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Text</th><td>Text channels in categories and direct conversations between two members: replies, files, reactions, edit, delete, typing and read state</td></tr>
+          <tr><th scope="row">Voice</th><td>Voice rooms people drop into, and calls between two members. Mute, deafen and who is speaking.</td></tr>
+          <tr><th scope="row">Video</th><td>One picture per listener: a screen share, or one other person&rsquo;s camera</td></tr>
+          <tr><th scope="row">Encryption</th><td>Calls end to end when every app in the call can. Text and files end to end in conversations created encrypted.</td></tr>
+          <tr><th scope="row">Sign-in</th><td>No passwords. Passkeys the server checks itself, an OpenID Connect provider, or both.</td></tr>
+          <tr><th scope="row">People</th><td>Owners, roles with permissions, overrides per room and channel, invites with uses and an expiry</td></tr>
+          <tr><th scope="row">Moderation</th><td>Server mute and deafen, move, disconnect, timeout, kick, ban and an audit log</td></tr>
+          <tr><th scope="row">Files</th><td>Uploads scanned before anyone can fetch them; images re-encoded; risky types refused</td></tr>
+          <tr><th scope="row">Bots</th><td>Application bots that can read and manage rooms and read the member list</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="parts">How it fits together</h2>
+    <ul>
+      <li><strong>tinyclient</strong> is the app. A member adds the server beside their other networks; tinyclient talks to it directly from their computer.</li>
+      <li><strong>tinyserver</strong> is one program: an HTTP API, a live socket for events and call setup, the sign-in pages, and the call server.</li>
+      <li><strong>Postgres</strong> holds accounts, messages and settings. Files live on a volume. <strong>ClamAV</strong> scans uploads.</li>
+      <li><strong>Web traffic</strong> reaches the server through a Cloudflare tunnel, or a reverse proxy of your own. <strong>Call audio and video</strong> go straight to one port on the host.</li>
+      <li><strong>tinyclient.io</strong> takes no part. Its invite page only opens the app, and the invite&rsquo;s secret never reaches it.</li>
+    </ul>
+
+    <h2 id="not">What it is not</h2>
+    <ul>
+      <li>Not federated. A server is one community, and two servers do not talk to each other.</li>
+      <li>Not hosted by the project. Someone runs each server and can read what is not end-to-end encrypted.</li>
+      <li>Not usable from a browser. tinyclient is the app; the only pages a server shows are for signing in.</li>
+      <li>Not able to carry calls from a host that cannot open a port. A relay is not built yet.</li>
+    </ul>
+
+    <h2 id="repo">In the repository</h2>
+    <p>These pages cover running and using a server. The contracts an app builds against, and the designs, stay in the repository:</p>
+    <ul>
+      <li><a href="https://github.com/TinyComms/tinyserver/blob/main/deploy/README.md"><code>deploy/README.md</code></a>: every deployment detail, and what each upgrade needs</li>
+      <li><a href="https://github.com/TinyComms/tinyserver/blob/main/docs/server.md"><code>docs/server.md</code></a>: the API for server management, messages, files and bots</li>
+      <li><a href="https://github.com/TinyComms/tinyserver/blob/main/docs/calls.md"><code>docs/calls.md</code></a>: the live socket, calls, and call encryption</li>
+      <li><a href="https://github.com/TinyComms/tinyserver/blob/main/docs/e2ee-text.md"><code>docs/e2ee-text.md</code></a>: text encryption and device linking</li>
+      <li><a href="https://github.com/TinyComms/tinyserver/blob/main/docs/auth-passkeys.md"><code>docs/auth-passkeys.md</code></a>: passkey sign-in and the move from Pocket ID</li>
+      <li><a href="https://github.com/TinyComms/tinyserver/tree/main/docs/privacy"><code>docs/privacy/</code></a>: guarantees, threat model and open findings</li>
+    </ul>
+
+    <nav class="pager" aria-label="Previous and next"><a href="../contributing.html"><span>Previous</span>Contributing</a><a class="next" href="join.html"><span>Next</span>Join &amp; use a server</a></nav>
+    <p class="edit"><a href="https://github.com/TinyComms/tinyclient/blob/main/site/docs/server/index.html">Edit this page on GitHub</a></p>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft, Signal or Google; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. Cloudflare Pages hosts it and can see your request the way any web server can.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

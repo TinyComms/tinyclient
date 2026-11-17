@@ -3,15 +3,18 @@
 //! `messages.signin.ctl` while linking: `confirm`, `expire`, `fail`.
 //! `messages.ctl` once linked:
 //! `incoming WHO TEXT…`, `group WHO TEXT…`, `photo WHO`, `caption WHO TEXT…`,
-//! `file WHO NAME`, `remote WHO`, `react WHO TEXT`, `typing WHO`, `typing-stop WHO`,
-//! `refuse WORDS…`, `drop`, `unlinked`.
+//! `file WHO NAME`, `remote WHO`, `react WHO TEXT`, `quote WHO ID TEXT…`,
+//! `typing WHO`, `typing-stop WHO`,
+//! `refuse WORDS…`, `drop`, `unlinked`, `silent`, `answer`.
+//! `silent` makes the phone stop answering sends, history, and files. `answer` clears that
+//! and tells the adapter the phone is back.
 //! WHO is `grace` or `alan`.
 
 use super::{Drive, Event, Saved};
-use crate::adapters::messages::bugle::{Chat, Mark, Note, Piece};
+use crate::adapters::messages::bugle::{Chat, Mark, Note, Piece, MESSAGE_PAGE, PHONE_QUIET};
 use crate::adapters::script;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -40,6 +43,9 @@ pub struct Fake {
     heard: Mutex<Option<Receiver<Event>>>,
     closed: Arc<AtomicBool>,
     refuse: Arc<Mutex<Option<String>>>,
+    /// Set by `silent`, cleared by `answer`. Requests fail at once and are not recorded.
+    quiet: Arc<AtomicBool>,
+    sent: AtomicU32,
 }
 
 impl Fake {
@@ -54,6 +60,9 @@ impl Fake {
                 unread: false,
                 mine: ME.into(),
                 peer: GRACE_PARTICIPANT.into(),
+                carrier: 0,
+                updated: 0,
+                phones: false,
             },
             Chat {
                 id: CLUB.into(),
@@ -62,6 +71,9 @@ impl Fake {
                 unread: true,
                 mine: ME.into(),
                 peer: String::new(),
+                carrier: 0,
+                updated: 0,
+                phones: false,
             },
         ]));
         let fake = Fake {
@@ -69,11 +81,14 @@ impl Fake {
             heard: Mutex::new(Some(heard)),
             closed: Arc::default(),
             refuse: Arc::default(),
+            quiet: Arc::default(),
+            sent: AtomicU32::new(0),
         };
-        let (events, closed, refuse) = (
+        let (events, closed, refuse, quiet) = (
             fake.events.clone(),
             fake.closed.clone(),
             fake.refuse.clone(),
+            fake.quiet.clone(),
         );
         let control = script::control("messages.ctl");
         let _ = std::thread::Builder::new()
@@ -93,6 +108,19 @@ impl Fake {
                             Some(words.to_owned());
                         return true;
                     }
+                    if line == "silent" {
+                        quiet.store(true, Ordering::Relaxed);
+                        // Recorded after the flag, so a test can wait until the phone is quiet.
+                        // The control file is marked taken before this line runs.
+                        record("silent");
+                        return true;
+                    }
+                    if line == "answer" {
+                        quiet.store(false, Ordering::Relaxed);
+                        record("answer");
+                        let _ = events.send(Event::PhoneBack);
+                        return true;
+                    }
                     for event in steer(line) {
                         let _ = events.send(event);
                     }
@@ -101,6 +129,50 @@ impl Fake {
             });
         fake
     }
+
+    /// The phone did not answer. The call is not recorded, so a test can see it was not asked.
+    fn unanswered(&self) -> Result<(), String> {
+        if self.quiet.load(Ordering::Relaxed) {
+            Err(PHONE_QUIET.to_owned())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn refusal(&self) -> Option<String> {
+        self.refuse
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+/// `TINYCLIENT_MESSAGES_MANY=100` is one conversation of 100 messages, newest page first.
+/// A cursor id `m-NNNN` is exclusive: the next page ends at the message before it.
+fn scripted_page(conversation: &str, before: Option<&str>) -> Vec<Note> {
+    if conversation != GRACE || std::env::var("TINYCLIENT_MESSAGES_MANY").ok().as_deref() != Some("100") {
+        return Vec::new();
+    }
+    let end = match before {
+        None => 100,
+        Some(id) => {
+            let Some(n) = id.strip_prefix("m-").and_then(|n| n.parse::<i64>().ok()) else {
+                return Vec::new();
+            };
+            n - 1
+        }
+    };
+    if end < 1 {
+        return Vec::new();
+    }
+    let start = (end - MESSAGE_PAGE as i64 + 1).max(1);
+    (start..=end)
+        .map(|n| {
+            let mut line = note(GRACE, "Grace Ombra", GRACE, &format!("m-{n:04}"), &format!("line {n}"), false, Vec::new(), Vec::new());
+            line.sent = 1_700_000_000 + n;
+            line
+        })
+        .collect()
 }
 
 fn note(
@@ -125,6 +197,9 @@ fn note(
         pieces,
         reactions,
         status: 0,
+        wire: 0,
+        phones: None,
+        reply: String::new(),
     }
 }
 
@@ -245,6 +320,25 @@ fn steer(line: &str) -> Vec<Event> {
                 Vec::new(),
             ))]
         }
+        "quote" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let original = words.next().unwrap_or("").to_owned();
+            let text = rest(3);
+            let mut sent = note(
+                author,
+                name,
+                author,
+                &format!("m-{author}-quote"),
+                &text,
+                false,
+                Vec::new(),
+                Vec::new(),
+            );
+            sent.reply = original;
+            vec![Event::Message(sent)]
+        }
         "react" => {
             let Some((author, name)) = who(words.next().unwrap_or("")) else {
                 return Vec::new();
@@ -278,6 +372,57 @@ fn steer(line: &str) -> Vec<Event> {
         }
         "drop" => vec![Event::Closed("the connection dropped".into())],
         "unlinked" => vec![Event::Ended("This device was removed in Messages.".into())],
+        "sms" | "rcs" | "sealed" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let (carrier, phones) = match command {
+                "sms" => (1, false),
+                "sealed" => (2, true),
+                _ => (2, false),
+            };
+            vec![Event::Chats(vec![Chat {
+                id: author.into(),
+                title: name.into(),
+                group: false,
+                unread: false,
+                mine: ME.into(),
+                peer: if author == GRACE {
+                    GRACE_PARTICIPANT.into()
+                } else {
+                    String::new()
+                },
+                carrier,
+                updated: 0,
+                phones,
+            }])]
+        }
+        "tick" => {
+            let Some((author, _)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let mut sent = note(ME, "Ada Quill", author, "m-mine-tick", "sent", false, Vec::new(), Vec::new());
+            sent.outgoing = true;
+            sent.status = 11;
+            vec![Event::Message(sent)]
+        }
+        "mms" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let mut sent = note(
+                author,
+                name,
+                author,
+                &format!("m-{author}-mms"),
+                &rest(2),
+                false,
+                Vec::new(),
+                Vec::new(),
+            );
+            sent.wire = 2;
+            vec![Event::Message(sent)]
+        }
         _ => Vec::new(),
     }
 }
@@ -296,21 +441,31 @@ impl Drive for Fake {
         record("list");
         Ok(())
     }
-    fn history(&self, conversation: &str) -> Result<Vec<Note>, String> {
-        record(&format!("history {conversation}"));
+    fn history(&self, conversation: &str, before: Option<(&str, i64)>) -> Result<Vec<Note>, String> {
+        self.unanswered()?;
+        match before {
+            Some((id, _)) => record(&format!("history {conversation} {id}")),
+            None => record(&format!("history {conversation}")),
+        }
+        Ok(scripted_page(conversation, before.map(|(id, _)| id)))
+    }
+    fn older_chats(&self) -> Result<Vec<Chat>, String> {
         Ok(Vec::new())
     }
-    fn send(&self, conversation: &str, text: &str) -> Result<String, String> {
-        if let Some(words) = self
-            .refuse
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
+    fn inbox_continues(&self) -> bool {
+        false
+    }
+    fn send(&self, conversation: &str, text: &str, reply: Option<&str>) -> Result<String, String> {
+        self.unanswered()?;
+        if let Some(words) = self.refusal() {
             return Err(words);
         }
         record(&format!("send {conversation} {text}"));
-        Ok(format!("sent-{conversation}"))
+        if let Some(id) = reply.filter(|id| !id.is_empty()) {
+            record(&format!("reply {conversation} {id}"));
+        }
+        let n = self.sent.fetch_add(1, Ordering::Relaxed);
+        Ok(format!("sent-{conversation}-{n}"))
     }
     fn send_file(
         &self,
@@ -318,13 +473,10 @@ impl Drive for Fake {
         caption: &str,
         path: &str,
         name: &str,
+        reply: Option<&str>,
     ) -> Result<String, String> {
-        if let Some(words) = self
-            .refuse
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
+        self.unanswered()?;
+        if let Some(words) = self.refusal() {
             return Err(words);
         }
         let bytes = std::fs::read(path).map_err(|_| format!("Messages couldn't read {name}."))?;
@@ -332,7 +484,11 @@ impl Drive for Fake {
             "file {conversation} {name} {} {caption}",
             bytes.len()
         ));
-        Ok(format!("sent-file-{conversation}"))
+        if let Some(id) = reply.filter(|id| !id.is_empty()) {
+            record(&format!("reply {conversation} {id}"));
+        }
+        let n = self.sent.fetch_add(1, Ordering::Relaxed);
+        Ok(format!("sent-file-{conversation}-{n}"))
     }
     fn react(&self, message: &str, emoji: &str, on: bool) -> Result<(), String> {
         if let Some(words) = self
@@ -353,10 +509,12 @@ impl Drive for Fake {
         message: &str,
         _action: &str,
     ) -> Result<Vec<u8>, String> {
+        self.unanswered()?;
         record(&format!("fetch {message} {media_id}"));
         Ok(png())
     }
     fn thumbnails(&self, participants: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {
+        self.unanswered()?;
         record(&format!("thumbnails {}", participants.join(" ")));
         Ok(participants
             .iter()

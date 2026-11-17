@@ -1,0 +1,12 @@
+{
+  "id": "teams-reactions",
+  "title": "A Teams reaction can be any catalog emoji, including a skin tone",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same catalog check is what this desktop run covers.",
+    "ios": "The phone proof build does not run desktop chatd. The same catalog check is what this desktop run covers."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

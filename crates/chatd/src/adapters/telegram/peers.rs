@@ -96,7 +96,7 @@ pub struct Known {
     pub deleted: bool,
     /// Telegram's own word on the account: verified, or flagged as a scam or an impostor.
     pub mark: Option<Mark>,
-    /// Telegram Premium, which only matters for our own account (what it may send).
+    /// Telegram Premium. Ours decides what this account may send. Someone else's is shown on their row.
     pub premium: bool,
 }
 
@@ -310,8 +310,9 @@ impl Directory {
             if before.map(|before| before.hash) != Some(known.hash) {
                 learned.notes.extend(known.note().map(|note| (note_key(who), note)));
             }
-            learned.people.push(person_row(who, &known));
-            learned.details.push((who.text(), PersonDetails { mark: known.mark, ..PersonDetails::default() }));
+            learned.people.push(shown_person(self.me, who, &known));
+            let title = if known.premium { super::premium::BADGE.to_owned() } else { String::new() };
+            learned.details.push((who.text(), PersonDetails { mark: known.mark, title, ..PersonDetails::default() }));
             self.map.insert(who, known);
         }
         for chat in chats {
@@ -386,6 +387,17 @@ impl Directory {
             _ => None,
         }
     }
+}
+
+/// A person as the store keeps them, with Premium named where the row can show it.
+/// Our own free account's link is the purchase hand-off. Our own status text stays empty.
+pub fn shown_person(me: i64, who: Who, known: &Known) -> PersonRow {
+    let mut row = person_row(who, known);
+    row.status = super::premium::badge(known.premium, who == Who::User(me)).to_owned();
+    if who == Who::User(me) && !known.premium {
+        row.link = super::premium::OFFER.to_owned();
+    }
+    row
 }
 
 /// A person as the store keeps them. The link opens them in Telegram's own app.

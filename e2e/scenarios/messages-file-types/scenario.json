@@ -1,0 +1,12 @@
+{
+  "id": "messages-file-types",
+  "title": "A Google Messages file is sent as its real type, including a video",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "The phone proof build does not run this chatd check.",
+    "ios": "The phone proof build does not run this chatd check."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

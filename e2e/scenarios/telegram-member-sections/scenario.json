@@ -1,0 +1,12 @@
+{
+  "id": "telegram-member-sections",
+  "title": "A Telegram supergroup lists its owner, admins and bots, and a rank query keeps that admin",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same sections are what the member list maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same sections are what the member list maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

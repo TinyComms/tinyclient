@@ -1,0 +1,12 @@
+{
+  "id": "teams-loop-component",
+  "title": "A Teams Loop component is labelled and linked to its file",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same card check is what this desktop run covers.",
+    "ios": "The phone proof build does not run desktop chatd. The same card check is what this desktop run covers."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

@@ -50,6 +50,18 @@
       ]
     },
     {
+      "identifier": "urn:air:tinyclient.io:page:docs-server",
+      "displayName": "Tiny server docs",
+      "type": "text/html",
+      "url": "https://tinyclient.io/docs/server/",
+      "representativeQueries": [
+        "how do I run tinyserver with Docker Compose",
+        "how do I join a Tiny server with an invite",
+        "how do passkeys and recovery codes work on a Tiny server",
+        "what can a Tiny server operator read"
+      ]
+    },
+    {
       "identifier": "urn:air:tinyclient.io:docs:privacy",
       "displayName": "Privacy and security",
       "type": "text/html",

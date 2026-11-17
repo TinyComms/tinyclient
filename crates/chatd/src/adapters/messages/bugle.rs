@@ -27,6 +27,13 @@ const FILE_CAP: u64 = 100 * 1024 * 1024;
 const NETWORK: &str = "Bugle";
 /// How long one request waits for the phone to answer on the long-poll.
 const PHONE: Duration = Duration::from_secs(20);
+/// One inbox page. `ListConversationsRequest.count`, field 2.
+pub(super) const CHAT_PAGE: u64 = 50;
+/// One conversation page. `ListMessagesRequest.count`, field 3.
+pub(super) const MESSAGE_PAGE: u64 = 40;
+/// What a request says when that wait runs out. The relay itself can still be up.
+pub const PHONE_QUIET: &str =
+    "Your phone isn't responding. Keep Messages open, and the phone online.";
 
 type AesCtr = Ctr128BE<Aes256>;
 type HmacSha = Hmac<Sha256>;
@@ -434,21 +441,76 @@ fn outgoing(
     ])
 }
 
-fn list_request(count: u64) -> Vec<u8> {
+/// Where the next page starts. Field 1 is the last item already seen, field 2 its time in
+/// milliseconds. Message times are stored here as unix seconds, so the request multiplies.
+#[derive(Clone)]
+pub(super) struct Cursor {
+    pub id: String,
+    pub millis: i64,
+}
+
+/// Unix seconds, as a message is stored, to the cursor's milliseconds.
+pub(super) fn cursor_millis(sent: i64) -> i64 {
+    sent.saturating_mul(1000)
+}
+
+/// A page shorter than asked is the last one. An empty page is too.
+pub(super) fn more_messages(got: usize) -> bool {
+    got as u64 >= MESSAGE_PAGE
+}
+
+fn cursor_message(cursor: &Cursor) -> Vec<u8> {
+    let mut buf = Buf::new();
+    buf.text(1, &cursor.id);
+    if cursor.millis > 0 {
+        buf.int(2, cursor.millis as u64);
+    }
+    buf.0
+}
+
+fn list_request(count: u64, before: Option<&Cursor>) -> Vec<u8> {
     let mut buf = Buf::new();
     buf.int(2, count);
     buf.int(4, 1); // INBOX
+    if let Some(cursor) = before {
+        buf.msg(5, &cursor_message(cursor));
+    }
     buf.0
 }
 
-fn messages_request(conversation: &str, count: u64) -> Vec<u8> {
+fn messages_request(conversation: &str, count: u64, before: Option<&Cursor>) -> Vec<u8> {
     let mut buf = Buf::new();
     buf.text(2, conversation);
     buf.int(3, count);
+    if let Some(cursor) = before {
+        buf.msg(5, &cursor_message(cursor));
+    }
     buf.0
 }
 
-fn send_request(conversation: &str, text: &str, tmp: &str, mine: &str) -> Vec<u8> {
+/// `ListConversationsResponse` and `ListMessagesResponse` field 5, when the phone sent one.
+fn decode_cursor(bytes: &[u8]) -> Option<Cursor> {
+    let list = fields(bytes);
+    let raw = field(&list, 5)?;
+    if raw.varint.is_some() || raw.bytes.is_empty() {
+        return None;
+    }
+    let inner = fields(&raw.bytes);
+    let id = field_text(&inner, 1);
+    if id.is_empty() {
+        return None;
+    }
+    Some(Cursor { id, millis: field_int(&inner, 2) as i64 })
+}
+
+/// The oldest chat on a page, when the phone sent no cursor of its own. A chat with no time is
+/// left out: a cursor at time 0 would ask for the same page again.
+fn oldest_cursor(chats: &[Chat]) -> Option<Cursor> {
+    let oldest = chats.iter().filter(|chat| chat.updated > 0 && !chat.id.is_empty()).min_by_key(|chat| chat.updated)?;
+    Some(Cursor { id: oldest.id.clone(), millis: oldest.updated.saturating_mul(1000) })
+}
+
+fn send_request(conversation: &str, text: &str, tmp: &str, mine: &str, reply: Option<&str>) -> Vec<u8> {
     let mut content = Buf::new();
     content.text(1, text);
     let mut info = Buf::new();
@@ -466,6 +528,12 @@ fn send_request(conversation: &str, text: &str, tmp: &str, mine: &str) -> Vec<u8
     req.text(2, conversation);
     req.msg(3, &payload.0);
     req.text(5, tmp);
+    // `SendMessageRequest.reply`, field 8: `ReplyPayload.messageID`. Absent on a plain send.
+    if let Some(id) = reply.filter(|id| !id.is_empty()) {
+        let mut quoted = Buf::new();
+        quoted.text(1, id);
+        req.msg(8, &quoted.0);
+    }
     req.0
 }
 
@@ -497,24 +565,231 @@ fn looks_b64(bytes: &[u8]) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
 }
 
-pub(super) fn mime_of(name: &str) -> &'static str {
-    match name
-        .rsplit('.')
-        .next()
+/// What the phone is told a file is. The bytes win when they name a type, because a wrong
+/// extension (or none) is how a video arrives as a generic download. A zip that is a Word,
+/// Excel or PowerPoint file keeps the name: those three start with the same bytes.
+/// `upload::mime_of` only reads the name, and other networks send through that. Messages keeps
+/// this one so a carrier is not handed `application/octet-stream` for a type it knows.
+pub(super) fn mime_of(name: &str, bytes: &[u8]) -> &'static str {
+    if let Some(found) = mime_of_bytes(bytes) {
+        if found == "application/zip" {
+            if let Some(office) = office_of(name) {
+                return office;
+            }
+        }
+        return found;
+    }
+    mime_of_name(name)
+}
+
+fn extension(name: &str) -> String {
+    name.rsplit_once('.')
+        .map(|(_, extension)| extension)
         .unwrap_or("")
         .to_ascii_lowercase()
-        .as_str()
-    {
+}
+
+fn office_of(name: &str) -> Option<&'static str> {
+    match extension(name).as_str() {
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        _ => None,
+    }
+}
+
+fn mime_of_name(name: &str) -> &'static str {
+    match extension(name).as_str() {
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",
         "gif" => "image/gif",
         "webp" => "image/webp",
-        "mp4" => "video/mp4",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        "bmp" => "image/bmp",
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "3gp" => "video/3gpp",
+        "3g2" => "video/3gpp2",
         "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "ogg" | "oga" => "audio/ogg",
+        "opus" => "audio/opus",
+        "wav" => "audio/wav",
+        "amr" => "audio/amr",
+        "awb" => "audio/amr-wb",
         "pdf" => "application/pdf",
         "vcf" => "text/vcard",
+        "txt" => "text/plain",
+        "csv" => "text/csv",
+        "zip" => "application/zip",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         _ => "application/octet-stream",
     }
+}
+
+fn mime_of_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"\x89PNG") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
+        return Some("audio/wav");
+    }
+    if bytes.starts_with(b"%PDF") {
+        return Some("application/pdf");
+    }
+    if bytes.starts_with(b"#!AMR-WB") {
+        return Some("audio/amr-wb");
+    }
+    if bytes.starts_with(b"#!AMR") {
+        return Some("audio/amr");
+    }
+    if bytes.starts_with(b"ID3") {
+        return Some("audio/mpeg");
+    }
+    if bytes.starts_with(b"OggS") {
+        if bytes.get(28..36) == Some(b"OpusHead") {
+            return Some("audio/opus");
+        }
+        return Some("audio/ogg");
+    }
+    if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        return Some("video/webm");
+    }
+    if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06") || bytes.starts_with(b"PK\x07\x08") {
+        return Some("application/zip");
+    }
+    if let Some(brand) = ftyp_brand(bytes) {
+        if let Some(mime) = brand_mime(brand) {
+            return Some(mime);
+        }
+    }
+    if bmp(bytes) {
+        return Some("image/bmp");
+    }
+    if let Some(audio) = audio_frame(bytes) {
+        return Some(audio);
+    }
+    None
+}
+
+fn ftyp_brand(bytes: &[u8]) -> Option<&[u8]> {
+    (bytes.get(4..8) == Some(b"ftyp")).then(|| bytes.get(8..12)).flatten()
+}
+
+fn brand_mime(brand: &[u8]) -> Option<&'static str> {
+    Some(match brand {
+        b"qt  " => "video/quicktime",
+        b"3gp4" | b"3gp5" | b"3gp6" | b"3gp7" => "video/3gpp",
+        b"3g2a" | b"3g2b" | b"3g2c" => "video/3gpp2",
+        b"M4A " | b"M4B " => "audio/mp4",
+        b"M4V " | b"mp41" | b"mp42" | b"isom" | b"iso2" | b"avc1" => "video/mp4",
+        b"heic" | b"heix" | b"hevc" | b"hevx" => "image/heic",
+        b"heif" | b"mif1" | b"msf1" => "image/heif",
+        _ => return None,
+    })
+}
+
+/// `BM` alone is two letters. A bitmap also names where its pixels start, at least the 54-byte
+/// header.
+fn bmp(bytes: &[u8]) -> bool {
+    if bytes.len() < 14 || !bytes.starts_with(b"BM") {
+        return false;
+    }
+    let offset = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
+    (54..=1024).contains(&offset)
+}
+
+/// An MPEG frame or an AAC ADTS frame. Layer `00` is reserved in MPEG and is what ADTS uses.
+fn audio_frame(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() < 3 || bytes[0] != 0xff || bytes[1] & 0xe0 != 0xe0 {
+        return None;
+    }
+    let layer = (bytes[1] >> 1) & 0x03;
+    if layer == 0 {
+        let rate = (bytes[2] >> 2) & 0x0f;
+        return (rate != 0x0f).then_some("audio/aac");
+    }
+    matches!(bytes[1], 0xfb | 0xf3 | 0xf2 | 0xfa | 0xe3).then_some("audio/mpeg")
+}
+
+fn ftyp(brand: &[u8; 4]) -> Vec<u8> {
+    let mut bytes = vec![0, 0, 0, 20];
+    bytes.extend_from_slice(b"ftyp");
+    bytes.extend_from_slice(brand);
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    bytes
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-file-types`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub(super) fn prove_message_file_types() -> Result<(), String> {
+    file_type_samples()
+}
+
+fn file_type_samples() -> Result<(), String> {
+    let mov = ftyp(b"qt  ");
+    let mp4 = ftyp(b"isom");
+    let three_gp = ftyp(b"3gp4");
+    let three_g2 = ftyp(b"3g2a");
+    let m4a = ftyp(b"M4A ");
+    let heic = ftyp(b"heic");
+    let heif = ftyp(b"mif1");
+    let samples: Vec<(&str, &[u8], &str)> = vec![
+        ("clip.mov", &mov, "video/quicktime"),
+        ("clip.dat", &mov, "video/quicktime"),
+        ("film.mp4", &mp4, "video/mp4"),
+        ("film.m4v", b"", "video/mp4"),
+        ("clip.webm", &[0x1a, 0x45, 0xdf, 0xa3], "video/webm"),
+        ("clip.3gp", &three_gp, "video/3gpp"),
+        ("clip.3g2", &three_g2, "video/3gpp2"),
+        ("song.m4a", &m4a, "audio/mp4"),
+        ("song.aac", &[0xff, 0xf1, 0x50, 0x80, 0x00, 0x1f, 0xfc], "audio/aac"),
+        ("song.ogg", b"OggS", "audio/ogg"),
+        ("voice.opus", b"OggS\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0OpusHead", "audio/opus"),
+        ("song.wav", b"RIFF\0\0\0\0WAVE", "audio/wav"),
+        ("song.amr", b"#!AMR\n", "audio/amr"),
+        ("song.awb", b"#!AMR-WB\n", "audio/amr-wb"),
+        ("song.mp3", b"ID3", "audio/mpeg"),
+        ("photo.heic", &heic, "image/heic"),
+        ("photo.heif", &heif, "image/heif"),
+        ("photo.jpg", b"\xff\xd8\xff", "image/jpeg"),
+        ("photo.bin", b"\xff\xd8\xff", "image/jpeg"),
+        ("photo.png", b"\x89PNG\r\n\x1a\n", "image/png"),
+        ("anim.gif", b"GIF89a", "image/gif"),
+        ("still.webp", b"RIFF\0\0\0\0WEBP", "image/webp"),
+        ("photo.bmp", b"BM\0\0\0\0\0\0\0\0\x36\0\0\0", "image/bmp"),
+        ("page.pdf", b"%PDF", "application/pdf"),
+        ("notes.txt", b"hello", "text/plain"),
+        ("notes.csv", b"a,b\n", "text/csv"),
+        ("card.vcf", b"BEGIN:VCARD", "text/vcard"),
+        ("pack.zip", b"PK\x03\x04", "application/zip"),
+        ("report.docx", b"PK\x03\x04", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        ("sheet.xlsx", b"PK\x03\x04", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        ("deck.pptx", b"PK\x03\x04", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        ("mystery.bin", b"hello", "application/octet-stream"),
+        ("photo.jpg", b"\x89PNG\r\n\x1a\n", "image/png"),
+    ];
+    for (name, bytes, want) in samples {
+        let got = mime_of(name, bytes);
+        if got != want {
+            return Err(format!("{name} was {got}, not {want}"));
+        }
+    }
+    Ok(())
 }
 
 fn send_media_request(
@@ -527,6 +802,7 @@ fn send_media_request(
     name: &str,
     mime: &str,
     size: u64,
+    reply: Option<&str>,
 ) -> Vec<u8> {
     let mut media = Buf::new();
     media.text(2, media_id);
@@ -556,6 +832,11 @@ fn send_media_request(
     req.text(2, conversation);
     req.msg(3, &payload.0);
     req.text(5, tmp);
+    if let Some(id) = reply.filter(|id| !id.is_empty()) {
+        let mut quoted = Buf::new();
+        quoted.text(1, id);
+        req.msg(8, &quoted.0);
+    }
     req.0
 }
 
@@ -639,6 +920,14 @@ pub struct Chat {
     /// The other side of a one-to-one chat, by participant id: whose picture the row shows.
     /// Empty for a group.
     pub peer: String,
+    /// `Conversation.type`, field 22: 1 SMS, 2 RCS, 0 when the phone did not say.
+    pub carrier: u64,
+    /// Unix seconds of the latest message, from field 5. 0 when the phone did not say.
+    /// The inbox cursor uses it when the response has no cursor of its own.
+    pub updated: i64,
+    /// A tombstone said the phones encrypt the chat. A later conversation update does not
+    /// clear it: the conversation message has no such field.
+    pub phones: bool,
 }
 
 /// One photo or file on a message. Bytes are already opened when the phone sent them inline.
@@ -677,6 +966,12 @@ pub struct Note {
     pub reactions: Vec<Mark>,
     /// The phone's word on the message (`MessageStatus.status`, field 4.2).
     pub status: u64,
+    /// `Message.type`, field 11. 0 when the phone did not say.
+    pub wire: u64,
+    /// This update only turns encryption between the phones on or off. It is not a message.
+    pub phones: Option<bool>,
+    /// `ReplyMessage.messageID`, field 21.1. Empty when this message is not a reply.
+    pub reply: String,
 }
 
 /// What the other side did with one of my messages, as far as the phone knows.
@@ -693,6 +988,74 @@ pub fn receipt(status: u64) -> Option<Receipt> {
     match status {
         2 => Some(Receipt::Delivered),
         11 => Some(Receipt::Read),
+        _ => None,
+    }
+}
+
+/// What the composer can say. Field 22 is `ConversationType`: 1 SMS, 2 RCS.
+/// Encryption between the phones is not a field on the conversation; tombstones say it, and
+/// this computer cannot check it, so the words stay "Encrypted between phones".
+pub fn composer_label(carrier: u64, phones: bool) -> String {
+    let base = match carrier {
+        2 => "RCS message",
+        1 => "Text message",
+        _ => "",
+    };
+    if !phones {
+        return base.to_owned();
+    }
+    if base.is_empty() {
+        "Encrypted between phones".to_owned()
+    } else {
+        format!("{base} · Encrypted between phones")
+    }
+}
+
+/// "SMS" or "MMS" when the message is not the conversation's usual kind. Field 11 is
+/// `Message.type`: 1 SMS, 2 downloaded MMS, 3 undownloaded MMS, 4 RCS.
+pub fn wire_tag(wire: u64, carrier: u64) -> &'static str {
+    let usual = match carrier {
+        2 => 4,
+        1 => 1,
+        _ => 0,
+    };
+    if wire == 0 || (usual != 0 && wire == usual) {
+        return "";
+    }
+    match wire {
+        1 => "SMS",
+        2 | 3 => "MMS",
+        4 => "RCS",
+        _ => "",
+    }
+}
+
+/// A reply reference is only sent in an RCS conversation (`Conversation.type` 2). SMS, MMS,
+/// and a chat the phone has not typed stay plain: a reference there can make the phone refuse
+/// the message.
+pub fn allows_reply(carrier: u64) -> bool {
+    carrier == 2
+}
+
+/// Typing and read ticks exist on RCS. An SMS chat (carrier 1) has neither. Unknown stays on:
+/// the phone has not said the chat is SMS.
+pub fn shows_typing(carrier: u64) -> bool {
+    carrier != 1
+}
+
+pub fn shows_receipts(carrier: u64) -> bool {
+    carrier != 1
+}
+
+/// Said before a file leaves a chat the phone has called SMS, not RCS.
+pub const MMS_WARNING: &str = "Sends as MMS; may be compressed";
+
+/// Published tombstones that turn encryption between the phones on or off. Nothing else in the
+/// conversation message says it.
+pub fn between_phones(status: u64) -> Option<bool> {
+    match status {
+        213 | 216 | 219 | 224 | 225 | 226 | 229 | 233 | 235 | 237 => Some(true),
+        214 | 234 | 236 | 238 | 252 => Some(false),
         _ => None,
     }
 }
@@ -817,12 +1180,19 @@ fn merge_cookies(old: &str, new: &str) -> String {
 }
 
 /// A running session: the long-poll thread and the commands share `live`.
+/// The inbox page still to ask for. `done` until the first list says there is another.
+struct Inbox {
+    next: Option<Cursor>,
+    done: bool,
+}
+
 pub struct Session {
     live: Arc<Mutex<Live>>,
     events: Sender<crate::adapters::messages::Event>,
     heard: Mutex<Option<Receiver<crate::adapters::messages::Event>>>,
     waiters: Arc<Mutex<Vec<Waiter>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    inbox: Mutex<Inbox>,
 }
 
 impl Session {
@@ -851,6 +1221,7 @@ impl Session {
             heard: Mutex::new(Some(heard)),
             waiters: Arc::default(),
             stop: Arc::default(),
+            inbox: Mutex::new(Inbox { next: None, done: true }),
         };
         let (live, events, waiters, stop) = (
             session.live.clone(),
@@ -1049,21 +1420,95 @@ impl Session {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .retain(|waiter| waiter.request != request);
-                Err("Your phone isn't responding. Keep Messages open, and the phone online.".into())
+                Err(PHONE_QUIET.into())
             }
         }
     }
 
     pub fn refresh(&self) -> Result<(), String> {
         self.activate()?;
-        let first = self.rpc(1, &list_request(50), 16)?;
-        self.apply_chats(&first);
+        let first = self.rpc(1, &list_request(CHAT_PAGE, None), 16)?;
+        let chats = decode_chats(&first);
+        self.note_inbox(&first, &chats);
+        self.store_chats(chats, true);
         Ok(())
     }
 
-    pub fn history(&self, conversation: &str) -> Result<Vec<Note>, String> {
-        let bytes = self.rpc(2, &messages_request(conversation, 40), 2)?;
+    /// True when the last inbox page was full and named a later one.
+    pub fn inbox_continues(&self) -> bool {
+        !self.inbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).done
+    }
+
+    /// The next inbox page, or nothing when the phone has no more. Later pages use message
+    /// type 2; the first page after pairing stays an annotation, which [`refresh`] sends.
+    pub fn older_chats(&self) -> Result<Vec<Chat>, String> {
+        let sent = {
+            let inbox = self.inbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if inbox.done {
+                return Ok(Vec::new());
+            }
+            inbox.next.clone()
+        };
+        let Some(cursor) = sent else {
+            self.finish_inbox();
+            return Ok(Vec::new());
+        };
+        let bytes = self.rpc(1, &list_request(CHAT_PAGE, Some(&cursor)), 2)?;
+        let chats = decode_chats(&bytes);
+        let next = decode_cursor(&bytes).or_else(|| oldest_cursor(&chats));
+        let moved = next.as_ref().is_some_and(|next| next.id != cursor.id || next.millis != cursor.millis);
+        if !moved {
+            self.finish_inbox();
+        } else {
+            self.note_inbox(&bytes, &chats);
+        }
+        self.store_chats(chats.clone(), false);
+        Ok(chats)
+    }
+
+    pub fn history(&self, conversation: &str, before: Option<&Cursor>) -> Result<Vec<Note>, String> {
+        let bytes = self.rpc(2, &messages_request(conversation, MESSAGE_PAGE, before), 2)?;
         Ok(decode_messages(&bytes))
+    }
+
+    fn finish_inbox(&self) {
+        let mut inbox = self.inbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        inbox.next = None;
+        inbox.done = true;
+    }
+
+    fn note_inbox(&self, bytes: &[u8], chats: &[Chat]) {
+        let next = decode_cursor(bytes).or_else(|| oldest_cursor(chats));
+        let more = chats.len() >= CHAT_PAGE as usize && next.is_some();
+        let mut inbox = self.inbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if more {
+            inbox.next = next;
+            inbox.done = false;
+        } else {
+            inbox.next = None;
+            inbox.done = true;
+        }
+    }
+
+    fn store_chats(&self, chats: Vec<Chat>, replace: bool) {
+        if chats.is_empty() {
+            return;
+        }
+        {
+            let mut live = self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if replace {
+                live.chats = chats.clone();
+            } else {
+                for chat in &chats {
+                    if let Some(had) = live.chats.iter_mut().find(|had| had.id == chat.id) {
+                        *had = chat.clone();
+                    } else {
+                        live.chats.push(chat.clone());
+                    }
+                }
+            }
+        }
+        let _ = self.events.send(crate::adapters::messages::Event::Chats(chats));
     }
 
     fn mine_of(&self, conversation: &str) -> String {
@@ -1078,10 +1523,10 @@ impl Session {
             .unwrap_or_default()
     }
 
-    pub fn send(&self, conversation: &str, text: &str) -> Result<String, String> {
+    pub fn send(&self, conversation: &str, text: &str, reply: Option<&str>) -> Result<String, String> {
         let mine = self.mine_of(conversation);
         let tmp = uuid();
-        let bytes = self.rpc(3, &send_request(conversation, text, &tmp, &mine), 2)?;
+        let bytes = self.rpc(3, &send_request(conversation, text, &tmp, &mine, reply), 2)?;
         refused(&bytes)?;
         Ok(tmp)
     }
@@ -1094,6 +1539,7 @@ impl Session {
         caption: &str,
         path: &str,
         name: &str,
+        reply: Option<&str>,
     ) -> Result<String, String> {
         let named = if name.is_empty() { "file" } else { name };
         let meta =
@@ -1108,7 +1554,7 @@ impl Session {
         let mut key = [0u8; 32];
         getrandom::fill(&mut key).map_err(|_| "Messages could not make a media key.".to_owned())?;
         let packed = super::media::pack(&key, &plain)?;
-        let mime = mime_of(named);
+        let mime = mime_of(named, &plain);
         let media_id = self.upload(&packed, &mime)?;
         let mine = self.mine_of(conversation);
         let tmp = uuid();
@@ -1124,6 +1570,7 @@ impl Session {
                 named,
                 &mime,
                 plain.len() as u64,
+                reply,
             ),
             2,
         )?;
@@ -1310,19 +1757,6 @@ impl Session {
         Ok(())
     }
 
-    fn apply_chats(&self, bytes: &[u8]) {
-        let chats = decode_chats(bytes);
-        if chats.is_empty() {
-            return;
-        }
-        self.live
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .chats = chats.clone();
-        let _ = self
-            .events
-            .send(crate::adapters::messages::Event::Chats(chats));
-    }
 }
 
 fn poll(
@@ -1651,6 +2085,7 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
         let mut title = field_text(&conv, 2);
         let group = field_int(&conv, 10) != 0;
         let unread = field_int(&conv, 6) != 0;
+        let carrier = field_int(&conv, 22);
         let mut mine = field_text(&conv, 11);
         let mut peer = String::new();
         for person in conv.iter().filter(|field| field.number == 20) {
@@ -1694,6 +2129,9 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
             unread,
             mine,
             peer,
+            carrier,
+            updated: unix_seconds(field_int(&conv, 5) as i64),
+            phones: false,
         });
     }
     chats
@@ -1820,10 +2258,22 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             continue;
         }
         let status = field_int(&fields(&field_bytes(&msg, 4)), 2);
+        // A tombstone is the only published word that the phones turned encryption on or off.
+        if let Some(on) = between_phones(status) {
+            notes.push(Note {
+                id,
+                conversation,
+                status,
+                phones: Some(on),
+                ..Note::default()
+            });
+            continue;
+        }
         // 200–299 is a tombstone, 300 a delete. Neither is a message to show.
         if (200..300).contains(&status) || status == 300 {
             continue;
         }
+        let wire = field_int(&msg, 11);
         let sent = unix_seconds(field_int(&msg, 5) as i64);
         let mut author = field_text(&msg, 9);
         let mut name = String::new();
@@ -1874,6 +2324,9 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             }
         }
         let reactions = decode_reactions(&msg);
+        let reply = field(&msg, 21)
+            .map(|field| field_text(&fields(&field.bytes), 1))
+            .unwrap_or_default();
         if text.is_empty()
             && file
             && pieces
@@ -1902,14 +2355,169 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             pieces,
             reactions,
             status,
+            wire,
+            phones: None,
+            reply,
         });
     }
     notes
 }
 
+/// The lab sets `TINYCLIENT_PROVE=messages-reply`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub(super) fn prove_message_reply() -> Result<(), String> {
+    if allows_reply(1) || allows_reply(0) || !allows_reply(2) {
+        return Err("a reply was allowed outside an RCS chat".into());
+    }
+    let asked = fields(&send_request("rcs-chat", "On my way", "tmp-1", "me", Some("m-orig")));
+    let quoted = fields(&field_bytes(&asked, 8));
+    if field_text(&quoted, 1) != "m-orig" {
+        return Err("the send dropped the message it answers".into());
+    }
+    let plain = fields(&send_request("sms-chat", "On my way", "tmp-2", "me", None));
+    if field(&plain, 8).is_some() {
+        return Err("a plain send carried a reply".into());
+    }
+    let media = fields(&send_media_request(
+        "rcs-chat",
+        "",
+        "tmp-3",
+        "me",
+        "media-1",
+        &[1; 32],
+        "a.png",
+        "image/png",
+        4,
+        Some("m-orig"),
+    ));
+    if field_text(&fields(&field_bytes(&media, 8)), 1) != "m-orig" {
+        return Err("the file send dropped the message it answers".into());
+    }
+    let mut target = Buf::new();
+    target.text(1, "m-orig");
+    let mut message = Buf::new();
+    message.text(1, "m-reply");
+    message.text(7, "rcs-chat");
+    message.msg(21, &target.0);
+    let mut wrap = Buf::new();
+    wrap.msg(1, &message.0);
+    let notes = decode_messages(&wrap.0);
+    if notes.first().map(|note| note.reply.as_str()) != Some("m-orig") {
+        return Err("an incoming reply lost the message it answers".into());
+    }
+    Ok(())
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-history`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub(super) fn prove_message_history() -> Result<(), String> {
+    let cursor = Cursor { id: "m-0061".into(), millis: 1_700_000_061_000 };
+    let asked = fields(&messages_request("phone-grace", MESSAGE_PAGE, Some(&cursor)));
+    if field_text(&asked, 2) != "phone-grace" {
+        return Err("the history request named the wrong chat".into());
+    }
+    if field_int(&asked, 3) != MESSAGE_PAGE {
+        return Err(format!("the history request asked for {} rows", field_int(&asked, 3)));
+    }
+    let inner = fields(&field_bytes(&asked, 5));
+    if field_text(&inner, 1) != "m-0061" || field_int(&inner, 2) != 1_700_000_061_000 {
+        return Err("the history cursor dropped the message or its time".into());
+    }
+    let first = fields(&messages_request("phone-grace", MESSAGE_PAGE, None));
+    if field(&first, 5).is_some() {
+        return Err("the newest history page sent a cursor".into());
+    }
+    let inbox = fields(&list_request(CHAT_PAGE, Some(&cursor)));
+    if field_int(&inbox, 2) != CHAT_PAGE || field_int(&inbox, 4) != 1 {
+        return Err("the inbox request lost its page or its folder".into());
+    }
+    let inbox_cursor = fields(&field_bytes(&inbox, 5));
+    if field_text(&inbox_cursor, 1) != "m-0061" || field_int(&inbox_cursor, 2) != 1_700_000_061_000 {
+        return Err("the inbox cursor dropped the chat or its time".into());
+    }
+    if !more_messages(MESSAGE_PAGE as usize) || more_messages(20) || more_messages(0) {
+        return Err("a short page was treated as another page".into());
+    }
+    Ok(())
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-transport`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub(super) fn prove_message_transport() -> Result<(), String> {
+    let mut sms = Buf::new();
+    sms.text(1, "sms-chat");
+    sms.text(2, "Sam");
+    sms.int(22, 1);
+    let mut sms_list = Buf::new();
+    sms_list.msg(2, &sms.0);
+    let sms_chat = decode_chats(&sms_list.0);
+    let sms_label = composer_label(sms_chat[0].carrier, sms_chat[0].phones);
+    if sms_label != "Text message" {
+        return Err(format!("an SMS chat was labelled {sms_label:?}"));
+    }
+
+    let mut rcs = Buf::new();
+    rcs.text(1, "rcs-chat");
+    rcs.text(2, "Rae");
+    rcs.int(22, 2);
+    let mut rcs_list = Buf::new();
+    rcs_list.msg(2, &rcs.0);
+    let rcs_chat = decode_chats(&rcs_list.0);
+    let mut status = Buf::new();
+    status.int(2, 216);
+    let mut tomb = Buf::new();
+    tomb.text(1, "tomb");
+    tomb.text(7, "rcs-chat");
+    tomb.msg(4, &status.0);
+    let mut wrap = Buf::new();
+    wrap.msg(1, &tomb.0);
+    let switched = decode_messages(&wrap.0);
+    if switched.first().and_then(|note| note.phones) != Some(true) {
+        return Err("the encrypted-RCS tombstone was dropped".into());
+    }
+    let rcs_label = composer_label(rcs_chat[0].carrier, true);
+    if !rcs_label.contains("RCS message") || !rcs_label.contains("Encrypted between phones") {
+        return Err(format!("an encrypted RCS chat was labelled {rcs_label:?}"));
+    }
+
+    let mut mms = Buf::new();
+    mms.text(1, "m-mms");
+    mms.text(7, "sms-chat");
+    mms.int(11, 2);
+    let mut mms_wrap = Buf::new();
+    mms_wrap.msg(1, &mms.0);
+    let mms_note = decode_messages(&mms_wrap.0);
+    if wire_tag(mms_note[0].wire, 1) != "MMS" {
+        return Err("an MMS inside an SMS chat had no MMS tag".into());
+    }
+    if !wire_tag(1, 1).is_empty() {
+        return Err("an SMS inside an SMS chat was tagged".into());
+    }
+    if shows_typing(1) || shows_receipts(1) {
+        return Err("an SMS chat still offers typing or read ticks".into());
+    }
+    if !shows_typing(2) || !shows_receipts(2) {
+        return Err("an RCS chat lost typing or read ticks".into());
+    }
+    if MMS_WARNING != "Sends as MMS; may be compressed" {
+        return Err("the file warning changed".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_type_comes_from_its_bytes_then_its_name() {
+        file_type_samples().unwrap();
+    }
+
+    #[test]
+    fn a_history_page_carries_the_message_it_starts_after() {
+        prove_message_history().unwrap();
+    }
 
     #[test]
     fn a_picture_a_caption_and_a_reaction_decode_and_a_tombstone_does_not() {
@@ -2019,5 +2627,25 @@ mod tests {
         answer.msg(1, &thumbnail("p-alan", &[]));
         answer.msg(1, &thumbnail("p-odd", b"<html>"));
         assert_eq!(decode_thumbnails(&answer.0), [("p-grace".to_owned(), jpeg.to_vec())]);
+    }
+
+    #[test]
+    fn an_rcs_reply_names_the_message_it_answers_and_an_sms_send_does_not() {
+        prove_message_reply().unwrap();
+    }
+
+    #[test]
+    fn a_chat_says_sms_or_rcs_and_a_tombstone_says_whether_the_phones_encrypt_it() {
+        prove_message_transport().unwrap();
+        let mut plain = Buf::new();
+        plain.text(1, "m-sms");
+        plain.text(7, "sms-chat");
+        plain.int(11, 1);
+        let mut wrap = Buf::new();
+        wrap.msg(1, &plain.0);
+        let note = decode_messages(&wrap.0);
+        assert_eq!(wire_tag(note[0].wire, 1), "");
+        assert_eq!(between_phones(200), None);
+        assert_eq!(between_phones(214), Some(false));
     }
 }

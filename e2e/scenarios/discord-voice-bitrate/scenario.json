@@ -1,0 +1,8 @@
+{
+  "id": "discord-voice-bitrate",
+  "title": "A Discord voice channel is encoded at the channel's bitrate",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

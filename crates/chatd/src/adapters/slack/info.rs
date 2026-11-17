@@ -22,9 +22,103 @@ pub(super) const PREVIEW_EVERY: Duration = Duration::from_secs(1);
 const PREVIEWS_WAITING: usize = 64;
 /// The most a page of `files.list` holds.
 const FILES_PAGE: u32 = 100;
+/// Other organisations named on one Slack Connect channel. More than this is not looked up.
+const CONNECTED_TEAMS: usize = 4;
+
+/// A direct message with someone at another company starts as an invitation Slack sends.
+pub(super) const EXTERNAL_EMAIL: &str =
+    "A direct message with someone at another company starts as an invitation. Send it in Slack: Home, Directories, External. If Directories is not there, open External connections.";
 
 fn channel_of(conversation: &str) -> &str {
     thread_of(conversation).map_or(conversation, |(channel, _)| channel)
+}
+
+/// The note a team's name is kept under, so a second pane does not ask `team.info` again.
+pub(super) fn team_note(id: &str) -> String {
+    format!("team:{id}")
+}
+
+/// Team ids of the other organisations on a Slack Connect channel. `connected_team_ids` when
+/// the channel is joined, otherwise `pending_connected_team_ids`. `shared_team_ids` includes
+/// our own workspace and is not used. Ours is dropped. At most [`CONNECTED_TEAMS`].
+pub(super) fn other_teams(channel: &Value, ours: &str) -> Vec<String> {
+    let listed = |name: &str| -> Vec<String> {
+        channel[name]
+            .as_array()
+            .map(|ids| ids.iter().filter_map(Value::as_str).filter(|id| !id.is_empty() && *id != ours).map(str::to_owned).collect())
+            .unwrap_or_default()
+    };
+    let mut teams = listed("connected_team_ids");
+    if teams.is_empty() {
+        teams = listed("pending_connected_team_ids");
+    }
+    teams.sort_unstable();
+    teams.dedup();
+    teams.truncate(CONNECTED_TEAMS);
+    teams
+}
+
+/// A Slack Connect invitation that has not been accepted yet.
+pub(super) fn invite_pending(channel: &Value) -> bool {
+    if channel["is_pending_ext_shared"] == true {
+        return true;
+    }
+    channel["pending_connected_team_ids"].as_array().is_some_and(|ids| ids.iter().any(|id| id.as_str().is_some_and(|id| !id.is_empty())))
+}
+
+/// Where the invitation is accepted. Slack documents that screen: Home, Directories, External,
+/// or External connections in the sidebar. An admin may still have to approve.
+pub(super) fn invite_handoff(organisation: &str) -> String {
+    let who = if organisation.is_empty() { "another organisation" } else { organisation };
+    format!("Invitation from {who}. Accept or decline it in Slack: Home, Directories, External. If Directories is not there, open External connections.")
+}
+
+/// A workspace domain Slack would put in `team.domain`: no slash, space or colon.
+fn domain_ok(domain: &str) -> bool {
+    !domain.is_empty() && !domain.contains(['/', ' ', ':'])
+}
+
+/// The lab's slack-connect-org driver. A build without this stays up and the driver fails.
+/// The same helpers name a channel and write the hand-off.
+pub(crate) fn prove_connect_names() -> Result<(), String> {
+    let ours = "T01ALPHA";
+    let joined = json!({
+        "is_ext_shared": true,
+        "connected_team_ids": ["T01ALPHA", "T0NORTH"],
+        "shared_team_ids": ["T01ALPHA", "T0SOUTH"],
+        "is_pending_ext_shared": false,
+        "pending_connected_team_ids": [],
+    });
+    if other_teams(&joined, ours) != ["T0NORTH"] {
+        return Err("a joined Slack Connect channel names the other organisation, not our own".into());
+    }
+    if invite_pending(&joined) {
+        return Err("a joined channel is not a pending invite".into());
+    }
+    let pending = json!({
+        "is_pending_ext_shared": true,
+        "pending_connected_team_ids": ["T0NORTH"],
+        "connected_team_ids": [],
+        "shared_team_ids": [ours],
+    });
+    if !invite_pending(&pending) {
+        return Err("a pending Slack Connect invite stays pending".into());
+    }
+    if other_teams(&pending, ours) != ["T0NORTH"] {
+        return Err("a pending invite names the other organisation".into());
+    }
+    let handoff = invite_handoff("Northwind");
+    if !handoff.contains("Northwind") || !handoff.contains("Directories") || !handoff.contains("External connections") {
+        return Err("the hand-off names the organisation and Slack's External connections screen".into());
+    }
+    let own = json!({"connected_team_ids": [ours], "shared_team_ids": [ours, "T0SOUTH"]});
+    if !other_teams(&own, ours).is_empty() {
+        return Err("our own team is not named, and shared_team_ids is not the other organisation".into());
+    }
+    if !EXTERNAL_EMAIL.contains("Directories") || !EXTERNAL_EMAIL.contains("External connections") {
+        return Err("an email invitation says where Slack accepts it".into());
+    }
+    Ok(())
 }
 
 impl Slack {
@@ -45,17 +139,71 @@ impl Slack {
         let said = |what: &str| channel[what]["value"].as_str().filter(|text| !text.is_empty());
         // The creator only by a name already known: their profile is not asked for this.
         let creator = channel["creator"].as_str().map(|id| self.cached(id).map_or_else(|| id.to_owned(), |user| user.name));
+        let names = self.connect_names(channel);
+        let mut description = said("purpose").or(said("topic")).unwrap_or("").to_owned();
+        if invite_pending(channel) {
+            let handoff = invite_handoff(names.first().map(String::as_str).unwrap_or(""));
+            if description.is_empty() {
+                description = handoff;
+            } else {
+                description.push_str("\n\n");
+                description.push_str(&handoff);
+            }
+        }
         Ok(ConversationAbout {
-            description: said("purpose").or(said("topic")).unwrap_or("").to_owned(),
+            description,
             members: channel["num_members"].as_u64().map(|count| count as u32),
             created: channel["created"].as_i64().filter(|created| *created > 0),
             creator: creator.unwrap_or_default(),
             notify,
-            // Unverified: the other organization's name needs a lookup per team; the shared
-            // channel is marked on its row, and its name is left out here.
-            external: String::new(),
+            external: names.join(", "),
             ..ConversationAbout::default()
         })
+    }
+
+    /// The other organisations on a Slack Connect channel, looked up once each and kept.
+    fn connect_names(&self, channel: &Value) -> Vec<String> {
+        let mut names = Vec::new();
+        for team in other_teams(channel, &self.session.team_id) {
+            if let Some(name) = self.organisation(&team) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// One team's name, from the note or from the documented `team.info`. An empty name or a
+    /// failed lookup is skipped and not cached, so a later open can try again. Our own team is
+    /// never asked: [`other_teams`] has already dropped it.
+    fn organisation(&self, team: &str) -> Option<String> {
+        let key = team_note(team);
+        if let Some(name) = self.ctx.note(&key) {
+            return (!name.is_empty()).then_some(name);
+        }
+        let info = self.api("team.info", &[("team", team)]).ok()?;
+        let named = &info["team"];
+        let name = named["name"].as_str().unwrap_or("").trim();
+        if name.is_empty() {
+            return None;
+        }
+        self.ctx.set_note(&key, name);
+        if let Some(domain) = named["domain"].as_str().map(str::trim).filter(|domain| domain_ok(domain)) {
+            self.ctx.set_note(&format!("domain:{domain}"), name);
+        }
+        Some(name.to_owned())
+    }
+
+    /// The other workspace's name on a forwarded message, only when that domain was already
+    /// looked up. A forward is not worth a lookup. An extra dot is an enterprise host, and
+    /// Slack's own hosts are not a workspace.
+    pub(super) fn workspace_named(&self, url: &str) -> Option<String> {
+        let host = super::https_host(url)?;
+        let domain = host.strip_suffix(".slack.com")?;
+        if domain.is_empty() || domain.contains('.') || matches!(domain, "app" | "files" | "status") {
+            return None;
+        }
+        let name = self.ctx.note(&format!("domain:{domain}"))?;
+        (!name.is_empty()).then_some(name)
     }
 
     /// Sets a conversation's notifications as the web client's channel menu does. Unverified
