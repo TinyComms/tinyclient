@@ -1865,25 +1865,30 @@ fn presence_a_profile_and_signing_out() {
     world.fake.push(ALPHA, json!({"type": "manual_presence_change", "presence": "away"}));
     world.until("my own presence from elsewhere", || (world.account("T01ALPHA").presence == Presence::Idle).then_some(()));
 
-    // A profile card is one request, and only because it was opened.
+    // A profile card is users.info plus one labelled profile, and only because it was opened.
     let before = world.fake.calls(ALPHA, "users.info").len();
     world.until("Ana to be known", || world.conversation(&alpha("D0ANA")));
     let Response::Profile { profile } = world.ask(Request::Profile { person: alpha("U0ANA"), space: None }) else {
         panic!("no profile");
     };
-    // The title is a title, not a bio (06, story 3).
+    // The title is a title, not a bio (06, story 3). The display name stays the row; the full
+    // name is the card's other line.
     assert_eq!((profile.title.as_str(), profile.bio.as_str()), ("Design lead", ""));
     assert_eq!((profile.time_zone.as_str(), profile.utc_offset), ("Europe/Lisbon", Some(3600)));
     assert_eq!((profile.person.name.as_str(), profile.person.link.as_str()), ("Ana", "slack://user?team=T01ALPHA&id=U0ANA"));
+    assert!(profile.fields.iter().any(|(label, value)| label == "Full name" && value == "Ana Lima"));
     assert_eq!(world.fake.calls(ALPHA, "users.info").len(), before + 1);
-    assert!(world.fake.calls(ALPHA, "users.profile.get").is_empty());
+    let labelled = world.fake.calls(ALPHA, "users.profile.get");
+    assert_eq!(labelled.len(), 1);
+    assert_eq!((labelled[0].params.get("user").map(String::as_str), labelled[0].params.get("include_labels").map(String::as_str)), (Some("U0ANA"), Some("true")));
     // Opened again from the Space (an answer chatd itself has not kept), Slack is still not
-    // asked again: one `users.info` per person per hour, the card read then answered again.
+    // asked again: one `users.info` and one labelled profile per person per hour.
     let Response::Profile { profile } = world.ask(Request::Profile { person: alpha("U0ANA"), space: Some(alpha("T01ALPHA")) }) else {
         panic!("no profile");
     };
     assert_eq!(profile.title.as_str(), "Design lead");
     assert_eq!(world.fake.calls(ALPHA, "users.info").len(), before + 1);
+    assert_eq!(world.fake.calls(ALPHA, "users.profile.get").len(), 1);
 
     // Signing out of one workspace has nothing to end on Slack, so it answers at once, and the
     // browser's session, which the other workspace shares, is left alone.
