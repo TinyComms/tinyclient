@@ -42,7 +42,7 @@ mod wire;
 use super::{keep_connected, serve_commands, About, Command, Context, Failure, Refusal, Signed};
 use crate::session;
 use crate::store::{ConversationRow, PersonRow};
-use protocol::{Contact, ContactKind, ConversationKind, Link, Message, MessageKind, Reaction, Relation, ReplyTo};
+use protocol::{Contact, ContactKind, ConversationKind, Link, Message, MessageKind, Poll, PollBallot, PollDraft, Reaction, Relation, ReplyTo};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::Receiver;
@@ -65,6 +65,16 @@ const CONVERSATIONS_KEPT: usize = 1_024;
 const SENT_KEPT: usize = 1_024;
 /// Reactions remembered, so a new one from the same person replaces their old one.
 const REACTIONS_KEPT: usize = 4_096;
+/// Ballots remembered on one poll. Older ones drop off the list; the choice counts stay.
+const BALLOTS_KEPT: usize = 1_024;
+/// Signal's poll limits, from its desktop schema: a question and each choice are at most this
+/// many characters, and a poll has at most this many choices.
+const POLL_CHARS: usize = 100;
+const POLL_MOST: usize = 10;
+/// A vote or an end, packed into an edit so the command channel already exists. A real edit
+/// never starts with this mark.
+const POLL_VOTE: &str = "\u{1}signal-poll-vote\u{1}";
+const POLL_END: &str = "\u{1}signal-poll-end\u{1}";
 /// What a person with no name we know is called.
 const NO_NAME: &str = "Signal user";
 /// Most pictures asked of Signal for one change to what is on screen.
@@ -562,6 +572,53 @@ fn apply(account: &Account, event: Event) {
         Event::Deleted { peer, author, target } => {
             let _ = ctx.deleted(&peer.conversation(), &wire::message_id(target, &author));
         }
+        Event::Poll { peer, author, name, sent, question, options, multiple, outgoing } => {
+            if !outgoing && !name.is_empty() {
+                let mut live = account.live();
+                if !live.names.contains_key(&author) {
+                    live.names.insert(author.clone(), name.clone());
+                }
+            }
+            let conversation = peer.conversation();
+            match &peer {
+                Peer::Direct(aci) => {
+                    let title = account.live().names.get(aci).cloned().unwrap_or_default();
+                    ensure_row(account, &peer, &title);
+                }
+                Peer::Group(_) => {
+                    if let Ok(None) = ctx.known(&conversation) {
+                        let _ = ctx.conversation(&row(&peer, ""));
+                    }
+                }
+            }
+            let message = with_poll(account, &author, &name, sent, outgoing, Poll::open(question, options, multiple));
+            if outgoing {
+                account.live().sent(sent, &conversation);
+            } else {
+                account.live().unread(&conversation, &author, sent);
+            }
+            let _ = ctx.message(&conversation, &message);
+        }
+        Event::PollVote { peer, by, author, target, indexes, serial } => {
+            let conversation = peer.conversation();
+            let id = wire::message_id(target, &author);
+            if let Ok(Some(mut message)) = ctx.stored_message(&conversation, &id) {
+                let changed = message.poll.as_mut().is_some_and(|poll| apply_ballot(poll, &by, indexes, serial, &account.me));
+                if changed {
+                    let _ = ctx.message(&conversation, &message);
+                }
+            }
+        }
+        Event::PollEnded { peer, author, target } => {
+            let conversation = peer.conversation();
+            let id = wire::message_id(target, &author);
+            if let Ok(Some(mut message)) = ctx.stored_message(&conversation, &id) {
+                if let Some(poll) = message.poll.as_mut().filter(|poll| !poll.closed) {
+                    poll.closed = true;
+                    let _ = ctx.message(&conversation, &message);
+                }
+            }
+        }
         Event::Reacted { peer, by, author, target, emoji, removed } => {
             let conversation = peer.conversation();
             let id = wire::message_id(target, &author);
@@ -670,8 +727,20 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
         Command::Edit { conversation_id, message_id, text, reply } => {
-            let _ = reply.send(edit(account, &conversation_id, &message_id, &text).map_err(refused));
+            let answered = match poll_action(&text) {
+                Some(act) => poll_act(account, &conversation_id, &message_id, act),
+                None => edit(account, &conversation_id, &message_id, &text),
+            };
+            let _ = reply.send(answered.map_err(refused));
         }
+        Command::SendWith { conversation_id, client_id, reply_to, with, .. } => match with.poll.clone() {
+            Some(_) if !with.files.is_empty() => ctx.sent(&conversation_id, &client_id, Err("A poll can't carry a file.".to_owned())),
+            Some(draft) => {
+                let outcome = send_poll(account, &conversation_id, &draft, reply_to.as_deref());
+                ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
+            }
+            None => Command::SendWith { conversation_id, client_id, text: String::new(), reply_to, with }.unsupported(ctx),
+        },
         Command::Delete { conversation_id, message_id, reply } => {
             let _ = reply.send(delete(account, &conversation_id, &message_id).map_err(refused));
         }
@@ -883,6 +952,202 @@ fn mark_read(account: &Account, conversation: &str, message_id: &str) {
     }
 }
 
+/// What a `Request::Poll` asked for, once the sentinel is read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollAct {
+    /// Replace our vote. Empty takes it back.
+    Vote(Vec<u32>),
+    /// End the poll. Only its author may.
+    End,
+}
+
+/// Packs a poll request into the edit text the Signal command thread already understands.
+pub fn poll_command(votes: Option<&[u32]>) -> String {
+    match votes {
+        None => POLL_END.to_owned(),
+        Some(votes) => {
+            let list = votes.iter().take(POLL_MOST).map(|index| index.to_string()).collect::<Vec<_>>().join(",");
+            format!("{POLL_VOTE}{list}")
+        }
+    }
+}
+
+/// The other way. `None` is an ordinary edit.
+pub fn poll_action(text: &str) -> Option<PollAct> {
+    if text == POLL_END {
+        return Some(PollAct::End);
+    }
+    let rest = text.strip_prefix(POLL_VOTE)?;
+    if rest.is_empty() {
+        return Some(PollAct::Vote(Vec::new()));
+    }
+    let mut votes = Vec::new();
+    for part in rest.split(',') {
+        votes.push(part.parse().ok()?);
+    }
+    Some(PollAct::Vote(votes))
+}
+
+/// What `TINYCLIENT_PROVE=signal-poll` checks, with no account and no network: a vote, a
+/// retraction and an end pack and unpack, and ordinary text does not.
+pub fn prove_signal_poll() -> Result<(), String> {
+    match poll_action(&poll_command(Some(&[0, 2]))) {
+        Some(PollAct::Vote(indexes)) if indexes == [0, 2] => {}
+        _ => return Err("a vote did not round-trip".into()),
+    }
+    match poll_action(&poll_command(Some(&[]))) {
+        Some(PollAct::Vote(indexes)) if indexes.is_empty() => {}
+        _ => return Err("taking a vote back did not round-trip".into()),
+    }
+    match poll_action(&poll_command(None)) {
+        Some(PollAct::End) => {}
+        _ => return Err("ending a poll did not round-trip".into()),
+    }
+    if poll_action("Dinner?").is_some() {
+        return Err("plain text was read as a poll".into());
+    }
+    Ok(())
+}
+
+fn checked_draft(draft: &PollDraft) -> Result<(String, Vec<String>, bool), Fault> {
+    let question = draft.question.trim();
+    if question.is_empty() {
+        return Err(Fault::Refused("A poll needs a question.".into()));
+    }
+    if question.chars().count() > POLL_CHARS {
+        return Err(Fault::Refused("A poll's question can be at most 100 characters.".into()));
+    }
+    let options: Vec<String> = draft.options.iter().map(|option| option.trim().to_owned()).filter(|option| !option.is_empty()).collect();
+    if options.len() < 2 {
+        return Err(Fault::Refused("A poll needs at least two choices.".into()));
+    }
+    if options.len() > POLL_MOST {
+        return Err(Fault::Refused("A poll can have at most 10 choices.".into()));
+    }
+    if options.iter().any(|option| option.chars().count() > POLL_CHARS) {
+        return Err(Fault::Refused("A poll's choice can be at most 100 characters.".into()));
+    }
+    Ok((question.to_owned(), options, draft.multiple))
+}
+
+fn with_poll(account: &Account, author: &str, name: &str, sent: u64, outgoing: bool, mut poll: Poll) -> Message {
+    protocol::clip(&mut poll.question, POLL_CHARS);
+    let words = Text { author: author.to_owned(), name: name.to_owned(), sent, text: format!("Poll: {}", poll.question), ..Text::default() };
+    let mut message = message(account, &words, outgoing);
+    message.poll = Some(Box::new(poll));
+    message
+}
+
+/// Records one person's vote, replacing their earlier one when `serial` is newer. `serial` of 0
+/// means this vote follows the one we already have.
+fn apply_ballot(poll: &mut Poll, person: &str, mut choices: Vec<u32>, serial: u32, me: &str) -> bool {
+    if poll.closed {
+        return false;
+    }
+    choices.retain(|index| (*index as usize) < poll.choices.len());
+    choices.sort_unstable();
+    choices.dedup();
+    if !poll.multiple {
+        choices.truncate(1);
+    }
+    let serial = if serial == 0 { poll.ballots.iter().find(|ballot| ballot.person == person).map(|ballot| ballot.serial.saturating_add(1)).unwrap_or(1) } else { serial };
+    if let Some(existing) = poll.ballots.iter().find(|ballot| ballot.person == person) {
+        if serial <= existing.serial {
+            return false;
+        }
+    }
+    if poll.ballots.len() >= BALLOTS_KEPT && !poll.ballots.iter().any(|ballot| ballot.person == person) {
+        poll.ballots.remove(0);
+    }
+    poll.ballots.retain(|ballot| ballot.person != person);
+    poll.ballots.push(PollBallot { person: person.to_owned(), choices, serial });
+    recount(poll, me);
+    true
+}
+
+fn recount(poll: &mut Poll, me: &str) {
+    let ballots = poll.ballots.clone();
+    for choice in &mut poll.choices {
+        choice.voters.clear();
+        choice.count = 0;
+    }
+    for ballot in &ballots {
+        for index in &ballot.choices {
+            if let Some(choice) = poll.choices.get_mut(*index as usize) {
+                choice.count = choice.count.saturating_add(1);
+                if choice.voters.len() < protocol::POLL_VOTERS {
+                    choice.voters.push(ballot.person.clone());
+                }
+            }
+        }
+    }
+    poll.mine = ballots.into_iter().find(|ballot| ballot.person == me).map(|ballot| ballot.choices).unwrap_or_default();
+}
+
+fn chosen(poll: &Poll, indexes: &[u32]) -> Result<Vec<u32>, Fault> {
+    if indexes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if indexes.iter().any(|index| *index as usize >= poll.choices.len()) {
+        return Err(Fault::Refused("That choice is not on this poll.".into()));
+    }
+    let mut indexes = indexes.to_vec();
+    indexes.sort_unstable();
+    indexes.dedup();
+    if !poll.multiple && indexes.len() > 1 {
+        return Err(Fault::Refused("This poll takes one choice.".into()));
+    }
+    Ok(indexes)
+}
+
+fn send_poll(account: &Account, conversation: &str, draft: &PollDraft, _reply_to: Option<&str>) -> Result<Message, Fault> {
+    let to = peer(conversation)?;
+    let (question, options, multiple) = checked_draft(draft)?;
+    let sent = account.wire.send(&to, Body::Poll { question: question.clone(), options: options.clone(), multiple })?;
+    account.live().sent(sent, conversation);
+    Ok(with_poll(account, &account.me, &account.name, sent, true, Poll::open(question, options, multiple)))
+}
+
+fn poll_act(account: &Account, conversation: &str, message_id: &str, act: PollAct) -> Result<(), Fault> {
+    let to = peer(conversation)?;
+    let (sent, author) = target(message_id)?;
+    let Some(mut message) = account.ctx.stored_message(conversation, message_id).ok().flatten() else {
+        return Err(Fault::Refused("That message is no longer there.".into()));
+    };
+    let Some(poll) = message.poll.as_ref() else {
+        return Err(Fault::Refused("That is not a poll.".into()));
+    };
+    match act {
+        PollAct::End => {
+            if author != account.me {
+                return Err(Fault::Refused("Only the person who started this poll can end it.".into()));
+            }
+            if poll.closed {
+                return Ok(());
+            }
+            account.wire.send(&to, Body::PollEnd { target: sent })?;
+            if let Some(poll) = message.poll.as_mut() {
+                poll.closed = true;
+            }
+            let _ = account.ctx.message(conversation, &message);
+            Ok(())
+        }
+        PollAct::Vote(indexes) => {
+            if poll.closed {
+                return Err(Fault::Refused("This poll has ended.".into()));
+            }
+            let choices = chosen(poll, &indexes)?;
+            let serial = poll.ballots.iter().find(|ballot| ballot.person == account.me).map(|ballot| ballot.serial.saturating_add(1)).unwrap_or(1);
+            account.wire.send(&to, Body::PollVote { author, target: sent, indexes: choices.clone(), serial })?;
+            if let Some(poll) = message.poll.as_mut() {
+                apply_ballot(poll, &account.me, choices, serial, &account.me);
+            }
+            let _ = account.ctx.message(conversation, &message);
+            Ok(())
+        }
+    }
+}
+
 fn typing(account: &Account, conversation: &str) {
     let Some(to) = Peer::parse(conversation) else {
         return;
@@ -901,6 +1166,11 @@ fn typing(account: &Account, conversation: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_poll_vote_is_not_an_edit() {
+        prove_signal_poll().unwrap();
+    }
 
     #[test]
     fn a_session_names_one_account_and_says_nothing_of_its_key() {

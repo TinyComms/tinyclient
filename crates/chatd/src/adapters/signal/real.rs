@@ -415,6 +415,37 @@ impl Session {
 
     /// One data message, from someone (`outgoing` false) or from us on another device.
     async fn data(&mut self, message: &DataMessage, author: &str, peer: Peer, sent: u64, outgoing: bool) {
+        // A poll's data message has an empty body. Read it before the empty-body drop below.
+        if let Some(create) = &message.poll_create {
+            let name = if author == self.me { String::new() } else { self.name_of(author).await };
+            self.tell(Event::Poll {
+                peer,
+                author: author.to_owned(),
+                name,
+                sent,
+                question: create.question.clone().unwrap_or_default(),
+                options: create.options.clone(),
+                multiple: create.allow_multiple.unwrap_or(false),
+                outgoing,
+            });
+            return;
+        }
+        if let Some(vote) = &message.poll_vote {
+            let target_author = vote.parse_target_author_aci().map(|aci| ServiceId::from(aci).raw_uuid().to_string()).unwrap_or_default();
+            self.tell(Event::PollVote {
+                peer,
+                by: author.to_owned(),
+                author: target_author,
+                target: vote.target_sent_timestamp.unwrap_or(0),
+                indexes: vote.option_indexes.clone(),
+                serial: vote.vote_count.unwrap_or(0),
+            });
+            return;
+        }
+        if let Some(end) = &message.poll_terminate {
+            self.tell(Event::PollEnded { peer, author: author.to_owned(), target: end.target_sent_timestamp.unwrap_or(0) });
+            return;
+        }
         if let Some(reaction) = &message.reaction {
             let target_author = reaction.target_author_aci.clone().unwrap_or_default();
             self.tell(Event::Reacted {
@@ -684,6 +715,33 @@ impl Session {
             Body::Edit { target, text } => ContentBody::EditMessage(EditMessage {
                 target_sent_timestamp: Some(target),
                 data_message: Some(DataMessage { body: Some(text), timestamp: Some(at), group_v2, ..Default::default() }),
+            }),
+            Body::Poll { question, options, multiple } => ContentBody::DataMessage(DataMessage {
+                poll_create: Some(data_message::PollCreate { question: Some(question), allow_multiple: Some(multiple), options }),
+                timestamp: Some(at),
+                required_protocol_version: Some(8),
+                group_v2,
+                ..Default::default()
+            }),
+            Body::PollVote { author, target, indexes, serial } => {
+                let uuid = Uuid::parse_str(&author).map_err(|_| Fault::Refused("That person can't be messaged from here.".to_owned()))?;
+                ContentBody::DataMessage(DataMessage {
+                    poll_vote: Some(data_message::PollVote {
+                        target_author_aci_binary: Some(uuid.as_bytes().to_vec()),
+                        target_sent_timestamp: Some(target),
+                        option_indexes: indexes,
+                        vote_count: Some(serial),
+                    }),
+                    timestamp: Some(at),
+                    group_v2,
+                    ..Default::default()
+                })
+            }
+            Body::PollEnd { target } => ContentBody::DataMessage(DataMessage {
+                poll_terminate: Some(data_message::PollTerminate { target_sent_timestamp: Some(target) }),
+                timestamp: Some(at),
+                group_v2,
+                ..Default::default()
             }),
         };
         self.deliver(to, content, at).await?;

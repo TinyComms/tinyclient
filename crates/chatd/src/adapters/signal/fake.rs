@@ -17,6 +17,9 @@
 //! | `note SENT TEXT…` | we wrote TEXT to Note to Self from the phone |
 //! | `edit WHO TARGET TEXT…`, `delete WHO TARGET` | WHO changed or took back their message |
 //! | `react WHO AUTHOR TARGET EMOJI`, `unreact …` | WHO reacted to AUTHOR's message |
+//! | `poll WHO SENT QUESTION \| OPT…`, `pollmulti …` | WHO started a poll in the group; `pollmulti` allows more than one choice |
+//! | `vote WHO AUTHOR TARGET INDEXES`, `unvote WHO AUTHOR TARGET` | WHO voted on AUTHOR's poll (indexes `0` or `0,1`), or took it back |
+//! | `endpoll AUTHOR TARGET` | AUTHOR ended their poll |
 //! | `read WHO SENT` | we read WHO's message on the phone |
 //! | `seen WHO SENT` | WHO read our message |
 //! | `typing WHO`, `typing-stop WHO` | WHO is typing to us, or stopped |
@@ -190,6 +193,49 @@ fn steer(line: &str) -> Vec<Event> {
             let emoji = next().to_owned();
             vec![Event::Reacted { peer: direct(by), by: by.into(), author: author.into(), target, emoji, removed: command == "unreact" }]
         }
+        "poll" | "pollmulti" => {
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let body = rest(line, 3);
+            let mut parts = body.split('|').map(|part| part.trim().to_owned());
+            let question = parts.next().unwrap_or_default();
+            let options: Vec<String> = parts.filter(|part| !part.is_empty()).collect();
+            vec![Event::Poll {
+                peer: club(),
+                author: author.into(),
+                name: name.into(),
+                sent,
+                question,
+                options,
+                multiple: command == "pollmulti",
+                outgoing: false,
+            }]
+        }
+        "vote" | "unvote" => {
+            let Some((by, _)) = who(next()) else {
+                return Vec::new();
+            };
+            let author = match next() {
+                "me" => ME,
+                other => who(other).map_or(ME, |(id, _)| id),
+            };
+            let target = next().parse().unwrap_or(0);
+            let indexes = if command == "unvote" { Vec::new() } else { next().split(',').filter_map(|part| part.parse().ok()).collect() };
+            vec![Event::PollVote { peer: club(), by: by.into(), author: author.into(), target, indexes, serial: 0 }]
+        }
+        "endpoll" => {
+            let author = match next() {
+                "me" => ME.to_owned(),
+                other => who(other).map(|(id, _)| id.to_owned()).unwrap_or_default(),
+            };
+            if author.is_empty() {
+                return Vec::new();
+            }
+            let target = next().parse().unwrap_or(0);
+            vec![Event::PollEnded { peer: club(), author, target }]
+        }
         "read" => {
             let Some((author, _)) = who(next()) else {
                 return Vec::new();
@@ -238,6 +284,12 @@ impl Wire for Fake {
             Body::React { author, target, emoji, remove } => format!("send {} react {target}-{author} {emoji} remove={remove}", describe(to)),
             Body::Edit { target, text } => format!("send {} edit {target} {text}", describe(to)),
             Body::Delete { target } => format!("send {} delete {target}", describe(to)),
+            Body::Poll { question, options, multiple } => format!("send {} poll {question} | {} multi={multiple}", describe(to), options.join(" | ")),
+            Body::PollVote { author, target, indexes, serial } => {
+                let picked = if indexes.is_empty() { "-".to_owned() } else { indexes.iter().map(|index| index.to_string()).collect::<Vec<_>>().join(",") };
+                format!("send {} vote {target}-{author} {picked} serial={serial}", describe(to))
+            }
+            Body::PollEnd { target } => format!("send {} endpoll {target}", describe(to)),
         };
         record(&line);
         if let Some(words) = self.refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {

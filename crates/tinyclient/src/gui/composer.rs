@@ -955,6 +955,7 @@ impl Composer {
             ping: reply_to.is_none() || !controls.ping || !self.ping_off.contains(&target.key.account()),
             pick: None,
             schedule,
+            poll: None,
         };
         let (shown, wire) = match as_file {
             true => (String::new(), String::new()),

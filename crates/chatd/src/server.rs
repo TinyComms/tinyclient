@@ -1181,6 +1181,14 @@ impl Chat {
             return error(ErrorCode::Offline, offline_words(&account, &with));
         }
         message.waiting = false;
+        if with.poll.is_some() {
+            if account.network != Network::Signal {
+                return error(ErrorCode::Unsupported, "Polls are not built for this network yet.");
+            }
+            if !with.files.is_empty() {
+                return error(ErrorCode::Refused, "A poll can't carry a file.");
+            }
+        }
         if let Err(refused) = self.allowed(&account, &with) {
             return *refused;
         }
@@ -1380,6 +1388,12 @@ impl Chat {
             snippet: quoted.text.chars().take(120).collect(),
             deleted: quoted.deleted,
         });
+        if let Some(draft) = &with.poll {
+            let mut question = draft.question.clone();
+            clip(&mut question, 100);
+            message.text = format!("Poll: {question}");
+            message.poll = Some(Box::new(protocol::Poll::open(question, draft.options.iter().take(10).cloned(), draft.multiple)));
+        }
         message
     }
 
@@ -1601,6 +1615,25 @@ impl Chat {
                 }
                 Response::Ok
             }
+            Err(refused) => *refused,
+        }
+    }
+
+    /// A vote, a retraction, or ending a poll. Not an edit: the poll may be someone else's, and
+    /// the message's text stays "Poll: …". Signal only; the adapter reads the sentinel.
+    fn poll(&self, conversation: Key, message_id: String, votes: Option<Vec<u32>>) -> Response {
+        let account = conversation.account();
+        if account.network != Network::Signal {
+            return error(ErrorCode::Unsupported, "Polls are not built for this network yet.");
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let votes = votes.map(|votes| votes.into_iter().take(10).collect::<Vec<_>>());
+        let text = adapters::signal::poll_command(votes.as_deref());
+        let conversation_id = conversation.id;
+        match self.ask(&account, |reply| Command::Edit { conversation_id, message_id, text, reply }) {
+            Ok(()) => Response::Ok,
             Err(refused) => *refused,
         }
     }
@@ -2501,6 +2534,7 @@ impl Chat {
             Request::Reactions { conversation } => self.reactions(conversation),
             Request::Edit { conversation, message_id, text } => self.rewrite(conversation, message_id, Some(text)),
             Request::Delete { conversation, message_id } => self.rewrite(conversation, message_id, None),
+            Request::Poll { conversation, message_id, votes } => self.poll(conversation, message_id, votes),
 
             Request::Fetch { account, ids, size, retry } => {
                 let adapter = lock(&self.adapters).get(&account).map(Adapter::sender);

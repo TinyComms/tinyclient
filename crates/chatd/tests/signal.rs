@@ -8,7 +8,8 @@
 
 use protocol::{
     read_frame, write_frame, AccountKey, Change, ChatStream, ContactKind, Conversation, ConversationKind, ErrorCode, Key, Link, Message,
-    MessageKind, Network, Page, Relation, Request, Response, SendState, SignInInput, SignInProblem, SignInStep,
+    MessageKind, Network, Outgoing, OutgoingFile, Page, PollDraft, Relation, Request, Response, SendState, SignInInput, SignInProblem,
+    SignInStep,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -568,4 +569,109 @@ fn note_to_self_from_the_phone_has_its_own_label() {
         (world.conversation(ME)?.title == "Note to Self").then_some(())
     });
     assert_eq!(world.messages(ME).len(), 1, "renaming must preserve messages");
+}
+
+#[test]
+fn a_group_poll_shows_its_counts_and_a_vote_reaches_the_wire() {
+    let world = World::linked();
+    world.connected();
+    let sent = T0 + 4_000;
+    world.steer(&format!("poll grace {sent} Dinner? | Thai | Pizza"));
+    let poll = world.arrived(CLUB, &id(sent, GRACE));
+    let held = poll.poll.expect("a poll");
+    assert_eq!(poll.text, "Poll: Dinner?");
+    assert_eq!(poll.kind, MessageKind::Normal);
+    assert_eq!(held.question, "Dinner?");
+    assert!(!held.multiple && !held.closed && held.mine.is_empty());
+    assert_eq!(held.choices.iter().map(|choice| (choice.text.as_str(), choice.count)).collect::<Vec<_>>(), [("Thai", 0), ("Pizza", 0)]);
+
+    // Grace moves from Thai to Pizza; Alan picks Thai. Counts follow the latest vote.
+    world.steer(&format!("vote grace grace {sent} 0"));
+    world.steer(&format!("vote grace grace {sent} 1"));
+    world.steer(&format!("vote alan grace {sent} 0"));
+    let voted = world.until("both votes", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == poll.id)?;
+        let poll = message.poll.as_ref()?;
+        (poll.choices[0].count == 1 && poll.choices[1].count == 1).then_some(message)
+    });
+    let voted = voted.poll.unwrap();
+    assert_eq!(voted.choices[0].voters, vec![ALAN.to_owned()]);
+    assert_eq!(voted.choices[1].voters, vec![GRACE.to_owned()]);
+
+    let multiple_at = T0 + 8_000;
+    world.steer(&format!("pollmulti alan {multiple_at} Sides? | Soup | Salad"));
+    world.steer(&format!("vote alan alan {multiple_at} 0,1"));
+    world.until("both sides", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == id(multiple_at, ALAN))?;
+        let poll = message.poll.as_ref()?;
+        (poll.multiple && poll.choices.iter().all(|choice| choice.count == 1)).then_some(())
+    });
+
+    // A file cannot ride along. Nothing is asked of Signal.
+    let with_file = Request::Send {
+        conversation: key(CLUB),
+        client_id: "poll-file".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            poll: Some(PollDraft { question: "Dinner?".into(), options: vec!["Thai".into(), "Pizza".into()], multiple: false }),
+            files: vec![OutgoingFile { path: "missing.txt".into(), name: String::new(), spoiler: false, as_file: false, original: false }],
+            ..Outgoing::default()
+        },
+    };
+    match world.ask(with_file) {
+        Response::Error { code: ErrorCode::Refused, detail } => assert_eq!(detail, "A poll can't carry a file."),
+        other => panic!("{other:?}"),
+    }
+    assert!(!world.calls().iter().any(|call| call.contains("poll")));
+
+    // Our vote is on the wire, then a retraction. Ending someone else's poll is refused.
+    assert_eq!(world.ask(Request::Poll { conversation: key(CLUB), message_id: poll.id.clone(), votes: Some(vec![0]) }), Response::Ok);
+    world.heard(&format!("send {CLUB} vote {sent}-{GRACE} 0 serial=1"));
+    world.until("our vote", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == poll.id)?;
+        let held = message.poll.as_ref()?;
+        (held.mine == vec![0] && held.choices[0].count == 2 && message.text == "Poll: Dinner?").then_some(())
+    });
+    assert_eq!(world.ask(Request::Poll { conversation: key(CLUB), message_id: poll.id.clone(), votes: Some(vec![]) }), Response::Ok);
+    world.heard(&format!("send {CLUB} vote {sent}-{GRACE} - serial=2"));
+    world.until("the retraction", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == poll.id)?;
+        let held = message.poll?;
+        (held.mine.is_empty() && held.choices[0].count == 1 && held.choices[1].count == 1).then_some(())
+    });
+    match world.ask(Request::Poll { conversation: key(CLUB), message_id: poll.id.clone(), votes: None }) {
+        Response::Error { code: ErrorCode::Refused, detail } => assert!(detail.contains("started"), "{detail}"),
+        other => panic!("{other:?}"),
+    }
+
+    let started = Request::Send {
+        conversation: key(CLUB),
+        client_id: "poll-1".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            poll: Some(PollDraft { question: "Next week?".into(), options: vec!["Yes".into(), "No".into()], multiple: false }),
+            ..Outgoing::default()
+        },
+    };
+    let Response::Sent { message: pending } = world.ask(started) else { panic!("not sent") };
+    assert_eq!(pending.text, "Poll: Next week?");
+    // The vote and the retraction were the first two sends, so this poll is the third.
+    let created = FIRST_SENT + 2_000;
+    let ours = world.arrived(CLUB, &id(created, ME));
+    assert_eq!(ours.client_id.as_deref(), Some("poll-1"));
+    assert_eq!(ours.poll.as_ref().map(|poll| poll.choices.len()), Some(2));
+    world.heard(&format!("send {CLUB} poll Next week? | Yes | No multi=false"));
+    assert_eq!(world.ask(Request::Poll { conversation: key(CLUB), message_id: ours.id.clone(), votes: None }), Response::Ok);
+    world.heard(&format!("send {CLUB} endpoll {created}"));
+    world.until("our poll to end", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == ours.id)?;
+        message.poll.as_ref().filter(|poll| poll.closed).map(|_| ())
+    });
+    world.steer(&format!("endpoll grace {sent}"));
+    world.until("Grace's poll to end", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == poll.id)?;
+        message.poll.as_ref().filter(|poll| poll.closed).map(|_| ())
+    });
 }
