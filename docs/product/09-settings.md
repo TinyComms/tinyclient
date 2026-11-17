@@ -14,7 +14,7 @@ The tables under "Information architecture" are the control design. A row marked
 | Notifications | N1, N2, ND, NG, NM, NT, N4, NL, N5–N11, N13 | ND / NG / NM / NT are "Direct messages", "Group chats", "Mentions in channels", "Tiny servers". There is no N3 per-account menu. NL is the lock-screen preview and is hidden on macOS, where the OS does that. N10 and N11 use the host's flash and badge labels and are hidden on Linux. |
 | Sounds | S1–S4, SV | Five message sounds, two rings, or None. No "System alert sound". SV is notification volume and is hidden on macOS. |
 | Appearance | A2, A3, A4 | Text size, density, list previews. No theme control. The app is dark. |
-| Messages | M1–M5 | Send key, where a conversation opens, typing line, emoticons, GIF and sticker autoplay. |
+| Messages | M1–M6 | Send key, where a conversation opens, typing line, emoticons, GIF and sticker autoplay, spelling. |
 | Privacy | P1–P4, PE | Typing and read receipts per account, image loading, keep-for 7 / 30 / 90 days. Telegram typing and receipts are fixed on. Signal says the phone. Messages says the phone. |
 | Audio & video | V1, V2, V4, V5 | Microphone, speaker, join muted, call volume. |
 | Voice | V3, V6, V8, V10–V19, S7–S10 | Input level, sensitivity, voice activation or push-to-talk, echo cancellation, noise suppression, automatic gain, key recorders, release delay, call cues and their volume. |
@@ -35,7 +35,7 @@ chatd keeps the notification, sound, privacy, voice, and storage values. The she
 | N14, N15 | No reaction or thread-follow notify control. |
 | S5, S6 pickers | chatd will honor an account or conversation sound if one is stored. No row was found that writes them. |
 | S13 custom files, S14 ring-back | Both are in: sounds of your own in every picker, and a ring back while you call. |
-| M6 spellcheck, P5 screen-share hide, P6 Touch ID, P7 Signal relay | In `NOT_YET` or absent. |
+| P5 screen-share hide, P6 Touch ID, P7 Signal relay | In `NOT_YET` or absent. |
 | V7 camera device | "tinyclient has no camera yet." A Tiny call can still toggle the camera from the call dock. That is `06-calls.md`. |
 | V9 per-person volume | `CallGain` on a Tiny participant row, not a Settings row. |
 | Proxy, accent, font, language, sync | `NOT_YET`. |
@@ -212,7 +212,7 @@ no control.
 | M3 | Show when others are typing | Switch | On | G | s | Off: no typing line is drawn. What I send is P1 | in |
 | M4 | Convert typed emoticons to emoji | Switch | Off | G | s | On send, `:)` `:(` `:D` `;)` `<3` standing alone become 🙂 🙁 😀 😉 ❤️. Never inside code spans | in |
 | M5 | Play GIFs and animated stickers | Segmented: "Automatically" / "On hover" / "Never" | Automatically | G | s | Automatically: every GIF, animated WebP, APNG and animated emoji on screen plays while the window is key, within the 07 budgets. On hover: a still with a GIF badge, playing under the pointer. Never: a still with a badge and a play disc; a click opens it in the viewer, which plays it. Reduce Motion makes Automatically play under the pointer. Kept in `shell.prefs` | in |
-| M6 | Check spelling | Switch | | G | s | | Later |
+| M6 | Check spelling | Switch | On | G | s | Underlines a misspelling in the message being typed and offers the system's suggestions, plus Add to dictionary and Ignore. Code, mentions, links and emoji are left alone, and so is a word still being typed. Checked by the spelling service on this machine. Nothing is sent to a network. Off: nothing is marked | in |
 
 ### Privacy
 
@@ -567,7 +567,6 @@ Still absent, matching `NOT_YET` and the "Not in the window" table above. M5, V8
 | S5, S6 pickers | chatd reads the scopes. No writer was found in the window. |
 | S13 Custom sound files | Built: Settings › Sounds › Your sounds. |
 | S14 Ring-back tone, longer looping ring | Ring back is built; an optional looping ringtone is not. |
-| M6 Spellcheck | `NOT_YET`. |
 | P5 Hide from screen sharing | `NOT_YET`. |
 | P6 Touch ID lock | `NOT_YET`. |
 | P7 Signal always relay | `NOT_YET`. |

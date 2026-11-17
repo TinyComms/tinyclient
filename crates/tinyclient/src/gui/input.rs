@@ -399,7 +399,20 @@ pub struct TextInput {
     in_grid: bool,
     /// Ranges drawn as mentions. The holder keeps them in step with the text.
     highlights: Vec<Range<usize>>,
-    edit_menu: Option<(Point<Pixels>, bool, bool)>,
+    /// Misspellings in a composer field. Empty unless [`TextInput::set_checking`] is on.
+    misses: Vec<super::spell::Miss>,
+    /// Bumped on each edit so a check that finished late does not paint over a newer draft.
+    spell_generation: u64,
+    checking: bool,
+    edit_menu: Option<EditMenu>,
+}
+
+#[derive(Clone)]
+struct EditMenu {
+    at: Point<Pixels>,
+    can_paste: bool,
+    has_image: bool,
+    miss: Option<super::spell::Miss>,
 }
 
 impl TextInput {
@@ -435,8 +448,16 @@ impl TextInput {
             grid: false,
             in_grid: false,
             highlights: Vec::new(),
+            misses: Vec::new(),
+            spell_generation: 0,
+            checking: false,
             edit_menu: None,
         }
+    }
+
+    /// Underline misspellings. Only the composer asks for this.
+    pub fn set_checking(&mut self, on: bool) {
+        self.checking = on;
     }
 
     pub fn text(&self) -> &str {
@@ -461,6 +482,7 @@ impl TextInput {
         self.scroll = px(0.);
         self.is_selecting = false;
         cx.notify();
+        self.schedule_spell(cx);
     }
 
     pub fn cursor(&self) -> usize {
@@ -515,6 +537,44 @@ impl TextInput {
     fn edited(&mut self, cx: &mut Context<Self>) {
         self.edit_menu = None;
         cx.emit(InputEvent::Changed);
+        cx.notify();
+        self.schedule_spell(cx);
+    }
+
+    /// Ask the system checker off this thread, and only after a short pause, so a frame never waits.
+    fn schedule_spell(&mut self, cx: &mut Context<Self>) {
+        let on = self.checking && self.editor.is_multiline() && !self.secret && super::app::prefs::choices().spell;
+        self.spell_generation = self.spell_generation.wrapping_add(1);
+        self.misses.clear();
+        if !on {
+            return;
+        }
+        let text = self.editor.text().to_owned();
+        let caret = self.editor.cursor();
+        let extra = self.highlights.clone();
+        let generation = self.spell_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
+            let still = this.update(cx, |this, _| this.spell_generation == generation).unwrap_or(false);
+            if !still {
+                return;
+            }
+            let checked = text.clone();
+            let misses = cx.background_executor().spawn(async move { super::spell::check(&checked, caret, &extra) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.spell_generation != generation || this.editor.text() != text {
+                    return;
+                }
+                this.misses = misses;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn forget_word(&mut self, word: &str, cx: &mut Context<Self>) {
+        let text = self.editor.text().to_owned();
+        self.misses.retain(|miss| !text.get(miss.range.clone()).is_some_and(|got| got.eq_ignore_ascii_case(word)));
         cx.notify();
     }
 
@@ -842,13 +902,15 @@ impl TextInput {
         let can_paste = !matches!(paste, Pasted::Nothing);
         let has_image = !matches!(paste, Pasted::Image(_))
             && entries.iter().any(|entry| matches!(entry, ClipboardEntry::Image(_)));
-        self.edit_menu = Some((event.position, can_paste, has_image));
+        let miss = self.misses.iter().find(|miss| miss.range.start <= offset && offset <= miss.range.end).cloned();
+        self.edit_menu = Some(EditMenu { at: event.position, can_paste, has_image, miss });
         cx.stop_propagation();
         cx.notify();
     }
 
     fn draw_edit_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (at, can_paste, has_image) = self.edit_menu?;
+        let edit = self.edit_menu.clone()?;
+        let (at, can_paste, has_image) = (edit.at, edit.can_paste, edit.has_image);
         let selected = !self.editor.selection().is_empty();
         let item = |id, label, shortcut, enabled| {
             if enabled { menu_item(id, None, label, shortcut) } else { menu_item_disabled(id, None, label, shortcut) }
@@ -880,13 +942,43 @@ impl TextInput {
             this.select_all(&SelectAll, window, cx);
             cx.notify();
         })));
-        let menu = menu().id("input-edit-menu").w(px(200.)).occlude()
+        let spell = edit.miss.as_ref().map(|miss| self.spell_rows(miss, cx)).unwrap_or_default();
+        let mut menu = menu().id("input-edit-menu").w(px(200.)).occlude()
             // Menu clicks must not move the caret or replace the field's selection.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| { this.edit_menu = None; cx.notify(); }))
-            .child(cut).child(copy).child(paste).children(picture).child(menu_separator()).child(all);
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| { this.edit_menu = None; cx.notify(); }));
+        if !spell.is_empty() {
+            menu = menu.children(spell).child(menu_separator());
+        }
+        let menu = menu.child(cut).child(copy).child(paste).children(picture).child(menu_separator()).child(all);
         Some(deferred(anchored().position(at).snap_to_window().child(menu)).priority(2).into_any_element())
+    }
+
+    fn spell_rows(&self, miss: &super::spell::Miss, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let entries = super::spell::menu_entries(&miss.suggestions);
+        let suggestions = entries.len().saturating_sub(2);
+        let word = self.editor.text().get(miss.range.clone()).unwrap_or("").to_owned();
+        let mut rows = Vec::new();
+        for (index, label) in entries.into_iter().enumerate() {
+            let range = miss.range.clone();
+            let word = word.clone();
+            let kept = label.clone();
+            rows.push(
+                menu_item(SharedString::from(format!("input-spell-{index}")), None, label, None)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.edit_menu = None;
+                        if index < suggestions {
+                            this.replace(range.clone(), &kept, cx);
+                        } else {
+                            super::spell::allow(&word, index == suggestions);
+                            this.forget_word(&word, cx);
+                        }
+                    }))
+                    .into_any_element(),
+            );
+        }
+        rows
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1139,15 +1231,16 @@ impl Shaping {
             (display.text.clone(), false)
         };
         let marked = input.editor.marked().filter(|_| !placeholder).map(|range| display.painted(range.start)..display.painted(range.end));
-        let run = |len: usize, color: Hsla, underlined: bool| TextRun {
+        let squiggle: Hsla = theme::danger().into_color();
+        let run = |len: usize, color: Hsla, underline: Option<bool>| TextRun {
             len,
             font: self.font.clone(),
             color,
             background_color: None,
-            underline: underlined.then_some(UnderlineStyle {
-                color: Some(color),
+            underline: underline.map(|wavy| UnderlineStyle {
+                color: Some(if wavy { squiggle } else { color }),
                 thickness: px(1.),
-                wavy: false,
+                wavy: wavy && super::spell::wavy(),
             }),
             strikethrough: None,
             letter_spacing: None,
@@ -1175,9 +1268,16 @@ impl Shaping {
                 range.start.saturating_sub(line_start).min(line.len())..range.end.saturating_sub(line_start).min(line.len())
             };
             let named: Vec<Range<usize>> = if placeholder || input.secret { Vec::new() } else { input.highlights.iter().map(within).collect() };
+            let spell_on = input.checking && super::app::prefs::choices().spell;
+            let misses: Vec<Range<usize>> = if placeholder || !spell_on {
+                Vec::new()
+            } else {
+                input.misses.iter().map(|miss| within(&miss.range)).filter(|range| range.start < range.end && line.is_char_boundary(range.start) && line.is_char_boundary(range.end)).collect()
+            };
             let mut cuts = vec![0, line.len()];
             cuts.extend(dim.iter().flat_map(|range| [range.start, range.end]));
             cuts.extend(named.iter().flat_map(|range| [range.start, range.end]).filter(|cut| line.is_char_boundary(*cut)));
+            cuts.extend(misses.iter().flat_map(|range| [range.start, range.end]));
             cuts.extend(marked.iter().flat_map(|range| [range.start, range.end]));
             cuts.sort_unstable();
             cuts.dedup();
@@ -1185,14 +1285,17 @@ impl Shaping {
                 .windows(2)
                 .map(|cut| {
                     let dimmed = placeholder || dim.iter().any(|range| range.start <= cut[0] && cut[1] <= range.end);
-                    let underlined = marked.as_ref().is_some_and(|range| range.start <= cut[0] && cut[1] <= range.end);
+                    let composed = marked.as_ref().is_some_and(|range| range.start <= cut[0] && cut[1] <= range.end);
+                    let missed = misses.iter().any(|range| range.start <= cut[0] && cut[1] <= range.end);
                     let named = named.iter().any(|range| range.start <= cut[0] && cut[1] <= range.end);
                     let color = match (dimmed, named) {
                         (true, _) => faint,
                         (false, true) => mention,
                         (false, false) => self.color,
                     };
-                    run(cut[1] - cut[0], color, underlined)
+                    // A composition underline stays straight. A misspelling is the wavy one.
+                    let underline = if composed { Some(false) } else if missed { Some(true) } else { None };
+                    run(cut[1] - cut[0], color, underline)
                 })
                 .collect();
             let wrap = room.filter(|_| !placeholder && input.editor.is_multiline());
