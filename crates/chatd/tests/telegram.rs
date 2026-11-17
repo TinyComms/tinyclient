@@ -1854,6 +1854,36 @@ fn following_a_sponsored_message_tells_telegram_of_the_click_but_a_post_does_not
 }
 
 #[test]
+fn a_hidden_last_seen_reads_in_words_and_common_groups_are_listed() {
+    let world = World::signed_in();
+    world.connected();
+    world.watch(Watching { people: vec![key("u7003")], ..Watching::default() });
+    let Response::Profile { profile } = world.ask(Request::Profile { person: key("u7003"), space: None }) else {
+        panic!("no profile");
+    };
+    assert_eq!(profile.person.presence, Presence::Unknown);
+    assert_eq!(profile.person.status, "last seen recently");
+    assert_eq!(profile.mutual_spaces, vec!["Trail crew".to_owned(), "Workshop".to_owned()]);
+    assert!(profile.fields.iter().any(|(label, value)| label == "Birthday" && value == "14 March"));
+    assert!(profile.fields.iter().any(|(label, value)| label == "Location" && value == "The hut"));
+    assert!(profile.fields.iter().any(|(label, value)| label == "Hours" && value == "Open now · Europe/Lisbon"));
+    assert!(profile.fields.iter().any(|(label, value)| label == "Also" && value.contains("@tobin_r")));
+    world.steer("rename");
+    // The list matches a prefix. "Hale" matches neither the old name nor the new one.
+    let renamed = world.until("the new name", || match world.ask(Request::People {
+        network: Some(Network::Telegram),
+        relation: None,
+        query: Some("Tobin Hale".into()),
+        offset: 0,
+        limit: 20,
+    }) {
+        Response::People { people, .. } => people.into_iter().find(|person| person.key.id == "u7003"),
+        _ => None,
+    });
+    assert_eq!(renamed.name, "Tobin Hale");
+}
+
+#[test]
 fn the_panes_ask_telegram_once_each_and_counts_are_telegrams_own() {
     let world = World::signed_in();
     world.connected();

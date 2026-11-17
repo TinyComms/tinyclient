@@ -532,6 +532,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-accounts:0");
         return Ok(());
     }
+    // The lab's telegram-profile driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-profile") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_profile() {
+            eprintln!("telegram-profile: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-profile:0");
+        return Ok(());
+    }
     // The lab's slack-connect-org driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("slack-connect-org") {
         if let Err(err) = chatd::adapters::prove_slack_connect_org() {

@@ -1329,6 +1329,15 @@ impl World {
                 update(tl::types::UpdateUserStatus { user_id: ODALYS, status: tl::types::UserStatusOffline { was_online: t0() }.into() }.into()),
                 update(tl::types::UpdateUserStatus { user_id: TOBIN, status: tl::enums::UserStatus::Recently(blank(&[&put(0u32)])) }.into()),
             ],
+            "rename" => vec![update(
+                tl::types::UpdateUserName {
+                    user_id: TOBIN,
+                    first_name: "Tobin".to_owned(),
+                    last_name: "Hale".to_owned(),
+                    usernames: vec![tl::types::Username { editable: true, active: true, username: "ridge".to_owned() }.into()],
+                }
+                .into(),
+            )],
             "poll" => {
                 let text = |text: &str| tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities { text: text.to_owned(), entities: Vec::new() });
                 let poll = tl::types::Poll {
@@ -2108,8 +2117,32 @@ impl World {
             let peer_settings: tl::types::PeerSettings = blank(&[&put(0u32)]);
             let mut full: tl::types::UserFull = blank(&[&put(0u32), &put(0u32), &put(id), &put(tl::enums::PeerSettings::from(peer_settings)), &put(settings(None)), &put(1i32)]);
             full.about = Some("Maps, mostly.".to_owned());
-            let found = tl::types::users::UserFull { full_user: full.into(), chats: Vec::new(), users: users() };
+            let mut people = users();
+            if id == TOBIN {
+                full.birthday = Some(tl::types::Birthday { day: 14, month: 3, year: None }.into());
+                full.business_location = Some(tl::types::BusinessLocation { geo_point: None, address: "The hut".to_owned() }.into());
+                full.business_work_hours = Some(tl::types::BusinessWorkHours {
+                    open_now: true,
+                    timezone_id: "Europe/Lisbon".to_owned(),
+                    weekly_open: Vec::new(),
+                }.into());
+                if let Some(tl::enums::User::User(user)) = people.iter_mut().find(|one| matches!(one, tl::enums::User::User(user) if user.id == TOBIN)) {
+                    user.usernames = Some(vec![
+                        tl::types::Username { editable: true, active: true, username: "ridge".to_owned() }.into(),
+                        tl::types::Username { editable: false, active: true, username: "tobin_r".to_owned() }.into(),
+                    ]);
+                }
+            }
+            let found = tl::types::users::UserFull { full_user: full.into(), chats: Vec::new(), users: people };
             return answer(tl::enums::users::UserFull::Full(found));
+        }
+        if let Some(request) = asked::<f::messages::GetCommonChats>(body) {
+            let id = match &request.user_id {
+                tl::enums::InputUser::User(user) => user.user_id,
+                _ => ME,
+            };
+            self.log(&format!("GetCommonChats {id}"));
+            return answer(tl::enums::messages::Chats::Chats(tl::types::messages::Chats { chats: chats() }));
         }
         if asked::<f::help::GetAppConfig>(body).is_some() {
             self.log("GetAppConfig");

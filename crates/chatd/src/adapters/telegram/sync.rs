@@ -481,8 +481,9 @@ fn contacts(account: &Account) -> Result<(), Fault> {
             continue;
         };
         let id = Who::User(user.id).text();
-        let badge = super::premium::badge(user.premium, user.id == account.me);
-        account.ctx.presence(&id, presence(user.status.as_ref()), badge, true);
+        let mine = user.id == account.me;
+        let line = super::peers::row_status(mine, user.premium, &super::peers::rough_seen(user.status.as_ref()));
+        account.ctx.presence(&id, presence(user.status.as_ref()), &line, true);
         owned.push((id, Relation::Contact));
     }
     let _ = account.ctx.relations(&owned);

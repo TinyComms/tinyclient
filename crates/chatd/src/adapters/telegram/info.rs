@@ -2,7 +2,7 @@
 //! pins and what was shared in it, and the two things a pane may change: the mute and leaving.
 //! Each is one request, made because the user opened or pressed something.
 
-use super::peers::Who;
+use super::peers::{self, Who};
 use super::sync::{self, SERVICE};
 use super::wire::Fault;
 use super::Account;
@@ -14,6 +14,42 @@ fn invalid(name: &str) -> Fault {
     Fault::Rpc { code: 400, name: name.to_owned(), value: None }
 }
 
+/// A shared group or supergroup. A broadcast channel is not a group in common.
+fn mutual_title(chat: &tl::enums::Chat) -> Option<String> {
+    match chat {
+        tl::enums::Chat::Chat(chat) if !chat.left && !chat.deactivated && !chat.title.is_empty() => Some(chat.title.clone()),
+        tl::enums::Chat::Channel(channel) if !channel.broadcast && !channel.left && !channel.title.is_empty() => Some(channel.title.clone()),
+        _ => None,
+    }
+}
+
+/// `14 March`, or `14 March 1990` when Telegram sent a year. A day or month outside the
+/// calendar is left off.
+pub(super) fn birthday_line(day: i32, month: i32, year: Option<i32>) -> Option<String> {
+    let name = match month {
+        1 => "January",
+        2 => "February",
+        3 => "March",
+        4 => "April",
+        5 => "May",
+        6 => "June",
+        7 => "July",
+        8 => "August",
+        9 => "September",
+        10 => "October",
+        11 => "November",
+        12 => "December",
+        _ => return None,
+    };
+    if !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(match year {
+        Some(year) if (1..=9_999).contains(&year) => format!("{day} {name} {year}"),
+        _ => format!("{day} {name}"),
+    })
+}
+
 /// A person's card: what `users.getFullUser` says, with what is already known of them.
 pub(super) fn profile(account: &Account, person_id: &str) -> Result<About, Fault> {
     let Some((who @ Who::User(user_id), None)) = Who::parse(person_id) else {
@@ -21,10 +57,17 @@ pub(super) fn profile(account: &Account, person_id: &str) -> Result<About, Fault
     };
     account.input(who)?;
     let id = account.dir().input_user(who).ok_or_else(|| invalid("USER_ID_INVALID"))?;
-    let tl::enums::users::UserFull::Full(full) = account.ask(&tl::functions::users::GetFullUser { id })?;
+    let tl::enums::users::UserFull::Full(full) = account.ask(&tl::functions::users::GetFullUser { id: id.clone() })?;
     account.learn(&full.users, &full.chats);
     let tl::enums::UserFull::Full(user) = full.full_user;
     let mut about = About { bio: user.about.unwrap_or_default(), mutual_total: user.common_chats_count.max(0) as u32, ..About::default() };
+    // A failure here keeps the count and an empty list. The card still opens.
+    if let Ok(shared) = account.ask(&tl::functions::messages::GetCommonChats { user_id: id, max_id: 0, limit: 100 }) {
+        let chats = shared.chats();
+        account.learn(&[], &chats);
+        about.mutual_spaces = chats.iter().filter_map(mutual_title).collect();
+        about.mutual_total = about.mutual_total.max(about.mutual_spaces.len() as u32);
+    }
     let this = full.users.iter().find_map(|found| match found {
         tl::enums::User::User(found) if found.id == user_id => Some(found),
         _ => None,
@@ -39,8 +82,50 @@ pub(super) fn profile(account: &Account, person_id: &str) -> Result<About, Fault
         }
     }
     let known = account.dir().get(who).cloned().unwrap_or_default();
+    let mine = user_id == account.me;
+    account.ctx.presence(
+        &who.text(),
+        super::presence(this.and_then(|user| user.status.as_ref())),
+        &peers::row_status(mine, known.premium, &known.seen),
+        known.contact || mine,
+    );
     if !known.handle.is_empty() {
         about.fields.push(("Username".to_owned(), format!("@{}", known.handle)));
+    }
+    if let Some(this) = this {
+        let also: Vec<String> = this
+            .usernames
+            .iter()
+            .flatten()
+            .filter_map(|name| {
+                let tl::enums::Username::Username(name) = name;
+                (name.active && name.username != known.handle && !name.username.is_empty()).then(|| format!("@{}", name.username))
+            })
+            .collect();
+        if !also.is_empty() {
+            about.fields.push(("Also".to_owned(), also.join(", ")));
+        }
+    }
+    if let Some(line) = user.birthday.as_ref().and_then(|day| {
+        let tl::enums::Birthday::Birthday(day) = day;
+        birthday_line(day.day, day.month, day.year)
+    }) {
+        about.fields.push(("Birthday".to_owned(), line));
+    }
+    if let Some(tl::enums::BusinessLocation::Location(place)) = &user.business_location {
+        if !place.address.is_empty() {
+            about.fields.push(("Location".to_owned(), place.address.clone()));
+        }
+    }
+    if let Some(tl::enums::BusinessWorkHours::Hours(hours)) = &user.business_work_hours {
+        let word = if hours.open_now { "Open now" } else { "Closed" };
+        let line = if hours.timezone_id.is_empty() { word.to_owned() } else { format!("{word} · {}", hours.timezone_id) };
+        about.fields.push(("Hours".to_owned(), line));
+    }
+    if let Some(name) = user.personal_channel_id.and_then(|id| account.dir().get(Who::Channel(id)).map(|known| known.name.clone())) {
+        if !name.is_empty() {
+            about.fields.push(("Channel".to_owned(), name));
+        }
     }
     about.warning = match known.mark {
         Some(Mark::Scam) => Some(Warning::Scam),

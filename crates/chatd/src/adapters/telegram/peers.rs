@@ -98,6 +98,9 @@ pub struct Known {
     pub mark: Option<Mark>,
     /// Telegram Premium. Ours decides what this account may send. Someone else's is shown on their row.
     pub premium: bool,
+    /// Rough last-seen words ("last seen recently"). Empty when Telegram gave an exact time,
+    /// or none. Never shown on our own row.
+    pub seen: String,
 }
 
 /// The tag Telegram's flags give: a warning wins over a tick.
@@ -134,6 +137,28 @@ fn user_name(user: &tl::types::User) -> String {
     }
 }
 
+/// Telegram's rough last-seen words. An empty status is not a guess at "long ago".
+pub(super) fn rough_seen(status: Option<&tl::enums::UserStatus>) -> String {
+    match status {
+        Some(tl::enums::UserStatus::Recently(_)) => "last seen recently".to_owned(),
+        Some(tl::enums::UserStatus::LastWeek(_)) => "last seen within a week".to_owned(),
+        Some(tl::enums::UserStatus::LastMonth(_)) => "last seen within a month".to_owned(),
+        _ => String::new(),
+    }
+}
+
+/// The line under a name. Rough last-seen words take the status line; the Premium badge stays
+/// the line when there are none. Our own row stays empty.
+pub(super) fn row_status(mine: bool, premium: bool, seen: &str) -> String {
+    if mine {
+        return String::new();
+    }
+    if !seen.is_empty() {
+        return seen.to_owned();
+    }
+    super::premium::badge(premium, false).to_owned()
+}
+
 fn first_username(username: &Option<String>, usernames: &Option<Vec<tl::enums::Username>>) -> String {
     let active = usernames.iter().flatten().find_map(|name| {
         let tl::enums::Username::Username(name) = name;
@@ -158,6 +183,7 @@ fn of_user(user: &tl::types::User) -> Known {
         deleted: user.deleted,
         mark: mark(user.verified, user.scam, user.fake),
         premium: user.premium,
+        seen: rough_seen(user.status.as_ref()),
         ..Known::default()
     }
 }
@@ -380,6 +406,43 @@ impl Directory {
         }
     }
 
+    /// A last-seen wording changed. The row is republished when the words did.
+    pub fn note_seen(&mut self, who: Who, seen: String) -> Option<PersonRow> {
+        let me = self.me;
+        let known = self.map.get_mut(&who)?;
+        if known.seen == seen {
+            return None;
+        }
+        known.seen = seen;
+        Some(shown_person(me, who, known))
+    }
+
+    /// A name or username told on its own, without a whole user. An unknown person is left
+    /// alone: the next user object still carries the hash.
+    pub fn rename(&mut self, user_id: i64, first: &str, last: &str, usernames: &[tl::enums::Username]) -> Option<PersonRow> {
+        let me = self.me;
+        let known = self.map.get_mut(&Who::User(user_id))?;
+        let first = first.trim();
+        let last = last.trim();
+        let name = match (first.is_empty(), last.is_empty()) {
+            (false, false) => format!("{first} {last}"),
+            (false, true) => first.to_owned(),
+            (true, false) => last.to_owned(),
+            (true, true) => known.name.clone(),
+        };
+        let handle = if usernames.is_empty() {
+            known.handle.clone()
+        } else {
+            first_username(&None, &Some(usernames.to_vec()))
+        };
+        if known.name == name && known.handle == handle {
+            return None;
+        }
+        known.name = name;
+        known.handle = handle;
+        Some(shown_person(me, Who::User(user_id), known))
+    }
+
     pub fn input_user(&self, who: Who) -> Option<tl::enums::InputUser> {
         match who {
             Who::User(user_id) if user_id == self.me => Some(tl::enums::InputUser::UserSelf),
@@ -393,7 +456,7 @@ impl Directory {
 /// Our own free account's link is the purchase hand-off. Our own status text stays empty.
 pub fn shown_person(me: i64, who: Who, known: &Known) -> PersonRow {
     let mut row = person_row(who, known);
-    row.status = super::premium::badge(known.premium, who == Who::User(me)).to_owned();
+    row.status = row_status(who == Who::User(me), known.premium, &known.seen);
     if who == Who::User(me) && !known.premium {
         row.link = super::premium::OFFER.to_owned();
     }
