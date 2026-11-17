@@ -73,15 +73,19 @@ const START_BPS: u64 = 1_000_000;
 /// str0m's 3 s, with its 9 tries, takes up to 21 s to call a path dead.
 const STUN_MAX_RTO: Duration = Duration::from_secs(1);
 /// Unanswered checks before a path is dead. About 7 s on a path that was working and 6 s on one
-/// that never was: [`SILENT`] speaks first on the one, and this bounds a new link on the other,
-/// with room for a slow first connect (TCP included) and for a lossy network's run of bad luck.
+/// that never was. That still bounds a new link (TCP included) on a lossy first connect.
+/// A working link's silence is [`SILENT`]: longer than a brief STUN gap, still ahead of the
+/// server's 15 s consent drop.
 const STUN_RETRANSMITS: usize = 7;
 /// A link that was up and has answered no STUN check for this long is lost, though ICE has not
 /// said so yet. Voice cannot say: a quiet room sends none, and the gate sends nothing between
 /// words. Nor can the server's RTCP, which goes on arriving on a path that only died our way.
-/// STUN can: the server, ICE-lite, sends it only to answer us, each [`STUN_MAX_RTO`] in any room,
-/// and by now several checks, retries included, have gone unanswered.
-const SILENT: Duration = Duration::from_secs(3);
+/// STUN can: the server, ICE-lite, sends it only to answer us, each [`STUN_MAX_RTO`] in any room.
+/// Three seconds was short enough that a Wi-Fi blip or a couple of lost answers flipped the call
+/// to Reconnecting while the seat on the server was still fine; ten seconds needs a real run of
+/// unanswered checks and still leaves the client ahead of the server's 15 s consent timeout.
+/// ICE's own give-up ([`STUN_RETRANSMITS`], about 7 s) usually comes first; this is the backstop.
+const SILENT: Duration = Duration::from_millis(protocol::TINY_STUN_SILENCE_MS);
 
 /// Opus for audio, H.264 for video, and no hold for a missing audio packet. str0m's default
 /// waits for 15 later packets or a second, and the talk spurt has already ended by then.
@@ -908,7 +912,12 @@ impl Call {
             Event::IceConnectionStateChange(IceConnectionState::Checking) => {
                 tracing::info!(state = "ice_checking", "media state");
             }
-            Event::IceConnectionStateChange(IceConnectionState::Disconnected) => self.fell(),
+            // A brief Disconnected often comes back. Announcing here made "Reconnecting…" flash
+            // while the seat stayed up. Real loss is [`watch_link`] (no STUN for [`SILENT`]) or
+            // str0m giving up (`drain` sees a dead `Rtc`).
+            Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
+                tracing::info!(state = "ice_disconnected", "media state");
+            }
             Event::IceConnectionStateChange(IceConnectionState::Connected | IceConnectionState::Completed) => {
                 tracing::info!(state = "ice_connected", "media state");
                 stages::mark("ice_connected");

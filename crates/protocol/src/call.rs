@@ -673,6 +673,11 @@ impl AudioProcessing {
     }
 }
 
+/// How long mediad waits with no STUN answer before saying a Tiny link is lost, in milliseconds.
+/// Short enough to stay ahead of the server's 15 s consent drop; long enough that a brief Wi-Fi
+/// blip does not flash Reconnecting while the seat is still up.
+pub const TINY_STUN_SILENCE_MS: u64 = 10_000;
+
 /// How the media gets to the server.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

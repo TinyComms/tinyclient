@@ -231,6 +231,15 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    // The lab's Tiny STUN-watchdog driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("stun-watchdog") {
+        if let Err(err) = gui::prove_stun_watchdog() {
+            eprintln!("stun-watchdog: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     // The lab's health-grade driver. A build without this opens the window below and stays up.
     #[cfg(feature = "gui")]
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("health-grade") {
