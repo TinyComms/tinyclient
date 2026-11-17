@@ -1,0 +1,12 @@
+{
+  "id": "discord-format",
+  "title": "Discord drafts wrap with shortcuts and preview markdown while typing",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same composer is what a phone Discord draft uses.",
+    "ios": "The phone proof build does not run the desktop window. The same composer is what a phone Discord draft uses."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

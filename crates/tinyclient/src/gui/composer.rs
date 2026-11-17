@@ -32,6 +32,7 @@ mod colon;
 mod complete;
 mod controls;
 pub(super) mod edit;
+pub(super) mod format;
 mod hold;
 mod length;
 mod mention;
@@ -659,7 +660,9 @@ impl Composer {
     /// typed here is saved and waits for the next visit. `stored` is the draft on the
     /// conversation's row, which is what a conversation not visited before opens with.
     fn aim(&mut self, target: Target, stored: &str, cx: &mut Context<Self>) {
+        let discord = target.key.network == Network::Discord;
         if self.target.as_ref() == Some(&target) && self.offered == stored {
+            self.input.update(cx, |input, cx| input.set_format_discord(discord, cx));
             return;
         }
         let moved = self.target.as_ref().map(|old| &old.key) != Some(&target.key);
@@ -698,7 +701,10 @@ impl Composer {
             });
         }
         let silent = controls(target.key.network, &target.can, false).silent;
-        self.input.update(cx, |input, _| input.set_alt_submits(silent));
+        self.input.update(cx, |input, cx| {
+            input.set_alt_submits(silent);
+            input.set_format_discord(discord, cx);
+        });
         self.target = Some(target);
         cx.notify();
     }
@@ -2159,6 +2165,65 @@ impl Composer {
             }))
     }
 
+    /// Bold, italic, and the rest, while a Discord draft has a selection. A click does not
+    /// steal focus from the field: the card's own press would, so the button stops it.
+    fn format_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let discord = self.target.as_ref().is_some_and(|target| target.key.network == Network::Discord);
+        if !discord || self.input.read(cx).selection().is_empty() {
+            return None;
+        }
+        let phone = crate::gui::phone::active();
+        let buttons = [
+            (format::Kind::Bold, "format-bold", "B", "Bold", "⌘B"),
+            (format::Kind::Italic, "format-italic", "I", "Italic", "⌘I"),
+            (format::Kind::Underline, "format-underline", "U", "Underline", "⌘U"),
+            (format::Kind::Strike, "format-strike", "S", "Strikethrough", "⌘⇧X"),
+            (format::Kind::Code, "format-code", "</>", "Code", "⌘⇧E"),
+            (format::Kind::Quote, "format-quote", ">", "Quote", "⌘⇧Q"),
+            (format::Kind::Spoiler, "format-spoiler", "||", "Spoiler", "⌘⇧P"),
+        ];
+        let mut bar = div()
+            .h(px(if phone { 40. } else { 32. }))
+            .flex_none()
+            .px(px(8.))
+            .gap(px(2.))
+            .border_b_1()
+            .border_color(theme::hairline())
+            .flex()
+            .items_center()
+            .type_small()
+            .text_color(theme::text());
+        for (kind, id, label, name, shortcut) in buttons {
+            bar = bar.child(
+                div()
+                    .id(id)
+                    .h(px(if phone { 32. } else { 22. }))
+                    .min_w(px(if phone { 32. } else { 22. }))
+                    .px(px(4.))
+                    .flex_none()
+                    .rounded(px(theme::R_CONTROL))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::hover()))
+                    .when(kind == format::Kind::Bold, |button| button.font_weight(theme::SEMIBOLD))
+                    .when(kind == format::Kind::Italic, |button| button.italic())
+                    .when(kind == format::Kind::Underline, |button| button.underline())
+                    .when(kind == format::Kind::Strike, |button| button.line_through())
+                    .tooltip(tip(name, Some(shortcut)))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.input.update(cx, |input, cx| input.format_with(kind, cx));
+                        this.focus_next = true;
+                        cx.notify();
+                    }))
+                    .child(label),
+            );
+        }
+        Some(bar)
+    }
+
     /// The 32 pt bar inside the card that says what Return will do: reply, or save an edit.
     fn mode_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
         // A phone's bar is the same line at the phone's run, 40 tall, its close a 36 pt target.
@@ -2576,6 +2641,7 @@ impl Composer {
             .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| window.focus(&focus, cx))
             .children(self.mode_bar(cx))
             .children(self.tray(window, cx))
+            .children(self.format_bar(cx))
             .child(row)
     }
 

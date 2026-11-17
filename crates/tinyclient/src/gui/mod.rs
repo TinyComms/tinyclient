@@ -149,6 +149,11 @@ pub(crate) fn prove_schedule_send() -> Result<(), &'static str> {
     composer::prove_schedule_send()
 }
 
+/// The lab's Discord formatting driver. Bold wraps, a fence toggles, and a pasted url becomes a masked link.
+pub(crate) fn prove_discord_format() -> Result<(), &'static str> {
+    composer::format::prove()
+}
+
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 
@@ -294,6 +299,18 @@ fn typed_text(text: &str) -> bool {
 fn bind_keys(cx: &mut App) {
     app::menubar::bind_keys(cx);
     cx.bind_keys(shell_bindings());
+    // After Attach File, so a focused field wins the tie on ⌘U. A field that is not a Discord
+    // draft hands that key back to Attach File.
+    let field = Some("TextInput");
+    cx.bind_keys([
+        KeyBinding::new("secondary-b", input::FormatBold, field),
+        KeyBinding::new("secondary-i", input::FormatItalic, field),
+        KeyBinding::new("secondary-u", input::FormatUnderline, field),
+        KeyBinding::new("secondary-shift-x", input::FormatStrike, field),
+        KeyBinding::new("secondary-shift-e", input::FormatCode, field),
+        KeyBinding::new("secondary-shift-q", input::FormatQuote, field),
+        KeyBinding::new("secondary-shift-p", input::FormatSpoiler, field),
+    ]);
 }
 
 fn shell_bindings() -> Vec<KeyBinding> {
