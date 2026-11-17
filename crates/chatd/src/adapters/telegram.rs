@@ -271,6 +271,9 @@ struct Live {
     limits: premium::Limits,
     /// One conversation's member list, so the next page does not ask Telegram again.
     roster: Option<members::Held>,
+    /// Photo albums still arriving or open, so a later item, edit, reaction or deletion
+    /// finds the row they share.
+    albums: VecDeque<live::HeldAlbum>,
 }
 
 /// Telegram's own send options, which Telegram carries out.
@@ -1169,6 +1172,11 @@ pub fn prove_telegram_member_sections() -> Result<(), String> {
 /// The lab's telegram-quote driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_quote() -> Result<(), String> {
     content::prove_quote()
+}
+
+/// The lab's telegram-album driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_album() -> Result<(), String> {
+    content::prove_album()
 }
 
 /// The lab's telegram-dice driver. A build without this stays up and the driver fails.

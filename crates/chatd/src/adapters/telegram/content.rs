@@ -8,6 +8,7 @@ use protocol::{
     Attachment, Card, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview, Reaction, ReplyTo, Sender, Span,
     Style, ThreadSummary,
 };
+use std::collections::HashSet;
 use tl::enums::{DocumentAttribute, MessageAction, MessageEntity, MessageMedia, PhotoSize};
 
 /// A file a message shows, and where Telegram keeps it.
@@ -47,6 +48,7 @@ pub(super) struct ReplyNote {
     pub story_id: i32,
 }
 
+#[derive(Clone)]
 pub struct Mapped {
     pub peer: Who,
     pub id: i32,
@@ -62,6 +64,11 @@ pub struct Mapped {
     /// What it shows inline (thumbnails and stills), and the originals of its pictures, which
     /// are only fetched when the viewer asks.
     pub wants: Vec<Want>,
+    /// Telegram's `grouped_id`. Items that share one are a single album.
+    pub group: Option<i64>,
+    /// Every Telegram message id folded into this row, including [`Mapped::id`]. Empty when
+    /// the row is one message.
+    pub members: Vec<i32>,
 }
 
 /// Byte offsets for UTF-16 offsets: entry `n` is where the `n`th UTF-16 unit of `text` starts.
@@ -1236,6 +1243,8 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 reply_note: None,
                 message,
                 wants: Vec::new(),
+                group: None,
+                members: Vec::new(),
             })
         }
         tl::enums::Message::Message(raw) => {
@@ -1362,6 +1371,8 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 reply_note,
                 message,
                 wants,
+                group: raw.grouped_id.filter(|id| *id != 0),
+                members: Vec::new(),
             })
         }
     }
@@ -1483,6 +1494,94 @@ fn topic_of(header: Option<&tl::enums::MessageReplyHeader>) -> (Option<i32>, Opt
     }
 }
 
+/// Telegram's album id, when this message is one item of a group.
+pub fn grouped_id(raw: &tl::enums::Message) -> Option<i64> {
+    match raw {
+        tl::enums::Message::Message(message) => message.grouped_id.filter(|id| *id != 0),
+        _ => None,
+    }
+}
+
+fn merged_reactions(parts: &[&Mapped]) -> Vec<Reaction> {
+    let mut out = Vec::new();
+    for part in parts {
+        for reaction in &part.message.reactions {
+            let same = |have: &Reaction| {
+                have.emoji == reaction.emoji && have.file.as_ref().map(|file| file.id.as_str()) == reaction.file.as_ref().map(|file| file.id.as_str())
+            };
+            if let Some(have) = out.iter_mut().find(|have| same(have)) {
+                have.count = have.count.saturating_add(reaction.count);
+                have.mine |= reaction.mine;
+            } else {
+                out.push(reaction.clone());
+            }
+        }
+    }
+    out
+}
+
+/// One album from its items. The row's id is the lowest Telegram id. The caption is the first
+/// item that has words. Pictures stay in the order Telegram sent them.
+pub fn merge_album(parts: &[Mapped]) -> Mapped {
+    let mut ordered: Vec<&Mapped> = parts.iter().collect();
+    ordered.sort_by_key(|part| part.id);
+    let primary = ordered[0];
+    let caption = ordered.iter().copied().find(|part| !part.message.text.is_empty()).unwrap_or(primary);
+    let mut merged = caption.clone();
+    let members: Vec<i32> = ordered.iter().map(|part| part.id).collect();
+    let member_ids: HashSet<i32> = members.iter().copied().collect();
+    merged.peer = primary.peer;
+    merged.id = primary.id;
+    merged.topic = primary.topic;
+    merged.group = primary.group.or(caption.group);
+    merged.discussion_top = ordered.iter().find_map(|part| part.discussion_top);
+    merged.members = members;
+    merged.message.id = primary.id.to_string();
+    merged.message.sent = ordered.iter().map(|part| part.message.sent).max().unwrap_or(merged.message.sent);
+    merged.message.attachments = ordered.iter().flat_map(|part| part.message.attachments.clone()).collect();
+    merged.wants = ordered.iter().flat_map(|part| part.wants.clone()).collect();
+    merged.message.reactions = merged_reactions(&ordered);
+    merged.message.edited = ordered.iter().any(|part| part.message.edited);
+    merged.message.pinned = ordered.iter().any(|part| part.message.pinned);
+    merged.message.mentions_me = ordered.iter().any(|part| part.message.mentions_me);
+    if merged.message.client_id.is_none() {
+        merged.message.client_id = ordered.iter().find_map(|part| part.message.client_id.clone());
+    }
+    // A reply that names another item of this same album is not a reply to a different message.
+    if merged.reply.is_some_and(|reply| member_ids.contains(&reply)) {
+        merged.reply = None;
+        merged.reply_note = None;
+        merged.message.reply_to = None;
+    }
+    if merged.reply.is_none() {
+        if let Some(part) = ordered.iter().find(|part| part.reply.is_some_and(|reply| !member_ids.contains(&reply))) {
+            merged.reply = part.reply;
+            merged.reply_note = part.reply_note.clone();
+            merged.message.reply_to = part.message.reply_to.clone();
+        }
+    }
+    merged
+}
+
+/// Newest first, as a page arrives. An album takes the seat of its newest item. Items that
+/// share no group stay where they were.
+pub fn group_albums(items: Vec<Mapped>) -> Vec<Mapped> {
+    let mut emitted = HashSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for item in &items {
+        let Some(group) = item.group else {
+            out.push(item.clone());
+            continue;
+        };
+        if !emitted.insert((item.peer, group)) {
+            continue;
+        }
+        let parts: Vec<Mapped> = items.iter().filter(|one| one.peer == item.peer && one.group == Some(group)).cloned().collect();
+        out.push(merge_album(&parts));
+    }
+    out
+}
+
 /// The lab's telegram-dice check. A roll of 5 reads as the emoji and the value.
 pub(super) fn prove_dice_roll() -> Result<(), String> {
     use grammers_tl_types::{Deserializable, Serializable};
@@ -1499,6 +1598,69 @@ pub(super) fn prove_dice_roll() -> Result<(), String> {
     let mapped = map(&Directory::new(7_001), &message.into()).ok_or("the roll maps")?;
     if mapped.message.text != "\u{1F3B2} 5" || !mapped.wants.is_empty() {
         return Err(format!("a dice of 5 reads as the emoji and the value, got {}", mapped.message.text));
+    }
+    Ok(())
+}
+
+fn album_item(id: i32, text: &str, group: i64, photo_id: i64) -> tl::enums::Message {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    id.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    text.to_owned().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).expect("a blank message reads back");
+    message.from_id = Some(Who::User(7_002).peer());
+    message.grouped_id = Some(group);
+    message.media = Some(tl::types::MessageMediaPhoto {
+        spoiler: false,
+        live_photo: false,
+        photo: Some(tl::types::Photo {
+            has_stickers: false,
+            id: photo_id,
+            access_hash: 1,
+            file_reference: vec![1],
+            date: 1_700_000_000,
+            sizes: vec![tl::types::PhotoSize { r#type: "y".to_owned(), w: 800, h: 600, size: 10 }.into()],
+            video_sizes: None,
+            dc_id: 2,
+        }.into()),
+        ttl_seconds: None,
+        video: None,
+    }.into());
+    message.into()
+}
+
+/// The lab's telegram-album check. Four items that share a grouped id are one message.
+pub(super) fn prove_album() -> Result<(), String> {
+    let dir = Directory::new(7_001);
+    let raws: Vec<tl::enums::Message> = (0..4).map(|at| album_item(40 + at, if at == 0 { "Ridge in four" } else { "" }, 900, 6_040 + i64::from(at))).collect();
+    let mapped: Vec<Mapped> = raws.iter().filter_map(|raw| map(&dir, raw)).collect();
+    if mapped.len() != 4 {
+        return Err(format!("four album items map, got {}", mapped.len()));
+    }
+    let mut newest_first = mapped.clone();
+    newest_first.reverse();
+    let grouped = group_albums(newest_first);
+    let one = grouped.first().ok_or("an album groups")?;
+    if grouped.len() != 1 || one.id != 40 || one.message.text != "Ridge in four" || one.message.attachments.len() != 4 {
+        return Err(format!(
+            "an album is one grid, got {} messages, id {}, text {}, {} attachments",
+            grouped.len(),
+            one.id,
+            one.message.text,
+            one.message.attachments.len()
+        ));
+    }
+    let mut grown = Vec::new();
+    for part in &mapped {
+        grown.push(part.clone());
+        let merged = merge_album(&grown);
+        if merged.message.attachments.len() != grown.len() || merged.id != 40 || merged.message.text != "Ridge in four" {
+            return Err("an album grows into one grid as its photos arrive".to_owned());
+        }
     }
     Ok(())
 }

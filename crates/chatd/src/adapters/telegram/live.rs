@@ -45,6 +45,155 @@ fn placed(account: &Account, raw: &tl::enums::Message) -> Option<(String, Mapped
     Some((conversation, mapped))
 }
 
+/// Albums held while connected. Each is at most ten items, and the list itself is capped.
+const ALBUMS: usize = 64;
+const ALBUM_PARTS: usize = 10;
+
+pub(super) struct HeldAlbum {
+    pub group: i64,
+    pub peer: Who,
+    pub conversation: String,
+    pub written: i32,
+    pub parts: Vec<Mapped>,
+}
+
+pub(super) struct Folded {
+    pub message: Message,
+    pub wants: Vec<content::Want>,
+    pub peer: Who,
+    pub members: Vec<i32>,
+    pub replaced: Option<i32>,
+}
+
+fn upsert_part(parts: &mut Vec<Mapped>, mut part: Mapped) {
+    if let Some(existing) = parts.iter_mut().find(|one| one.id == part.id) {
+        if part.message.client_id.is_none() {
+            part.message.client_id = existing.message.client_id.clone();
+        }
+        *existing = part;
+        return;
+    }
+    if parts.len() >= ALBUM_PARTS {
+        return;
+    }
+    parts.push(part);
+}
+
+fn album_mut<'a>(live: &'a mut super::Live, peer: Who, group: i64, conversation: &str) -> &'a mut HeldAlbum {
+    if !live.albums.iter().any(|album| album.peer == peer && album.group == group) && live.albums.len() >= ALBUMS {
+        live.albums.pop_front();
+    }
+    if let Some(at) = live.albums.iter().position(|album| album.peer == peer && album.group == group) {
+        live.albums[at].conversation = conversation.to_owned();
+        return &mut live.albums[at];
+    }
+    live.albums.push_back(HeldAlbum { group, peer, conversation: conversation.to_owned(), written: 0, parts: Vec::new() });
+    live.albums.back_mut().expect("the album was just stored")
+}
+
+/// Folds one item into its album and returns the row to write. `None` when the item is not grouped.
+pub(super) fn fold(account: &Account, conversation: &str, part: Mapped) -> Option<Folded> {
+    let group = part.group?;
+    let peer = part.peer;
+    let mut live = account.live();
+    let album = album_mut(&mut live, peer, group, conversation);
+    let previous = album.written;
+    upsert_part(&mut album.parts, part);
+    let merged = content::merge_album(&album.parts);
+    album.written = merged.id;
+    let replaced = (previous != 0 && previous != merged.id).then_some(previous);
+    Some(Folded { message: merged.message, wants: merged.wants, peer, members: merged.members, replaced })
+}
+
+/// Remembers the albums on a history page, so a later edit, reaction or deletion finds them.
+pub(super) fn remember(account: &Account, conversation: &str, items: &[Mapped]) {
+    let mut groups = Vec::new();
+    for item in items {
+        if let Some(group) = item.group {
+            if !groups.contains(&(item.peer, group)) {
+                groups.push((item.peer, group));
+            }
+        }
+    }
+    if groups.is_empty() {
+        return;
+    }
+    let mut live = account.live();
+    for (peer, group) in groups {
+        let mut parts: Vec<Mapped> = items.iter().filter(|item| item.peer == peer && item.group == Some(group)).cloned().collect();
+        let album = album_mut(&mut live, peer, group, conversation);
+        for part in &mut parts {
+            if part.message.client_id.is_none() {
+                part.message.client_id = album.parts.iter().find(|old| old.id == part.id).and_then(|old| old.message.client_id.clone());
+            }
+        }
+        let previous = album.written;
+        album.parts = parts;
+        album.written = album.parts.iter().map(|part| part.id).min().unwrap_or(previous);
+    }
+}
+
+/// The row id an album item was written under.
+pub(super) fn written_id(account: &Account, message: i32) -> Option<i32> {
+    account.live().albums.iter().find(|album| album.parts.iter().any(|part| part.id == message) || album.written == message).map(|album| album.written)
+}
+
+fn group_of(account: &Account, conversation: &str, message: i32) -> Option<i64> {
+    account.live().albums.iter().find(|album| album.conversation == conversation && album.parts.iter().any(|part| part.id == message)).map(|album| album.group)
+}
+
+fn keep_client_id(account: &Account, conversation: &str, message: &mut Message) {
+    if message.client_id.is_some() {
+        return;
+    }
+    if let Ok(Some(stored)) = account.ctx.stored_message(conversation, &message.id) {
+        message.client_id = stored.client_id;
+    }
+}
+
+/// Drops one item from its album and rewrites the grid. `false` when `message` is not in one.
+pub(super) fn drop_member(account: &Account, conversation: &str, message: i32) -> bool {
+    let outcome = {
+        let mut live = account.live();
+        let Some(at) = live.albums.iter().position(|album| {
+            album.conversation == conversation && (album.parts.iter().any(|part| part.id == message) || album.written == message)
+        }) else {
+            return false;
+        };
+        let album = &mut live.albums[at];
+        let previous = album.written;
+        album.parts.retain(|part| part.id != message);
+        if album.parts.is_empty() {
+            let written = album.written;
+            live.albums.remove(at);
+            drop(live);
+            let _ = account.ctx.deleted(conversation, &written.to_string());
+            if message != written {
+                let _ = account.ctx.deleted(conversation, &message.to_string());
+            }
+            return true;
+        } else {
+            let merged = content::merge_album(&album.parts);
+            let written = if album.parts.iter().any(|part| part.id == previous) { previous } else { merged.id };
+            album.written = written;
+            let mut row = merged.message;
+            row.id = written.to_string();
+            Some((written, row, previous))
+        }
+    };
+    if let Some((written, mut row, previous)) = outcome {
+        keep_client_id(account, conversation, &mut row);
+        let _ = account.ctx.history(conversation, std::slice::from_ref(&row));
+        if previous != written {
+            let _ = account.ctx.deleted(conversation, &previous.to_string());
+        }
+        if message != written {
+            let _ = account.ctx.deleted(conversation, &message.to_string());
+        }
+    }
+    true
+}
+
 const PENDING_CHATS: usize = 100;
 const PENDING_MESSAGES: usize = 32;
 const CHAT_RETRY: Duration = Duration::from_secs(3);
@@ -163,6 +312,21 @@ fn message(account: &Account, raw: &tl::enums::Message, edit: bool) {
     deliver_message(account, raw, edit, covered_by_dialog);
 }
 
+fn dialog_counts(account: &Account, conversation: &str, peer: Who, covered_by_dialog: bool) -> bool {
+    let forum = account.dir().get(peer).is_some_and(|known| known.forum);
+    covered_by_dialog && (forum || conversation == peer.text())
+}
+
+fn publish(account: &Account, conversation: &str, message: &Message, raw_id: i32, fresh: bool, member: bool, counted: bool) {
+    if fresh && member && !counted {
+        let _ = account.ctx.message(conversation, message);
+    } else if fresh && member && past_read(account, conversation, raw_id) {
+        let _ = account.ctx.counted_message(conversation, message);
+    } else {
+        let _ = account.ctx.history(conversation, std::slice::from_ref(message));
+    }
+}
+
 fn deliver_message(account: &Account, raw: &tl::enums::Message, edit: bool, covered_by_dialog: bool) {
     let Some((conversation, mut mapped)) = placed(account, raw) else {
         return;
@@ -175,8 +339,13 @@ fn deliver_message(account: &Account, raw: &tl::enums::Message, edit: bool, cove
     if !member && !open {
         return;
     }
+    if mapped.group.is_none() {
+        mapped.group = group_of(account, &conversation, mapped.id);
+    }
+    let in_album = mapped.group.is_some();
     // An edit of something never stored is not news: it would count as a new unread message.
-    if edit && !matches!(account.ctx.stored_message(&conversation, &mapped.message.id), Ok(Some(_))) {
+    // An album item was stored under the group's id, not its own.
+    if edit && !in_album && !matches!(account.ctx.stored_message(&conversation, &mapped.message.id), Ok(Some(_))) {
         return;
     }
     // Our own message coming back: it replaces the one the shell is showing as pending.
@@ -186,24 +355,41 @@ fn deliver_message(account: &Account, raw: &tl::enums::Message, edit: bool, cove
             mapped.message.client_id = live.sent.remove(at).map(|(_, client_id)| client_id);
         }
     }
+    if in_album {
+        let Some(folded) = fold(account, &conversation, mapped) else {
+            return;
+        };
+        if let Some(old) = folded.replaced {
+            let _ = account.ctx.deleted(&conversation, &old.to_string());
+        }
+        let mut message = folded.message;
+        keep_client_id(account, &conversation, &mut message);
+        if edit && message.views.is_none() {
+            if let Ok(Some(stored)) = account.ctx.stored_message(&conversation, &message.id) {
+                message.views = stored.views;
+            }
+        }
+        let fresh = folded.members.len() == 1 && folded.replaced.is_none() && !edit;
+        let counted = dialog_counts(account, &conversation, folded.peer, covered_by_dialog);
+        publish(account, &conversation, &message, raw.id(), fresh, member, counted);
+        for id in &folded.members {
+            account.place(folded.peer, *id, &conversation);
+        }
+        if open {
+            sync::reaction_emoji(account, &conversation, std::slice::from_ref(&message));
+            sync::text_emoji(account, &conversation, std::slice::from_ref(&message));
+            account.files.want(folded.wants);
+        }
+        return;
+    }
     // An edit says nothing of a channel post's views: the count the page read kept stands.
     if edit && mapped.message.views.is_none() {
         if let Ok(Some(stored)) = account.ctx.stored_message(&conversation, &mapped.message.id) {
             mapped.message.views = stored.views;
         }
     }
-    // A recovered dialog counted the chat's own messages, and a recovered forum's topics were
-    // read with it. A comment's thread was not read again, so a comment still counts here.
-    let forum = account.dir().get(mapped.peer).is_some_and(|known| known.forum);
-    let counted = covered_by_dialog && (forum || conversation == mapped.peer.text());
-    if member && !counted {
-        let _ = account.ctx.message(&conversation, &mapped.message);
-    } else if member && past_read(account, &conversation, raw.id()) {
-        // Counted already, but not yet read anywhere: a mention in it still notifies.
-        let _ = account.ctx.counted_message(&conversation, &mapped.message);
-    } else {
-        let _ = account.ctx.history(&conversation, std::slice::from_ref(&mapped.message));
-    }
+    let counted = dialog_counts(account, &conversation, mapped.peer, covered_by_dialog);
+    publish(account, &conversation, &mapped.message, raw.id(), true, member, counted);
     // What it shows is fetched only when the user is looking at the conversation; otherwise
     // opening it fetches the page it is on.
     if open {
@@ -293,7 +479,9 @@ pub(super) fn apply(account: &Account, update: &Update) {
             }
             for id in &gone.messages {
                 if let Some(conversation) = account.placed(None, *id) {
-                    let _ = account.ctx.deleted(&conversation, &id.to_string());
+                    if !drop_member(account, &conversation, *id) {
+                        let _ = account.ctx.deleted(&conversation, &id.to_string());
+                    }
                 }
             }
         }
@@ -306,7 +494,9 @@ pub(super) fn apply(account: &Account, update: &Update) {
             for id in &gone.messages {
                 let conversation = if forum { account.placed(Some(who), *id) } else { Some(who.text()) };
                 if let Some(conversation) = conversation {
-                    let _ = account.ctx.deleted(&conversation, &id.to_string());
+                    if !drop_member(account, &conversation, *id) {
+                        let _ = account.ctx.deleted(&conversation, &id.to_string());
+                    }
                 }
             }
         }
@@ -363,7 +553,8 @@ pub(super) fn apply(account: &Account, update: &Update) {
         }
         Update::MessageReactions(reacted) => {
             let conversation = place(account, Who::of(&reacted.peer), reacted.top_msg_id);
-            reactions(account, &conversation, reacted.msg_id, &reacted.reactions);
+            let message = written_id(account, reacted.msg_id).unwrap_or(reacted.msg_id);
+            reactions(account, &conversation, message, &reacted.reactions);
         }
         // A draft typed (or cleared) on the phone while we are here, or ours echoed back.
         Update::DraftMessage(drafted) => {
@@ -443,7 +634,18 @@ pub(super) fn sent(account: &Account, conversation: &str, who: Who, text: &str, 
         let me = Who::User(account.me);
         message.sender = protocol::Sender { id: me.text(), name: account.dir().name(me), ..protocol::Sender::default() };
         message.spans = content::spans(text, short.entities.as_deref().unwrap_or(&[]));
-        let mut mapped = Mapped { peer: who, id: short.id, topic: None, discussion_top: None, reply, reply_note: None, message, wants: Vec::new() };
+        let mut mapped = Mapped {
+            peer: who,
+            id: short.id,
+            topic: None,
+            discussion_top: None,
+            reply,
+            reply_note: None,
+            message,
+            wants: Vec::new(),
+            group: None,
+            members: Vec::new(),
+        };
         finish(account, conversation, &mut mapped, &HashMap::new());
         return Some(mapped.message);
     }
@@ -453,12 +655,44 @@ pub(super) fn sent(account: &Account, conversation: &str, who: Who, text: &str, 
         _ => return None,
     };
     account.learn(users, chats);
-    updates.iter().find_map(|update| {
+    let mut outgoing = Vec::new();
+    for update in updates {
         let raw = match update {
             Update::NewMessage(new) => &new.message,
             Update::NewChannelMessage(new) => &new.message,
-            _ => return None,
+            _ => continue,
         };
+        outgoing.push(raw);
+    }
+    outgoing.sort_by_key(|raw| raw.id());
+    if outgoing.iter().any(|raw| content::grouped_id(raw).is_some()) {
+        let mut last = None;
+        for raw in outgoing {
+            let Some((place, mut mapped)) = placed(account, raw) else {
+                continue;
+            };
+            if place != conversation || !mapped.message.outgoing {
+                continue;
+            }
+            if mapped.message.outgoing {
+                let mut live = account.live();
+                if let Some(at) = live.sent.iter().position(|(id, _)| *id == mapped.id) {
+                    mapped.message.client_id = live.sent.remove(at).map(|(_, client_id)| client_id);
+                }
+            }
+            if let Some(folded) = fold(account, conversation, mapped) {
+                if let Some(old) = folded.replaced {
+                    let _ = account.ctx.deleted(conversation, &old.to_string());
+                }
+                for id in &folded.members {
+                    account.place(folded.peer, *id, conversation);
+                }
+                last = Some(folded.message);
+            }
+        }
+        return last;
+    }
+    outgoing.into_iter().find_map(|raw| {
         let (place, mapped) = placed(account, raw)?;
         (place == conversation && mapped.message.outgoing).then_some(mapped.message)
     })

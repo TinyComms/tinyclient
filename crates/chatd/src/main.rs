@@ -398,6 +398,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-quote:0");
         return Ok(());
     }
+    // The lab's telegram-album driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-album") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_album() {
+            eprintln!("telegram-album: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-album:0");
+        return Ok(());
+    }
     // The lab's telegram-dice driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-dice") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_dice() {
