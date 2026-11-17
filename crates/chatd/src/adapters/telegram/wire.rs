@@ -67,6 +67,10 @@ impl Fault {
                 "PEER_ID_INVALID" | "CHANNEL_INVALID" | "CHANNEL_PRIVATE" | "USER_ID_INVALID" => {
                     "Telegram no longer lets this account reach that chat.".to_owned()
                 }
+                "PREMIUM_ACCOUNT_REQUIRED" => "This needs Telegram Premium.".to_owned(),
+                // A length or a count past the free plan. `MESSAGE_TOO_LONG` and
+                // `REACTIONS_TOO_MANY` are named above and are not this.
+                name if name.ends_with("_TOO_MUCH") => "This needs Telegram Premium.".to_owned(),
                 other => format!("Telegram refused this ({other})."),
             },
             Fault::Net(_) => "Telegram did not answer.".to_owned(),
@@ -174,5 +178,17 @@ mod tests {
         // A password still owed is not an ended session.
         assert!(!Fault::Rpc { code: 401, name: "SESSION_PASSWORD_NEEDED".into(), value: None }.signed_out());
         assert!(!Fault::Net("timed out".into()).signed_out());
+    }
+
+    #[test]
+    fn a_premium_limit_says_it_needs_telegram_premium() {
+        let required = Fault::Rpc { code: 403, name: "PREMIUM_ACCOUNT_REQUIRED".into(), value: None };
+        assert!(required.words().contains("needs Telegram Premium"), "{}", required.words());
+        let too_much = Fault::Rpc { code: 400, name: "STICKERS_TOO_MUCH".into(), value: None };
+        assert!(too_much.words().contains("needs Telegram Premium"), "{}", too_much.words());
+        let long = Fault::Rpc { code: 400, name: "MESSAGE_TOO_LONG".into(), value: None };
+        assert!(!long.words().contains("needs Telegram Premium"), "{}", long.words());
+        let many = Fault::Rpc { code: 400, name: "REACTIONS_TOO_MANY".into(), value: None };
+        assert!(!many.words().contains("needs Telegram Premium"), "{}", many.words());
     }
 }

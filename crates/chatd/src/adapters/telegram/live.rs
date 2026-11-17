@@ -321,8 +321,9 @@ pub(super) fn apply(account: &Account, update: &Update) {
         }
         Update::UserStatus(status) => {
             let who = Who::User(status.user_id);
-            let owned = account.dir().get(who).is_some_and(|known| known.contact);
-            account.ctx.presence(&who.text(), presence(Some(&status.status)), "", owned || status.user_id == account.me);
+            let (owned, premium) = account.dir().get(who).map(|known| (known.contact, known.premium)).unwrap_or((false, false));
+            let badge = super::premium::badge(premium, status.user_id == account.me);
+            account.ctx.presence(&who.text(), presence(Some(&status.status)), badge, owned || status.user_id == account.me);
         }
         Update::ReadHistoryInbox(seen) => {
             let conversation = place(account, Who::of(&seen.peer), seen.top_msg_id);

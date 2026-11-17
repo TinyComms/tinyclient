@@ -1648,6 +1648,40 @@ fn sending_editing_deleting_and_reacting_wait_for_telegram() {
 }
 
 #[test]
+fn a_free_account_is_told_when_a_send_needs_premium_and_reads_its_limits() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_CAPTION", "2048"), ("TINYCLIENT_TELEGRAM_PEER_PREMIUM", "7002")]);
+    world.connected();
+    let (accounts, _) = world.status();
+    assert_eq!(accounts[0].name, "Mira Kessler");
+    assert_eq!(accounts[0].can.caption_limit, 2_048);
+    assert_eq!(accounts[0].can.max_file_bytes, 2_000 * 1024 * 1024);
+
+    world.send("u7002", "5002", "premium file", None);
+    let failed = world.until("the premium refusal", || {
+        world.messages("u7002").into_iter().find(|message| matches!(message.state, SendState::Failed { .. }))
+    });
+    assert_eq!(failed.state, SendState::Failed { reason: "This needs Telegram Premium.".into() });
+
+    let people = world.until("the contacts", || {
+        let asked = Request::People { network: Some(Network::Telegram), relation: Some(Relation::Contact), query: None, offset: 0, limit: 50 };
+        match world.ask(asked) {
+            Response::People { people, .. } if !people.is_empty() => Some(people),
+            _ => None,
+        }
+    });
+    assert_eq!((people[0].name.as_str(), people[0].status.as_str()), ("Odalys Brandt", "Telegram Premium"));
+
+    let me = world.until("our row", || match world.ask(Request::People {
+        network: Some(Network::Telegram), relation: None, query: Some("Mira".into()), offset: 0, limit: 20,
+    }) {
+        Response::People { people, .. } => people.into_iter().find(|person| person.key.id == "u7001"),
+        _ => None,
+    });
+    assert_eq!(me.link, "tg://premium_offer");
+    assert!(me.status.is_empty(), "our own status text stays ours to set");
+}
+
+#[test]
 fn a_public_username_resolves_a_person_outside_contacts_and_global_search_results() {
     let world = World::signed_in();
     world.connected();
@@ -2204,6 +2238,8 @@ fn a_premium_account_lists_its_emoji_packs_and_sending_one_names_the_document() 
     let world = World::premium();
     world.connected();
     let (accounts, _) = world.status();
+    assert_eq!(accounts[0].name, "Mira Kessler · Premium");
+    assert_eq!(accounts[0].can.max_file_bytes, 4_000 * 1024 * 1024);
     assert_eq!(accounts[0].can.custom_emoji, EmojiScope::All);
     let Response::Catalog { items, .. } = world.ask(Request::Catalog {
         account: account(),
