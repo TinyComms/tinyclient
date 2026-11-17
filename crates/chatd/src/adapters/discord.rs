@@ -91,6 +91,30 @@ pub(super) fn prove_voice_bitrate() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's discord-voice-move driver. A same-guild move is followed. A direct call, another
+/// guild, and the channel we are already in are not. A build from before the fix ignores the
+/// variable and stays up.
+pub(super) fn prove_voice_move() -> Result<(), String> {
+    use voice::Follow::*;
+    match voice::follow(Some("4000"), Some("4203"), Some("4000"), "4201") {
+        Moved(channel) if channel == "4203" => {}
+        other => return Err(format!("a same-guild move is followed, got {other:?}")),
+    }
+    if voice::follow(Some("4000"), Some("4201"), Some("4000"), "4201") != Here {
+        return Err("the same channel stays".to_owned());
+    }
+    if voice::follow(Some("9"), Some("1"), Some("4000"), "4201") != Elsewhere {
+        return Err("another guild is not this call".to_owned());
+    }
+    if voice::follow(None, Some("9"), None, "3001") != Elsewhere {
+        return Err("a direct call is not followed".to_owned());
+    }
+    if voice::follow(Some("4000"), None, Some("4000"), "4201") != Left {
+        return Err("a null channel is a leave".to_owned());
+    }
+    Ok(())
+}
+
 /// The lab's discord-nitro-length driver. `send`, `edit` and `send_with` all ask [`too_long`].
 /// A build from before the fix ignores the variable and stays up.
 pub(super) fn prove_nitro_length() -> Result<(), String> {

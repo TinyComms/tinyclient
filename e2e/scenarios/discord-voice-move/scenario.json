@@ -1,0 +1,8 @@
+{
+  "id": "discord-voice-move",
+  "title": "A move to another Discord voice channel is followed",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
