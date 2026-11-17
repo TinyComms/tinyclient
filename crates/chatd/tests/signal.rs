@@ -374,10 +374,13 @@ fn reactions_edits_deletes_and_receipts_land_on_the_right_message() {
     let custom = world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: ":party:".into(), on: true });
     assert!(matches!(&custom, Response::Error { code: protocol::ErrorCode::Refused, .. }), "{custom:?}");
     assert!(!world.calls().iter().any(|call| call.contains(":party:")));
-    assert_eq!(world.ask(Request::Edit { conversation: key(GRACE), message_id: ours.id.clone(), text: "Sure!".into() }), Response::Ok);
+    assert_eq!(
+        world.ask(Request::Edit { conversation: key(GRACE), message_id: ours.id.clone(), text: "Sure!".into(), spans: Vec::new() }),
+        Response::Ok
+    );
     world.heard(&format!("send {GRACE} edit {FIRST_SENT} Sure!"));
     assert!(world.messages(GRACE).iter().any(|m| m.id == ours.id && m.edited && m.text == "Sure!"));
-    let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: again.id.clone(), text: "Not mine".into() });
+    let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: again.id.clone(), text: "Not mine".into(), spans: Vec::new() });
     assert!(matches!(&refused, Response::Error { detail, .. } if detail.contains("own messages")), "{refused:?}");
     // Grace's phone has ours, then Grace read it.
     assert!(!world.conversation(GRACE).unwrap().delivered);

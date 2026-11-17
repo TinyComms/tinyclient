@@ -1364,11 +1364,14 @@ pub enum Request {
         conversation: Key,
     },
     /// Replaces the text of one of our own messages. Nothing changes on screen until the
-    /// network accepts it; a refusal is the answer.
+    /// network accepts it; a refusal is the answer. `spans` are the styled ranges of `text`;
+    /// empty keeps the edit as plain text. An older client omits them.
     Edit {
         conversation: Key,
         message_id: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        spans: Vec<Span>,
     },
     /// Deletes a message for everyone. Waits for the network, like `Edit`.
     Delete {
@@ -2447,6 +2450,16 @@ mod tests {
         let json = serde_json::to_string(&quiet).unwrap();
         assert_eq!(json, r#"{"ping":false}"#);
         assert_eq!(serde_json::from_str::<Outgoing>(&json).unwrap(), quiet);
+        let old: Request = serde_json::from_str(
+            r#"{"op":"edit","conversation":{"network":"slack","account":"T1","id":"C1"},"message_id":"1","text":"hi"}"#,
+        )
+        .unwrap();
+        let Request::Edit { spans, text, .. } = &old else { panic!("not an edit") };
+        assert!(spans.is_empty() && text == "hi");
+        assert!(!serde_json::to_string(&old).unwrap().contains("spans"));
+        let styled = Outgoing { spans: vec![Span { start: 0, end: 2, style: Style::Bold }], ..Outgoing::default() };
+        assert!(!styled.is_plain());
+        assert!(serde_json::to_string(&styled).unwrap().contains("bold"));
     }
 
     #[test]

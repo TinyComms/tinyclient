@@ -362,6 +362,7 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             conversation_id,
             message_id,
             text,
+            spans: _,
             reply,
         } => edit(ctx, saved, &conversation_id, &message_id, &text, reply),
         Command::Delete {

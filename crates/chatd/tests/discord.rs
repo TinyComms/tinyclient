@@ -1528,6 +1528,7 @@ fn nitro_plain_text_uses_the_four_thousand_character_limit() {
         conversation: free.key("3001"),
         message_id: "1300000000000000009".into(),
         text: three.clone(),
+        spans: Vec::new(),
     });
     match edit {
         Response::Error { detail, .. } => assert!(detail.contains("2000"), "{detail}"),
@@ -1563,7 +1564,7 @@ fn nitro_plain_text_uses_the_four_thousand_character_limit() {
     assert_eq!(posted.len(), 2);
     assert_eq!(posted.last().unwrap().body["content"].as_str().map(|text| text.chars().count()), Some(3000));
 
-    let edited = nitro.ask(Request::Edit { conversation: nitro.key("3002"), message_id: sent.id, text: three });
+    let edited = nitro.ask(Request::Edit { conversation: nitro.key("3002"), message_id: sent.id, text: three, spans: Vec::new() });
     assert_eq!(edited, Response::Ok);
     let patched = nitro.discord.requests_to("PATCH", "/channels/3002/messages");
     assert_eq!(patched.last().unwrap().body["content"].as_str().map(|text| text.chars().count()), Some(3000));
@@ -2418,7 +2419,7 @@ fn reactions_edits_and_deletes_go_to_discord_and_the_store_follows_its_word() {
 
     // An edit changes nothing until Discord accepts it; then the store has Discord's version.
     let edit = |text: &str| {
-        world.ask(Request::Edit { conversation: world.key(dm), message_id: mine.to_owned(), text: text.to_owned() })
+        world.ask(Request::Edit { conversation: world.key(dm), message_id: mine.to_owned(), text: text.to_owned(), spans: Vec::new() })
     };
     assert_eq!(edit("is the *deploy* done yet?"), Response::Ok);
     let patched = world.discord.requests_to("PATCH", &format!("{reactions}/{mine}"));

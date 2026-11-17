@@ -283,11 +283,13 @@ pub enum Command {
     /// network to judge.
     ReactionRules { conversation_id: String, reply: Reply<protocol::ReactionRules> },
     /// Replace the text of one of our messages. Report the edited message through
-    /// [`Context::message`] before answering: nothing was changed locally.
+    /// [`Context::message`] before answering: nothing was changed locally. `spans` are the
+    /// styled ranges of `text`; an adapter that cannot send them leaves them unused.
     Edit {
         conversation_id: String,
         message_id: String,
         text: String,
+        spans: Vec<protocol::Span>,
         reply: Reply<()>,
     },
     /// Delete a message for everyone. Report it through [`Context::deleted`] before answering.
@@ -1629,6 +1631,11 @@ pub fn prove_teams_loop_component() -> Result<(), String> {
 /// The lab's slack-connect-org driver. See `slack::prove_connect_names`.
 pub fn prove_slack_connect_org() -> Result<(), String> {
     slack::prove_connect_names()
+}
+
+/// The lab's slack-rich-text driver. See `slack::prove_rich_text`.
+pub fn prove_slack_rich_text() -> Result<(), String> {
+    slack::prove_rich_text()
 }
 
 /// An adapter with no network behind it, for whatever serves an account inside chatd (the

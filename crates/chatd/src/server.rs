@@ -1372,6 +1372,7 @@ impl Chat {
             })
             .collect();
         message.client_id = Some(client_id);
+        message.spans = with.spans.clone();
         let quoted = reply_to.and_then(|id| store.message(conversation, id).ok().flatten());
         message.reply_to = quoted.map(|quoted| protocol::ReplyTo {
             id: quoted.id,
@@ -1491,7 +1492,7 @@ impl Chat {
 
     /// Edit and delete change nothing here: the answer is the network's, and the message
     /// changes when the adapter reports it.
-    fn rewrite(&self, conversation: Key, message_id: String, text: Option<String>) -> Response {
+    fn rewrite(&self, conversation: Key, message_id: String, text: Option<String>, spans: Vec<protocol::Span>) -> Response {
         let account = conversation.account();
         if let Err(refused) = self.online(&account) {
             return *refused;
@@ -1512,6 +1513,7 @@ impl Chat {
                 conversation_id,
                 message_id,
                 text,
+                spans,
                 reply,
             }),
             None => self.ask(&account, |reply| Command::Delete {
@@ -2499,8 +2501,8 @@ impl Chat {
 
             Request::React { conversation, message_id, emoji, on } => self.react(conversation, message_id, emoji, on),
             Request::Reactions { conversation } => self.reactions(conversation),
-            Request::Edit { conversation, message_id, text } => self.rewrite(conversation, message_id, Some(text)),
-            Request::Delete { conversation, message_id } => self.rewrite(conversation, message_id, None),
+            Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans),
+            Request::Delete { conversation, message_id } => self.rewrite(conversation, message_id, None, Vec::new()),
 
             Request::Fetch { account, ids, size, retry } => {
                 let adapter = lock(&self.adapters).get(&account).map(Adapter::sender);
@@ -3304,7 +3306,7 @@ pub fn prove_offline_queue() -> Result<(), String> {
     if !matches!(scheduled, Response::Error { code: ErrorCode::Offline, .. }) {
         return Err("a scheduled send while offline was stored".into());
     }
-    let edit = chat.handle(Request::Edit { conversation: conversation.clone(), message_id: "1".into(), text: "no".into() });
+    let edit = chat.handle(Request::Edit { conversation: conversation.clone(), message_id: "1".into(), text: "no".into(), spans: Vec::new() });
     let react = chat.handle(Request::React {
         conversation: conversation.clone(),
         message_id: "1".into(),

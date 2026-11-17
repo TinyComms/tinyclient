@@ -669,7 +669,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
         }
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
-        Command::Edit { conversation_id, message_id, text, reply } => {
+        Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
             let _ = reply.send(edit(account, &conversation_id, &message_id, &text).map_err(refused));
         }
         Command::Delete { conversation_id, message_id, reply } => {

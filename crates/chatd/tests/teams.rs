@@ -1088,7 +1088,7 @@ fn sending_editing_reacting_deleting_and_reading_go_to_teams() {
     assert_eq!(failed.state, SendState::Failed { reason: "Teams is rate limiting you. Try again in 7 s.".to_owned() });
 
     // Edit: Teams is asked first, and the message changes once it agreed.
-    let edit = Request::Edit { conversation: ana.clone(), message_id: sent.id.clone(), text: "hello Ana".to_owned() };
+    let edit = Request::Edit { conversation: ana.clone(), message_id: sent.id.clone(), text: "hello Ana".to_owned(), spans: Vec::new() };
     assert_eq!(world.ask(edit), Response::Ok);
     let put = world.fake.calls("PUT", &path("/messages/1760001000000")).pop().expect("the edit reached Teams");
     assert_eq!((put.json()["content"].as_str(), put.json()["messagetype"].as_str()), (Some("<p>hello Ana</p>"), Some("RichText/Html")));

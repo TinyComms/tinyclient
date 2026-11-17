@@ -627,7 +627,7 @@ impl Demo {
                 let reacted = demo.ctx.reacted(&conversation_id, &message_id, &demo.reaction(&emoji), on);
                 let _ = reply.send(reacted.map_err(|err| Refusal::Refused(err.to_string())));
             }
-            Command::Edit { conversation_id, message_id, text, reply } => {
+            Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
                 let _ = reply.send(demo.edit(&conversation_id, &message_id, text));
             }
             Command::Delete { conversation_id, message_id, reply } => {
