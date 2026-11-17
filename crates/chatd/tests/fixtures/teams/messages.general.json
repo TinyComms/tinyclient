@@ -1,6 +1,26 @@
 {
  "messages": [
   {
+   "id": "1760000310310",
+   "sequenceId": 310,
+   "clientmessageid": "13937442450000000",
+   "version": "1760000310310",
+   "conversationid": "19:platform0general@thread.tacv2",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000310310",
+   "type": "Message",
+   "messagetype": "RichText/Media_Card",
+   "contenttype": "text",
+   "content": "<URIObject type=\"SWIFT.1\" url_thumbnail=\"https://urlp.asm.skype.com/v1/url/content?url=https://neu1-urlp.secure.skypeassets.com/static/card-128x128.png\"><Swift b64=\"eyJ0eXBlIjoibWVzc2FnZS9jYXJkIn0=\"></Swift>Card - access it on https://go.skype.com/cards.unsupported</URIObject>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+   "imdisplayname": "Ana Ruiz",
+   "composetime": "2025-10-09T08:58:30.3100000Z",
+   "originalarrivaltime": "2025-10-09T08:58:30.3100000Z",
+   "properties": {
+    "cards": "[{\"cardClientId\": \"c2\", \"contentType\": \"application/vnd.microsoft.card.fluidEmbedCard\", \"teamsAppId\": \"FluidEmbedCard\", \"name\": \"Sprint checklist\", \"content\": \"{\\\"componentUrl\\\": \\\"https://contoso.sharepoint.com/:fl:/g/personal/ana/EaBcDeF\\\", \\\"sourceType\\\": \\\"Compose\\\"}\"}]"
+   }
+  },
+  {
    "id": "1760000300300",
    "sequenceId": 300,
    "clientmessageid": "13937442378075700",

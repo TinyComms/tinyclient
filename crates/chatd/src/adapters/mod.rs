@@ -1575,6 +1575,11 @@ pub fn prove_teams_shared_file() -> Result<(), String> {
     teams::prove_shared_file()
 }
 
+/// The lab's teams-loop-component driver. See `teams::prove_loop_component`.
+pub fn prove_teams_loop_component() -> Result<(), String> {
+    teams::prove_loop_component()
+}
+
 /// The lab's slack-connect-org driver. See `slack::prove_connect_names`.
 pub fn prove_slack_connect_org() -> Result<(), String> {
     slack::prove_connect_names()

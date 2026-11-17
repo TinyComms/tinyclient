@@ -105,6 +105,11 @@ pub fn prove_reactions() -> Result<(), String> {
     message::prove_reactions()
 }
 
+/// The lab's teams-loop-component driver. A build without this returns to the server and stays up.
+pub fn prove_loop_component() -> Result<(), String> {
+    message::prove_loop_component()
+}
+
 /// The lab's teams-file-download driver. A build without this returns to the server and stays up.
 pub fn prove_shared_file() -> Result<(), String> {
     let share = "https://contoso.sharepoint.com/:x:/s/Platform/EaBcDeF";
