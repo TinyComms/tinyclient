@@ -192,6 +192,9 @@ pub trait Wire: Send + Sync {
     /// emoji clears it. Succeeds only once the written profile was read back and the other
     /// devices were told.
     fn set_card(&self, name: Option<String>, about: Option<String>, emoji: Option<String>) -> Result<(), Fault>;
+    /// The account id behind a username (`name.42`), or none when Signal has no such username.
+    /// A phone number is not looked up here.
+    fn lookup(&self, username: &str) -> Result<Option<String>, Fault>;
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);
 }

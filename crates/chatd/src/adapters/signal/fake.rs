@@ -21,6 +21,7 @@
 //! | `seen WHO SENT` | WHO read our message |
 //! | `typing WHO`, `typing-stop WHO` | WHO is typing to us, or stopped |
 //! | `refuse WORDS…` | the next send is refused, in those words |
+//! | `lookup USERNAME ACI` | a later username search for USERNAME answers ACI |
 //! | `drop`, `unlinked` | the connection ends; the phone removed this device |
 //!
 //! WHO is `grace` or `alan`. Every request it is sent is appended to `signal.calls`, one line
@@ -32,6 +33,7 @@
 use super::wire::{Body, Contact, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use crate::adapters::script;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -73,6 +75,8 @@ pub struct Fake {
     clock: AtomicU64,
     control: PathBuf,
     card: Arc<Mutex<OwnCard>>,
+    /// Usernames a test has scripted, lower case, to an account id.
+    lookups: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Fake {
@@ -102,6 +106,7 @@ impl Fake {
                 phone: "+15550100001".into(),
                 link: "https://signal.me/#eu/fake-ada".into(),
             })),
+            lookups: Arc::default(),
         };
         fake.listen();
         fake
@@ -109,7 +114,7 @@ impl Fake {
 
     /// Reads the test's lines for as long as this wire lives; closing the wire ends it.
     fn listen(&self) {
-        let (events, closed, refuse, control) = (self.events.clone(), self.closed.clone(), self.refuse.clone(), self.control.clone());
+        let (events, closed, refuse, control, lookups) = (self.events.clone(), self.closed.clone(), self.refuse.clone(), self.control.clone(), self.lookups.clone());
         let _ = std::thread::Builder::new().name("signal-fake".into()).spawn(move || {
             script::follow(&control, |line| {
                 if closed.load(Ordering::Relaxed) {
@@ -118,6 +123,15 @@ impl Fake {
                 let Some(line) = line.map(str::trim) else {
                     return true;
                 };
+                if let Some(rest) = line.strip_prefix("lookup ") {
+                    let mut parts = rest.split_whitespace();
+                    let username = parts.next().unwrap_or("");
+                    let aci = parts.next().unwrap_or("");
+                    if !username.is_empty() && super::wire::is_aci(aci) {
+                        lookups.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(username.to_ascii_lowercase(), aci.to_owned());
+                    }
+                    return true;
+                }
                 if let Some(words) = line.strip_prefix("refuse ") {
                     *refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(words.to_owned());
                     return true;
@@ -291,6 +305,12 @@ impl Wire for Fake {
         const PNG: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c4944415408d763f8cfc0000000020001e221bc330000000049454e44ae426082";
         let png = (0..PNG.len()).step_by(2).filter_map(|at| u8::from_str_radix(&PNG[at..at + 2], 16).ok()).collect();
         Ok((*of == Peer::Direct(GRACE.to_owned())).then_some(png))
+    }
+
+    fn lookup(&self, username: &str) -> Result<Option<String>, Fault> {
+        record(&format!("lookup {username}"));
+        let found = self.lookups.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&username.to_ascii_lowercase()).cloned();
+        Ok(found)
     }
 
     fn close(&self) {

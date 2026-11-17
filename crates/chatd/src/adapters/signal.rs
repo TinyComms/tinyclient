@@ -637,6 +637,93 @@ fn read_elsewhere(account: &Account, read: &[(String, u64)]) {
     }
 }
 
+/// A Signal username as libsignal's `Username::new` accepts one: `nickname.42`, optionally with
+/// one leading `@`. A plain name, a phone number, and a `signal.me` link are not usernames, so
+/// they are not sent to Signal.
+fn username_of(query: &str) -> Option<&str> {
+    let username = query.trim().strip_prefix('@').unwrap_or(query.trim());
+    let (nickname, discriminator) = username.rsplit_once('.')?;
+    (nickname_ok(nickname) && discriminator_ok(discriminator)).then_some(username)
+}
+
+/// Nickname: 1 to 48 of `[_0-9A-Za-z]`, and not starting with a digit. libsignal's hard limit.
+fn nickname_ok(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first.is_ascii_digit() || !nickname_char(first) {
+        return false;
+    }
+    let mut count = 1usize;
+    for ch in chars {
+        if !nickname_char(ch) {
+            return false;
+        }
+        count += 1;
+        if count > 48 {
+            return false;
+        }
+    }
+    true
+}
+
+fn nickname_char(ch: char) -> bool {
+    matches!(ch, '_' | 'a'..='z' | 'A'..='Z' | '0'..='9')
+}
+
+/// Discriminator: at least two digits, not zero, and no leading zero once it is longer than two.
+/// `01` is a username; `1` and `042` are not.
+fn discriminator_ok(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() || bytes.len() == 1 || !bytes.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    if bytes.len() > 2 && bytes[0] == b'0' {
+        return false;
+    }
+    text.parse::<u64>().ok().is_some_and(|value| value != 0)
+}
+
+/// Looks up a username and stores the account it names. Anything else only finishes the search.
+fn search_people(account: &Account, query: &str) {
+    if let Some(username) = username_of(query) {
+        match account.wire.lookup(username) {
+            Ok(Some(aci)) if wire::is_aci(&aci) => {
+                let name = account.live().names.entry(aci.clone()).or_insert_with(|| username.to_owned()).clone();
+                let _ = account.ctx.people(&[PersonRow {
+                    avatar: account.ctx.avatar_of(&aci),
+                    id: aci,
+                    name,
+                    handle: username.to_owned(),
+                    ..PersonRow::default()
+                }]);
+            }
+            Ok(_) => {}
+            Err(fault) => tracing::warn!("chatd: Signal: username: {}", super::net::redact(&fault.to_string())),
+        }
+    }
+    account.ctx.searched(query);
+}
+
+/// The lab checks this without a Signal account: which typed queries are usernames.
+pub fn prove_signal_username() -> Result<(), String> {
+    for username in ["ada.42", "@ada.42", "Ada.42", "@Ada.42", "He110.01", "usr.999999999", "_identifier.42"] {
+        if username_of(username).is_none() {
+            return Err(format!("{username} should be a username"));
+        }
+    }
+    if username_of("@Ada.42") != Some("Ada.42") {
+        return Err("a leading @ is not part of the username".to_owned());
+    }
+    for query in ["Grace", "+15550100002", "https://signal.me/#eu/abc", "ada.1", "ada.042", "1ada.42", "ada.00"] {
+        if username_of(query).is_some() {
+            return Err(format!("{query} should not be looked up"));
+        }
+    }
+    Ok(())
+}
+
 /// Answers a command while there is no connection.
 fn offline(ctx: &Context, command: Command) {
     let down = || Refusal::Refused("Signal is offline.".to_owned());
@@ -685,8 +772,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             });
             let _ = reply.send(started.ok_or_else(|| Refusal::Refused("That person can't be messaged from here.".to_owned())));
         }
-        // Signal has no directory to search: the people known are the contacts already stored.
-        Command::SearchPeople(query) => ctx.searched(&query),
+        Command::SearchPeople(query) => search_people(account, &query),
         Command::Watch(watching) => pictures(account, &watching),
         Command::SignOut(reply) => {
             if let Err(fault) = account.wire.unlink() {
@@ -920,6 +1006,11 @@ mod tests {
         assert_eq!(live.react("m", "p", Some("❤️")), Some("👍".to_owned()));
         assert_eq!(live.react("m", "p", Some("❤️")), None);
         assert_eq!(live.react("m", "p", None), Some("❤️".to_owned()));
+    }
+
+    #[test]
+    fn a_username_shape_is_proven() {
+        prove_signal_username().unwrap();
     }
 
     #[test]
