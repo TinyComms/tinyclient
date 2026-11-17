@@ -44,7 +44,16 @@ impl World {
         World::start(Some(SESSION))
     }
 
+    /// A scripted conversation of 100 messages, so a scroll can ask for the pages under the newest.
+    fn many() -> World {
+        World::open(Some(SESSION), true)
+    }
+
     fn start(session: Option<&str>) -> World {
+        World::open(session, false)
+    }
+
+    fn open(session: Option<&str>, many: bool) -> World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let dir = std::path::absolute(format!(
             "/tmp/tinyclient-msg-{}-{}",
@@ -68,6 +77,9 @@ impl World {
             .stderr(Stdio::from(log));
         if let Some(session) = session {
             command.env("TINYCLIENT_SESSION_MESSAGES", session);
+        }
+        if many {
+            command.env("TINYCLIENT_MESSAGES_MANY", "100");
         }
         let child = command.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -180,14 +192,29 @@ impl World {
     }
 
     fn messages(&self, conversation: &str) -> Vec<Message> {
+        self.page(conversation, Page::Newest, 100)
+    }
+
+    fn before(&self, id: &str) -> Vec<Message> {
+        self.page(GRACE, Page::Before { id: id.to_owned() }, 40)
+    }
+
+    fn page(&self, conversation: &str, page: Page, limit: u32) -> Vec<Message> {
         match self.ask(Request::Messages {
             conversation: key(conversation),
-            page: Page::Newest,
-            limit: 100,
+            page,
+            limit,
         }) {
             Response::Messages { messages, .. } => messages,
             _ => Vec::new(),
         }
+    }
+
+    fn lines(&self) -> Vec<Message> {
+        self.messages(GRACE)
+            .into_iter()
+            .filter(|message| message.text.starts_with("line "))
+            .collect()
     }
 
     fn arrived(&self, conversation: &str, text: &str) -> Message {
@@ -804,4 +831,60 @@ fn a_quiet_phone_holds_a_text_until_the_phone_answers() {
             (status.link == Link::Connected && status.required.is_empty()).then_some(())
         })
     });
+}
+
+#[test]
+fn scrolling_back_reads_every_message_and_then_stops_asking() {
+    let world = World::many();
+    world.connected();
+    let oldest = |messages: &[Message]| {
+        messages
+            .iter()
+            .min_by_key(|message| message.sent)
+            .map(|message| message.id.clone())
+            .unwrap_or_default()
+    };
+    let first = world.until("the newest forty", || {
+        let lines = world.lines();
+        (lines.len() == 40).then_some(lines)
+    });
+    let _ = world.before(&oldest(&first));
+    world.until("the next forty", || (world.lines().len() == 80).then_some(()));
+    let mid = world.lines();
+    let _ = world.before(&oldest(&mid));
+    let all = world.until("all one hundred", || {
+        let lines = world.lines();
+        (lines.len() == 100).then_some(lines)
+    });
+    assert_eq!(all.first().map(|message| message.text.as_str()), Some("line 1"));
+    assert_eq!(all.last().map(|message| message.text.as_str()), Some("line 100"));
+    let calls = world.calls();
+    assert!(
+        calls.iter().any(|call| call == "history phone-grace m-0061"),
+        "the second page did not start after the first: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|call| call == "history phone-grace m-0021"),
+        "the last page did not start after the second: {calls:?}"
+    );
+    let asked = world
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("history "))
+        .count();
+    let _ = world.before(&oldest(&all));
+    world.ask(Request::Typing {
+        conversation: key(GRACE),
+    });
+    world.heard(&format!("typing {GRACE}"));
+    let after = world
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("history "))
+        .count();
+    assert_eq!(
+        after, asked,
+        "a third scroll asked the phone again: {:?}",
+        world.calls()
+    );
 }
