@@ -539,7 +539,11 @@ pub struct Composer {
 
 impl Composer {
     fn new(shell: WeakEntity<Shell>, hub: Hub, thread: bool, cx: &mut Context<Self>) -> Composer {
-        let input = cx.new(|cx| TextInput::multiline(placeholder("", thread), cx));
+        let input = cx.new(|cx| {
+            let mut field = TextInput::multiline(placeholder("", thread), cx);
+            field.set_checking(true);
+            field
+        });
         cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
             InputEvent::Submit => this.send(false, cx),
             InputEvent::Changed => this.typed(cx),
