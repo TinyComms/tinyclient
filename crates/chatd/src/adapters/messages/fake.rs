@@ -54,6 +54,8 @@ impl Fake {
                 unread: false,
                 mine: ME.into(),
                 peer: GRACE_PARTICIPANT.into(),
+                carrier: 0,
+                phones: false,
             },
             Chat {
                 id: CLUB.into(),
@@ -62,6 +64,8 @@ impl Fake {
                 unread: true,
                 mine: ME.into(),
                 peer: String::new(),
+                carrier: 0,
+                phones: false,
             },
         ]));
         let fake = Fake {
@@ -125,6 +129,8 @@ fn note(
         pieces,
         reactions,
         status: 0,
+        wire: 0,
+        phones: None,
     }
 }
 
@@ -278,6 +284,56 @@ fn steer(line: &str) -> Vec<Event> {
         }
         "drop" => vec![Event::Closed("the connection dropped".into())],
         "unlinked" => vec![Event::Ended("This device was removed in Messages.".into())],
+        "sms" | "rcs" | "sealed" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let (carrier, phones) = match command {
+                "sms" => (1, false),
+                "sealed" => (2, true),
+                _ => (2, false),
+            };
+            vec![Event::Chats(vec![Chat {
+                id: author.into(),
+                title: name.into(),
+                group: false,
+                unread: false,
+                mine: ME.into(),
+                peer: if author == GRACE {
+                    GRACE_PARTICIPANT.into()
+                } else {
+                    String::new()
+                },
+                carrier,
+                phones,
+            }])]
+        }
+        "tick" => {
+            let Some((author, _)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let mut sent = note(ME, "Ada Quill", author, "m-mine-tick", "sent", false, Vec::new(), Vec::new());
+            sent.outgoing = true;
+            sent.status = 11;
+            vec![Event::Message(sent)]
+        }
+        "mms" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let mut sent = note(
+                author,
+                name,
+                author,
+                &format!("m-{author}-mms"),
+                &rest(2),
+                false,
+                Vec::new(),
+                Vec::new(),
+            );
+            sent.wire = 2;
+            vec![Event::Message(sent)]
+        }
         _ => Vec::new(),
     }
 }

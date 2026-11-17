@@ -639,6 +639,11 @@ pub struct Chat {
     /// The other side of a one-to-one chat, by participant id: whose picture the row shows.
     /// Empty for a group.
     pub peer: String,
+    /// `Conversation.type`, field 22: 1 SMS, 2 RCS, 0 when the phone did not say.
+    pub carrier: u64,
+    /// A tombstone said the phones encrypt the chat. A later conversation update does not
+    /// clear it: the conversation message has no such field.
+    pub phones: bool,
 }
 
 /// One photo or file on a message. Bytes are already opened when the phone sent them inline.
@@ -677,6 +682,10 @@ pub struct Note {
     pub reactions: Vec<Mark>,
     /// The phone's word on the message (`MessageStatus.status`, field 4.2).
     pub status: u64,
+    /// `Message.type`, field 11. 0 when the phone did not say.
+    pub wire: u64,
+    /// This update only turns encryption between the phones on or off. It is not a message.
+    pub phones: Option<bool>,
 }
 
 /// What the other side did with one of my messages, as far as the phone knows.
@@ -693,6 +702,67 @@ pub fn receipt(status: u64) -> Option<Receipt> {
     match status {
         2 => Some(Receipt::Delivered),
         11 => Some(Receipt::Read),
+        _ => None,
+    }
+}
+
+/// What the composer can say. Field 22 is `ConversationType`: 1 SMS, 2 RCS.
+/// Encryption between the phones is not a field on the conversation; tombstones say it, and
+/// this computer cannot check it, so the words stay "Encrypted between phones".
+pub fn composer_label(carrier: u64, phones: bool) -> String {
+    let base = match carrier {
+        2 => "RCS message",
+        1 => "Text message",
+        _ => "",
+    };
+    if !phones {
+        return base.to_owned();
+    }
+    if base.is_empty() {
+        "Encrypted between phones".to_owned()
+    } else {
+        format!("{base} · Encrypted between phones")
+    }
+}
+
+/// "SMS" or "MMS" when the message is not the conversation's usual kind. Field 11 is
+/// `Message.type`: 1 SMS, 2 downloaded MMS, 3 undownloaded MMS, 4 RCS.
+pub fn wire_tag(wire: u64, carrier: u64) -> &'static str {
+    let usual = match carrier {
+        2 => 4,
+        1 => 1,
+        _ => 0,
+    };
+    if wire == 0 || (usual != 0 && wire == usual) {
+        return "";
+    }
+    match wire {
+        1 => "SMS",
+        2 | 3 => "MMS",
+        4 => "RCS",
+        _ => "",
+    }
+}
+
+/// Typing and read ticks exist on RCS. An SMS chat (carrier 1) has neither. Unknown stays on:
+/// the phone has not said the chat is SMS.
+pub fn shows_typing(carrier: u64) -> bool {
+    carrier != 1
+}
+
+pub fn shows_receipts(carrier: u64) -> bool {
+    carrier != 1
+}
+
+/// Said before a file leaves a chat the phone has called SMS, not RCS.
+pub const MMS_WARNING: &str = "Sends as MMS; may be compressed";
+
+/// Published tombstones that turn encryption between the phones on or off. Nothing else in the
+/// conversation message says it.
+pub fn between_phones(status: u64) -> Option<bool> {
+    match status {
+        213 | 216 | 219 | 224 | 225 | 226 | 229 | 233 | 235 | 237 => Some(true),
+        214 | 234 | 236 | 238 | 252 => Some(false),
         _ => None,
     }
 }
@@ -1651,6 +1721,7 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
         let mut title = field_text(&conv, 2);
         let group = field_int(&conv, 10) != 0;
         let unread = field_int(&conv, 6) != 0;
+        let carrier = field_int(&conv, 22);
         let mut mine = field_text(&conv, 11);
         let mut peer = String::new();
         for person in conv.iter().filter(|field| field.number == 20) {
@@ -1694,6 +1765,8 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
             unread,
             mine,
             peer,
+            carrier,
+            phones: false,
         });
     }
     chats
@@ -1820,10 +1893,22 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             continue;
         }
         let status = field_int(&fields(&field_bytes(&msg, 4)), 2);
+        // A tombstone is the only published word that the phones turned encryption on or off.
+        if let Some(on) = between_phones(status) {
+            notes.push(Note {
+                id,
+                conversation,
+                status,
+                phones: Some(on),
+                ..Note::default()
+            });
+            continue;
+        }
         // 200–299 is a tombstone, 300 a delete. Neither is a message to show.
         if (200..300).contains(&status) || status == 300 {
             continue;
         }
+        let wire = field_int(&msg, 11);
         let sent = unix_seconds(field_int(&msg, 5) as i64);
         let mut author = field_text(&msg, 9);
         let mut name = String::new();
@@ -1902,9 +1987,75 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             pieces,
             reactions,
             status,
+            wire,
+            phones: None,
         });
     }
     notes
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-transport`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub(super) fn prove_message_transport() -> Result<(), String> {
+    let mut sms = Buf::new();
+    sms.text(1, "sms-chat");
+    sms.text(2, "Sam");
+    sms.int(22, 1);
+    let mut sms_list = Buf::new();
+    sms_list.msg(2, &sms.0);
+    let sms_chat = decode_chats(&sms_list.0);
+    let sms_label = composer_label(sms_chat[0].carrier, sms_chat[0].phones);
+    if sms_label != "Text message" {
+        return Err(format!("an SMS chat was labelled {sms_label:?}"));
+    }
+
+    let mut rcs = Buf::new();
+    rcs.text(1, "rcs-chat");
+    rcs.text(2, "Rae");
+    rcs.int(22, 2);
+    let mut rcs_list = Buf::new();
+    rcs_list.msg(2, &rcs.0);
+    let rcs_chat = decode_chats(&rcs_list.0);
+    let mut status = Buf::new();
+    status.int(2, 216);
+    let mut tomb = Buf::new();
+    tomb.text(1, "tomb");
+    tomb.text(7, "rcs-chat");
+    tomb.msg(4, &status.0);
+    let mut wrap = Buf::new();
+    wrap.msg(1, &tomb.0);
+    let switched = decode_messages(&wrap.0);
+    if switched.first().and_then(|note| note.phones) != Some(true) {
+        return Err("the encrypted-RCS tombstone was dropped".into());
+    }
+    let rcs_label = composer_label(rcs_chat[0].carrier, true);
+    if !rcs_label.contains("RCS message") || !rcs_label.contains("Encrypted between phones") {
+        return Err(format!("an encrypted RCS chat was labelled {rcs_label:?}"));
+    }
+
+    let mut mms = Buf::new();
+    mms.text(1, "m-mms");
+    mms.text(7, "sms-chat");
+    mms.int(11, 2);
+    let mut mms_wrap = Buf::new();
+    mms_wrap.msg(1, &mms.0);
+    let mms_note = decode_messages(&mms_wrap.0);
+    if wire_tag(mms_note[0].wire, 1) != "MMS" {
+        return Err("an MMS inside an SMS chat had no MMS tag".into());
+    }
+    if !wire_tag(1, 1).is_empty() {
+        return Err("an SMS inside an SMS chat was tagged".into());
+    }
+    if shows_typing(1) || shows_receipts(1) {
+        return Err("an SMS chat still offers typing or read ticks".into());
+    }
+    if !shows_typing(2) || !shows_receipts(2) {
+        return Err("an RCS chat lost typing or read ticks".into());
+    }
+    if MMS_WARNING != "Sends as MMS; may be compressed" {
+        return Err("the file warning changed".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2019,5 +2170,20 @@ mod tests {
         answer.msg(1, &thumbnail("p-alan", &[]));
         answer.msg(1, &thumbnail("p-odd", b"<html>"));
         assert_eq!(decode_thumbnails(&answer.0), [("p-grace".to_owned(), jpeg.to_vec())]);
+    }
+
+    #[test]
+    fn a_chat_says_sms_or_rcs_and_a_tombstone_says_whether_the_phones_encrypt_it() {
+        prove_message_transport().unwrap();
+        let mut plain = Buf::new();
+        plain.text(1, "m-sms");
+        plain.text(7, "sms-chat");
+        plain.int(11, 1);
+        let mut wrap = Buf::new();
+        wrap.msg(1, &plain.0);
+        let note = decode_messages(&wrap.0);
+        assert_eq!(wire_tag(note[0].wire, 1), "");
+        assert_eq!(between_phones(200), None);
+        assert_eq!(between_phones(214), Some(false));
     }
 }

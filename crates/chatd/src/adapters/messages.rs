@@ -224,6 +224,12 @@ fn open(saved: &Saved) -> Result<Box<dyn Drive>, String> {
     }))
 }
 
+/// The lab sets `TINYCLIENT_PROVE=messages-transport`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_message_transport() -> Result<(), String> {
+    bugle::prove_message_transport()
+}
+
 pub fn reaction_rules() -> protocol::ReactionRules {
     protocol::ReactionRules {
         set: ReactionSet::Any,
@@ -253,6 +259,8 @@ struct Account {
     peers: Mutex<HashMap<String, String>>,
     /// Participants whose picture has been asked of the phone on this connection.
     pictured: Mutex<HashSet<String>>,
+    /// The last conversation update, so a send knows SMS from RCS.
+    chats: Mutex<HashMap<String, Chat>>,
 }
 
 pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<(), String> {
@@ -322,6 +330,7 @@ fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) 
         held: Mutex::default(),
         peers: Mutex::default(),
         pictured: Mutex::default(),
+        chats: Mutex::default(),
     });
     ctx.capabilities(Capabilities {
         max_file_bytes: 100 * 1024 * 1024,
@@ -382,12 +391,67 @@ fn row(chat: &Chat) -> ConversationRow {
     if !chat.group && !chat.mine.is_empty() {
         row.peer = Some(chat.id.clone());
     }
+    // The shell already draws this line. It is not `Encryption::EndToEnd`: those words would
+    // claim this computer checked the keys, and the paired browser is a separate hop.
+    row.topic = bugle::composer_label(chat.carrier, chat.phones);
     row
+}
+
+fn carrier_of(account: &Account, id: &str) -> u64 {
+    account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(id)
+        .map(|chat| chat.carrier)
+        .unwrap_or(0)
+}
+
+/// A conversation update does not clear encryption: the conversation message has no field for
+/// it. A tombstone is what turns it on or off.
+fn remember(account: &Account, incoming: &[Chat]) -> Vec<Chat> {
+    let mut held = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut kept = Vec::with_capacity(incoming.len());
+    for chat in incoming {
+        let mut chat = chat.clone();
+        if let Some(had) = held.get(&chat.id) {
+            chat.phones = chat.phones || had.phones;
+        }
+        held.insert(chat.id.clone(), chat.clone());
+        kept.push(chat);
+    }
+    kept
+}
+
+fn seal(account: &Account, conversation: &str, on: bool) {
+    let chat = {
+        let mut held = account
+            .chats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let chat = held.entry(conversation.to_owned()).or_insert_with(|| Chat {
+            id: conversation.to_owned(),
+            title: "Messages".into(),
+            group: false,
+            unread: false,
+            mine: String::new(),
+            peer: String::new(),
+            carrier: 0,
+            phones: false,
+        });
+        chat.phones = on;
+        chat.clone()
+    };
+    let _ = account.ctx.conversation(&row(&chat));
 }
 
 fn apply(account: &Account, event: Event) {
     match event {
         Event::Chats(chats) => {
+            let chats = remember(account, &chats);
             let mut people = Vec::new();
             {
                 let mut peers = account.peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -424,12 +488,13 @@ fn apply(account: &Account, event: Event) {
             }
         }
         Event::Message(note) => {
-            if account
-                .ctx
-                .known(&note.conversation)
-                .ok()
-                .flatten()
-                .is_none()
+            if note.phones.is_none()
+                && account
+                    .ctx
+                    .known(&note.conversation)
+                    .ok()
+                    .flatten()
+                    .is_none()
             {
                 let chat = Chat {
                     id: note.conversation.clone(),
@@ -438,13 +503,13 @@ fn apply(account: &Account, event: Event) {
                     unread: false,
                     mine: String::new(),
                     peer: String::new(),
+                    carrier: 0,
+                    phones: false,
                 };
-                let _ = account.ctx.conversation(&row(&chat));
+                let chat = remember(account, &[chat]);
+                let _ = account.ctx.conversation(&row(&chat[0]));
             }
-            let _ = account
-                .ctx
-                .message(&note.conversation, &message(account, &note));
-            receipt(account, &note.conversation, &note);
+            show(account, &note);
         }
         Event::Typing {
             conversation,
@@ -465,6 +530,21 @@ fn apply(account: &Account, event: Event) {
         }
         Event::Ready | Event::Closed(_) | Event::Ended(_) => {}
     }
+}
+
+fn show(account: &Account, note: &bugle::Note) {
+    if let Some(on) = note.phones {
+        seal(account, &note.conversation, on);
+        return;
+    }
+    let _ = account.ctx.message(&note.conversation, &message(account, note));
+    let tag = bugle::wire_tag(note.wire, carrier_of(account, &note.conversation));
+    if !tag.is_empty() {
+        let mut line = Message::plain(format!("{}:kind", note.id), String::new(), tag, note.sent, false);
+        line.kind = MessageKind::System;
+        let _ = account.ctx.history(&note.conversation, &[line]);
+    }
+    receipt(account, &note.conversation, note);
 }
 
 fn message(account: &Account, note: &bugle::Note) -> Message {
@@ -769,6 +849,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         } => {
             let outcome = match with.files.as_slice() {
                 [file] => {
+                    warn_mms(account, &conversation_id, &client_id);
                     let name = if file.name.is_empty() {
                         std::path::Path::new(&file.path)
                             .file_name()
@@ -831,7 +912,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Wanted(ids) => wanted(account, &ids),
         Command::Watch(watching) => pictures(account, &watching),
         Command::Typing(conversation_id) => {
-            let _ = account.drive.typing(&conversation_id);
+            if bugle::shows_typing(carrier_of(account, &conversation_id)) {
+                let _ = account.drive.typing(&conversation_id);
+            }
         }
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
         Command::Handoff { reply, .. } => {
@@ -845,6 +928,21 @@ fn serve(account: &Arc<Account>, command: Command) {
     }
 }
 
+fn warn_mms(account: &Account, conversation: &str, client_id: &str) {
+    if carrier_of(account, conversation) != 1 {
+        return;
+    }
+    let mut line = Message::plain(
+        format!("mms-warn-{client_id}"),
+        String::new(),
+        bugle::MMS_WARNING,
+        crate::hub::now(),
+        false,
+    );
+    line.kind = MessageKind::System;
+    let _ = account.ctx.history(conversation, &[line]);
+}
+
 fn outgoing(account: &Account, id: String, text: String) -> Message {
     let mut message = Message::plain(id, account.name.clone(), text, crate::hub::now(), true);
     message.sender.id = account.me.clone();
@@ -853,6 +951,9 @@ fn outgoing(account: &Account, id: String, text: String) -> Message {
 
 /// The second tick or the read mark, when the phone says one of my messages has it.
 fn receipt(account: &Account, conversation: &str, note: &bugle::Note) {
+    if !bugle::shows_receipts(carrier_of(account, conversation)) {
+        return;
+    }
     if !(note.outgoing || note.author == account.me) {
         return;
     }
@@ -867,8 +968,7 @@ fn backfill(account: &Account, conversation: &str) {
     match account.drive.history(conversation) {
         Ok(notes) => {
             for note in notes {
-                let _ = account.ctx.message(conversation, &message(account, &note));
-                receipt(account, conversation, &note);
+                show(account, &note);
             }
         }
         Err(why) => tracing::warn!("chatd: Messages: {why}"),
