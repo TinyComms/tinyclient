@@ -47,6 +47,18 @@
           <li><a href="networks.html">Networks &amp; terms</a></li>
           <li><a href="contributing.html" aria-current="page">Contributing</a></li>
       </ul>
+      <h2>Tiny server</h2>
+      <ul>
+          <li><a href="server/index.html">Overview</a></li>
+          <li><a href="server/join.html">Join &amp; use a server</a></li>
+          <li><a href="server/run.html">Run a server</a></li>
+          <li><a href="server/sign-in.html">Sign-in &amp; passkeys</a></li>
+          <li><a href="server/calls.html">Calls &amp; media</a></li>
+          <li><a href="server/manage.html">Manage a community</a></li>
+          <li><a href="server/operate.html">Operate &amp; upgrade</a></li>
+          <li><a href="server/encryption.html">End-to-end encryption</a></li>
+          <li><a href="server/privacy.html">Server privacy</a></li>
+      </ul>
       <h2 class="ext">On GitHub</h2>
       <ul class="ext">
           <li><a href="https://github.com/TinyComms/tinyclient/releases">Releases</a></li>
@@ -84,7 +96,7 @@
           <tr>
             <th scope="row">4. Talk</th>
             <td>A call in <code>mediad</code>, which runs only while the call does. Discord voice first, then one screen share each way. Slack huddles after a spike that is heard on a real huddle. Telegram 1:1 calls. Teams calls and meetings open in Teams.</td>
-            <td>Discord voice is in, audio only, with its end-to-end encryption. A <a href="../tinyserver.html">Tiny server</a> room joins with audio, and with one picture when the room allows video. That call is end-to-end encrypted when the server offers it. Echo cancellation, noise suppression and automatic gain default on. The camera sends on Windows only. Screen share sends on Windows, macOS and Linux X11. Slack huddles, Teams meetings, Telegram calls and Messages calls open in the official app. Discord video is not in.</td>
+            <td>Discord voice is in, audio only, with its end-to-end encryption. A <a href="../tinyserver.html">Tiny server</a> room joins with audio, and with one picture when the room allows video. That call is end-to-end encrypted when the server offers it. Echo cancellation, noise suppression and automatic gain default on. The camera and screen share send on Windows, macOS and Linux. Slack huddles, Teams meetings, Telegram calls and Messages calls open in the official app. Discord video is not in.</td>
           </tr>
           <tr>
             <th scope="row">5. Every network</th>
@@ -156,7 +168,7 @@
           </tr>
           <tr>
             <th scope="row">Tiny video on every desktop</th>
-            <td>A Tiny room already sends and shows one H.264 picture. Still open: a camera on macOS and Linux, and a screen share on Wayland. Screen share already sends on Windows, macOS and Linux X11. The camera already sends on Windows.</td>
+            <td>A Tiny room sends and shows one H.264 picture. The camera and screen share send on Windows, macOS and Linux.</td>
             <td><a href="https://github.com/TinyComms/tinyclient/blob/main/docs/product/06-calls.md"><code>06</code></a></td>
           </tr>
           <tr>
@@ -211,7 +223,7 @@ TINYCLIENT_DIR=/tmp/tinyclient-demo cargo run -p tinyclient --features gui</code
     <h2 id="license">License</h2>
     <p>The source is MIT. A <code>chatd</code> built with the default <code>signal</code> feature links AGPL-3.0 libraries and is distributed under the AGPL-3.0 as a combined work.</p>
 
-    <nav class="pager" aria-label="Previous and next"><a href="networks.html"><span>Previous</span>Networks &amp; terms</a></nav>
+    <nav class="pager" aria-label="Previous and next"><a href="networks.html"><span>Previous</span>Networks &amp; terms</a><a class="next" href="server/index.html"><span>Next</span>Tiny server</a></nav>
     <p class="edit"><a href="https://github.com/TinyComms/tinyclient/blob/main/site/docs/contributing.html">Edit this page on GitHub</a></p>
   </main>
 </div>

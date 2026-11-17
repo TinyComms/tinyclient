@@ -47,6 +47,18 @@
           <li><a href="networks.html">Networks &amp; terms</a></li>
           <li><a href="contributing.html">Contributing</a></li>
       </ul>
+      <h2>Tiny server</h2>
+      <ul>
+          <li><a href="server/index.html">Overview</a></li>
+          <li><a href="server/join.html">Join &amp; use a server</a></li>
+          <li><a href="server/run.html">Run a server</a></li>
+          <li><a href="server/sign-in.html">Sign-in &amp; passkeys</a></li>
+          <li><a href="server/calls.html">Calls &amp; media</a></li>
+          <li><a href="server/manage.html">Manage a community</a></li>
+          <li><a href="server/operate.html">Operate &amp; upgrade</a></li>
+          <li><a href="server/encryption.html">End-to-end encryption</a></li>
+          <li><a href="server/privacy.html">Server privacy</a></li>
+      </ul>
       <h2 class="ext">On GitHub</h2>
       <ul class="ext">
           <li><a href="https://github.com/TinyComms/tinyclient/releases">Releases</a></li>
@@ -130,7 +142,7 @@
 
     <h2 id="calls">Calls</h2>
     <p>A call on Discord starts <code>mediad</code>, which connects to Discord&rsquo;s voice servers itself, runs Discord&rsquo;s end-to-end encryption (DAVE, through <code>davey</code> on OpenMLS) and encodes with Opus (libopus 1.3.1 transpiled to Rust, so no C toolchain). Every way a call can fail ends the same way: the reason stays on screen until dismissed, <code>mediad</code> is gone, and the network is told we left.</p>
-    <p>A call on a Tiny server is WebRTC to the server&rsquo;s own SFU, through <a href="https://github.com/algesten/str0m">str0m</a> in pure Rust: one audio stream out, one in for each other person, over UDP, or ICE-TCP on the same port where UDP is blocked. When the server offers <code>e2ee_calls</code> and every app in the call can do it, the client seals Opus and the one H.264 picture in an MLS group and leaves the one-byte NAL header clear. The server forwards that payload and does not seal video. Otherwise the call says encrypted to the server. A room that allows video shows one picture: a screen share, or one other person&rsquo;s camera. The camera sends on Windows only. Screen share sends on Windows, macOS and Linux X11. Echo cancellation, noise suppression and automatic gain come from <a href="https://crates.io/crates/sonora">sonora</a>, a pure-Rust port of WebRTC&rsquo;s audio processing, and default on. Discord voice stays audio only. Stage channels, Slack huddles, Teams meetings, Telegram calls and Messages calls open in that network&rsquo;s own app.</p>
+    <p>A call on a Tiny server is WebRTC to the server&rsquo;s own SFU, through <a href="https://github.com/algesten/str0m">str0m</a> in pure Rust: one audio stream out, one in for each other person, over UDP, or ICE-TCP on the same port where UDP is blocked. When the server offers <code>e2ee_calls</code> and every app in the call can do it, the client seals Opus and the one H.264 picture in an MLS group and leaves the one-byte NAL header clear. The server forwards that payload and does not seal video. Otherwise the call says encrypted to the server. A room that allows video shows one picture: a screen share, or one other person&rsquo;s camera. The camera and screen share send on Windows, macOS and Linux. Echo cancellation, noise suppression and automatic gain come from <a href="https://crates.io/crates/sonora">sonora</a>, a pure-Rust port of WebRTC&rsquo;s audio processing, and default on. Discord voice stays audio only. Stage channels, Slack huddles, Teams meetings, Telegram calls and Messages calls open in that network&rsquo;s own app.</p>
 
     <h2 id="sizes">Sizes</h2>
     <div class="table-wrap" tabindex="0" role="region" aria-label="Binary sizes and memory">

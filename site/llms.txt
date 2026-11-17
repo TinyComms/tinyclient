@@ -14,6 +14,15 @@ tinyclient runs on the person's computer. chatd keeps messages on disk and sessi
 - [Privacy and security](https://tinyclient.io/docs/privacy.html): what is stored, which connections are made, and what the app never does
 - [Networks and terms](https://tinyclient.io/docs/networks.html): Slack, Discord, Telegram, Teams, Signal, Messages, and a Tiny server, including what is not built yet
 - [Contributing](https://tinyclient.io/docs/contributing.html): roadmap and the rules every change keeps
+- [Tiny server docs](https://tinyclient.io/docs/server/): what a Tiny server is, what works today, and where to start
+- [Join and use a server](https://tinyclient.io/docs/server/join.html): invites, passkey sign-in, recovery codes, and what the server can see
+- [Run a server](https://tinyclient.io/docs/server/run.html): Docker Compose, the environment file, the first owner, and your own reverse proxy
+- [Sign-in and passkeys](https://tinyclient.io/docs/server/sign-in.html): built-in passkeys, passkey links, OpenID Connect providers, and sessions
+- [Calls and media](https://tinyclient.io/docs/server/calls.html): voice rooms, one picture, the media port, and tuning a host for calls
+- [Manage a community](https://tinyclient.io/docs/server/manage.html): first-run setup, roles and permissions, invites, moderation, uploads, and bots
+- [Operate and upgrade](https://tinyclient.io/docs/server/operate.html): upgrades, backups, suspension, logs, and every optional setting
+- [End-to-end encryption](https://tinyclient.io/docs/server/encryption.html): what the server cannot read in calls and text, and the limits
+- [Server privacy and security](https://tinyclient.io/docs/server/privacy.html): what a server stores, what its operator can read, retention, and remaining risks
 - [Tiny server](https://tinyclient.io/tinyserver): a self-hosted server for one community: text channels, direct messages, voice rooms, one picture, roles and moderation, and how to run one. A call is end-to-end encrypted when that server offers it.
 
 ## Downloads

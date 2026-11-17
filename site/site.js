@@ -246,7 +246,16 @@ function registerSiteTools() {
     { path: "/docs/privacy.html", title: "Privacy and security", about: "What tinyclient stores, which connections it makes, and what it never does." },
     { path: "/docs/networks.html", title: "Networks and terms", about: "Support on Slack, Discord, Telegram, Teams, Signal, Android Messages and a Tiny server." },
     { path: "/docs/contributing.html", title: "Contributing", about: "Roadmap and the rules every change keeps." },
-    { path: "/tinyserver", title: "Tiny server", about: "A self-hosted server for one community: text, voice, one picture, and how to run one." }
+    { path: "/tinyserver", title: "Tiny server", about: "A self-hosted server for one community: text, voice, one picture, and how to run one." },
+    { path: "/docs/server/", title: "Tiny server docs", about: "What a Tiny server is, what works today, and where to start." },
+    { path: "/docs/server/join.html", title: "Join and use a server", about: "Invites, passkey sign-in, recovery codes, and what the server can see." },
+    { path: "/docs/server/run.html", title: "Run a server", about: "Docker Compose, the environment file, the first owner, and your own reverse proxy." },
+    { path: "/docs/server/sign-in.html", title: "Sign-in and passkeys", about: "Built-in passkeys, passkey links, OpenID Connect providers, and sessions." },
+    { path: "/docs/server/calls.html", title: "Calls and media", about: "Voice rooms, one picture, the media port, and tuning a host for calls." },
+    { path: "/docs/server/manage.html", title: "Manage a community", about: "First-run setup, roles and permissions, invites, moderation, uploads, and bots." },
+    { path: "/docs/server/operate.html", title: "Operate and upgrade", about: "Upgrades, backups, suspension, logs, and every optional setting." },
+    { path: "/docs/server/encryption.html", title: "End-to-end encryption", about: "What the server cannot read in calls and text, and the limits." },
+    { path: "/docs/server/privacy.html", title: "Server privacy and security", about: "What a server stores, what its operator can read, retention, and remaining risks." }
   ];
 
   var tools = [

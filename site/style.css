@@ -976,7 +976,7 @@ caption {
 }
 
 .docs-nav { font-size: 14px; }
-.docs-nav-inner { position: sticky; top: 92px; }
+.docs-nav-inner { position: sticky; top: 92px; max-height: calc(100vh - 108px); overflow-y: auto; }
 .docs-nav h2 {
   font-size: 12px;
   font-weight: 600;
@@ -996,7 +996,7 @@ caption {
 
 @media (max-width: 860px) {
   .docs { grid-template-columns: minmax(0, 1fr); gap: 0; padding-top: 24px; }
-  .docs-nav-inner { position: static; }
+  .docs-nav-inner { position: static; max-height: none; overflow: visible; }
   .docs-nav ul { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
   .docs-nav a { border: 1px solid var(--line); }
   .docs-nav h2 { margin-left: 0; }

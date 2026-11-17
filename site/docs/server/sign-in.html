@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Sign-in and passkeys · Tiny server docs</title>
+<meta name="description" content="How people sign in to a Tiny server: built-in passkeys, recovery codes, passkey links, OpenID Connect providers, and sessions.">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://tinyclient.io/docs/server/sign-in.html">
+<link rel="ai-catalog" href="/.well-known/ai-catalog.json">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../../style.css">
+<script src="../../site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../" aria-label="tinyclient home"><img src="../../favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="../" aria-current="page">Docs</a>
+      <a href="../../tinyserver.html">Tiny server</a>
+      <a class="hide-sm" href="../privacy.html">Privacy</a>
+      <a class="dc" href="https://discord.gg/kJHK7BNvJP" aria-label="Discord"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
+      <a class="gh" href="https://github.com/TinyComms/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    <div class="docs-nav-inner">
+      <h2>Documentation</h2>
+      <ul>
+          <li><a href="../index.html">Getting started</a></li>
+          <li><a href="../using.html">Using tinyclient</a></li>
+          <li><a href="../build.html">Build from source</a></li>
+          <li><a href="../architecture.html">Architecture</a></li>
+          <li><a href="../performance.html">Size &amp; performance</a></li>
+          <li><a href="../privacy.html">Privacy &amp; security</a></li>
+          <li><a href="../networks.html">Networks &amp; terms</a></li>
+          <li><a href="../contributing.html">Contributing</a></li>
+      </ul>
+      <h2>Tiny server</h2>
+      <ul>
+          <li><a href="index.html">Overview</a></li>
+          <li><a href="join.html">Join &amp; use a server</a></li>
+          <li><a href="run.html">Run a server</a></li>
+          <li><a href="sign-in.html" aria-current="page">Sign-in &amp; passkeys</a></li>
+          <li><a href="calls.html">Calls &amp; media</a></li>
+          <li><a href="manage.html">Manage a community</a></li>
+          <li><a href="operate.html">Operate &amp; upgrade</a></li>
+          <li><a href="encryption.html">End-to-end encryption</a></li>
+          <li><a href="privacy.html">Server privacy</a></li>
+      </ul>
+      <h2 class="ext">On GitHub</h2>
+      <ul class="ext">
+          <li><a href="https://github.com/TinyComms/tinyserver">tinyserver source</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/blob/main/deploy/README.md">Deployment reference</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/tree/main/docs">Design documents</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main" class="prose">
+    <h1>Sign-in and passkeys</h1>
+    <p class="lede">The server keeps no passwords. People sign in with a passkey the server checks itself, through an OpenID Connect provider, or either, as the owner chooses.</p>
+
+    <h2 id="how">How sign-in works</h2>
+    <p>tinyclient never sees a password and never picks a provider. It asks the server to start a sign-in, opens the address it gets back in the person&rsquo;s own browser, and listens on the loopback address of that computer for a one-time code. The code lasts 60 seconds and works once. tinyclient trades it for a session.</p>
+    <p>Signing in proves who someone is to the server. It never grants decryption: the keys for <a href="encryption.html">end-to-end encrypted</a> conversations belong to devices.</p>
+
+    <h2 id="choice">The owner&rsquo;s choice</h2>
+    <p>Passkeys are always on in the server. What the community accepts is the owner&rsquo;s choice, made in tinyclient at <strong>Server Settings &rsaquo; Privacy</strong>. It takes effect at once, with no restart.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Sign-in choices">
+      <table>
+        <thead><tr><th scope="col">Choice</th><th scope="col">What opens at sign-in</th><th scope="col">Who can get in</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Through Pocket ID only (the default)</th><td>The provider&rsquo;s sign-in page</td><td>Provider accounts. Passkeys already made stay stored and are not offered.</td></tr>
+          <tr><th scope="row">Passkeys, or through Pocket ID</th><td>The server&rsquo;s passkey page, with a link to the provider</td><td>Both</td></tr>
+          <tr><th scope="row">Passkeys only</th><td>The server&rsquo;s passkey page</td><td>Passkeys</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The choices carry the provider&rsquo;s name, Pocket ID unless you set another. A server with no provider configured is always passkeys only, whatever is stored.</p>
+    <p>Sessions already open carry on until they expire or the person signs out. A switch to one sign-in only is refused unless the owner has that sign-in themself, so the owner cannot lock themself out. If other members lack it, the app says how many and offers <strong>Switch anyway</strong>: they stay members and cannot sign in again until the owner gives them a <a href="#claim">passkey link</a>.</p>
+    <div class="callout warn">
+      <p><strong>Adding a provider to a passkey-only server.</strong> Once a provider is configured the stored choice applies at once, and it starts at <em>Through Pocket ID only</em>, which shuts out every member whose only sign-in is a passkey. Choose <em>Passkeys, or through Pocket ID</em> before you add one. The server logs a warning at start when the stored choice would leave members without a way in.</p>
+    </div>
+
+    <h2 id="passkeys">Passkeys</h2>
+    <p>A passkey is a key pair made on a person&rsquo;s device. The device keeps the private half; the server keeps the public half and a counter. Signing in is the device signing a fresh challenge. There is no password to steal or reuse.</p>
+    <p>The pages are served by the community&rsquo;s own server, at <code>TINYSERVER_PUBLIC_URL</code>. They carry one fixed script that talks only to that server and load nothing from anywhere else. They are not part of tinyclient.io.</p>
+    <ul>
+      <li><strong>Sign up</strong> needs an invite. The person types the name others will see, makes a passkey, and is shown 10 recovery codes before they continue. A failed attempt spends nothing, the invite included.</li>
+      <li><strong>Sign in</strong> asks for no username. The browser offers the passkeys it holds for the site.</li>
+      <li><strong>A lost passkey:</strong> a recovery code lets the person make a new passkey and sign in. The code is used up at that moment.</li>
+      <li><strong>Another device</strong> is one more passkey on the same account. In tinyclient, <strong>Server Settings &rsaquo; Sign-in &rsaquo; Add a passkey</strong> makes a link, good for an hour and for one use; opening it on the other device makes a passkey there.</li>
+      <li><strong>Managing them:</strong> the same page lists a person&rsquo;s passkeys, removes one, and makes a new set of recovery codes. Each of those needs a sign-in within the last 10 minutes, so a stolen old session cannot plant a passkey of its own. The last passkey can be removed only while a recovery code is left.</li>
+      <li><strong>A passkey that looks copied</strong>, one whose counter did not go up, is refused and turned off until its owner removes it. Passkeys that sync keep the counter at zero and are not subject to this.</li>
+    </ul>
+    <div class="callout danger">
+      <p><strong>When everything is lost.</strong> If a person loses every passkey and every recovery code, the account cannot be signed in to again. The server holds nothing that proves who they are: no email, no phone number. The owner can invite them again as a new account; their old messages stay with the old one. Tell your members before they depend on it.</p>
+    </div>
+
+    <h3 id="stored">What the server stores for a passkey</h3>
+    <p>For each passkey: its credential id, the public key and counter, whether the platform may sync it, a label, when it was made and when it was last used. For each account: the display name typed at sign-up, a random id, and the recovery codes as hashes.</p>
+    <p>Not stored for a passkey, in any table or log: an IP address, a user agent, an email address, a phone number, or a device model. A test fails if a column named for one of those is added.</p>
+
+    <h2 id="relying-party">The hostname is permanent</h2>
+    <p>A passkey works only for the site it was made for. By default that is the host of <code>TINYSERVER_PUBLIC_URL</code>, such as <code>chat.example.org</code>. If the community later moves to another host, every passkey stops working, and everyone needs a recovery code or a new passkey link.</p>
+    <p>If you may ever move between subdomains, set <code>TINYSERVER_PASSKEY_RP_ID</code> to the domain above them, such as <code>example.org</code>, <strong>before anyone makes a passkey</strong>. The cost: any site under that domain can then ask the browser for these passkeys, so a taken-over subdomain becomes a place to phish them. The default, the exact host, is the safer choice.</p>
+
+    <h2 id="claim">Passkey links</h2>
+    <p>A passkey link, called a claim link in the server&rsquo;s documents, lets one existing member make a passkey for their account. The owner makes them at <strong>Server Settings &rsaquo; Privacy</strong>, where the page also shows who has a passkey and who does not.</p>
+    <ul>
+      <li>Each link works once, for that member only, and expires after 14 days unless you choose 1 to 90.</li>
+      <li>A new link for a person replaces their old one.</li>
+      <li>The app shows each link once. The server keeps only a hash.</li>
+      <li>The token sits after the <code>#</code>, which a browser never sends, so it is in no server or proxy log.</li>
+    </ul>
+    <p>Send each person only their own link, by a way you trust. Anyone who holds an unused link can set up a passkey on that account, so treat one like a password reset.</p>
+
+    <h2 id="move">Moving a community from Pocket ID to passkeys</h2>
+    <p>A member&rsquo;s account does not change in the move. They keep their id, name, roles, messages and device keys; the move adds a passkey to the same account. Pocket ID&rsquo;s own passkeys cannot be carried over, because they belong to Pocket ID&rsquo;s hostname, so everyone makes a new one.</p>
+    <ol>
+      <li>Back up the database and the uploads, and check the backup.</li>
+      <li>Update the server. Sign-in does not change yet.</li>
+      <li>Add your own passkey: <strong>Server Settings &rsaquo; Sign-in &rsaquo; Add a passkey</strong>.</li>
+      <li>Choose <em>Passkeys, or through Pocket ID</em>. Then sign in with your passkey in every browser your members use, on a phone and on a computer, before you send anyone a link.</li>
+      <li>Make and send the passkey links.</li>
+      <li>Watch the counts on the same page, and send new links as needed.</li>
+      <li>Choose <em>Passkeys only</em>.</li>
+      <li>Check: sign in with a passkey, then make an invite and sign up a test account with it.</li>
+      <li id="passkey-only">Optional, from a shell: remove the Pocket ID identities of members who have a passkey, then stop Pocket ID with <code>docker compose -f compose.yml -f compose.passkey.yml up -d</code>. The auth hostname is then no longer needed.</li>
+    </ol>
+    <p>Until the last step, going back is one choice in the app. The <a href="https://github.com/TinyComms/tinyserver/blob/main/docs/auth-passkeys.md#8-moving-a-community-from-pocket-id">full runbook</a> has the exact commands, the shell alternatives, and how to go back after the last step. Rehearse it on a restored backup first.</p>
+    <div class="callout warn">
+      <p><strong>Test it in your browsers.</strong> The passkey pages are tested against a software authenticator, not a real browser, and the sign-in code has had no independent security review. Try every browser your members use, on your own hostname, before you move anyone.</p>
+    </div>
+
+    <h2 id="providers">Other providers</h2>
+    <p>Any OpenID Connect provider with discovery, the authorization code flow and a confidential client works: Authentik, Keycloak, Zitadel, Google and others. Register the redirect address <code>${TINYSERVER_PUBLIC_URL}/v1/auth/callback</code>.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Provider settings">
+      <table>
+        <thead><tr><th scope="col">Variable</th><th scope="col">Meaning</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>TINYSERVER_OIDC_ISSUER</code></th><td>The issuer. Discovery is read from it, and it must match exactly.</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_OIDC_CLIENT_ID</code></th><td>The client id</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_OIDC_CLIENT_SECRET_FILE</code></th><td>The secret. Or <code>TINYSERVER_OIDC_PRIVATE_KEY_FILE</code> for <code>private_key_jwt</code>; not both.</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_OIDC_SCOPES</code></th><td><code>openid profile email</code> unless set</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_OIDC_PROVIDER_NAME</code></th><td>Shown in tinyclient. The issuer&rsquo;s host unless set.</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_OIDC_INTERNAL_URL</code></th><td>Where the server reaches the provider, when not at the issuer</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_OIDC_MEMBER_GROUPS</code></th><td>Comma list. Someone in one of these groups joins without an invite. Unset is invite only.</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_OIDC_ADMIN_GROUPS</code></th><td>Comma list. A member in one of these gets the admin role when they sign in. Leaving the group does not take it away. No group makes an owner.</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_OIDC_GROUPS_CLAIM</code></th><td>The token claim with the person&rsquo;s groups. <code>groups</code> unless set.</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_OIDC_SIGNUP</code></th><td><code>pocket-id</code> lets an invite make the person&rsquo;s account at Pocket ID. Unset or <code>none</code> for every other provider.</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_OIDC_PROVIDERS</code></th><td>Several providers at once, such as <code>pocket-id,google</code>. The first is the default. Each then has its own variables, such as <code>TINYSERVER_OIDC_GOOGLE_ISSUER</code>.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>A person is the pair of issuer and subject, so the same person at two providers is two accounts. Email never links accounts. A provider that supports OpenID Connect Back-Channel Logout can end the sessions it started; register <code>${TINYSERVER_PUBLIC_URL}/v1/auth/backchannel-logout</code>.</p>
+    <p><a href="https://github.com/TinyComms/tinyserver/blob/main/deploy/README.md#other-providers"><code>deploy/README.md</code></a> has the Pocket ID setup, the rest of the variables, and how an invite makes a Pocket ID account.</p>
+
+    <h2 id="sessions">Sessions</h2>
+    <ul>
+      <li>A session lasts <code>TINYSERVER_SESSION_MAX_DAYS</code>, 30 unless set, 1 to 365. Nothing extends it; tinyclient then signs in again.</li>
+      <li>The database stores only the SHA-256 of the session token, with no address, user agent or device name.</li>
+      <li>Signing out in tinyclient ends that session. <strong>Sign out everywhere</strong> ends all of that person&rsquo;s sessions.</li>
+      <li>A kick or a ban ends every session the person has.</li>
+      <li>A session token is not tied to a device or an address. A stolen one works until it is ended or expires.</li>
+    </ul>
+
+    <h2 id="limits">Rate limits</h2>
+    <p>Starting a sign-in and trading its code allow 5 tries a minute per address. The passkey routes allow 30 posts a minute per address; recovery codes and passkey links allow 8. The address is the connection&rsquo;s, or the header your proxy sets when the proxy is trusted. It is kept as a keyed hash in memory for a minute and is not written anywhere. <a href="run.html#proxy">Behind your own proxy</a>, set that header, or every member shares one allowance.</p>
+
+    <h2 id="operator">What an operator can do</h2>
+    <p>Someone with access to the database can make a session for any account, read who is a member, and delete or ban anyone. Passkeys do not defend against the person who runs the server; nothing that signs people in to a server can. What they give is that nobody else learns a secret that signs them in as a member, and that a leaked database hands over no passwords. <a href="privacy.html">Server privacy and security</a> has the rest.</p>
+
+    <nav class="pager" aria-label="Previous and next"><a href="run.html"><span>Previous</span>Run a server</a><a class="next" href="calls.html"><span>Next</span>Calls &amp; media</a></nav>
+    <p class="edit"><a href="https://github.com/TinyComms/tinyclient/blob/main/site/docs/server/sign-in.html">Edit this page on GitHub</a></p>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft, Signal or Google; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. Cloudflare Pages hosts it and can see your request the way any web server can.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

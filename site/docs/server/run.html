@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Run a server · Tiny server docs</title>
+<meta name="description" content="Run tinyserver with Docker Compose: the environment file, hostnames, the first owner, a health check, and your own reverse proxy.">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://tinyclient.io/docs/server/run.html">
+<link rel="ai-catalog" href="/.well-known/ai-catalog.json">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../../style.css">
+<script src="../../site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../" aria-label="tinyclient home"><img src="../../favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="../" aria-current="page">Docs</a>
+      <a href="../../tinyserver.html">Tiny server</a>
+      <a class="hide-sm" href="../privacy.html">Privacy</a>
+      <a class="dc" href="https://discord.gg/kJHK7BNvJP" aria-label="Discord"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
+      <a class="gh" href="https://github.com/TinyComms/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    <div class="docs-nav-inner">
+      <h2>Documentation</h2>
+      <ul>
+          <li><a href="../index.html">Getting started</a></li>
+          <li><a href="../using.html">Using tinyclient</a></li>
+          <li><a href="../build.html">Build from source</a></li>
+          <li><a href="../architecture.html">Architecture</a></li>
+          <li><a href="../performance.html">Size &amp; performance</a></li>
+          <li><a href="../privacy.html">Privacy &amp; security</a></li>
+          <li><a href="../networks.html">Networks &amp; terms</a></li>
+          <li><a href="../contributing.html">Contributing</a></li>
+      </ul>
+      <h2>Tiny server</h2>
+      <ul>
+          <li><a href="index.html">Overview</a></li>
+          <li><a href="join.html">Join &amp; use a server</a></li>
+          <li><a href="run.html" aria-current="page">Run a server</a></li>
+          <li><a href="sign-in.html">Sign-in &amp; passkeys</a></li>
+          <li><a href="calls.html">Calls &amp; media</a></li>
+          <li><a href="manage.html">Manage a community</a></li>
+          <li><a href="operate.html">Operate &amp; upgrade</a></li>
+          <li><a href="encryption.html">End-to-end encryption</a></li>
+          <li><a href="privacy.html">Server privacy</a></li>
+      </ul>
+      <h2 class="ext">On GitHub</h2>
+      <ul class="ext">
+          <li><a href="https://github.com/TinyComms/tinyserver">tinyserver source</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/blob/main/deploy/README.md">Deployment reference</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/tree/main/docs">Design documents</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main" class="prose">
+    <h1>Run a server</h1>
+    <p class="lede">One Docker Compose file runs one community: the server, Postgres, a file scanner, and a tunnel that carries the web traffic.</p>
+
+    <p>The files are in <a href="https://github.com/TinyComms/tinyserver/tree/main/deploy"><code>deploy/</code></a> of the tinyserver repository. This page follows <a href="https://github.com/TinyComms/tinyserver/blob/main/deploy/README.md"><code>deploy/README.md</code></a>, which stays the reference when the two differ.</p>
+
+    <h2 id="need">What you need</h2>
+    <ul>
+      <li>A Linux host with Docker and Docker Compose. The <a href="sign-in.html#passkey-only">passkey-only file</a> needs Compose 2.24.4 or later.</li>
+      <li>A hostname you control, such as <code>chat.example.org</code>, served over https. Passkeys are bound to that hostname, so it cannot be an IP address and <a href="sign-in.html#relying-party">should not change later</a>.</li>
+      <li>For calls: one port, UDP and TCP, that members can reach directly on a public IPv4 address. Without it the server runs and calls have no audio or video. <a href="calls.html#port">Calls and media</a> has the steps.</li>
+      <li>Memory for the default caps: 1 GiB for the server, 1 GiB for Postgres and 3 GiB for the scanner. They are caps, not reservations. <a href="operate.html#limits">Raise or lower them</a> in the environment file.</li>
+    </ul>
+
+    <h2 id="stack">What the compose file runs</h2>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Services in the compose file">
+      <table>
+        <thead><tr><th scope="col">Service</th><th scope="col">What it does</th><th scope="col">Reachable from</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>tinyserver</code></th><td>The HTTP API, the live socket, the sign-in pages and the call server (SFU)</td><td>Port 8080 inside the network only. The media port is the one port published on the host.</td></tr>
+          <tr><th scope="row"><code>tinyserver-init</code></th><td>Runs before the server on every start: migrates the database and, while there is no owner, writes the owner invite. It is the only container with the database owner password.</td><td>Nothing</td></tr>
+          <tr><th scope="row"><code>postgres</code></th><td>The database</td><td>The internal network, which has no route to the internet</td></tr>
+          <tr><th scope="row"><code>clamd</code></th><td>Scans uploads before anyone can fetch them</td><td>The server only. It has a route out for signature updates.</td></tr>
+          <tr><th scope="row"><code>pocket-id</code></th><td>An OpenID Connect provider where people sign in with passkeys. Optional: the server also <a href="sign-in.html">signs people in with its own passkeys</a>.</td><td>The tunnel, on a second hostname</td></tr>
+          <tr><th scope="row"><code>tunnel</code></th><td>cloudflared. Carries https and the live socket to the server, so no web port is opened on the host. <a href="#proxy">Use your own proxy instead</a> if you prefer.</td><td>Makes an outbound connection to Cloudflare</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="env">The environment file</h2>
+<div class="code"><pre><code>git clone https://github.com/TinyComms/tinyserver
+cd tinyserver/deploy
+cp .env.example .env</code></pre></div>
+    <p>Compose refuses to start while one of these seven is empty. Keep <code>.env</code> and <code>deploy/secrets</code> to yourself; neither is committed.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Required settings">
+      <table>
+        <thead><tr><th scope="col">Variable</th><th scope="col">What it is</th><th scope="col">Make it with</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>POSTGRES_PASSWORD</code></th><td>The Postgres superuser. Only the postgres container has it.</td><td><code>openssl rand -hex 24</code></td></tr>
+          <tr><th scope="row"><code>APP_OWNER_PASSWORD</code></th><td>The role that owns the schema and migrates it</td><td><code>openssl rand -hex 24</code></td></tr>
+          <tr><th scope="row"><code>APP_RUNTIME_PASSWORD</code></th><td>The role the server runs as. Letters and digits only: it goes into a database URL.</td><td><code>openssl rand -hex 24</code></td></tr>
+          <tr><th scope="row"><code>TINYSERVER_MEDIA_HMAC_SECRET</code></th><td>Signs attachment links. 64 hex characters.</td><td><code>openssl rand -hex 32</code></td></tr>
+          <tr><th scope="row"><code>TINYSERVER_PUBLIC_URL</code></th><td>The address people type into tinyclient, such as <code>https://chat.example.org</code>. A hostname, no path, no trailing slash.</td><td></td></tr>
+          <tr><th scope="row"><code>AUTH_PUBLIC_URL</code></th><td>Pocket ID&rsquo;s address and issuer, such as <code>https://auth.example.org</code>. Keep it set even after Pocket ID is retired: compose still reads it.</td><td></td></tr>
+          <tr><th scope="row"><code>TUNNEL_TOKEN</code></th><td>The Cloudflare tunnel&rsquo;s token. With your own proxy, write <code>unused</code>.</td><td>Cloudflare shows it when you create the tunnel</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The optional settings are listed in <a href="operate.html#settings">Operate and upgrade</a>. The <code>.env.example</code> at the top of the repository is for a local checkout, not for this stack.</p>
+
+    <h2 id="hostnames">Two hostnames</h2>
+    <p>Add both as public hostnames on the tunnel in Cloudflare:</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Tunnel hostnames">
+      <table>
+        <thead><tr><th scope="col">Hostname</th><th scope="col">Tunnel sends it to</th><th scope="col">Used for</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>TINYSERVER_PUBLIC_URL</code></th><td><code>http://tinyserver:8080</code></td><td>Chat, the live socket, and the server&rsquo;s own passkey pages</td></tr>
+          <tr><th scope="row"><code>AUTH_PUBLIC_URL</code></th><td><code>http://pocket-id:1411</code></td><td>Pocket ID&rsquo;s pages. Not needed on a <a href="sign-in.html#passkey-only">passkey-only server</a>.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The issuer is <code>AUTH_PUBLIC_URL</code> exactly, with no trailing slash and no path, because that is what Pocket ID puts in its tokens.</p>
+
+    <h2 id="start">Start it</h2>
+<div class="code"><pre><code>sh pocket-id/setup.sh moss  <span class="c"># moss is the first Pocket ID admin's username</span>
+docker compose up -d</code></pre></div>
+    <p><code>setup.sh</code> writes three secrets to <code>deploy/secrets</code>, starts Pocket ID, registers the server as its OpenID Connect client, and prints a one-time login link for that admin, good for an hour. Run it again at any time; every step is skipped when already done.</p>
+    <p>To run the image CI published for a commit instead of building on the host, see <a href="operate.html#image">Running a published image</a>.</p>
+
+    <h2 id="owner">The first owner</h2>
+    <p>There is no owner password. While the community has no owner, <code>tinyserver-init</code> writes a single-use owner invite, good for 24 hours, to a file. The log names the file and never holds the invite.</p>
+<div class="code"><pre><code>docker compose exec tinyserver cat /bootstrap/owner-invite</code></pre></div>
+    <p>The file holds a <code>https://tinyclient.io/invite#&hellip;</code> link and a <code>tc1.</code> code. In tinyclient, choose <strong>Join a server</strong>, paste the code and sign in. Whoever does that is the owner. After an owner exists, the file is removed on the next start.</p>
+    <p>Lost it, or it expired? Make a new one. The old one stops working.</p>
+<div class="code"><pre><code>docker compose run --rm --entrypoint tinyserver tinyserver-init bootstrap --owner-invite</code></pre></div>
+    <p>The first time the owner opens the server, tinyclient asks what the community keeps about its members. <a href="manage.html#setup">First-run setup</a> describes the three choices.</p>
+
+    <h2 id="check">Check it</h2>
+    <p>Open <code>/health</code> on the chat hostname. Port 8080 is not published on the host, so go through the tunnel or your proxy.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Fields of the health response">
+      <table>
+        <thead><tr><th scope="col">Field</th><th scope="col">Meaning</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>ok</code></th><td><code>true</code> when the schema is there and media is not <code>down</code></td></tr>
+          <tr><th scope="row"><code>schema</code></th><td><code>ready</code> or <code>missing</code></td></tr>
+          <tr><th scope="row"><code>media</code></th><td><code>off</code> (no public address set), <code>up</code>, or <code>down</code></td></tr>
+          <tr><th scope="row"><code>transports</code></th><td>While media is up: <code>udp</code> and <code>tcp</code>, plus <code>lan</code> when a LAN address is set</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="proxy">Without Cloudflare</h2>
+    <p>Nothing in tinyserver needs Cloudflare. It is a plain HTTP server on port 8080 inside its container. <code>compose.proxy.yml</code> turns cloudflared off and publishes port 8080 on the host&rsquo;s loopback for your own proxy:</p>
+<div class="code"><pre><code>docker compose -f compose.yml -f compose.proxy.yml up -d</code></pre></div>
+    <p>Put <code>TUNNEL_TOKEN=unused</code> in <code>.env</code>. Your front end must do three things:</p>
+    <ol>
+      <li><strong>End TLS</strong> for the hostname in <code>TINYSERVER_PUBLIC_URL</code>. tinyserver does not do TLS itself, and browsers refuse passkeys on plain http.</li>
+      <li><strong>Pass WebSockets.</strong> The live socket is <code>/v1/live</code>. Leave idle connections open.</li>
+      <li><strong>Set one header to the client&rsquo;s address</strong>, replacing whatever the client sent, and name it in <code>TINYSERVER_CLIENT_IP_HEADER</code>. It keys the sign-in rate limits. Without it every member shares the proxy&rsquo;s one allowance. The server believes the header only from a proxy on a private or loopback address; list a proxy with a public address in <code>TINYSERVER_TRUSTED_PROXIES</code>.</li>
+    </ol>
+    <p>Caddy on the host, which gets the certificate itself, with <code>TINYSERVER_CLIENT_IP_HEADER=x-real-ip</code>:</p>
+<div class="code"><pre><code>chat.example.org {
+    reverse_proxy 127.0.0.1:8080 {
+        header_up X-Real-IP {remote_host}
+    }
+}</code></pre></div>
+    <p>nginx, in a <code>server</code> block that already ends TLS, with the same setting:</p>
+<div class="code"><pre><code>location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_read_timeout 3600s;
+}</code></pre></div>
+    <p>Another tunnel works the same way: it needs a hostname, TLS, WebSockets and a header with the client&rsquo;s address. A proxy or tunnel carries the web pages and chat, not call audio; calls still need <a href="calls.html#port">their own port</a>.</p>
+    <div class="callout warn">
+      <p><strong>Not tested by the project.</strong> These proxy settings were written from each proxy&rsquo;s documentation and checked only as far as compose accepting the files and the server reading the header. Run a sign-in through yours, and look for &ldquo;rate limited&rdquo; in the server log under normal use, before relying on it.</p>
+    </div>
+
+    <h2 id="local">On your own machine</h2>
+    <p>A checkout runs the server against a local Postgres, for development or a server only you use. Rust is the stable toolchain.</p>
+<div class="code"><pre><code>cp .env.example .env
+docker compose up -d --wait  <span class="c"># Postgres 17 on 127.0.0.1:54329, nothing else</span>
+cargo run -p tinyserver -- migrate
+cargo run -p tinyserver -- bootstrap
+cargo run -p tinyserver -- serve</code></pre></div>
+    <ul>
+      <li><code>serve</code> will not start without a scanner: set <code>TINYSERVER_CLAMD_SOCKET</code> to <code>host:port</code>, or <code>TINYSERVER_ALLOW_FAKE_SCAN=1</code> when no clamd is running.</li>
+      <li>Keep the example&rsquo;s <code>TINYSERVER_PUBLIC_URL=http://localhost:8080</code>. An IP address such as <code>127.0.0.1</code> stops the start, because passkeys are bound to a hostname.</li>
+      <li>Without the OIDC variables the server is passkeys only.</li>
+      <li>It listens on <code>127.0.0.1:8080</code> unless <code>BIND</code> says otherwise. The passwords in this <code>.env.example</code> are known development ones, which is why this Postgres never listens on a network address.</li>
+    </ul>
+
+    <nav class="pager" aria-label="Previous and next"><a href="join.html"><span>Previous</span>Join &amp; use a server</a><a class="next" href="sign-in.html"><span>Next</span>Sign-in &amp; passkeys</a></nav>
+    <p class="edit"><a href="https://github.com/TinyComms/tinyclient/blob/main/site/docs/server/run.html">Edit this page on GitHub</a></p>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft, Signal or Google; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. Cloudflare Pages hosts it and can see your request the way any web server can.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

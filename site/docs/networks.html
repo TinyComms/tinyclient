@@ -47,6 +47,18 @@
           <li><a href="networks.html" aria-current="page">Networks &amp; terms</a></li>
           <li><a href="contributing.html">Contributing</a></li>
       </ul>
+      <h2>Tiny server</h2>
+      <ul>
+          <li><a href="server/index.html">Overview</a></li>
+          <li><a href="server/join.html">Join &amp; use a server</a></li>
+          <li><a href="server/run.html">Run a server</a></li>
+          <li><a href="server/sign-in.html">Sign-in &amp; passkeys</a></li>
+          <li><a href="server/calls.html">Calls &amp; media</a></li>
+          <li><a href="server/manage.html">Manage a community</a></li>
+          <li><a href="server/operate.html">Operate &amp; upgrade</a></li>
+          <li><a href="server/encryption.html">End-to-end encryption</a></li>
+          <li><a href="server/privacy.html">Server privacy</a></li>
+      </ul>
       <h2 class="ext">On GitHub</h2>
       <ul class="ext">
           <li><a href="https://github.com/TinyComms/tinyclient/releases">Releases</a></li>
@@ -152,13 +164,13 @@
     </ul>
 
     <h2 id="tiny">Tiny server</h2>
-    <p>A <a href="../tinyserver.html">Tiny server</a> is one you already run, or one someone invites you to. tinyclient.io does not run it, does not take its credentials, and does not proxy its messages. You can add more than one. Sign-in is an invite code or the server address, then your browser and that server&rsquo;s OpenID Connect provider.</p>
+    <p>A <a href="../tinyserver.html">Tiny server</a> is one you already run, or one someone invites you to. tinyclient.io does not run it, does not take its credentials, and does not proxy its messages. You can add more than one. Sign-in is an invite link or code, or the server address, then your browser: the server&rsquo;s own passkey page, or the OpenID Connect provider its owner chose. The <a href="server/index.html">Tiny server docs</a> cover joining one and running one.</p>
     <div class="table-wrap" tabindex="0" role="region" aria-label="Tiny server support">
       <table>
         <tbody>
         <tr><th scope="row">Reading</th><td>Rooms and who is in each, people with presence, text channels and direct messages, invites, roles, and the audit log when your account may see them</td></tr>
         <tr><th scope="row">Writing</th><td>Text, replies, files, reactions, edit, delete, a direct message from a profile. Make, rename and delete rooms, invite, change roles, and the moderation that server allows. A server that scans files holds the send until the scan settles.</td></tr>
-        <tr><th scope="row">Calls</th><td>Audio when the server has it on, over UDP or ICE-TCP. Mute, deafen, see who is speaking, and leave. Echo cancellation, noise suppression and automatic gain default on. End-to-end encryption when the server offers it; otherwise the call says encrypted to the server. One picture on a room that allows video: a screen share, or one other person&rsquo;s camera. The camera sends on Windows only. Screen share sends on Windows, macOS and Linux X11.</td></tr>
+        <tr><th scope="row">Calls</th><td>Audio when the server has it on, over UDP or ICE-TCP. Mute, deafen, see who is speaking, and leave. Echo cancellation, noise suppression and automatic gain default on. End-to-end encryption when the server offers it; otherwise the call says encrypted to the server. One picture on a room that allows video: a screen share, or one other person&rsquo;s camera. The camera and screen share send on Windows, macOS and Linux.</td></tr>
         </tbody>
       </table>
     </div>
@@ -175,7 +187,7 @@
     <p>These are missing on purpose until they can pass the same memory, speed and idle budgets as the rest. Each one is a place to help.</p>
     <ul>
       <li>Searching the network itself, except Discord (a server or one channel) and Telegram (one conversation). The search pane searches the messages tinyclient has cached, on every network.</li>
-      <li>Video and screen share on Discord, Slack, Teams, Telegram, Signal and Messages. A Tiny room already shows one picture. The camera sends on Windows only, and screen share does not send on Wayland. Recording a voice message is not built. Voice messages from Telegram and Discord play, with their waveform.</li>
+      <li>Video and screen share on Discord, Slack, Teams, Telegram, Signal and Messages. A Tiny room already shows one picture. Recording a voice message is not built. Voice messages from Telegram and Discord play, with their waveform.</li>
       <li>Signal photos, files, safety numbers and calls. A contact&rsquo;s new identity key is trusted automatically until safety numbers are shown.</li>
       <li>Teams personal accounts. Calls and meetings open in Teams.</li>
       <li>Discord stage channels, Telegram secret chats, and Slack huddles inside tinyclient. Their buttons open the official app.</li>

@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Calls and media · Tiny server docs</title>
+<meta name="description" content="Voice rooms, one picture, direct calls, the media port to open, the upload budget, and tuning a VPS for calls.">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://tinyclient.io/docs/server/calls.html">
+<link rel="ai-catalog" href="/.well-known/ai-catalog.json">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../../style.css">
+<script src="../../site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../" aria-label="tinyclient home"><img src="../../favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="../" aria-current="page">Docs</a>
+      <a href="../../tinyserver.html">Tiny server</a>
+      <a class="hide-sm" href="../privacy.html">Privacy</a>
+      <a class="dc" href="https://discord.gg/kJHK7BNvJP" aria-label="Discord"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
+      <a class="gh" href="https://github.com/TinyComms/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    <div class="docs-nav-inner">
+      <h2>Documentation</h2>
+      <ul>
+          <li><a href="../index.html">Getting started</a></li>
+          <li><a href="../using.html">Using tinyclient</a></li>
+          <li><a href="../build.html">Build from source</a></li>
+          <li><a href="../architecture.html">Architecture</a></li>
+          <li><a href="../performance.html">Size &amp; performance</a></li>
+          <li><a href="../privacy.html">Privacy &amp; security</a></li>
+          <li><a href="../networks.html">Networks &amp; terms</a></li>
+          <li><a href="../contributing.html">Contributing</a></li>
+      </ul>
+      <h2>Tiny server</h2>
+      <ul>
+          <li><a href="index.html">Overview</a></li>
+          <li><a href="join.html">Join &amp; use a server</a></li>
+          <li><a href="run.html">Run a server</a></li>
+          <li><a href="sign-in.html">Sign-in &amp; passkeys</a></li>
+          <li><a href="calls.html" aria-current="page">Calls &amp; media</a></li>
+          <li><a href="manage.html">Manage a community</a></li>
+          <li><a href="operate.html">Operate &amp; upgrade</a></li>
+          <li><a href="encryption.html">End-to-end encryption</a></li>
+          <li><a href="privacy.html">Server privacy</a></li>
+      </ul>
+      <h2 class="ext">On GitHub</h2>
+      <ul class="ext">
+          <li><a href="https://github.com/TinyComms/tinyserver">tinyserver source</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/blob/main/deploy/README.md">Deployment reference</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/tree/main/docs">Design documents</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main" class="prose">
+    <h1>Calls and media</h1>
+    <p class="lede">Voice rooms, one picture per listener, calls between two people, and the one port that carries them.</p>
+
+    <h2 id="how">How a call travels</h2>
+    <p>Chat and call setup go over the live socket, through the tunnel or your proxy. Call audio and video do not fit through the tunnel, so they go straight to the server on one port number: UDP first, and TCP on the same number for networks that block UDP.</p>
+    <p>The server is a selective forwarding unit. It passes each person&rsquo;s Opus audio and H.264 video on to the others and never re-encodes them. Nothing is recorded or stored. Calls live in memory, so a restart ends them and the apps rejoin.</p>
+
+    <h2 id="port">Open the media port</h2>
+    <ol>
+      <li>Set <code>TINYSERVER_PUBLIC_IP</code> in the environment file to the address members reach: the router&rsquo;s public IPv4 address. The server does not guess it.</li>
+      <li><code>TINYSERVER_MEDIA_PORT</code> is 50000 unless set. Compose publishes the same number inside and out, on UDP and TCP.</li>
+      <li>On the router, forward that port to the host, both UDP and TCP.</li>
+      <li>On the host firewall, allow it for both. With the default port and ufw: <code>ufw allow 50000/udp</code> and <code>ufw allow 50000/tcp</code>.</li>
+      <li>Optional: set <code>TINYSERVER_LAN_IP</code> to the host&rsquo;s address on the home network, such as <code>192.168.1.20</code>. Many routers do not let a member at home reach the public address from inside; with this set, the server offers them the LAN address too.</li>
+      <li><code>docker compose up -d</code>, then open <code>/health</code> on the chat hostname. It says <code>"media": "up"</code> and lists <code>"transports": ["udp", "tcp"]</code>, with <code>"lan"</code> when step 5 is set.</li>
+    </ol>
+    <p>Without <code>TINYSERVER_PUBLIC_IP</code> the server still runs. <code>/health</code> says <code>"media": "off"</code>, and a call has no audio or video.</p>
+    <div class="callout warn">
+      <p><strong>Members see the host&rsquo;s address.</strong> Every member in a call is sent <code>TINYSERVER_PUBLIC_IP</code>. The tunnel does not hide the host&rsquo;s address from members. Members do not learn each other&rsquo;s addresses from the server.</p>
+    </div>
+    <p>A stranger who finds the port gets a reply to a connectivity check and nothing else: no media is processed without the per-join password, which travels only over the signed-in live socket.</p>
+
+    <h3 id="not-built">What is not built</h3>
+    <ul>
+      <li><strong>No relay.</strong> There is no TURN server and no relay mode yet. A host that cannot open a port, such as one behind carrier-grade NAT, cannot carry calls today.</li>
+      <li><strong>No IPv6</strong> for media. <code>TINYSERVER_PUBLIC_IP</code> is an IPv4 address.</li>
+      <li>A member on a network that allows only port 443 cannot reach the media port.</li>
+    </ul>
+
+    <h2 id="budget">Upload budget</h2>
+    <p>Set <code>TINYSERVER_MEDIA_EGRESS_KBPS</code> to what the host can upload for calls, in kb/s, such as <code>8000</code> on a 10 Mb/s line. The server plans every call together to fit it: screen shares first, then everyone gets the high camera layer if that fits, else the low one, else audio only.</p>
+    <p>Each listener with a camera to watch costs about 1,200 kb/s on the high layer and 350 on the low one, and each voice about 50. Without a budget, nothing stops a large room sending more than the line carries, and everyone&rsquo;s audio suffers along with the video.</p>
+
+    <h2 id="vps">On a VPS</h2>
+    <p>A small VPS drops call packets long before its CPU is busy, because the kernel&rsquo;s socket buffer limits are low. The media socket asks for 4 MiB of buffer each way, and a stock Linux kernel silently caps that at about 200 KiB. These are host settings; a container cannot change them. On the host:</p>
+<div class="code"><pre><code>printf 'net.core.rmem_max=4194304\nnet.core.wmem_max=4194304\n' | sudo tee /etc/sysctl.d/90-tinyserver-media.conf
+sudo sysctl --system</code></pre></div>
+    <p>Restart tinyserver afterwards. Its log says <code>media socket buffers</code> with what it got; Linux reports double the usable size, so about 8388608 each way means the setting took.</p>
+    <p>Set the upload budget a little under what the plan really sustains, not its burst figure.</p>
+    <p>Once a minute during a call the log has a <code>media counters</code> line:</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Fields of the media counters log line">
+      <table>
+        <thead><tr><th scope="col">Field</th><th scope="col">What it tells you</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>send_dropped</code></th><td>Above zero: the host could not keep up</td></tr>
+          <tr><th scope="row"><code>longest_turn_ms</code></th><td>Above about 20: the media thread was short of CPU</td></tr>
+          <tr><th scope="row"><code>longest_gap_ms</code></th><td>Well over 50: the thread, or the whole VM, was not running</td></tr>
+          <tr><th scope="row"><code>audio_late_ms</code></th><td>How late audio reached the server. It measures the path to the server, not the server.</td></tr>
+          <tr><th scope="row"><code>tcp_sent</code></th><td>Above zero: someone&rsquo;s media is on TCP</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>TCP streams are capped at 256 in all and 16 from one address. One that sends nothing for a call within 5 seconds, or nothing at all for 30, is closed.</p>
+
+    <h2 id="rooms">Voice rooms</h2>
+    <p>A room is a voice channel people drop into; nobody is rung. A person is in one call at a time, and joining another leaves the first.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Room settings">
+      <table>
+        <thead><tr><th scope="col">Setting</th><th scope="col">Range</th><th scope="col">Notes</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">User limit</th><td>0 to 99</td><td>0 means the server&rsquo;s limit for a room</td></tr>
+          <tr><th scope="row">Bitrate</th><td>16 to 128 kb/s, 64 unless set</td><td>What each app encodes its voice at</td></tr>
+          <tr><th scope="row">Push to talk only</th><td>on or off</td><td>Kept by the server and honoured by the app; the server does not check it</td></tr>
+          <tr><th scope="row">Video</th><td>on or off</td><td>The same: honoured by the app</td></tr>
+          <tr><th scope="row">Require end-to-end encryption</th><td>on or off</td><td>The server refuses an app that cannot. <a href="encryption.html#calls">End-to-end encryption</a>.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>How many people a room and a server hold is set by the operator: <code>TINYSERVER_CALL_ROOM_MAX</code>, 12 unless set, and <code>TINYSERVER_CALL_SERVER_MAX</code>, 32 unless set. Size them to what the host and its line carry. A room&rsquo;s own user limit can lower its number and never raises it past the server&rsquo;s.</p>
+    <p>Room permissions decide who may join and who may speak. Someone without the speak permission joins and listens; their audio is not forwarded. <a href="manage.html#moderation">Moderators</a> can server mute, server deafen, move and disconnect people. A timeout or a ban ends the person&rsquo;s call.</p>
+    <p>A dropped connection keeps its seat for 10 seconds. After 15 seconds with no media at all, the server ends that person&rsquo;s seat.</p>
+
+    <h2 id="video">One picture</h2>
+    <p>Each listener gets everyone else&rsquo;s audio and at most one video: the room&rsquo;s screen share while someone else is sharing, otherwise one camera, the active speaker&rsquo;s when it is live. A listener is never sent their own picture.</p>
+    <ul>
+      <li>One screen share per room. The first to start holds it; a second person is told the share is taken. A moderator can end it.</li>
+      <li>Cameras send two sizes, 1280&times;720 and 640&times;360. The server picks one per listener from that listener&rsquo;s connection, their own quality choice, and the upload budget.</li>
+      <li>Which systems can send a camera or a screen share depends on the app, not the server. <a href="join.html#calls">Join and use a server</a> lists them.</li>
+    </ul>
+
+    <h2 id="direct">Calls between two people</h2>
+    <p>A member can call another from their direct conversation. It rings for 30 seconds. Only the two people see it, and it ends for both when one leaves. The conversation keeps whether the call was missed, declined, cancelled or ended, with no duration. A room&rsquo;s encryption setting does not apply: the call is end-to-end encrypted when both apps can.</p>
+    <p>There are no group calls outside rooms.</p>
+
+    <nav class="pager" aria-label="Previous and next"><a href="sign-in.html"><span>Previous</span>Sign-in &amp; passkeys</a><a class="next" href="manage.html"><span>Next</span>Manage a community</a></nav>
+    <p class="edit"><a href="https://github.com/TinyComms/tinyclient/blob/main/site/docs/server/calls.html">Edit this page on GitHub</a></p>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft, Signal or Google; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. Cloudflare Pages hosts it and can see your request the way any web server can.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

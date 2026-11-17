@@ -47,6 +47,18 @@
           <li><a href="networks.html">Networks &amp; terms</a></li>
           <li><a href="contributing.html">Contributing</a></li>
       </ul>
+      <h2>Tiny server</h2>
+      <ul>
+          <li><a href="server/index.html">Overview</a></li>
+          <li><a href="server/join.html">Join &amp; use a server</a></li>
+          <li><a href="server/run.html">Run a server</a></li>
+          <li><a href="server/sign-in.html">Sign-in &amp; passkeys</a></li>
+          <li><a href="server/calls.html">Calls &amp; media</a></li>
+          <li><a href="server/manage.html">Manage a community</a></li>
+          <li><a href="server/operate.html">Operate &amp; upgrade</a></li>
+          <li><a href="server/encryption.html">End-to-end encryption</a></li>
+          <li><a href="server/privacy.html">Server privacy</a></li>
+      </ul>
       <h2 class="ext">On GitHub</h2>
       <ul class="ext">
           <li><a href="https://github.com/TinyComms/tinyclient/releases">Releases</a></li>
@@ -64,7 +76,7 @@
     <p>You start <code>tinyclient</code>. It starts <code>chatd</code> when nothing is already listening on the local socket. <code>chatd</code> holds the connections and the cache. The window only draws what <code>chatd</code> reports.</p>
     <ul>
       <li>The inbox is one list across Slack, Discord, Telegram, Teams, Signal and Messages.</li>
-      <li>A network&rsquo;s own sidebar is there too: servers, workspaces, folders, teams. A <a href="../tinyserver.html">Tiny server</a> you add has its own place on the rail, laid out as a Discord server is.</li>
+      <li>A network&rsquo;s own sidebar is there too: servers, workspaces, folders, teams. A <a href="../tinyserver.html">Tiny server</a> you add has its own place on the rail, laid out as a Discord server is. <a href="server/join.html">Join and use a server</a> covers invites, sign-in and what the server can see.</li>
       <li><strong>Quick Switcher</strong> finds a conversation, a person or a server in the local cache. Its <strong>Search messages</strong> row, and Edit &rsaquo; Find, open the search pane: this conversation, this space, or everywhere. Each keystroke searches the cache, and a hit opens its conversation on that message. Enter asks Discord&rsquo;s own search for a server or one channel, and Telegram&rsquo;s search for one conversation. Slack, Teams, Signal and Messages are not asked. <code>tinyclient --text --search</code> searches the cache from a terminal.</li>
       <li>Your newest message shows whether it is sending, sent, delivered or read, where the network says so. Discord and Slack have no read receipts, so they show one tick.</li>
       <li>A conversation is marked read only when the window is active, that conversation is open, and the message is on screen.</li>
@@ -118,7 +130,7 @@
     </ul>
 
     <h2 id="calls">Calls and voice</h2>
-    <p>Calls run on Discord, in DMs and voice channels, and on a <a href="../tinyserver.html">Tiny server</a> you add. Discord voice is audio only. A Tiny room can also show one picture: a screen share, or one other person&rsquo;s camera. The camera sends on Windows only. Screen share sends on Windows, macOS and Linux X11. <strong>Settings &rsaquo; Voice</strong> and <strong>Audio &amp; video</strong> apply to both.</p>
+    <p>Calls run on Discord, in DMs and voice channels, and on a <a href="../tinyserver.html">Tiny server</a> you add. Discord voice is audio only. A Tiny room can also show one picture: a screen share, or one other person&rsquo;s camera. The camera and screen share send on Windows, macOS and Linux. <strong>Settings &rsaquo; Voice</strong> and <strong>Audio &amp; video</strong> apply to both.</p>
     <ul>
       <li><strong>Microphone</strong>: voice activation with a sensitivity you can see, or push to talk, with a priority key for priority speakers. Echo cancellation, noise suppression and automatic gain are on by default.</li>
       <li><strong>Keys</strong>: push to talk, mute and deafen can work while tinyclient is in the background: keys and mouse buttons on Windows; keys on macOS once you allow Input Monitoring; keys and the middle button on X11. On Wayland, mute and deafen work only while the window is in front.</li>

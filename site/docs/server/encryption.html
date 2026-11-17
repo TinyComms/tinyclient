@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>End-to-end encryption · Tiny server docs</title>
+<meta name="description" content="What a Tiny server cannot read: end-to-end encrypted calls and text, call codes and safety numbers, device linking, and the limits.">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://tinyclient.io/docs/server/encryption.html">
+<link rel="ai-catalog" href="/.well-known/ai-catalog.json">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../../style.css">
+<script src="../../site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../" aria-label="tinyclient home"><img src="../../favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="../" aria-current="page">Docs</a>
+      <a href="../../tinyserver.html">Tiny server</a>
+      <a class="hide-sm" href="../privacy.html">Privacy</a>
+      <a class="dc" href="https://discord.gg/kJHK7BNvJP" aria-label="Discord"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
+      <a class="gh" href="https://github.com/TinyComms/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    <div class="docs-nav-inner">
+      <h2>Documentation</h2>
+      <ul>
+          <li><a href="../index.html">Getting started</a></li>
+          <li><a href="../using.html">Using tinyclient</a></li>
+          <li><a href="../build.html">Build from source</a></li>
+          <li><a href="../architecture.html">Architecture</a></li>
+          <li><a href="../performance.html">Size &amp; performance</a></li>
+          <li><a href="../privacy.html">Privacy &amp; security</a></li>
+          <li><a href="../networks.html">Networks &amp; terms</a></li>
+          <li><a href="../contributing.html">Contributing</a></li>
+      </ul>
+      <h2>Tiny server</h2>
+      <ul>
+          <li><a href="index.html">Overview</a></li>
+          <li><a href="join.html">Join &amp; use a server</a></li>
+          <li><a href="run.html">Run a server</a></li>
+          <li><a href="sign-in.html">Sign-in &amp; passkeys</a></li>
+          <li><a href="calls.html">Calls &amp; media</a></li>
+          <li><a href="manage.html">Manage a community</a></li>
+          <li><a href="operate.html">Operate &amp; upgrade</a></li>
+          <li><a href="encryption.html" aria-current="page">End-to-end encryption</a></li>
+          <li><a href="privacy.html">Server privacy</a></li>
+      </ul>
+      <h2 class="ext">On GitHub</h2>
+      <ul class="ext">
+          <li><a href="https://github.com/TinyComms/tinyserver">tinyserver source</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/blob/main/deploy/README.md">Deployment reference</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/tree/main/docs">Design documents</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main" class="prose">
+    <h1>End-to-end encryption</h1>
+    <p class="lede">What the server cannot read, what it still sees, and where the limits are.</p>
+
+    <p>Two things are encrypted end to end on a Tiny server, separately: calls, and text in conversations created encrypted. In both, the keys belong to members&rsquo; devices. Signing in does not grant decryption, and the server holds no key that opens the content.</p>
+
+    <h2 id="calls">Calls</h2>
+    <p>Every call is encrypted between each app and the server. On top of that, when every app in a call can, the apps form one group and seal each audio frame and the picture themselves. The server relays the group&rsquo;s messages and does not hold its secret, so it cannot hear or see those frames. The design is MLS, as in Discord&rsquo;s DAVE protocol, version 1.</p>
+    <p>tinyclient says which of the two a call is:</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Call encryption states">
+      <table>
+        <thead><tr><th scope="col">The call says</th><th scope="col">Meaning</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">End-to-end encrypted</th><td>Only people in this call can hear it.</td></tr>
+          <tr><th scope="row">Encrypted to the server</th><td>Encrypted between each app and the server. The server could hear this call.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <ul>
+      <li>One app that cannot do it turns the call to encrypted-to-the-server for everyone, and the others are told who. The call goes back when that person leaves.</li>
+      <li>A room set to <strong>require end-to-end encryption</strong> refuses an app that cannot, so the call never drops down. It is a setting on the room; there is no server-wide switch.</li>
+      <li>A member can also choose, in tinyclient&rsquo;s own settings, to join only end-to-end encrypted calls.</li>
+      <li>A call between two people is end-to-end encrypted when both apps can.</li>
+    </ul>
+
+    <h3 id="verify">Call codes and safety numbers</h3>
+    <ul>
+      <li><strong>The call code</strong> is 30 digits, the same for everyone in the call, and changes whenever someone joins or leaves. If two people read out different codes, something sits between them.</li>
+      <li><strong>A safety number</strong> is 45 digits for a pair of people. Compare it in person or over another channel you trust; both of you see the same number. After you mark someone verified, the app warns you if their key changes.</li>
+    </ul>
+
+    <h3 id="calls-sees">What the server still sees in a call</h3>
+    <p>Who is in which call and when, who is speaking and how loudly, the size and timing of packets, and each participant&rsquo;s address. A server can also force a call down to encrypted-to-the-server, which the apps show, and can add a member nobody has verified. Verifying safety numbers is what catches that.</p>
+    <p>That a room requires encryption is a promise the server makes, not one an app can check from outside.</p>
+
+    <h2 id="text">Text and files</h2>
+    <p>From tinyclient 0.2.37, a conversation created encrypted seals message text, edits, replies, and attachment contents, names and types on the sending device. The server stores ciphertext.</p>
+    <ul>
+      <li>Direct conversations are created encrypted. A channel is encrypted only when it was made that way or later upgraded.</li>
+      <li>Upgrading leaves earlier messages as they were, readable by the server. There is no way back to plaintext.</li>
+      <li>The app labels each conversation. A plaintext one says the server can read it.</li>
+    </ul>
+    <p>Someone who manages the server sets the policy for the whole community:</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Text encryption policy">
+      <table>
+        <thead><tr><th scope="col">Policy</th><th scope="col">Effect</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>off</code></th><td>No encrypted conversations</td></tr>
+          <tr><th scope="row"><code>optional</code> (the default)</th><td>A conversation may be created encrypted</td></tr>
+          <tr><th scope="row"><code>new_required</code></th><td>Every new conversation is encrypted</td></tr>
+          <tr><th scope="row"><code>required</code></th><td>Every conversation is encrypted</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 id="text-sees">What the server still sees</h3>
+    <p>Who is in the conversation, who posted and in which minute, how large each message is, how many attachments it has and their sizes, each person&rsquo;s list of devices, and addresses while connected.</p>
+
+    <h3 id="devices">Devices and history</h3>
+    <ul>
+      <li>A new member, or a new device, cannot read messages from before it joined.</li>
+      <li><strong>Linking a device</strong> carries history over. In tinyclient, <strong>Server Settings &rsaquo; Encryption</strong> on the device you already have accepts the new device&rsquo;s link code; check its fingerprint before approving. The old device then hands over an archive the server cannot read. A link lasts five minutes.</li>
+      <li><strong>There is no key backup.</strong> Someone who loses every device starts again with a new identity and no old history. Signing back in does not bring it back.</li>
+      <li>The first device of a person is trusted the first time it is seen.</li>
+    </ul>
+
+    <h3 id="limits">Limits to know</h3>
+    <ul>
+      <li>Sealed files are never virus scanned: the server could scan only ciphertext.</li>
+      <li>Moderators cannot delete a message in an encrypted conversation, and bots cannot post there.</li>
+      <li>The server cannot search encrypted text or make previews of it.</li>
+      <li>A person removed from a conversation keeps what they already received.</li>
+      <li>The server can withhold or delay messages. It cannot read or change them.</li>
+      <li>A hostile operator could add an account of its own to an encrypted conversation.</li>
+      <li>tinyclient keeps messages you have opened in its own store on your computer, in plaintext. <a href="../privacy.html">The app&rsquo;s privacy page</a> says what is stored there.</li>
+    </ul>
+    <div class="callout warn">
+      <p><strong>Not independently reviewed.</strong> Neither the call encryption nor the text encryption has had an outside security review or a cryptographic audit.</p>
+    </div>
+
+    <h2 id="operator">For the person who runs the server</h2>
+    <ul>
+      <li>The server&rsquo;s own key for encrypted conversations is a file on the <code>tinyserver_keys</code> volume, not a row in the database. Members&rsquo; apps pin it. <a href="operate.html#backup"><code>operator.sh backup</code></a> carries it; a plain database dump does not.</li>
+      <li>Scanning can be <a href="operate.html#scan-off">turned off</a> only for a community whose attachments are all sealed.</li>
+    </ul>
+    <p>The protocols, frame formats and threat models are in the repository: <a href="https://github.com/TinyComms/tinyserver/blob/main/docs/calls.md#end-to-end-encryption"><code>docs/calls.md</code></a> for calls and <a href="https://github.com/TinyComms/tinyserver/blob/main/docs/e2ee-text.md"><code>docs/e2ee-text.md</code></a> for text.</p>
+
+    <nav class="pager" aria-label="Previous and next"><a href="operate.html"><span>Previous</span>Operate &amp; upgrade</a><a class="next" href="privacy.html"><span>Next</span>Server privacy</a></nav>
+    <p class="edit"><a href="https://github.com/TinyComms/tinyclient/blob/main/site/docs/server/encryption.html">Edit this page on GitHub</a></p>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft, Signal or Google; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. Cloudflare Pages hosts it and can see your request the way any web server can.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

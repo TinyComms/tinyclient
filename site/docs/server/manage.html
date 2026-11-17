@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Manage a community · Tiny server docs</title>
+<meta name="description" content="First-run setup, owners, roles and permissions, rooms and channels, invites, moderation, abuse reports, uploads and bots.">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://tinyclient.io/docs/server/manage.html">
+<link rel="ai-catalog" href="/.well-known/ai-catalog.json">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../../style.css">
+<script src="../../site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../" aria-label="tinyclient home"><img src="../../favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="../" aria-current="page">Docs</a>
+      <a href="../../tinyserver.html">Tiny server</a>
+      <a class="hide-sm" href="../privacy.html">Privacy</a>
+      <a class="dc" href="https://discord.gg/kJHK7BNvJP" aria-label="Discord"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
+      <a class="gh" href="https://github.com/TinyComms/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    <div class="docs-nav-inner">
+      <h2>Documentation</h2>
+      <ul>
+          <li><a href="../index.html">Getting started</a></li>
+          <li><a href="../using.html">Using tinyclient</a></li>
+          <li><a href="../build.html">Build from source</a></li>
+          <li><a href="../architecture.html">Architecture</a></li>
+          <li><a href="../performance.html">Size &amp; performance</a></li>
+          <li><a href="../privacy.html">Privacy &amp; security</a></li>
+          <li><a href="../networks.html">Networks &amp; terms</a></li>
+          <li><a href="../contributing.html">Contributing</a></li>
+      </ul>
+      <h2>Tiny server</h2>
+      <ul>
+          <li><a href="index.html">Overview</a></li>
+          <li><a href="join.html">Join &amp; use a server</a></li>
+          <li><a href="run.html">Run a server</a></li>
+          <li><a href="sign-in.html">Sign-in &amp; passkeys</a></li>
+          <li><a href="calls.html">Calls &amp; media</a></li>
+          <li><a href="manage.html" aria-current="page">Manage a community</a></li>
+          <li><a href="operate.html">Operate &amp; upgrade</a></li>
+          <li><a href="encryption.html">End-to-end encryption</a></li>
+          <li><a href="privacy.html">Server privacy</a></li>
+      </ul>
+      <h2 class="ext">On GitHub</h2>
+      <ul class="ext">
+          <li><a href="https://github.com/TinyComms/tinyserver">tinyserver source</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/blob/main/deploy/README.md">Deployment reference</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/tree/main/docs">Design documents</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main" class="prose">
+    <h1>Manage a community</h1>
+    <p class="lede">First-run setup, roles, channels and rooms, invites, moderation, reports, uploads and bots.</p>
+
+    <p>All of it is done in tinyclient, in <strong>Server Settings</strong> and the menus on people, rooms and channels. A page shows only to someone whose permissions allow it. The API behind each is in <a href="https://github.com/TinyComms/tinyserver/blob/main/docs/server.md"><code>docs/server.md</code></a>.</p>
+
+    <h2 id="setup">First-run setup</h2>
+    <p>A new server has an owner and nobody else. The first time the owner opens it, tinyclient asks what the community keeps about its members: three choices, or a preset that makes all three. Only an owner can read or change them, later too, at <strong>Server Settings &rsaquo; Privacy</strong>. Every member can see the choices in force.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="First-run setup choices">
+      <table>
+        <thead><tr><th scope="col">Choice</th><th scope="col">Options</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">What to keep from a sign-in provider</th><td><strong>Name and email</strong> (the default), <strong>name only</strong>, or <strong>neither</strong>: the account starts as &ldquo;Member&rdquo; and the person chooses a name. It applies to accounts made from then on, and has nothing to act on without a provider.</td></tr>
+          <tr><th scope="row">Who sees when members were last online</th><td><strong>Everyone</strong> (the default), <strong>admins only</strong>, or <strong>nobody</strong>: the server stops recording it and clears what it had.</td></tr>
+          <tr><th scope="row">How members sign in</th><td>Through the provider only (the default), passkeys or the provider, or passkeys only. <a href="sign-in.html#choice">Sign-in and passkeys</a>.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The <strong>Convenience</strong> preset is the three defaults. The <strong>Privacy</strong> preset keeps neither name nor email from a provider, records nobody&rsquo;s last-online time, and accepts passkeys only. Either can be adjusted one choice at a time.</p>
+    <p>Setup is not a gate: the owner can invite people before answering. Two things in it are one-way, and each happens only when asked for: erasing every member&rsquo;s stored email address, and clearing last-online times by choosing <em>nobody</em>.</p>
+    <p>Setup does not turn message encryption on or off, does not change what the audit log or the operator can see, and does not reach backups. It does not make anyone anonymous to the owner, who knows whom they invited.</p>
+
+    <h2 id="roles">Owners, roles and permissions</h2>
+    <ul>
+      <li><strong>Owner</strong> is a flag above every role. Owners have every permission everywhere. There can be several; the last one cannot be demoted, kicked or banned. Only owners make owners.</li>
+      <li><strong>Roles</strong> carry permissions and an order. Everyone has <em>@everyone</em>. A member&rsquo;s permissions are those of @everyone and every role they hold, together.</li>
+      <li><strong>Rank</strong> is the highest role a member holds. Kicking, banning, timing out, giving roles, and muting, moving or disconnecting someone all need that person&rsquo;s rank below yours. You can create, edit and give only roles below your own.</li>
+      <li>Someone who is not an owner cannot grant a permission they do not have themself.</li>
+      <li><strong>A room or a text channel</strong> can allow or deny permissions per role. Among a member&rsquo;s roles, an allow beats a deny.</li>
+    </ul>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Permissions">
+      <table>
+        <thead><tr><th scope="col">Permission</th><th scope="col">Lets a member</th><th scope="col">Per room or channel</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">View channel</th><td>See the room or channel, and read it</td><td>Yes</td></tr>
+          <tr><th scope="row">Connect</th><td>Join a room&rsquo;s call</td><td>Yes</td></tr>
+          <tr><th scope="row">Speak</th><td>Be heard in a call. In a text channel: post, react and upload.</td><td>Yes</td></tr>
+          <tr><th scope="row">Video, Share screen</th><td>Send a camera or a screen share. Honoured by the app; the server does not enforce these two.</td><td>Yes</td></tr>
+          <tr><th scope="row">Voice activity</th><td>Talk without push to talk</td><td>Yes</td></tr>
+          <tr><th scope="row">Priority speaker</th><td>Be heard over others, whose volume drops while they talk</td><td>Yes</td></tr>
+          <tr><th scope="row">Create invites, Manage invites</th><td>Make invites; see and revoke other people&rsquo;s</td><td></td></tr>
+          <tr><th scope="row">Manage channels</th><td>Add, edit, order and remove rooms, channels and categories</td><td>Yes</td></tr>
+          <tr><th scope="row">Manage roles</th><td>Make and edit roles below their own, and give them</td><td></td></tr>
+          <tr><th scope="row">Kick, Ban, Timeout members</th><td>Remove someone, keep them out, or silence them for a while</td><td></td></tr>
+          <tr><th scope="row">Mute, Deafen, Move, Disconnect members</th><td>Moderate people in a call</td><td>Yes</td></tr>
+          <tr><th scope="row">View audit log</th><td>Read the audit log</td><td></td></tr>
+          <tr><th scope="row">Manage server</th><td>Change the server&rsquo;s name, icon, welcome and upload limits, and manage bots. It implies no other permission.</td><td></td></tr>
+          <tr><th scope="row">Manage reports</th><td>Read and handle abuse reports</td><td></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>On a new server, @everyone can view, connect, speak, send video, share a screen and use voice activity. The database enforces permissions and rank itself, not only the API in front of it.</p>
+
+    <h2 id="channels">Rooms, channels and categories</h2>
+    <p>A <strong>room</strong> is a voice channel. A <strong>text channel</strong> is separate. Both can sit in categories, which someone with Manage channels orders by dragging. A member sees only the rooms and channels they may view.</p>
+    <ul>
+      <li>A room has a name, a topic, a user limit, a bitrate, push to talk only, video on or off, and whether end-to-end encryption is required. <a href="calls.html#rooms">Calls and media</a> has the ranges.</li>
+      <li>A text channel has a name, up to 80 characters, and a topic. Deleting one deletes its messages and their files.</li>
+      <li>A direct conversation is between two members. One pair has one conversation.</li>
+      <li>The server&rsquo;s own page, <strong>Overview</strong>, sets its name, icon, description, welcome text, the room people land in, and an away room with its timeout.</li>
+    </ul>
+
+    <h2 id="invites">Invites</h2>
+    <p>Membership is by invite, unless the operator lets a provider&rsquo;s groups join. An invite carries a label, the roles it gives, a number of uses and an expiry.</p>
+    <ul>
+      <li>Left alone, an invite is one use and lasts 7 days. Uses go from 1 to 1,000, or unlimited. An expiry runs from a minute to 30 days; only an owner or someone with Manage server can make one that never expires.</li>
+      <li>The invite is shown once, as a <code>https://tinyclient.io/invite#&hellip;</code> link. The server keeps only a hash. The link holds the server&rsquo;s address, so the person has nothing else to type.</li>
+      <li>The link&rsquo;s secret sits after the <code>#</code>, which a browser does not send, so tinyclient.io never receives it. That page only opens the app.</li>
+      <li>An invite can give only roles below the rank of whoever made it.</li>
+      <li>Revoke one at any time. Invites that were accepted stay in the list.</li>
+    </ul>
+
+    <h2 id="moderation">Moderation</h2>
+    <p>Right-click a person. What the menu offers depends on your permissions and on their rank being below yours.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Moderation actions">
+      <table>
+        <thead><tr><th scope="col">Action</th><th scope="col">Effect</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Server mute, server deafen</th><td>In a call. The person cannot undo it themself.</td></tr>
+          <tr><th scope="row">Move, disconnect</th><td>To another room, or out of the call</td></tr>
+          <tr><th scope="row">Timeout</th><td>For up to 28 days. Ends their call. They can still read, and cannot post, react, upload or join a call.</td></tr>
+          <tr><th scope="row">Kick</th><td>The membership and every session go. They can come back with a new invite.</td></tr>
+          <tr><th scope="row">Ban</th><td>The same, and every sign-in identity of that person is held, so a new invite or a fresh sign-in is refused. A ban can have an expiry. Someone who already left can be banned too.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Each of these is written to the audit log with who did it and the reason they gave. Only a message&rsquo;s author can edit or delete it.</p>
+
+    <h2 id="audit">The audit log</h2>
+    <p>Someone with View audit log reads who did what, to whom and why, newest first, filtered by person or by kind of action. It covers rooms, channels, roles, invites, members, bans, timeouts, call moderation, bots, server settings, first-run setup and sign-out everywhere. It never holds message text.</p>
+
+    <h2 id="reports">Abuse reports</h2>
+    <p>A member can report a message, a member or a channel to the people who run the community, under a category and with a note. A report stays inside that one server.</p>
+    <div class="callout">
+      <p><strong>Server side only, so far.</strong> Reports are built in the server and its API. tinyclient 0.2.71 has no screen for filing or reading them yet.</p>
+    </div>
+    <ul>
+      <li>Only holders of Manage reports see reports, and never one about themselves.</li>
+      <li>The person reported never learns who reported. Moderators do see the reporter. The reporter cannot read their report back.</li>
+      <li>Reporting a message records which message it was, not its text. Text is in a report only if the reporter chose to send it as evidence. The server cannot check that evidence is genuine, least of all from an encrypted conversation, and marks it unverified.</li>
+      <li>A moderator moves a report between open, reviewing, actioned and dismissed, adds notes, and can link the kick, ban or timeout that answered it.</li>
+      <li>A resolved report is deleted after 90 days unless the operator set otherwise. An owner can put a hold on one, which is the only thing that stops that.</li>
+      <li>One member can file 10 reports an hour and 50 a day.</li>
+    </ul>
+
+    <h2 id="uploads">Uploads and scanning</h2>
+    <ul>
+      <li>Images and GIFs may be up to 8 MiB and other files up to 25 MiB. Someone with Manage server can raise either, up to 100 MiB.</li>
+      <li>A file is scanned by ClamAV and three built-in rules before anyone can fetch it. If the scanner is down, the upload is refused, not let through.</li>
+      <li>PNG, JPEG, WebP and GIF images are re-encoded before they are stored, so nothing hidden after the image reaches the disk.</li>
+      <li>Always refused: programs and scripts (<code>exe</code>, <code>dll</code>, <code>msi</code>, <code>bat</code>, <code>ps1</code>, <code>js</code>, <code>jar</code> and the like), shortcuts and disk images, HTML and SVG, Office files with macros, and any file whose name, declared type and contents disagree.</li>
+      <li>Archives are refused unless someone with Manage server allows them. Zip files are then still checked for size and for tricks such as nested archives and escaping paths.</li>
+      <li>Files sealed for an <a href="encryption.html#text">encrypted conversation</a> are not scanned: the server has only ciphertext.</li>
+    </ul>
+
+    <h2 id="bots">Bots</h2>
+    <p>Someone with Manage server makes a bot with a name and a few scopes, and is shown its token once. A bot is not a member and does not appear as a person online.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Bot scopes">
+      <table>
+        <thead><tr><th scope="col">Scope</th><th scope="col">Lets the bot</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>rooms.read</code></th><td>List rooms, and hear room changes and who joins and leaves calls</td></tr>
+          <tr><th scope="row"><code>rooms.write</code></th><td>Create a room, change its settings, and delete it</td></tr>
+          <tr><th scope="row"><code>members.read</code></th><td>List people, and hear member changes and presence</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>A bot cannot join or change a call, and cannot read or post messages. Revoking it ends its connection within a minute. It sends <code>Authorization: Bot &lt;token&gt;</code>; the routes are in <a href="https://github.com/TinyComms/tinyserver/blob/main/docs/server.md#bots"><code>docs/server.md</code></a>.</p>
+
+    <nav class="pager" aria-label="Previous and next"><a href="calls.html"><span>Previous</span>Calls &amp; media</a><a class="next" href="operate.html"><span>Next</span>Operate &amp; upgrade</a></nav>
+    <p class="edit"><a href="https://github.com/TinyComms/tinyclient/blob/main/site/docs/server/manage.html">Edit this page on GitHub</a></p>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft, Signal or Google; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. Cloudflare Pages hosts it and can see your request the way any web server can.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

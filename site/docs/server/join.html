@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Join and use a server · Tiny server docs</title>
+<meta name="description" content="Join a Tiny server with an invite, sign in with a passkey, keep your recovery codes, and know what the server can see.">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://tinyclient.io/docs/server/join.html">
+<link rel="ai-catalog" href="/.well-known/ai-catalog.json">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../../style.css">
+<script src="../../site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../" aria-label="tinyclient home"><img src="../../favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="../" aria-current="page">Docs</a>
+      <a href="../../tinyserver.html">Tiny server</a>
+      <a class="hide-sm" href="../privacy.html">Privacy</a>
+      <a class="dc" href="https://discord.gg/kJHK7BNvJP" aria-label="Discord"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
+      <a class="gh" href="https://github.com/TinyComms/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    <div class="docs-nav-inner">
+      <h2>Documentation</h2>
+      <ul>
+          <li><a href="../index.html">Getting started</a></li>
+          <li><a href="../using.html">Using tinyclient</a></li>
+          <li><a href="../build.html">Build from source</a></li>
+          <li><a href="../architecture.html">Architecture</a></li>
+          <li><a href="../performance.html">Size &amp; performance</a></li>
+          <li><a href="../privacy.html">Privacy &amp; security</a></li>
+          <li><a href="../networks.html">Networks &amp; terms</a></li>
+          <li><a href="../contributing.html">Contributing</a></li>
+      </ul>
+      <h2>Tiny server</h2>
+      <ul>
+          <li><a href="index.html">Overview</a></li>
+          <li><a href="join.html" aria-current="page">Join &amp; use a server</a></li>
+          <li><a href="run.html">Run a server</a></li>
+          <li><a href="sign-in.html">Sign-in &amp; passkeys</a></li>
+          <li><a href="calls.html">Calls &amp; media</a></li>
+          <li><a href="manage.html">Manage a community</a></li>
+          <li><a href="operate.html">Operate &amp; upgrade</a></li>
+          <li><a href="encryption.html">End-to-end encryption</a></li>
+          <li><a href="privacy.html">Server privacy</a></li>
+      </ul>
+      <h2 class="ext">On GitHub</h2>
+      <ul class="ext">
+          <li><a href="https://github.com/TinyComms/tinyserver">tinyserver source</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/blob/main/deploy/README.md">Deployment reference</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/tree/main/docs">Design documents</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main" class="prose">
+    <h1>Join and use a server</h1>
+    <p class="lede">For a member: get in with an invite, sign in, and know what the server can see.</p>
+
+    <p>You need <a href="../index.html#download">tinyclient</a> and an invite from someone on the server. A Tiny server is run by its owner, not by the tinyclient project.</p>
+
+    <h2 id="join">Join with an invite</h2>
+    <p>An invite is a link that starts <code>https://tinyclient.io/invite#</code>, or a code that starts <code>tc1.</code> Both hold the server&rsquo;s address, so there is nothing else to type.</p>
+    <ol>
+      <li><strong>Open the link.</strong> The page opens tinyclient. The part after the <code>#</code> is never sent to tinyclient.io. Or, in tinyclient, choose <strong>Join a server</strong> on the Tiny rail and paste the link or the code.</li>
+      <li><strong>Check the address.</strong> tinyclient shows which server you are about to join and asks before it goes on. Continue only if you trust that server.</li>
+      <li><strong>Sign in in your browser.</strong> tinyclient opens the server&rsquo;s sign-in page in your own browser and waits. It moves on by itself when you are done. If the page did not open, choose <strong>Open the page again</strong>.</li>
+    </ol>
+    <p>tinyclient waits five minutes for the browser. After that, start again from the invite; nothing was spent.</p>
+    <p>If you already have an account on a server, choose <strong>I already have an account</strong> and type its address instead.</p>
+    <div class="callout warn">
+      <p><strong>A plain <code>http</code> address</strong> works, for a server on your own machine or network. Anyone on the way can then read the session and everything sent. tinyclient says so under such an address.</p>
+    </div>
+
+    <h2 id="sign-in">Sign in</h2>
+    <p>tinyclient never sees a password. What the browser shows depends on what the server&rsquo;s owner chose:</p>
+    <ul>
+      <li><strong>The server&rsquo;s own passkey page.</strong> New here: type the name others will see and choose <strong>Create my account</strong>. Your device makes a passkey, which may ask for your fingerprint, face or PIN. Coming back: choose <strong>Sign in with a passkey</strong>.</li>
+      <li><strong>A sign-in provider</strong> the owner set up, Pocket ID by default, where you also sign in with a passkey. With Pocket ID, an invite can make your account there: choose <strong>I&rsquo;m new here</strong>.</li>
+      <li>Some servers offer both.</li>
+    </ul>
+
+    <h3 id="recovery">Keep your recovery codes</h3>
+    <p>When you make an account with a passkey, the page shows 10 recovery codes once. Save them somewhere other than the device that holds the passkey. A code lets you make a new passkey when you have lost yours, and is used up when you do: choose <strong>Lost your passkeys?</strong> on the sign-in page.</p>
+    <div class="callout danger">
+      <p><strong>Lose every passkey and every code, and the account is gone.</strong> The server holds no email address or phone number to prove who you are. The owner can invite you again as a new person; your old messages stay with the old account.</p>
+    </div>
+    <p><strong>Server Settings &rsaquo; Sign-in</strong> lists your passkeys. <strong>Add a passkey</strong> makes a link that opens in your browser; open it on another device to give that device a passkey of its own. <strong>New recovery codes</strong> replaces the set. Both ask you to have signed in within the last ten minutes.</p>
+
+    <h2 id="server">What you see</h2>
+    <p>A server has its own place on the rail, laid out as a Discord server is: text channels and voice rooms in categories on the left, people by role on the right.</p>
+    <ul>
+      <li><strong>Text channels and direct messages:</strong> text, replies, files, reactions, edit and delete. A file is held until the server&rsquo;s scan passes it.</li>
+      <li><strong>Voice rooms:</strong> click one to join. Mute, deafen, see who is speaking, and leave.</li>
+      <li><strong>A direct call:</strong> call another member from your conversation with them.</li>
+    </ul>
+    <p>What you may do in each room and channel depends on the roles the server gave you.</p>
+
+    <h2 id="calls">Calls</h2>
+    <p>A room carries everyone&rsquo;s audio and, when the room allows video, one picture: a screen share while someone is sharing, otherwise one other person&rsquo;s camera. The camera and screen share send on Windows, macOS and Linux.</p>
+    <p>Echo cancellation, noise suppression and automatic gain are on unless you turn them off. <a href="../using.html#calls">Using tinyclient</a> covers the microphone, push to talk and devices.</p>
+    <p>A call says how it is encrypted. <strong>End-to-end encrypted</strong>: only the people in the call can hear it. <strong>Encrypted to the server</strong>: the server could hear it. Open the call&rsquo;s security panel for the call code and the safety numbers, and compare them with the others over a channel you trust. <a href="encryption.html#verify">How to read them</a>.</p>
+    <p>While you are in a call, your computer talks directly to the server&rsquo;s media port, so the server sees your address.</p>
+
+    <h2 id="encrypted">Encrypted conversations</h2>
+    <p>Direct conversations are created end-to-end encrypted when the server offers it. A channel is encrypted only if it was made or upgraded that way. tinyclient labels each conversation, and says so when the server can read one.</p>
+    <ul>
+      <li>A new device cannot read earlier encrypted messages by itself. Link it from a device you already use, at <strong>Server Settings &rsaquo; Encryption</strong>, to carry your history over.</li>
+      <li>There is no key backup. If you lose every device, the old encrypted messages cannot be read again, even after you sign back in.</li>
+    </ul>
+    <p><a href="encryption.html">End-to-end encryption</a> has the rest.</p>
+
+    <h2 id="trust">What the server can see</h2>
+    <p>The person who runs a server can read every conversation that is not end-to-end encrypted, and its files. Even for encrypted ones they see who talks to whom and when. Other members see your name, your picture, your roles and, unless the owner chose otherwise, when you were last online. <a href="privacy.html">Server privacy and security</a> lists all of it.</p>
+
+    <h2 id="leave">Sign out</h2>
+    <ul>
+      <li><strong>Signing out</strong> in tinyclient ends that session on the server, then removes the server&rsquo;s messages and media from your computer.</li>
+      <li><strong>Sign out everywhere</strong>, in <strong>Settings &rsaquo; Accounts</strong>, ends your sessions on that server on every computer.</li>
+      <li>A session ends by itself after 30 days unless the operator set otherwise. tinyclient then asks you to sign in again.</li>
+    </ul>
+    <p>You can add more than one server. Every server&rsquo;s session is kept in your system&rsquo;s credential store, in one item they share.</p>
+
+    <nav class="pager" aria-label="Previous and next"><a href="index.html"><span>Previous</span>Overview</a><a class="next" href="run.html"><span>Next</span>Run a server</a></nav>
+    <p class="edit"><a href="https://github.com/TinyComms/tinyclient/blob/main/site/docs/server/join.html">Edit this page on GitHub</a></p>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft, Signal or Google; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. Cloudflare Pages hosts it and can see your request the way any web server can.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>
