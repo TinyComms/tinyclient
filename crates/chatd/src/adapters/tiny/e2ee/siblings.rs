@@ -223,6 +223,7 @@ impl Device {
             reply_to: None,
             attachments: Vec::new(),
             sent_at: None,
+            on: false,
         };
         let Ok(client_id) = super::attachment_id() else {
             return false;

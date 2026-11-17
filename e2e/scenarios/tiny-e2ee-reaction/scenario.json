@@ -1,0 +1,12 @@
+{
+  "id": "tiny-e2ee-reaction",
+  "title": "A reaction in an encrypted Tiny conversation is sealed, lands, and echoes back onto the message",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd against a localhost MLS fake. The same sealed-reaction path is what this desktop run checks.",
+    "ios": "The phone proof build does not run desktop chatd against a localhost MLS fake. The same sealed-reaction path is what this desktop run checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 90
+}

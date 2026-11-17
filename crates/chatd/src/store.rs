@@ -2196,6 +2196,26 @@ impl Store {
                 incoming.seq = kept;
             }
         }
+        let before: Option<(String, String)> = tx
+            .query_row(
+                "SELECT text, body FROM message
+                  WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
+                params![network, account, id, incoming.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        // A sealed conversation's wire rows never carry reactions — they are folded ciphertexts
+        // of their own, on a route of theirs — so what this store folded stays when a fetched
+        // page replaces the row.
+        if incoming.seal == Seal::Encrypted && incoming.reactions.is_empty() {
+            if let Some((_, old)) = &before {
+                if let Ok(had) = serde_json::from_str::<Message>(old) {
+                    if !had.reactions.is_empty() {
+                        incoming.reactions = had.reactions;
+                    }
+                }
+            }
+        }
         let mut stored = incoming.clone();
         stored.bound();
         stored.id.clear();
@@ -2206,14 +2226,6 @@ impl Store {
             SendState::Pending => 1,
             SendState::Failed { .. } => 2,
         };
-        let before: Option<(String, String)> = tx
-            .query_row(
-                "SELECT text, body FROM message
-                  WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
-                params![network, account, id, incoming.id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
         let outcome = match before {
             Some((text, old)) if text == incoming.text && old == body => Stored::Same,
             // A later fetch that cannot open must not replace what this device already opened.
