@@ -500,24 +500,231 @@ fn looks_b64(bytes: &[u8]) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
 }
 
-pub(super) fn mime_of(name: &str) -> &'static str {
-    match name
-        .rsplit('.')
-        .next()
+/// What the phone is told a file is. The bytes win when they name a type, because a wrong
+/// extension (or none) is how a video arrives as a generic download. A zip that is a Word,
+/// Excel or PowerPoint file keeps the name: those three start with the same bytes.
+/// `upload::mime_of` only reads the name, and other networks send through that. Messages keeps
+/// this one so a carrier is not handed `application/octet-stream` for a type it knows.
+pub(super) fn mime_of(name: &str, bytes: &[u8]) -> &'static str {
+    if let Some(found) = mime_of_bytes(bytes) {
+        if found == "application/zip" {
+            if let Some(office) = office_of(name) {
+                return office;
+            }
+        }
+        return found;
+    }
+    mime_of_name(name)
+}
+
+fn extension(name: &str) -> String {
+    name.rsplit_once('.')
+        .map(|(_, extension)| extension)
         .unwrap_or("")
         .to_ascii_lowercase()
-        .as_str()
-    {
+}
+
+fn office_of(name: &str) -> Option<&'static str> {
+    match extension(name).as_str() {
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        _ => None,
+    }
+}
+
+fn mime_of_name(name: &str) -> &'static str {
+    match extension(name).as_str() {
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",
         "gif" => "image/gif",
         "webp" => "image/webp",
-        "mp4" => "video/mp4",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        "bmp" => "image/bmp",
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "3gp" => "video/3gpp",
+        "3g2" => "video/3gpp2",
         "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "ogg" | "oga" => "audio/ogg",
+        "opus" => "audio/opus",
+        "wav" => "audio/wav",
+        "amr" => "audio/amr",
+        "awb" => "audio/amr-wb",
         "pdf" => "application/pdf",
         "vcf" => "text/vcard",
+        "txt" => "text/plain",
+        "csv" => "text/csv",
+        "zip" => "application/zip",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         _ => "application/octet-stream",
     }
+}
+
+fn mime_of_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"\x89PNG") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
+        return Some("audio/wav");
+    }
+    if bytes.starts_with(b"%PDF") {
+        return Some("application/pdf");
+    }
+    if bytes.starts_with(b"#!AMR-WB") {
+        return Some("audio/amr-wb");
+    }
+    if bytes.starts_with(b"#!AMR") {
+        return Some("audio/amr");
+    }
+    if bytes.starts_with(b"ID3") {
+        return Some("audio/mpeg");
+    }
+    if bytes.starts_with(b"OggS") {
+        if bytes.get(28..36) == Some(b"OpusHead") {
+            return Some("audio/opus");
+        }
+        return Some("audio/ogg");
+    }
+    if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        return Some("video/webm");
+    }
+    if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06") || bytes.starts_with(b"PK\x07\x08") {
+        return Some("application/zip");
+    }
+    if let Some(brand) = ftyp_brand(bytes) {
+        if let Some(mime) = brand_mime(brand) {
+            return Some(mime);
+        }
+    }
+    if bmp(bytes) {
+        return Some("image/bmp");
+    }
+    if let Some(audio) = audio_frame(bytes) {
+        return Some(audio);
+    }
+    None
+}
+
+fn ftyp_brand(bytes: &[u8]) -> Option<&[u8]> {
+    (bytes.get(4..8) == Some(b"ftyp")).then(|| bytes.get(8..12)).flatten()
+}
+
+fn brand_mime(brand: &[u8]) -> Option<&'static str> {
+    Some(match brand {
+        b"qt  " => "video/quicktime",
+        b"3gp4" | b"3gp5" | b"3gp6" | b"3gp7" => "video/3gpp",
+        b"3g2a" | b"3g2b" | b"3g2c" => "video/3gpp2",
+        b"M4A " | b"M4B " => "audio/mp4",
+        b"M4V " | b"mp41" | b"mp42" | b"isom" | b"iso2" | b"avc1" => "video/mp4",
+        b"heic" | b"heix" | b"hevc" | b"hevx" => "image/heic",
+        b"heif" | b"mif1" | b"msf1" => "image/heif",
+        _ => return None,
+    })
+}
+
+/// `BM` alone is two letters. A bitmap also names where its pixels start, at least the 54-byte
+/// header.
+fn bmp(bytes: &[u8]) -> bool {
+    if bytes.len() < 14 || !bytes.starts_with(b"BM") {
+        return false;
+    }
+    let offset = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
+    (54..=1024).contains(&offset)
+}
+
+/// An MPEG frame or an AAC ADTS frame. Layer `00` is reserved in MPEG and is what ADTS uses.
+fn audio_frame(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() < 3 || bytes[0] != 0xff || bytes[1] & 0xe0 != 0xe0 {
+        return None;
+    }
+    let layer = (bytes[1] >> 1) & 0x03;
+    if layer == 0 {
+        let rate = (bytes[2] >> 2) & 0x0f;
+        return (rate != 0x0f).then_some("audio/aac");
+    }
+    matches!(bytes[1], 0xfb | 0xf3 | 0xf2 | 0xfa | 0xe3).then_some("audio/mpeg")
+}
+
+fn ftyp(brand: &[u8; 4]) -> Vec<u8> {
+    let mut bytes = vec![0, 0, 0, 20];
+    bytes.extend_from_slice(b"ftyp");
+    bytes.extend_from_slice(brand);
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    bytes
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-file-types`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub(super) fn prove_message_file_types() -> Result<(), String> {
+    file_type_samples()
+}
+
+fn file_type_samples() -> Result<(), String> {
+    let mov = ftyp(b"qt  ");
+    let mp4 = ftyp(b"isom");
+    let three_gp = ftyp(b"3gp4");
+    let three_g2 = ftyp(b"3g2a");
+    let m4a = ftyp(b"M4A ");
+    let heic = ftyp(b"heic");
+    let heif = ftyp(b"mif1");
+    let samples: Vec<(&str, &[u8], &str)> = vec![
+        ("clip.mov", &mov, "video/quicktime"),
+        ("clip.dat", &mov, "video/quicktime"),
+        ("film.mp4", &mp4, "video/mp4"),
+        ("film.m4v", b"", "video/mp4"),
+        ("clip.webm", &[0x1a, 0x45, 0xdf, 0xa3], "video/webm"),
+        ("clip.3gp", &three_gp, "video/3gpp"),
+        ("clip.3g2", &three_g2, "video/3gpp2"),
+        ("song.m4a", &m4a, "audio/mp4"),
+        ("song.aac", &[0xff, 0xf1, 0x50, 0x80, 0x00, 0x1f, 0xfc], "audio/aac"),
+        ("song.ogg", b"OggS", "audio/ogg"),
+        ("voice.opus", b"OggS\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0OpusHead", "audio/opus"),
+        ("song.wav", b"RIFF\0\0\0\0WAVE", "audio/wav"),
+        ("song.amr", b"#!AMR\n", "audio/amr"),
+        ("song.awb", b"#!AMR-WB\n", "audio/amr-wb"),
+        ("song.mp3", b"ID3", "audio/mpeg"),
+        ("photo.heic", &heic, "image/heic"),
+        ("photo.heif", &heif, "image/heif"),
+        ("photo.jpg", b"\xff\xd8\xff", "image/jpeg"),
+        ("photo.bin", b"\xff\xd8\xff", "image/jpeg"),
+        ("photo.png", b"\x89PNG\r\n\x1a\n", "image/png"),
+        ("anim.gif", b"GIF89a", "image/gif"),
+        ("still.webp", b"RIFF\0\0\0\0WEBP", "image/webp"),
+        ("photo.bmp", b"BM\0\0\0\0\0\0\0\0\x36\0\0\0", "image/bmp"),
+        ("page.pdf", b"%PDF", "application/pdf"),
+        ("notes.txt", b"hello", "text/plain"),
+        ("notes.csv", b"a,b\n", "text/csv"),
+        ("card.vcf", b"BEGIN:VCARD", "text/vcard"),
+        ("pack.zip", b"PK\x03\x04", "application/zip"),
+        ("report.docx", b"PK\x03\x04", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        ("sheet.xlsx", b"PK\x03\x04", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        ("deck.pptx", b"PK\x03\x04", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        ("mystery.bin", b"hello", "application/octet-stream"),
+        ("photo.jpg", b"\x89PNG\r\n\x1a\n", "image/png"),
+    ];
+    for (name, bytes, want) in samples {
+        let got = mime_of(name, bytes);
+        if got != want {
+            return Err(format!("{name} was {got}, not {want}"));
+        }
+    }
+    Ok(())
 }
 
 fn send_media_request(
@@ -1181,7 +1388,7 @@ impl Session {
         let mut key = [0u8; 32];
         getrandom::fill(&mut key).map_err(|_| "Messages could not make a media key.".to_owned())?;
         let packed = super::media::pack(&key, &plain)?;
-        let mime = mime_of(named);
+        let mime = mime_of(named, &plain);
         let media_id = self.upload(&packed, &mime)?;
         let mine = self.mine_of(conversation);
         let tmp = uuid();
@@ -2064,6 +2271,11 @@ pub(super) fn prove_message_transport() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_type_comes_from_its_bytes_then_its_name() {
+        file_type_samples().unwrap();
+    }
 
     #[test]
     fn a_picture_a_caption_and_a_reaction_decode_and_a_tombstone_does_not() {
