@@ -1,7 +1,8 @@
 //! Android Messages: Google Messages on the phone, with this computer paired to it the way
 //! messages.google.com is. The phone stays the account and has to be online; texts (SMS and RCS)
 //! go through it. Photos are shown. Other files are named and can be opened. Reactions can be
-//! read and sent. Calls stay on the phone.
+//! read and sent. Calls stay on the phone. When the phone does not answer, texts wait and the
+//! account says so. They go when it answers, unless the user cancelled them.
 
 mod bugle;
 mod fake;
@@ -15,10 +16,10 @@ use crate::store::{ConversationRow, PersonRow};
 use bugle::Chat;
 use protocol::{
     Attachment, Capabilities, Change, ConversationKind, MediaFile, MediaKind, Message, MessageKind,
-    Reaction, ReactionSet, Relation,
+    Reaction, ReactionSet, Relation, SendState,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
@@ -26,6 +27,24 @@ use std::sync::{Arc, Mutex};
 const TYPING_SHOWN: i64 = 15;
 /// Most participants whose pictures are asked of the phone in one request.
 const PICTURES: usize = 25;
+/// A text waits this long for the phone, then it is left unsent.
+const HOLD_FOR: i64 = 15 * 60;
+/// The account banner while the relay is up and the phone is not answering.
+pub const CANT_REACH: &str = "Can't reach your phone";
+/// Under a text held until the phone answers. The row stays, so it can be cancelled.
+pub const WAITING: &str = "Waiting for your phone";
+/// After [`HOLD_FOR`], the text is not sent.
+pub const GAVE_UP: &str = "Not sent. Your phone did not answer in time.";
+
+/// True when a request ended because the phone did not answer, not because it refused.
+pub fn phone_quiet(why: &str) -> bool {
+    why == bugle::PHONE_QUIET
+}
+
+/// A held text is still sent at `now` when the phone answers. After fifteen minutes it is not.
+pub fn held_text_waits(since: i64, now: i64) -> bool {
+    now.saturating_sub(since) < HOLD_FOR
+}
 
 fn scripted() -> bool {
     !session::enabled() && std::env::var_os("TINYCLIENT_MESSAGES_FAKE").is_some()
@@ -82,6 +101,9 @@ pub enum Event {
     },
     Closed(String),
     Ended(String),
+    /// The scripted phone answers again. The live relay has no separate notice for this:
+    /// a message, a chat list, or a later request that succeeds is what says the phone is back.
+    PhoneBack,
 }
 
 trait Drive: Send + Sync {
@@ -230,6 +252,28 @@ pub fn prove_message_transport() -> Result<(), String> {
     bugle::prove_message_transport()
 }
 
+/// The lab sets `TINYCLIENT_PROVE=messages-phone-quiet`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_phone_quiet() -> Result<(), String> {
+    if !phone_quiet(bugle::PHONE_QUIET) {
+        return Err("a quiet phone was not recognised".into());
+    }
+    if phone_quiet("Messages takes one file at a time.") {
+        return Err("a refusal was treated as the phone being quiet".into());
+    }
+    let now = 1_700_000_000;
+    if !held_text_waits(now - (HOLD_FOR - 1), now) {
+        return Err("a text inside fifteen minutes was dropped".into());
+    }
+    if held_text_waits(now - HOLD_FOR, now) {
+        return Err("a text at fifteen minutes was still waiting".into());
+    }
+    if CANT_REACH.is_empty() || WAITING.is_empty() || GAVE_UP.is_empty() {
+        return Err("the phone warning has no words".into());
+    }
+    Ok(())
+}
+
 pub fn reaction_rules() -> protocol::ReactionRules {
     protocol::ReactionRules {
         set: ReactionSet::Any,
@@ -249,6 +293,28 @@ struct Held {
     mime: String,
 }
 
+/// A text this computer has not asked the phone to send yet. Kept only for this connection.
+struct WaitingSend {
+    conversation: String,
+    client_id: String,
+    text: String,
+    /// Empty for a text. A file keeps the path the shell handed over.
+    path: String,
+    name: String,
+    since: i64,
+}
+
+/// Work the phone did not answer. The relay can still be up: that is [`CANT_REACH`], not offline.
+#[derive(Default)]
+struct Phone {
+    down: bool,
+    queue: VecDeque<WaitingSend>,
+    /// Conversations whose history the phone did not return.
+    history: VecDeque<String>,
+    /// (conversation, participant) whose picture the phone did not return.
+    pictures: Vec<(String, String)>,
+}
+
 struct Account {
     ctx: Context,
     drive: Box<dyn Drive>,
@@ -261,6 +327,7 @@ struct Account {
     pictured: Mutex<HashSet<String>>,
     /// The last conversation update, so a send knows SMS from RCS.
     chats: Mutex<HashMap<String, Chat>>,
+    phone: Mutex<Phone>,
 }
 
 pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<(), String> {
@@ -331,6 +398,7 @@ fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) 
         peers: Mutex::default(),
         pictured: Mutex::default(),
         chats: Mutex::default(),
+        phone: Mutex::default(),
     });
     ctx.capabilities(Capabilities {
         max_file_bytes: 100 * 1024 * 1024,
@@ -486,6 +554,7 @@ fn apply(account: &Account, event: Event) {
                     .collect();
                 let _ = account.ctx.relations(&owned);
             }
+            nudge(account);
         }
         Event::Message(note) => {
             if note.phones.is_none()
@@ -510,6 +579,7 @@ fn apply(account: &Account, event: Event) {
                 let _ = account.ctx.conversation(&row(&chat[0]));
             }
             show(account, &note);
+            nudge(account);
         }
         Event::Typing {
             conversation,
@@ -527,6 +597,10 @@ fn apply(account: &Account, event: Event) {
             } else {
                 account.ctx.typing_stopped(&conversation, &by);
             }
+            nudge(account);
+        }
+        Event::PhoneBack => {
+            let _ = account.ctx.commands.send(Command::OpenHome);
         }
         Event::Ready | Event::Closed(_) | Event::Ended(_) => {}
     }
@@ -764,8 +838,24 @@ fn pictures(account: &Arc<Account>, watching: &protocol::Watching) {
         let participants: Vec<String> = wanted.iter().map(|(_, peer)| peer.clone()).collect();
         let pictures = match account.drive.thumbnails(&participants) {
             Ok(pictures) => pictures,
-            // Asked again on the next connection.
-            Err(why) => return tracing::warn!("chatd: Messages: pictures: {why}"),
+            Err(why) => {
+                // A quiet phone is asked again when it answers. Anything else waits for the
+                // next connection: the participants stay in `pictured`.
+                if phone_quiet(&why) {
+                    {
+                        let mut pictured = account
+                            .pictured
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        for (_, peer) in &wanted {
+                            pictured.remove(peer);
+                        }
+                    }
+                    remember_pictures(&account, &wanted);
+                    lost_phone(&account);
+                }
+                return tracing::warn!("chatd: Messages: pictures: {why}");
+            }
         };
         for (participant, bytes) in pictures {
             // A new picture is a new id, so the shell never draws the old one in its place.
@@ -833,68 +923,50 @@ fn serve(account: &Arc<Account>, command: Command) {
             client_id,
             text,
             ..
-        } => {
-            let outcome = account
-                .drive
-                .send(&conversation_id, &text)
-                .map(|id| outgoing(account, id, text));
-            ctx.sent(&conversation_id, &client_id, outcome);
-        }
+        } => post_text(account, &conversation_id, &client_id, text),
         Command::SendWith {
             conversation_id,
             client_id,
             text,
             with,
             ..
+        } => match with.files.as_slice() {
+            [file] => {
+                warn_mms(account, &conversation_id, &client_id);
+                let name = if file.name.is_empty() {
+                    std::path::Path::new(&file.path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("file")
+                        .to_owned()
+                } else {
+                    file.name.clone()
+                };
+                post_file(
+                    account,
+                    &conversation_id,
+                    &client_id,
+                    text,
+                    file.path.clone(),
+                    name,
+                );
+            }
+            [] => post_text(account, &conversation_id, &client_id, text),
+            _ => ctx.sent(
+                &conversation_id,
+                &client_id,
+                Err("Messages takes one file at a time.".into()),
+            ),
+        },
+        Command::OpenHome => catch_up(account),
+        Command::CancelSend {
+            conversation_id,
+            client_id,
         } => {
-            let outcome = match with.files.as_slice() {
-                [file] => {
-                    warn_mms(account, &conversation_id, &client_id);
-                    let name = if file.name.is_empty() {
-                        std::path::Path::new(&file.path)
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("file")
-                            .to_owned()
-                    } else {
-                        file.name.clone()
-                    };
-                    let bytes = std::fs::read(&file.path).unwrap_or_default();
-                    let mime = bugle::mime_of(&name);
-                    account
-                        .drive
-                        .send_file(&conversation_id, &text, &file.path, &name)
-                        .map(|id| {
-                            let mut message = outgoing(account, id.clone(), text);
-                            if !bytes.is_empty() {
-                                let mut media =
-                                    MediaFile::new(format!("messages:{id}:0"), kind_of(mime));
-                                media.bytes = bytes.len() as u64;
-                                if let Some(path) = land(account, &media, &bytes) {
-                                    media.path = Some(path);
-                                }
-                                message.attachments = vec![Attachment {
-                                    name: name.clone(),
-                                    file: media,
-                                    thumb: None,
-                                    mime: mime.to_owned(),
-                                    duration: 0,
-                                    spoiler: false,
-                                    sticker: false,
-                                    waveform: Vec::new(),
-                                    round: false,
-                                }];
-                            }
-                            message
-                        })
-                }
-                [] => account
-                    .drive
-                    .send(&conversation_id, &text)
-                    .map(|id| outgoing(account, id, text)),
-                _ => Err("Messages takes one file at a time.".into()),
-            };
-            ctx.sent(&conversation_id, &client_id, outcome);
+            phone(account).queue.retain(|held| {
+                held.conversation != conversation_id || held.client_id != client_id
+            });
+            ctx.sent(&conversation_id, &client_id, Err("Cancelled".into()));
         }
         Command::React {
             message_id,
@@ -965,12 +1037,288 @@ fn receipt(account: &Account, conversation: &str, note: &bugle::Note) {
 }
 
 fn backfill(account: &Account, conversation: &str) {
+    if phone(account).down {
+        remember_history(account, conversation);
+        return;
+    }
     match account.drive.history(conversation) {
         Ok(notes) => {
             for note in notes {
                 show(account, &note);
             }
+            mark_up(account);
+            nudge(account);
+        }
+        Err(why) if phone_quiet(&why) => {
+            remember_history(account, conversation);
+            lost_phone(account);
         }
         Err(why) => tracing::warn!("chatd: Messages: {why}"),
     }
+}
+
+fn phone(account: &Account) -> std::sync::MutexGuard<'_, Phone> {
+    account.phone.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn mark_up(account: &Account) {
+    let mut phone = phone(account);
+    if !phone.down {
+        return;
+    }
+    phone.down = false;
+    drop(phone);
+    account.ctx.attention("");
+}
+
+fn lost_phone(account: &Account) {
+    phone(account).down = true;
+    account.ctx.attention(CANT_REACH);
+}
+
+/// Ask the command thread to send what is waiting. The link thread must not call the phone itself.
+fn nudge(account: &Account) {
+    let waiting = {
+        let phone = phone(account);
+        phone.down || !phone.queue.is_empty() || !phone.history.is_empty() || !phone.pictures.is_empty()
+    };
+    if waiting {
+        let _ = account.ctx.commands.send(Command::OpenHome);
+    }
+}
+
+fn hold(account: &Account, item: WaitingSend) {
+    let conversation = item.conversation.clone();
+    let client_id = item.client_id.clone();
+    {
+        let mut phone = phone(account);
+        phone.queue.retain(|held| held.conversation != conversation || held.client_id != client_id);
+        phone.queue.push_back(item);
+    }
+    account.ctx.sent(&conversation, &client_id, Err(WAITING.to_owned()));
+}
+
+fn post_text(account: &Account, conversation: &str, client_id: &str, text: String) {
+    let item = WaitingSend {
+        conversation: conversation.to_owned(),
+        client_id: client_id.to_owned(),
+        text,
+        path: String::new(),
+        name: String::new(),
+        since: crate::hub::now(),
+    };
+    post(account, item);
+}
+
+fn post_file(
+    account: &Account,
+    conversation: &str,
+    client_id: &str,
+    text: String,
+    path: String,
+    name: String,
+) {
+    let item = WaitingSend {
+        conversation: conversation.to_owned(),
+        client_id: client_id.to_owned(),
+        text,
+        path,
+        name,
+        since: crate::hub::now(),
+    };
+    post(account, item);
+}
+
+fn post(account: &Account, item: WaitingSend) {
+    if phone(account).down {
+        hold(account, item);
+        return;
+    }
+    match ask(account, &item) {
+        Ok(message) => {
+            mark_up(account);
+            account.ctx.sent(&item.conversation, &item.client_id, Ok(message));
+            nudge(account);
+        }
+        Err(why) if phone_quiet(&why) => {
+            lost_phone(account);
+            hold(account, item);
+        }
+        Err(why) => account.ctx.sent(&item.conversation, &item.client_id, Err(why)),
+    }
+}
+
+fn ask(account: &Account, item: &WaitingSend) -> Result<Message, String> {
+    if item.path.is_empty() {
+        return account
+            .drive
+            .send(&item.conversation, &item.text)
+            .map(|id| outgoing(account, id, item.text.clone()));
+    }
+    let bytes = std::fs::read(&item.path).unwrap_or_default();
+    let mime = bugle::mime_of(&item.name);
+    account
+        .drive
+        .send_file(&item.conversation, &item.text, &item.path, &item.name)
+        .map(|id| with_file(account, id, item.text.clone(), &item.name, mime, &bytes))
+}
+
+fn with_file(
+    account: &Account,
+    id: String,
+    text: String,
+    name: &str,
+    mime: &str,
+    bytes: &[u8],
+) -> Message {
+    let mut message = outgoing(account, id.clone(), text);
+    if bytes.is_empty() {
+        return message;
+    }
+    let mut media = MediaFile::new(format!("messages:{id}:0"), kind_of(mime));
+    media.bytes = bytes.len() as u64;
+    if let Some(path) = land(account, &media, bytes) {
+        media.path = Some(path);
+    }
+    message.attachments = vec![Attachment {
+        name: name.to_owned(),
+        file: media,
+        thumb: None,
+        mime: mime.to_owned(),
+        duration: 0,
+        spoiler: false,
+        sticker: false,
+        waveform: Vec::new(),
+        round: false,
+    }];
+    message
+}
+
+/// The row is still the one we held. A discard or a retry removed it.
+fn still_held(account: &Account, item: &WaitingSend) -> bool {
+    let key = account.ctx.key(&item.conversation);
+    match account.ctx.hub.store().message(&key, &item.client_id) {
+        Ok(Some(message)) => matches!(message.state, SendState::Failed { reason } if reason == WAITING),
+        _ => false,
+    }
+}
+
+/// True when the phone is still quiet and the rest of the queue should wait.
+fn release(account: &Account, item: WaitingSend) -> bool {
+    if !held_text_waits(item.since, crate::hub::now()) {
+        account.ctx.sent(&item.conversation, &item.client_id, Err(GAVE_UP.to_owned()));
+        return false;
+    }
+    if !still_held(account, &item) {
+        return false;
+    }
+    match ask(account, &item) {
+        Ok(message) => {
+            mark_up(account);
+            account.ctx.sent(&item.conversation, &item.client_id, Ok(message));
+            false
+        }
+        Err(why) if phone_quiet(&why) => {
+            phone(account).queue.push_front(item);
+            lost_phone(account);
+            true
+        }
+        Err(why) => {
+            account.ctx.sent(&item.conversation, &item.client_id, Err(why));
+            false
+        }
+    }
+}
+
+fn remember_history(account: &Account, conversation: &str) {
+    let mut phone = phone(account);
+    if phone.history.iter().any(|id| id == conversation) {
+        return;
+    }
+    phone.history.push_back(conversation.to_owned());
+}
+
+fn remember_pictures(account: &Account, wanted: &[(String, String)]) {
+    let mut phone = phone(account);
+    for pair in wanted {
+        if !phone.pictures.iter().any(|have| have == pair) {
+            phone.pictures.push(pair.clone());
+        }
+    }
+}
+
+/// True when this conversation's history still has to wait.
+fn retry_history(account: &Account, conversation: &str) -> bool {
+    match account.drive.history(conversation) {
+        Ok(notes) => {
+            for note in notes {
+                show(account, &note);
+            }
+            mark_up(account);
+            false
+        }
+        Err(why) if phone_quiet(&why) => {
+            phone(account).history.push_front(conversation.to_owned());
+            lost_phone(account);
+            true
+        }
+        Err(why) => {
+            tracing::warn!("chatd: Messages: {why}");
+            false
+        }
+    }
+}
+
+fn catch_up(account: &Arc<Account>) {
+    loop {
+        let next = {
+            let mut phone = phone(account);
+            phone.queue.pop_front()
+        };
+        let Some(item) = next else {
+            break;
+        };
+        if release(account, item) {
+            return;
+        }
+    }
+    loop {
+        let next = {
+            let mut phone = phone(account);
+            phone.history.pop_front()
+        };
+        let Some(conversation) = next else {
+            break;
+        };
+        if retry_history(account, &conversation) {
+            return;
+        }
+    }
+    let again = {
+        let mut phone = phone(account);
+        std::mem::take(&mut phone.pictures)
+    };
+    if again.is_empty() {
+        return;
+    }
+    {
+        let mut pictured = account
+            .pictured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (_, peer) in &again {
+            pictured.remove(peer);
+        }
+    }
+    let rows = again
+        .into_iter()
+        .map(|(id, _)| account.ctx.key(&id))
+        .collect();
+    pictures(
+        account,
+        &protocol::Watching {
+            rows,
+            ..Default::default()
+        },
+    );
 }

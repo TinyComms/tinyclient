@@ -696,3 +696,62 @@ fn an_sms_chat_says_text_and_an_encrypted_rcs_chat_does_not_claim_this_computer_
             .find(|message| message.text == "Sends as MMS; may be compressed")
     });
 }
+
+#[test]
+fn a_quiet_phone_holds_a_text_until_the_phone_answers() {
+    chatd::adapters::messages::prove_phone_quiet().expect("the quiet-phone check");
+    let world = World::linked();
+    world.connected();
+    world.steer("silent");
+    world.heard("silent");
+    let _ = world.messages(GRACE);
+    world.until("the phone banner while the relay stays up", || {
+        let (accounts, _) = world.status();
+        accounts.into_iter().find(|status| status.key.account == ME).and_then(|status| {
+            (status.link == Link::Connected
+                && status.required == chatd::adapters::messages::CANT_REACH)
+                .then_some(())
+        })
+    });
+    assert!(
+        world.calls().iter().all(|call| !call.starts_with("history ")),
+        "a quiet phone was asked for history: {:?}",
+        world.calls()
+    );
+    let pending = world.send(GRACE, "held-1", "On my way.");
+    assert!(matches!(pending.state, SendState::Pending), "{pending:?}");
+    let waiting = |text: &str| {
+        world.messages(GRACE).into_iter().find(|message| {
+            message.text == text
+                && matches!(&message.state, SendState::Failed { reason } if reason == chatd::adapters::messages::WAITING)
+        })
+    };
+    world.until("the first text to wait", || waiting("On my way."));
+    world.send(GRACE, "held-2", "Still here.");
+    world.until("the second text to wait", || waiting("Still here."));
+    assert!(
+        world.calls().iter().all(|call| !call.starts_with("send ")),
+        "a quiet phone was asked to send: {:?}",
+        world.calls()
+    );
+    world.steer("answer");
+    world.until("the held texts to go, then the history", || {
+        let calls = world.calls();
+        let first = calls.iter().position(|call| call == "send phone-grace On my way.")?;
+        let second = calls.iter().position(|call| call == "send phone-grace Still here.")?;
+        let history = calls.iter().position(|call| call == "history phone-grace")?;
+        (first < second && second < history).then_some(())
+    });
+    world.until("both texts to be sent", || {
+        let messages = world.messages(GRACE);
+        let first = messages.iter().find(|message| message.text == "On my way.")?;
+        let second = messages.iter().find(|message| message.text == "Still here.")?;
+        (first.state == SendState::Sent && second.state == SendState::Sent).then_some(())
+    });
+    world.until("the banner to clear", || {
+        let (accounts, _) = world.status();
+        accounts.into_iter().find(|status| status.key.account == ME).and_then(|status| {
+            (status.link == Link::Connected && status.required.is_empty()).then_some(())
+        })
+    });
+}

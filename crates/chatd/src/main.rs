@@ -290,6 +290,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-messages-transport:0");
         return Ok(());
     }
+    // The lab's messages-phone-quiet driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-phone-quiet") {
+        if let Err(err) = chatd::adapters::messages::prove_phone_quiet() {
+            eprintln!("messages-phone-quiet: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-phone-quiet:0");
+        return Ok(());
+    }
     // The lab's teams-reactions driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("teams-reactions") {
         if let Err(err) = chatd::adapters::prove_teams_reactions() {

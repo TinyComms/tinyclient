@@ -4,14 +4,16 @@
 //! `messages.ctl` once linked:
 //! `incoming WHO TEXT…`, `group WHO TEXT…`, `photo WHO`, `caption WHO TEXT…`,
 //! `file WHO NAME`, `remote WHO`, `react WHO TEXT`, `typing WHO`, `typing-stop WHO`,
-//! `refuse WORDS…`, `drop`, `unlinked`.
+//! `refuse WORDS…`, `drop`, `unlinked`, `silent`, `answer`.
+//! `silent` makes the phone stop answering sends, history, and files. `answer` clears that
+//! and tells the adapter the phone is back.
 //! WHO is `grace` or `alan`.
 
 use super::{Drive, Event, Saved};
-use crate::adapters::messages::bugle::{Chat, Mark, Note, Piece};
+use crate::adapters::messages::bugle::{Chat, Mark, Note, Piece, PHONE_QUIET};
 use crate::adapters::script;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -40,6 +42,9 @@ pub struct Fake {
     heard: Mutex<Option<Receiver<Event>>>,
     closed: Arc<AtomicBool>,
     refuse: Arc<Mutex<Option<String>>>,
+    /// Set by `silent`, cleared by `answer`. Requests fail at once and are not recorded.
+    quiet: Arc<AtomicBool>,
+    sent: AtomicU32,
 }
 
 impl Fake {
@@ -73,11 +78,14 @@ impl Fake {
             heard: Mutex::new(Some(heard)),
             closed: Arc::default(),
             refuse: Arc::default(),
+            quiet: Arc::default(),
+            sent: AtomicU32::new(0),
         };
-        let (events, closed, refuse) = (
+        let (events, closed, refuse, quiet) = (
             fake.events.clone(),
             fake.closed.clone(),
             fake.refuse.clone(),
+            fake.quiet.clone(),
         );
         let control = script::control("messages.ctl");
         let _ = std::thread::Builder::new()
@@ -97,6 +105,19 @@ impl Fake {
                             Some(words.to_owned());
                         return true;
                     }
+                    if line == "silent" {
+                        quiet.store(true, Ordering::Relaxed);
+                        // Recorded after the flag, so a test can wait until the phone is quiet.
+                        // The control file is marked taken before this line runs.
+                        record("silent");
+                        return true;
+                    }
+                    if line == "answer" {
+                        quiet.store(false, Ordering::Relaxed);
+                        record("answer");
+                        let _ = events.send(Event::PhoneBack);
+                        return true;
+                    }
                     for event in steer(line) {
                         let _ = events.send(event);
                     }
@@ -104,6 +125,22 @@ impl Fake {
                 });
             });
         fake
+    }
+
+    /// The phone did not answer. The call is not recorded, so a test can see it was not asked.
+    fn unanswered(&self) -> Result<(), String> {
+        if self.quiet.load(Ordering::Relaxed) {
+            Err(PHONE_QUIET.to_owned())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn refusal(&self) -> Option<String> {
+        self.refuse
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 }
 
@@ -353,20 +390,18 @@ impl Drive for Fake {
         Ok(())
     }
     fn history(&self, conversation: &str) -> Result<Vec<Note>, String> {
+        self.unanswered()?;
         record(&format!("history {conversation}"));
         Ok(Vec::new())
     }
     fn send(&self, conversation: &str, text: &str) -> Result<String, String> {
-        if let Some(words) = self
-            .refuse
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
+        self.unanswered()?;
+        if let Some(words) = self.refusal() {
             return Err(words);
         }
         record(&format!("send {conversation} {text}"));
-        Ok(format!("sent-{conversation}"))
+        let n = self.sent.fetch_add(1, Ordering::Relaxed);
+        Ok(format!("sent-{conversation}-{n}"))
     }
     fn send_file(
         &self,
@@ -375,12 +410,8 @@ impl Drive for Fake {
         path: &str,
         name: &str,
     ) -> Result<String, String> {
-        if let Some(words) = self
-            .refuse
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
+        self.unanswered()?;
+        if let Some(words) = self.refusal() {
             return Err(words);
         }
         let bytes = std::fs::read(path).map_err(|_| format!("Messages couldn't read {name}."))?;
@@ -388,7 +419,8 @@ impl Drive for Fake {
             "file {conversation} {name} {} {caption}",
             bytes.len()
         ));
-        Ok(format!("sent-file-{conversation}"))
+        let n = self.sent.fetch_add(1, Ordering::Relaxed);
+        Ok(format!("sent-file-{conversation}-{n}"))
     }
     fn react(&self, message: &str, emoji: &str, on: bool) -> Result<(), String> {
         if let Some(words) = self
@@ -409,10 +441,12 @@ impl Drive for Fake {
         message: &str,
         _action: &str,
     ) -> Result<Vec<u8>, String> {
+        self.unanswered()?;
         record(&format!("fetch {message} {media_id}"));
         Ok(png())
     }
     fn thumbnails(&self, participants: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {
+        self.unanswered()?;
         record(&format!("thumbnails {}", participants.join(" ")));
         Ok(participants
             .iter()
