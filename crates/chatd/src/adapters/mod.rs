@@ -1570,6 +1570,11 @@ pub fn prove_teams_reactions() -> Result<(), String> {
     teams::prove_reactions()
 }
 
+/// The lab's teams-file-download driver. See `teams::prove_shared_file`.
+pub fn prove_teams_shared_file() -> Result<(), String> {
+    teams::prove_shared_file()
+}
+
 /// The lab's slack-connect-org driver. See `slack::prove_connect_names`.
 pub fn prove_slack_connect_org() -> Result<(), String> {
     slack::prove_connect_names()

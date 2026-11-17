@@ -72,7 +72,9 @@
 //!
 //! Pictures in messages are on AMS (`*.asm.skype.com`, `*.asyncgw.teams.microsoft.com`) and
 //! need `Authorization: skype_token …` [C]. Files are SharePoint links in `properties.files`
-//! [C] and need another audience, so they open in the browser.
+//! [C]. The bytes are Graph's documented `GET /shares/u!{base64url}/driveItem/content`, with
+//! `Prefer: redeemSharingLinkIfNecessary` [C: mautrix]. Graph redirects to SharePoint, and
+//! that hop does not get the Graph bearer. A document's name stays a link to the sharing address.
 //!
 //! Push is trouter [C: purple-teams, mautrix, ost]: `POST go.trouter.teams.microsoft.com/v4/a`,
 //! a socket.io 0.9 session, a websocket, `user.authenticate`, and a registration at
@@ -101,6 +103,24 @@ pub(crate) mod message;
 /// The lab's teams-reactions driver. A build without this returns to the server and stays up.
 pub fn prove_reactions() -> Result<(), String> {
     message::prove_reactions()
+}
+
+/// The lab's teams-file-download driver. A build without this returns to the server and stays up.
+pub fn prove_shared_file() -> Result<(), String> {
+    let share = "https://contoso.sharepoint.com/:x:/s/Platform/EaBcDeF";
+    let id = share_id(share);
+    if !id.starts_with("u!") || id.contains(['+', '/', '=']) {
+        return Err(format!("a share id is not unpadded base64url: {id}"));
+    }
+    let url = graph_content(GRAPH, share);
+    if url != format!("{GRAPH}/v1.0/shares/{id}/driveItem/content") {
+        return Err(format!("a shared file is not fetched from Graph: {url}"));
+    }
+    let kind = |name| message::shared_kind(name);
+    if kind("Q4 plan.xlsx") != protocol::MediaKind::File || kind("board.png") != protocol::MediaKind::Image || kind("walk.mp4") != protocol::MediaKind::Video {
+        return Err("a shared picture is still listed as a document".to_owned());
+    }
+    Ok(())
 }
 mod people;
 mod push;
@@ -465,6 +485,16 @@ fn https_host(url: &str) -> Option<&str> {
 
 fn within(host: &str, domain: &str) -> bool {
     host == domain || host.strip_suffix(domain).is_some_and(|sub| sub.ends_with('.'))
+}
+
+/// Graph's share id: `u!` plus the sharing URL in unpadded base64url.
+fn share_id(url: &str) -> String {
+    format!("u!{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(url.as_bytes()))
+}
+
+/// Where the media cache fetches a sharing link. Graph answers the bytes, or redirects to them.
+fn graph_content(graph: &str, share_url: &str) -> String {
+    format!("{}/v1.0/shares/{}/driveItem/content", graph.trim_end_matches('/'), share_id(share_url))
 }
 
 /// An id Teams writes as text in one place and as a number in another.
@@ -906,10 +936,16 @@ impl Teams {
         }
     }
 
-    /// How the media cache fetches a registered file: the media store takes the skype token,
-    /// a person's picture the bearer token as the web client's cookie.
+    /// How the media cache fetches a registered file: a shared file through Graph, a picture
+    /// from the media store with the skype token, a person's picture with the bearer as the
+    /// web client's cookie.
     fn download(&self, url: String) -> Result<Download, Fault> {
         let mut headers = vec![("User-Agent".to_owned(), self.session.user_agent.clone())];
+        if let Some(shared) = self.shared_download(&url) {
+            headers.push(("Authorization".to_owned(), format!("Bearer {}", self.token(GRAPH)?)));
+            headers.push(("Prefer".to_owned(), "redeemSharingLinkIfNecessary".to_owned()));
+            return Ok(Download { url: shared, headers, sealed: None });
+        }
         if self.pictures(&url) {
             headers.push(("Authorization".to_owned(), format!("skype_token {}", self.skype()?.0)));
         } else if self.ours(&url) {
@@ -918,6 +954,18 @@ impl Teams {
             headers.push(("Referer".to_owned(), "https://teams.microsoft.com/".to_owned()));
         }
         Ok(Download { url, headers, sealed: None })
+    }
+
+    /// Graph's content address for a sharing link, or the address itself when it already is one.
+    /// The bearer is Graph's. The cache attaches these headers only on a session host, and
+    /// SharePoint is not one, so the redirect does not carry the bearer.
+    fn shared_download(&self, url: &str) -> Option<String> {
+        let path = url.split(['?', '#']).next().unwrap_or(url);
+        if path.contains("/v1.0/shares/") && path.ends_with("/driveItem/content") {
+            return Some(url.to_owned());
+        }
+        let host = https_host(url)?;
+        within(host, "sharepoint.com").then(|| graph_content(&self.graph, url))
     }
 
     /// Tells the conversation the user is typing, at most once per [`TYPING_EVERY`].
@@ -1005,6 +1053,11 @@ mod tests {
         assert_eq!(https_host("https://teams.microsoft.com:pw@evil.example/a"), None);
         assert!(within("emea.ng.msg.teams.microsoft.com", "teams.microsoft.com"));
         assert!(!within("notteams.microsoft.com.evil.example", "teams.microsoft.com"));
+        let share = "https://contoso.sharepoint.com/:x:/s/Platform/EaBcDeF";
+        let id = share_id(share);
+        assert!(id.starts_with("u!") && !id.contains(['+', '/', '=']));
+        assert_eq!(graph_content(GRAPH, share), format!("{GRAPH}/v1.0/shares/{id}/driveItem/content"));
+        assert_eq!(graph_content("http://127.0.0.1:9/graph/", share), format!("http://127.0.0.1:9/graph/v1.0/shares/{id}/driveItem/content"));
         let id = uuid();
         assert_eq!(id.split('-').map(str::len).collect::<Vec<_>>(), [8, 4, 4, 4, 12]);
         assert!(id.split('-').nth(2).unwrap().starts_with('4'));
