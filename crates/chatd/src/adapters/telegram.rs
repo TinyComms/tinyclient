@@ -1179,6 +1179,11 @@ pub fn prove_telegram_album() -> Result<(), String> {
     content::prove_album()
 }
 
+/// The lab's telegram-stickers driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_stickers() -> Result<(), String> {
+    content::prove_stickers()
+}
+
 /// The lab's telegram-dice driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_dice() -> Result<(), String> {
     content::prove_dice_roll()?;

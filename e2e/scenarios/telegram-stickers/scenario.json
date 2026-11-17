@@ -1,0 +1,12 @@
+{
+  "id": "telegram-stickers",
+  "title": "An animated Telegram sticker keeps its still and names the file that plays",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same sticker file is what a phone row would keep.",
+    "ios": "The phone proof build does not run desktop chatd. The same sticker file is what a phone row would keep."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
