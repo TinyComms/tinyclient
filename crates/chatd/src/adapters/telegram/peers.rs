@@ -277,6 +277,11 @@ impl Directory {
         self.map.get(&who)
     }
 
+    /// People this account has learned, id then what is known of them.
+    pub fn users(&self) -> Vec<(i64, Known)> {
+        self.map.iter().filter_map(|(who, known)| match who { Who::User(id) => Some((*id, known.clone())), _ => None }).collect()
+    }
+
     pub fn name(&self, who: Who) -> String {
         self.map.get(&who).map_or_else(|| "Unknown".to_owned(), |known| known.name.clone())
     }
