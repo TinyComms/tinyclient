@@ -113,7 +113,8 @@ pub fn refusal_words(code: ErrorCode, detail: &str) -> String {
         ErrorCode::Unsupported if detail.is_empty() => {
             "Parts of tinyclient are different versions. Quit and reopen tinyclient.".to_owned()
         }
-        ErrorCode::Offline => "Not connected. It goes through when the network is back.".to_owned(),
+        ErrorCode::Offline if !detail.is_empty() => detail.to_owned(),
+        ErrorCode::Offline => "Not connected.".to_owned(),
         ErrorCode::Internal => "Something went wrong inside tinyclient. Try again.".to_owned(),
         _ if !detail.is_empty() => detail.to_owned(),
         _ => "That didn't work. Try again.".to_owned(),
@@ -151,6 +152,11 @@ mod tests {
         }
         assert!(refusal_words(ErrorCode::Unsupported, "").contains("different versions"));
         assert_eq!(refusal_words(ErrorCode::Refused, "Slow mode is on."), "Slow mode is on.");
+        assert_eq!(refusal_words(ErrorCode::Offline, ""), "Not connected.");
+        assert_eq!(
+            refusal_words(ErrorCode::Offline, "Discord is offline. Files need a connection."),
+            "Discord is offline. Files need a connection."
+        );
         assert!(is_gone(&io::Error::from(io::ErrorKind::ConnectionRefused)));
         for kind in [io::ErrorKind::NotFound, io::ErrorKind::TimedOut, io::ErrorKind::InvalidData, io::ErrorKind::Other] {
             let words = trouble_words("window", &io::Error::new(kind, "os error 61"));

@@ -25,6 +25,12 @@ const WAIT: Duration = Duration::from_secs(30);
 const ANSWER: Duration = Duration::from_secs(30);
 /// A message still pending after this many seconds did not go.
 const SEND_SECONDS: i64 = 60;
+/// How many text sends one account may hold while it is offline.
+const QUEUE_LIMIT: usize = 32;
+/// A queued send older than this is not sent when the link returns.
+const QUEUE_AGE: i64 = 24 * 60 * 60;
+/// Shown on a queued send that aged out, with Retry under it.
+const QUEUE_LATE: &str = "This waited more than a day. Send it if you still want it to go.";
 /// Most conversations of a Space's tree in one answer; they are small rows.
 const TREE_LIMIT: u32 = 500;
 /// A people search reaches a network once the typing has paused this long, so at most one
@@ -138,6 +144,22 @@ pub struct Chat {
 
 /// A refusal on its way out of a helper. Boxed, because a `Response` is large.
 type Refused = Box<Response>;
+
+/// Text with no file, voice note, picker item, or scheduled time. Those still need a connection.
+fn queueable(with: &Outgoing) -> bool {
+    with.files.is_empty() && with.voice.is_none() && with.pick.is_none() && with.schedule.is_none()
+}
+
+/// What a refused offline send says. A file names that it needs a connection. Nothing here
+/// promises the send will go by itself.
+fn offline_words(account: &AccountKey, with: &Outgoing) -> String {
+    let name = account.network.label();
+    if with.files.is_empty() && with.voice.is_none() {
+        format!("{name} is offline.")
+    } else {
+        format!("{name} is offline. Files need a connection.")
+    }
+}
 
 fn error(code: ErrorCode, detail: impl ToString) -> Response {
     Response::Error {
@@ -273,8 +295,10 @@ impl Chat {
         }
         // A seeded demo serves its own accounts.
         lock(&chat.adapters).extend(crate::demo::attach(&chat.hub));
-        // Whatever was on its way when chatd last stopped did not go.
+        // Whatever was on its way when chatd last stopped did not go. A text send queued while
+        // the account was offline stays, unless it has already waited more than a day.
         let _ = chat.hub.store().fail_pending(i64::MAX, "tinyclient was restarted before this was sent.");
+        let _ = chat.hub.store().fail_queued(now() - QUEUE_AGE, QUEUE_LATE);
         // Expiry and retention run behind the socket. A message whose own timer ran out goes at
         // its moment, online or not — the thread sleeps until then, at most a minute, and
         // wakes sooner when a message with a timer arrived. Retention runs about a minute after
@@ -949,11 +973,16 @@ impl Chat {
         }
         let read = {
             let mut store = self.hub.store();
-            let failed = store.fail_pending(now() - SEND_SECONDS, "The network did not answer.");
-            for stuck in failed.iter().flatten().filter(|stuck| **stuck != conversation) {
-                self.hub.changed(Change::Messages { conversation: stuck.clone() });
+            let swept = store.fail_pending(now() - SEND_SECONDS, "The network did not answer.").and_then(|failed| {
+                let aged = store.fail_queued(now() - QUEUE_AGE, QUEUE_LATE)?;
+                Ok((failed, aged))
+            });
+            if let Ok((failed, aged)) = &swept {
+                for stuck in failed.iter().chain(aged.iter()).filter(|stuck| **stuck != conversation) {
+                    self.hub.changed(Change::Messages { conversation: stuck.clone() });
+                }
             }
-            failed.and_then(|_| store.messages(&conversation, &page, limit.min(PAGE_LIMIT), now()))
+            swept.and_then(|_| store.messages(&conversation, &page, limit.min(PAGE_LIMIT), now()))
         };
         match read {
             Ok(Some(found)) => {
@@ -1114,13 +1143,18 @@ impl Chat {
     }
 
     /// Stores the message as pending and hands it to the adapter. The answer does not wait for
-    /// the network; the outcome arrives as a `Messages` change.
+    /// the network; the outcome arrives as a `Messages` change. A text send while the account
+    /// is offline is stored and handed off when the link returns.
     fn send(&self, conversation: Key, mut message: Message, reply_to: Option<String>, with: Outgoing) -> Response {
         let account = conversation.account();
-        if self.hub.link(&account) != Link::Connected {
-            let what = if with.files.is_empty() { "" } else { " Files need a connection." };
-            return error(ErrorCode::Offline, format!("{} is offline.{what}", account.network.label()));
+        let link = self.hub.link(&account);
+        if link != Link::Connected {
+            if link == Link::Offline && queueable(&with) {
+                return self.queue_offline(conversation, message);
+            }
+            return error(ErrorCode::Offline, offline_words(&account, &with));
         }
+        message.waiting = false;
         if let Err(refused) = self.allowed(&account, &with) {
             return *refused;
         }
@@ -1154,6 +1188,102 @@ impl Chat {
         };
         self.command(&account, command);
         Response::Sent { message }
+    }
+
+    /// A text send while the account is offline. Stored pending, not handed to the adapter yet.
+    fn queue_offline(&self, conversation: Key, mut message: Message) -> Response {
+        let account = conversation.account();
+        let client_id = message.client_id.clone().unwrap_or_else(|| message.id.clone());
+        let waiting = self.hub.store().queued_count(&account, &client_id).unwrap_or(QUEUE_LIMIT);
+        if waiting >= QUEUE_LIMIT {
+            return error(
+                ErrorCode::Refused,
+                format!("Too many messages are waiting for {}. Cancel one, or wait until it is back.", account.network.label()),
+            );
+        }
+        if let Err(err) = self.ensure_thread(&conversation) {
+            return internal(err);
+        }
+        message.state = SendState::Pending;
+        message.waiting = true;
+        message.sent = now();
+        let stored = {
+            let mut store = self.hub.store();
+            match store.conversation(&conversation) {
+                Ok(Some(row)) if row.read_only => return error(ErrorCode::Refused, format!("You can read {} but not post in it.", row.title)),
+                Ok(Some(_)) => store.ingest(&conversation, &message, true),
+                Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
+                Err(err) => Err(err),
+            }
+        };
+        if let Err(err) = stored {
+            return internal(err);
+        }
+        self.hub.changed(Change::Messages { conversation: conversation.clone() });
+        self.hub.changed(Change::Conversation { conversation });
+        Response::Sent { message }
+    }
+
+    /// Hands this account's offline queue to its adapter, oldest first. One older than a day
+    /// fails instead, and stays for Retry. The 60s pending timer starts at this hand-off.
+    fn release_queue(&self, account: &AccountKey) {
+        if self.hub.link(account) != Link::Connected {
+            return;
+        }
+        let clock = now();
+        let aged = match self.hub.store().fail_queued(clock - QUEUE_AGE, QUEUE_LATE) {
+            Ok(aged) => aged,
+            Err(err) => {
+                tracing::warn!("chatd: offline queue: {err}");
+                return;
+            }
+        };
+        let queued = match self.hub.store().queued(account) {
+            Ok(queued) => queued,
+            Err(err) => {
+                tracing::warn!("chatd: offline queue: {err}");
+                return;
+            }
+        };
+        let mut ready = Vec::with_capacity(queued.len());
+        for (conversation, mut message) in queued {
+            message.waiting = false;
+            message.sent = clock;
+            message.state = SendState::Pending;
+            if self.hub.store().ingest(&conversation, &message, true).is_err() {
+                continue;
+            }
+            ready.push((conversation, message));
+        }
+        for conversation in &aged {
+            self.hub.changed(Change::Messages { conversation: conversation.clone() });
+            self.hub.changed(Change::Conversation { conversation: conversation.clone() });
+        }
+        for (conversation, message) in ready {
+            self.hub.changed(Change::Messages { conversation: conversation.clone() });
+            self.hub.changed(Change::Conversation { conversation: conversation.clone() });
+            let conversation_id = conversation.id.clone();
+            let reply_to = message.reply_to.as_ref().map(|quoted| quoted.id.clone());
+            let client_id = message.client_id.clone().unwrap_or_else(|| message.id.clone());
+            self.command(
+                account,
+                Command::Send {
+                    conversation_id,
+                    client_id,
+                    text: message.text,
+                    reply_to,
+                },
+            );
+        }
+    }
+
+    /// When this account connects, hand off the text that was written while it was offline.
+    fn arm_queue(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        self.hub.on_connected(move |account| {
+            let Some(chat) = weak.upgrade() else { return };
+            chat.release_queue(account);
+        });
     }
 
     /// What the account may send, checked before anything is stored: a file too large or too
@@ -1664,6 +1794,18 @@ impl Chat {
                 Response::Shared { conversation, items: page.items, more: page.more, complete: true, total: page.total }
             }
             Err(refused) => *refused,
+        }
+    }
+
+    /// Drops an unsent row locally. A queued send is cancelled this way: the adapter never had it.
+    fn drop_unsent(&self, conversation: Key, client_id: &str, message: &Message) -> Response {
+        match self.hub.store().delete_message(&conversation, client_id) {
+            Ok(_) => {
+                crate::blobs::upload::discard(&outgoing_files(message));
+                self.hub.changed(Change::Messages { conversation });
+                Response::Ok
+            }
+            Err(err) => internal(err),
         }
     }
 
@@ -2244,8 +2386,12 @@ impl Chat {
                 answer
             }
             Request::CancelSend { conversation, client_id } => {
-                if let Err(refused) = self.unsent(&conversation, &client_id) {
-                    return *refused;
+                let message = match self.unsent(&conversation, &client_id) {
+                    Ok(message) => message,
+                    Err(refused) => return *refused,
+                };
+                if message.waiting {
+                    return self.drop_unsent(conversation, &client_id, &message);
                 }
                 let conversation_id = conversation.id.clone();
                 self.command(&conversation.account(), Command::CancelSend { conversation_id, client_id });
@@ -2265,15 +2411,7 @@ impl Chat {
                     Ok(message) => message,
                     Err(refused) => return *refused,
                 };
-                match self.hub.store().delete_message(&conversation, &client_id) {
-                    Ok(_) => {
-                        // The shell's staged copies in `outbox/` go with it; the user's own stay.
-                        crate::blobs::upload::discard(&outgoing_files(&message));
-                        self.hub.changed(Change::Messages { conversation });
-                        Response::Ok
-                    }
-                    Err(err) => internal(err),
-                }
+                self.drop_unsent(conversation, &client_id, &message)
             }
             Request::Typing { conversation } => {
                 let account = conversation.account();
@@ -2701,6 +2839,7 @@ pub fn serve(listener: ChatListener, chat: Chat) -> io::Result<()> {
     let chat = Arc::new(chat);
     let _ = chat.this.set(Arc::downgrade(&chat));
     crate::notify::start(chat.hub.clone(), Arc::downgrade(&chat));
+    chat.arm_queue();
     Chat::read_sessions(&chat, Network::ALL.to_vec(), true);
     loop {
         let stream = match listener.accept() {
@@ -3034,6 +3173,173 @@ pub fn prove_connect_keeps_offline() -> Result<(), String> {
         Link::Offline => Ok(()),
         other => Err(format!("link was {other:?}, not Offline")),
     }
+}
+
+/// The lab's offline-queue driver. Text written while the account is offline is stored and
+/// handed off in order when it connects. A file is refused. One older than a day fails instead
+/// of going. A restart does not fail a young queued row, and does not send an old one.
+pub fn prove_offline_queue() -> Result<(), String> {
+    let mut store = Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?;
+    let account = AccountKey { network: Network::Discord, account: "ada".into() };
+    store
+        .upsert_conversation(&account, &crate::store::ConversationRow::new("general", ConversationKind::Channel, "general"))
+        .map_err(|err| err.to_string())?;
+    let chat = Arc::new(Chat::new(store));
+    chat.arm_queue();
+    let conversation = Key::new(&account, "general");
+    chat.hub.set_link(&account, Link::Offline, "");
+    let send = |id: &str, text: &str, with: Outgoing| {
+        chat.handle(Request::Send {
+            conversation: conversation.clone(),
+            client_id: id.into(),
+            text: text.into(),
+            reply_to: None,
+            with,
+        })
+    };
+    let Response::Sent { message } = send("1", "one", Outgoing::default()) else {
+        return Err("offline text was refused".into());
+    };
+    if !message.waiting || message.state != SendState::Pending {
+        return Err("a queued send was marked on its way".into());
+    }
+    let Response::Sent { message } = send("2", "two", Outgoing::default()) else {
+        return Err("the second offline text was refused".into());
+    };
+    if !message.waiting || message.text != "two" {
+        return Err("the second offline text was not queued".into());
+    }
+    let files = send(
+        "3",
+        "pic",
+        Outgoing {
+            files: vec![protocol::OutgoingFile {
+                path: "pic.png".into(),
+                name: "pic.png".into(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+            }],
+            ..Outgoing::default()
+        },
+    );
+    let Response::Error { code: ErrorCode::Offline, detail } = files else {
+        return Err("a file send while offline was not refused".into());
+    };
+    if !detail.contains("Files") {
+        return Err(detail);
+    }
+    if chat.hub.store().message(&conversation, "3").map_err(|err| err.to_string())?.is_some() {
+        return Err("a file was stored offline".into());
+    }
+    let scheduled = send("4", "later", Outgoing { schedule: Some(1), ..Outgoing::default() });
+    if !matches!(scheduled, Response::Error { code: ErrorCode::Offline, .. }) {
+        return Err("a scheduled send while offline was stored".into());
+    }
+    let edit = chat.handle(Request::Edit { conversation: conversation.clone(), message_id: "1".into(), text: "no".into() });
+    let react = chat.handle(Request::React {
+        conversation: conversation.clone(),
+        message_id: "1".into(),
+        emoji: "👍".into(),
+        on: true,
+    });
+    let delete = chat.handle(Request::Delete { conversation: conversation.clone(), message_id: "1".into() });
+    if !matches!(edit, Response::Error { code: ErrorCode::Offline, .. })
+        || !matches!(react, Response::Error { code: ErrorCode::Offline, .. })
+        || !matches!(delete, Response::Error { code: ErrorCode::Offline, .. })
+    {
+        return Err("an edit, reaction, or delete was accepted offline".into());
+    }
+    let Response::Sent { message } = send("hold", "hold", Outgoing::default()) else {
+        return Err("the cancellable send was refused".into());
+    };
+    if !message.waiting {
+        return Err("the cancellable send was not queued".into());
+    }
+    let cancelled = chat.handle(Request::CancelSend { conversation: conversation.clone(), client_id: "hold".into() });
+    if !matches!(cancelled, Response::Ok) {
+        return Err("cancel of a queued send was refused".into());
+    }
+    if chat.hub.store().message(&conversation, "hold").map_err(|err| err.to_string())?.is_some() {
+        return Err("a cancelled queued send was kept".into());
+    }
+    chat.hub.set_link(&account, Link::SignedOut, "");
+    let signed_out = send("ghost", "ghost", Outgoing::default());
+    if !matches!(signed_out, Response::Error { code: ErrorCode::Offline, .. }) {
+        return Err("a signed-out send was stored".into());
+    }
+    chat.hub.set_link(&account, Link::Expired, "");
+    let expired = send("expired", "expired", Outgoing::default());
+    if !matches!(expired, Response::Error { code: ErrorCode::Offline, .. }) {
+        return Err("an expired account stored a send".into());
+    }
+    chat.hub.set_link(&account, Link::Offline, "");
+    let kept = chat.hub.store().message(&conversation, "1").map_err(|err| err.to_string())?.ok_or("queued text was dropped")?;
+    let next = chat.hub.store().message(&conversation, "2").map_err(|err| err.to_string())?.ok_or("second queued text was dropped")?;
+    if kept.text != "one" || next.text != "two" || kept.sent > next.sent {
+        return Err("the queue lost the order they were written".into());
+    }
+    for n in 3..=32 {
+        let Response::Sent { message } = send(&n.to_string(), "more", Outgoing::default()) else {
+            return Err(format!("queue slot {n} was refused"));
+        };
+        if !message.waiting {
+            return Err(format!("queue slot {n} was marked on its way"));
+        }
+    }
+    let over = send("33", "more", Outgoing::default());
+    if !matches!(over, Response::Error { code: ErrorCode::Refused, .. }) {
+        return Err("the queue grew past 32".into());
+    }
+    if chat.hub.store().message(&conversation, "33").map_err(|err| err.to_string())?.is_some() {
+        return Err("the refused extra was stored".into());
+    }
+    let mut late = chat.hub.store().message(&conversation, "1").map_err(|err| err.to_string())?.ok_or("missing late row")?;
+    late.sent = now() - QUEUE_AGE - 120;
+    chat.hub.store().ingest(&conversation, &late, false).map_err(|err| err.to_string())?;
+    let mut young = chat.hub.store().message(&conversation, "2").map_err(|err| err.to_string())?.ok_or("missing young row")?;
+    young.sent = now() - 90;
+    chat.hub.store().ingest(&conversation, &young, false).map_err(|err| err.to_string())?;
+    chat.hub.store().fail_pending(i64::MAX, "restart").map_err(|err| err.to_string())?;
+    let still = chat.hub.store().message(&conversation, "1").map_err(|err| err.to_string())?.ok_or("restart dropped the queue")?;
+    if !still.waiting || still.state != SendState::Pending {
+        return Err("a restart failed a queued send".into());
+    }
+    let _ = chat.handle(Request::Messages { conversation: conversation.clone(), page: Page::Newest, limit: 50 });
+    let late = chat.hub.store().message(&conversation, "1").map_err(|err| err.to_string())?.ok_or("the late row vanished")?;
+    let young = chat.hub.store().message(&conversation, "2").map_err(|err| err.to_string())?.ok_or("the young row vanished")?;
+    if late.waiting || !matches!(late.state, SendState::Failed { reason } if reason == QUEUE_LATE) {
+        return Err("a day-old queued send was not failed".into());
+    }
+    if !young.waiting || young.state != SendState::Pending {
+        return Err("a queued send younger than a day was failed while still offline".into());
+    }
+    let queued = chat.hub.store().queued(&account).map_err(|err| err.to_string())?;
+    if queued.first().map(|(_, message)| message.id.as_str()) != Some("2") {
+        return Err("the oldest queued send was not first".into());
+    }
+    let mut previous = 0;
+    for (_, message) in &queued {
+        if message.sent < previous {
+            return Err("the queue lost the order they were written".into());
+        }
+        previous = message.sent;
+    }
+    let handed = now();
+    chat.hub.set_link(&account, Link::Connected, "");
+    let late = chat.hub.store().message(&conversation, "1").map_err(|err| err.to_string())?.ok_or("the late row vanished on connect")?;
+    let young = chat.hub.store().message(&conversation, "2").map_err(|err| err.to_string())?.ok_or("the young row vanished on connect")?;
+    let third = chat.hub.store().message(&conversation, "3").map_err(|err| err.to_string())?.ok_or("a later queued send vanished")?;
+    if late.waiting || late.sent >= handed || !matches!(late.state, SendState::Failed { .. }) {
+        return Err("a day-old send went when the link returned".into());
+    }
+    if young.waiting || young.state != SendState::Pending || young.sent < handed || young.text != "two" {
+        return Err("a young queued send was not handed off".into());
+    }
+    if third.waiting || third.state != SendState::Pending || third.sent < handed {
+        return Err("a later queued send was not handed off".into());
+    }
+    Ok(())
 }
 
 /// Who we are on this conversation's account for a pending outgoing row: a prior message of
@@ -3446,5 +3752,10 @@ mod tests {
         assert_eq!(super::thread_name(&"x".repeat(150)).chars().count(), 100);
         assert_eq!(super::first_line("Release train\nWho drives", 40), "Release train");
         assert!(super::first_line("A post with no subject that goes on for quite a while", 40).ends_with('…'));
+    }
+
+    #[test]
+    fn a_text_sent_while_offline_waits_and_a_late_one_fails_instead_of_going() {
+        assert_eq!(super::prove_offline_queue(), Ok(()));
     }
 }

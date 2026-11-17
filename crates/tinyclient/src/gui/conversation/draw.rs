@@ -31,6 +31,11 @@ use std::time::Duration;
 
 /// How long the tint on a jump's target takes to fade.
 pub const FLASH: Duration = Duration::from_millis(1200);
+
+/// The line under a send that is queued until the account is back.
+pub(crate) fn waiting_line(network: &str) -> String {
+    format!("Waiting for {network}")
+}
 /// Lines of a code block shown before "Show more".
 const CODE_LINES: usize = 20;
 /// Link cards drawn per message; further links stay text.
@@ -1913,6 +1918,10 @@ impl Pane {
         if message.state != SendState::Pending {
             return None;
         }
+        if message.waiting {
+            let client_id = message.client_id.clone().unwrap_or_else(|| message.id.clone());
+            return self.waiting_mark(client_id, cx);
+        }
         let client_id = message.client_id.clone()?;
         let words = div().type_small().text_color(theme::text_faint()).font_family(theme::FONT);
         let Some(&(sent, total)) = self.uploads.get(&client_id) else {
@@ -1953,6 +1962,40 @@ impl Pane {
             .child(bar)
             .child(words.child(uploading_words(&sizes, sent, total)))
             .children(silent_mark(message))
+            .child(cancel);
+        Some(line.into_any_element())
+    }
+
+    /// Under one of my messages written while the account was offline: a clock, who it is
+    /// waiting for, and Cancel. Not "Sending…", which is a send the adapter already has.
+    fn waiting_mark(&self, client_id: String, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let conversation = self.key()?.clone();
+        let network = conversation.network.label();
+        let words = div().type_small().text_color(theme::text_faint()).font_family(theme::FONT);
+        let cancel = div()
+            .id("cancel-wait")
+            .flex_none()
+            .size(px(20.))
+            .rounded(px(theme::R_CHIP))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::hover()))
+            .tooltip(tip("Cancel", None))
+            .child(icon(Icon::Close, 12., theme::text_soft()))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                let request = protocol::Request::CancelSend { conversation: conversation.clone(), client_id: client_id.clone() };
+                cx.background_executor().spawn(async move { crate::client::ask(&request) }).detach();
+            }));
+        let line = div()
+            .h(px(20.))
+            .mt(px(4.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .child(glyph("icons/clock.svg", 12., theme::text_faint()))
+            .child(words.child(waiting_line(network)))
             .child(cancel);
         Some(line.into_any_element())
     }
@@ -2164,6 +2207,12 @@ mod tests {
         message.sender.id = "me".into();
         message.sender.avatar = avatar.map(picture);
         Rc::new(message)
+    }
+
+    #[test]
+    fn a_queued_send_is_waiting_for_its_network_not_on_its_way() {
+        assert_eq!(waiting_line("Discord"), "Waiting for Discord");
+        assert!(!waiting_line("Discord").contains("Sending"));
     }
 
     /// One of mine still going: chatd names no sender on it.

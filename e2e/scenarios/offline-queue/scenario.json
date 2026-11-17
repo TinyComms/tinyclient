@@ -1,0 +1,12 @@
+{
+  "id": "offline-queue",
+  "title": "A message written while offline waits, then goes when the connection returns",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same queue holds a text send while the account is offline.",
+    "ios": "The phone proof build does not run desktop chatd. The same queue holds a text send while the account is offline."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

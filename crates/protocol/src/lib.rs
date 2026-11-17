@@ -1281,7 +1281,9 @@ pub enum Request {
     },
     /// Answers at once with the message as `Pending`. `client_id` is made by the shell and comes
     /// back on the message; when the network accepts it the same row turns `Sent` under its real
-    /// id, or `Failed` with the reason. Refused outright when the account is not connected.
+    /// id, or `Failed` with the reason. A text send while the account is `Offline` is stored
+    /// `Pending` with `waiting` and goes when the link returns. `SignedOut`, `Expired`, and a
+    /// send that carries files are still refused.
     ///
     /// `with` carries files (streamed by chatd from their paths, with `Change::Upload` as they
     /// go) and options; the pending message lists the files at once. Refused when it asks
