@@ -738,6 +738,7 @@ impl Discord {
             schedule: false,
             suppress_embeds: true,
             reply_ping: true,
+            text_limit: super::message_limit(premium) as u32,
             edit_window: 0,
             file_scan: false,
             allow_archives: false,

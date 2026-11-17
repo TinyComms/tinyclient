@@ -1512,6 +1512,68 @@ fn sending_echoes_once_and_failures_say_why() {
     assert_eq!(world.discord.requests.lock().unwrap().len(), asked, "a challenged account sends nothing");
 }
 
+/// Nitro (`premium_type` 2) may send and edit 4,000 characters on the plain path, the same
+/// limit a message with options already had. A free account is still refused at 2,000, and
+/// that refusal never leaves the machine.
+#[test]
+fn nitro_plain_text_uses_the_four_thousand_character_limit() {
+    let three = "n".repeat(3000);
+    let free = account_with_premium(0);
+    assert_eq!(text_limit_of(&free), 2000);
+    let before = free.discord.requests_to("POST", "/channels/3002/messages").len();
+    free.send("3002", "free-3000", &three, None);
+    assert_eq!(free.failure("3002", "free-3000"), "Message too long: Discord allows 2000 characters.");
+    assert_eq!(free.discord.requests_to("POST", "/channels/3002/messages").len(), before);
+    let edit = free.ask(Request::Edit {
+        conversation: free.key("3001"),
+        message_id: "1300000000000000009".into(),
+        text: three.clone(),
+    });
+    match edit {
+        Response::Error { detail, .. } => assert!(detail.contains("2000"), "{detail}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(free.discord.requests_to("PATCH", "/channels/3001/messages/1300000000000000009").is_empty());
+
+    let basic = account_with_premium(1);
+    assert_eq!(text_limit_of(&basic), 2000);
+    basic.send("3002", "basic-3000", &three, None);
+    assert_eq!(basic.failure("3002", "basic-3000"), "Message too long: Discord allows 2000 characters.");
+
+    let nitro = account_with_premium(2);
+    assert_eq!(text_limit_of(&nitro), 4000);
+    // A nonce is kept only when it is digits, at most 25, which is what the shell's client id is.
+    nitro.send("3002", "1730000000000000102", &three, None);
+    let sent = nitro.outcome("3002", "1730000000000000102");
+    assert_eq!((sent.state, sent.text.chars().count()), (SendState::Sent, 3000));
+    let posted = nitro.discord.requests_to("POST", "/channels/3002/messages");
+    assert_eq!(posted.last().unwrap().body["content"].as_str().map(|text| text.chars().count()), Some(3000));
+
+    let silent = protocol::Outgoing { silent: true, ..protocol::Outgoing::default() };
+    let asked = Request::Send {
+        conversation: nitro.key("3002"),
+        client_id: "1730000000000000103".into(),
+        text: three.clone(),
+        reply_to: None,
+        with: silent,
+    };
+    assert!(matches!(nitro.ask(asked), Response::Sent { .. }));
+    assert_eq!(nitro.outcome("3002", "1730000000000000103").state, SendState::Sent);
+    let posted = nitro.discord.requests_to("POST", "/channels/3002/messages");
+    assert_eq!(posted.len(), 2);
+    assert_eq!(posted.last().unwrap().body["content"].as_str().map(|text| text.chars().count()), Some(3000));
+
+    let edited = nitro.ask(Request::Edit { conversation: nitro.key("3002"), message_id: sent.id, text: three });
+    assert_eq!(edited, Response::Ok);
+    let patched = nitro.discord.requests_to("PATCH", "/channels/3002/messages");
+    assert_eq!(patched.last().unwrap().body["content"].as_str().map(|text| text.chars().count()), Some(3000));
+
+    nitro.send("3002", "1730000000000000104", &"n".repeat(4001), None);
+    assert_eq!(nitro.failure("3002", "1730000000000000104"), "Message too long: Discord allows 4000 characters.");
+    let over = nitro.discord.requests_to("POST", "/channels/3002/messages");
+    assert!(over.iter().all(|seen| seen.body["content"].as_str().is_none_or(|text| text.chars().count() <= 4000)));
+}
+
 #[test]
 fn a_blocked_persons_refused_ack_does_not_bring_the_unread_back() {
     let world = World::start();
@@ -3136,6 +3198,23 @@ fn polished_ready() -> String {
     let general = rustaceans["channels"].as_array_mut().unwrap().iter_mut().find(|channel| channel["id"] == "4101").unwrap();
     general["topic"] = json!("Anything goes.\nKeep it kind.");
     ready.to_string()
+}
+
+fn text_limit_of(world: &World) -> u32 {
+    match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|account| account.key == world.account()).unwrap().can.text_limit,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn account_with_premium(premium: u8) -> World {
+    let world = World::launch(&[], |shared| {
+        let mut ready: Value = serde_json::from_str(&shared.ready.lock().unwrap()).unwrap();
+        ready["user"]["premium_type"] = json!(premium);
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    world
 }
 
 fn polished() -> World {

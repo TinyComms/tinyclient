@@ -297,6 +297,9 @@ pub struct Capabilities {
     /// Longest caption under files, in characters. 0: the text limit.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub caption_limit: u32,
+    /// Longest message, in characters. 0: the composer does not count.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub text_limit: u32,
     /// Per-file options.
     #[serde(default, skip_serializing_if = "is_false")]
     pub spoiler: bool,
