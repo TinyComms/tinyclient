@@ -3243,7 +3243,8 @@ fn account_with_premium(premium: u8) -> World {
 }
 
 /// A group DM's member list is the other people plus us, from READY, with the owner's mark.
-/// Someone leaving drops them from the list and from an unnamed title.
+/// Someone leaving drops them from the list and from an unnamed title. Someone joining
+/// puts them back, and that title gains their name.
 #[test]
 fn a_group_dm_lists_its_people_and_drops_one_who_leaves() {
     let world = World::launch(&[], |shared| {
@@ -3301,6 +3302,25 @@ fn a_group_dm_lists_its_people_and_drops_one_who_leaves() {
     };
     assert_eq!(info.members, Some(3));
     assert_eq!(world.conversation("3010").title, "Mara O, Dev Patel");
+
+    world.discord.push(
+        "CHANNEL_RECIPIENT_ADD",
+        json!({"channel_id": "3010", "user": {"id": "2010", "username": "nia", "global_name": "Nia Cole", "discriminator": "0"}}),
+    );
+    let joined = wait("Nia to join the group", || {
+        match world.ask(Request::Members { conversation: world.key("3010"), offset: 0, limit: 50 }) {
+            Response::Members { members, .. } if members.len() == 4 => Some(members),
+            _ => None,
+        }
+    });
+    assert_eq!(joined.iter().map(|person| person.key.id.as_str()).collect::<Vec<_>>(), ["2001", "2002", "2010", "1000"]);
+    assert_eq!(joined.iter().find(|person| person.key.id == "2010").map(|person| person.name.as_str()), Some("Nia Cole"));
+    let info = match world.ask(Request::ConversationInfo { conversation: world.key("3010") }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(info.members, Some(4));
+    assert_eq!(world.conversation("3010").title, "Mara O, Dev Patel, Nia Cole");
 }
 
 fn polished() -> World {

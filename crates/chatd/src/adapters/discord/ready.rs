@@ -655,11 +655,15 @@ impl Discord {
                     row.avatar = Some(file.id.clone());
                     files.push((file, url));
                 }
-                state.groups.insert(channel.id.clone(), super::GroupDm {
-                    owner: channel.owner_id.clone().unwrap_or_default(),
-                    recipients: recipients.iter().map(|user| user.id.clone()).collect(),
-                    named: channel.name.as_deref().is_some_and(|name| !name.is_empty()),
-                });
+                // A create or update can carry recipient ids and no user objects. Resolving
+                // nobody must not replace the list READY already recorded.
+                if !recipients.is_empty() {
+                    state.groups.insert(channel.id.clone(), super::GroupDm {
+                        owner: channel.owner_id.clone().unwrap_or_default(),
+                        recipients: recipients.iter().map(|user| user.id.clone()).collect(),
+                        named: channel.name.as_deref().is_some_and(|name| !name.is_empty()),
+                    });
+                }
             }
         }
         state.privates.insert(channel.id.clone());
