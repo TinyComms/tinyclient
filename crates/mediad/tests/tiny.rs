@@ -595,7 +595,7 @@ fn someone_with_no_microphone_joins_listens_and_is_told_nobody_hears_them() {
         matches!(event, MediaResponse::Devices { input, notice: Some(words), stuck: true, .. } if input.is_empty() && words.contains("nobody can hear you"))
     });
     wait_for("Ada hears Bea's tone", || (4000. ..7000.).contains(&played_level(&ada_sink, 0.5)));
-    // Longer than the device self-check and the dead-path watchdog wait.
+    // Longer than the device self-check; STUN still answers, so the silence watchdog stays quiet.
     sleep(Duration::from_secs(4));
     assert_eq!(ada.ask(MediaRequest::Audio { muted: false, deafened: false }), MediaResponse::Done, "the call is still up");
     assert_eq!(sfu.frames("ada"), 0, "someone with no microphone sent audio");
@@ -620,8 +620,9 @@ fn with_both_offered_udp_carries_the_call() {
 }
 
 /// A muted person alone in a room sends nothing and hears nothing, and only STUN's answers say
-/// the path is alive: that is enough to stay up for longer than the watchdog waits. When those
-/// stop too, the call says so in seconds, and a new link brings it back with no restart.
+/// the path is alive: that is enough to stay up past a short gap and past the old three-second
+/// watchdog. A few seconds of silence must not reconnect; a long dead path still is noticed,
+/// and a new link brings it back with no restart.
 #[test]
 fn a_quiet_room_stays_up_and_a_dead_path_is_noticed_in_seconds() {
     let sfu = Sfu::start();
@@ -639,11 +640,26 @@ fn a_quiet_room_stays_up_and_a_dead_path_is_noticed_in_seconds() {
     assert_eq!(ada.ask(MediaRequest::Audio { muted: true, deafened: false }), MediaResponse::Done);
     assert!(!ada.seen.iter().any(|event| matches!(event, MediaResponse::Interrupted)), "a quiet room is not a lost one: {:?}", ada.seen);
 
+    // Longer than the old three-second watchdog, shorter than today's ten: a blip is not a drop.
+    sfu.deaf.store(true, Ordering::Relaxed);
+    sleep(Duration::from_secs(4));
+    sfu.deaf.store(false, Ordering::Relaxed);
+    sleep(Duration::from_millis(500));
+    assert_eq!(ada.ask(MediaRequest::Audio { muted: true, deafened: false }), MediaResponse::Done);
+    assert!(
+        !ada.seen.iter().any(|event| matches!(event, MediaResponse::Interrupted)),
+        "a four-second STUN gap must not reconnect: {:?}",
+        ada.seen
+    );
+
     sfu.deaf.store(true, Ordering::Relaxed);
     let lost = Instant::now();
     ada.event("Interrupted", |event| matches!(event, MediaResponse::Interrupted));
     let noticed = lost.elapsed();
-    assert!(noticed < Duration::from_secs(5), "noticed after {noticed:?}");
+    assert!(
+        noticed >= Duration::from_secs(4) && noticed < Duration::from_secs(13),
+        "noticed after {noticed:?}"
+    );
 
     sfu.deaf.store(false, Ordering::Relaxed);
     let again = Instant::now();

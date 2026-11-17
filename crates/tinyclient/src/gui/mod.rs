@@ -46,6 +46,15 @@ pub(crate) fn prove_focus_ring() -> Result<(), &'static str> {
     }
 }
 
+/// The lab's Tiny STUN-watchdog driver. A short gap on a live call is not a reconnect.
+pub(crate) fn prove_stun_watchdog() -> Result<(), &'static str> {
+    if protocol::TINY_STUN_SILENCE_MS >= 10_000 {
+        Ok(())
+    } else {
+        Err("a Tiny call still treats a short STUN gap as a drop")
+    }
+}
+
 /// The lab's health-grade driver. A green link does not hide a dry speaker.
 pub(crate) fn prove_health_grade() -> Result<(), &'static str> {
     let dry = call::health::Health {

@@ -1,0 +1,12 @@
+{
+  "id": "stun-watchdog",
+  "title": "A short STUN gap on a Tiny call is not a reconnect",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop prove hook. The same silence constant is what phone mediad uses.",
+    "ios": "The phone proof build does not run the desktop prove hook. The same silence constant is what phone mediad uses."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
