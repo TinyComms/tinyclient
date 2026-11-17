@@ -91,6 +91,15 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    // The lab's discord-share-quality driver. A build without this opens the audio engine below and stays up.
+    if env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-share-quality") {
+        if let Err(err) = mediad::session::prove_discord_share_quality() {
+            eprintln!("discord-share-quality: {err}");
+            return ExitCode::from(1);
+        }
+        eprintln!("prove-discord-share-quality:0");
+        return ExitCode::SUCCESS;
+    }
     // The lab's isolation-bounded driver.
     if env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("isolation-bounded") {
         if let Err(err) = mediad::process::prove_isolation_limit() {
