@@ -826,9 +826,6 @@ fn unsupported(media: &MessageMedia) -> Option<String> {
             let tl::enums::Poll::Poll(poll) = &media.poll;
             format!("Poll: {}", plain(&poll.question))
         }
-        MessageMedia::Geo(_) => "Location".to_owned(),
-        MessageMedia::GeoLive(_) => "Live location".to_owned(),
-        MessageMedia::Venue(venue) => format!("Location: {}", venue.title),
         MessageMedia::Contact(contact) => format!("Contact: {} {}", contact.first_name, contact.last_name).trim_end().to_owned(),
         MessageMedia::Game(media) => {
             let tl::enums::Game::Game(game) = &media.game;
@@ -885,6 +882,78 @@ fn price_of(currency: &str, amount: i64) -> Option<String> {
     } else {
         format!("{sign}{code} {whole}.{frac:0width$}", width = digits as usize)
     })
+}
+
+/// A coordinate with trailing zeros trimmed, so `37.774900` reads `37.7749`.
+fn coord(value: f64) -> String {
+    let text = format!("{value:.6}");
+    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() || trimmed == "-" { "0".to_owned() } else { trimmed.to_owned() }
+}
+
+/// `geo:lat,lon`, which a maps app opens. Nothing here asks a tile server.
+fn geo_uri(lat: f64, long: f64) -> String {
+    format!("geo:{},{}", coord(lat), coord(long))
+}
+
+fn coordinates(geo: &tl::enums::GeoPoint) -> Option<(f64, f64, Option<i32>)> {
+    match geo {
+        tl::enums::GeoPoint::Point(point) => Some((point.lat, point.long, point.accuracy_radius)),
+        tl::enums::GeoPoint::Empty => None,
+    }
+}
+
+fn place_fields(lat: f64, long: f64, accuracy: Option<i32>) -> Vec<(String, String)> {
+    let mut fields = vec![("Latitude".to_owned(), coord(lat)), ("Longitude".to_owned(), coord(long))];
+    if let Some(meters) = accuracy.filter(|meters| *meters > 0) {
+        fields.push(("Accuracy".to_owned(), format!("{meters} m")));
+    }
+    fields
+}
+
+/// A shared place: the name, the coordinates, and a `geo:` link. A live one says how long it
+/// was shared for. The shell draws the card; this build does not fetch a map tile.
+fn location_card(media: &MessageMedia) -> Option<Card> {
+    let mut card = Card { footer: "Open in Maps".to_owned(), ..Card::default() };
+    match media {
+        MessageMedia::Geo(media) => {
+            card.title = "Location".to_owned();
+            match coordinates(&media.geo) {
+                Some((lat, long, accuracy)) => {
+                    card.text = geo_uri(lat, long);
+                    card.fields = place_fields(lat, long, accuracy);
+                }
+                None => card.text = "Coordinates were not included".to_owned(),
+            }
+        }
+        MessageMedia::Venue(venue) => {
+            card.title = if venue.title.is_empty() { "Location".to_owned() } else { venue.title.clone() };
+            card.text = venue.address.clone();
+            if let Some((lat, long, accuracy)) = coordinates(&venue.geo) {
+                card.fields = place_fields(lat, long, accuracy);
+                if card.text.is_empty() {
+                    card.text = geo_uri(lat, long);
+                }
+            }
+        }
+        MessageMedia::GeoLive(live) => {
+            card.title = "Live location".to_owned();
+            if let Some((lat, long, accuracy)) = coordinates(&live.geo) {
+                card.text = geo_uri(lat, long);
+                card.fields = place_fields(lat, long, accuracy);
+            } else {
+                card.text = "Coordinates were not included".to_owned();
+            }
+            if let Some(heading) = live.heading {
+                card.fields.push(("Heading".to_owned(), format!("{heading}°")));
+            }
+            if live.period > 0 {
+                card.fields.push(("Shared for".to_owned(), kept_for(live.period)));
+            }
+        }
+        _ => return None,
+    }
+    Some(card)
 }
 
 /// The card for an invoice or a paid-media preview. The message stays a hand-off: paying and
@@ -1356,8 +1425,9 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                         message.kind = MessageKind::Unsupported { link: message_link(peer, dir.get(peer), raw.id) };
                     }
                     // An invoice or paid preview is still a hand-off, and also a card: title,
-                    // description and price. Paying stays in Telegram's own app.
-                    if let Some(card) = detail_card(media) {
+                    // description and price. Paying stays in Telegram's own app. A shared place
+                    // is a normal message whose card keeps the coordinates. No map tile is fetched.
+                    if let Some(card) = detail_card(media).or_else(|| location_card(media)) {
                         message.card = Some(Box::new(card));
                     }
                 }
@@ -1988,6 +2058,65 @@ pub(super) fn prove_invoices() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's telegram-location check. A point and a venue are cards with coordinates, and a
+/// live location keeps its place. A build from before this names them and drops the numbers.
+pub(super) fn prove_location() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    9i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let point = tl::types::GeoPoint { long: -122.4194, lat: 37.7749, access_hash: 0, accuracy_radius: None };
+    let mut message = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    message.media = Some(tl::types::MessageMediaGeo { geo: point.clone().into() }.into());
+    let mapped = map(&Directory::new(7_001), &message.into()).ok_or("the location maps")?;
+    let card = mapped.message.card.ok_or("a location is a card")?;
+    if card.title != "Location" || card.footer != "Open in Maps" || !card.text.contains("geo:37.7749,-122.4194") {
+        return Err(format!("the location card dropped its place, got {} {}", card.title, card.text));
+    }
+    if !matches!(mapped.message.kind, MessageKind::Normal) {
+        return Err("a location still opens only in Telegram".into());
+    }
+    let mut venue = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    venue.id = 10;
+    venue.media = Some(
+        tl::types::MessageMediaVenue {
+            geo: point.into(),
+            title: "Ferry Building".into(),
+            address: "1 The Embarcadero".into(),
+            provider: String::new(),
+            venue_id: String::new(),
+            venue_type: String::new(),
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &venue.into()).ok_or("the venue maps")?;
+    let card = mapped.message.card.ok_or("a venue is a card")?;
+    if card.title != "Ferry Building" || card.text != "1 The Embarcadero" {
+        return Err(format!("the venue card dropped its name, got {} {}", card.title, card.text));
+    }
+    let mut live = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    live.id = 11;
+    live.media = Some(
+        tl::types::MessageMediaGeoLive {
+            geo: tl::types::GeoPoint { long: -122.4, lat: 37.7, access_hash: 0, accuracy_radius: None }.into(),
+            heading: Some(90),
+            period: 900,
+            proximity_notification_radius: None,
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &live.into()).ok_or("the live location maps")?;
+    let card = mapped.message.card.ok_or("a live location is a card")?;
+    if card.title != "Live location" || !card.text.contains("geo:37.7,-122.4") {
+        return Err(format!("the live location dropped its place, got {} {}", card.title, card.text));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2149,6 +2278,45 @@ mod tests {
         let mut message = tl::types::Message::from_bytes(&bytes).expect("a blank message reads back");
         message.from_id = Some(Who::User(7_002).peer());
         message
+    }
+
+    fn point(lat: f64, long: f64) -> tl::enums::GeoPoint {
+        tl::types::GeoPoint { long, lat, access_hash: 0, accuracy_radius: None }.into()
+    }
+
+    #[test]
+    fn a_shared_location_and_a_venue_keep_their_place() {
+        let mut place = blank_message();
+        place.media = Some(tl::types::MessageMediaGeo { geo: point(37.7749, -122.4194) }.into());
+        let mapped = map(&Directory::new(7_001), &place.into()).expect("the location maps");
+        assert!(matches!(mapped.message.kind, MessageKind::Normal), "a location is the card, not a hand-off");
+        let card = mapped.message.card.expect("a location is a card");
+        assert_eq!(card.title, "Location");
+        assert_eq!(card.footer, "Open in Maps");
+        assert!(card.text.contains("geo:37.7749,-122.4194"), "{}", card.text);
+        assert!(card.fields.iter().any(|(label, value)| label == "Latitude" && value.starts_with("37.7749")));
+        assert!(card.fields.iter().any(|(label, value)| label == "Longitude" && value.starts_with("-122.4194")));
+
+        let mut venue = blank_message();
+        venue.id = 10;
+        venue.media = Some(
+            tl::types::MessageMediaVenue {
+                geo: point(37.7955, -122.3937),
+                title: "Ferry Building".into(),
+                address: "1 The Embarcadero".into(),
+                provider: String::new(),
+                venue_id: String::new(),
+                venue_type: String::new(),
+            }
+            .into(),
+        );
+        let mapped = map(&Directory::new(7_001), &venue.into()).expect("the venue maps");
+        assert!(matches!(mapped.message.kind, MessageKind::Normal));
+        let card = mapped.message.card.expect("a venue is a card");
+        assert_eq!(card.title, "Ferry Building");
+        assert_eq!(card.text, "1 The Embarcadero");
+        assert_eq!(card.footer, "Open in Maps");
+        assert!(card.fields.iter().any(|(label, value)| label == "Latitude" && value.starts_with("37.7955")));
     }
 
     #[test]
