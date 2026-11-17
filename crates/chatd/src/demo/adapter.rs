@@ -657,6 +657,12 @@ impl Demo {
                 let muted = demo.ctx.muted(&conversation_id, notify == Notify::Nothing);
                 let _ = reply.send(muted.map_err(|err| Refusal::Refused(err.to_string())));
             }
+            // The demo has no Slack to tell. The flag is still Slack's for a Slack row: it is
+            // stored here, which is all the demo's network is.
+            Command::Star { conversation_id, starred, reply } => {
+                let set = demo.ctx.starred(&conversation_id, starred);
+                let _ = reply.send(set.map_err(|err| Refusal::Refused(err.to_string())));
+            }
             Command::Leave { conversation_id, reply } => {
                 let left = demo.ctx.conversation_gone(&conversation_id);
                 let _ = reply.send(left.map_err(|err| Refusal::Refused(err.to_string())));

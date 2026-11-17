@@ -264,7 +264,7 @@ struct Pacer {
 /// Slack does not say whether the web client's token is counted by the same tiers.
 fn per_minute(method: &str) -> f64 {
     match method {
-        "users.setPresence" | "reactions.remove" | "emoji.list" | "usergroups.list" | "dnd.setSnooze" => 20.,
+        "users.setPresence" | "reactions.remove" | "emoji.list" | "usergroups.list" | "dnd.setSnooze" | "stars.add" | "stars.remove" => 20.,
         "conversations.members" | "users.info" | "users.profile.get" => 100.,
         // One message a second per channel, and the sign-in check is in a tier of its own.
         "chat.postMessage" | "auth.test" => 60.,
@@ -904,6 +904,8 @@ impl Slack {
                 Ok(())
             }
             "pref_change" => self.muted(event["name"].as_str().unwrap_or(""), &event["value"]),
+            // A conversation star. A message, file, or comment star is not the row's.
+            "star_added" | "star_removed" => self.star_heard(event),
             "emoji_changed" => {
                 self.emoji_changed(event);
                 Ok(())
@@ -1323,6 +1325,7 @@ impl Slack {
             Command::CancelSend { client_id, .. } => crate::blobs::upload::cancel(&self.ctx.account, &client_id),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
+            Command::Star { conversation_id, starred, reply } => answer(reply, self.star(&conversation_id, starred)),
             Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
             Command::Search { query, scope, at, reply } => {
                 if at.elapsed() >= SEARCH_PATIENCE {
@@ -1513,6 +1516,30 @@ impl Slack {
         }
     }
 
+    /// Stars or unstars a channel or direct conversation. Slack's documented call is `stars.add`
+    /// or `stars.remove` with the channel and no timestamp; a timestamp would star a message.
+    /// A thread is not a channel. `already_starred` and `not_starred` are the state we asked for.
+    fn star(&self, conversation_id: &str, starred: bool) -> Result<(), Fault> {
+        if thread_of(conversation_id).is_some() {
+            return Err(Fault::Slack("not_a_channel".to_owned()));
+        }
+        match self.api(star_method(starred), &[("channel", conversation_id)]) {
+            Err(Fault::Slack(error)) if error == "already_starred" || error == "not_starred" => {}
+            other => {
+                other?;
+            }
+        }
+        self.ctx.starred(conversation_id, starred).map_err(|err| Fault::Net(err.to_string()))
+    }
+
+    /// A `star_added` or `star_removed` for a conversation. A message star changes nothing here.
+    fn star_heard(&self, event: &Value) -> Result<(), Failure> {
+        let Some((id, starred)) = conversation_star(event) else {
+            return Ok(());
+        };
+        self.ctx.starred(&id, starred).map_err(|err| Failure::Dropped(err.to_string()))
+    }
+
     /// Adds or takes back our reaction. The store already shows it; Slack's own event for it
     /// arrives on the socket and counts once.
     fn react(&self, conversation: &str, ts: &str, emoji: &str, on: bool) -> Result<(), Fault> {
@@ -1682,9 +1709,73 @@ fn download_headers(agent: &str, token: &str, cookie: &str, private: bool) -> Ve
     headers
 }
 
+/// `stars.add` when starring, `stars.remove` when not. Tier 2, the same as the pacer holds them to.
+fn star_method(starred: bool) -> &'static str {
+    if starred { "stars.add" } else { "stars.remove" }
+}
+
+/// A conversation star on the socket: a channel, a direct conversation, or a private group.
+/// A message, file, or comment star is not one, and neither is an item with no channel.
+fn conversation_star(event: &Value) -> Option<(String, bool)> {
+    let starred = match event["type"].as_str()? {
+        "star_added" => true,
+        "star_removed" => false,
+        _ => return None,
+    };
+    let item = &event["item"];
+    if !matches!(item["type"].as_str()?, "channel" | "im" | "group") {
+        return None;
+    }
+    let id = item["channel"].as_str().filter(|id| !id.is_empty())?;
+    Some((id.to_owned(), starred))
+}
+
+/// What the slack-star-channel driver checks, with no workspace and no socket.
+pub(crate) fn prove_channel_star() -> Result<(), String> {
+    if star_method(true) != "stars.add" || star_method(false) != "stars.remove" {
+        return Err("a conversation star is stars.add or stars.remove".to_owned());
+    }
+    let channel = json!({"type": "star_added", "item": {"type": "channel", "channel": "C0GEN"}});
+    match conversation_star(&channel) {
+        Some((id, true)) if id == "C0GEN" => {}
+        other => return Err(format!("star_added on a channel was {other:?}")),
+    }
+    let direct = json!({"type": "star_removed", "item": {"type": "im", "channel": "D0ANA"}});
+    match conversation_star(&direct) {
+        Some((id, false)) if id == "D0ANA" => {}
+        other => return Err(format!("star_removed on a direct conversation was {other:?}")),
+    }
+    let group = json!({"type": "star_added", "item": {"type": "group", "channel": "G0GRP"}});
+    match conversation_star(&group) {
+        Some((id, true)) if id == "G0GRP" => {}
+        other => return Err(format!("star_added on a group was {other:?}")),
+    }
+    let message = json!({"type": "star_added", "item": {"type": "message", "channel": "C0GEN", "message": {"ts": "1.000"}}});
+    if conversation_star(&message).is_some() {
+        return Err("a message star is not the channel's star".to_owned());
+    }
+    let file = json!({"type": "star_removed", "item": {"type": "file", "file": "F0"}});
+    if conversation_star(&file).is_some() {
+        return Err("a file star is not a conversation star".to_owned());
+    }
+    if conversation_star(&json!({"type": "star_added", "item": {"type": "channel", "channel": ""}})).is_some() {
+        return Err("a star with no channel is nothing".to_owned());
+    }
+    let filed = tree::starred_from(&[("channels", &["C0GEN"]), ("stars", &["C0DEP", "D0ANA", "C0DEP"])]);
+    if filed != ["C0DEP", "D0ANA"] {
+        return Err(format!("the stars section marks {filed:?}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_channel_star_is_slacks_and_a_message_star_is_not() {
+        super::prove_channel_star().unwrap();
+    }
 
     #[test]
     fn a_typed_mention_survives_the_escapes_and_nothing_else_does() {
