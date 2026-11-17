@@ -37,9 +37,12 @@ pub(super) fn send_with(account: &Arc<Account>, conversation: &str, client_id: &
     if with.files.is_empty() {
         let outcome = match &with.pick {
             Some(pick) => send_pick(account, conversation, client_id, text, reply_to, &pick.id, opts),
-            None => match dice_emoticon(text) {
-                Some(emoticon) => send_dice(account, conversation, client_id, text, reply_to, emoticon, opts),
-                None => super::send_text(account, conversation, client_id, text, reply_to, opts),
+            None => match pasted_place(text) {
+                Some(found) => send_place(account, conversation, client_id, reply_to, &found, opts),
+                None => match dice_emoticon(text) {
+                    Some(emoticon) => send_dice(account, conversation, client_id, text, reply_to, emoticon, opts),
+                    None => super::send_text(account, conversation, client_id, text, reply_to, opts),
+                },
             },
         };
         ctx.sent(conversation, client_id, outcome.map_err(|fault| fault.words()));
@@ -116,6 +119,70 @@ fn send_pick(account: &Account, conversation: &str, client_id: &str, text: &str,
         }
     };
     made(account, conversation, &target, caption, opts, &answer)
+}
+
+/// A message that is only a place the person pasted. Words around the numbers stay text.
+pub(super) enum PastedPlace {
+    Point { lat: f64, long: f64 },
+    Venue { title: String, address: String, lat: f64, long: f64 },
+}
+
+/// `lat, lon` or `geo:lat,lon`. Out of range, or anything else on the line, is not a place.
+fn coordinate_pair(text: &str) -> Option<(f64, f64)> {
+    let text = text.trim();
+    let text = text.strip_prefix("geo:").unwrap_or(text).trim();
+    let (lat, long) = text.split_once(',')?;
+    let lat: f64 = lat.trim().parse().ok()?;
+    let long: f64 = long.trim().parse().ok()?;
+    if !lat.is_finite() || !long.is_finite() || !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&long) {
+        return None;
+    }
+    Some((lat, long))
+}
+
+pub(super) fn pasted_place(text: &str) -> Option<PastedPlace> {
+    let text = text.trim();
+    if let Some(rest) = text.strip_prefix("venue:").or_else(|| text.strip_prefix("Venue:")) {
+        let mut parts = rest.split(" | ");
+        let title = parts.next()?.trim();
+        let address = parts.next()?.trim();
+        let coords = parts.next()?.trim();
+        if parts.next().is_some() || title.is_empty() {
+            return None;
+        }
+        let (lat, long) = coordinate_pair(coords)?;
+        return Some(PastedPlace::Venue { title: title.to_owned(), address: address.to_owned(), lat, long });
+    }
+    let (lat, long) = coordinate_pair(text)?;
+    Some(PastedPlace::Point { lat, long })
+}
+
+fn input_point(lat: f64, long: f64) -> tl::enums::InputGeoPoint {
+    tl::types::InputGeoPoint { lat, long, accuracy_radius: None }.into()
+}
+
+pub(super) fn pasted_media(place: &PastedPlace) -> tl::enums::InputMedia {
+    match place {
+        PastedPlace::Point { lat, long } => tl::types::InputMediaGeoPoint { geo_point: input_point(*lat, *long) }.into(),
+        PastedPlace::Venue { title, address, lat, long } => tl::types::InputMediaVenue {
+            geo_point: input_point(*lat, *long),
+            title: title.clone(),
+            address: address.clone(),
+            provider: String::new(),
+            venue_id: String::new(),
+            venue_type: String::new(),
+        }
+        .into(),
+    }
+}
+
+/// A pasted place, sent as the location itself. The numbers are not a caption.
+fn send_place(account: &Account, conversation: &str, client_id: &str, reply_to: Option<&str>, place: &PastedPlace, opts: Options) -> Result<Message, Fault> {
+    let target = target(account, conversation, reply_to)?;
+    let random = random_id(client_id);
+    remember_random(account, random, client_id);
+    let answer = account.ask(&send_media(&target, pasted_media(place), "", None, random, opts))?;
+    made(account, conversation, &target, "", opts, &answer)
 }
 
 /// A message that is only one of Telegram's dice: 🎲 🎯 🏀 ⚽ 🎳 🎰. A variation selector
@@ -410,6 +477,31 @@ mod tests {
         assert_eq!(super::super::content::waveform(&packed(&[10]))[0], (10u16 * 31 / 255) as u8 * 255 / 31);
         assert_eq!(packed(&[255])[0], 0b11111, "the widest bar is five set bits");
         assert!(packed(&[]).is_empty());
+    }
+
+    #[test]
+    fn pasted_coordinates_are_a_place_and_a_venue_line_is_a_venue() {
+        let point = pasted_place("37.7749, -122.4194").expect("coordinates are a place");
+        match pasted_media(&point) {
+            tl::enums::InputMedia::GeoPoint(media) => match media.geo_point {
+                tl::enums::InputGeoPoint::Point(point) => {
+                    assert!((point.lat - 37.7749).abs() < 1e-6);
+                    assert!((point.long - -122.4194).abs() < 1e-6);
+                }
+                other => panic!("not a point: {other:?}"),
+            },
+            other => panic!("not a location: {other:?}"),
+        }
+        assert!(pasted_place("see you at 37.7749, -122.4194").is_none(), "words around coordinates stay text");
+        assert!(pasted_place("geo:37.7955,-122.3937").is_some());
+        let venue = pasted_place("venue: Ferry Building | 1 The Embarcadero | 37.7955, -122.3937").expect("a venue line is a venue");
+        match pasted_media(&venue) {
+            tl::enums::InputMedia::Venue(media) => {
+                assert_eq!(media.title, "Ferry Building");
+                assert_eq!(media.address, "1 The Embarcadero");
+            }
+            other => panic!("not a venue: {other:?}"),
+        }
     }
 
     #[test]

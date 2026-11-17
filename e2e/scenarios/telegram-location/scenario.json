@@ -1,0 +1,12 @@
+{
+  "id": "telegram-location",
+  "title": "A shared location or venue shows its place, and pasted coordinates send as one",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same card is what a location maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same card is what a location maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

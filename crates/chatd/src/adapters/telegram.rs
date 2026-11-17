@@ -1164,6 +1164,24 @@ pub fn prove_telegram_invoices() -> Result<(), String> {
     content::prove_invoices()
 }
 
+/// The lab's telegram-location driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_location() -> Result<(), String> {
+    content::prove_location()?;
+    match send::pasted_place("37.7749, -122.4194") {
+        Some(send::PastedPlace::Point { lat, long }) if (lat - 37.7749).abs() < 1e-6 && (long + 122.4194).abs() < 1e-6 => {}
+        _ => return Err("pasted coordinates are not a location".into()),
+    }
+    let venue = send::pasted_place("venue: Ferry Building | 1 The Embarcadero | 37.7955, -122.3937").ok_or("a venue line is not a venue")?;
+    match send::pasted_media(&venue) {
+        tl::enums::InputMedia::Venue(media) if media.title == "Ferry Building" && media.address == "1 The Embarcadero" => {}
+        _ => return Err("a venue line is not sent as a venue".into()),
+    }
+    if send::pasted_place("see you at 37.7749, -122.4194").is_some() {
+        return Err("words around coordinates were sent as a place".into());
+    }
+    Ok(())
+}
+
 /// The lab's telegram-member-sections driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_member_sections() -> Result<(), String> {
     members::prove()
