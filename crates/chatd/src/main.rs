@@ -515,6 +515,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-messages-unpaired:0");
         return Ok(());
     }
+    // The lab's messages-delete driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-delete") {
+        if let Err(err) = chatd::adapters::messages::prove_messages_delete() {
+            eprintln!("messages-delete: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-delete:0");
+        return Ok(());
+    }
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());
     protocol::crash::install_panic_hook("chatd");
     let dir = protocol::support_dir();

@@ -150,6 +150,8 @@ trait Drive: Send + Sync {
     fn thumbnails(&self, participants: &[String]) -> Result<Vec<(String, Vec<u8>)>, String>;
     fn mark_read(&self, conversation: &str, message: &str) -> Result<(), String>;
     fn typing(&self, conversation: &str) -> Result<(), String>;
+    fn delete_message(&self, message: &str) -> Result<(), String>;
+    fn delete_conversation(&self, conversation: &str) -> Result<(), String>;
     fn close(&self);
 }
 
@@ -220,6 +222,12 @@ impl Drive for LiveDrive {
     }
     fn typing(&self, conversation: &str) -> Result<(), String> {
         self.inner.typing(conversation)
+    }
+    fn delete_message(&self, message: &str) -> Result<(), String> {
+        self.inner.delete_message(message)
+    }
+    fn delete_conversation(&self, conversation: &str) -> Result<(), String> {
+        self.inner.delete_conversation(conversation)
     }
     fn close(&self) {
         self.inner.close();
@@ -333,6 +341,12 @@ pub fn prove_phone_quiet() -> Result<(), String> {
 /// and keeps serving, so the same driver fails there.
 pub fn prove_messages_unpaired() -> Result<(), String> {
     bugle::prove_unpaired()
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-delete`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_messages_delete() -> Result<(), String> {
+    bugle::prove_messages_delete()
 }
 
 /// The lab checks that a phone failure is not shown as sent. A build without this stays up.
@@ -643,6 +657,7 @@ fn seal(account: &Account, conversation: &str, on: bool) {
             carrier: 0,
             updated: 0,
             phones: false,
+            gone: false,
         });
         chat.phones = on;
         chat.clone()
@@ -662,6 +677,10 @@ fn apply(account: &Account, event: Event) {
                 }
             }
             for chat in &chats {
+                if chat.gone {
+                    let _ = account.ctx.conversation_gone(&chat.id);
+                    continue;
+                }
                 // A picture fetched earlier stays the row's when the row is recorded again.
                 let avatar = account.ctx.avatar_of(&chat.id);
                 let _ = account.ctx.conversation(&ConversationRow { avatar: avatar.clone(), ..row(chat) });
@@ -691,7 +710,8 @@ fn apply(account: &Account, event: Event) {
             nudge(account);
         }
         Event::Message(note) => {
-            if note.phones.is_none()
+            if note.status != 300
+                && note.phones.is_none()
                 && account
                     .ctx
                     .known(&note.conversation)
@@ -709,6 +729,7 @@ fn apply(account: &Account, event: Event) {
                     carrier: 0,
                     updated: 0,
                     phones: false,
+                    gone: false,
                 };
                 let chat = remember(account, &[chat]);
                 let _ = account.ctx.conversation(&row(&chat[0]));
@@ -742,8 +763,18 @@ fn apply(account: &Account, event: Event) {
 }
 
 fn show(account: &Account, note: &bugle::Note, page: &[bugle::Note]) {
+    if note.status == 300 {
+        let _ = account.ctx.deleted(&note.conversation, &note.id);
+        return;
+    }
     if let Some(on) = note.phones {
         seal(account, &note.conversation, on);
+        return;
+    }
+    if let Some(words) = bugle::tombstone(note.status) {
+        let mut line = Message::plain(format!("{}:note", note.id), String::new(), words, note.sent, false);
+        line.kind = MessageKind::System;
+        let _ = account.ctx.history(&note.conversation, &[line]);
         return;
     }
     let mut shown = message(account, note, page);
@@ -1186,6 +1217,28 @@ fn serve(account: &Arc<Account>, command: Command) {
             if bugle::shows_typing(carrier_of(account, &conversation_id)) {
                 let _ = account.drive.typing(&conversation_id);
             }
+        }
+        Command::Delete {
+            conversation_id,
+            message_id,
+            reply,
+        } => {
+            let answer = account.drive.delete_message(&message_id).map_err(Refusal::Refused);
+            if answer.is_ok() {
+                let _ = ctx.deleted(&conversation_id, &message_id);
+            }
+            let _ = reply.send(answer);
+        }
+        // Leave stays unsupported. Closing the chat is what deletes it on the phone.
+        Command::CloseDirect { conversation_id, reply } => {
+            let answer = account
+                .drive
+                .delete_conversation(&conversation_id)
+                .map_err(Refusal::Refused);
+            if answer.is_ok() {
+                let _ = ctx.conversation_gone(&conversation_id);
+            }
+            let _ = reply.send(answer);
         }
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
         Command::Handoff { reply, .. } => {
