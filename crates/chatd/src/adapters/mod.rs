@@ -1592,6 +1592,12 @@ pub fn prove_teams_markdown() -> Result<(), String> {
     teams::prove_teams_markdown()
 }
 
+/// The lab's discord-code-colors driver. A fenced block is coloured from its language.
+/// A build without this returns to the server and stays up.
+pub fn prove_discord_code_colors() -> Result<(), String> {
+    discord::prove_code_colors()
+}
+
 /// The lab's failed-start-offline driver. A start that fails leaves the account offline,
 /// so messages() still answers from the cache instead of an empty signed-out page.
 pub fn prove_failed_start_offline() -> Result<(), String> {

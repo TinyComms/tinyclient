@@ -14,6 +14,30 @@ pub fn code_inline() -> Rgba { rgba(0xffffff14) }
 pub fn media_fill() -> Rgba { rgb(0x1f2023) }
 pub fn card() -> Rgba { rgb(0x1f2023) }
 pub fn code_bg() -> Rgba { rgb(0x1f2023) }
+pub fn code_keyword() -> Rgba { rgb(0xc792ea) }
+pub fn code_string() -> Rgba { rgb(0xc3e88d) }
+pub fn code_comment() -> Rgba { rgb(0x7f8c98) }
+pub fn code_number() -> Rgba { rgb(0xf78c6c) }
+pub fn code_type() -> Rgba { rgb(0xffcb6b) }
+pub fn code_function() -> Rgba { rgb(0x82aaff) }
+pub fn code_added() -> Rgba { rgb(0x7ee787) }
+pub fn code_added_bg() -> Rgba { rgba(0x3fb95033) }
+pub fn code_removed() -> Rgba { rgb(0xff7b72) }
+pub fn code_removed_bg() -> Rgba { rgba(0xf8514933) }
+
+/// ANSI SGR colours. `0` is the default, so it has no paint of its own.
+pub fn code_ansi(code: u8) -> Option<Rgba> {
+    let (index, bright) = match code {
+        30..=37 => (code - 30, false),
+        90..=97 => (code - 90, true),
+        40..=47 => (code - 40, false),
+        100..=107 => (code - 100, true),
+        _ => return None,
+    };
+    const DIM: [u32; 8] = [0x4a4a4a, 0xf07178, 0xc3e88d, 0xffcb6b, 0x82aaff, 0xc792ea, 0x89ddff, 0xeeffff];
+    const BRIGHT: [u32; 8] = [0x6b6b6b, 0xff8b92, 0xd0f0a0, 0xffe082, 0x9cc4ff, 0xd4b0ff, 0xb3e5ff, 0xffffff];
+    Some(rgb(if bright { BRIGHT[index as usize] } else { DIM[index as usize] }))
+}
 pub fn float_hover() -> Rgba { rgb(0x303136) }
 pub fn spoiler() -> Rgba { rgb(0x3a3b42) }
 /// Labels over media.
