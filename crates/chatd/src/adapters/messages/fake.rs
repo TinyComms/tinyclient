@@ -3,7 +3,8 @@
 //! `messages.signin.ctl` while linking: `confirm`, `expire`, `fail`.
 //! `messages.ctl` once linked:
 //! `incoming WHO TEXT…`, `group WHO TEXT…`, `photo WHO`, `caption WHO TEXT…`,
-//! `file WHO NAME`, `remote WHO`, `react WHO TEXT`, `typing WHO`, `typing-stop WHO`,
+//! `file WHO NAME`, `remote WHO`, `react WHO TEXT`, `quote WHO ID TEXT…`,
+//! `typing WHO`, `typing-stop WHO`,
 //! `refuse WORDS…`, `drop`, `unlinked`, `silent`, `answer`.
 //! `silent` makes the phone stop answering sends, history, and files. `answer` clears that
 //! and tells the adapter the phone is back.
@@ -198,6 +199,7 @@ fn note(
         status: 0,
         wire: 0,
         phones: None,
+        reply: String::new(),
     }
 }
 
@@ -318,6 +320,25 @@ fn steer(line: &str) -> Vec<Event> {
                 Vec::new(),
             ))]
         }
+        "quote" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let original = words.next().unwrap_or("").to_owned();
+            let text = rest(3);
+            let mut sent = note(
+                author,
+                name,
+                author,
+                &format!("m-{author}-quote"),
+                &text,
+                false,
+                Vec::new(),
+                Vec::new(),
+            );
+            sent.reply = original;
+            vec![Event::Message(sent)]
+        }
         "react" => {
             let Some((author, name)) = who(words.next().unwrap_or("")) else {
                 return Vec::new();
@@ -434,12 +455,15 @@ impl Drive for Fake {
     fn inbox_continues(&self) -> bool {
         false
     }
-    fn send(&self, conversation: &str, text: &str) -> Result<String, String> {
+    fn send(&self, conversation: &str, text: &str, reply: Option<&str>) -> Result<String, String> {
         self.unanswered()?;
         if let Some(words) = self.refusal() {
             return Err(words);
         }
         record(&format!("send {conversation} {text}"));
+        if let Some(id) = reply.filter(|id| !id.is_empty()) {
+            record(&format!("reply {conversation} {id}"));
+        }
         let n = self.sent.fetch_add(1, Ordering::Relaxed);
         Ok(format!("sent-{conversation}-{n}"))
     }
@@ -449,6 +473,7 @@ impl Drive for Fake {
         caption: &str,
         path: &str,
         name: &str,
+        reply: Option<&str>,
     ) -> Result<String, String> {
         self.unanswered()?;
         if let Some(words) = self.refusal() {
@@ -459,6 +484,9 @@ impl Drive for Fake {
             "file {conversation} {name} {} {caption}",
             bytes.len()
         ));
+        if let Some(id) = reply.filter(|id| !id.is_empty()) {
+            record(&format!("reply {conversation} {id}"));
+        }
         let n = self.sent.fetch_add(1, Ordering::Relaxed);
         Ok(format!("sent-file-{conversation}-{n}"))
     }
