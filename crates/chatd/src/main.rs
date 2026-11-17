@@ -290,6 +290,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-messages-transport:0");
         return Ok(());
     }
+    // The lab's teams-reactions driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("teams-reactions") {
+        if let Err(err) = chatd::adapters::prove_teams_reactions() {
+            eprintln!("teams-reactions: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
     // The lab's discord-forum-landing driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-forum-landing") {
         if let Err(err) = chatd::demo::prove_discord_forum_landing() {

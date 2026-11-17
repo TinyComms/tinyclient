@@ -1565,6 +1565,11 @@ pub fn prove_failed_start_offline() -> Result<(), String> {
     }
 }
 
+/// The lab's teams-reactions driver. See `teams::prove_reactions`.
+pub fn prove_teams_reactions() -> Result<(), String> {
+    teams::prove_reactions()
+}
+
 /// An adapter with no network behind it, for whatever serves an account inside chatd (the
 /// demo). The caller runs `serve_commands` on the inbox with the context.
 pub(crate) fn local(account: AccountKey, hub: Arc<Hub>) -> (Adapter, Context, Receiver<Command>) {

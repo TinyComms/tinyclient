@@ -9,34 +9,24 @@ use protocol::{
 };
 use serde_json::{json, Value};
 
-/// Reaction keys and the emoji they are, from Teams' own emoji catalog: the six every client
-/// offers first, then the ones people reach for. A key shaped `1f389_partypopper` says its own
-/// emoji and needs no entry to be read, only to be sent.
-const REACTIONS: &[(&str, &str)] = &[
-    ("like", "👍"), ("heart", "❤️"), ("laugh", "😆"), ("surprised", "😮"), ("sad", "🙁"), ("angry", "😠"),
-    ("cry", "😢"), ("cwl", "😂"), ("1f389_partypopper", "🎉"), ("praying", "🙏"), ("1f440_eyes", "👀"),
-    ("fire", "🔥"), ("2705_whiteheavycheckmark", "✅"), ("sarcastic", "👏"), ("smileeyes", "😊"),
-    ("wink", "😉"), ("hearteyes", "😍"), ("think", "🤔"), ("1f4af_hundredpointssymbol", "💯"),
-    ("launch", "🚀"), ("no", "👎"), ("rofl", "🤣"), ("cool", "😎"), ("loudlycrying", "😭"),
-    ("party", "🥳"), ("1f44b_wavinghand", "👋"), ("muscle", "💪"), ("2728_sparkles", "✨"),
-    ("star", "⭐"), ("274c_crossmark", "❌"), ("handshake", "🤝"), ("ok", "👌"), ("shrug", "🤷"),
-    ("salute", "🫡"), ("skull", "💀"), ("coffee", "☕"), ("yes", "👍"),
-];
-
-/// What reactions a Teams conversation takes: the emoji Teams has a key for here, and nothing
-/// custom. Teams names a reaction by a key of its catalog (`like`, `1f389_partypopper`), and
-/// one outside the table has no key chatd can spell; a reaction already on a message brought
-/// its own key and can be added to. Teams lets a person give several; no limit on them or on
-/// different emoji is documented, so none is set.
+/// What reactions a Teams conversation takes. The catalog in `emoji` names every
+/// emoji Teams has a key for, so this is not a short list. A skin tone is sent as
+/// `key-toneN` and stays. A reaction already on a message brought its own key and
+/// can be added to even when the catalog has no name for it. Teams lets a person
+/// give several; no limit on them or on different emoji is documented, so none is set.
 pub(crate) fn reaction_rules() -> protocol::ReactionRules {
-    let mut only: Vec<String> = Vec::with_capacity(REACTIONS.len());
-    for (_, emoji) in REACTIONS {
-        if !only.iter().any(|held| held == emoji) {
-            only.push((*emoji).to_owned());
-        }
+    protocol::ReactionRules { set: protocol::ReactionSet::Any, tones: true, ..protocol::ReactionRules::default() }
+}
+
+/// The lab's teams-reactions driver. Every catalog emoji maps to a key and back,
+/// and a skin tone is `key-toneN`.
+pub(crate) fn prove_reactions() -> Result<(), String> {
+    super::emoji::prove_catalog()?;
+    let rules = reaction_rules();
+    if rules.set != protocol::ReactionSet::Any || !rules.tones || !rules.only.is_empty() {
+        return Err("Teams reactions are still a short list, or a skin tone would be dropped".to_owned());
     }
-    // Plain only: chatd sends a toned one as its plain key, so the tone would not stay.
-    protocol::ReactionRules { set: protocol::ReactionSet::Only, only, ..protocol::ReactionRules::default() }
+    Ok(())
 }
 
 /// An emoji without the marks that do not change which one it is.
@@ -46,26 +36,12 @@ fn bare_emoji(emoji: &str) -> String {
 
 /// The emoji a reaction key is. A key Teams added since reads as `:key:`.
 fn emoji_of(key: &str) -> String {
-    let (key, tone) = key.split_once("-tone").map_or((key, None), |(key, tone)| (key, tone.parse::<u32>().ok()));
-    let known = REACTIONS.iter().find(|(known, _)| *known == key).map(|(_, emoji)| (*emoji).to_owned());
-    let spelled = || {
-        let points = key.split_once('_')?.0;
-        let read: Option<String> = points.split('-').map(|hex| u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)).collect();
-        read.filter(|read| !read.is_empty() && points.len() >= 4)
-    };
-    let Some(mut emoji) = known.or_else(spelled) else {
-        return format!(":{key}:");
-    };
-    if let Some(tone) = tone.filter(|tone| (1..=5).contains(tone)).and_then(|tone| char::from_u32(0x1f3fa + tone)) {
-        emoji.push(tone);
-    }
-    emoji
+    super::emoji::emoji_of(key)
 }
 
-/// The key Teams knows an emoji by, for the ones in the table.
-fn key_of(emoji: &str) -> Option<&'static str> {
-    let wanted = bare_emoji(emoji);
-    REACTIONS.iter().find(|(_, known)| bare_emoji(known) == wanted).map(|(key, _)| *key)
+/// The key Teams knows an emoji by, including a skin tone's `-toneN`.
+fn key_of(emoji: &str) -> Option<String> {
+    super::emoji::reaction_key(emoji)
 }
 
 /// The person id at the end of `https://…/v1/users/ME/contacts/8:orgid:…`, or the id itself.
@@ -864,7 +840,7 @@ impl Teams {
 
     pub(super) fn react(&self, conversation: &str, id: &str, emoji: &str, on: bool) -> Result<(), Fault> {
         let learned = || self.ctx.note(&format!("r:{}", bare_emoji(emoji)));
-        let Some(key) = key_of(emoji).map(str::to_owned).or_else(learned) else {
+        let Some(key) = key_of(emoji).or_else(learned) else {
             return Err(Fault::Refused {
                 status: 400,
                 message: "tinyclient does not know Teams' name for that emoji yet".to_owned(),
@@ -919,9 +895,18 @@ mod tests {
         assert_eq!(emoji_of("1f389_partypopper"), "🎉");
         assert_eq!(emoji_of("1f9d1-200d-1f4bb_technologist"), "🧑\u{200d}💻");
         assert_eq!(emoji_of("like-tone3"), "👍🏽");
-        assert_eq!(emoji_of("oreoyum"), ":oreoyum:");
-        assert_eq!((key_of("👍"), key_of("👍🏽"), key_of("❤"), key_of("🎉")), (Some("like"), Some("like"), Some("heart"), Some("1f389_partypopper")));
-        assert_eq!(key_of("🦑"), None);
+        assert_eq!(emoji_of("oreoyum"), "(oreoyum)");
+        assert_eq!(key_of("👍").as_deref(), Some("like"));
+        assert_eq!(key_of("👍🏽").as_deref(), Some("yes-tone3"));
+        assert_eq!(key_of("❤").as_deref(), Some("cactuslove"));
+        assert_eq!(key_of("❤️").as_deref(), Some("heart"));
+        assert_eq!(key_of("🎉").as_deref(), Some("1f389_partypopper"));
+        assert_eq!(key_of("🦑").as_deref(), Some("1f991_squid"));
+    }
+
+    #[test]
+    fn a_catalog_emoji_and_a_skin_tone_use_teams_keys() {
+        prove_reactions().unwrap();
     }
 
     #[test]

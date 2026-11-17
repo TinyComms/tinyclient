@@ -1070,15 +1070,32 @@ fn sending_editing_reacting_deleting_and_reading_go_to_teams() {
     assert_eq!(world.ask(react("👍", false)), Response::Ok);
     let taken = world.until("the reaction to be taken back", || world.fake.calls("DELETE", &path("/messages/1760000500500/properties")).pop());
     assert_eq!(taken.json(), json!({"emotions": {"key": "like"}}));
-    // Teams takes the emoji it has a key for here; one it has none for is refused before
-    // Teams hears of it.
+    // A skin tone stays on the catalog's tone base (`yes`), not the plain `like` key.
+    assert_eq!(world.ask(react("👍🏽", true)), Response::Ok);
+    let toned = world.until("the toned reaction to reach Teams", || {
+        world.fake.calls("PUT", &path("/messages/1760000500500/properties")).into_iter().rev().find(|call| call.json()["emotions"]["key"].as_str() == Some("yes-tone3"))
+    });
+    assert!(toned.json()["emotions"]["value"].as_u64().is_some());
+    // Squid is in the catalog, so it goes out under that key.
+    assert_eq!(world.ask(react("🦑", true)), Response::Ok);
+    let squid = world.until("the squid reaction to reach Teams", || {
+        world.fake.calls("PUT", &path("/messages/1760000500500/properties")).into_iter().rev().find(|call| call.json()["emotions"]["key"].as_str() == Some("1f991_squid"))
+    });
+    assert_eq!(squid.json()["emotions"]["key"].as_str(), Some("1f991_squid"));
     let Response::Reactions { rules, .. } = world.ask(Request::Reactions { conversation: ana.clone() }) else {
         panic!("no rules");
     };
-    assert_eq!((rules.set, &rules.only[..6]), (protocol::ReactionSet::Only, &["👍", "❤️", "😆", "😮", "🙁", "😠"].map(String::from)[..]));
-    let unkeyed = world.ask(react("🦑", true));
-    assert_eq!(unkeyed, Response::Error { code: protocol::ErrorCode::Refused, detail: "That reaction isn't allowed here.".to_owned() });
-    assert_eq!(world.fake.calls("PUT", &path("/messages/1760000500500/properties")).len(), 1, "only the 👍 went");
+    assert_eq!(rules.set, protocol::ReactionSet::Any);
+    assert!(rules.tones);
+    assert!(rules.only.is_empty());
+    // One the catalog cannot name is refused, and Teams is not asked.
+    let before = world.fake.calls("PUT", &path("/messages/1760000500500/properties")).len();
+    let unkeyed = world.ask(react("\u{e000}", true));
+    assert_eq!(
+        unkeyed,
+        Response::Error { code: protocol::ErrorCode::Refused, detail: "Teams refused (400: tinyclient does not know Teams' name for that emoji yet).".to_owned() }
+    );
+    assert_eq!(world.fake.calls("PUT", &path("/messages/1760000500500/properties")).len(), before);
 
     // Mark read: the read marker, at that message.
     assert_eq!(world.ask(Request::MarkRead { conversation: ana.clone(), message_id: sent.id.clone() }), Response::Ok);
