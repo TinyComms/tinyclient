@@ -1248,7 +1248,7 @@ impl Discord {
             Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
             Command::SpaceInfo { space_id, reply } => answer(reply, self.space_info(&space_id)),
-            Command::SetMute { conversation_id, notify, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
+            Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true)),
             Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),

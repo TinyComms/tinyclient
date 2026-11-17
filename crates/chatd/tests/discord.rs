@@ -3466,13 +3466,13 @@ fn info_mute_leave_pins_and_the_shared_search_ask_discord_once_each_and_only_whe
 
     // Mute: the server's settings for that one channel, as Discord's own menu sends them; the
     // row follows Discord's answer.
-    assert_eq!(world.ask(Request::SetMute { conversation: world.key("4101"), notify: protocol::Notify::Nothing }), Response::Ok);
+    assert_eq!(world.ask(Request::SetMute { conversation: world.key("4101"), notify: protocol::Notify::Nothing, until: None }), Response::Ok);
     let patched = world.discord.requests_to("PATCH", "/users/@me/guilds/4000/settings");
     assert_eq!(patched.len(), 1);
     assert_eq!(patched[0].body["channel_overrides"]["4101"]["muted"], true);
     assert_eq!(patched[0].body["channel_overrides"]["4101"]["mute_config"]["selected_time_window"], -1);
     assert!(world.conversation("4101").muted);
-    assert_eq!(world.ask(Request::SetMute { conversation: world.key("3001"), notify: protocol::Notify::Mentions }), Response::Ok);
+    assert_eq!(world.ask(Request::SetMute { conversation: world.key("3001"), notify: protocol::Notify::Mentions, until: None }), Response::Ok);
     let direct = world.discord.requests_to("PATCH", "/users/@me/guilds/@me/settings");
     assert_eq!(direct[0].body["channel_overrides"]["3001"], json!({"muted": false, "message_notifications": 1, "mute_config": {"end_time": null, "selected_time_window": -1}}));
 

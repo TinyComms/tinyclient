@@ -2213,8 +2213,8 @@ impl Chat {
             Request::Profile { person, space } => self.profile(person, space),
             Request::ConversationInfo { conversation } => self.conversation_info(conversation),
             Request::SpaceInfo { space } => self.space_info(space),
-            Request::SetMute { conversation, notify } => {
-                self.act(&conversation, |conversation_id, reply| Command::SetMute { conversation_id, notify, reply })
+            Request::SetMute { conversation, notify, until } => {
+                self.act(&conversation, |conversation_id, reply| Command::SetMute { conversation_id, notify, until, reply })
             }
             Request::Leave { conversation } => self.act(&conversation, |conversation_id, reply| Command::Leave { conversation_id, reply }),
             Request::CloseDirect { conversation } => {

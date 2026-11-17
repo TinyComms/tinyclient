@@ -40,6 +40,44 @@ pub(super) struct Facts {
     pub muted: bool,
     /// Nothing unread when it was last told.
     pub read: bool,
+    /// When this chat's own mute ends, as Unix seconds. `None` is the kind's default.
+    /// [`i32::MAX`] is muted until it is turned off.
+    pub mute_until: Option<i64>,
+}
+
+/// Whether a Telegram `mute_until` still silences the chat. [`i32::MAX`] does not expire.
+pub(super) fn mute_holds(until: i32) -> bool {
+    until == i32::MAX || i64::from(until) > crate::hub::now()
+}
+
+/// The chat's own `mute_until`, when Telegram named one.
+pub(super) fn mute_stamp(settings: &tl::enums::PeerNotifySettings) -> Option<i64> {
+    let tl::enums::PeerNotifySettings::Settings(settings) = settings;
+    settings.mute_until.map(i64::from)
+}
+
+fn clamp_stamp(until: i64) -> i32 {
+    until.clamp(0, i64::from(i32::MAX)) as i32
+}
+
+/// A timed mute that has ended is not muted, the next time this chat is read. No timer.
+pub(super) fn refresh_timed_mute(account: &Account, who: Who) {
+    let (until, was) = {
+        let live = account.live();
+        match live.filed.facts.get(&who) {
+            Some(facts) => (facts.mute_until, facts.muted),
+            None => return,
+        }
+    };
+    let Some(until) = until else {
+        return;
+    };
+    let muted = mute_holds(clamp_stamp(until));
+    if muted == was {
+        return;
+    }
+    let _ = account.ctx.muted(&who.text(), muted);
+    facts_changed(account, who, |facts| facts.muted = muted);
 }
 
 /// Where the next page of a list starts: the last dialog's date, message and peer.
@@ -73,6 +111,11 @@ impl Filed {
     /// Where a chat is filed now.
     pub fn filing(&self, who: Who, known: &Known) -> Filing {
         let mut facts = self.facts.get(&who).copied().unwrap_or_default();
+        if let Some(until) = facts.mute_until {
+            if !mute_holds(clamp_stamp(until)) {
+                facts.muted = false;
+            }
+        }
         if let Some((_, read)) = self.open.filter(|(held, _)| *held == who) {
             facts.read = read;
         }

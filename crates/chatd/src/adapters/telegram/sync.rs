@@ -48,7 +48,7 @@ fn now() -> i64 {
 fn muted(account: &Account, who: Who, settings: &tl::enums::PeerNotifySettings) -> bool {
     let tl::enums::PeerNotifySettings::Settings(settings) = settings;
     match settings.mute_until {
-        Some(until) => i64::from(until) > now(),
+        Some(until) => filing::mute_holds(until),
         None => {
             let broadcast = account.dir().get(who).is_some_and(|known| known.broadcast);
             let kind = match who {
@@ -359,7 +359,7 @@ pub(super) fn sign_on(account: &Arc<Account>) -> Result<(), Fault> {
     ];
     for (index, peer) in kinds.into_iter().enumerate() {
         let tl::enums::PeerNotifySettings::Settings(settings) = account.ask(&tl::functions::account::GetNotifySettings { peer })?;
-        account.live().muted[index] = settings.mute_until.is_some_and(|until| i64::from(until) > now());
+        account.live().muted[index] = settings.mute_until.is_some_and(filing::mute_holds);
     }
     dialogs(account)?;
     // An earlier build kept every chat in one invented Space. The rows read just now have left
@@ -708,7 +708,12 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     let filing = {
         let mut live = account.live();
         let filed = &mut live.filed;
-        filed.note(who, Facts { archived: list == 1, muted: is_muted, read: unread == 0 });
+        filed.note(who, Facts {
+            archived: list == 1,
+            muted: is_muted,
+            read: unread == 0,
+            mute_until: filing::mute_stamp(&dialog.notify_settings),
+        });
         if !filed.order[list].contains(&who) {
             filed.order[list].push(who);
         }
@@ -1424,6 +1429,9 @@ fn fetch(account: &Account, who: Who, topic: Option<i32>, around: &Around, limit
 /// queued to be fetched: the user is looking at this conversation.
 pub(super) fn history(account: &Account, conversation: &str, around: Around) -> Option<Message> {
     let (who, topic) = Who::parse(conversation)?;
+    if topic.is_none() {
+        filing::refresh_timed_mute(account, who);
+    }
     if let Around::After(after) = &around {
         let mut live = account.live();
         live.after.retain(|(_, _, at)| at.elapsed() < AFTER_FRESH);

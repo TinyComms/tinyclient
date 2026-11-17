@@ -411,7 +411,7 @@ fn a_card_and_an_info_pane_are_typed_and_a_mute_is_the_network_s() {
     let Response::ConversationInfo { info } = chatd.ask(Request::ConversationInfo { conversation: showcase.clone() }) else { panic!("no info") };
     assert_eq!((info.notify, info.conversation.title.as_str()), (Notify::All, "showcase"));
     assert!(info.members.is_some_and(|members| members > 2));
-    assert!(matches!(chatd.ask(Request::SetMute { conversation: showcase.clone(), notify: Notify::Nothing }), Response::Ok));
+    assert!(matches!(chatd.ask(Request::SetMute { conversation: showcase.clone(), notify: Notify::Nothing, until: None }), Response::Ok));
     assert!(chatd.row(&showcase).muted);
     let Response::ConversationInfo { info } = chatd.ask(Request::ConversationInfo { conversation: showcase }) else { panic!("no info") };
     assert_eq!(info.notify, Notify::Nothing, "a mute is not answered from what was kept before it");

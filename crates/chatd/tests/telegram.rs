@@ -1887,10 +1887,10 @@ fn the_panes_ask_telegram_once_each_and_counts_are_telegrams_own() {
     assert_eq!(info.notify, protocol::Notify::Nothing);
 
     // Mute is Telegram's, then shown.
-    assert_eq!(world.ask(Request::SetMute { conversation: key("g8001"), notify: protocol::Notify::Nothing }), Response::Ok);
+    assert_eq!(world.ask(Request::SetMute { conversation: key("g8001"), notify: protocol::Notify::Nothing, until: None }), Response::Ok);
     assert_eq!(world.called("UpdateNotifySettings g8001 2147483647"), 1);
     assert!(world.conversation("g8001").unwrap().muted);
-    assert_eq!(world.ask(Request::SetMute { conversation: key("g8001"), notify: protocol::Notify::All }), Response::Ok);
+    assert_eq!(world.ask(Request::SetMute { conversation: key("g8001"), notify: protocol::Notify::All, until: None }), Response::Ok);
     assert!(!world.conversation("g8001").unwrap().muted);
 
     // Pins and shared things from Telegram's own search, with its count as the total.
@@ -1916,6 +1916,25 @@ fn the_panes_ask_telegram_once_each_and_counts_are_telegrams_own() {
     assert!(world.conversation("c9001").is_none());
     // A direct chat cannot be left.
     assert!(matches!(world.ask(Request::Leave { conversation: key("u7002") }), Response::Error { .. }));
+}
+
+#[test]
+fn a_mute_until_a_time_is_sent_and_a_past_one_does_not_mute() {
+    let world = World::signed_in();
+    world.connected();
+    let until = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 + 3_600;
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: key("g8001"), notify: protocol::Notify::Nothing, until: Some(until) }),
+        Response::Ok
+    );
+    assert_eq!(world.called(&format!("UpdateNotifySettings g8001 {until}")), 1);
+    assert!(world.conversation("g8001").unwrap().muted);
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: key("u7003"), notify: protocol::Notify::Nothing, until: Some(1) }),
+        Response::Ok
+    );
+    assert_eq!(world.called("UpdateNotifySettings u7003 1"), 1);
+    assert!(!world.conversation("u7003").unwrap().muted);
 }
 
 #[test]

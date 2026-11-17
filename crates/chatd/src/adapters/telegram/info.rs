@@ -134,17 +134,28 @@ pub(super) fn conversation(account: &Account, conversation: &str) -> Result<Conv
 
 /// The network's own mute. Telegram has no "mentions only" for a chat: a muted chat still
 /// counts its mentions, so that is what `Mentions` sets (unverified that every app notifies them).
-pub(super) fn set_mute(account: &Account, conversation: &str, notify: Notify) -> Result<(), Fault> {
+/// `until` is when that mute ends, as Unix seconds. Absent is muted until it is turned off.
+/// A time that has already passed is not muted.
+pub(super) fn set_mute(account: &Account, conversation: &str, notify: Notify, until: Option<i64>) -> Result<(), Fault> {
     let (who, topic) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
     if who == Who::User(SERVICE) {
         return Err(Fault::Rpc { code: 400, name: "SERVICE_NEVER_MUTED".to_owned(), value: None });
     }
     let peer = account.input(who)?;
-    let muted = notify != Notify::All;
+    let asked = notify != Notify::All;
+    let stamp = if !asked {
+        0
+    } else {
+        match until {
+            None => i32::MAX,
+            Some(unix) => unix.clamp(0, i64::from(i32::MAX)) as i32,
+        }
+    };
+    let muted = super::filing::mute_holds(stamp);
     let settings = tl::types::InputPeerNotifySettings {
         show_previews: None,
         silent: None,
-        mute_until: Some(if muted { i32::MAX } else { 0 }),
+        mute_until: Some(stamp),
         sound: None,
         stories_muted: None,
         stories_hide_sender: None,
@@ -156,7 +167,13 @@ pub(super) fn set_mute(account: &Account, conversation: &str, notify: Notify) ->
     };
     account.ask(&tl::functions::account::UpdateNotifySettings { peer, settings: settings.into() })?;
     let _ = account.ctx.muted(conversation, muted);
-    super::filing::facts_changed(account, who, |facts| facts.muted = muted);
+    super::filing::facts_changed(account, who, |facts| {
+        facts.muted = muted;
+        if topic.is_none() {
+            // No end time once it is off, so a later topic mute is not cleared as expired.
+            facts.mute_until = (stamp != 0).then_some(i64::from(stamp));
+        }
+    });
     Ok(())
 }
 

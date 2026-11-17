@@ -1,0 +1,12 @@
+{
+  "id": "telegram-mute-until",
+  "title": "Telegram: mute a chat for an hour, a day or until a date, not only forever",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same mute end time is what a timed mute maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same mute end time is what a timed mute maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

@@ -460,7 +460,7 @@ impl Floating {
                         return;
                     };
                     let notify = if muted { Notify::All } else { Notify::Nothing };
-                    super::ask_later(cx, Request::SetMute { conversation, notify }, |_, _| {});
+                    super::ask_later(cx, Request::SetMute { conversation, notify, until: None }, |_, _| {});
                 })))
             }
             Item::CopyHandle => {

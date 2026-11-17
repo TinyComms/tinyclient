@@ -579,7 +579,11 @@ pub(super) fn apply(account: &Account, update: &Update) {
                 let who = Who::of(&peer.peer);
                 let muted = sync::is_muted(account, who, &settings.notify_settings);
                 let _ = account.ctx.muted(&who.text(), muted);
-                filing::facts_changed(account, who, |facts| facts.muted = muted);
+                let stamp = filing::mute_stamp(&settings.notify_settings);
+                filing::facts_changed(account, who, |facts| {
+                    facts.muted = muted;
+                    facts.mute_until = stamp;
+                });
             }
             tl::enums::NotifyPeer::NotifyForumTopic(topic) => {
                 let who = Who::of(&topic.peer);

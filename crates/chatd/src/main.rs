@@ -488,6 +488,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-member-sections:0");
         return Ok(());
     }
+    // The lab's telegram-mute-until driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-mute-until") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_mute_until() {
+            eprintln!("telegram-mute-until: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-mute-until:0");
+        return Ok(());
+    }
     // The lab's telegram-accounts driver. A build without this stays up and the driver fails.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-accounts") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_accounts() {

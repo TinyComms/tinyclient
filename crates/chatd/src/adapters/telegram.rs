@@ -730,8 +730,8 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::ConversationInfo { conversation_id, reply } => {
             let _ = reply.send(info::conversation(account, &conversation_id).map_err(refused));
         }
-        Command::SetMute { conversation_id, notify, reply } => {
-            let _ = reply.send(info::set_mute(account, &conversation_id, notify).map_err(refused));
+        Command::SetMute { conversation_id, notify, until, reply } => {
+            let _ = reply.send(info::set_mute(account, &conversation_id, notify, until).map_err(refused));
         }
         Command::Leave { conversation_id, reply } => {
             let _ = reply.send(info::leave(account, &conversation_id).map_err(refused));
@@ -1200,6 +1200,21 @@ pub fn prove_telegram_album() -> Result<(), String> {
 /// The lab's telegram-stickers driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_stickers() -> Result<(), String> {
     content::prove_stickers()
+}
+
+/// The lab's telegram-mute-until driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_mute_until() -> Result<(), String> {
+    if !filing::mute_holds(i32::MAX) {
+        return Err("a mute until it is turned off does not stay muted".into());
+    }
+    if filing::mute_holds(1) {
+        return Err("a mute that already ended still silences the chat".into());
+    }
+    let soon = (crate::hub::now() + 3_600).clamp(0, i64::from(i32::MAX)) as i32;
+    if !filing::mute_holds(soon) {
+        return Err("a mute until a later time is not muted".into());
+    }
+    Ok(())
 }
 
 /// The lab's telegram-dice driver. A build without this stays up and the driver fails.

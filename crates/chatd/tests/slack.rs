@@ -2183,11 +2183,11 @@ fn info_mute_pins_files_emoji_threads_and_a_scheduled_send_ask_slack_once_each()
     assert_eq!(world.fake.calls(ALPHA, "conversations.info").len(), before);
 
     // Mute and unmute: the web client's notification call, and the row follows.
-    assert_eq!(world.ask(Request::SetMute { conversation: general.clone(), notify: protocol::Notify::Nothing }), Response::Ok);
+    assert_eq!(world.ask(Request::SetMute { conversation: general.clone(), notify: protocol::Notify::Nothing, until: None }), Response::Ok);
     let set = world.fake.calls(ALPHA, "users.prefs.setNotifications");
     assert_eq!((set[0].params["name"].as_str(), set[0].params["value"].as_str(), set[0].params["channel_id"].as_str()), ("muted", "true", "C0GEN"));
     assert!(world.conversation(&general).unwrap().muted);
-    assert_eq!(world.ask(Request::SetMute { conversation: general.clone(), notify: protocol::Notify::Mentions }), Response::Ok);
+    assert_eq!(world.ask(Request::SetMute { conversation: general.clone(), notify: protocol::Notify::Mentions, until: None }), Response::Ok);
     let set = world.fake.calls(ALPHA, "users.prefs.setNotifications");
     assert!(set[1].params["prefs"].contains("mentions_dms") && set[1].params["channel_ids"] == "C0GEN");
     assert!(!world.conversation(&general).unwrap().muted);
