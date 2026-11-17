@@ -83,7 +83,7 @@ fn made(account: &Account, conversation: &str, target: &Target, text: &str, opts
 fn send_pick(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, pick: &str, opts: Options) -> Result<Message, Fault> {
     let target = target(account, conversation, reply_to)?;
     let random = random_id(client_id);
-    let (plain, entities) = super::content::outgoing(text);
+    let (plain, entities) = super::prepared(account, conversation, text);
     let (answer, caption) = match catalog::find(account, pick).ok_or_else(|| Fault::Rpc { code: 400, name: "PICK_EXPIRED".to_owned(), value: None })? {
         Pick::Document(id) => {
             remember_random(account, random, client_id);
@@ -182,7 +182,7 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
     let target = target(account, conversation, reply_to).map_err(words)?;
     let premium = account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium);
     let limit = if premium { 4_096 } else { 1_024 };
-    let (plain, entities) = super::content::outgoing(text);
+    let (plain, entities) = super::prepared(account, conversation, text);
     // A caption longer than Telegram takes goes first as a message of its own.
     let caption = if plain.chars().count() > limit {
         super::send_text(account, conversation, &format!("{client_id}1"), text, reply_to, opts).map_err(words)?;

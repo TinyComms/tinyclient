@@ -194,6 +194,10 @@ struct Live {
     picks: VecDeque<(String, catalog::Pick)>,
     /// The installed sticker packs, from the first page of the Stickers tab.
     sticker_sets: Option<Vec<(i64, i64, String)>>,
+    /// The installed custom-emoji packs, kept apart from stickers so one tab does not blank the other.
+    emoji_sets: Option<Vec<(i64, i64, String)>>,
+    /// `:alt:` labels the emoji tab offered, newest last, so a send can name the document.
+    emoji_labels: VecDeque<content::EmojiLabel>,
     /// Scheduled sends shown until Telegram sends them: the chat, the text, the placeholder.
     scheduled: VecDeque<(String, String, String)>,
     /// The next slice of cached unread channels to check after sign-on.
@@ -759,7 +763,7 @@ fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str,
     let reply = reply_to.and_then(|id| id.parse::<i32>().ok());
     let random = random_id(client_id);
     remember_random(account, random, client_id);
-    let (plain, entities) = content::outgoing(text);
+    let (plain, entities) = prepared(account, conversation, text);
     let request = tl::functions::messages::SendMessage {
         no_webpage: opts.no_webpage,
         silent: opts.silent,
@@ -799,6 +803,7 @@ fn edit(account: &Account, conversation: &str, message: &str, text: &str) -> Res
             entities = content::with_stored(&plain, &stored.spans);
         }
     }
+    let (plain, entities) = dress(account, conversation, plain, entities);
     let request = tl::functions::messages::EditMessage {
         no_webpage: false,
         invert_media: false,
@@ -886,7 +891,7 @@ fn save_draft(account: &Account, conversation: &str, text: &str) {
     let Ok(peer) = account.input(who) else {
         return;
     };
-    let (plain, entities) = content::outgoing(text);
+    let (plain, entities) = prepared(account, conversation, text);
     let request = tl::functions::messages::SaveDraft {
         no_webpage: false,
         invert_media: false,
@@ -979,6 +984,40 @@ fn members(account: &Account, conversation: &str, offset: u32, limit: u32) -> Re
     })
 }
 
+/// Composer text as Telegram should receive it: markers become entities, and a custom emoji
+/// the catalog offered (`:alt:`) becomes that emoji's fallback glyph.
+fn prepared(account: &Account, conversation: &str, text: &str) -> (String, Option<Vec<tl::enums::MessageEntity>>) {
+    let (plain, entities) = content::outgoing(text);
+    dress(account, conversation, plain, entities)
+}
+
+fn dress(
+    account: &Account,
+    conversation: &str,
+    plain: String,
+    entities: Option<Vec<tl::enums::MessageEntity>>,
+) -> (String, Option<Vec<tl::enums::MessageEntity>>) {
+    if !plain.contains(':') {
+        return (plain, entities);
+    }
+    let labels: Vec<content::EmojiLabel> = account.live().emoji_labels.iter().cloned().collect();
+    if labels.is_empty() {
+        return (plain, entities);
+    }
+    let allow = custom_allowed(account, conversation);
+    let (plain, entities) = content::apply_emoji(&plain, entities.unwrap_or_default(), &labels, allow);
+    (plain, (!entities.is_empty()).then_some(entities))
+}
+
+/// Premium may send a custom emoji in any chat. Anyone may send one in Saved Messages.
+/// Everywhere else only the fallback glyph goes out.
+fn custom_allowed(account: &Account, conversation: &str) -> bool {
+    if account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium) {
+        return true;
+    }
+    matches!(Who::parse(conversation), Some((Who::User(id), _)) if id == account.me)
+}
+
 /// The lab's telegram-markers driver. A build without this returns to the server below and stays up.
 pub fn prove_telegram_markers() -> Result<(), String> {
     let text = "né 🇵🇹 🦀 code";
@@ -1005,6 +1044,36 @@ pub fn prove_telegram_markers() -> Result<(), String> {
     let still = content::spans(&plain, &kept);
     if !still.iter().any(|span| matches!(span.style, protocol::Style::Bold) && span.start == 0 && span.end == 2) {
         return Err("the bold run was not kept on edit".into());
+    }
+    Ok(())
+}
+
+/// The lab's telegram-custom-emoji driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_custom_emoji() -> Result<(), String> {
+    let labels = vec![content::EmojiLabel {
+        label: ":\u{2B50}:".to_owned(),
+        document_id: 6_402,
+        fallback: "\u{2B50}".to_owned(),
+        ambiguous: false,
+    }];
+    let (plain, entities) = content::outgoing("**go** :\u{2B50}:");
+    let (plain, entities) = content::apply_emoji(&plain, entities.unwrap_or_default(), &labels, true);
+    if plain != "go \u{2B50}" {
+        return Err(format!("the fallback did not replace the label: {plain}"));
+    }
+    let bold = entities.iter().any(|entity| matches!(entity, tl::enums::MessageEntity::Bold(bold) if bold.offset == 0 && bold.length == 2));
+    let emoji = entities.iter().any(|entity| {
+        matches!(entity, tl::enums::MessageEntity::CustomEmoji(emoji) if emoji.document_id == 6_402 && emoji.offset == 3 && emoji.length == 1)
+    });
+    if !bold || !emoji {
+        return Err("the custom emoji was not named on the send".into());
+    }
+    let (plain, entities) = content::apply_emoji("go :\u{2B50}:", Vec::new(), &labels, false);
+    if plain != "go \u{2B50}" {
+        return Err(format!("a chat without Premium did not keep the fallback: {plain}"));
+    }
+    if entities.iter().any(|entity| matches!(entity, tl::enums::MessageEntity::CustomEmoji(_))) {
+        return Err("a chat without Premium kept the custom emoji".into());
     }
     Ok(())
 }

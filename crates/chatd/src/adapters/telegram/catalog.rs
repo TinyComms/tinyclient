@@ -1,7 +1,9 @@
-//! The picker's catalogs: saved GIFs, a GIF search through Telegram's `@gif` inline bot, and
-//! the installed sticker packs one pack a page. Every preview is a still (a GIF's or sticker's
-//! thumbnail); nothing animated is fetched. Asked only when a picker tab opens or the query
-//! changes, never ahead. What a pick names is remembered here, so sending it uploads nothing.
+//! The picker's catalogs: saved GIFs, a GIF search through Telegram's `@gif` inline bot, the
+//! installed sticker packs one pack a page, and the installed custom-emoji packs the same way.
+//! Every preview is a still (a GIF's or sticker's thumbnail); nothing animated is fetched.
+//! Asked only when a picker tab opens or the query changes, never ahead. What a pick names is
+//! remembered here, so sending it uploads nothing. A custom emoji is also remembered by the
+//! `:alt:` the composer inserts, which is all a send is given.
 
 use super::content;
 use super::peers::Who;
@@ -13,6 +15,8 @@ use protocol::{CatalogItem, CatalogKind};
 
 /// Picks remembered, newest last: enough for a few pages of every tab.
 const PICKS: usize = 1_000;
+/// `:alt:` labels remembered for custom emoji, newest last.
+const EMOJI_LABELS: usize = 2_000;
 
 /// What a catalog item sends.
 #[derive(Debug, Clone)]
@@ -78,12 +82,116 @@ fn item(account: &Account, document: &tl::enums::Document, pack: &str) -> Option
 
 pub(super) fn catalog(account: &Account, kind: CatalogKind, query: &str, cursor: Option<&str>) -> Result<CatalogPage, Fault> {
     match kind {
-        // Custom emoji are Premium's; this account is offered none (`Capabilities`).
-        CatalogKind::Emoji => Ok(CatalogPage::default()),
+        CatalogKind::Emoji => emojis(account, cursor.and_then(|cursor| cursor.parse().ok()).unwrap_or(0)),
         CatalogKind::Gifs if query.is_empty() => saved_gifs(account),
         CatalogKind::Gifs => gif_search(account, query, cursor.unwrap_or("")),
         CatalogKind::Stickers => stickers(account, cursor.and_then(|cursor| cursor.parse().ok()).unwrap_or(0)),
     }
+}
+
+/// `:alt:` for one document, so a later send can put the glyph back and name the document.
+fn remember_label(account: &Account, label: String, document_id: i64, fallback: String) {
+    if label.is_empty() || fallback.is_empty() {
+        return;
+    }
+    let mut live = account.live();
+    if let Some(held) = live.emoji_labels.iter_mut().find(|held| held.label == label) {
+        if held.document_id != document_id {
+            held.ambiguous = true;
+        }
+        return;
+    }
+    if live.emoji_labels.len() >= EMOJI_LABELS {
+        live.emoji_labels.pop_front();
+    }
+    live.emoji_labels.push_back(content::EmojiLabel { label, document_id, fallback, ambiguous: false });
+}
+
+/// A custom-emoji document as a picker item. The id is `e<document>`, which is what a span
+/// names, and the name is the alt glyph the composer wraps in colons.
+fn emoji_item(account: &Account, document: &tl::enums::Document, pack: &str) -> Option<CatalogItem> {
+    let tl::enums::Document::Document(raw) = document else {
+        return None;
+    };
+    let mut shown = item(account, document, pack)?;
+    let alt = raw.attributes.iter().find_map(|attribute| match attribute {
+        tl::enums::DocumentAttribute::CustomEmoji(emoji) if !emoji.alt.is_empty() => Some(emoji.alt.clone()),
+        _ => None,
+    });
+    shown.id = format!("e{}", raw.id);
+    match alt {
+        Some(alt) => {
+            remember_label(account, format!(":{alt}:"), raw.id, alt.clone());
+            shown.name = alt;
+        }
+        None => {
+            shown.name = shown.id.clone();
+            remember_label(account, format!(":{}:", shown.id), raw.id, "\u{2606}".to_owned());
+        }
+    }
+    Some(shown)
+}
+
+/// Emoji used lately, ahead of the first pack. A miss here still leaves the packs.
+fn recent_emoji(account: &Account) -> Vec<CatalogItem> {
+    let found = account.ask(&tl::functions::messages::GetRecentReactions { limit: 50, hash: 0 });
+    let ids: Vec<i64> = match found {
+        Ok(tl::enums::messages::Reactions::Reactions(found)) => found
+            .reactions
+            .iter()
+            .filter_map(|reaction| match reaction {
+                tl::enums::Reaction::CustomEmoji(emoji) => Some(emoji.document_id),
+                _ => None,
+            })
+            .collect(),
+        _ => return Vec::new(),
+    };
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let documents = match account.ask(&tl::functions::messages::GetCustomEmojiDocuments { document_id: ids }) {
+        Ok(documents) => documents,
+        Err(_) => return Vec::new(),
+    };
+    documents.iter().filter_map(|document| emoji_item(account, document, "Recent")).take(protocol::CATALOG_LIMIT).collect()
+}
+
+/// One installed emoji pack a page, in the user's order. The first page leads with recent emoji.
+fn emojis(account: &Account, at: usize) -> Result<CatalogPage, Fault> {
+    let held = account.live().emoji_sets.clone().filter(|_| at > 0);
+    let sets = match held {
+        Some(sets) => sets,
+        None => match account.ask(&tl::functions::messages::GetEmojiStickers { hash: 0 })? {
+            tl::enums::messages::AllStickers::Stickers(all) => {
+                let sets: Vec<(i64, i64, String)> =
+                    all.sets.iter().map(|tl::enums::StickerSet::Set(set)| (set.id, set.access_hash, set.title.clone())).collect();
+                account.live().emoji_sets = Some(sets.clone());
+                sets
+            }
+            tl::enums::messages::AllStickers::NotModified => {
+                account.live().emoji_sets = Some(Vec::new());
+                Vec::new()
+            }
+        },
+    };
+    let mut items = Vec::new();
+    if at == 0 {
+        items.extend(recent_emoji(account));
+    }
+    if let Some((id, access_hash, title)) = sets.get(at).cloned() {
+        let request = tl::functions::messages::GetStickerSet { stickerset: tl::types::InputStickerSetId { id, access_hash }.into(), hash: 0 };
+        match account.ask(&request) {
+            Ok(tl::enums::messages::StickerSet::Set(set)) => {
+                let room = protocol::CATALOG_LIMIT.saturating_sub(items.len());
+                items.extend(set.documents.iter().take(room).filter_map(|document| emoji_item(account, document, &title)));
+            }
+            Ok(tl::enums::messages::StickerSet::NotModified) => {}
+            Err(fault) if items.is_empty() => return Err(fault),
+            Err(_) => {}
+        }
+    }
+    let cursor = (at + 1 < sets.len()).then(|| (at + 1).to_string());
+    Ok(CatalogPage { items, cursor })
 }
 
 fn saved_gifs(account: &Account) -> Result<CatalogPage, Fault> {

@@ -113,6 +113,7 @@ fn user(id: i64, first: &str, last: &str, username: &str) -> tl::types::User {
     if id == TOBIN {
         user.status = Some(tl::enums::UserStatus::Recently(blank(&[&put(0u32)])));
     }
+    user.premium = id == ME && std::env::var("TINYCLIENT_TELEGRAM_PREMIUM").ok().as_deref() == Some("1");
     user.verified = id == SERVICE;
     user.bot = id == BOT || id == GIF_BOT;
     // A bot's flag is shared with its info version, which must then be there.
@@ -1736,6 +1737,11 @@ impl World {
             // The animated icon's own id (5002) is what Telegram names an animated emoji:
             // no still thumbnail, and the file itself is its Lottie play.
             let documents: Vec<tl::enums::Document> = request.document_id.iter().map(|&id| {
+                // Installed and recent custom emoji carry the alt the picker shows.
+                if id == 6_402 || id == 6_403 {
+                    let alt = if id == 6_402 { "\u{2B50}" } else { "\u{2605}" };
+                    return custom_emoji(id, alt).into();
+                }
                 let animated = id == 5002;
                 tl::enums::Document::Document(tl::types::Document {
                     id,
@@ -2149,7 +2155,34 @@ impl World {
             let found = tl::types::messages::AllStickers { hash: 1, sets: vec![set.into()] };
             return Some(answer(tl::enums::messages::AllStickers::Stickers(found)));
         }
-        if asked::<f::messages::GetStickerSet>(body).is_some() {
+        if asked::<f::messages::GetEmojiStickers>(body).is_some() {
+            self.log("GetEmojiStickers");
+            let mut set: tl::types::StickerSet = blank(&[&put(0u32), &put(910i64), &put(911i64), &put("Faces".to_owned()), &put("faces".to_owned()), &put(1i32), &put(1i32)]);
+            set.installed_date = Some(t0());
+            let found = tl::types::messages::AllStickers { hash: 1, sets: vec![set.into()] };
+            return Some(answer(tl::enums::messages::AllStickers::Stickers(found)));
+        }
+        if asked::<f::messages::GetRecentReactions>(body).is_some() {
+            self.log("GetRecentReactions");
+            let found = tl::types::messages::Reactions {
+                hash: 1,
+                reactions: vec![tl::types::ReactionCustomEmoji { document_id: 6_403 }.into()],
+            };
+            return Some(answer(tl::enums::messages::Reactions::Reactions(found)));
+        }
+        if let Some(request) = asked::<f::messages::GetStickerSet>(body) {
+            let emoji = matches!(&request.stickerset, tl::enums::InputStickerSet::Id(set) if set.id == 910);
+            if emoji {
+                self.log("GetStickerSet emoji");
+                let set: tl::types::StickerSet = blank(&[&put(0u32), &put(910i64), &put(911i64), &put("Faces".to_owned()), &put("faces".to_owned()), &put(1i32), &put(1i32)]);
+                let found = tl::types::messages::StickerSet {
+                    set: set.into(),
+                    packs: Vec::new(),
+                    keywords: Vec::new(),
+                    documents: vec![custom_emoji(6_402, "\u{2B50}").into()],
+                };
+                return Some(answer(tl::enums::messages::StickerSet::Set(found)));
+            }
             self.log("GetStickerSet");
             let set: tl::types::StickerSet = blank(&[&put(0u32), &put(900i64), &put(901i64), &put("Hiking".to_owned()), &put("hiking".to_owned()), &put(2i32), &put(1i32)]);
             let found = tl::types::messages::StickerSet { set: set.into(), packs: Vec::new(), keywords: Vec::new(), documents: vec![sticker(6_400).into(), sticker(6_401).into()] };
@@ -2221,6 +2254,28 @@ fn gif(id: i64) -> tl::types::Document {
             }
             .into(),
         ],
+    }
+}
+
+/// A custom emoji document: the alt is what the picker shows and what a send falls back to.
+fn custom_emoji(id: i64, alt: &str) -> tl::types::Document {
+    tl::types::Document {
+        id,
+        access_hash: id + 1,
+        file_reference: vec![9],
+        date: t0(),
+        mime_type: "image/webp".to_owned(),
+        size: 4_096,
+        thumbs: Some(vec![tl::types::PhotoSize { r#type: "m".to_owned(), w: 128, h: 128, size: 2_000 }.into()]),
+        video_thumbs: None,
+        dc_id: 2,
+        attributes: vec![tl::types::DocumentAttributeCustomEmoji {
+            free: false,
+            text_color: false,
+            alt: alt.to_owned(),
+            stickerset: tl::types::InputStickerSetId { id: 910, access_hash: 911 }.into(),
+        }
+        .into()],
     }
 }
 

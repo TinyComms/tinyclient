@@ -307,8 +307,9 @@ pub(super) fn remove_chat(account: &Account, who: Who) {
     }
 }
 
-/// What this account may send, from what Telegram says of it: Premium raises the file size and
-/// the caption, and allows custom emoji.
+/// What this account may send, from what Telegram says of it. Premium raises the file size
+/// and the caption. Custom emoji are listed for every account; a send names the document
+/// only with Premium, or in Saved Messages (`prepared`).
 fn capabilities(premium: bool) -> Capabilities {
     Capabilities {
         // 2 GB, 4 GB with Premium: 4,000 parts of 512 KB, 8,000 with Premium.
@@ -320,7 +321,7 @@ fn capabilities(premium: bool) -> Capabilities {
         gifs: true,
         stickers: true,
         search: true,
-        custom_emoji: if premium { EmojiScope::All } else { EmojiScope::None },
+        custom_emoji: EmojiScope::All,
         silent: true,
         schedule: true,
         suppress_embeds: true,
