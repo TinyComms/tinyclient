@@ -425,8 +425,9 @@ impl Slack {
         };
         Forwarded {
             from_title,
-            // Another workspace's name is not known here, and Slack does not send it.
-            from_space: String::new(),
+            // Only a domain already looked up for a Slack Connect channel. A forward is not
+            // worth a lookup, and Slack does not send the workspace's name.
+            from_space: first(&[&card["from_url"]]).and_then(|url| self.workspace_named(url)).unwrap_or_default(),
             link: first(&[&card["from_url"]]).unwrap_or("").to_owned(),
         }
     }

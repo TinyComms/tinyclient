@@ -326,6 +326,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-dice:0");
         return Ok(());
     }
+    // The lab's slack-connect-org driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("slack-connect-org") {
+        if let Err(err) = chatd::adapters::prove_slack_connect_org() {
+            eprintln!("slack-connect-org: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-slack-connect-org:0");
+        return Ok(());
+    }
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());
     protocol::crash::install_panic_hook("chatd");
     let dir = protocol::support_dir();

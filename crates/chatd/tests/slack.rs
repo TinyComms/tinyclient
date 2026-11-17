@@ -193,6 +193,16 @@ impl Fake {
     }
 
     fn user(&self, token: &str, id: &str) -> Option<Value> {
+        // Not in the fixture: a Slack Connect person, so the documented `users.info` path runs
+        // and the people-count fixtures stay as they are.
+        if token == ALPHA && id == "U0NIA" {
+            return Some(json!({
+                "id": "U0NIA", "team_id": "T0NORTH", "name": "nia", "deleted": false,
+                "real_name": "Nia North", "is_bot": false, "is_app_user": false, "is_stranger": true,
+                "profile": {"title": "Buyer", "real_name": "Nia North", "display_name": "Nia North",
+                            "status_text": "", "status_emoji": "", "team": "T0NORTH"},
+            }));
+        }
         let users = self.fixture(token, "users")?;
         users.as_array()?.iter().find(|user| user["id"] == id).cloned()
     }
@@ -421,12 +431,35 @@ impl Fake {
                             "user": param("users"), "is_open": true, "priority": 0},
             })),
             "users.info" => self.user(token, param("user")).map(|user| json!({"ok": true, "user": user})),
+            // A team id asks for that workspace. No id is the current one, from the fixture.
+            "team.info" if !param("team").is_empty() => {
+                let (id, name, domain) = match param("team") {
+                    "T0NORTH" => ("T0NORTH", "Northwind", "northwind"),
+                    "T0SOUTH" => ("T0SOUTH", "Contoso", "contoso"),
+                    other => (other, "Elsewhere", "elsewhere"),
+                };
+                Some(json!({"ok": true, "team": {"id": id, "name": name, "domain": domain}}))
+            }
             "conversations.info" => {
                 let listed = self.fixture(token, "users.conversations").unwrap();
                 let known = listed["channels"].as_array().unwrap().iter().find(|known| known["id"] == channel).cloned();
                 known.map(|mut known| {
                     if param("include_num_members") == "true" {
                         known["num_members"] = 4.into();
+                    }
+                    if token == ALPHA && channel == "C0SIDE" {
+                        known["is_ext_shared"] = true.into();
+                        known["connected_team_ids"] = json!(["T01ALPHA", "T0NORTH"]);
+                    }
+                    if token == ALPHA && channel == "C0DEP" {
+                        known["is_ext_shared"] = true.into();
+                        known["is_pending_ext_shared"] = true.into();
+                        known["pending_connected_team_ids"] = json!(["T0NORTH"]);
+                        known["connected_team_ids"] = json!([]);
+                    }
+                    // Our own list of workspaces, which includes us. Not the other organisation.
+                    if token == ALPHA && channel == "C0GEN" {
+                        known["shared_team_ids"] = json!(["T01ALPHA", "T0SOUTH"]);
                     }
                     json!({"ok": true, "channel": known})
                 })
@@ -2301,4 +2334,63 @@ fn files_go_up_from_their_paths_and_the_socket_names_the_message() {
     assert!(matches!(world.ask(asked), Response::Sent { .. }));
     let posted = world.until("the post", || world.fake.calls(ALPHA, "chat.postMessage").pop());
     assert_eq!((posted.params["unfurl_links"].as_str(), posted.params["unfurl_media"].as_str()), ("false", "false"));
+}
+
+#[test]
+fn a_slack_connect_channel_names_the_other_organisation() {
+    let world = World::start();
+    world.ready();
+    let info = |id: &str| match world.ask(Request::ConversationInfo { conversation: alpha(id) }) {
+        Response::ConversationInfo { info } => *info,
+        other => panic!("{other:?}"),
+    };
+    let looked_up = |team: &str| {
+        world.fake.calls(ALPHA, "team.info").into_iter().filter(|call| call.params.get("team").map(String::as_str) == Some(team)).count()
+    };
+
+    // Joined: the other organisation, not ours, and not a pending invitation.
+    let side = info("C0SIDE");
+    assert_eq!(side.external, "Northwind");
+    assert!(!side.description.contains("Invitation"), "{}", side.description);
+    assert_eq!(looked_up("T0NORTH"), 1);
+
+    // Pending: the same name, from the note, and where Slack accepts the invite.
+    let deploys = info("C0DEP");
+    assert_eq!(deploys.external, "Northwind");
+    assert!(deploys.description.contains("Northwind"), "{}", deploys.description);
+    assert!(deploys.description.contains("Directories"), "{}", deploys.description);
+    assert!(deploys.description.contains("External"), "{}", deploys.description);
+    assert_eq!(looked_up("T0NORTH"), 1, "the name was already known");
+
+    // `shared_team_ids` includes us and is not the other organisation.
+    let general = info("C0GEN");
+    assert_eq!(general.external, "");
+    assert_eq!(looked_up("T0SOUTH"), 0);
+
+    // A share from a workspace already named: its domain, with no further lookup.
+    let ts = "1760000600.000600";
+    world.fake.push(ALPHA, json!({
+        "type": "message", "channel": "C0GEN", "user": "U0NIA", "text": "shared from buying",
+        "ts": ts, "event_ts": ts,
+        "attachments": [{
+            "is_share": true, "channel_name": "buying", "text": "the order", "fallback": "the order",
+            "from_url": "https://northwind.slack.com/archives/C0BUY/p1760000100000100",
+        }],
+    }));
+    let arrived = world.until("the shared message", || world.message(&alpha("C0GEN"), ts));
+    let shared = arrived.forwarded.as_ref().expect("the share");
+    assert_eq!((shared.from_space.as_str(), shared.from_title.as_str()), ("Northwind", "#buying"));
+
+    let Response::Profile { profile } = world.ask(Request::Profile { person: alpha("U0NIA"), space: None }) else {
+        panic!("no profile");
+    };
+    assert!(profile.fields.iter().any(|(label, value)| label == "Organisation" && value == "Northwind"), "{:?}", profile.fields);
+    assert_eq!(profile.person.mark, Some(protocol::Mark::External));
+
+    let before = world.fake.calls(ALPHA, "conversations.open").len();
+    let refused = world.ask(Request::StartDirect { person: alpha("buyer@northwind.example") });
+    assert!(matches!(&refused, Response::Error { code: ErrorCode::Refused, detail } if detail.contains("Directories") && detail.contains("External")), "{refused:?}");
+    let opened = world.fake.calls(ALPHA, "conversations.open");
+    assert_eq!(opened.len(), before);
+    assert!(opened.iter().all(|call| !call.params["users"].contains('@')));
 }
