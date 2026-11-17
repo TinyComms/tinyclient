@@ -34,6 +34,84 @@ pub(super) const MESSAGE_PAGE: u64 = 40;
 /// What a request says when that wait runs out. The relay itself can still be up.
 pub const PHONE_QUIET: &str =
     "Your phone isn't responding. Keep Messages open, and the phone online.";
+/// The account shows this when the phone unpaired this computer, or the pairing expired.
+pub const UNPAIRED: &str = "Your phone unpaired this computer. Pair again.";
+/// The quiet poll starts here and doubles after a failed refresh, connect, or refused status, up to this.
+const POLL_FLOOR: Duration = Duration::from_secs(2);
+const POLL_CEILING: Duration = Duration::from_secs(900);
+
+/// Why one poll stopped. A network failure is not an unpaired phone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// The relay refused the session (401 or 403).
+    Auth,
+    /// The network, or any other status. A retry can survive it.
+    Closed,
+}
+
+/// What to do after one stop. Two auth refusals in a row end the session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    Retry,
+    End,
+}
+
+/// Consecutive auth refusals, kept across reconnects. One can be a blip.
+#[derive(Default)]
+pub struct Gate {
+    auth: u32,
+}
+
+impl Gate {
+    pub fn observe(&mut self, stop: Stop) -> Step {
+        match stop {
+            Stop::Auth => {
+                self.auth = self.auth.saturating_add(1);
+                if self.auth >= 2 {
+                    Step::End
+                } else {
+                    Step::Retry
+                }
+            }
+            Stop::Closed => {
+                self.auth = 0;
+                Step::Retry
+            }
+        }
+    }
+
+    /// A 401, a 403, or the cookie refresh giving up counts as auth. Two in a row end the session.
+    /// One `Sign in again` can be a Google hiccup, so it retries.
+    pub fn fail(&mut self, words: &str) -> crate::adapters::Failure {
+        let auth = words.contains("(401)") || words.contains("(403)") || cookie_failure_ends(words);
+        let stop = if auth { Stop::Auth } else { Stop::Closed };
+        match self.observe(stop) {
+            Step::End => crate::adapters::Failure::SignedOut(UNPAIRED.to_owned()),
+            Step::Retry => crate::adapters::Failure::Dropped(words.to_owned()),
+        }
+    }
+}
+
+pub fn cookie_failure_ends(words: &str) -> bool {
+    words.contains("Sign in again")
+}
+
+pub fn http_stop(status: u16) -> Stop {
+    match status {
+        401 | 403 => Stop::Auth,
+        _ => Stop::Closed,
+    }
+}
+
+pub fn next_pause(pause: Duration) -> Duration {
+    pause.saturating_mul(2).min(POLL_CEILING)
+}
+
+/// The long-poll's own close. The 90-second global timeout cuts a quiet healthy stream
+/// with no payload; that is not an outage, so the pause stays at the floor.
+fn stream_exit_failed() -> bool {
+    false
+}
 
 type AesCtr = Ctr128BE<Aes256>;
 type HmacSha = Hmac<Sha256>;
@@ -277,6 +355,12 @@ fn field_int(list: &[Field], number: u32) -> u64 {
     field(list, number)
         .and_then(|field| field.varint)
         .unwrap_or(0)
+}
+
+/// `RPCPairData.revoked` (field 5) with no `paired` (field 4): the phone removed this computer.
+pub fn revoked_pair(bytes: &[u8]) -> bool {
+    let list = fields(bytes);
+    field_bytes(&list, 4).is_empty() && field(&list, 5).is_some()
 }
 
 fn field_texts(list: &[Field], number: u32) -> Vec<String> {
@@ -1233,8 +1317,9 @@ impl Session {
             .name("messages-events".into())
             .spawn(move || {
                 let mut first = true;
+                let mut pause = POLL_FLOOR;
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    poll(
+                    let failed = poll(
                         live.clone(),
                         events.clone(),
                         waiters.clone(),
@@ -1246,7 +1331,13 @@ impl Session {
                     if stop.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
-                    std::thread::sleep(Duration::from_secs(2));
+                    // A failed refresh, connect, or refused status backs off. A normal close,
+                    // including the 90-second timeout, starts the wait over.
+                    pause = if failed { next_pause(pause) } else { POLL_FLOOR };
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    wait_or_stop(&stop, pause);
                 }
             })
             .map_err(|err| err.to_string())?;
@@ -1759,6 +1850,19 @@ impl Session {
 
 }
 
+/// Sleeps `pause`, but wakes within a slice when `close` sets `stop`.
+fn wait_or_stop(stop: &std::sync::atomic::AtomicBool, pause: Duration) {
+    let slice = Duration::from_millis(200);
+    let mut left = pause;
+    while !left.is_zero() && !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let step = if left < slice { left } else { slice };
+        std::thread::sleep(step);
+        left = left.saturating_sub(step);
+    }
+}
+
+/// True when this poll failed before its own close, so the next wait should grow.
+/// Refresh, connect, and a refused status return true. The stream's own close returns false.
 fn poll(
     live: Arc<Mutex<Live>>,
     events: Sender<crate::adapters::messages::Event>,
@@ -1766,7 +1870,7 @@ fn poll(
     stop: Arc<std::sync::atomic::AtomicBool>,
     announce: bool,
     paired: Option<Sender<Saved>>,
-) {
+) -> bool {
     let refresh = {
         let live = live.lock().unwrap_or_else(|p| p.into_inner());
         let lifetime = if live.ttl > 0 {
@@ -1781,7 +1885,7 @@ fn poll(
     if let Some(mut saved) = refresh {
         if let Err(reason) = google::refresh(&mut saved) {
             let _ = events.send(crate::adapters::messages::Event::Closed(reason));
-            return;
+            return true;
         }
         let mut live = live.lock().unwrap_or_else(|p| p.into_inner());
         live.token = unb64(&saved.token).unwrap_or_default();
@@ -1824,13 +1928,14 @@ fn poll(
         let _ = events.send(crate::adapters::messages::Event::Closed(
             "Couldn't reach Messages.".into(),
         ));
-        return;
+        return true;
     };
     if !(200..300).contains(&response.status().as_u16()) {
-        let _ = events.send(crate::adapters::messages::Event::Closed(
-            "Messages refused the connection.".into(),
-        ));
-        return;
+        let status = response.status().as_u16();
+        let _ = events.send(crate::adapters::messages::Event::Closed(format!(
+            "Messages refused the request ({status})."
+        )));
+        return true;
     }
     {
         let mut live = live.lock().unwrap_or_else(|p| p.into_inner());
@@ -1881,11 +1986,15 @@ fn poll(
         }
         let (values, used) = complete_values(&pending);
         for value in &values {
-            on_payload(value, &live, &events, &waiters, &paired);
+            if on_payload(value, &live, &events, &waiters, &paired) {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
         }
         google::acknowledge(&values, &live);
         pending.drain(..used);
     }
+    stream_exit_failed()
 }
 
 /// Decode completed payloads while the outer HTTP stream remains open.
@@ -1932,33 +2041,39 @@ fn complete_values(bytes: &[u8]) -> (Vec<serde_json::Value>, usize) {
     (values, used)
 }
 
+/// True when the phone revoked the pairing and the poll should stop.
 fn on_payload(
     value: &serde_json::Value,
     live: &Mutex<Live>,
     events: &Sender<crate::adapters::messages::Event>,
     waiters: &Mutex<Vec<Waiter>>,
     paired: &Option<Sender<Saved>>,
-) {
+) -> bool {
     // Long-poll chunks are one payload, or a stream wrapped in an extra array.
     if let Some(list) = value.as_array() {
         if list.first().and_then(|item| item.as_array()).is_some() && at(value, 2).is_none() {
             for item in list {
-                on_payload(item, live, events, waiters, paired);
+                if on_payload(item, live, events, waiters, paired) {
+                    return true;
+                }
             }
-            return;
+            return false;
         }
     }
     let Some(data) = at(value, 2) else {
-        return;
+        return false;
     };
     let route = at(data, 2).map(as_i64).unwrap_or(0);
     let message = at(data, 12).map(as_bytes).unwrap_or_default();
     if route == 14 {
-        on_pair(&message, live, paired);
-        return;
+        if on_pair(&message, live, paired) {
+            let _ = events.send(crate::adapters::messages::Event::Ended(UNPAIRED.into()));
+            return true;
+        }
+        return false;
     }
     if route != 19 || message.is_empty() {
-        return;
+        return false;
     }
     let rpc = fields(&message);
     let echoed = field_text(&rpc, 1);
@@ -1984,7 +2099,7 @@ fn on_payload(
         }
     }
     if plain.is_empty() {
-        return;
+        return false;
     }
     match action {
         1 => {
@@ -1999,23 +2114,22 @@ fn on_payload(
         16 => on_updates(&plain, live, events),
         _ => {}
     }
+    false
 }
 
-fn on_pair(message: &[u8], live: &Mutex<Live>, paired: &Option<Sender<Saved>>) {
+/// True when this notice is a revoke, so the caller ends the session.
+fn on_pair(message: &[u8], live: &Mutex<Live>, paired: &Option<Sender<Saved>>) -> bool {
     let list = fields(message);
     let paired_bytes = field_bytes(&list, 4);
     if paired_bytes.is_empty() {
-        if field(&list, 5).is_some() {
-            let _ = paired;
-        }
-        return;
+        return revoked_pair(message);
     }
     let inner = fields(&paired_bytes);
     let mobile = decode_device(&field_bytes(&inner, 1));
     let (token, ttl) = decode_token(&field_bytes(&inner, 2));
     let browser = decode_device(&field_bytes(&inner, 3));
     if mobile.source.is_empty() {
-        return;
+        return false;
     }
     let mut held = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     held.saved.account = mobile.source.clone();
@@ -2034,6 +2148,7 @@ fn on_pair(message: &[u8], live: &Mutex<Live>, paired: &Option<Sender<Saved>>) {
     if let Some(paired) = paired {
         let _ = paired.send(held.saved.clone());
     }
+    false
 }
 
 fn on_updates(bytes: &[u8], live: &Mutex<Live>, events: &Sender<crate::adapters::messages::Event>) {
@@ -2505,6 +2620,48 @@ pub(super) fn prove_message_transport() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab sets `TINYCLIENT_PROVE=messages-unpaired`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_unpaired() -> Result<(), String> {
+    let mut device = Buf::new();
+    device.text(1, "phone");
+    let mut revoked = Buf::new();
+    revoked.msg(1, &device.0);
+    let mut notice = Buf::new();
+    notice.msg(5, &revoked.0);
+    if !revoked_pair(&notice.0) {
+        return Err("a revoke on the pairing route was ignored".into());
+    }
+    let mut gate = Gate::default();
+    if gate.observe(http_stop(403)) != Step::Retry {
+        return Err("one refusal signed out".into());
+    }
+    if gate.observe(http_stop(403)) != Step::End {
+        return Err("a second refusal kept reconnecting".into());
+    }
+    if http_stop(503) != Stop::Closed {
+        return Err("a server error was treated as unpaired".into());
+    }
+    if next_pause(Duration::from_secs(2)) != Duration::from_secs(4) {
+        return Err("the poll pause did not grow".into());
+    }
+    if UNPAIRED != "Your phone unpaired this computer. Pair again." {
+        return Err("the re-pair sentence changed".into());
+    }
+    let words = "Google did not issue a Messages session. Sign in again.";
+    let mut gate = Gate::default();
+    if !matches!(gate.fail(words), crate::adapters::Failure::Dropped(_)) {
+        return Err("one Sign in again ended the session".into());
+    }
+    if !matches!(gate.fail(words), crate::adapters::Failure::SignedOut(_)) {
+        return Err("a second Sign in again kept reconnecting".into());
+    }
+    if stream_exit_failed() {
+        return Err("an empty long-poll close counted as a failure".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2647,5 +2804,83 @@ mod tests {
         assert_eq!(wire_tag(note[0].wire, 1), "");
         assert_eq!(between_phones(200), None);
         assert_eq!(between_phones(214), Some(false));
+    }
+
+    #[test]
+    fn a_revoke_on_the_pairing_route_ends_and_auth_failures_need_two() {
+        let mut device = Buf::new();
+        device.text(1, "phone");
+        let mut revoked = Buf::new();
+        revoked.msg(1, &device.0);
+        let mut notice = Buf::new();
+        notice.msg(5, &revoked.0);
+        assert!(revoked_pair(&notice.0));
+        let mut paired = Buf::new();
+        paired.text(1, "phone");
+        let mut kept = Buf::new();
+        kept.msg(4, &paired.0);
+        assert!(!revoked_pair(&kept.0));
+        assert_eq!(http_stop(401), Stop::Auth);
+        assert_eq!(http_stop(403), Stop::Auth);
+        assert_eq!(http_stop(503), Stop::Closed);
+        assert_eq!(http_stop(404), Stop::Closed);
+        let mut gate = Gate::default();
+        assert_eq!(gate.observe(Stop::Auth), Step::Retry);
+        assert_eq!(gate.observe(Stop::Auth), Step::End);
+        let mut gate = Gate::default();
+        let _ = gate.observe(Stop::Auth);
+        let _ = gate.observe(Stop::Closed);
+        assert_eq!(gate.observe(Stop::Auth), Step::Retry);
+        assert_eq!(next_pause(Duration::from_secs(2)), Duration::from_secs(4));
+        assert_eq!(next_pause(Duration::from_secs(600)), Duration::from_secs(900));
+        assert!(cookie_failure_ends(
+            "Google did not issue a Messages session. Sign in again."
+        ));
+        assert!(!cookie_failure_ends("Messages refused the request (403)."));
+        assert!(!cookie_failure_ends("Messages: connection reset"));
+    }
+
+    #[test]
+    fn a_quiet_long_poll_close_stays_at_the_floor() {
+        assert!(
+            !stream_exit_failed(),
+            "an empty close under the 90-second timeout counted as a failed poll"
+        );
+        let mut pause = POLL_FLOOR;
+        for _ in 0..14 {
+            pause = if stream_exit_failed() {
+                next_pause(pause)
+            } else {
+                POLL_FLOOR
+            };
+        }
+        assert_eq!(pause, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn sign_in_again_needs_two_strikes_before_the_session_ends() {
+        let words = "Google did not issue a Messages session. Sign in again.";
+        let mut gate = Gate::default();
+        assert!(
+            matches!(gate.fail(words), crate::adapters::Failure::Dropped(_)),
+            "one Sign in again ended the session"
+        );
+        assert!(
+            matches!(gate.fail(words), crate::adapters::Failure::SignedOut(_)),
+            "a second Sign in again kept retrying"
+        );
+        let mut gate = Gate::default();
+        assert!(matches!(
+            gate.fail(words),
+            crate::adapters::Failure::Dropped(_)
+        ));
+        assert!(
+            matches!(gate.fail("Messages: connection reset"), crate::adapters::Failure::Dropped(_)),
+            "a network close was not a retry"
+        );
+        assert!(
+            matches!(gate.fail(words), crate::adapters::Failure::Dropped(_)),
+            "a Sign in again after a close ended immediately"
+        );
     }
 }

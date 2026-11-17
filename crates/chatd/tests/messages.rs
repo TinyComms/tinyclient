@@ -972,3 +972,61 @@ fn an_rcs_reply_quotes_the_original_and_an_sms_reply_stays_plain() {
     let after = world.calls().iter().filter(|call| call.starts_with("reply ")).count();
     assert_eq!(after, before, "an SMS chat was handed a reply reference: {:?}", world.calls());
 }
+
+#[test]
+fn a_revoked_phone_signs_out_and_does_not_connect_again() {
+    let world = World::linked();
+    world.connected();
+    let lists = world.calls().iter().filter(|call| *call == "list").count();
+    world.steer("revoke");
+    world.until("Messages to ask to pair again", || {
+        world.status().0.into_iter().find(|account| {
+            account.key.network == Network::Messages
+                && account.link == Link::Expired
+                && account.detail.contains("Pair again")
+        })
+    });
+    sleep(Duration::from_millis(400));
+    let later = world.calls().iter().filter(|call| *call == "list").count();
+    assert_eq!(later, lists);
+}
+
+#[test]
+fn a_phone_revoked_while_offline_does_not_keep_connecting() {
+    let world = World::linked();
+    world.connected();
+    world.steer("revoke-offline");
+    world.until("Messages to ask to pair again", || {
+        world.status().0.into_iter().find(|account| {
+            account.key.network == Network::Messages
+                && account.link == Link::Expired
+                && account.detail.contains("Pair again")
+        })
+    });
+    let connects = world.calls().iter().filter(|call| *call == "connect").count();
+    assert_eq!(connects, 1);
+    sleep(Duration::from_millis(400));
+    let connects = world.calls().iter().filter(|call| *call == "connect").count();
+    assert_eq!(connects, 1);
+}
+
+#[test]
+fn two_auth_refusals_sign_out_and_one_does_not() {
+    let world = World::linked();
+    world.connected();
+    let lists = world.calls().iter().filter(|call| *call == "list").count();
+    world.steer("auth");
+    world.until("Messages to connect again after one refusal", || {
+        let listed = world.calls().iter().filter(|call| *call == "list").count();
+        (listed > lists).then_some(())
+    });
+    assert!(world.status().0.iter().all(|account| account.link != Link::Expired));
+    world.steer("auth");
+    world.until("Messages to ask to pair again", || {
+        world.status().0.into_iter().find(|account| {
+            account.key.network == Network::Messages
+                && account.link == Link::Expired
+                && account.detail.contains("Pair again")
+        })
+    });
+}
