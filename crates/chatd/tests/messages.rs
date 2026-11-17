@@ -1086,3 +1086,37 @@ fn a_failed_send_is_one_message_and_try_again_uses_the_phone_copy() {
     }
     assert_eq!(world.messages(GRACE).iter().filter(|message| message.id == "c-wait").count(), 1);
 }
+
+#[test]
+fn a_text_deleted_on_the_phone_leaves_and_delete_reaches_the_phone() {
+    let world = World::linked();
+    world.connected();
+    world.steer("incoming grace hi");
+    let mine = world.arrived(GRACE, "hi");
+    match world.ask(Request::Delete {
+        conversation: key(GRACE),
+        message_id: mine.id.clone(),
+    }) {
+        Response::Ok => {}
+        other => panic!("{other:?}"),
+    }
+    world.heard(&format!("delete {}", mine.id));
+    world.steer("incoming grace hello");
+    let message = world.arrived(GRACE, "hello");
+    world.steer(&format!("erase grace {}", message.id));
+    world.until("the text deleted on the phone", || {
+        (!world.messages(GRACE).iter().any(|item| item.id == message.id)).then_some(())
+    });
+    world.steer("joined grace");
+    world.until("someone joined", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|item| item.text == "Someone joined" && item.kind == MessageKind::System)
+    });
+    world.steer("gone grace");
+    world.until("the chat deleted on the phone", || match world.conversation(GRACE) {
+        None => Some(()),
+        Some(_) => None,
+    });
+}

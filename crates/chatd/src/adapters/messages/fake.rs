@@ -89,6 +89,7 @@ impl Fake {
                 carrier: 0,
                 updated: 0,
                 phones: false,
+                gone: false,
             },
             Chat {
                 id: CLUB.into(),
@@ -100,6 +101,7 @@ impl Fake {
                 carrier: 0,
                 updated: 0,
                 phones: false,
+                gone: false,
             },
         ]));
         let fake = Fake {
@@ -468,6 +470,7 @@ fn steer(line: &str) -> Vec<Event> {
                 carrier,
                 updated: 0,
                 phones,
+                gone: false,
             }])]
         }
         "tick" => {
@@ -495,6 +498,44 @@ fn steer(line: &str) -> Vec<Event> {
             );
             sent.wire = 2;
             vec![Event::Message(sent)]
+        }
+        "erase" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let id = words.next().unwrap_or("");
+            let mut sent = note(author, name, author, id, "", false, Vec::new(), Vec::new());
+            sent.status = 300;
+            vec![Event::Message(sent)]
+        }
+        "joined" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let mut sent = note(author, name, author, "m-joined", "", false, Vec::new(), Vec::new());
+            sent.status = 200;
+            vec![Event::Message(sent)]
+        }
+        "gone" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            vec![Event::Chats(vec![Chat {
+                id: author.into(),
+                title: name.into(),
+                group: false,
+                unread: false,
+                mine: ME.into(),
+                peer: if author == GRACE {
+                    GRACE_PARTICIPANT.into()
+                } else {
+                    String::new()
+                },
+                carrier: 0,
+                updated: 0,
+                phones: false,
+                gone: true,
+            }])]
         }
         _ => Vec::new(),
     }
@@ -618,6 +659,14 @@ impl Drive for Fake {
     }
     fn typing(&self, conversation: &str) -> Result<(), String> {
         record(&format!("typing {conversation}"));
+        Ok(())
+    }
+    fn delete_message(&self, message: &str) -> Result<(), String> {
+        record(&format!("delete {message}"));
+        Ok(())
+    }
+    fn delete_conversation(&self, conversation: &str) -> Result<(), String> {
+        record(&format!("delete-chat {conversation}"));
         Ok(())
     }
     fn close(&self) {

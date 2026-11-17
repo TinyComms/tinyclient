@@ -562,6 +562,26 @@ fn list_request(count: u64, before: Option<&Cursor>) -> Vec<u8> {
     buf.0
 }
 
+/// `DeleteMessageRequest.messageID` is field 2. ActionType DELETE_MESSAGE is 23.
+fn delete_message_request(message: &str) -> Vec<u8> {
+    let mut req = Buf::new();
+    req.text(2, message);
+    req.0
+}
+
+/// `UpdateConversationRequest`: action DELETE is 1 at field 2, the id is field 3, and
+/// `DeleteConversationData.conversationID` is field 1 inside field 6. The phone number there
+/// is optional and this does not invent one.
+fn delete_conversation_request(conversation: &str) -> Vec<u8> {
+    let mut data = Buf::new();
+    data.text(1, conversation);
+    let mut req = Buf::new();
+    req.int(2, 1);
+    req.text(3, conversation);
+    req.msg(6, &data.0);
+    req.0
+}
+
 fn messages_request(conversation: &str, count: u64, before: Option<&Cursor>) -> Vec<u8> {
     let mut buf = Buf::new();
     buf.text(2, conversation);
@@ -1019,6 +1039,8 @@ pub struct Chat {
     /// A tombstone said the phones encrypt the chat. A later conversation update does not
     /// clear it: the conversation message has no such field.
     pub phones: bool,
+    /// Conversation status DELETED (field 12 is 3): the phone no longer has this chat.
+    pub gone: bool,
 }
 
 /// One photo or file on a message. Bytes are already opened when the phone sent them inline.
@@ -1085,6 +1107,75 @@ pub fn receipt(status: u64) -> Option<Receipt> {
         11 => Some(Receipt::Read),
         _ => None,
     }
+}
+
+/// A tombstone a person would notice. `MessageStatusType` 200–299. The rest of that range
+/// (education, satellite, toolstones) stays hidden. 300 is a delete, not one of these.
+/// Encryption tombstones are handled first, by [`between_phones`], and are not drawn as these lines.
+pub fn tombstone(status: u64) -> Option<&'static str> {
+    Some(match status {
+        200 | 225 | 226 => "Someone joined",
+        201 | 227 => "Someone left",
+        202 | 228 => "You left",
+        203 | 204 | 229 => "Group created",
+        205 => "Broadcast created",
+        208 => "Switched to group MMS",
+        211 | 217 => "Group renamed",
+        218 => "Group name cleared",
+        220 | 230 => "You were removed",
+        221 | 231 => "Someone was removed",
+        244 => "Missed video call",
+        _ => return None,
+    })
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-delete`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub(super) fn prove_messages_delete() -> Result<(), String> {
+    let message = delete_message_request("m1");
+    if field_text(&fields(&message), 2) != "m1" {
+        return Err("the delete-message request did not name the message".into());
+    }
+    let chat = delete_conversation_request("c1");
+    let chat_fields = fields(&chat);
+    if field_int(&chat_fields, 2) != 1 || field_text(&chat_fields, 3) != "c1" {
+        return Err("the delete-chat request was not a delete of that chat".into());
+    }
+    if field_text(&fields(&field_bytes(&chat_fields, 6)), 1) != "c1" {
+        return Err("the delete-chat data did not name the chat".into());
+    }
+    let mut status = Buf::new();
+    status.int(2, 300);
+    let mut gone = Buf::new();
+    gone.text(1, "m-gone");
+    gone.text(7, "c1");
+    gone.msg(4, &status.0);
+    let mut wrap = Buf::new();
+    wrap.msg(1, &gone.0);
+    let notes = decode_messages(&wrap.0);
+    if notes.len() != 1 || notes[0].status != 300 || notes[0].id != "m-gone" {
+        return Err("a deleted message was not reported".into());
+    }
+    if tombstone(300).is_some() {
+        return Err("a delete was shown as a system line".into());
+    }
+    if tombstone(200) != Some("Someone joined") {
+        return Err("someone joining was dropped".into());
+    }
+    if tombstone(251).is_some() {
+        return Err("a toolstone was shown".into());
+    }
+    let mut conv = Buf::new();
+    conv.text(1, "c1");
+    conv.text(2, "Club");
+    conv.int(12, 3);
+    let mut list = Buf::new();
+    list.msg(2, &conv.0);
+    let chats = decode_chats(&list.0);
+    if chats.len() != 1 || !chats[0].gone {
+        return Err("a chat deleted on the phone was kept".into());
+    }
+    Ok(())
 }
 
 /// Whether one of my messages is on its way, sent, or refused by the phone.
@@ -1888,6 +1979,19 @@ impl Session {
         Ok(body)
     }
 
+    pub fn delete_message(&self, message: &str) -> Result<(), String> {
+        let bytes = self.rpc(23, &delete_message_request(message), 2)?;
+        if field_int(&fields(&bytes), 2) != 1 {
+            return Err("Messages didn't delete that. Keep the phone online.".into());
+        }
+        Ok(())
+    }
+
+    pub fn delete_conversation(&self, conversation: &str) -> Result<(), String> {
+        let bytes = self.rpc(15, &delete_conversation_request(conversation), 2)?;
+        refused(&bytes)
+    }
+
     pub fn mark_read(&self, conversation: &str, message: &str) -> Result<(), String> {
         let _ = self.rpc(10, &read_request(conversation, message), 2)?;
         Ok(())
@@ -2250,6 +2354,8 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
         let mut title = field_text(&conv, 2);
         let group = field_int(&conv, 10) != 0;
         let unread = field_int(&conv, 6) != 0;
+        // ConversationStatus: 3 is DELETED.
+        let gone = field_int(&conv, 12) == 3;
         let carrier = field_int(&conv, 22);
         let mut mine = field_text(&conv, 11);
         let mut peer = String::new();
@@ -2297,6 +2403,7 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
             carrier,
             updated: unix_seconds(field_int(&conv, 5) as i64),
             phones: false,
+            gone,
         });
     }
     chats
@@ -2447,8 +2554,30 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             });
             continue;
         }
-        // 200–299 is a tombstone, 300 a delete. Neither is a message to show.
-        if (200..300).contains(&status) || status == 300 {
+        // 300 is MESSAGE_DELETED. A known tombstone is a system line. The rest of 200–299
+        // stay hidden: they are toolstones, not something to put in the transcript.
+        // Encryption changes were already taken above.
+        if status == 300 {
+            notes.push(Note {
+                id,
+                conversation,
+                status,
+                ..Note::default()
+            });
+            continue;
+        }
+        if let Some(words) = tombstone(status) {
+            notes.push(Note {
+                id,
+                conversation,
+                sent: unix_seconds(field_int(&msg, 5) as i64),
+                text: words.to_owned(),
+                status,
+                ..Note::default()
+            });
+            continue;
+        }
+        if (200..300).contains(&status) {
             continue;
         }
         let wire = field_int(&msg, 11);
@@ -2742,7 +2871,7 @@ mod tests {
     }
 
     #[test]
-    fn a_picture_a_caption_and_a_reaction_decode_and_a_tombstone_does_not() {
+    fn a_picture_a_caption_and_a_reaction_decode_and_a_join_is_a_line() {
         let mut media = Buf::new();
         media.text(2, "media-1");
         media.text(4, "IMG_1.jpg");
@@ -2779,8 +2908,10 @@ mod tests {
         wrap.msg(1, &message.0);
         wrap.msg(1, &gone.0);
         let notes = decode_messages(&wrap.0);
-        assert_eq!(notes.len(), 1);
+        assert_eq!(notes.len(), 2);
         assert_eq!(notes[0].text, "look");
+        assert_eq!(notes[1].status, 200);
+        assert_eq!(notes[1].text, "Someone joined");
         assert_eq!(notes[0].pieces[0].name, "IMG_1.jpg");
         assert_eq!(notes[0].pieces[0].media_id, "media-1");
         assert_eq!(notes[0].pieces[0].action_id, "part-1");
@@ -3006,5 +3137,10 @@ mod tests {
             matches!(gate.fail(words), crate::adapters::Failure::Dropped(_)),
             "a Sign in again after a close ended immediately"
         );
+    }
+
+    #[test]
+    fn a_deleted_message_and_a_deleted_chat_are_read_from_the_published_fields() {
+        prove_messages_delete().unwrap();
     }
 }
