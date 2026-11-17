@@ -137,30 +137,35 @@ pub fn menus(places: &[(String, usize)], open_network: Option<Network>, update_i
 /// The keys of the menu bar's items. The rest are bound in `gui::bind_keys`.
 pub fn bind_keys(cx: &mut App) {
     use gpui::KeyBinding;
-    cx.bind_keys([
-        KeyBinding::new("secondary-,", Settings, None),
-        KeyBinding::new("secondary-n", NewMessage, None),
-        KeyBinding::new("secondary-u", AttachFile, None),
-        KeyBinding::new("secondary-w", CloseWindow, None),
-        KeyBinding::new("secondary-f", SearchConversation, None),
-        KeyBinding::new("secondary-shift-f", SearchEverywhere, None),
-        KeyBinding::new("secondary-=", BiggerText, None),
-        KeyBinding::new("secondary-+", BiggerText, None),
-        KeyBinding::new("secondary--", SmallerText, None),
-        KeyBinding::new("secondary-0", ActualSize, None),
-        KeyBinding::new(if cfg!(target_os = "macos") { "ctrl-cmd-f" } else { "ctrl-alt-f" }, FullScreen, None),
-        KeyBinding::new("alt-secondary-u", MarkUnread, None),
-        KeyBinding::new("alt-secondary-i", ShowDetails, None),
-        KeyBinding::new("secondary-shift-c", StartCall, None),
-        KeyBinding::new("alt-secondary-o", OpenInNetwork, None),
-        KeyBinding::new("secondary-m", Minimize, None),
-        KeyBinding::new("secondary-/", KeyboardShortcuts, None),
-        KeyBinding::new("secondary-shift-l", ShowLogs, None),
-    ]);
+    macro_rules! bind {
+        ($id:literal, $action:expr) => {
+            for chord in crate::gui::keymap::chords($id) {
+                cx.bind_keys([KeyBinding::new(&chord, $action, None)]);
+            }
+        };
+    }
+    bind!("settings", Settings);
+    bind!("new-message", NewMessage);
+    bind!("attach", AttachFile);
+    bind!("close-window", CloseWindow);
+    bind!("search-here", SearchConversation);
+    bind!("search-all", SearchEverywhere);
+    bind!("bigger-text", BiggerText);
+    bind!("smaller-text", SmallerText);
+    bind!("actual-size", ActualSize);
+    bind!("full-screen", FullScreen);
+    cx.bind_keys([KeyBinding::new("alt-secondary-u", MarkUnread, None)]);
+    bind!("details", ShowDetails);
+    bind!("start-call", StartCall);
+    bind!("open-in", OpenInNetwork);
+    bind!("minimize", Minimize);
+    bind!("shortcuts-page", KeyboardShortcuts);
+    bind!("show-logs", ShowLogs);
     super::super::logs::bind_keys(cx);
     // Hiding is macOS's. Linux ignores it, and GPUI on Windows panics at Hide Others.
     if cfg!(target_os = "macos") {
-        cx.bind_keys([KeyBinding::new("secondary-h", Hide, None), KeyBinding::new("alt-secondary-h", HideOthers, None)]);
+        bind!("hide", Hide);
+        bind!("hide-others", HideOthers);
     }
 }
 

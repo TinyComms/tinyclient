@@ -1901,11 +1901,98 @@ impl SettingsWindow {
         });
     }
 
+    fn take_chord(&mut self, id: &'static str, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        if event.keystroke.is_ime_in_progress() {
+            return;
+        }
+        let bare = !event.keystroke.modifiers.modified();
+        if event.keystroke.key == "escape" && bare {
+            self.chord = None;
+            cx.notify();
+            return;
+        }
+        if event.keystroke.key == "backspace" && bare {
+            crate::gui::keymap::live_reset_one(id);
+            self.chord = None;
+            self.chord_clash = None;
+            crate::gui::rebind_keys(cx);
+            cx.notify();
+            return;
+        }
+        match crate::gui::keymap::live_rebind(id, &event.keystroke.unparse()) {
+            Ok(()) => {
+                self.chord = None;
+                self.chord_clash = None;
+                crate::gui::rebind_keys(cx);
+            }
+            Err(err) => self.chord_clash = Some(err.words()),
+        }
+        cx.notify();
+    }
+
+    /// One shortcut line. A command with an id takes a click, then the next key.
+    fn shortcut_row(&mut self, command: &str, fallback: &str, id: Option<&'static str>, cx: &mut Context<Self>) -> AnyElement {
+        let capturing = id.is_some_and(|id| self.chord == Some(id));
+        let glyph = id.map(crate::gui::keymap::glyph_for).filter(|glyph| !glyph.is_empty()).unwrap_or_else(|| fallback.to_owned());
+        let keys = |capturing: bool, glyph: String| -> AnyElement {
+            if capturing {
+                div().type_small().text_color(theme::accent_text()).child("Press a key…").into_any_element()
+            } else {
+                div().flex().gap(px(2.)).child(keycap(glyph)).into_any_element()
+            }
+        };
+        let label = |command: &str| div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(command.to_owned());
+        let Some(id) = id else {
+            return div().h(px(32.)).px(px(12.)).flex().items_center().child(label(command)).child(keys(false, glyph)).into_any_element();
+        };
+        let mut row = div()
+            .id(SharedString::from(format!("shortcut-{id}")))
+            .h(px(32.))
+            .px(px(12.))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.chord = Some(id);
+                this.chord_clash = None;
+                window.focus(&this.chord_focus, cx);
+                cx.notify();
+            }))
+            .child(label(command))
+            .child(keys(capturing, glyph));
+        if capturing {
+            row = row.track_focus(&self.chord_focus).on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                if this.chord != Some(id) {
+                    return;
+                }
+                cx.stop_propagation();
+                this.take_chord(id, event, cx);
+            }));
+        }
+        row.into_any_element()
+    }
+
     /// The Shortcuts section, or its lines that match `query`.
-    pub(super) fn shortcuts(&self, query: &str, cx: &gpui::App) -> Div {
+    pub(super) fn shortcuts(&mut self, query: &str, cx: &mut Context<Self>) -> Div {
         let mut column = div().flex().flex_col();
         if query.is_empty() {
             column = column.child(caption(crate::host::SHORTCUTS_CAPTION).pt(px(0.)).pb(px(14.)));
+            if crate::gui::keymap::dirty() {
+                column = column.child(
+                    button("reset-shortcuts", ButtonKind::Ghost, "Reset shortcuts")
+                        .mb(px(12.))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            crate::gui::keymap::live_reset();
+                            this.chord = None;
+                            this.chord_clash = None;
+                            crate::gui::rebind_keys(cx);
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+        if let Some(words) = self.chord_clash.clone() {
+            column = column.child(div().pb(px(8.)).type_small().text_color(theme::danger()).child(words));
         }
         let (open_in, places) = self.shell.upgrade().map(|shell| {
             let shell = shell.read(cx);
@@ -1932,25 +2019,21 @@ impl SettingsWindow {
             }
         }
         let query_folded = query.trim().to_lowercase();
-        let place_hits: Vec<&rows::PlaceKey> = places.iter().filter(|place| !query_folded.is_empty() && place.command.to_lowercase().contains(&query_folded)).collect();
+        let place_hits: Vec<(usize, &rows::PlaceKey)> = places.iter().enumerate().filter(|(_, place)| !query_folded.is_empty() && place.command.to_lowercase().contains(&query_folded)).collect();
         for (ix, name) in menus.iter().enumerate() {
             let mut card = card();
             let mut n = 0;
             for shortcut in found.iter().filter(|s| s.menu == *name) {
                 if *name == "View" && shortcut.command == "Quick Switcher" {
-                    for place in places.iter().filter(|place| query_folded.is_empty() || place.command.to_lowercase().contains(&query_folded)) {
-                        let keys = div().flex().gap(px(2.)).child(keycap(place.keys));
-                        card = card.when(n > 0, |card| card.child(rule())).child(
-                            div().h(px(32.)).px(px(12.)).flex().items_center().child(div().flex_1().type_ui().text_color(theme::text()).child(place.command.clone())).child(keys),
-                        );
+                    for (pix, place) in places.iter().enumerate().filter(|(_, place)| query_folded.is_empty() || place.command.to_lowercase().contains(&query_folded)) {
+                        card = card.when(n > 0, |card| card.child(rule())).child(self.shortcut_row(&place.command, place.keys, crate::gui::keymap::place_id(pix + 2), cx));
                         n += 1;
                     }
                 }
                 let command = if shortcut.command == "Open in App" { open_in.clone().unwrap_or_else(|| shortcut.command.to_owned()) } else { shortcut.command.to_owned() };
-                let keys = div().flex().gap(px(2.)).child(keycap(shortcut.keys));
-                card = card.when(n > 0, |card| card.child(rule())).child(
-                    div().h(px(32.)).px(px(12.)).flex().items_center().child(div().flex_1().type_ui().text_color(theme::text()).child(command)).child(keys),
-                );
+                // Undo, Redo, Cut, Copy, Paste and Select All stay the platform's own keys.
+                let id = crate::gui::keymap::id_for(shortcut.command);
+                card = card.when(n > 0, |card| card.child(rule())).child(self.shortcut_row(&command, shortcut.keys, id, cx));
                 n += 1;
             }
             // In search results each group says where it is, as every other result does.
@@ -1965,14 +2048,25 @@ impl SettingsWindow {
         // A rail place is not a static shortcut row. A search for its name still lists it.
         if !place_hits.is_empty() && !found.iter().any(|shortcut| shortcut.menu == "View" && shortcut.command == "Quick Switcher") {
             let mut card = card();
-            for (n, place) in place_hits.iter().enumerate() {
-                let keys = div().flex().gap(px(2.)).child(keycap(place.keys));
-                card = card.when(n > 0, |card| card.child(rule())).child(
-                    div().h(px(32.)).px(px(12.)).flex().items_center().child(div().flex_1().type_ui().text_color(theme::text()).child(place.command.clone())).child(keys),
-                );
+            for (n, (pix, place)) in place_hits.iter().enumerate() {
+                card = card.when(n > 0, |card| card.child(rule())).child(self.shortcut_row(&place.command, place.keys, crate::gui::keymap::place_id(pix + 2), cx));
             }
             let label = div().pl(px(12.)).pb(px(4.)).type_small().text_color(theme::text_faint()).child("Shortcuts › View");
             column = column.child(div().flex().flex_col().child(label).child(card));
+        }
+        let messages: Vec<_> = crate::gui::keymap::message_rows().into_iter().filter(|row| query_folded.is_empty() || row.title.to_lowercase().contains(&query_folded)).collect();
+        if !messages.is_empty() {
+            let mut card = card();
+            for (n, row) in messages.iter().enumerate() {
+                let glyph = row.glyph.clone();
+                card = card.when(n > 0, |card| card.child(rule())).child(self.shortcut_row(row.title, &glyph, Some(row.id), cx));
+            }
+            let label = if query.is_empty() {
+                group_label("Messages")
+            } else {
+                div().pl(px(12.)).pb(px(4.)).type_small().text_color(theme::text_faint()).child("Shortcuts › Messages")
+            };
+            column = column.child(div().pt(px(if query.is_empty() { 20. } else { 12. })).flex().flex_col().child(label).child(card));
         }
         column
     }
