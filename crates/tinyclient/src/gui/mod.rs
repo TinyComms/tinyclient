@@ -144,6 +144,11 @@ pub(crate) fn prove_spell_check() -> Result<(), &'static str> {
     spell::prove()
 }
 
+/// The lab's schedule-send driver. A network that schedules gets a time. One that does not is refused.
+pub(crate) fn prove_schedule_send() -> Result<(), &'static str> {
+    composer::prove_schedule_send()
+}
+
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 
