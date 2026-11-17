@@ -876,14 +876,15 @@ fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: 
     let conversation = conversation.to_owned();
     let text = text.to_owned();
     let reply_to = reply_to.map(str::to_owned);
+    let client_id_owned = client_id.to_owned();
     let ctx = account.ctx.clone();
     let conversation_id = conversation.clone();
     upload::spawn(&ctx, &conversation_id, client_id, &with.files, move |upload| {
-        send_files(&account, &conversation, &text, reply_to.as_deref(), upload)
+        send_files(&account, &conversation, &client_id_owned, &text, reply_to.as_deref(), upload)
     });
 }
 
-fn send_files(account: &Account, conversation: &str, text: &str, reply_to: Option<&str>, upload: &mut Upload) -> Result<Message, String> {
+fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, upload: &mut Upload) -> Result<Message, String> {
     if upload.files().len() > files::MAX_FILES as usize {
         return Err(format!("Signal takes at most {} files in one message.", files::MAX_FILES));
     }
@@ -907,36 +908,58 @@ fn send_files(account: &Account, conversation: &str, text: &str, reply_to: Optio
     upload.check()?;
     let to = peer(conversation).map_err(|fault| fault.words())?;
     let quote = quote_of(account, conversation, reply_to).map_err(|fault| fault.words())?;
-    let sent = account
-        .wire
-        .send(&to, Body::Files { text: text.to_owned(), quote: quote.clone(), files: prepared.clone() })
-        .map_err(|fault| fault.words())?;
+    // Write each file to disk first, then move that one copy to Signal. Cloning `prepared`
+    // would keep every payload in memory a second time for the whole upload.
+    let attachments: Vec<_> = prepared.iter().enumerate().map(|(index, file)| show_file(account, client_id, index, file)).collect();
+    let sent = match account.wire.send(&to, Body::Files { text: text.to_owned(), quote: quote.clone(), files: prepared }) {
+        Ok(sent) => sent,
+        Err(fault) => {
+            forget_landed(&attachments);
+            return Err(fault.words());
+        }
+    };
     account.live().echoed(sent);
     account.live().sent(sent, conversation);
     let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: text.to_owned(), quote, ..Text::default() };
     let mut message = message(account, &words, true);
-    message.attachments = prepared.iter().enumerate().map(|(index, file)| show_file(account, sent, index, file)).collect();
+    message.attachments = attachments;
     Ok(message)
 }
 
 /// The file as the row shows it, kept here so it stays after the staged copy is removed.
-fn show_file(account: &Account, sent: u64, index: usize, file: &wire::File) -> Attachment {
-    let mut media = MediaFile::new(format!("signal:{sent}:{index}"), files::kind(&file.mime));
+/// The id is the shell's client id, known before Signal names the message, so the bytes can
+/// be written once and then moved to the wire.
+fn show_file(account: &Account, client_id: &str, index: usize, file: &wire::File) -> Attachment {
+    let mut media = MediaFile::new(format!("signal:{client_id}:{index}"), files::kind(&file.mime));
     media.width = file.width;
     media.height = file.height;
     media.bytes = file.bytes.len() as u64;
-    if let Some(landed) = account.ctx.landed(&media, &format!("signal://file/{sent}/{index}"), &file.bytes) {
+    if let Some(landed) = account.ctx.landed(&media, &format!("signal://file/{client_id}/{index}"), &file.bytes) {
         media = landed;
     }
     let mut attachment = Attachment::new(file.name.clone(), media);
     attachment.mime = file.mime.clone();
     if !file.thumb.is_empty() {
-        let thumb = MediaFile::new(format!("signal:{sent}:{index}:thumb"), MediaKind::Image);
-        if let Some(landed) = account.ctx.landed(&thumb, &format!("signal://file/{sent}/{index}/thumb"), &file.thumb) {
+        let thumb = MediaFile::new(format!("signal:{client_id}:{index}:thumb"), MediaKind::Image);
+        if let Some(landed) = account.ctx.landed(&thumb, &format!("signal://file/{client_id}/{index}/thumb"), &file.thumb) {
             attachment.thumb = Some(landed);
         }
     }
     attachment
+}
+
+/// A send that did not go must not leave its files on disk.
+fn forget_landed(attachments: &[Attachment]) {
+    for attachment in attachments {
+        if let Some(path) = &attachment.file.path {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(thumb) = &attachment.thumb {
+            if let Some(path) = &thumb.path {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
 }
 
 fn react(account: &Account, conversation: &str, message_id: &str, emoji: &str, on: bool) -> Result<(), Fault> {
