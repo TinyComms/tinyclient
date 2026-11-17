@@ -37,6 +37,7 @@ mod length;
 mod mention;
 mod niceties;
 mod rec;
+mod schedule;
 // The picker is the composer's and the reactions'; it lives in `gui/picker`.
 #[path = "picker/mod.rs"]
 pub(in crate::gui) mod picker;
@@ -46,7 +47,7 @@ mod typing;
 pub use typing::preview as typing_preview;
 
 use super::components::place::{max_height, placed, Layer, Place};
-use super::components::{button, glyph, menu, menu_item, tip, ButtonKind};
+use super::components::{button, glyph, menu, menu_item, menu_item_disabled, menu_label, menu_separator, tip, ButtonKind};
 use super::input::{InputEvent, InputKey, InputList, InputPaste, PickEmoji, PickGifs, SubmitSilently, TextInput};
 use super::people::{ask_later, Hub};
 use super::playing;
@@ -384,6 +385,12 @@ pub(crate) fn prove_offline_send_kept() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The lab's schedule-send driver. A network that schedules gets an hour, tomorrow, and Monday.
+/// One that does not is refused, and a time that has passed is not sent now.
+pub(crate) fn prove_schedule_send() -> Result<(), &'static str> {
+    schedule::prove()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Reply {
     id: String,
@@ -514,6 +521,10 @@ pub struct Composer {
     /// Member counts learned for the confirm: (members, online).
     counts: HashMap<Key, (Option<u32>, Option<u32>)>,
     send_menu: bool,
+    /// The day whose hours are open in the send menu. None: the presets and the days.
+    schedule_day: Option<schedule::Day>,
+    /// A time the send menu chose, kept while a confirm asks how many people a broadcast reaches.
+    schedule_at: Option<i64>,
     anchors: Rc<Anchors>,
     /// The recording of this conversation, as chatd said it (`Change::Recording`).
     recording: Option<Rec>,
@@ -615,6 +626,8 @@ impl Composer {
             armed: None,
             counts: HashMap::new(),
             send_menu: false,
+            schedule_day: None,
+            schedule_at: None,
             anchors: Rc::new(Anchors::default()),
             recording: None,
             holding: None,
@@ -695,6 +708,9 @@ impl Composer {
     fn leave(&mut self, cx: &mut Context<Self>) {
         self.end_edit(cx);
         self.save_draft(cx);
+        self.send_menu = false;
+        self.schedule_day = None;
+        self.schedule_at = None;
         self.draft_timer = None;
         self.close_picker(cx);
         self.chip_menu = None;
@@ -817,8 +833,10 @@ impl Composer {
             self.colon_dismissed = Some(colon.trigger.start);
         } else if self.armed.take().is_some() {
             self.caption = None;
+            self.schedule_at = None;
         } else if self.chip_menu.take().is_some() || self.send_menu {
             self.send_menu = false;
+            self.schedule_day = None;
         } else if self.editing.is_some() {
             self.end_edit(cx);
         } else if self.reply.take().is_none() {
@@ -834,33 +852,49 @@ impl Composer {
 
     // Sending.
 
-    /// Return, or Option-Return for `silent`. chatd answers as soon as the message is stored
-    /// as pending, and the row comes from that; the text and chips leave only then, so a
-    /// refused send loses nothing. When the account is offline chatd stores nothing, and the
-    /// shell holds a text message instead; files wait for the connection in the tray.
+    /// Return, or Option-Return for `silent`. A time kept in `schedule_at` is the moment the
+    /// network sends it; an ordinary Return leaves that unset. chatd answers as soon as the
+    /// message is stored as pending, and the row comes from that; the text and chips leave
+    /// only then, so a refused send loses nothing. When the account is offline chatd stores
+    /// nothing, and the shell holds a text message instead; files wait for the connection in
+    /// the tray.
     pub fn send(&mut self, silent: bool, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone() else {
+            self.schedule_at = None;
             return;
         };
-        if self.sending || self.scan_blocks(&target.key) || target.locked().is_some() {
+        // A member count for a broadcast is already in flight. Leave the chosen time for it.
+        if self.sending {
+            return;
+        }
+        if self.scan_blocks(&target.key) || target.locked().is_some() {
+            self.schedule_at = None;
             return;
         }
         if self.editing.is_some() {
+            self.schedule_at = None;
             self.save_edit(&target, cx);
             return;
         }
         self.follow_text(cx);
         self.send_menu = false;
+        self.schedule_day = None;
         let field = self.input.read(cx).text().to_owned();
         if field.trim().is_empty() && self.tray.is_empty() {
+            if self.schedule_at.take().is_some() {
+                self.caption = Some(("Write a message to schedule.".to_owned(), Tone::Refused));
+                cx.notify();
+            }
             return;
         }
         if let Some(why) = attach::blocker(&self.tray) {
+            self.schedule_at = None;
             self.caption = Some((why, Tone::Refused));
             cx.notify();
             return;
         }
         if !live() {
+            self.schedule_at = None;
             return;
         }
         let network = target.key.network;
@@ -898,6 +932,15 @@ impl Composer {
         let reply_to = self.reply.as_ref().map(|reply| reply.id.clone());
         let files: Vec<OutgoingFile> = self.tray.iter().filter_map(Staged::outgoing).collect();
         let voice = rec::sent_as(&self.note, &files);
+        let chosen = self.schedule_at.take();
+        let schedule = match schedule::for_send(controls.schedule, chosen, now()) {
+            Ok(at) => at,
+            Err(why) => {
+                self.caption = Some((why.to_owned(), Tone::Refused));
+                cx.notify();
+                return;
+            }
+        };
         let with = protocol::Outgoing {
             files,
             voice: voice.clone(),
@@ -905,7 +948,7 @@ impl Composer {
             suppress_embeds: self.no_preview && controls.link_chip && !hosts.is_empty(),
             ping: reply_to.is_none() || !controls.ping || !self.ping_off.contains(&target.key.account()),
             pick: None,
-            schedule: None,
+            schedule,
         };
         let (shown, wire) = match as_file {
             true => (String::new(), String::new()),
@@ -1003,6 +1046,8 @@ impl Composer {
                 this.counts.insert(key, counts);
                 if still_here {
                     this.send(silent, cx);
+                } else {
+                    this.schedule_at = None;
                 }
             });
         });
@@ -2454,7 +2499,9 @@ impl Composer {
             .on_mouse_down(
                 gpui::MouseButton::Right,
                 cx.listener(|this, _, _, cx| {
-                    this.send_menu = this.controls().silent;
+                    let controls = this.controls();
+                    this.schedule_day = None;
+                    this.send_menu = schedule::send_menu_for(controls.silent, controls.schedule);
                     cx.notify();
                 }),
             )
@@ -2702,22 +2749,84 @@ impl Composer {
         Some(placed("composer-picker", place, Layer::Popover, window, panel))
     }
 
-    /// Right-click on Send: what else Return can do here.
+    /// A time from the send menu. The field is sent with it, or the menu stays if the send
+    /// only asked for a confirm.
+    fn choose_schedule(&mut self, at: i64, cx: &mut Context<Self>) {
+        self.schedule_at = Some(at);
+        self.send_menu = false;
+        self.schedule_day = None;
+        self.send(false, cx);
+    }
+
+    /// Right-click on Send: send quietly, or hand the network a time when it schedules.
     fn send_menu_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.send_menu {
             return None;
         }
         let anchor = self.anchors.send.get()?;
-        let items = menu()
-            .w(px(260.))
-            .child(menu_item("send-silently", Some("icons/bell-off.svg"), "Send without notification", Some("⌥↩")).on_click(cx.listener(|this, _, _, cx| {
-                this.send_menu = false;
-                this.send(true, cx);
-            })))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.send_menu = false;
+        let controls = self.controls();
+        if !schedule::send_menu_for(controls.silent, controls.schedule) {
+            return None;
+        }
+        let now = now();
+        let mut items = menu().w(px(260.));
+        if let Some(day) = self.schedule_day {
+            items = items.child(menu_item("schedule-back", Some("icons/calendar.svg"), "Schedule", None).on_click(cx.listener(|this, _, _, cx| {
+                this.schedule_day = None;
                 cx.notify();
-            }));
+            })));
+            let hours = schedule::hours(now, day);
+            if hours.is_empty() {
+                items = items.child(menu_item_disabled("schedule-none", None, "No time left that day", None));
+            }
+            for (index, moment) in hours.into_iter().enumerate() {
+                let at = moment.at;
+                items = items.child(menu_item(schedule::hour_id(index), Some("icons/calendar.svg"), moment.label, None).on_click(
+                    cx.listener(move |this, _, _, cx| this.choose_schedule(at, cx)),
+                ));
+            }
+        } else {
+            if controls.silent {
+                items = items.child(menu_item("send-silently", Some("icons/bell-off.svg"), "Send without notification", Some("⌥↩")).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.send_menu = false;
+                        this.schedule_day = None;
+                        this.schedule_at = None;
+                        this.send(true, cx);
+                    }),
+                ));
+            }
+            if controls.schedule {
+                let presets = schedule::presets(now);
+                if controls.silent && !presets.is_empty() {
+                    items = items.child(menu_separator());
+                }
+                for (index, moment) in presets.into_iter().enumerate() {
+                    let at = moment.at;
+                    items = items.child(menu_item(schedule::preset_id(index), Some("icons/calendar.svg"), moment.label, None).on_click(
+                        cx.listener(move |this, _, _, cx| this.choose_schedule(at, cx)),
+                    ));
+                }
+                let days = schedule::days(now);
+                if !days.is_empty() {
+                    items = items.child(menu_label("Pick a day"));
+                    for (index, day) in days.into_iter().enumerate() {
+                        let label = schedule::day_label(now, day);
+                        items = items.child(menu_item(schedule::day_id(index), None, label, None).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.schedule_day = Some(day);
+                                cx.notify();
+                            },
+                        )));
+                    }
+                }
+            }
+        }
+        let items = items.on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            this.send_menu = false;
+            this.schedule_day = None;
+            cx.notify();
+        }));
         Some(placed("send-menu", Place::Above(anchor), Layer::Menu, window, items))
     }
 

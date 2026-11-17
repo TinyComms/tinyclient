@@ -20,6 +20,8 @@ pub struct Controls {
     pub custom_emoji: bool,
     /// The mic: the network names a recorded file it is sent a voice note with.
     pub voice: bool,
+    /// Right-click on Send can hand the network a time (`Outgoing::schedule`).
+    pub schedule: bool,
 }
 
 /// `editing`: edit mode is text only on every network.
@@ -47,6 +49,7 @@ pub fn controls(network: Network, can: &Capabilities, editing: bool) -> Controls
         link_chip: can.suppress_embeds && network != Network::Teams && !editing,
         custom_emoji: can.custom_emoji != EmojiScope::None,
         voice: super::rec::available(can) && !editing,
+        schedule: can.schedule && !editing,
     }
 }
 
@@ -109,5 +112,15 @@ mod tests {
         assert!(!edit.attach && !edit.gif && edit.emoji && !edit.silent && !edit.link_chip);
         assert!(!edit.voice, "edit mode is text only");
         assert_eq!(edit.tabs, [Tab::Emoji]);
+    }
+
+    #[test]
+    fn schedule_shows_only_when_the_network_schedules_and_an_edit_hides_it() {
+        let slack = Capabilities { schedule: true, silent: true, ..Capabilities::default() };
+        let open = controls(Network::Slack, &slack, false);
+        assert!(open.schedule && open.silent);
+        let edit = controls(Network::Slack, &slack, true);
+        assert!(!edit.schedule && !edit.silent, "edit mode is text only");
+        assert!(!controls(Network::Discord, &discord(), false).schedule);
     }
 }
