@@ -35,6 +35,9 @@ pub const CANT_REACH: &str = "Can't reach your phone";
 pub const WAITING: &str = "Waiting for your phone";
 /// After [`HOLD_FOR`], the text is not sent.
 pub const GAVE_UP: &str = "Not sent. Your phone did not answer in time.";
+/// Between extra pages of the inbox or of one chat. The command thread already waits this long
+/// after a conversation is first opened.
+const PACE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// True when a request ended because the phone did not answer, not because it refused.
 pub fn phone_quiet(why: &str) -> bool {
@@ -110,7 +113,13 @@ trait Drive: Send + Sync {
     fn events(&self) -> Option<std::sync::mpsc::Receiver<Event>>;
     fn me(&self) -> (String, String);
     fn refresh(&self) -> Result<(), String>;
-    fn history(&self, conversation: &str) -> Result<Vec<bugle::Note>, String>;
+    /// `before` is the last message already shown, and its time in milliseconds. `None` is the
+    /// newest page. Bugle has no forward cursor: older pages are the only ones it can ask for.
+    fn history(&self, conversation: &str, before: Option<(&str, i64)>) -> Result<Vec<bugle::Note>, String>;
+    /// The next inbox page. Empty when the phone has no more chats.
+    fn older_chats(&self) -> Result<Vec<Chat>, String>;
+    /// True when the last inbox page was full and named a later one.
+    fn inbox_continues(&self) -> bool;
     fn send(&self, conversation: &str, text: &str) -> Result<String, String>;
     fn send_file(
         &self,
@@ -148,8 +157,15 @@ impl Drive for LiveDrive {
     fn refresh(&self) -> Result<(), String> {
         self.inner.refresh()
     }
-    fn history(&self, conversation: &str) -> Result<Vec<bugle::Note>, String> {
-        self.inner.history(conversation)
+    fn history(&self, conversation: &str, before: Option<(&str, i64)>) -> Result<Vec<bugle::Note>, String> {
+        let cursor = before.map(|(id, millis)| bugle::Cursor { id: id.to_owned(), millis });
+        self.inner.history(conversation, cursor.as_ref())
+    }
+    fn older_chats(&self) -> Result<Vec<Chat>, String> {
+        self.inner.older_chats()
+    }
+    fn inbox_continues(&self) -> bool {
+        self.inner.inbox_continues()
     }
     fn send(&self, conversation: &str, text: &str) -> Result<String, String> {
         self.inner.send(conversation, text)
@@ -258,6 +274,12 @@ pub fn prove_message_file_types() -> Result<(), String> {
     bugle::prove_message_file_types()
 }
 
+/// The lab sets `TINYCLIENT_PROVE=messages-history`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_message_history() -> Result<(), String> {
+    bugle::prove_message_history()
+}
+
 /// The lab sets `TINYCLIENT_PROVE=messages-phone-quiet`. A build from before this ignores that
 /// and keeps serving, so the same driver fails there.
 pub fn prove_phone_quiet() -> Result<(), String> {
@@ -310,13 +332,31 @@ struct WaitingSend {
     since: i64,
 }
 
+/// How far one conversation has been read this session. `started` means the phone said there
+/// is nothing older, so a later scroll does not ask again.
+#[derive(Default)]
+struct Span {
+    oldest_id: String,
+    oldest_sent: i64,
+    started: bool,
+}
+
+/// One history read the phone did not answer. `before` is the cursor. `find` is a message a
+/// forward or around read is walking back toward. A retry keeps both, so it does not start over
+/// at the newest page.
+struct Due {
+    conversation: String,
+    before: Option<String>,
+    find: Option<String>,
+}
+
 /// Work the phone did not answer. The relay can still be up: that is [`CANT_REACH`], not offline.
 #[derive(Default)]
 struct Phone {
     down: bool,
     queue: VecDeque<WaitingSend>,
-    /// Conversations whose history the phone did not return.
-    history: VecDeque<String>,
+    /// History reads the phone did not return.
+    history: VecDeque<Due>,
     /// (conversation, participant) whose picture the phone did not return.
     pictures: Vec<(String, String)>,
 }
@@ -333,6 +373,8 @@ struct Account {
     pictured: Mutex<HashSet<String>>,
     /// The last conversation update, so a send knows SMS from RCS.
     chats: Mutex<HashMap<String, Chat>>,
+    /// Per conversation, the oldest page read this session.
+    span: Mutex<HashMap<String, Span>>,
     phone: Mutex<Phone>,
 }
 
@@ -364,7 +406,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
             serve_commands(
                 &ctx,
                 inbox,
-                std::time::Duration::from_millis(200),
+                PACE,
                 |id| {
                     if let Some(account) = account() {
                         backfill(&account, id);
@@ -404,6 +446,7 @@ fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) 
         peers: Mutex::default(),
         pictured: Mutex::default(),
         chats: Mutex::default(),
+        span: Mutex::default(),
         phone: Mutex::default(),
     });
     ctx.capabilities(Capabilities {
@@ -432,6 +475,11 @@ fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) 
             Ok(Event::Ready) => {
                 if let Err(why) = account.drive.refresh() {
                     break Failure::Dropped(why);
+                }
+                // Further inbox pages run on the command thread. This loop has to stay free to
+                // read the phone.
+                if account.drive.inbox_continues() {
+                    let _ = account.ctx.commands.send(Command::OpenHome);
                 }
             }
             Ok(Event::Closed(why)) => break Failure::Dropped(why),
@@ -514,6 +562,7 @@ fn seal(account: &Account, conversation: &str, on: bool) {
             mine: String::new(),
             peer: String::new(),
             carrier: 0,
+            updated: 0,
             phones: false,
         });
         chat.phones = on;
@@ -579,6 +628,7 @@ fn apply(account: &Account, event: Event) {
                     mine: String::new(),
                     peer: String::new(),
                     carrier: 0,
+                    updated: 0,
                     phones: false,
                 };
                 let chat = remember(account, &[chat]);
@@ -909,17 +959,9 @@ fn serve(account: &Arc<Account>, command: Command) {
     let ctx = &account.ctx;
     match command {
         Command::Backfill(id) | Command::Warm(id) => backfill(account, &id),
-        Command::History {
-            conversation_id, ..
-        }
-        | Command::HistoryAfter {
-            conversation_id, ..
-        }
-        | Command::HistoryAround {
-            conversation_id, ..
-        } => {
-            backfill(account, &conversation_id);
-        }
+        Command::History { conversation_id, before } => older(account, &conversation_id, &before),
+        Command::HistoryAfter { conversation_id, after } => later(account, &conversation_id, &after),
+        Command::HistoryAround { conversation_id, around } => surround(account, &conversation_id, &around),
         Command::MarkRead {
             conversation_id,
             message_id,
@@ -1048,23 +1090,235 @@ fn receipt(account: &Account, conversation: &str, note: &bugle::Note) {
 
 fn backfill(account: &Account, conversation: &str) {
     if phone(account).down {
-        remember_history(account, conversation);
+        remember_due(account, due_of(conversation, None, None), false);
         return;
     }
-    match account.drive.history(conversation) {
-        Ok(notes) => {
-            for note in notes {
-                show(account, &note);
-            }
-            mark_up(account);
-            nudge(account);
-        }
-        Err(why) if phone_quiet(&why) => {
-            remember_history(account, conversation);
-            lost_phone(account);
-        }
-        Err(why) => tracing::warn!("chatd: Messages: {why}"),
+    fetch_back(account, conversation, None, None);
+}
+
+/// One older page, when the cache has run out. Nothing, once this session has already read it
+/// or the phone has said the conversation starts here.
+fn older(account: &Account, conversation: &str, before: &str) {
+    if older_held(account, conversation, before) {
+        return;
     }
+    if phone(account).down {
+        remember_due(account, due_of(conversation, Some(before), None), false);
+        return;
+    }
+    fetch_back(account, conversation, Some(before.to_owned()), None);
+}
+
+/// Messages after `after`. The store already answers when it holds that page. Bugle can only
+/// page backward, so a gap at the tip is the newest page, and an older missing message is a
+/// walk back to it.
+fn later(account: &Account, conversation: &str, after: &str) {
+    if forward_held(account, conversation, after) {
+        return;
+    }
+    if phone(account).down {
+        remember_due(account, due_of(conversation, None, Some(after)), false);
+        return;
+    }
+    fetch_back(account, conversation, None, Some(after.to_owned()));
+}
+
+/// The page around one message. A cached window that already has older and newer rows is left
+/// alone. Otherwise the phone is paged backward until the message is in a page, or a short page
+/// says the conversation starts.
+fn surround(account: &Account, conversation: &str, id: &str) {
+    let cached = holds(account, conversation, id);
+    if cached && forward_held(account, conversation, id) && (older_held(account, conversation, id) || reached_start(account, conversation)) {
+        return;
+    }
+    if reached_start(account, conversation) {
+        return;
+    }
+    if phone(account).down {
+        remember_due(account, due_of(conversation, resume_cursor(account, conversation).as_deref(), Some(id)), false);
+        return;
+    }
+    // A cached message with nothing after it needs the newest page. Anything else resumes from
+    // the oldest page already read, so the newest page is not asked for again.
+    let cursor = if cached && !forward_held(account, conversation, id) {
+        None
+    } else {
+        resume_cursor(account, conversation)
+    };
+    fetch_back(account, conversation, cursor, Some(id.to_owned()));
+}
+
+fn due_of(conversation: &str, before: Option<&str>, find: Option<&str>) -> Due {
+    Due {
+        conversation: conversation.to_owned(),
+        before: before.map(str::to_owned),
+        find: find.map(str::to_owned),
+    }
+}
+
+/// Reads pages until `find` is on one of them, or one page when `find` is absent. A quiet phone
+/// keeps the cursor it had reached. The next try does not start again at the newest page.
+fn fetch_back(account: &Account, conversation: &str, mut cursor: Option<String>, find: Option<String>) {
+    loop {
+        if account.ctx.stopped() {
+            return;
+        }
+        let asked = cursor.clone();
+        match ask_history(account, conversation, asked.as_deref()) {
+            Ok(notes) => {
+                for note in &notes {
+                    show(account, note);
+                }
+                mark_up(account);
+                let moved = note_span(account, conversation, &notes, asked.as_deref());
+                let found = match find.as_deref() {
+                    None => true,
+                    Some(id) => covers(account, conversation, &notes, id),
+                };
+                if found || !moved || !bugle::more_messages(notes.len()) {
+                    nudge(account);
+                    return;
+                }
+                let Some(oldest) = oldest_note(&notes) else {
+                    nudge(account);
+                    return;
+                };
+                cursor = Some(oldest.id.clone());
+                if account.ctx.pause(PACE) {
+                    return;
+                }
+            }
+            Err(why) if phone_quiet(&why) => {
+                remember_due(account, due_of(conversation, asked.as_deref(), find.as_deref()), true);
+                lost_phone(account);
+                return;
+            }
+            Err(why) => {
+                tracing::warn!("chatd: Messages: {why}");
+                return;
+            }
+        }
+    }
+}
+
+fn ask_history(account: &Account, conversation: &str, before: Option<&str>) -> Result<Vec<bugle::Note>, String> {
+    let cursor = before.map(|id| (id, cursor_at(account, conversation, id)));
+    account.drive.history(conversation, cursor)
+}
+
+fn cursor_at(account: &Account, conversation: &str, id: &str) -> i64 {
+    account
+        .ctx
+        .stored_message(conversation, id)
+        .ok()
+        .flatten()
+        .map(|message| bugle::cursor_millis(message.sent))
+        .unwrap_or(0)
+}
+
+fn spans(account: &Account) -> std::sync::MutexGuard<'_, HashMap<String, Span>> {
+    account.span.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn reached_start(account: &Account, conversation: &str) -> bool {
+    spans(account).get(conversation).is_some_and(|span| span.started)
+}
+
+/// The oldest message id already read, when a later page should start there.
+fn resume_cursor(account: &Account, conversation: &str) -> Option<String> {
+    let spans = spans(account);
+    let span = spans.get(conversation)?;
+    if span.started || span.oldest_id.is_empty() {
+        None
+    } else {
+        Some(span.oldest_id.clone())
+    }
+}
+
+fn holds(account: &Account, conversation: &str, id: &str) -> bool {
+    account.ctx.stored_message(conversation, id).ok().flatten().is_some()
+}
+
+/// True when this scroll's page is already in the store, or the phone has said there is nothing
+/// older than it. The cursor itself is not older: that page still has to be fetched.
+fn older_held(account: &Account, conversation: &str, before: &str) -> bool {
+    let (started, oldest_id, oldest_sent) = {
+        let spans = spans(account);
+        let Some(span) = spans.get(conversation) else {
+            return false;
+        };
+        (span.started, span.oldest_id.clone(), span.oldest_sent)
+    };
+    if started {
+        return true;
+    }
+    if oldest_id.is_empty() || oldest_id == before {
+        return false;
+    }
+    account
+        .ctx
+        .stored_message(conversation, before)
+        .ok()
+        .flatten()
+        .is_some_and(|message| message.sent > oldest_sent)
+}
+
+/// True when the store already has a message newer than `after`. Compared by id, as
+/// [`Context::stored_ids`] stores them. The newest message itself is not a held page: something
+/// may have arrived after it.
+fn forward_held(account: &Account, conversation: &str, after: &str) -> bool {
+    let Ok(Some(newest)) = account.ctx.newest(conversation) else {
+        return false;
+    };
+    if newest == after {
+        return false;
+    }
+    account
+        .ctx
+        .stored_ids(conversation, after, &newest, 2)
+        .map(|ids| ids.len() > 1)
+        .unwrap_or(false)
+}
+
+fn oldest_note(notes: &[bugle::Note]) -> Option<&bugle::Note> {
+    notes
+        .iter()
+        .filter(|note| note.phones.is_none() && !note.id.is_empty())
+        .min_by(|left, right| left.sent.cmp(&right.sent).then_with(|| left.id.cmp(&right.id)))
+}
+
+/// True when `id` is on this page, or the page reached back to its time.
+fn covers(account: &Account, conversation: &str, notes: &[bugle::Note], id: &str) -> bool {
+    if notes.iter().any(|note| note.id == id) {
+        return true;
+    }
+    let Some(sent) = account.ctx.stored_message(conversation, id).ok().flatten().map(|message| message.sent) else {
+        return false;
+    };
+    oldest_note(notes).is_some_and(|oldest| oldest.sent <= sent)
+}
+
+/// Records the oldest message of a page. A short page, an empty page, or a page that did not
+/// move past the cursor means the conversation has been read back to its start.
+fn note_span(account: &Account, conversation: &str, notes: &[bugle::Note], asked: Option<&str>) -> bool {
+    let mut spans = spans(account);
+    let span = spans.entry(conversation.to_owned()).or_default();
+    let Some(oldest) = oldest_note(notes) else {
+        span.started = true;
+        return false;
+    };
+    let moved = match asked {
+        Some(id) => oldest.id != id,
+        None => span.oldest_id != oldest.id,
+    };
+    if span.oldest_id.is_empty() || oldest.sent < span.oldest_sent || (oldest.sent == span.oldest_sent && oldest.id < span.oldest_id) {
+        span.oldest_id = oldest.id.clone();
+        span.oldest_sent = oldest.sent;
+    }
+    if !moved || !bugle::more_messages(notes.len()) {
+        span.started = true;
+    }
+    moved
 }
 
 fn phone(account: &Account) -> std::sync::MutexGuard<'_, Phone> {
@@ -1240,12 +1494,18 @@ fn release(account: &Account, item: WaitingSend) -> bool {
     }
 }
 
-fn remember_history(account: &Account, conversation: &str) {
+fn remember_due(account: &Account, due: Due, front: bool) {
     let mut phone = phone(account);
-    if phone.history.iter().any(|id| id == conversation) {
+    if phone.history.iter().any(|have| {
+        have.conversation == due.conversation && have.before == due.before && have.find == due.find
+    }) {
         return;
     }
-    phone.history.push_back(conversation.to_owned());
+    if front {
+        phone.history.push_front(due);
+    } else {
+        phone.history.push_back(due);
+    }
 }
 
 fn remember_pictures(account: &Account, wanted: &[(String, String)]) {
@@ -1257,26 +1517,10 @@ fn remember_pictures(account: &Account, wanted: &[(String, String)]) {
     }
 }
 
-/// True when this conversation's history still has to wait.
-fn retry_history(account: &Account, conversation: &str) -> bool {
-    match account.drive.history(conversation) {
-        Ok(notes) => {
-            for note in notes {
-                show(account, &note);
-            }
-            mark_up(account);
-            false
-        }
-        Err(why) if phone_quiet(&why) => {
-            phone(account).history.push_front(conversation.to_owned());
-            lost_phone(account);
-            true
-        }
-        Err(why) => {
-            tracing::warn!("chatd: Messages: {why}");
-            false
-        }
-    }
+/// True when this read still has to wait. One try: a phone that is still quiet stops the queue.
+fn retry_due(account: &Account, due: Due) -> bool {
+    fetch_back(account, &due.conversation, due.before, due.find);
+    phone(account).down
 }
 
 fn catch_up(account: &Arc<Account>) {
@@ -1297,10 +1541,10 @@ fn catch_up(account: &Arc<Account>) {
             let mut phone = phone(account);
             phone.history.pop_front()
         };
-        let Some(conversation) = next else {
+        let Some(due) = next else {
             break;
         };
-        if retry_history(account, &conversation) {
+        if retry_due(account, due) {
             return;
         }
     }
@@ -1308,27 +1552,41 @@ fn catch_up(account: &Arc<Account>) {
         let mut phone = phone(account);
         std::mem::take(&mut phone.pictures)
     };
-    if again.is_empty() {
+    if !again.is_empty() {
+        {
+            let mut pictured = account
+                .pictured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (_, peer) in &again {
+                pictured.remove(peer);
+            }
+        }
+        let rows = again.into_iter().map(|(id, _)| account.ctx.key(&id)).collect();
+        pictures(
+            account,
+            &protocol::Watching {
+                rows,
+                ..Default::default()
+            },
+        );
+    }
+    continue_inbox(account);
+}
+
+/// One more inbox page, on the command thread. A quiet phone waits for the next home open.
+/// Asking again here would spin while it is still down.
+fn continue_inbox(account: &Arc<Account>) {
+    if phone(account).down || !account.drive.inbox_continues() {
         return;
     }
-    {
-        let mut pictured = account
-            .pictured
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (_, peer) in &again {
-            pictured.remove(peer);
+    match account.drive.older_chats() {
+        Ok(_) => {
+            if account.drive.inbox_continues() && !account.ctx.pause(PACE) {
+                let _ = account.ctx.commands.send(Command::OpenHome);
+            }
         }
+        Err(why) if phone_quiet(&why) => lost_phone(account),
+        Err(why) => tracing::warn!("chatd: Messages: {why}"),
     }
-    let rows = again
-        .into_iter()
-        .map(|(id, _)| account.ctx.key(&id))
-        .collect();
-    pictures(
-        account,
-        &protocol::Watching {
-            rows,
-            ..Default::default()
-        },
-    );
 }

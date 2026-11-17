@@ -10,7 +10,7 @@
 //! WHO is `grace` or `alan`.
 
 use super::{Drive, Event, Saved};
-use crate::adapters::messages::bugle::{Chat, Mark, Note, Piece, PHONE_QUIET};
+use crate::adapters::messages::bugle::{Chat, Mark, Note, Piece, MESSAGE_PAGE, PHONE_QUIET};
 use crate::adapters::script;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -60,6 +60,7 @@ impl Fake {
                 mine: ME.into(),
                 peer: GRACE_PARTICIPANT.into(),
                 carrier: 0,
+                updated: 0,
                 phones: false,
             },
             Chat {
@@ -70,6 +71,7 @@ impl Fake {
                 mine: ME.into(),
                 peer: String::new(),
                 carrier: 0,
+                updated: 0,
                 phones: false,
             },
         ]));
@@ -142,6 +144,34 @@ impl Fake {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
     }
+}
+
+/// `TINYCLIENT_MESSAGES_MANY=100` is one conversation of 100 messages, newest page first.
+/// A cursor id `m-NNNN` is exclusive: the next page ends at the message before it.
+fn scripted_page(conversation: &str, before: Option<&str>) -> Vec<Note> {
+    if conversation != GRACE || std::env::var("TINYCLIENT_MESSAGES_MANY").ok().as_deref() != Some("100") {
+        return Vec::new();
+    }
+    let end = match before {
+        None => 100,
+        Some(id) => {
+            let Some(n) = id.strip_prefix("m-").and_then(|n| n.parse::<i64>().ok()) else {
+                return Vec::new();
+            };
+            n - 1
+        }
+    };
+    if end < 1 {
+        return Vec::new();
+    }
+    let start = (end - MESSAGE_PAGE as i64 + 1).max(1);
+    (start..=end)
+        .map(|n| {
+            let mut line = note(GRACE, "Grace Ombra", GRACE, &format!("m-{n:04}"), &format!("line {n}"), false, Vec::new(), Vec::new());
+            line.sent = 1_700_000_000 + n;
+            line
+        })
+        .collect()
 }
 
 fn note(
@@ -342,6 +372,7 @@ fn steer(line: &str) -> Vec<Event> {
                     String::new()
                 },
                 carrier,
+                updated: 0,
                 phones,
             }])]
         }
@@ -389,10 +420,19 @@ impl Drive for Fake {
         record("list");
         Ok(())
     }
-    fn history(&self, conversation: &str) -> Result<Vec<Note>, String> {
+    fn history(&self, conversation: &str, before: Option<(&str, i64)>) -> Result<Vec<Note>, String> {
         self.unanswered()?;
-        record(&format!("history {conversation}"));
+        match before {
+            Some((id, _)) => record(&format!("history {conversation} {id}")),
+            None => record(&format!("history {conversation}")),
+        }
+        Ok(scripted_page(conversation, before.map(|(id, _)| id)))
+    }
+    fn older_chats(&self) -> Result<Vec<Chat>, String> {
         Ok(Vec::new())
+    }
+    fn inbox_continues(&self) -> bool {
+        false
     }
     fn send(&self, conversation: &str, text: &str) -> Result<String, String> {
         self.unanswered()?;

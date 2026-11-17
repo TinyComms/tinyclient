@@ -27,6 +27,10 @@ const FILE_CAP: u64 = 100 * 1024 * 1024;
 const NETWORK: &str = "Bugle";
 /// How long one request waits for the phone to answer on the long-poll.
 const PHONE: Duration = Duration::from_secs(20);
+/// One inbox page. `ListConversationsRequest.count`, field 2.
+pub(super) const CHAT_PAGE: u64 = 50;
+/// One conversation page. `ListMessagesRequest.count`, field 3.
+pub(super) const MESSAGE_PAGE: u64 = 40;
 /// What a request says when that wait runs out. The relay itself can still be up.
 pub const PHONE_QUIET: &str =
     "Your phone isn't responding. Keep Messages open, and the phone online.";
@@ -437,18 +441,73 @@ fn outgoing(
     ])
 }
 
-fn list_request(count: u64) -> Vec<u8> {
+/// Where the next page starts. Field 1 is the last item already seen, field 2 its time in
+/// milliseconds. Message times are stored here as unix seconds, so the request multiplies.
+#[derive(Clone)]
+pub(super) struct Cursor {
+    pub id: String,
+    pub millis: i64,
+}
+
+/// Unix seconds, as a message is stored, to the cursor's milliseconds.
+pub(super) fn cursor_millis(sent: i64) -> i64 {
+    sent.saturating_mul(1000)
+}
+
+/// A page shorter than asked is the last one. An empty page is too.
+pub(super) fn more_messages(got: usize) -> bool {
+    got as u64 >= MESSAGE_PAGE
+}
+
+fn cursor_message(cursor: &Cursor) -> Vec<u8> {
     let mut buf = Buf::new();
-    buf.int(2, count);
-    buf.int(4, 1); // INBOX
+    buf.text(1, &cursor.id);
+    if cursor.millis > 0 {
+        buf.int(2, cursor.millis as u64);
+    }
     buf.0
 }
 
-fn messages_request(conversation: &str, count: u64) -> Vec<u8> {
+fn list_request(count: u64, before: Option<&Cursor>) -> Vec<u8> {
+    let mut buf = Buf::new();
+    buf.int(2, count);
+    buf.int(4, 1); // INBOX
+    if let Some(cursor) = before {
+        buf.msg(5, &cursor_message(cursor));
+    }
+    buf.0
+}
+
+fn messages_request(conversation: &str, count: u64, before: Option<&Cursor>) -> Vec<u8> {
     let mut buf = Buf::new();
     buf.text(2, conversation);
     buf.int(3, count);
+    if let Some(cursor) = before {
+        buf.msg(5, &cursor_message(cursor));
+    }
     buf.0
+}
+
+/// `ListConversationsResponse` and `ListMessagesResponse` field 5, when the phone sent one.
+fn decode_cursor(bytes: &[u8]) -> Option<Cursor> {
+    let list = fields(bytes);
+    let raw = field(&list, 5)?;
+    if raw.varint.is_some() || raw.bytes.is_empty() {
+        return None;
+    }
+    let inner = fields(&raw.bytes);
+    let id = field_text(&inner, 1);
+    if id.is_empty() {
+        return None;
+    }
+    Some(Cursor { id, millis: field_int(&inner, 2) as i64 })
+}
+
+/// The oldest chat on a page, when the phone sent no cursor of its own. A chat with no time is
+/// left out: a cursor at time 0 would ask for the same page again.
+fn oldest_cursor(chats: &[Chat]) -> Option<Cursor> {
+    let oldest = chats.iter().filter(|chat| chat.updated > 0 && !chat.id.is_empty()).min_by_key(|chat| chat.updated)?;
+    Some(Cursor { id: oldest.id.clone(), millis: oldest.updated.saturating_mul(1000) })
 }
 
 fn send_request(conversation: &str, text: &str, tmp: &str, mine: &str) -> Vec<u8> {
@@ -851,6 +910,9 @@ pub struct Chat {
     pub peer: String,
     /// `Conversation.type`, field 22: 1 SMS, 2 RCS, 0 when the phone did not say.
     pub carrier: u64,
+    /// Unix seconds of the latest message, from field 5. 0 when the phone did not say.
+    /// The inbox cursor uses it when the response has no cursor of its own.
+    pub updated: i64,
     /// A tombstone said the phones encrypt the chat. A later conversation update does not
     /// clear it: the conversation message has no such field.
     pub phones: bool,
@@ -1097,12 +1159,19 @@ fn merge_cookies(old: &str, new: &str) -> String {
 }
 
 /// A running session: the long-poll thread and the commands share `live`.
+/// The inbox page still to ask for. `done` until the first list says there is another.
+struct Inbox {
+    next: Option<Cursor>,
+    done: bool,
+}
+
 pub struct Session {
     live: Arc<Mutex<Live>>,
     events: Sender<crate::adapters::messages::Event>,
     heard: Mutex<Option<Receiver<crate::adapters::messages::Event>>>,
     waiters: Arc<Mutex<Vec<Waiter>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    inbox: Mutex<Inbox>,
 }
 
 impl Session {
@@ -1131,6 +1200,7 @@ impl Session {
             heard: Mutex::new(Some(heard)),
             waiters: Arc::default(),
             stop: Arc::default(),
+            inbox: Mutex::new(Inbox { next: None, done: true }),
         };
         let (live, events, waiters, stop) = (
             session.live.clone(),
@@ -1336,14 +1406,88 @@ impl Session {
 
     pub fn refresh(&self) -> Result<(), String> {
         self.activate()?;
-        let first = self.rpc(1, &list_request(50), 16)?;
-        self.apply_chats(&first);
+        let first = self.rpc(1, &list_request(CHAT_PAGE, None), 16)?;
+        let chats = decode_chats(&first);
+        self.note_inbox(&first, &chats);
+        self.store_chats(chats, true);
         Ok(())
     }
 
-    pub fn history(&self, conversation: &str) -> Result<Vec<Note>, String> {
-        let bytes = self.rpc(2, &messages_request(conversation, 40), 2)?;
+    /// True when the last inbox page was full and named a later one.
+    pub fn inbox_continues(&self) -> bool {
+        !self.inbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).done
+    }
+
+    /// The next inbox page, or nothing when the phone has no more. Later pages use message
+    /// type 2; the first page after pairing stays an annotation, which [`refresh`] sends.
+    pub fn older_chats(&self) -> Result<Vec<Chat>, String> {
+        let sent = {
+            let inbox = self.inbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if inbox.done {
+                return Ok(Vec::new());
+            }
+            inbox.next.clone()
+        };
+        let Some(cursor) = sent else {
+            self.finish_inbox();
+            return Ok(Vec::new());
+        };
+        let bytes = self.rpc(1, &list_request(CHAT_PAGE, Some(&cursor)), 2)?;
+        let chats = decode_chats(&bytes);
+        let next = decode_cursor(&bytes).or_else(|| oldest_cursor(&chats));
+        let moved = next.as_ref().is_some_and(|next| next.id != cursor.id || next.millis != cursor.millis);
+        if !moved {
+            self.finish_inbox();
+        } else {
+            self.note_inbox(&bytes, &chats);
+        }
+        self.store_chats(chats.clone(), false);
+        Ok(chats)
+    }
+
+    pub fn history(&self, conversation: &str, before: Option<&Cursor>) -> Result<Vec<Note>, String> {
+        let bytes = self.rpc(2, &messages_request(conversation, MESSAGE_PAGE, before), 2)?;
         Ok(decode_messages(&bytes))
+    }
+
+    fn finish_inbox(&self) {
+        let mut inbox = self.inbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        inbox.next = None;
+        inbox.done = true;
+    }
+
+    fn note_inbox(&self, bytes: &[u8], chats: &[Chat]) {
+        let next = decode_cursor(bytes).or_else(|| oldest_cursor(chats));
+        let more = chats.len() >= CHAT_PAGE as usize && next.is_some();
+        let mut inbox = self.inbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if more {
+            inbox.next = next;
+            inbox.done = false;
+        } else {
+            inbox.next = None;
+            inbox.done = true;
+        }
+    }
+
+    fn store_chats(&self, chats: Vec<Chat>, replace: bool) {
+        if chats.is_empty() {
+            return;
+        }
+        {
+            let mut live = self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if replace {
+                live.chats = chats.clone();
+            } else {
+                for chat in &chats {
+                    if let Some(had) = live.chats.iter_mut().find(|had| had.id == chat.id) {
+                        *had = chat.clone();
+                    } else {
+                        live.chats.push(chat.clone());
+                    }
+                }
+            }
+        }
+        let _ = self.events.send(crate::adapters::messages::Event::Chats(chats));
     }
 
     fn mine_of(&self, conversation: &str) -> String {
@@ -1590,19 +1734,6 @@ impl Session {
         Ok(())
     }
 
-    fn apply_chats(&self, bytes: &[u8]) {
-        let chats = decode_chats(bytes);
-        if chats.is_empty() {
-            return;
-        }
-        self.live
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .chats = chats.clone();
-        let _ = self
-            .events
-            .send(crate::adapters::messages::Event::Chats(chats));
-    }
 }
 
 fn poll(
@@ -1976,6 +2107,7 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
             mine,
             peer,
             carrier,
+            updated: unix_seconds(field_int(&conv, 5) as i64),
             phones: false,
         });
     }
@@ -2204,6 +2336,39 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
     notes
 }
 
+/// The lab sets `TINYCLIENT_PROVE=messages-history`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub(super) fn prove_message_history() -> Result<(), String> {
+    let cursor = Cursor { id: "m-0061".into(), millis: 1_700_000_061_000 };
+    let asked = fields(&messages_request("phone-grace", MESSAGE_PAGE, Some(&cursor)));
+    if field_text(&asked, 2) != "phone-grace" {
+        return Err("the history request named the wrong chat".into());
+    }
+    if field_int(&asked, 3) != MESSAGE_PAGE {
+        return Err(format!("the history request asked for {} rows", field_int(&asked, 3)));
+    }
+    let inner = fields(&field_bytes(&asked, 5));
+    if field_text(&inner, 1) != "m-0061" || field_int(&inner, 2) != 1_700_000_061_000 {
+        return Err("the history cursor dropped the message or its time".into());
+    }
+    let first = fields(&messages_request("phone-grace", MESSAGE_PAGE, None));
+    if field(&first, 5).is_some() {
+        return Err("the newest history page sent a cursor".into());
+    }
+    let inbox = fields(&list_request(CHAT_PAGE, Some(&cursor)));
+    if field_int(&inbox, 2) != CHAT_PAGE || field_int(&inbox, 4) != 1 {
+        return Err("the inbox request lost its page or its folder".into());
+    }
+    let inbox_cursor = fields(&field_bytes(&inbox, 5));
+    if field_text(&inbox_cursor, 1) != "m-0061" || field_int(&inbox_cursor, 2) != 1_700_000_061_000 {
+        return Err("the inbox cursor dropped the chat or its time".into());
+    }
+    if !more_messages(MESSAGE_PAGE as usize) || more_messages(20) || more_messages(0) {
+        return Err("a short page was treated as another page".into());
+    }
+    Ok(())
+}
+
 /// The lab sets `TINYCLIENT_PROVE=messages-transport`. A build from before this ignores that
 /// and keeps serving, so the same driver fails there.
 pub(super) fn prove_message_transport() -> Result<(), String> {
@@ -2275,6 +2440,11 @@ mod tests {
     #[test]
     fn a_file_type_comes_from_its_bytes_then_its_name() {
         file_type_samples().unwrap();
+    }
+
+    #[test]
+    fn a_history_page_carries_the_message_it_starts_after() {
+        prove_message_history().unwrap();
     }
 
     #[test]
