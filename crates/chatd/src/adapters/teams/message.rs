@@ -94,6 +94,95 @@ fn inside<'a>(xml: &'a str, name: &str) -> Vec<&'a str> {
     found
 }
 
+/// Microsoft Graph names a Loop component `application/vnd.microsoft.card.fluidEmbedCard`.
+/// Its file address is `componentUrl` inside `content`. The chat service keeps that card
+/// in `properties.cards`, the same place as an adaptive card.
+const FLUID_CARD: &str = "application/vnd.microsoft.card.fluidEmbedCard";
+
+/// A Loop component read out of a card list: the row's title, and the file to open.
+struct LoopCard {
+    title: String,
+    url: String,
+}
+
+/// The first Loop component in a card list. An adaptive card is not one.
+fn loop_card(cards: &[Value]) -> Option<LoopCard> {
+    cards.iter().find_map(|card| {
+        let kind = card.get("contentType").and_then(Value::as_str).unwrap_or("");
+        let app = card.get("teamsAppId").and_then(Value::as_str).unwrap_or("");
+        if kind != FLUID_CARD && app != "FluidEmbedCard" {
+            return None;
+        }
+        let content = match card.get("content") {
+            Some(Value::String(text)) => serde_json::from_str::<Value>(text).unwrap_or(Value::Null),
+            Some(other) => other.clone(),
+            None => Value::Null,
+        };
+        let url = content
+            .get("componentUrl")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|url| url.starts_with("https://"))
+            .unwrap_or("")
+            .to_owned();
+        let title = card.get("name").and_then(Value::as_str).map(str::trim).filter(|name| !name.is_empty()).unwrap_or("").to_owned();
+        Some(LoopCard { title, url })
+    })
+}
+
+/// `Loop component` or `Loop component · <title>` when the card names itself.
+fn loop_label(title: &str) -> String {
+    let title = title.trim();
+    if title.is_empty() {
+        "Loop component".to_owned()
+    } else {
+        format!("Loop component · {}", title.chars().take(200).collect::<String>())
+    }
+}
+
+/// The lab's teams-loop-component driver. A fluid embed card is labelled and linked to its
+/// file. An adaptive card stays an ordinary card. A file address that is not https is dropped.
+pub(crate) fn prove_loop_component() -> Result<(), String> {
+    let url = "https://contoso.sharepoint.com/:fl:/g/personal/ana/EaBcDeF";
+    let named = json!([{
+        "contentType": FLUID_CARD,
+        "teamsAppId": "FluidEmbedCard",
+        "name": "Sprint checklist",
+        "content": json!({"componentUrl": url, "sourceType": "Compose"}).to_string(),
+    }]);
+    let found = loop_card(named.as_array().unwrap()).ok_or_else(|| "a Loop component is still read as an ordinary card".to_owned())?;
+    if found.url != url {
+        return Err(format!("a Loop component does not link to its file: {}", found.url));
+    }
+    if loop_label(&found.title) != "Loop component · Sprint checklist" {
+        return Err(format!("a Loop component reads as {}", loop_label(&found.title)));
+    }
+    let bare = json!([{
+        "contentType": FLUID_CARD,
+        "content": json!({"componentUrl": "https://contoso.sharepoint.com/personal/ana/standup.loop", "sourceType": "Compose"}).to_string(),
+    }]);
+    let bare = loop_card(bare.as_array().unwrap()).ok_or_else(|| "a Loop component without a name was dropped".to_owned())?;
+    if loop_label(&bare.title) != "Loop component" || !bare.url.ends_with(".loop") {
+        return Err("a Loop component without a name was not labelled".to_owned());
+    }
+    let adaptive = json!([{
+        "contentType": "application/vnd.microsoft.card.adaptive",
+        "content": "{\"type\":\"AdaptiveCard\",\"body\":[{\"type\":\"TextBlock\",\"text\":\"Build\"}]}",
+    }]);
+    if loop_card(adaptive.as_array().unwrap()).is_some() {
+        return Err("an adaptive card was labelled as a Loop component".to_owned());
+    }
+    let plain = json!([{
+        "contentType": FLUID_CARD,
+        "content": "{\"componentUrl\": \"http://contoso.sharepoint.com/x.loop\", \"sourceType\": \"Compose\"}",
+    }]);
+    let plain = loop_card(plain.as_array().unwrap()).ok_or_else(|| "a Loop component with a non-https file was dropped".to_owned())?;
+    if !plain.url.is_empty() {
+        return Err("a Loop component kept a file address that is not https".to_owned());
+    }
+    Ok(())
+}
+
 /// The first title or text a card carries, looked for a few levels down.
 fn card_title(card: &Value, depth: u8) -> Option<String> {
     if depth == 0 {
@@ -440,6 +529,18 @@ impl Teams {
             message.kind = MessageKind::Unsupported {
                 link: format!("{TEAMS}/l/meetup-join/{}/0", escaped(conversation)),
             };
+        } else if let Some(component) = loop_card(&cards) {
+            // A Loop component names itself and opens its file. Live editing is not drawn.
+            let label = loop_label(&component.title);
+            if message.text.is_empty() {
+                message.text = label;
+                message.spans.clear();
+            } else {
+                message.text.push('\n');
+                message.text.push_str(&label);
+            }
+            let link = if component.url.is_empty() { self.message_link(conversation, &id) } else { component.url };
+            message.kind = MessageKind::Unsupported { link };
         } else if parsed.card || !cards.is_empty() || kind == "RichText/Media_Card" {
             let title = cards.iter().find_map(|card| card_title(card, 6));
             if message.text.is_empty() {
@@ -924,6 +1025,11 @@ mod tests {
     #[test]
     fn a_catalog_emoji_and_a_skin_tone_use_teams_keys() {
         prove_reactions().unwrap();
+    }
+
+    #[test]
+    fn a_fluid_embed_card_is_a_loop_component() {
+        prove_loop_component().unwrap();
     }
 
     #[test]

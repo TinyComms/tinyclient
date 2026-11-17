@@ -845,7 +845,7 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
     let ids: Vec<&str> = page.iter().map(|message| message.id.as_str()).collect();
     assert_eq!(
         ids,
-        ["1760000050050", "1760000100100", "1760000200200", "1760000250250", "1760000260260", "1760000300300"],
+        ["1760000050050", "1760000100100", "1760000200200", "1760000250250", "1760000260260", "1760000300300", "1760000310310"],
         "the deleted post and the replies are not in the channel's own page"
     );
     let by = |id: &str| page.iter().find(|message| message.id == id).unwrap();
@@ -921,6 +921,14 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
         panic!("{:?}", card.kind);
     };
     assert_eq!(link, &format!("https://teams.microsoft.com/l/message/19%3Aplatform0general%40thread.tacv2/1760000300300?tenantId={HOME}"));
+
+    // A Loop component is named and linked to its file, not left as a blank card.
+    let looped = by("1760000310310");
+    assert_eq!(looped.text, "Loop component · Sprint checklist");
+    let MessageKind::Unsupported { link } = &looped.kind else {
+        panic!("{:?}", looped.kind);
+    };
+    assert_eq!(link, "https://contoso.sharepoint.com/:fl:/g/personal/ana/EaBcDeF");
 
     // The post's replies are a thread: counted on the post, read in a conversation of its own
     // that names its channel and its post.
