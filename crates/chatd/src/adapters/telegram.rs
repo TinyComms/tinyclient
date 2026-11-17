@@ -1217,6 +1217,11 @@ pub fn prove_telegram_mute_until() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's telegram-link-preview driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_link_preview() -> Result<(), String> {
+    content::prove_link_preview()
+}
+
 /// The lab's telegram-dice driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_dice() -> Result<(), String> {
     content::prove_dice_roll()?;

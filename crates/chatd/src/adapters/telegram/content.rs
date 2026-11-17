@@ -713,6 +713,52 @@ fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>) -> Opti
     Some(attachment)
 }
 
+/// The picture a link card shows. A photo's row-sized still, or a video's thumbnail. The full
+/// picture stays with Telegram until someone opens it, and a card does not open it.
+fn preview_image(page: &tl::types::WebPage, wants: &mut Vec<Want>) -> Option<MediaFile> {
+    if let Some(tl::enums::Photo::Photo(photo)) = &page.photo {
+        let (kind, width, height, bytes, inline) = pick(&photo.sizes, INLINE)?;
+        let mut image = MediaFile::new(format!("p{}{kind}", photo.id), MediaKind::Image);
+        (image.width, image.height, image.bytes) = (width, height, bytes);
+        wants.push(Want {
+            file: image.clone(),
+            dc: photo.dc_id,
+            location: tl::types::InputPhotoFileLocation {
+                id: photo.id,
+                access_hash: photo.access_hash,
+                file_reference: photo.file_reference.clone(),
+                thumb_size: kind.to_owned(),
+            }
+            .into(),
+            inline: inline.map(<[u8]>::to_vec),
+            row: None,
+            watched: false,
+            original: false,
+        });
+        return Some(image);
+    }
+    let tl::enums::Document::Document(document) = page.document.as_ref()? else { return None };
+    let (kind, width, height, bytes, inline) = document.thumbs.as_deref().and_then(|thumbs| pick(thumbs, INLINE))?;
+    let mut image = MediaFile::new(format!("d{}{kind}", document.id), MediaKind::Image);
+    (image.width, image.height, image.bytes) = (width, height, bytes);
+    wants.push(Want {
+        file: image.clone(),
+        dc: document.dc_id,
+        location: tl::types::InputDocumentFileLocation {
+            id: document.id,
+            access_hash: document.access_hash,
+            file_reference: document.file_reference.clone(),
+            thumb_size: kind.to_owned(),
+        }
+        .into(),
+        inline: inline.map(<[u8]>::to_vec),
+        row: None,
+        watched: false,
+        original: false,
+    });
+    Some(image)
+}
+
 pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::types::Document, wants: &mut Vec<Want>) -> Attachment {
     let (mut name, mut size, mut duration, mut wave) = (String::new(), (0u32, 0u32), 0u32, Vec::new());
     let (mut sticker, mut animated, mut video, mut round, mut voice, mut audio) = (false, false, false, false, false, false);
@@ -1395,14 +1441,15 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 }
                 Some(MessageMedia::WebPage(media)) => {
                     if let tl::enums::WebPage::Page(page) = &media.webpage {
-                        // The card is Telegram's own; its picture is a Telegram file and is not
-                        // fetched for a row.
+                        // The card is Telegram's own. Its picture is the row-sized still, fetched
+                        // the way any thumbnail is. Instant View and the send controls stay outside
+                        // this mapping.
                         message.previews.push(Preview {
                             url: page.url.clone(),
                             site: page.site_name.clone().unwrap_or_default(),
                             title: page.title.clone().unwrap_or_default(),
                             description: page.description.clone().unwrap_or_default(),
-                            image: None,
+                            image: preview_image(page, &mut wants),
                         });
                     }
                 }
@@ -1797,6 +1844,58 @@ pub(super) fn prove_stickers() -> Result<(), String> {
     let still = document(&media, &raw, &mut wants);
     if still.file.id != "d6412m" || wants.iter().any(|want| want.file.id == "d6412") {
         return Err("a static sticker must stay its thumbnail".into());
+    }
+    Ok(())
+}
+
+/// The lab's telegram-link-preview check. A link card names its row-sized picture and asks for
+/// that still, not the full photo.
+pub(super) fn prove_link_preview() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    8_801i64.serialize(&mut bytes);
+    "https://example.org/ridge".to_owned().serialize(&mut bytes);
+    "example.org".to_owned().serialize(&mut bytes);
+    1i32.serialize(&mut bytes);
+    let mut page = tl::types::WebPage::from_bytes(&bytes).map_err(|_| "a blank page reads back".to_owned())?;
+    page.title = Some("Ridge".to_owned());
+    page.photo = Some(tl::types::Photo {
+        has_stickers: false,
+        id: 8_801,
+        access_hash: 1,
+        file_reference: vec![1],
+        date: 1_700_000_000,
+        sizes: vec![
+            tl::types::PhotoSize { r#type: "m".to_owned(), w: 320, h: 240, size: 4_000 }.into(),
+            tl::types::PhotoSize { r#type: "y".to_owned(), w: 1_280, h: 960, size: 200_000 }.into(),
+        ],
+        video_sizes: None,
+        dc_id: 4,
+    }.into());
+    let mut message_bytes = Vec::new();
+    0u32.serialize(&mut message_bytes);
+    0u32.serialize(&mut message_bytes);
+    32i32.serialize(&mut message_bytes);
+    Who::User(7_002).peer().serialize(&mut message_bytes);
+    1_700_000_000i32.serialize(&mut message_bytes);
+    "https://example.org/ridge".to_owned().serialize(&mut message_bytes);
+    let mut message = tl::types::Message::from_bytes(&message_bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    message.from_id = Some(Who::User(7_002).peer());
+    message.media = Some(tl::types::MessageMediaWebPage {
+        force_large_media: false,
+        force_small_media: false,
+        manual: false,
+        safe: true,
+        webpage: page.into(),
+    }.into());
+    let mapped = map(&Directory::new(7_001), &message.into()).ok_or("a link maps")?;
+    let image = mapped.message.previews.first().and_then(|card| card.image.as_ref()).ok_or("a link card names no picture")?;
+    if image.id != "p8801m" || image.width != 320 {
+        return Err(format!("a link card's picture is the row-sized still, got {} at {}", image.id, image.width));
+    }
+    if !mapped.wants.iter().any(|want| want.file.id == "p8801m" && !want.original) || mapped.wants.iter().any(|want| want.original) {
+        return Err("a link card fetches its still and not the full picture".into());
     }
     Ok(())
 }
@@ -2251,6 +2350,78 @@ mod tests {
             .into(),
         );
         message.into()
+    }
+
+    fn blank_page(url: &str) -> tl::types::WebPage {
+        use grammers_tl_types::{Deserializable, Serializable};
+        let mut bytes = Vec::new();
+        0u32.serialize(&mut bytes);
+        8_801i64.serialize(&mut bytes);
+        url.to_owned().serialize(&mut bytes);
+        "example.org".to_owned().serialize(&mut bytes);
+        1i32.serialize(&mut bytes);
+        tl::types::WebPage::from_bytes(&bytes).expect("a blank page reads back")
+    }
+
+    fn link_message(photo: bool, document: bool) -> tl::enums::Message {
+        let mut message = blank_message();
+        message.id = 32;
+        let mut page = blank_page("https://example.org/ridge");
+        page.site_name = Some("Example".to_owned());
+        page.title = Some("Ridge".to_owned());
+        page.description = Some("The trail.".to_owned());
+        if photo {
+            page.photo = Some(tl::types::Photo {
+                has_stickers: false,
+                id: 8_801,
+                access_hash: 1,
+                file_reference: vec![1],
+                date: 1_700_000_000,
+                sizes: vec![
+                    tl::types::PhotoSize { r#type: "m".to_owned(), w: 320, h: 240, size: 4_000 }.into(),
+                    tl::types::PhotoSize { r#type: "y".to_owned(), w: 1_280, h: 960, size: 200_000 }.into(),
+                ],
+                video_sizes: None,
+                dc_id: 4,
+            }.into());
+        }
+        if document {
+            page.document = Some(tl::types::Document {
+                id: 8_802,
+                access_hash: 1,
+                file_reference: vec![2],
+                date: 1_700_000_000,
+                mime_type: "video/mp4".to_owned(),
+                size: 1_000,
+                thumbs: Some(vec![tl::types::PhotoSize { r#type: "m".to_owned(), w: 320, h: 180, size: 20 }.into()]),
+                video_thumbs: None,
+                dc_id: 2,
+                attributes: Vec::new(),
+            }.into());
+        }
+        message.media = Some(tl::types::MessageMediaWebPage {
+            force_large_media: false,
+            force_small_media: false,
+            manual: false,
+            safe: true,
+            webpage: page.into(),
+        }.into());
+        message.into()
+    }
+
+    #[test]
+    fn a_link_card_names_its_picture_and_asks_for_the_thumb_only() {
+        let card = map(&Directory::new(7_001), &link_message(true, false)).expect("a link maps");
+        let image = card.message.previews[0].image.as_ref().expect("the card names its picture");
+        assert_eq!(image.id, "p8801m");
+        assert!(card.wants.iter().any(|want| want.file.id == "p8801m" && !want.original));
+        assert!(card.wants.iter().all(|want| !want.original));
+        let video = map(&Directory::new(7_001), &link_message(false, true)).expect("a video card maps");
+        assert_eq!(video.message.previews[0].image.as_ref().expect("a video card names its still").id, "d8802m");
+        assert!(video.wants.iter().all(|want| want.file.id == "d8802m" && !want.original));
+        let bare = map(&Directory::new(7_001), &link_message(false, false)).expect("a card without a picture maps");
+        assert!(bare.message.previews[0].image.is_none());
+        assert!(bare.wants.is_empty());
     }
 
     #[test]

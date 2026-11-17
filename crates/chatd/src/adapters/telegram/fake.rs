@@ -6,7 +6,7 @@
 //! scratch directory (`adapters/script.rs`): `telegram.signin.ctl` while signing in (`scan`,
 //! `scan-other`, `scan-password`), `telegram.ctl` once signed in (`incoming`, `photo`, `react`, `edit`,
 //! `delete`, `ttl`, `ttl-gone`, `topic`, `comments`, `typing`, `typing-stop`, `read`, `status`,
-//! `poll`, `voice`, `forward`, `flood-send N`, `revoke`, and the holds of
+//! `poll`, `voice`, `link`, `forward`, `flood-send N`, `revoke`, and the holds of
 //! `TINYCLIENT_TELEGRAM_HOLD` and `TINYCLIENT_TELEGRAM_PEER_HOLD` through `dialogs-go` and
 //! `peer-go`). Every request it is sent is appended to `telegram.calls`, one line each, so a
 //! test can see what the network would have heard.
@@ -1355,6 +1355,24 @@ impl World {
                 message.media = Some(tl::enums::MessageMedia::Poll(Box::new(tl::types::MessageMediaPoll { poll: poll.into(), results: results.into(), attached_media: None })));
                 self.store(None, message.clone());
                 vec![update(tl::types::UpdateNewMessage { message: message.into(), pts: 0, pts_count: 0 }.into())]
+            }
+            // A link card with the row-sized still and a larger photo that a row does not fetch.
+            "link" => {
+                let mut page: tl::types::WebPage = blank(&[&put(0u32), &put(8_801i64), &put("https://example.org/ridge".to_owned()), &put("example.org".to_owned()), &put(1i32)]);
+                page.site_name = Some("Example".to_owned());
+                page.title = Some("Ridge".to_owned());
+                page.description = Some("The trail.".to_owned());
+                page.photo = Some(photo(8_801));
+                let mut message = message(odalys, 32, ODALYS, t0() + 80, "https://example.org/ridge");
+                message.media = Some(tl::types::MessageMediaWebPage {
+                    force_large_media: false,
+                    force_small_media: false,
+                    manual: false,
+                    safe: true,
+                    webpage: page.into(),
+                }.into());
+                self.store(None, message.clone());
+                vec![new(message)]
             }
             "voice" => {
                 let voice = tl::types::Document {

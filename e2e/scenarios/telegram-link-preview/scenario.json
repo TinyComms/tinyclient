@@ -1,0 +1,12 @@
+{
+  "id": "telegram-link-preview",
+  "title": "A Telegram link card names its picture",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same still is what a link card maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same still is what a link card maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
