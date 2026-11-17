@@ -913,8 +913,14 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                         });
                     }
                 }
-                // The dice is its own emoji; the roll is animated in Telegram's app only.
-                Some(MessageMedia::Dice(dice)) => message.text = dice.emoticon.clone(),
+                // The value is the roll everyone sees. Zero means it is still spinning, so the
+                // row is the emoji alone until Telegram names the result.
+                Some(MessageMedia::Dice(dice)) => {
+                    message.text = match dice.value {
+                        1.. => format!("{} {}", dice.emoticon, dice.value),
+                        _ => dice.emoticon.clone(),
+                    };
+                }
                 Some(media) => {
                     if let Some(label) = unsupported(media) {
                         // The caption follows the label; its styles no longer line up, so they go.
@@ -956,6 +962,26 @@ fn topic_of(header: Option<&tl::enums::MessageReplyHeader>) -> (Option<i32>, Opt
         (true, None, top) => (top, None),
         (false, _, reply) => (None, reply),
     }
+}
+
+/// The lab's telegram-dice check. A roll of 5 reads as the emoji and the value.
+pub(super) fn prove_dice_roll() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    7i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    message.from_id = Some(Who::User(7_002).peer());
+    message.media = Some(tl::types::MessageMediaDice { value: 5, emoticon: "\u{1F3B2}".into(), game_outcome: None }.into());
+    let mapped = map(&Directory::new(7_001), &message.into()).ok_or("the roll maps")?;
+    if mapped.message.text != "\u{1F3B2} 5" || !mapped.wants.is_empty() {
+        return Err(format!("a dice of 5 reads as the emoji and the value, got {}", mapped.message.text));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1069,5 +1095,36 @@ mod tests {
         assert!(matches!(entities[0], MessageEntity::Bold(_)));
         assert_eq!(place(&entities[1]), (3, 5));
         assert!(matches!(entities[1], MessageEntity::Italic(_)));
+    }
+
+    fn dice_message(value: i32) -> tl::enums::Message {
+        use grammers_tl_types::{Deserializable, Serializable};
+        let mut bytes = Vec::new();
+        0u32.serialize(&mut bytes);
+        0u32.serialize(&mut bytes);
+        7i32.serialize(&mut bytes);
+        Who::User(7_002).peer().serialize(&mut bytes);
+        1_700_000_000i32.serialize(&mut bytes);
+        String::new().serialize(&mut bytes);
+        let mut message = tl::types::Message::from_bytes(&bytes).expect("a blank message reads back");
+        message.from_id = Some(Who::User(7_002).peer());
+        message.media = Some(
+            tl::types::MessageMediaDice {
+                value,
+                emoticon: "\u{1F3B2}".into(),
+                game_outcome: None,
+            }
+            .into(),
+        );
+        message.into()
+    }
+
+    #[test]
+    fn a_dice_roll_keeps_its_value() {
+        let rolled = map(&Directory::new(7_001), &dice_message(5)).expect("the roll maps");
+        assert!(rolled.wants.is_empty());
+        assert_eq!(rolled.message.text, "\u{1F3B2} 5");
+        let spinning = map(&Directory::new(7_001), &dice_message(0)).expect("a roll still spinning maps");
+        assert_eq!(spinning.message.text, "\u{1F3B2}");
     }
 }

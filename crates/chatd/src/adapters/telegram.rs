@@ -1008,3 +1008,15 @@ pub fn prove_telegram_markers() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// The lab's telegram-dice driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_dice() -> Result<(), String> {
+    content::prove_dice_roll()?;
+    if send::dice_emoticon("\u{1F3B2}") != Some("\u{1F3B2}") {
+        return Err("a lone dice emoji is sent as a roll".into());
+    }
+    if send::dice_emoticon("\u{1F3B2} please").is_some() {
+        return Err("words around a dice emoji stay ordinary text".into());
+    }
+    Ok(())
+}

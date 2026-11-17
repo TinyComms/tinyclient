@@ -2328,6 +2328,10 @@ fn held_media(media: &tl::enums::InputMedia, id: i32) -> (String, tl::enums::Mes
             (kind, media)
         }
         tl::enums::InputMedia::Photo(one) => (if one.spoiler { "kept-photo+spoiler" } else { "kept-photo" }.to_owned(), photo(one.spoiler)),
+        tl::enums::InputMedia::Dice(one) => (
+            format!("dice:{}", one.emoticon),
+            tl::types::MessageMediaDice { value: 5, emoticon: one.emoticon.clone(), game_outcome: None }.into(),
+        ),
         tl::enums::InputMedia::Document(one) => match &one.id {
             tl::enums::InputDocument::Document(kept) if kept.id == 6_200 => ("gif".to_owned(), document_media(gif(6_200))),
             tl::enums::InputDocument::Document(kept) if kept.id >= 6_400 && kept.id < 6_500 => ("sticker".to_owned(), document_media(sticker(kept.id))),
