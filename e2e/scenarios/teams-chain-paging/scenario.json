@@ -1,0 +1,12 @@
+{
+  "id": "teams-chain-paging",
+  "title": "A Teams thread longer than one page still loads when scrolled",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same chain paging is what this desktop run checks.",
+    "ios": "The phone proof build does not run desktop chatd. The same chain paging is what this desktop run checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

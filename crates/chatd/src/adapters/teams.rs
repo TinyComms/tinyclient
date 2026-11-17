@@ -137,6 +137,11 @@ mod push;
 mod send;
 mod tree;
 
+/// The lab's teams-chain-paging driver. A build without this returns to the server and stays up.
+pub fn prove_chain_paging() -> Result<(), String> {
+    message::prove_chain_paging()
+}
+
 use super::net::{address, browser};
 use super::{keep_connected, serve_commands, Command, Context, Download, Failure, Refusal, Signed};
 use base64::Engine;
