@@ -160,6 +160,14 @@ fn main() -> ExitCode {
         println!("tinyclient {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
+    // The lab's save-downloads driver. A build without this opens the window below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("save-downloads") {
+        if let Err(err) = host::prove_save_downloads() {
+            eprintln!("save-downloads: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     // The lab's no-console driver. A build without this opens the window below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("no-console") {
         let swap = update::windows_swap_args(std::path::Path::new("apply.ps1"));

@@ -95,6 +95,8 @@ pub struct Viewer {
     dragged: bool,
     /// What the last save or copy said.
     note: Option<String>,
+    /// The file the last save wrote, so the note can show it in its folder.
+    saved: Option<PathBuf>,
     /// The sizes the original was asked to be decoded at, as `(path, edge)`: each goes once a
     /// larger or smaller one shows, and all of them when the viewer moves on or closes.
     decoded: Vec<(String, u32)>,
@@ -184,6 +186,7 @@ impl Pane {
             grab: None,
             dragged: false,
             note: None,
+            saved: None,
             decoded: Vec::new(),
         });
         self.hover = None;
@@ -228,6 +231,7 @@ impl Pane {
         viewer.zoom = None;
         viewer.pan = (0., 0.);
         viewer.note = None;
+        viewer.saved = None;
         cx.notify();
     }
 
@@ -277,6 +281,7 @@ impl Pane {
                 }
                 if let Some(viewer) = this.viewer.as_mut() {
                     viewer.note = Some(if read.is_some() { "Copied".to_owned() } else { "Couldn't copy this picture".to_owned() });
+                    viewer.saved = None;
                     cx.notify();
                 }
             });
@@ -292,39 +297,67 @@ impl Pane {
         let Some(from) = attachment.file.path.clone() else {
             return;
         };
-        // Only the last part of the name: a file is never written outside Downloads.
-        let name = attachment.name.rsplit(['/', '\\']).next().filter(|name| !name.is_empty()).unwrap_or("image").to_owned();
+        let name = media::disk_name(&attachment);
+        // Resolved here, on a thread that can ask the system. The copy itself is off this thread.
+        let Some(folder) = crate::host::downloads_dir() else {
+            self.note_save(None, cx);
+            return;
+        };
         cx.spawn(async move |this, cx| {
-            let saved = cx
-                .background_executor()
-                .spawn(async move {
-                    let folder = PathBuf::from(std::env::var_os("HOME")?).join("Downloads");
-                    let (stem, extension) = match name.rsplit_once('.') {
-                        Some((stem, extension)) => (stem.to_owned(), format!(".{extension}")),
-                        None => (name.clone(), String::new()),
-                    };
-                    let free = (1..100)
-                        .map(|n| if n == 1 { folder.join(&name) } else { folder.join(format!("{stem} {n}{extension}")) })
-                        .find(|path| !path.exists())?;
-                    std::fs::copy(from, &free).ok()?;
-                    // Marked as from the internet, so the system checks it when it is opened.
-                    if let Err(err) = protocol::quarantine::mark(&free) {
-                        tracing::warn!("tinyclient: a saved file was not marked as downloaded: {err}");
-                    }
-                    Some(free)
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if let Some(viewer) = this.viewer.as_mut() {
-                    viewer.note = Some(match &saved {
-                        Some(_) => "Saved to Downloads".to_owned(),
-                        None => "Couldn't save to Downloads".to_owned(),
-                    });
-                    cx.notify();
-                }
-            });
+            let saved = cx.background_executor().spawn(async move { crate::host::save_into(&folder, &name, std::path::Path::new(&from)) }).await;
+            let _ = this.update(cx, |this, cx| this.note_save(saved, cx));
         })
         .detach();
+    }
+
+    /// Asks where to put the original, then copies it there.
+    fn save_viewed_as(&mut self, cx: &mut Context<Self>) {
+        let Some((_, attachment)) = self.viewed() else {
+            return;
+        };
+        let Some(from) = attachment.file.path.clone() else {
+            return;
+        };
+        self.save_attachment_as(from, media::disk_name(&attachment), cx);
+    }
+
+    /// "Save as…" for a file already on disk: the viewer, or a file attachment's menu.
+    pub(super) fn save_attachment_as(&mut self, from: String, name: String, cx: &mut Context<Self>) {
+        let start = crate::host::downloads_or_home();
+        let asked = cx.prompt_for_new_path(&start, Some(&name));
+        cx.spawn(async move |this, cx| {
+            let selected = asked.await;
+            let Ok(Ok(Some(path))) = selected else {
+                return;
+            };
+            let saved = cx.background_executor().spawn(async move { crate::host::copy_downloaded(std::path::Path::new(&from), &path).ok() }).await;
+            let _ = this.update(cx, |this, cx| this.note_save(saved, cx));
+        })
+        .detach();
+    }
+
+    /// The viewer's note after a save. With no viewer open, the window's toast offers the folder.
+    fn note_save(&mut self, saved: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.viewer.is_none() {
+            let _ = self.shell.update(cx, |shell, cx| match saved {
+                Some(path) => shell.toast_reveal(path, cx),
+                None => shell.toast(Some(("icons/circle-alert.svg", theme::danger())), crate::host::COULD_NOT_SAVE, cx),
+            });
+            return;
+        }
+        if let Some(viewer) = self.viewer.as_mut() {
+            match saved {
+                Some(path) => {
+                    viewer.note = Some(crate::host::SAVED_DOWNLOADS.to_owned());
+                    viewer.saved = Some(path);
+                }
+                None => {
+                    viewer.note = Some(crate::host::COULD_NOT_SAVE.to_owned());
+                    viewer.saved = None;
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn open_viewed(&mut self, preview: bool, cx: &mut Context<Self>) {
@@ -382,6 +415,7 @@ impl Pane {
             ("=" | "+", _) => self.zoom_step(true, fit, cx),
             ("-", _) => self.zoom_step(false, fit, cx),
             ("c", true) => self.copy_viewed(cx),
+            ("s", true) if keys.modifiers.shift => self.save_viewed_as(cx),
             ("s", true) => self.save_viewed(cx),
             ("space", false) | ("y", true) => self.open_viewed(false, cx),
             _ => return false,
@@ -391,7 +425,7 @@ impl Pane {
 
     pub(super) fn viewer_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (message, attachment) = self.viewed()?;
-        let (asked, pan, note) = self.viewer.as_ref().map(|viewer| (viewer.zoom, viewer.pan, viewer.note.clone()))?;
+        let (asked, pan, note, saved) = self.viewer.as_ref().map(|viewer| (viewer.zoom, viewer.pan, viewer.note.clone(), viewer.saved.clone()))?;
         let pictures = self.pictures();
         let at = pictures.iter().position(|(held, ix)| held.id == message.id && Some(*ix) == self.viewer.as_ref().map(|v| v.attachment));
         let size = window.viewport_size();
@@ -570,7 +604,21 @@ impl Pane {
             .children(said.map(|said| {
                 div().max_w_full().when(!phone, |line| line.truncate()).when(phone, |line| line.line_clamp(2).text_center()).text_color(theme::text()).child(said)
             }))
-            .children(note.map(|note| div().text_color(theme::accent_text()).child(note)));
+            .children(note.map(|note| {
+                let line = div().id("viewer-note").text_color(theme::accent_text());
+                match saved.clone() {
+                    Some(path) => line
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.reveal_path(&path);
+                        }))
+                        .child(crate::host::offer_reveal(&note))
+                        .into_any_element(),
+                    None => line.child(note).into_any_element(),
+                }
+            }));
 
         let layer = div()
             .id("viewer")
@@ -702,13 +750,18 @@ impl Pane {
                     .on_click(cx.listener(|this, _, _, cx| this.save_viewed(cx))),
             )
             .child(
+                bar_button("save-as", Icon::Folder)
+                    .tooltip(tip("Save as…", Some("⇧⌘S")))
+                    .on_click(cx.listener(|this, _, _, cx| this.save_viewed_as(cx))),
+            )
+            .child(
                 bar_button("look", Icon::Eye)
-                    .tooltip(tip("Quick Look", Some("Space")))
+                    .tooltip(tip(crate::host::QUICK_LOOK, Some("Space")))
                     .on_click(cx.listener(|this, _, _, cx| this.open_viewed(false, cx))),
             )
             .child(
                 bar_button("preview", Icon::External)
-                    .tooltip(tip("Open in Preview", None))
+                    .tooltip(tip(crate::host::OPEN_PICTURE, None))
                     .on_click(cx.listener(|this, _, _, cx| this.open_viewed(true, cx))),
             )
             .child(

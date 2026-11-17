@@ -19,13 +19,7 @@ const FILE_NAME: &str = "tinyclient-backup.tnyb";
 
 /// Where the save dialog opens: Downloads, else home.
 fn start_folder() -> PathBuf {
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_default();
-    let downloads = home.join("Downloads");
-    if downloads.is_dir() {
-        downloads
-    } else {
-        home
-    }
+    crate::host::downloads_or_home()
 }
 
 /// What is wrong with the passphrase typed twice for a new backup, in words.

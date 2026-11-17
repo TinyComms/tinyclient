@@ -209,6 +209,8 @@ enum MenuAct {
     Edit,
     Link,
     Open,
+    /// A file attachment that is already on disk.
+    SaveAs,
     /// A sent message: ask, unless the click held Shift.
     Delete,
 }
@@ -222,6 +224,7 @@ fn menu_acts(
     adds: bool,
     has_text: bool,
     has_link: bool,
+    can_save: bool,
 ) -> Vec<MenuAct> {
     if can.unsent {
         let mut acts = Vec::new();
@@ -254,6 +257,9 @@ fn menu_acts(
     if has_link {
         acts.push(MenuAct::Link);
         acts.push(MenuAct::Open);
+    }
+    if can_save {
+        acts.push(MenuAct::SaveAs);
     }
     if can.delete {
         acts.push(MenuAct::Delete);
@@ -684,6 +690,7 @@ impl Pane {
             self.adds(message),
             !message.text.is_empty(),
             self.link_of(message, cx).is_some(),
+            self.saveable_file(message).is_some(),
         );
         let cursor = if acts.is_empty() {
             0
@@ -753,8 +760,24 @@ impl Pane {
                     cx.open_url(&link);
                 }
             }
+            MenuAct::SaveAs => {
+                if let Some((path, name)) = self.saveable_file(&message) {
+                    self.save_attachment_as(path, name, cx);
+                }
+            }
             MenuAct::Delete => self.delete(&message, at_once, window, cx),
         }
+    }
+
+    /// A file attachment already on disk, as `(path, name)`, for Save as….
+    fn saveable_file(&self, message: &Message) -> Option<(String, String)> {
+        message.attachments.iter().find_map(|attachment| {
+            if super::media::shape(attachment) != super::media::Shape::File {
+                return None;
+            }
+            let path = attachment.file.path.clone().or_else(|| self.known.get(&attachment.file.id).cloned())?;
+            Some((path, super::media::disk_name(attachment)))
+        })
     }
 
     /// Where a message leads in the network's own app.
@@ -885,6 +908,16 @@ impl Pane {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_menu(cx);
                             cx.open_url(&open);
+                        }))
+                        .into_any_element(),
+                );
+            }
+            if let Some((path, name)) = self.saveable_file(message) {
+                rows.push(
+                    row("sheet-save-as", "icons/folder-plus.svg", "Save as…".into(), false)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.save_attachment_as(path.clone(), name.clone(), cx);
                         }))
                         .into_any_element(),
                 );
@@ -1031,6 +1064,13 @@ impl Pane {
                     .child(menu_item("open-in", Some("icons/external-link.svg"), format!("Open in {network}"), None).when(lit(MenuAct::Open), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::Open
                     )));
+            }
+            if self.saveable_file(&message).is_some() {
+                items = items.child(
+                    menu_item("save-as", Some("icons/folder-plus.svg"), "Save as…", None)
+                        .when(lit(MenuAct::SaveAs), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::SaveAs)),
+                );
             }
             if can.delete {
                 items = items.child(menu_separator()).child(
@@ -1339,7 +1379,7 @@ mod tests {
         let said = Message::plain("1", "Mara", "hello", 1, false);
         let on = can(&said, Network::Discord, channel, false);
         assert_eq!(
-            menu_acts(on, false, 2, true, true, true),
+            menu_acts(on, false, 2, true, true, true, false),
             vec![
                 MenuAct::Quick(0),
                 MenuAct::Quick(1),
@@ -1357,8 +1397,12 @@ mod tests {
         };
         let failed = can(&mine, Network::Discord, channel, false);
         assert_eq!(
-            menu_acts(failed, true, 3, true, true, false),
+            menu_acts(failed, true, 3, true, true, false, true),
             vec![MenuAct::Retry, MenuAct::Copy, MenuAct::Drop]);
+        assert_eq!(
+            menu_acts(on, false, 0, false, false, false, true),
+            vec![MenuAct::Reply, MenuAct::Thread, MenuAct::SaveAs],
+        );
     }
 
     #[test]

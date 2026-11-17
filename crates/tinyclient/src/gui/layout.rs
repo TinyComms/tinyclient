@@ -137,7 +137,7 @@ pub enum Edge {
 }
 
 /// The toast on show: which one, its glyph and color, its words.
-type Toast = (u64, Option<(&'static str, Rgba)>, SharedString);
+type Toast = (u64, Option<(&'static str, Rgba)>, SharedString, Option<std::path::PathBuf>);
 
 pub struct State {
     pub sidebar_width: f32,
@@ -346,10 +346,19 @@ impl Shell {
         words: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
+        self.place_toast(icon, words, None, cx);
+    }
+
+    /// A save's confirmation: the same toast, and a click shows the file.
+    pub(super) fn toast_reveal(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        self.place_toast(Some(("icons/check.svg", super::theme::text_soft())), crate::host::offer_reveal(crate::host::SAVED_DOWNLOADS), Some(path), cx);
+    }
+
+    fn place_toast(&mut self, icon: Option<(&'static str, Rgba)>, words: impl Into<SharedString>, reveal: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
         let state = &mut self.layout_state;
         state.toasts += 1;
         let id = state.toasts;
-        state.toast = Some((id, icon, words.into()));
+        state.toast = Some((id, icon, words.into(), reveal));
         cx.notify();
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(4)).await;
@@ -1360,8 +1369,23 @@ impl Shell {
         let width = place::toast_width(window_width);
         let crash = self.crash_toast(width, cx);
         let update = self.update_toast(width, cx);
-        let toast = self.layout_state.toast.as_ref().map(|(id, icon, words)| {
-            fade_in(("toast", *id as usize), 160, toast(*icon, words.clone()).w(px(width))).into_any_element()
+        let toast = self.layout_state.toast.as_ref().map(|(id, icon, words, reveal)| {
+            let (id, icon, words) = (*id, *icon, words.clone());
+            match reveal.clone() {
+                Some(path) => {
+                    let body = toast(icon, words)
+                        .id(("toast-body", id as usize))
+                        .w(px(width))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.reveal_path(&path);
+                            this.layout_state.toast = None;
+                            cx.notify();
+                        }));
+                    fade_in(("toast", id as usize), 160, body).into_any_element()
+                }
+                None => fade_in(("toast", id as usize), 160, toast(icon, words).w(px(width))).into_any_element(),
+            }
         });
         if crash.is_none() && toast.is_none() && update.is_none() {
             return None;
