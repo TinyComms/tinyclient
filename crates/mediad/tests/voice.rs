@@ -20,7 +20,7 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::Aes256Gcm;
 use chacha20poly1305::XChaCha20Poly1305;
 use mediad::opus::{Decoder, Encoder, MAX_FRAME};
-use protocol::{read_frame, write_frame, AudioDevice, CallFailure, CallPath, Cue, Dave, MediaRequest, MediaResponse, Network, Tuning, VoiceJoin};
+use protocol::{read_frame, write_frame, AudioDevice, CallFailure, CallPath, Cue, Dave, MediaRequest, MediaResponse, Network, ShareQuality, Tuning, VoiceJoin};
 use serde_json::{json, Value};
 use native_tls::{Identity, TlsAcceptor, TlsStream};
 use std::io::{ErrorKind, Read, Write};
@@ -272,6 +272,8 @@ struct Fake {
     client: Option<SocketAddr>,
     mode: &'static str,
     counter: u32,
+    /// Video SSRC and its retransmission, put on Ready when a test wants opcode 12.
+    video: Option<(u32, u32)>,
 }
 
 /// The server's end of one websocket.
@@ -415,7 +417,7 @@ impl Fake {
         // socket "in an indeterminate state" (SO_RCVTIMEO), and a timeout as long as the gap between
         // packets loses one now and then: sent, and never heard, with the sequence one short.
         udp.set_nonblocking(true).unwrap();
-        Fake { listener, udp, client: None, mode: AES, counter: 0 }
+        Fake { listener, udp, client: None, mode: AES, counter: 0, video: None }
     }
 
     fn endpoint(&self) -> String {
@@ -481,7 +483,11 @@ impl Fake {
         assert!(identify.get("max_dave_protocol_version").is_some());
         peer.send(8, json!({ "v": 8, "heartbeat_interval": heartbeat_ms }));
         let port = self.udp.local_addr().unwrap().port();
-        peer.send(2, json!({ "ssrc": OUR_SSRC, "ip": "127.0.0.1", "port": port, "modes": offered, "experiments": [] }));
+        let mut ready = json!({ "ssrc": OUR_SSRC, "ip": "127.0.0.1", "port": port, "modes": offered, "experiments": [] });
+        if let Some((ssrc, rtx)) = self.video {
+            ready["streams"] = json!([{ "rid": "100", "ssrc": ssrc, "rtx_ssrc": rtx }]);
+        }
+        peer.send(2, ready);
 
         // Address discovery: 74 bytes, type 1, length 70, our SSRC. The answer is type 2.
         let mut request = [0u8; 128];
@@ -1462,6 +1468,40 @@ fn hang_up_while_still_connecting_exits_cleanly() {
     let (status, took) = mediad.hang_up();
     assert_eq!(status.code(), Some(0));
     assert!(took < Duration::from_secs(2), "{took:?}");
+}
+
+#[test]
+fn a_balanced_share_tells_the_voice_server_1080p_at_30_and_a_later_pick_is_told_again() {
+    let mut fake = Fake::new();
+    let mut mediad = Mediad::start("null", None);
+    // The voice call only has to exist, so a share is allowed. It is not readied, and sends no UDP.
+    mediad.join(&fake.endpoint(), NO_DAVE);
+    let voice = fake.accept();
+    let mut join = session(&fake.endpoint(), "session-1", "voice-token", NO_DAVE);
+    join.stream = true;
+    join.group_id = "899".into();
+    assert_eq!(mediad.ask(MediaRequest::Stream(join)), MediaResponse::Done);
+    fake.video = Some((7, 8));
+    let mut live = fake.accept();
+    fake.handshake_kind(&mut live, &[AES], 0, 30_000, Some("screen"));
+    assert_eq!(live.expect(15)["any"], 100);
+    let started = mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: Some(ShareQuality::Balanced) });
+    assert!(matches!(started, MediaResponse::Streams { .. }), "{started:?}");
+    let told = live.expect(12);
+    assert_eq!(told["streams"][0]["max_resolution"]["width"], 1920);
+    assert_eq!(told["streams"][0]["max_resolution"]["height"], 1080);
+    assert_eq!(told["streams"][0]["max_framerate"], 30);
+    assert_eq!(told["streams"][0]["max_bitrate"], 4_000_000);
+    let again = mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: Some(ShareQuality::Low) });
+    assert!(matches!(again, MediaResponse::Streams { .. }), "{again:?}");
+    let told = live.expect(12);
+    assert_eq!(told["streams"][0]["max_resolution"]["width"], 1280);
+    assert_eq!(told["streams"][0]["max_resolution"]["height"], 720);
+    assert_eq!(told["streams"][0]["max_framerate"], 15);
+    assert_eq!(told["streams"][0]["max_bitrate"], 1_500_000);
+    drop(voice);
+    assert_eq!(mediad.ask(MediaRequest::StreamStop { watch: false }), MediaResponse::Done);
+    assert_eq!(mediad.hang_up().0.code(), Some(0));
 }
 
 #[test]
