@@ -820,8 +820,9 @@ fn plain(text: &tl::enums::TextWithEntities) -> &str {
 }
 
 /// A checklist as text. The title is an ordinary line. Each item is a list line, checked
-/// when a completion names its id. Read-only: ticking stays in Telegram.
-fn checklist(media: &tl::types::MessageMediaToDo) -> (String, Vec<Span>) {
+/// when a completion names its id. Ticking stays in Telegram, so the last line is `link`
+/// (the same address the old box opened) and the row can still reach that message.
+fn checklist(media: &tl::types::MessageMediaToDo, link: &str) -> (String, Vec<Span>) {
     let tl::enums::TodoList::List(list) = &media.todo;
     let done = |id: i32| {
         media.completions.as_ref().is_some_and(|all| {
@@ -844,6 +845,14 @@ fn checklist(media: &tl::types::MessageMediaToDo) -> (String, Vec<Span>) {
         text.push(' ');
         text.push_str(plain(&item.title));
         spans.push(Span { start, end: text.len() as u32, style: Style::ListItem { ordered: false, depth: 0 } });
+    }
+    if !link.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        let start = text.len() as u32;
+        text.push_str("Open in Telegram");
+        spans.push(Span { start, end: text.len() as u32, style: Style::Link { url: link.to_owned() } });
     }
     (text, spans)
 }
@@ -1444,7 +1453,8 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 }
                 // The title, then each item on its own list line. A done item is checked.
                 Some(MessageMedia::ToDo(media)) => {
-                    let (text, spans) = checklist(media);
+                    let link = message_link(peer, dir.get(peer), raw.id);
+                    let (text, spans) = checklist(media, &link);
                     message.text = text;
                     message.spans = spans;
                 }
@@ -1601,7 +1611,7 @@ pub(super) fn prove_checklist() -> Result<(), String> {
     if mapped.message.kind != MessageKind::Normal {
         return Err("a checklist is the list, not a box that opens Telegram".into());
     }
-    let text = "Packing\n\u{2610} Passport\n\u{2611} Tickets\n\u{2610} Charger";
+    let text = "Packing\n\u{2610} Passport\n\u{2611} Tickets\n\u{2610} Charger\nOpen in Telegram";
     if mapped.message.text != text {
         return Err(format!("a three-item list with one done reads as the items, got {}", mapped.message.text));
     }
@@ -1609,13 +1619,19 @@ pub(super) fn prove_checklist() -> Result<(), String> {
         let start = text.find(line).ok_or("the item is in the text")? as u32;
         Ok::<Span, &str>(Span { start, end: start + line.len() as u32, style: Style::ListItem { ordered: false, depth: 0 } })
     };
-    let expected = vec![
+    let open = text.rfind("Open in Telegram").ok_or("the open link is in the text")? as u32;
+    let mut expected = vec![
         item("\u{2610} Passport").map_err(str::to_owned)?,
         item("\u{2611} Tickets").map_err(str::to_owned)?,
         item("\u{2610} Charger").map_err(str::to_owned)?,
     ];
+    expected.push(Span {
+        start: open,
+        end: text.len() as u32,
+        style: Style::Link { url: "tg://openmessage?user_id=7002&message_id=7".into() },
+    });
     if mapped.message.spans != expected {
-        return Err("each item is its own list line, and the done one is checked".into());
+        return Err("each item is its own list line, the done one is checked, and the message link is on the list".into());
     }
     Ok(())
 }
