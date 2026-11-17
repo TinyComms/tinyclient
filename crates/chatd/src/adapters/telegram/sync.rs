@@ -1100,24 +1100,28 @@ pub(super) enum Around<'a> {
     At(&'a str),
 }
 
-/// Fills in what a reply answers from what is already known: the same page, or the store.
-fn quote(account: &Account, conversation: &str, page: &HashMap<i32, (String, String, String)>, reply: i32) -> ReplyTo {
-    let id = reply.to_string();
-    let known = page.get(&reply).cloned().or_else(|| {
-        let stored = account.ctx.stored_message(conversation, &id).ok().flatten()?;
+/// The answered message when it is already known: the same page, or the store.
+fn known_reply(account: &Account, conversation: &str, page: &HashMap<i32, (String, String, String)>, reply: i32) -> Option<(String, String, String)> {
+    page.get(&reply).cloned().or_else(|| {
+        let stored = account.ctx.stored_message(conversation, &reply.to_string()).ok().flatten()?;
         Some((stored.sender.id, stored.sender.name, stored.text))
-    });
-    match known {
-        Some((person, sender, text)) => ReplyTo {
-            id,
-            sender,
-            snippet: text.chars().take(120).collect(),
-            person: (!person.is_empty()).then(|| account.ctx.key(&person)),
-            deleted: false,
-        },
-        // Not on this page and never stored: the row says who and what once it is.
-        None => ReplyTo { id, sender: String::new(), snippet: String::new(), person: None, deleted: false },
+    })
+}
+
+/// The reply line, including a partial quote or a reply that points at another chat.
+fn reply_line(account: &Account, conversation: &str, page: &HashMap<i32, (String, String, String)>, reply: i32, note: Option<&content::ReplyNote>) -> ReplyTo {
+    let elsewhere = note.is_some_and(|note| note.elsewhere);
+    let known = if elsewhere { None } else { known_reply(account, conversation, page, reply) };
+    let mut line = content::line_for(reply, known.as_ref(), note);
+    let person = if elsewhere {
+        note.and_then(|note| (!note.author_id.is_empty()).then(|| note.author_id.clone()))
+    } else {
+        known.and_then(|(person, _, _)| (!person.is_empty()).then_some(person))
+    };
+    if let Some(person) = person {
+        line.person = Some(account.ctx.key(&person));
     }
+    line
 }
 
 /// Where a message belongs: its chat, in a forum the thread of its topic, and in a
@@ -1140,8 +1144,10 @@ pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped,
         // answering another comment in the thread names that one.
         let anchor = account.live().discussion.iter().any(|(held, _, echo)| *held == conversation && *echo == reply);
         if !anchor {
-            mapped.message.reply_to = Some(quote(account, conversation, page, reply));
+            mapped.message.reply_to = Some(reply_line(account, conversation, page, reply, mapped.reply_note.as_ref()));
         }
+    } else if mapped.reply_note.as_ref().is_some_and(|note| note.story) {
+        mapped.message.reply_to = Some(reply_line(account, conversation, page, 0, mapped.reply_note.as_ref()));
     }
     // A pin names the message it points at. The words are filled once that message is known.
     content::quote_pin(&mut mapped.message);

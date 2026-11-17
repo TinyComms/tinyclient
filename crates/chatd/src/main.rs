@@ -389,6 +389,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-custom-emoji:0");
         return Ok(());
     }
+    // The lab's telegram-quote driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-quote") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_quote() {
+            eprintln!("telegram-quote: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-quote:0");
+        return Ok(());
+    }
     // The lab's telegram-dice driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-dice") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_dice() {

@@ -443,7 +443,7 @@ pub(super) fn sent(account: &Account, conversation: &str, who: Who, text: &str, 
         let me = Who::User(account.me);
         message.sender = protocol::Sender { id: me.text(), name: account.dir().name(me), ..protocol::Sender::default() };
         message.spans = content::spans(text, short.entities.as_deref().unwrap_or(&[]));
-        let mut mapped = Mapped { peer: who, id: short.id, topic: None, discussion_top: None, reply, message, wants: Vec::new() };
+        let mut mapped = Mapped { peer: who, id: short.id, topic: None, discussion_top: None, reply, reply_note: None, message, wants: Vec::new() };
         finish(account, conversation, &mut mapped, &HashMap::new());
         return Some(mapped.message);
     }

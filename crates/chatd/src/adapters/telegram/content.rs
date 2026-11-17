@@ -5,7 +5,7 @@
 use super::peers::{is_replies, message_link, thread_id, Directory, Who};
 use grammers_tl_types as tl;
 use protocol::{
-    Attachment, Card, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview, Reaction, Sender, Span,
+    Attachment, Card, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview, Reaction, ReplyTo, Sender, Span,
     Style, ThreadSummary,
 };
 use tl::enums::{DocumentAttribute, MessageAction, MessageEntity, MessageMedia, PhotoSize};
@@ -29,6 +29,24 @@ pub struct Want {
     pub original: bool,
 }
 
+/// What a reply header says besides the id of the message it answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ReplyNote {
+    /// The part that was quoted. Empty when Telegram did not send the words.
+    pub quote: String,
+    /// Who wrote it, when the header names them.
+    pub author: String,
+    /// `u<id>` when that author is a user. Empty when the name is all Telegram sent.
+    pub author_id: String,
+    /// The answered message is in another chat, so an id in this one is a different message.
+    pub elsewhere: bool,
+    /// The other chat's name, when the directory knows it.
+    pub place: String,
+    /// A reply to a story. The line says "Story" and [`ReplyNote::story_id`] is what it points at.
+    pub story: bool,
+    pub story_id: i32,
+}
+
 pub struct Mapped {
     pub peer: Who,
     pub id: i32,
@@ -38,6 +56,8 @@ pub struct Mapped {
     pub discussion_top: Option<i32>,
     /// The message it answers, when it is a reply and not just a post in a topic.
     pub reply: Option<i32>,
+    /// A partial quote, a reply in another chat, or a reply to a story.
+    pub reply_note: Option<ReplyNote>,
     pub message: Message,
     /// What it shows inline (thumbnails and stills), and the originals of its pictures, which
     /// are only fetched when the viewer asks.
@@ -1213,6 +1233,7 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 topic,
                 discussion_top: None,
                 reply: pin.then_some(reply).flatten(),
+                reply_note: None,
                 message,
                 wants: Vec::new(),
             })
@@ -1331,17 +1352,122 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 Some(tl::enums::MessageReplyHeader::Header(header)) if !header.forum_topic => header.reply_to_top_id,
                 _ => None,
             };
+            let reply_note = if replies { None } else { reply_note(dir, peer, raw.reply_to.as_ref()) };
             Some(Mapped {
                 peer,
                 id: raw.id,
                 topic,
                 discussion_top,
                 reply: if replies { None } else { reply },
+                reply_note,
                 message,
                 wants,
             })
         }
     }
+}
+
+fn user_id(who: Who) -> String {
+    match who {
+        Who::User(_) => who.text(),
+        _ => String::new(),
+    }
+}
+
+fn reply_author(dir: &Directory, header: &tl::enums::MessageFwdHeader) -> (String, String) {
+    let tl::enums::MessageFwdHeader::Header(header) = header;
+    let id = header.from_id.as_ref().map(Who::of).map(user_id).unwrap_or_default();
+    if let Some(name) = header.from_name.as_ref().filter(|name| !name.is_empty()) {
+        return (name.clone(), id);
+    }
+    if let Some(who) = header.from_id.as_ref().map(Who::of) {
+        let name = dir.name(who);
+        if name != "Unknown" {
+            return (name, id);
+        }
+        if let Some(author) = header.post_author.as_ref().filter(|name| !name.is_empty()) {
+            return (author.clone(), id);
+        }
+        return (String::new(), id);
+    }
+    if let Some(author) = header.post_author.as_ref().filter(|name| !name.is_empty()) {
+        return (author.clone(), String::new());
+    }
+    (String::new(), String::new())
+}
+
+/// The quote, the other chat, or the story a reply header names. `None` when the line is
+/// just the answered message in this chat.
+fn reply_note(dir: &Directory, peer: Who, header: Option<&tl::enums::MessageReplyHeader>) -> Option<ReplyNote> {
+    match header? {
+        tl::enums::MessageReplyHeader::Header(header) => {
+            let quote = header.quote_text.clone().filter(|text| text.chars().any(|c| !c.is_whitespace())).unwrap_or_default();
+            let other = header.reply_to_peer_id.as_ref().map(Who::of).filter(|who| *who != peer);
+            let (author, author_id) = header.reply_from.as_ref().map(|from| reply_author(dir, from)).unwrap_or_default();
+            let place = other
+                .map(|who| {
+                    let name = dir.name(who);
+                    if name == "Unknown" { String::new() } else { name }
+                })
+                .unwrap_or_default();
+            let elsewhere = other.is_some();
+            if quote.is_empty() && author.is_empty() && !elsewhere {
+                return None;
+            }
+            Some(ReplyNote { quote, author, author_id, elsewhere, place, story: false, story_id: 0 })
+        }
+        tl::enums::MessageReplyHeader::MessageReplyStoryHeader(story) => {
+            let who = Who::of(&story.peer);
+            let name = dir.name(who);
+            let author = if name == "Unknown" { String::new() } else { name };
+            Some(ReplyNote {
+                quote: String::new(),
+                author,
+                author_id: user_id(who),
+                elsewhere: who != peer,
+                place: String::new(),
+                story: true,
+                story_id: story.story_id,
+            })
+        }
+    }
+}
+
+/// The reply line. `known` is the answered message in this chat: its sender id, name, and text.
+/// A partial quote replaces the start of that text. A reply in another chat does not use it.
+pub(super) fn line_for(reply: i32, known: Option<&(String, String, String)>, note: Option<&ReplyNote>) -> ReplyTo {
+    let elsewhere = note.is_some_and(|note| note.elsewhere);
+    let story_id = note.and_then(|note| note.story.then_some(note.story_id));
+    let id = story_id.map(|id| id.to_string()).unwrap_or_else(|| reply.to_string());
+    let mut line = match known.filter(|_| !elsewhere && story_id.is_none()) {
+        Some((_, sender, text)) => ReplyTo {
+            id,
+            sender: sender.clone(),
+            snippet: text.chars().take(120).collect(),
+            person: None,
+            deleted: false,
+        },
+        None => ReplyTo { id, sender: String::new(), snippet: String::new(), person: None, deleted: false },
+    };
+    let Some(note) = note else {
+        return line;
+    };
+    if note.story {
+        line.snippet = "Story".to_owned();
+        if !note.author.is_empty() {
+            line.sender = note.author.clone();
+        }
+        return line;
+    }
+    if !note.quote.is_empty() {
+        line.snippet = note.quote.chars().take(120).collect();
+    } else if note.elsewhere {
+        line.snippet = if note.place.is_empty() { "Another chat".to_owned() } else { format!("In {}", note.place) };
+    }
+    if (note.elsewhere || line.sender.is_empty()) && !note.author.is_empty() {
+        line.sender = note.author.clone();
+    }
+    line
 }
 
 /// The topic and the answered message a reply header names. In a forum a post that answers
@@ -1375,6 +1501,85 @@ pub(super) fn prove_dice_roll() -> Result<(), String> {
         return Err(format!("a dice of 5 reads as the emoji and the value, got {}", mapped.message.text));
     }
     Ok(())
+}
+
+/// The lab's telegram-quote check. A partial quote is the reply line, and a reply in another
+/// chat shows that quote rather than a message in this chat that happens to share the id.
+pub(super) fn prove_quote() -> Result<(), String> {
+    let dir = Directory::new(1);
+    let whole = "Meet at the gate and bring the rope tomorrow, then wait";
+    let known = ("u7002".to_owned(), "Bea".to_owned(), whole.to_owned());
+    let partial = map(&dir, &quote_message(Some("bring the rope"), None, None)).ok_or("a reply maps")?;
+    let line = line_for(4, Some(&known), partial.reply_note.as_ref());
+    if line.sender != "Bea" || line.snippet != "bring the rope" {
+        return Err(format!("a partial quote did not replace the message, got {} / {}", line.sender, line.snippet));
+    }
+    let cross = map(&dir, &quote_message(Some("only this part"), Some(Who::Channel(90).peer()), Some("Nia"))).ok_or("a cross-chat reply maps")?;
+    let line = line_for(4, Some(&known), cross.reply_note.as_ref());
+    if line.sender != "Nia" || line.snippet != "only this part" || line.snippet.contains("Meet at the gate") {
+        return Err(format!("a reply in another chat did not keep its quote, got {} / {}", line.sender, line.snippet));
+    }
+    let story = tl::types::MessageReplyStoryHeader { peer: Who::User(7_004).peer(), story_id: 15 }.into();
+    let told = map(&dir, &quote_message_header(story)).ok_or("a story reply maps")?;
+    let line = line_for(0, None, told.reply_note.as_ref());
+    if line.id != "15" || line.snippet != "Story" {
+        return Err(format!("a story reply was not named, got {} / {}", line.id, line.snippet));
+    }
+    Ok(())
+}
+
+fn quote_message(text: Option<&str>, peer: Option<tl::enums::Peer>, from_name: Option<&str>) -> tl::enums::Message {
+    let reply_from = from_name.map(|name| {
+        tl::types::MessageFwdHeader {
+            imported: false,
+            saved_out: false,
+            from_id: None,
+            from_name: Some(name.to_owned()),
+            date: 1_700_000_000,
+            channel_post: None,
+            post_author: None,
+            saved_from_peer: None,
+            saved_from_msg_id: None,
+            saved_from_id: None,
+            saved_from_name: None,
+            saved_date: None,
+            psa_type: None,
+        }
+        .into()
+    });
+    let header = tl::types::MessageReplyHeader {
+        reply_to_scheduled: false,
+        forum_topic: false,
+        quote: text.is_some(),
+        reply_to_ephemeral: false,
+        reply_to_msg_id: Some(4),
+        reply_to_peer_id: peer,
+        reply_from,
+        reply_media: None,
+        reply_to_top_id: None,
+        quote_text: text.map(str::to_owned),
+        quote_entities: None,
+        quote_offset: Some(9),
+        todo_item_id: None,
+        poll_option: None,
+    };
+    quote_message_header(header.into())
+}
+
+fn quote_message_header(reply_to: tl::enums::MessageReplyHeader) -> tl::enums::Message {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    9i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).expect("a blank message reads back");
+    message.message = "On my way".to_owned();
+    message.reply_to = Some(reply_to);
+    message.from_id = Some(Who::User(7_003).peer());
+    message.into()
 }
 
 /// The lab's telegram-service-lines check. A premium gift is named, a pin quotes the message
@@ -2025,5 +2230,86 @@ mod tests {
             }
             MessageKind::System | MessageKind::Normal => panic!("an unnamed action needs a link into Telegram"),
         }
+    }
+
+    fn text_message(text: &str, reply_to: Option<tl::enums::MessageReplyHeader>) -> tl::enums::Message {
+        use grammers_tl_types::{Deserializable, Serializable};
+        let mut bytes = Vec::new();
+        0u32.serialize(&mut bytes);
+        0u32.serialize(&mut bytes);
+        9i32.serialize(&mut bytes);
+        Who::User(7_002).peer().serialize(&mut bytes);
+        1_700_000_000i32.serialize(&mut bytes);
+        String::new().serialize(&mut bytes);
+        let mut message = tl::types::Message::from_bytes(&bytes).expect("a blank message reads back");
+        message.message = text.to_owned();
+        message.reply_to = reply_to;
+        message.from_id = Some(Who::User(7_003).peer());
+        message.into()
+    }
+
+    fn quoted(text: Option<&str>, peer: Option<tl::enums::Peer>, from_name: Option<&str>) -> tl::enums::MessageReplyHeader {
+        let reply_from = from_name.map(|name| {
+            tl::types::MessageFwdHeader {
+                imported: false,
+                saved_out: false,
+                from_id: None,
+                from_name: Some(name.to_owned()),
+                date: 1_700_000_000,
+                channel_post: None,
+                post_author: None,
+                saved_from_peer: None,
+                saved_from_msg_id: None,
+                saved_from_id: None,
+                saved_from_name: None,
+                saved_date: None,
+                psa_type: None,
+            }
+            .into()
+        });
+        tl::types::MessageReplyHeader {
+            reply_to_scheduled: false,
+            forum_topic: false,
+            quote: text.is_some(),
+            reply_to_ephemeral: false,
+            reply_to_msg_id: Some(4),
+            reply_to_peer_id: peer,
+            reply_from,
+            reply_media: None,
+            reply_to_top_id: None,
+            quote_text: text.map(str::to_owned),
+            quote_entities: None,
+            quote_offset: Some(9),
+            todo_item_id: None,
+            poll_option: None,
+        }
+        .into()
+    }
+
+    #[test]
+    fn a_partial_quote_is_the_reply_line_and_another_chat_keeps_its_own_words() {
+        let dir = Directory::new(1);
+        let whole = "Meet at the gate and bring the rope tomorrow, then wait";
+        let partial = map(&dir, &text_message("On my way", Some(quoted(Some("bring the rope"), None, None)))).expect("a reply maps");
+        let known = ("u7002".to_owned(), "Bea".to_owned(), whole.to_owned());
+        let line = line_for(4, Some(&known), partial.reply_note.as_ref());
+        assert_eq!(line.sender, "Bea");
+        assert_eq!(line.snippet, "bring the rope");
+        assert_ne!(line.snippet, whole.chars().take(120).collect::<String>());
+
+        let other = Who::Channel(90).peer();
+        let cross = map(&dir, &text_message("On my way", Some(quoted(Some("only this part"), Some(other), Some("Nia"))))).expect("a cross-chat reply maps");
+        let note = cross.reply_note.as_ref().expect("the header's quote is kept");
+        assert!(note.elsewhere);
+        let line = line_for(4, Some(&known), Some(note));
+        assert_eq!(line.sender, "Nia");
+        assert_eq!(line.snippet, "only this part");
+        assert!(!line.snippet.contains("Meet at the gate"));
+
+        let story = tl::types::MessageReplyStoryHeader { peer: Who::User(7_004).peer(), story_id: 15 }.into();
+        let told = map(&dir, &text_message("seen", Some(story))).expect("a story reply maps");
+        let line = line_for(0, None, told.reply_note.as_ref());
+        assert_eq!(line.id, "15");
+        assert_eq!(line.snippet, "Story");
     }
 }
