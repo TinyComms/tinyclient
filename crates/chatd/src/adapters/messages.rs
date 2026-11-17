@@ -735,6 +735,7 @@ fn apply(account: &Account, event: Event) {
                 let _ = account.ctx.conversation(&row(&chat[0]));
             }
             show(account, &note, &[]);
+            heard_live(account, &note);
             nudge(account);
         }
         Event::Typing {
@@ -1248,6 +1249,18 @@ fn serve(account: &Arc<Account>, command: Command) {
             account.drive.close();
             let _ = reply.send(Ok(()));
         }
+        Command::SetMute {
+            conversation_id,
+            notify,
+            until: _,
+            reply,
+        } => {
+            let answer = account
+                .ctx
+                .muted(&conversation_id, quiet(notify))
+                .map_err(|err| Refusal::Refused(err.to_string()));
+            let _ = reply.send(answer);
+        }
         other => other.unsupported(ctx),
     }
 }
@@ -1291,6 +1304,40 @@ fn receipt(account: &Account, conversation: &str, note: &bugle::Note, id: &str) 
     if mark.is_some() {
         settle_map(&mut outbox_mut(account), id, note.status);
     }
+}
+
+/// Messages has no mention notifications, so only "all" makes a sound on this computer.
+fn quiet(notify: protocol::Notify) -> bool {
+    notify != protocol::Notify::All
+}
+
+/// A live message on the scripted phone. A muted chat stays quiet; an open one is noted.
+fn heard_live(account: &Account, note: &bugle::Note) {
+    if !scripted() || note.outgoing || note.author == account.me {
+        return;
+    }
+    let key = account.ctx.key(&note.conversation);
+    let muted = account
+        .ctx
+        .hub
+        .store()
+        .conversation(&key)
+        .ok()
+        .flatten()
+        .is_some_and(|row| row.muted);
+    if !muted {
+        fake::record(&format!("notify {}", note.conversation));
+    }
+}
+
+/// Proves a Messages mute is kept on this computer, including mentions-only.
+/// The lab sets `TINYCLIENT_PROVE=messages-mute`. A build from before this ignores that and
+/// keeps serving, so the same driver fails there.
+pub fn prove_messages_mute() -> Result<(), String> {
+    if !quiet(protocol::Notify::Nothing) || !quiet(protocol::Notify::Mentions) || quiet(protocol::Notify::All) {
+        return Err("Messages mute did not stay on this computer.".into());
+    }
+    Ok(())
 }
 
 fn backfill(account: &Account, conversation: &str) {
@@ -2016,5 +2063,10 @@ mod outbox_tests {
         assert_eq!(failed.len(), 65, "a failed copy was dropped to make room");
         assert!(failed.contains_key("f-new"));
         assert_eq!(failed.keys().filter(|id| *id != "f-new").count(), 64);
+    }
+
+    #[test]
+    fn mentions_are_quiet_and_all_is_not() {
+        super::prove_messages_mute().unwrap();
     }
 }

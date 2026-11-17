@@ -4,8 +4,8 @@
 
 use protocol::{
     read_frame, write_frame, AccountKey, Change, ChatStream, ConversationKind, Encryption, Key,
-    Link, MediaKind, Message, MessageKind, Network, Outgoing, OutgoingFile, Page, ReactionSet,
-    Request, Response, SendState, SignInInput, SignInStep,
+    Link, MediaKind, Message, MessageKind, Network, Notify, Outgoing, OutgoingFile, Page,
+    ReactionSet, Request, Response, SendState, SignInInput, SignInStep,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -468,6 +468,59 @@ fn a_reaction_is_shown_and_one_we_send_is_asked_of_the_phone() {
         other => panic!("{other:?}"),
     }
     world.heard(&format!("react {} 😂 0", message.id));
+}
+
+#[test]
+fn a_muted_chat_records_no_notification_and_an_open_one_does() {
+    let world = World::linked();
+    world.connected();
+    assert_eq!(
+        world.ask(Request::SetMute {
+            conversation: key(GRACE),
+            notify: Notify::Nothing,
+            until: None,
+        }),
+        Response::Ok
+    );
+    assert!(world.conversation(GRACE).unwrap().muted);
+
+    world.steer("incoming grace still tuesday?");
+    world.arrived(GRACE, "still tuesday?");
+    assert_eq!(world.calls().iter().filter(|call| *call == &format!("notify {GRACE}")).count(), 0);
+
+    world.steer("group grace the cards");
+    world.arrived(CLUB, "the cards");
+    world.heard(&format!("notify {CLUB}"));
+
+    assert_eq!(
+        world.ask(Request::SetMute {
+            conversation: key(GRACE),
+            notify: Notify::All,
+            until: None,
+        }),
+        Response::Ok
+    );
+    assert!(!world.conversation(GRACE).unwrap().muted);
+    world.steer("incoming grace now it rings");
+    world.arrived(GRACE, "now it rings");
+    world.heard(&format!("notify {GRACE}"));
+
+    assert_eq!(
+        world.ask(Request::SetMute {
+            conversation: key(GRACE),
+            notify: Notify::Mentions,
+            until: None,
+        }),
+        Response::Ok
+    );
+    assert!(world.conversation(GRACE).unwrap().muted);
+    let before = world.calls().iter().filter(|call| *call == &format!("notify {GRACE}")).count();
+    world.steer("incoming grace mentions stay quiet");
+    world.arrived(GRACE, "mentions stay quiet");
+    assert_eq!(
+        world.calls().iter().filter(|call| *call == &format!("notify {GRACE}")).count(),
+        before
+    );
 }
 
 #[test]
