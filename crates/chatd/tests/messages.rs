@@ -1030,3 +1030,59 @@ fn two_auth_refusals_sign_out_and_one_does_not() {
         })
     });
 }
+
+#[test]
+fn a_failed_send_is_one_message_and_try_again_uses_the_phone_copy() {
+    let world = World::linked();
+    world.connected();
+    let pending = world.send(GRACE, "c-fail", "too big");
+    assert!(matches!(pending.state, SendState::Pending), "{pending:?}");
+    world.heard(&format!("send {GRACE} too big"));
+    world.until("the pending row", || {
+        world.messages(GRACE).into_iter().find(|message| message.id == "c-fail" && message.text == "too big")
+    });
+    world.steer("status 13");
+    let failed = world.until("the failure", || {
+        world.messages(GRACE).into_iter().find(|message| {
+            message.text == "too big" && matches!(message.state, SendState::Failed { .. })
+        })
+    });
+    assert_eq!(failed.id, "c-fail");
+    match &failed.state {
+        SendState::Failed { reason } => assert!(reason.contains("too large"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(world.messages(GRACE).iter().filter(|message| message.text == "too big").count(), 1);
+    let sends = world.calls().iter().filter(|call| call.starts_with("send ")).count();
+    match world.ask(Request::Retry { conversation: key(GRACE), client_id: "c-fail".into() }) {
+        Response::Sent { message } => assert!(matches!(message.state, SendState::Pending), "{message:?}"),
+        other => panic!("{other:?}"),
+    }
+    world.until("the phone copy is sent again", || {
+        world.calls().iter().any(|call| call.starts_with("resend phone-")).then_some(())
+    });
+    let calls = world.calls();
+    assert_eq!(calls.iter().filter(|call| call.starts_with("send ")).count(), sends);
+    assert_eq!(calls.iter().filter(|call| call.starts_with("resend ")).count(), 1);
+
+    world.send(GRACE, "c-wait", "on its way");
+    world.heard(&format!("send {GRACE} on its way"));
+    world.until("the waiting row", || world.messages(GRACE).into_iter().find(|message| message.id == "c-wait"));
+    world.steer("status 5");
+    world.until("still sending", || {
+        world.messages(GRACE).into_iter().find(|message| {
+            message.id == "c-wait" && matches!(message.state, SendState::Pending)
+        })
+    });
+    world.steer("status 8");
+    let quiet = world.until("no service", || {
+        world.messages(GRACE).into_iter().find(|message| {
+            message.id == "c-wait" && matches!(message.state, SendState::Failed { .. })
+        })
+    });
+    match quiet.state {
+        SendState::Failed { reason } => assert!(reason.contains("No service"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(world.messages(GRACE).iter().filter(|message| message.id == "c-wait").count(), 1);
+}

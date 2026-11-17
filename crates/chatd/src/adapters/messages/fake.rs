@@ -5,11 +5,11 @@
 //! `incoming WHO TEXT…`, `group WHO TEXT…`, `photo WHO`, `caption WHO TEXT…`,
 //! `file WHO NAME`, `remote WHO`, `react WHO TEXT`, `quote WHO ID TEXT…`,
 //! `typing WHO`, `typing-stop WHO`,
-//! `refuse WORDS…`, `drop`, `unlinked`, `silent`, `answer`,
+//! `refuse WORDS…`, `status CODE`, `drop`, `unlinked`, `silent`, `answer`,
 //! `revoke`, `revoke-offline`, `auth`.
 //! `silent` makes the phone stop answering sends, history, and files. `answer` clears that
 //! and tells the adapter the phone is back.
-//! WHO is `grace` or `alan`.
+//! WHO is `grace` or `alan`. `status` reports that code on the last text this computer sent.
 
 use super::{Drive, Event, Saved};
 use crate::adapters::messages::bugle::{Chat, Mark, Note, Piece, MESSAGE_PAGE, PHONE_QUIET, UNPAIRED};
@@ -27,6 +27,14 @@ pub const CLUB: &str = "phone-club";
 pub const GRACE_PARTICIPANT: &str = "participant-grace";
 pub const EMOJI: &str = "🐢";
 pub const EMOJI_AGAIN: &str = "🐈";
+
+#[derive(Clone)]
+struct SentCopy {
+    conversation: String,
+    text: String,
+    relay_id: String,
+    phone_id: String,
+}
 
 fn record(line: &str) {
     let path = protocol::support_dir().join("messages.calls");
@@ -47,6 +55,7 @@ pub struct Fake {
     /// Set by `silent`, cleared by `answer`. Requests fail at once and are not recorded.
     quiet: Arc<AtomicBool>,
     sent: AtomicU32,
+    last: Arc<Mutex<Option<SentCopy>>>,
 }
 
 impl Fake {
@@ -64,6 +73,7 @@ impl Fake {
                 refuse: Arc::default(),
                 quiet: Arc::default(),
                 sent: AtomicU32::new(0),
+                last: Arc::default(),
             };
         }
         let (events, heard) = channel();
@@ -99,12 +109,14 @@ impl Fake {
             refuse: Arc::default(),
             quiet: Arc::default(),
             sent: AtomicU32::new(0),
+            last: Arc::default(),
         };
-        let (events, closed, refuse, quiet) = (
+        let (events, closed, refuse, quiet, last) = (
             fake.events.clone(),
             fake.closed.clone(),
             fake.refuse.clone(),
             fake.quiet.clone(),
+            fake.last.clone(),
         );
         let control = script::control("messages.ctl");
         let _ = std::thread::Builder::new()
@@ -137,6 +149,29 @@ impl Fake {
                         let _ = events.send(Event::PhoneBack);
                         return true;
                     }
+                    if let Some(code) = line.strip_prefix("status ") {
+                        let code = code.split_whitespace().next().unwrap_or("").parse::<u64>().unwrap_or(0);
+                        if let Some(sent) = last.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() {
+                            let mut spoken = note(
+                                ME,
+                                "Ada Quill",
+                                &sent.conversation,
+                                &sent.phone_id,
+                                &sent.text,
+                                false,
+                                Vec::new(),
+                                Vec::new(),
+                            );
+                            spoken.outgoing = true;
+                            spoken.tmp = sent.relay_id;
+                            spoken.status = code;
+                            // The phone's clock, not the fixture stamp: a text still sending must
+                            // not look an hour old and be failed for silence.
+                            spoken.sent = crate::hub::now();
+                            let _ = events.send(Event::Message(spoken));
+                        }
+                        return true;
+                    }
                     for event in steer(line) {
                         let _ = events.send(event);
                     }
@@ -144,6 +179,19 @@ impl Fake {
                 });
             });
         fake
+    }
+
+    fn remember(&self, conversation: &str, text: &str) -> String {
+        let n = self.sent.fetch_add(1, Ordering::Relaxed) + 1;
+        let relay_id = format!("relay-{n}");
+        let phone_id = format!("phone-{n}");
+        *self.last.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SentCopy {
+            conversation: conversation.to_owned(),
+            text: text.to_owned(),
+            relay_id: relay_id.clone(),
+            phone_id,
+        });
+        relay_id
     }
 
     /// The phone did not answer. The call is not recorded, so a test can see it was not asked.
@@ -213,6 +261,8 @@ fn note(
         pieces,
         reactions,
         status: 0,
+        tmp: String::new(),
+        detail: String::new(),
         wire: 0,
         phones: None,
         reply: String::new(),
@@ -478,17 +528,24 @@ impl Drive for Fake {
     fn inbox_continues(&self) -> bool {
         false
     }
-    fn send(&self, conversation: &str, text: &str, reply: Option<&str>) -> Result<String, String> {
+    fn send(
+        &self,
+        conversation: &str,
+        text: &str,
+        reply: Option<&str>,
+        noted: &mut dyn FnMut(&str),
+    ) -> Result<String, String> {
         self.unanswered()?;
         if let Some(words) = self.refusal() {
             return Err(words);
         }
+        let relay_id = self.remember(conversation, text);
+        noted(&relay_id);
         record(&format!("send {conversation} {text}"));
         if let Some(id) = reply.filter(|id| !id.is_empty()) {
             record(&format!("reply {conversation} {id}"));
         }
-        let n = self.sent.fetch_add(1, Ordering::Relaxed);
-        Ok(format!("sent-{conversation}-{n}"))
+        Ok(relay_id)
     }
     fn send_file(
         &self,
@@ -497,12 +554,15 @@ impl Drive for Fake {
         path: &str,
         name: &str,
         reply: Option<&str>,
+        noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
         self.unanswered()?;
         if let Some(words) = self.refusal() {
             return Err(words);
         }
         let bytes = std::fs::read(path).map_err(|_| format!("Messages couldn't read {name}."))?;
+        let relay_id = self.remember(conversation, caption);
+        noted(&relay_id);
         record(&format!(
             "file {conversation} {name} {} {caption}",
             bytes.len()
@@ -510,8 +570,15 @@ impl Drive for Fake {
         if let Some(id) = reply.filter(|id| !id.is_empty()) {
             record(&format!("reply {conversation} {id}"));
         }
-        let n = self.sent.fetch_add(1, Ordering::Relaxed);
-        Ok(format!("sent-file-{conversation}-{n}"))
+        Ok(relay_id)
+    }
+    fn resend(&self, message: &str) -> Result<(), String> {
+        self.unanswered()?;
+        if let Some(words) = self.refusal() {
+            return Err(words);
+        }
+        record(&format!("resend {message}"));
+        Ok(())
     }
     fn react(&self, message: &str, emoji: &str, on: bool) -> Result<(), String> {
         if let Some(words) = self
