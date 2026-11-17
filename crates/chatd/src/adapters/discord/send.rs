@@ -7,7 +7,7 @@
 //! message then names the uploaded files. A cancelled send deletes what it already uploaded.
 
 use super::model::Posted;
-use super::{Discord, LONGEST};
+use super::Discord;
 use crate::blobs::upload::{Target, Upload};
 use protocol::{CatalogKind, Message, Outgoing};
 use serde::Deserialize;
@@ -44,9 +44,8 @@ impl Discord {
     /// the files and ends the send through `Context::sent`.
     pub(super) fn send_with(&self, channel: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &Outgoing, up: &mut Upload) -> Result<Message, String> {
         let premium = self.state.lock().unwrap().premium;
-        let longest = if premium == 2 { 2 * LONGEST } else { LONGEST };
-        if text.chars().count() > longest {
-            return Err(format!("Message too long: Discord allows {longest} characters."));
+        if let Some(why) = super::too_long(premium, text) {
+            return Err(why);
         }
         if with.schedule.is_some() {
             return Err("Discord cannot schedule a message.".to_owned());

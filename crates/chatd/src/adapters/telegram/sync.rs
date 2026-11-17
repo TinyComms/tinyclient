@@ -325,6 +325,7 @@ fn capabilities(premium: bool) -> Capabilities {
         schedule: true,
         suppress_embeds: true,
         reply_ping: false,
+        text_limit: 0,
         // Telegram lets a message be edited for 48 hours (unverified for every chat kind).
         edit_window: 48 * 3_600,
         file_scan: false,

@@ -33,6 +33,7 @@ mod complete;
 mod controls;
 pub(super) mod edit;
 mod hold;
+mod length;
 mod mention;
 mod niceties;
 mod rec;
@@ -859,6 +860,11 @@ impl Composer {
             return;
         }
         let network = target.key.network;
+        let emoticons = super::app::prefs::choices().emoticons;
+        let wired = length::wire_text(&field, &self.tokens, network, emoticons);
+        let Some(as_file) = self.stage_over_limit(&field, &wired, &target, cx) else {
+            return;
+        };
         let confirmed = self.armed.as_ref().is_some_and(|armed| *armed == field);
         // A role or user group reaches people no count here says: it always asks first.
         let mut roles: Vec<String> = Vec::new();
@@ -867,8 +873,8 @@ impl Composer {
                 roles.push(token.label.clone());
             }
         }
-        let broadcast = niceties::broadcast(&field, network).is_some();
-        if !confirmed && (broadcast || !roles.is_empty()) {
+        let broadcast = !as_file && niceties::broadcast(&field, network).is_some();
+        if !as_file && !confirmed && (broadcast || !roles.is_empty()) {
             let count = match (broadcast, self.counts.get(&target.key).copied()) {
                 (false, _) => None,
                 (true, None) => {
@@ -897,10 +903,14 @@ impl Composer {
             pick: None,
             schedule: None,
         };
-        let (mut shown, mut wire) = (field.trim().to_owned(), mention::wire(&field, &self.tokens, network).trim().to_owned());
-        if super::app::prefs::choices().emoticons {
-            (shown, wire) = (niceties::emoticons(&shown), niceties::emoticons(&wire));
-        }
+        let (shown, wire) = match as_file {
+            true => (String::new(), String::new()),
+            false => {
+                let shown = field.trim().to_owned();
+                let shown = if emoticons { niceties::emoticons(&shown) } else { shown };
+                (shown, wired)
+            }
+        };
         let out = Outgoing {
             key: target.key.clone(),
             shown,
@@ -1006,6 +1016,51 @@ impl Composer {
         self.armed = Some(field);
         self.caption = Some((words, Tone::Warning));
         cx.notify();
+    }
+
+    /// `None` when this Return only offered to send the text as a file, or that file could not
+    /// be written. `Some(true)` when message.txt is in the tray and the body should go out empty.
+    fn stage_over_limit(&mut self, field: &str, wired: &str, target: &Target, cx: &mut Context<Self>) -> Option<bool> {
+        let counted = wired.chars().count();
+        if !length::over(counted, target.can.text_limit) {
+            return Some(false);
+        }
+        if self.armed.as_ref().is_some_and(|armed| armed == field) {
+            match self.message_file(wired, &target.can, target.key.network) {
+                Some(chip) => {
+                    self.tray.push(chip);
+                    self.armed = None;
+                    Some(true)
+                }
+                None => {
+                    self.caption = Some(("Could not write message.txt.".to_owned(), Tone::Refused));
+                    cx.notify();
+                    None
+                }
+            }
+        } else {
+            self.arm(field.to_owned(), length::line(counted, target.can.text_limit).unwrap_or_default(), cx);
+            None
+        }
+    }
+
+    /// The wire text as message.txt in the outbox, the same place a paste lands.
+    fn message_file(&mut self, text: &str, can: &Capabilities, network: Network) -> Option<Staged> {
+        let dir = attach::outbox();
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = attach::free_path(&dir, "message.txt");
+        if std::fs::write(&path, text.as_bytes()).is_err() {
+            return None;
+        }
+        let id = self.next_chip;
+        self.next_chip += 1;
+        let mut chip = Staged::new(id, path.clone(), Found::File(text.len() as u64), can, network);
+        chip.owned = true;
+        if chip.refused.is_some() {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        Some(chip)
     }
 
     fn sent(&mut self, out: Outgoing, files: bool,
@@ -1756,10 +1811,16 @@ impl Composer {
             return;
         }
         let key = target.key.clone();
+        let wire = length::wire_text(&field, &self.tokens, key.network, false);
+        if let Some(words) = length::edit_refusal(wire.chars().count(), target.can.text_limit) {
+            self.caption = Some((words, Tone::Refused));
+            cx.notify();
+            return;
+        }
         let request = Request::Edit {
             conversation: key.clone(),
             message_id: id.clone(),
-            text: mention::wire(&field, &self.tokens, key.network).trim().to_owned(),
+            text: wire,
         };
         self.sending = true;
         cx.notify();
@@ -2478,7 +2539,21 @@ impl Composer {
         let text = self.input.read(cx).text().to_owned();
         let note = || attach::sending_note(target.key.network, &target.can, &self.tray, &text).map(|words| (words, Tone::Note));
         let recording = rec::foot(&self.recording, &target.key, playing::now_ms(), crate::gui::app::prefs::values().on(protocol::settings::PUSH_TO_TALK));
-        let said = self.caption.clone().or(recording).or_else(note).or_else(|| (unlocked && target.link == Link::Offline).then(offline));
+        let length_note = || {
+            // An edit cannot become a file, so the offer is only for a new message. Emoticons
+            // count only where the send would convert them.
+            let editing = self.editing.is_some();
+            let emoticons = !editing && super::app::prefs::choices().emoticons;
+            let counted = length::wire_text(&text, &self.tokens, target.key.network, emoticons).chars().count();
+            if editing {
+                if let Some(words) = length::edit_refusal(counted, target.can.text_limit) {
+                    return Some((words, Tone::Refused));
+                }
+            }
+            let tone = if length::over(counted, target.can.text_limit) { Tone::Warning } else { Tone::Note };
+            length::line(counted, target.can.text_limit).map(|words| (words, tone))
+        };
+        let said = self.caption.clone().or(recording).or_else(length_note).or_else(note).or_else(|| (unlocked && target.link == Link::Offline).then(offline));
         let hosts = if self.controls().link_chip && unlocked { niceties::link_hosts(&text) } else { Vec::new() };
         let chip = niceties::preview_words(&hosts, self.no_preview).map(|words| {
             let suppressed = self.no_preview;
