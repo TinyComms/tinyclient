@@ -47,6 +47,8 @@ const CHAT_DEE: &str = "19:00000000-0000-4000-8000-0000000000aa_00000000-0000-40
 /// The post in General the fixtures hang a reply chain off.
 const ROOT: &str = "1760000200200";
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\nnot really";
+/// What the fake returns for a shared spreadsheet, so a fetch can be told from a sign-in page.
+const SHEET: &[u8] = b"PK\x03\x04shared-file";
 
 /// One request the fake received.
 #[derive(Clone, Debug)]
@@ -300,6 +302,13 @@ impl Fake {
             }
             "/presence/v1/presence/getpresence/" if bearer("presence") => ok(self.fixture("presence").unwrap()),
             "/presence/v1/me/forceavailability/" if bearer("presence") => ok(json!({})),
+            // A shared file's bytes. The cache asks Graph's shares route; this stands in for it.
+            _ if call.method == "GET" && path.contains("/shares/u!") && path.ends_with("/driveItem/content") => Reply {
+                status: "200 OK",
+                headers: Vec::new(),
+                kind: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                body: SHEET.to_vec(),
+            },
             _ if path.starts_with("/graph/") && bearer("graph") => self.graph(call, &path["/graph".len()..]),
             _ if path.starts_with("/upload/") => self.upload(call),
             _ if path.starts_with("/ams/") || path.contains("/profilepicturev2") => Reply {
@@ -887,6 +896,23 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
     let attached = &shared.attachments[0];
     assert_eq!((attached.name.as_str(), attached.file.kind, attached.file.bytes), ("Q4 plan.xlsx", MediaKind::File, 48_211));
     assert!(ranges(shared).contains(&("Q4 plan.xlsx", &Style::Link { url: "https://contoso.sharepoint.com/:x:/s/Platform/EaBcDeF".into() })));
+    // Asking for the file fetches it through Graph's shares route. The name stays a link.
+    let share = "https://contoso.sharepoint.com/:x:/s/Platform/EaBcDeF";
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(share.as_bytes());
+    let content = format!("/v1.0/shares/u!{encoded}/driveItem/content");
+    let file_id = attached.file.id.clone();
+    let fetched = world.until("the shared file to be fetched or refused", || {
+        let asked = Request::Fetch { retry: false, size: None, account: general.account(), ids: vec![file_id.clone()] };
+        match world.ask(asked) {
+            Response::Media { files } => files.into_iter().find(|file| file.id == file_id && (file.path.is_some() || file.failed.is_some())),
+            _ => None,
+        }
+    });
+    let Some(path) = fetched.path else {
+        panic!("{}", fetched.failed.unwrap_or_else(|| "the shared file was not fetched".to_owned()));
+    };
+    assert_eq!(std::fs::read(path).unwrap(), SHEET);
+    assert_eq!(world.fake.calls("GET", &content).len(), 1);
 
     // A card is named and linked into the official app, never blank.
     let card = by("1760000300300");

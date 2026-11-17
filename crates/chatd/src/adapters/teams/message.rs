@@ -138,6 +138,16 @@ fn call_line(content: &str) -> String {
     }
 }
 
+/// How a shared file is shown. A picture or a video is the row; anything else is a document.
+pub(super) fn shared_kind(name: &str) -> MediaKind {
+    let ext = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => MediaKind::Image,
+        "mp4" | "mov" | "webm" => MediaKind::Video,
+        _ => MediaKind::File,
+    }
+}
+
 /// The size Teams draws a Giphy GIF at, about: what the small copy is asked for.
 const GIPHY_TALL: u32 = 200;
 
@@ -379,21 +389,28 @@ impl Teams {
             let named = [&shared["fileName"], &shared["title"]].into_iter().filter_map(Value::as_str).find(|name| !name.is_empty()).unwrap_or("File");
             let sizes = [&shared["fileSize"], &shared["size"], &info["fileSize"]];
             let key = Some(id_of(&shared["id"])).filter(|key| !key.is_empty()).unwrap_or_else(|| id_of(&shared["itemid"]));
+            let kind = shared_kind(named);
             let file = MediaFile {
                 bytes: sizes.into_iter().find_map(Value::as_u64).unwrap_or(0),
-                ..MediaFile::new(format!("file:{id}:{}", escaped(&key)), MediaKind::File)
+                ..MediaFile::new(format!("file:{id}:{}", escaped(&key)), kind)
             };
-            media.push((file.clone(), url.to_owned()));
-            message.attachments.push(Attachment::new(named, file));
-            // CONTRACT: an `Attachment` has nowhere to say "open this in the browser", and a
-            // SharePoint file answers only to a token for SharePoint, which the media cache is
-            // not given. So the file is listed, and its name is also a link that opens it.
-            if !parsed.text.is_empty() {
-                parsed.text.push('\n');
+            // The cache fetches Graph's content address. The sharing address stays the link.
+            media.push((file.clone(), super::graph_content(&self.graph, url)));
+            let shown = matches!(kind, MediaKind::Image | MediaKind::Video);
+            message.attachments.push(Attachment {
+                thumb: (kind == MediaKind::Image).then(|| file.clone()),
+                ..Attachment::new(named, file)
+            });
+            // A picture or a video is the row. A document keeps its name as a link, so it can
+            // still open in the browser.
+            if !shown {
+                if !parsed.text.is_empty() {
+                    parsed.text.push('\n');
+                }
+                let start = parsed.text.len() as u32;
+                parsed.text.push_str(named);
+                parsed.spans.push(Span { start, end: parsed.text.len() as u32, style: Style::Link { url: url.to_owned() } });
             }
-            let start = parsed.text.len() as u32;
-            parsed.text.push_str(named);
-            parsed.spans.push(Span { start, end: parsed.text.len() as u32, style: Style::Link { url: url.to_owned() } });
         }
         if let Err(err) = self.ctx.media(&media) {
             tracing::warn!("chatd: Teams: {err}");
@@ -907,6 +924,15 @@ mod tests {
     #[test]
     fn a_catalog_emoji_and_a_skin_tone_use_teams_keys() {
         prove_reactions().unwrap();
+    }
+
+    #[test]
+    fn a_shared_picture_is_shown_and_a_document_stays_a_file() {
+        assert_eq!(shared_kind("board.png"), MediaKind::Image);
+        assert_eq!(shared_kind("board.JPEG"), MediaKind::Image);
+        assert_eq!(shared_kind("walk.mp4"), MediaKind::Video);
+        assert_eq!(shared_kind("Q4 plan.xlsx"), MediaKind::File);
+        assert_eq!(shared_kind("notes"), MediaKind::File);
     }
 
     #[test]

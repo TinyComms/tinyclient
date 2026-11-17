@@ -58,8 +58,10 @@ impl Hosts {
             // Avatars, emoji and unfurled images are public; files need the workspace's token.
             Network::Slack => (&["slack-edge.com", "slack-imgs.com", "slack-files.com"], &["files.slack.com"]),
             // Pictures in messages and people's pictures, each behind the session's own token;
-            // GIFs from Teams' Giphy button, public, on Giphy's host.
-            Network::Teams => (&["giphy.com"], &["asm.skype.com", "asyncgw.teams.microsoft.com", "teams.microsoft.com"]),
+            // GIFs from Teams' Giphy button, public, on Giphy's host. A shared file is fetched
+            // from Graph with the session. Graph redirects to a pre-authenticated SharePoint
+            // address, which is followed without that bearer.
+            Network::Teams => (&["giphy.com", "sharepoint.com"], &["asm.skype.com", "asyncgw.teams.microsoft.com", "teams.microsoft.com", "graph.microsoft.com"]),
             Network::Telegram => (&[], &[]),
             // Attachments are encrypted end to end: the adapter fetches and opens them itself.
             Network::Signal => (&[], &[]),
@@ -643,6 +645,11 @@ mod tests {
         assert_eq!(trust(Discord, "https://files.slack.com/files-pri/T1-F1/a.png"), None);
         assert_eq!(trust(Slack, "https://cdn.discordapp.com/avatars/1/a.webp"), None);
         assert_eq!(trust(Teams, "https://cdn.discordapp.com/avatars/1/a.webp"), None);
+        // A shared file is fetched from Graph with the session. The redirect lands on SharePoint
+        // without that bearer, so SharePoint is open.
+        assert_eq!(trust(Teams, "https://graph.microsoft.com/v1.0/shares/u!abc/driveItem/content"), Some(Trust::Session));
+        assert_eq!(trust(Teams, "https://contoso.sharepoint.com/:x:/s/Platform/EaBcDeF"), Some(Trust::Open));
+        assert_eq!(trust(Teams, "https://contoso.sharepoint.com.evil.example/a"), None);
         // Not HTTPS, a look-alike, a user part, a link from a message.
         assert_eq!(trust(Discord, "http://cdn.discordapp.com/avatars/1/a.webp"), None);
         assert_eq!(trust(Discord, "https://cdn.discordapp.com.example.org/a.png"), None);
