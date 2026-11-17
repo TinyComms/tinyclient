@@ -51,7 +51,7 @@ pub fn sign_in_words(network: Network, code: ErrorCode, detail: &str) -> Option<
         ErrorCode::SignInBlocked => Some(format!(
             "Your organization doesn't allow this app. {name} stays in the {name} app for this account."
         )),
-        _ => Some(crate::client::refusal_words(code, detail)),
+        _ => Some(crate::client::refusal_words("sign in", code, detail)),
     }
 }
 

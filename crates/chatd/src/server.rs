@@ -183,7 +183,7 @@ fn call_error(err: CallError) -> Response {
 fn response_detail(response: &Response) -> String {
     match response {
         Response::Error { detail, .. } => detail.clone(),
-        _ => "That didn't work. Try again.".to_owned(),
+        _ => "Couldn't place that call. Try again.".to_owned(),
     }
 }
 
@@ -3570,6 +3570,13 @@ mod tests {
     use crate::adapters::Command;
     use crate::store::{ConversationRow, PersonRow, Store};
     use protocol::{AccountKey, ConversationKind, Key, Link, MediaFile, MediaKind, Message, Network, Outgoing};
+
+    #[test]
+    fn a_missing_error_names_the_call() {
+        let words = super::response_detail(&protocol::Response::Ok);
+        assert!(words.starts_with("Couldn't place that call"), "{words}");
+        assert!(!words.contains("That didn't work"), "{words}");
+    }
 
     #[test]
     fn a_pending_message_names_the_cached_self_sender_before_any_ack() {
