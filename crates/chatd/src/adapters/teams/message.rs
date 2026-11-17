@@ -2,7 +2,7 @@
 //! everything done to messages: pages, sending, editing, deleting, reacting.
 
 use super::html::{self, Lookup};
-use super::{chain_id, chain_of, escaped, id_of, millis, now_ms, seconds, Body, Fault, Teams, CHAIN, PAGE, TEAMS, TYPING_SHOWN};
+use super::{chain_id, chain_of, escaped, id_of, millis, now_ms, seconds, thread_of, Body, Fault, Teams, CHAIN, PAGE, TEAMS, TYPING_SHOWN};
 use protocol::{
     Attachment, ConversationKind, MediaFile, MediaKind, MentionKind, Message, MessageKind, Reaction,
     ReplyTo, Span, Style, ThreadSummary,
@@ -327,14 +327,13 @@ fn quote_markup(reply: &ReplyTo) -> String {
 }
 
 impl Teams {
-    /// Where the official app opens one message.
-    fn message_link(&self, conversation: &str, id: &str) -> String {
-        let chat = if conversation.contains("@thread.tacv2") || conversation.contains("@thread.skype") {
-            ""
-        } else {
-            "&context=%7B%22contextType%22%3A%22chat%22%7D"
-        };
-        format!("{TEAMS}/l/message/{}/{id}?tenantId={}{chat}", escaped(conversation), escaped(&self.session.tenant))
+    /// Where the official app opens one message. A reply names its post as `parentMessageId`.
+    fn message_link(&self, conversation: &str, id: &str, raw: &Value) -> String {
+        let placed = placed(raw);
+        let thread = placed.as_ref().map(|(channel, _)| channel.as_str()).unwrap_or_else(|| thread_of(conversation));
+        let parent = placed.as_ref().and_then(|(_, root)| root.as_deref()).filter(|root| *root != id);
+        let parent = parent.or_else(|| chain_of(conversation).map(|(_, root)| root).filter(|root| *root != id));
+        super::links::message_share(thread, id, &self.session.tenant, parent)
     }
 
     /// `ThreadActivity/…`: who joined, left or renamed the conversation, in words. Names come
@@ -427,7 +426,7 @@ impl Teams {
                 return Read::Message(Box::new(message));
             }
             "RichText/Media_CallRecording" | "RichText/Media_CallTranscript" => {
-                message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id) };
+                message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
                 message.text = "Meeting recording".to_owned();
                 return Read::Message(Box::new(message));
             }
@@ -540,17 +539,17 @@ impl Teams {
                 message.text.push('\n');
                 message.text.push_str(&label);
             }
-            let link = if component.url.is_empty() { self.message_link(conversation, &id) } else { component.url };
+            let link = if component.url.is_empty() { self.message_link(conversation, &id, raw) } else { component.url };
             message.kind = MessageKind::Unsupported { link };
         } else if parsed.card || !cards.is_empty() || kind == "RichText/Media_Card" {
             let title = cards.iter().find_map(|card| card_title(card, 6));
             if message.text.is_empty() {
                 message.text = title.map_or_else(|| "Card".to_owned(), |title| format!("Card: {}", title.chars().take(200).collect::<String>()));
             }
-            message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id) };
+            message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
         } else if message.text.is_empty() && message.attachments.is_empty() {
             message.text = "Unsupported message".to_owned();
-            message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id) };
+            message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
         }
         message.client_id = echoed_client_id(raw, message.outgoing, &id);
         Read::Message(Box::new(message))
@@ -1104,5 +1103,51 @@ mod tests {
         let quote = parsed.quote.unwrap();
         assert_eq!(parsed.text, "yes");
         assert_eq!((quote.id.as_str(), quote.name.as_str(), quote.preview.as_str()), ("1760000100100", "Ana <Ruiz>", "is it \"green\"?"));
+    }
+
+    #[test]
+    fn documented_links_round_trip_to_the_chat_channel_message_and_team() {
+        let tenant = "11111111-1111-4111-8111-111111111111";
+        let channel = "19:platform0general@thread.tacv2";
+        let chat = "19:grp1@thread.v2";
+        let group = "e0873025-0000-4000-8000-00000000beef";
+        let chat_link = super::super::links::chat_share(chat);
+        let channel_link = super::super::links::channel_share(channel, "General", group, tenant);
+        let message_link = super::super::links::message_share(channel, "1760000210210", tenant, Some("1760000200200"));
+        let team_link = super::super::links::team_share(channel, group, tenant);
+        assert_eq!(chat_link, "https://teams.microsoft.com/l/chat/19%3Agrp1%40thread.v2/conversations");
+        assert_eq!(
+            channel_link,
+            format!("https://teams.microsoft.com/l/channel/19%3Aplatform0general%40thread.tacv2/General?groupId={group}&tenantId={tenant}")
+        );
+        assert_eq!(
+            message_link,
+            format!("https://teams.microsoft.com/l/message/19%3Aplatform0general%40thread.tacv2/1760000210210?tenantId={tenant}&parentMessageId=1760000200200")
+        );
+        assert_eq!(
+            team_link,
+            format!("https://teams.microsoft.com/l/team/19%3Aplatform0general%40thread.tacv2/conversations?groupId={group}&tenantId={tenant}")
+        );
+        assert_eq!(super::super::links::parse_share(&chat_link).map(|found| found.conversation), Some(chat.to_owned()));
+        let channel_back = super::super::links::parse_share(&channel_link).expect("channel");
+        assert_eq!(
+            (channel_back.kind, channel_back.conversation.as_str(), channel_back.group.as_str(), channel_back.title.as_str()),
+            (super::super::links::ShareKind::Channel, channel, group, "General")
+        );
+        let message_back = super::super::links::parse_share(&message_link).expect("message");
+        assert_eq!((message_back.kind, message_back.message.as_str(), message_back.parent.as_str()), (super::super::links::ShareKind::Message, "1760000210210", "1760000200200"));
+        let team_back = super::super::links::parse_share(&team_link).expect("team");
+        assert_eq!((team_back.kind, team_back.group.as_str()), (super::super::links::ShareKind::Team, group));
+        // A chat message uses the documented context. A post's own id is not a parent.
+        let in_chat = super::super::links::message_share(chat, "1563480968434", tenant, None);
+        assert!(in_chat.contains("context=%7B%22contextType%22%3A%22chat%22%7D"), "{in_chat}");
+        assert_eq!(super::super::links::parse_share(&in_chat).map(|found| found.conversation), Some(chat.to_owned()));
+        let post = super::super::links::message_share(channel, "1760000200200", tenant, Some("1760000200200"));
+        assert!(!post.contains("parentMessageId"), "{post}");
+        // The desktop scheme opens the same place. A link that is not Teams does not.
+        let desktop = chat_link.replacen("https://teams.microsoft.com", "msteams:", 1);
+        assert_eq!(super::super::links::parse_share(&desktop).map(|found| (found.kind, found.conversation)), Some((super::super::links::ShareKind::Chat, chat.to_owned())));
+        assert!(super::super::links::parse_share("https://ex.com/plan").is_none());
+        assert!(super::super::links::parse_share("https://teams.microsoft.com/l/chat/0/0?users=a@contoso.com").is_none());
     }
 }

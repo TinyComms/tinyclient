@@ -1,0 +1,12 @@
+{
+  "id": "teams-copy-link",
+  "title": "A Teams chat, channel, message and team each have a link that opens the same place",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same link check is what this desktop run covers.",
+    "ios": "The phone proof build does not run desktop chatd. The same link check is what this desktop run covers."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
