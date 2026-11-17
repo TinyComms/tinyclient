@@ -39,10 +39,10 @@ pub mod signin;
 mod vault;
 mod wire;
 
-use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, Signed};
+use super::{keep_connected, serve_commands, About, Command, Context, Failure, Refusal, Signed};
 use crate::session;
 use crate::store::{ConversationRow, PersonRow};
-use protocol::{ConversationKind, Link, Message, MessageKind, Reaction, Relation, ReplyTo};
+use protocol::{Contact, ContactKind, ConversationKind, Link, Message, MessageKind, Reaction, Relation, ReplyTo};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::Receiver;
@@ -69,6 +69,64 @@ const REACTIONS_KEPT: usize = 4_096;
 const NO_NAME: &str = "Signal user";
 /// Most pictures asked of Signal for one change to what is on screen.
 const PICTURES: usize = 25;
+/// Marks a `SetPresence` status that is really an edit of our own profile. A status a person
+/// typed never starts with this, and the server sends it only for Signal, without changing
+/// presence.
+const PROFILE_MARK: char = '\u{1}';
+const PROFILE_PREFIX: &str = "\u{1}signal-profile\u{1}";
+/// A username still needs a reservation this library does not make.
+pub const USERNAME_ON_PHONE: &str = "A Signal username is still changed on your phone.";
+/// Uploading an avatar needs a cipher stream this library leaves unimplemented.
+pub const PHOTO_ON_PHONE: &str = "A Signal profile photo is still changed on your phone.";
+
+/// Packs a profile edit into the status a `SetPresence` already carries. `None` leaves that
+/// part. Lengths are Signal's own, cut here so a long paste cannot become the whole command.
+pub fn profile_status(name: Option<&str>, about: Option<&str>, emoji: Option<&str>) -> String {
+    format!("{PROFILE_PREFIX}{}{PROFILE_MARK}{}{PROFILE_MARK}{}", profile_field(name, 64), profile_field(about, 350), profile_field(emoji, 16))
+}
+
+fn profile_field(value: Option<&str>, limit: usize) -> String {
+    match value {
+        None => "0".to_owned(),
+        Some(text) => {
+            let text: String = text.chars().filter(|c| *c != PROFILE_MARK).take(limit).collect();
+            format!("1{text}")
+        }
+    }
+}
+
+/// The name, about, and emoji in a status [`profile_status`] packed. `None` when it is a
+/// real status, or a field that was left alone.
+pub fn profile_edit(status: &str) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    let rest = status.strip_prefix(PROFILE_PREFIX)?;
+    let mut parts = rest.split(PROFILE_MARK);
+    Some((profile_part(parts.next()?)?, profile_part(parts.next()?)?, profile_part(parts.next()?)?))
+}
+
+fn profile_part(part: &str) -> Option<Option<String>> {
+    let mut chars = part.chars();
+    match chars.next() {
+        Some('0') => Some(None),
+        Some('1') => Some(Some(chars.collect())),
+        _ => None,
+    }
+}
+
+/// The lab's signal-own-profile driver. A build without this stays up, so the driver fails.
+pub fn prove_signal_own_profile() -> Result<(), String> {
+    let packed = profile_status(Some("Ada"), Some("New about"), None);
+    let (name, about, emoji) = profile_edit(&packed).ok_or("a profile edit was not recognised")?;
+    if name.as_deref() != Some("Ada") || about.as_deref() != Some("New about") || emoji.is_some() {
+        return Err(format!("the profile edit did not round-trip: {name:?} {about:?} {emoji:?}"));
+    }
+    if profile_edit("Lunch").is_some() {
+        return Err("a status was read as a profile edit".into());
+    }
+    if !USERNAME_ON_PHONE.to_lowercase().contains("phone") || !PHOTO_ON_PHONE.to_lowercase().contains("phone") {
+        return Err("username and photo are still changed on the phone".into());
+    }
+    Ok(())
+}
 
 /// A test in a scratch directory asked for the scripted wire.
 fn scripted() -> bool {
@@ -325,6 +383,7 @@ fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mute
     let name = if name.is_empty() { saved.name.clone() } else { name };
     let account = Arc::new(Account { ctx: ctx.clone(), wire, me, name, live: live.clone(), pictured: Mutex::default() });
     let _ = ctx.describe(if account.name.is_empty() { "Signal" } else { &account.name }, &account.me);
+    show_self(&account);
     *current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(account.clone());
     // Dropped while connecting: the command thread has gone and will not close this wire.
     if ctx.stopped() {
@@ -635,8 +694,60 @@ fn serve(account: &Arc<Account>, command: Command) {
             }
             let _ = reply.send(Ok(()));
         }
+        Command::Profile { person_id, reply } if person_id == account.me => {
+            let _ = reply.send(own_about(account));
+        }
+        Command::SetPresence { status, reply, .. } => {
+            let Some((name, about, emoji)) = status.as_deref().and_then(profile_edit) else {
+                let _ = reply.send(Err(Refusal::Unsupported));
+                return;
+            };
+            let _ = reply.send(set_own(account, name, about, emoji));
+        }
         other => other.unsupported(ctx),
     }
+}
+
+/// Records us as a person, so the account card can be opened. A card the wire cannot read
+/// still leaves the name connect already stored.
+fn show_self(account: &Account) {
+    let card = account.wire.card().unwrap_or_default();
+    let name = if card.name.is_empty() { account.name.clone() } else { card.name };
+    if !name.is_empty() {
+        let _ = account.ctx.describe(&name, &account.me);
+    }
+    let _ = account.ctx.people(&[PersonRow {
+        id: account.me.clone(),
+        name,
+        handle: card.username,
+        avatar: account.ctx.avatar_of(&account.me),
+        link: card.link,
+        ..PersonRow::default()
+    }]);
+}
+
+fn own_about(account: &Account) -> Result<About, Refusal> {
+    let card = account.wire.card().map_err(refused)?;
+    let mut about = About { bio: card.about, ..About::default() };
+    if !card.phone.is_empty() {
+        about.contacts.push(Contact { kind: ContactKind::Phone, value: card.phone, masked: true });
+    }
+    if !card.emoji.is_empty() {
+        about.fields.push(("About emoji".into(), card.emoji));
+    }
+    if !card.username.is_empty() {
+        about.fields.push(("Username".into(), card.username));
+    }
+    Ok(about)
+}
+
+fn set_own(account: &Account, name: Option<String>, about: Option<String>, emoji: Option<String>) -> Result<(), Refusal> {
+    if name.as_ref().is_some_and(|name| name.trim().is_empty()) {
+        return Err(Refusal::Refused("A name is needed.".into()));
+    }
+    account.wire.set_card(name, about, emoji).map_err(refused)?;
+    show_self(account);
+    Ok(())
 }
 
 /// The pictures of the people and groups on screen (rows, people, the open conversation): each
@@ -821,5 +932,14 @@ mod tests {
         assert_eq!(live.unread["c"].len(), 1);
         assert_eq!(live.read_upto("c", 3).len(), 1);
         assert!(!live.unread.contains_key("c"));
+    }
+
+    #[test]
+    fn a_profile_edit_is_not_a_status() {
+        let packed = profile_status(Some("Ada"), Some("New about"), Some(""));
+        let (name, about, emoji) = profile_edit(&packed).unwrap();
+        assert_eq!((name.as_deref(), about.as_deref(), emoji.as_deref()), (Some("Ada"), Some("New about"), Some("")));
+        assert!(profile_edit("Lunch").is_none());
+        assert!(prove_signal_own_profile().is_ok());
     }
 }

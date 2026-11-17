@@ -7,8 +7,8 @@
 //! libsignal underneath, which no test can reach without a real account and a phone to link from.
 
 use protocol::{
-    read_frame, write_frame, AccountKey, Change, ChatStream, Conversation, ConversationKind, ErrorCode, Key, Link, Message, MessageKind,
-    Network, Page, Relation, Request, Response, SendState, SignInInput, SignInProblem, SignInStep,
+    read_frame, write_frame, AccountKey, Change, ChatStream, ContactKind, Conversation, ConversationKind, ErrorCode, Key, Link, Message,
+    MessageKind, Network, Page, Relation, Request, Response, SendState, SignInInput, SignInProblem, SignInStep,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -476,6 +476,72 @@ fn a_cancelled_link_stops_and_a_new_one_begins_afresh() {
     assert!(matches!(world.sign_in(Some(SignInInput::UseQr)), SignInStep::Failed { .. }));
     assert!(matches!(world.sign_in(None), SignInStep::Qr { .. }));
     world.ask(Request::SignInCancel { network: Network::Signal });
+}
+
+#[test]
+fn my_own_profile_shows_and_an_edit_reaches_the_wire() {
+    let world = World::linked();
+    world.connected();
+    let Response::Profile { profile } = world.ask(Request::Profile { person: key(ME), space: None }) else {
+        panic!("no card");
+    };
+    assert_eq!(profile.person.name, "Ada Quill");
+    assert_eq!(profile.person.handle, "ada.12");
+    assert_eq!(profile.person.link, "https://signal.me/#eu/fake-ada");
+    assert_eq!(profile.bio, "Keeps the score.");
+    assert!(profile.fields.iter().any(|(label, value)| label == "About emoji" && value == "🌉"), "{:?}", profile.fields);
+    let phone = profile.contacts.iter().find(|contact| contact.kind == ContactKind::Phone).expect("a phone");
+    assert_eq!((phone.value.as_str(), phone.masked), ("+15550100001", true));
+
+    assert_eq!(
+        world.ask(Request::SetProfile {
+            account: account(),
+            name: Some("Ada Q.".into()),
+            about: Some("New about".into()),
+            emoji: None,
+            username: None,
+            photo: false,
+        }),
+        Response::Ok
+    );
+    let wrote = world.calls().into_iter().filter(|line| line.contains("sync=local-profile")).collect::<Vec<_>>();
+    assert_eq!(wrote.len(), 1, "{wrote:?}");
+    assert!(wrote[0].contains("name=Ada Q.") && wrote[0].contains("about=New about"), "{}", wrote[0]);
+
+    let Response::Profile { profile } = world.ask(Request::Profile { person: key(ME), space: None }) else {
+        panic!("no card after the edit");
+    };
+    assert_eq!(profile.person.name, "Ada Q.");
+    assert_eq!(profile.bio, "New about");
+    assert_eq!(profile.person.handle, "ada.12");
+    assert!(profile.fields.iter().any(|(label, value)| label == "About emoji" && value == "🌉"), "{:?}", profile.fields);
+    assert_eq!(world.status().0.iter().find(|status| status.key == account()).unwrap().name, "Ada Q.");
+
+    let username = world.ask(Request::SetProfile {
+        account: account(),
+        name: None,
+        about: None,
+        emoji: None,
+        username: Some("nope".into()),
+        photo: false,
+    });
+    match username {
+        Response::Error { code: ErrorCode::Refused, detail } if detail.to_lowercase().contains("phone") => {}
+        other => panic!("{other:?}"),
+    }
+    let photo = world.ask(Request::SetProfile {
+        account: account(),
+        name: None,
+        about: None,
+        emoji: None,
+        username: None,
+        photo: true,
+    });
+    match photo {
+        Response::Error { code: ErrorCode::Refused, detail } if detail.to_lowercase().contains("phone") => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(world.calls().into_iter().filter(|line| line.contains("sync=local-profile")).count(), 1);
 }
 
 #[test]

@@ -185,8 +185,29 @@ pub trait Wire: Send + Sync {
     /// A person's profile picture or a group's, opened: `None` when they have none, or we hold
     /// no key to their profile.
     fn picture(&self, of: &Peer) -> Result<Option<Vec<u8>>, Fault>;
+    /// Our own card: name, about, about emoji, username, phone, and a signal.me link when one
+    /// is known. A username the library cannot read is empty, and so is the link.
+    fn card(&self) -> Result<OwnCard, Fault>;
+    /// Writes the name, about, and about emoji. `None` leaves that part. An empty about or
+    /// emoji clears it. Succeeds only once the written profile was read back and the other
+    /// devices were told.
+    fn set_card(&self, name: Option<String>, about: Option<String>, emoji: Option<String>) -> Result<(), Fault>;
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);
+}
+
+/// Our own profile, as the wire can read it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnCard {
+    pub name: String,
+    pub about: String,
+    pub emoji: String,
+    /// Empty when this build cannot read one.
+    pub username: String,
+    /// International form. Empty when the registration did not keep one.
+    pub phone: String,
+    /// A signal.me link when a username is known. Empty otherwise. The shell draws the QR.
+    pub link: String,
 }
 
 /// What a finished link produced.

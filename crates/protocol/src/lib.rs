@@ -1251,6 +1251,22 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
+    /// Our own profile on one account. `None` leaves that part. An empty about or emoji clears
+    /// it. A username, or `photo`, is refused: those are still changed on the phone. Signal is
+    /// the account that accepts a name, about, and about emoji.
+    SetProfile {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        about: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emoji: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        photo: bool,
+    },
     Watch(Watching),
 
     /// A page of one conversation, oldest first. Reading is not marking read.
