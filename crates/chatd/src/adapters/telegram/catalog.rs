@@ -63,6 +63,15 @@ fn item(account: &Account, document: &tl::enums::Document, pack: &str) -> Option
         _ => None,
     });
     let animated = matches!(document.mime_type.as_str(), "application/x-tgsticker" | "video/webm" | "video/mp4" | "image/gif");
+    // A pack shows stills. The animation is fetched when a message shows the sticker, not for
+    // every cell of a pack at once.
+    if attachment.sticker {
+        if let Some(still) = &attachment.thumb {
+            if still.id != attachment.file.id {
+                wants.retain(|want| want.file.id == still.id);
+            }
+        }
+    }
     account.files.want(wants);
     let id = format!("d{}", document.id);
     remember(

@@ -782,19 +782,25 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
     let mut file = MediaFile::new(format!("d{}", document.id), kind);
     (file.width, file.height) = size;
     file.bytes = document.size.max(0) as u64;
-    // An animated or video sticker is shown as its still; a static one is small enough to be
-    // its own still, but only the thumbnail is fetched for a row either way.
-    if let (true, Some(still)) = (sticker, &still) {
+    // A Lottie or WebM sticker is small (under 64 KB and 256 KB). The still stays the
+    // thumbnail, and the document itself is fetched with the row. A static sticker is its
+    // own still: only the thumbnail is fetched.
+    let moving = sticker && matches!(mime, "application/x-tgsticker" | "video/webm");
+    let location = tl::types::InputDocumentFileLocation {
+        id: document.id,
+        access_hash: document.access_hash,
+        file_reference: document.file_reference.clone(),
+        thumb_size: String::new(),
+    };
+    if moving {
+        // `.tgs` arrives gzipped, like a custom emoji, so the fetch unpacks it for the Lottie player.
+        file.kind = if mime == "application/x-tgsticker" { MediaKind::Emoji } else { MediaKind::Video };
+        wants.push(Want { file: file.clone(), dc: document.dc_id, location: location.into(), inline: None, row: None, watched: false, original: false });
+    } else if let (true, Some(still)) = (sticker, &still) {
         file = still.clone();
     } else if kind != MediaKind::Image || still.is_some() {
         // A picture sent as a file opens in the viewer like a photo, so it is kept the same way;
         // so is anything else, which is fetched only when the user plays or opens it.
-        let location = tl::types::InputDocumentFileLocation {
-            id: document.id,
-            access_hash: document.access_hash,
-            file_reference: document.file_reference.clone(),
-            thumb_size: String::new(),
-        };
         wants.push(Want { file: file.clone(), dc: document.dc_id, location: location.into(), inline: None, row: None, watched: false, original: true });
     }
     let mut attachment = Attachment::new(if name.is_empty() { label.to_owned() } else { name }, file);
@@ -1631,6 +1637,98 @@ fn album_item(id: i32, text: &str, group: i64, photo_id: i64) -> tl::enums::Mess
         video: None,
     }.into());
     message.into()
+}
+
+/// The lab's telegram-stickers check. A Lottie sticker and a WebM sticker keep the still
+/// and name the document, which is fetched with the row.
+pub(super) fn prove_stickers() -> Result<(), String> {
+    let one = |id: i64, mime: &str, kind: MediaKind| -> Result<(), String> {
+        let raw = tl::types::Document {
+            id,
+            access_hash: id + 1,
+            file_reference: vec![8],
+            date: 1_700_000_000,
+            mime_type: mime.to_owned(),
+            size: 30_000,
+            thumbs: Some(vec![tl::types::PhotoSize { r#type: "m".into(), w: 128, h: 128, size: 4_000 }.into()]),
+            video_thumbs: None,
+            dc_id: 2,
+            attributes: vec![tl::types::DocumentAttributeSticker {
+                mask: false,
+                alt: "🥾".into(),
+                stickerset: tl::types::InputStickerSetId { id: 900, access_hash: 901 }.into(),
+                mask_coords: None,
+            }
+            .into()],
+        };
+        let media = tl::types::MessageMediaDocument {
+            nopremium: false,
+            spoiler: false,
+            video: false,
+            round: false,
+            voice: false,
+            document: None,
+            alt_documents: None,
+            video_cover: None,
+            video_timestamp: None,
+            ttl_seconds: None,
+        };
+        let mut wants = Vec::new();
+        let attachment = document(&media, &raw, &mut wants);
+        let file_id = format!("d{id}");
+        let thumb_id = format!("d{id}m");
+        if !attachment.sticker || attachment.file.id != file_id || attachment.file.kind != kind || attachment.file.bytes != 30_000 {
+            return Err(format!("{mime} sticker file was {} {:?}", attachment.file.id, attachment.file.kind));
+        }
+        if attachment.thumb.as_ref().is_none_or(|thumb| thumb.id != thumb_id) {
+            return Err(format!("{mime} sticker dropped its still"));
+        }
+        if !wants.iter().any(|want| want.file.id == file_id && !want.original) {
+            return Err(format!("{mime} sticker was not fetched with the row"));
+        }
+        Ok(())
+    };
+    one(6_410, "application/x-tgsticker", MediaKind::Emoji)?;
+    one(6_411, "video/webm", MediaKind::Video)?;
+    let (media, raw) = {
+        let raw = tl::types::Document {
+            id: 6_412,
+            access_hash: 6_413,
+            file_reference: vec![8],
+            date: 1_700_000_000,
+            mime_type: "image/webp".into(),
+            size: 8_000,
+            thumbs: Some(vec![tl::types::PhotoSize { r#type: "m".into(), w: 128, h: 128, size: 4_000 }.into()]),
+            video_thumbs: None,
+            dc_id: 2,
+            attributes: vec![tl::types::DocumentAttributeSticker {
+                mask: false,
+                alt: "🥾".into(),
+                stickerset: tl::types::InputStickerSetId { id: 900, access_hash: 901 }.into(),
+                mask_coords: None,
+            }
+            .into()],
+        };
+        let media = tl::types::MessageMediaDocument {
+            nopremium: false,
+            spoiler: false,
+            video: false,
+            round: false,
+            voice: false,
+            document: None,
+            alt_documents: None,
+            video_cover: None,
+            video_timestamp: None,
+            ttl_seconds: None,
+        };
+        (media, raw)
+    };
+    let mut wants = Vec::new();
+    let still = document(&media, &raw, &mut wants);
+    if still.file.id != "d6412m" || wants.iter().any(|want| want.file.id == "d6412") {
+        return Err("a static sticker must stay its thumbnail".into());
+    }
+    Ok(())
 }
 
 /// The lab's telegram-album check. Four items that share a grouped id are one message.
@@ -2473,5 +2571,81 @@ mod tests {
         let line = line_for(0, None, told.reply_note.as_ref());
         assert_eq!(line.id, "15");
         assert_eq!(line.snippet, "Story");
+    }
+
+    fn sticker_media(id: i64, mime: &str) -> (tl::types::MessageMediaDocument, tl::types::Document) {
+        let document = tl::types::Document {
+            id,
+            access_hash: id + 1,
+            file_reference: vec![8],
+            date: 1_700_000_000,
+            mime_type: mime.to_owned(),
+            size: 30_000,
+            thumbs: Some(vec![tl::types::PhotoSize { r#type: "m".into(), w: 128, h: 128, size: 4_000 }.into()]),
+            video_thumbs: None,
+            dc_id: 2,
+            attributes: vec![tl::types::DocumentAttributeSticker {
+                mask: false,
+                alt: "🥾".into(),
+                stickerset: tl::types::InputStickerSetId { id: 900, access_hash: 901 }.into(),
+                mask_coords: None,
+            }
+            .into()],
+        };
+        let media = tl::types::MessageMediaDocument {
+            nopremium: false,
+            spoiler: false,
+            video: false,
+            round: false,
+            voice: false,
+            document: None,
+            alt_documents: None,
+            video_cover: None,
+            video_timestamp: None,
+            ttl_seconds: None,
+        };
+        (media, document)
+    }
+
+    #[test]
+    fn an_animated_sticker_names_the_lottie_file_and_keeps_the_still() {
+        let (media, raw) = sticker_media(6_410, "application/x-tgsticker");
+        let mut wants = Vec::new();
+        let attachment = document(&media, &raw, &mut wants);
+        assert!(attachment.sticker);
+        assert_eq!(attachment.mime, "application/x-tgsticker");
+        assert_eq!(attachment.file.id, "d6410", "the document is the file the row plays");
+        assert_eq!(attachment.file.bytes, 30_000);
+        assert_eq!(attachment.file.kind, MediaKind::Emoji, "a .tgs is unpacked the way a custom emoji is");
+        assert_eq!(attachment.thumb.as_ref().map(|thumb| thumb.id.as_str()), Some("d6410m"));
+        assert_eq!(attachment.thumb.as_ref().map(|thumb| thumb.bytes), Some(4_000));
+        let animation = wants.iter().find(|want| want.file.id == "d6410").expect("the animation is fetched for the row");
+        assert!(!animation.original, "a sticker is small enough to fetch with the row");
+        assert!(wants.iter().any(|want| want.file.id == "d6410m" && !want.original));
+    }
+
+    #[test]
+    fn a_video_sticker_names_the_webm_and_keeps_the_still() {
+        let (media, raw) = sticker_media(6_411, "video/webm");
+        let mut wants = Vec::new();
+        let attachment = document(&media, &raw, &mut wants);
+        assert!(attachment.sticker);
+        assert_eq!(attachment.file.id, "d6411");
+        assert_eq!(attachment.file.kind, MediaKind::Video);
+        assert_eq!(attachment.file.bytes, 30_000);
+        assert_eq!(attachment.thumb.as_ref().map(|thumb| thumb.id.as_str()), Some("d6411m"));
+        let animation = wants.iter().find(|want| want.file.id == "d6411").expect("the webm is fetched for the row");
+        assert!(!animation.original);
+    }
+
+    #[test]
+    fn a_static_sticker_stays_its_thumbnail() {
+        let (media, raw) = sticker_media(6_412, "image/webp");
+        let mut wants = Vec::new();
+        let attachment = document(&media, &raw, &mut wants);
+        assert!(attachment.sticker);
+        assert_eq!(attachment.file.id, "d6412m");
+        assert!(attachment.thumb.as_ref().is_some_and(|thumb| thumb.id == "d6412m"));
+        assert!(wants.iter().all(|want| want.file.id == "d6412m"));
     }
 }
