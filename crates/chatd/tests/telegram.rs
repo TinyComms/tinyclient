@@ -800,6 +800,34 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
 }
 
 #[test]
+fn a_poll_shows_its_options_and_a_later_update_replaces_the_counts() {
+    let world = World::signed_in();
+    world.connected();
+    world.steer("poll-full");
+    let poll = world.arrived("g8001", "31");
+    assert_eq!(poll.text, "Poll: Saturday or Sunday?");
+    assert!(matches!(poll.kind, MessageKind::Unsupported { ref link } if link.contains("message_id=31")));
+    let card = poll.card.expect("a poll is a card");
+    assert_eq!(card.title, "Saturday or Sunday?");
+    assert_eq!(card.footer, "Open in Telegram");
+    assert_eq!(card.fields, vec![("3 votes".to_owned(), "Saturday".to_owned()), ("1 vote".to_owned(), "Sunday".to_owned())]);
+    world.steer("poll-update");
+    let updated = world.until("the new counts", || {
+        let message = world.message("g8001", "31")?;
+        let card = message.card.as_ref()?;
+        (card.fields.first().is_some_and(|(label, _)| label == "5 votes")).then_some(message)
+    });
+    let card = updated.card.expect("the card stays");
+    assert_eq!(card.fields, vec![("5 votes".to_owned(), "Saturday".to_owned()), ("2 votes".to_owned(), "Sunday".to_owned())]);
+    assert_eq!(card.text, "7 votes");
+    // Counts alone name options by their bytes, which the stored card does not keep.
+    world.steer("poll-counts");
+    sleep(Duration::from_millis(200));
+    let card = world.message("g8001", "31").and_then(|message| message.card).expect("the card stays");
+    assert_eq!(card.fields[0].0, "5 votes");
+}
+
+#[test]
 fn a_message_whose_own_time_has_passed_is_nowhere_and_one_still_alive_leaves_the_store_offline_too() {
     let world = World::signed_in();
     world.connected();

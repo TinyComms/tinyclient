@@ -6,7 +6,7 @@
 //! scratch directory (`adapters/script.rs`): `telegram.signin.ctl` while signing in (`scan`,
 //! `scan-other`, `scan-password`), `telegram.ctl` once signed in (`incoming`, `photo`, `react`, `edit`,
 //! `delete`, `ttl`, `ttl-gone`, `topic`, `comments`, `typing`, `typing-stop`, `read`, `status`,
-//! `poll`, `voice`, `forward`, `flood-send N`, `revoke`, and the holds of
+//! `poll`, `poll-full`, `poll-update`, `poll-counts`, `voice`, `forward`, `flood-send N`, `revoke`, and the holds of
 //! `TINYCLIENT_TELEGRAM_HOLD` and `TINYCLIENT_TELEGRAM_PEER_HOLD` through `dialogs-go` and
 //! `peer-go`). Every request it is sent is appended to `telegram.calls`, one line each, so a
 //! test can see what the network would have heard.
@@ -205,6 +205,72 @@ fn discussion_group(left: bool) -> tl::types::Channel {
 
 fn off_page_group() -> tl::types::Channel {
     a_channel(OFF_PAGE_GROUP, "Weather desk", false, false, OFF_PAGE_HANDLE)
+}
+
+fn poll_words(text: &str) -> tl::enums::TextWithEntities {
+    tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities { text: text.to_owned(), entities: Vec::new() })
+}
+
+/// Saturday or Sunday, with a count on each option. The first option is not the one we chose.
+fn crew_poll(counts: &[(u8, i32)], total: i32) -> (tl::enums::Poll, tl::enums::PollResults) {
+    let answers = [("Saturday", 0u8), ("Sunday", 1u8)];
+    let poll = tl::types::Poll {
+        id: 44,
+        closed: false,
+        public_voters: false,
+        multiple_choice: false,
+        quiz: false,
+        open_answers: false,
+        revoting_disabled: false,
+        shuffle_answers: false,
+        hide_results_until_close: false,
+        creator: false,
+        subscribers_only: false,
+        question: poll_words("Saturday or Sunday?"),
+        answers: answers
+            .iter()
+            .map(|(text, option)| {
+                tl::types::PollAnswer {
+                    text: poll_words(text),
+                    option: vec![*option],
+                    media: None,
+                    added_by: None,
+                    date: None,
+                }
+                .into()
+            })
+            .collect(),
+        close_period: None,
+        close_date: None,
+        countries_iso2: None,
+        hash: 0,
+    };
+    let results = tl::types::PollResults {
+        min: false,
+        has_unread_votes: false,
+        can_view_stats: false,
+        results: Some(
+            counts
+                .iter()
+                .map(|(option, count)| {
+                    tl::types::PollAnswerVoters {
+                        chosen: false,
+                        correct: false,
+                        option: vec![*option],
+                        voters: Some(*count),
+                        recent_voters: None,
+                    }
+                    .into()
+                })
+                .collect(),
+        ),
+        total_voters: Some(total),
+        recent_voters: None,
+        solution: None,
+        solution_entities: None,
+        solution_media: None,
+    };
+    (poll.into(), results.into())
 }
 
 fn message(peer: Who, id: i32, from: i64, date: i32, text: &str) -> tl::types::Message {
@@ -1355,6 +1421,43 @@ impl World {
                 message.media = Some(tl::enums::MessageMedia::Poll(Box::new(tl::types::MessageMediaPoll { poll: poll.into(), results: results.into(), attached_media: None })));
                 self.store(None, message.clone());
                 vec![update(tl::types::UpdateNewMessage { message: message.into(), pts: 0, pts_count: 0 }.into())]
+            }
+            // The same question with its options and counts, then a full update, then a
+            // results-only update whose option bytes cannot be lined up with the labels.
+            "poll-full" => {
+                let (poll, results) = crew_poll(&[(0, 3), (1, 1)], 4);
+                let mut message = message(Who::Group(CREW), 31, TOBIN, t0() + 70, "");
+                message.media = Some(tl::enums::MessageMedia::Poll(Box::new(tl::types::MessageMediaPoll { poll, results, attached_media: None })));
+                self.store(None, message.clone());
+                vec![update(tl::types::UpdateNewMessage { message: message.into(), pts: 0, pts_count: 0 }.into())]
+            }
+            "poll-update" => {
+                let (poll, results) = crew_poll(&[(0, 5), (1, 2)], 7);
+                vec![update(
+                    tl::types::UpdateMessagePoll {
+                        peer: Some(Who::Group(CREW).peer()),
+                        msg_id: Some(31),
+                        top_msg_id: None,
+                        poll_id: 44,
+                        poll: Some(poll),
+                        results,
+                    }
+                    .into(),
+                )]
+            }
+            "poll-counts" => {
+                let (_, results) = crew_poll(&[(0, 9), (1, 9)], 18);
+                vec![update(
+                    tl::types::UpdateMessagePoll {
+                        peer: Some(Who::Group(CREW).peer()),
+                        msg_id: Some(31),
+                        top_msg_id: None,
+                        poll_id: 44,
+                        poll: None,
+                        results,
+                    }
+                    .into(),
+                )]
             }
             "voice" => {
                 let voice = tl::types::Document {

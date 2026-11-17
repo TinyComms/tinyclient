@@ -556,6 +556,23 @@ pub(super) fn apply(account: &Account, update: &Update) {
             let message = written_id(account, reacted.msg_id).unwrap_or(reacted.msg_id);
             reactions(account, &conversation, message, &reacted.reactions);
         }
+        // A full poll replaces the card. Counts alone name each option by its bytes, which the
+        // stored card does not keep, so a results-only update is left as it is.
+        Update::MessagePoll(changed) => {
+            let (Some(peer), Some(msg_id), Some(poll)) = (&changed.peer, changed.msg_id, changed.poll.as_ref()) else {
+                return;
+            };
+            let tl::enums::Poll::Poll(poll) = poll;
+            let tl::enums::PollResults::Results(results) = &changed.results;
+            let conversation = place(account, Who::of(peer), changed.top_msg_id);
+            let Ok(Some(mut stored)) = account.ctx.stored_message(&conversation, &msg_id.to_string()) else {
+                return;
+            };
+            let card = content::poll_card(poll, results);
+            stored.text = format!("Poll: {}", card.title);
+            stored.card = Some(Box::new(card));
+            let _ = account.ctx.history(&conversation, std::slice::from_ref(&stored));
+        }
         // A draft typed (or cleared) on the phone while we are here, or ours echoed back.
         Update::DraftMessage(drafted) => {
             let who = Who::of(&drafted.peer);

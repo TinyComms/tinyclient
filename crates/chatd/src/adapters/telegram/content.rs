@@ -814,6 +814,77 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
     attachment
 }
 
+/// The card for a poll or a quiz. Counts stay off while Telegram is still hiding them.
+/// Voting, retracting, and creating a poll stay a hand-off: the message keeps its link.
+pub(super) fn poll_card(poll: &tl::types::Poll, results: &tl::types::PollResults) -> Card {
+    let hidden = results.min || (poll.hide_results_until_close && !poll.closed);
+    let rows = results.results.as_deref().unwrap_or(&[]);
+    let mut fields = Vec::new();
+    for answer in &poll.answers {
+        let tl::enums::PollAnswer::Answer(answer) = answer else { continue };
+        let found = rows.iter().find_map(|one| match one {
+            tl::enums::PollAnswerVoters::Voters(row) if row.option == answer.option => Some(row),
+            _ => None,
+        });
+        let mut label = String::new();
+        if !hidden {
+            if let Some(count) = found.and_then(|row| row.voters) {
+                label = if count == 1 { "1 vote".to_owned() } else { format!("{count} votes") };
+            }
+        }
+        if found.is_some_and(|row| row.chosen) {
+            label = if label.is_empty() { "Your vote".to_owned() } else { format!("{label} · your vote") };
+        }
+        if found.is_some_and(|row| row.correct) {
+            label = if label.is_empty() { "Correct".to_owned() } else { format!("{label} · correct") };
+        }
+        if label.is_empty() {
+            label = "Option".to_owned();
+        }
+        fields.push((label, plain(&answer.text).to_owned()));
+    }
+    let extra = fields.len().saturating_sub(protocol::CARD_FIELDS);
+    fields.truncate(protocol::CARD_FIELDS);
+    let mut lines = Vec::new();
+    if poll.quiz {
+        lines.push("Quiz".to_owned());
+    }
+    if poll.closed {
+        lines.push("Closed".to_owned());
+    }
+    if poll.multiple_choice {
+        lines.push("Pick any".to_owned());
+    }
+    if poll.public_voters {
+        lines.push("Votes are public".to_owned());
+    }
+    if hidden {
+        lines.push(
+            if poll.hide_results_until_close && !poll.closed {
+                "Results stay hidden until the poll closes."
+            } else {
+                "Results stay hidden until you vote."
+            }
+            .to_owned(),
+        );
+    } else if let Some(total) = results.total_voters {
+        lines.push(if total == 1 { "1 vote".to_owned() } else { format!("{total} votes") });
+    }
+    if extra > 0 {
+        lines.push(format!("{extra} more"));
+    }
+    if let Some(solution) = results.solution.as_ref().filter(|text| !text.is_empty()) {
+        lines.push(solution.clone());
+    }
+    Card {
+        title: plain(&poll.question).to_owned(),
+        text: lines.join("\n"),
+        fields,
+        footer: "Open in Telegram".to_owned(),
+        ..Card::default()
+    }
+}
+
 fn plain(text: &tl::enums::TextWithEntities) -> &str {
     let tl::enums::TextWithEntities::Entities(text) = text;
     &text.text
@@ -1429,6 +1500,10 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                     // is a normal message whose card keeps the coordinates. No map tile is fetched.
                     if let Some(card) = detail_card(media).or_else(|| location_card(media)) {
                         message.card = Some(Box::new(card));
+                    } else if let MessageMedia::Poll(media) = media {
+                        let tl::enums::Poll::Poll(poll) = &media.poll;
+                        let tl::enums::PollResults::Results(results) = &media.results;
+                        message.card = Some(Box::new(poll_card(poll, results)));
                     }
                 }
             }
@@ -1912,6 +1987,96 @@ fn quote_message_header(reply_to: tl::enums::MessageReplyHeader) -> tl::enums::M
     message.into()
 }
 
+/// The lab's telegram-polls check. A poll is a card with its options and counts, a quiz hides
+/// those counts until the poll closes, and both stay a hand-off.
+pub(super) fn prove_polls() -> Result<(), String> {
+    let words = |text: &str| tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities { text: text.to_owned(), entities: Vec::new() });
+    let answer = |text: &str, option: u8| {
+        tl::types::PollAnswer { text: words(text), option: vec![option], media: None, added_by: None, date: None }.into()
+    };
+    let row = |option: u8, count: i32, chosen: bool, correct: bool| {
+        tl::types::PollAnswerVoters { chosen, correct, option: vec![option], voters: Some(count), recent_voters: None }.into()
+    };
+    let poll = |hide: bool, quiz: bool| tl::types::Poll {
+        id: 1,
+        closed: false,
+        public_voters: false,
+        multiple_choice: false,
+        quiz,
+        open_answers: false,
+        revoting_disabled: false,
+        shuffle_answers: false,
+        hide_results_until_close: hide,
+        creator: false,
+        subscribers_only: false,
+        question: words("Saturday or Sunday?"),
+        answers: vec![answer("Saturday", 0), answer("Sunday", 1)],
+        close_period: None,
+        close_date: None,
+        countries_iso2: None,
+        hash: 0,
+    };
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    21i32.serialize(&mut bytes);
+    Who::Group(8_001).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let mut raw = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    raw.from_id = Some(Who::User(7_003).peer());
+    let results = tl::types::PollResults {
+        min: false,
+        has_unread_votes: false,
+        can_view_stats: false,
+        results: Some(vec![row(0, 3, true, false), row(1, 1, false, false)]),
+        total_voters: Some(4),
+        recent_voters: None,
+        solution: None,
+        solution_entities: None,
+        solution_media: None,
+    };
+    raw.media = Some(tl::enums::MessageMedia::Poll(Box::new(tl::types::MessageMediaPoll {
+        poll: poll(false, false).into(),
+        results: results.into(),
+        attached_media: None,
+    })));
+    let mapped = map(&Directory::new(7_001), &raw.clone().into()).ok_or("the poll maps")?;
+    let card = mapped.message.card.as_ref().ok_or("a poll is a card")?;
+    if card.title != "Saturday or Sunday?" || card.footer != "Open in Telegram" || card.text != "4 votes" {
+        return Err(format!("a poll's card lost its question or its count: {} / {}", card.title, card.text));
+    }
+    if card.fields.first().map(|(label, value)| (label.as_str(), value.as_str())) != Some(("3 votes · your vote", "Saturday")) {
+        return Err(format!("the chosen option was not named: {:?}", card.fields));
+    }
+    if !matches!(mapped.message.kind, MessageKind::Unsupported { ref link } if link.contains("message_id=21")) {
+        return Err("a poll is still a hand-off".into());
+    }
+    let hidden = tl::types::PollResults {
+        min: true,
+        has_unread_votes: false,
+        can_view_stats: false,
+        results: Some(vec![row(0, 9, false, true)]),
+        total_voters: Some(9),
+        recent_voters: None,
+        solution: Some("The north ridge.".into()),
+        solution_entities: None,
+        solution_media: None,
+    };
+    raw.media = Some(tl::enums::MessageMedia::Poll(Box::new(tl::types::MessageMediaPoll {
+        poll: poll(true, true).into(),
+        results: hidden.into(),
+        attached_media: None,
+    })));
+    let quiz = map(&Directory::new(7_001), &raw.into()).ok_or("the quiz maps")?;
+    let card = quiz.message.card.as_ref().ok_or("a quiz is a card")?;
+    if !card.text.contains("hidden") || !card.text.contains("The north ridge.") || card.fields.iter().any(|(label, _)| label.contains('9')) {
+        return Err(format!("a hidden quiz showed a count: {}", card.text));
+    }
+    Ok(())
+}
+
 /// The lab's telegram-service-lines check. A premium gift is named, a pin quotes the message
 /// it points at, and an action this build does not word opens in Telegram.
 pub(super) fn prove_service_lines() -> Result<(), String> {
@@ -2260,6 +2425,129 @@ mod tests {
         assert_eq!(rolled.message.text, "\u{1F3B2} 5");
         let spinning = map(&Directory::new(7_001), &dice_message(0)).expect("a roll still spinning maps");
         assert_eq!(spinning.message.text, "\u{1F3B2}");
+    }
+
+    fn words(text: &str) -> tl::enums::TextWithEntities {
+        tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities { text: text.to_owned(), entities: Vec::new() })
+    }
+
+    fn poll_answer(text: &str, option: u8) -> tl::enums::PollAnswer {
+        tl::types::PollAnswer {
+            text: words(text),
+            option: vec![option],
+            media: None,
+            added_by: None,
+            date: None,
+        }
+        .into()
+    }
+
+    fn poll_voters(option: u8, count: i32, chosen: bool, correct: bool) -> tl::enums::PollAnswerVoters {
+        tl::types::PollAnswerVoters {
+            chosen,
+            correct,
+            option: vec![option],
+            voters: Some(count),
+            recent_voters: None,
+        }
+        .into()
+    }
+
+    fn poll_message(poll: tl::types::Poll, results: tl::types::PollResults) -> tl::enums::Message {
+        use grammers_tl_types::{Deserializable, Serializable};
+        let mut bytes = Vec::new();
+        0u32.serialize(&mut bytes);
+        0u32.serialize(&mut bytes);
+        21i32.serialize(&mut bytes);
+        Who::Group(8_001).peer().serialize(&mut bytes);
+        1_700_000_000i32.serialize(&mut bytes);
+        String::new().serialize(&mut bytes);
+        let mut message = tl::types::Message::from_bytes(&bytes).expect("a blank message reads back");
+        message.from_id = Some(Who::User(7_003).peer());
+        message.media = Some(
+            tl::enums::MessageMedia::Poll(Box::new(tl::types::MessageMediaPoll {
+                poll: poll.into(),
+                results: results.into(),
+                attached_media: None,
+            })),
+        );
+        message.into()
+    }
+
+    fn open_poll(hide: bool, quiz: bool, closed: bool) -> tl::types::Poll {
+        tl::types::Poll {
+            id: 1,
+            closed,
+            public_voters: false,
+            multiple_choice: false,
+            quiz,
+            open_answers: false,
+            revoting_disabled: false,
+            shuffle_answers: false,
+            hide_results_until_close: hide,
+            creator: false,
+            subscribers_only: false,
+            question: words("Saturday or Sunday?"),
+            answers: vec![poll_answer("Saturday", 0), poll_answer("Sunday", 1)],
+            close_period: None,
+            close_date: None,
+            countries_iso2: None,
+            hash: 0,
+        }
+    }
+
+    /// Options, counts, and the vote already cast are on the card. Voting stays a hand-off.
+    #[test]
+    fn a_poll_is_a_card_with_its_options_and_a_hand_off() {
+        let results = tl::types::PollResults {
+            min: false,
+            has_unread_votes: false,
+            can_view_stats: false,
+            results: Some(vec![poll_voters(0, 3, true, false), poll_voters(1, 1, false, false)]),
+            total_voters: Some(4),
+            recent_voters: None,
+            solution: None,
+            solution_entities: None,
+            solution_media: None,
+        };
+        let mapped = map(&Directory::new(7_001), &poll_message(open_poll(false, false, false), results)).expect("the poll maps");
+        assert_eq!(mapped.message.text, "Poll: Saturday or Sunday?");
+        match &mapped.message.kind {
+            MessageKind::Unsupported { link } => assert!(link.contains("message_id=21"), "{link}"),
+            other => panic!("a poll stays a hand-off, got {other:?}"),
+        }
+        let card = mapped.message.card.as_ref().expect("a poll is a card");
+        assert_eq!(card.title, "Saturday or Sunday?");
+        assert_eq!(card.footer, "Open in Telegram");
+        assert_eq!(card.text, "4 votes");
+        assert_eq!(
+            card.fields,
+            vec![
+                ("3 votes · your vote".to_owned(), "Saturday".to_owned()),
+                ("1 vote".to_owned(), "Sunday".to_owned()),
+            ]
+        );
+
+        let hidden = tl::types::PollResults {
+            min: true,
+            has_unread_votes: false,
+            can_view_stats: false,
+            results: Some(vec![poll_voters(0, 9, false, true), poll_voters(1, 9, true, false)]),
+            total_voters: Some(9),
+            recent_voters: None,
+            solution: Some("The north ridge.".to_owned()),
+            solution_entities: None,
+            solution_media: None,
+        };
+        let quiz = map(&Directory::new(7_001), &poll_message(open_poll(true, true, false), hidden)).expect("the quiz maps");
+        let card = quiz.message.card.as_ref().expect("a quiz is a card");
+        assert_eq!(card.title, "Saturday or Sunday?");
+        assert!(card.text.contains("hidden"), "{}", card.text);
+        assert!(card.text.contains("Quiz"), "{}", card.text);
+        assert!(card.text.contains("The north ridge."), "{}", card.text);
+        assert!(card.fields.iter().all(|(_, value)| !value.chars().any(|ch| ch.is_ascii_digit())), "hidden counts stay off the card");
+        assert!(card.fields.iter().any(|(label, value)| value == "Saturday" && label.to_lowercase().contains("correct")));
+        assert!(card.fields.iter().any(|(label, value)| value == "Sunday" && label.to_lowercase().contains("your vote")));
     }
 
     fn said(action: MessageAction) -> String {
