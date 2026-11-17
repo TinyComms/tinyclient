@@ -281,6 +281,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-call-leave-clears:0");
         return Ok(());
     }
+    // The lab's messages-transport driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-transport") {
+        if let Err(err) = chatd::adapters::messages::prove_message_transport() {
+            eprintln!("messages-transport: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-transport:0");
+        return Ok(());
+    }
     // The lab's discord-forum-landing driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-forum-landing") {
         if let Err(err) = chatd::demo::prove_discord_forum_landing() {

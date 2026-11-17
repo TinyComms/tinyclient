@@ -3,9 +3,9 @@
 //! the contract. It proves nothing about Google's relay, which needs a real phone.
 
 use protocol::{
-    read_frame, write_frame, AccountKey, Change, ChatStream, ConversationKind, Key, Link,
-    MediaKind, Message, MessageKind, Network, Outgoing, OutgoingFile, Page, ReactionSet, Request,
-    Response, SendState, SignInInput, SignInStep,
+    read_frame, write_frame, AccountKey, Change, ChatStream, ConversationKind, Encryption, Key,
+    Link, MediaKind, Message, MessageKind, Network, Outgoing, OutgoingFile, Page, ReactionSet,
+    Request, Response, SendState, SignInInput, SignInStep,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -613,4 +613,86 @@ fn google_pairing_failure_is_reported_without_adopting_an_account() {
         _ => None,
     });
     assert!(world.status().0.iter().all(|status| status.key.network != Network::Messages || status.link == Link::SignedOut));
+}
+
+#[test]
+fn an_sms_chat_says_text_and_an_encrypted_rcs_chat_does_not_claim_this_computer_holds_the_keys() {
+    let world = World::linked();
+    world.connected();
+    world.steer("sms grace");
+    let sms = world.until("the text label", || {
+        world
+            .conversation(GRACE)
+            .filter(|row| row.topic == "Text message")
+    });
+    assert_eq!(sms.encryption, Encryption::Unknown);
+    world.ask(Request::Typing {
+        conversation: key(GRACE),
+    });
+    let quiet = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < quiet {
+        assert!(
+            !world.calls().iter().any(|call| call.starts_with("typing ")),
+            "an SMS chat told the phone we were typing"
+        );
+        sleep(Duration::from_millis(50));
+    }
+    world.steer("tick grace");
+    sleep(Duration::from_millis(400));
+    assert!(!world.conversation(GRACE).unwrap().seen);
+
+    world.steer("sealed grace");
+    let rcs = world.until("the encrypted RCS label", || {
+        world.conversation(GRACE).filter(|row| {
+            row.topic.contains("RCS message") && row.topic.contains("Encrypted between phones")
+        })
+    });
+    assert_eq!(rcs.encryption, Encryption::Unknown);
+    world.ask(Request::Typing {
+        conversation: key(GRACE),
+    });
+    world.heard(&format!("typing {GRACE}"));
+    world.steer("tick grace");
+    world.until("the read tick", || {
+        world.conversation(GRACE).filter(|row| row.seen)
+    });
+
+    world.steer("mms grace a picture");
+    world.until("the MMS tag", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|message| message.text == "MMS" && message.kind == MessageKind::System)
+    });
+
+    world.steer("sms grace");
+    let dir = world.dir.join("outbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("note.txt");
+    std::fs::write(&path, b"hello").unwrap();
+    match world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "mms-warn".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            files: vec![OutgoingFile {
+                path: path.to_string_lossy().into_owned(),
+                name: "note.txt".into(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+            }],
+            ..Outgoing::default()
+        },
+    }) {
+        Response::Sent { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    world.until("the MMS warning", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|message| message.text == "Sends as MMS; may be compressed")
+    });
 }
