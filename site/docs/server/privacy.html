@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Server privacy and security · Tiny server docs</title>
+<meta name="description" content="What a Tiny server stores, what its operator can read, what it logs, retention and deletion, and what it does not protect against.">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://tinyclient.io/docs/server/privacy.html">
+<link rel="ai-catalog" href="/.well-known/ai-catalog.json">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../../style.css">
+<script src="../../site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../" aria-label="tinyclient home"><img src="../../favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="../" aria-current="page">Docs</a>
+      <a href="../../tinyserver.html">Tiny server</a>
+      <a class="hide-sm" href="../privacy.html">Privacy</a>
+      <a class="dc" href="https://discord.gg/kJHK7BNvJP" aria-label="Discord"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
+      <a class="gh" href="https://github.com/TinyComms/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    <div class="docs-nav-inner">
+      <h2>Documentation</h2>
+      <ul>
+          <li><a href="../index.html">Getting started</a></li>
+          <li><a href="../using.html">Using tinyclient</a></li>
+          <li><a href="../build.html">Build from source</a></li>
+          <li><a href="../architecture.html">Architecture</a></li>
+          <li><a href="../performance.html">Size &amp; performance</a></li>
+          <li><a href="../privacy.html">Privacy &amp; security</a></li>
+          <li><a href="../networks.html">Networks &amp; terms</a></li>
+          <li><a href="../contributing.html">Contributing</a></li>
+      </ul>
+      <h2>Tiny server</h2>
+      <ul>
+          <li><a href="index.html">Overview</a></li>
+          <li><a href="join.html">Join &amp; use a server</a></li>
+          <li><a href="run.html">Run a server</a></li>
+          <li><a href="sign-in.html">Sign-in &amp; passkeys</a></li>
+          <li><a href="calls.html">Calls &amp; media</a></li>
+          <li><a href="manage.html">Manage a community</a></li>
+          <li><a href="operate.html">Operate &amp; upgrade</a></li>
+          <li><a href="encryption.html">End-to-end encryption</a></li>
+          <li><a href="privacy.html" aria-current="page">Server privacy</a></li>
+      </ul>
+      <h2 class="ext">On GitHub</h2>
+      <ul class="ext">
+          <li><a href="https://github.com/TinyComms/tinyserver">tinyserver source</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/blob/main/deploy/README.md">Deployment reference</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/tree/main/docs">Design documents</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main" class="prose">
+    <h1>Server privacy and security</h1>
+    <p class="lede">What a Tiny server stores, what the person who runs it can read, and what it does not protect against.</p>
+
+    <p>A Tiny server is run by its owner, not by the tinyclient project. Joining one means trusting whoever runs it with what is listed here. This page is about the server; <a href="../privacy.html">Privacy and security</a> is about the app on your computer.</p>
+
+    <h2 id="stored">What the server stores</h2>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="What the server stores">
+      <table>
+        <thead><tr><th scope="col">Data</th><th scope="col">How it is kept</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Passwords</th><td>None. There are none.</td></tr>
+          <tr><th scope="row">Accounts</th><td>A display name and an optional picture. An email address only if a sign-in provider sent one and the owner chose to keep it. There are no usernames.</td></tr>
+          <tr><th scope="row">Passkeys</th><td>The public key, a counter, a label, and when it was made and last used. Recovery codes as hashes.</td></tr>
+          <tr><th scope="row">Sessions, invites, bot tokens</th><td>Only a hash of each token. A session has no address, user agent or device name beside it.</td></tr>
+          <tr><th scope="row">Plaintext messages</th><td>The text, in the database</td></tr>
+          <tr><th scope="row">Encrypted messages</th><td>Ciphertext, with who posted it and when</td></tr>
+          <tr><th scope="row">Files</th><td>One file each on the upload volume, under a random name. A plaintext upload is plaintext on disk; a sealed one is stored as it arrived.</td></tr>
+          <tr><th scope="row">Calls</th><td>Nothing. No recording. A call between two people leaves one line in their conversation saying how it ended.</td></tr>
+          <tr><th scope="row">Audit log</th><td>Who did what to whom, with any reason they typed</td></tr>
+          <tr><th scope="row">Device names</th><td>An optional label for each device used with encrypted conversations</td></tr>
+          <tr><th scope="row">IP addresses</th><td>No table holds one. The call server holds participants&rsquo; addresses in memory during a call.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The stack does not encrypt the database or the volumes on disk. That is the host&rsquo;s to do.</p>
+
+    <h2 id="operator">What the operator can read</h2>
+    <p>The person with the database owner role or root on the host can read every plaintext conversation and attachment, any email addresses, the audit log and every abuse report. They can sign in as any member, make themself an owner, and restore an older backup. Reading leaves no trace.</p>
+    <p>They cannot read the text of an <a href="encryption.html#text">encrypted conversation</a>, the contents, names or types of sealed files, or the audio of an <a href="encryption.html#calls">end-to-end encrypted call</a>.</p>
+    <p>Roles do not change this. A moderator sees what their permissions show in the app; the operator is whoever holds the machine.</p>
+
+    <h2 id="metadata">What the server always sees</h2>
+    <ul>
+      <li>Who is a member, who talks to whom, and when. The record that two people have a direct conversation outlives either account.</li>
+      <li>For encrypted conversations: who posted, in which conversation, the minute, the size, and the number and sizes of attachments.</li>
+      <li>For calls: who is in which call, when they joined and left, who is speaking, packet sizes, and each participant&rsquo;s address.</li>
+      <li>When each member was last online, unless the owner <a href="manage.html#setup">chose not to record it</a>.</li>
+    </ul>
+    <p>Other members learn who is on the server and, in a call, the host&rsquo;s public address. They do not learn each other&rsquo;s addresses from the server.</p>
+    <p>A Tiny server is not an anonymity system.</p>
+
+    <h2 id="logs">Logs and telemetry</h2>
+    <ul>
+      <li>The server sends no analytics, no crash reports and no update checks. Its log stays on its own machine.</li>
+      <li>There is no HTTP access log.</li>
+      <li>Never logged: IP addresses, message text, filenames, tokens, email addresses, display names.</li>
+      <li>Logged by default: sign-ins and connections opening and closing, with the account&rsquo;s id, and moderation with ids. That is a history of who was connected and when, so this is not a server that keeps no logs.</li>
+      <li>Redaction works by field name, and a crash message bypasses it.</li>
+    </ul>
+    <p><a href="operate.html#logs">Operate and upgrade</a> has the settings.</p>
+
+    <h2 id="network">What is on the network</h2>
+    <ul>
+      <li>The server does not do TLS itself; the tunnel or proxy in front of it does. With the default Cloudflare tunnel, Cloudflare ends TLS and can see every request, session tokens and plaintext content included. <a href="run.html#proxy">A proxy of your own</a> avoids that.</li>
+      <li>One port is published: the media port. The web port is not.</li>
+      <li>The server makes no outbound connections, except to a sign-in provider outside its own compose file when one is configured. The scanner fetches virus signatures, so its mirrors see the host&rsquo;s address.</li>
+      <li><code>/health</code> answers without a session.</li>
+    </ul>
+
+    <h2 id="retention">Retention and deletion</h2>
+    <p>Nothing deletes messages, audit rows or bans by age. There is no auto-delete setting.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="What is kept and for how long">
+      <table>
+        <thead><tr><th scope="col">What</th><th scope="col">Kept for</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">A session</th><td>30 days unless the operator set otherwise. Not extended by use.</td></tr>
+          <tr><th scope="row">The replay of live events</th><td>24 hours</td></tr>
+          <tr><th scope="row">An upload never attached to a message</th><td>1 hour</td></tr>
+          <tr><th scope="row">An invite nobody used</th><td>Until it expires: 7 days unless set</td></tr>
+          <tr><th scope="row">A resolved abuse report</th><td>90 days unless set, or for as long as an owner holds it</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <ul>
+      <li><strong>Deleting a message</strong>, which only its author can do, removes the text, the attachments and the reactions. A marker with the author and the times stays.</li>
+      <li><strong>A kick</strong> removes the membership and every session. <strong>A ban</strong> does the same and is kept until lifted. The person&rsquo;s messages stay in both cases.</li>
+      <li><strong>Sign out everywhere</strong> ends every session; open connections close within a minute.</li>
+      <li><strong>Deleting an account</strong> removes the email address, name, picture, sign-in identities, passkeys, recovery codes, sessions, and the text and attachments of every message the person wrote. It keeps the markers where those messages were, the record of who they had direct conversations with, audit rows, and bans. A sole owner cannot delete their account. It does not delete an account at Pocket ID or another provider.</li>
+    </ul>
+    <p>No deletion reaches the database&rsquo;s write-ahead log, earlier backups, other people&rsquo;s copies, or a proxy&rsquo;s logs. Deleted files are unlinked, not overwritten. Restoring a backup brings back what was deleted after it. Backups have no schedule or expiry of their own.</p>
+
+    <h2 id="risks">What it does not protect against</h2>
+    <ul>
+      <li>There has been no independent security review, penetration test or cryptographic audit.</li>
+      <li>The passkey sign-in pages are tested against a software authenticator, not a real browser.</li>
+      <li>There is no per-member storage quota: a member can fill the disk with uploads.</li>
+      <li>The media port has no protection against a flood of traffic.</li>
+      <li>A member cannot list their own sessions, only end them all.</li>
+      <li>A plaintext upload is written to disk before the scan verdict comes back. Nobody can fetch it until it passes.</li>
+      <li>A legal hold stops resolved reports from expiring. It does not stop a member deleting their messages or their account.</li>
+      <li>The <a href="encryption.html#limits">limits of the encryption</a> apply.</li>
+    </ul>
+
+    <h2 id="more">The full account</h2>
+    <p>The repository&rsquo;s <a href="https://github.com/TinyComms/tinyserver/tree/main/docs/privacy"><code>docs/privacy/</code></a> has the guarantees with the test behind each, the threat model, the data flows, and the open findings. Where those documents and this page differ, the repository is right. Some of them were written before the server had passkeys of its own and still describe sign-in through a provider only.</p>
+
+    <nav class="pager" aria-label="Previous and next"><a href="encryption.html"><span>Previous</span>End-to-end encryption</a></nav>
+    <p class="edit"><a href="https://github.com/TinyComms/tinyclient/blob/main/site/docs/server/privacy.html">Edit this page on GitHub</a></p>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft, Signal or Google; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. Cloudflare Pages hosts it and can see your request the way any web server can.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

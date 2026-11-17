@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Operate and upgrade · Tiny server docs</title>
+<meta name="description" content="Upgrade, back up, restore, suspend and log a Tiny server, with every optional setting.">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://tinyclient.io/docs/server/operate.html">
+<link rel="ai-catalog" href="/.well-known/ai-catalog.json">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="../../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../../style.css">
+<script src="../../site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../../" aria-label="tinyclient home"><img src="../../favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="../" aria-current="page">Docs</a>
+      <a href="../../tinyserver.html">Tiny server</a>
+      <a class="hide-sm" href="../privacy.html">Privacy</a>
+      <a class="dc" href="https://discord.gg/kJHK7BNvJP" aria-label="Discord"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
+      <a class="gh" href="https://github.com/TinyComms/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    <div class="docs-nav-inner">
+      <h2>Documentation</h2>
+      <ul>
+          <li><a href="../index.html">Getting started</a></li>
+          <li><a href="../using.html">Using tinyclient</a></li>
+          <li><a href="../build.html">Build from source</a></li>
+          <li><a href="../architecture.html">Architecture</a></li>
+          <li><a href="../performance.html">Size &amp; performance</a></li>
+          <li><a href="../privacy.html">Privacy &amp; security</a></li>
+          <li><a href="../networks.html">Networks &amp; terms</a></li>
+          <li><a href="../contributing.html">Contributing</a></li>
+      </ul>
+      <h2>Tiny server</h2>
+      <ul>
+          <li><a href="index.html">Overview</a></li>
+          <li><a href="join.html">Join &amp; use a server</a></li>
+          <li><a href="run.html">Run a server</a></li>
+          <li><a href="sign-in.html">Sign-in &amp; passkeys</a></li>
+          <li><a href="calls.html">Calls &amp; media</a></li>
+          <li><a href="manage.html">Manage a community</a></li>
+          <li><a href="operate.html" aria-current="page">Operate &amp; upgrade</a></li>
+          <li><a href="encryption.html">End-to-end encryption</a></li>
+          <li><a href="privacy.html">Server privacy</a></li>
+      </ul>
+      <h2 class="ext">On GitHub</h2>
+      <ul class="ext">
+          <li><a href="https://github.com/TinyComms/tinyserver">tinyserver source</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/blob/main/deploy/README.md">Deployment reference</a></li>
+          <li><a href="https://github.com/TinyComms/tinyserver/tree/main/docs">Design documents</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main" class="prose">
+    <h1>Operate and upgrade</h1>
+    <p class="lede">Upgrades, backups, suspension, logs, and every optional setting.</p>
+
+    <p>Commands run from <code>deploy/</code>, next to <code>compose.yml</code> and <code>.env</code>.</p>
+
+    <h2 id="upgrade">Upgrade</h2>
+    <p>Back up the database first, then pull and rebuild:</p>
+<div class="code"><pre><code>docker compose exec -T postgres pg_dump -U postgres tinyserver &gt; backups/before-upgrade.sql
+git pull
+docker compose up -d --build --remove-orphans</code></pre></div>
+    <p><code>tinyserver-init</code> applies any new migrations and exits before the server starts. If it fails, the server does not start; <code>docker compose logs tinyserver-init</code> says why.</p>
+    <p>Going back to an older release means restoring that backup: an older binary refuses a database that has migrations it does not know.</p>
+    <p>Some releases need a step from you, such as the one that moved the sign-in choice into the app. <a href="https://github.com/TinyComms/tinyserver/blob/main/deploy/README.md#upgrading">Upgrading in <code>deploy/README.md</code></a> lists them. Read it before each upgrade.</p>
+
+    <h3 id="image">Running a published image</h3>
+    <p>Every push to main that passes CI is published as <code>ghcr.io/tinycomms/tinyserver:&lt;sha&gt;</code> and <code>:main</code>. <code>compose.image.yml</code> runs that image instead of building one on the host. Name the sha, not <code>:main</code>, so the host runs the commit you chose and going back is naming the one before.</p>
+<div class="code"><pre><code>docker compose exec -T postgres pg_dump -U postgres tinyserver &gt; backups/before-upgrade.sql
+TINYSERVER_IMAGE=ghcr.io/tinycomms/tinyserver:&lt;sha&gt; \
+  docker compose -f compose.yml -f compose.image.yml up -d --pull always --remove-orphans</code></pre></div>
+    <p><code>TINYSERVER_IMAGE</code> can live in the environment file instead. The binary carries its migrations; the checkout is still where the compose files and the Postgres init script come from.</p>
+
+    <h2 id="stop">Stop</h2>
+    <p><code>docker stop</code> sends SIGTERM. The server ends every call, finishes the requests it has, and exits. Calls live in memory, so a restart ends them.</p>
+
+    <h2 id="backup">Back up, restore and move</h2>
+    <p><code>tenant/operator.sh</code> works on a single community when given <code>--stack .env</code>. Backups are encrypted with <a href="https://age-encryption.org">age</a>, which has to be on the host.</p>
+<div class="code"><pre><code>sh tenant/operator.sh backup  --stack .env --out community-2026-11-01.age --recipient age1...
+sh tenant/operator.sh restore --stack .env --in community-2026-11-01.age --identity operator.key
+sh tenant/operator.sh export  --stack .env --out community-export.age --recipients-file owner.txt</code></pre></div>
+    <p>A backup holds the database, the uploads, Pocket ID&rsquo;s data, the secrets, and the server&rsquo;s end-to-end key file. That key is not in the database, so a plain <code>pg_dump</code> does not contain it. Losing the key file and its database row together stops the server from starting, rather than making a key that members&rsquo; apps would reject.</p>
+    <p><code>export</code> writes the same to hand to someone who will run the community elsewhere. <code>delete</code> removes it and asks for the name again with <code>--confirm</code>.</p>
+
+    <h2 id="suspend">Suspend and hold</h2>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Operator commands">
+      <table>
+        <thead><tr><th scope="col">Command</th><th scope="col">Effect</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>status</code></th><td>The mode, the notice, since when, and whether there is a hold</td></tr>
+          <tr><th scope="row"><code>suspend --read-only --notice TEXT</code></th><td>Reading, signing in and out, deleting your account and filing a report still work. Every other write is refused. Calls already running go on until they end; new ones are refused.</td></tr>
+          <tr><th scope="row"><code>suspend --offline --notice TEXT</code></th><td>Only the health and status routes answer. Open connections close within a minute.</td></tr>
+          <tr><th scope="row"><code>resume</code></th><td>Normal again. The notice is cleared.</td></tr>
+          <tr><th scope="row"><code>hold --reason TEXT</code>, <code>release</code></th><td>A legal hold. Resolved reports stop expiring, and <code>operator.sh</code> refuses to delete or overwrite the community.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Members see the notice, 1 to 500 characters. The public status route never says whether there is a hold.</p>
+
+    <h2 id="logs">Logs</h2>
+    <p>The server logs on its own machine only. There is no exporter and no telemetry.</p>
+    <ul>
+      <li>The log is stderr; Docker keeps three files of 10 MB. The level is <code>info</code> unless <code>TINYSERVER_LOG_LEVEL</code> says <code>error</code>, <code>warn</code>, <code>debug</code> or <code>trace</code>. <code>RUST_LOG</code> is ignored.</li>
+      <li>A debug ring of about 2,000 lines, none older than an hour, stays in memory. It is written to disk only when the process receives <code>SIGUSR1</code>, and bundles older than 24 hours are deleted on the next start.</li>
+      <li>Message text, filenames, tokens, keys, invite secrets, email addresses, display names, and call setup (SDP) are never recorded. Ids such as <code>user_id</code>, <code>room_id</code> and <code>call_id</code> are.</li>
+      <li>Client addresses are kept out of the log unless <code>TINYSERVER_LOG_PEER_IP=on</code>, and then only on the debug ring.</li>
+    </ul>
+    <p>During a call the log has a <code>media counters</code> line once a minute. <a href="calls.html#vps">Calls and media</a> says how to read it.</p>
+
+    <h2 id="housekeeping">Housekeeping</h2>
+    <p>Every ten minutes the server deletes expired sessions, expired invites nobody used, sign-ins nobody finished, one-time codes nobody redeemed, uploads never attached to a message after an hour, and resolved reports past their retention. Accepted invites stay in the invite list.</p>
+
+    <h2 id="settings">Optional settings</h2>
+    <p>Unset, each has the default the compose file gives it. They go in <code>deploy/.env</code>.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Optional settings">
+      <table>
+        <thead><tr><th scope="col">Variable</th><th scope="col">Default</th><th scope="col">Meaning</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>TINYSERVER_PUBLIC_IP</code></th><td>unset</td><td>The IPv4 address members reach the media port at. Unset, calls have no media.</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_MEDIA_PORT</code></th><td><code>50000</code></td><td>The one port for call audio and video, UDP and TCP</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_LAN_IP</code></th><td>unset</td><td>The host&rsquo;s address on the home network, for members on it</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_MEDIA_EGRESS_KBPS</code></th><td>no budget</td><td>What the host can upload for calls, in kb/s</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_CALL_ROOM_MAX</code>, <code>TINYSERVER_CALL_SERVER_MAX</code></th><td><code>12</code>, <code>32</code></td><td>People in one room&rsquo;s call, and in calls on the whole server</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_SESSION_MAX_DAYS</code></th><td><code>30</code></td><td>Days a sign-in lasts, 1 to 365. Nothing extends a session.</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_PASSKEY_RP_NAME</code></th><td><code>TinyComms</code></td><td>The name a browser shows when it asks for a passkey</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_PASSKEY_RP_ID</code></th><td>the host of the public URL</td><td>The domain passkeys belong to. <a href="sign-in.html#relying-party">Set it before anyone makes one, or not at all.</a></td></tr>
+          <tr><th scope="row"><code>TINYSERVER_OIDC_*</code></th><td></td><td>A sign-in provider. <a href="sign-in.html#providers">Sign-in and passkeys</a> lists them.</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_TRUSTED_PROXIES</code>, <code>TINYSERVER_CLIENT_IP_HEADER</code></th><td>private and loopback peers; Cloudflare&rsquo;s header</td><td>Whose client-address header the sign-in limiter believes, and which header</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_LOG_LEVEL</code></th><td><code>info</code></td><td>How much the log says</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_LOG_RING</code>, <code>TINYSERVER_LOG_EXPORT</code></th><td><code>on</code>, <code>on</code></td><td>Whether a debug ring is kept, and whether <code>SIGUSR1</code> may write it to disk</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_REPORT_RETENTION_DAYS</code></th><td><code>90</code></td><td>Days a resolved abuse report is kept, 7 to 3650</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_PG_DIR</code>, <code>POCKETID_DATA_DIR</code></th><td>Docker volumes</td><td>Host directories for the data</td></tr>
+          <tr id="limits"><th scope="row"><code>TINYSERVER_MEM_LIMIT</code>, <code>TINYSERVER_PIDS_LIMIT</code>, <code>TINYSERVER_CPUS</code></th><td><code>1g</code>, <code>512</code>, <code>2</code></td><td>Caps on the server container</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_PG_MEM_LIMIT</code>, <code>TINYSERVER_PG_PIDS_LIMIT</code></th><td><code>1g</code>, <code>256</code></td><td>Caps on Postgres</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_CLAMD_MEM_LIMIT</code></th><td><code>3g</code></td><td>Cap on the scanner</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_IMAGE</code></th><td>built on the host</td><td>With <code>compose.image.yml</code>: the published image to run</td></tr>
+          <tr><th scope="row"><code>TINYSERVER_INSIDE_SUBNET</code>, <code>TINYSERVER_TUNNEL_IP</code></th><td><code>172.30.53.0/24</code>, <code>172.30.53.10</code></td><td>The internal network and the tunnel&rsquo;s address on it. Change both if the range is taken.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="scan-off">Scanning off</h2>
+<div class="code"><pre><code>docker compose -f compose.yml -f scan-off.yml up -d</code></pre></div>
+    <p>This runs without clamd and marks every upload clean without scanning it. It is only for a community whose attachments are sealed on the sending device, where the server could scan nothing but ciphertext. Anywhere else it lets any file through.</p>
+
+    <h2 id="tenants">Many communities on one host</h2>
+    <p><code>tenant/tenant.sh</code> runs the same compose file once per community, each with its own project, networks, volumes, subnet, media port, database, roles, passwords and secrets.</p>
+<div class="code"><pre><code>sh tenant/tenant.sh new acme --chat-url https://acme.example.org \
+    --auth-url https://auth.acme.example.org --tunnel-token &lt;token&gt;
+sh tenant/tenant.sh compose acme up -d</code></pre></div>
+    <p><a href="https://github.com/TinyComms/tinyserver/blob/main/deploy/tenant/README.md"><code>deploy/tenant/README.md</code></a> has the rest.</p>
+
+    <nav class="pager" aria-label="Previous and next"><a href="manage.html"><span>Previous</span>Manage a community</a><a class="next" href="encryption.html"><span>Next</span>End-to-end encryption</a></nav>
+    <p class="edit"><a href="https://github.com/TinyComms/tinyclient/blob/main/site/docs/server/operate.html">Edit this page on GitHub</a></p>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft, Signal or Google; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. Cloudflare Pages hosts it and can see your request the way any web server can.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

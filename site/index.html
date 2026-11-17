@@ -153,7 +153,7 @@
       </li>
       <li class="feat-card spot">
         <div class="crop side"><img src="shots/tile-call-1.webp" alt="" width="630" height="627" loading="lazy" decoding="async"></div>
-        <div class="feat-text"><h3>Voice calls</h3><p>Discord voice, audio only, and a Tiny room you run. A Tiny call is end-to-end encrypted when that server offers it. Echo cancellation is on.</p></div>
+        <div class="feat-text"><h3>Voice calls</h3><p>Discord calls, with a camera and Go Live, and a Tiny room you run. A Tiny call is end-to-end encrypted when that server offers it. Echo cancellation is on.</p></div>
       </li>
       <li class="feat-card spot">
         <div class="crop pane top"><img src="shots/tile-thread-1.webp" alt="" width="591" height="510" loading="lazy" decoding="async"></div>
@@ -420,8 +420,8 @@
           <td data-label="Edit, delete"><span class="tag yes">Yes</span></td>
           <td data-label="Files"><span class="tag yes">Yes</span></td>
           <td data-label="Voice"><span class="tag yes">In tinyclient</span></td>
-          <td data-label="Video"><span class="tag warn">Not yet</span></td>
-          <td data-label="Screen share"><span class="tag warn">Not yet</span></td>
+          <td data-label="Video"><span class="tag yes">Camera</span></td>
+          <td data-label="Screen share"><span class="tag yes">Go Live</span></td>
         </tr>
         <tr>
           <th scope="row"><span class="th-net"><img src="assets/networks/microsoft-teams.svg" alt="" width="20" height="20">Teams</span></th>
@@ -471,12 +471,12 @@
           <td data-label="Files"><span class="tag yes">Yes</span></td>
           <td data-label="Voice"><span class="tag yes">In tinyclient</span></td>
           <td data-label="Video"><span class="tag yes">One picture</span></td>
-          <td data-label="Screen share"><span class="tag yes">Win, macOS, X11</span></td>
+          <td data-label="Screen share"><span class="tag yes">Win, macOS, Linux</span></td>
         </tr>
         </tbody>
       </table>
     </div>
-    <p class="fine-note center">Not built yet: video and screen share on Discord, Slack, Teams, Telegram, Signal and Messages. A Tiny room shows one picture, a share or one other person&rsquo;s camera. The camera sends on Windows only; screen share sends on Windows, macOS and Linux&nbsp;X11. Signal photos and files are a labelled line, and Signal calls are not built. Teams personal accounts are not built. Recording a voice message is not built.</p>
+    <p class="fine-note center">Not built yet: video and screen share on Slack, Teams, Telegram, Signal and Messages. A Discord call carries a camera, and Go Live sends the screen. A Tiny room shows one picture, a share or one other person&rsquo;s camera. The camera and screen share send on Windows, macOS and&nbsp;Linux. Signal photos and files are a labelled line, and Signal calls are not built. Teams personal accounts are not built. A voice message can be recorded on Telegram only.</p>
     <p class="more center"><a href="docs/networks.html">The details, and each network&rsquo;s terms →</a></p>
   </div>
 </section>
@@ -485,14 +485,38 @@
   <div class="wrap">
     <p class="kicker center reveal">Your own server</p>
     <h2 id="tinyserver-title" class="center reveal">Tiny server</h2>
-    <p class="lede center reveal">A server you run for your own community: text channels, direct messages and voice rooms, with tinyclient as its app. Open source, MIT.</p>
-    <ul class="points reveal">
-      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M11 4.7a.7.7 0 0 0-1.2-.5L6.4 7.6A1.4 1.4 0 0 1 5.4 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.4a1.4 1.4 0 0 1 1 .4l3.4 3.4a.7.7 0 0 0 1.2-.5z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.4 18.4a9 9 0 0 0 0-12.8"/></svg></span><strong>Text and voice</strong><span>Channels, direct messages and rooms, with echo&nbsp;cancellation.</span></li>
-      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span><strong>Encrypted</strong><span>End-to-end encrypted when the server offers it. Otherwise the call says encrypted to the&nbsp;server.</span></li>
-      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.7 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.5 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span><strong>Moderated</strong><span>Roles, permissions, invites, bans and an audit&nbsp;log.</span></li>
-      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><path d="M6 7h.01M6 17h.01"/></svg></span><strong>Yours</strong><span>Docker Compose, passkeys through Pocket&nbsp;ID, one open&nbsp;port.</span></li>
+    <p class="lede center reveal">A server you run for your own community, with tinyclient as its app. Text, voice and one picture, on one Docker Compose file. Open source,&nbsp;MIT.</p>
+    <ul class="feat reveal">
+      <li class="feat-card spot">
+        <div class="crop side"><img src="shots/tile-tiny-rooms-1.webp" alt="" width="316" height="237" loading="lazy" decoding="async"></div>
+        <div class="feat-text"><h3>Rooms and channels</h3><p>Voice rooms and text channels in categories, and who is in each. Direct messages between&nbsp;members.</p></div>
+      </li>
+      <li class="feat-card spot">
+        <div class="crop pane"><img src="shots/tile-tiny-voice-1.webp" alt="" width="460" height="360" loading="lazy" decoding="async"></div>
+        <div class="feat-text"><h3>Voice, and one picture</h3><p>Drop into a room. Mute, deafen and see who is speaking. A room can show a screen share or one&nbsp;camera.</p></div>
+      </li>
+      <li class="feat-card spot">
+        <div class="crop pane"><img src="shots/tile-tiny-e2ee-1.webp" alt="" width="480" height="360" loading="lazy" decoding="async"></div>
+        <div class="feat-text"><h3>End-to-end encrypted</h3><p>When every app in the call can, the server cannot hear it. A call code and safety numbers let you&nbsp;check.</p></div>
+      </li>
+      <li class="feat-card spot">
+        <div class="crop pane"><img src="shots/tile-tiny-moderation-1.webp" alt="" width="496" height="404" loading="lazy" decoding="async"></div>
+        <div class="feat-text"><h3>Moderation</h3><p>Right-click anyone: server mute, move, disconnect, timeout, kick or ban. Every one is in the audit&nbsp;log.</p></div>
+      </li>
+      <li class="feat-card spot">
+        <div class="crop pane"><img src="shots/tile-tiny-roles-1.webp" alt="" width="480" height="360" loading="lazy" decoding="async"></div>
+        <div class="feat-text"><h3>Roles and permissions</h3><p>Drag roles into order and switch on what each may do, for the whole server or one&nbsp;room.</p></div>
+      </li>
+      <li class="feat-card spot">
+        <div class="crop pane"><img src="shots/tile-tiny-invite-1.webp" alt="" width="480" height="360" loading="lazy" decoding="async"></div>
+        <div class="feat-text"><h3>Invites, and no passwords</h3><p>An invite gives roles, a number of uses and an expiry. People sign in with a passkey, in their&nbsp;browser.</p></div>
+      </li>
     </ul>
-    <p class="more center"><a href="tinyserver.html">Everything a Tiny server does →</a></p>
+    <div class="actions center ts-actions reveal">
+      <a class="btn btn-primary" href="docs/server/run.html"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><path d="M6 7h.01M6 17h.01"/></svg>Run your own</a>
+      <a class="btn btn-secondary" href="docs/server/"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/></svg>Server docs</a>
+      <a class="btn btn-secondary" href="tinyserver.html">See it in pictures →</a>
+    </div>
   </div>
 </section>
 
@@ -604,6 +628,7 @@
           <li><a href="https://github.com/TinyComms/tinyclient">Source on GitHub</a></li>
           <li><a href="https://github.com/TinyComms/tinyclient/releases">Releases</a></li>
           <li><a href="tinyserver.html">Tiny server</a></li>
+          <li><a href="docs/server/">Tiny server docs</a></li>
           <li><a href="docs/contributing.html">Contributing</a></li>
         </ul>
       </nav>

@@ -18,7 +18,7 @@ tinyclient is a native desktop app. It has no tinyclient account, no tinyclient 
 
 ## Do not invent
 
-Do not tell a person to register an agent, mint an OAuth token, or call a tinyclient HTTP API. None of those exist. Sign-in happens inside the app, against Slack, Discord, Telegram, Teams, Signal, or Android Messages. A Tiny server is run by its owner with Docker Compose; people sign in to it in their browser through the server's OpenID Connect provider (Pocket ID by default). It has text channels, direct messages, and voice rooms. A room can show one picture. A call is end-to-end encrypted only when that server offers it.
+Do not tell a person to register an agent, mint an OAuth token, or call a tinyclient HTTP API. None of those exist. Sign-in happens inside the app, against Slack, Discord, Telegram, Teams, Signal, or Android Messages. A Tiny server is run by its owner with Docker Compose; people sign in to it in their browser with a passkey, at the server's own page or at an OpenID Connect provider its owner set up. Its documentation is at https://tinyclient.io/docs/server/. It has text channels, direct messages, and voice rooms. A room can show one picture. A call is end-to-end encrypted only when that server offers it.
 
 ## What the site is
 
