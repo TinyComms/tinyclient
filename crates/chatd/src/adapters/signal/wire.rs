@@ -112,6 +112,10 @@ pub enum Event {
     /// A message was edited. `target` is when it was first sent.
     Edited { peer: Peer, author: String, target: u64, text: String },
     Deleted { peer: Peer, author: String, target: u64 },
+    /// Removed on another device for this account only. `target` is when it was first sent.
+    DeletedForMe { peer: Peer, author: String, target: u64 },
+    /// The whole conversation was removed for this account on another device.
+    Forgot(Peer),
     /// `by` reacted to `author`'s message sent at `target`.
     Reacted { peer: Peer, by: String, author: String, target: u64, emoji: String, removed: bool },
     /// The user read these messages (author, sent) on another device.
@@ -135,7 +139,10 @@ pub enum Body {
     Text { text: String, quote: Option<Quote> },
     React { author: String, target: u64, emoji: String, remove: bool },
     Edit { target: u64, text: String },
+    /// Delete for everyone.
     Delete { target: u64 },
+    /// Delete for me: the user's other devices drop this message, and nobody else is told.
+    DeleteForMe { author: String, target: u64 },
 }
 
 /// Why something failed.

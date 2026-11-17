@@ -1,0 +1,12 @@
+{
+  "id": "signal-delete-for-me",
+  "title": "Signal delete for me follows the phone, and a late delete is not for everyone",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same window check is what this desktop run checks.",
+    "ios": "The phone proof build does not run desktop chatd. The same window check is what this desktop run checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

@@ -16,6 +16,8 @@
 //! | `mine SENT TEXT…` | we wrote TEXT to Grace from the phone |
 //! | `note SENT TEXT…` | we wrote TEXT to Note to Self from the phone |
 //! | `edit WHO TARGET TEXT…`, `delete WHO TARGET` | WHO changed or took back their message |
+//! | `delete-for-me WHO SENT` | the phone deleted WHO's message, sent at SENT, for this device only |
+//! | `delete-chat WHO` | the phone deleted the whole chat with WHO for this device only |
 //! | `react WHO AUTHOR TARGET EMOJI`, `unreact …` | WHO reacted to AUTHOR's message |
 //! | `read WHO SENT` | we read WHO's message on the phone |
 //! | `seen WHO SENT` | WHO read our message |
@@ -44,7 +46,8 @@ pub const ALAN: &str = "c3c3c3c3-0000-4000-8000-000000000003";
 pub const CLUB: &str = "5a175a175a175a175a175a175a175a175a175a175a175a175a175a175a175a17";
 /// What the fake keeps as the key to a state it does not have.
 const VAULT: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-/// 2026-10-13 12:00 UTC, in milliseconds: what the fake sends with is counted on from here.
+/// 2026-10-13 12:00 UTC, in milliseconds. A scripted line that names no time uses this, which is
+/// outside the edit and delete-for-everyone windows. A send from the test uses the clock below.
 const T0: u64 = 1_791_892_800_000;
 /// The link the fake shows, and the one after it expires.
 pub const LINK: &str = "sgnl://linkdevice?uuid=fake-1&pub_key=BfakeKey1";
@@ -91,7 +94,7 @@ impl Fake {
             heard: Mutex::new(Some(heard)),
             closed: Arc::default(),
             refuse: Arc::default(),
-            clock: AtomicU64::new(T0 + 1_000_000),
+            clock: AtomicU64::new(super::now_ms()),
             control: script::control("signal.ctl"),
             // A scripted card. The link is invented: nothing here reserves a username.
             card: Arc::new(Mutex::new(OwnCard {
@@ -168,15 +171,23 @@ fn steer(line: &str) -> Vec<Event> {
             let peer = direct(if command == "note" { ME } else { GRACE });
             vec![Event::Message { peer, text, outgoing: true }]
         }
-        "edit" | "delete" => {
+        "edit" | "delete" | "delete-for-me" => {
             let Some((author, _)) = who(next()) else {
                 return Vec::new();
             };
             let target = next().parse().unwrap_or(0);
+            let peer = direct(author);
             match command {
-                "edit" => vec![Event::Edited { peer: direct(author), author: author.into(), target, text: rest(line, 3) }],
-                _ => vec![Event::Deleted { peer: direct(author), author: author.into(), target }],
+                "edit" => vec![Event::Edited { peer, author: author.into(), target, text: rest(line, 3) }],
+                "delete-for-me" => vec![Event::DeletedForMe { peer, author: author.into(), target }],
+                _ => vec![Event::Deleted { peer, author: author.into(), target }],
             }
+        }
+        "delete-chat" => {
+            let Some((author, _)) = who(next()) else {
+                return Vec::new();
+            };
+            vec![Event::Forgot(direct(author))]
         }
         "react" | "unreact" => {
             let Some((by, _)) = who(next()) else {
@@ -238,6 +249,7 @@ impl Wire for Fake {
             Body::React { author, target, emoji, remove } => format!("send {} react {target}-{author} {emoji} remove={remove}", describe(to)),
             Body::Edit { target, text } => format!("send {} edit {target} {text}", describe(to)),
             Body::Delete { target } => format!("send {} delete {target}", describe(to)),
+            Body::DeleteForMe { target, .. } => format!("send {} delete-for-me {target}", describe(to)),
         };
         record(&line);
         if let Some(words) = self.refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
