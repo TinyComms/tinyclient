@@ -1,0 +1,12 @@
+{
+  "id": "telegram-live-location",
+  "title": "A live location shows its place and moves when the share does",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same card is what a live location maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same card is what a live location maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

@@ -1264,6 +1264,31 @@ impl World {
                 self.store(None, message.clone());
                 vec![update(tl::types::UpdateEditMessage { message: message.into(), pts: 0, pts_count: 0 }.into())]
             }
+            // A live location, then the same message moved. The second is an edit, so it must
+            // not count as another unread message.
+            "live-place" | "live-move" => {
+                let moved = line == "live-move";
+                let (lat, long) = if moved { (37.8, -122.5) } else { (37.7, -122.4) };
+                let mut message = message(odalys, 40, ODALYS, crate::hub::now() as i32, "");
+                if moved {
+                    message.edit_date = Some(crate::hub::now() as i32);
+                }
+                message.media = Some(
+                    tl::types::MessageMediaGeoLive {
+                        geo: tl::types::GeoPoint { long, lat, access_hash: 0, accuracy_radius: None }.into(),
+                        heading: Some(90),
+                        period: 3_600,
+                        proximity_notification_radius: None,
+                    }
+                    .into(),
+                );
+                self.store(None, message.clone());
+                if moved {
+                    vec![update(tl::types::UpdateEditMessage { message: message.into(), pts: 0, pts_count: 0 }.into())]
+                } else {
+                    vec![new(message)]
+                }
+            }
             "delete" => {
                 if let Some(held) = self.messages.get_mut(&odalys.text()) {
                     held.remove(&13);

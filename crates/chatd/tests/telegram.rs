@@ -688,6 +688,27 @@ fn a_pin_or_a_folder_change_is_told_row_by_row_and_never_rereads_the_chats() {
     assert_eq!(world.called("GetDialogs"), 2);
 }
 #[test]
+fn a_live_location_moves_on_the_card_and_the_move_is_not_a_new_message() {
+    let world = World::signed_in();
+    world.connected();
+    world.ask(Request::Watch(Watching { conversation: Some(key("u7002")), ..Watching::default() }));
+    world.until("history", || world.message("u7002", "12"));
+    world.steer("live-place");
+    let place = world.until("the live location", || world.message("u7002", "40").filter(|message| message.card.is_some()));
+    let card = place.card.expect("a live location is a card");
+    assert_eq!(card.title, "Live location");
+    assert!(card.text.contains("geo:37.7,-122.4"), "{}", card.text);
+    assert!(card.fields.iter().any(|(label, value)| label == "Status" && value == "Still sharing"), "{:?}", card.fields);
+    world.until("the live location counts once", || world.conversation("u7002").filter(|row| row.unread == 2));
+    world.steer("live-move");
+    let moved = world.until("the live location moved", || {
+        world.message("u7002", "40").filter(|message| message.card.as_ref().is_some_and(|card| card.text.contains("geo:37.8,-122.5")))
+    });
+    assert!(moved.card.unwrap().text.contains("geo:37.8,-122.5"));
+    assert_eq!(world.conversation("u7002").unwrap().unread, 2);
+}
+
+#[test]
 fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
     let world = World::signed_in();
     world.connected();
