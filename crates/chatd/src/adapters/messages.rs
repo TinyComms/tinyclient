@@ -252,6 +252,12 @@ pub fn prove_message_transport() -> Result<(), String> {
     bugle::prove_message_transport()
 }
 
+/// The lab sets `TINYCLIENT_PROVE=messages-file-types`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_message_file_types() -> Result<(), String> {
+    bugle::prove_message_file_types()
+}
+
 /// The lab sets `TINYCLIENT_PROVE=messages-phone-quiet`. A build from before this ignores that
 /// and keeps serving, so the same driver fails there.
 pub fn prove_phone_quiet() -> Result<(), String> {
@@ -725,6 +731,10 @@ fn kind_of(mime: &str) -> MediaKind {
         MediaKind::Gif
     } else if mime.starts_with("image/") {
         MediaKind::Image
+    } else if mime.starts_with("video/") {
+        MediaKind::Video
+    } else if mime.starts_with("audio/") {
+        MediaKind::Audio
     } else {
         MediaKind::File
     }
@@ -1156,7 +1166,7 @@ fn ask(account: &Account, item: &WaitingSend) -> Result<Message, String> {
             .map(|id| outgoing(account, id, item.text.clone()));
     }
     let bytes = std::fs::read(&item.path).unwrap_or_default();
-    let mime = bugle::mime_of(&item.name);
+    let mime = bugle::mime_of(&item.name, &bytes);
     account
         .drive
         .send_file(&item.conversation, &item.text, &item.path, &item.name)

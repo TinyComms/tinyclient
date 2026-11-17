@@ -486,7 +486,7 @@ fn a_file_we_send_is_read_and_shown_back() {
             sent.attachments[0].file.kind,
             sent.attachments[0].mime.as_str()
         ),
-        (MediaKind::File, "application/octet-stream")
+        (MediaKind::File, "text/plain")
     );
 
     let photo = dir.join("shot.jpg");
@@ -527,6 +527,56 @@ fn a_file_we_send_is_read_and_shown_back() {
             shown.attachments[0].mime.as_str()
         ),
         (MediaKind::Image, "image/jpeg")
+    );
+}
+
+#[test]
+fn a_mov_is_sent_as_a_video() {
+    let world = World::linked();
+    world.connected();
+    let dir = world.dir.join("outbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("clip.mov");
+    let mut bytes = vec![0, 0, 0, 0x14];
+    bytes.extend_from_slice(b"ftypqt  ");
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    std::fs::write(&path, &bytes).unwrap();
+    match world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "file-mov".into(),
+        text: "the clip".into(),
+        reply_to: None,
+        with: Outgoing {
+            files: vec![OutgoingFile {
+                path: path.to_string_lossy().into_owned(),
+                name: "clip.mov".into(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+            }],
+            ..Outgoing::default()
+        },
+    }) {
+        Response::Sent { message } => {
+            assert!(matches!(message.state, SendState::Pending), "{message:?}")
+        }
+        other => panic!("{other:?}"),
+    }
+    let shown = world.until("the sent clip", || {
+        world.messages(GRACE).into_iter().find(|message| {
+            message.text == "the clip"
+                && message
+                    .attachments
+                    .iter()
+                    .any(|file| file.name == "clip.mov" && file.file.id.starts_with("messages:"))
+        })
+    });
+    assert_eq!(
+        (
+            shown.attachments[0].file.kind,
+            shown.attachments[0].mime.as_str()
+        ),
+        (MediaKind::Video, "video/quicktime")
     );
 }
 
