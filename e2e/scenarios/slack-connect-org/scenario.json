@@ -1,0 +1,12 @@
+{
+  "id": "slack-connect-org",
+  "title": "A Slack Connect channel names the other organisation, and an invite says where it is accepted",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same organisation name is what a Slack Connect channel maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same organisation name is what a Slack Connect channel maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

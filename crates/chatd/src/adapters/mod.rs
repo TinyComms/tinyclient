@@ -1570,6 +1570,11 @@ pub fn prove_teams_reactions() -> Result<(), String> {
     teams::prove_reactions()
 }
 
+/// The lab's slack-connect-org driver. See `slack::prove_connect_names`.
+pub fn prove_slack_connect_org() -> Result<(), String> {
+    slack::prove_connect_names()
+}
+
 /// An adapter with no network behind it, for whatever serves an account inside chatd (the
 /// demo). The caller runs `serve_commands` on the inbox with the context.
 pub(crate) fn local(account: AccountKey, hub: Arc<Hub>) -> (Adapter, Context, Receiver<Command>) {
