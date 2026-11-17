@@ -719,7 +719,9 @@ fn take_sgr(bytes: &[u8], i: usize) -> (usize, Option<&[u8]>) {
             return (j, None);
         }
         if !(byte.is_ascii_digit() || byte == b';') {
-            return (j, None);
+            // A byte of a multi-byte character is not part of the escape: leave it for the caller
+            // so the text is never cut mid-character.
+            return (if byte.is_ascii() { j } else { j - 1 }, None);
         }
     }
     (j.min(bytes.len()), None)
@@ -830,6 +832,19 @@ mod tests {
         assert_eq!(ink_of("--- a/f"), None);
         assert_eq!(ink_of("+++ b/f"), None);
         assert_eq!(ink_of(" context"), None);
+    }
+
+    #[test]
+    fn ansi_escape_followed_by_non_ascii_text_does_not_panic() {
+        for text in ["\u{1b}[é", "\u{1b}[1;é", "a\u{1b}[😀b", "\u{1b}[31;你好\u{1b}[0m"] {
+            let lit = highlight("ansi", text);
+            assert!(lit.text.is_char_boundary(lit.text.len()));
+            for run in &lit.runs {
+                assert!(lit.text.get(run.start as usize..run.end as usize).is_some());
+            }
+        }
+        assert_eq!(highlight("ansi", "\u{1b}[é").text, "é");
+        assert_eq!(highlight("ansi", "a\u{1b}[😀b").text, "a😀b");
     }
 
     #[test]
