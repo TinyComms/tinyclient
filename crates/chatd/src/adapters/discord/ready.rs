@@ -1230,7 +1230,9 @@ impl Discord {
                 self.ctx.set_note(&note, &listed);
             }
         }
-        Ok(self.ctx.conversation(&row)?)
+        self.ctx.conversation(&row)?;
+        self.note_thread_update(&thread)?;
+        Ok(())
     }
 
     /// The user changed a mute or suppress setting in Discord.

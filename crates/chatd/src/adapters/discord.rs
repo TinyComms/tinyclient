@@ -29,8 +29,8 @@ use crate::blobs::upload;
 use crate::store::ConversationRow;
 use base64::Engine;
 use content::{Files, Names, Place};
-use model::{number, Posted, User};
-use protocol::{Conversation, ConversationKind, Message, MessageKind, Presence, RelateAction, Relation, SendState, ThreadSummary};
+use model::{number, seconds, Posted, User};
+use protocol::{Conversation, ConversationKind, Key, Message, MessageKind, Presence, RelateAction, Relation, SendState, ThreadSummary};
 use rest::{Refused, Rest};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -520,6 +520,76 @@ fn refusal(refused: Refused) -> Refusal {
     Refusal::Refused(refused.reason())
 }
 
+/// Where the starter message lives, and the newest reply id already on its chip.
+struct ThreadChip {
+    parent: String,
+    starter: String,
+    seen: u64,
+}
+
+fn chip_key(thread: &str) -> String {
+    format!("thread-chip:{thread}")
+}
+
+/// One new reply on a starter's thread chip. `seen` is the newest reply id already
+/// counted, so a reply at or behind it does not move the count.
+fn fold_reply(summary: &mut ThreadSummary, seen: &mut u64, reply_id: u64, author: Option<&Key>, unread: u32) -> bool {
+    if reply_id == 0 || reply_id <= *seen {
+        return false;
+    }
+    *seen = reply_id;
+    summary.replies = summary.replies.saturating_add(1);
+    summary.last = seconds(&reply_id.to_string());
+    summary.unread = unread;
+    if let Some(author) = author.filter(|author| !author.id.is_empty()).cloned() {
+        summary.participants.retain(|person| person.id != author.id);
+        summary.participants.insert(0, author);
+        summary.participants.truncate(protocol::THREAD_FACES);
+    }
+    true
+}
+
+/// `TINYCLIENT_PROVE=discord-thread-chip`. Two replies would be the count and the faces;
+/// a third and fourth keep only the newest three, and an id already counted stays put.
+pub(super) fn prove_thread_chip() -> Result<(), String> {
+    let account = protocol::AccountKey { network: protocol::Network::Discord, account: "1".into() };
+    let person = |id: &str| Key::new(&account, id);
+    let (a, b, c, d) = (person("a"), person("b"), person("c"), person("d"));
+    let mut summary = ThreadSummary {
+        id: "t".into(),
+        replies: 4,
+        last: 0,
+        participants: Vec::new(),
+        unread: 0,
+    };
+    let mut seen = 100u64;
+    if fold_reply(&mut summary, &mut seen, 100, Some(&a), 1) || summary.replies != 4 {
+        return Err("a reply already in the count was counted again".to_owned());
+    }
+    let stamp = (1_700_000_000_000u64 - 1_420_070_400_000) << 22;
+    let ids = [stamp + 1, stamp + 2, stamp + 3, stamp + 4];
+    let authors = [&a, &b, &c, &d];
+    for (at, (id, author)) in ids.iter().zip(authors).enumerate() {
+        if !fold_reply(&mut summary, &mut seen, *id, Some(author), (at as u32) + 1) {
+            return Err("a new reply did not count".to_owned());
+        }
+    }
+    if summary.replies != 8 {
+        return Err(format!("the chip counted {} replies, not 8", summary.replies));
+    }
+    let faces: Vec<&str> = summary.participants.iter().map(|person| person.id.as_str()).collect();
+    if faces != ["d", "c", "b"] {
+        return Err(format!("the chip showed {faces:?}, not the newest three"));
+    }
+    if summary.unread != 4 || summary.last == 0 {
+        return Err("the chip did not keep the unread count and the time of the newest reply".to_owned());
+    }
+    if fold_reply(&mut summary, &mut seen, ids[3], Some(&d), 4) {
+        return Err("the same reply was counted twice".to_owned());
+    }
+    Ok(())
+}
+
 impl Discord {
     fn log(&self, what: &str, why: impl std::fmt::Display) {
         tracing::warn!("chatd: Discord: {what}: {why}");
@@ -579,26 +649,205 @@ impl Discord {
         named || (posted.mention_everyone && !info.quiet.suppress_everyone) || (role && !info.quiet.suppress_roles)
     }
 
-    /// Records the thread a message started, so the shell can open it like any conversation.
-    fn thread_of(&self, posted: &Posted, parent: &Conversation) -> rusqlite::Result<()> {
-        let Some(thread) = &posted.thread else {
+    fn read_chip(&self, thread: &str) -> ThreadChip {
+        let raw = self.ctx.note(&chip_key(thread)).unwrap_or_default();
+        let mut parts = raw.split('\t');
+        ThreadChip {
+            parent: parts.next().unwrap_or("").to_owned(),
+            starter: parts.next().unwrap_or("").to_owned(),
+            seen: parts.next().unwrap_or("").parse().unwrap_or(0),
+        }
+    }
+
+    fn write_chip(&self, thread: &str, chip: &ThreadChip) {
+        self.ctx.set_note(&chip_key(thread), &format!("{}\t{}\t{}", chip.parent, chip.starter, chip.seen));
+    }
+
+    /// The message that carries `thread` is the starter. Its id is not always the thread's.
+    fn remember_starter(&self, thread: &model::Channel, parent: &str, starter: &str) {
+        let mut chip = self.read_chip(&thread.id);
+        if !parent.is_empty() {
+            chip.parent = parent.to_owned();
+        }
+        if !starter.is_empty() {
+            chip.starter = starter.to_owned();
+        }
+        if let Some(last) = thread.last_message_id.as_deref() {
+            let seen = number(last);
+            if seen > chip.seen {
+                chip.seen = seen;
+            }
+        }
+        self.write_chip(&thread.id, &chip);
+    }
+
+    /// A page brought the starter again. Keep faces and a count we already learned, and
+    /// take the thread row's unread, which is the same read state as any channel.
+    fn carried_thread(&self, channel: &str, message: &mut Message) -> rusqlite::Result<()> {
+        let Some(summary) = message.thread.as_mut() else {
             return Ok(());
         };
-        if self.ctx.known(&thread.id)?.is_some() {
+        if let Some(row) = self.ctx.known(&summary.id)? {
+            summary.unread = row.unread;
+        }
+        if let Some(stored) = self.ctx.stored_message(channel, &message.id)? {
+            if let Some(had) = stored.thread.filter(|had| had.id == summary.id) {
+                if summary.participants.is_empty() {
+                    summary.participants = had.participants;
+                }
+                summary.replies = summary.replies.max(had.replies);
+                if summary.last < had.last {
+                    summary.last = had.last;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `THREAD_UPDATE`: Discord's count and newest id, when they are ahead of the chip.
+    /// Faces stay; this event does not name who replied.
+    pub(super) fn note_thread_update(&self, thread: &model::Channel) -> rusqlite::Result<()> {
+        let mut chip = self.read_chip(&thread.id);
+        if chip.parent.is_empty() {
+            if let Some(parent) = thread.parent_id.as_deref() {
+                chip.parent = parent.to_owned();
+            }
+        }
+        if chip.starter.is_empty() && !chip.parent.is_empty() {
+            let guess = self
+                .ctx
+                .known(&thread.id)?
+                .and_then(|known| known.root)
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| thread.id.clone());
+            if self.ctx.stored_message(&chip.parent, &guess)?.is_some() {
+                chip.starter = guess;
+            }
+        }
+        if let Some(last) = thread.last_message_id.as_deref().filter(|id| !id.is_empty()) {
+            let seen = number(last);
+            if seen > chip.seen {
+                chip.seen = seen;
+            }
+        }
+        let parent = chip.parent.clone();
+        let starter = chip.starter.clone();
+        self.write_chip(&thread.id, &chip);
+        if parent.is_empty() || starter.is_empty() {
             return Ok(());
         }
-        // Outside the tree: a thread we are not in is not listed there. It names its parent,
-        // so it goes when the channel goes.
-        let title = thread.name.clone().unwrap_or_else(|| "Thread".to_owned());
-        if let Some(guild) = self.guild_of(parent) {
-            self.ctx.set_note(&format!("guild:{}", thread.id), &guild);
+        let Some(mut message) = self.ctx.stored_message(&parent, &starter)? else {
+            return Ok(());
+        };
+        let Some(summary) = message.thread.as_mut().filter(|summary| summary.id == thread.id) else {
+            return Ok(());
+        };
+        let mut changed = false;
+        if let Some(count) = thread.message_count {
+            if count > summary.replies {
+                summary.replies = count;
+                changed = true;
+            }
         }
-        self.ctx.conversation(&ConversationRow {
-            parent: Some(parent.key.id.clone()),
-            // A thread started from a message has that message's id.
-            root: Some(thread.id.clone()),
-            ..ConversationRow::new(&thread.id, ConversationKind::Thread, title)
-        })
+        if let Some(last) = thread.last_message_id.as_deref().filter(|id| !id.is_empty()) {
+            let at = seconds(last);
+            if number(last) >= chip.seen && at != summary.last {
+                summary.last = at;
+                changed = true;
+            }
+        }
+        if let Some(row) = self.ctx.known(&thread.id)? {
+            if summary.unread != row.unread {
+                summary.unread = row.unread;
+                changed = true;
+            }
+        }
+        if changed {
+            self.ctx.history(&parent, &[message])?;
+        }
+        Ok(())
+    }
+
+    /// A reply arrived in a thread whose starter is already stored.
+    fn fold_thread_reply(&self, posted: &Posted, thread: &Conversation) -> rusqlite::Result<()> {
+        let mut chip = self.read_chip(&thread.key.id);
+        let mut learned = false;
+        if chip.parent.is_empty() {
+            if let Some(parent) = thread.parent.as_deref() {
+                chip.parent = parent.to_owned();
+                learned = true;
+            }
+        }
+        if chip.starter.is_empty() {
+            if let Some(root) = thread.root.as_deref().filter(|id| !id.is_empty()) {
+                chip.starter = root.to_owned();
+                learned = true;
+            }
+        }
+        let reply = number(&posted.id);
+        let starter_id = chip.starter.clone();
+        let starter_message = posted.id == starter_id || posted.id == thread.key.id || thread.root.as_deref() == Some(posted.id.as_str());
+        if posted.id.is_empty() || starter_message || reply == 0 || reply <= chip.seen {
+            if learned {
+                self.write_chip(&thread.key.id, &chip);
+            }
+            return Ok(());
+        }
+        let parent = chip.parent.clone();
+        if parent.is_empty() || starter_id.is_empty() {
+            return Ok(());
+        }
+        let Some(mut message) = self.ctx.stored_message(&parent, &starter_id)? else {
+            return Ok(());
+        };
+        let summary = message.thread.get_or_insert(ThreadSummary {
+            id: thread.key.id.clone(),
+            replies: 0,
+            last: 0,
+            participants: Vec::new(),
+            unread: 0,
+        });
+        if !summary.id.is_empty() && summary.id != thread.key.id {
+            return Ok(());
+        }
+        summary.id = thread.key.id.clone();
+        let outgoing = posted.author.as_ref().is_some_and(|author| author.id == self.me());
+        let already = self.ctx.stored_message(&thread.key.id, &posted.id)?.is_some();
+        let unread = if already || outgoing { thread.unread } else { thread.unread.saturating_add(1) };
+        let author = posted.author.as_ref().filter(|author| !author.id.is_empty()).map(|author| Key::new(&self.ctx.account, &author.id));
+        if !fold_reply(summary, &mut chip.seen, reply, author.as_ref(), unread) {
+            return Ok(());
+        }
+        self.write_chip(&thread.key.id, &chip);
+        self.ctx.history(&parent, &[message])
+    }
+
+    /// Records the thread a message started, and folds a reply onto the starter's chip.
+    fn thread_of(&self, posted: &Posted, conversation: &Conversation) -> rusqlite::Result<()> {
+        if let Some(thread) = &posted.thread {
+            if conversation.kind != ConversationKind::Thread {
+                self.remember_starter(thread, &conversation.key.id, &posted.id);
+            }
+            if self.ctx.known(&thread.id)?.is_none() {
+                // Outside the tree: a thread we are not in is not listed there. It names its
+                // parent, so it goes when the channel goes.
+                let title = thread.name.clone().unwrap_or_else(|| "Thread".to_owned());
+                if let Some(guild) = self.guild_of(conversation) {
+                    self.ctx.set_note(&format!("guild:{}", thread.id), &guild);
+                }
+                self.ctx.conversation(&ConversationRow {
+                    parent: Some(conversation.key.id.clone()),
+                    // A thread started from a message has that message's id on Discord. The
+                    // note from `remember_starter` is what the chip follows when it differs.
+                    root: Some(thread.id.clone()),
+                    ..ConversationRow::new(&thread.id, ConversationKind::Thread, title)
+                })?;
+            }
+        }
+        if conversation.kind == ConversationKind::Thread {
+            self.fold_thread_reply(posted, conversation)?;
+        }
+        Ok(())
     }
 
     /// Remembers that the messages `from..=to` of a conversation are stored whole.
@@ -646,9 +895,10 @@ impl Discord {
         let mut messages = Vec::with_capacity(posted.len());
         let mut files = Files::default();
         for posted in &posted {
-            let (message, referred) = self.convert(posted, guild.as_deref(), conversation.kind);
+            let (mut message, referred) = self.convert(posted, guild.as_deref(), conversation.kind);
             files.merge(referred);
             self.thread_of(posted, conversation)?;
+            self.carried_thread(channel, &mut message)?;
             messages.push(message);
         }
         let full = messages.len() >= PAGE;
@@ -1079,13 +1329,15 @@ impl Discord {
             .map_err(|err| refuse(format!("Discord's answer was unreadable: {err}")))?;
         let title = thread.name.clone().filter(|title| !title.trim().is_empty()).unwrap_or_else(|| name.clone());
         self.record_thread(&parent, &thread.id, message_id, &title)?;
+        self.remember_starter(&thread, channel, message_id);
+        let unread = self.ctx.known(&thread.id).ok().flatten().map(|row| row.unread).unwrap_or(0);
         let mut message = stored;
         message.thread = Some(ThreadSummary {
             id: thread.id.clone(),
             replies: thread.message_count.unwrap_or(0),
-            last: 0,
+            last: thread.last_message_id.as_deref().map_or(0, seconds),
             participants: Vec::new(),
-            unread: 0,
+            unread,
         });
         self.ctx.history(channel, &[message]).map_err(|err| refuse(err.to_string()))?;
         Ok(thread.id)

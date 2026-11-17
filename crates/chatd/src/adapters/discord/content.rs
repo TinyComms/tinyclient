@@ -804,8 +804,8 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         }),
         _ => None,
     };
-    // Discord does not say who replied in a thread or how much of it we read, short of
-    // fetching the thread: the faces and the count stay empty.
+    // The thread object names the count and the newest id. Faces and unread are filled
+    // as replies arrive, and a thread update can raise the count.
     let thread = posted.thread.as_ref().map(|thread| ThreadSummary {
         participants: Vec::new(),
         unread: 0,

@@ -1592,6 +1592,12 @@ pub fn prove_teams_markdown() -> Result<(), String> {
     teams::prove_teams_markdown()
 }
 
+/// The lab's discord-thread-chip driver. A thread chip counts new replies and keeps the
+/// newest faces. A build without this returns to the server and stays up.
+pub fn prove_discord_thread_chip() -> Result<(), String> {
+    discord::prove_thread_chip()
+}
+
 /// The lab's failed-start-offline driver. A start that fails leaves the account offline,
 /// so messages() still answers from the cache instead of an empty signed-out page.
 pub fn prove_failed_start_offline() -> Result<(), String> {

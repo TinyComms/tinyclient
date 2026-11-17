@@ -1378,6 +1378,75 @@ fn a_channel_message_can_start_a_thread_and_a_direct_message_cannot() {
     assert!(world.discord.requests_to("POST", "/channels/3001/messages/").iter().all(|seen| !seen.path.contains("/threads")));
 }
 
+/// Replies in a thread show on the starter message: the count, two faces, and the thread's unread.
+/// A later thread update raises the count without dropping the faces. Opening the thread does not
+/// count the reply Discord had already included.
+#[test]
+fn a_thread_chip_counts_replies_and_shows_their_faces() {
+    let world = World::start();
+    let starter = "1300000000000000100";
+    wait("the channel's history", || {
+        world.messages("4101").into_iter().find(|message| message.id == starter).filter(|message| {
+            message.thread.as_ref().is_some_and(|thread| thread.id == "4500" && thread.replies == 4 && thread.participants.is_empty())
+        })
+    });
+
+    wait("the thread's messages", || Some(world.messages("4500")).filter(|messages| !messages.is_empty()));
+    let opened_chip = world.messages("4101").into_iter().find(|message| message.id == starter).unwrap();
+    let opened_thread = opened_chip.thread.as_ref().unwrap();
+    assert_eq!(opened_thread.replies, 4, "a reply already in Discord's count must not be counted again");
+    assert!(opened_thread.participants.is_empty());
+
+    let author = |id: &str, username: &str, name: &str| {
+        json!({"id": id, "username": username, "global_name": name, "discriminator": "0", "avatar": null})
+    };
+    world.incoming("4500", Some("4000"), "one", json!({"author": author("2001", "mara", "Mara")}));
+    world.incoming("4500", Some("4000"), "two", json!({"author": author("2002", "dev", "Dev")}));
+    let chip = wait("the chip after two replies", || {
+        let arrived = world.messages("4500").iter().filter(|message| message.text == "one" || message.text == "two").count();
+        if arrived < 2 {
+            return None;
+        }
+        world.messages("4101").into_iter().find(|message| message.id == starter).and_then(|message| {
+            let thread = message.thread?;
+            (thread.replies == 6 && thread.participants.len() == 2).then_some(thread)
+        })
+    });
+    assert_eq!(chip.participants.iter().map(|person| person.id.as_str()).collect::<Vec<_>>(), ["2002", "2001"]);
+    let row = world.conversation("4500");
+    assert_eq!(chip.unread, row.unread);
+    assert!(chip.last > 0);
+
+    let newer = world.discord.snowflake();
+    world.discord.push(
+        "THREAD_UPDATE",
+        json!({
+            "id": "4500",
+            "type": 11,
+            "name": "release plan",
+            "parent_id": "4101",
+            "guild_id": "4000",
+            "message_count": 9,
+            "last_message_id": newer,
+            "thread_metadata": {"archived": false, "locked": false},
+            "member": {"join_timestamp": "2024-10-20T00:00:00+00:00"},
+        }),
+    );
+    let raised = wait("the count from the thread update", || {
+        world.messages("4101").into_iter().find(|message| message.id == starter).and_then(|message| {
+            let thread = message.thread?;
+            (thread.replies == 9).then_some(thread)
+        })
+    });
+    assert_eq!(raised.participants.iter().map(|person| person.id.as_str()).collect::<Vec<_>>(), ["2002", "2001"]);
+    assert_eq!(raised.last, model_seconds(&newer));
+}
+
+fn model_seconds(id: &str) -> i64 {
+    let id: u64 = id.parse().unwrap_or(0);
+    (((id >> 22) + 1_420_070_400_000) / 1000) as i64
+}
+
 #[test]
 fn typing_appears_expires_and_is_paced_on_the_way_out() {
     let world = World::start();
