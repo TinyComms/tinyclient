@@ -16,7 +16,8 @@
 //! (9001, muted, with a sponsored message) with a linked discussion group "Field Notes chat"
 //! (9003, which the comments on its post come from, heard of at `getDiscussionMessage`); a
 //! forum "Workshop" (9002) with topics General, "Tools" (31) and "Jigs" (55, the newest
-//! unread). The phone +1 555 010 0142
+//! unread). Workshop's member list is its owner, two admins and its bot. A search there for
+//! Nia Pell (7012) names her; she is not otherwise in the account. The phone +1 555 010 0142
 //! signs in with the code 24680; +1 555 010 0199 also wants the password "correct horse".
 //! Username resolution serves only `gif` and `forest_wren`; `flood_wait` returns a flood wait,
 //! and every other name returns USERNAME_NOT_OCCUPIED.
@@ -57,6 +58,8 @@ const JIGS: i32 = 55;
 const SERVICE: i64 = 777_000;
 const REPLIES: i64 = 1_271_266_957;
 const BOT: i64 = 7004;
+/// Named only by a member search of Workshop. Not in `users()`, so a contact search never finds her.
+const NIA: i64 = 7012;
 const SCAM: i64 = 7005;
 const FAKE: i64 = 7006;
 /// The `@gif` bot.
@@ -2013,6 +2016,77 @@ impl World {
         Err(rpc(400, "METHOD_NOT_IN_THE_SCRIPT", None))
     }
 
+    /// `channels.getParticipants`. Workshop has an owner, two admins and a bot. A search for
+    /// Nia names her and nobody else. Any other channel answers with an empty page.
+    fn roster(&mut self, body: &[u8]) -> Option<Result<Vec<u8>, Fault>> {
+        use tl::functions as f;
+        let request = asked::<f::channels::GetParticipants>(body)?;
+        let tl::enums::InputChannel::Channel(channel) = &request.channel else {
+            return Some(Err(rpc(400, "CHANNEL_INVALID", None)));
+        };
+        let id = channel.channel_id;
+        let asked_for = match &request.filter {
+            tl::enums::ChannelParticipantsFilter::ChannelParticipantsAdmins => "admins".to_owned(),
+            tl::enums::ChannelParticipantsFilter::ChannelParticipantsBots => "bots".to_owned(),
+            tl::enums::ChannelParticipantsFilter::ChannelParticipantsRecent => "recent".to_owned(),
+            tl::enums::ChannelParticipantsFilter::ChannelParticipantsSearch(search) => format!("search {}", search.q.trim()),
+            _ => "other".to_owned(),
+        };
+        let logged = if asked_for == "search " {
+            format!("GetParticipants c{id} search")
+        } else {
+            format!("GetParticipants c{id} {asked_for}")
+        };
+        self.log(&logged);
+        let rights = || {
+            let rights: tl::types::ChatAdminRights = blank(&[&put(0u32)]);
+            rights
+        };
+        let creator = |user_id| {
+            tl::enums::ChannelParticipant::from(tl::types::ChannelParticipantCreator { user_id, admin_rights: rights().into(), rank: None })
+        };
+        let admin = |user_id, rank: &str| {
+            tl::enums::ChannelParticipant::from(tl::types::ChannelParticipantAdmin {
+                can_edit: false,
+                is_self: false,
+                user_id,
+                inviter_id: None,
+                promoted_by: ME,
+                date: t0() - 1_000,
+                admin_rights: rights().into(),
+                rank: Some(rank.to_owned()),
+            })
+        };
+        let member = |user_id| {
+            tl::enums::ChannelParticipant::from(tl::types::ChannelParticipant {
+                user_id,
+                date: t0() - 500,
+                subscription_until_date: None,
+                rank: None,
+            })
+        };
+        let (participants, users): (Vec<tl::enums::ChannelParticipant>, Vec<tl::enums::User>) = if id != WORKSHOP {
+            (Vec::new(), Vec::new())
+        } else if asked_for == "admins" {
+            (vec![creator(ME), admin(TOBIN, "Guide"), admin(ODALYS, "Quartermaster")], users())
+        } else if asked_for == "bots" {
+            (vec![member(BOT)], users())
+        } else if asked_for == "recent" {
+            (vec![creator(ME), admin(TOBIN, "Guide"), admin(ODALYS, "Quartermaster"), member(BOT)], users())
+        } else if asked_for.eq_ignore_ascii_case("search nia") {
+            (vec![member(NIA)], vec![user(NIA, "Nia", "Pell", "").into()])
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let page = tl::types::channels::ChannelParticipants {
+            count: participants.len() as i32,
+            participants,
+            chats: chats(),
+            users,
+        };
+        Some(answer(tl::enums::channels::ChannelParticipants::Participants(page)))
+    }
+
     /// The requests of the panes, the pickers and sending with files.
     fn panes(&mut self, body: &[u8], events: &Sender<Event>) -> Option<Result<Vec<u8>, Fault>> {
         use tl::functions as f;
@@ -2086,10 +2160,18 @@ impl World {
                 full.available_reactions = Some(tl::types::ChatReactionsAll { allow_custom: false }.into());
                 full.reactions_limit = Some(2);
             }
-            full.participants_count = Some(1_204);
+            // Field Notes stays a large channel. Workshop's count is the four people its
+            // member list holds, so no empty Members tail is drawn behind them.
+            full.participants_count = Some(if channel.channel_id == WORKSHOP { 4 } else { 1_204 });
+            if channel.channel_id == WORKSHOP && std::env::var("TINYCLIENT_TELEGRAM_HIDDEN").ok().as_deref() == Some("1") {
+                full.participants_hidden = true;
+            }
             full.online_count = Some(230);
             let found = tl::types::messages::ChatFull { full_chat: full.into(), chats: chats(), users: users() };
             return Some(answer(tl::enums::messages::ChatFull::Full(found)));
+        }
+        if let Some(answered) = self.roster(body) {
+            return Some(answered);
         }
         if let Some(request) = asked::<f::channels::GetParticipant>(body) {
             let who = input_who(&request.participant);

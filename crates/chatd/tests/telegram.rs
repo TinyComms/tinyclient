@@ -1644,7 +1644,50 @@ fn sending_editing_deleting_and_reacting_wait_for_telegram() {
     let Response::Members { members, sections, .. } = world.ask(Request::Members { conversation: key("g8001"), offset: 0, limit: 50 }) else {
         panic!("no members");
     };
-    assert_eq!((sections[0].count, members.len(), members[1].name.as_str(), members[1].relation), (3, 3, "Odalys Brandt", Relation::Contact));
+    assert_eq!(
+        (sections.len(), sections[0].name.as_str(), sections[0].count, members.len(), members[0].name.as_str(), members[0].relation),
+        (1, "Members", 3, 3, "Odalys Brandt", Relation::Contact),
+    );
+}
+
+#[test]
+fn a_supergroup_lists_its_owner_admins_and_bots_and_a_search_filters() {
+    let world = World::signed_in();
+    world.connected();
+    let Response::Members { members, sections, .. } = world.ask(Request::Members { conversation: key("c9002"), offset: 0, limit: 50 }) else {
+        panic!("no members");
+    };
+    let names: Vec<&str> = sections.iter().map(|section| section.name.as_str()).collect();
+    assert_eq!(names, ["Owner", "Admins", "Bots"]);
+    assert_eq!(sections.iter().map(|section| section.count).collect::<Vec<_>>(), [1, 2, 1]);
+    assert_eq!(
+        members.iter().map(|person| (person.name.as_str(), person.title.as_str(), person.bot)).collect::<Vec<_>>(),
+        [("Mira Kessler", "", false), ("Odalys Brandt", "Quartermaster", false), ("Tobin Reyes", "Guide", false), ("Trail Bot", "", true)],
+    );
+    let calls = world.calls();
+    assert!(calls.iter().any(|call| call == "GetParticipants c9002 admins"), "{calls:#?}");
+    assert!(calls.iter().any(|call| call == "GetParticipants c9002 bots"), "{calls:#?}");
+
+    world.watch(Watching { conversation: Some(key("c9002")), ..Watching::default() });
+    world.ask(Request::People { network: Some(Network::Telegram), relation: None, query: Some("nia".into()), offset: 0, limit: 20 });
+    world.until("the member search", || world.calls().iter().any(|call| call == "GetParticipants c9002 search nia").then_some(()));
+    let found = world.until("the member the search named", || match world.ask(Request::People {
+        network: Some(Network::Telegram), relation: None, query: Some("nia".into()), offset: 0, limit: 20,
+    }) {
+        Response::People { people, .. } => people.into_iter().find(|person| person.key.id == "u7012"),
+        _ => None,
+    });
+    assert_eq!(found.name, "Nia Pell");
+}
+
+#[test]
+fn a_group_that_hides_its_members_says_so() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_HIDDEN", "1")]);
+    world.connected();
+    assert_eq!(
+        world.ask(Request::Members { conversation: key("c9002"), offset: 0, limit: 50 }),
+        Response::Error { code: ErrorCode::Refused, detail: "This group hides its member list.".into() },
+    );
 }
 
 #[test]
