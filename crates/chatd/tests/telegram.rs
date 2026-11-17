@@ -2079,6 +2079,51 @@ fn pickers_and_sending_with_files_options_and_picks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn an_inline_bot_query_lists_articles_and_a_pick_sends_the_result() {
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+    let (found, next) = match world.ask(Request::Catalog {
+        account: account(),
+        kind: protocol::CatalogKind::Gifs,
+        space: Some(key("u7002")),
+        query: "@wiki rust".into(),
+        cursor: None,
+    }) {
+        Response::Catalog { items, cursor } => (items, cursor),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].name, "Rust");
+    assert_eq!(found[0].pack, "A language");
+    assert!(found[0].file.is_none(), "an article has no file");
+    assert_eq!(next.as_deref(), Some("2"));
+    assert_eq!(world.called("ResolveUsername wiki"), 1);
+    assert_eq!(world.called("GetInlineBotResults rust"), 1);
+    assert!(
+        world.calls().iter().any(|call| call.contains("7060") && call.contains("u7002")),
+        "the query is asked of that bot in the open chat: {:?}",
+        world.calls()
+    );
+    let asked = Request::Send {
+        conversation: key("u7002"),
+        client_id: "8201".into(),
+        text: String::new(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            pick: Some(protocol::Pick { kind: protocol::CatalogKind::Gifs, id: found[0].id.clone() }),
+            ..Default::default()
+        },
+    };
+    assert!(matches!(world.ask(asked), Response::Sent { .. }));
+    let sent = world.until("the inline result is sent", || {
+        world.messages("u7002").into_iter().find(|message| message.client_id.as_deref() == Some("8201") && message.state != SendState::Pending)
+    });
+    assert_eq!(sent.state, SendState::Sent);
+    assert_eq!(world.called("SendInlineBotResult u7002 88 a1"), 1);
+}
+
 /// A send whose file is a voice message this client recorded: uploaded as any file, sent as a
 /// voice note whose audio attribute carries the facts the recorder read, and the way the
 /// message comes back shows the row as it would on Telegram.

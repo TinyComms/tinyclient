@@ -64,6 +64,8 @@ const SCAM: i64 = 7005;
 const FAKE: i64 = 7006;
 /// The `@gif` bot.
 const GIF_BOT: i64 = 7050;
+/// An inline bot named `@wiki`, for a query that is not a GIF search.
+const WIKI_BOT: i64 = 7060;
 /// The folders: Work (the group and the forum) and Family (Odalys pinned, and the group too).
 const WORK: i32 = 2;
 const FAMILY: i32 = 3;
@@ -120,7 +122,7 @@ fn user(id: i64, first: &str, last: &str, username: &str) -> tl::types::User {
     let id_text = id.to_string();
     user.premium = (id == ME && std::env::var("TINYCLIENT_TELEGRAM_PREMIUM").ok().as_deref() == Some("1")) || peer.as_deref() == Some(id_text.as_str());
     user.verified = id == SERVICE;
-    user.bot = id == BOT || id == GIF_BOT;
+    user.bot = id == BOT || id == GIF_BOT || id == WIKI_BOT;
     // A bot's flag is shared with its info version, which must then be there.
     user.bot_info_version = user.bot.then_some(1);
     user.scam = id == SCAM;
@@ -710,6 +712,8 @@ fn resolve_username(username: &str) -> Result<Vec<u8>, Fault> {
         (7_011, "Robin", "Vale", "forest_wren")
     } else if username == "gif" {
         (GIF_BOT, "GIF Search", "", "gif")
+    } else if username == "wiki" {
+        (WIKI_BOT, "Wiki", "", "wiki")
     } else {
         return Err(rpc(400, "USERNAME_NOT_OCCUPIED", None));
     };
@@ -2336,7 +2340,41 @@ impl World {
             return Some(resolve_username(&request.username));
         }
         if let Some(request) = asked::<f::messages::GetInlineBotResults>(body) {
-            self.log(&format!("GetInlineBotResults {} {}", request.query, request.offset));
+            let bot = match &request.bot {
+                tl::enums::InputUser::User(user) => user.user_id,
+                _ => 0,
+            };
+            self.log(&format!("GetInlineBotResults {} {} {} {}", request.query, request.offset, bot, input_who(&request.peer).text()));
+            if request.query == "rust" {
+                let send_message = tl::types::BotInlineMessageText {
+                    no_webpage: false,
+                    invert_media: false,
+                    message: "Rust".to_owned(),
+                    entities: None,
+                    reply_markup: None,
+                };
+                let result = tl::types::BotInlineResult {
+                    id: "a1".to_owned(),
+                    r#type: "article".to_owned(),
+                    title: Some("Rust".to_owned()),
+                    description: Some("A language".to_owned()),
+                    url: None,
+                    thumb: None,
+                    content: None,
+                    send_message: send_message.into(),
+                };
+                let found = tl::types::messages::BotResults {
+                    gallery: false,
+                    query_id: 88,
+                    next_offset: Some("2".to_owned()),
+                    switch_pm: None,
+                    switch_webview: None,
+                    results: vec![result.into()],
+                    cache_time: 300,
+                    users: Vec::new(),
+                };
+                return Some(answer(tl::enums::messages::BotResults::Results(found)));
+            }
             let send_message = tl::types::BotInlineMessageMediaAuto { invert_media: false, message: String::new(), entities: None, reply_markup: None };
             let result = tl::types::BotInlineMediaResult {
                 id: "r1".to_owned(),

@@ -749,8 +749,8 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::SearchShared { conversation_id, kind, before, limit, reply } => {
             let _ = reply.send(info::shared(account, &conversation_id, kind, before.as_deref(), limit).map_err(refused));
         }
-        Command::Catalog { kind, query, cursor, reply, .. } => {
-            let _ = reply.send(catalog::catalog(account, kind, &query, cursor.as_deref()).map_err(refused));
+        Command::Catalog { kind, space_id, query, cursor, reply } => {
+            let _ = reply.send(catalog::catalog(account, kind, space_id.as_deref(), &query, cursor.as_deref()).map_err(refused));
         }
         Command::Handoff { conversation_id, reply } => {
             let link = Who::parse(&conversation_id).map(|(who, _)| {
@@ -1178,6 +1178,19 @@ pub fn prove_telegram_location() -> Result<(), String> {
     }
     if send::pasted_place("see you at 37.7749, -122.4194").is_some() {
         return Err("words around coordinates were sent as a place".into());
+    }
+    Ok(())
+}
+
+/// The lab's telegram-inline-bots driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_inline_bots() -> Result<(), String> {
+    content::prove_inline_bots()?;
+    match catalog::bot_query("@wiki rust") {
+        Some(("wiki", "rust")) => {}
+        other => return Err(format!("@wiki rust was not that bot's query, got {other:?}")),
+    }
+    if catalog::bot_query("hike").is_some() {
+        return Err("a GIF search was treated as a bot".into());
     }
     Ok(())
 }

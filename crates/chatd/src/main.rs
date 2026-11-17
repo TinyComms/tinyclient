@@ -505,6 +505,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-location:0");
         return Ok(());
     }
+    // The lab's telegram-inline-bots driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-inline-bots") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_inline_bots() {
+            eprintln!("telegram-inline-bots: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-inline-bots:0");
+        return Ok(());
+    }
     // The lab's telegram-member-sections driver. A build without this stays up and the driver fails.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-member-sections") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_member_sections() {

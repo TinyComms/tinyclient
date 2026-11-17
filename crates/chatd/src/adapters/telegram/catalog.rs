@@ -89,11 +89,17 @@ fn item(account: &Account, document: &tl::enums::Document, pack: &str) -> Option
     })
 }
 
-pub(super) fn catalog(account: &Account, kind: CatalogKind, query: &str, cursor: Option<&str>) -> Result<CatalogPage, Fault> {
+pub(super) fn catalog(
+    account: &Account,
+    kind: CatalogKind,
+    space: Option<&str>,
+    query: &str,
+    cursor: Option<&str>,
+) -> Result<CatalogPage, Fault> {
     match kind {
         CatalogKind::Emoji => emojis(account, cursor.and_then(|cursor| cursor.parse().ok()).unwrap_or(0)),
         CatalogKind::Gifs if query.is_empty() => saved_gifs(account),
-        CatalogKind::Gifs => gif_search(account, query, cursor.unwrap_or("")),
+        CatalogKind::Gifs => inline_search(account, query, cursor.unwrap_or(""), space),
         CatalogKind::Stickers => stickers(account, cursor.and_then(|cursor| cursor.parse().ok()).unwrap_or(0)),
     }
 }
@@ -233,34 +239,93 @@ fn gif_bot(account: &Account) -> Result<(tl::enums::InputUser, tl::enums::InputP
     Ok((user, peer))
 }
 
-fn gif_search(account: &Account, query: &str, offset: &str) -> Result<CatalogPage, Fault> {
-    let (bot, _) = gif_bot(account)?;
+/// `@username rest` is that inline bot and the words after it. Anything else is a GIF search.
+pub(super) fn bot_query(query: &str) -> Option<(&str, &str)> {
+    let rest = query.trim().strip_prefix('@')?;
+    let (name, words) = match rest.split_once(|c: char| c.is_whitespace()) {
+        Some((name, words)) => (name, words.trim()),
+        None => (rest, ""),
+    };
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((name, words))
+}
+
+/// One bot, resolved once and remembered. `@gif` keeps the note GIF search already used.
+fn inline_bot(account: &Account, username: &str) -> Result<tl::enums::InputUser, Fault> {
+    if username.eq_ignore_ascii_case("gif") {
+        return gif_bot(account).map(|(user, _)| user);
+    }
+    let note = format!("inline:{username}");
+    let bot = Who::User(match account.ctx.note(&note).and_then(|id| id.parse().ok()) {
+        Some(id) => id,
+        None => {
+            let request = tl::functions::contacts::ResolveUsername { username: username.to_owned(), referer: None };
+            let tl::enums::contacts::ResolvedPeer::Peer(found) = account.ask(&request)?;
+            account.learn(&found.users, &found.chats);
+            let Who::User(id) = Who::of(&found.peer) else {
+                return Err(Fault::Rpc { code: 400, name: "BOT_INVALID".to_owned(), value: None });
+            };
+            account.ctx.set_note(&note, &id.to_string());
+            id
+        }
+    });
+    account.dir().input_user(bot).ok_or_else(|| Fault::Rpc { code: 400, name: "BOT_INVALID".to_owned(), value: None })
+}
+
+/// The open chat when the picker was asked from one, so the bot sees that chat. Otherwise the
+/// bot sees only the words. A bot that wants a location is not given one: there is no confirm.
+fn inline_peer(account: &Account, space: Option<&str>) -> tl::enums::InputPeer {
+    space.and_then(Who::parse).and_then(|(who, _)| account.input(who).ok()).unwrap_or(tl::enums::InputPeer::PeerSelf)
+}
+
+fn inline_search(account: &Account, query: &str, offset: &str, space: Option<&str>) -> Result<CatalogPage, Fault> {
+    let (username, words) = bot_query(query).unwrap_or(("gif", query));
+    let bot = inline_bot(account, username)?;
     let request = tl::functions::messages::GetInlineBotResults {
         bot,
-        // The query is asked in no chat: the bot sees only the words.
-        peer: tl::enums::InputPeer::PeerSelf,
+        peer: inline_peer(account, space),
+        // Never a location. A bot that asks for one would need a confirm this build does not have.
         geo_point: None,
-        query: query.to_owned(),
+        query: words.to_owned(),
         offset: offset.to_owned(),
     };
     let tl::enums::messages::BotResults::Results(found) = account.ask(&request)?;
     account.learn(&found.users, &[]);
+    // `switch_pm` and `switch_webview` have nowhere to go on a catalog page, so they are not shown.
     let mut items = Vec::new();
     for result in &found.results {
-        let (id, document) = match result {
-            tl::enums::BotInlineResult::BotInlineMediaResult(result) => (result.id.clone(), result.document.as_ref()),
-            tl::enums::BotInlineResult::Result(result) => (result.id.clone(), None),
-        };
-        let pick_id = format!("i{}:{id}", found.query_id);
-        let Some(mut shown) = document.and_then(|document| item(account, document, "")) else {
-            continue;
-        };
-        // Sent as the bot's result, not as the document: that is what the bot was asked for.
-        remember(account, &pick_id, Pick::Inline { query_id: found.query_id, result: id });
-        shown.id = pick_id;
-        items.push(shown);
+        let pick_id = format!("i{}:{}", found.query_id, inline_id(result));
+        match result {
+            tl::enums::BotInlineResult::BotInlineMediaResult(result) => {
+                let Some(mut shown) = result.document.as_ref().and_then(|document| item(account, document, "")) else {
+                    continue;
+                };
+                remember(account, &pick_id, Pick::Inline { query_id: found.query_id, result: result.id.clone() });
+                shown.id = pick_id;
+                items.push(shown);
+            }
+            tl::enums::BotInlineResult::Result(result) => {
+                remember(account, &pick_id, Pick::Inline { query_id: found.query_id, result: result.id.clone() });
+                items.push(CatalogItem {
+                    id: pick_id,
+                    name: result.title.clone().unwrap_or_default(),
+                    file: None,
+                    pack: result.description.clone().unwrap_or_default(),
+                    animated: false,
+                });
+            }
+        }
     }
     Ok(CatalogPage { items, cursor: found.next_offset.filter(|next| !next.is_empty()) })
+}
+
+fn inline_id(result: &tl::enums::BotInlineResult) -> &str {
+    match result {
+        tl::enums::BotInlineResult::BotInlineMediaResult(result) => &result.id,
+        tl::enums::BotInlineResult::Result(result) => &result.id,
+    }
 }
 
 /// One installed pack a page, in the user's order: the list of packs, then that pack.
