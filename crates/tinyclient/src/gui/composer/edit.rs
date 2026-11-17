@@ -247,6 +247,15 @@ impl Editor {
         self.splice(range, &text);
     }
 
+    /// Moves the selection without recording a step. Offsets snap to grapheme boundaries.
+    pub fn select(&mut self, range: Range<usize>) {
+        let end = self.snap(range.end.min(self.text.len()));
+        let start = self.snap(range.start.min(end));
+        self.selection = start..end;
+        self.reversed = false;
+        self.goal_x = None;
+    }
+
     /// Puts `text` in place of `range`, as one step: a completion taking the place of what was
     /// typed to find it.
     pub fn replace(&mut self, range: Range<usize>, text: &str) {
