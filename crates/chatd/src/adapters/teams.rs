@@ -47,6 +47,9 @@
 //! - Edit: `PUT …/messages/{id}`, same body [C: mautrix only]. Delete: `DELETE
 //!   …/messages/{id}?behavior=softDelete` [C: Squads; mautrix sends it bare].
 //! - Reactions: `PUT` / `DELETE …/messages/{id}/properties?name=emotions` [C].
+//!   The key is the catalog's (`like`, `1f389_partypopper`). A skin tone is
+//!   `{base}-toneN`, and a thumbs-up's toned base is `yes`, not `like`
+//!   [C: mautrix-teams d02a207].
 //! - Read marker: `PUT …/conversations/{id}/properties?name=consumptionhorizon`,
 //!   `{"consumptionhorizon":"{id};{now ms};{id}"}` [C].
 //! - Typing: a message of type `Control/Typing` with `contenttype: Application/Message` [C].
@@ -90,9 +93,15 @@
 //! then hands out must be under it), `TINYCLIENT_TEAMS_TROUTER` replaces
 //! `https://go.trouter.teams.microsoft.com`. The session comes from `TINYCLIENT_SESSION_TEAMS`.
 
+mod emoji;
 mod html;
 mod info;
 pub(crate) mod message;
+
+/// The lab's teams-reactions driver. A build without this returns to the server and stays up.
+pub fn prove_reactions() -> Result<(), String> {
+    message::prove_reactions()
+}
 mod people;
 mod push;
 mod send;
