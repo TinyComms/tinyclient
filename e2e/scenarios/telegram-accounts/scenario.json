@@ -1,0 +1,12 @@
+{
+  "id": "telegram-accounts",
+  "title": "Two Telegram accounts stay signed in, and removing one leaves the other",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same session list is what a second account uses.",
+    "ios": "The phone proof build does not run desktop chatd. The same session list is what a second account uses."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

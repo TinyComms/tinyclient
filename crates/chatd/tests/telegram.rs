@@ -2428,3 +2428,62 @@ fn a_premium_account_lists_its_emoji_packs_and_sending_one_names_the_document() 
         plain.calls()
     );
 }
+
+const LEA: &str = r#"{"user":7101,"name":"Lea Hart","home":2,"dcs":[]}"#;
+
+fn lea() -> AccountKey {
+    AccountKey { network: Network::Telegram, account: "7101".into() }
+}
+
+fn lea_key(id: &str) -> Key {
+    Key { network: Network::Telegram, account: "7101".into(), id: id.into() }
+}
+
+/// Two stored sessions, both connected, with the same chat id under each account.
+fn both_connected(world: &World) {
+    world.until("both Telegram accounts to connect", || {
+        let accounts = world.status().0;
+        let mira = accounts.iter().any(|row| row.key == account() && row.link == Link::Connected);
+        let other = accounts.iter().any(|row| row.key == lea() && row.link == Link::Connected && row.name == "Lea Hart");
+        (mira && other).then_some(())
+    });
+}
+
+#[test]
+fn two_saved_sessions_connect_and_removing_one_leaves_the_other() {
+    let session = format!("[{SESSION},{LEA}]");
+    let world = World::start(Some(&session), "30");
+    both_connected(&world);
+    let mine = world.conversation("u7002").expect("Mira's chat");
+    assert_eq!(mine.key.account, "7001");
+    let Response::Conversation { conversation } = world.ask(Request::Conversation { conversation: lea_key("u7002") }) else {
+        panic!("Lea's chat is missing");
+    };
+    assert_eq!(conversation.key.account, "7101");
+    assert_ne!(mine.key, conversation.key);
+    let left = chatd::adapters::telegram::without(&session, "7101").expect("removing one dropped the session");
+    let still = chatd::adapters::telegram::accounts(&left).expect("the session left behind");
+    assert_eq!(still.iter().map(|signed| signed.account.as_str()).collect::<Vec<_>>(), ["7001"]);
+    world.ask(Request::SignOut { account: lea(), erase: false });
+    world.until("Mira to stay signed in", || {
+        let accounts = world.status().0;
+        let mira = accounts.iter().any(|row| row.key == account() && row.link == Link::Connected);
+        let gone = accounts.iter().all(|row| row.key != lea());
+        (mira && gone).then_some(())
+    });
+    assert!(world.conversation("u7002").is_some(), "Mira's chat went with Lea");
+}
+
+#[test]
+fn a_second_sign_in_keeps_the_telegram_account_already_there() {
+    let world = World::signed_in();
+    world.connected();
+    assert!(matches!(world.sign_in(None), SignInStep::Qr { .. }));
+    world.steer_sign_in("scan-other");
+    both_connected(&world);
+    assert!(world.conversation("u7002").is_some());
+    let Response::Conversation { conversation } = world.ask(Request::Conversation { conversation: lea_key("u7002") }) else {
+        panic!("the second account has no chat");
+    };
+    assert_eq!(conversation.key, lea_key("u7002"));
+}
