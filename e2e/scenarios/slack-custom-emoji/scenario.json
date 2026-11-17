@@ -1,0 +1,12 @@
+{
+  "id": "slack-custom-emoji",
+  "title": "A Slack custom emoji is a picture without opening the emoji picker",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window.",
+    "ios": "The phone proof build does not run the desktop window."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

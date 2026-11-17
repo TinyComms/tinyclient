@@ -1,11 +1,11 @@
 //! One Slack message, from the socket or from a page of history, as the one message model.
 
 use super::emoji;
-use super::text::{Custom, Names, Rich};
+use super::text::{emoji_end, Custom, Names, Rich};
 use super::{fnv, seconds, thread_id, Slack};
 use protocol::{
     Attachment, Card, Forwarded, MediaFile, MediaKind, Message, MessageKind, Preview, Reaction,
-    Sender, Style, ThreadSummary, CARD_FIELDS, THREAD_FACES, WAVEFORM_LIMIT,
+    Sender, Span, Style, ThreadSummary, CARD_FIELDS, THREAD_FACES, WAVEFORM_LIMIT,
 };
 use serde_json::Value;
 
@@ -52,6 +52,68 @@ fn first<'a>(values: &[&'a Value]) -> Option<&'a str> {
 
 fn pixels(value: &Value) -> u32 {
     value.as_u64().unwrap_or(0).min(u64::from(u32::MAX)) as u32
+}
+
+/// What a stored custom-emoji note stands for: `=glyph` is an alias of a standard emoji.
+pub(super) fn custom_picture(name: &str, known: &str) -> Custom {
+    if let Some(emoji) = known.strip_prefix('=') {
+        return Custom::Unicode(emoji.to_owned());
+    }
+    Custom::File(MediaFile::new(format!("emoji:{name}:{:x}", fnv(known)), MediaKind::Emoji))
+}
+
+/// The picker's name list after a rename: the old name is gone and the new one is in it.
+pub(super) fn renamed_names(names: &str, old_name: &str, new_name: &str) -> String {
+    let mut parts: Vec<&str> = names.split(',').filter(|name| !name.is_empty() && *name != old_name && *name != new_name).collect();
+    if !new_name.is_empty() {
+        parts.push(new_name);
+    }
+    parts.sort_unstable();
+    parts.join(",")
+}
+
+/// A custom emoji reads back as a picture, and a rename keeps that picture under the new name.
+pub(super) fn prove_custom_emoji() -> Result<(), String> {
+    struct Book;
+    impl Names for Book {
+        fn me(&self) -> &str {
+            ""
+        }
+        fn user(&self, id: &str) -> String {
+            id.to_owned()
+        }
+        fn channel(&self, _id: &str) -> Option<String> {
+            None
+        }
+        fn usergroup(&self, _id: &str) -> Option<String> {
+            None
+        }
+        fn custom(&self, name: &str) -> Option<Custom> {
+            (name == "partyparrot").then(|| custom_picture(name, "pic"))
+        }
+    }
+    let mut rich = Rich::new(&Book);
+    rich.mrkdwn("see :partyparrot:");
+    if rich.text != "see :partyparrot:" {
+        return Err(format!("a custom emoji was written as {}", rich.text));
+    }
+    let Some(span) = rich.spans.iter().find(|span| matches!(span.style, Style::Emoji { .. })) else {
+        return Err("a custom emoji was not a picture".to_owned());
+    };
+    let Style::Emoji { file } = &span.style else {
+        return Err("a custom emoji was not a picture".to_owned());
+    };
+    let Custom::File(want) = custom_picture("partyparrot", "pic") else {
+        return Err("a picture note was not a file".to_owned());
+    };
+    if file.id != want.id || file.kind != MediaKind::Emoji {
+        return Err(format!("the emoji file was {}", file.id));
+    }
+    let names = renamed_names("parrot,partyparrot,shipit", "partyparrot", "party-parrot");
+    if names.split(',').any(|name| name == "partyparrot") || !names.split(',').any(|name| name == "party-parrot") {
+        return Err(format!("a rename left {names}"));
+    }
+    Ok(())
 }
 
 /// A huddle's one line. Slack keeps the same message and marks the room ended.
@@ -116,36 +178,53 @@ impl Names for Slack {
         self.ctx.note(&note)
     }
 
-    /// A custom emoji as the workspace's list names it. A message arriving never asks for the
-    /// list (`emoji.list`): only the picker does (`info.rs`), and until then the name shows.
+    /// A custom emoji as the workspace's list names it. The first message that names one with no
+    /// note asks for the list (`emoji.list`), once a day, the same way the picker does.
     fn custom(&self, name: &str) -> Option<Custom> {
-        let known = self.ctx.note(&format!("e:{name}"))?;
-        if let Some(emoji) = known.strip_prefix('=') {
-            return Some(Custom::Unicode(emoji.to_owned()));
+        if name.is_empty() {
+            return None;
         }
-        let file = MediaFile::new(format!("emoji:{name}:{:x}", fnv(&known)), MediaKind::Emoji);
-        if let Err(err) = self.ctx.media(&[(file.clone(), known)]) {
-            tracing::warn!("chatd: Slack: {err}");
+        let note = format!("e:{name}");
+        match self.ctx.note(&note) {
+            Some(known) if known.is_empty() => None,
+            Some(known) => self.custom_known(name, &known),
+            None => {
+                self.list_emoji();
+                let known = self.ctx.note(&note)?;
+                if known.is_empty() { None } else { self.custom_known(name, &known) }
+            }
         }
-        Some(Custom::File(file))
     }
 }
 
 impl Slack {
-    /// The workspace's custom emoji, written to the store once a day at most and only when the
-    /// picker asks for them. Nothing of it stays in memory.
-    pub(super) fn list_emoji(&self) {
+    fn custom_known(&self, name: &str, known: &str) -> Option<Custom> {
+        match custom_picture(name, known) {
+            Custom::Unicode(emoji) => Some(Custom::Unicode(emoji)),
+            Custom::File(file) => {
+                if let Err(err) = self.ctx.media(&[(file.clone(), known.to_owned())]) {
+                    tracing::warn!("chatd: Slack: {err}");
+                }
+                Some(Custom::File(file))
+            }
+        }
+    }
+
+    /// The workspace's custom emoji, written to the store once a day at most. The picker asks,
+    /// and so does the first message that names one the store has no note for. Nothing of the
+    /// list stays in memory. True when this call fetched it.
+    pub(super) fn list_emoji(&self) -> bool {
         let now = crate::hub::now();
         let listed = self.ctx.note("emoji").and_then(|at| at.parse::<i64>().ok());
-        if listed.is_some_and(|at| now - at < 86_400) {
-            return;
+        if listed.is_some_and(|at| now.saturating_sub(at) < 86_400) {
+            return false;
         }
         self.ctx.set_note("emoji", &now.to_string());
         let Ok(list) = self.api("emoji.list", &[]) else {
-            return;
+            return false;
         };
         let Some(all) = list["emoji"].as_object() else {
-            return;
+            return false;
         };
         // The names, for the picker: one note, not one read per emoji.
         let mut names: Vec<&str> = all.keys().map(String::as_str).collect();
@@ -170,6 +249,8 @@ impl Slack {
                 self.ctx.set_note(&format!("e:{name}"), value);
             }
         }
+        self.repaint_emoji();
+        true
     }
 
     /// One custom emoji changed: `emoji_changed` on the socket.
@@ -183,16 +264,143 @@ impl Slack {
                     if !names.split(',').any(|known| known == name) {
                         self.ctx.set_note("emoji:names", &format!("{names},{name}"));
                     }
+                    self.repaint_emoji();
                 }
             }
             Some("remove") => {
                 for name in event["names"].as_array().into_iter().flatten().filter_map(Value::as_str) {
                     self.ctx.set_note(&format!("e:{name}"), "");
                 }
+                self.repaint_emoji();
             }
-            // A rename is rare; the next daily listing picks it up.
+            // The new name keeps the picture now. Waiting a day would fetch the old list again.
+            Some("rename") => {
+                let old_name = event["old_name"].as_str().unwrap_or("");
+                let new_name = event["new_name"].as_str().unwrap_or("");
+                if old_name.is_empty() || new_name.is_empty() {
+                    return;
+                }
+                let value = event["value"].as_str().unwrap_or("");
+                let picture = if self.hosted(value) {
+                    value.to_owned()
+                } else if let Some(alias) = value.strip_prefix("alias:") {
+                    match emoji::standard(alias) {
+                        Some(glyph) => format!("={glyph}"),
+                        None => self.ctx.note(&format!("e:{alias}")).filter(|known| !known.is_empty()).unwrap_or_default(),
+                    }
+                } else {
+                    self.ctx.note(&format!("e:{old_name}")).unwrap_or_default()
+                };
+                if !picture.is_empty() {
+                    self.ctx.set_note(&format!("e:{new_name}"), &picture);
+                }
+                self.ctx.set_note(&format!("e:{old_name}"), "");
+                let names = self.ctx.note("emoji:names").unwrap_or_default();
+                self.ctx.set_note("emoji:names", &renamed_names(&names, old_name, new_name));
+                self.repaint_emoji();
+            }
             _ => self.ctx.set_note("emoji", "0"),
         }
+    }
+
+    /// A status emoji: a standard one as itself, a custom one as `:name:` with its picture
+    /// registered the way a reaction's is. The live emoji is the short name, which fits where
+    /// a file id does not.
+    pub(super) fn status_emoji(&self, raw: &str) -> String {
+        let name = raw.trim().trim_matches(':');
+        if name.is_empty() {
+            return String::new();
+        }
+        if let Some(glyph) = emoji::standard(name) {
+            return glyph.to_owned();
+        }
+        match self.custom(name) {
+            Some(Custom::Unicode(glyph)) => glyph,
+            Some(Custom::File(_)) | None => format!(":{name}:"),
+        }
+    }
+
+    /// Rows already on screen were stored before this name had a picture. Fill those in place.
+    /// A page is not fetched again: the tests count `conversations.history`.
+    fn repaint_emoji(&self) {
+        let watching = self.ctx.watching();
+        let Some(open) = watching.conversation.as_ref().filter(|open| open.account() == self.ctx.account) else {
+            return;
+        };
+        // The newest page, which is what is on screen. `stored_ids` orders by id length first,
+        // so a short upper bound would miss every Slack timestamp.
+        let loaded = {
+            let mut store = self.ctx.hub.store();
+            store.messages(&self.ctx.key(&open.id), &protocol::Page::Newest, 50, crate::hub::now())
+        };
+        let Ok(Some(page)) = loaded else {
+            return;
+        };
+        let mut changed = Vec::new();
+        for mut message in page.messages {
+            if self.paint_emoji(&mut message) {
+                changed.push(message);
+            }
+        }
+        if !changed.is_empty() {
+            let _ = self.ctx.history(&open.id, &changed);
+        }
+    }
+
+    /// Adds a picture to a custom emoji this message still shows as a bare `:name:`.
+    fn paint_emoji(&self, message: &mut Message) -> bool {
+        let mut changed = false;
+        for reaction in &mut message.reactions {
+            if reaction.file.is_some() {
+                continue;
+            }
+            let Some(name) = reaction.emoji.strip_prefix(':').and_then(|rest| rest.strip_suffix(':')) else {
+                continue;
+            };
+            if name.is_empty() || emoji::standard(name).is_some() {
+                continue;
+            }
+            match self.custom(name) {
+                Some(Custom::File(file)) => {
+                    reaction.file = Some(file);
+                    changed = true;
+                }
+                Some(Custom::Unicode(glyph)) => {
+                    reaction.emoji = glyph;
+                    changed = true;
+                }
+                None => {}
+            }
+        }
+        let text = message.text.clone();
+        let bytes = text.as_bytes();
+        let mut at = 0;
+        let mut extra = Vec::new();
+        while at < bytes.len() {
+            if bytes[at] != b':' {
+                at += 1;
+                continue;
+            }
+            let Some(close) = emoji_end(&text, at) else {
+                at += 1;
+                continue;
+            };
+            let end = close + 1;
+            let name = &text[at + 1..close];
+            let (start, end) = (at as u32, end as u32);
+            let covered = message.spans.iter().any(|span| span.start < end && start < span.end);
+            if !covered && !name.is_empty() && emoji::standard(name).is_none() {
+                if let Some(Custom::File(file)) = self.custom(name) {
+                    extra.push(Span { start, end, style: Style::Emoji { file } });
+                }
+            }
+            at = end as usize;
+        }
+        if !extra.is_empty() {
+            message.spans.extend(extra);
+            changed = true;
+        }
+        changed
     }
 
     /// A reaction's emoji as the model writes it: the emoji itself, or `:name:` with its picture.

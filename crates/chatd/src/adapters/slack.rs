@@ -439,6 +439,12 @@ pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
     Ok(found)
 }
 
+/// The lab's slack-custom-emoji driver. A custom emoji is a picture, and a rename keeps the
+/// picture under the new name. A build without this stays up, so the driver fails there.
+pub(crate) fn prove_custom_emoji() -> Result<(), String> {
+    message::prove_custom_emoji()
+}
+
 /// The session without one workspace, or `None` when it was the last.
 pub fn without(session: &str, account: &str) -> Option<String> {
     let mut parsed: Value = serde_json::from_str(session).ok()?;

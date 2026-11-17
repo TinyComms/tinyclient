@@ -1592,6 +1592,12 @@ pub fn prove_teams_markdown() -> Result<(), String> {
     teams::prove_teams_markdown()
 }
 
+/// The lab's slack-custom-emoji driver. A custom emoji is a picture, and renaming it keeps
+/// that picture under the new name.
+pub fn prove_slack_custom_emoji() -> Result<(), String> {
+    slack::prove_custom_emoji()
+}
+
 /// The lab's failed-start-offline driver. A start that fails leaves the account offline,
 /// so messages() still answers from the cache instead of an empty signed-out page.
 pub fn prove_failed_start_offline() -> Result<(), String> {

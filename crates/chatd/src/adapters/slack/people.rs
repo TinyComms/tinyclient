@@ -1,7 +1,6 @@
 //! People on a workspace: who wrote a message, who a direct message is with, who is typing or
 //! online. The directory is searched and looked up by id, never listed.
 
-use super::emoji;
 use super::{https_host, within, Fault, Slack, SEARCHED, SEARCH_EVERY, UNKNOWN};
 use crate::adapters::{Failure, Members};
 use crate::store::{ConversationRow, PersonDetails, PersonRow};
@@ -267,8 +266,7 @@ impl Slack {
                     tracing::warn!("chatd: Slack: {err}");
                 }
             }
-            let status_emoji = profile["status_emoji"].as_str().unwrap_or("").trim_matches(':');
-            let status_emoji = emoji::standard(status_emoji).unwrap_or_default();
+            let status_emoji = self.status_emoji(profile["status_emoji"].as_str().unwrap_or(""));
             let status = format!("{status_emoji} {}", profile["status_text"].as_str().unwrap_or(""));
             let mark = mark_of(user, &self.session.team_id);
             let known = User {

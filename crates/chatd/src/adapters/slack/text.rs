@@ -412,7 +412,7 @@ fn closer(line: &str, open: usize, mark: u8) -> Option<usize> {
 }
 
 /// The closing colon of an emoji name opened at `open`.
-fn emoji_end(line: &str, open: usize) -> Option<usize> {
+pub(super) fn emoji_end(line: &str, open: usize) -> Option<usize> {
     let rest = &line[open + 1..];
     let len = rest.find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || "_+-'".contains(c)))?;
     let mut close = open + 1 + len;

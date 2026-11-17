@@ -1043,7 +1043,7 @@ fn a_channel_reads_as_it_does_in_slack_and_stays_current() {
 
     // Rich text, a mention of me, an image and reactions.
     let shipping = by_id("1760000300.000300");
-    assert_eq!(shipping.text, "Shipping today 🚀 @Justin");
+    assert_eq!(shipping.text, "Shipping today 🚀 @Justin :partyparrot:");
     assert!(ranges(shipping).contains(&("today", &Style::Bold)));
     let me_named = Style::Mention { kind: MentionKind::User, id: "U0ME".to_owned() };
     assert!(ranges(shipping).contains(&("@Justin", &me_named)));
@@ -1064,10 +1064,10 @@ fn a_channel_reads_as_it_does_in_slack_and_stays_current() {
         .iter()
         .map(|reaction| (reaction.emoji.as_str(), reaction.count, reaction.mine, reaction.file.is_some()))
         .collect();
-    // A custom emoji shows by name: the workspace's list is read when the picker asks for
-    // it, never because a message arrived.
-    assert_eq!(reactions, [("🎉", 2, true, false), (":partyparrot:", 1, false, false)]);
-    assert!(world.fake.calls(ALPHA, "emoji.list").is_empty());
+    // A custom emoji is a picture once the workspace list has been read, which a message
+    // that names one does. The picker is not required.
+    assert_eq!(reactions, [("🎉", 2, true, false), (":partyparrot:", 1, false, true)]);
+    assert_eq!(world.fake.calls(ALPHA, "emoji.list").len(), 1);
 
     // Its files are registered with their sizes before any byte is fetched. Only the upload is
     // asked for here: its address is the fake's, and the avatar's and emoji's are Slack's own.
@@ -2393,4 +2393,76 @@ fn a_slack_connect_channel_names_the_other_organisation() {
     let opened = world.fake.calls(ALPHA, "conversations.open");
     assert_eq!(opened.len(), before);
     assert!(opened.iter().all(|call| !call.params["users"].contains('@')));
+}
+
+/// The picture id `emoji.list` gives a custom emoji, without asking the picker.
+fn emoji_id(name: &str, url: &str) -> String {
+    let hash = url.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3));
+    format!("emoji:{name}:{hash:x}")
+}
+
+fn emoji_span<'a>(message: &'a Message, name: &str) -> Option<&'a protocol::MediaFile> {
+    let needle = format!(":{name}:");
+    message.spans.iter().find_map(|span| {
+        let Style::Emoji { file } = &span.style else {
+            return None;
+        };
+        let text = &message.text[span.start as usize..span.end as usize];
+        (text == needle).then_some(file)
+    })
+}
+
+#[test]
+fn a_custom_emoji_is_a_picture_without_opening_the_picker() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    let shipping = world.general().into_iter().find(|message| message.id == "1760000300.000300").unwrap();
+    let file = emoji_span(&shipping, "partyparrot").expect("the custom emoji is a picture, and the picker was never opened");
+    assert!(file.id.starts_with("emoji:partyparrot:") && file.kind == MediaKind::Emoji, "{}", file.id);
+    let reaction = shipping.reactions.iter().find(|reaction| reaction.emoji == ":partyparrot:").unwrap();
+    assert_eq!(reaction.file.as_ref().map(|file| file.id.as_str()), Some(file.id.as_str()));
+    assert_eq!(world.fake.calls(ALPHA, "emoji.list").len(), 1, "one list for the workspace, not a catalog request");
+
+    let wave = "https://emoji.slack-edge.com/T01ALPHA/waveblob/89ab.gif";
+    world.fake.push(ALPHA, json!({
+        "type": "user_status_changed",
+        "user": {
+            "id": "U0ANA", "name": "ana",
+            "profile": {"display_name": "Ana", "title": "Design lead", "status_text": "shipping", "status_emoji": ":waveblob:"},
+        },
+    }));
+    let ana = world.until("a custom status emoji", || {
+        let Response::People { people, .. } = world.ask(Request::People {
+            network: Some(Network::Slack), relation: None, query: Some("Ana".into()), offset: 0, limit: 10,
+        }) else {
+            return None;
+        };
+        people.into_iter().find(|person| person.key == alpha("U0ANA") && person.emoji == ":waveblob:" && person.status.contains("shipping"))
+    });
+    assert_eq!(ana.emoji, ":waveblob:");
+    let id = emoji_id("waveblob", wave);
+    let Response::Media { files } = world.ask(Request::Fetch { retry: false, size: None, account: general.account(), ids: vec![id.clone()] }) else {
+        panic!("no media");
+    };
+    assert!(files.iter().any(|file| file.id == id && file.kind == MediaKind::Emoji), "the status emoji is registered as a file");
+
+    world.ask(Request::Watch(Watching { conversation: Some(general.clone()), ..Watching::default() }));
+    world.fake.push(ALPHA, json!({
+        "type": "message", "channel": "C0GEN", "user": "U0ANA", "text": "go :party-parrot:",
+        "ts": "1760000501.000501", "event_ts": "1760000501.000501", "channel_type": "channel",
+    }));
+    world.until("the new name before it is renamed", || {
+        world.message(&general, "1760000501.000501").filter(|message| emoji_span(message, "party-parrot").is_none())
+    });
+    world.fake.push(ALPHA, json!({
+        "type": "emoji_changed", "subtype": "rename",
+        "old_name": "partyparrot", "new_name": "party-parrot",
+        "value": "https://emoji.slack-edge.com/T01ALPHA/partyparrot/0123abcd4567.gif",
+        "event_ts": "1760000500.000500",
+    }));
+    let renamed = world.until("a rename is a picture without another list", || {
+        world.message(&general, "1760000501.000501").and_then(|message| emoji_span(&message, "party-parrot").map(|file| file.id.clone()))
+    });
+    assert!(renamed.starts_with("emoji:party-parrot:") && world.fake.calls(ALPHA, "emoji.list").len() == 1, "{renamed}");
 }
