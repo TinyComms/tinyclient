@@ -533,9 +533,29 @@ impl Flow {
             Some(last) if !last.is_empty() => format!("{first} {last}").trim().to_owned(),
             _ => first,
         };
-        let session = self.wire.session(user.id, &name);
+        let fresh = self.wire.session(user.id, &name);
+        // A second sign-in joins the accounts already stored. Replacing the item would
+        // sign the first one out.
+        let session = match crate::session::read(Network::Telegram) {
+            crate::session::Stored::Absent => fresh,
+            crate::session::Stored::Found(existing) => match super::combine(&existing, &fresh) {
+                Ok(joined) => joined,
+                Err(_) => {
+                    let _ = wire::call(self.wire.as_ref(), &tl::functions::auth::LogOut {});
+                    return self.fail("The other Telegram account could not be read, so this sign-in was not kept.");
+                }
+            },
+            crate::session::Stored::Unreadable(_) => {
+                let _ = wire::call(self.wire.as_ref(), &tl::functions::auth::LogOut {});
+                return self.fail("The other Telegram account could not be read, so this sign-in was not kept.");
+            }
+        };
         let step = match (self.adopt)(&session) {
-            Ok(accounts) => SignInStep::Done { account: accounts.into_iter().next() },
+            // The step names who just signed in. The list also holds the accounts already there.
+            Ok(accounts) => {
+                let id = user.id.to_string();
+                SignInStep::Done { account: accounts.into_iter().find(|key| key.account == id) }
+            }
             Err(why) => {
                 tracing::warn!("chatd: Telegram: the sign-in was not kept: {}", super::super::net::redact(&why));
                 // The session exists on Telegram but not here: it is ended there, so the

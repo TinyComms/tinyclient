@@ -32,8 +32,9 @@
 //!
 //! # The session
 //!
-//! One keychain item, like every network: the keys Telegram issued (256 bytes a datacenter),
-//! the home datacenter and whose they are, as JSON (`Saved`). Nothing of it is on disk.
+//! One keychain item, like every network. It holds every Telegram account signed in here:
+//! one `Saved`, or a list of them. The keys Telegram issued (256 bytes a datacenter), the
+//! home datacenter and whose they are. Nothing of it is on disk. Removing one leaves the rest.
 //!
 //! # What the terms bind (`docs/product/08-sign-in-accounts.md`)
 //!
@@ -140,24 +141,82 @@ fn parse(session: &str) -> Result<Saved, String> {
     serde_json::from_str(session).map_err(|_| "the Telegram session is unreadable".to_owned())
 }
 
-pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
-    let saved = parse(session)?;
-    Ok(vec![Signed {
-        account: saved.user.to_string(),
-        name: if saved.name.is_empty() { "Telegram".to_owned() } else { saved.name },
-        session: session.to_owned(),
-    }])
+fn unreadable() -> String {
+    "the Telegram session is unreadable".to_owned()
 }
 
-/// One sign-in is one account, so nothing is left once it goes.
-pub fn without(_session: &str, _account: &str) -> Option<String> {
-    None
+/// One stored sign-in, or a list of them. A session from before several accounts were kept
+/// is the one object.
+fn rows(session: &str) -> Result<Vec<Saved>, String> {
+    if session.trim_start().starts_with('[') {
+        let saved: Vec<Saved> = serde_json::from_str(session).map_err(|_| unreadable())?;
+        if saved.is_empty() {
+            return Err(unreadable());
+        }
+        return Ok(saved);
+    }
+    Ok(vec![parse(session)?])
+}
+
+/// One account stays one object. Several are a list.
+fn pack(saved: &[Saved]) -> Result<String, String> {
+    match saved {
+        [] => Err(unreadable()),
+        [one] => serde_json::to_string(one).map_err(|_| unreadable()),
+        many => serde_json::to_string(many).map_err(|_| unreadable()),
+    }
+}
+
+fn signed_for(saved: &Saved) -> Result<Signed, String> {
+    Ok(Signed {
+        account: saved.user.to_string(),
+        name: if saved.name.is_empty() { "Telegram".to_owned() } else { saved.name.clone() },
+        session: serde_json::to_string(saved).map_err(|_| unreadable())?,
+    })
+}
+
+pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
+    let mut found = Vec::new();
+    for saved in rows(session)? {
+        if found.iter().any(|signed: &Signed| signed.account == saved.user.to_string()) {
+            continue;
+        }
+        found.push(signed_for(&saved)?);
+    }
+    if found.is_empty() {
+        return Err(unreadable());
+    }
+    Ok(found)
+}
+
+/// The session with one account taken out. `None` only when that was the last one. An
+/// account that is not in it leaves the original string untouched.
+pub fn without(session: &str, account: &str) -> Option<String> {
+    let mut saved = rows(session).ok()?;
+    let before = saved.len();
+    saved.retain(|one| one.user.to_string() != account);
+    if saved.len() == before {
+        return Some(session.to_owned());
+    }
+    match saved.len() {
+        0 => None,
+        _ => pack(&saved).ok(),
+    }
+}
+
+/// A finished sign-in joins the accounts already stored. The same user replaces their own keys.
+pub(super) fn combine(existing: &str, fresh: &str) -> Result<String, String> {
+    let fresh_saved = parse(fresh)?;
+    let mut kept = rows(existing)?;
+    kept.retain(|saved| saved.user != fresh_saved.user);
+    kept.push(fresh_saved);
+    pack(&kept)
 }
 
 /// A wire for this session, or for a sign-in when there is none yet.
 fn open(saved: Option<&Saved>) -> Result<Box<dyn Wire>, String> {
     if scripted() {
-        return Ok(Box::new(fake::Fake::open(saved.is_some())));
+        return Ok(Box::new(fake::Fake::open(saved)));
     }
     let (api_id, _) = credentials().ok_or_else(unsupported_reason)?;
     Ok(Box::new(real::Real::open(api_id, saved)?))
@@ -319,11 +378,15 @@ impl Account {
         found.map(|(_, conversation)| conversation.clone())
     }
 
-    /// Writes the session out again when a key was made for another datacenter.
+    /// Writes the session out again when a key was made for another datacenter. The stored
+    /// item may hold other accounts; only this one is replaced.
     fn keep_session(&self) {
         if self.wire.unsaved() {
             let fresh = self.wire.session(self.me, &self.name);
-            self.ctx.save_session(|_| Some(fresh));
+            self.ctx.save_session(|stored| match combine(stored, &fresh) {
+                Ok(joined) if joined != stored => Some(joined),
+                _ => None,
+            });
         }
     }
 
@@ -387,7 +450,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
                     Some(account) => sync::backfill(&account, id),
                     // The link is down. The store holds its answer already and the ask waits
                     // for the next connect, where it fills what was opened.
-                    None => held_back(id.to_owned()),
+                    None => held_back(&ctx.account.account, id.to_owned()),
                 },
                 |command| match account() {
                     Some(account) => serve(&account, command),
@@ -399,6 +462,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
             if let Some(account) = account() {
                 account.wire.close();
             }
+            held_drop(&ctx.account.account);
         })
         .map_err(|err| err.to_string())?;
     Ok(())
@@ -461,7 +525,7 @@ fn connect(
     account.keep_session();
     // The asks the link was down for go before anything else: the user's open stands, and
     // the chats the sign-on read have the rows the ask refers to.
-    for id in held_take() {
+    for id in held_take(&ctx.account.account) {
         sync::backfill(&account, &id);
     }
     // Telegram fades an account to offline by itself, so being here is said on opening the
@@ -504,10 +568,10 @@ fn connect(
     }
 }
 
-#[derive(Default)]
 struct Held {
-    /// Ids of conversations to fill, newest last; one read twice is still one look.
-    backs: VecDeque<String>,
+    /// Conversation ids to fill, newest last, each with the account that asked. One read
+    /// twice is still one look. Two accounts do not share a list.
+    backs: VecDeque<(String, String)>,
 }
 
 /// Asks the shell made while the link was down, that the network hears at the next
@@ -518,17 +582,38 @@ static HELD: Mutex<Held> = Mutex::new(Held { backs: VecDeque::new() });
 
 const HELD_BACKS: usize = 32;
 
-fn held_back(id: String) {
-    let mut held = HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    held.backs.retain(|held| *held != id);
-    held.backs.push_back(id);
-    while held.backs.len() > HELD_BACKS {
-        held.backs.pop_front();
+fn held_lock() -> MutexGuard<'static, Held> {
+    HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn held_back(account: &str, id: String) {
+    let mut held = held_lock();
+    held.backs.retain(|(who, held_id)| who != account || held_id != &id);
+    held.backs.push_back((account.to_owned(), id));
+    while held.backs.iter().filter(|(who, _)| who == account).count() > HELD_BACKS {
+        if let Some(at) = held.backs.iter().position(|(who, _)| who == account) {
+            held.backs.remove(at);
+        }
     }
 }
 
-fn held_take() -> VecDeque<String> {
-    std::mem::take(&mut HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).backs)
+fn held_take(account: &str) -> VecDeque<String> {
+    let mut held = held_lock();
+    let mut mine = VecDeque::new();
+    let mut keep = VecDeque::new();
+    for (who, id) in held.backs.drain(..) {
+        if who == account {
+            mine.push_back(id);
+        } else {
+            keep.push_back((who, id));
+        }
+    }
+    held.backs = keep;
+    mine
+}
+
+fn held_drop(account: &str) {
+    held_lock().backs.retain(|(who, _)| who != account);
 }
 
 /// Answers a command while there is no connection.
@@ -679,7 +764,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::SignOut(reply) => {
             // Ends the session on Telegram, so the device list no longer shows it. What the
             // link was down for belongs to this session and not the next.
-            held_take();
+            held_take(&account.ctx.account.account);
             let _ = account.ask(&tl::functions::auth::LogOut {});
             let _ = reply.send(Ok(()));
         }
@@ -1042,6 +1127,33 @@ pub fn prove_telegram_service_lines() -> Result<(), String> {
 /// The lab's telegram-premium driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_premium() -> Result<(), String> {
     premium::prove()
+}
+
+/// The lab's telegram-accounts driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_accounts() -> Result<(), String> {
+    let mira = r#"{"user":7001,"name":"Mira Kessler","home":2,"dcs":[]}"#;
+    let lea = r#"{"user":7101,"name":"Lea Hart","home":2,"dcs":[]}"#;
+    let both = format!("[{mira},{lea}]");
+    let signed = accounts(&both)?;
+    if signed.len() != 2 || signed[0].account == signed[1].account {
+        return Err(format!("two accounts were not keyed apart: {}", signed.len()));
+    }
+    let left = without(&both, &signed[1].account).ok_or("removing one dropped the session")?;
+    let still = accounts(&left)?;
+    if still.len() != 1 || still[0].account != signed[0].account {
+        return Err("the account that stayed was not the first".into());
+    }
+    let again = combine(mira, lea)?;
+    if accounts(&again)?.len() != 2 {
+        return Err("a second sign-in replaced the first".into());
+    }
+    if accounts(&combine(&again, lea)?)?.len() != 2 {
+        return Err("signing in again duplicated an account".into());
+    }
+    if accounts(mira)?.len() != 1 {
+        return Err("an older session was not one account".into());
+    }
+    Ok(())
 }
 
 /// The lab's telegram-member-sections driver. A build without this stays up and the driver fails.
