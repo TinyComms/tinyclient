@@ -1561,6 +1561,11 @@ pub fn start(account: AccountKey, session: &str, hub: Arc<Hub>) -> Result<Adapte
     Ok(Adapter { commands, stop })
 }
 
+/// The lab's teams-markdown driver. See `teams::prove_teams_markdown`.
+pub fn prove_teams_markdown() -> Result<(), String> {
+    teams::prove_teams_markdown()
+}
+
 /// The lab's failed-start-offline driver. A start that fails leaves the account offline,
 /// so messages() still answers from the cache instead of an empty signed-out page.
 pub fn prove_failed_start_offline() -> Result<(), String> {

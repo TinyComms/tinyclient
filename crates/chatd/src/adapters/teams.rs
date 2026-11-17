@@ -97,6 +97,11 @@
 
 mod emoji;
 mod html;
+
+/// The lab's teams-markdown driver. A build without this returns to the server and stays up.
+pub fn prove_teams_markdown() -> Result<(), String> {
+    html::prove_markdown()
+}
 mod info;
 pub(crate) mod message;
 

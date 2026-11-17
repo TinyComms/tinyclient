@@ -312,7 +312,8 @@ impl Lookup for Refs<'_> {
 
 /// The header of a quoted reply, as Teams' own client writes it.
 fn quote_markup(reply: &ReplyTo) -> String {
-    let text = |text: &str| html::compose(text).trim_start_matches("<p>").trim_end_matches("</p>").to_owned();
+    // A quote's name and preview are already plain text. Escaping them must not read markdown.
+    let text = |text: &str| html::escape_plain(text);
     let person = reply.person.as_ref().map_or("", |person| person.id.as_str());
     format!(
         "<blockquote itemscope=\"\" itemtype=\"http://schema.skype.com/Reply\" itemid=\"{id}\">\
@@ -436,7 +437,7 @@ impl Teams {
         let refs = Refs { teams: self, mentions: &mentions };
         let mut parsed = match kind {
             // Plain text is taken as written, not read for markup.
-            "Text" => html::parse(&html::compose(content), &refs, &me),
+            "Text" => html::parse(&format!("<p>{}</p>", html::escape_plain(content)), &refs, &me),
             _ => html::parse(content, &refs, &me),
         };
         // A channel post's headline is part of what it says.
@@ -909,7 +910,9 @@ impl Teams {
         let me = self.me();
         let name = self.own_name();
         let sent = millis(&id) / 1000;
-        let mut message = Message::plain(id, name.clone(), text, sent, true);
+        let (shown, spans) = html::styled(text);
+        let mut message = Message::plain(id, name.clone(), shown, sent, true);
+        message.spans = spans;
         message.sender.avatar = self.picture(&me, &name);
         message.sender.id = me;
         if let Some((channel, root)) = chain_of(&target) {
@@ -937,8 +940,9 @@ impl Teams {
         let body = self.body(&now_ms().to_string(), &content);
         self.chat("PUT", &self.message_path(conversation, id), Body::Json(&body), false)?;
         if let Some(mut edited) = stored {
-            edited.text = text.to_owned();
-            edited.spans.clear();
+            let (shown, spans) = html::styled(text);
+            edited.text = shown;
+            edited.spans = spans;
             edited.edited = true;
             self.ctx.history(conversation, &[edited])?;
         }

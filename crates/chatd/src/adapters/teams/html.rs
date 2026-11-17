@@ -566,22 +566,488 @@ pub(super) fn parse(html: &str, lookup: &dyn Lookup, me: &str) -> Parsed {
     builder.finish(me)
 }
 
-/// Text the user typed, as the HTML Teams takes: escaped, one paragraph, line ends as breaks.
-pub(super) fn compose(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 7);
-    out.push_str("<p>");
+struct Quiet;
+
+impl Lookup for Quiet {
+    fn mention(&self, _: &str) -> Option<(MentionKind, String)> {
+        None
+    }
+
+    fn hosted(&self, _: &str) -> bool {
+        false
+    }
+
+    fn emoji(&self, _: &str, _: &str) -> Option<MediaFile> {
+        None
+    }
+}
+
+/// The text and spans a sent message shows. The same reading as Teams gives the HTML we post.
+pub(super) fn styled(text: &str) -> (String, Vec<Span>) {
+    let parsed = parse(&compose(text), &Quiet, "");
+    (parsed.text, parsed.spans)
+}
+
+/// Bold, a list, a code block and a link, read back from the HTML `compose` posts.
+pub(super) fn prove_markdown() -> Result<(), String> {
+    let (text, spans) = styled("**done**\n- first\n- second\n```rs\nlet a = 1;\n```\n[plan](https://example.com/a)");
+    if text != "done\nfirst\nsecond\nlet a = 1;\nplan" {
+        return Err(format!("text {text:?}"));
+    }
+    let has = |needle: &str, style: Style| {
+        spans.iter().any(|span| text.get(span.start as usize..span.end as usize) == Some(needle) && span.style == style)
+    };
+    if !has("done", Style::Bold) {
+        return Err("bold".to_owned());
+    }
+    let item = Style::ListItem { ordered: false, depth: 0 };
+    if !has("first", item.clone()) || !has("second", item) {
+        return Err("list".to_owned());
+    }
+    if !has("let a = 1;", Style::CodeBlock { language: "rs".to_owned() }) {
+        return Err("code".to_owned());
+    }
+    if !has("plan", Style::Link { url: "https://example.com/a".to_owned() }) {
+        return Err("link".to_owned());
+    }
+    Ok(())
+}
+
+struct Item {
+    depth: u8,
+    ordered: bool,
+    body: String,
+}
+
+enum Block {
+    Para(String),
+    Quote(String),
+    List(Vec<Item>),
+    Code { language: String, body: String },
+}
+
+fn normalized(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "")
+}
+
+/// Escapes text for HTML, with line ends as breaks. Not markdown: a quote preview is already plain.
+pub(super) fn escape_plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    escape_text(&mut out, &normalized(text), true);
+    out
+}
+
+fn escape_text(out: &mut String, text: &str, breaks: bool) {
     for c in text.chars() {
         match c {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
-            '\n' => out.push_str("<br>"),
-            '\r' => {}
+            '\n' if breaks => out.push_str("<br>"),
+            '\n' => out.push('\n'),
             c => out.push(c),
         }
     }
+}
+
+fn closing(text: &str, from: usize, delimiter: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut at = from;
+    while at < bytes.len() {
+        if bytes[at] == b'\\' {
+            at += 1;
+            at += text[at..].chars().next().map_or(0, char::len_utf8);
+            continue;
+        }
+        if text[at..].starts_with(delimiter) {
+            return (at > from).then_some(at);
+        }
+        at += text[at..].chars().next().map_or(1, char::len_utf8);
+    }
+    None
+}
+
+/// A lone `_`, not half of `__`. `__word__` is not underline and not italic.
+fn closing_underscore(text: &str, from: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut at = from;
+    while at < bytes.len() {
+        if bytes[at] == b'\\' {
+            at += 1;
+            at += text[at..].chars().next().map_or(0, char::len_utf8);
+            continue;
+        }
+        let single = text[at..].starts_with('_') && !text[at..].starts_with("__") && !text[..at].ends_with('_');
+        if single {
+            return (at > from).then_some(at);
+        }
+        at += text[at..].chars().next().map_or(1, char::len_utf8);
+    }
+    None
+}
+
+fn edged(text: &str) -> bool {
+    text.chars().next().is_some_and(char::is_whitespace) || text.chars().next_back().is_some_and(char::is_whitespace)
+}
+
+fn take_wrap(out: &mut String, text: &str, delimiter: &str, open: &str, close: &str) -> Option<usize> {
+    if !text.starts_with(delimiter) {
+        return None;
+    }
+    let close_at = closing(text, delimiter.len(), delimiter)?;
+    let inner = &text[delimiter.len()..close_at];
+    if inner.is_empty() || edged(inner) {
+        return None;
+    }
+    out.push_str(open);
+    inline_into(out, inner);
+    out.push_str(close);
+    Some(close_at + delimiter.len())
+}
+
+fn take_code(out: &mut String, text: &str) -> Option<usize> {
+    let delimiter = if text.starts_with("``") { "``" } else if text.starts_with('`') { "`" } else { return None };
+    let close_at = closing(text, delimiter.len(), delimiter)?;
+    let inner = &text[delimiter.len()..close_at];
+    if inner.contains('\n') {
+        return None;
+    }
+    out.push_str("<code>");
+    escape_text(out, inner, false);
+    out.push_str("</code>");
+    Some(close_at + delimiter.len())
+}
+
+fn allowed_href(url: &str) -> bool {
+    let schemes = ["https://", "http://", "mailto:"];
+    let scheme = schemes.iter().any(|scheme| {
+        url.get(..scheme.len()).is_some_and(|start| start.eq_ignore_ascii_case(scheme)) && url.len() > scheme.len()
+    });
+    scheme && !url.chars().any(|c| c.is_ascii_whitespace() || matches!(c, '"' | '<' | '>' | '\u{0}'))
+}
+
+fn take_link(out: &mut String, text: &str) -> Option<usize> {
+    if !text.starts_with('[') {
+        return None;
+    }
+    let label_end = closing(text, 1, "](")?;
+    let target = &text[label_end + 2..];
+    let target_end = target.find(')')?;
+    let url = target[..target_end].trim();
+    if !allowed_href(url) {
+        return None;
+    }
+    let label = &text[1..label_end];
+    if label.is_empty() || label.contains('\n') {
+        return None;
+    }
+    out.push_str("<a href=\"");
+    escape_text(out, url, false);
+    out.push_str("\">");
+    inline_into(out, label);
+    out.push_str("</a>");
+    Some(label_end + 2 + target_end + 1)
+}
+
+fn bare_end(text: &str) -> usize {
+    let mut end = text.find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"')).unwrap_or(text.len());
+    while let Some(last) = text[..end].chars().next_back() {
+        let unmatched = last == ')' && !text[..end].contains('(');
+        if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | '\'') || unmatched {
+            end -= last.len_utf8();
+        } else {
+            break;
+        }
+    }
+    end
+}
+
+fn take_autolink(out: &mut String, text: &str, after_word: bool) -> Option<usize> {
+    if after_word {
+        return None;
+    }
+    let schemes = ["https://", "http://", "mailto:"];
+    let scheme = schemes.iter().find(|scheme| {
+        text.get(..scheme.len()).is_some_and(|start| start.eq_ignore_ascii_case(scheme))
+    })?;
+    let end = bare_end(text);
+    if end <= scheme.len() || !allowed_href(&text[..end]) {
+        return None;
+    }
+    let url = &text[..end];
+    out.push_str("<a href=\"");
+    escape_text(out, url, false);
+    out.push_str("\">");
+    escape_text(out, url, false);
+    out.push_str("</a>");
+    Some(end)
+}
+
+fn take_underscore(out: &mut String, text: &str, after_word: bool) -> Option<usize> {
+    if after_word || !text.starts_with('_') || text.starts_with("__") {
+        return None;
+    }
+    let close_at = closing_underscore(text, 1)?;
+    let inner = &text[1..close_at];
+    if inner.is_empty() || edged(inner) {
+        return None;
+    }
+    if text[close_at + 1..].chars().next().is_some_and(char::is_alphanumeric) {
+        return None;
+    }
+    out.push_str("<em>");
+    inline_into(out, inner);
+    out.push_str("</em>");
+    Some(close_at + 1)
+}
+
+fn inline_into(out: &mut String, text: &str) {
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        let after_word = text[..at].chars().next_back().is_some_and(char::is_alphanumeric);
+        if let Some(escaped) = rest.strip_prefix('\\').and_then(|rest| rest.chars().next()).filter(char::is_ascii_punctuation) {
+            escape_text(out, &escaped.to_string(), true);
+            at += 1 + escaped.len_utf8();
+            continue;
+        }
+        let taken = take_code(out, rest)
+            .or_else(|| take_wrap(out, rest, "~~", "<s>", "</s>"))
+            .or_else(|| take_wrap(out, rest, "***", "<strong><em>", "</em></strong>"))
+            .or_else(|| take_wrap(out, rest, "**", "<strong>", "</strong>"))
+            .or_else(|| take_wrap(out, rest, "*", "<em>", "</em>"))
+            .or_else(|| take_underscore(out, rest, after_word))
+            .or_else(|| take_link(out, rest))
+            .or_else(|| take_autolink(out, rest, after_word));
+        if let Some(taken) = taken {
+            at += taken;
+            continue;
+        }
+        let ch = rest.chars().next().unwrap_or(' ');
+        escape_text(out, &ch.to_string(), true);
+        at += ch.len_utf8();
+    }
+}
+
+fn fence_open(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix("```")?;
+    if rest.contains('`') {
+        return None;
+    }
+    let lang = rest.trim();
+    if lang.is_empty() {
+        return Some(String::new());
+    }
+    lang.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '#' | '_' | '.'))
+        .then(|| lang.to_ascii_lowercase())
+}
+
+fn is_fence_close(line: &str) -> bool {
+    let line = line.trim();
+    line.len() >= 3 && line.bytes().all(|byte| byte == b'`')
+}
+
+fn quote_body(line: &str) -> Option<&str> {
+    let spaces = line.bytes().take_while(|byte| *byte == b' ').count();
+    if spaces > 3 {
+        return None;
+    }
+    let rest = line[spaces..].strip_prefix('>')?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
+
+fn list_marker(line: &str) -> Option<(u8, bool, &str)> {
+    let spaces = line.bytes().take_while(|byte| *byte == b' ').count();
+    if spaces > 16 {
+        return None;
+    }
+    let rest = &line[spaces..];
+    let depth = (spaces / 2).min(8) as u8;
+    if let Some(body) = rest.strip_prefix("- ").or_else(|| rest.strip_prefix("* ")) {
+        return Some((depth, false, body));
+    }
+    let digits = rest.bytes().take_while(|byte| byte.is_ascii_digit()).count();
+    if (1..=6).contains(&digits) && rest[digits..].starts_with(". ") {
+        return Some((depth, true, &rest[digits + 2..]));
+    }
+    None
+}
+
+fn closed_fence(lines: &[&str], open: usize) -> Option<usize> {
+    fence_open(lines.get(open).copied()?)?;
+    lines.iter().skip(open + 1).position(|line| is_fence_close(line)).map(|rel| open + 1 + rel)
+}
+
+fn structured(text: &str) -> bool {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut i = 0;
+    while i < lines.len() {
+        if closed_fence(&lines, i).is_some() {
+            return true;
+        }
+        if quote_body(lines[i]).is_some() || list_marker(lines[i]).is_some() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn push_item(items: &mut Vec<Item>, depth: u8, ordered: bool, body: &str) {
+    let depth = match items.last() {
+        Some(prev) if depth > prev.depth.saturating_add(1) => prev.depth + 1,
+        _ => depth,
+    };
+    items.push(Item { depth, ordered, body: body.to_owned() });
+}
+
+fn flush_para(para: &mut Vec<&str>, blocks: &mut Vec<Block>, before_block: bool) {
+    if para.iter().all(|line| line.trim().is_empty()) {
+        para.clear();
+        return;
+    }
+    let mut body = para.join("\n");
+    para.clear();
+    if before_block && body.ends_with('\n') {
+        body.push('\n');
+    }
+    if !before_block {
+        while body.ends_with('\n') {
+            body.pop();
+        }
+    }
+    if !body.is_empty() {
+        blocks.push(Block::Para(body));
+    }
+}
+
+fn split_blocks(text: &str) -> Vec<Block> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut blocks = Vec::new();
+    let mut para = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some(close) = closed_fence(&lines, i) {
+            flush_para(&mut para, &mut blocks, true);
+            let language = fence_open(lines[i]).unwrap_or_default();
+            blocks.push(Block::Code { language, body: lines[i + 1..close].join("\n") });
+            i = close + 1;
+            continue;
+        }
+        if quote_body(lines[i]).is_some() {
+            flush_para(&mut para, &mut blocks, true);
+            let mut parts = Vec::new();
+            while i < lines.len() {
+                match quote_body(lines[i]) {
+                    Some(body) => {
+                        parts.push(body);
+                        i += 1;
+                    }
+                    None => break,
+                }
+            }
+            blocks.push(Block::Quote(parts.join("\n")));
+            continue;
+        }
+        if list_marker(lines[i]).is_some() {
+            flush_para(&mut para, &mut blocks, true);
+            let mut items = Vec::new();
+            while i < lines.len() {
+                if let Some((depth, ordered, body)) = list_marker(lines[i]) {
+                    push_item(&mut items, depth, ordered, body);
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            blocks.push(Block::List(items));
+            continue;
+        }
+        para.push(lines[i]);
+        i += 1;
+    }
+    flush_para(&mut para, &mut blocks, false);
+    blocks
+}
+
+fn write_run(out: &mut String, items: &[Item], mut index: usize) -> usize {
+    let depth = items[index].depth;
+    let ordered = items[index].ordered;
+    out.push_str(if ordered { "<ol>" } else { "<ul>" });
+    while index < items.len() && items[index].depth == depth && items[index].ordered == ordered {
+        out.push_str("<li>");
+        inline_into(out, &items[index].body);
+        index += 1;
+        while index < items.len() && items[index].depth > depth {
+            index = write_run(out, items, index);
+        }
+        out.push_str("</li>");
+    }
+    out.push_str(if ordered { "</ol>" } else { "</ul>" });
+    index
+}
+
+fn write_list(out: &mut String, items: &[Item]) {
+    let mut index = 0;
+    while index < items.len() {
+        index = write_run(out, items, index);
+    }
+}
+
+fn emit_paragraph(out: &mut String, body: &str, quote: bool) {
+    if quote {
+        out.push_str("<blockquote>");
+    }
+    out.push_str("<p>");
+    inline_into(out, body);
     out.push_str("</p>");
+    if quote {
+        out.push_str("</blockquote>");
+    }
+}
+
+fn emit_code(out: &mut String, language: &str, body: &str) {
+    if language.is_empty() {
+        out.push_str("<codeblock>");
+    } else {
+        out.push_str("<codeblock class=\"language-");
+        out.push_str(language);
+        out.push_str("\">");
+    }
+    escape_text(out, body, false);
+    out.push_str("</codeblock>");
+}
+
+fn emit_block(out: &mut String, block: Block) {
+    match block {
+        Block::Para(body) => emit_paragraph(out, &body, false),
+        Block::Quote(body) => emit_paragraph(out, &body, true),
+        Block::Code { language, body } => emit_code(out, &language, &body),
+        Block::List(items) => write_list(out, &items),
+    }
+}
+
+/// The text the user typed, as HTML Teams will show. Bold, italic, strike, code, quotes,
+/// lists and links become tags. Underline, headings, colour and tables have no markdown, so
+/// they stay as typed. Only http, https and mailto become links; everything else is escaped.
+pub(super) fn compose(text: &str) -> String {
+    let text = normalized(text);
+    if !structured(&text) {
+        let mut out = String::with_capacity(text.len() + 7);
+        out.push_str("<p>");
+        inline_into(&mut out, &text);
+        out.push_str("</p>");
+        return out;
+    }
+    let mut out = String::new();
+    for block in split_blocks(&text) {
+        emit_block(&mut out, block);
+    }
+    if out.is_empty() {
+        out.push_str("<p></p>");
+    }
     out
 }
 
@@ -737,5 +1203,46 @@ mod tests {
     fn typed_text_is_escaped_on_the_way_out() {
         assert_eq!(compose("a < b & \"c\"\nnext"), "<p>a &lt; b &amp; &quot;c&quot;<br>next</p>");
         assert_eq!(read(&compose("1 < 2 && <b>not bold</b>\nline")).text, "1 < 2 && <b>not bold</b>\nline");
+    }
+
+    #[test]
+    fn typed_markdown_reads_back_as_the_same_text_and_spans() {
+        let parsed = read(&compose("Ship **today**, not ~~yesterday~~: `cargo test` and *now*"));
+        assert_eq!(parsed.text, "Ship today, not yesterday: cargo test and now");
+        assert!(has(&parsed, "today", Style::Bold));
+        assert!(has(&parsed, "yesterday", Style::Strike));
+        assert!(has(&parsed, "cargo test", Style::Code));
+        assert!(has(&parsed, "now", Style::Italic));
+
+        let parsed = read(&compose("[the plan](https://ex.com/a?b=1&c=2) and [mail](mailto:a@b.c)"));
+        assert_eq!(parsed.text, "the plan and mail");
+        assert!(has(&parsed, "the plan", Style::Link { url: "https://ex.com/a?b=1&c=2".into() }));
+        assert!(has(&parsed, "mail", Style::Link { url: "mailto:a@b.c".into() }));
+        let unsafe_link = read(&compose("[x](javascript:alert(1))"));
+        assert_eq!(unsafe_link.text, "[x](javascript:alert(1))");
+        assert!(unsafe_link.spans.is_empty());
+
+        let parsed = read(&compose("- build\n- deploy\n  - eu\n1. ship"));
+        assert_eq!(parsed.text, "build\ndeploy\neu\nship");
+        assert!(has(&parsed, "build", Style::ListItem { ordered: false, depth: 0 }));
+        assert!(has(&parsed, "eu", Style::ListItem { ordered: false, depth: 1 }));
+        assert!(has(&parsed, "ship", Style::ListItem { ordered: true, depth: 0 }));
+
+        let parsed = read(&compose("> looks good\n> really"));
+        assert_eq!(parsed.text, "looks good\nreally");
+        assert!(has(&parsed, "looks good\nreally", Style::Quote));
+
+        let parsed = read(&compose("```rust\nlet a = 1;\n  let b = 2;\n```"));
+        assert_eq!(parsed.text, "let a = 1;\n  let b = 2;");
+        assert!(has(&parsed, "let a = 1;\n  let b = 2;", Style::CodeBlock { language: "rust".into() }));
+
+        // Underline, headings, colour and tables have no markdown in what we send.
+        let plain = read(&compose("# Title\n__nope__\nsnake_case"));
+        assert_eq!(plain.text, "# Title\n__nope__\nsnake_case");
+        assert!(plain.spans.is_empty());
+        prove_markdown().unwrap();
+        let (shown, spans) = styled("**today**");
+        assert_eq!(shown, "today");
+        assert!(spans.iter().any(|span| span.style == Style::Bold));
     }
 }
