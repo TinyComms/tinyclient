@@ -1,0 +1,12 @@
+{
+  "id": "teams-markdown",
+  "title": "Teams markdown is sent as bold, a list, code and a link",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same markdown check is what this desktop run checks.",
+    "ios": "The phone proof build does not run desktop chatd. The same markdown check is what this desktop run checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
