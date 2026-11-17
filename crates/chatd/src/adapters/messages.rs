@@ -152,6 +152,7 @@ trait Drive: Send + Sync {
     fn typing(&self, conversation: &str) -> Result<(), String>;
     fn delete_message(&self, message: &str) -> Result<(), String>;
     fn delete_conversation(&self, conversation: &str) -> Result<(), String>;
+    fn unpair(&self) -> Result<(), String>;
     fn close(&self);
 }
 
@@ -229,10 +230,17 @@ impl Drive for LiveDrive {
     fn delete_conversation(&self, conversation: &str) -> Result<(), String> {
         self.inner.delete_conversation(conversation)
     }
+    fn unpair(&self) -> Result<(), String> {
+        self.inner.unpair()
+    }
     fn close(&self) {
         self.inner.close();
     }
 }
+
+/// Said when sign-out cannot reach the phone, so this computer may stay in its paired-device list.
+pub const STILL_LISTED: &str =
+    "This computer may still be listed under Device pairing on your phone. Remove it there.";
 
 fn parse(session: &str) -> Result<Saved, String> {
     let saved: Saved = serde_json::from_str(session)
@@ -262,6 +270,10 @@ pub fn without(_session: &str, _account: &str) -> Option<String> {
 
 fn open(saved: &Saved) -> Result<Box<dyn Drive>, String> {
     if scripted() {
+        if std::env::var_os("TINYCLIENT_MESSAGES_OFFLINE").is_some() {
+            fake::record("offline");
+            return Err("Messages is offline.".into());
+        }
         return Ok(Box::new(fake::Fake::open(saved)));
     }
     let real = bugle::Saved {
@@ -369,6 +381,21 @@ pub fn prove_messages_failed_send() -> Result<(), String> {
         return Err("a delivered text was not sent".into());
     }
     Ok(())
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-sign-out`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_messages_sign_out() -> Result<(), String> {
+    if STILL_LISTED
+        != "This computer may still be listed under Device pairing on your phone. Remove it there."
+    {
+        return Err("the offline sign-out sentence changed".into());
+    }
+    // Signing out forgets the whole saved session. The generic path deletes it from the keychain.
+    if without(r#"{"account":"phone"}"#, "phone").is_some() {
+        return Err("signing out would keep the saved session".into());
+    }
+    bugle::prove_sign_out()
 }
 
 pub fn reaction_rules() -> protocol::ReactionRules {
@@ -502,7 +529,11 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
                 |command| match (account(), command) {
                     (Some(account), command) => serve(&account, command),
                     (None, Command::SignOut(reply)) => {
-                        let _ = reply.send(Ok(()));
+                        if scripted() {
+                            fake::record(STILL_LISTED);
+                        }
+                        tracing::warn!("chatd: Messages: {STILL_LISTED}");
+                        let _ = reply.send(Err(Refusal::Refused(STILL_LISTED.to_owned())));
                     }
                     (None, command) => offline(&ctx, command),
                 },
@@ -1245,6 +1276,9 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(Ok("https://messages.google.com/web/".to_owned()));
         }
         Command::SignOut(reply) => {
+            if let Err(why) = account.drive.unpair() {
+                tracing::warn!("chatd: Messages: {why}");
+            }
             account.drive.close();
             let _ = reply.send(Ok(()));
         }

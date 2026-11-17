@@ -36,7 +36,7 @@ struct SentCopy {
     phone_id: String,
 }
 
-fn record(line: &str) {
+pub(super) fn record(line: &str) {
     let path = protocol::support_dir().join("messages.calls");
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
@@ -667,6 +667,10 @@ impl Drive for Fake {
     }
     fn delete_conversation(&self, conversation: &str) -> Result<(), String> {
         record(&format!("delete-chat {conversation}"));
+        Ok(())
+    }
+    fn unpair(&self) -> Result<(), String> {
+        record("unpair");
         Ok(())
     }
     fn close(&self) {
