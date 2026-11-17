@@ -521,3 +521,12 @@ fn a_ring_with_the_window_in_focus_is_still_heard() {
     assert_eq!(notes.call(Some(&call), Some(verdict), "", "Slack"), Some("soft_ring".to_owned()));
     assert!(fake.log().shown.is_empty(), "the card is all the window shows");
 }
+
+#[test]
+fn an_app_lock_names_the_message_and_refuses_the_reply() {
+    let (title, subtitle, body, reply) = redact_for_app_lock("Ines".into(), "Tiny".into(), "the plan".into(), true, true);
+    assert_eq!(title, "New message");
+    assert!(subtitle.is_empty() && body.is_empty() && !reply);
+    let (title, subtitle, body, reply) = redact_for_app_lock("Ines".into(), "Tiny".into(), "the plan".into(), true, false);
+    assert_eq!((title, subtitle, body, reply), ("Ines".into(), "Tiny".into(), "the plan".into(), true));
+}

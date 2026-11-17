@@ -569,6 +569,7 @@ impl Shell {
             tiny_members: self.tiny_state.members_open(),
             me: prefs::me(),
             trusted_links: prefs::trusted_links(),
+            lock: crate::gui::lock::policy(),
         }
     }
 

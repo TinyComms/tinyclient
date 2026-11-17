@@ -421,12 +421,17 @@ pub struct SettingsWindow {
     pub(super) loopback: bool,
     /// Shared by the page, scrollbar, and screenshot harness.
     pane_scroll: gpui::ScrollHandle,
+    /// The Linux passphrase for the screen lock. Other systems use the device prompt.
+    #[cfg(target_os = "linux")]
+    lock_phrase: Entity<TextInput>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl SettingsWindow {
     fn new(shell: WeakEntity<Shell>, section: Section, phone: bool, window: &mut Window, cx: &mut Context<Self>) -> SettingsWindow {
         let search = cx.new(|cx| TextInput::new("Search settings", cx));
+        #[cfg(target_os = "linux")]
+        let lock_phrase = cx.new(|cx| TextInput::secret("Passphrase", cx));
         let mut subscriptions = vec![
             cx.subscribe_in(&search, window, |this, input, event: &InputEvent, _, cx| {
                 if let InputEvent::Changed = event {
@@ -495,6 +500,8 @@ impl SettingsWindow {
             clash: None,
             loopback: false,
             pane_scroll: gpui::ScrollHandle::new(),
+            #[cfg(target_os = "linux")]
+            lock_phrase,
             _subscriptions: subscriptions,
         };
         window.focus(&this.focus, cx);

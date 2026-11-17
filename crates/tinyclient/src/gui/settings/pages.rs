@@ -374,7 +374,9 @@ impl SettingsWindow {
             // A phone has no Return key to choose: its keyboard's own key sends.
             Section::Messages => vec![self.group(if phone::active() { &["M2", "M3", "M4", "M5", "M6"] } else { &["M1", "M2", "M3", "M4", "M5", "M6"] }, None, window, cx)],
             Section::Privacy => {
-                let mut groups = self.per_account(window, cx);
+                let lock_rows: &[&str] = if cfg!(target_os = "linux") { &["LK", "LS", "LP"] } else { &["LK", "LS"] };
+                let mut groups = vec![self.group(lock_rows, Some("Lock"), window, cx).child(caption(crate::gui::lock::CAPTION))];
+                groups.extend(self.per_account(window, cx));
                 groups.push(self.group(&["P3"], None, window, cx));
                 let trusted = prefs::trusted_links();
                 let link_rows: &[&str] = if trusted.is_empty() { &["PL", "PS"] } else { &["PL", "PS", "PF"] };
@@ -630,6 +632,45 @@ impl SettingsWindow {
                     _ => None,
                 };
                 self.menu_choice_row(id, &["Automatically", "On hover", "Never"], at, 0, second, None, cx)
+            }
+            "LK" => {
+                let policy = crate::gui::lock::policy();
+                let at = match policy.away {
+                    crate::gui::lock::Away::Off => 0,
+                    crate::gui::lock::Away::Minute => 1,
+                    crate::gui::lock::Away::Five => 2,
+                    crate::gui::lock::Away::Hour => 3,
+                };
+                let second = (cfg!(target_os = "linux") && policy.hash.is_empty()).then(|| "Set a passphrase below. Until then the lock stays off.".to_owned());
+                self.segmented_row(id, &["Off", "After 1 minute", "After 5 minutes", "After 1 hour"], at, 0, second, |this, ix, cx| {
+                    let away = [crate::gui::lock::Away::Off, crate::gui::lock::Away::Minute, crate::gui::lock::Away::Five, crate::gui::lock::Away::Hour][ix];
+                    this.set_lock(|policy| policy.away = away, cx);
+                }, cx)
+            }
+            "LS" => {
+                let on = crate::gui::lock::policy().on_screen_lock;
+                self.switch_row(id, on, false, None, |this, on, cx| this.set_lock(|policy| policy.on_screen_lock = on, cx), cx)
+            }
+            #[cfg(target_os = "linux")]
+            "LP" => {
+                let set = !crate::gui::lock::policy().hash.is_empty();
+                let second = if set { "Set. The lock can use it.".to_owned() } else { "None set. The lock stays off until there is one.".to_owned() };
+                let phrase = self.lock_phrase.clone();
+                wide_row(
+                    label,
+                    Some(second.into()),
+                    div().flex().items_center().gap(px(8.)).w(px(280.)).child(phrase).child(
+                        button("LP", ButtonKind::Secondary, if set { "Remove" } else { "Save" }).on_click(cx.listener(move |this, _, _, cx| {
+                            if set {
+                                this.set_lock(|policy| policy.set_passphrase(""), cx);
+                            } else {
+                                let words = this.lock_phrase.read(cx).text().to_owned();
+                                this.lock_phrase.update(cx, |input, cx| input.clear(cx));
+                                this.set_lock(|policy| policy.set_passphrase(&words), cx);
+                            }
+                        })),
+                    ),
+                )
             }
             "P3" => {
                 let second = (!choices.images).then(|| "Nothing is fetched until you click it.".to_owned());
@@ -1850,11 +1891,23 @@ impl SettingsWindow {
         }
     }
 
+    fn set_lock(&mut self, change: impl FnOnce(&mut crate::gui::lock::Policy), cx: &mut Context<Self>) {
+        let mut policy = crate::gui::lock::policy();
+        change(&mut policy);
+        crate::gui::lock::set_policy(policy);
+        let _ = self.shell.update(cx, |shell, cx| {
+            shell.save_prefs(cx);
+            cx.notify();
+        });
+        cx.refresh_windows();
+    }
+
     /// B3: chatd's settings, the window's own, and the text size, all to their defaults.
     fn reset_all(&mut self, cx: &mut Context<Self>) {
         let section = prefs::choices().section;
         prefs::set_choices(Choices { section, ..Choices::default() });
         prefs::set_trusted_links(Default::default());
+        crate::gui::lock::set_policy(crate::gui::lock::Policy::default());
         theme::set_text_step(0);
         anim::set_autoplay(Autoplay::default());
         self.pending.clear();

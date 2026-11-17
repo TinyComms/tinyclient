@@ -160,6 +160,8 @@ pub struct Prefs {
     pub me: Me,
     /// Domains whose links open without the question (PL's "Don't ask again for ...").
     pub trusted_links: Trusted,
+    /// The window's screen lock (Settings › Privacy). Not one of chatd's settings.
+    pub lock: crate::gui::lock::Policy,
 }
 
 impl Default for Prefs {
@@ -181,6 +183,7 @@ impl Default for Prefs {
             tiny_members: true,
             me: Me::default(),
             trusted_links: Trusted::default(),
+            lock: crate::gui::lock::Policy::default(),
         }
     }
 }
@@ -287,6 +290,10 @@ pub fn parse(text: &str) -> Prefs {
                 }
             }
             "settings_section" => prefs.choices.section = fields.next().and_then(Section::from_word).unwrap_or(Section::Accounts),
+            "lock_away" => prefs.lock.read_away(fields.next().unwrap_or("")),
+            "lock_screen" => prefs.lock.read_screen(fields.next()),
+            "lock_salt" => prefs.lock.read_salt(fields.next().unwrap_or("")),
+            "lock_hash" => prefs.lock.read_hash(fields.next().unwrap_or("")),
             _ if !line.trim().is_empty() => prefs.kept.push(line.to_owned()),
             _ => {}
         }
@@ -361,6 +368,7 @@ pub fn write(prefs: &Prefs) -> String {
     if prefs.autoplay != Autoplay::default() {
         text.push_str(&format!("autoplay\t{}\n", prefs.autoplay.word()));
     }
+    text.push_str(&prefs.lock.write_lines());
     text
 }
 
@@ -406,6 +414,7 @@ mod tests {
             tiny_members: false,
             me: Me { name: "Justin\tS".into(), picture: "me-17.png".into() },
             trusted_links: Trusted::from_lines(["example.com", "example.co.uk"]),
+            lock: crate::gui::lock::Policy::default(),
         };
         let read = parse(&write(&saved));
         let me = Me { name: "Justin S".into(), picture: "me-17.png".into() };
