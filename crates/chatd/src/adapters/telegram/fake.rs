@@ -369,6 +369,8 @@ struct World {
     /// A read of the group that no longer counts here, as one told during a dropped link. It
     /// stays lost until that read is told again, and then it is heard.
     lost_reads: bool,
+    /// Manual unread marks (`messages.markDialogUnread` and `unread-mark`), by peer.
+    unread_marks: HashMap<Who, bool>,
     /// The cloud drafts Telegram keeps, by their conversation: some typed on the phone, some
     /// told by `saveDraft` from here. The key is whose, and in a forum which topic.
     drafts: HashMap<(Who, Option<i32>), String>,
@@ -434,6 +436,7 @@ impl World {
             revoked: false,
             family_grew: false,
             lost_reads: false,
+            unread_marks: HashMap::new(),
             exclude_read: false,
             drafts: HashMap::new(),
             comments_unread: 0,
@@ -494,6 +497,13 @@ impl World {
             true => (14, 7),
             false => (20, 0),
         }
+    }
+
+    /// A manual unread mark rides the dialog the next time it is read.
+    fn flag_unread(&self, dialog: &mut tl::enums::Dialog) {
+        let tl::enums::Dialog::Dialog(row) = dialog else { return };
+        let Some(on) = self.unread_marks.get(&Who::of(&row.peer)) else { return };
+        row.unread_mark = *on;
     }
 
     fn folder(&self, id: i32) -> tl::enums::DialogFilter {
@@ -1305,6 +1315,20 @@ impl World {
             "read" => vec![update(
                 tl::types::UpdateReadHistoryInbox { folder_id: None, peer: odalys.peer(), top_msg_id: None, max_id: 14, still_unread_count: 0, pts: 0, pts_count: 0 }.into(),
             )],
+            // Another device set the group's manual unread mark, or `unread-mark off` cleared it.
+            "unread-mark" => {
+                let unread = words.next() != Some("off");
+                let who = Who::Group(CREW);
+                self.unread_marks.insert(who, unread);
+                vec![update(
+                    tl::types::UpdateDialogUnreadMark {
+                        unread,
+                        peer: tl::types::DialogPeer { peer: who.peer() }.into(),
+                        saved_peer_id: None,
+                    }
+                    .into(),
+                )]
+            }
             // A draft typed on the phone while we are here, and one the phone dropped.
             "draft" => {
                 let text = "Riding up with Tobin.".to_owned();
@@ -1713,6 +1737,7 @@ impl World {
             let dialogs = page.iter().map(|(dialog, who, _)| {
                 let mut dialog = dialog.clone();
                 drafted(self, &mut dialog, *who);
+                self.flag_unread(&mut dialog);
                 dialog
             }).collect();
             let mut chats = chats();
@@ -1787,6 +1812,7 @@ impl World {
                 let dialogs = found.into_iter().map(|(_, mut dialog)| {
                     let who = Who::of(&dialog.peer());
                     drafted(self, &mut dialog, who);
+                    self.flag_unread(&mut dialog);
                     dialog
                 }).collect();
                 let state = tl::types::updates::State { pts: 1, qts: 0, date: t0(), seq: 1, unread_count: 0 };
@@ -2023,6 +2049,15 @@ impl World {
             let reactions = tl::types::MessageReactions { min: false, can_see_list: true, reactions_as_tags: false, results: results.collect(), recent_reactions: None, top_reactors: None };
             let reacted = tl::types::UpdateMessageReactions { peer: peer.peer(), msg_id: request.msg_id, top_msg_id: None, saved_peer_id: None, reactions: reactions.into() };
             return answer(updates(vec![reacted.into()]));
+        }
+        if let Some(request) = asked::<f::messages::MarkDialogUnread>(body) {
+            let who = match &request.peer {
+                tl::enums::InputDialogPeer::Peer(dialog) => input_who(&dialog.peer),
+                _ => return Err(rpc(400, "PEER_ID_INVALID", None)),
+            };
+            self.unread_marks.insert(who, request.unread);
+            self.log(&format!("MarkDialogUnread {} {}", who.text(), if request.unread { "unread" } else { "read" }));
+            return answer(true);
         }
         if let Some(request) = asked::<f::messages::ReadHistory>(body) {
             let who = input_who(&request.peer);

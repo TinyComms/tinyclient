@@ -593,6 +593,24 @@ pub(super) fn apply(account: &Account, update: &Update) {
             // reading the chats again shows.
             _ => account.live().stale = true,
         },
+        // Another device marked the chat unread, or took that mark off. The mark is not the
+        // unread count: taking it off asks the dialog what is still unread.
+        Update::DialogUnreadMark(marked) => {
+            if let tl::enums::DialogPeer::Peer(dialog) = &marked.peer {
+                let who = Who::of(&dialog.peer);
+                let id = who.text();
+                if marked.unread {
+                    let _ = account.ctx.mark_unread(&id);
+                    filing::facts_changed(account, who, |facts| facts.read = false);
+                } else if let Some(fresh) = sync::peer_dialog(account, who) {
+                    let unread = sync::unread_of(fresh.unread_count, fresh.unread_mark);
+                    let mentions = fresh.unread_mentions_count.max(0) as u32;
+                    let read = (fresh.read_inbox_max_id > 0).then(|| fresh.read_inbox_max_id.to_string());
+                    let _ = account.ctx.counts(&id, unread, mentions, read.as_deref(), 0);
+                    filing::facts_changed(account, who, |facts| facts.read = unread == 0);
+                }
+            }
+        }
         // A chat joined, left or changed: what changed came with the update's chats, which
         // `learn` has already written.
         _ => {}

@@ -2059,10 +2059,11 @@ impl Store {
 
     /// `message_id` is the first message that counts as unread. Empty means the newest message
     /// stored. The marker becomes the newest stored id strictly before that, which may be older
-    /// than the marker already held, and the badge is counted from what is stored. `None` when
-    /// the conversation is missing or there is no message to unread. The pair is the ack target
-    /// (empty when the first stored message is the one marked) and how many of the unread
-    /// messages mention me.
+    /// than the marker already held, and the badge is counted from what is stored. When no
+    /// messages are stored yet, the badge still becomes at least one and the ack target is empty
+    /// (for networks with a dialog-level unread mark). `None` when the conversation is missing.
+    /// The pair is the ack target (empty when the first stored message is the one marked or no
+    /// messages are stored) and how many of the unread messages mention me.
     pub fn mark_unread(&mut self, conversation: &Key, message_id: &str) -> rusqlite::Result<Option<(String, u32)>> {
         let have = self.conversation_row_exists(conversation)?;
         if !have {
@@ -2070,7 +2071,8 @@ impl Store {
         }
         let target = if message_id.is_empty() { self.newest(conversation)?.unwrap_or_default() } else { message_id.to_owned() };
         if target.is_empty() {
-            return Ok(None);
+            self.mark_unread_badge(conversation)?;
+            return Ok(Some((String::new(), 0)));
         }
         let marker = self.message_before(conversation, &target)?;
         let (unread, mentions) = self.unread_from(conversation, &target, true)?;
@@ -2080,6 +2082,18 @@ impl Store {
             params![word(&conversation.network), conversation.account, conversation.id, unread, mentions, marker],
         )?;
         Ok(Some((marker, mentions)))
+    }
+
+    /// The user marked the conversation unread on another device via a dialog-level flag.
+    /// The badge becomes at least one and the read marker stays, so a later read can still say
+    /// how far it had been seen. True when the badge changed.
+    pub fn mark_unread_badge(&mut self, conversation: &Key) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE conversation SET unread = 1
+              WHERE network = ?1 AND account = ?2 AND id = ?3 AND unread < 1",
+            params![word(&conversation.network), conversation.account, conversation.id],
+        )?;
+        Ok(changed == 1)
     }
 
     /// A deliberate rewind from another device: `last_read` is the last message that still
