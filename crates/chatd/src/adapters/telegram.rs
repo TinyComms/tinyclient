@@ -1166,6 +1166,11 @@ pub fn prove_telegram_member_sections() -> Result<(), String> {
     members::prove()
 }
 
+/// The lab's telegram-quote driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_quote() -> Result<(), String> {
+    content::prove_quote()
+}
+
 /// The lab's telegram-dice driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_dice() -> Result<(), String> {
     content::prove_dice_roll()?;
