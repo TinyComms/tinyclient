@@ -129,10 +129,26 @@ pub enum Event {
     Ended(String),
 }
 
+/// One file on a message we send. The bytes are what Signal is given: a still picture has already
+/// had its metadata removed, unless the person asked for the file as it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct File {
+    pub name: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    /// A small JPEG a conversation can show while the file arrives. Empty when there is none.
+    pub thumb: Vec<u8>,
+    pub blurhash: Option<String>,
+}
+
 /// What is sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
     Text { text: String, quote: Option<Quote> },
+    /// Files, with the caption in `text` (empty when there is none).
+    Files { text: String, quote: Option<Quote>, files: Vec<File> },
     React { author: String, target: u64, emoji: String, remove: bool },
     Edit { target: u64, text: String },
     Delete { target: u64 },
