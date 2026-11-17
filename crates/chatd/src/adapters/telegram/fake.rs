@@ -266,7 +266,12 @@ fn dialog(peer: Who, top: i32, read: i32, outbox: i32, unread: i32, pinned: bool
 
 /// Telegram's word for the text a chat's draft holds, written by its own date.
 fn draft_message(text: &str) -> tl::enums::DraftMessage {
-    let draft: tl::types::DraftMessage = blank(&[&put(0u32), &put(text.to_owned()), &put(t0())]);
+    draft_with(text, None)
+}
+
+fn draft_with(text: &str, entities: Option<Vec<tl::enums::MessageEntity>>) -> tl::enums::DraftMessage {
+    let mut draft: tl::types::DraftMessage = blank(&[&put(0u32), &put(text.to_owned()), &put(t0())]);
+    draft.entities = entities;
     draft.into()
 }
 
@@ -504,15 +509,16 @@ impl World {
 
     /// What a send makes: each item a message of ours with the id Telegram gives it, told on the
     /// update stream and in the answer, or scheduled for later.
-    fn deliver(&mut self, events: &Sender<Event>, peer: Who, topic: Option<i32>, reply: Option<i32>, items: Vec<(i64, String, Option<tl::enums::MessageMedia>)>, schedule: Option<i32>) -> Result<Vec<u8>, Fault> {
+    fn deliver(&mut self, events: &Sender<Event>, peer: Who, topic: Option<i32>, reply: Option<i32>, items: Vec<(i64, String, Option<tl::enums::MessageMedia>, Option<Vec<tl::enums::MessageEntity>>)>, schedule: Option<i32>) -> Result<Vec<u8>, Fault> {
         // What was sent clears the chat's draft, on this device and everywhere.
         self.drafts.remove(&(peer, topic));
         let mut all = Vec::new();
-        for (random_id, text, media) in items {
+        for (random_id, text, media, entities) in items {
             self.next += 1;
             let id = self.next;
             let mut sent = message(peer, id, ME, schedule.unwrap_or(crate::hub::now() as i32), &text);
             sent.media = media;
+            sent.entities = entities;
             if let Some(reply_to_msg_id) = reply {
                 let mut header: tl::types::MessageReplyHeader = blank(&[&put(0u32)]);
                 header.reply_to_msg_id = Some(reply_to_msg_id);
@@ -814,10 +820,16 @@ fn saved_draft(world: &mut World, request: tl::functions::messages::SaveDraft, e
         Some(tl::enums::InputReplyTo::Message(reply)) => Some(reply.top_msg_id.unwrap_or(reply.reply_to_msg_id)),
         _ => None,
     };
-    world.log(&format!("SaveDraft {} {}", key(peer, topic), request.message));
+    let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
+    world.log(&format!("SaveDraft {} {}{noted}", key(peer, topic), request.message));
     let draft = request.message.clone();
     world.drafts.insert((peer, topic), draft.clone());
-    let echo = tl::types::UpdateDraftMessage { peer: peer.peer(), top_msg_id: topic, saved_peer_id: None, draft: draft_message(&draft) };
+    let echo = tl::types::UpdateDraftMessage {
+        peer: peer.peer(),
+        top_msg_id: topic,
+        saved_peer_id: None,
+        draft: draft_with(&draft, request.entities.clone()),
+    };
     let _ = events.send(update(echo.into()));
     answer(true)
 }
@@ -1808,19 +1820,22 @@ impl World {
                 true => key(peer, reply),
                 false => key(peer, topic),
             };
-            self.log(&format!("SendMessage {said} {}{options}", request.message));
-            return self.deliver(events, peer, topic, reply, vec![(request.random_id, request.message, None)], request.schedule_date);
+            let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
+            self.log(&format!("SendMessage {said} {}{noted}{options}", request.message));
+            return self.deliver(events, peer, topic, reply, vec![(request.random_id, request.message, None, request.entities)], request.schedule_date);
         }
         if let Some(request) = asked::<f::messages::EditMessage>(body) {
             let peer = input_who(&request.peer);
-            self.log(&format!("EditMessage {} {}", peer.text(), request.id));
+            let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
+            self.log(&format!("EditMessage {} {}{noted}", peer.text(), request.id));
             let Some(tl::enums::Message::Message(mut edited)) = self.messages.get(&peer.text()).and_then(|held| held.get(&request.id)).cloned() else {
                 return Err(rpc(400, "MESSAGE_ID_INVALID", None));
             };
             if !edited.out {
                 return Err(rpc(403, "MESSAGE_AUTHOR_REQUIRED", None));
             }
-            edited.message = request.message.unwrap_or_default();
+            edited.message = request.message.clone().unwrap_or_default();
+            edited.entities = request.entities.clone();
             edited.edit_date = Some(crate::hub::now() as i32);
             self.store(None, edited.clone());
             return answer(updates(vec![tl::types::UpdateEditMessage { message: edited.into(), pts: 0, pts_count: 0 }.into()]));
@@ -2125,7 +2140,7 @@ impl World {
             let peer = input_who(&request.peer);
             self.log(&format!("SendInlineBotResult {} {} {}", peer.text(), request.query_id, request.id));
             let media = document_media(gif(6_300));
-            return Some(self.deliver(events, peer, None, None, vec![(request.random_id, String::new(), Some(media))], request.schedule_date));
+            return Some(self.deliver(events, peer, None, None, vec![(request.random_id, String::new(), Some(media), None)], request.schedule_date));
         }
         if asked::<f::messages::GetAllStickers>(body).is_some() {
             self.log("GetAllStickers");
@@ -2158,8 +2173,9 @@ impl World {
             let (kind, media) = held_media(&request.media, self.next + 2_000);
             let options = [("silent", request.silent), ("scheduled", request.schedule_date.is_some())];
             let options: String = options.iter().filter(|(_, on)| *on).map(|(name, _)| format!(" [{name}]")).collect();
-            self.log(&format!("SendMedia {} {kind} {}{options}", peer.text(), request.message));
-            return Some(self.deliver(events, peer, None, None, vec![(request.random_id, request.message, Some(media))], request.schedule_date));
+            let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
+            self.log(&format!("SendMedia {} {kind} {}{noted}{options}", peer.text(), request.message));
+            return Some(self.deliver(events, peer, None, None, vec![(request.random_id, request.message, Some(media), request.entities)], request.schedule_date));
         }
         if let Some(request) = asked::<f::messages::SendMultiMedia>(body) {
             let peer = input_who(&request.peer);
@@ -2169,7 +2185,7 @@ impl World {
                 let tl::enums::InputSingleMedia::Media(one) = one;
                 let (kind, media) = held_media(&one.media, self.next + 3_000 + at as i32);
                 kinds.push(kind);
-                items.push((one.random_id, one.message.clone(), Some(media)));
+                items.push((one.random_id, one.message.clone(), Some(media), one.entities.clone()));
             }
             self.log(&format!("SendMultiMedia {} {}", peer.text(), kinds.join(",")));
             return Some(self.deliver(events, peer, None, None, items, request.schedule_date));

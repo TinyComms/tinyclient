@@ -299,6 +299,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-discord-forum-landing:0");
         return Ok(());
     }
+    // The lab's telegram-markers driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-markers") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_markers() {
+            eprintln!("telegram-markers: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-markers:0");
+        return Ok(());
+    }
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());
     protocol::crash::install_panic_hook("chatd");
     let dir = protocol::support_dir();

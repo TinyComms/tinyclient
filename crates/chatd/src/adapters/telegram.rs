@@ -759,6 +759,7 @@ fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str,
     let reply = reply_to.and_then(|id| id.parse::<i32>().ok());
     let random = random_id(client_id);
     remember_random(account, random, client_id);
+    let (plain, entities) = content::outgoing(text);
     let request = tl::functions::messages::SendMessage {
         no_webpage: opts.no_webpage,
         silent: opts.silent,
@@ -770,10 +771,10 @@ fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str,
         allow_paid_floodskip: false,
         peer,
         reply_to: reply_header(reply, topic),
-        message: text.to_owned(),
+        message: plain.clone(),
         random_id: random,
         reply_markup: None,
-        entities: None,
+        entities,
         schedule_date: opts.schedule,
         schedule_repeat_period: None,
         send_as: None,
@@ -784,23 +785,29 @@ fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str,
         rich_message: None,
     };
     let answer = account.ask(&request)?;
-    live::answered_scheduled(account, conversation, text, opts, &answer)
-        .or_else(|| live::sent(account, conversation, who, text, reply, &answer))
+    live::answered_scheduled(account, conversation, &plain, opts, &answer)
+        .or_else(|| live::sent(account, conversation, who, &plain, reply, &answer))
         .ok_or_else(|| Fault::Net("Telegram accepted the message but did not name it".to_owned()))
 }
 
 fn edit(account: &Account, conversation: &str, message: &str, text: &str) -> Result<(), Fault> {
     let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
     let ((who, _), id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
+    let (plain, mut entities) = content::outgoing(text);
+    if entities.is_none() {
+        if let Ok(Some(stored)) = account.ctx.stored_message(conversation, message) {
+            entities = content::with_stored(&plain, &stored.spans);
+        }
+    }
     let request = tl::functions::messages::EditMessage {
         no_webpage: false,
         invert_media: false,
         peer: account.input(who)?,
         id,
-        message: Some(text.to_owned()),
+        message: Some(plain),
         media: None,
         reply_markup: None,
-        entities: None,
+        entities,
         schedule_date: None,
         schedule_repeat_period: None,
         quick_reply_shortcut_id: None,
@@ -879,14 +886,15 @@ fn save_draft(account: &Account, conversation: &str, text: &str) {
     let Ok(peer) = account.input(who) else {
         return;
     };
+    let (plain, entities) = content::outgoing(text);
     let request = tl::functions::messages::SaveDraft {
         no_webpage: false,
         invert_media: false,
         // In a forum the draft belongs to the topic it was typed in.
         reply_to: reply_header(None, topic),
         peer,
-        message: text.to_owned(),
-        entities: None,
+        message: plain,
+        entities,
         media: None,
         effect: None,
         suggested_post: None,
@@ -969,4 +977,34 @@ fn members(account: &Account, conversation: &str, offset: u32, limit: u32) -> Re
         sections: vec![MemberSection { name: "Members".to_owned(), count: total }],
         members: ids.into_iter().map(|id| person(account, Who::User(id), relation(account, id))).collect(),
     })
+}
+
+/// The lab's telegram-markers driver. A build without this returns to the server below and stays up.
+pub fn prove_telegram_markers() -> Result<(), String> {
+    let text = "né 🇵🇹 🦀 code";
+    let entities = vec![
+        tl::types::MessageEntityBold { offset: 0, length: 2 }.into(),
+        tl::types::MessageEntityItalic { offset: 3, length: 4 }.into(),
+        tl::types::MessageEntityTextUrl { offset: 8, length: 2, url: "https://crab.example".into() }.into(),
+    ];
+    let once = content::spans(text, &entities);
+    let twice = content::spans(text, &content::entities_of(text, &once));
+    if twice != once {
+        return Err("styled ranges did not survive a trip through Telegram entities".into());
+    }
+    let (plain, styled) = content::from_markers("**hi** _there_");
+    if plain != "hi there" {
+        return Err(format!("markers were left in the text: {plain}"));
+    }
+    let bold = styled.iter().any(|span| matches!(span.style, protocol::Style::Bold) && span.start == 0 && span.end == 2);
+    let italic = styled.iter().any(|span| matches!(span.style, protocol::Style::Italic) && span.start == 3 && span.end == 8);
+    if !bold || !italic {
+        return Err("bold and italic did not land on the words".into());
+    }
+    let kept = content::with_stored(&plain, &styled).ok_or("an edit with no markers dropped the bold")?;
+    let still = content::spans(&plain, &kept);
+    if !still.iter().any(|span| matches!(span.style, protocol::Style::Bold) && span.start == 0 && span.end == 2) {
+        return Err("the bold run was not kept on edit".into());
+    }
+    Ok(())
 }
