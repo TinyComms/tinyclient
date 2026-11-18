@@ -128,6 +128,30 @@ pub fn prove_signal_own_profile() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's signal-privacy-local driver. Signal takes a local switch for typing and read
+/// receipts: stored in its account scope, on until chosen, off stops it here. Nothing stored is
+/// the account's own setting, which stays off until the phone says otherwise.
+pub fn prove_signal_privacy_local() -> Result<(), String> {
+    let account = protocol::AccountKey { network: protocol::Network::Signal, account: "prove".to_owned() };
+    let scope = protocol::settings::account_scope(&account);
+    if !protocol::settings::typing_choice(protocol::Network::Signal) {
+        return Err("Signal has no local typing switch".to_owned());
+    }
+    if !protocol::settings::valid(&scope, protocol::settings::TYPING, "off") || !protocol::settings::valid(&scope, protocol::settings::RECEIPTS, "off") {
+        return Err("Signal's account scope takes no local off for typing or receipts".to_owned());
+    }
+    let mut values = protocol::settings::Values::default();
+    if !values.typing(&account) || !values.receipts(&account) {
+        return Err("nothing stored must leave both on".to_owned());
+    }
+    values.set(&scope, protocol::settings::TYPING, Some("off".into()));
+    values.set(&scope, protocol::settings::RECEIPTS, Some("off".into()));
+    if values.typing(&account) || values.receipts(&account) {
+        return Err("off here did not stop it".to_owned());
+    }
+    Ok(())
+}
+
 /// A test in a scratch directory asked for the scripted wire.
 fn scripted() -> bool {
     !session::enabled() && std::env::var_os("TINYCLIENT_SIGNAL_FAKE").is_some()
