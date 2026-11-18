@@ -1312,7 +1312,7 @@ fn mentions_missed_while_closed_info_mute_seen_hidden_chats_and_files_through_on
     assert_eq!((info.members, info.notify), (Some(4), protocol::Notify::All));
 
     // Mute is set on Teams, then shown.
-    assert_eq!(world.ask(Request::SetMute { conversation: grp1.clone(), notify: protocol::Notify::Nothing }), Response::Ok);
+    assert_eq!(world.ask(Request::SetMute { conversation: grp1.clone(), notify: protocol::Notify::Nothing, until: None }), Response::Ok);
     let muted = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
     assert_eq!((muted.query.as_str(), muted.json()), ("name=alerts", json!({"alerts": "false"})));
     assert!(world.conversation(&grp1).unwrap().muted);

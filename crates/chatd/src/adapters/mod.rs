@@ -337,9 +337,15 @@ pub enum Command {
     ConversationInfo { conversation_id: String, reply: Reply<ConversationAbout> },
     /// A Space's info, opened from its name.
     SpaceInfo { space_id: String, reply: Reply<SpaceAbout> },
-    /// Set the network's notification setting. Report the new mute through [`Context::muted`]
-    /// before answering.
-    SetMute { conversation_id: String, notify: Notify, reply: Reply<()> },
+    /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
+    /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
+    /// ignores it. Report the new mute through [`Context::muted`] before answering.
+    SetMute {
+        conversation_id: String,
+        notify: Notify,
+        until: Option<i64>,
+        reply: Reply<()>,
+    },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
     Leave { conversation_id: String, reply: Reply<()> },
     /// Close a direct conversation as the network's own × does. Report it through

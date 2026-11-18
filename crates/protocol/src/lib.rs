@@ -1205,10 +1205,13 @@ pub enum Request {
         space: Key,
     },
     /// The network's notification setting for a conversation. The row changes when the network
-    /// says so.
+    /// says so. `until` is when a mute ends, as Unix seconds. Absent means muted until it is
+    /// turned off, or not muted when `notify` asks for everything.
     SetMute {
         conversation: Key,
         notify: Notify,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
     },
     /// Leaves a group conversation on the network. The shell asks once to confirm first.
     Leave {

@@ -920,7 +920,7 @@ impl Teams {
             Command::ConversationInfo { conversation_id, reply } => {
                 let _ = reply.send(self.conversation_info(&conversation_id).map_err(refuse));
             }
-            Command::SetMute { conversation_id, notify, reply } => {
+            Command::SetMute { conversation_id, notify, until: _, reply } => {
                 let _ = reply.send(self.set_mute(&conversation_id, notify).map_err(refuse));
             }
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {

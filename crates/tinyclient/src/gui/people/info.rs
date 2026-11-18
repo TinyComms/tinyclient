@@ -412,7 +412,7 @@ impl InfoPane {
         let pane = cx.weak_entity();
         let shell = self.shell.clone();
         let saved = conversation.clone();
-        super::ask_later(cx, Request::SetMute { conversation, notify }, move |answer, cx| {
+        super::ask_later(cx, Request::SetMute { conversation, notify, until: None }, move |answer, cx| {
             let accepted = matches!(&answer, Ok(Response::Ok));
             let _ = pane.update(cx, |this, cx| {
                 let still = this.notify_set.as_ref().is_some_and(|(key, set)| key == &saved && *set == notify);
@@ -1028,7 +1028,7 @@ impl Shell {
     /// network says so.
     pub(in crate::gui) fn set_row_mute(&mut self, conversation: Key, mute: bool, cx: &mut Context<Self>) {
         let notify = if mute { Notify::Nothing } else { Notify::All };
-        self.conversation_act(Request::SetMute { conversation, notify }, "Can't change notifications".to_owned(), cx);
+        self.conversation_act(Request::SetMute { conversation, notify, until: None }, "Can't change notifications".to_owned(), cx);
     }
 
     /// Closes a DM as the network's own ×: it leaves the list until a new message.
