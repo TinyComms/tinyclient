@@ -1437,6 +1437,44 @@ impl Chat {
         }
     }
 
+    /// Our own profile. `None` leaves that part. A username or a photo is still changed on the
+    /// phone. Only Signal accepts a name, about, and about emoji, and the answer is not a
+    /// presence change: the adapter is asked directly.
+    fn set_profile(
+        &self,
+        account: AccountKey,
+        name: Option<String>,
+        about: Option<String>,
+        emoji: Option<String>,
+        username: Option<String>,
+        photo: bool,
+    ) -> Response {
+        if account.network != Network::Signal {
+            return error(ErrorCode::Unsupported, format!("{} cannot edit a profile from here", account.network.label()));
+        }
+        if photo {
+            return error(ErrorCode::Refused, adapters::signal::PHOTO_ON_PHONE);
+        }
+        if username.is_some() {
+            return error(ErrorCode::Refused, adapters::signal::USERNAME_ON_PHONE);
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let status = adapters::signal::profile_status(name.as_deref(), about.as_deref(), emoji.as_deref());
+        match self.ask(&account, |reply| Command::SetPresence { presence: Presence::Online, status: Some(status), reply }) {
+            Ok(()) => {
+                if let Some(me) = self.hub.store().accounts().ok().and_then(|rows| {
+                    rows.into_iter().find(|row| row.key == account).map(|row| row.me).filter(|me| !me.is_empty())
+                }) {
+                    self.hub.profiles.forget(&(Key::new(&account, me), None));
+                }
+                Response::Ok
+            }
+            Err(refused) => *refused,
+        }
+    }
+
     /// One person's card: asked of the network once, kept five minutes. Opened from a Space,
     /// the adapter is asked for what is said of them there, and failing that for the card alone.
     fn profile(&self, person: Key, space: Option<Key>) -> Response {
@@ -2250,6 +2288,9 @@ impl Chat {
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::Relate { person, action } => self.relate(person, action),
             Request::SetPresence { account, presence, status } => self.set_presence(account, presence, status),
+            Request::SetProfile { account, name, about, emoji, username, photo } => {
+                self.set_profile(account, name, about, emoji, username, photo)
+            }
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),

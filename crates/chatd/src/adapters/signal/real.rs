@@ -6,11 +6,12 @@
 //! Signal without a real phone to link from (see `tests/signal.rs` for what is proven).
 
 use super::vault::{self, Vault};
-use super::wire::{Body, Contact, Event, Fault, GroupInfo, Linked, Linker, Peer, Quote, Text, Wire};
+use super::wire::{Body, Contact, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use futures::StreamExt;
 use presage::libsignal_service::content::ContentBody;
 use presage::libsignal_service::prelude::{Content, GroupMasterKey, GroupSecretParams, PushService, ServiceCredentials, ServiceError, Uuid};
+use presage::libsignal_service::profile_name::ProfileName;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::libsignal_service::sender::MessageSenderError;
 use presage::libsignal_service::utils::TryIntoE164;
@@ -45,6 +46,8 @@ enum Ask {
     Read { read: Vec<(String, u64)>, receipts: bool, answer: Sender<Result<(), Fault>> },
     Unlink { answer: Sender<Result<(), Fault>> },
     Picture { of: Peer, answer: Sender<Result<Option<Vec<u8>>, Fault>> },
+    Card { answer: Sender<Result<OwnCard, Fault>> },
+    SetCard { name: Option<String>, about: Option<String>, emoji: Option<String>, answer: Sender<Result<(), Fault>> },
 }
 
 pub struct Real {
@@ -218,6 +221,14 @@ impl Wire for Real {
 
     fn picture(&self, of: &Peer) -> Result<Option<Vec<u8>>, Fault> {
         self.ask(|answer| Ask::Picture { of: of.clone(), answer })
+    }
+
+    fn card(&self) -> Result<OwnCard, Fault> {
+        self.ask(|answer| Ask::Card { answer })
+    }
+
+    fn set_card(&self, name: Option<String>, about: Option<String>, emoji: Option<String>) -> Result<(), Fault> {
+        self.ask(|answer| Ask::SetCard { name, about, emoji, answer })
     }
 
     fn close(&self) {
@@ -528,7 +539,71 @@ impl Session {
             Ask::Picture { of, answer } => {
                 let _ = answer.send(self.picture(&of).await);
             }
+            Ask::Card { answer } => {
+                let _ = answer.send(self.card().await);
+            }
+            Ask::SetCard { name, about, emoji, answer } => {
+                let _ = answer.send(self.set_card(name, about, emoji).await);
+            }
         }
+    }
+
+    /// Name, about, emoji, and the number this device registered with. A username is not on
+    /// the profile this library reads, so the link stays empty.
+    async fn card(&mut self) -> Result<OwnCard, Fault> {
+        let profile = self.manager.retrieve_profile().await.map_err(fault)?;
+        let phone = (&self.manager.registration_data().phone_number).try_into_e164().map(|number| number.to_string()).unwrap_or_default();
+        Ok(OwnCard {
+            name: profile.name.map(|name| name.to_string()).unwrap_or_default(),
+            about: profile.about.unwrap_or_default(),
+            emoji: profile.about_emoji.unwrap_or_default(),
+            username: String::new(),
+            phone,
+            link: String::new(),
+        })
+    }
+
+    /// Encrypts the name, about, and emoji into the versioned profile, tells the other devices
+    /// to fetch it, then reads it back. Success is that read matching what was written.
+    async fn set_card(&mut self, name: Option<String>, about: Option<String>, emoji: Option<String>) -> Result<(), Fault> {
+        let current = self.manager.retrieve_profile().await.map_err(fault)?;
+        let profile_name = match name {
+            Some(name) if !name.trim().is_empty() => ProfileName { given_name: name, family_name: None },
+            Some(_) => return Err(Fault::Refused("A name is needed.".into())),
+            None => current.name.clone().filter(|name| !name.is_empty()).unwrap_or(ProfileName { given_name: String::new(), family_name: None }),
+        };
+        let family_empty = profile_name.family_name.as_ref().is_none_or(|family| family.trim().is_empty());
+        if profile_name.given_name.trim().is_empty() && family_empty {
+            return Err(Fault::Refused("A name is needed.".into()));
+        }
+        let about = match about {
+            Some(text) if text.is_empty() => None,
+            Some(text) => Some(text),
+            None => current.about.clone().filter(|text| !text.is_empty()),
+        };
+        let emoji = match emoji {
+            Some(text) if text.is_empty() => None,
+            Some(text) => Some(text),
+            None => current.about_emoji.clone().filter(|text| !text.is_empty()),
+        };
+        let expect_name = profile_name.to_string();
+        let expect_about = about.clone().unwrap_or_default();
+        let expect_emoji = emoji.clone().unwrap_or_default();
+        self.manager.update_profile(profile_name, about, emoji).await.map_err(fault)?;
+        let sync = SyncMessage {
+            fetch_latest: Some(sync_message::FetchLatest { r#type: Some(sync_message::fetch_latest::Type::LocalProfile.into()) }),
+            ..SyncMessage::with_padding(&mut rand::rng())
+        };
+        let me = Uuid::parse_str(&self.me).map_err(|_| Fault::Net("no account id".into()))?;
+        self.manager.send_message(Aci::from(me), sync, now_ms()).await.map_err(fault)?;
+        let read = self.manager.retrieve_profile().await.map_err(fault)?;
+        let got_name = read.name.map(|name| name.to_string()).unwrap_or_default();
+        let got_about = read.about.unwrap_or_default();
+        let got_emoji = read.about_emoji.unwrap_or_default();
+        if got_name != expect_name || got_about != expect_about || got_emoji != expect_emoji {
+            return Err(Fault::Refused("Signal did not keep that profile. Nothing else was changed.".into()));
+        }
+        Ok(())
     }
 
     /// A person's profile picture, fetched from Signal's CDN and opened with their profile key

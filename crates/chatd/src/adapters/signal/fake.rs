@@ -29,7 +29,7 @@
 //! The account: Ada Quill (us); Grace Ombra and Alan Ferro, both contacts; the group "Bridge
 //! club" with all three of us in it.
 
-use super::wire::{Body, Contact, Event, Fault, GroupInfo, Linked, Linker, Peer, Quote, Text, Wire};
+use super::wire::{Body, Contact, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use crate::adapters::script;
 use std::io::Write;
@@ -72,6 +72,7 @@ pub struct Fake {
     refuse: Arc<Mutex<Option<String>>>,
     clock: AtomicU64,
     control: PathBuf,
+    card: Arc<Mutex<OwnCard>>,
 }
 
 impl Fake {
@@ -92,6 +93,15 @@ impl Fake {
             refuse: Arc::default(),
             clock: AtomicU64::new(T0 + 1_000_000),
             control: script::control("signal.ctl"),
+            // A scripted card. The link is invented: nothing here reserves a username.
+            card: Arc::new(Mutex::new(OwnCard {
+                name: "Ada Quill".into(),
+                about: "Keeps the score.".into(),
+                emoji: "🌉".into(),
+                username: "ada.12".into(),
+                phone: "+15550100001".into(),
+                link: "https://signal.me/#eu/fake-ada".into(),
+            })),
         };
         fake.listen();
         fake
@@ -214,7 +224,8 @@ impl Wire for Fake {
     }
 
     fn me(&self) -> (String, String) {
-        (ME.to_owned(), "Ada Quill".to_owned())
+        let name = self.card.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).name.clone();
+        (ME.to_owned(), name)
     }
 
     fn send(&self, to: &Peer, body: Body) -> Result<u64, Fault> {
@@ -248,6 +259,29 @@ impl Wire for Fake {
 
     fn unlink(&self) -> Result<(), Fault> {
         record("unlink");
+        Ok(())
+    }
+
+    fn card(&self) -> Result<OwnCard, Fault> {
+        record("profile read");
+        Ok(self.card.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone())
+    }
+
+    fn set_card(&self, name: Option<String>, about: Option<String>, emoji: Option<String>) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let mut card = self.card.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(name) = name {
+            card.name = name;
+        }
+        if let Some(about) = about {
+            card.about = about;
+        }
+        if let Some(emoji) = emoji {
+            card.emoji = emoji;
+        }
+        record(&format!("profile name={} about={} emoji={} sync=local-profile", card.name, card.about, card.emoji));
         Ok(())
     }
 
