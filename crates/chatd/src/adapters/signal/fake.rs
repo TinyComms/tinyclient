@@ -12,6 +12,8 @@
 //! | `group WHO SENT TEXT…` | the same, in the group |
 //! | `mention WHO SENT TEXT…` | the same, in the group, naming us |
 //! | `photo WHO SENT` | WHO sent a photo with no caption |
+//! | `payment WHO SENT NOTE…` | WHO sent a payment notification; its note, when words follow |
+//! | `giftbadge WHO SENT` | WHO sent a gift badge, redeemed on the phone |
 //! | `quote WHO SENT QUOTED TEXT…` | WHO answered our message sent at QUOTED |
 //! | `mine SENT TEXT…` | we wrote TEXT to Grace from the phone |
 //! | `note SENT TEXT…` | we wrote TEXT to Note to Self from the phone |
@@ -29,7 +31,7 @@
 //! The account: Ada Quill (us); Grace Ombra and Alan Ferro, both contacts; the group "Bridge
 //! club" with all three of us in it.
 
-use super::wire::{Body, Contact, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{gift_badge_label, payment_label, Body, Contact, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use crate::adapters::script;
 use std::io::Write;
@@ -140,7 +142,7 @@ fn steer(line: &str) -> Vec<Event> {
     let club = || Peer::Group(CLUB.to_owned());
     let rest = |line: &str, skip: usize| line.split_whitespace().skip(skip).collect::<Vec<_>>().join(" ");
     match command {
-        "incoming" | "group" | "mention" | "photo" | "quote" => {
+        "incoming" | "group" | "mention" | "photo" | "quote" | "payment" | "giftbadge" => {
             let Some((author, name)) = who(next()) else {
                 return Vec::new();
             };
@@ -148,6 +150,11 @@ fn steer(line: &str) -> Vec<Event> {
             let mut text = Text { author: author.into(), name: name.into(), sent, ..Text::default() };
             match command {
                 "photo" => text.unsupported = Some("Photo".into()),
+                "payment" => {
+                    let note = rest(line, 3);
+                    text.unsupported = Some(payment_label((!note.is_empty()).then_some(note.as_str())));
+                }
+                "giftbadge" => text.unsupported = Some(gift_badge_label().to_owned()),
                 "quote" => {
                     let quoted = next().parse().unwrap_or(0);
                     text.quote = Some(Quote { sent: quoted, author: ME.into(), text: String::new() });

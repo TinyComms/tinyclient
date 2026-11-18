@@ -100,6 +100,29 @@ pub struct Text {
     pub unsupported: Option<String>,
 }
 
+/// Longest payment note shown in its label: what a sender typed joins the words after an em dash.
+/// The reply snippet in `signal.rs` keeps the same room.
+const NOTE_LIMIT: usize = 200;
+
+/// What a payment says (#733): where it is acted on, and the note the sender wrote, when one came.
+/// The amount itself rides inside an encrypted receipt only a wallet can read, so nothing of it is
+/// shown. The real wire and the fake one say the same words, so a scripted test exercises what a
+/// person is told.
+pub fn payment_label(note: Option<&str>) -> String {
+    let mut label = "Payment · open Signal on your phone".to_owned();
+    if let Some(note) = note.map(str::trim).filter(|note| !note.is_empty()) {
+        label.push_str(" — ");
+        label.push_str(&note.chars().take(NOTE_LIMIT).collect::<String>());
+    }
+    label
+}
+
+/// What a gift badge says (#733): redeeming it presents a receipt credential to Signal's server,
+/// and that is the phone's work.
+pub fn gift_badge_label() -> &'static str {
+    "Gift badge · open Signal on your phone to redeem"
+}
+
 /// Something Signal sent unasked, or the end of the connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -237,5 +260,19 @@ mod tests {
         assert_eq!(Peer::parse("0F6C2A3E-1B4D-4E5F-8A9B-0C1D2E3F4A5B"), None);
         assert_eq!(parse_message_id(&message_id(1_791_892_800_123, aci)), Some((1_791_892_800_123, aci.to_owned())));
         assert_eq!(parse_message_id("17-not-an-aci"), None);
+    }
+
+    #[test]
+    fn a_payment_and_a_gift_badge_say_where_they_are_acting() {
+        assert_eq!(payment_label(None), "Payment · open Signal on your phone");
+        assert_eq!(payment_label(Some("for coffee")), "Payment · open Signal on your phone — for coffee");
+        // An empty or blank note is no note.
+        assert_eq!(payment_label(Some("")), "Payment · open Signal on your phone");
+        assert_eq!(payment_label(Some("   ")), "Payment · open Signal on your phone");
+        // A note is a peer's words: capped, never unbounded.
+        let long = "x".repeat(NOTE_LIMIT + 50);
+        let said = payment_label(Some(long.as_str()));
+        assert_eq!(said.chars().count(), "Payment · open Signal on your phone — ".chars().count() + NOTE_LIMIT);
+        assert_eq!(gift_badge_label(), "Gift badge · open Signal on your phone to redeem");
     }
 }

@@ -128,6 +128,18 @@ pub fn prove_signal_own_profile() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's signal-payment-labels driver. A build without this stays up, so the driver fails.
+pub fn prove_signal_payment_labels() -> Result<(), String> {
+    #[cfg(feature = "signal")]
+    {
+        real::prove_payment_labels()
+    }
+    #[cfg(not(feature = "signal"))]
+    {
+        Err(unsupported_reason())
+    }
+}
+
 /// A test in a scratch directory asked for the scripted wire.
 fn scripted() -> bool {
     !session::enabled() && std::env::var_os("TINYCLIENT_SIGNAL_FAKE").is_some()

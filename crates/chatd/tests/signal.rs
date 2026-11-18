@@ -569,3 +569,23 @@ fn note_to_self_from_the_phone_has_its_own_label() {
     });
     assert_eq!(world.messages(ME).len(), 1, "renaming must preserve messages");
 }
+
+#[test]
+fn a_payment_and_a_gift_badge_say_where_they_are_acting_on() {
+    let world = World::linked();
+    world.connected();
+    world.steer(&format!("payment grace {} for coffee", T0 + 4_000));
+    let paid = world.arrived(GRACE, &id(T0 + 4_000, GRACE));
+    assert_eq!(
+        (paid.text.as_str(), &paid.kind),
+        ("Payment · open Signal on your phone — for coffee", &MessageKind::Unsupported { link: String::new() })
+    );
+    // No note, no dash.
+    world.steer(&format!("payment grace {}", T0 + 5_000));
+    let bare = world.arrived(GRACE, &id(T0 + 5_000, GRACE));
+    assert_eq!(bare.text.as_str(), "Payment · open Signal on your phone");
+    // Redeeming is the phone's work, and the row says so.
+    world.steer(&format!("giftbadge grace {}", T0 + 6_000));
+    let badge = world.arrived(GRACE, &id(T0 + 6_000, GRACE));
+    assert_eq!(badge.text.as_str(), "Gift badge · open Signal on your phone to redeem");
+}

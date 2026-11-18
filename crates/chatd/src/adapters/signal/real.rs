@@ -6,7 +6,7 @@
 //! Signal without a real phone to link from (see `tests/signal.rs` for what is proven).
 
 use super::vault::{self, Vault};
-use super::wire::{Body, Contact, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{gift_badge_label, payment_label, Body, Contact, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use futures::StreamExt;
 use presage::libsignal_service::content::ContentBody;
@@ -113,6 +113,16 @@ fn fault<E: std::error::Error>(err: presage::Error<E>) -> Fault {
         (P::ServiceError(ServiceError::RateLimitExceeded { .. }), _) => Fault::Refused("Signal asked for a pause. Try again in a minute.".to_owned()),
         (P::UnknownGroup, _) => Fault::Refused("This group isn't one Signal still knows for you.".to_owned()),
         _ => Fault::Net(err.to_string()),
+    }
+}
+
+/// What of a payment can be shown beside its label: the note its sender typed, when they did.
+/// Nothing else of it is readable — the amount rides inside an encrypted receipt only a wallet
+/// can open, and this is not one (#733).
+fn payment_note(payment: &data_message::Payment) -> Option<&str> {
+    match &payment.item {
+        Some(data_message::payment::Item::Notification(notification)) => notification.note.as_deref(),
+        _ => None,
     }
 }
 
@@ -391,16 +401,17 @@ impl Session {
                 Some("audio") => "Audio",
                 _ => "File",
             })
+            .map(str::to_owned)
         } else if message.sticker.is_some() {
-            Some("Sticker")
+            Some("Sticker".to_owned())
         } else if !message.contact.is_empty() {
-            Some("Contact")
-        } else if message.payment.is_some() {
-            Some("Payment")
+            Some("Contact".to_owned())
+        } else if let Some(payment) = message.payment.as_ref() {
+            Some(payment_label(payment_note(payment)))
         } else if message.gift_badge.is_some() {
-            Some("Gift badge")
+            Some(gift_badge_label().to_owned())
         } else if message.is_view_once.unwrap_or(false) {
-            Some("View-once media")
+            Some("View-once media".to_owned())
         } else {
             None
         };
@@ -410,7 +421,7 @@ impl Session {
             text: quote.text.clone().unwrap_or_default(),
         });
         let name = if author == self.me { String::new() } else { self.name_of(author).await };
-        Text { author: author.to_owned(), name, sent, text, quote, mentions_me, unsupported: unsupported.map(str::to_owned) }
+        Text { author: author.to_owned(), name, sent, text, quote, mentions_me, unsupported }
     }
 
     /// One data message, from someone (`outgoing` false) or from us on another device.
@@ -797,5 +808,102 @@ impl Linker for RealLinker {
         let saved = Saved { aci, name, vault: hex(&key) };
         let session = serde_json::to_string(&saved).map_err(|err| Fault::Net(err.to_string()))?;
         Ok(Linked { session })
+    }
+}
+
+/// The lab's signal-payment-labels driver: the words of a payment and a gift badge, read off the
+/// proto the way the wire carries them. A build without this stays up, so the driver fails.
+pub fn prove_payment_labels() -> Result<(), String> {
+    let mut message = DataMessage::default();
+    message.payment = Some(data_message::Payment {
+        item: Some(data_message::payment::Item::Notification(data_message::payment::Notification {
+            note: Some("for coffee".to_owned()),
+            transaction: None,
+        })),
+    });
+    let payment = message.payment.as_ref().ok_or("the payment did not stay set")?;
+    let said = payment_label(payment_note(payment));
+    if said != "Payment · open Signal on your phone — for coffee" {
+        return Err(format!("a payment with a note is labelled {said:?}"));
+    }
+
+    let mut message = DataMessage::default();
+    message.payment = Some(data_message::Payment {
+        item: Some(data_message::payment::Item::Notification(data_message::payment::Notification {
+            note: None,
+            transaction: None,
+        })),
+    });
+    let payment = message.payment.as_ref().ok_or("the bare payment did not stay set")?;
+    let said = payment_label(payment_note(payment));
+    if said != "Payment · open Signal on your phone" {
+        return Err(format!("a payment without a note is labelled {said:?}"));
+    }
+
+    let mut message = DataMessage::default();
+    message.gift_badge = Some(data_message::GiftBadge { receipt_credential_presentation: Some(vec![0xde, 0xad]) });
+    if message.gift_badge.is_none() {
+        return Err("the gift badge did not stay set".into());
+    }
+    let said = gift_badge_label();
+    if said != "Gift badge · open Signal on your phone to redeem" {
+        return Err(format!("a gift badge is labelled {said:?}"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A payment as the wire carries it: the sender's note beside a receipt no wallet here opens.
+    fn payment(note: Option<&str>) -> DataMessage {
+        let mut message = DataMessage::default();
+        message.payment = Some(data_message::Payment {
+            item: Some(data_message::payment::Item::Notification(data_message::payment::Notification {
+                note: note.map(str::to_owned),
+                transaction: Some(data_message::payment::notification::Transaction::MobileCoin(
+                    data_message::payment::notification::MobileCoin { receipt: Some(vec![0xde, 0xad]) },
+                )),
+            })),
+        });
+        message
+    }
+
+    fn gift_badge() -> DataMessage {
+        let mut message = DataMessage::default();
+        message.gift_badge = Some(data_message::GiftBadge { receipt_credential_presentation: Some(vec![0xbe, 0xef]) });
+        message
+    }
+
+    #[test]
+    fn a_payment_names_where_it_is_acting_and_shows_its_note() {
+        // The note is the one readable field; the amount stays unread in its encrypted receipt.
+        let with_note = payment(Some("for coffee"));
+        let paid = with_note.payment.as_ref().unwrap();
+        assert_eq!(payment_label(payment_note(paid)), "Payment · open Signal on your phone — for coffee");
+
+        // No note, no dash: the words stand alone.
+        let bare = payment(None);
+        let paid = bare.payment.as_ref().unwrap();
+        assert_eq!(payment_label(payment_note(paid)), "Payment · open Signal on your phone");
+
+        // A payments-activation request is a payment too, and carries no note.
+        let mut activation = DataMessage::default();
+        activation.payment = Some(data_message::Payment {
+            item: Some(data_message::payment::Item::Activation(data_message::payment::Activation {
+                r#type: Some(data_message::payment::activation::Type::Request as i32),
+            })),
+        });
+        let paid = activation.payment.as_ref().unwrap();
+        assert_eq!(payment_label(payment_note(paid)), "Payment · open Signal on your phone");
+    }
+
+    #[test]
+    fn a_gift_badge_says_where_it_is_redeemed() {
+        // The presentation is opaque bytes here; redeeming is the phone's work and the words say so.
+        let badge = gift_badge();
+        assert!(badge.gift_badge.is_some());
+        assert_eq!(gift_badge_label(), "Gift badge · open Signal on your phone to redeem");
     }
 }
