@@ -183,7 +183,7 @@ pub fn absent(id: &str) -> bool {
     match id {
         "G2" => !cfg!(target_os = "macos"),
         "SV" | "NL" => cfg!(target_os = "macos"),
-        "N10" | "N11" => !cfg!(any(windows, target_os = "macos", target_os = "linux")),
+        "N10" | "N11" => !cfg!(any(target_os = "android", target_os = "ios")),
         // Nothing to forget until a link's "Don't ask again" has been used.
         "PF" => crate::gui::app::prefs::trusted_links().is_empty(),
         _ => false,
