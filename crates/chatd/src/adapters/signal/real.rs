@@ -822,14 +822,14 @@ mod tests {
         let mut message = DataMessage::default();
         message.is_view_once = Some(true);
         if let Some(kind) = content_type {
-            message.attachments.push(data_message::AttachmentPointer { content_type: Some(kind.to_owned()), ..Default::default() });
+            message.attachments.push(presage::proto::AttachmentPointer { content_type: Some(kind.to_owned()), ..Default::default() });
         }
         message
     }
 
     fn photo() -> DataMessage {
         let mut message = DataMessage::default();
-        message.attachments.push(data_message::AttachmentPointer { content_type: Some("image/jpeg".to_owned()), ..Default::default() });
+        message.attachments.push(presage::proto::AttachmentPointer { content_type: Some("image/jpeg".to_owned()), ..Default::default() });
         message
     }
 
