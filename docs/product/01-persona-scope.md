@@ -84,7 +84,7 @@ These are part of the goal. They are not in the product yet, so each one opens i
 | Password, 2FA, billing, and the network's own privacy screens | Open in the official app. Mutes, presence, and the local settings in `09` are here. |
 | Telegram secret chats | grammers does not carry them. Say so on the row. |
 | Scheduled send | Not in the composer. Voice messages play, and Telegram records one on the composer's mic. |
-| Light theme, open at login | Search says so. Dark only. No login item. |
+| Light theme | Search says so. Dark only. |
 
 A downloaded noise-suppression model is a non-goal. The Voice switch that turns suppression on is already a setting.
 

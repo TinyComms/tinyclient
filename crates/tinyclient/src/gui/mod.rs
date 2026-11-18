@@ -8,6 +8,7 @@ mod anim;
 mod app;
 mod attention;
 mod assets;
+mod autostart;
 // `pub(crate)` so the mobile layer can reach the call's platform hooks (`call::phone::hooks`).
 pub(crate) mod call;
 mod chrome;
@@ -161,6 +162,12 @@ pub(crate) fn prove_schedule_send() -> Result<(), &'static str> {
 /// The lab's Discord formatting driver. Bold wraps, a fence toggles, and a pasted url becomes a masked link.
 pub(crate) fn prove_discord_format() -> Result<(), &'static str> {
     composer::format::prove()
+}
+
+/// The lab's open-at-login driver. The row is there, off by default, and the switch writes and
+/// removes the entry the system reads at sign-in.
+pub(crate) fn prove_open_at_login() -> Result<(), &'static str> {
+    autostart::prove()
 }
 
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};

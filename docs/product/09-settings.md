@@ -10,7 +10,7 @@ The tables under "Information architecture" are the control design. A row marked
 
 | Section | Rows | Notes |
 | --- | --- | --- |
-| General | G2, G4 | G2 "Keep receiving when the window is closed" is in the window on macOS only. Linux uses the systemd user unit when that unit is enabled; quitting the GUI then leaves chatd up either way. G4 is automatic updates from the public GitHub release. |
+| General | G1, G2, G4 | G1 starts tinyclient when the person signs in, through each system's own startup entry. G2 "Keep receiving when the window is closed" is in the window on macOS only. Linux uses the systemd user unit when that unit is enabled; quitting the GUI then leaves chatd up either way. G4 is automatic updates from the public GitHub release. |
 | Notifications | N1, N2, ND, NG, NM, NT, N4, NL, N5–N11, N13 | ND / NG / NM / NT are "Direct messages", "Group chats", "Mentions in channels", "Tiny servers". There is no N3 per-account menu. NL is the lock-screen preview and is hidden on macOS, where the OS does that. N10 and N11 use the host's flash and badge labels and are hidden on Linux. |
 | Sounds | S1–S4, SV | Five message sounds, two rings, or None. No "System alert sound". SV is notification volume and is hidden on macOS. |
 | Appearance | A2, A3, A4 | Text size, density, list previews. No theme control. The app is dark. |
@@ -28,7 +28,6 @@ chatd keeps the notification, sound, privacy, voice, and storage values. The she
 
 | Gap | What search says, or what the code does |
 | --- | --- |
-| G1 Open at login | "tinyclient has no open-at-login setting yet." |
 | G3 Menu bar | No tray icon on this commit's search line. |
 | A1 Light theme | "tinyclient is dark only for now." |
 | N3 per-account notify menu | Not a row. ND, NG, NM, and NT are global. chatd can store an account-level notify word; the window does not show N3. |
@@ -96,7 +95,7 @@ Each setting has exactly one home. The Settings window reads and writes both.
 | --- | --- | --- |
 | chatd: table `settings(scope, key, value)` in `chat.sqlite` | Anything chatd acts on while the window may be closed: notifications, sounds, pause, quiet hours, privacy, call devices, storage, quit behaviour | chatd posts notifications and talks to the networks; the window may not be running |
 | Shell: `shell.prefs` | Anything only the window draws or reads: theme, text size, density, send key, list previews, last Settings section | It is read before the first frame, so the window opens looking right |
-| The OS | Notification permission, Focus. Open at login is not a setting (G1). | The OS is the source of truth; tinyclient reads it, never caches a copy |
+| The OS | Notification permission, Focus, and the sign-in entry G1 keeps: the per-user Run key, a LaunchAgent, an XDG autostart file | The entry is the OS's own: written and removed where that system reads it, and rewritten with the running path at launch while the switch is on |
 
 `scope` is `""` for global, `account:<network>:<id>` for one account (one Slack workspace is one
 account), and `conv:<network>:<id>` for one conversation.
@@ -122,7 +121,7 @@ One group per network, a row per account with state in words, Sign out, Sign in 
 
 | # | Setting | Type | Default | Scope | Home | What it changes | Rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| G1 | Open at login | Switch | | G | OS | Not in 0.2.35. Search: "tinyclient has no open-at-login setting yet." | not in 0.2.35 |
+| G1 | Open at login | Switch | Off | G | s | On: the system starts tinyclient at sign-in. Windows: the per-user Run key (the uninstaller removes it; a disable in Task Manager's Startup tab wins). macOS: a LaunchAgent in `~/Library/LaunchAgents`. Linux: an XDG autostart file in `~/.config/autostart`. Rewritten with the running path at every launch, so a moved portable copy keeps starting | in |
 | G2 | Keep receiving when the window is closed | Switch | On | G | d | On: closing the window hides it and chatd keeps running. Off: closing the window quits the window and chatd. In the window on macOS only. Linux uses the systemd user unit when that unit is enabled. | in |
 | G3 | Show in menu bar | Switch | Off | G | s | | Later |
 | G4 | Install updates automatically | Switch | On | G | s | On: a newer GitHub release is downloaded while the window is open and replaces this copy on quit. Off: the notice still appears and nothing is downloaded until asked | in |
@@ -468,7 +467,8 @@ notification delivered by the system, read with `log stream --predicate 'subsyst
 "com.apple.usernotifications"'` or the e2e harness's capture.
 
 **General**
-- G1: not in 0.2.35. There is no open-at-login switch and no Login Items row.
+- G1: on, sign out and in: tinyclient starts by itself. Off then: the entry is gone. Windows: the
+  Run value; macOS: the LaunchAgent file; Linux: the autostart file.
 - G2: off, ⌘W: no shell and no chatd within 2 s. On, ⌘W: chatd still answers `ping`; a DM
   posts. ⌘Q in both cases: no tinyclient process within 2 s.
 
@@ -546,7 +546,7 @@ notification delivered by the system, read with `log stream --predicate 'subsyst
   are untouched.
 
 **Search and keyboard**
-- Searching "ding" lists S2, S3, S4. "dark" and "login" return the `NOT_YET` line (A1 and G1 are not in 0.2.35). "proxy" shows the honest line. "System alert sound" is not a result.
+- Searching "ding" lists S2, S3, S4. "dark" returns the `NOT_YET` line (A1 is not in 0.2.35). "login", "startup" and "autostart" find G1 Open at login. "proxy" shows the honest line. "System alert sound" is not a result.
 - With the mouse unplugged, every control that is in the window can be reached and changed from ⌘, (scripted
   keystrokes in the e2e harness).
 
@@ -558,7 +558,6 @@ Still absent, matching `NOT_YET` and the "Not in the window" table above. M5, V8
 
 | Item | Waits on |
 | --- | --- |
-| G1 Open at login | A login item. Search says there is none yet. |
 | G3 Show in menu bar | No tray icon on this commit. |
 | A1 Light theme | Dark only. |
 | N3 per-account notify menu | Not a row. ND, NG, NM, and NT are global. |

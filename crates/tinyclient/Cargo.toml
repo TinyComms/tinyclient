@@ -101,8 +101,9 @@ gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = tr
 [target.'cfg(windows)'.dependencies]
 gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = true, default-features = false, features = ["font-kit"] }
 # `--version` and `--text` print to the terminal from a windowed program, a call's link opens
-# through ShellExecuteW, and the voice keys are read with GetAsyncKeyState. Already in the tree.
-windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Com", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# through ShellExecuteW, the voice keys are read with GetAsyncKeyState, and the sign-in entry
+# (G1) is written in the per-user Run key. Already in the tree.
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Com", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 # The icon, in the .exe: Explorer, the taskbar and the window (GPUI loads resource 1) show it.
 # Already in the tree.

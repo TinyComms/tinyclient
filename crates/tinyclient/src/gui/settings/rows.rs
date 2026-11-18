@@ -33,6 +33,7 @@ use Section::*;
 
 /// Every row, in the order the sections draw them.
 pub const ROWS: &[Row] = &[
+    row("G1", General, "", "Open at login", &[], &["login", "log in", "startup", "launch", "autostart", "sign in"]),
     row("G2", General, "", "Keep receiving when the window is closed", &[], &["background", "quit", "close", "run", "daemon"]),
     row("G4", General, "", "Install updates automatically", &[], &["update", "upgrade", "version", "install", "automatic"]),
     row("N1", Notifications, "", "Show notifications", &[], &["notify", "notification", "alert", "banner", "toast", "popup"]),
@@ -114,10 +115,6 @@ pub const NOT_YET: &[(&str, &str)] = &[
     ("proxy", "tinyclient has no proxy setting yet."),
     ("socks", "tinyclient has no proxy setting yet."),
     ("reaction", "tinyclient does not notify about reactions yet."),
-    ("login", "tinyclient has no open-at-login setting yet."),
-    ("startup", "tinyclient has no open-at-login setting yet."),
-    ("launch", "tinyclient has no open-at-login setting yet."),
-    ("autostart", "tinyclient has no open-at-login setting yet."),
     ("theme", "tinyclient is dark only for now."),
     ("light", "tinyclient is dark only for now."),
     ("dark mode", "tinyclient is dark only for now."),
@@ -179,9 +176,10 @@ pub fn search(query: &str) -> Vec<&'static Row> {
 
 /// Rows this system cannot honour, so they are neither drawn nor found here: macOS plays
 /// sounds at its own alert volume and hides previews on a locked screen itself; Linux has no
-/// badge or flash here.
+/// badge or flash here; a phone keeps no sign-in list for Open at login to join.
 pub fn absent(id: &str) -> bool {
     match id {
+        "G1" => !crate::gui::autostart::supported(),
         "G2" => !cfg!(target_os = "macos"),
         "SV" | "NL" => cfg!(target_os = "macos"),
         "N10" | "N11" => !cfg!(any(windows, target_os = "macos")),
@@ -352,7 +350,7 @@ mod tests {
         assert!(search("proxy").is_empty());
         assert_eq!(not_yet("proxy"), Some("tinyclient has no proxy setting yet."));
         // The words people reach for, not only the names in the product doc.
-        for words in ["launch", "start at login", "autostart", "reactions"] {
+        for words in ["reactions"] {
             assert!(search(words).is_empty(), "{words} finds a row");
             assert!(not_yet(words).is_some(), "{words} gets no line");
         }
@@ -363,6 +361,20 @@ mod tests {
         assert_eq!(not_yet("sound file"), None);
         assert!(search("custom sound").iter().any(|row| row.id == "S13"));
         assert_eq!(not_yet("zzz"), None);
+    }
+
+    #[test]
+    fn open_at_login_is_a_row_where_signing_in_can_start_the_app() {
+        let desktop = crate::gui::autostart::supported();
+        assert_eq!(search("open at login").iter().any(|row| row.id == "G1"), desktop);
+        // The words people reach for, not only the row's own label.
+        for words in ["login", "startup", "launch", "autostart", "sign in"] {
+            assert_eq!(search(words).iter().any(|row| row.id == "G1"), desktop, "{words}");
+        }
+        assert_eq!(not_yet("login"), None);
+        assert_eq!(not_yet("startup"), None);
+        assert_eq!(not_yet("launch"), None);
+        assert_eq!(not_yet("autostart"), None);
     }
 
     #[test]
