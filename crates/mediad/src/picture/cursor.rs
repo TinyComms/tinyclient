@@ -217,7 +217,9 @@ fn stride(width: u32, bits: u32) -> u32 {
 
 /// A bitmap's rows, top down, `bits` a pixel (32 colour, 1 the masks), each row `stride`.
 fn read(handle: HBITMAP, width: u32, height: u32, stride: u32, bits: u32) -> Option<Vec<u8>> {
-    let dc = GetDC(std::ptr::null_mut());
+    // SAFETY: a null window asks for the screen's DC; the call only hands out a handle or
+    // null, checked below.
+    let dc = unsafe { GetDC(std::ptr::null_mut()) };
     if dc.is_null() {
         return None;
     }
@@ -238,7 +240,9 @@ fn read(handle: HBITMAP, width: u32, height: u32, stride: u32, bits: u32) -> Opt
     // SAFETY: the desktop's DC, released below; the read lands in the rows and stride Windows
     // reported, in a buffer of exactly that size.
     let rows = unsafe { GetDIBits(dc, handle, 0, height, out.as_mut_ptr().cast(), (&mut header as *mut BITMAPINFOHEADER).cast(), DIB_RGB_COLORS) };
-    ReleaseDC(std::ptr::null_mut(), dc);
+    // SAFETY: the screen DC GetDC handed back above, released once with the matching null
+    // window, on the thread that took it; nothing reads it after.
+    unsafe { ReleaseDC(std::ptr::null_mut(), dc) };
     (rows == height as i32).then_some(out)
 }
 
