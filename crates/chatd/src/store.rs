@@ -2950,13 +2950,15 @@ impl Store {
 
     /// Pending messages older than `before` did not go: the adapter never answered, or chatd was
     /// restarted. They become `Failed` and wait for the user; nothing is ever sent late on its
-    /// own. Returns the conversations touched.
+    /// own. A row queued while the account was offline (`waiting`) is left for [`Self::fail_queued`].
+    /// Returns the conversations touched.
     pub fn fail_pending(&mut self, before: i64, reason: &str) -> rusqlite::Result<Vec<Key>> {
         let stuck: Vec<(Key, String)> = self
             .db
             .prepare(
                 "SELECT network, account, conversation, id FROM message
-                  WHERE pending = 1 AND sent < ?1",
+                  WHERE pending = 1 AND sent < ?1
+                    AND coalesce(json_extract(body, '$.waiting'), 0) = 0",
             )?
             .query_map(params![before], |row| Ok((key_at(row)?, row.get(3)?)))?
             .collect::<rusqlite::Result<_>>()?;
@@ -2973,6 +2975,66 @@ impl Store {
             }
         }
         Ok(touched)
+    }
+
+    /// Offline-queue rows older than `before` waited too long to send themselves when the link
+    /// returns. They become `Failed` with `waiting` cleared, so a later connect does not hand
+    /// them off. Returns the conversations touched.
+    pub fn fail_queued(&mut self, before: i64, reason: &str) -> rusqlite::Result<Vec<Key>> {
+        let stuck: Vec<(Key, String)> = self
+            .db
+            .prepare(
+                "SELECT network, account, conversation, id FROM message
+                  WHERE pending = 1 AND sent < ?1 AND json_extract(body, '$.waiting') = 1",
+            )?
+            .query_map(params![before], |row| Ok((key_at(row)?, row.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut touched = Vec::new();
+        for (conversation, id) in stuck {
+            if let Some(mut message) = self.message(&conversation, &id)? {
+                message.state = SendState::Failed { reason: reason.to_owned() };
+                message.waiting = false;
+                self.ingest(&conversation, &message, false)?;
+            }
+            if !touched.contains(&conversation) {
+                touched.push(conversation);
+            }
+        }
+        Ok(touched)
+    }
+
+    /// Text this account wrote while it was offline, oldest first.
+    pub fn queued(&self, account: &AccountKey) -> rusqlite::Result<Vec<(Key, Message)>> {
+        let rows: Vec<(Key, String)> = self
+            .db
+            .prepare(
+                "SELECT network, account, conversation, id FROM message
+                  WHERE pending = 1 AND network = ?1 AND account = ?2
+                    AND json_extract(body, '$.waiting') = 1
+                  ORDER BY sent, id",
+            )?
+            .query_map(params![word(&account.network), account.account], |row| Ok((key_at(row)?, row.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut queued = Vec::with_capacity(rows.len());
+        for (conversation, id) in rows {
+            if let Some(message) = self.message(&conversation, &id)? {
+                queued.push((conversation, message));
+            }
+        }
+        Ok(queued)
+    }
+
+    /// How many offline-queue rows this account has, aside from one the shell is sending again.
+    pub fn queued_count(&self, account: &AccountKey, except: &str) -> rusqlite::Result<usize> {
+        let count: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM message
+              WHERE pending = 1 AND network = ?1 AND account = ?2
+                AND json_extract(body, '$.waiting') = 1
+                AND id != ?3 AND coalesce(client_id, '') != ?3",
+            params![word(&account.network), account.account, except],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 
     // People.

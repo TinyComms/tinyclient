@@ -384,6 +384,11 @@ pub struct Message {
     pub kind: MessageKind,
     #[serde(default, skip_serializing_if = "SendState::is_sent")]
     pub state: SendState,
+    /// Queued because the account was offline. Still [`SendState::Pending`]. The shell draws a
+    /// clock and "Waiting for {network}", not "Sending…". Older clients ignore the field and
+    /// show it as on its way.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub waiting: bool,
     /// What the shell called it when sending. Set on our own messages only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
@@ -440,6 +445,7 @@ impl Message {
             mentions_me: false,
             kind: MessageKind::Normal,
             state: SendState::Sent,
+            waiting: false,
             client_id: None,
             seal: crate::Seal::Plain,
         }

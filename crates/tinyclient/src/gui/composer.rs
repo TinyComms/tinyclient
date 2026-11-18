@@ -20,9 +20,9 @@
 //!   (`Change::Upload`), and `composer_cancel_upload(conversation, client_id, cx)` stops them.
 //! - `unsent_line(conversation, message, cx)` is what a failed row shows under its body: the
 //!   reason, Retry and Delete. `None` for a message that went.
-//! - `held_sends(conversation)` are the messages sent while the account was offline, which
-//!   chatd does not store: draw each as a pending row with `held_line(conversation, held, cx)`
-//!   under its body. They wait 60 s for the link (`hold`). One that never goes is not lost:
+//! - `held_sends(conversation)` are text sends chatd refused (signed out, or the queue is
+//!   full). chatd stores a text send while the link is offline. A refusal waits 60 s for the
+//!   link (`hold`), drawn with `held_line(conversation, held, cx)`. One that never goes is not lost:
 //!   what was typed comes back to the composer it was typed in (`held_back`).
 //! - `send_failed_in(conversation)`: a message sent from here did not go and is unresolved.
 //! - `composer_links_changed(cx)` and `composer_changed(change, cx)` are called by the shell.
@@ -861,9 +861,9 @@ impl Composer {
     /// Return, or Option-Return for `silent`. A time kept in `schedule_at` is the moment the
     /// network sends it; an ordinary Return leaves that unset. chatd answers as soon as the
     /// message is stored as pending, and the row comes from that; the text and chips leave
-    /// only then, so a refused send loses nothing. When the account is offline chatd stores
-    /// nothing, and the shell holds a text message instead; files wait for the connection in
-    /// the tray.
+    /// only then, so a refused send loses nothing. A text send while the link is offline is
+    /// stored by chatd. A refusal (signed out, or a file) stays here: text is held for a
+    /// minute, and files wait in the tray.
     pub fn send(&mut self, silent: bool, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone() else {
             self.schedule_at = None;

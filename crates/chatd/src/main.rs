@@ -245,6 +245,14 @@ fn main() -> io::Result<()> {
         }
         return Ok(());
     }
+    // The lab's offline-queue driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("offline-queue") {
+        if let Err(err) = chatd::server::prove_offline_queue() {
+            eprintln!("offline-queue: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     // The lab's pending-message-identity driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("pending-message-identity") {
         if let Err(err) = chatd::server::prove_pending_message_identity() {

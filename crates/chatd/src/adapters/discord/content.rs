@@ -851,6 +851,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         mentions_me: false,
         kind: message_kind,
         state: protocol::SendState::Sent,
+        waiting: false,
         client_id,
     };
     (message, rich.files)

@@ -169,6 +169,9 @@ pub struct Hub {
     /// The notification thread (`notify::start`), once it runs. Told of new messages, rows
     /// that may have been read, and the call.
     notifier: OnceLock<crate::notify::Line>,
+    /// Runs after an account becomes [`Link::Connected`], once the links lock is dropped.
+    /// chatd uses it to hand off text that was written while the account was offline.
+    on_connected: Mutex<Option<OnConnected>>,
 }
 
 fn apply_log_policy(values: &Values) {
@@ -177,6 +180,9 @@ fn apply_log_policy(values: &Values) {
     };
     guard.apply(protocol::log_policy::LogPolicy::for_settings(values));
 }
+
+/// Runs when an account becomes connected, after the links lock is dropped.
+type OnConnected = Arc<dyn Fn(&AccountKey) + Send + Sync>;
 
 /// What asks are standing for the retention thread, to be taken at its next wake.
 #[derive(Default)]
@@ -225,6 +231,7 @@ impl Hub {
             soon: Mutex::default(),
             prune_wake: Condvar::new(),
             notifier: OnceLock::new(),
+            on_connected: Mutex::new(None),
         }
         .tap_settings(&settings)
     }
@@ -391,13 +398,22 @@ impl Hub {
         self.set_linked(account, Link::Offline, "", retrying);
     }
 
+    /// Told once when an account becomes connected, after [`Self::changed`]. The links lock is
+    /// not held. A connect that is already connected does not run it again.
+    pub fn on_connected(&self, hook: impl Fn(&AccountKey) + Send + Sync + 'static) {
+        let hook: OnConnected = Arc::new(hook);
+        *lock(&self.on_connected) = Some(hook);
+    }
+
     fn set_linked(&self, account: &AccountKey, link: Link, detail: &str, reconnecting: bool) {
-        {
+        let became_connected = {
             let mut links = lock(&self.links);
             let at = links.iter().position(|linked| linked.account == *account);
+            let previous = at.and_then(|at| links.get(at).map(|linked| linked.link));
             match (at, link) {
                 (Some(at), Link::SignedOut) => {
                     links.remove(at);
+                    false
                 }
                 (None, Link::SignedOut) => return,
                 (Some(at), _) => {
@@ -408,18 +424,28 @@ impl Hub {
                     linked.link = link;
                     linked.detail = detail.to_owned();
                     linked.reconnecting = reconnecting;
+                    link == Link::Connected && previous != Some(Link::Connected)
                 }
-                (None, _) => links.push(Linked {
-                    account: account.clone(),
-                    link,
-                    detail: detail.to_owned(),
-                    reconnecting,
-                    required: String::new(),
-                    can: Capabilities::default(),
-                }),
+                (None, _) => {
+                    links.push(Linked {
+                        account: account.clone(),
+                        link,
+                        detail: detail.to_owned(),
+                        reconnecting,
+                        required: String::new(),
+                        can: Capabilities::default(),
+                    });
+                    link == Link::Connected
+                }
+            }
+        };
+        self.changed(Change::Status);
+        if became_connected {
+            let hook = lock(&self.on_connected).clone();
+            if let Some(hook) = hook {
+                hook(account);
             }
         }
-        self.changed(Change::Status);
     }
 
     /// What the user must do in the network's own app (a captcha, a verification), in words,
