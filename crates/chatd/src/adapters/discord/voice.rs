@@ -1102,7 +1102,7 @@ impl Discord {
             let request = if watch {
                 MediaRequest::ShareWatch { source: None }
             } else {
-                MediaRequest::ShareSend { on: false, screen: None, quality: None }
+                MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None }
             };
             self.ctx.tell_media(&conversation, request);
         }

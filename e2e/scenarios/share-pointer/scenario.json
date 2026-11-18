@@ -1,0 +1,12 @@
+{
+  "id": "share-pointer",
+  "title": "A shared screen carries the sharer's pointer, and a share can ask for none",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "A phone has no pointer, and its own capture draws none; this is the desktop capture path.",
+    "ios": "A phone has no pointer, and its own capture draws none; this is the desktop capture path."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 120
+}

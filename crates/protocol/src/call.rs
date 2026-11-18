@@ -423,6 +423,11 @@ pub enum MediaRequest {
         /// How much to spend on it. `None` is [`ShareQuality::Best`], as older shells asked for.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quality: Option<ShareQuality>,
+        /// The sharer's pointer drawn into the frames. `None` is on, as viewers follow what is
+        /// pointed at and the Wayland portal already embedded it; `Some(false)` hides it where
+        /// the capture can.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        show_cursor: Option<bool>,
     },
     /// Watch one participant's share. Replaces any share already being watched.
     ShareWatch { source: Option<String> },
@@ -988,12 +993,15 @@ mod tests {
     #[test]
     fn a_share_without_a_screen_is_the_frame_an_older_build_sends() {
         let older: MediaRequest = serde_json::from_str(r#"{"media":"share_send","on":true}"#).unwrap();
-        assert_eq!(older, MediaRequest::ShareSend { on: true, screen: None, quality: None });
+        assert_eq!(older, MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None });
         assert_eq!(serde_json::to_string(&older).unwrap(), r#"{"media":"share_send","on":true}"#);
-        let chosen = MediaRequest::ShareSend { on: true, screen: Some("display:\\\\.\\DISPLAY2".into()), quality: Some(ShareQuality::Balanced) };
+        // The pointer is on when nothing is said, so an older shell gets it like everyone.
+        let chosen = MediaRequest::ShareSend { on: true, screen: Some("display:\\\\.\\DISPLAY2".into()), quality: Some(ShareQuality::Balanced), show_cursor: Some(false) };
         let json = serde_json::to_string(&chosen).unwrap();
-        assert!(json.contains(r#""quality":"balanced""#));
+        assert!(json.contains(r#""quality":"balanced""#) && json.contains(r#""show_cursor":false"#));
         assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), chosen);
+        let shown = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: Some(true) };
+        assert_eq!(serde_json::to_string(&shown).unwrap(), r#"{"media":"share_send","on":true,"show_cursor":true}"#);
     }
 
     #[test]

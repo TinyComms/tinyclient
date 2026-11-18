@@ -259,7 +259,10 @@ fn open_screen() -> Result<Live, PortalError> {
         ("handle_token", str_value(&handle)),
         ("types", Value::from(1u32 | 2u32)),
         ("multiple", Value::from(false)),
-        ("cursor_mode", Value::from(2u32)),
+        // The pointer embedded in the stream buffers, so viewers see it, or hidden when the
+        // share says none (`ShareSend::show_cursor`). Metadata is the other mode, but nothing
+        // here reads PipeWire cursor metadata, so it would draw no pointer at all.
+        ("cursor_mode", Value::from(if super::cursor_shown() { 2u32 } else { 1u32 })),
     ]);
     let session_path =
         OwnedObjectPath::try_from(session.clone()).map_err(|err| failed_err(PORTAL_DOWN, err))?;
