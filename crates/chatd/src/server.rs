@@ -2367,6 +2367,35 @@ impl Chat {
                 }
                 Err(err) => internal(err),
             },
+            Request::Remind { conversation, message_id, remind_at } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                if remind_at.is_some_and(|due| due <= now()) {
+                    return error(ErrorCode::Refused, "That time has passed.");
+                }
+                match self.hub.store().remind(&conversation, &message_id, remind_at) {
+                    Ok(crate::store::RemindOutcome::Set | crate::store::RemindOutcome::Cleared) => {
+                        // The notification thread's next wait is due at a different time now.
+                        self.hub.notify(crate::notify::Event::Remind);
+                        Response::Ok
+                    }
+                    Ok(crate::store::RemindOutcome::Missing) => error(ErrorCode::NotFound, "no such message"),
+                    Ok(crate::store::RemindOutcome::Full) => {
+                        error(ErrorCode::Refused, format!("You have {} reminders already. Cancel one first.", crate::store::REMINDER_CAP))
+                    }
+                    Err(err) => internal(err),
+                }
+            }
+            Request::Reminders { conversation } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.hub.store().reminders(&conversation) {
+                    Ok(reminders) => Response::Reminders { conversation, reminders },
+                    Err(err) => internal(err),
+                }
+            }
 
             Request::People { network, relation, query, offset, limit } => {
                 self.people(network, relation, query, offset, limit)

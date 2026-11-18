@@ -44,6 +44,24 @@ pub const NOTICED_SECONDS: i64 = 86_400;
 pub const QUIET_SECONDS: i64 = 30 * 86_400;
 /// "Talked to lately", for People's Recent section.
 pub const RECENT_SECONDS: i64 = 14 * 86_400;
+/// Most reminders one account may hold. A message can only be reminded about from its menu,
+/// so this bounds a runaway picker, not a hostile peer.
+pub const REMINDER_CAP: usize = 256;
+/// Most due reminders one sweep hands the notification thread. The rest wait for the next wake.
+const DUE_SWEEP: usize = 32;
+
+/// What setting a reminder did, in the order the shell says why it did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemindOutcome {
+    /// Stored, replacing any the message already had.
+    Set,
+    /// Taken back, whether or not there was one.
+    Cleared,
+    /// No such conversation, or no such message in it.
+    Missing,
+    /// The account holds [`REMINDER_CAP`] reminders already.
+    Full,
+}
 
 
 const TABLES: &str = "
@@ -861,6 +879,22 @@ const SETTINGS: &str = "
     ) WITHOUT ROWID;
 ";
 
+/// The reminders the user set on messages ("Remind me…"), like `settings` kept apart from the
+/// cache: a schema change that rebuilds the tables keeps them, and the drop below names this
+/// table so it survives. Created on every open, so no schema version moves for it.
+const REMINDERS_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS reminder (
+        network      TEXT NOT NULL,
+        account      TEXT NOT NULL,
+        conversation TEXT NOT NULL,
+        message_id   TEXT NOT NULL,
+        due          INTEGER NOT NULL,
+        created      INTEGER NOT NULL,
+        PRIMARY KEY (network, account, conversation, message_id)
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS reminder_due ON reminder (due);
+";
+
 /// The shape of the settings rows. A migration from an older one runs in `migrate_settings`.
 const SETTINGS_VERSION: u32 = 1;
 
@@ -930,7 +964,7 @@ impl Store {
             // and the server no longer has the opened text to fill back in.
             if !keep_added_columns(&db, version)? {
                 let old: Vec<String> = db
-                    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'settings'")?
+                    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'settings' AND name != 'reminder'")?
                     .query_map([], |row| row.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
                 for table in old {
@@ -942,6 +976,7 @@ impl Store {
         }
         let mut store = Store { db };
         store.migrate_settings()?;
+        store.migrate_reminders()?;
         Ok(store)
     }
 
@@ -957,6 +992,12 @@ impl Store {
             params![protocol::settings::VERSION, SETTINGS_VERSION.to_string()],
         )?;
         tx.commit()
+    }
+
+    /// Creates the reminders table, on every open, before the socket is served. Nothing to
+    /// convert: the table is new.
+    fn migrate_reminders(&mut self) -> rusqlite::Result<()> {
+        self.db.execute_batch(REMINDERS_TABLE)
     }
 
     /// Every stored setting, the version row included.
@@ -2019,6 +2060,96 @@ impl Store {
 
     pub fn set_starred(&mut self, conversation: &Key, starred: bool) -> rusqlite::Result<bool> {
         self.set_flag(conversation, "starred", starred)
+    }
+
+    // Reminders.
+
+    /// Puts a reminder on a message, or takes it back with `None`. Only a message the cache
+    /// holds can be reminded about, so the id cannot name something else. Setting on a message
+    /// that has one replaces its time; taking one back that is not there is fine. An account at
+    /// [`REMINDER_CAP`] takes no new one, but always replaces what it has.
+    pub fn remind(&mut self, conversation: &Key, message_id: &str, due: Option<i64>) -> rusqlite::Result<RemindOutcome> {
+        let network = word(&conversation.network);
+        if let Some(due) = due {
+            let known = self
+                .db
+                .query_row(
+                    "SELECT 1 FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
+                    params![network, conversation.account, conversation.id, message_id],
+                    |row| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !known {
+                return Ok(RemindOutcome::Missing);
+            }
+            let had = self
+                .db
+                .query_row(
+                    "SELECT 1 FROM reminder WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND message_id = ?4",
+                    params![network, conversation.account, conversation.id, message_id],
+                    |row| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !had {
+                let held: u32 = self.db.query_row(
+                    "SELECT count(*) FROM reminder WHERE network = ?1 AND account = ?2",
+                    params![network, conversation.account],
+                    |row| row.get(0),
+                )?;
+                if held as usize >= REMINDER_CAP {
+                    return Ok(RemindOutcome::Full);
+                }
+            }
+            self.db.execute(
+                "INSERT OR REPLACE INTO reminder (network, account, conversation, message_id, due, created)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![network, conversation.account, conversation.id, message_id, due, crate::hub::now()],
+            )?;
+            return Ok(RemindOutcome::Set);
+        }
+        self.db.execute(
+            "DELETE FROM reminder WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND message_id = ?4",
+            params![network, conversation.account, conversation.id, message_id],
+        )?;
+        Ok(RemindOutcome::Cleared)
+    }
+
+    /// The reminders still waiting in one conversation, due first.
+    pub fn reminders(&self, conversation: &Key) -> rusqlite::Result<Vec<protocol::MessageReminder>> {
+        let mut query = self.db.prepare(
+            "SELECT message_id, due FROM reminder
+              WHERE network = ?1 AND account = ?2 AND conversation = ?3 ORDER BY due",
+        )?;
+        let rows = query.query_map(
+            params![word(&conversation.network), conversation.account, conversation.id],
+            |row| Ok(protocol::MessageReminder { message_id: row.get(0)?, due: row.get(1)? }),
+        )?;
+        rows.collect()
+    }
+
+    /// What is due now, oldest first, with the words each message had. A conversation that has
+    /// left the cache (signed out) holds nothing back here: its reminders wait until it is
+    /// back. At most [`DUE_SWEEP`] at once; the rest come with the next wake.
+    pub fn due_reminders(&self, now: i64) -> rusqlite::Result<Vec<(Key, String, String)>> {
+        let mut query = self.db.prepare(
+            "SELECT r.network, r.account, r.conversation, r.message_id, COALESCE(m.text, '')
+              FROM reminder r
+              JOIN conversation c ON c.network = r.network AND c.account = r.account AND c.id = r.conversation
+              LEFT JOIN message m ON m.network = r.network AND m.account = r.account AND m.conversation = r.conversation AND m.id = r.message_id
+              WHERE r.due <= ?1 ORDER BY r.due LIMIT ?2",
+        )?;
+        let rows = query.query_map(params![now, DUE_SWEEP as i64], |row| {
+            let account = AccountKey { network: from_word(row.get(0)?)?, account: row.get(1)? };
+            Ok((Key::new(&account, row.get::<_, String>(2)?), row.get(3)?, row.get(4)?))
+        })?;
+        rows.collect()
+    }
+
+    /// When the next reminder still waiting is due, if one is.
+    pub fn next_reminder_due(&self) -> rusqlite::Result<Option<i64>> {
+        self.db.query_row("SELECT min(due) FROM reminder", [], |row| row.get::<_, Option<i64>>(0))
     }
 
     /// The user read the conversation up to `message_id`. An empty id means the newest message
@@ -3610,6 +3741,7 @@ mod tests {
         let mut store = Store { db: Connection::open_in_memory().unwrap() };
         store.db.execute_batch(TABLES).unwrap();
         store.db.execute_batch(SETTINGS).unwrap();
+        store.db.execute_batch(REMINDERS_TABLE).unwrap();
         let account = AccountKey { network: Network::Discord, account: "me".into() };
         let row = ConversationRow::new("general", ConversationKind::Channel, "#general");
         store.upsert_conversation(&account, &row).unwrap();
@@ -3652,6 +3784,85 @@ mod tests {
         let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
         assert!(page.messages[0].deleted);
         assert!(page.messages[0].attachments.is_empty());
+    }
+
+    #[test]
+    fn a_reminder_is_set_on_a_stored_message_and_answers_what_is_due() {
+        let (mut store, key) = store();
+        store.ingest(&key, &said("m1", "read this later", NOW), false).unwrap();
+        // Nothing can be reminded about that the cache does not hold.
+        assert_eq!(store.remind(&key, "no-such", Some(NOW + 60)).unwrap(), RemindOutcome::Missing);
+        assert_eq!(store.remind(&key, "m1", Some(NOW + 60)).unwrap(), RemindOutcome::Set);
+        assert_eq!(store.reminders(&key).unwrap(), [protocol::MessageReminder { message_id: "m1".into(), due: NOW + 60 }]);
+        // Not yet: the future one waits.
+        assert!(store.due_reminders(NOW).unwrap().is_empty());
+        assert_eq!(store.next_reminder_due().unwrap(), Some(NOW + 60));
+        // Due: the row answers with the message's own words.
+        assert_eq!(store.due_reminders(NOW + 60).unwrap(), [(key.clone(), "m1".into(), "read this later".into())]);
+        // A message the cache let go of is still reminded about, without its words.
+        store.db.execute("DELETE FROM message WHERE id = 'm1'", []).unwrap();
+        assert_eq!(store.due_reminders(NOW + 60).unwrap(), [(key.clone(), "m1".into(), String::new())]);
+    }
+
+    #[test]
+    fn replacing_a_reminder_moves_its_time_and_cancelling_removes_it() {
+        let (mut store, key) = store();
+        store.ingest(&key, &said("m1", "one", NOW), false).unwrap();
+        store.ingest(&key, &said("m2", "two", NOW), false).unwrap();
+        store.remind(&key, "m1", Some(NOW + 60)).unwrap();
+        store.remind(&key, "m1", Some(NOW + 120)).unwrap();
+        assert_eq!(store.reminders(&key).unwrap(), [protocol::MessageReminder { message_id: "m1".into(), due: NOW + 120 }]);
+        // Cancelling a message that has none is fine, and changes nothing else.
+        assert_eq!(store.remind(&key, "m2", None).unwrap(), RemindOutcome::Cleared);
+        assert_eq!(store.reminders(&key).unwrap().len(), 1);
+        store.remind(&key, "m1", None).unwrap();
+        assert!(store.reminders(&key).unwrap().is_empty());
+        assert_eq!(store.next_reminder_due().unwrap(), None);
+    }
+
+    #[test]
+    fn a_reminder_survives_a_restart_and_a_cache_rebuild() {
+        let path = scratch("remind");
+        let mut store = Store::open(&path).unwrap();
+        let account = AccountKey { network: Network::Slack, account: "T1".into() };
+        let row = ConversationRow::new("later", ConversationKind::Channel, "#later");
+        store.upsert_conversation(&account, &row).unwrap();
+        let key = Key::new(&account, "later");
+        store.ingest(&key, &said("m1", "tomorrow", NOW), false).unwrap();
+        store.remind(&key, "m1", Some(NOW + 3_600)).unwrap();
+        drop(store);
+        // A restart keeps it, and answers it like any other open.
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.reminders(&key).unwrap().len(), 1);
+        assert_eq!(store.next_reminder_due().unwrap(), Some(NOW + 3_600));
+        // A schema change that drops the cache keeps the user's reminders, like the settings.
+        store.db.execute_batch("PRAGMA user_version = 1;").unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert!(store.conversation(&key).unwrap().is_none(), "the cache was rebuilt");
+        assert_eq!(store.reminders(&key).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_account_at_the_reminder_cap_takes_no_new_one_but_replaces_what_it_has() {
+        let (mut store, key) = store();
+        let account = key.account();
+        let other = Key::new(&account, "other");
+        store.upsert_conversation(&account, &ConversationRow::new("other", ConversationKind::Direct, "Other")).unwrap();
+        for slot in 0..REMINDER_CAP {
+            store.ingest(&key, &said(&format!("m{slot}"), "hold", NOW), false).unwrap();
+            store.ingest(&other, &said(&format!("o{slot}"), "hold", NOW), false).unwrap();
+        }
+        for slot in 0..REMINDER_CAP {
+            let message = if slot % 2 == 0 { key.clone() } else { other.clone() };
+            let id = if slot % 2 == 0 { format!("m{slot}") } else { format!("o{slot}") };
+            assert_eq!(store.remind(&message, &id, Some(NOW + slot as i64 + 1)).unwrap(), RemindOutcome::Set);
+        }
+        // One more, in either conversation: refused. The count is per account.
+        store.ingest(&key, &said("extra", "one too many", NOW), false).unwrap();
+        assert_eq!(store.remind(&key, "extra", Some(NOW + 999)).unwrap(), RemindOutcome::Full);
+        // Replacing a reminder the account already holds is not a new one.
+        assert_eq!(store.remind(&key, "m0", Some(NOW + 5)).unwrap(), RemindOutcome::Set);
     }
 
     #[test]

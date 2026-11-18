@@ -523,6 +523,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-mute-until:0");
         return Ok(());
     }
+    // The lab's message-remind driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("message-remind") {
+        if let Err(err) = chatd::notify::prove_message_remind() {
+            eprintln!("message-remind: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-message-remind:0");
+        return Ok(());
+    }
     // The lab's telegram-accounts driver. A build without this stays up and the driver fails.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-accounts") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_accounts() {
