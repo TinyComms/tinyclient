@@ -1,0 +1,12 @@
+{
+  "id": "quick-actions",
+  "title": "A launcher's quick action reaches the window: New Message opens the switcher, Inbox is handed over, Quit ends the app",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "The phone proof build has no taskbar, Dock or desktop launcher. The same actions do nothing there.",
+    "ios": "The phone proof build has no taskbar, Dock or desktop launcher. The same actions do nothing there."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

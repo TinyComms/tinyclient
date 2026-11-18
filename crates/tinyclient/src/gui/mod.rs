@@ -163,7 +163,7 @@ pub(crate) fn prove_discord_format() -> Result<(), &'static str> {
     composer::format::prove()
 }
 
-use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
+use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, MenuItem, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 
 /// The windows' Wayland app id and X11 class: a desktop matches them to `dev.tinyclient.app.desktop`
@@ -866,16 +866,17 @@ pub(crate) fn feed_platform_insets(window: &gpui::Window) {
     let _ = window;
 }
 
-/// Opens the window. `invite` is a `tinyclient://join#…` link the launch carried; `incoming`
-/// delivers the links a second launch hands this one.
-pub fn run(invite: Option<String>, incoming: Option<std::sync::mpsc::Receiver<String>>) {
-    run_with(gpui_platform::application(), invite, incoming);
+/// Opens the window. `invite` is a `tinyclient://join#…` link the launch carried, `action` a
+/// quick action (`--action`/`--dock-action`); `incoming` delivers the links a second launch
+/// hands this one.
+pub fn run(invite: Option<String>, action: Option<crate::quick::QuickAction>, incoming: Option<std::sync::mpsc::Receiver<String>>) {
+    run_with(gpui_platform::application(), invite, action, incoming);
 }
 
 /// Runs the window on an application the caller built. Android builds its own (see
 /// `android_main`): `gpui_platform::application()` there has no NativeActivity session, so
 /// GPUI would open the window before the surface exists.
-pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, incoming: Option<std::sync::mpsc::Receiver<String>>) {
+pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, action: Option<crate::quick::QuickAction>, incoming: Option<std::sync::mpsc::Receiver<String>>) {
     #[cfg(feature = "gui-shot")]
     LAUNCHED.get_or_init(std::time::Instant::now);
     app::crash::install();
@@ -915,6 +916,19 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
                 crate::update::recall();
             }
             cx.set_menus(app::menubar::menus(&[], None, crate::update::menu_label()));
+            // The same three quick actions on every launcher: the Dock menu (macOS) and the
+            // taskbar's jump list (Windows) here, the desktop file's Actions on Linux
+            // (`packaging/linux/dev.tinyclient.app.desktop`). The Windows list is written under
+            // the identity the installer's shortcuts carry, so it groups with them
+            // (`packaging/windows/tinyclient.iss`). A shot run leaves the user's own list alone.
+            if !cfg!(feature = "gui-shot") {
+                cx.set_app_identity(APP_ID, "tinyclient");
+                cx.set_dock_menu(vec![
+                    MenuItem::action("New Message", NewMessage),
+                    MenuItem::action("Inbox", Place1),
+                    MenuItem::action("Quit tinyclient", Quit),
+                ]);
+            }
 
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(window_bounds(prefs.frame, cx))),
@@ -981,6 +995,9 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
             if let Some(invite) = invite {
                 links.borrow_mut().push_back(invite);
             }
+            if let Some(action) = action {
+                links.borrow_mut().push_back(action.link());
+            }
             cx.spawn(async move |cx| {
                 loop {
                     cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
@@ -993,7 +1010,16 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
                     }
                     let next = links.borrow().front().cloned();
                     if let Some(next) = next {
-                        if cx.update(|cx| signin::open_invite(&next, cx)) {
+                        if let Some(action) = crate::quick::parse_link(&next) {
+                            // A quick action a second launch handed over: the same action as
+                            // its menu bar item, once, then the next link in line.
+                            links.borrow_mut().pop_front();
+                            cx.update(|cx| {
+                                dispatch_quick(action, cx);
+                                cx.refresh_windows();
+                                cx.activate(true);
+                            });
+                        } else if cx.update(|cx| signin::open_invite(&next, cx)) {
                             links.borrow_mut().pop_front();
                             cx.update(|cx| { cx.refresh_windows(); cx.activate(true); });
                         }
@@ -1007,6 +1033,17 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
             let _ = window;
             cx.activate(true);
         });
+}
+
+/// What a quick action does when it reaches the window: the same action as its menu bar item,
+/// handled where the others are (`app::menubar`, the shell's keys). Unsigned in, New Message
+/// does what the menu item does with nothing signed in: nothing.
+fn dispatch_quick(action: crate::quick::QuickAction, cx: &mut App) {
+    match action {
+        crate::quick::QuickAction::NewMessage => cx.dispatch_action(&NewMessage),
+        crate::quick::QuickAction::Inbox => cx.dispatch_action(&Place1),
+        crate::quick::QuickAction::Quit => cx.dispatch_action(&Quit),
+    }
 }
 
 /// Watches for the main HWND vanishing while the process hangs. OS thread, not GPUI timers.

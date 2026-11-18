@@ -11,3 +11,19 @@ StartupWMClass=dev.tinyclient.app
 Categories=Network;InstantMessaging;Chat;
 MimeType=x-scheme-handler/tinyclient;
 Keywords=Slack;Discord;Telegram;Teams;Signal;chat;messenger;
+Actions=new-message;inbox;quit;
+
+[Desktop Action new-message]
+Name=New Message
+Exec=tinyclient --action new-message
+Icon=dev.tinyclient.app
+
+[Desktop Action inbox]
+Name=Open Inbox
+Exec=tinyclient --action inbox
+Icon=dev.tinyclient.app
+
+[Desktop Action quit]
+Name=Quit tinyclient
+Exec=tinyclient --action quit
+Icon=dev.tinyclient.app
