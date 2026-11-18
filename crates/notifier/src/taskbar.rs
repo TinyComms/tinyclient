@@ -243,7 +243,7 @@ mod linux {
 
     /// What the entry should show now: the signal's dict, read for `count` (a number) and
     /// `count-visible`. Nothing unread draws nothing, as on the other systems.
-    fn properties(count: u32) -> HashMap<&'static str, Value> {
+    fn properties(count: u32) -> HashMap<&'static str, Value<'static>> {
         let mut shown = HashMap::new();
         shown.insert("count", Value::from(i64::from(count)));
         shown.insert("count-visible", Value::from(badge_words(count).is_some()));
