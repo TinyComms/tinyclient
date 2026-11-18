@@ -1,0 +1,8 @@
+{
+  "id": "signal-view-once",
+  "title": "A view-once photo says it opens on the phone instead of promising a photo that cannot open",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

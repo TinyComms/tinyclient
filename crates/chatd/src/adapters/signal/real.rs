@@ -6,7 +6,7 @@
 //! Signal without a real phone to link from (see `tests/signal.rs` for what is proven).
 
 use super::vault::{self, Vault};
-use super::wire::{Body, Contact, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{view_once_label, Body, Contact, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use futures::StreamExt;
 use presage::libsignal_service::content::ContentBody;
@@ -114,6 +114,38 @@ fn fault<E: std::error::Error>(err: presage::Error<E>) -> Fault {
         (P::UnknownGroup, _) => Fault::Refused("This group isn't one Signal still knows for you.".to_owned()),
         _ => Fault::Net(err.to_string()),
     }
+}
+
+/// What a message that is not drawn here says, in words. A view-once photo or video is named
+/// before its attachment: it opens once, on the phone, so "Photo" would promise a file that is
+/// not here to open and say nothing of why (#748).
+fn unsupported_label(message: &DataMessage) -> Option<&'static str> {
+    if message.is_view_once.unwrap_or(false) {
+        let kind = message.attachments.first().and_then(|attachment| attachment.content_type.as_deref());
+        return Some(view_once_label(kind));
+    }
+    if let Some(attachment) = message.attachments.first() {
+        let kind = attachment.content_type.as_deref().unwrap_or("");
+        return Some(match kind.split('/').next() {
+            Some("image") => "Photo",
+            Some("video") => "Video",
+            Some("audio") => "Audio",
+            _ => "File",
+        });
+    }
+    if message.sticker.is_some() {
+        return Some("Sticker");
+    }
+    if !message.contact.is_empty() {
+        return Some("Contact");
+    }
+    if message.payment.is_some() {
+        return Some("Payment");
+    }
+    if message.gift_badge.is_some() {
+        return Some("Gift badge");
+    }
+    None
 }
 
 impl Real {
@@ -383,27 +415,7 @@ impl Session {
             let mut named = names.into_iter();
             text = text.chars().map(|c| if c == '\u{FFFC}' { named.next().unwrap_or_default() } else { c.to_string() }).collect();
         }
-        let unsupported = if let Some(attachment) = message.attachments.first() {
-            let kind = attachment.content_type.as_deref().unwrap_or("");
-            Some(match kind.split('/').next() {
-                Some("image") => "Photo",
-                Some("video") => "Video",
-                Some("audio") => "Audio",
-                _ => "File",
-            })
-        } else if message.sticker.is_some() {
-            Some("Sticker")
-        } else if !message.contact.is_empty() {
-            Some("Contact")
-        } else if message.payment.is_some() {
-            Some("Payment")
-        } else if message.gift_badge.is_some() {
-            Some("Gift badge")
-        } else if message.is_view_once.unwrap_or(false) {
-            Some("View-once media")
-        } else {
-            None
-        };
+        let unsupported = unsupported_label(message);
         let quote = message.quote.as_ref().map(|quote| Quote {
             sent: quote.id.unwrap_or(0),
             author: quote.author_aci.clone().unwrap_or_default(),
@@ -797,5 +809,42 @@ impl Linker for RealLinker {
         let saved = Saved { aci, name, vault: hex(&key) };
         let session = serde_json::to_string(&saved).map_err(|err| Fault::Net(err.to_string()))?;
         Ok(Linked { session })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A view-once message as the wire carries it: the flag, usually one attachment with its
+    /// content type, and no caption.
+    fn view_once(content_type: Option<&str>) -> DataMessage {
+        let mut message = DataMessage::default();
+        message.is_view_once = Some(true);
+        if let Some(kind) = content_type {
+            message.attachments.push(data_message::AttachmentPointer { content_type: Some(kind.to_owned()), ..Default::default() });
+        }
+        message
+    }
+
+    fn photo() -> DataMessage {
+        let mut message = DataMessage::default();
+        message.attachments.push(data_message::AttachmentPointer { content_type: Some("image/jpeg".to_owned()), ..Default::default() });
+        message
+    }
+
+    #[test]
+    fn a_view_once_photo_is_not_promised_as_a_photo() {
+        // The attachment branch used to name it "Photo": a row that opens to nothing and tells
+        // nobody why.
+        assert_eq!(unsupported_label(&view_once(Some("image/jpeg"))), Some("View-once photo · open it on your phone"));
+        assert_eq!(unsupported_label(&view_once(Some("video/mp4"))), Some("View-once video · open it on your phone"));
+        assert_eq!(unsupported_label(&view_once(None)), Some("View-once media · open it on your phone"));
+
+        // Without the flag a photo stays a photo, and an explicit false is no view-once.
+        assert_eq!(unsupported_label(&photo()), Some("Photo"));
+        let mut plain = photo();
+        plain.is_view_once = Some(false);
+        assert_eq!(unsupported_label(&plain), Some("Photo"));
     }
 }

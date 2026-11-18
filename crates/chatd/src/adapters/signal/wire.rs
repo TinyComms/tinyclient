@@ -100,6 +100,18 @@ pub struct Text {
     pub unsupported: Option<String>,
 }
 
+/// What a view-once photo or video says while its media cannot be opened from here (#748): what
+/// it is, and where it opens. The flag goes with an attachment, and the attachment is not a
+/// "Photo" that opens to nothing. The real wire and the fake one say the same words, so a
+/// scripted test exercises what a person is told.
+pub fn view_once_label(content_type: Option<&str>) -> &'static str {
+    match content_type.and_then(|kind| kind.split('/').next()) {
+        Some("image") => "View-once photo · open it on your phone",
+        Some("video") => "View-once video · open it on your phone",
+        _ => "View-once media · open it on your phone",
+    }
+}
+
 /// Something Signal sent unasked, or the end of the connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -237,5 +249,13 @@ mod tests {
         assert_eq!(Peer::parse("0F6C2A3E-1B4D-4E5F-8A9B-0C1D2E3F4A5B"), None);
         assert_eq!(parse_message_id(&message_id(1_791_892_800_123, aci)), Some((1_791_892_800_123, aci.to_owned())));
         assert_eq!(parse_message_id("17-not-an-aci"), None);
+    }
+
+    #[test]
+    fn a_view_once_message_says_where_it_opens() {
+        assert_eq!(view_once_label(Some("image/jpeg")), "View-once photo · open it on your phone");
+        assert_eq!(view_once_label(Some("video/mp4")), "View-once video · open it on your phone");
+        assert_eq!(view_once_label(Some("application/pdf")), "View-once media · open it on your phone");
+        assert_eq!(view_once_label(None), "View-once media · open it on your phone");
     }
 }

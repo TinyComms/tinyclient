@@ -48,7 +48,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use wire::{Body, Event, Fault, Peer, Quote, Text, Wire};
+use wire::{view_once_label, Body, Event, Fault, Peer, Quote, Text, Wire};
 
 /// Signal has no history to fetch, so nothing is paced.
 const PACE: Duration = Duration::ZERO;
@@ -124,6 +124,18 @@ pub fn prove_signal_own_profile() -> Result<(), String> {
     }
     if !USERNAME_ON_PHONE.to_lowercase().contains("phone") || !PHOTO_ON_PHONE.to_lowercase().contains("phone") {
         return Err("username and photo are still changed on the phone".into());
+    }
+    Ok(())
+}
+
+/// The lab's signal-view-once driver. A build without this stays up, so the driver fails.
+pub fn prove_signal_view_once() -> Result<(), String> {
+    let wants = [(Some("image/jpeg"), "View-once photo · open it on your phone"), (Some("video/mp4"), "View-once video · open it on your phone"), (None, "View-once media · open it on your phone")];
+    for (kind, want) in wants {
+        let said = view_once_label(kind);
+        if said != want {
+            return Err(format!("a view-once message is labelled {said:?}, not {want:?}"));
+        }
     }
     Ok(())
 }
