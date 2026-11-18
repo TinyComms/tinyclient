@@ -212,8 +212,7 @@ pub fn absent(id: &str) -> bool {
 /// its row; macOS and Linux say so until theirs land.
 pub fn not_yet(query: &str) -> Option<&'static str> {
     let query = fold(query.trim());
-    let known = |(term, _): &(&str, &str)| query.contains(term) || (query.len() >= 3 && term.starts_with(&query));
-    NOT_YET.iter().chain(NOT_YET_TRAY.iter()).find(known).map(|(_, words)| *words)
+    NOT_YET.iter().chain(NOT_YET_TRAY.iter()).find(|(term, _)| query.contains(term) || (query.len() >= 3 && term.starts_with(&query))).map(|(_, words)| *words)
 }
 
 /// A search result's breadcrumb: its section, and its group when it has one. P1 and P2 are a
