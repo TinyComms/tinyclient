@@ -831,11 +831,17 @@ fn target(message_id: &str) -> Result<(u64, String), Fault> {
     wire::parse_message_id(message_id).ok_or_else(|| Fault::Refused("That message is no longer there.".to_owned()))
 }
 
+/// The words a quote quotes of a stored message: without the note that the rest is on the
+/// phone, which is this device's invention for drawing the message and never travels.
+fn quoted_words(text: &str) -> String {
+    text.strip_suffix(wire::CONTINUES).map_or_else(|| text.to_owned(), str::to_owned)
+}
+
 fn send_text(account: &Account, conversation: &str, text: &str, reply_to: Option<&str>) -> Result<Message, Fault> {
     let to = peer(conversation)?;
     let quote = match reply_to.map(target).transpose()? {
         Some((sent, author)) => {
-            let text = account.ctx.stored_message(conversation, &wire::message_id(sent, &author)).ok().flatten().map_or_else(String::new, |m| m.text);
+            let text = account.ctx.stored_message(conversation, &wire::message_id(sent, &author)).ok().flatten().map_or_else(String::new, |m| quoted_words(&m.text));
             Some(Quote { sent, author, text })
         }
         None => None,
@@ -966,5 +972,12 @@ mod tests {
         assert_eq!((name.as_deref(), about.as_deref(), emoji.as_deref()), (Some("Ada"), Some("New about"), Some("")));
         assert!(profile_edit("Lunch").is_none());
         assert!(prove_signal_own_profile().is_ok());
+    }
+
+    #[test]
+    fn a_quote_quotes_the_words_without_the_note() {
+        let body = "y".repeat(2_048);
+        assert_eq!(quoted_words(&format!("{body}{}", wire::CONTINUES)), body);
+        assert_eq!(quoted_words("Tuesday, seven sharp."), "Tuesday, seven sharp.");
     }
 }
