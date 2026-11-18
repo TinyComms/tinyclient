@@ -12,6 +12,7 @@
 //! | `group WHO SENT TEXT…` | the same, in the group |
 //! | `mention WHO SENT TEXT…` | the same, in the group, naming us |
 //! | `photo WHO SENT` | WHO sent a photo with no caption |
+//! | `longtext WHO SENT TEXT…` | WHO sent text too long for one message: TEXT is the part in the body, the rest on the phone |
 //! | `quote WHO SENT QUOTED TEXT…` | WHO answered our message sent at QUOTED |
 //! | `mine SENT TEXT…` | we wrote TEXT to Grace from the phone |
 //! | `note SENT TEXT…` | we wrote TEXT to Note to Self from the phone |
@@ -29,7 +30,7 @@
 //! The account: Ada Quill (us); Grace Ombra and Alan Ferro, both contacts; the group "Bridge
 //! club" with all three of us in it.
 
-use super::wire::{Body, Contact, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{Body, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use crate::adapters::script;
 use std::io::Write;
@@ -140,7 +141,7 @@ fn steer(line: &str) -> Vec<Event> {
     let club = || Peer::Group(CLUB.to_owned());
     let rest = |line: &str, skip: usize| line.split_whitespace().skip(skip).collect::<Vec<_>>().join(" ");
     match command {
-        "incoming" | "group" | "mention" | "photo" | "quote" => {
+        "incoming" | "group" | "mention" | "photo" | "quote" | "longtext" => {
             let Some((author, name)) = who(next()) else {
                 return Vec::new();
             };
@@ -156,6 +157,10 @@ fn steer(line: &str) -> Vec<Event> {
                 "mention" => {
                     text.text = format!("@Ada Quill {}", rest(line, 3));
                     text.mentions_me = true;
+                }
+                "longtext" => {
+                    let body = rest(line, 3);
+                    text.text = format!("{body}{CONTINUES}");
                 }
                 _ => text.text = rest(line, 3),
             }

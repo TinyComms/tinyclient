@@ -69,6 +69,10 @@ const REACTIONS_KEPT: usize = 4_096;
 const NO_NAME: &str = "Signal user";
 /// Most pictures asked of Signal for one change to what is on screen.
 const PICTURES: usize = 25;
+/// What the official apps keep in the message itself of a long text; more travels as Signal's
+/// own plain-text attachment, whose first part the body repeats. Sending that way is still to
+/// come. The composer counts in characters where Signal cuts in bytes on a character boundary.
+const TEXT_LIMIT: u32 = 2_048;
 /// Marks a `SetPresence` status that is really an edit of our own profile. A status a person
 /// typed never starts with this, and the server sends it only for Signal, without changing
 /// presence.
@@ -109,6 +113,18 @@ fn profile_part(part: &str) -> Option<Option<String>> {
         Some('0') => Some(None),
         Some('1') => Some(Some(chars.collect())),
         _ => None,
+    }
+}
+
+/// The lab's signal-long-text driver. A build without the Signal library has no driver, so it stays up and the lab fails.
+pub fn prove_signal_long_text() -> Result<(), String> {
+    #[cfg(feature = "signal")]
+    {
+        real::prove_long_text()
+    }
+    #[cfg(not(feature = "signal"))]
+    {
+        Err(unsupported_reason())
     }
 }
 
@@ -384,6 +400,8 @@ fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mute
     let account = Arc::new(Account { ctx: ctx.clone(), wire, me, name, live: live.clone(), pictured: Mutex::default() });
     let _ = ctx.describe(if account.name.is_empty() { "Signal" } else { &account.name }, &account.me);
     show_self(&account);
+    // Nothing is counted until an adapter says so; Signal counts its own body limit.
+    ctx.capabilities(capabilities());
     *current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(account.clone());
     // Dropped while connecting: the command thread has gone and will not close this wire.
     if ctx.stopped() {
@@ -655,6 +673,13 @@ fn offline(ctx: &Context, command: Command) {
 /// emoji per person). No custom emoji, and no cap on how many different ones a message holds.
 pub fn reaction_rules() -> protocol::ReactionRules {
     protocol::ReactionRules { mine: 1, replaces: true, ..protocol::ReactionRules::default() }
+}
+
+/// What this account may send: text up to the body other clients keep in the message itself,
+/// and no files (attachments are neither uploaded nor fetched yet). The counter keeps a long
+/// paste from becoming a message other clients may cut short or refuse.
+fn capabilities() -> protocol::Capabilities {
+    protocol::Capabilities { text_limit: TEXT_LIMIT, ..protocol::Capabilities::default() }
 }
 
 fn serve(account: &Arc<Account>, command: Command) {
