@@ -158,6 +158,12 @@ struct ReadMark {
     /// Seen since, waiting for the second to pass.
     next: Option<String>,
     waiting: bool,
+    /// The user just marked this unread. Messages already on screen must not read it again
+    /// until they scroll. Leaving and coming back starts a fresh mark, so the divider shows.
+    suppress: bool,
+    /// The first frame after the mark records where the list sat. A later move is a scroll.
+    armed: bool,
+    held_at: Option<(usize, f32)>,
 }
 
 /// Selected text, by message and place in it rather than by anything drawn, so it outlives
@@ -794,6 +800,11 @@ impl Pane {
     /// Scrolls by a distance. Following the newest message, the list counts from the end of
     /// its rows rather than the top of the viewport, so the first step up starts a viewport higher.
     fn scroll_by(&mut self, distance: Pixels) {
+        if self.read.suppress {
+            self.read.suppress = false;
+            self.read.armed = false;
+            self.read.held_at = None;
+        }
         let following = !self.is_thread() && self.pinned();
         let viewport = self.list.viewport_bounds().size.height;
         self.list.scroll_by(if following && distance < px(0.) { distance - viewport } else { distance });
@@ -1179,14 +1190,83 @@ impl Pane {
             .filter(|message| message.state == SendState::Sent)
             .max_by_key(|message| message.rank())
             .cloned();
-        if let Some(newest) = newest.filter(|_| may_mark_read(SCREENSHOTS, self.active, self.open.is_some(), true)) {
-            self.saw(&newest, cx);
+        self.note_unread_hold();
+        if !self.read.suppress {
+            if let Some(newest) = newest.filter(|_| may_mark_read(SCREENSHOTS, self.active, self.open.is_some(), true)) {
+                self.saw(&newest, cx);
+            }
         }
+    }
+
+    /// A mark-unread holds until the list moves. The frame that sets it only records the place.
+    fn note_unread_hold(&mut self) {
+        if !self.read.suppress {
+            return;
+        }
+        let top = self.list.logical_scroll_top();
+        let offset: f32 = top.offset_in_item.into();
+        if !self.read.armed {
+            self.read.armed = true;
+            self.read.held_at = Some((top.item_ix, offset));
+            return;
+        }
+        let moved = self.read.held_at.is_some_and(|(row, was)| top.item_ix != row || (offset - was).abs() > 24.);
+        if moved {
+            self.read.suppress = false;
+            self.read.armed = false;
+            self.read.held_at = None;
+        }
+    }
+
+    /// The open conversation was marked unread from outside this pane. The divider sits above
+    /// the newest message, and the messages already on screen are not read again.
+    pub(super) fn hold_unread(&mut self, cx: &mut Context<Self>) {
+        let previous = self.window.messages.len().checked_sub(2).map(|ix| self.window.messages[ix].id.clone());
+        if let Some(open) = self.open.as_mut() {
+            open.last_read = previous;
+        }
+        self.read.suppress = true;
+        self.read.armed = false;
+        self.read.held_at = None;
+        self.read.next = None;
+        let top = self.list.logical_scroll_top();
+        self.relay(self.pinned(), top);
+        cx.notify();
+    }
+
+    /// `message` is the first one that counts as unread. The network hears that, and this pane
+    /// does not immediately read it again.
+    fn mark_message_unread(&mut self, message: &Message, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        let previous = self
+            .window
+            .position(&message.id)
+            .and_then(|ix| ix.checked_sub(1))
+            .map(|ix| self.window.messages[ix].id.clone());
+        if let Some(open) = self.open.as_mut() {
+            open.last_read = previous;
+        }
+        self.read.suppress = true;
+        self.read.armed = false;
+        self.read.held_at = None;
+        self.read.next = None;
+        let top = self.list.logical_scroll_top();
+        self.relay(false, top);
+        let message_id = message.id.clone();
+        cx.background_executor().spawn(async move {
+            ask(&Request::MarkUnread { conversation, message_id })
+        }).detach();
+        cx.notify();
     }
 
     /// The user has this message on screen in the active window. The network hears of the
     /// newest such message at most once a second.
     fn saw(&mut self, message: &Message, cx: &mut Context<Self>) {
+        if self.read.suppress {
+            return;
+        }
         let order = message.rank();
         if self.read.sent.as_ref().is_some_and(|sent| *sent >= order) {
             return;
@@ -1404,6 +1484,14 @@ impl Shell {
         let account = conversation.account();
         let accounts = self.snapshot.iter().flat_map(|snapshot| &snapshot.accounts);
         accounts.filter(|status| status.key == account).map(|status| status.me.clone()).next().unwrap_or_default()
+    }
+
+    /// The open conversation was marked unread from a row or the menu bar. The pane keeps the
+    /// divider and does not read the messages already on screen.
+    pub(super) fn hold_open_unread(&mut self, cx: &mut Context<Self>) {
+        if let Some(pane) = self.conversation_state.pane.get().cloned() {
+            pane.update(cx, |pane, cx| pane.hold_unread(cx));
+        }
     }
 
     /// Back on a phone: what a pane of messages has over it (the viewer, a message's sheet, the

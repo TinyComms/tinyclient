@@ -6,7 +6,7 @@
 // disabled until those views register them with `.on_action`: Attach File (`AttachFile`,
 // composer), Show Details (`ShowDetails`, pane), Mute… (`Mute`, profile), Start Call
 // (`StartCall`, call) and Open in <network> (`OpenInNetwork`, handoff). Items with nothing built
-// behind them are left out rather than shown dead: Mark as Unread, Mark Server as Read,
+// behind them are left out rather than shown dead: Mark Server as Read,
 // Copy Link, Release Notes and Report a Problem…. They come back with what they do, as Find
 // (⌘F, ⇧⌘F) did. Check for Updates… is here; it becomes Restart to Update once a build is staged.
 
@@ -116,6 +116,7 @@ pub fn menus(places: &[(String, usize)], open_network: Option<Network>, update_i
             MenuItem::action("Previous Unread", PreviousUnread),
             MenuItem::separator(),
             MenuItem::action("Mark as Read", MarkRead),
+            MenuItem::action("Mark Unread", MarkUnread),
             MenuItem::separator(),
             MenuItem::action("Show Details", ShowDetails),
             MenuItem::action("Star", Star),
@@ -148,6 +149,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary--", SmallerText, None),
         KeyBinding::new("secondary-0", ActualSize, None),
         KeyBinding::new(if cfg!(target_os = "macos") { "ctrl-cmd-f" } else { "ctrl-alt-f" }, FullScreen, None),
+        KeyBinding::new("alt-secondary-u", MarkUnread, None),
         KeyBinding::new("alt-secondary-i", ShowDetails, None),
         KeyBinding::new("secondary-shift-c", StartCall, None),
         KeyBinding::new("alt-secondary-o", OpenInNetwork, None),

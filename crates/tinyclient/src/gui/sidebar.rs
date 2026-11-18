@@ -659,6 +659,22 @@ impl Shell {
         self.off_thread(cx, move || ask(&request), |_, _, _| {});
     }
 
+    /// The newest stored message becomes the first unread one. An open pane keeps its divider
+    /// and does not immediately read the messages already on screen.
+    pub(super) fn mark_conversation_unread(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        if self.open.as_ref() == Some(&conversation) {
+            self.hold_open_unread(cx);
+        }
+        let request = Request::MarkUnread { conversation, message_id: String::new() };
+        self.off_thread(cx, move || ask(&request), |this, answer, cx| {
+            if let Some(words) = refused(&answer) {
+                this.toast(Some(("icons/circle-alert.svg", theme::danger())), words, cx);
+            }
+            let pages = this.sidebar_state.inbox.stale();
+            this.load_inbox(pages, cx);
+        });
+    }
+
     pub(super) fn mark_conversation_read(&mut self, conversation: Key, cx: &mut Context<Self>) {
         let request = Request::MarkRead { conversation, message_id: String::new() };
         self.off_thread(cx, move || ask(&request), |this, answer, cx| {

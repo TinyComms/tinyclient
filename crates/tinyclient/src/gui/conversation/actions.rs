@@ -211,6 +211,8 @@ enum MenuAct {
     Open,
     /// A file attachment that is already on disk.
     SaveAs,
+    /// This message becomes the first unread one.
+    Unread,
     /// A sent message: ask, unless the click held Shift.
     Delete,
 }
@@ -260,6 +262,9 @@ fn menu_acts(
     }
     if can_save {
         acts.push(MenuAct::SaveAs);
+    }
+    if !can.unsent {
+        acts.push(MenuAct::Unread);
     }
     if can.delete {
         acts.push(MenuAct::Delete);
@@ -765,6 +770,7 @@ impl Pane {
                     self.save_attachment_as(path, name, cx);
                 }
             }
+            MenuAct::Unread => self.mark_message_unread(&message, cx),
             MenuAct::Delete => self.delete(&message, at_once, window, cx),
         }
     }
@@ -922,6 +928,13 @@ impl Pane {
                         .into_any_element(),
                 );
             }
+            if message.state == SendState::Sent {
+                rows.push(
+                    row("sheet-unread", "icons/mail.svg", "Mark unread".into(), false)
+                        .on_click(then(|this, message, _, cx| this.mark_message_unread(message, cx)))
+                        .into_any_element(),
+                );
+            }
             if can.delete {
                 rows.push(rule().into_any_element());
                 rows.push(
@@ -1070,6 +1083,13 @@ impl Pane {
                     menu_item("save-as", Some("icons/folder-plus.svg"), "Save as…", None)
                         .when(lit(MenuAct::SaveAs), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::SaveAs)),
+                );
+            }
+            if message.state == SendState::Sent {
+                items = items.child(
+                    menu_item("unread", Some("icons/mail.svg"), "Mark unread", None)
+                        .when(lit(MenuAct::Unread), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Unread)),
                 );
             }
             if can.delete {
@@ -1389,6 +1409,7 @@ mod tests {
                 MenuAct::Copy,
                 MenuAct::Link,
                 MenuAct::Open,
+                MenuAct::Unread,
             ]
         );
         let mut mine = Message::plain("2", "Robin", "on it", 2, true);
@@ -1401,7 +1422,7 @@ mod tests {
             vec![MenuAct::Retry, MenuAct::Copy, MenuAct::Drop]);
         assert_eq!(
             menu_acts(on, false, 0, false, false, false, true),
-            vec![MenuAct::Reply, MenuAct::Thread, MenuAct::SaveAs],
+            vec![MenuAct::Reply, MenuAct::Thread, MenuAct::SaveAs, MenuAct::Unread],
         );
     }
 

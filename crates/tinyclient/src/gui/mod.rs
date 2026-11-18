@@ -250,6 +250,7 @@ impl Shell {
             .on_action(cx.listener(|this, _: &UpLevel, _, cx| this.up_level(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)))
             .on_action(cx.listener(|this, _: &MarkRead, _, cx| this.mark_open_read(cx)))
+            .on_action(cx.listener(|this, _: &MarkUnread, _, cx| this.mark_open_unread(cx)))
             .on_action(cx.listener(|this, _: &FocusNext, window, cx| this.focus_region(true, window, cx)))
             .on_action(cx.listener(|this, _: &FocusPrevious, window, cx| this.focus_region(false, window, cx)))
             .on_key_down(cx.listener(Self::typed))

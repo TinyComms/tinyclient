@@ -1,0 +1,8 @@
+{
+  "id": "discord-mark-unread",
+  "title": "Marking a Discord message unread moves the read marker back",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

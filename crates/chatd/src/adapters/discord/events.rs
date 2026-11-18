@@ -55,6 +55,9 @@ struct Acked {
     message_id: String,
     #[serde(default)]
     mention_count: Option<u32>,
+    /// The user moved the marker on purpose, including backwards. Absent on an ordinary read.
+    #[serde(default)]
+    manual: bool,
 }
 
 #[derive(Deserialize)]
@@ -395,6 +398,19 @@ impl Discord {
 
     /// Read on another device (or acknowledged from here): the count goes, and the marker moves.
     fn acked(&self, acked: Acked) -> Result<(), Failure> {
+        // A manual ack is the user moving the marker, including back to an older message.
+        // The forward-only guard below stays for every other ack: a refused ack on a blocked
+        // DM must not put the badge back.
+        if super::older_ack_applies(acked.manual) {
+            {
+                let mut state = crate::hub::lock(&self.state);
+                if let Some(ack) = state.acks.get_mut(&acked.channel_id) {
+                    ack.held = None;
+                }
+            }
+            self.ctx.manual_ack(&acked.channel_id, &acked.message_id, acked.mention_count)?;
+            return Ok(());
+        }
         let Some(conversation) = self.ctx.known(&acked.channel_id)? else {
             return Ok(());
         };

@@ -31,6 +31,12 @@ pub fn prove_discord_voice_bitrate() -> Result<(), String> {
 pub fn prove_discord_group_dm() -> Result<(), String> {
     discord::prove_group_dm()
 }
+
+/// `TINYCLIENT_PROVE=discord-mark-unread`. A deliberate unread ack is manual, and an older
+/// ack only moves the marker when it says so.
+pub fn prove_discord_mark_unread() -> Result<(), String> {
+    discord::prove_mark_unread()
+}
 mod recovery;
 pub mod net;
 mod script;
@@ -236,6 +242,9 @@ pub enum Command {
     OpenSpace(String),
     /// Tell the network the conversation has been read up to this message.
     MarkRead { conversation_id: String, message_id: String },
+    /// Tell the network the marker moved back. `message_id` is the last message that still
+    /// counts as read (possibly empty). `mentions` is how many unread messages name the user.
+    MarkUnread { conversation_id: String, message_id: String, mentions: u32 },
     /// Tell Discord several conversations are read, in one request. Other networks ignore it.
     AckBulk { reads: Vec<(String, String)> },
     /// Send, with `client_id` as the network's nonce. Always answer through [`Context::sent`].
@@ -650,6 +659,17 @@ impl Context {
     ) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().set_counts(&conversation, unread, mentions, last_read, updated)? {
+            self.hub.changed(Change::Conversation { conversation });
+            self.hub.changed(Change::Status);
+        }
+        Ok(())
+    }
+
+    /// Another device deliberately moved the read marker, including backwards. [`Self::counts`]
+    /// refuses that move, so a manual acknowledgement uses this instead.
+    pub fn manual_ack(&self, conversation_id: &str, last_read: &str, mentions: Option<u32>) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().apply_manual_ack(&conversation, last_read, mentions)? {
             self.hub.changed(Change::Conversation { conversation });
             self.hub.changed(Change::Status);
         }

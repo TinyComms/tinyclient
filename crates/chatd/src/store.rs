@@ -2057,6 +2057,136 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// `message_id` is the first message that counts as unread. Empty means the newest message
+    /// stored. The marker becomes the newest stored id strictly before that, which may be older
+    /// than the marker already held, and the badge is counted from what is stored. `None` when
+    /// the conversation is missing or there is no message to unread. The pair is the ack target
+    /// (empty when the first stored message is the one marked) and how many of the unread
+    /// messages mention me.
+    pub fn mark_unread(&mut self, conversation: &Key, message_id: &str) -> rusqlite::Result<Option<(String, u32)>> {
+        let have = self.conversation_row_exists(conversation)?;
+        if !have {
+            return Ok(None);
+        }
+        let target = if message_id.is_empty() { self.newest(conversation)?.unwrap_or_default() } else { message_id.to_owned() };
+        if target.is_empty() {
+            return Ok(None);
+        }
+        let marker = self.message_before(conversation, &target)?;
+        let (unread, mentions) = self.unread_from(conversation, &target, true)?;
+        self.db.execute(
+            "UPDATE conversation SET unread = ?4, mentions = ?5, last_read = ?6
+              WHERE network = ?1 AND account = ?2 AND id = ?3",
+            params![word(&conversation.network), conversation.account, conversation.id, unread, mentions, marker],
+        )?;
+        Ok(Some((marker, mentions)))
+    }
+
+    /// A deliberate rewind from another device: `last_read` is the last message that still
+    /// counts as read. Messages stored after it become unread. `mention_count` is the network's
+    /// figure when it sent one. This is allowed to move the marker backwards; [`Self::set_counts`]
+    /// is not.
+    pub fn apply_manual_ack(
+        &mut self,
+        conversation: &Key,
+        last_read: &str,
+        mention_count: Option<u32>,
+    ) -> rusqlite::Result<bool> {
+        let current: Option<(String, String, u32, u32)> = self
+            .db
+            .query_row(
+                "SELECT preview_id, last_read, unread, mentions FROM conversation
+                  WHERE network = ?1 AND account = ?2 AND id = ?3",
+                params![word(&conversation.network), conversation.account, conversation.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((preview, had, had_unread, had_mentions)) = current else {
+            return Ok(false);
+        };
+        let (counted, counted_mentions) = if last_read.is_empty() {
+            self.unread_from(conversation, "", false)?
+        } else {
+            self.unread_from(conversation, last_read, false)?
+        };
+        let ahead = !preview.is_empty()
+            && preview != last_read
+            && (last_read.is_empty() || self.cursor_ahead(conversation, &preview, last_read));
+        let unread = if counted > 0 { counted } else if ahead { 1 } else { 0 };
+        let mentions = mention_count.unwrap_or(counted_mentions);
+        if had == last_read && had_unread == unread && had_mentions == mentions {
+            return Ok(false);
+        }
+        let changed = self.db.execute(
+            "UPDATE conversation SET unread = ?4, mentions = ?5, last_read = ?6
+              WHERE network = ?1 AND account = ?2 AND id = ?3",
+            params![word(&conversation.network), conversation.account, conversation.id, unread, mentions, last_read],
+        )?;
+        Ok(changed == 1)
+    }
+
+    fn conversation_row_exists(&self, conversation: &Key) -> rusqlite::Result<bool> {
+        let found: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT 1 FROM conversation WHERE network = ?1 AND account = ?2 AND id = ?3",
+                params![word(&conversation.network), conversation.account, conversation.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// The newest stored id strictly before `target`. Empty when nothing is.
+    fn message_before(&self, conversation: &Key, target: &str) -> rusqlite::Result<String> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT id FROM message
+                  WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND pending = 0
+                    AND (length(id), id) < (length(?4), ?4)
+                  ORDER BY length(id) DESC, id DESC LIMIT 1",
+                params![word(&conversation.network), conversation.account, conversation.id, target],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// How many stored messages are unread from `anchor`, and how many of those mention me.
+    /// `inclusive` counts `anchor` itself (it is the first unread). Otherwise `anchor` is the
+    /// last message still read, and an empty anchor counts every stored message.
+    fn unread_from(&self, conversation: &Key, anchor: &str, inclusive: bool) -> rusqlite::Result<(u32, u32)> {
+        let (count, mentions): (i64, i64) = if anchor.is_empty() {
+            self.db.query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN json_extract(body, '$.mentions_me') IN (1, 'true') THEN 1 ELSE 0 END), 0)
+                   FROM message
+                  WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND pending = 0",
+                params![word(&conversation.network), conversation.account, conversation.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        } else {
+            let side = if inclusive { ">=" } else { ">" };
+            self.db.query_row(
+                &format!(
+                    "SELECT COUNT(*),
+                            COALESCE(SUM(CASE WHEN json_extract(body, '$.mentions_me') IN (1, 'true') THEN 1 ELSE 0 END), 0)
+                       FROM message
+                      WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND pending = 0
+                        AND (length(id), id) {side} (length(?4), ?4)"
+                ),
+                params![word(&conversation.network), conversation.account, conversation.id, anchor],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        };
+        let unread = u32::try_from(count).unwrap_or(u32::MAX);
+        let mentions = u32::try_from(mentions).unwrap_or(u32::MAX);
+        // A target the store has not seen yet still turns the badge on.
+        let unread = if inclusive && unread == 0 { 1 } else { unread };
+        Ok((unread, mentions))
+    }
+
     /// The newest message id the network named, without touching the preview text. Moves only
     /// forward, so a later history page cannot replace a newer id with an older one.
     pub fn note_newest(&mut self, conversation: &Key, message_id: &str) -> rusqlite::Result<bool> {

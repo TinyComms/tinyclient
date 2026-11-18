@@ -725,6 +725,7 @@ impl Demo {
             | Command::OpenHome
             | Command::OpenThreads(_)
             | Command::MarkRead { .. }
+            | Command::MarkUnread { .. }
             | Command::AckBulk { .. }
             | Command::Typing(_)
             | Command::FollowLink { .. }

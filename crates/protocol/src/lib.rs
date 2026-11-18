@@ -1267,6 +1267,13 @@ pub enum Request {
         conversation: Key,
         message_id: String,
     },
+    /// The user marked `message_id` unread: it is the first message that counts, and the marker
+    /// moves to the one before it. An empty id means the newest message chatd knows. This is the
+    /// user's own marker, so it is told to the network even when read receipts are off.
+    MarkUnread {
+        conversation: Key,
+        message_id: String,
+    },
     /// Every conversation with a badge is read, here and on the network. `network` limits it to
     /// one; `None` is the whole Inbox. Message requests are read here only.
     MarkAllRead {

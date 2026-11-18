@@ -1614,6 +1614,50 @@ fn a_blocked_persons_refused_ack_does_not_bring_the_unread_back() {
 }
 
 #[test]
+fn marking_a_message_unread_moves_the_marker_back_and_a_manual_ack_does_too() {
+    let world = World::start();
+    let stored = wait("history of the conversation", || Some(world.messages("3001")).filter(|messages| messages.len() == 5));
+    assert!(stored.iter().any(|message| message.id == "1300000000000000008"));
+    assert_eq!(
+        world.ask(Request::MarkUnread {
+            conversation: world.key("3001"),
+            message_id: "1300000000000000008".to_owned(),
+        }),
+        Response::Ok
+    );
+    let row = world.conversation("3001");
+    assert_eq!(row.last_read.as_deref(), Some("1300000000000000007"));
+    assert!(row.unread >= 3, "the marked message and everything after it are unread, got {}", row.unread);
+    let acked = wait("the manual acknowledgement", || {
+        world.discord.requests_to("POST", "/channels/3001/messages/1300000000000000007/ack").pop()
+    });
+    assert_eq!(acked.body["manual"], json!(true));
+    assert!(acked.body["mention_count"].is_number());
+    assert!(acked.body["last_viewed"].is_null());
+
+    assert_eq!(
+        world.ask(Request::MarkRead {
+            conversation: world.key("3001"),
+            message_id: "1300000010000000010".to_owned(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation("3001").unread, 0);
+    let heard = world.discord.sequence.load(Ordering::Relaxed);
+    world.discord.push(
+        "MESSAGE_ACK",
+        json!({"channel_id": "3001", "message_id": "1300000000000000007", "mention_count": 1, "manual": true, "version": 820}),
+    );
+    let row = wait("the manual ack from another device", || {
+        let row = world.conversation("3001");
+        (row.last_read.as_deref() == Some("1300000000000000007")).then_some(row)
+    });
+    assert!(row.unread >= 1, "a manual ack unread the channel");
+    assert_eq!(row.mentions, 1);
+    assert!(world.discord.sequence.load(Ordering::Relaxed) > heard);
+}
+
+#[test]
 fn marking_everything_read_tells_discord_in_one_bulk_ack() {
     let world = World::start();
     assert!(world.conversation("3001").unread > 0);
