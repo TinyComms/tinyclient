@@ -395,6 +395,50 @@ impl Notes {
         }
     }
 
+    /// A ring the desktop cannot answer: one banner with one action, "Answer on your phone".
+    /// The same ring note (`ring_id`) and slot as a call's own ring, so ending it reads the
+    /// same, and so a second ring — here or on the phone — is not shown on top of one showing.
+    /// Answers the sound to play (`Some(word)`), or that nothing is shown.
+    pub fn phone_ring(&mut self, conversation: &Key, from: &str, verdict: Option<Verdict>, place: &str, network: &str) -> Option<String> {
+        if self.ringing.is_some() {
+            return None;
+        }
+        let verdict = verdict?;
+        self.ringing = Some(conversation.clone());
+        let caller = if from.is_empty() { place.to_owned() } else { from.to_owned() };
+        let (title, subtitle) = match verdict.preview {
+            Preview::Nothing => (network.to_owned(), String::new()),
+            _ => (caller, if place.is_empty() { format!("{network} · Incoming call") } else { format!("{place} · Incoming call") }),
+        };
+        let id = ring_id(conversation);
+        let note = Note {
+            id: id.clone(),
+            title,
+            subtitle,
+            body: "Incoming call".to_owned(),
+            kind: Kind::CallOnPhone,
+            reply_hint: String::new(),
+            sound: verdict.sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
+            locked_body: "Incoming call".to_owned(),
+        };
+        if let Err(err) = self.sink.post(&note) {
+            tracing::warn!("chatd: ring not shown: {err}");
+            // No banner means no system sound; play it here instead.
+            return verdict.sound;
+        }
+        self.ids.insert(id, conversation.clone());
+        verdict.sound.filter(|word| !system_plays(word))
+    }
+
+    /// That call is over: its note and its sound go. `Some("")` stops a playing ring.
+    pub fn phone_ring_stopped(&mut self, conversation: &Key) -> Option<String> {
+        if self.ringing.as_ref() != Some(conversation) {
+            return None;
+        }
+        self.stop_ring();
+        Some(String::new())
+    }
+
     fn stop_ring(&mut self) {
         self.ringing_busy = false;
         if let Some(key) = self.ringing.take() {
@@ -479,6 +523,11 @@ pub enum Event {
     /// A conversation's row changed: it may have been read.
     Row(Key),
     Call(Option<Call>),
+    /// A ring answered on the phone (a Signal call): one banner, one action, no call on this
+    /// machine. `from` is the caller's name as shown.
+    PhoneRing { conversation: Key, from: String },
+    /// That ring is over.
+    PhoneRingStopped(Key),
     Activated(Activation),
     Test(Sender<(bool, String)>),
     /// S11: a sound, played once whatever S1 says.
@@ -731,6 +780,32 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                         }
                     }
                     None => {}
+                }
+            }
+            Event::PhoneRing { conversation, from } => {
+                let row = hub.store().conversation(&conversation).ok().flatten();
+                let direct = row.as_ref().is_some_and(|row| row.kind.is_direct());
+                let place = row
+                    .filter(|row| row.kind != ConversationKind::Direct)
+                    .map(|row| place(&row))
+                    .unwrap_or_default();
+                let moment = Moment {
+                    dnd: dnd(hub, &conversation),
+                    ..moment(hub, &conversation, &notes, Instant::now())
+                };
+                let verdict = decide_ring_in(&values, &conversation, &moment, direct);
+                let network = conversation.network.label();
+                if let Some(word) = notes.phone_ring(&conversation, &from, verdict, &place, network) {
+                    stop(&mut ring);
+                    ring = play(&word, volume, Some(RING_GAP), RING_FOR);
+                    if ring.is_some() {
+                        tracing::info!("chatd: ringing with {word}");
+                    }
+                }
+            }
+            Event::PhoneRingStopped(conversation) => {
+                if notes.phone_ring_stopped(&conversation).as_deref() == Some("") {
+                    stop(&mut ring);
                 }
             }
             Event::Activated(done) => act(hub, chat, &notes, done),

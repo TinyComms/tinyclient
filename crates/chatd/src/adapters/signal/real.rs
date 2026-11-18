@@ -20,8 +20,8 @@ use presage::libsignal_service::configuration::SignalServers;
 use presage::manager::{Registered, RegistrationData};
 use presage::model::messages::Received;
 use presage::proto::{
-    body_range::AssociatedValue, data_message, receipt_message, sync_message, typing_message, DataMessage, EditMessage, GroupContextV2,
-    ReceiptMessage, SyncMessage, TypingMessage,
+    body_range::AssociatedValue, call_message, data_message, receipt_message, sync_message, typing_message, CallMessage, DataMessage, EditMessage,
+    GroupContextV2, ReceiptMessage, SyncMessage, TypingMessage,
 };
 use presage::store::ContentsStore;
 use presage::Manager;
@@ -484,7 +484,32 @@ impl Session {
                 let started = action == Some(typing_message::Action::Started.into());
                 self.tell(Event::Typing { peer, by: sender, name, started });
             }
+            ContentBody::CallMessage(message) => self.call_message(message, sender, sent).await,
             _ => {}
+        }
+    }
+
+    /// A call. The offer rings, and the hangup or busy with its id ends the ring. An offer of
+    /// our own (another of our devices announcing a call) is not a call to us. Nothing is sent
+    /// back: this client has no call control, so declining is not answering the wire, and the
+    /// caller's own no-answer deadline ends the call on their side.
+    async fn call_message(&mut self, message: CallMessage, sender: String, sent: u64) {
+        if let Some(offer) = message.offer {
+            if sender == self.me {
+                return;
+            }
+            let video = offer.r#type == Some(call_message::offer::Type::OfferVideoCall.into());
+            let name = self.name_of(&sender).await;
+            self.tell(Event::Call { peer: Peer::Direct(sender.clone()), by: sender, name, video, id: offer.id.unwrap_or(0), sent });
+            return;
+        }
+        if let Some(hangup) = message.hangup {
+            let answered = hangup.r#type == Some(call_message::hangup::Type::HangupAccepted.into());
+            self.tell(Event::CallEnded { id: hangup.id.unwrap_or(0), answered });
+            return;
+        }
+        if let Some(busy) = message.busy {
+            self.tell(Event::CallEnded { id: busy.id.unwrap_or(0), answered: false });
         }
     }
 

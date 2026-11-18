@@ -1,0 +1,8 @@
+{
+  "id": "signal-missed-call",
+  "title": "A Signal call rings as a notification, and a call nobody answered leaves a missed-call line",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

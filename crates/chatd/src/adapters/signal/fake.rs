@@ -20,6 +20,9 @@
 //! | `read WHO SENT` | we read WHO's message on the phone |
 //! | `seen WHO SENT` | WHO read our message |
 //! | `typing WHO`, `typing-stop WHO` | WHO is typing to us, or stopped |
+//! | `call WHO SENT`, `call-video WHO SENT` | WHO calls us (a voice offer, or a video one), call id SENT |
+//! | `hangup SENT`, `busy SENT` | the call SENT ended, or we were busy on the other side |
+//! | `hangup-accepted SENT` | the call SENT was answered on another of our devices |
 //! | `refuse WORDS…` | the next send is refused, in those words |
 //! | `drop`, `unlinked` | the connection ends; the phone removed this device |
 //!
@@ -207,6 +210,17 @@ fn steer(line: &str) -> Vec<Event> {
                 return Vec::new();
             };
             vec![Event::Typing { peer: direct(by), by: by.into(), name: name.into(), started: command == "typing" }]
+        }
+        "call" | "call-video" => {
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            vec![Event::Call { peer: direct(author), by: author.into(), name: name.into(), video: command == "call-video", id: sent, sent }]
+        }
+        "hangup" | "hangup-accepted" | "busy" => {
+            let id = next().parse().unwrap_or(T0);
+            vec![Event::CallEnded { id, answered: command == "hangup-accepted" }]
         }
         "drop" => vec![Event::Closed("the fake dropped the connection".into())],
         "unlinked" => vec![Event::Ended("This computer was removed from your Signal account.".into())],

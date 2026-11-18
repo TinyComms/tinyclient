@@ -334,6 +334,37 @@ fn a_group_mention_counts_and_what_cannot_be_drawn_says_so() {
 }
 
 #[test]
+fn an_incoming_call_rings_and_leaves_a_missed_call_or_none_when_answered() {
+    let world = World::linked();
+    world.connected();
+    // An offer is not a message: the row appears, with nothing in it and nothing unread.
+    world.steer(&format!("call grace {}", T0 + 5_000));
+    let row = world.until("Grace's row to be recorded", || world.conversation(GRACE));
+    assert_eq!((row.kind, row.title.as_str(), row.unread), (ConversationKind::Direct, "Grace Ombra", 0));
+    assert!(world.messages(GRACE).is_empty());
+    // The caller gave up: one missed-call line, unread by one.
+    world.steer(&format!("hangup {}", T0 + 5_000));
+    let line = world.arrived(GRACE, &id(T0 + 5_000, GRACE));
+    assert_eq!((&line.kind, line.text.as_str(), line.outgoing, line.sender.id.as_str()), (&MessageKind::System, "Missed voice call", false, GRACE));
+    world.until("one unread", || (world.conversation(GRACE)?.unread == 1).then_some(()));
+    // A missed video call reads as one.
+    world.steer(&format!("call-video grace {}", T0 + 6_000));
+    world.steer(&format!("hangup {}", T0 + 6_000));
+    let video = world.arrived(GRACE, &id(T0 + 6_000, GRACE));
+    assert_eq!((&video.kind, video.text.as_str()), (&MessageKind::System, "Missed video call"));
+    // Answered on the phone: the ring ends and no line is left.
+    world.steer(&format!("call alan {}", T0 + 7_000));
+    world.until("Alan's row to be recorded", || world.conversation(ALAN).map(|row| row.unread == 0));
+    world.steer(&format!("hangup-accepted {}", T0 + 7_000));
+    sleep(Duration::from_millis(300));
+    assert!(world.messages(ALAN).is_empty(), "an answered call is not a missed one");
+    // A hangup for a call we never heard of leaves nothing.
+    world.steer(&format!("busy {}", T0 + 8_000));
+    sleep(Duration::from_millis(300));
+    assert!(world.messages(ALAN).is_empty());
+}
+
+#[test]
 fn reactions_edits_deletes_and_receipts_land_on_the_right_message() {
     let world = World::linked();
     world.connected();

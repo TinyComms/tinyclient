@@ -61,6 +61,9 @@ const TYPING_SHOWN: i64 = 15;
 const UNREAD_KEPT: usize = 500;
 /// Conversations with unread messages remembered.
 const CONVERSATIONS_KEPT: usize = 1_024;
+/// An offer older than this is catch-up from a call that is long over: a line to record when
+/// it ends, not news to ring.
+const CALL_STALE: i64 = 120;
 /// Our sent messages remembered, for the receipt that says where one was read.
 const SENT_KEPT: usize = 1_024;
 /// Reactions remembered, so a new one from the same person replaces their old one.
@@ -240,9 +243,21 @@ struct Live {
     reactions: HashMap<(String, String), String>,
     reacted_order: VecDeque<(String, String)>,
     typed: HashMap<String, Instant>,
+    /// The one incoming call we ring for: its id, conversation, caller, kind, and when the
+    /// offer was sent. A newer offer replaces an older one, so this stays one entry.
+    ring: Option<Ring>,
     /// The user's own Signal settings. Off until the phone says.
     read_receipts: bool,
     typing: bool,
+}
+
+/// What [`Event::Call`] told of, for [`Event::CallEnded`] to end it.
+struct Ring {
+    id: u64,
+    conversation: String,
+    author: String,
+    video: bool,
+    sent: u64,
 }
 
 impl Live {
@@ -596,6 +611,8 @@ fn apply(account: &Account, event: Event) {
                 ctx.typing_stopped(&conversation, &by);
             }
         }
+        Event::Call { peer, by, name, video, id, sent } => incoming_call(account, &peer, &by, &name, video, id, sent),
+        Event::CallEnded { id, answered } => ended_call(account, id, answered),
         Event::Settings { read_receipts, typing } => {
             let mut live = account.live();
             live.read_receipts = read_receipts;
@@ -635,6 +652,56 @@ fn read_elsewhere(account: &Account, read: &[(String, u64)]) {
         let updated = account.ctx.known(&conversation).ok().flatten().map_or(0, |row| row.updated);
         let _ = account.ctx.counts(&conversation, left, 0, Some(&wire::message_id(upto, &author)), updated);
     }
+}
+
+/// Whether an offer sent `sent` (ms) is recent enough to ring for. One from before we
+/// connected is a call that is long over.
+fn fresh_call(sent: u64) -> bool {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis() as u64);
+    sent <= now && now - sent <= (CALL_STALE as u64) * 1_000
+}
+
+/// Someone is calling: their row is recorded (a ring names a conversation the list may not
+/// have yet), and the ring is one notification with one action, "Answer on your phone" —
+/// a Signal call is answered on the phone, never here. An offer that waited while we were
+/// away is remembered for its end, but not replayed as a ring. Only a person calls here: a
+/// group's ring update is a blob the wire cannot open, so it never names a conversation.
+fn incoming_call(account: &Account, peer: &Peer, by: &str, name: &str, video: bool, id: u64, sent: u64) {
+    if by == account.me || !matches!(peer, Peer::Direct(_)) {
+        return;
+    }
+    let conversation = peer.conversation();
+    let caller = if name.is_empty() { account.live().name(by) } else { name.to_owned() };
+    ensure_row(account, peer, &caller);
+    account.live().ring = Some(Ring { id, conversation: conversation.clone(), author: by.to_owned(), video, sent });
+    if fresh_call(sent) {
+        account.ctx.phone_ring(&conversation, &caller);
+    }
+}
+
+/// The call ended: the ring goes, and a call nobody answered here leaves the line the other
+/// networks leave. One answered on the phone leaves none, because it was not missed.
+fn ended_call(account: &Account, id: u64, answered: bool) {
+    if account.live().ring.as_ref().is_none_or(|ring| ring.id != id) {
+        return;
+    }
+    let Some(ring) = account.live().ring.take() else {
+        return;
+    };
+    account.ctx.phone_ring_stopped(&ring.conversation);
+    if answered {
+        return;
+    }
+    let mut line = Message::plain(
+        wire::message_id(ring.sent, &ring.author),
+        account.live().name(&ring.author),
+        if ring.video { "Missed video call" } else { "Missed voice call" },
+        i64::try_from(ring.sent / 1_000).unwrap_or(0),
+        false,
+    );
+    line.kind = MessageKind::System;
+    line.sender.id = ring.author;
+    let _ = account.ctx.quiet_line(&ring.conversation, &line, true);
 }
 
 /// Answers a command while there is no connection.
