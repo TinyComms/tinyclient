@@ -1294,10 +1294,15 @@ pub enum Request {
         message_id: String,
     },
     /// Every conversation with a badge is read, here and on the network. `network` limits it to
-    /// one; `None` is the whole Inbox. Message requests are read here only.
+    /// one; `space` to one Space's conversations; both `None` is the whole Inbox. Message
+    /// requests are read here only.
     MarkAllRead {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         network: Option<Network>,
+        /// The Space to read out, the account it belongs to and the network's own id. An older
+        /// peer that does not know the field ignores it and hears the wider request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
     },
     /// Drops this conversation's cached messages and its badge. A direct or group conversation
     /// leaves the Inbox until a newer message arrives. The network is not asked to delete

@@ -1,0 +1,8 @@
+{
+  "id": "space-mark-all-read",
+  "title": "Marking one Space read clears only that Space's badges",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

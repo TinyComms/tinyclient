@@ -809,13 +809,14 @@ impl Shell {
                     );
                 }
             }
-            // CONTRACT: of the Space menu in `02-layout-navigation.md` only pinning has a
-            // request behind it. Nothing marks a whole Space read or mutes it, and a Space
-            // carries no link to open it in the network's app, so those items are left out.
+            // CONTRACT: of the Space menu in `02-layout-navigation.md` pinning and mark-as-read
+            // have a request behind them. Nothing mutes a whole Space, and a Space carries no
+            // link to open it in the network's app, so those items are left out.
             Menu::Space(space) => {
                 let pinned = self.sidebar_state.pins.contains(space);
                 let key = space.clone();
                 let shown = space.clone();
+                let read = space.clone();
                 items.push(
                     menu_item("details", Some("icons/info.svg"), "Details", None)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -829,6 +830,14 @@ impl Shell {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_menu(cx);
                             this.pin(key.clone(), !pinned, cx);
+                        }))
+                        .into_any_element(),
+                );
+                items.push(
+                    menu_item("space-read", Some("icons/check.svg"), "Mark as read", None)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.mark_space_read(read.clone(), cx);
                         }))
                         .into_any_element(),
                 );

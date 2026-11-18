@@ -307,6 +307,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-discord-group-members:0");
         return Ok(());
     }
+    // The lab's space-mark-all-read driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("space-mark-all-read") {
+        if let Err(err) = chatd::server::prove_space_mark_all_read() {
+            eprintln!("space-mark-all-read: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-space-mark-all-read:0");
+        return Ok(());
+    }
     // The lab's call-leave-clears driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("call-leave-clears") {
         if let Err(err) = chatd::media::prove_call_leave_clears() {
