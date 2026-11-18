@@ -178,13 +178,11 @@ pub fn search(query: &str) -> Vec<&'static Row> {
 }
 
 /// Rows this system cannot honour, so they are neither drawn nor found here: macOS plays
-/// sounds at its own alert volume and hides previews on a locked screen itself; Linux has no
-/// badge or flash here.
+/// sounds at its own alert volume and hides previews on a locked screen itself.
 pub fn absent(id: &str) -> bool {
     match id {
         "G2" => !cfg!(target_os = "macos"),
         "SV" | "NL" => cfg!(target_os = "macos"),
-        "N10" | "N11" => !cfg!(any(windows, target_os = "macos")),
         // Nothing to forget until a link's "Don't ask again" has been used.
         "PF" => crate::gui::app::prefs::trusted_links().is_empty(),
         _ => false,

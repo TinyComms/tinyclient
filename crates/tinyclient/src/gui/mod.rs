@@ -934,6 +934,9 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
                 ..Default::default()
             };
             let opened = cx.open_window(options, |window, cx| {
+                // The launcher entry and the flash's urgency hint are this window's from now.
+                #[cfg(target_os = "linux")]
+                attention::note_window(window.window_handle());
                 // The red button closes the window as ⌘W does (Keep receiving decides how).
                 window.on_window_should_close(cx, |_, cx| {
                     tracing::warn!("tinyclient: window should close");

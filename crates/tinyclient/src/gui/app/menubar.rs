@@ -170,6 +170,10 @@ pub fn quit(cx: &mut App) {
     if let Some(guard) = protocol::log_policy::current() {
         guard.flush();
     }
+    // The launcher entry goes to 0 first: a quit without it leaves the icon with a dead app's
+    // number. The ask is sent before anything is torn down.
+    #[cfg(target_os = "linux")]
+    notifier::taskbar::badge(0);
     cx.quit();
 }
 

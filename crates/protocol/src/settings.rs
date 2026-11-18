@@ -133,10 +133,12 @@ pub const QUIET_FROM: &str = "quiet_from";
 pub const QUIET_TO: &str = "quiet_to";
 /// N9. A call still rings during a pause or quiet hours.
 pub const CALLS_THROUGH: &str = "calls_through";
-/// N10. Flash the taskbar button (Windows) or bounce the Dock icon when something notifies
-/// while the window is in the background.
+/// N10. Ask for attention when something notifies while the window is in the background: the
+/// taskbar button flashes (Windows), the Dock icon bounces (macOS), the window manager's
+/// urgency hint is set (Linux).
 pub const FLASH: &str = "flash";
-/// N11. The number on the taskbar button or the Dock icon.
+/// N11. The number on the taskbar button (Windows), the Dock icon (macOS) or the launcher
+/// icon (Linux).
 pub const BADGE: &str = "badge";
 /// S2, S3, S4: the sounds by [`SOUND_CHOICES`] word. S3 may also be `same`.
 pub const MESSAGE_SOUND: &str = "message_sound";
