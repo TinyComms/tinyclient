@@ -1127,6 +1127,11 @@ pub fn prove_telegram_service_lines() -> Result<(), String> {
     content::prove_service_lines()
 }
 
+/// The lab's telegram-edited driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_edited() -> Result<(), String> {
+    content::prove_edited()
+}
+
 /// The lab's telegram-premium driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_premium() -> Result<(), String> {
     premium::prove()

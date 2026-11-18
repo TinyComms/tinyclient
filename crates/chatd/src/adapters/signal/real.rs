@@ -465,7 +465,8 @@ impl Session {
             ContentBody::EditMessage(EditMessage { target_sent_timestamp, data_message: Some(message) }) => {
                 let peer = self.peer(message.group_v2.as_ref(), &sender).await;
                 let text = self.text(&message, &sender, sent).await.text;
-                self.tell(Event::Edited { peer, author: sender, target: target_sent_timestamp.unwrap_or(0), text });
+                let at = message.timestamp.unwrap_or(sent);
+                self.tell(Event::Edited { peer, author: sender, target: target_sent_timestamp.unwrap_or(0), at, text });
             }
             ContentBody::SynchronizeMessage(sync) => self.sync(sync).await,
             ContentBody::ReceiptMessage(ReceiptMessage { r#type, timestamp }) => {
@@ -501,7 +502,8 @@ impl Session {
             if let Some(EditMessage { target_sent_timestamp, data_message: Some(message) }) = &sent.edit_message {
                 let peer = self.peer(message.group_v2.as_ref(), destination.as_deref().unwrap_or(&me)).await;
                 let text = self.text(message, &me, 0).await.text;
-                self.tell(Event::Edited { peer, author: me, target: target_sent_timestamp.unwrap_or(0), text });
+                let at = message.timestamp.or(sent.timestamp).unwrap_or(0);
+                self.tell(Event::Edited { peer, author: me, target: target_sent_timestamp.unwrap_or(0), at, text });
             }
         }
         if !sync.read.is_empty() {

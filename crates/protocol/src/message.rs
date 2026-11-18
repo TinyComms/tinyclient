@@ -10,6 +10,8 @@ pub const THREAD_FACES: usize = 3;
 pub const CARD_FIELDS: usize = 10;
 /// Most bytes of a voice message's waveform.
 pub const WAVEFORM_LIMIT: usize = 256;
+/// Most characters a message keeps of the text it said before its last edit.
+pub const PRIOR_LIMIT: usize = 4_000;
 
 /// Cuts text from a network to at most `chars` characters, so no frame grows with what a
 /// stranger typed.
@@ -373,6 +375,15 @@ pub struct Message {
     pub deleted: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub edited: bool,
+    /// Unix seconds of the last edit, from a network that hands one over. `None`: never
+    /// edited, or only the fact is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_at: Option<i64>,
+    /// What the message said before its last edit, at most [`PRIOR_LIMIT`] characters. The
+    /// store keeps one prior text when an edit changes the words. `None`: never edited, or
+    /// nothing kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_text: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub pinned: bool,
     /// How many people saw a channel's post, when the network counts them.
@@ -440,6 +451,8 @@ impl Message {
             card: None,
             deleted: false,
             edited: false,
+            edited_at: None,
+            prior_text: None,
             pinned: false,
             views: None,
             mentions_me: false,
@@ -473,6 +486,9 @@ impl Message {
             clip(&mut forwarded.from_title, 200);
             clip(&mut forwarded.from_space, 200);
             clip(&mut forwarded.link, 2_000);
+        }
+        if let Some(prior) = &mut self.prior_text {
+            clip(prior, PRIOR_LIMIT);
         }
         if let Some(card) = &mut self.card {
             clip(&mut card.title, 256);

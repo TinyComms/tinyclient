@@ -1344,7 +1344,8 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             message.expires_at = raw.ttl_period.filter(|ttl| *ttl > 0).map(|ttl| i64::from(raw.date) + i64::from(ttl));
             message.sender = sender(dir, from);
             message.spans = spans(&raw.message, raw.entities.as_deref().unwrap_or(&[]));
-            message.edited = raw.edit_date.is_some() && !raw.edit_hide;
+            message.edited_at = if raw.edit_hide { None } else { raw.edit_date.map(i64::from) };
+            message.edited = message.edited_at.is_some();
             message.pinned = raw.pinned;
             message.mentions_me = raw.mentioned;
             message.reactions = raw.reactions.as_ref().map(reactions).unwrap_or_default();
@@ -1618,6 +1619,7 @@ pub fn merge_album(parts: &[Mapped]) -> Mapped {
     merged.wants = ordered.iter().flat_map(|part| part.wants.clone()).collect();
     merged.message.reactions = merged_reactions(&ordered);
     merged.message.edited = ordered.iter().any(|part| part.message.edited);
+    merged.message.edited_at = ordered.iter().filter_map(|part| part.message.edited_at).max();
     merged.message.pinned = ordered.iter().any(|part| part.message.pinned);
     merged.message.mentions_me = ordered.iter().any(|part| part.message.mentions_me);
     if merged.message.client_id.is_none() {
@@ -1909,6 +1911,59 @@ fn quote_message_header(reply_to: tl::enums::MessageReplyHeader) -> tl::enums::M
     message.message = "On my way".to_owned();
     message.reply_to = Some(reply_to);
     message.from_id = Some(Who::User(7_003).peer());
+    message.into()
+}
+
+/// The lab's telegram-edited check. An edit arrives with its time, and the store keeps what
+/// the words were before, where the replace would otherwise forget both.
+pub(super) fn prove_edited() -> Result<(), String> {
+    use crate::store::{ConversationRow, Store};
+    let dir = Directory::new(1);
+    let first = map(&dir, &edited_message("On my way", None)).ok_or("a plain message maps")?;
+    if first.message.edited || first.message.edited_at.is_some() {
+        return Err("a message nobody edited says it was".into());
+    }
+    let second = map(&dir, &edited_message("On my way, the rope too", Some(1_700_000_100)))
+        .ok_or("an edited message maps")?;
+    if !second.message.edited || second.message.edited_at != Some(1_700_000_100) {
+        return Err("an edit did not keep its fact or its time".into());
+    }
+    let mut store = Store::open(std::path::Path::new(":memory:")).map_err(|err| format!("a store: {err}"))?;
+    let account = protocol::AccountKey { network: protocol::Network::Telegram, account: "me".to_owned() };
+    let row = ConversationRow::new("chat", protocol::ConversationKind::Direct, "Ada");
+    store.upsert_conversation(&account, &row).map_err(|err| format!("a conversation: {err}"))?;
+    let key = protocol::Key::new(&account, "chat");
+    store.ingest(&key, &first.message, false).map_err(|err| format!("the message: {err}"))?;
+    store.ingest(&key, &second.message, false).map_err(|err| format!("the edit: {err}"))?;
+    let page = store
+        .messages(&key, &protocol::Page::Newest, 10, 1_700_000_200)
+        .map_err(|err| format!("a page: {err}"))?
+        .ok_or("the conversation holds the edit")?;
+    let kept = page.messages.first().ok_or("the edited row")?;
+    if !kept.edited || kept.edited_at != Some(1_700_000_100) || kept.prior_text.as_deref() != Some("On my way") {
+        return Err(format!(
+            "the row kept the edit wrong: edited {}, at {:?}, prior {:?}",
+            kept.edited,
+            kept.edited_at,
+            kept.prior_text.as_deref()
+        ));
+    }
+    Ok(())
+}
+
+/// A plain Telegram message from Ada, edited at `edit_date` when it is given.
+fn edited_message(text: &str, edit_date: Option<i32>) -> tl::enums::Message {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    9i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    text.to_owned().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).expect("a blank message reads back");
+    message.from_id = Some(Who::User(7_002).peer());
+    message.edit_date = edit_date;
     message.into()
 }
 

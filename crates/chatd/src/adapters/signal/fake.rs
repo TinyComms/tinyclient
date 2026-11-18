@@ -174,7 +174,7 @@ fn steer(line: &str) -> Vec<Event> {
             };
             let target = next().parse().unwrap_or(0);
             match command {
-                "edit" => vec![Event::Edited { peer: direct(author), author: author.into(), target, text: rest(line, 3) }],
+                "edit" => vec![Event::Edited { peer: direct(author), author: author.into(), target, at: T0 + 60_000, text: rest(line, 3) }],
                 _ => vec![Event::Deleted { peer: direct(author), author: author.into(), target }],
             }
         }

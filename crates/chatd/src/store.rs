@@ -2330,7 +2330,7 @@ impl Store {
         stored.bound();
         stored.id.clear();
         stored.text.clear();
-        let body = serde_json::to_string(&stored).map_err(broken)?;
+        let mut body = serde_json::to_string(&stored).map_err(broken)?;
         let pending = match incoming.state {
             SendState::Sent => 0,
             SendState::Pending => 1,
@@ -2358,6 +2358,32 @@ impl Store {
             Some(_) => Stored::Updated,
             None => Stored::New,
         };
+        // An edit replaces the row whole, which would forget both the time of the edit and
+        // what the words were before. Keep what this update does not repeat, and keep one
+        // capped prior text: the words this update replaces. A row being deleted keeps
+        // nothing.
+        if outcome == Stored::Updated && !incoming.deleted {
+            if let Some((text, old)) = &before {
+                let had = serde_json::from_str::<Message>(old).ok();
+                if stored.edited_at.is_none() {
+                    stored.edited_at = had.as_ref().and_then(|had| had.edited_at);
+                }
+                if had.as_ref().is_some_and(|had| had.edited) {
+                    stored.edited = true;
+                }
+                if stored.prior_text.is_none() {
+                    let mut prior = had.as_ref().and_then(|had| had.prior_text.clone());
+                    if *text != incoming.text && !text.is_empty() {
+                        prior = Some(text.clone());
+                    }
+                    if let Some(mut prior) = prior {
+                        protocol::clip(&mut prior, protocol::PRIOR_LIMIT);
+                        stored.prior_text = Some(prior);
+                    }
+                }
+                body = serde_json::to_string(&stored).map_err(broken)?;
+            }
+        }
         if outcome != Stored::Same {
             tx.execute(
                 "INSERT OR REPLACE INTO message
@@ -3717,6 +3743,62 @@ mod tests {
         assert_eq!(store.until_expiry(NOW).unwrap(), None);
         assert!(store.expire(NOW + 10).unwrap().is_empty());
         assert_eq!(store.conversation(&key).unwrap().unwrap().preview, "permanent edit");
+    }
+
+    #[test]
+    fn an_edit_keeps_when_it_happened_and_what_it_said_before() {
+        let (mut store, key) = store();
+        let mut message = said("41", "first words", NOW);
+        store.ingest(&key, &message, false).unwrap();
+        message.text = "second words".into();
+        message.edited = true;
+        message.edited_at = Some(NOW + 5);
+        store.ingest(&key, &message, false).unwrap();
+        let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(page.messages[0].edited_at, Some(NOW + 5));
+        assert_eq!(page.messages[0].prior_text.as_deref(), Some("first words"));
+
+        // An update that repeats neither keeps both: a reaction must not drop the badge.
+        message.edited = false;
+        message.edited_at = None;
+        store.ingest(&key, &message, false).unwrap();
+        let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert!(page.messages[0].edited);
+        assert_eq!(page.messages[0].edited_at, Some(NOW + 5));
+        assert_eq!(page.messages[0].prior_text.as_deref(), Some("first words"));
+
+        // A second edit makes the words it just replaced the prior text.
+        message.text = "third words".into();
+        message.edited = true;
+        message.edited_at = Some(NOW + 10);
+        store.ingest(&key, &message, false).unwrap();
+        let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(page.messages[0].prior_text.as_deref(), Some("second words"));
+        assert_eq!(page.messages[0].edited_at, Some(NOW + 10));
+    }
+
+    #[test]
+    fn a_deleted_row_keeps_no_prior_text_and_a_kept_prior_is_capped() {
+        let (mut store, key) = store();
+        let mut message = said("42", "gone soon", NOW);
+        store.ingest(&key, &message, false).unwrap();
+        message.deleted = true;
+        message.text = String::new();
+        message.tombstone();
+        store.ingest(&key, &message, false).unwrap();
+        let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(page.messages[0].prior_text, None);
+
+        let mut long = said("43", "x".repeat(protocol::PRIOR_LIMIT + 100).as_str(), NOW);
+        store.ingest(&key, &long, false).unwrap();
+        long.text = "short".into();
+        long.edited = true;
+        long.edited_at = Some(NOW + 1);
+        store.ingest(&key, &long, false).unwrap();
+        let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        let prior = page.messages[0].prior_text.unwrap();
+        assert_eq!(prior.chars().count(), protocol::PRIOR_LIMIT);
+        assert!(prior.starts_with('x'));
     }
 
     #[test]

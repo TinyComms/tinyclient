@@ -278,6 +278,18 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_reaches_the_window_with_its_time_and_prior_text() {
+        let mut window = Window::default();
+        window.merge(&Page::Newest, run(1..=2), false, false);
+        let mut again = run(1..=2);
+        again[1].edited = true;
+        again[1].edited_at = Some(1_700_000_000);
+        again[1].prior_text = Some("what it said".into());
+        assert!(window.merge(&Page::Newest, again, false, false));
+        assert_eq!((window.messages[1].edited_at, window.messages[1].prior_text.as_deref()), (Some(1_700_000_000), Some("what it said")));
+    }
+
+    #[test]
     fn a_refresh_around_the_viewport_replaces_only_what_it_covers() {
         let mut window = Window::default();
         window.merge(&Page::Newest, run(1..=20), false, false);

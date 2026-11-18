@@ -2540,6 +2540,11 @@ mod tests {
             "participants":[],"muted":false,"deafened":false,"joined":1,"engine_linked":true,"video":[]}"#;
         let call: Call = serde_json::from_str(call).unwrap();
         assert_eq!((call.speaking, call.level, call.inputs.len()), (false, None, 0));
+        let message: Message = serde_json::from_str(
+            r#"{"id":"1","sender":{"name":"mara"},"sent":1,"text":"hi"}"#,
+        )
+        .unwrap();
+        assert_eq!((message.edited, message.edited_at, message.prior_text.as_deref()), (false, None, None));
     }
 
     #[test]
@@ -2567,7 +2572,7 @@ mod tests {
     fn empty_fields_stay_off_the_wire() {
         let message = Message::plain("1", "mara", "hi", 1_700_000_000, false);
         let json = serde_json::to_string(&message).unwrap();
-        for absent in ["spans", "attachments", "reactions", "reply_to", "thread", "client_id", "card", "forwarded", "deleted"] {
+        for absent in ["spans", "attachments", "reactions", "reply_to", "thread", "client_id", "card", "forwarded", "deleted", "edited", "edited_at", "prior_text"] {
             assert!(!json.contains(absent), "{absent} in {json}");
         }
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), message);
