@@ -1092,6 +1092,43 @@ pub fn prove_telegram_markers() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's reaction-reactors driver, Telegram's half. The list sent with the message names
+/// each reactor where Telegram shows it; a hidden list (`can_see_list` unset) leaves the chip
+/// a number.
+pub fn prove_telegram_reactors() -> Result<(), String> {
+    let emoji = |emoticon: &str| tl::enums::Reaction::Emoji(tl::types::ReactionEmoji { emoticon: emoticon.to_owned() }.into());
+    let reacted = |user: i64, emoticon: &str| tl::types::MessagePeerReaction {
+        big: false,
+        unread: false,
+        my: false,
+        peer_id: tl::enums::Peer::User(tl::types::PeerUser { user_id }),
+        date: 0,
+        reaction: emoji(emoticon),
+    };
+    let results = |count: i32, emoticon: &str| tl::enums::ReactionCount::Count(tl::types::ReactionCount {
+        chosen_order: None,
+        reaction: emoji(emoticon),
+        count,
+    });
+    let mut shown = tl::types::MessageReactions {
+        min: false,
+        can_see_list: true,
+        reactions_as_tags: false,
+        results: vec![results(2, "👍")],
+        recent_reactions: Some(vec![reacted(42, "👍").into(), reacted(43, "👍").into()]),
+        top_reactors: None,
+    };
+    let read = content::reactions_of(&shown.clone().into());
+    if read.first().map(|one| one.who.as_slice()) != Some(&["u42".to_owned(), "u43".to_owned()][..]) {
+        return Err(format!("the reactors the message carried were dropped: {:?}", read.first().map(|one| &one.who)));
+    }
+    shown.can_see_list = false;
+    if content::reactions_of(&shown.into()).iter().any(|one| !one.who.is_empty()) {
+        return Err("a list Telegram hides was shown anyway".into());
+    }
+    Ok(())
+}
+
 /// The lab's telegram-custom-emoji driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_custom_emoji() -> Result<(), String> {
     let labels = vec![content::EmojiLabel {

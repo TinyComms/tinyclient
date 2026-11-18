@@ -191,6 +191,10 @@ pub struct Preview {
     pub image: Option<MediaFile>,
 }
 
+/// How many reactors a reaction carries: what a network names in the payload it already
+/// sends, never a reason to ask again.
+pub const REACTION_REACTORS: usize = 50;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reaction {
     /// The emoji itself, or `:name:` for a custom one.
@@ -200,6 +204,12 @@ pub struct Reaction {
     pub count: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mine: bool,
+    /// Who gave it, where the network said: their ids as `Sender::id` spells them, at most
+    /// [`REACTION_REACTORS`], in the network's own order. Empty where the network serves
+    /// only a count (Discord's message payload, Tiny's history rows) or hides the list
+    /// (Telegram in channels and large groups): the chip then stays a number and says so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub who: Vec<String>,
 }
 
 /// The earlier message this one answers, as one line.
@@ -469,6 +479,12 @@ impl Message {
         if let Some(thread) = &mut self.thread {
             thread.participants.truncate(THREAD_FACES);
         }
+        for reaction in &mut self.reactions {
+            reaction.who.truncate(REACTION_REACTORS);
+            for id in &mut reaction.who {
+                clip(id, 200);
+            }
+        }
         if let Some(forwarded) = &mut self.forwarded {
             clip(&mut forwarded.from_title, 200);
             clip(&mut forwarded.from_space, 200);
@@ -533,5 +549,32 @@ impl Message {
             .chain(self.reactions.iter_mut().filter_map(|reaction| reaction.file.as_mut()))
             .chain(emoji)
             .chain(&mut self.sender.avatar)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An older frame without `who` still reads, an empty list stays off the wire, and `bound`
+    /// holds the list to its cap.
+    #[test]
+    fn reaction_reactors_read_and_stay_bounded() {
+        let plain = Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: Vec::new() };
+        let on = serde_json::to_string(&plain).unwrap();
+        assert!(!on.contains("who"), "an empty list stays off the wire");
+        assert_eq!(serde_json::from_str::<Reaction>(&on).unwrap(), plain);
+
+        let older = r#"{"emoji":"👍","count":2,"mine":false}"#;
+        assert_eq!(serde_json::from_str::<Reaction>(older).unwrap().who, Vec::<String>::new());
+
+        let mut message = Message::plain("m1", "Ada", "hi", 1_700_000_000, false);
+        let many: Vec<String> = (0..REACTION_REACTORS - 1).map(|one| format!("u{one}")).collect();
+        let mut named = Reaction { emoji: "👍".into(), file: None, count: 60, mine: false, who: many };
+        named.who.insert(1, "u".repeat(500));
+        message.reactions.push(named);
+        message.bound();
+        assert_eq!(message.reactions[0].who.len(), REACTION_REACTORS);
+        assert_eq!(message.reactions[0].who[1].len(), 200, "a long id is clipped");
     }
 }

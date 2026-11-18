@@ -1304,7 +1304,7 @@ fn merge_reaction(ctx: &Context, saved: &Saved, frame: &Value) {
             message.reactions[at].mine = mine;
         }
     } else {
-        message.reactions.push(Reaction { emoji: emoji.to_owned(), file: None, count, mine: mine.unwrap_or(false) });
+        message.reactions.push(Reaction { emoji: emoji.to_owned(), file: None, count, mine: mine.unwrap_or(false), who: Vec::new() });
     }
     let _ = ctx.message(conversation_id, &message);
 }
@@ -1815,7 +1815,7 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
         if reaction.count == 0 || !unicode_emoji(&reaction.emoji) {
             continue;
         }
-        message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me });
+        message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new() });
     }
     relink(&mut message);
     Some(message)
@@ -1886,7 +1886,7 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
         if reaction.count == 0 || !unicode_emoji(&reaction.emoji) {
             continue;
         }
-        message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me });
+        message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new() });
     }
     relink(&mut message);
     Some(message)

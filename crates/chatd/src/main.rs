@@ -181,6 +181,15 @@ fn main() -> io::Result<()> {
         }
         return Ok(());
     }
+    // The lab's reaction-reactors driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("reaction-reactors") {
+        if let Err(err) = chatd::adapters::prove_reactors() {
+            eprintln!("reaction-reactors: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-reaction-reactors:0");
+        return Ok(());
+    }
     // The lab's empty-list driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("empty-list") {
         if let Err(err) = chatd::adapters::tiny::prove_empty_list() {

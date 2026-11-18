@@ -275,7 +275,7 @@ fn span(text: &str, part: &str, style: Style) -> Span {
 }
 
 fn reaction(emoji: &str, count: u32, mine: bool) -> Reaction {
-    Reaction { emoji: emoji.into(), file: None, count, mine }
+    Reaction { emoji: emoji.into(), file: None, count, mine, who: Vec::new() }
 }
 
 /// The conversation worth opening: four people planning a Saturday, over yesterday and today,

@@ -28,6 +28,30 @@ const TOOLBAR_REACH: f32 = 320.;
 /// that a scroll never reads as one, short enough that the actions feel like an answer.
 pub(super) const LONG_PRESS: std::time::Duration = std::time::Duration::from_millis(450);
 
+/// How many reactors a list names before it says how many are kept back.
+const REACTORS_SHOWN: usize = 12;
+
+/// The names one reaction's `who` spells, for a tooltip and a sheet row: the first three
+/// resolved, "Someone" where a name is not known yet, then how many more. `None` for a
+/// reaction the network kept to a count, which names nobody.
+pub(super) fn reactor_words(who: &[String], name: impl Fn(&str) -> String) -> Option<String> {
+    match who.len() {
+        0 => None,
+        1 => Some(format!("{} reacted", said(who, 0, name))),
+        2 => Some(format!("{} and {} reacted", said(who, 0, name), said(who, 1, name))),
+        others => {
+            let head: Vec<String> = who.iter().take(3).enumerate().map(|(at, _)| said(who, at, name)).collect();
+            Some(format!("{} and {} others reacted", head.join(", "), others - 3))
+        }
+    }
+}
+
+/// One name in the list, or Someone where this person is not known to the shell yet.
+fn said(who: &[String], at: usize, name: impl Fn(&str) -> String) -> String {
+    let one = name(&who[at]);
+    if one.is_empty() { "Someone".to_owned() } else { one }
+}
+
 const TOOLBAR_H: f32 = 30.;
 
 /// Top of the toolbar within its row. Negative sits above the row. When that rise would
@@ -69,6 +93,9 @@ pub struct Menu {
     pub at: Point<Pixels>,
     /// Which actionable row the keyboard has selected.
     pub cursor: usize,
+    /// The reaction whose reactors the menu lists, by its place on the message. `None` for
+    /// the message's own menu.
+    pub reactor: Option<usize>,
 }
 
 /// The reaction picker, open for a message.
@@ -667,7 +694,19 @@ impl Pane {
         self.close_picker(cx);
         self.hover = Some(message.id.clone());
         self.menu = Some(Menu { message, at,
-            cursor: 0, });
+            cursor: 0, reactor: None });
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// The people behind one reaction, where the pointer was. A reaction the network kept to
+    /// a count has no list, and its chip never asks for one.
+    pub(super) fn open_reactors(&mut self, message: Rc<Message>, reaction: usize, at: Point<Pixels>,
+        window: &mut Window, cx: &mut Context<Self>) {
+        self.close_picker(cx);
+        self.hover = Some(message.id.clone());
+        self.menu = Some(Menu { message, at,
+            cursor: 0, reactor: Some(reaction) });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -681,6 +720,10 @@ impl Pane {
     /// The actionable rows of the open menu, and which one the keyboard has selected.
     fn menu_state(&self, cx: &Context<Self>) -> Option<(Vec<MenuAct>, usize)> {
         let menu = self.menu.as_ref()?;
+        // A list of reactors has no rows to act on: the keyboard only closes it.
+        if menu.reactor.is_some() {
+            return None;
+        }
         let message = &menu.message;
         let can = self.can(message);
         let quick = if can.unsent || !can.act {
@@ -989,10 +1032,44 @@ impl Pane {
             }
             strip
         });
+        // Who each reaction came from, where the network said. A chip that is only a count
+        // names nobody and is left out.
+        let reacted_by: Vec<AnyElement> = message
+            .reactions
+            .iter()
+            .filter(|one| !one.who.is_empty())
+            .take(3)
+            .map(|one| {
+                let names =
+                    reactor_words(&one.who, |id| match self.person(id) {
+                        Some(person) => self.who(&person, cx).0,
+                        None => String::new(),
+                    })
+                    .unwrap_or_default();
+                div()
+                    .flex_none()
+                    .px(px(20.))
+                    .py(px(4.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(glyph_of(&one.emoji).text_size(px(tokens::scaled(18.))).line_height(px(tokens::scaled(24.))))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .phone_preview()
+                            .text_color(theme::text_soft())
+                            .child(names),
+                    )
+                    .into_any_element()
+            })
+            .collect();
         let panel = sheet_panel()
             .max_h(px(f32::from(window.viewport_size().height) * 0.85))
             .child(about)
             .child(div().flex_none().h(px(1.)).bg(theme::hairline()))
+            .children(reacted_by)
             .children(quick_row.map(|strip| div().flex_none().flex().flex_col().child(strip).child(div().h(px(1.)).mt(px(4.)).bg(theme::hairline()))))
             .child(div().id("sheet-rows").flex_1().min_h_0().overflow_y_scroll().pt(px(4.)).flex().flex_col().children(rows));
         let scrim = sheet_scrim(window)
@@ -1005,6 +1082,9 @@ impl Pane {
         let shown = self.menu.as_ref()?;
         let message = shown.message.clone();
         let at = shown.at;
+        if let Some(reactor) = shown.reactor {
+            return self.reactors_layer(&message, reactor, at, window, cx);
+        }
         let can = self.can(&message);
         let network = self.network().label();
         let chosen = self
@@ -1108,6 +1188,50 @@ impl Pane {
             Layer::Menu,
             window,
             fade_in("message-menu", 120, items),
+        ))
+    }
+
+    /// Who one reaction came from, where the pointer was: the names the network sent with the
+    /// message, in its own order, then how many are kept back. A row opens the person's card;
+    /// a person the shell does not know yet reads Someone and opens nothing.
+    fn reactors_layer(&self, message: &Rc<Message>, reactor: usize, at: Point<Pixels>,
+        window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let reaction = message.reactions.get(reactor)?;
+        let mut list = menu().w(px(248.));
+        for (ix, id) in reaction.who.iter().enumerate() {
+            if ix == REACTORS_SHOWN {
+                list = list.child(menu_separator()).child(menu_item(
+                    "reactors-more",
+                    None,
+                    format!("and {} more", reaction.who.len() - ix),
+                    None,
+                ));
+                break;
+            }
+            let one = match self.person(id) {
+                Some(person) => self.who(&person, cx).0,
+                None => String::new(),
+            };
+            let (label, person) = if one.is_empty() { ("Someone".to_owned(), None) } else { (one, self.person(id)) };
+            // Their card, where this person is known by name.
+            let open = person.map(|person| {
+                cx.listener(move |this: &mut Pane, _: &gpui::ClickEvent, window, cx| {
+                    this.close_menu(cx);
+                    let at = window.mouse_position();
+                    let _ = this.shell.update(cx, |shell, cx| shell.open_profile(person, at, cx));
+                })
+            });
+            list = list.child(
+                menu_item(("reactor", ix).into(), None, label, None).when_some(open, |row, open| row.on_click(open)),
+            );
+        }
+        let list = list.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)));
+        Some(placed(
+            "reactors-menu-scroll",
+            Place::Pointer(at),
+            Layer::Menu,
+            window,
+            fade_in("reactors-menu", 120, list),
         ))
     }
 
@@ -1339,6 +1463,28 @@ impl Pane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reaction_names_who_it_can_and_a_count_only_one_names_nobody() {
+        let known = |id: &str| if id == "u-ghost" { String::new() } else { format!("name of {id}") };
+        // A count-only reaction names nobody: no list, no words.
+        assert_eq!(reactor_words(&[], known), None);
+        assert_eq!(reactor_words(&["u-1".to_owned()], known).as_deref(), Some("name of u-1 reacted"));
+        assert_eq!(
+            reactor_words(&["u-1".to_owned(), "u-2".to_owned()], known).as_deref(),
+            Some("name of u-1 and name of u-2 reacted")
+        );
+        assert_eq!(
+            reactor_words(&["u-1".to_owned(), "u-2".to_owned(), "u-3".to_owned(), "u-4".to_owned(), "u-5".to_owned()], known).as_deref(),
+            Some("name of u-1, name of u-2, name of u-3 and 2 others reacted")
+        );
+        // A person the shell does not know yet is Someone, never a bare id.
+        assert_eq!(reactor_words(&["u-ghost".to_owned()], known).as_deref(), Some("Someone reacted"));
+        assert_eq!(
+            reactor_words(&["u-1".to_owned(), "u-ghost".to_owned()], known).as_deref(),
+            Some("name of u-1 and Someone reacted")
+        );
+    }
 
     #[test]
     fn crossing_onto_toolbar_buttons_keeps_the_same_message() {

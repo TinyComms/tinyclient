@@ -895,6 +895,8 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
             file: None,
             count: mark.who.len().max(1) as u32,
             mine: mark.who.iter().any(|who| who == &account.me),
+            // The phone names the participants who reacted, as the sender ids do.
+            who: mark.who.iter().take(protocol::REACTION_REACTORS).cloned().collect(),
         })
         .collect();
     if message.attachments.is_empty() && note.file {

@@ -551,11 +551,20 @@ impl Slack {
         let reactions = event["reactions"].as_array().into_iter().flatten().filter_map(|reaction| {
             let (emoji, file) = self.reaction(reaction["name"].as_str()?);
             let users = reaction["users"].as_array();
+            // The payload names everyone: the ids the shell draws faces and names from.
+            let who: Vec<String> = users
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .take(protocol::REACTION_REACTORS)
+                .map(str::to_owned)
+                .collect();
             Some(Reaction {
                 emoji,
                 file,
                 count: reaction["count"].as_u64().or(users.map(|users| users.len() as u64)).unwrap_or(1) as u32,
                 mine: users.is_some_and(|users| users.iter().any(|user| user == mine)),
+                who,
             })
         });
         let reactions: Vec<Reaction> = reactions.collect();

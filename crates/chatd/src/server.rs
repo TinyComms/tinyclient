@@ -1425,6 +1425,9 @@ impl Chat {
             file: None,
             count: 1,
             mine: true,
+            // Ours is one person the store cannot name here; the network's word of the
+            // reaction carries the id, and a fresh payload corrects the list.
+            who: Vec::new(),
         };
         let message = match self.hub.store().message(&conversation, &message_id) {
             Ok(Some(message)) => message,

@@ -647,6 +647,9 @@ fn reactions(rich: &mut Rich, reacted: &[model::Reacted]) -> Vec<Reaction> {
             file,
             count: reaction.count,
             mine: reaction.me,
+            // Discord's message payload counts reactions and never names who: the list
+            // would need one request per emoji, which this build does not make.
+            who: Vec::new(),
         }
     });
     mapped.collect()

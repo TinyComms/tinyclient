@@ -3,6 +3,7 @@
 //! row is its final height before any file arrives.
 
 use palette::IntoColor;
+use super::actions::reactor_words;
 use super::emoji;
 use super::icons::{icon, Icon};
 use super::images::Picture;
@@ -1747,18 +1748,41 @@ impl Pane {
             // Joining one the conversation no longer takes, or past a limit, is not offered:
             // the chip says why instead.
             let refused = (!reaction.mine).then(|| self.refusal(message, &toggled)).flatten();
-            let words = match (&refused, reaction.mine) {
+            // Who reacted, where the network said; a chip that is only a count keeps its
+            // own words.
+            let named = !reaction.who.is_empty();
+            let names = named.then(|| {
+                let said = |id: &str| match self.person(id) {
+                    Some(person) => self.who(&person, cx).0,
+                    None => String::new(),
+                };
+                reactor_words(&reaction.who, said).unwrap_or_default()
+            });
+            let words = match (&refused, &names) {
                 (Some(why), _) => why.clone(),
-                (None, true) => "Take back your reaction".to_owned(),
-                (None, false) => "React with this too".to_owned(),
+                (None, Some(names)) => names.clone(),
+                (None, None) if reaction.mine => "Take back your reaction".to_owned(),
+                (None, None) => "React with this too".to_owned(),
             };
             let joins = acts && refused.is_none();
+            // Right-click names them in a list, where one was sent. Left-click keeps its
+            // work: joining or taking the reaction back.
+            let list = (!phone && named).then(|| {
+                let open = message.clone();
+                cx.listener(move |this: &mut Pane, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let at = event.position;
+                    let open = open.clone();
+                    this.open_reactors(open, ix, at, window, cx);
+                })
+            });
             row = row.child(
                 chip(("chip", ix).into(), reaction.mine)
                     .child(emoji)
                     .child(count)
                     .when(acts && !phone, |chip| chip.tooltip(tip(words, None)))
                     .when(joins, |chip| chip.on_click(cx.listener(move |this, _, _, cx| this.react(&id, &toggled, on, cx))))
+                    .when_some(list, |chip, list| chip.on_mouse_down(MouseButton::Right, list))
                     .when(!joins, |chip| chip.cursor_default()),
             );
         }

@@ -2694,6 +2694,14 @@ impl Store {
             (Some(at), true) => {
                 message.reactions[at].count += 1;
                 message.reactions[at].mine |= reaction.mine;
+                // Events arrive one person at a time; the list keeps who it was told of,
+                // newest last, and stays within the cap a payload is held to.
+                for id in &reaction.who {
+                    if !message.reactions[at].who.contains(id) {
+                        message.reactions[at].who.push(id.clone());
+                    }
+                }
+                message.reactions[at].who.truncate(protocol::REACTION_REACTORS);
             }
             (None, true) => message.reactions.push(Reaction {
                 count: 1,
@@ -2703,6 +2711,11 @@ impl Store {
                 let have = &mut message.reactions[at];
                 have.count = have.count.saturating_sub(1);
                 have.mine &= !reaction.mine;
+                // The one who took theirs back leaves the list; a removal that names nobody
+                // (ours, before the network's word) leaves it as it was.
+                if !reaction.who.is_empty() {
+                    have.who.retain(|id| !reaction.who.contains(id));
+                }
                 if have.count == 0 {
                     message.reactions.remove(at);
                 }
@@ -4491,7 +4504,7 @@ mod tests {
         store.register_media(&account, &[(thumb, "https://cdn.example/att-1".into())]).unwrap();
         store.ingest(&key, &message, false).unwrap();
 
-        let thumbs_up = |mine| Reaction { emoji: "👍".into(), file: None, count: 1, mine };
+        let thumbs_up = |mine| Reaction { emoji: "👍".into(), file: None, count: 1, mine, who: Vec::new() };
         assert!(store.react(&key, "1", &thumbs_up(false), true).unwrap());
         assert!(store.react(&key, "1", &thumbs_up(true), true).unwrap());
         assert!(store.react(&key, "1", &thumbs_up(false), false).unwrap());
@@ -4511,6 +4524,38 @@ mod tests {
         store.forget(&account).unwrap();
         assert!(store.conversation(&key).unwrap().is_none());
         assert_eq!(store.media_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_reaction_keeps_who_the_network_named_and_lets_them_go() {
+        let (mut store, key) = store();
+        store.ingest(&key, &said("1", "look", 10), false).unwrap();
+        let by = |id: &str| Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: vec![id.into()] };
+        // One event at a time, as an event that names its one person arrives.
+        assert!(store.react(&key, "1", &by("u-ana"), true).unwrap());
+        assert!(store.react(&key, "1", &by("u-bea"), true).unwrap());
+        // A payload naming everyone replaces the list wholesale.
+        let mut stored = store.message(&key, "1").unwrap().unwrap();
+        stored.reactions[0].count = 3;
+        stored.reactions[0].who = vec!["u-ana".into(), "u-bea".into(), "u-cy".into()];
+        store.ingest(&key, &stored, false).unwrap();
+        let shown = store.message(&key, "1").unwrap().unwrap();
+        assert_eq!(shown.reactions[0].who, ["u-ana", "u-bea", "u-cy"]);
+        // Taking one back names the one who went.
+        assert!(store.react(&key, "1", &by("u-ana"), false).unwrap());
+        let shown = store.message(&key, "1").unwrap().unwrap();
+        assert_eq!((shown.reactions[0].count, shown.reactions[0].who.as_slice()), (2, &["u-bea", "u-cy"][..]));
+        // Ours goes before the network says who: the count moves, the list stands.
+        let ours = |on| Reaction { emoji: "👍".into(), file: None, count: 1, mine: true, who: Vec::new() };
+        assert!(store.react(&key, "1", &ours(true), true).unwrap());
+        assert!(store.react(&key, "1", &ours(false), false).unwrap());
+        let shown = store.message(&key, "1").unwrap().unwrap();
+        assert_eq!((shown.reactions[0].count, shown.reactions[0].who.as_slice()), (2, &["u-bea", "u-cy"][..]));
+        // Nobody left: the reaction goes, list and all.
+        assert!(store.react(&key, "1", &by("u-bea"), false).unwrap());
+        assert!(store.react(&key, "1", &by("u-cy"), false).unwrap());
+        let shown = store.message(&key, "1").unwrap().unwrap();
+        assert!(shown.reactions.is_empty());
     }
 
     #[test]

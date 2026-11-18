@@ -583,6 +583,7 @@ impl Teams {
                 file: None,
                 count: people.len() as u32,
                 mine: people.contains(&me),
+                who: people.iter().take(protocol::REACTION_REACTORS).map(|mri| (*mri).to_owned()).collect(),
             });
         }
         found
