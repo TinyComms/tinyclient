@@ -5,24 +5,27 @@
 //! Linux keeps chatd up through its systemd unit until its StatusNotifierItem lands; macOS
 //! has Keep receiving (G2) instead of an icon, so both stay out of here for now.
 //!
-//! The icon exists exactly while the setting is on ([`set`]). Closing the window with it up
-//! hides the window ([`close_into_tray`]) and leaves chatd running — the process never left,
+//! The icon exists exactly while the setting is on ([`set`]), and when the shell remakes the
+//! taskbar under it (an explorer restart) it comes back on the `TaskbarCreated` broadcast.
+//! Closing the window with it up hides the window ([`close_into_tray`]) and leaves chatd
+//! running — the process never left,
 //! so nothing else has to hold the icon. The icon's click opens the window again; its menu's
 //! Quit sets a flag ([`take_quit`]) that the window's own loop reads, so the ask crosses no
 //! thread but a flag and runs the menu bar's quit, which stops chatd as every way out does.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT, LRESULT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIIF_NOSOUND, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, EnumWindows, GetCursorPos,
-    GetModuleHandleW, GetWindow, GetWindowTextW, GetWindowThreadProcessId, HICON, IsIconic, LoadIconW, MF_STRING, PostMessageW,
-    RegisterClassW, SetForegroundWindow, ShowWindow, ShowWindowAsync, TrackPopupMenu, WNDCLASSW, GW_OWNER, SW_HIDE, SW_RESTORE,
-    SW_SHOW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL,
-    WM_RBUTTONUP,
+    GetWindow, GetWindowTextW, GetWindowThreadProcessId, HICON, IsIconic, LoadIconW, MF_STRING, PostMessageW, RegisterClassW,
+    RegisterWindowMessageW, SetForegroundWindow, ShowWindow, ShowWindowAsync, TrackPopupMenu, WNDCLASSW, GW_OWNER, SW_HIDE,
+    SW_RESTORE, SW_SHOW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+    WM_NULL, WM_RBUTTONUP,
 };
 
 /// The one icon this process adds. One per process is all the shell shows well.
@@ -78,6 +81,9 @@ static WINDOW: AtomicIsize = AtomicIsize::new(0);
 static QUIT: AtomicBool = AtomicBool::new(false);
 /// The balloon showed once per run; after that, closing says nothing.
 static NOTED: AtomicBool = AtomicBool::new(false);
+/// The number of the shell's `TaskbarCreated` broadcast, 0 until asked for: the taskbar was
+/// rebuilt and the icon with it, so this icon has to go back up.
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 /// Whether the icon is up now. Close asks this: the promise "the icon is the way back in"
 /// only holds while it exists, so without it closing keeps quitting as it always did.
@@ -93,6 +99,17 @@ pub fn set(on: bool) {
     } else {
         remove();
     }
+}
+
+/// Asks the shell once for the number of its `TaskbarCreated` broadcast — what it sends every
+/// top-level window when the taskbar is rebuilt (explorer restarted) and every tray icon with
+/// it. The same name answers the same number for the length of the session.
+fn register_taskbar_created() {
+    if TASKBAR_CREATED.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    // SAFETY: a plain lookup of the shell's fixed message name.
+    TASKBAR_CREATED.store(unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) }, Ordering::Relaxed);
 }
 
 /// Whether the menu's Quit has been asked since the last read, for the window's own loop.
@@ -141,6 +158,7 @@ fn add() {
     if active() {
         return;
     }
+    register_taskbar_created();
     let Some(window) = hidden_window() else {
         tracing::warn!("tinyclient: tray window refused");
         return;
@@ -221,6 +239,13 @@ unsafe extern "system" fn wnd_proc(window: HWND, msg: u32, wparam: WPARAM, lpara
         WINDOW.store(0, Ordering::SeqCst);
         return LRESULT(0);
     }
+    if msg != 0 && msg == TASKBAR_CREATED.load(Ordering::SeqCst) {
+        // The shell rebuilt the taskbar and the icon with it, so ours is gone while
+        // `WINDOW` still names a live window: the same rebuild [`set`] does puts it back.
+        remove();
+        add();
+        return LRESULT(0);
+    }
     // SAFETY: the default answer for a message this window has no other opinion on.
     unsafe { DefWindowProcW(window, msg, wparam, lparam) }
 }
@@ -257,8 +282,8 @@ fn menu(window: HWND) {
     unsafe {
         let _ = GetCursorPos(&mut at);
         let _ = SetForegroundWindow(window);
-        let picked = TrackPopupMenu(items, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, at.x, at.y, 0, window, None);
-        let _ = PostMessageW(window, WM_NULL, WPARAM(0), LPARAM(0));
+        let picked = TrackPopupMenu(items, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, at.x, at.y, Some(0), window, None);
+        let _ = PostMessageW(Some(window), WM_NULL, WPARAM(0), LPARAM(0));
         match ask(picked.0 as u32) {
             Some(Ask::Open) => open(),
             Some(Ask::Quit) => QUIT.store(true, Ordering::SeqCst),
@@ -276,7 +301,7 @@ fn menu(window: HWND) {
 fn icon() -> Option<HICON> {
     // SAFETY: reads our own module's resource table.
     let module = unsafe { GetModuleHandleW(None) }.ok()?;
-    let icon = unsafe { LoadIconW(HINSTANCE(module.0), PCWSTR(1 as _)) }.ok()?;
+    let icon = unsafe { LoadIconW(Some(HINSTANCE(module.0)), PCWSTR(1 as _)) }.ok()?;
     Some(icon)
 }
 
