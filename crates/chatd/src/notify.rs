@@ -397,12 +397,11 @@ impl Notes {
 
     /// A ring the desktop cannot answer: one banner with one action, "Answer on your phone".
     /// The same ring note (`ring_id`) and slot as a call's own ring, so ending it reads the
-    /// same, and so a second ring — here or on the phone — is not shown on top of one showing.
-    /// Answers the sound to play (`Some(word)`), or that nothing is shown.
+    /// same, and the newest ring takes the slot as a call's does (`stop_ring`, then post):
+    /// the note that was showing goes with it. Answers the sound to play (`Some(word)`), or
+    /// that nothing is shown.
     pub fn phone_ring(&mut self, conversation: &Key, from: &str, verdict: Option<Verdict>, place: &str, network: &str) -> Option<String> {
-        if self.ringing.is_some() {
-            return None;
-        }
+        self.stop_ring();
         let verdict = verdict?;
         self.ringing = Some(conversation.clone());
         let caller = if from.is_empty() { place.to_owned() } else { from.to_owned() };

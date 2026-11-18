@@ -244,7 +244,8 @@ struct Live {
     reacted_order: VecDeque<(String, String)>,
     typed: HashMap<String, Instant>,
     /// The one incoming call we ring for: its id, conversation, caller, kind, and when the
-    /// offer was sent. A newer offer replaces an older one, so this stays one entry.
+    /// offer was sent. The newest offer replaces an older one, so this stays one entry, and
+    /// only the offer sitting here ends its own ring.
     ring: Option<Ring>,
     /// The user's own Signal settings. Off until the phone says.
     read_receipts: bool,
@@ -673,9 +674,14 @@ fn incoming_call(account: &Account, peer: &Peer, by: &str, name: &str, video: bo
     let conversation = peer.conversation();
     let caller = if name.is_empty() { account.live().name(by) } else { name.to_owned() };
     ensure_row(account, peer, &caller);
-    account.live().ring = Some(Ring { id, conversation: conversation.clone(), author: by.to_owned(), video, sent });
-    if fresh_call(sent) {
-        account.ctx.phone_ring(&conversation, &caller);
+    // The newest offer takes the one ring slot. An older or replayed one leaves both the slot
+    // and the ring alone: a displaced call's hangup matches nothing here, and a losing offer
+    // must not ring for a note its own hangup could not end.
+    if account.live().ring.as_ref().is_none_or(|held| held.sent < sent) {
+        account.live().ring = Some(Ring { id, conversation: conversation.clone(), author: by.to_owned(), video, sent });
+        if fresh_call(sent) {
+            account.ctx.phone_ring(&conversation, &caller);
+        }
     }
 }
 

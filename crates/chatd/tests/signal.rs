@@ -365,6 +365,26 @@ fn an_incoming_call_rings_and_leaves_a_missed_call_or_none_when_answered() {
 }
 
 #[test]
+fn a_newer_offer_takes_the_ring_and_only_its_own_hangup_ends_it() {
+    let world = World::linked();
+    world.connected();
+    // Grace rings, then Alan's newer offer takes the one ring slot.
+    world.steer(&format!("call grace {}", T0 + 5_000));
+    world.until("Grace's row to be recorded", || world.conversation(GRACE));
+    world.steer(&format!("call alan {}", T0 + 6_000));
+    world.until("Alan's row to be recorded", || world.conversation(ALAN));
+    // Grace's hangup is the displaced call's: it must not end Alan's ring or leave a line.
+    world.steer(&format!("hangup {}", T0 + 5_000));
+    sleep(Duration::from_millis(300));
+    assert!(world.messages(GRACE).is_empty() && world.messages(ALAN).is_empty());
+    // Only Alan's own hangup ends it: the caller gave up, so his missed-call line is left.
+    world.steer(&format!("hangup {}", T0 + 6_000));
+    let line = world.arrived(ALAN, &id(T0 + 6_000, ALAN));
+    assert_eq!((&line.kind, line.text.as_str(), line.outgoing, line.sender.id.as_str()), (&MessageKind::System, "Missed voice call", false, ALAN));
+    world.until("one unread", || (world.conversation(ALAN)?.unread == 1).then_some(()));
+}
+
+#[test]
 fn reactions_edits_deletes_and_receipts_land_on_the_right_message() {
     let world = World::linked();
     world.connected();
