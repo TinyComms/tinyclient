@@ -978,12 +978,24 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
             // The HWND can die while GPUI's loop keeps spinning on "Invalid window handle"
             // and never drains timers. Watch from a plain OS thread so a hung UI still exits.
             watch_for_vanished_window();
+            // The tray icon (G3, Windows so far) exists exactly while the choice is on: it is
+            // what makes closing mean hide, and the click on it the way back in
+            // (docs/product/09-settings.md). Off, as prefs ship, nothing is added.
+            #[cfg(windows)]
+            notifier::tray::set(prefs.choices.tray);
             if let Some(invite) = invite {
                 links.borrow_mut().push_back(invite);
             }
             cx.spawn(async move |cx| {
                 loop {
                     cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                    // The tray's Quit (G3) is a flag the icon's window set from GPUI's own
+                    // thread; this loop delivers it, so the ask waits at most one tick and
+                    // runs the menu bar's quit, which stops chatd.
+                    #[cfg(windows)]
+                    if notifier::tray::take_quit() {
+                        let _ = cx.update(|cx| app::menubar::quit(cx));
+                    }
                     if let Some(incoming) = incoming.as_ref() {
                         while links.borrow().len() < 8 {
                             let Ok(link) = incoming.try_recv() else { break; };

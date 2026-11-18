@@ -356,6 +356,11 @@ impl SettingsWindow {
                 if cfg!(target_os = "macos") {
                     groups.push(self.group(&["G2"], None, window, cx).child(caption(self.keep_running_caption())));
                 }
+                // The tray, on the systems with an icon (Windows so far): closing the window
+                // can hide it there, and the icon is the way back in.
+                if cfg!(windows) {
+                    groups.push(self.group(&["G3"], None, window, cx).child(caption(self.tray_caption())));
+                }
                 groups.push(self.group(&["G4"], None, window, cx).child(caption(self.updates_caption())));
                 groups
             }
@@ -478,6 +483,22 @@ impl SettingsWindow {
         }
     }
 
+    fn tray_caption(&self) -> &'static str {
+        if prefs::choices().tray {
+            "Closing the window keeps tinyclient running in the tray. Quit tinyclient ends it."
+        } else {
+            "Off: closing the window quits tinyclient, as it does now."
+        }
+    }
+
+    fn set_tray(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.choose(|choices| choices.tray = on, cx);
+        // The icon is the way back in, so it exists exactly while the switch is on. Never in a
+        // screenshot build: that window exists to be pictured, and the shot must not keep it.
+        #[cfg(all(windows, not(feature = "gui-shot")))]
+        notifier::tray::set(on);
+    }
+
     fn set_updates(&mut self, on: bool, cx: &mut Context<Self>) {
         self.choose(|choices| choices.updates = on, cx);
         if on {
@@ -541,6 +562,10 @@ impl SettingsWindow {
             "G2" => {
                 let on = values.on(KEEP_RUNNING);
                 self.switch_row(id, on, true, None, move |this, on, cx| this.set_switch(id, KEEP_RUNNING, on, true, cx), cx)
+            }
+            "G3" => {
+                let on = choices.tray;
+                self.switch_row(id, on, false, None, move |this, on, cx| this.set_tray(on, cx), cx)
             }
             "G4" => {
                 let on = choices.updates;
