@@ -53,6 +53,8 @@ struct Server {
     seen: Vec<String>,
     /// Sealed reaction blobs, in `seq` order.
     blobs: Vec<Value>,
+    /// Reaction list rows a misbehaving server adds: no id, no ciphertext, position only.
+    junk: Vec<Value>,
 }
 
 struct Fake {
@@ -76,6 +78,7 @@ impl Fake {
             messages: Vec::new(),
             seen: Vec::new(),
             blobs: Vec::new(),
+            junk: Vec::new(),
         }));
         let serving = server.clone();
         let base = crate::adapters::tiny::serve(move |request| {
@@ -220,12 +223,18 @@ impl Server {
             "POST" if path == format!("{conversation}/reactions") => self.reaction(&caller, &body),
             "GET" if path == format!("{conversation}/reactions") => {
                 let after: i64 = param("after").parse().unwrap_or(0);
-                let rows: Vec<Value> = self
+                let mut rows: Vec<Value> = self
                     .blobs
                     .iter()
                     .filter(|row| row["seq"].as_i64().unwrap_or(0) > after)
                     .cloned()
                     .collect();
+                rows.extend(
+                    self.junk
+                        .iter()
+                        .filter(|row| row["seq"].as_i64().unwrap_or(0) > after)
+                        .cloned(),
+                );
                 (200, Value::Array(rows))
             }
             _ => (404, json!({ "error": "not_found" })),
@@ -1017,5 +1026,188 @@ fn a_reaction_that_cannot_open_yet_is_retried_when_its_epoch_arrives() {
     }
     let asks = lock(&fake.server).seen.iter().filter(|seen| seen.starts_with("GET") && seen.contains("/reactions")).count();
     assert_eq!(asks - before, 2, "the same blob was asked for again, from the waiting cursor");
+}
+
+/// A reaction that could not open three times is skipped for this process only: after a
+/// restart, with the keys it needs arrived, the fold steps back below it and lands it.
+#[test]
+fn a_blob_skipped_three_times_is_tried_again_after_a_restart() {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "recheck-ada");
+    let mut bea = device(&fake, BEA, "recheck-bea");
+    ada.sync(CONVERSATION).unwrap();
+    bea.sync(CONVERSATION).unwrap();
+    ada.sync(CONVERSATION).unwrap();
+    // A third person joins: the commit moves the epoch, and a device behind it cannot
+    // open what is sealed after.
+    let mut cyd = device(&fake, CYD, "recheck-cyd");
+    cyd.sync(CONVERSATION).unwrap();
+    ada.sync(CONVERSATION).unwrap();
+    let first = id_of(
+        &ada.post(CONVERSATION, "c-1", Kind::Message, None, &Envelope::message("hello"), &[])
+            .unwrap(),
+    );
+    ada.react(CONVERSATION, &first, "\u{1f44d}", true).unwrap();
+    let blob_id = lock(&fake.server).blobs[0]["id"].as_str().unwrap().to_owned();
+    // Three folds cannot open the blob: the budget runs out, the fold moves past it, and
+    // the blob is remembered for a restart — not written off in what persists.
+    for _ in 0..3 {
+        assert!(bea.reaction_changes(CONVERSATION).is_empty());
+    }
+    assert!(bea.reaction_of(CONVERSATION, &first, "\u{1f44d}").is_none());
+    let fold = bea.folds.get(CONVERSATION).unwrap();
+    assert_eq!(fold.state.at, 1, "the cursor passed the skipped blob");
+    assert!(fold.state.recheck.contains_key(&blob_id), "the blob waits for a restart");
+    assert!(!fold.state.seen.contains_key(&blob_id), "the skip is not persisted");
+    // The restart: a fresh device over Bea's own state and the sealed cache she left.
+    let saved_bea = bea.saved.clone();
+    let dir_bea = bea.dir.clone();
+    drop(bea);
+    let mut bea = Device::new(&saved_bea);
+    bea.dir = dir_bea.clone();
+    bea.enrol();
+    // Catching up brings the commit; the fold steps back below the blob and opens it.
+    bea.sync(CONVERSATION).unwrap();
+    let landed = bea.reaction_changes(CONVERSATION);
+    match landed.as_slice() {
+        [landed] if landed.message == first && landed.emoji == "\u{1f44d}" && landed.count == 1 && !landed.mine => {}
+        other => panic!("after the restart Bea folds {other:?}, not the thumbs-up"),
+    }
+    assert!(
+        !bea.folds.get(CONVERSATION).unwrap().state.recheck.contains_key(&blob_id),
+        "a landed blob is off the recheck list"
+    );
+}
+
+/// A page of reaction rows that says nothing this device can file moves the cursor past
+/// itself: the same window is never asked for again.
+#[test]
+fn a_page_of_rows_without_ids_moves_the_cursor_and_is_not_asked_for_twice() {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "idless-ada");
+    let mut bea = device(&fake, BEA, "idless-bea");
+    ada.sync(CONVERSATION).unwrap();
+    bea.sync(CONVERSATION).unwrap();
+    ada.sync(CONVERSATION).unwrap();
+    let first = id_of(
+        &ada.post(CONVERSATION, "c-1", Kind::Message, None, &Envelope::message("hello"), &[])
+            .unwrap(),
+    );
+    ada.react(CONVERSATION, &first, "\u{1f44d}", true).unwrap();
+    let landed = bea.heard_reaction(CONVERSATION);
+    match landed.as_slice() {
+        [landed] if landed.count == 1 => {}
+        other => panic!("Bea folds {other:?}, not one thumbs-up"),
+    }
+    // A misbehaving server: a full page of rows with no id and no ciphertext, behind the
+    // folded blob.
+    for seq in 2..=(REACTIONS_PAGE as i64 + 1) {
+        lock(&fake.server).junk.push(json!({ "seq": seq, "created_at": "2026-11-05T00:00:00Z" }));
+    }
+    let asks = |fake: &Fake| {
+        lock(&fake.server).seen.iter().filter(|seen| seen.starts_with("GET") && seen.contains("/reactions")).count()
+    };
+    // One pass walks the full page, one confirms the list moved, and the fold stops.
+    let _ = bea.heard_reaction(CONVERSATION);
+    let walked = asks(&fake);
+    assert!(walked <= 3, "a page of id-less rows was walked {walked} times in one fold");
+    assert_eq!(
+        bea.folds.get(CONVERSATION).unwrap().state.at,
+        REACTIONS_PAGE as i64 + 1,
+        "the cursor moved past the unreadable rows"
+    );
+    // The next fold does not ask for that window again.
+    let _ = bea.heard_reaction(CONVERSATION);
+    assert_eq!(asks(&fake) - walked, 1, "the id-less window was asked for again");
+}
+
+/// A fold kept dozens of times does not pile copies of itself into the sealed log: the log
+/// is rewritten with one fold line, and a restart still restores the chips from it.
+#[test]
+fn a_fold_kept_many_times_leaves_the_sealed_log_bounded() {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "compact-ada");
+    let mut bea = device(&fake, BEA, "compact-bea");
+    ada.sync(CONVERSATION).unwrap();
+    bea.sync(CONVERSATION).unwrap();
+    ada.sync(CONVERSATION).unwrap();
+    let first = id_of(
+        &ada.post(CONVERSATION, "c-1", Kind::Message, None, &Envelope::message("hello"), &[])
+            .unwrap(),
+    );
+    let fold_lines = |bea: &Device| {
+        std::fs::read_to_string(bea.dir.join(format!("cache-{CONVERSATION}.log")))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("reactionfold "))
+            .count()
+    };
+    // Twice the compaction batch of folds: every reaction moves the cursor, every fold
+    // keeps it, and the log is rewritten somewhere along the way.
+    for _ in 0..(FOLD_LINES_PER_COMPACT * 2) {
+        ada.react(CONVERSATION, &first, "\u{1f44d}", true).unwrap();
+        let landed = bea.heard_reaction(CONVERSATION);
+        assert_eq!(landed.len(), 1, "every reaction is a change of its own");
+    }
+    let kept = fold_lines(&bea);
+    assert!(kept > 0, "the fold is in the sealed log");
+    assert!(
+        kept < FOLD_LINES_PER_COMPACT as usize,
+        "the log kept {kept} fold lines for {} folds",
+        FOLD_LINES_PER_COMPACT * 2
+    );
+    match bea.reaction_of(CONVERSATION, &first, "\u{1f44d}") {
+        Some(landed) if landed.count == 1 => {}
+        other => panic!("Bea folds {other:?}, not one thumbs-up of many"),
+    }
+    // The restart restores the fold from the rewritten log, and asks for nothing behind
+    // its cursor.
+    let saved_bea = bea.saved.clone();
+    let dir_bea = bea.dir.clone();
+    drop(bea);
+    let mut bea = Device::new(&saved_bea);
+    bea.dir = dir_bea.clone();
+    bea.enrol();
+    assert!(bea.reaction_changes(CONVERSATION).is_empty());
+    match bea.reaction_of(CONVERSATION, &first, "\u{1f44d}") {
+        Some(landed) if landed.count == 1 && !landed.mine => {}
+        other => panic!("after the restart Bea folds {other:?}, not the thumbs-up"),
+    }
+}
+
+/// A taken-back reaction leaves no empty entry behind, and the fold does not remember
+/// blobs its cursor has passed: the fold stays as big as the live reactions.
+#[test]
+fn a_taken_back_reaction_leaves_no_empty_entry_and_seen_stays_bounded() {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "bound-ada");
+    let mut bea = device(&fake, BEA, "bound-bea");
+    ada.sync(CONVERSATION).unwrap();
+    bea.sync(CONVERSATION).unwrap();
+    ada.sync(CONVERSATION).unwrap();
+    let first = id_of(
+        &ada.post(CONVERSATION, "c-1", Kind::Message, None, &Envelope::message("hello"), &[])
+            .unwrap(),
+    );
+    let key = format!("{first}\u{1f}\u{1f44d}");
+    for _ in 0..4 {
+        ada.react(CONVERSATION, &first, "\u{1f44d}", true).unwrap();
+        let landed = bea.heard_reaction(CONVERSATION);
+        match landed.as_slice() {
+            [landed] if landed.count == 1 && !landed.mine => {}
+            other => panic!("Bea folds {other:?}, not one thumbs-up"),
+        }
+        ada.react(CONVERSATION, &first, "\u{1f44d}", false).unwrap();
+        // The take-back still tells the store: a count of zero, no entry left behind.
+        let landed = bea.heard_reaction(CONVERSATION);
+        match landed.as_slice() {
+            [landed] if landed.count == 0 => {}
+            other => panic!("a taken-back reaction folds {other:?}, not zero"),
+        }
+        let fold = bea.folds.get(CONVERSATION).unwrap();
+        assert!(!fold.state.on.contains_key(&key), "an empty entry stayed behind after the take-back");
+        assert!(fold.state.seen.is_empty(), "the fold kept blobs its cursor has passed");
+    }
+    assert!(bea.reaction_of(CONVERSATION, &first, "\u{1f44d}").is_none());
 }
 

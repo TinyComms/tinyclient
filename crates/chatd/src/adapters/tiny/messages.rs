@@ -273,21 +273,26 @@ pub(crate) fn on_live(
             let conversation_id = field(frame, "conversation_id");
             if super::safe_id(conversation_id) {
                 if let Some(device) = e2ee::started(saved) {
-                    let (conversation_id, ctx) = (conversation_id.to_owned(), ctx.clone());
+                    let (conversation_id, ctx, saved) =
+                        (conversation_id.to_owned(), ctx.clone(), saved.clone());
                     let _ = std::thread::Builder::new().name("tiny-e2ee".into()).spawn(move || {
-                        let mut device = device.lock().unwrap_or_else(|err| err.into_inner());
-                        let mut landed = device.heard_reaction(&conversation_id);
-                        landed.extend(device.owed_reactions(&conversation_id));
+                        // The list is paged without the device mutex: sends and the socket
+                        // thread must not wait on the server.
+                        let mut landed = e2ee::fold_reactions_unlocked(&device, &saved, &conversation_id);
                         let (mut applied, mut owed) = (Vec::new(), Vec::new());
-                        for reaction in &landed {
-                            let pair = (reaction.message.clone(), reaction.emoji.clone());
-                            if apply_reaction(&ctx, &conversation_id, reaction) {
-                                applied.push(pair);
-                            } else {
-                                owed.push(pair);
+                        {
+                            let mut device = device.lock().unwrap_or_else(|err| err.into_inner());
+                            landed.extend(device.owed_reactions(&conversation_id));
+                            for reaction in &landed {
+                                let pair = (reaction.message.clone(), reaction.emoji.clone());
+                                if apply_reaction(&ctx, &conversation_id, reaction) {
+                                    applied.push(pair);
+                                } else {
+                                    owed.push(pair);
+                                }
                             }
+                            device.settle_reactions(&conversation_id, &applied, &owed);
                         }
-                        device.settle_reactions(&conversation_id, &applied, &owed);
                     });
                 }
             }
@@ -1434,11 +1439,12 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
             }
             // The reactions of an encrypted conversation are not rows of this page; the folded
             // ones that changed while this device was away are asked for now, with anything a
-            // page before this one still owed.
+            // page before this one still owed. The list is paged without the device mutex,
+            // so the network holds up no other user of this device.
             if sealed_here(ctx, saved, conversation_id) == Ok(true) {
                 if let Some(device) = e2ee::started(saved) {
+                    let mut landed = e2ee::fold_reactions_unlocked(&device, saved, conversation_id);
                     let mut device = device.lock().unwrap_or_else(|err| err.into_inner());
-                    let mut landed = device.reaction_changes(conversation_id);
                     landed.extend(device.owed_reactions(conversation_id));
                     let (mut applied, mut owed) = (Vec::new(), Vec::new());
                     for reaction in &landed {
