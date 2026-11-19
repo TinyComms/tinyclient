@@ -905,17 +905,19 @@ impl Pane {
             let element = match block {
                 // A flex column, so the text is a flex item that is measured on its own: in a
                 // block its layout belongs to the line box, and `Rich` reads its own layout.
-                Block::Text(inline) => div()
-                    .max_w(px(MEASURE))
-                    .flex()
-                    .flex_col()
-                    .type_body()
-                    .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
-                    .when_some(edited_words, |block, words| {
-                        block.id(name_id("edited", &message.id)).tooltip(tip(words, None))
-                    })
-                    .child(self.rich(message, ix, inline, theme::text().into_color(), window, cx))
-                    .into_any_element(),
+                Block::Text(inline) => {
+                    let block = div()
+                        .max_w(px(MEASURE))
+                        .flex()
+                        .flex_col()
+                        .type_body()
+                        .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
+                        .child(self.rich(message, ix, inline, theme::text().into_color(), window, cx));
+                    match edited_words {
+                        Some(words) => block.id(name_id("edited", &message.id)).tooltip(tip(words, None)).into_any_element(),
+                        None => block.into_any_element(),
+                    }
+                }
                 Block::Quote(inline) => div()
                     .max_w(px(MEASURE))
                     .mt(px(3.))
