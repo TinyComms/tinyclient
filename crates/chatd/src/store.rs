@@ -2344,12 +2344,12 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let outcome = match before {
-            Some((text, old)) if text == incoming.text && old == body => Stored::Same,
+        let outcome = match &before {
+            Some((text, old)) if *text == incoming.text && *old == body => Stored::Same,
             // A later fetch that cannot open must not replace what this device already opened.
             Some((text, old))
                 if incoming.seal == Seal::Undecryptable
-                    && serde_json::from_str::<Message>(&old)
+                    && serde_json::from_str::<Message>(old)
                         .is_ok_and(|had| had.seal == Seal::Encrypted
                             && (!text.trim().is_empty() || !had.attachments.is_empty())) =>
             {
@@ -3796,7 +3796,7 @@ mod tests {
         long.edited_at = Some(NOW + 1);
         store.ingest(&key, &long, false).unwrap();
         let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
-        let prior = page.messages[0].prior_text.unwrap();
+        let prior = page.messages[0].prior_text.as_deref().unwrap();
         assert_eq!(prior.chars().count(), protocol::PRIOR_LIMIT);
         assert!(prior.starts_with('x'));
     }
