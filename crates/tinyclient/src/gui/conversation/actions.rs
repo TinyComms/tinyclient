@@ -1218,7 +1218,7 @@ impl Pane {
                 cx.listener(move |this: &mut Pane, _: &gpui::ClickEvent, window, cx| {
                     this.close_menu(cx);
                     let at = window.mouse_position();
-                    let _ = this.shell.update(cx, |shell, cx| shell.open_profile(person, at, cx));
+                    let _ = this.shell.update(cx, |shell, cx| shell.open_profile(person.clone(), at, cx));
                 })
             });
             list = list.child(
