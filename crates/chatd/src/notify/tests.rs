@@ -524,7 +524,7 @@ fn a_ring_with_the_window_in_focus_is_still_heard() {
 
 #[test]
 fn a_due_reminder_posts_silent_and_is_taken_out_but_waits_out_a_hush() {
-    let hub = std::sync::Arc::new(crate::hub::Hub::new(crate::store::Store::open(":memory:").unwrap()));
+    let hub = std::sync::Arc::new(crate::hub::Hub::new(crate::store::Store::open(std::path::Path::new(":memory:")).unwrap()));
     let account = protocol::AccountKey { network: Network::Slack, account: "T1".into() };
     hub.store().upsert_conversation(&account, &crate::store::ConversationRow::new("later", ConversationKind::Channel, "#later")).unwrap();
     let conversation = Key { network: Network::Slack, account: "T1".into(), id: "later".into() };
