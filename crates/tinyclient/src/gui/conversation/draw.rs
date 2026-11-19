@@ -719,14 +719,14 @@ impl Pane {
             .into_any_element()
     }
 
-    fn person(&self, id: &str) -> Option<Key> {
+    pub(super) fn person(&self, id: &str) -> Option<Key> {
         let open = self.open.as_ref()?;
         (!id.is_empty()).then(|| Key { id: id.to_owned(), ..open.key.clone() })
     }
 
     /// Someone in this conversation, from what its messages say of them, else from the people
     /// hub: their name and their picture.
-    fn who(&self, person: &Key, cx: &mut Context<Self>) -> (String, Option<MediaFile>) {
+    pub(super) fn who(&self, person: &Key, cx: &Context<Self>) -> (String, Option<MediaFile>) {
         if let Some(message) = said_by(self.root(), &self.window.messages, &person.id) {
             return (message.sender.name.clone(), message.sender.avatar.clone());
         }

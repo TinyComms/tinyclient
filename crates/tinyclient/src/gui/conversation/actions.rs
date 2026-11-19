@@ -34,20 +34,20 @@ const REACTORS_SHOWN: usize = 12;
 /// The names one reaction's `who` spells, for a tooltip and a sheet row: the first three
 /// resolved, "Someone" where a name is not known yet, then how many more. `None` for a
 /// reaction the network kept to a count, which names nobody.
-pub(super) fn reactor_words(who: &[String], name: impl Fn(&str) -> String) -> Option<String> {
+pub(super) fn reactor_words(who: &[String], mut name: impl FnMut(&str) -> String) -> Option<String> {
     match who.len() {
         0 => None,
-        1 => Some(format!("{} reacted", said(who, 0, name))),
-        2 => Some(format!("{} and {} reacted", said(who, 0, name), said(who, 1, name))),
+        1 => Some(format!("{} reacted", said(who, 0, &mut name))),
+        2 => Some(format!("{} and {} reacted", said(who, 0, &mut name), said(who, 1, &mut name))),
         others => {
-            let head: Vec<String> = who.iter().take(3).enumerate().map(|(at, _)| said(who, at, name)).collect();
+            let head: Vec<String> = who.iter().take(3).enumerate().map(|(at, _)| said(who, at, &mut name)).collect();
             Some(format!("{} and {} others reacted", head.join(", "), others - 3))
         }
     }
 }
 
 /// One name in the list, or Someone where this person is not known to the shell yet.
-fn said(who: &[String], at: usize, name: impl Fn(&str) -> String) -> String {
+fn said(who: &[String], at: usize, name: &mut impl FnMut(&str) -> String) -> String {
     let one = name(&who[at]);
     if one.is_empty() { "Someone".to_owned() } else { one }
 }
