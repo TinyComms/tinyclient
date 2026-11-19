@@ -130,7 +130,7 @@ fn search_fate(fresh_sent: Option<&str>, waiting: Option<&str>, query: &str) -> 
 }
 
 pub struct Chat {
-    hub: Arc<Hub>,
+    pub(crate) hub: Arc<Hub>,
     adapters: Adapters,
     /// History catch-ups asked before that account's adapter was in the map.
     held: Mutex<Vec<(AccountKey, Command)>>,

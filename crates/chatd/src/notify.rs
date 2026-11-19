@@ -816,7 +816,7 @@ fn due(hub: &Arc<Hub>, notes: &mut Notes, values: &Values) {
             return;
         }
         let (title, subtitle) = match hub.store().conversation(&conversation) {
-            Ok(Some(row)) => (row.title, place(&row)),
+            Ok(Some(row)) => (row.title.clone(), place(&row)),
             _ => (String::new(), String::new()),
         };
         notes.reminder(&conversation, &message_id, &title, &subtitle, &text);
@@ -912,7 +912,7 @@ pub fn prove_message_remind() -> Result<(), String> {
     store.ingest(&conversation, &message, false).map_err(|err| err.to_string())?;
     // Quiet hours off: this driver runs whenever the lab does, and the hold-under-a-hush rule
     // has its own test.
-    store.set_setting("", settings::QUIET_HOURS, Some("off".to_owned())).map_err(|err| err.to_string())?;
+    store.set_setting("", settings::QUIET_HOURS, Some("off")).map_err(|err| err.to_string())?;
     let chat = Arc::new(Chat::new(store));
     // The account is signed in as far as the server is concerned, whoever runs this.
     chat.hub.set_link(&account, protocol::Link::Connected, "");
