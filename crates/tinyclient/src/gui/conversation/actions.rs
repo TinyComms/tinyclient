@@ -1222,7 +1222,7 @@ impl Pane {
                 })
             });
             list = list.child(
-                menu_item(("reactor", ix).into(), None, label, None).when_some(open, |row, open| row.on_click(open)),
+                menu_item(("reactor", ix), None, label, None).when_some(open, |row, open| row.on_click(open)),
             );
         }
         let list = list.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)));
