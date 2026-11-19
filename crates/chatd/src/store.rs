@@ -4544,13 +4544,13 @@ mod tests {
         // Taking one back names the one who went.
         assert!(store.react(&key, "1", &by("u-ana"), false).unwrap());
         let shown = store.message(&key, "1").unwrap().unwrap();
-        assert_eq!((shown.reactions[0].count, shown.reactions[0].who.as_slice()), (2, &["u-bea", "u-cy"][..]));
+        assert_eq!((shown.reactions[0].count, shown.reactions[0].who.as_slice()), (2u32, &["u-bea".to_owned(), "u-cy".to_owned()][..]));
         // Ours goes before the network says who: the count moves, the list stands.
         let ours = |on| Reaction { emoji: "👍".into(), file: None, count: 1, mine: true, who: Vec::new() };
         assert!(store.react(&key, "1", &ours(true), true).unwrap());
         assert!(store.react(&key, "1", &ours(false), false).unwrap());
         let shown = store.message(&key, "1").unwrap().unwrap();
-        assert_eq!((shown.reactions[0].count, shown.reactions[0].who.as_slice()), (2, &["u-bea", "u-cy"][..]));
+        assert_eq!((shown.reactions[0].count, shown.reactions[0].who.as_slice()), (2u32, &["u-bea".to_owned(), "u-cy".to_owned()][..]));
         // Nobody left: the reaction goes, list and all.
         assert!(store.react(&key, "1", &by("u-bea"), false).unwrap());
         assert!(store.react(&key, "1", &by("u-cy"), false).unwrap());

@@ -1101,7 +1101,7 @@ pub fn prove_telegram_reactors() -> Result<(), String> {
         big: false,
         unread: false,
         my: false,
-        peer_id: tl::enums::Peer::User(tl::types::PeerUser { user_id }),
+        peer_id: tl::enums::Peer::User(tl::types::PeerUser { user_id: user }),
         date: 0,
         reaction: emoji(emoticon),
     };
