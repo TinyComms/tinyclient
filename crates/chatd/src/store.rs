@@ -3789,7 +3789,8 @@ mod tests {
         let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
         assert_eq!(page.messages[0].prior_text, None);
 
-        let mut long = said("43", "x".repeat(protocol::PRIOR_LIMIT + 100).as_str(), NOW);
+        // The page lists oldest first, so the kept edit sits before the deleted row.
+        let mut long = said("43", "x".repeat(protocol::PRIOR_LIMIT + 100).as_str(), NOW - 1);
         store.ingest(&key, &long, false).unwrap();
         long.text = "short".into();
         long.edited = true;
