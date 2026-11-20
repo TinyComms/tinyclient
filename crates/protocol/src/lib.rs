@@ -1009,6 +1009,16 @@ pub struct MessageHit {
     pub outgoing: bool,
 }
 
+/// A reminder the user set on one message ("Remind me…"). Local to this device: no network
+/// hears of it, and it lives until it fires or the user cancels it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageReminder {
+    /// The message the reminder is on.
+    pub message_id: String,
+    /// Unix seconds it is due at.
+    pub due: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -1062,6 +1072,19 @@ pub enum Request {
     Star {
         conversation: Key,
         starred: bool,
+    },
+    /// Puts a reminder on one message, to be told about it when the time comes, or takes it
+    /// back with `remind_at: None`. Local: nothing goes to any network. A time already past is
+    /// refused, and a message that is not in the cache has nothing to remind about.
+    Remind {
+        conversation: Key,
+        message_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remind_at: Option<i64>,
+    },
+    /// The reminders still waiting in one conversation, due first.
+    Reminders {
+        conversation: Key,
     },
     /// Conversations whose title contains `query`, across every Space, most recent first. From
     /// the cache alone: a channel of a Space never opened is not in it.
@@ -1295,10 +1318,15 @@ pub enum Request {
         message_id: String,
     },
     /// Every conversation with a badge is read, here and on the network. `network` limits it to
-    /// one; `None` is the whole Inbox. Message requests are read here only.
+    /// one; `space` to one Space's conversations; both `None` is the whole Inbox. Message
+    /// requests are read here only.
     MarkAllRead {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         network: Option<Network>,
+        /// The Space to read out, the account it belongs to and the network's own id. An older
+        /// peer that does not know the field ignores it and hears the wider request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
     },
     /// Drops this conversation's cached messages and its badge. A direct or group conversation
     /// leaves the Inbox until a newer message arrives. The network is not asked to delete
@@ -2091,6 +2119,11 @@ pub enum Response {
     MessageHits {
         hits: Vec<MessageHit>,
     },
+    /// Answers `Reminders`: what is still waiting in the conversation, due first.
+    Reminders {
+        conversation: Key,
+        reminders: Vec<MessageReminder>,
+    },
     Sent {
         message: Message,
     },
@@ -2563,6 +2596,11 @@ mod tests {
             "participants":[],"muted":false,"deafened":false,"joined":1,"engine_linked":true,"video":[]}"#;
         let call: Call = serde_json::from_str(call).unwrap();
         assert_eq!((call.speaking, call.level, call.inputs.len()), (false, None, 0));
+        let message: Message = serde_json::from_str(
+            r#"{"id":"1","sender":{"name":"mara"},"sent":1,"text":"hi"}"#,
+        )
+        .unwrap();
+        assert_eq!((message.edited, message.edited_at, message.prior_text.as_deref()), (false, None, None));
     }
 
     #[test]
@@ -2590,7 +2628,7 @@ mod tests {
     fn empty_fields_stay_off_the_wire() {
         let message = Message::plain("1", "mara", "hi", 1_700_000_000, false);
         let json = serde_json::to_string(&message).unwrap();
-        for absent in ["spans", "attachments", "reactions", "reply_to", "thread", "client_id", "card", "forwarded", "deleted"] {
+        for absent in ["spans", "attachments", "reactions", "reply_to", "thread", "client_id", "card", "forwarded", "deleted", "edited", "edited_at", "prior_text"] {
             assert!(!json.contains(absent), "{absent} in {json}");
         }
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), message);

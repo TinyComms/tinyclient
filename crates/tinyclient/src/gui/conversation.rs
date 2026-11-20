@@ -1332,6 +1332,9 @@ impl Pane {
             cx.stop_propagation();
             return;
         }
+        if self.message_shortcut(event, window, cx) {
+            return;
+        }
         // Never further than the rows already built: the list knows no heights beyond them.
         let page = (self.list.viewport_bounds().size.height - px(40.)).min(px(AHEAD - 40.));
         let keys = &event.keystroke;
@@ -1350,6 +1353,58 @@ impl Pane {
         }
         cx.stop_propagation();
         cx.notify();
+    }
+
+    /// E, R, +, T, P, U and Delete while a message row has focus. A menu, a confirm and a picker
+    /// keep their own keys. Pin and mark-unread-from-here have no request, so they are taken and
+    /// not sent. Up on an empty composer is decided in the keymap and not read here.
+    fn message_shortcut(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() {
+            return false;
+        }
+        let Some(act) = crate::gui::keymap::with_live(|map| map.message_action(&event.keystroke, crate::gui::keymap::Focus::Message, event.keystroke.is_ime_in_progress())) else {
+            return false;
+        };
+        cx.stop_propagation();
+        let Some(message) = self.shortcut_message() else {
+            return true;
+        };
+        let allowed = self.can(&message);
+        match act {
+            crate::gui::keymap::MessageAct::Edit => {
+                if allowed.edit {
+                    self.edit(&message, window, cx);
+                }
+            }
+            crate::gui::keymap::MessageAct::Reply => {
+                if allowed.reply {
+                    self.reply(&message, window, cx);
+                }
+            }
+            crate::gui::keymap::MessageAct::React => {
+                if allowed.act && self.adds(&message) {
+                    self.open_picker(&message.id, window.mouse_position(), window, cx);
+                }
+            }
+            crate::gui::keymap::MessageAct::Thread => {
+                if allowed.thread {
+                    cx.emit(PaneEvent::OpenThread(message));
+                }
+            }
+            crate::gui::keymap::MessageAct::Delete => {
+                if allowed.delete {
+                    self.delete(&message, event.keystroke.modifiers.shift, window, cx);
+                }
+            }
+            crate::gui::keymap::MessageAct::Pin | crate::gui::keymap::MessageAct::Unread | crate::gui::keymap::MessageAct::EditLast => {}
+        }
+        true
+    }
+
+    /// The message under the pointer, or the last one that is not a system line.
+    fn shortcut_message(&self) -> Option<Rc<Message>> {
+        let hovered = self.hover.as_deref().and_then(|id| self.find(id)).filter(|message| !matches!(message.kind, protocol::MessageKind::System));
+        hovered.or_else(|| self.window.messages.iter().rev().find(|message| !matches!(message.kind, protocol::MessageKind::System)).cloned())
     }
 
     /// What is selected, as plain text.

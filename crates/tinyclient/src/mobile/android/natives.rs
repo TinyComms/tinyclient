@@ -135,6 +135,12 @@ pub extern "system" fn Java_dev_tinyclient_app_TinyPlatform_nativeDebugJoin(mut 
     }));
 }
 
+/// `WindowManager.LayoutParams.FLAG_SECURE` while the screen lock is armed.
+#[no_mangle]
+pub extern "system" fn Java_dev_tinyclient_app_TinyPlatform_nativeHidesSwitcher(_env: JNIEnv, _class: JClass) -> jni::sys::jboolean {
+    u8::from(crate::gui::lock::hides_switcher())
+}
+
 #[no_mangle]
 pub extern "system" fn Java_dev_tinyclient_app_TinyPlatform_nativeRedirected(mut env: JNIEnv, _class: JClass, auth: jlong, url: JString) {
     let _ = catch_unwind(AssertUnwindSafe(|| {

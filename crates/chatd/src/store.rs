@@ -44,6 +44,24 @@ pub const NOTICED_SECONDS: i64 = 86_400;
 pub const QUIET_SECONDS: i64 = 30 * 86_400;
 /// "Talked to lately", for People's Recent section.
 pub const RECENT_SECONDS: i64 = 14 * 86_400;
+/// Most reminders one account may hold. A message can only be reminded about from its menu,
+/// so this bounds a runaway picker, not a hostile peer.
+pub const REMINDER_CAP: usize = 256;
+/// Most due reminders one sweep hands the notification thread. The rest wait for the next wake.
+const DUE_SWEEP: usize = 32;
+
+/// What setting a reminder did, in the order the shell says why it did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemindOutcome {
+    /// Stored, replacing any the message already had.
+    Set,
+    /// Taken back, whether or not there was one.
+    Cleared,
+    /// No such conversation, or no such message in it.
+    Missing,
+    /// The account holds [`REMINDER_CAP`] reminders already.
+    Full,
+}
 
 
 const TABLES: &str = "
@@ -899,6 +917,22 @@ const SETTINGS: &str = "
     ) WITHOUT ROWID;
 ";
 
+/// The reminders the user set on messages ("Remind me…"), like `settings` kept apart from the
+/// cache: a schema change that rebuilds the tables keeps them, and the drop below names this
+/// table so it survives. Created on every open, so no schema version moves for it.
+const REMINDERS_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS reminder (
+        network      TEXT NOT NULL,
+        account      TEXT NOT NULL,
+        conversation TEXT NOT NULL,
+        message_id   TEXT NOT NULL,
+        due          INTEGER NOT NULL,
+        created      INTEGER NOT NULL,
+        PRIMARY KEY (network, account, conversation, message_id)
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS reminder_due ON reminder (due);
+";
+
 /// The shape of the settings rows. A migration from an older one runs in `migrate_settings`.
 const SETTINGS_VERSION: u32 = 1;
 
@@ -968,7 +1002,7 @@ impl Store {
             // and the server no longer has the opened text to fill back in.
             if !keep_added_columns(&db, version)? {
                 let old: Vec<String> = db
-                    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'settings'")?
+                    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'settings' AND name != 'reminder'")?
                     .query_map([], |row| row.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
                 for table in old {
@@ -980,6 +1014,7 @@ impl Store {
         }
         let mut store = Store { db };
         store.migrate_settings()?;
+        store.migrate_reminders()?;
         Ok(store)
     }
 
@@ -995,6 +1030,12 @@ impl Store {
             params![protocol::settings::VERSION, SETTINGS_VERSION.to_string()],
         )?;
         tx.commit()
+    }
+
+    /// Creates the reminders table, on every open, before the socket is served. Nothing to
+    /// convert: the table is new.
+    fn migrate_reminders(&mut self) -> rusqlite::Result<()> {
+        self.db.execute_batch(REMINDERS_TABLE)
     }
 
     /// Every stored setting, the version row included.
@@ -2059,6 +2100,96 @@ impl Store {
         self.set_flag(conversation, "starred", starred)
     }
 
+    // Reminders.
+
+    /// Puts a reminder on a message, or takes it back with `None`. Only a message the cache
+    /// holds can be reminded about, so the id cannot name something else. Setting on a message
+    /// that has one replaces its time; taking one back that is not there is fine. An account at
+    /// [`REMINDER_CAP`] takes no new one, but always replaces what it has.
+    pub fn remind(&mut self, conversation: &Key, message_id: &str, due: Option<i64>) -> rusqlite::Result<RemindOutcome> {
+        let network = word(&conversation.network);
+        if let Some(due) = due {
+            let known = self
+                .db
+                .query_row(
+                    "SELECT 1 FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
+                    params![network, conversation.account, conversation.id, message_id],
+                    |row| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !known {
+                return Ok(RemindOutcome::Missing);
+            }
+            let had = self
+                .db
+                .query_row(
+                    "SELECT 1 FROM reminder WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND message_id = ?4",
+                    params![network, conversation.account, conversation.id, message_id],
+                    |row| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !had {
+                let held: u32 = self.db.query_row(
+                    "SELECT count(*) FROM reminder WHERE network = ?1 AND account = ?2",
+                    params![network, conversation.account],
+                    |row| row.get(0),
+                )?;
+                if held as usize >= REMINDER_CAP {
+                    return Ok(RemindOutcome::Full);
+                }
+            }
+            self.db.execute(
+                "INSERT OR REPLACE INTO reminder (network, account, conversation, message_id, due, created)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![network, conversation.account, conversation.id, message_id, due, crate::hub::now()],
+            )?;
+            return Ok(RemindOutcome::Set);
+        }
+        self.db.execute(
+            "DELETE FROM reminder WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND message_id = ?4",
+            params![network, conversation.account, conversation.id, message_id],
+        )?;
+        Ok(RemindOutcome::Cleared)
+    }
+
+    /// The reminders still waiting in one conversation, due first.
+    pub fn reminders(&self, conversation: &Key) -> rusqlite::Result<Vec<protocol::MessageReminder>> {
+        let mut query = self.db.prepare(
+            "SELECT message_id, due FROM reminder
+              WHERE network = ?1 AND account = ?2 AND conversation = ?3 ORDER BY due",
+        )?;
+        let rows = query.query_map(
+            params![word(&conversation.network), conversation.account, conversation.id],
+            |row| Ok(protocol::MessageReminder { message_id: row.get(0)?, due: row.get(1)? }),
+        )?;
+        rows.collect()
+    }
+
+    /// What is due now, oldest first, with the words each message had. A conversation that has
+    /// left the cache (signed out) holds nothing back here: its reminders wait until it is
+    /// back. At most [`DUE_SWEEP`] at once; the rest come with the next wake.
+    pub fn due_reminders(&self, now: i64) -> rusqlite::Result<Vec<(Key, String, String)>> {
+        let mut query = self.db.prepare(
+            "SELECT r.network, r.account, r.conversation, r.message_id, COALESCE(m.text, '')
+              FROM reminder r
+              JOIN conversation c ON c.network = r.network AND c.account = r.account AND c.id = r.conversation
+              LEFT JOIN message m ON m.network = r.network AND m.account = r.account AND m.conversation = r.conversation AND m.id = r.message_id
+              WHERE r.due <= ?1 ORDER BY r.due LIMIT ?2",
+        )?;
+        let rows = query.query_map(params![now, DUE_SWEEP as i64], |row| {
+            let account = AccountKey { network: from_word(row.get(0)?)?, account: row.get(1)? };
+            Ok((Key::new(&account, row.get::<_, String>(2)?), row.get(3)?, row.get(4)?))
+        })?;
+        rows.collect()
+    }
+
+    /// When the next reminder still waiting is due, if one is.
+    pub fn next_reminder_due(&self) -> rusqlite::Result<Option<i64>> {
+        self.db.query_row("SELECT min(due) FROM reminder", [], |row| row.get::<_, Option<i64>>(0))
+    }
+
     /// The user read the conversation up to `message_id`. An empty id means the newest message
     /// this store knows (`preview_id`), which is how "mark as read" works before history has
     /// loaded. A marker older than the one already stored is ignored, so seeing an earlier
@@ -2300,14 +2431,20 @@ impl Store {
     }
 
     /// Every conversation with a badge. The message id is the newest known, for the ack.
-    /// The bool is a message request: read here, and not told to the network.
-    pub fn unread_marks(&self, network: Option<Network>) -> rusqlite::Result<Vec<(Key, String, bool)>> {
+    /// The bool is a message request: read here, and not told to the network. `network` limits
+    /// it to one network; `space` to one Space's conversations, which are that Space's account's.
+    pub fn unread_marks(&self, network: Option<Network>, space: Option<&Key>) -> rusqlite::Result<Vec<(Key, String, bool)>> {
         let mut stmt = self.db.prepare(
             "SELECT network, account, id, preview_id, last_read, special FROM conversation
-              WHERE (unread > 0 OR mentions > 0) AND (?1 IS NULL OR network = ?1)",
+              WHERE (unread > 0 OR mentions > 0) AND (?1 IS NULL OR network = ?1)
+                AND (?2 IS NULL OR (network = ?3 AND account = ?4 AND space = ?2))",
         )?;
         let network = network.map(|network| word(&network));
-        let rows = stmt.query_map(params![network], |row| {
+        let (space_id, space_network, space_account) = match space {
+            Some(space) => (Some(space.id.as_str()), Some(word(&space.network)), Some(space.account.as_str())),
+            None => (None, None, None),
+        };
+        let rows = stmt.query_map(params![network, space_id, space_network, space_account], |row| {
             let key = Key {
                 network: from_word(row.get(0)?)?,
                 account: row.get(1)?,
@@ -2378,16 +2515,6 @@ impl Store {
                 incoming.seq = kept;
             }
         }
-        let mut stored = incoming.clone();
-        stored.bound();
-        stored.id.clear();
-        stored.text.clear();
-        let body = serde_json::to_string(&stored).map_err(broken)?;
-        let pending = match incoming.state {
-            SendState::Sent => 0,
-            SendState::Pending => 1,
-            SendState::Failed { .. } => 2,
-        };
         let before: Option<(String, String)> = tx
             .query_row(
                 "SELECT text, body FROM message
@@ -2396,12 +2523,34 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let outcome = match before {
-            Some((text, old)) if text == incoming.text && old == body => Stored::Same,
+        // A sealed conversation's wire rows never carry reactions — they are folded ciphertexts
+        // of their own, on a route of theirs — so what this store folded stays when a fetched
+        // page replaces the row.
+        if incoming.seal == Seal::Encrypted && incoming.reactions.is_empty() {
+            if let Some((_, old)) = &before {
+                if let Ok(had) = serde_json::from_str::<Message>(old) {
+                    if !had.reactions.is_empty() {
+                        incoming.reactions = had.reactions;
+                    }
+                }
+            }
+        }
+        let mut stored = incoming.clone();
+        stored.bound();
+        stored.id.clear();
+        stored.text.clear();
+        let mut body = serde_json::to_string(&stored).map_err(broken)?;
+        let pending = match incoming.state {
+            SendState::Sent => 0,
+            SendState::Pending => 1,
+            SendState::Failed { .. } => 2,
+        };
+        let outcome = match &before {
+            Some((text, old)) if *text == incoming.text && *old == body => Stored::Same,
             // A later fetch that cannot open must not replace what this device already opened.
             Some((text, old))
                 if incoming.seal == Seal::Undecryptable
-                    && serde_json::from_str::<Message>(&old)
+                    && serde_json::from_str::<Message>(old)
                         .is_ok_and(|had| had.seal == Seal::Encrypted
                             && (!text.trim().is_empty() || !had.attachments.is_empty())) =>
             {
@@ -2410,6 +2559,32 @@ impl Store {
             Some(_) => Stored::Updated,
             None => Stored::New,
         };
+        // An edit replaces the row whole, which would forget both the time of the edit and
+        // what the words were before. Keep what this update does not repeat, and keep one
+        // capped prior text: the words this update replaces. A row being deleted keeps
+        // nothing.
+        if outcome == Stored::Updated && !incoming.deleted {
+            if let Some((text, old)) = &before {
+                let had = serde_json::from_str::<Message>(old).ok();
+                if stored.edited_at.is_none() {
+                    stored.edited_at = had.as_ref().and_then(|had| had.edited_at);
+                }
+                if had.as_ref().is_some_and(|had| had.edited) {
+                    stored.edited = true;
+                }
+                if stored.prior_text.is_none() {
+                    let mut prior = had.as_ref().and_then(|had| had.prior_text.clone());
+                    if *text != incoming.text && !text.is_empty() {
+                        prior = Some(text.clone());
+                    }
+                    if let Some(mut prior) = prior {
+                        protocol::clip(&mut prior, protocol::PRIOR_LIMIT);
+                        stored.prior_text = Some(prior);
+                    }
+                }
+                body = serde_json::to_string(&stored).map_err(broken)?;
+            }
+        }
         if outcome != Stored::Same {
             tx.execute(
                 "INSERT OR REPLACE INTO message
@@ -2746,6 +2921,14 @@ impl Store {
             (Some(at), true) => {
                 message.reactions[at].count += 1;
                 message.reactions[at].mine |= reaction.mine;
+                // Events arrive one person at a time; the list keeps who it was told of,
+                // newest last, and stays within the cap a payload is held to.
+                for id in &reaction.who {
+                    if !message.reactions[at].who.contains(id) {
+                        message.reactions[at].who.push(id.clone());
+                    }
+                }
+                message.reactions[at].who.truncate(protocol::REACTION_REACTORS);
             }
             (None, true) => message.reactions.push(Reaction {
                 count: 1,
@@ -2755,6 +2938,11 @@ impl Store {
                 let have = &mut message.reactions[at];
                 have.count = have.count.saturating_sub(1);
                 have.mine &= !reaction.mine;
+                // The one who took theirs back leaves the list; a removal that names nobody
+                // (ours, before the network's word) leaves it as it was.
+                if !reaction.who.is_empty() {
+                    have.who.retain(|id| !reaction.who.contains(id));
+                }
                 if have.count == 0 {
                     message.reactions.remove(at);
                 }
@@ -3663,6 +3851,7 @@ mod tests {
         let mut store = Store { db: Connection::open_in_memory().unwrap() };
         store.db.execute_batch(TABLES).unwrap();
         store.db.execute_batch(SETTINGS).unwrap();
+        store.db.execute_batch(REMINDERS_TABLE).unwrap();
         let account = AccountKey { network: Network::Discord, account: "me".into() };
         let row = ConversationRow::new("general", ConversationKind::Channel, "#general");
         store.upsert_conversation(&account, &row).unwrap();
@@ -3705,6 +3894,85 @@ mod tests {
         let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
         assert!(page.messages[0].deleted);
         assert!(page.messages[0].attachments.is_empty());
+    }
+
+    #[test]
+    fn a_reminder_is_set_on_a_stored_message_and_answers_what_is_due() {
+        let (mut store, key) = store();
+        store.ingest(&key, &said("m1", "read this later", NOW), false).unwrap();
+        // Nothing can be reminded about that the cache does not hold.
+        assert_eq!(store.remind(&key, "no-such", Some(NOW + 60)).unwrap(), RemindOutcome::Missing);
+        assert_eq!(store.remind(&key, "m1", Some(NOW + 60)).unwrap(), RemindOutcome::Set);
+        assert_eq!(store.reminders(&key).unwrap(), [protocol::MessageReminder { message_id: "m1".into(), due: NOW + 60 }]);
+        // Not yet: the future one waits.
+        assert!(store.due_reminders(NOW).unwrap().is_empty());
+        assert_eq!(store.next_reminder_due().unwrap(), Some(NOW + 60));
+        // Due: the row answers with the message's own words.
+        assert_eq!(store.due_reminders(NOW + 60).unwrap(), [(key.clone(), "m1".into(), "read this later".into())]);
+        // A message the cache let go of is still reminded about, without its words.
+        store.db.execute("DELETE FROM message WHERE id = 'm1'", []).unwrap();
+        assert_eq!(store.due_reminders(NOW + 60).unwrap(), [(key.clone(), "m1".into(), String::new())]);
+    }
+
+    #[test]
+    fn replacing_a_reminder_moves_its_time_and_cancelling_removes_it() {
+        let (mut store, key) = store();
+        store.ingest(&key, &said("m1", "one", NOW), false).unwrap();
+        store.ingest(&key, &said("m2", "two", NOW), false).unwrap();
+        store.remind(&key, "m1", Some(NOW + 60)).unwrap();
+        store.remind(&key, "m1", Some(NOW + 120)).unwrap();
+        assert_eq!(store.reminders(&key).unwrap(), [protocol::MessageReminder { message_id: "m1".into(), due: NOW + 120 }]);
+        // Cancelling a message that has none is fine, and changes nothing else.
+        assert_eq!(store.remind(&key, "m2", None).unwrap(), RemindOutcome::Cleared);
+        assert_eq!(store.reminders(&key).unwrap().len(), 1);
+        store.remind(&key, "m1", None).unwrap();
+        assert!(store.reminders(&key).unwrap().is_empty());
+        assert_eq!(store.next_reminder_due().unwrap(), None);
+    }
+
+    #[test]
+    fn a_reminder_survives_a_restart_and_a_cache_rebuild() {
+        let path = scratch("remind");
+        let mut store = Store::open(&path).unwrap();
+        let account = AccountKey { network: Network::Slack, account: "T1".into() };
+        let row = ConversationRow::new("later", ConversationKind::Channel, "#later");
+        store.upsert_conversation(&account, &row).unwrap();
+        let key = Key::new(&account, "later");
+        store.ingest(&key, &said("m1", "tomorrow", NOW), false).unwrap();
+        store.remind(&key, "m1", Some(NOW + 3_600)).unwrap();
+        drop(store);
+        // A restart keeps it, and answers it like any other open.
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.reminders(&key).unwrap().len(), 1);
+        assert_eq!(store.next_reminder_due().unwrap(), Some(NOW + 3_600));
+        // A schema change that drops the cache keeps the user's reminders, like the settings.
+        store.db.execute_batch("PRAGMA user_version = 1;").unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert!(store.conversation(&key).unwrap().is_none(), "the cache was rebuilt");
+        assert_eq!(store.reminders(&key).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_account_at_the_reminder_cap_takes_no_new_one_but_replaces_what_it_has() {
+        let (mut store, key) = store();
+        let account = key.account();
+        let other = Key::new(&account, "other");
+        store.upsert_conversation(&account, &ConversationRow::new("other", ConversationKind::Direct, "Other")).unwrap();
+        for slot in 0..REMINDER_CAP {
+            store.ingest(&key, &said(&format!("m{slot}"), "hold", NOW), false).unwrap();
+            store.ingest(&other, &said(&format!("o{slot}"), "hold", NOW), false).unwrap();
+        }
+        for slot in 0..REMINDER_CAP {
+            let message = if slot % 2 == 0 { key.clone() } else { other.clone() };
+            let id = if slot % 2 == 0 { format!("m{slot}") } else { format!("o{slot}") };
+            assert_eq!(store.remind(&message, &id, Some(NOW + slot as i64 + 1)).unwrap(), RemindOutcome::Set);
+        }
+        // One more, in either conversation: refused. The count is per account.
+        store.ingest(&key, &said("extra", "one too many", NOW), false).unwrap();
+        assert_eq!(store.remind(&key, "extra", Some(NOW + 999)).unwrap(), RemindOutcome::Full);
+        // Replacing a reminder the account already holds is not a new one.
+        assert_eq!(store.remind(&key, "m0", Some(NOW + 5)).unwrap(), RemindOutcome::Set);
     }
 
     #[test]
@@ -3770,6 +4038,63 @@ mod tests {
         assert_eq!(store.until_expiry(NOW).unwrap(), None);
         assert!(store.expire(NOW + 10).unwrap().is_empty());
         assert_eq!(store.conversation(&key).unwrap().unwrap().preview, "permanent edit");
+    }
+
+    #[test]
+    fn an_edit_keeps_when_it_happened_and_what_it_said_before() {
+        let (mut store, key) = store();
+        let mut message = said("41", "first words", NOW);
+        store.ingest(&key, &message, false).unwrap();
+        message.text = "second words".into();
+        message.edited = true;
+        message.edited_at = Some(NOW + 5);
+        store.ingest(&key, &message, false).unwrap();
+        let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(page.messages[0].edited_at, Some(NOW + 5));
+        assert_eq!(page.messages[0].prior_text.as_deref(), Some("first words"));
+
+        // An update that repeats neither keeps both: a reaction must not drop the badge.
+        message.edited = false;
+        message.edited_at = None;
+        store.ingest(&key, &message, false).unwrap();
+        let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert!(page.messages[0].edited);
+        assert_eq!(page.messages[0].edited_at, Some(NOW + 5));
+        assert_eq!(page.messages[0].prior_text.as_deref(), Some("first words"));
+
+        // A second edit makes the words it just replaced the prior text.
+        message.text = "third words".into();
+        message.edited = true;
+        message.edited_at = Some(NOW + 10);
+        store.ingest(&key, &message, false).unwrap();
+        let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(page.messages[0].prior_text.as_deref(), Some("second words"));
+        assert_eq!(page.messages[0].edited_at, Some(NOW + 10));
+    }
+
+    #[test]
+    fn a_deleted_row_keeps_no_prior_text_and_a_kept_prior_is_capped() {
+        let (mut store, key) = store();
+        let mut message = said("42", "gone soon", NOW);
+        store.ingest(&key, &message, false).unwrap();
+        message.deleted = true;
+        message.text = String::new();
+        message.tombstone();
+        store.ingest(&key, &message, false).unwrap();
+        let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        assert_eq!(page.messages[0].prior_text, None);
+
+        // The page lists oldest first, so the kept edit sits before the deleted row.
+        let mut long = said("43", "x".repeat(protocol::PRIOR_LIMIT + 100).as_str(), NOW - 1);
+        store.ingest(&key, &long, false).unwrap();
+        long.text = "short".into();
+        long.edited = true;
+        long.edited_at = Some(NOW + 1);
+        store.ingest(&key, &long, false).unwrap();
+        let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
+        let prior = page.messages[0].prior_text.as_deref().unwrap();
+        assert_eq!(prior.chars().count(), protocol::PRIOR_LIMIT);
+        assert!(prior.starts_with('x'));
     }
 
     #[test]
@@ -4017,7 +4342,7 @@ mod tests {
             store.ingest(&key, &earlier, true).unwrap();
             assert!(store.mark_read(&key, &earlier.id).unwrap());
             store.ingest(&key, &later, true).unwrap();
-            let marks = store.unread_marks(Some(Network::Discord)).unwrap();
+            let marks = store.unread_marks(Some(Network::Discord), None).unwrap();
             assert!(marks.iter().any(|(found, marker, _)| found == &key && marker == &later.id));
             store.set_counts(&key, 0, 0, None, 20).unwrap();
             assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 1);
@@ -4183,7 +4508,7 @@ mod tests {
         let row = store.conversation(&key).unwrap().unwrap();
         assert_eq!((row.unread, row.last_read.as_deref()), (1, Some(earlier)));
         assert_eq!(store.preview_id(&key).unwrap(), later);
-        let marks = store.unread_marks(Some(Network::Discord)).unwrap();
+        let marks = store.unread_marks(Some(Network::Discord), None).unwrap();
         assert!(
             marks.iter().any(|(found, marker, request)| found == &key && marker == later && !request),
             "the ack is the newer message, not the uuid that sorts first"
@@ -4218,7 +4543,7 @@ mod tests {
 
         // A newer live message is unread again; a stale network count must not invent that.
         store.ingest(&dm, &said("30", "again", 30), true).unwrap();
-        let marks = store.unread_marks(Some(Network::Discord)).unwrap();
+        let marks = store.unread_marks(Some(Network::Discord), None).unwrap();
         assert!(marks.iter().any(|(found, marker, request)| found == &dm && marker == "30" && !request));
         assert!(store.forget_conversation(&dm).unwrap());
         let row = store.conversation(&dm).unwrap().unwrap();
@@ -4233,6 +4558,50 @@ mod tests {
         assert!(!row.hidden);
         assert_eq!(row.unread, 1);
         let _ = key;
+    }
+
+    #[test]
+    fn unread_marks_of_one_space_do_not_name_another_spaces_rows() {
+        let (mut store, key) = store();
+        let account = key.account();
+        let mut channel = ConversationRow::new("announcements", ConversationKind::Channel, "#announcements");
+        channel.space = Some("4000".into());
+        store.upsert_conversation(&account, &channel).unwrap();
+        let in_space = Key::new(&account, "announcements");
+        store.ingest(&in_space, &said("8", "hello", 10), true).unwrap();
+        store.ingest(&key, &said("9", "dm hello", 20), true).unwrap();
+
+        let space = Key::new(&account, "4000");
+        let marks = store.unread_marks(None, Some(&space)).unwrap();
+        assert_eq!(marks.len(), 1, "only the space's conversations are named");
+        assert_eq!(marks[0].0, in_space);
+        // Without a space everything with a badge is named, as before.
+        let all = store.unread_marks(None, None).unwrap();
+        assert!(all.iter().any(|(found, _, _)| found == &in_space));
+        assert!(all.iter().any(|(found, _, _)| found == &key));
+        let discord = store.unread_marks(Some(Network::Discord), None).unwrap();
+        assert_eq!(discord.len(), 2);
+    }
+
+    #[test]
+    fn a_local_unread_survives_a_stale_count_and_yields_to_a_newer_read() {
+        let (mut store, key) = store();
+        store.ingest(&key, &said("8", "one", 10), true).unwrap();
+        store.ingest(&key, &said("9", "two", 20), true).unwrap();
+        assert_eq!(
+            store.mark_unread(&key, "9").unwrap().map(|(marker, _)| marker),
+            Some("8".to_owned()),
+            "the marker moves to the message before the one marked"
+        );
+        assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 1);
+        // A network word that is not newer than what is stored cannot undo the mark: nothing
+        // read it, the list is just stale.
+        store.set_counts(&key, 0, 0, None, 20).unwrap();
+        assert!(store.conversation(&key).unwrap().unwrap().unread >= 1, "a stale count cleared a local unread");
+        // Another device read past the mark for real: the badge goes and the marker follows it.
+        store.set_counts(&key, 0, 0, Some("9"), 30).unwrap();
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.unread, row.last_read.as_deref()), (0, Some("9")));
     }
 
     #[test]
@@ -4544,7 +4913,7 @@ mod tests {
         store.register_media(&account, &[(thumb, "https://cdn.example/att-1".into())]).unwrap();
         store.ingest(&key, &message, false).unwrap();
 
-        let thumbs_up = |mine| Reaction { emoji: "👍".into(), file: None, count: 1, mine };
+        let thumbs_up = |mine| Reaction { emoji: "👍".into(), file: None, count: 1, mine, who: Vec::new() };
         assert!(store.react(&key, "1", &thumbs_up(false), true).unwrap());
         assert!(store.react(&key, "1", &thumbs_up(true), true).unwrap());
         assert!(store.react(&key, "1", &thumbs_up(false), false).unwrap());
@@ -4564,6 +4933,38 @@ mod tests {
         store.forget(&account).unwrap();
         assert!(store.conversation(&key).unwrap().is_none());
         assert_eq!(store.media_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_reaction_keeps_who_the_network_named_and_lets_them_go() {
+        let (mut store, key) = store();
+        store.ingest(&key, &said("1", "look", 10), false).unwrap();
+        let by = |id: &str| Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: vec![id.into()] };
+        // One event at a time, as an event that names its one person arrives.
+        assert!(store.react(&key, "1", &by("u-ana"), true).unwrap());
+        assert!(store.react(&key, "1", &by("u-bea"), true).unwrap());
+        // A payload naming everyone replaces the list wholesale.
+        let mut stored = store.message(&key, "1").unwrap().unwrap();
+        stored.reactions[0].count = 3;
+        stored.reactions[0].who = vec!["u-ana".into(), "u-bea".into(), "u-cy".into()];
+        store.ingest(&key, &stored, false).unwrap();
+        let shown = store.message(&key, "1").unwrap().unwrap();
+        assert_eq!(shown.reactions[0].who, ["u-ana", "u-bea", "u-cy"]);
+        // Taking one back names the one who went.
+        assert!(store.react(&key, "1", &by("u-ana"), false).unwrap());
+        let shown = store.message(&key, "1").unwrap().unwrap();
+        assert_eq!((shown.reactions[0].count, shown.reactions[0].who.as_slice()), (2u32, &["u-bea".to_owned(), "u-cy".to_owned()][..]));
+        // Ours goes before the network says who: the count moves, the list stands.
+        let ours = |on| Reaction { emoji: "👍".into(), file: None, count: 1, mine: true, who: Vec::new() };
+        assert!(store.react(&key, "1", &ours(true), true).unwrap());
+        assert!(store.react(&key, "1", &ours(false), false).unwrap());
+        let shown = store.message(&key, "1").unwrap().unwrap();
+        assert_eq!((shown.reactions[0].count, shown.reactions[0].who.as_slice()), (2u32, &["u-bea".to_owned(), "u-cy".to_owned()][..]));
+        // Nobody left: the reaction goes, list and all.
+        assert!(store.react(&key, "1", &by("u-bea"), false).unwrap());
+        assert!(store.react(&key, "1", &by("u-cy"), false).unwrap());
+        let shown = store.message(&key, "1").unwrap().unwrap();
+        assert!(shown.reactions.is_empty());
     }
 
     #[test]

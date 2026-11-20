@@ -239,6 +239,7 @@ fn failure_words(row: &str, reachable: bool) -> &'static str {
         ("V3", _) => "Couldn't start the test. Try again.",
         ("D3", _) => "Couldn't clear. Try again.",
         ("B3", _) => "Couldn't reset every setting. Try again.",
+        ("G1", _) => "Couldn't change the sign-in entry. Try again.",
         _ => "Couldn't save. Try again.",
     }
 }
@@ -353,8 +354,14 @@ impl SettingsWindow {
             Section::Accounts => return column.child(self.accounts(window, cx)),
             Section::General => {
                 let mut groups = Vec::new();
+                groups.push(self.group(&["G1"], None, window, cx).child(caption(self.login_caption())));
                 if cfg!(target_os = "macos") {
                     groups.push(self.group(&["G2"], None, window, cx).child(caption(self.keep_running_caption())));
+                }
+                // The tray, on the systems with an icon (Windows so far): closing the window
+                // can hide it there, and the icon is the way back in.
+                if cfg!(windows) {
+                    groups.push(self.group(&["G3"], None, window, cx).child(caption(self.tray_caption())));
                 }
                 groups.push(self.group(&["G4"], None, window, cx).child(caption(self.updates_caption())));
                 groups
@@ -374,7 +381,9 @@ impl SettingsWindow {
             // A phone has no Return key to choose: its keyboard's own key sends.
             Section::Messages => vec![self.group(if phone::active() { &["M2", "M3", "M4", "M5", "M6"] } else { &["M1", "M2", "M3", "M4", "M5", "M6"] }, None, window, cx)],
             Section::Privacy => {
-                let mut groups = self.per_account(window, cx);
+                let lock_rows: &[&str] = if cfg!(target_os = "linux") { &["LK", "LS", "LP"] } else { &["LK", "LS"] };
+                let mut groups = vec![self.group(lock_rows, Some("Lock"), window, cx).child(caption(crate::gui::lock::CAPTION))];
+                groups.extend(self.per_account(window, cx));
                 groups.push(self.group(&["P3"], None, window, cx));
                 let trusted = prefs::trusted_links();
                 let link_rows: &[&str] = if trusted.is_empty() { &["PL", "PS"] } else { &["PL", "PS", "PF"] };
@@ -478,6 +487,42 @@ impl SettingsWindow {
         }
     }
 
+    fn login_caption(&self) -> String {
+        if prefs::choices().open_at_login {
+            format!("tinyclient starts when you sign in to {}.", crate::host::HERE)
+        } else {
+            "tinyclient opens only when you start it yourself.".to_owned()
+        }
+    }
+
+    fn set_open_at_login(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.choose(|choices| choices.open_at_login = on, cx);
+        self.off_thread(cx, move || crate::gui::autostart::apply(on), move |this, answer, cx| {
+            if answer.is_err() {
+                // The entry did not change: the switch goes back, and the row says so.
+                this.choose(|choices| choices.open_at_login = !on, cx);
+                this.failed = Some("G1");
+            }
+            cx.notify();
+        });
+    }
+
+    fn tray_caption(&self) -> &'static str {
+        if prefs::choices().tray {
+            "Closing the window keeps tinyclient running in the tray. Quit tinyclient ends it."
+        } else {
+            "Off: closing the window quits tinyclient, as it does now."
+        }
+    }
+
+    fn set_tray(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.choose(|choices| choices.tray = on, cx);
+        // The icon is the way back in, so it exists exactly while the switch is on. Never in a
+        // screenshot build: that window exists to be pictured, and the shot must not keep it.
+        #[cfg(all(windows, not(feature = "gui-shot")))]
+        notifier::tray::set(on);
+    }
+
     fn set_updates(&mut self, on: bool, cx: &mut Context<Self>) {
         self.choose(|choices| choices.updates = on, cx);
         if on {
@@ -538,9 +583,17 @@ impl SettingsWindow {
         let choices = prefs::choices();
         let label = label_of(id);
         let built = match id {
+            "G1" => {
+                let on = choices.open_at_login;
+                self.switch_row(id, on, false, None, move |this, on, cx| this.set_open_at_login(on, cx), cx)
+            }
             "G2" => {
                 let on = values.on(KEEP_RUNNING);
                 self.switch_row(id, on, true, None, move |this, on, cx| this.set_switch(id, KEEP_RUNNING, on, true, cx), cx)
+            }
+            "G3" => {
+                let on = choices.tray;
+                self.switch_row(id, on, false, None, move |this, on, cx| this.set_tray(on, cx), cx)
             }
             "G4" => {
                 let on = choices.updates;
@@ -630,6 +683,45 @@ impl SettingsWindow {
                     _ => None,
                 };
                 self.menu_choice_row(id, &["Automatically", "On hover", "Never"], at, 0, second, None, cx)
+            }
+            "LK" => {
+                let policy = crate::gui::lock::policy();
+                let at = match policy.away {
+                    crate::gui::lock::Away::Off => 0,
+                    crate::gui::lock::Away::Minute => 1,
+                    crate::gui::lock::Away::Five => 2,
+                    crate::gui::lock::Away::Hour => 3,
+                };
+                let second = (cfg!(target_os = "linux") && policy.hash.is_empty()).then(|| "Set a passphrase below. Until then the lock stays off.".to_owned());
+                self.segmented_row(id, &["Off", "After 1 minute", "After 5 minutes", "After 1 hour"], at, 0, second, |this, ix, cx| {
+                    let away = [crate::gui::lock::Away::Off, crate::gui::lock::Away::Minute, crate::gui::lock::Away::Five, crate::gui::lock::Away::Hour][ix];
+                    this.set_lock(|policy| policy.away = away, cx);
+                }, cx)
+            }
+            "LS" => {
+                let on = crate::gui::lock::policy().on_screen_lock;
+                self.switch_row(id, on, false, None, |this, on, cx| this.set_lock(|policy| policy.on_screen_lock = on, cx), cx)
+            }
+            #[cfg(target_os = "linux")]
+            "LP" => {
+                let set = !crate::gui::lock::policy().hash.is_empty();
+                let second = if set { "Set. The lock can use it.".to_owned() } else { "None set. The lock stays off until there is one.".to_owned() };
+                let phrase = self.lock_phrase.clone();
+                wide_row(
+                    label,
+                    Some(second.into()),
+                    div().flex().items_center().gap(px(8.)).w(px(280.)).child(phrase).child(
+                        button("LP", ButtonKind::Secondary, if set { "Remove" } else { "Save" }).on_click(cx.listener(move |this, _, _, cx| {
+                            if set {
+                                this.set_lock(|policy| policy.set_passphrase(""), cx);
+                            } else {
+                                let words = this.lock_phrase.read(cx).text().to_owned();
+                                this.lock_phrase.update(cx, |input, cx| input.clear(cx));
+                                this.set_lock(|policy| policy.set_passphrase(&words), cx);
+                            }
+                        })),
+                    ),
+                )
             }
             "P3" => {
                 let second = (!choices.images).then(|| "Nothing is fetched until you click it.".to_owned());
@@ -1857,11 +1949,23 @@ impl SettingsWindow {
         }
     }
 
+    fn set_lock(&mut self, change: impl FnOnce(&mut crate::gui::lock::Policy), cx: &mut Context<Self>) {
+        let mut policy = crate::gui::lock::policy();
+        change(&mut policy);
+        crate::gui::lock::set_policy(policy);
+        let _ = self.shell.update(cx, |shell, cx| {
+            shell.save_prefs(cx);
+            cx.notify();
+        });
+        cx.refresh_windows();
+    }
+
     /// B3: chatd's settings, the window's own, and the text size, all to their defaults.
     fn reset_all(&mut self, cx: &mut Context<Self>) {
         let section = prefs::choices().section;
         prefs::set_choices(Choices { section, ..Choices::default() });
         prefs::set_trusted_links(Default::default());
+        crate::gui::lock::set_policy(crate::gui::lock::Policy::default());
         theme::set_text_step(0);
         anim::set_autoplay(Autoplay::default());
         self.pending.clear();
@@ -1908,11 +2012,98 @@ impl SettingsWindow {
         });
     }
 
+    fn take_chord(&mut self, id: &'static str, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        if event.keystroke.is_ime_in_progress() {
+            return;
+        }
+        let bare = !event.keystroke.modifiers.modified();
+        if event.keystroke.key == "escape" && bare {
+            self.chord = None;
+            cx.notify();
+            return;
+        }
+        if event.keystroke.key == "backspace" && bare {
+            crate::gui::keymap::live_reset_one(id);
+            self.chord = None;
+            self.chord_clash = None;
+            crate::gui::rebind_keys(cx);
+            cx.notify();
+            return;
+        }
+        match crate::gui::keymap::live_rebind(id, &event.keystroke.unparse()) {
+            Ok(()) => {
+                self.chord = None;
+                self.chord_clash = None;
+                crate::gui::rebind_keys(cx);
+            }
+            Err(err) => self.chord_clash = Some(err.words()),
+        }
+        cx.notify();
+    }
+
+    /// One shortcut line. A command with an id takes a click, then the next key.
+    fn shortcut_row(&mut self, command: &str, fallback: &str, id: Option<&'static str>, cx: &mut Context<Self>) -> AnyElement {
+        let capturing = id.is_some_and(|id| self.chord == Some(id));
+        let glyph = id.map(crate::gui::keymap::glyph_for).filter(|glyph| !glyph.is_empty()).unwrap_or_else(|| fallback.to_owned());
+        let keys = |capturing: bool, glyph: String| -> AnyElement {
+            if capturing {
+                div().type_small().text_color(theme::accent_text()).child("Press a key…").into_any_element()
+            } else {
+                div().flex().gap(px(2.)).child(keycap(glyph)).into_any_element()
+            }
+        };
+        let label = |command: &str| div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(command.to_owned());
+        let Some(id) = id else {
+            return div().h(px(32.)).px(px(12.)).flex().items_center().child(label(command)).child(keys(false, glyph)).into_any_element();
+        };
+        let mut row = div()
+            .id(SharedString::from(format!("shortcut-{id}")))
+            .h(px(32.))
+            .px(px(12.))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.chord = Some(id);
+                this.chord_clash = None;
+                window.focus(&this.chord_focus, cx);
+                cx.notify();
+            }))
+            .child(label(command))
+            .child(keys(capturing, glyph));
+        if capturing {
+            row = row.track_focus(&self.chord_focus).on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                if this.chord != Some(id) {
+                    return;
+                }
+                cx.stop_propagation();
+                this.take_chord(id, event, cx);
+            }));
+        }
+        row.into_any_element()
+    }
+
     /// The Shortcuts section, or its lines that match `query`.
-    pub(super) fn shortcuts(&self, query: &str, cx: &gpui::App) -> Div {
+    pub(super) fn shortcuts(&mut self, query: &str, cx: &mut Context<Self>) -> Div {
         let mut column = div().flex().flex_col();
         if query.is_empty() {
             column = column.child(caption(crate::host::SHORTCUTS_CAPTION).pt(px(0.)).pb(px(14.)));
+            if crate::gui::keymap::dirty() {
+                column = column.child(
+                    button("reset-shortcuts", ButtonKind::Ghost, "Reset shortcuts")
+                        .mb(px(12.))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            crate::gui::keymap::live_reset();
+                            this.chord = None;
+                            this.chord_clash = None;
+                            crate::gui::rebind_keys(cx);
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+        if let Some(words) = self.chord_clash.clone() {
+            column = column.child(div().pb(px(8.)).type_small().text_color(theme::danger()).child(words));
         }
         let (open_in, places) = self.shell.upgrade().map(|shell| {
             let shell = shell.read(cx);
@@ -1939,25 +2130,21 @@ impl SettingsWindow {
             }
         }
         let query_folded = query.trim().to_lowercase();
-        let place_hits: Vec<&rows::PlaceKey> = places.iter().filter(|place| !query_folded.is_empty() && place.command.to_lowercase().contains(&query_folded)).collect();
+        let place_hits: Vec<(usize, &rows::PlaceKey)> = places.iter().enumerate().filter(|(_, place)| !query_folded.is_empty() && place.command.to_lowercase().contains(&query_folded)).collect();
         for (ix, name) in menus.iter().enumerate() {
             let mut card = card();
             let mut n = 0;
             for shortcut in found.iter().filter(|s| s.menu == *name) {
                 if *name == "View" && shortcut.command == "Quick Switcher" {
-                    for place in places.iter().filter(|place| query_folded.is_empty() || place.command.to_lowercase().contains(&query_folded)) {
-                        let keys = div().flex().gap(px(2.)).child(keycap(place.keys));
-                        card = card.when(n > 0, |card| card.child(rule())).child(
-                            div().h(px(32.)).px(px(12.)).flex().items_center().child(div().flex_1().type_ui().text_color(theme::text()).child(place.command.clone())).child(keys),
-                        );
+                    for (pix, place) in places.iter().enumerate().filter(|(_, place)| query_folded.is_empty() || place.command.to_lowercase().contains(&query_folded)) {
+                        card = card.when(n > 0, |card| card.child(rule())).child(self.shortcut_row(&place.command, place.keys, crate::gui::keymap::place_id(pix + 2), cx));
                         n += 1;
                     }
                 }
                 let command = if shortcut.command == "Open in App" { open_in.clone().unwrap_or_else(|| shortcut.command.to_owned()) } else { shortcut.command.to_owned() };
-                let keys = div().flex().gap(px(2.)).child(keycap(shortcut.keys));
-                card = card.when(n > 0, |card| card.child(rule())).child(
-                    div().h(px(32.)).px(px(12.)).flex().items_center().child(div().flex_1().type_ui().text_color(theme::text()).child(command)).child(keys),
-                );
+                // Undo, Redo, Cut, Copy, Paste and Select All stay the platform's own keys.
+                let id = crate::gui::keymap::id_for(shortcut.command);
+                card = card.when(n > 0, |card| card.child(rule())).child(self.shortcut_row(&command, shortcut.keys, id, cx));
                 n += 1;
             }
             // In search results each group says where it is, as every other result does.
@@ -1972,14 +2159,25 @@ impl SettingsWindow {
         // A rail place is not a static shortcut row. A search for its name still lists it.
         if !place_hits.is_empty() && !found.iter().any(|shortcut| shortcut.menu == "View" && shortcut.command == "Quick Switcher") {
             let mut card = card();
-            for (n, place) in place_hits.iter().enumerate() {
-                let keys = div().flex().gap(px(2.)).child(keycap(place.keys));
-                card = card.when(n > 0, |card| card.child(rule())).child(
-                    div().h(px(32.)).px(px(12.)).flex().items_center().child(div().flex_1().type_ui().text_color(theme::text()).child(place.command.clone())).child(keys),
-                );
+            for (n, (pix, place)) in place_hits.iter().enumerate() {
+                card = card.when(n > 0, |card| card.child(rule())).child(self.shortcut_row(&place.command, place.keys, crate::gui::keymap::place_id(pix + 2), cx));
             }
             let label = div().pl(px(12.)).pb(px(4.)).type_small().text_color(theme::text_faint()).child("Shortcuts › View");
             column = column.child(div().flex().flex_col().child(label).child(card));
+        }
+        let messages: Vec<_> = crate::gui::keymap::message_rows().into_iter().filter(|row| query_folded.is_empty() || row.title.to_lowercase().contains(&query_folded)).collect();
+        if !messages.is_empty() {
+            let mut card = card();
+            for (n, row) in messages.iter().enumerate() {
+                let glyph = row.glyph.clone();
+                card = card.when(n > 0, |card| card.child(rule())).child(self.shortcut_row(row.title, &glyph, Some(row.id), cx));
+            }
+            let label = if query.is_empty() {
+                group_label("Messages")
+            } else {
+                div().pl(px(12.)).pb(px(4.)).type_small().text_color(theme::text_faint()).child("Shortcuts › Messages")
+            };
+            column = column.child(div().pt(px(if query.is_empty() { 20. } else { 12. })).flex().flex_col().child(label).child(card));
         }
         column
     }

@@ -251,7 +251,6 @@ pub fn day(now: i64, unix: i64) -> String {
 }
 
 /// `Tuesday, October 13, 2026 at 10:37 PM`: the tooltip on every time.
-#[allow(dead_code)]
 pub fn tooltip_in(then: Local, style: Style) -> String {
     format!(
         "{}, {} {}, {} at {}",
@@ -263,7 +262,6 @@ pub fn tooltip_in(then: Local, style: Style) -> String {
     )
 }
 
-#[allow(dead_code)]
 pub fn tooltip(unix: i64) -> String {
     tooltip_in(local(unix), style())
 }

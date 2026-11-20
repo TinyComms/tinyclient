@@ -29,6 +29,10 @@ mod invite_ipc;
 #[cfg(all(feature = "gui", windows))]
 #[path = "invite_ipc_windows.rs"]
 mod invite_ipc;
+// The quick actions (jump list, Dock menu, desktop Actions) and their launch arguments.
+#[cfg(any(feature = "gui", test))]
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+mod quick;
 mod view;
 
 use client::ask;
@@ -164,6 +168,14 @@ fn main() -> ExitCode {
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("save-downloads") {
         if let Err(err) = host::prove_save_downloads() {
             eprintln!("save-downloads: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    // The lab's error-text driver. A build without this opens the window below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("error-text") {
+        if let Err(err) = client::prove_error_text() {
+            eprintln!("error-text: {err}");
             return ExitCode::from(1);
         }
         return ExitCode::SUCCESS;
@@ -321,19 +333,57 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    // The lab's open-at-login driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("open-at-login") {
+        if let Err(err) = gui::prove_open_at_login() {
+            eprintln!("open-at-login: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    // The lab's command-palette driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("command-palette") {
+        if let Err(err) = gui::prove_command_palette() {
+            eprintln!("command-palette: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    // The lab's screen-lock driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("screen-lock") {
+        if let Err(err) = gui::prove_screen_lock() {
+            eprintln!("screen-lock: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     let _log = protocol::log_policy::install("tinyclient", protocol::log_policy::LogPolicy::from_env());
     #[cfg(feature = "gui")]
     if !args.iter().any(|arg| arg == "--text" || arg == "--notify-test") && query.is_none() {
         let invite = launch_invite(&args);
+        let action = quick::launch_action(&args);
+        // A second launch hands the first one its invite, or a quick action, and exits.
         #[cfg(any(target_os = "linux", windows))]
-        let incoming = match invite_ipc::start(invite.as_deref()) {
+        let handoff = invite.clone().or_else(|| action.map(quick::QuickAction::link));
+        #[cfg(any(target_os = "linux", windows))]
+        let incoming = match invite_ipc::start(handoff.as_deref()) {
             invite_ipc::Handoff::Delivered => return ExitCode::SUCCESS,
-            invite_ipc::Handoff::Primary(receiver) => Some(receiver),
+            invite_ipc::Handoff::Primary(receiver) => {
+                // Nothing was running: a quick Quit has no window to close, so the launcher's
+                // item ends here instead of opening one only to close it.
+                if action == Some(quick::QuickAction::Quit) && invite.is_none() {
+                    return ExitCode::SUCCESS;
+                }
+                Some(receiver)
+            }
             invite_ipc::Handoff::Unavailable => None,
         };
         #[cfg(not(any(target_os = "linux", windows)))]
         let incoming = None;
-        gui::run(invite, incoming);
+        gui::run(invite, action, incoming);
         return ExitCode::SUCCESS;
     }
 

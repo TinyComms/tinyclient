@@ -1101,6 +1101,8 @@ impl Slack {
             file,
             count: 1,
             mine: self.me.get().is_some_and(|me| event["user"] == me.as_str()),
+            // The event names the one who acted; the store folds them into the list.
+            who: event["user"].as_str().map(|user| vec![user.to_owned()]).unwrap_or_default(),
         };
         let added = event["type"] == "reaction_added";
         // The event does not say which thread a reply is in. The message is found in the

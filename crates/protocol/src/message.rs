@@ -14,6 +14,8 @@ pub const WAVEFORM_LIMIT: usize = 256;
 pub const POLL_OPTIONS: usize = 10;
 /// Most voters named on one choice. The count can be higher.
 pub const POLL_VOTERS: usize = 200;
+/// Most characters a message keeps of the text it said before its last edit.
+pub const PRIOR_LIMIT: usize = 4_000;
 
 /// Cuts text from a network to at most `chars` characters, so no frame grows with what a
 /// stranger typed.
@@ -203,6 +205,10 @@ pub struct Preview {
     pub image: Option<MediaFile>,
 }
 
+/// How many reactors a reaction carries: what a network names in the payload it already
+/// sends, never a reason to ask again.
+pub const REACTION_REACTORS: usize = 50;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reaction {
     /// The emoji itself, or `:name:` for a custom one.
@@ -212,6 +218,12 @@ pub struct Reaction {
     pub count: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mine: bool,
+    /// Who gave it, where the network said: their ids as `Sender::id` spells them, at most
+    /// [`REACTION_REACTORS`], in the network's own order. Empty where the network serves
+    /// only a count (Discord's message payload, Tiny's history rows) or hides the list
+    /// (Telegram in channels and large groups): the chip then stays a number and says so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub who: Vec<String>,
 }
 
 /// The earlier message this one answers, as one line.
@@ -441,6 +453,15 @@ pub struct Message {
     pub deleted: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub edited: bool,
+    /// Unix seconds of the last edit, from a network that hands one over. `None`: never
+    /// edited, or only the fact is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_at: Option<i64>,
+    /// What the message said before its last edit, at most [`PRIOR_LIMIT`] characters. The
+    /// store keeps one prior text when an edit changes the words. `None`: never edited, or
+    /// nothing kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_text: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub pinned: bool,
     /// How many people saw a channel's post, when the network counts them.
@@ -509,6 +530,8 @@ impl Message {
             poll: None,
             deleted: false,
             edited: false,
+            edited_at: None,
+            prior_text: None,
             pinned: false,
             views: None,
             mentions_me: false,
@@ -538,10 +561,19 @@ impl Message {
         if let Some(thread) = &mut self.thread {
             thread.participants.truncate(THREAD_FACES);
         }
+        for reaction in &mut self.reactions {
+            reaction.who.truncate(REACTION_REACTORS);
+            for id in &mut reaction.who {
+                clip(id, 200);
+            }
+        }
         if let Some(forwarded) = &mut self.forwarded {
             clip(&mut forwarded.from_title, 200);
             clip(&mut forwarded.from_space, 200);
             clip(&mut forwarded.link, 2_000);
+        }
+        if let Some(prior) = &mut self.prior_text {
+            clip(prior, PRIOR_LIMIT);
         }
         if let Some(card) = &mut self.card {
             clip(&mut card.title, 256);
@@ -616,5 +648,32 @@ impl Message {
             .chain(self.reactions.iter_mut().filter_map(|reaction| reaction.file.as_mut()))
             .chain(emoji)
             .chain(&mut self.sender.avatar)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An older frame without `who` still reads, an empty list stays off the wire, and `bound`
+    /// holds the list to its cap.
+    #[test]
+    fn reaction_reactors_read_and_stay_bounded() {
+        let plain = Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: Vec::new() };
+        let on = serde_json::to_string(&plain).unwrap();
+        assert!(!on.contains("who"), "an empty list stays off the wire");
+        assert_eq!(serde_json::from_str::<Reaction>(&on).unwrap(), plain);
+
+        let older = r#"{"emoji":"👍","count":2,"mine":false}"#;
+        assert_eq!(serde_json::from_str::<Reaction>(older).unwrap().who, Vec::<String>::new());
+
+        let mut message = Message::plain("m1", "Ada", "hi", 1_700_000_000, false);
+        let many: Vec<String> = (0..REACTION_REACTORS - 1).map(|one| format!("u{one}")).collect();
+        let mut named = Reaction { emoji: "👍".into(), file: None, count: 60, mine: false, who: many };
+        named.who.insert(1, "u".repeat(500));
+        message.reactions.push(named);
+        message.bound();
+        assert_eq!(message.reactions[0].who.len(), REACTION_REACTORS);
+        assert_eq!(message.reactions[0].who[1].len(), 200, "a long id is clipped");
     }
 }

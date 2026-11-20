@@ -1,0 +1,12 @@
+{
+  "id": "message-remind",
+  "title": "A reminder set on a message survives a restart, fires once, and is gone after it",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same reminder rows live in the phone's message menu.",
+    "ios": "The phone proof build does not run desktop chatd. The same reminder rows live in the phone's message menu."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

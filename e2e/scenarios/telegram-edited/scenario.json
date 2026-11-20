@@ -1,0 +1,12 @@
+{
+  "id": "telegram-edited",
+  "title": "An edit arrives with its time and the row keeps what the words were before",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same edit check is what this desktop run covers.",
+    "ios": "The phone proof build does not run desktop chatd. The same edit check is what this desktop run covers."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

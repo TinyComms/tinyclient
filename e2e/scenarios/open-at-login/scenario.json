@@ -1,0 +1,12 @@
+{
+  "id": "open-at-login",
+  "title": "Open at login is a setting, off by default, and the switch writes and removes the sign-in entry",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "A phone keeps no sign-in list for the app to join, so the row is absent there.",
+    "ios": "A phone keeps no sign-in list for the app to join, so the row is absent there."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

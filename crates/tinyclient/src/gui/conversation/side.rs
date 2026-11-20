@@ -158,7 +158,7 @@ fn asked_words(code: protocol::ErrorCode, detail: &str) -> String {
     } else if let Some(network) = detail.strip_suffix(" is not signed in") {
         format!("{network} isn't signed in.")
     } else {
-        crate::client::refusal_words(code, detail)
+        crate::client::refusal_words("search", code, detail)
     }
 }
 

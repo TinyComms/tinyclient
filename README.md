@@ -386,9 +386,13 @@ With `TINYCLIENT_DIR` set, browser sign-in runs only a helper named by `TINYCLIE
 
 Shortcuts use Command on macOS and Ctrl on Linux and Windows. Menus, tooltips, and Settings → Shortcuts show the keys for this computer. Help → Keyboard Shortcuts (Command-/ , Ctrl-/ elsewhere) opens that page. Super is left to the Linux desktop.
 
-The list in Settings shows the keys. It does not change them. Voice keys are the exception: Settings → Voice records push-to-talk, priority push-to-talk, toggle mute, and toggle deafen. On Wayland those mute and deafen keys work while the window is in front, and push-to-talk does not.
+Settings → Shortcuts lists the keys and changes them. Click a row, then press the new keys. Reset restores the defaults, and Backspace on a row restores that one. A key another command uses is refused. Undo, Redo, Cut, Copy, Paste and Select All stay the platform's own keys. Voice keys are separate: Settings → Voice records push-to-talk, priority push-to-talk, toggle mute, and toggle deafen. On Wayland those mute and deafen keys work while the window is in front, and push-to-talk does not.
 
-Full screen is Control-Command-F on macOS and Ctrl-Alt-F on Linux and Windows. Quick Switcher is Command-K on macOS and Ctrl-K elsewhere. Its field reads “Jump to a conversation, a person or a server”.
+Type `>` in the Quick Switcher for commands: menu actions, set status, pause notifications, toggle mute, sign in, and open a settings section. Commands with nothing behind them are not listed.
+
+With a message row focused, E edits, R replies, + reacts, T starts a thread, and Delete deletes, when that message allows it. P and U are listed and resolve the message, and they do not call out: pinning and mark-unread-from-here have no request. Up on an empty composer is the edit-last binding. The composer does not read it yet.
+
+Full screen is Control-Command-F on macOS and Ctrl-Alt-F on Linux and Windows. Quick Switcher is Command-K on macOS and Ctrl-K elsewhere. Its field reads “Jump to a conversation, a person or a server, or type > for a command”.
 
 Keys below are written with macOS glyphs. On Linux and Windows, Command becomes Ctrl, Option becomes Alt, and Control-Command becomes Ctrl-Alt. Hide tinyclient and Hide Others exist on macOS only. Inbox and People are Command-1 and Command-2. Further places on the rail take Command-3 through Command-9 in rail order.
 

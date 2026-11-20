@@ -3,6 +3,7 @@
 //! row is its final height before any file arrives.
 
 use palette::IntoColor;
+use super::actions::reactor_words;
 use super::emoji;
 use super::icons::{icon, Icon};
 use super::images::Picture;
@@ -773,14 +774,14 @@ impl Pane {
             .into_any_element()
     }
 
-    fn person(&self, id: &str) -> Option<Key> {
+    pub(super) fn person(&self, id: &str) -> Option<Key> {
         let open = self.open.as_ref()?;
         (!id.is_empty()).then(|| Key { id: id.to_owned(), ..open.key.clone() })
     }
 
     /// Someone in this conversation, from what its messages say of them, else from the people
     /// hub: their name and their picture.
-    fn who(&self, person: &Key, cx: &mut Context<Self>) -> (String, Option<MediaFile>) {
+    pub(super) fn who(&self, person: &Key, cx: &Context<Self>) -> (String, Option<MediaFile>) {
         if let Some(message) = said_by(self.root(), &self.window.messages, &person.id) {
             return (message.sender.name.clone(), message.sender.avatar.clone());
         }
@@ -915,7 +916,16 @@ impl Pane {
     // Words.
 
     fn content(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let edited = || div().h(px(16.)).type_micro().text_color(theme::text_faint()).child("(edited)").into_any_element();
+        // The mark itself is a run of the text it closes, so the tooltip lives on the block
+        // that owns the words, and on the mark when the mark stands alone.
+        let edited_tip = message.edited_at.map(|at| format!("Edited {}", time::tooltip(at)));
+        let edited = || {
+            let mark = div().h(px(16.)).type_micro().text_color(theme::text_faint()).child("(edited)");
+            match edited_tip.as_deref() {
+                Some(words) => mark.id(name_id("edited", &message.id)).tooltip(tip(words, None)).into_any_element(),
+                None => mark.into_any_element(),
+            }
+        };
         let phone = self.metrics == Metrics::PHONE;
         // An encrypted message this device can't open says so, quietly, and never as its text.
         if message.seal == protocol::Seal::Undecryptable {
@@ -946,17 +956,24 @@ impl Pane {
         }
         let mut out = Vec::with_capacity(blocks.len() + 1);
         for (ix, block) in blocks.iter().enumerate() {
+            // Only the last block carries the mark, so only it says when the edit was made.
+            let edited_words = (ix + 1 == blocks.len()).then(|| edited_tip.clone()).flatten();
             let element = match block {
                 // A flex column, so the text is a flex item that is measured on its own: in a
                 // block its layout belongs to the line box, and `Rich` reads its own layout.
-                Block::Text(inline) => div()
-                    .max_w(px(MEASURE))
-                    .flex()
-                    .flex_col()
-                    .type_body()
-                    .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
-                    .child(self.rich(message, ix, inline, theme::text().into_color(), window, cx))
-                    .into_any_element(),
+                Block::Text(inline) => {
+                    let block = div()
+                        .max_w(px(MEASURE))
+                        .flex()
+                        .flex_col()
+                        .type_body()
+                        .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
+                        .child(self.rich(message, ix, inline, theme::text().into_color(), window, cx));
+                    match edited_words {
+                        Some(words) => block.id(name_id("edited", &message.id)).tooltip(tip(words, None)).into_any_element(),
+                        None => block.into_any_element(),
+                    }
+                }
                 Block::Quote(inline) => div()
                     .max_w(px(MEASURE))
                     .mt(px(3.))
@@ -1874,18 +1891,41 @@ impl Pane {
             // Joining one the conversation no longer takes, or past a limit, is not offered:
             // the chip says why instead.
             let refused = (!reaction.mine).then(|| self.refusal(message, &toggled)).flatten();
-            let words = match (&refused, reaction.mine) {
+            // Who reacted, where the network said; a chip that is only a count keeps its
+            // own words.
+            let named = !reaction.who.is_empty();
+            let names = named.then(|| {
+                let said = |id: &str| match self.person(id) {
+                    Some(person) => self.who(&person, cx).0,
+                    None => String::new(),
+                };
+                reactor_words(&reaction.who, said).unwrap_or_default()
+            });
+            let words = match (&refused, &names) {
                 (Some(why), _) => why.clone(),
-                (None, true) => "Take back your reaction".to_owned(),
-                (None, false) => "React with this too".to_owned(),
+                (None, Some(names)) => names.clone(),
+                (None, None) if reaction.mine => "Take back your reaction".to_owned(),
+                (None, None) => "React with this too".to_owned(),
             };
             let joins = acts && refused.is_none();
+            // Right-click names them in a list, where one was sent. Left-click keeps its
+            // work: joining or taking the reaction back.
+            let list = (!phone && named).then(|| {
+                let open = message.clone();
+                cx.listener(move |this: &mut Pane, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let at = event.position;
+                    let open = open.clone();
+                    this.open_reactors(open, ix, at, window, cx);
+                })
+            });
             row = row.child(
                 chip(("chip", ix).into(), reaction.mine)
                     .child(emoji)
                     .child(count)
                     .when(acts && !phone, |chip| chip.tooltip(tip(words, None)))
                     .when(joins, |chip| chip.on_click(cx.listener(move |this, _, _, cx| this.react(&id, &toggled, on, cx))))
+                    .when_some(list, |chip, list| chip.on_mouse_down(MouseButton::Right, list))
                     .when(!joins, |chip| chip.cursor_default()),
             );
         }

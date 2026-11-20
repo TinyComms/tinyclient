@@ -1,0 +1,14 @@
+{
+  "id": "linux-launcher-badge",
+  "title": "A Tiny direct message puts 1 on the Linux launcher entry and reading it clears it",
+  "platforms": ["linux"],
+  "not_applicable": {
+    "windows": "The count is drawn on the taskbar button there already; the launcher entry is a freedesktop signal with no Windows equivalent.",
+    "macos": "The count is drawn on the Dock icon there already; the launcher entry is a freedesktop signal with no macOS equivalent.",
+    "android": "A phone has no desktop launcher entry, and no session bus to speak one on.",
+    "ios": "A phone has no desktop launcher entry, and no session bus to speak one on."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

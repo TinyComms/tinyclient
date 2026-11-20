@@ -173,18 +173,26 @@ pub const APPEARANCE_CAPTION: &str = if cfg!(target_os = "macos") {
     "Text size is also ⌘+, ⌘− and ⌘0."
 };
 
-/// Settings › Shortcuts, above the list. Only macOS lets a person rebind an app's menu keys.
-pub const SHORTCUTS_CAPTION: &str = if cfg!(target_os = "macos") {
-    "To change a shortcut, add it in System Settings › Keyboard › Keyboard Shortcuts › App Shortcuts. The call keys are in no menu, so they cannot be changed there."
-} else {
-    "Shortcuts cannot be changed yet."
-};
+/// Settings › Shortcuts, above the list. Click a row, then press the new keys.
+pub const SHORTCUTS_CAPTION: &str = "Click a row, then press the new keys. Reset restores the defaults. A key another command uses is refused. Backspace on a row restores that one.";
 
 /// Settings › Notifications, N10: what draws attention to something new in the background.
-pub const FLASH_LABEL: &str = if cfg!(target_os = "macos") { "Bounce the Dock icon" } else { "Flash the taskbar button" };
+pub const FLASH_LABEL: &str = if cfg!(target_os = "macos") {
+    "Bounce the Dock icon"
+} else if cfg!(target_os = "linux") {
+    "Ask the desktop for attention"
+} else {
+    "Flash the taskbar button"
+};
 
 /// Settings › Notifications, N11: where the unread number is drawn.
-pub const BADGE_LABEL: &str = if cfg!(target_os = "macos") { "Show the unread count on the Dock icon" } else { "Show the unread count on the taskbar button" };
+pub const BADGE_LABEL: &str = if cfg!(target_os = "macos") {
+    "Show the unread count on the Dock icon"
+} else if cfg!(target_os = "linux") {
+    "Show the unread count on the launcher icon"
+} else {
+    "Show the unread count on the taskbar button"
+};
 
 /// Settings › Notifications, N13, after the test notification was posted.
 pub const TEST_SENT: &str = if cfg!(target_os = "macos") {
@@ -571,7 +579,8 @@ mod tests {
             assert!(STORE_WAITING_LINE.contains("Always Allow"));
             assert_eq!(FOLLOWS_LANGUAGE, "tinyclient follows the language of macOS.");
             assert!(APPEARANCE_CAPTION.ends_with("Reduce Motion follows System Settings."));
-            assert!(SHORTCUTS_CAPTION.contains("App Shortcuts"));
+            assert!(SHORTCUTS_CAPTION.contains("Click a row"));
+            assert!(SHORTCUTS_CAPTION.contains("Reset"));
             assert_eq!(FLASH_LABEL, "Bounce the Dock icon");
             assert!(FOCUS_CAPTION.contains("Focus"));
             assert_eq!(NO_TRAY_ICON, "tinyclient has no menu bar icon yet.");

@@ -410,6 +410,7 @@ impl Teams {
         message.sender.avatar = self.picture(&from, &name);
         message.sender.id = from;
         message.edited = set(&props["edittime"]);
+        message.edited_at = props["edittime"].as_str().filter(|_| message.edited).map(seconds).filter(|at| *at > 0);
         let content = raw["content"].as_str().unwrap_or("");
         match kind {
             "Event/Call" => {
@@ -582,6 +583,7 @@ impl Teams {
                 file: None,
                 count: people.len() as u32,
                 mine: people.contains(&me),
+                who: people.iter().take(protocol::REACTION_REACTORS).map(|mri| (*mri).to_owned()).collect(),
             });
         }
         found

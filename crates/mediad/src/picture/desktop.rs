@@ -940,6 +940,10 @@ fn grab(id: Option<&str>, allow_portal: bool) -> Result<Rgba, String> {
 #[cfg(target_os = "macos")]
 fn capture_screen_macos() -> Result<Rgba, String> {
     use core_graphics::display::CGDisplay;
+    // A Core Graphics grab never carries the pointer, and Core Graphics has no mode that draws
+    // it. ScreenCaptureKit's `showsCursor` is the native way, which the capture's move to SCK
+    // brings (#773); until then a macOS share draws no pointer, and `show_cursor` is kept for
+    // that day.
     let image = CGDisplay::main().image().ok_or_else(|| {
         "tinyclient can't record the screen. Allow it in System Settings › Privacy & Security › Screen & System Audio Recording.".to_owned()
     })?;

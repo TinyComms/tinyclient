@@ -82,10 +82,28 @@ fn main() -> io::Result<()> {
         eprintln!("prove-exit:0");
         return Ok(());
     }
+    // The lab's encrypted-reaction driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("tiny-e2ee-reaction") {
+        if let Err(err) = chatd::adapters::tiny::prove_encrypted_reaction() {
+            eprintln!("tiny-e2ee-reaction: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
     // The lab's linkify driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("linkify") {
         if let Err(err) = chatd::adapters::tiny::prove_linkify() {
             eprintln!("linkify: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
+    // The lab's telegram-edited driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-edited") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_edited() {
+            eprintln!("telegram-edited: {err}");
             std::process::exit(1);
         }
         eprintln!("prove-exit:0");
@@ -179,6 +197,15 @@ fn main() -> io::Result<()> {
             eprintln!("refused-list: {err}");
             std::process::exit(1);
         }
+        return Ok(());
+    }
+    // The lab's reaction-reactors driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("reaction-reactors") {
+        if let Err(err) = chatd::adapters::prove_reactors() {
+            eprintln!("reaction-reactors: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-reaction-reactors:0");
         return Ok(());
     }
     // The lab's empty-list driver. A build without this returns to the server below and stays up.
@@ -314,6 +341,15 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-discord-group-members:0");
+        return Ok(());
+    }
+    // The lab's space-mark-all-read driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("space-mark-all-read") {
+        if let Err(err) = chatd::server::prove_space_mark_all_read() {
+            eprintln!("space-mark-all-read: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-space-mark-all-read:0");
         return Ok(());
     }
     // The lab's call-leave-clears driver. A build without this returns to the server below and stays up.
@@ -652,6 +688,13 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-telegram-mark-unread:0");
+    // The lab's message-remind driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("message-remind") {
+        if let Err(err) = chatd::notify::prove_message_remind() {
+            eprintln!("message-remind: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-message-remind:0");
         return Ok(());
     }
     // The lab's telegram-accounts driver. A build without this stays up and the driver fails.

@@ -1029,7 +1029,7 @@ fn apply(account: &Account, event: Event) {
             }
             let _ = ctx.message(&conversation, &message);
         }
-        Event::Edited { peer, author, target, text, spans } => {
+        Event::Edited { peer, author, target, at, text, spans } => {
             // A late edit is ignored by every other client. Keeping it here would show words
             // nobody else has.
             if !accept_remote(target, now_ms(), note_to_self(account, &peer)) {
@@ -1040,6 +1040,7 @@ fn apply(account: &Account, event: Event) {
                 message.text = text;
                 message.spans = spans;
                 message.edited = true;
+                message.edited_at = (at > 0).then(|| i64::try_from(at / 1_000).unwrap_or(0));
                 let _ = ctx.message(&conversation, &message);
             }
         }
@@ -1109,9 +1110,9 @@ fn apply(account: &Account, event: Event) {
             let mine = by == account.me;
             let replaced = account.live().react(&id, &by, (!removed).then_some(emoji.as_str()));
             if let Some(old) = replaced {
-                let _ = ctx.reacted(&conversation, &id, &Reaction { emoji: old, file: None, count: 1, mine }, false);
+                let _ = ctx.reacted(&conversation, &id, &Reaction { emoji: old, file: None, count: 1, mine, who: vec![by.clone()] }, false);
             }
-            let _ = ctx.reacted(&conversation, &id, &Reaction { emoji, file: None, count: 1, mine }, !removed);
+            let _ = ctx.reacted(&conversation, &id, &Reaction { emoji, file: None, count: 1, mine, who: vec![by] }, !removed);
         }
         Event::ReadElsewhere(read) => read_elsewhere(account, &read),
         Event::Receipt { by, sent, read } => {
@@ -1660,7 +1661,7 @@ fn react(account: &Account, conversation: &str, message_id: &str, emoji: &str, o
     account.wire.send(&to, Body::React { author, target: sent, emoji: emoji.to_owned(), remove: !on })?;
     let replaced = account.live().react(message_id, &account.me, on.then_some(emoji));
     if let Some(old) = replaced.filter(|_| on) {
-        let _ = account.ctx.reacted(conversation, message_id, &Reaction { emoji: old, file: None, count: 1, mine: true }, false);
+        let _ = account.ctx.reacted(conversation, message_id, &Reaction { emoji: old, file: None, count: 1, mine: true, who: vec![account.me.clone()] }, false);
     }
     Ok(())
 }

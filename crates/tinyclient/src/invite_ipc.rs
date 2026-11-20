@@ -78,8 +78,8 @@ fn receive(mut stream: UnixStream, sender: &mpsc::SyncSender<String>) -> io::Res
     let mut bytes = vec![0; len];
     stream.read_exact(&mut bytes)?;
     let link = String::from_utf8(bytes).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid invite encoding"))?;
-    if !link.starts_with("tinyclient://join#") || protocol::parse_invite_link(&link).is_none() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid invite"));
+    if !crate::quick::handoff(&link) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid handoff"));
     }
     sender.try_send(link).map_err(|_| io::Error::other("invite queue unavailable"))?;
     stream.write_all(&[1])
@@ -128,6 +128,33 @@ mod tests {
         let join = std::thread::spawn(move || receive(server, &tx));
         client.write_all(&3u32.to_be_bytes()).unwrap();
         client.write_all(b"bad").unwrap();
+        assert!(join.join().unwrap().is_err());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_quick_action_is_acknowledged_and_delivered() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (tx, rx) = mpsc::sync_channel(8);
+        let join = std::thread::spawn(move || receive(server, &tx));
+        let link = crate::quick::QuickAction::NewMessage.link();
+        client.write_all(&(link.len() as u32).to_be_bytes()).unwrap();
+        client.write_all(link.as_bytes()).unwrap();
+        let mut ack = [0];
+        client.read_exact(&mut ack).unwrap();
+        assert_eq!(ack, [1]);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), link);
+        join.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn an_unknown_action_does_not_enter_the_queue() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (tx, rx) = mpsc::sync_channel(8);
+        let join = std::thread::spawn(move || receive(server, &tx));
+        let link = "tinyclient://action/nope".to_owned();
+        client.write_all(&(link.len() as u32).to_be_bytes()).unwrap();
+        client.write_all(link.as_bytes()).unwrap();
         assert!(join.join().unwrap().is_err());
         assert!(rx.try_recv().is_err());
     }

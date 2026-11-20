@@ -911,11 +911,20 @@ impl Slack {
         let reactions = event["reactions"].as_array().into_iter().flatten().filter_map(|reaction| {
             let (emoji, file) = self.reaction(reaction["name"].as_str()?);
             let users = reaction["users"].as_array();
+            // The payload names everyone: the ids the shell draws faces and names from.
+            let who: Vec<String> = users
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .take(protocol::REACTION_REACTORS)
+                .map(str::to_owned)
+                .collect();
             Some(Reaction {
                 emoji,
                 file,
                 count: reaction["count"].as_u64().or(users.map(|users| users.len() as u64)).unwrap_or(1) as u32,
                 mine: users.is_some_and(|users| users.iter().any(|user| user == mine)),
+                who,
             })
         });
         let reactions: Vec<Reaction> = reactions.collect();
@@ -963,6 +972,7 @@ impl Slack {
         message.card = framed;
         message.forwarded = forwarded;
         message.edited = event["edited"].is_object();
+        message.edited_at = event["edited"]["ts"].as_str().map(seconds).filter(|at| *at > 0);
         message.pinned = event["pinned_to"].as_array().is_some_and(|pinned| !pinned.is_empty());
         if outgoing {
             message.client_id = event["client_msg_id"].as_str().and_then(super::client_id);

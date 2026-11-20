@@ -1,0 +1,12 @@
+{
+  "id": "reaction-reactors",
+  "title": "A reaction keeps who the network named with it, and a count-only chip names nobody",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same reaction check is what this desktop run covers.",
+    "ios": "The phone proof build does not run desktop chatd. The same reaction check is what this desktop run covers."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

@@ -48,14 +48,19 @@ gpui::actions!(call, [ToggleMute, ToggleDeafen, Leave, Accept, Decline, Jump]);
 /// input or the window. They are bound the first time a call view is drawn (`ensure_keys`), so
 /// nothing outside this file has to call this.
 pub(super) fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("secondary-shift-m", ToggleMute, None),
-        KeyBinding::new("secondary-shift-d", ToggleDeafen, None),
-        KeyBinding::new("secondary-shift-h", Leave, None),
-        KeyBinding::new("secondary-shift-a", Accept, None),
-        KeyBinding::new("secondary-shift-r", Decline, None),
-        KeyBinding::new("secondary-shift-j", Jump, None),
-    ]);
+    macro_rules! bind {
+        ($id:literal, $action:expr) => {
+            for chord in super::keymap::chords($id) {
+                cx.bind_keys([KeyBinding::new(&chord, $action, None)]);
+            }
+        };
+    }
+    bind!("mute", ToggleMute);
+    bind!("deafen", ToggleDeafen);
+    bind!("leave-call", Leave);
+    bind!("accept", Accept);
+    bind!("decline", Decline);
+    bind!("go-to-call", Jump);
 }
 
 /// Set once the shortcuts are bound and their handlers registered.

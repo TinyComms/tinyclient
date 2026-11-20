@@ -27,7 +27,7 @@ impl Shell {
     /// Share pressed while not sharing: the picker.
     pub(in crate::gui) fn tiny_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if crate::gui::phone::active() {
-            self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None }), cx);
+            self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None }), cx);
             return;
         }
         self.tiny_state.screens = None;
@@ -48,12 +48,13 @@ impl Shell {
         self.tiny_state.shared = picked;
         self.close_modal(cx);
         let quality = Some(self.tiny_state.share_quality);
-        self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen, quality }), cx);
+        let show_cursor = Some(self.tiny_state.share_cursor);
+        self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen, quality, show_cursor }), cx);
     }
 
     pub(in crate::gui) fn tiny_stop_share(&mut self, cx: &mut Context<Self>) {
         self.tiny_state.shared = None;
-        self.call_ask(Request::Media(MediaRequest::ShareSend { on: false, screen: None, quality: None }), cx);
+        self.call_ask(Request::Media(MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None }), cx);
     }
 
     /// A click on a stream: watched, and filling the stage; when it already fills it, the grid.
@@ -164,6 +165,23 @@ impl Shell {
                         cx.notify();
                     }))
             })));
+        // Whether viewers see my pointer, so they can follow what I point at. Shown unless they
+        // are told otherwise; a platform that cannot draw it just keeps drawing none.
+        let pointer = div()
+            .mt(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .child(div().type_ui().text_color(theme::text_soft()).child("Pointer"))
+            .child(segmented()
+                .child(segment("tiny-share-pointer-shown", "Shown", state.share_cursor).on_click(cx.listener(|this, _, _, cx| {
+                    this.tiny_state.share_cursor = true;
+                    cx.notify();
+                })))
+                .child(segment("tiny-share-pointer-hidden", "Hidden", !state.share_cursor).on_click(cx.listener(|this, _, _, cx| {
+                    this.tiny_state.share_cursor = false;
+                    cx.notify();
+                }))));
         let ready = state.screens.is_some();
         let go = if ready && !self.tiny_state.busy {
             button("tiny-share-go", ButtonKind::Primary, "Share").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.tiny_share_picked(cx))).into_any_element()
@@ -177,6 +195,7 @@ impl Shell {
             .children(tabs)
             .child(body)
             .child(quality)
+            .child(pointer)
             .child(
                 div()
                     .mt(px(20.))

@@ -1435,14 +1435,14 @@ fn a_picture_on_a_voice_call_is_not_refused_for_being_voice_only() {
     let mut fake = Fake::new();
     let mut mediad = Mediad::start("null", None);
     // Before a join there is no engine in the call and the request is only noted. Nothing is opened.
-    assert!(matches!(mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: None }), MediaResponse::Streams { video } if video.len() == 1));
+    assert!(matches!(mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None }), MediaResponse::Streams { video } if video.len() == 1));
     mediad.join(&fake.endpoint(), NO_DAVE);
     let mut peer = fake.accept();
     fake.handshake(&mut peer, &[AES], 0, 30_000);
     mediad.connected();
     assert_eq!(mediad.ask(MediaRequest::Streams), MediaResponse::Streams { video: vec![] }, "joining clears a picture noted before it");
     for request in [
-        MediaRequest::ShareSend { on: true, screen: None, quality: None },
+        MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None },
         MediaRequest::ShareWatch { source: Some(THEM.into()) },
         MediaRequest::Speaker { source: Some(THEM.into()) },
         MediaRequest::Camera { on: true },
@@ -1454,7 +1454,7 @@ fn a_picture_on_a_voice_call_is_not_refused_for_being_voice_only() {
             other => panic!("a picture request answered {other:?}"),
         }
     }
-    let off = mediad.ask(MediaRequest::ShareSend { on: false, screen: None, quality: None });
+    let off = mediad.ask(MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None });
     assert!(matches!(off, MediaResponse::Streams { .. }), "{off:?}");
     assert_eq!(mediad.hang_up().0.code(), Some(0));
 }

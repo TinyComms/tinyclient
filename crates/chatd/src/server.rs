@@ -130,7 +130,7 @@ fn search_fate(fresh_sent: Option<&str>, waiting: Option<&str>, query: &str) -> 
 }
 
 pub struct Chat {
-    hub: Arc<Hub>,
+    pub(crate) hub: Arc<Hub>,
     adapters: Adapters,
     /// History catch-ups asked before that account's adapter was in the map.
     held: Mutex<Vec<(AccountKey, Command)>>,
@@ -183,7 +183,7 @@ fn call_error(err: CallError) -> Response {
 fn response_detail(response: &Response) -> String {
     match response {
         Response::Error { detail, .. } => detail.clone(),
-        _ => "That didn't work. Try again.".to_owned(),
+        _ => "Couldn't place that call. Try again.".to_owned(),
     }
 }
 
@@ -1102,9 +1102,10 @@ impl Chat {
     }
 
     /// Every badge goes. Discord hears one bulk ack per account; the other networks hear the
-    /// read they already know. A message request is read here and not announced.
-    fn mark_all_read(&self, network: Option<Network>) -> Response {
-        let marks = match self.hub.store().unread_marks(network) {
+    /// read they already know. A message request is read here and not announced. `network`
+    /// limits it to one network; `space` to one Space's conversations.
+    fn mark_all_read(&self, network: Option<Network>, space: Option<Key>) -> Response {
+        let marks = match self.hub.store().unread_marks(network, space.as_ref()) {
             Ok(marks) => marks,
             Err(err) => return internal(err),
         };
@@ -1438,6 +1439,9 @@ impl Chat {
             file: None,
             count: 1,
             mine: true,
+            // Ours is one person the store cannot name here; the network's word of the
+            // reaction carries the id, and a fresh payload corrects the list.
+            who: Vec::new(),
         };
         let message = match self.hub.store().message(&conversation, &message_id) {
             Ok(Some(message)) => message,
@@ -2413,6 +2417,35 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::Remind { conversation, message_id, remind_at } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                if remind_at.is_some_and(|due| due <= now()) {
+                    return error(ErrorCode::Refused, "That time has passed.");
+                }
+                match self.hub.store().remind(&conversation, &message_id, remind_at) {
+                    Ok(crate::store::RemindOutcome::Set | crate::store::RemindOutcome::Cleared) => {
+                        // The notification thread's next wait is due at a different time now.
+                        self.hub.notify(crate::notify::Event::Remind);
+                        Response::Ok
+                    }
+                    Ok(crate::store::RemindOutcome::Missing) => error(ErrorCode::NotFound, "no such message"),
+                    Ok(crate::store::RemindOutcome::Full) => {
+                        error(ErrorCode::Refused, format!("You have {} reminders already. Cancel one first.", crate::store::REMINDER_CAP))
+                    }
+                    Err(err) => internal(err),
+                }
+            }
+            Request::Reminders { conversation } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.hub.store().reminders(&conversation) {
+                    Ok(reminders) => Response::Reminders { conversation, reminders },
+                    Err(err) => internal(err),
+                }
+            }
 
             Request::People { network, relation, query, offset, limit } => {
                 self.people(network, relation, query, offset, limit)
@@ -2484,7 +2517,7 @@ impl Chat {
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
             Request::MarkRead { conversation, message_id } => self.mark_read(conversation, message_id),
             Request::MarkUnread { conversation, message_id } => self.mark_unread(conversation, message_id),
-            Request::MarkAllRead { network } => self.mark_all_read(network),
+            Request::MarkAllRead { network, space } => self.mark_all_read(network, space),
             Request::Forget { conversation } => self.forget_conversation(conversation),
             Request::Send { conversation, client_id, text, reply_to, with } => {
                 let began = std::time::Instant::now();
@@ -3458,6 +3491,43 @@ pub fn prove_offline_queue() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's space-mark-all-read driver. Reading one Space out leaves every other Space's and
+/// every direct row's badge alone, and a frame from an older peer without the Space still
+/// reads the whole Inbox.
+pub fn prove_space_mark_all_read() -> Result<(), String> {
+    match serde_json::from_value::<Request>(serde_json::json!({"op": "mark_all_read"})) {
+        Ok(Request::MarkAllRead { network: None, space: None }) => {}
+        _ => return Err("an older frame without a Space did not read".into()),
+    }
+    let mut store = Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?;
+    let account = AccountKey { network: Network::Discord, account: "ada".into() };
+    let mut room = crate::store::ConversationRow::new("general", ConversationKind::Channel, "general");
+    room.space = Some("4000".into());
+    store.upsert_conversation(&account, &room).map_err(|err| err.to_string())?;
+    store
+        .upsert_conversation(&account, &crate::store::ConversationRow::new("elsewhere", ConversationKind::Channel, "elsewhere"))
+        .map_err(|err| err.to_string())?;
+    let general = Key::new(&account, "general");
+    let elsewhere = Key::new(&account, "elsewhere");
+    store.ingest(&general, &Message::plain("8", "mara", "for this space", 10, false), true).map_err(|err| err.to_string())?;
+    store.ingest(&elsewhere, &Message::plain("9", "mara", "for another", 20, false), true).map_err(|err| err.to_string())?;
+    let chat = Arc::new(Chat::new(store));
+    let read = chat.handle(Request::MarkAllRead { network: Some(Network::Discord), space: Some(Key::new(&account, "4000")) });
+    if !matches!(read, Response::Ok) {
+        return Err(format!("the space-scoped read was refused: {read:?}"));
+    }
+    let row = |chat: &Chat, key: &Key| -> Result<Conversation, String> {
+        chat.hub.store().conversation(key).map_err(|err| err.to_string())?.ok_or_else(|| "the row vanished".into())
+    };
+    if row(&chat, &general)?.unread != 0 {
+        return Err("a conversation of the Space kept its badge".into());
+    }
+    if row(&chat, &elsewhere)?.unread != 1 {
+        return Err("another Space's badge was cleared".into());
+    }
+    Ok(())
+}
+
 /// Who we are on this conversation's account for a pending outgoing row: a prior message of
 /// ours in this chat when one names us (per-chat nick/avatar), else the cached self person.
 /// Never the account or workspace label. "You" only while nothing of us is cached.
@@ -3618,6 +3688,13 @@ mod tests {
     use crate::adapters::Command;
     use crate::store::{ConversationRow, PersonRow, Store};
     use protocol::{AccountKey, ConversationKind, Key, Link, MediaFile, MediaKind, Message, Network, Outgoing};
+
+    #[test]
+    fn a_missing_error_names_the_call() {
+        let words = super::response_detail(&protocol::Response::Ok);
+        assert!(words.starts_with("Couldn't place that call"), "{words}");
+        assert!(!words.contains("That didn't work"), "{words}");
+    }
 
     #[test]
     fn a_pending_message_names_the_cached_self_sender_before_any_ack() {

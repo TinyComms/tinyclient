@@ -551,3 +551,43 @@ fn a_ring_with_the_window_in_focus_is_still_heard() {
     assert_eq!(notes.call(Some(&call), Some(verdict), "", "Slack"), Some("soft_ring".to_owned()));
     assert!(fake.log().shown.is_empty(), "the card is all the window shows");
 }
+
+#[test]
+fn an_app_lock_names_the_message_and_refuses_the_reply() {
+    let (title, subtitle, body, reply) = redact_for_app_lock("Ines".into(), "Tiny".into(), "the plan".into(), true, true);
+    assert_eq!(title, "New message");
+    assert!(subtitle.is_empty() && body.is_empty() && !reply);
+    let (title, subtitle, body, reply) = redact_for_app_lock("Ines".into(), "Tiny".into(), "the plan".into(), true, false);
+    assert_eq!((title, subtitle, body, reply), ("Ines".into(), "Tiny".into(), "the plan".into(), true));
+}
+
+#[test]
+fn a_due_reminder_posts_silent_and_is_taken_out_but_waits_out_a_hush() {
+    let hub = std::sync::Arc::new(crate::hub::Hub::new(crate::store::Store::open(std::path::Path::new(":memory:")).unwrap()));
+    let account = protocol::AccountKey { network: Network::Slack, account: "T1".into() };
+    hub.store().upsert_conversation(&account, &crate::store::ConversationRow::new("later", ConversationKind::Channel, "#later")).unwrap();
+    let conversation = Key { network: Network::Slack, account: "T1".into(), id: "later".into() };
+    let saved: Message = serde_json::from_value(serde_json::json!({
+        "id": "m1", "sender": { "id": "u1", "name": "Mara" }, "sent": NOW, "text": "read this"
+    }))
+    .unwrap();
+    hub.store().ingest(&conversation, &saved, false).unwrap();
+    hub.store().remind(&conversation, "m1", Some(now())).unwrap();
+    let fake = Fake::default();
+    let mut notes = Notes::new(Box::new(fake.clone()));
+    // A pause holds the reminder back: nothing posts, nothing is lost.
+    let mut paused = Values::default();
+    set(&mut paused, GLOBAL, settings::PAUSED_UNTIL, "resume");
+    due(&hub, &mut notes, &paused);
+    assert!(fake.log().posted.is_empty(), "a pause holds a reminder back");
+    assert_eq!(hub.store().reminders(&conversation).unwrap().len(), 1);
+    // Once the hush lifts it posts one silent note, and the store forgets it.
+    let values = Values::default();
+    due(&hub, &mut notes, &values);
+    let posted = fake.log().posted.clone();
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0].id, reminder_id(&conversation, "m1"));
+    assert_eq!((posted[0].kind, posted[0].sound.as_deref(), posted[0].body.as_str()), (Kind::Plain, None, "read this"));
+    assert!(hub.store().reminders(&conversation).unwrap().is_empty(), "a fired reminder is gone");
+    assert_eq!(hub.store().next_reminder_due().unwrap(), None);
+}

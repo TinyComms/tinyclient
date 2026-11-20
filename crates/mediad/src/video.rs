@@ -2091,6 +2091,32 @@ mod tests {
         video.stop();
     }
 
+    /// What `e2e/scenarios/share-pointer` runs: a real share goes out with the pointer shown,
+    /// which is the default, and a share that asks for none turns it off for the next one.
+    #[test]
+    #[ignore = "needs a screen and the OpenH264 binary"]
+    fn the_capture_thread_shares_with_the_pointer_the_share_asked_for() {
+        let mut video = Video::new(Arc::default());
+        video.want(Wants { share: true, rates: Rates::default(), ..Wants::default() });
+        assert!(picture::cursor_shown(), "the pointer is shown unless the share asks for none");
+        let (mut frames, started) = (0u32, Instant::now());
+        while started.elapsed() < Duration::from_secs(3) {
+            match video.next() {
+                Some(Word::Frame { track, .. }) if track == Track::Share => frames += 1,
+                Some(Word::Failed { words, .. }) => panic!("{words}"),
+                Some(_) => {}
+                None => std::thread::yield_now(),
+            }
+        }
+        assert!(frames >= 30, "about 15 a second: {frames}");
+        eprintln!("share-pointer-proof: {frames} frames went out with the pointer shown");
+        picture::choose_cursor(Some(false));
+        assert!(!picture::cursor_shown(), "the share asked for no pointer");
+        eprintln!("share-pointer-proof: a share that asks for none turns it off");
+        picture::choose_cursor(None);
+        video.stop();
+    }
+
     #[test]
     fn a_resume_starts_no_new_thread_and_hang_up_ends_them_all() {
         let mut video = Video::new(Arc::default());

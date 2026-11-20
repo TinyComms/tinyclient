@@ -1,8 +1,8 @@
 //! The window's part in notifications, which chatd posts (`chatd/src/notify.rs`): it tells
 //! chatd when it has focus, so the conversation being read never notifies; it comes forward on
 //! the conversation a clicked notification names (`Change::Open`, or `--open` when chatd had to
-//! start it); and it keeps the taskbar button or Dock icon's number (N11) and flashes it for
-//! something new while it is in the background (N10).
+//! start it); and it keeps the taskbar button, Dock icon or launcher entry's number (N11) and
+//! flashes or bounces it for something new while it is in the background (N10).
 
 use super::Shell;
 use gpui::Context;
@@ -15,6 +15,15 @@ thread_local! {
     static SHOWN: Cell<Option<u32>> = const { Cell::new(None) };
     /// `--open` at launch, held until the first status, when there is a list to open it in.
     static PENDING: RefCell<Option<Key>> = const { RefCell::new(None) };
+    /// The window whose manager a flash asks. The other systems find their own (`taskbar`).
+    #[cfg(target_os = "linux")]
+    static WINDOW: Cell<Option<gpui::AnyWindowHandle>> = const { Cell::new(None) };
+}
+
+/// The window, noted when it opens, so a flash can reach it without a redraw in hand.
+#[cfg(target_os = "linux")]
+pub(super) fn note_window(window: gpui::AnyWindowHandle) {
+    WINDOW.with(|slot| slot.set(Some(window)));
 }
 
 /// `--open=<key as JSON>`: chatd started the window for a clicked notification.
@@ -64,7 +73,14 @@ impl Shell {
         if before == Some(now) {
             return;
         }
-        show(if values.on(BADGE) { now } else { 0 }, flashes(before, now, self.active, values.on(FLASH)));
+        let flash = flashes(before, now, self.active, values.on(FLASH));
+        show(if values.on(BADGE) { now } else { 0 }, flash);
+        // The flash asks the window, which only this update's context can reach; the number
+        // went to the launcher entry without it (`notifier::taskbar`).
+        #[cfg(target_os = "linux")]
+        if flash {
+            demand_attention(cx);
+        }
     }
 
     /// N11 was turned on or off: show or clear the number now.
@@ -74,8 +90,9 @@ impl Shell {
     }
 }
 
-/// The number on the button or icon, and a flash. Linux has neither here: a desktop's own
-/// launcher badge (Unity's LauncherEntry) is not spoken yet.
+/// The number on the button, icon or launcher entry, and a flash. On Linux the number goes to
+/// the desktop's launcher entry over the session bus, and the flash is asked of the window
+/// manager in `attention_changed`, whose context can reach the window.
 fn show(badge: u32, flash: bool) {
     #[cfg(any(windows, target_os = "macos"))]
     {
@@ -84,8 +101,26 @@ fn show(badge: u32, flash: bool) {
             notifier::taskbar::flash();
         }
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        notifier::taskbar::badge(badge);
+        let _ = flash;
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     let _ = (badge, flash);
+}
+
+/// The window manager's attention for something new: X11's urgency hint
+/// (`_NET_WM_STATE_DEMANDS_ATTENTION` through GPUI's `Window::request_attention`), which the
+/// manager clears when the window comes to front. Wayland has no such hint, where the call is
+/// nothing and the entry's number is the only sign.
+#[cfg(target_os = "linux")]
+fn demand_attention(cx: &mut Context<Shell>) {
+    WINDOW.with(|window| {
+        if let Some(window) = window.get() {
+            let _ = window.update(cx, |_, window, _| window.request_attention());
+        }
+    });
 }
 
 #[cfg(test)]
