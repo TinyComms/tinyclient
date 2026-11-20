@@ -10,6 +10,10 @@ pub const THREAD_FACES: usize = 3;
 pub const CARD_FIELDS: usize = 10;
 /// Most bytes of a voice message's waveform.
 pub const WAVEFORM_LIMIT: usize = 256;
+/// Most choices one poll lists. Signal allows ten.
+pub const POLL_OPTIONS: usize = 10;
+/// Most voters named on one choice. The count can be higher.
+pub const POLL_VOTERS: usize = 200;
 
 /// Cuts text from a network to at most `chars` characters, so no frame grows with what a
 /// stranger typed.
@@ -320,6 +324,59 @@ pub struct Sender {
     pub bot: bool,
 }
 
+/// One choice on a [`Poll`], and who currently picked it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollChoice {
+    pub text: String,
+    #[serde(default)]
+    pub count: u32,
+    /// People who picked this, when the network names them. Shorter than `count` once the list is full.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub voters: Vec<String>,
+}
+
+/// One person's current vote. `serial` is Signal's `voteCount`: a later vote replaces an earlier
+/// one only when it is higher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollBallot {
+    pub person: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<u32>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub serial: u32,
+}
+
+/// A poll on a message: the question, the choices and their counts, which I picked, and whether
+/// it has ended. `ballots` is who voted for what, so a later vote from the same person replaces
+/// theirs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Poll {
+    pub question: String,
+    pub choices: Vec<PollChoice>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub multiple: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub closed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mine: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ballots: Vec<PollBallot>,
+}
+
+impl Poll {
+    /// A poll nobody has voted on yet.
+    pub fn open(question: impl Into<String>, options: impl IntoIterator<Item = impl Into<String>>, multiple: bool) -> Poll {
+        Poll {
+            question: question.into(),
+            choices: options.into_iter().map(|text| PollChoice { text: text.into(), count: 0, voters: Vec::new() }).collect(),
+            multiple,
+            closed: false,
+            mine: Vec::new(),
+            ballots: Vec::new(),
+        }
+    }
+}
+
 /// One message. Which conversation it is in comes from the answer that carries it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
@@ -367,6 +424,9 @@ pub struct Message {
     pub forwarded: Option<Box<Forwarded>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card: Option<Box<Card>>,
+    /// Boxed, like `card`: few messages are a poll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll: Option<Box<Poll>>,
     /// A message that was deleted but still has a thread hanging off it. Everything it said
     /// is gone; the row stays so the thread has somewhere to hang.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -438,6 +498,7 @@ impl Message {
             thread: None,
             forwarded: None,
             card: None,
+            poll: None,
             deleted: false,
             edited: false,
             pinned: false,
@@ -484,6 +545,19 @@ impl Message {
                 clip(value, 1_000);
             }
         }
+        if let Some(poll) = &mut self.poll {
+            clip(&mut poll.question, 100);
+            poll.choices.truncate(POLL_OPTIONS);
+            for choice in &mut poll.choices {
+                clip(&mut choice.text, 100);
+                choice.voters.truncate(POLL_VOTERS);
+            }
+            poll.mine.truncate(POLL_OPTIONS);
+            poll.ballots.truncate(1_024);
+            for ballot in &mut poll.ballots {
+                ballot.choices.truncate(POLL_OPTIONS);
+            }
+        }
     }
 
     /// What is left of a message once it is deleted but must stay: who and when, nothing else.
@@ -496,6 +570,7 @@ impl Message {
         self.reply_to = None;
         self.forwarded = None;
         self.card = None;
+        self.poll = None;
         self.pinned = false;
         self.mentions_me = false;
         self.deleted = true;

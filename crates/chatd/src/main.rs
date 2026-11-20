@@ -586,6 +586,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-signal-privacy-local:0");
         return Ok(());
     }
+    // The lab's signal-poll driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-poll") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_poll() {
+            eprintln!("signal-poll: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-poll:0");
+        return Ok(());
+    }
     // The lab's messages-unpaired driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-unpaired") {
         if let Err(err) = chatd::adapters::messages::prove_messages_unpaired() {

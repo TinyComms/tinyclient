@@ -180,6 +180,22 @@ pub enum Event {
     Forgot(Peer),
     /// `by` reacted to `author`'s message sent at `target`.
     Reacted { peer: Peer, by: String, author: String, target: u64, emoji: String, removed: bool },
+    /// A poll was started. `options` are the choices, in order.
+    Poll {
+        peer: Peer,
+        author: String,
+        name: String,
+        sent: u64,
+        question: String,
+        options: Vec<String>,
+        multiple: bool,
+        outgoing: bool,
+    },
+    /// `by` voted on `author`'s poll sent at `target`. An empty `indexes` takes the vote back.
+    /// `serial` is Signal's voteCount; `0` means this vote is newer than the one we have.
+    PollVote { peer: Peer, by: String, author: String, target: u64, indexes: Vec<u32>, serial: u32 },
+    /// `author` ended their poll sent at `target`.
+    PollEnded { peer: Peer, author: String, target: u64 },
     /// The user read these messages (author, sent) on another device.
     ReadElsewhere(Vec<(String, u64)>),
     /// `by`'s phone received our messages sent at these times, or `by` read them (`read`).
@@ -228,6 +244,12 @@ pub enum Body {
     Delete { target: u64 },
     /// Delete for me: the user's other devices drop this message, and nobody else is told.
     DeleteForMe { author: String, target: u64 },
+    /// Start a poll. `options` has 2 to 10 choices.
+    Poll { question: String, options: Vec<String>, multiple: bool },
+    /// Vote, or take a vote back when `indexes` is empty. `serial` increments each time we vote.
+    PollVote { author: String, target: u64, indexes: Vec<u32>, serial: u32 },
+    /// End our own poll.
+    PollEnd { target: u64 },
 }
 
 /// Why something failed.
