@@ -10,6 +10,7 @@
 //! | --- | --- |
 //! | `incoming WHO SENT TEXT…` | WHO wrote TEXT to us, sent at SENT (ms) |
 //! | `group WHO SENT TEXT…` | the same, in the group |
+//! | `group-title TITLE…` | the group was renamed to TITLE |
 //! | `mention WHO SENT TEXT…` | the same, in the group, naming us |
 //! | `photo WHO SENT` | WHO sent a photo with no caption |
 //! | `payment WHO SENT NOTE…` | WHO sent a payment notification; its note, when words follow |
@@ -97,7 +98,7 @@ impl Fake {
         let grace = Contact { id: GRACE.into(), name: "Grace Ombra".into(), phone: "+15550100002".into() };
         let alan = Contact { id: ALAN.into(), name: "Alan Ferro".into(), phone: String::new() };
         let _ = events.send(Event::Contacts(vec![grace, alan]));
-        let club = GroupInfo { id: CLUB.into(), title: "Bridge club".into(), description: "Tuesdays, 7 pm".into(), members: 3 };
+        let club = GroupInfo { id: CLUB.into(), title: "Bridge club".into(), description: "Tuesdays, 7 pm".into(), members: 3, member: true };
         let _ = events.send(Event::Groups(vec![club]));
         let _ = events.send(Event::Settings { read_receipts: true, typing: true });
         let _ = events.send(Event::Caught);
@@ -263,6 +264,39 @@ fn steer(line: &str) -> Vec<Event> {
             let id = next().parse().unwrap_or(T0);
             vec![Event::CallEnded { id, answered: command == "hangup-accepted" }]
         }
+        "group-title" => {
+            let title = rest(line, 1);
+            if title.is_empty() {
+                return Vec::new();
+            }
+            vec![Event::GroupChanged {
+                peer: club(),
+                by: String::new(),
+                changes: vec![format!("The group name is now {title}")],
+                title: Some(title),
+                description: None,
+                left: false,
+                rejoined: false,
+            }]
+        }
+        "group-leave" => vec![Event::GroupChanged {
+            peer: club(),
+            by: String::new(),
+            changes: vec!["You are no longer in this group".to_owned()],
+            title: None,
+            description: None,
+            left: true,
+            rejoined: false,
+        }],
+        "group-rejoin" => vec![Event::GroupChanged {
+            peer: club(),
+            by: String::new(),
+            changes: vec!["You joined the group".to_owned()],
+            title: None,
+            description: None,
+            left: false,
+            rejoined: true,
+        }],
         "drop" => vec![Event::Closed("the fake dropped the connection".into())],
         "unlinked" => vec![Event::Ended("This computer was removed from your Signal account.".into())],
         _ => Vec::new(),

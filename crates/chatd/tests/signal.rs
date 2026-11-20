@@ -949,3 +949,44 @@ fn a_delete_older_than_the_window_is_not_offered_for_everyone() {
     assert!(!chatd::adapters::signal::accept_remote(now - 49 * hour, now, false));
     assert!(chatd::adapters::signal::accept_remote(now - 49 * hour, now, true));
 }
+
+/// A rename while connected updates the row and writes one system line. The first snapshot does not.
+#[test]
+fn a_renamed_group_takes_the_new_name_and_one_system_row() {
+    let world = World::linked();
+    world.connected();
+    assert_eq!(world.conversation(CLUB).unwrap().title, "Bridge club");
+    assert!(world.messages(CLUB).iter().all(|message| message.kind != MessageKind::System));
+    world.steer("group-title Wednesday club");
+    world.until("the new name", || (world.conversation(CLUB)?.title == "Wednesday club").then_some(()));
+    let systems: Vec<_> = world.messages(CLUB).into_iter().filter(|message| message.kind == MessageKind::System).collect();
+    assert_eq!(systems.len(), 1, "{systems:?}");
+    assert_eq!(systems[0].text, "The group name is now Wednesday club");
+    assert!(!world.conversation(CLUB).unwrap().read_only);
+
+    // Leaving marks the group read-only, a rename while removed keeps it read-only,
+    // and being re-added clears read-only again.
+    world.steer("group-leave");
+    world.until("read-only after leave", || world.conversation(CLUB)?.read_only.then_some(()));
+    world.steer("group-title Thursday club");
+    world.until("renamed while removed", || (world.conversation(CLUB)?.title == "Thursday club").then_some(()));
+    assert!(world.conversation(CLUB).unwrap().read_only);
+    world.steer("group-rejoin");
+    world.until("writable after rejoin", || (!world.conversation(CLUB)?.read_only).then_some(()));
+}
+
+/// The sentence for a rename, a join, and leaving. The connect snapshot is not a sentence.
+#[test]
+fn a_group_delta_names_the_rename_the_join_and_the_leave() {
+    chatd::adapters::signal::prove_signal_group_rename().expect("rename");
+    let before = chatd::adapters::signal::GroupSnap {
+        members: vec![chatd::adapters::signal::MemberSnap { id: ME.into(), admin: false }],
+        ..chatd::adapters::signal::GroupSnap::default()
+    };
+    let mut members = before.members.clone();
+    members.push(chatd::adapters::signal::MemberSnap { id: GRACE.into(), admin: false });
+    let after = chatd::adapters::signal::GroupSnap { members, ..chatd::adapters::signal::GroupSnap::default() };
+    let joined = chatd::adapters::signal::group_delta(&before, &after, ME, |id| if id == GRACE { "Grace Ombra".into() } else { String::new() });
+    assert_eq!(joined.lines, ["Grace Ombra joined the group"]);
+    assert!(!joined.left);
+}
