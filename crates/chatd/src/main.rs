@@ -476,6 +476,8 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-slack-custom-emoji:0");
+        return Ok(());
+    }
     // The lab's teams-copy-link driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("teams-copy-link") {
         if let Err(err) = chatd::adapters::prove_share_links() {
@@ -492,6 +494,8 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-teams-team-info:0");
+        return Ok(());
+    }
     // The lab's messages-unread driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-unread") {
         if let Err(err) = chatd::adapters::messages::prove_messages_unread() {
@@ -688,6 +692,8 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-telegram-mark-unread:0");
+        return Ok(());
+    }
     // The lab's message-remind driver. A build without this stays up and the driver fails.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("message-remind") {
         if let Err(err) = chatd::notify::prove_message_remind() {
@@ -848,6 +854,8 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-slack-rich-text:0");
+        return Ok(());
+    }
     // The lab's telegram-delete-placed driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-delete-placed") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_delete_placed() {
@@ -873,6 +881,8 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-telegram-checklist:0");
+        return Ok(());
+    }
     // The lab's signal-text-styles driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-text-styles") {
         if let Err(err) = chatd::adapters::signal::prove_signal_styles() {

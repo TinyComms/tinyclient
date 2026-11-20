@@ -1496,14 +1496,14 @@ fn a_balanced_share_tells_the_voice_server_1080p_at_30_and_a_later_pick_is_told_
     let mut live = fake.accept();
     fake.handshake_kind(&mut live, &[AES], 0, 30_000, Some("screen"));
     assert_eq!(live.expect(15)["any"], 100);
-    let started = mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: Some(ShareQuality::Balanced) });
+    let started = mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: Some(ShareQuality::Balanced), show_cursor: None });
     assert!(matches!(started, MediaResponse::Streams { .. }), "{started:?}");
     let told = live.expect(12);
     assert_eq!(told["streams"][0]["max_resolution"]["width"], 1920);
     assert_eq!(told["streams"][0]["max_resolution"]["height"], 1080);
     assert_eq!(told["streams"][0]["max_framerate"], 30);
     assert_eq!(told["streams"][0]["max_bitrate"], 4_000_000);
-    let again = mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: Some(ShareQuality::Low) });
+    let again = mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: Some(ShareQuality::Low), show_cursor: None });
     assert!(matches!(again, MediaResponse::Streams { .. }), "{again:?}");
     let told = live.expect(12);
     assert_eq!(told["streams"][0]["max_resolution"]["width"], 1280);

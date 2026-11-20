@@ -2612,6 +2612,8 @@ pub(super) fn prove_polls() -> Result<(), String> {
         return Err(format!("a hidden quiz showed a count: {}", card.text));
     }
     Ok(())
+}
+
 /// The lab's telegram-edited check. An edit arrives with its time, and the store keeps what
 /// the words were before, where the replace would otherwise forget both.
 pub(super) fn prove_edited() -> Result<(), String> {

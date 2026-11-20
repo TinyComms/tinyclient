@@ -839,7 +839,7 @@ fn styled_text_is_sent_as_ranges_and_a_spoiler_stays_out_of_the_preview() {
         world.messages(GRACE).into_iter().find(|message| message.client_id.as_deref() == Some("5002") && message.id != "5002")
     });
     assert_eq!(answered.reply_to.as_ref().map(|reply| reply.snippet.as_str()), Some("Hold Spoiler"));
-    assert_eq!(world.ask(Request::Edit { conversation: key(GRACE), message_id: styled.id, text: "~~no~~".into() }), Response::Ok);
+    assert_eq!(world.ask(Request::Edit { conversation: key(GRACE), message_id: styled.id, text: "~~no~~".into(), spans: Vec::new() }), Response::Ok);
     world.heard(&format!("send {GRACE} edit {styled_at} no ranges=Strike:0+2"));
     let edited = world.until("the strike", || {
         world.messages(GRACE).into_iter().find(|message| message.text == "no" && message.spans.iter().any(|span| span.style == protocol::Style::Strike))
@@ -978,7 +978,7 @@ fn deleting_an_old_message_is_delete_for_me() {
     world.connected();
     world.steer(&format!("mine {T0} From the phone"));
     let old = world.arrived(GRACE, &id(T0, ME));
-    let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: old.id.clone(), text: "Too late".into() });
+    let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: old.id.clone(), text: "Too late".into(), spans: Vec::new() });
     assert!(matches!(&refused, Response::Error { detail, .. } if detail.contains("no longer")), "{refused:?}");
     assert!(!world.calls().iter().any(|call| call.contains(&format!("edit {T0}"))));
     assert_eq!(world.ask(Request::Delete { conversation: key(GRACE), message_id: old.id.clone() }), Response::Ok);

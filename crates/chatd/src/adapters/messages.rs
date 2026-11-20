@@ -1802,6 +1802,7 @@ fn deliver_files(
             name: part.name.clone(),
             file,
             thumb: None,
+            preview: None,
             mime: part.mime.to_owned(),
             duration,
             spoiler: false,

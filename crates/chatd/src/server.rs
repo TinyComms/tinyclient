@@ -1636,7 +1636,7 @@ impl Chat {
         let votes = votes.map(|votes| votes.into_iter().take(10).collect::<Vec<_>>());
         let text = adapters::signal::poll_command(votes.as_deref());
         let conversation_id = conversation.id;
-        match self.ask(&account, |reply| Command::Edit { conversation_id, message_id, text, reply }) {
+        match self.ask(&account, |reply| Command::Edit { conversation_id, message_id, text, spans: Vec::new(), reply }) {
             Ok(()) => Response::Ok,
             Err(refused) => *refused,
         }

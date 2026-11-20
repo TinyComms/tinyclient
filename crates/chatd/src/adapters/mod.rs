@@ -1663,6 +1663,8 @@ pub fn prove_slack_channel_star() -> Result<(), String> {
 /// with a Join link, and an old Slack call says that it happened.
 pub fn prove_slack_call_cards() -> Result<(), String> {
     slack::prove_call_cards()
+}
+
 /// The lab's discord-thread-chip driver. A thread chip counts new replies and keeps the
 /// newest faces. A build without this returns to the server and stays up.
 pub fn prove_discord_thread_chip() -> Result<(), String> {
@@ -1760,6 +1762,8 @@ pub fn prove_slack_connect_org() -> Result<(), String> {
 /// The lab's slack-rich-text driver. See `slack::prove_rich_text`.
 pub fn prove_slack_rich_text() -> Result<(), String> {
     slack::prove_rich_text()
+}
+
 /// The lab's teams-team-info driver. See `teams::prove_team_info`.
 pub fn prove_teams_team_info() -> Result<(), String> {
     teams::prove_team_info()
