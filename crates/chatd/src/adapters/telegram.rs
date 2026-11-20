@@ -1415,3 +1415,8 @@ pub fn prove_telegram_block_contact() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// The lab's telegram-checklist driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_checklist() -> Result<(), String> {
+    content::prove_checklist()
+}
