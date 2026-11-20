@@ -26,8 +26,7 @@ mod video;
 mod viewer;
 mod when;
 mod wiki;
-#[path = "../../../chatd/src/adapters/discord/highlight.rs"]
-mod highlight;
+use protocol::highlight;
 
 pub(in crate::gui) use player::glyph as player_glyph;
 

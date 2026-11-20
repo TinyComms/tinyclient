@@ -56,8 +56,7 @@ pub fn highlight(language: &str, source: &str) -> Lit {
 
 /// The lab's discord-code-colors driver. A rust keyword, a diff's added and removed lines,
 /// and an ansi colour with the escapes gone. A build without this stays up and the driver fails.
-#[allow(dead_code)]
-pub(super) fn prove_code_colors() -> Result<(), String> {
+pub fn prove_code_colors() -> Result<(), String> {
     let rust = highlight("rust", "fn main() {}");
     let keyword = rust
         .runs
@@ -836,7 +835,17 @@ mod tests {
 
     #[test]
     fn ansi_escape_followed_by_non_ascii_text_does_not_panic() {
-        for text in ["\u{1b}[é", "\u{1b}[1;é", "a\u{1b}[😀b", "\u{1b}[31;你好\u{1b}[0m"] {
+        let capped = format!("\u{1b}[{}é", "1".repeat(64));
+        for text in [
+            "\u{1b}[é",
+            "\u{1b}[1;é",
+            "a\u{1b}[😀b",
+            "\u{1b}[31;你好\u{1b}[0m",
+            "\u{1b}é",
+            "\u{1b}[",
+            "\u{1b}",
+            capped.as_str(),
+        ] {
             let lit = highlight("ansi", text);
             assert!(lit.text.is_char_boundary(lit.text.len()));
             for run in &lit.runs {
@@ -845,6 +854,8 @@ mod tests {
         }
         assert_eq!(highlight("ansi", "\u{1b}[é").text, "é");
         assert_eq!(highlight("ansi", "a\u{1b}[😀b").text, "a😀b");
+        assert_eq!(highlight("ansi", "\u{1b}é").text, "é");
+        assert_eq!(highlight("ansi", &capped).text, "é");
     }
 
     #[test]
