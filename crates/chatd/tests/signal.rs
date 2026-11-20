@@ -355,6 +355,21 @@ fn a_view_once_message_says_where_it_opens_instead_of_promising_the_media() {
 }
 
 #[test]
+fn a_long_text_is_the_message_not_a_file() {
+    let world = World::linked();
+    world.connected();
+    let body = "y".repeat(2_048);
+    world.steer(&format!("longtext grace {} {body}", T0 + 4_000));
+    let long = world.arrived(GRACE, &id(T0 + 4_000, GRACE));
+    // What the body carried is the message, named as itself, with the note about the rest.
+    assert_eq!(&long.kind, &MessageKind::Normal, "{long:?}");
+    assert_eq!(long.text, format!("{body}\n\n(message continues on your phone)"));
+    // And it reads like any message.
+    world.send(GRACE, "5001", "Read it all.", None);
+    world.heard(&format!("send {GRACE} text Read it all."));
+}
+
+#[test]
 fn reactions_edits_deletes_and_receipts_land_on_the_right_message() {
     let world = World::linked();
     world.connected();

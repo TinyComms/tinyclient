@@ -135,6 +135,10 @@ pub fn view_once_label(content_type: Option<&str>) -> &'static str {
     }
 }
 
+/// The note under a long text's body until attachments can be fetched: what is here is its
+/// first part, the rest on the phone.
+pub const CONTINUES: &str = "\n\n(message continues on your phone)";
+
 /// Something Signal sent unasked, or the end of the connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {

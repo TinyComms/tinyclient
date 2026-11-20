@@ -69,6 +69,10 @@ const REACTIONS_KEPT: usize = 4_096;
 const NO_NAME: &str = "Signal user";
 /// Most pictures asked of Signal for one change to what is on screen.
 const PICTURES: usize = 25;
+/// What the official apps keep in the message itself of a long text; more travels as Signal's
+/// own plain-text attachment, whose first part the body repeats. Sending that way is still to
+/// come. The composer counts in characters where Signal cuts in bytes on a character boundary.
+const TEXT_LIMIT: u32 = 2_048;
 /// Marks a `SetPresence` status that is really an edit of our own profile. A status a person
 /// typed never starts with this, and the server sends it only for Signal, without changing
 /// presence.
@@ -109,6 +113,18 @@ fn profile_part(part: &str) -> Option<Option<String>> {
         Some('0') => Some(None),
         Some('1') => Some(Some(chars.collect())),
         _ => None,
+    }
+}
+
+/// The lab's signal-long-text driver. A build without the Signal library has no driver, so it stays up and the lab fails.
+pub fn prove_signal_long_text() -> Result<(), String> {
+    #[cfg(feature = "signal")]
+    {
+        real::prove_long_text()
+    }
+    #[cfg(not(feature = "signal"))]
+    {
+        Err(unsupported_reason())
     }
 }
 
@@ -408,6 +424,8 @@ fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mute
     let account = Arc::new(Account { ctx: ctx.clone(), wire, me, name, live: live.clone(), pictured: Mutex::default() });
     let _ = ctx.describe(if account.name.is_empty() { "Signal" } else { &account.name }, &account.me);
     show_self(&account);
+    // Nothing is counted until an adapter says so; Signal counts its own body limit.
+    ctx.capabilities(capabilities());
     *current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(account.clone());
     // Dropped while connecting: the command thread has gone and will not close this wire.
     if ctx.stopped() {
@@ -681,6 +699,13 @@ pub fn reaction_rules() -> protocol::ReactionRules {
     protocol::ReactionRules { mine: 1, replaces: true, ..protocol::ReactionRules::default() }
 }
 
+/// What this account may send: text up to the body other clients keep in the message itself,
+/// and no files (attachments are neither uploaded nor fetched yet). The counter keeps a long
+/// paste from becoming a message other clients may cut short or refuse.
+fn capabilities() -> protocol::Capabilities {
+    protocol::Capabilities { text_limit: TEXT_LIMIT, ..protocol::Capabilities::default() }
+}
+
 fn serve(account: &Arc<Account>, command: Command) {
     let ctx = &account.ctx;
     match command {
@@ -830,11 +855,17 @@ fn target(message_id: &str) -> Result<(u64, String), Fault> {
     wire::parse_message_id(message_id).ok_or_else(|| Fault::Refused("That message is no longer there.".to_owned()))
 }
 
+/// The words a quote quotes of a stored message: without the note that the rest is on the
+/// phone, which is this device's invention for drawing the message and never travels.
+fn quoted_words(text: &str) -> String {
+    text.strip_suffix(wire::CONTINUES).map_or_else(|| text.to_owned(), str::to_owned)
+}
+
 fn send_text(account: &Account, conversation: &str, text: &str, reply_to: Option<&str>) -> Result<Message, Fault> {
     let to = peer(conversation)?;
     let quote = match reply_to.map(target).transpose()? {
         Some((sent, author)) => {
-            let text = account.ctx.stored_message(conversation, &wire::message_id(sent, &author)).ok().flatten().map_or_else(String::new, |m| m.text);
+            let text = account.ctx.stored_message(conversation, &wire::message_id(sent, &author)).ok().flatten().map_or_else(String::new, |m| quoted_words(&m.text));
             Some(Quote { sent, author, text })
         }
         None => None,
@@ -965,5 +996,12 @@ mod tests {
         assert_eq!((name.as_deref(), about.as_deref(), emoji.as_deref()), (Some("Ada"), Some("New about"), Some("")));
         assert!(profile_edit("Lunch").is_none());
         assert!(prove_signal_own_profile().is_ok());
+    }
+
+    #[test]
+    fn a_quote_quotes_the_words_without_the_note() {
+        let body = "y".repeat(2_048);
+        assert_eq!(quoted_words(&format!("{body}{}", wire::CONTINUES)), body);
+        assert_eq!(quoted_words("Tuesday, seven sharp."), "Tuesday, seven sharp.");
     }
 }

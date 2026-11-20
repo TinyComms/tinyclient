@@ -6,7 +6,7 @@
 //! Signal without a real phone to link from (see `tests/signal.rs` for what is proven).
 
 use super::vault::{self, Vault};
-use super::wire::{gift_badge_label, payment_label, view_once_label, Body, Contact, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{gift_badge_label, payment_label, view_once_label, Body, Contact, CONTINUES, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use futures::StreamExt;
 use presage::libsignal_service::content::ContentBody;
@@ -36,6 +36,9 @@ use tokio::sync::mpsc as async_mpsc;
 const ANSWER: Duration = Duration::from_secs(45);
 /// How long connecting may take before the attempt counts as dropped.
 const CONNECT: Duration = Duration::from_secs(60);
+/// Signal's content type for text too long for one message: the whole text travels as this
+/// attachment, and the body repeats its first part.
+const LONG_TEXT: &str = "text/x-signal-plain";
 
 type Signal = Manager<Vault, Registered>;
 
@@ -128,11 +131,15 @@ fn payment_note(payment: &data_message::Payment) -> Option<&str> {
 
 /// What a message that is not drawn here says, in words. A view-once photo or video is named
 /// before its attachment: it opens once, on the phone, so "Photo" would promise a file that is
-/// not here to open and say nothing of why (#748).
+/// not here to open and say nothing of why (#748). A long text is drawn: it is the message's own
+/// words, not a file (#728).
 fn unsupported_label(message: &DataMessage) -> Option<String> {
     if message.is_view_once.unwrap_or(false) {
         let kind = message.attachments.first().and_then(|attachment| attachment.content_type.as_deref());
         return Some(view_once_label(kind).to_owned());
+    }
+    if long_text(message) {
+        return None;
     }
     if let Some(attachment) = message.attachments.first() {
         let kind = attachment.content_type.as_deref().unwrap_or("");
@@ -294,6 +301,50 @@ async fn own_name(manager: &mut Signal) -> Option<String> {
     profile.name.map(|name| name.to_string()).filter(|name| !name.trim().is_empty())
 }
 
+/// Whether the message's text is too long for one message: Signal carries the whole text as
+/// its own plain-text attachment, the first part of which the body repeats. Until attachments
+/// can be fetched, the body is all this device has of it.
+fn long_text(message: &DataMessage) -> bool {
+    message.attachments.first().is_some_and(|attachment| attachment.content_type.as_deref() == Some(LONG_TEXT))
+}
+
+/// The words of a message before names are put to its mentions. A long text's body carries the
+/// note that the rest follows on the phone.
+fn words(message: &DataMessage) -> String {
+    let mut text = message.body.clone().unwrap_or_default();
+    if long_text(message) {
+        text.push_str(CONTINUES);
+    }
+    text
+}
+
+/// The lab's signal-long-text driver: a long text is the message's own words, not a file, and
+/// its body carries the note that the rest is on the phone.
+pub fn prove_long_text() -> Result<(), String> {
+    let body = "x".repeat(2_048);
+    let mut long = DataMessage::default();
+    long.body = Some(body.clone());
+    long.attachments.push(Default::default());
+    if let Some(attachment) = long.attachments.last_mut() {
+        attachment.content_type = Some(LONG_TEXT.to_owned());
+    }
+    if unsupported_label(&long).is_some() {
+        return Err("a long text was named like a file".into());
+    }
+    if words(&long) != format!("{body}{CONTINUES}") {
+        return Err("a long text was shown without the note".into());
+    }
+    let mut photo = DataMessage::default();
+    photo.attachments.push(Default::default());
+    if let Some(attachment) = photo.attachments.last_mut() {
+        attachment.content_type = Some("image/jpeg".to_owned());
+    }
+    if unsupported_label(&photo).as_deref() != Some("Photo") {
+        return Err("a photo was no longer named a photo".into());
+    }
+    Ok(())
+}
+
 /// One connection's state, on the wire's thread.
 struct Session {
     manager: Signal,
@@ -408,7 +459,7 @@ impl Session {
 
     /// The words of a message: mentions read as names, and what is not drawn here named.
     async fn text(&mut self, message: &DataMessage, author: &str, sent: u64) -> Text {
-        let mut text = message.body.clone().unwrap_or_default();
+        let mut text = words(message);
         let mut mentions_me = false;
         let mut mentions: Vec<(u32, String)> = Vec::new();
         for range in &message.body_ranges {
@@ -951,5 +1002,43 @@ mod tests {
         let mut plain = photo();
         plain.is_view_once = Some(false);
         assert_eq!(unsupported_label(&plain).as_deref(), Some("Photo"));
+    }
+
+    /// A message whose text is too long for one message: 2 KB in the body, the whole text as a
+    /// plain-text pointer.
+    fn long() -> DataMessage {
+        let mut message = DataMessage::default();
+        message.body = Some("x".repeat(2_048));
+        message.attachments.push(Default::default());
+        if let Some(attachment) = message.attachments.last_mut() {
+            attachment.content_type = Some(LONG_TEXT.to_owned());
+        }
+        message
+    }
+
+    fn with_attachment(kind: &str) -> DataMessage {
+        let mut message = DataMessage::default();
+        message.attachments.push(Default::default());
+        if let Some(attachment) = message.attachments.last_mut() {
+            attachment.content_type = Some(kind.to_owned());
+        }
+        message
+    }
+
+    #[test]
+    fn a_long_text_is_the_message_not_a_file() {
+        let body = "x".repeat(2_048);
+        assert_eq!(unsupported_label(&long()), None);
+        assert_eq!(words(&long()), format!("{body}{CONTINUES}"));
+        // A file of no kind the window draws keeps its name, and so does everything else.
+        assert_eq!(unsupported_label(&with_attachment("application/pdf")).as_deref(), Some("File"));
+        assert_eq!(unsupported_label(&with_attachment("image/jpeg")).as_deref(), Some("Photo"));
+        assert_eq!(unsupported_label(&with_attachment("video/mp4")).as_deref(), Some("Video"));
+        assert_eq!(unsupported_label(&with_attachment("audio/ogg")).as_deref(), Some("Audio"));
+        let mut sticker = DataMessage::default();
+        sticker.sticker = Some(Default::default());
+        assert_eq!(unsupported_label(&sticker).as_deref(), Some("Sticker"));
+        assert_eq!(unsupported_label(&DataMessage::default()), None);
+        assert_eq!(words(&DataMessage::default()), String::new());
     }
 }
