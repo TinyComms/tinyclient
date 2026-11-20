@@ -937,6 +937,60 @@ fn main() -> io::Result<()> {
         eprintln!("prove-signal-send-file:0");
         return Ok(());
     }
+    // The lab's discord-thread-chip driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-thread-chip") {
+        if let Err(err) = chatd::adapters::prove_discord_thread_chip() {
+            eprintln!("discord-thread-chip: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-discord-thread-chip:0");
+        return Ok(());
+    }
+    // The lab's discord-code-colors driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-code-colors") {
+        if let Err(err) = chatd::adapters::prove_discord_code_colors() {
+            eprintln!("discord-code-colors: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-discord-code-colors:0");
+        return Ok(());
+    }
+    // The lab's teams-chain-paging driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("teams-chain-paging") {
+        if let Err(err) = chatd::adapters::prove_chain_paging() {
+            eprintln!("teams-chain-paging: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
+    // The lab's messages-several-files driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-several-files") {
+        if let Err(err) = chatd::adapters::messages::prove_messages_several_files() {
+            eprintln!("messages-several-files: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-several-files:0");
+        return Ok(());
+    }
+    // The lab's messages-mute driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-mute") {
+        if let Err(err) = chatd::adapters::messages::prove_messages_mute() {
+            eprintln!("messages-mute: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-mute:0");
+        return Ok(());
+    }
+    // The lab's messages-sign-out driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-sign-out") {
+        if let Err(err) = chatd::adapters::messages::prove_messages_sign_out() {
+            eprintln!("messages-sign-out: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-sign-out:0");
+        return Ok(());
+    }
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());
     protocol::crash::install_panic_hook("chatd");
     let dir = protocol::support_dir();

@@ -200,7 +200,7 @@ pub fn absent(id: &str) -> bool {
         // The tray icon (and with it, close-to-tray) exists on Windows so far.
         "G3" => !cfg!(windows),
         "SV" | "NL" => cfg!(target_os = "macos"),
-        "N10" | "N11" => !cfg!(any(target_os = "android", target_os = "ios")),
+        "N10" | "N11" => cfg!(any(target_os = "android", target_os = "ios")),
         // Nothing to forget until a link's "Don't ask again" has been used.
         "PF" => crate::gui::app::prefs::trusted_links().is_empty(),
         // The passphrase is the Linux fallback. Other systems use the device prompt.
@@ -412,6 +412,11 @@ mod tests {
             assert_eq!(not_yet(words), None, "{words} is built");
         }
         assert_eq!(ids("badge").contains(&"N11"), !absent("N11"));
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            assert!(!absent("N10"), "N10 (attention) should be present on desktop");
+            assert!(!absent("N11"), "N11 (unread badge) should be present on desktop");
+        }
     }
 
     #[test]
