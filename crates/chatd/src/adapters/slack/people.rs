@@ -16,9 +16,11 @@ const BATCH: usize = 50;
 /// One-by-one lookups made for a single page when the batch is refused.
 const SINGLES: usize = 20;
 /// Avatars are registered at list size, `image_72`, with `image_192` beside it for a screen
-/// that draws them larger (the 80 pt profile card at 2x).
+/// that draws them larger (the 80 pt profile card at 2x). `image_512` is the full portrait
+/// when Slack names one.
 const AVATAR: u32 = 72;
 const AVATAR_LARGE: u32 = 192;
+const PORTRAIT: u32 = 512;
 /// Members asked for per call, and how far down a member list is ever walked.
 const MEMBERS_PAGE: &str = "200";
 const ROSTER: usize = 1_000;
@@ -99,6 +101,9 @@ struct Kept {
     picture: String,
     #[serde(rename = "q", default, skip_serializing_if = "String::is_empty")]
     large: String,
+    /// `image_512`, when the profile named one. Absent from notes written before it.
+    #[serde(rename = "g", default, skip_serializing_if = "String::is_empty")]
+    portrait: String,
 }
 
 /// The member list being read: the ids walked so far and where Slack's paging stands, so the
@@ -214,16 +219,23 @@ impl Slack {
         gravatar_default(url).filter(|fallback| self.hosted(fallback))
     }
 
-    /// Registers a person's picture: once at list size, and the larger one as its variant.
-    fn register_avatar(&self, id: &str, picture: &str, large: &str) -> rusqlite::Result<()> {
+    /// Registers a person's picture: once at list size, and the larger ones as variants.
+    fn register_avatar(&self, id: &str, picture: &str, large: &str, portrait: &str) -> rusqlite::Result<()> {
         let file = MediaFile {
             width: AVATAR,
             height: AVATAR,
             ..MediaFile::new(id, MediaKind::Avatar)
         };
         self.ctx.media(&[(file, picture.to_owned())])?;
+        let mut variants = Vec::new();
         if !large.is_empty() && large != picture {
-            self.ctx.media_variants(id, &[(AVATAR_LARGE, large.to_owned())])?;
+            variants.push((AVATAR_LARGE, large.to_owned()));
+        }
+        if !portrait.is_empty() && portrait != picture && portrait != large && self.hosted(portrait) {
+            variants.push((PORTRAIT, portrait.to_owned()));
+        }
+        if !variants.is_empty() {
+            self.ctx.media_variants(id, &variants)?;
         }
         Ok(())
     }
@@ -256,13 +268,14 @@ impl Slack {
             let name = names.into_iter().filter_map(Value::as_str).find(|name| !name.is_empty());
             let large = self.picture(id, profile, AVATAR_LARGE).unwrap_or_default();
             let picture = self.picture(id, profile, AVATAR).or_else(|| self.picture(id, profile, 48)).unwrap_or_else(|| large.clone());
+            let portrait = profile["image_512"].as_str().filter(|url| self.hosted(url)).unwrap_or("").to_owned();
             let avatar = (!picture.is_empty()).then(|| {
                 // A changed picture is a new hash, so a new id.
                 let hash = profile["avatar_hash"].as_str().map_or_else(|| format!("{:x}", super::fnv(&picture)), str::to_owned);
                 format!("avatar:{id}:{hash}")
             });
             if let Some(avatar) = &avatar {
-                if let Err(err) = self.register_avatar(avatar, &picture, &large) {
+                if let Err(err) = self.register_avatar(avatar, &picture, &large, &portrait) {
                     tracing::warn!("chatd: Slack: {err}");
                 }
             }
@@ -289,6 +302,7 @@ impl Slack {
                 form: NOTE,
                 picture,
                 large,
+                portrait,
             };
             self.ctx.set_note(&format!("u:{id}"), &serde_json::to_string(&kept).unwrap_or_default());
             self.remember(id, &known);
@@ -322,7 +336,7 @@ impl Slack {
             return None;
         }
         if !kept.user.avatar.is_empty() {
-            if let Err(err) = self.register_avatar(&kept.user.avatar, &kept.picture, &kept.large) {
+            if let Err(err) = self.register_avatar(&kept.user.avatar, &kept.picture, &kept.large, &kept.portrait) {
                 tracing::warn!("chatd: Slack: {err}");
             }
         }
@@ -703,14 +717,15 @@ mod tests {
     #[test]
     fn a_note_in_an_older_form_reads_as_one_and_a_new_one_keeps_where_the_picture_is() {
         let old: Kept = serde_json::from_str(r#"{"n":"Ana","h":"ana","a":"avatar:U1:abc"}"#).unwrap();
-        assert_eq!((old.form, old.picture.as_str()), (0, ""));
+        assert_eq!((old.form, old.picture.as_str(), old.portrait.as_str()), (0, "", ""));
         let kept = Kept {
             user: old.user,
             form: NOTE,
             picture: "https://avatars.slack-edge.com/a_72.png".to_owned(),
             large: String::new(),
+            portrait: "https://avatars.slack-edge.com/a_512.png".to_owned(),
         };
         let read: Kept = serde_json::from_str(&serde_json::to_string(&kept).unwrap()).unwrap();
-        assert_eq!((read.form, read.user.name.as_str(), read.picture.as_str()), (NOTE, "Ana", kept.picture.as_str()));
+        assert_eq!((read.form, read.user.name.as_str(), read.picture.as_str(), read.portrait.as_str()), (NOTE, "Ana", kept.picture.as_str(), kept.portrait.as_str()));
     }
 }
