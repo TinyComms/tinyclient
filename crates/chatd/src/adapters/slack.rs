@@ -19,6 +19,7 @@ mod text;
 mod tree;
 
 pub(crate) use info::prove_connect_names;
+pub(crate) use text::prove_rich_text;
 use super::net::{address, browser, redact, Socket};
 use super::{keep_connected, serve_commands, About, Command, Context, Download, Failure, Refusal, Signed};
 use people::{Roster, User};
@@ -1356,8 +1357,8 @@ impl Slack {
             Command::React { conversation_id, message_id, emoji, on, reply } => {
                 answer(reply, self.react(&conversation_id, &message_id, &emoji, on));
             }
-            Command::Edit { conversation_id, message_id, text, reply } => {
-                answer(reply, self.edit(&conversation_id, &message_id, &text));
+            Command::Edit { conversation_id, message_id, text, spans, reply } => {
+                answer(reply, self.edit(&conversation_id, &message_id, &text, &spans));
             }
             Command::Delete { conversation_id, message_id, reply } => {
                 answer(reply, self.delete(&conversation_id, &message_id));
@@ -1459,23 +1460,54 @@ impl Slack {
         state.queue(frame);
     }
 
+    /// Slack `blocks` for a formatted send. `None` when the text is plain, so the call stays
+    /// `text` alone and an older message is unchanged.
+    pub(super) fn blocks_json(text: &str, spans: &[protocol::Span]) -> Option<String> {
+        let blocks = text::rich_blocks(text, spans);
+        if blocks.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&blocks).ok()
+        }
+    }
+
+    /// Puts those blocks on an event Slack answered without them, so the stored row keeps the
+    /// ranges. An event that already carries blocks is left as Slack sent it.
+    pub(super) fn with_blocks(mut event: Value, text: &str, spans: &[protocol::Span]) -> Value {
+        if spans.is_empty() || !event.is_object() {
+            return event;
+        }
+        if event["blocks"].as_array().is_some_and(|blocks| !blocks.is_empty()) {
+            return event;
+        }
+        let blocks = text::rich_blocks(text, spans);
+        if !blocks.is_empty() {
+            event["blocks"] = Value::Array(blocks);
+        }
+        event
+    }
+
     /// Posts a message and ends the send. In a thread's conversation it is a reply to that
     /// thread. Slack has no reply outside threads, so a reply to a message in a channel is a
     /// reply in its thread that is also shown in the channel.
     fn send(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool) {
-        let outcome = self.post(conversation, client_id, text, reply_to, suppress);
+        let outcome = self.post(conversation, client_id, text, reply_to, suppress, &[]);
         self.ctx.sent(conversation, client_id, outcome);
     }
 
     /// The post itself, answering what Slack accepted.
-    fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool) -> Result<Message, String> {
+    fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool, spans: &[protocol::Span]) -> Result<Message, String> {
         let (channel, thread) = match thread_of(conversation) {
             Some((channel, root)) => (channel, Some(root)),
             None => (conversation, None),
         };
         let nonce = client_msg_id(client_id);
         let escaped = escape(text);
+        let blocks = Self::blocks_json(text, spans);
         let mut params = vec![("channel", channel), ("text", escaped.as_str()), ("client_msg_id", nonce.as_str())];
+        if let Some(blocks) = blocks.as_deref() {
+            params.push(("blocks", blocks));
+        }
         let shown = reply_to.filter(|_| thread.is_none());
         if let Some(root) = thread.or(shown) {
             params.push(("thread_ts", root));
@@ -1493,6 +1525,7 @@ impl Slack {
             if event["ts"].is_null() {
                 event["ts"] = posted["ts"].clone();
             }
+            let event = Self::with_blocks(event, text, spans);
             let accepted = self.message(channel, &event);
             accepted.ok_or_else(|| "Slack accepted it but sent nothing back.".to_owned())
         });
@@ -1560,12 +1593,18 @@ impl Slack {
     }
 
     /// Replaces the text of one of our messages and reports it as Slack now has it.
-    fn edit(&self, conversation: &str, ts: &str, text: &str) -> Result<(), Fault> {
+    fn edit(&self, conversation: &str, ts: &str, text: &str, spans: &[protocol::Span]) -> Result<(), Fault> {
         let (channel, thread) = match thread_of(conversation) {
             Some((channel, root)) => (channel, Some(root)),
             None => (conversation, None),
         };
-        let updated = self.api("chat.update", &[("channel", channel), ("ts", ts), ("text", &escape(text))])?;
+        let escaped = escape(text);
+        let blocks = Self::blocks_json(text, spans);
+        let mut asked = vec![("channel", channel), ("ts", ts), ("text", escaped.as_str())];
+        if let Some(blocks) = blocks.as_deref() {
+            asked.push(("blocks", blocks));
+        }
+        let updated = self.api("chat.update", &asked)?;
         let mut inner = match &updated["message"] {
             message @ Value::Object(_) => message.clone(),
             _ => json!({"type": "message", "text": updated["text"].as_str().unwrap_or(&escape(text))}),
@@ -1580,6 +1619,7 @@ impl Slack {
         if let (Some(root), true) = (thread, inner["thread_ts"].is_null()) {
             inner["thread_ts"] = root.into();
         }
+        let inner = Self::with_blocks(inner, text, spans);
         self.changed(channel, &inner).map_err(kept)
     }
 

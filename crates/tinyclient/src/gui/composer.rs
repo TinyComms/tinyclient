@@ -955,6 +955,7 @@ impl Composer {
             ping: reply_to.is_none() || !controls.ping || !self.ping_off.contains(&target.key.account()),
             pick: None,
             schedule,
+            spans: Vec::new(),
         };
         let (shown, wire) = match as_file {
             true => (String::new(), String::new()),
@@ -1876,6 +1877,7 @@ impl Composer {
             conversation: key.clone(),
             message_id: id.clone(),
             text: wire,
+            spans: Vec::new(),
         };
         self.sending = true;
         cx.notify();

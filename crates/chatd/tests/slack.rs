@@ -1799,7 +1799,12 @@ fn reacting_editing_and_deleting_ask_slack_and_show_what_slack_says() {
 
     // An edit changes nothing until Slack accepts it, and is there when the answer is.
     let mine = "1760000100.000100";
-    let edit = Request::Edit { conversation: general.clone(), message_id: mine.to_owned(), text: "good morning <team> & all".to_owned() };
+    let edit = Request::Edit {
+        conversation: general.clone(),
+        message_id: mine.to_owned(),
+        text: "good morning <team> & all".to_owned(),
+        spans: Vec::new(),
+    };
     assert_eq!(world.ask(edit), Response::Ok);
     let edited = world.message(&general, mine).unwrap();
     assert_eq!((edited.text.as_str(), edited.edited, edited.outgoing), ("good morning <team> & all", true, true));
@@ -1807,7 +1812,7 @@ fn reacting_editing_and_deleting_ask_slack_and_show_what_slack_says() {
     assert_eq!((said(&updated, "channel"), said(&updated, "ts")), ("C0GEN".to_owned(), mine.to_owned()));
     assert_eq!(updated.params["text"], "good morning &lt;team&gt; &amp; all");
     // Only my own: chatd refuses the rest before Slack hears of it.
-    let theirs = Request::Edit { conversation: general.clone(), message_id: ROOT.to_owned(), text: "mine now".to_owned() };
+    let theirs = Request::Edit { conversation: general.clone(), message_id: ROOT.to_owned(), text: "mine now".to_owned(), spans: Vec::new() };
     assert!(matches!(world.ask(theirs), Response::Error { code: ErrorCode::Refused, .. }), "someone else's message is not mine to edit");
     assert_eq!(world.fake.calls(ALPHA, "chat.update").len(), 1);
 

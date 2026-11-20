@@ -681,7 +681,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::ReactionRules { conversation_id, reply } => {
             let _ = reply.send(react::rules(account, &conversation_id).map_err(refused));
         }
-        Command::Edit { conversation_id, message_id, text, reply } => {
+        Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
             let _ = reply.send(edit(account, &conversation_id, &message_id, &text).map_err(refused));
         }
         Command::Delete { conversation_id, message_id, reply } => {

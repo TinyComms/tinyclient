@@ -1285,7 +1285,7 @@ impl Discord {
             Command::React { conversation_id, message_id, emoji, on, reply } => {
                 answer(reply, self.react(&conversation_id, &message_id, &emoji, on))
             }
-            Command::Edit { conversation_id, message_id, text, reply } => {
+            Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
                 answer(reply, self.edit(&conversation_id, &message_id, &text))
             }
             Command::Delete { conversation_id, message_id, reply } => answer(reply, self.delete(&conversation_id, &message_id)),

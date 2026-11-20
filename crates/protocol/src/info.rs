@@ -420,6 +420,10 @@ pub struct Outgoing {
     /// that sends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<i64>,
+    /// Styled ranges of the send's text, the same model a stored message uses. Empty is plain
+    /// text and stays off the wire, so an older client still reads the send.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<crate::Span>,
 }
 
 impl Default for Outgoing {
@@ -432,6 +436,7 @@ impl Default for Outgoing {
             pick: None,
             schedule: None,
             voice: None,
+            spans: Vec::new(),
         }
     }
 }

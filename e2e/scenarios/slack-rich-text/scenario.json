@@ -1,0 +1,12 @@
+{
+  "id": "slack-rich-text",
+  "title": "Slack sends formatted text as rich text, including a labelled link",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same rich text blocks are what a formatted Slack send maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same rich text blocks are what a formatted Slack send maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

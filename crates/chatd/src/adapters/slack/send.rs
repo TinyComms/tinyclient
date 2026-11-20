@@ -35,10 +35,10 @@ impl Slack {
             if !up.files().is_empty() {
                 return Err("Slack schedules text only, not files.".to_owned());
             }
-            return self.schedule(conversation, text, at, with.suppress_embeds);
+            return self.schedule(conversation, text, at, with.suppress_embeds, &with.spans);
         }
         if up.files().is_empty() {
-            return self.post(conversation, client_id, text, reply_to, with.suppress_embeds);
+            return self.post(conversation, client_id, text, reply_to, with.suppress_embeds, &with.spans);
         }
         if up.files().len() > FILES {
             return Err(format!("Slack takes {FILES} files in one message."));
@@ -60,7 +60,11 @@ impl Slack {
         let files: Vec<Value> = ids.iter().zip(up.files()).map(|(id, file)| json!({"id": id, "title": file.name})).collect();
         let files = json!(files).to_string();
         let comment = escape(text);
+        let blocks = super::Slack::blocks_json(text, &with.spans);
         let mut asked = vec![("files", files.as_str()), ("channel_id", channel), ("initial_comment", comment.as_str())];
+        if let Some(blocks) = blocks.as_deref() {
+            asked.push(("blocks", blocks));
+        }
         if let Some(root) = thread {
             asked.push(("thread_ts", root));
         }
@@ -91,7 +95,11 @@ impl Slack {
         let ts = ["public", "private"].iter().find_map(|access| shares[*access][channel][0]["ts"].as_str());
         let ts = ts.map(str::to_owned).unwrap_or_else(|| format!("{}.000000", crate::hub::now()));
         let me = self.me.get().cloned().unwrap_or_default();
-        let event = json!({"type": "message", "ts": ts, "user": me, "text": comment, "files": completed["files"]});
+        let event = super::Slack::with_blocks(
+            json!({"type": "message", "ts": ts, "user": me, "text": comment, "files": completed["files"]}),
+            text,
+            &with.spans,
+        );
         self.message(channel, &event).ok_or_else(|| "Slack took the files but described no message.".to_owned())
     }
 
@@ -123,7 +131,7 @@ impl Slack {
     /// CONTRACT: there is no state for a scheduled message, so it ends as sent, dated when it
     /// will go, under Slack's id for the schedule. When Slack posts it, the socket brings it
     /// under its own timestamp, which is a second row until the scheduled one ages out.
-    fn schedule(&self, conversation: &str, text: &str, at: i64, suppress: bool) -> Result<Message, String> {
+    fn schedule(&self, conversation: &str, text: &str, at: i64, suppress: bool, spans: &[protocol::Span]) -> Result<Message, String> {
         let now = crate::hub::now();
         if at <= now || at > now + SCHEDULE_AHEAD {
             return Err("Slack schedules a message up to 120 days ahead.".to_owned());
@@ -133,7 +141,11 @@ impl Slack {
             None => (conversation, None),
         };
         let (escaped, post_at) = (escape(text), at.to_string());
+        let blocks = super::Slack::blocks_json(text, spans);
         let mut asked = vec![("channel", channel), ("text", escaped.as_str()), ("post_at", post_at.as_str())];
+        if let Some(blocks) = blocks.as_deref() {
+            asked.push(("blocks", blocks));
+        }
         if let Some(root) = thread {
             asked.push(("thread_ts", root));
         }
@@ -143,7 +155,11 @@ impl Slack {
         let scheduled = self.api("chat.scheduleMessage", &asked).map_err(super::reason)?;
         let id = scheduled["scheduled_message_id"].as_str().ok_or("Slack did not say it was scheduled.")?;
         let me = self.me.get().cloned().unwrap_or_default();
-        let event = json!({"type": "message", "user": me, "text": escaped, "ts": format!("{at}.000000")});
+        let event = super::Slack::with_blocks(
+            json!({"type": "message", "user": me, "text": escaped, "ts": format!("{at}.000000")}),
+            text,
+            spans,
+        );
         let mut message = self.message(channel, &event).ok_or("Slack did not say it was scheduled.")?;
         message.id = format!("scheduled:{id}");
         message.sent = scheduled["post_at"].as_i64().unwrap_or(at);
