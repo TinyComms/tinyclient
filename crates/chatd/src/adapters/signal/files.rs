@@ -345,6 +345,7 @@ mod tests {
             sent: 5,
             author: "a1a1a1a1-0000-4000-8000-000000000001".into(),
             text: String::new(),
+            spans: Vec::new(),
         };
         assert_eq!(
             call_line(

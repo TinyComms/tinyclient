@@ -408,10 +408,6 @@ const SEND_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
 /// Two days. An incoming edit or delete for everyone older than this is ignored (`DAY * 2`).
 const RECEIVE_WINDOW_MS: u64 = 2 * SEND_WINDOW_MS;
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis() as u64)
-}
-
 /// A test in a scratch directory asked for the scripted wire.
 fn scripted() -> bool {
     !session::enabled() && std::env::var_os("TINYCLIENT_SIGNAL_FAKE").is_some()
@@ -836,12 +832,7 @@ fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mute
     if matches!(ctx.known(&account.me), Ok(Some(_))) {
         ensure_row(&account, &Peer::Direct(account.me.clone()), "");
     }
-    // The composer shows attach once a file can go.
-    ctx.capabilities(files::capabilities());
     ctx.link(Link::Connected);
-    // One day, which is how long Signal Desktop still sends an edit. There is no delete-window
-    // field: a late delete is delete-for-me instead, decided in `delete`.
-    ctx.capabilities(protocol::Capabilities { edit_window: (SEND_WINDOW_MS / 1_000) as u32, ..protocol::Capabilities::default() });
     let ended = loop {
         match events.recv() {
             Ok(Event::Closed(why)) => break Failure::Dropped(why),
@@ -1355,10 +1346,17 @@ pub fn reaction_rules() -> protocol::ReactionRules {
 }
 
 /// What this account may send: text up to the body other clients keep in the message itself,
-/// and no files (attachments are neither uploaded nor fetched yet). The counter keeps a long
-/// paste from becoming a message other clients may cut short or refuse.
+/// files up to Signal's limits, and a one-day edit window (how long Signal Desktop still sends an
+/// edit; a late delete is delete-for-me instead, decided in `delete`).
 fn capabilities() -> protocol::Capabilities {
-    protocol::Capabilities { text_limit: TEXT_LIMIT, ..protocol::Capabilities::default() }
+    let files = files::capabilities();
+    protocol::Capabilities {
+        text_limit: TEXT_LIMIT,
+        edit_window: (SEND_WINDOW_MS / 1_000) as u32,
+        max_file_bytes: files.max_file_bytes,
+        max_files: files.max_files,
+        ..protocol::Capabilities::default()
+    }
 }
 
 fn serve(account: &Arc<Account>, command: Command) {
@@ -1370,7 +1368,16 @@ fn serve(account: &Arc<Account>, command: Command) {
             ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
         }
         Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
-            send_with(account, &conversation_id, &client_id, &text, reply_to.as_deref(), *with);
+            if let Some(draft) = with.poll.clone() {
+                if !with.files.is_empty() {
+                    ctx.sent(&conversation_id, &client_id, Err("A poll can't carry a file.".to_owned()));
+                } else {
+                    let outcome = send_poll(account, &conversation_id, &draft, reply_to.as_deref());
+                    ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
+                }
+            } else {
+                send_with(account, &conversation_id, &client_id, &text, reply_to.as_deref(), *with);
+            }
         }
         Command::CancelSend { client_id, .. } => upload::cancel(&account.ctx.account, &client_id),
         Command::React { conversation_id, message_id, emoji, on, reply } => {
@@ -1384,14 +1391,6 @@ fn serve(account: &Arc<Account>, command: Command) {
             };
             let _ = reply.send(answered.map_err(refused));
         }
-        Command::SendWith { conversation_id, client_id, reply_to, with, .. } => match with.poll.clone() {
-            Some(_) if !with.files.is_empty() => ctx.sent(&conversation_id, &client_id, Err("A poll can't carry a file.".to_owned())),
-            Some(draft) => {
-                let outcome = send_poll(account, &conversation_id, &draft, reply_to.as_deref());
-                ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
-            }
-            None => Command::SendWith { conversation_id, client_id, text: String::new(), reply_to, with }.unsupported(ctx),
-        },
         Command::Delete { conversation_id, message_id, reply } => {
             let _ = reply.send(delete(account, &conversation_id, &message_id).map_err(refused));
         }

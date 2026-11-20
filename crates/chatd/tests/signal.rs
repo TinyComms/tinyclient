@@ -676,7 +676,10 @@ fn a_file_is_sent_with_its_attachment_and_the_phones_copy_does_not_replace_it() 
         other => panic!("{other:?}"),
     };
     assert!(matches!(pending.state, SendState::Pending), "{pending:?}");
-    let sent = world.arrived(GRACE, &id(FIRST_SENT, ME));
+    let sent = world.until("the sent file", || {
+        world.messages(GRACE).into_iter().find(|message| message.client_id.as_deref() == Some("5001") && message.id != "5001")
+    });
+    let sent_at = sent.id.split_once('-').unwrap().0;
     assert_eq!(sent.text.as_str(), "the hand");
     assert!(matches!(sent.state, SendState::Sent), "{sent:?}");
     assert_eq!(sent.attachments.len(), 1);
@@ -688,7 +691,7 @@ fn a_file_is_sent_with_its_attachment_and_the_phones_copy_does_not_replace_it() 
     assert_eq!(world.messages(GRACE).iter().filter(|message| message.outgoing).count(), 1);
 
     // The phone's sync of the same send must not become a second row, or wipe the file.
-    world.steer(&format!("mine {FIRST_SENT} from the phone"));
+    world.steer(&format!("mine {sent_at} from the phone"));
     sleep(Duration::from_millis(400));
     let kept: Vec<Message> = world.messages(GRACE).into_iter().filter(|message| message.outgoing).collect();
     assert_eq!(kept.len(), 1, "{kept:?}");
@@ -816,7 +819,10 @@ fn styled_text_is_sent_as_ranges_and_a_spoiler_stays_out_of_the_preview() {
     world.steer(&format!("incoming grace {} hello", T0 + 1_000));
     world.arrived(GRACE, &id(T0 + 1_000, GRACE));
     world.send(GRACE, "5001", "**Hold** ||the plan||", None);
-    let styled = world.arrived(GRACE, &id(FIRST_SENT, ME));
+    let styled = world.until("styled message", || {
+        world.messages(GRACE).into_iter().find(|message| message.client_id.as_deref() == Some("5001") && message.id != "5001")
+    });
+    let styled_at = styled.id.split_once('-').unwrap().0.to_owned();
     assert_eq!(styled.text, "Hold the plan");
     let bold = styled.spans.iter().any(|span| span.style == protocol::Style::Bold && styled.text.get(span.start as usize..span.end as usize) == Some("Hold"));
     let hidden = styled.spans.iter().any(|span| span.style == protocol::Style::Spoiler && styled.text.get(span.start as usize..span.end as usize) == Some("the plan"));
@@ -825,10 +831,12 @@ fn styled_text_is_sent_as_ranges_and_a_spoiler_stays_out_of_the_preview() {
     let preview = world.conversation(GRACE).unwrap().preview;
     assert!(!preview.contains("plan"), "{preview}");
     world.send(GRACE, "5002", "ok", Some(&styled.id));
-    let answered = world.arrived(GRACE, &id(FIRST_SENT + 1_000, ME));
+    let answered = world.until("reply to styled", || {
+        world.messages(GRACE).into_iter().find(|message| message.client_id.as_deref() == Some("5002") && message.id != "5002")
+    });
     assert_eq!(answered.reply_to.as_ref().map(|reply| reply.snippet.as_str()), Some("Hold Spoiler"));
     assert_eq!(world.ask(Request::Edit { conversation: key(GRACE), message_id: styled.id, text: "~~no~~".into() }), Response::Ok);
-    world.heard(&format!("send {GRACE} edit {FIRST_SENT} no ranges=Strike:0+2"));
+    world.heard(&format!("send {GRACE} edit {styled_at} no ranges=Strike:0+2"));
     let edited = world.until("the strike", || {
         world.messages(GRACE).into_iter().find(|message| message.text == "no" && message.spans.iter().any(|span| span.style == protocol::Style::Strike))
     });
@@ -1144,9 +1152,10 @@ fn a_group_poll_shows_its_counts_and_a_vote_reaches_the_wire() {
     };
     let Response::Sent { message: pending } = world.ask(started) else { panic!("not sent") };
     assert_eq!(pending.text, "Poll: Next week?");
-    // The vote and the retraction were the first two sends, so this poll is the third.
-    let created = FIRST_SENT + 2_000;
-    let ours = world.arrived(CLUB, &id(created, ME));
+    let ours = world.until("our poll", || {
+        world.messages(CLUB).into_iter().find(|message| message.client_id.as_deref() == Some("poll-1") && message.id != "poll-1")
+    });
+    let created = ours.id.split_once('-').unwrap().0;
     assert_eq!(ours.client_id.as_deref(), Some("poll-1"));
     assert_eq!(ours.poll.as_ref().map(|poll| poll.choices.len()), Some(2));
     world.heard(&format!("send {CLUB} poll Next week? | Yes | No multi=false"));
