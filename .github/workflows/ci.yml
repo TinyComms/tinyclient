@@ -178,6 +178,20 @@ jobs:
           name: tinyclient-${{ matrix.artifact }}
           path: dist/*
 
+      # The site's "every build" numbers: this build, started on invented data and measured from
+      # outside (scripts/perf/measure.ps1). The Site workflow publishes the reading when this run
+      # ends. A reading that fails must not cost main its release programs, so it never fails the job.
+      - name: Measure the build
+        if: matrix.artifact == 'windows' && github.event_name != 'pull_request'
+        continue-on-error: true
+        shell: pwsh
+        run: scripts/perf/measure.ps1 -Mode demo -Bin target/release -Out perf/build.json -Where "a GitHub-hosted Windows runner, which has no graphics card" -Commit $env:GITHUB_SHA
+      - uses: actions/upload-artifact@v6
+        if: matrix.artifact == 'windows' && github.event_name != 'pull_request' && hashFiles('perf/build.json') != ''
+        with:
+          name: perf-build
+          path: perf/build.json
+
       - name: Pack binaries
         if: matrix.artifact == 'windows'
         shell: pwsh

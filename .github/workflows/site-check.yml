@@ -1,0 +1,25 @@
+name: Site check
+
+# What the Site workflow would refuse or get wrong, caught on the pull request: a page that loads
+# something from another origin, and a size or memory number that was typed into a page and does
+# not come from the measurements (.github/scripts/site-perf.py).
+on:
+  pull_request:
+    paths: ["site/**", "scripts/perf/**", ".github/scripts/site-perf.py", ".github/workflows/site-check.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: No third-party requests
+        run: |
+          if grep -rnE '(src|srcset)="(https?:)?//|url\((["'"'"']?)(https?:)?//|@import' site --include='*.html' --include='*.css'; then
+            echo "site/ loads something from another origin" >&2
+            exit 1
+          fi
+      - name: The numbers come from the measurements
+        run: python3 .github/scripts/site-perf.py --check

@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "mode": "demo",
+  "measured": "2026-11-17",
+  "os": "Windows 11",
+  "cpu_seconds": 15,
+  "memory": "private working set, the Memory column of Task Manager, summed over the app's processes",
+  "settle_seconds": 20,
+  "data": "invented demo data: Discord, two Slack workspaces, Telegram, Teams, Signal and a Tiny server",
+  "apps": [
+    {
+      "id": "tinyclient",
+      "name": "tinyclient",
+      "version": "0.2.71",
+      "processes": 2,
+      "memory_mb": 34,
+      "working_set_mb": 125,
+      "commit_mb": 104,
+      "cpu_percent": 7.9,
+      "disk_mb": 104,
+      "parts": [
+        {
+          "name": "chatd",
+          "processes": 1,
+          "memory_mb": 4
+        },
+        {
+          "name": "tinyclient",
+          "processes": 1,
+          "memory_mb": 29
+        }
+      ]
+    }
+  ]
+}
