@@ -1803,6 +1803,34 @@ fn a_read_lost_on_the_way_is_told_again_and_the_badge_stays() {
 }
 
 #[test]
+fn marking_a_chat_unread_sets_a_badge_and_tells_telegram() {
+    let world = World::signed_in();
+    world.connected();
+    let crew = world.until("the group on the list", || world.conversation("g8001"));
+    assert_eq!(crew.unread, 0);
+
+    assert_eq!(world.ask(Request::MarkUnread { conversation: key("g8001"), message_id: String::new() }), Response::Ok);
+    world.until("the unread mark to be told", || world.calls().iter().any(|call| call == "MarkDialogUnread g8001 unread").then_some(()));
+    assert_eq!(world.conversation("g8001").unwrap().unread, 1);
+
+    // Another device takes the mark off. Nothing in the chat is unread, so the badge goes.
+    world.steer("unread-mark off");
+    world.until("the mark to clear", || world.conversation("g8001").filter(|row| row.unread == 0));
+
+    // The phone puts the mark back on a chat this device had already read.
+    world.steer("unread-mark");
+    world.until("the mark to show", || world.conversation("g8001").filter(|row| row.unread == 1));
+
+    // Reading it tells Telegram both that the messages were seen and that the mark is off.
+    world.ask(Request::MarkRead { conversation: key("g8001"), message_id: "20".into() });
+    world.until("the mark to be cleared on the network", || {
+        let calls = world.calls();
+        (calls.iter().any(|call| call == "ReadHistory g8001 20") && calls.iter().any(|call| call == "MarkDialogUnread g8001 read")).then_some(())
+    });
+    assert_eq!(world.conversation("g8001").unwrap().unread, 0);
+}
+
+#[test]
 fn typing_reading_and_presence_go_both_ways_and_are_never_withheld() {
     let world = World::signed_in();
     world.connected();

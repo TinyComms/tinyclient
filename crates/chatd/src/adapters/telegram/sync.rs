@@ -737,7 +737,7 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
         return Ok(None);
     }
     let is_muted = muted(account, who, &dialog.notify_settings);
-    let unread = (dialog.unread_count.max(0) as u32).max(u32::from(dialog.unread_mark));
+    let unread = unread_of(dialog.unread_count, dialog.unread_mark);
     let filing = {
         let mut live = account.live();
         let filed = &mut live.filed;
@@ -796,7 +796,7 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
             super::mark_read(account, &id, &up_to);
             match peer_dialog(account, who) {
                 Some(fresh) => {
-                    unread = (fresh.unread_count.max(0) as u32).max(u32::from(fresh.unread_mark));
+                    unread = unread_of(fresh.unread_count, fresh.unread_mark);
                     mentions = fresh.unread_mentions_count.max(0) as u32;
                     read = (fresh.read_inbox_max_id > 0).then(|| fresh.read_inbox_max_id.to_string());
                     through = Some(fresh.top_message);
@@ -822,8 +822,13 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     Ok(through)
 }
 
+/// A dialog's badge: the unread messages, or one when only the manual mark is set.
+pub(super) fn unread_of(count: i32, mark: bool) -> u32 {
+    (count.max(0) as u32).max(u32::from(mark))
+}
+
 /// One dialog as the network counts it right now, what a read told again leaves.
-fn peer_dialog(account: &Account, who: Who) -> Option<tl::types::Dialog> {
+pub(super) fn peer_dialog(account: &Account, who: Who) -> Option<tl::types::Dialog> {
     let peer = account.input(who).ok()?;
     let request = tl::functions::messages::GetPeerDialogs { peers: vec![tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer })] };
     match account.ask(&request) {

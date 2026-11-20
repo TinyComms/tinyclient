@@ -685,6 +685,17 @@ impl Context {
         Ok(())
     }
 
+    /// The user marked the conversation unread. The badge becomes at least one; a higher count
+    /// stays. The read marker is left where it is.
+    pub fn mark_unread(&self, conversation_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().mark_unread_badge(&conversation)? {
+            self.hub.changed(Change::Conversation { conversation });
+            self.hub.changed(Change::Status);
+        }
+        Ok(())
+    }
+
     /// A conversation this client already has was upgraded to end-to-end encryption. Only the
     /// label changes; the row is not rebuilt.
     pub fn mark_encryption(

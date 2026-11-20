@@ -1083,17 +1083,15 @@ impl Chat {
     fn mark_unread(&self, conversation: Key, message_id: String) -> Response {
         match self.hub.store().mark_unread(&conversation, &message_id) {
             Ok(Some((marker, mentions))) => {
-                if !marker.is_empty() {
-                    let account = conversation.account();
-                    self.command(
-                        &account,
-                        Command::MarkUnread {
-                            conversation_id: conversation.id.clone(),
-                            message_id: marker,
-                            mentions,
-                        },
-                    );
-                }
+                let account = conversation.account();
+                self.command(
+                    &account,
+                    Command::MarkUnread {
+                        conversation_id: conversation.id.clone(),
+                        message_id: marker,
+                        mentions,
+                    },
+                );
                 self.hub.changed(Change::Conversation { conversation });
                 self.hub.changed(Change::Status);
                 Response::Ok

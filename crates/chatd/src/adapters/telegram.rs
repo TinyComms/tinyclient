@@ -746,6 +746,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Wanted(ids) => drop(account.files.asked(&ids)),
         Command::Previews(ids) => sync::previews(account, &ids),
         Command::MarkRead { conversation_id, message_id } => mark_read(account, &conversation_id, &message_id),
+        Command::MarkUnread { conversation_id, .. } => mark_dialog_unread(account, &conversation_id, true),
         Command::Send { conversation_id, client_id, text, reply_to } => {
             account.here();
             let outcome = send_text(account, &conversation_id, &client_id, &text, reply_to.as_deref(), Options::default());
@@ -890,12 +891,36 @@ fn mark_read(account: &Account, conversation: &str, message: &str) {
     if let Err(fault) = told {
         tracing::warn!("chatd: Telegram: read: {fault}");
     }
+    // Reading does not clear a manual unread mark. Telegram's own apps send both.
+    if topic.is_none() {
+        mark_dialog_unread(account, conversation, false);
+    }
     // The comments were read: the badge on the post they hang off goes with them.
     if let (true, who @ Who::Channel(_), Some(root)) = (read, who, topic) {
         if account.dir().get(who).is_some_and(|known| known.broadcast) {
             sync::comment_unread(account, who, root, 0);
         }
     }
+}
+
+/// `messages.markDialogUnread`. A topic has no dialog mark of its own; the forum's does.
+fn mark_dialog_unread(account: &Account, conversation: &str, unread: bool) {
+    let Some((who, None)) = Who::parse(conversation) else {
+        return;
+    };
+    let Ok(peer) = account.input(who) else {
+        return;
+    };
+    account.here();
+    let request = tl::functions::messages::MarkDialogUnread {
+        unread,
+        parent_peer: None,
+        peer: tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer }),
+    };
+    if let Err(fault) = account.ask(&request) {
+        tracing::warn!("chatd: Telegram: unread mark: {fault}");
+    }
+    filing::facts_changed(account, who, |facts| facts.read = !unread);
 }
 
 /// The nonce Telegram dedupes a send by, from the shell's client id.
@@ -1369,6 +1394,17 @@ pub fn prove_telegram_inline_bots() -> Result<(), String> {
 /// The lab's telegram-live-location driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_live_location() -> Result<(), String> {
     content::prove_live_location()
+}
+
+/// The lab's telegram-mark-unread driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_mark_unread() -> Result<(), String> {
+    if sync::unread_of(0, true) != 1 || sync::unread_of(4, true) != 4 {
+        return Err("a manual unread mark does not leave a badge of at least one".into());
+    }
+    if sync::unread_of(0, false) != 0 || sync::unread_of(3, false) != 3 {
+        return Err("clearing the mark did not keep the dialog's own unread count".into());
+    }
+    Ok(())
 }
 
 /// The lab's telegram-member-sections driver. A build without this stays up and the driver fails.
