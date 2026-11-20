@@ -5,8 +5,11 @@
 //! `incoming WHO TEXT…`, `group WHO TEXT…`, `photo WHO`, `caption WHO TEXT…`,
 //! `file WHO NAME`, `video WHO`, `poster WHO`, `voice WHO`, `remote WHO`,
 //! `react WHO TEXT`, `quote WHO ID TEXT…`, `typing WHO`, `typing-stop WHO`,
+//! `archive WHO`, `spam WHO`, `again WHO`,
 //! `refuse WORDS…`, `status CODE`, `hold`, `go`, `drop`, `unlinked`, `silent`, `answer`,
 //! `revoke`, `revoke-offline`, `auth`.
+//! `archive` files the chat as archived. `spam` files it as spam. `again` repeats the
+//! chat with a new title and no status, which must keep the folder it already had.
 //! `silent` makes the phone stop answering sends, history, and files. `answer` clears that
 //! and tells the adapter the phone is back.
 //! `hold` pauses a file upload until `go`, so a cancel can land while it is still unsent.
@@ -93,7 +96,7 @@ impl Fake {
                 carrier: 0,
                 updated: 0,
                 phones: false,
-                gone: false,
+                status: 1,
             },
             Chat {
                 id: CLUB.into(),
@@ -105,7 +108,7 @@ impl Fake {
                 carrier: 0,
                 updated: 0,
                 phones: false,
-                gone: false,
+                status: 1,
             },
         ]));
         let fake = Fake {
@@ -350,6 +353,25 @@ fn png() -> Vec<u8> {
         .collect()
 }
 
+fn listed(id: &str, title: &str, status: u64) -> Chat {
+    Chat {
+        id: id.into(),
+        title: title.into(),
+        group: false,
+        unread: false,
+        mine: ME.into(),
+        peer: if id == GRACE {
+            GRACE_PARTICIPANT.into()
+        } else {
+            String::new()
+        },
+        carrier: 0,
+        updated: 0,
+        phones: false,
+        status,
+    }
+}
+
 fn who(word: &str) -> Option<(&'static str, &'static str)> {
     match word {
         "grace" => Some((GRACE, "Grace Ombra")),
@@ -547,8 +569,19 @@ fn steer(line: &str) -> Vec<Event> {
                 carrier,
                 updated: 0,
                 phones,
-                gone: false,
+                status: 0,
             }])]
+        }
+        "archive" | "spam" | "again" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let (title, status) = match command {
+                "archive" => (name.to_owned(), 2),
+                "spam" => (name.to_owned(), 5),
+                _ => (format!("{name} still"), 0),
+            };
+            vec![Event::Chats(vec![listed(author, &title, status)])]
         }
         "tick" => {
             let Some((author, _)) = who(words.next().unwrap_or("")) else {
@@ -611,7 +644,7 @@ fn steer(line: &str) -> Vec<Event> {
                 carrier: 0,
                 updated: 0,
                 phones: false,
-                gone: true,
+                status: 3,
             }])]
         }
         "hold" | "read" => {
@@ -780,6 +813,11 @@ impl Drive for Fake {
     }
     fn unpair(&self) -> Result<(), String> {
         record("unpair");
+        Ok(())
+    }
+    fn block(&self, conversation: &str) -> Result<(), String> {
+        self.unanswered()?;
+        record(&format!("block {conversation}"));
         Ok(())
     }
     fn close(&self) {

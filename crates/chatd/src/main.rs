@@ -379,6 +379,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-messages-media:0");
         return Ok(());
     }
+    // The lab's messages-folders driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-folders") {
+        if let Err(err) = chatd::adapters::messages::prove_message_folders() {
+            eprintln!("messages-folders: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-folders:0");
+        return Ok(());
+    }
     // The lab's teams-reactions driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("teams-reactions") {
         if let Err(err) = chatd::adapters::prove_teams_reactions() {
