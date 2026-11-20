@@ -1791,11 +1791,13 @@ fn reacting_editing_and_deleting_ask_slack_and_show_what_slack_says() {
         panic!("no rules");
     };
     assert_eq!((rules.set, rules.custom, rules.mine, rules.distinct, rules.tones), (ReactionSet::Only, EmojiScope::All, 23, 50, true));
-    assert!(rules.only.contains(&"👀".to_owned()) && !rules.only.contains(&"🫥".to_owned()));
-    let unnamed = react("🫥", true);
+    assert!(rules.only.contains(&"👀".to_owned()));
+    assert!(rules.only.len() > 1_500, "{}", rules.only.len());
+    assert!(rules.only.iter().any(|emoji| emoji == "🏴󠁧󠁢󠁷󠁬󠁳󠁿"));
+    let unnamed = react("\u{E000}", true);
     assert_eq!(unnamed, Response::Error { code: ErrorCode::Refused, detail: "That reaction isn't allowed here.".to_owned() });
     assert_eq!(world.fake.calls(ALPHA, "reactions.add").len(), 4, "never asked of Slack");
-    assert_eq!(reaction("🫥"), None);
+    assert_eq!(reaction("\u{E000}"), None);
 
     // An edit changes nothing until Slack accepts it, and is there when the answer is.
     let mine = "1760000100.000100";

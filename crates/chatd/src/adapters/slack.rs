@@ -135,11 +135,11 @@ impl From<Fault> for Failure {
 }
 
 /// What reactions a Slack conversation takes. Slack takes a reaction by name, so the standard
-/// emoji are the ones chatd can name (`emoji::nameable`); a reaction already on a message is
-/// named there and can always be added to. The workspace's custom emoji are all usable. Slack's
-/// help centre puts the limits at 23 reactions a person and 50 different emoji a message
-/// (`too_many_reactions`, `too_many_emoji`); unverified against a real workspace. An archived
-/// channel, which takes none, is never listed (`exclude_archived`).
+/// emoji are every one the picker offers that chatd can name (`emoji::nameable`); a reaction
+/// already on a message is named there and can always be added to. The workspace's custom emoji
+/// are all usable. Slack's help centre puts the limits at 23 reactions a person and 50 different
+/// emoji a message (`too_many_reactions`, `too_many_emoji`); unverified against a real workspace.
+/// An archived channel, which takes none, is never listed (`exclude_archived`).
 pub(crate) fn reaction_rules() -> protocol::ReactionRules {
     protocol::ReactionRules {
         set: protocol::ReactionSet::Only,
