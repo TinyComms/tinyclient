@@ -37,7 +37,7 @@ struct SentCopy {
     phone_id: String,
 }
 
-fn record(line: &str) {
+pub(super) fn record(line: &str) {
     let path = protocol::support_dir().join("messages.calls");
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
