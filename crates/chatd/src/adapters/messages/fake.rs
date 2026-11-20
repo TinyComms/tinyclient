@@ -671,7 +671,7 @@ fn steer(line: &str) -> Vec<Event> {
                 carrier: 0,
                 updated: 0,
                 phones: false,
-                gone: false,
+                status: 1,
             }])]
         }
         _ => Vec::new(),
