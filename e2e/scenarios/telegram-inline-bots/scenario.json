@@ -1,0 +1,12 @@
+{
+  "id": "telegram-inline-bots",
+  "title": "Typing @bot query lists that bot's results, and picking one sends it",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same result is what an inline query maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same result is what an inline query maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

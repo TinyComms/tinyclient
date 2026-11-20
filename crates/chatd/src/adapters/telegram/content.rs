@@ -148,6 +148,14 @@ pub fn spans(text: &str, entities: &[MessageEntity]) -> Vec<Span> {
             // A mention by username names nobody the account has an id for: it opens in Telegram.
             E::Mention(_) => Style::Link { url: format!("https://t.me/{}", said.trim_start_matches('@')) },
             E::MentionName(named) => Style::Mention { kind: MentionKind::User, id: Who::User(named.user_id).text() },
+            // A send names the person with an input user. The echo carries that until Telegram
+            // stores the incoming form.
+            E::InputMessageEntityMentionName(named) => {
+                let tl::enums::InputUser::User(user) = &named.user_id else {
+                    continue;
+                };
+                Style::Mention { kind: MentionKind::User, id: Who::User(user.user_id).text() }
+            }
             // The text under it is the plain emoji Telegram chose as its fallback.
             E::CustomEmoji(emoji) => Style::Emoji { file: MediaFile::new(format!("e{}", emoji.document_id), MediaKind::Emoji) },
             _ => continue,
@@ -353,6 +361,137 @@ fn shift_for_emoji(entities: Vec<MessageEntity>, swaps: &[EmojiSwap], allow: boo
     out
 }
 
+/// Someone the directory can notify. `handle` is empty when they have no username.
+#[derive(Debug, Clone)]
+pub(super) struct MentionTarget {
+    pub name: String,
+    pub first: String,
+    pub handle: String,
+    pub user_id: i64,
+    pub access_hash: i64,
+}
+
+struct MentionSwap {
+    old_start: i32,
+    old_len: i32,
+    new_len: i32,
+    /// Set when the replacement is a text mention. A username is plain `@handle` and notifies on its own.
+    mention: Option<(i64, i64)>,
+}
+
+fn boundary_before(text: &str, at: usize) -> bool {
+    text[..at].chars().next_back().is_none_or(char::is_whitespace)
+}
+
+fn boundary_after(text: &str, at: usize) -> bool {
+    text[at..].chars().next().is_none_or(|c| !c.is_alphanumeric() && c != '_')
+}
+
+/// The next `@Display Name` that stands on its own. An earlier `@` glued to other text is skipped.
+fn mention_at(plain: &str, from: usize, person: &MentionTarget) -> Option<usize> {
+    let needle = format!("@{}", person.name);
+    let mut search = from;
+    while let Some(at) = plain[search..].find(&needle) {
+        let start = search + at;
+        let end = start + needle.len();
+        if boundary_before(plain, start) && boundary_after(plain, end) {
+            return Some(start);
+        }
+        search = start + 1;
+    }
+    None
+}
+
+/// `@Display Name` as the composer inserts it. A person with a username becomes `@username`.
+/// A person without one becomes their first name, covered by a text mention Telegram notifies on.
+/// Two people with the same name are left as typed. Entities that covered a replaced run are
+/// dropped; ones after it move by how much the text shrank or grew.
+pub(super) fn apply_mentions(plain: &str, entities: Vec<MessageEntity>, people: &[MentionTarget]) -> (String, Vec<MessageEntity>) {
+    if people.is_empty() || !plain.contains('@') {
+        return (plain.to_owned(), entities);
+    }
+    let mut people: Vec<&MentionTarget> = people.iter().filter(|person| !person.name.is_empty()).collect();
+    people.sort_by(|left, right| right.name.len().cmp(&left.name.len()).then(left.name.cmp(&right.name)));
+    let mut out = String::with_capacity(plain.len());
+    let mut swaps = Vec::new();
+    let mut from = 0usize;
+    let mut old_utf16 = 0i32;
+    while from < plain.len() {
+        let mut best: Option<(usize, usize)> = None;
+        for (index, person) in people.iter().enumerate() {
+            let Some(start) = mention_at(plain, from, person) else {
+                continue;
+            };
+            // The same place keeps the longer name, which was sorted first.
+            let earlier = best.is_none_or(|(prev, _)| start < prev);
+            if earlier {
+                best = Some((start, index));
+            }
+        }
+        let Some((start, index)) = best else {
+            out.push_str(&plain[from..]);
+            break;
+        };
+        let person = people[index];
+        let needle_len = 1 + person.name.len();
+        out.push_str(&plain[from..start]);
+        old_utf16 += utf16_len(&plain[from..start]);
+        let old_len = utf16_len(&plain[start..start + needle_len]);
+        let (spoken, mention) = match person.handle.is_empty() {
+            true => (person.first.clone(), Some((person.user_id, person.access_hash))),
+            false => (format!("@{}", person.handle), None),
+        };
+        let new_len = utf16_len(&spoken);
+        out.push_str(&spoken);
+        if old_len > 0 {
+            swaps.push(MentionSwap { old_start: old_utf16, old_len, new_len, mention });
+        }
+        old_utf16 += old_len;
+        from = start + needle_len;
+    }
+    (out, shift_for_mentions(entities, &swaps))
+}
+
+fn mention_delta(swaps: &[MentionSwap], at: i32) -> i32 {
+    swaps.iter().filter(|swap| swap.old_start + swap.old_len <= at).map(|swap| swap.new_len - swap.old_len).sum()
+}
+
+fn shift_for_mentions(entities: Vec<MessageEntity>, swaps: &[MentionSwap]) -> Vec<MessageEntity> {
+    if swaps.is_empty() {
+        return entities;
+    }
+    let mut out = Vec::new();
+    for entity in entities {
+        let (offset, length) = place(&entity);
+        if length <= 0 {
+            continue;
+        }
+        let end = offset + length;
+        let overlaps = swaps.iter().any(|swap| offset < swap.old_start + swap.old_len && end > swap.old_start);
+        if overlaps {
+            continue;
+        }
+        let delta = mention_delta(swaps, offset);
+        match retarget(&entity, offset + delta, length) {
+            Some(next) => out.push(next),
+            None if delta == 0 => out.push(entity),
+            None => {}
+        }
+    }
+    for swap in swaps {
+        let Some((user_id, access_hash)) = swap.mention else {
+            continue;
+        };
+        if swap.new_len <= 0 {
+            continue;
+        }
+        let offset = swap.old_start + mention_delta(swaps, swap.old_start);
+        let user = tl::types::InputUser { user_id, access_hash };
+        out.push(tl::types::InputMessageEntityMentionName { offset, length: swap.new_len, user_id: user.into() }.into());
+    }
+    out
+}
+
 /// The same entity at a new UTF-16 offset. Kinds a send does not produce stay as they are
 /// when nothing moved, and are dropped when it did.
 fn retarget(entity: &MessageEntity, offset: i32, length: i32) -> Option<MessageEntity> {
@@ -368,6 +507,7 @@ fn retarget(entity: &MessageEntity, offset: i32, length: i32) -> Option<MessageE
         E::Spoiler(_) => tl::types::MessageEntitySpoiler { offset, length }.into(),
         E::TextUrl(link) => tl::types::MessageEntityTextUrl { offset, length, url: link.url.clone() }.into(),
         E::MentionName(named) => tl::types::MessageEntityMentionName { offset, length, user_id: named.user_id }.into(),
+        E::InputMessageEntityMentionName(named) => tl::types::InputMessageEntityMentionName { offset, length, user_id: named.user_id.clone() }.into(),
         E::CustomEmoji(emoji) => tl::types::MessageEntityCustomEmoji { offset, length, document_id: emoji.document_id }.into(),
         _ => return None,
     })
@@ -404,6 +544,13 @@ pub fn entity_note(entities: &[MessageEntity]) -> String {
             MessageEntity::Spoiler(_) => note.push_str(&format!(" spoiler:{offset}+{length}")),
             MessageEntity::TextUrl(link) => note.push_str(&format!(" link:{offset}+{length}:{}", link.url)),
             MessageEntity::CustomEmoji(emoji) => note.push_str(&format!(" emoji:{offset}+{length}:{}", emoji.document_id)),
+            MessageEntity::InputMessageEntityMentionName(named) => {
+                let id = match &named.user_id {
+                    tl::enums::InputUser::User(user) => user.user_id,
+                    _ => 0,
+                };
+                note.push_str(&format!(" mention:{offset}+{length}:{id}"));
+            }
             _ => {}
         }
     }
@@ -684,6 +831,76 @@ fn pick(sizes: &[PhotoSize], least: u32) -> Option<Size<'_>> {
 /// What a row shows of a photo, and no more than a row needs: 320 on its longer side.
 const INLINE: u32 = 320;
 
+/// Most bytes of a stripped thumbnail's picture. Telegram's are a few hundred; one larger than
+/// this is not one.
+const STRIPPED_MOST: usize = 16 * 1024;
+
+/// The JPEG header Telegram leaves out of a stripped thumbnail
+/// (<https://core.telegram.org/api/files#stripped-thumbnails>). It is the same for every one but
+/// the picture's height and width, at 164 and 166.
+#[rustfmt::skip]
+const STRIPPED_HEADER: [u8; 623] = [
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
+    0x00, 0x01, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x28, 0x1c, 0x1e, 0x23, 0x1e, 0x19, 0x28,
+    0x23, 0x21, 0x23, 0x2d, 0x2b, 0x28, 0x30, 0x3c, 0x64, 0x41, 0x3c, 0x37, 0x37, 0x3c, 0x7b, 0x58,
+    0x5d, 0x49, 0x64, 0x91, 0x80, 0x99, 0x96, 0x8f, 0x80, 0x8c, 0x8a, 0xa0, 0xb4, 0xe6, 0xc3, 0xa0,
+    0xaa, 0xda, 0xad, 0x8a, 0x8c, 0xc8, 0xff, 0xcb, 0xda, 0xee, 0xf5, 0xff, 0xff, 0xff, 0x9b, 0xc1,
+    0xff, 0xff, 0xff, 0xfa, 0xff, 0xe6, 0xfd, 0xff, 0xf8, 0xff, 0xdb, 0x00, 0x43, 0x01, 0x2b, 0x2d,
+    0x2d, 0x3c, 0x35, 0x3c, 0x76, 0x41, 0x41, 0x76, 0xf8, 0xa5, 0x8c, 0xa5, 0xf8, 0xf8, 0xf8, 0xf8,
+    0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8,
+    0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8,
+    0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xff, 0xc0,
+    0x00, 0x11, 0x08, 0x00, 0x00, 0x00, 0x00, 0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11,
+    0x01, 0xff, 0xc4, 0x00, 0x1f, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+    0x0a, 0x0b, 0xff, 0xc4, 0x00, 0xb5, 0x10, 0x00, 0x02, 0x01, 0x03, 0x03, 0x02, 0x04, 0x03, 0x05,
+    0x05, 0x04, 0x04, 0x00, 0x00, 0x01, 0x7d, 0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21,
+    0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23,
+    0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17,
+    0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a,
+    0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a,
+    0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a,
+    0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99,
+    0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7,
+    0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5,
+    0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1,
+    0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xff, 0xc4, 0x00, 0x1f, 0x01, 0x00, 0x03,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0xff, 0xc4, 0x00, 0xb5, 0x11, 0x00,
+    0x02, 0x01, 0x02, 0x04, 0x04, 0x03, 0x04, 0x07, 0x05, 0x04, 0x04, 0x00, 0x01, 0x02, 0x77, 0x00,
+    0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71, 0x13,
+    0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0, 0x15,
+    0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26, 0x27,
+    0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+    0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88,
+    0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6,
+    0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4,
+    0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe2,
+    0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9,
+    0xfa, 0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3f, 0x00,
+];
+
+/// A stripped thumbnail put back together as the JPEG it was, with its width and height.
+/// `None` for bytes that are not one: another version, no size, no picture, too many bytes.
+/// chatd only joins the pieces and never decodes them; a shell that cannot read the result
+/// draws the usual placeholder.
+pub(super) fn stripped_jpeg(stripped: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let [1, height, width, body @ ..] = stripped else {
+        return None;
+    };
+    if *height == 0 || *width == 0 || body.is_empty() || body.len() > STRIPPED_MOST {
+        return None;
+    }
+    let mut jpeg = Vec::with_capacity(STRIPPED_HEADER.len() + body.len() + 2);
+    jpeg.extend_from_slice(&STRIPPED_HEADER);
+    jpeg[164] = *height;
+    jpeg[166] = *width;
+    jpeg.extend_from_slice(body);
+    jpeg.extend_from_slice(&[0xff, 0xd9]);
+    Some((u32::from(*width), u32::from(*height), jpeg))
+}
+
 fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>) -> Option<Attachment> {
     let location = |kind: &str| -> tl::enums::InputFileLocation {
         tl::types::InputPhotoFileLocation {
@@ -695,6 +912,20 @@ fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>) -> Opti
         .into()
     };
     let (kind, width, height, bytes, inline) = pick(&photo.sizes, INLINE)?;
+    // The few pixels Telegram sends inside the message: on disk with the page, and drawn until
+    // the row's own size is. A row's size that came inside the message needs none.
+    let stripped = photo.sizes.iter().find_map(|size| match size {
+        PhotoSize::PhotoStrippedSize(stripped) if inline.is_none() => Some(stripped),
+        _ => None,
+    });
+    let preview = stripped.and_then(|stripped| {
+        let (width, height, jpeg) = stripped_jpeg(&stripped.bytes)?;
+        let mut preview = MediaFile::new(format!("p{}{}", photo.id, stripped.r#type), MediaKind::Image);
+        (preview.width, preview.height, preview.bytes) = (width, height, jpeg.len() as u64);
+        let location = location(&stripped.r#type);
+        wants.push(Want { file: preview.clone(), dc: photo.dc_id, location, inline: Some(jpeg), row: None, watched: false, original: false });
+        Some(preview)
+    });
     let mut thumb = MediaFile::new(format!("p{}{kind}", photo.id), MediaKind::Image);
     (thumb.width, thumb.height, thumb.bytes) = (width, height, bytes);
     wants.push(Want { file: thumb.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, watched: false, original: false });
@@ -708,9 +939,56 @@ fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>) -> Opti
     }
     let mut attachment = Attachment::new("Photo", file);
     attachment.thumb = Some(thumb);
+    attachment.preview = preview;
     attachment.mime = "image/jpeg".to_owned();
     attachment.spoiler = spoiler;
     Some(attachment)
+}
+
+/// The picture a link card shows. A photo's row-sized still, or a video's thumbnail. The full
+/// picture stays with Telegram until someone opens it, and a card does not open it.
+fn preview_image(page: &tl::types::WebPage, wants: &mut Vec<Want>) -> Option<MediaFile> {
+    if let Some(tl::enums::Photo::Photo(photo)) = &page.photo {
+        let (kind, width, height, bytes, inline) = pick(&photo.sizes, INLINE)?;
+        let mut image = MediaFile::new(format!("p{}{kind}", photo.id), MediaKind::Image);
+        (image.width, image.height, image.bytes) = (width, height, bytes);
+        wants.push(Want {
+            file: image.clone(),
+            dc: photo.dc_id,
+            location: tl::types::InputPhotoFileLocation {
+                id: photo.id,
+                access_hash: photo.access_hash,
+                file_reference: photo.file_reference.clone(),
+                thumb_size: kind.to_owned(),
+            }
+            .into(),
+            inline: inline.map(<[u8]>::to_vec),
+            row: None,
+            watched: false,
+            original: false,
+        });
+        return Some(image);
+    }
+    let tl::enums::Document::Document(document) = page.document.as_ref()? else { return None };
+    let (kind, width, height, bytes, inline) = document.thumbs.as_deref().and_then(|thumbs| pick(thumbs, INLINE))?;
+    let mut image = MediaFile::new(format!("d{}{kind}", document.id), MediaKind::Image);
+    (image.width, image.height, image.bytes) = (width, height, bytes);
+    wants.push(Want {
+        file: image.clone(),
+        dc: document.dc_id,
+        location: tl::types::InputDocumentFileLocation {
+            id: document.id,
+            access_hash: document.access_hash,
+            file_reference: document.file_reference.clone(),
+            thumb_size: kind.to_owned(),
+        }
+        .into(),
+        inline: inline.map(<[u8]>::to_vec),
+        row: None,
+        watched: false,
+        original: false,
+    });
+    Some(image)
 }
 
 pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::types::Document, wants: &mut Vec<Want>) -> Attachment {
@@ -814,9 +1092,159 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
     attachment
 }
 
+/// The card for a poll or a quiz. Counts stay off while Telegram is still hiding them.
+/// Voting, retracting, and creating a poll stay a hand-off: the message keeps its link.
+pub(super) fn poll_card(poll: &tl::types::Poll, results: &tl::types::PollResults) -> Card {
+    let hidden = results.min || (poll.hide_results_until_close && !poll.closed);
+    let rows = results.results.as_deref().unwrap_or(&[]);
+    let mut fields = Vec::new();
+    for answer in &poll.answers {
+        let tl::enums::PollAnswer::Answer(answer) = answer else { continue };
+        let found = rows.iter().find_map(|one| match one {
+            tl::enums::PollAnswerVoters::Voters(row) if row.option == answer.option => Some(row),
+            _ => None,
+        });
+        let mut label = String::new();
+        if !hidden {
+            if let Some(count) = found.and_then(|row| row.voters) {
+                label = if count == 1 { "1 vote".to_owned() } else { format!("{count} votes") };
+            }
+        }
+        if found.is_some_and(|row| row.chosen) {
+            label = if label.is_empty() { "Your vote".to_owned() } else { format!("{label} · your vote") };
+        }
+        if found.is_some_and(|row| row.correct) {
+            label = if label.is_empty() { "Correct".to_owned() } else { format!("{label} · correct") };
+        }
+        if label.is_empty() {
+            label = "Option".to_owned();
+        }
+        fields.push((label, plain(&answer.text).to_owned()));
+    }
+    let extra = fields.len().saturating_sub(protocol::CARD_FIELDS);
+    fields.truncate(protocol::CARD_FIELDS);
+    let mut lines = Vec::new();
+    if poll.quiz {
+        lines.push("Quiz".to_owned());
+    }
+    if poll.closed {
+        lines.push("Closed".to_owned());
+    }
+    if poll.multiple_choice {
+        lines.push("Pick any".to_owned());
+    }
+    if poll.public_voters {
+        lines.push("Votes are public".to_owned());
+    }
+    if hidden {
+        lines.push(
+            if poll.hide_results_until_close && !poll.closed {
+                "Results stay hidden until the poll closes."
+            } else {
+                "Results stay hidden until you vote."
+            }
+            .to_owned(),
+        );
+    } else if let Some(total) = results.total_voters {
+        lines.push(if total == 1 { "1 vote".to_owned() } else { format!("{total} votes") });
+    }
+    if extra > 0 {
+        lines.push(format!("{extra} more"));
+    }
+    if let Some(solution) = results.solution.as_ref().filter(|text| !text.is_empty()) {
+        lines.push(solution.clone());
+    }
+    Card {
+        title: plain(&poll.question).to_owned(),
+        text: lines.join("\n"),
+        fields,
+        footer: "Open in Telegram".to_owned(),
+        ..Card::default()
+    }
+}
+
 fn plain(text: &tl::enums::TextWithEntities) -> &str {
     let tl::enums::TextWithEntities::Entities(text) = text;
     &text.text
+}
+
+/// View-once is Telegram's `ttl_seconds` of `0x7FFFFFFF`. Anything shorter is a timer.
+fn locked_media(kind: &str, ttl: Option<i32>) -> String {
+    if ttl == Some(i32::MAX) {
+        return format!("View-once {kind}");
+    }
+    let named = match kind {
+        "photo" => "Photo",
+        "video" => "Video",
+        "voice message" => "Voice message",
+        "video message" => "Video message",
+        _ => "File",
+    };
+    format!("{named} with a timer")
+}
+
+/// Voice, a round video, a video, or a file, from the media flags and then the document.
+fn locked_kind(media: &tl::types::MessageMediaDocument) -> &'static str {
+    if media.voice {
+        return "voice message";
+    }
+    if media.round {
+        return "video message";
+    }
+    if media.video {
+        return "video";
+    }
+    let Some(tl::enums::Document::Document(file)) = &media.document else {
+        return "file";
+    };
+    let mut kind = "file";
+    for attribute in &file.attributes {
+        match attribute {
+            DocumentAttribute::Audio(audio) if audio.voice => kind = "voice message",
+            DocumentAttribute::Video(video) if video.round_message => kind = "video message",
+            DocumentAttribute::Video(_) if kind == "file" => kind = "video",
+            _ => {}
+        }
+    }
+    kind
+}
+
+/// A checklist as text. The title is an ordinary line. Each item is a list line, checked
+/// when a completion names its id. Ticking stays in Telegram, so the last line is `link`
+/// (the same address the old box opened) and the row can still reach that message.
+fn checklist(media: &tl::types::MessageMediaToDo, link: &str) -> (String, Vec<Span>) {
+    let tl::enums::TodoList::List(list) = &media.todo;
+    let done = |id: i32| {
+        media.completions.as_ref().is_some_and(|all| {
+            all.iter().any(|one| {
+                let tl::enums::TodoCompletion::Completion(one) = one;
+                one.id == id
+            })
+        })
+    };
+    let mut text = plain(&list.title).to_owned();
+    let mut spans = Vec::new();
+    for item in &list.list {
+        let tl::enums::TodoItem::Item(item) = item;
+        let mark = if done(item.id) { "\u{2611}" } else { "\u{2610}" };
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        let start = text.len() as u32;
+        text.push_str(mark);
+        text.push(' ');
+        text.push_str(plain(&item.title));
+        spans.push(Span { start, end: text.len() as u32, style: Style::ListItem { ordered: false, depth: 0 } });
+    }
+    if !link.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        let start = text.len() as u32;
+        text.push_str("Open in Telegram");
+        spans.push(Span { start, end: text.len() as u32, style: Style::Link { url: link.to_owned() } });
+    }
+    (text, spans)
 }
 
 /// What stands in for media tinyclient cannot draw. Never empty.
@@ -835,12 +1263,15 @@ fn unsupported(media: &MessageMedia) -> Option<String> {
         MessageMedia::Story(_) => "Story".to_owned(),
         MessageMedia::Giveaway(_) | MessageMedia::GiveawayResults(_) => "Giveaway".to_owned(),
         MessageMedia::PaidMedia(_) => "Paid media".to_owned(),
-        MessageMedia::ToDo(_) => "Checklist".to_owned(),
         MessageMedia::VideoStream(_) => "Live stream".to_owned(),
         MessageMedia::Unsupported => "A message this version of tinyclient cannot show".to_owned(),
         // A photo or document that has run out (a self-destructing one, once seen).
         MessageMedia::Photo(photo) if photo.photo.is_none() => "Photo that has expired".to_owned(),
         MessageMedia::Document(document) if document.document.is_none() => "File that has expired".to_owned(),
+        // Still on Telegram's servers, but with a timer. Desktop does not open these. Fetching
+        // them would keep a file the sender was promised would not stay.
+        MessageMedia::Photo(photo) if photo.ttl_seconds.is_some() => locked_media("photo", photo.ttl_seconds),
+        MessageMedia::Document(document) if document.ttl_seconds.is_some() => locked_media(locked_kind(document), document.ttl_seconds),
         _ => return None,
     })
 }
@@ -911,9 +1342,19 @@ fn place_fields(lat: f64, long: f64, accuracy: Option<i32>) -> Vec<(String, Stri
     fields
 }
 
+/// Still shared when the share's end is ahead of now. This layer has no stopped flag.
+fn still_sharing(date: i32, period: i32) -> bool {
+    if period <= 0 {
+        return false;
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    i64::from(date) + i64::from(period) > now
+}
+
 /// A shared place: the name, the coordinates, and a `geo:` link. A live one says how long it
-/// was shared for. The shell draws the card; this build does not fetch a map tile.
-fn location_card(media: &MessageMedia) -> Option<Card> {
+/// was shared for and whether it is still going. The shell draws the card; this build does not
+/// fetch a map tile.
+fn location_card(media: &MessageMedia, date: i32) -> Option<Card> {
     let mut card = Card { footer: "Open in Maps".to_owned(), ..Card::default() };
     match media {
         MessageMedia::Geo(media) => {
@@ -950,6 +1391,8 @@ fn location_card(media: &MessageMedia) -> Option<Card> {
             if live.period > 0 {
                 card.fields.push(("Shared for".to_owned(), kept_for(live.period)));
             }
+            let status = if still_sharing(date, live.period) { "Still sharing" } else { "Stopped" };
+            card.fields.push(("Status".to_owned(), status.to_owned()));
         }
         _ => return None,
     }
@@ -1279,6 +1722,14 @@ fn action(dir: &Directory, who: &str, action: &MessageAction) -> (String, bool) 
         } else {
             format!("{who} marked {} not done", count_words(todo.incompleted.len() as i32, "item", "items"))
         }),
+        A::GeoProximityReached(reached) => {
+            let side = |peer: &tl::enums::Peer| {
+                let person = Who::of(peer);
+                if person == Who::User(dir.me) { "you".to_owned() } else { dir.name(person) }
+            };
+            let meters = if reached.distance == 1 { "1 m".to_owned() } else { format!("{} m", reached.distance) };
+            named(format!("{} is within {meters} of {}", side(&reached.from_id), side(&reached.to_id)))
+        }
         _ => (format!("{who} changed something tinyclient cannot show yet"), false),
     }
 }
@@ -1380,29 +1831,40 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                     }
                 }
             }
+            // An inline result names the bot it came through. The handle is whatever this
+            // account already knows; mapping a message does not ask the network.
+            if let Some(bot) = raw.via_bot_id {
+                if let Some(handle) = dir.get(Who::User(bot)).map(|known| known.handle.as_str()).filter(|handle| !handle.is_empty()) {
+                    message.sender.name = format!("{} via @{handle}", message.sender.name);
+                }
+            }
             let mut wants = Vec::new();
             match &raw.media {
                 None | Some(MessageMedia::Empty) => {}
-                Some(MessageMedia::Photo(media)) if media.photo.is_some() => {
+                // `ttl_seconds` is view-once (`0x7FFFFFFF`) or a shorter timer. Either way the
+                // bytes are not queued: the row below is a locked placeholder, opened in
+                // Telegram's own app, and Save has nothing to copy.
+                Some(MessageMedia::Photo(media)) if media.photo.is_some() && media.ttl_seconds.is_none() => {
                     if let Some(tl::enums::Photo::Photo(picture)) = &media.photo {
                         message.attachments.extend(photo(picture, media.spoiler, &mut wants));
                     }
                 }
-                Some(MessageMedia::Document(media)) if media.document.is_some() => {
+                Some(MessageMedia::Document(media)) if media.document.is_some() && media.ttl_seconds.is_none() => {
                     if let Some(tl::enums::Document::Document(file)) = &media.document {
                         message.attachments.push(document(media, file, &mut wants));
                     }
                 }
                 Some(MessageMedia::WebPage(media)) => {
                     if let tl::enums::WebPage::Page(page) = &media.webpage {
-                        // The card is Telegram's own; its picture is a Telegram file and is not
-                        // fetched for a row.
+                        // The card is Telegram's own. Its picture is the row-sized still, fetched
+                        // the way any thumbnail is. Instant View and the send controls stay outside
+                        // this mapping.
                         message.previews.push(Preview {
                             url: page.url.clone(),
                             site: page.site_name.clone().unwrap_or_default(),
                             title: page.title.clone().unwrap_or_default(),
                             description: page.description.clone().unwrap_or_default(),
-                            image: None,
+                            image: preview_image(page, &mut wants),
                         });
                     }
                 }
@@ -1413,6 +1875,13 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                         1.. => format!("{} {}", dice.emoticon, dice.value),
                         _ => dice.emoticon.clone(),
                     };
+                }
+                // The title, then each item on its own list line. A done item is checked.
+                Some(MessageMedia::ToDo(media)) => {
+                    let link = message_link(peer, dir.get(peer), raw.id);
+                    let (text, spans) = checklist(media, &link);
+                    message.text = text;
+                    message.spans = spans;
                 }
                 Some(media) => {
                     if let Some(label) = unsupported(media) {
@@ -1427,8 +1896,12 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                     // An invoice or paid preview is still a hand-off, and also a card: title,
                     // description and price. Paying stays in Telegram's own app. A shared place
                     // is a normal message whose card keeps the coordinates. No map tile is fetched.
-                    if let Some(card) = detail_card(media).or_else(|| location_card(media)) {
+                    if let Some(card) = detail_card(media).or_else(|| location_card(media, raw.date)) {
                         message.card = Some(Box::new(card));
+                    } else if let MessageMedia::Poll(media) = media {
+                        let tl::enums::Poll::Poll(poll) = &media.poll;
+                        let tl::enums::PollResults::Results(results) = &media.results;
+                        message.card = Some(Box::new(poll_card(poll, results)));
                     }
                 }
             }
@@ -1555,6 +2028,65 @@ pub(super) fn line_for(reply: i32, known: Option<&(String, String, String)>, not
         line.sender = note.author.clone();
     }
     line
+}
+
+/// The lab's telegram-checklist check. Three items, the middle one done.
+pub(super) fn prove_checklist() -> Result<(), String> {
+    let raw = sample_checklist()?;
+    let mapped = map(&Directory::new(7_001), &raw).ok_or("the checklist maps")?;
+    if !mapped.wants.is_empty() {
+        return Err("a checklist fetches nothing".into());
+    }
+    if mapped.message.kind != MessageKind::Normal {
+        return Err("a checklist is the list, not a box that opens Telegram".into());
+    }
+    let text = "Packing\n\u{2610} Passport\n\u{2611} Tickets\n\u{2610} Charger\nOpen in Telegram";
+    if mapped.message.text != text {
+        return Err(format!("a three-item list with one done reads as the items, got {}", mapped.message.text));
+    }
+    let item = |line: &str| {
+        let start = text.find(line).ok_or("the item is in the text")? as u32;
+        Ok::<Span, &str>(Span { start, end: start + line.len() as u32, style: Style::ListItem { ordered: false, depth: 0 } })
+    };
+    let open = text.rfind("Open in Telegram").ok_or("the open link is in the text")? as u32;
+    let mut expected = vec![
+        item("\u{2610} Passport").map_err(str::to_owned)?,
+        item("\u{2611} Tickets").map_err(str::to_owned)?,
+        item("\u{2610} Charger").map_err(str::to_owned)?,
+    ];
+    expected.push(Span {
+        start: open,
+        end: text.len() as u32,
+        style: Style::Link { url: "tg://openmessage?user_id=7002&message_id=7".into() },
+    });
+    if mapped.message.spans != expected {
+        return Err("each item is its own list line, the done one is checked, and the message link is on the list".into());
+    }
+    Ok(())
+}
+
+fn sample_checklist() -> Result<tl::enums::Message, String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let words = |text: &str| tl::types::TextWithEntities { text: text.to_owned(), entities: Vec::new() }.into();
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    7i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    message.from_id = Some(Who::User(7_002).peer());
+    let item = |id: i32, title: &str| tl::types::TodoItem { id, title: words(title) }.into();
+    let list = tl::types::TodoList {
+        others_can_append: false,
+        others_can_complete: true,
+        title: words("Packing"),
+        list: vec![item(1, "Passport"), item(2, "Tickets"), item(3, "Charger")],
+    };
+    let done = tl::types::TodoCompletion { id: 2, completed_by: Who::User(7_002).peer(), date: 1_700_000_100 };
+    message.media = Some(tl::types::MessageMediaToDo { todo: list.into(), completions: Some(vec![done.into()]) }.into());
+    Ok(message.into())
 }
 
 /// The topic and the answered message a reply header names. In a forum a post that answers
@@ -1801,6 +2333,58 @@ pub(super) fn prove_stickers() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's telegram-link-preview check. A link card names its row-sized picture and asks for
+/// that still, not the full photo.
+pub(super) fn prove_link_preview() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    8_801i64.serialize(&mut bytes);
+    "https://example.org/ridge".to_owned().serialize(&mut bytes);
+    "example.org".to_owned().serialize(&mut bytes);
+    1i32.serialize(&mut bytes);
+    let mut page = tl::types::WebPage::from_bytes(&bytes).map_err(|_| "a blank page reads back".to_owned())?;
+    page.title = Some("Ridge".to_owned());
+    page.photo = Some(tl::types::Photo {
+        has_stickers: false,
+        id: 8_801,
+        access_hash: 1,
+        file_reference: vec![1],
+        date: 1_700_000_000,
+        sizes: vec![
+            tl::types::PhotoSize { r#type: "m".to_owned(), w: 320, h: 240, size: 4_000 }.into(),
+            tl::types::PhotoSize { r#type: "y".to_owned(), w: 1_280, h: 960, size: 200_000 }.into(),
+        ],
+        video_sizes: None,
+        dc_id: 4,
+    }.into());
+    let mut message_bytes = Vec::new();
+    0u32.serialize(&mut message_bytes);
+    0u32.serialize(&mut message_bytes);
+    32i32.serialize(&mut message_bytes);
+    Who::User(7_002).peer().serialize(&mut message_bytes);
+    1_700_000_000i32.serialize(&mut message_bytes);
+    "https://example.org/ridge".to_owned().serialize(&mut message_bytes);
+    let mut message = tl::types::Message::from_bytes(&message_bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    message.from_id = Some(Who::User(7_002).peer());
+    message.media = Some(tl::types::MessageMediaWebPage {
+        force_large_media: false,
+        force_small_media: false,
+        manual: false,
+        safe: true,
+        webpage: page.into(),
+    }.into());
+    let mapped = map(&Directory::new(7_001), &message.into()).ok_or("a link maps")?;
+    let image = mapped.message.previews.first().and_then(|card| card.image.as_ref()).ok_or("a link card names no picture")?;
+    if image.id != "p8801m" || image.width != 320 {
+        return Err(format!("a link card's picture is the row-sized still, got {} at {}", image.id, image.width));
+    }
+    if !mapped.wants.iter().any(|want| want.file.id == "p8801m" && !want.original) || mapped.wants.iter().any(|want| want.original) {
+        return Err("a link card fetches its still and not the full picture".into());
+    }
+    Ok(())
+}
+
 /// The lab's telegram-album check. Four items that share a grouped id are one message.
 pub(super) fn prove_album() -> Result<(), String> {
     let dir = Directory::new(7_001);
@@ -1910,6 +2494,96 @@ fn quote_message_header(reply_to: tl::enums::MessageReplyHeader) -> tl::enums::M
     message.reply_to = Some(reply_to);
     message.from_id = Some(Who::User(7_003).peer());
     message.into()
+}
+
+/// The lab's telegram-polls check. A poll is a card with its options and counts, a quiz hides
+/// those counts until the poll closes, and both stay a hand-off.
+pub(super) fn prove_polls() -> Result<(), String> {
+    let words = |text: &str| tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities { text: text.to_owned(), entities: Vec::new() });
+    let answer = |text: &str, option: u8| {
+        tl::types::PollAnswer { text: words(text), option: vec![option], media: None, added_by: None, date: None }.into()
+    };
+    let row = |option: u8, count: i32, chosen: bool, correct: bool| {
+        tl::types::PollAnswerVoters { chosen, correct, option: vec![option], voters: Some(count), recent_voters: None }.into()
+    };
+    let poll = |hide: bool, quiz: bool| tl::types::Poll {
+        id: 1,
+        closed: false,
+        public_voters: false,
+        multiple_choice: false,
+        quiz,
+        open_answers: false,
+        revoting_disabled: false,
+        shuffle_answers: false,
+        hide_results_until_close: hide,
+        creator: false,
+        subscribers_only: false,
+        question: words("Saturday or Sunday?"),
+        answers: vec![answer("Saturday", 0), answer("Sunday", 1)],
+        close_period: None,
+        close_date: None,
+        countries_iso2: None,
+        hash: 0,
+    };
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    21i32.serialize(&mut bytes);
+    Who::Group(8_001).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let mut raw = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    raw.from_id = Some(Who::User(7_003).peer());
+    let results = tl::types::PollResults {
+        min: false,
+        has_unread_votes: false,
+        can_view_stats: false,
+        results: Some(vec![row(0, 3, true, false), row(1, 1, false, false)]),
+        total_voters: Some(4),
+        recent_voters: None,
+        solution: None,
+        solution_entities: None,
+        solution_media: None,
+    };
+    raw.media = Some(tl::enums::MessageMedia::Poll(Box::new(tl::types::MessageMediaPoll {
+        poll: poll(false, false).into(),
+        results: results.into(),
+        attached_media: None,
+    })));
+    let mapped = map(&Directory::new(7_001), &raw.clone().into()).ok_or("the poll maps")?;
+    let card = mapped.message.card.as_ref().ok_or("a poll is a card")?;
+    if card.title != "Saturday or Sunday?" || card.footer != "Open in Telegram" || card.text != "4 votes" {
+        return Err(format!("a poll's card lost its question or its count: {} / {}", card.title, card.text));
+    }
+    if card.fields.first().map(|(label, value)| (label.as_str(), value.as_str())) != Some(("3 votes · your vote", "Saturday")) {
+        return Err(format!("the chosen option was not named: {:?}", card.fields));
+    }
+    if !matches!(mapped.message.kind, MessageKind::Unsupported { ref link } if link.contains("message_id=21")) {
+        return Err("a poll is still a hand-off".into());
+    }
+    let hidden = tl::types::PollResults {
+        min: true,
+        has_unread_votes: false,
+        can_view_stats: false,
+        results: Some(vec![row(0, 9, false, true)]),
+        total_voters: Some(9),
+        recent_voters: None,
+        solution: Some("The north ridge.".into()),
+        solution_entities: None,
+        solution_media: None,
+    };
+    raw.media = Some(tl::enums::MessageMedia::Poll(Box::new(tl::types::MessageMediaPoll {
+        poll: poll(true, true).into(),
+        results: hidden.into(),
+        attached_media: None,
+    })));
+    let quiz = map(&Directory::new(7_001), &raw.into()).ok_or("the quiz maps")?;
+    let card = quiz.message.card.as_ref().ok_or("a quiz is a card")?;
+    if !card.text.contains("hidden") || !card.text.contains("The north ridge.") || card.fields.iter().any(|(label, _)| label.contains('9')) {
+        return Err(format!("a hidden quiz showed a count: {}", card.text));
+    }
+    Ok(())
 }
 
 /// The lab's telegram-service-lines check. A premium gift is named, a pin quotes the message
@@ -2117,6 +2791,178 @@ pub(super) fn prove_location() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's telegram-view-once check. A view-once photo and a listen-once voice message
+/// queue no file and read as locked. An ordinary photo is still fetched.
+pub(super) fn prove_view_once() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+
+    fn blank(id: i32) -> tl::types::Message {
+        let mut bytes = Vec::new();
+        0u32.serialize(&mut bytes);
+        0u32.serialize(&mut bytes);
+        id.serialize(&mut bytes);
+        Who::User(7_002).peer().serialize(&mut bytes);
+        1_700_000_000i32.serialize(&mut bytes);
+        String::new().serialize(&mut bytes);
+        let mut message = tl::types::Message::from_bytes(&bytes).expect("a blank message reads back");
+        message.from_id = Some(Who::User(7_002).peer());
+        message
+    }
+
+    let photo = |ttl: Option<i32>| {
+        let mut message = blank(14);
+        message.media = Some(
+            tl::types::MessageMediaPhoto {
+                spoiler: false,
+                live_photo: false,
+                photo: Some(
+                    tl::types::Photo {
+                        has_stickers: false,
+                        id: 6_014,
+                        access_hash: 6_015,
+                        file_reference: vec![1],
+                        date: 1_700_000_000,
+                        sizes: vec![tl::types::PhotoSize { r#type: "m".into(), w: 320, h: 240, size: 4_000 }.into()],
+                        video_sizes: None,
+                        dc_id: 4,
+                    }
+                    .into(),
+                ),
+                ttl_seconds: ttl,
+                video: None,
+            }
+            .into(),
+        );
+        tl::enums::Message::from(message)
+    };
+    let mapped = |raw: &tl::enums::Message| map(&Directory::new(7_001), raw).ok_or("the message maps");
+    let ordinary = mapped(&photo(None))?;
+    if ordinary.wants.is_empty() || ordinary.message.attachments.len() != 1 {
+        return Err("an ordinary photo is still fetched".into());
+    }
+    let once = mapped(&photo(Some(i32::MAX)))?;
+    if !once.wants.is_empty() || !once.message.attachments.is_empty() {
+        return Err("a view-once photo queues no file".into());
+    }
+    if !once.message.text.contains("View-once photo") || !matches!(once.message.kind, MessageKind::Unsupported { .. }) {
+        return Err(format!("a view-once photo reads as locked, got {}", once.message.text));
+    }
+    let timed = mapped(&photo(Some(30)))?;
+    if !timed.wants.is_empty() || !timed.message.text.contains("Photo with a timer") {
+        return Err(format!("a photo with a timer stays locked, got {}", timed.message.text));
+    }
+    let voice_doc = tl::types::Document {
+        id: 6_100,
+        access_hash: 6_101,
+        file_reference: vec![4],
+        date: 1_700_000_000,
+        mime_type: "audio/ogg".into(),
+        size: 18_000,
+        thumbs: None,
+        video_thumbs: None,
+        dc_id: 2,
+        attributes: vec![tl::types::DocumentAttributeAudio { voice: true, duration: 7, title: None, performer: None, waveform: Some(vec![0b0001_1111]) }.into()],
+    };
+    let mut voice = blank(15);
+    voice.media = Some(
+        tl::types::MessageMediaDocument {
+            nopremium: false,
+            spoiler: false,
+            video: false,
+            round: false,
+            voice: true,
+            document: Some(voice_doc.into()),
+            alt_documents: None,
+            video_cover: None,
+            video_timestamp: None,
+            ttl_seconds: Some(i32::MAX),
+        }
+        .into(),
+    );
+    let voice = mapped(&voice.into())?;
+    if !voice.wants.is_empty() || !voice.message.attachments.is_empty() || !voice.message.text.contains("View-once voice message") {
+        return Err(format!("a listen-once voice message stays locked, got {}", voice.message.text));
+    }
+    Ok(())
+}
+
+/// The lab's telegram-inline-bots check. A message sent through a bot the account already
+/// knows names that bot. A build from before this leaves the name as the person only.
+pub(super) fn prove_inline_bots() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    7_060i64.serialize(&mut bytes);
+    let mut user = tl::types::User::from_bytes(&bytes).map_err(|_| "a blank user reads back".to_owned())?;
+    user.first_name = Some("Wiki".to_owned());
+    user.username = Some("wiki".to_owned());
+    user.access_hash = Some(1);
+    user.bot = true;
+    user.bot_info_version = Some(1);
+    let mut dir = Directory::new(7_001);
+    dir.learn(&[user.into()], &[]);
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    9i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    "Rust".to_owned().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    message.from_id = Some(Who::User(7_002).peer());
+    message.via_bot_id = Some(7_060);
+    let mapped = map(&dir, &message.into()).ok_or("the message maps")?;
+    if !mapped.message.sender.name.contains("via @wiki") {
+        return Err(format!("an inline result did not name the bot, got {}", mapped.message.sender.name));
+    }
+    Ok(())
+}
+
+/// The lab's telegram-live-location check. A live share keeps its coordinates and says whether
+/// it is still going, and coming into range is a service line. A build from before this drops
+/// the coordinates.
+pub(super) fn prove_live_location() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    11i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i32;
+    now.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    message.from_id = Some(Who::User(7_002).peer());
+    message.media = Some(
+        tl::types::MessageMediaGeoLive {
+            geo: tl::types::GeoPoint { long: -122.4, lat: 37.7, access_hash: 0, accuracy_radius: None }.into(),
+            heading: Some(90),
+            period: 900,
+            proximity_notification_radius: None,
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &message.into()).ok_or("the live location maps")?;
+    let card = mapped.message.card.ok_or("a live location is a card")?;
+    if card.title != "Live location" || !card.text.contains("geo:37.7,-122.4") || !card.fields.iter().any(|field| field.0 == "Status" && field.1 == "Still sharing") {
+        return Err(format!("the live location dropped its place, got {} {}", card.title, card.text));
+    }
+    if !matches!(mapped.message.kind, MessageKind::Normal) {
+        return Err("a live location still opens only in Telegram".into());
+    }
+    let reached = tl::types::MessageActionGeoProximityReached {
+        from_id: Who::User(7_002).peer(),
+        to_id: Who::User(7_001).peer(),
+        distance: 50,
+    };
+    let (line, known) = action(&Directory::new(7_001), "Ada", &reached.into());
+    if !known || !line.contains("50 m") {
+        return Err(format!("coming into range is unnamed, got {line}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2186,6 +3032,83 @@ mod tests {
         assert!(waveform(&[]).is_empty());
     }
 
+    fn a_photo(sizes: Vec<PhotoSize>) -> tl::types::Photo {
+        tl::types::Photo { has_stickers: false, id: 6_016, access_hash: 1, file_reference: vec![1], date: 0, sizes, video_sizes: None, dc_id: 4 }
+    }
+
+    fn sized(kind: &str, w: i32, h: i32) -> PhotoSize {
+        tl::types::PhotoSize { r#type: kind.to_owned(), w, h, size: 4_096 }.into()
+    }
+
+    fn stripped(bytes: &[u8]) -> PhotoSize {
+        tl::types::PhotoStrippedSize { r#type: "i".to_owned(), bytes: bytes.to_vec() }.into()
+    }
+
+    /// A real one: the fake wire's 40 by 30 photo, as Telegram would send it.
+    const RIDGE: &[u8] = include_bytes!("fake_ridge_i.bin");
+
+    #[test]
+    fn a_stripped_thumbnail_is_put_back_together_as_the_jpeg_it_was() {
+        let (width, height, jpeg) = stripped_jpeg(RIDGE).unwrap();
+        assert_eq!((width, height), (40, 30));
+        assert_eq!(jpeg.len(), STRIPPED_HEADER.len() + RIDGE.len() - 3 + 2);
+        assert_eq!(&jpeg[..4], &[0xff, 0xd8, 0xff, 0xe0], "it starts a JFIF file");
+        // The frame header names the picture's size where a decoder reads it.
+        assert_eq!(&jpeg[158..167], &[0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 30, 0x00, 40]);
+        assert_eq!(&jpeg[STRIPPED_HEADER.len()..jpeg.len() - 2], &RIDGE[3..], "the picture follows the header untouched");
+        assert_eq!(&jpeg[jpeg.len() - 2..], &[0xff, 0xd9]);
+    }
+
+    #[test]
+    fn bytes_that_are_not_a_stripped_thumbnail_make_no_preview() {
+        assert!(stripped_jpeg(&[]).is_none());
+        // The fake wire's other photos carry only a size and no picture.
+        assert!(stripped_jpeg(&[1, 20, 30]).is_none());
+        assert!(stripped_jpeg(&[2, 30, 40, 0x12]).is_none(), "another version");
+        assert!(stripped_jpeg(&[1, 0, 40, 0x12]).is_none(), "no height");
+        assert!(stripped_jpeg(&[1, 30, 0, 0x12]).is_none(), "no width");
+        let mut huge = vec![1, 30, 40];
+        huge.resize(3 + STRIPPED_MOST + 1, 0x12);
+        assert!(stripped_jpeg(&huge).is_none(), "too many bytes");
+    }
+
+    #[test]
+    fn a_photo_with_a_stripped_thumbnail_has_its_preview_on_disk_with_the_page() {
+        let mut wants = Vec::new();
+        let attachment = photo(&a_photo(vec![stripped(RIDGE), sized("m", 320, 240), sized("y", 1_280, 960)]), false, &mut wants).unwrap();
+        let preview = attachment.preview.as_ref().unwrap();
+        assert_eq!((preview.id.as_str(), preview.kind, preview.width, preview.height), ("p6016i", MediaKind::Image, 40, 30));
+        assert_eq!(attachment.thumb.as_ref().map(|thumb| thumb.id.as_str()), Some("p6016m"));
+        // Its bytes are in the want: nothing is asked of Telegram for it.
+        let kept = wants.iter().find(|want| want.file.id == "p6016i").unwrap();
+        assert_eq!(kept.inline.as_deref(), Some(stripped_jpeg(RIDGE).unwrap().2.as_slice()));
+        assert_eq!(kept.file.bytes, kept.inline.as_ref().unwrap().len() as u64);
+        assert!(!kept.original && !kept.watched && kept.row.is_none());
+        // The row's size is still fetched, and the original still waits for the viewer.
+        let thumb = wants.iter().find(|want| want.file.id == "p6016m").unwrap();
+        assert!(thumb.inline.is_none() && !thumb.original);
+        assert!(wants.iter().any(|want| want.file.id == "p6016y" && want.original));
+    }
+
+    #[test]
+    fn a_photo_without_a_usable_stripped_thumbnail_has_no_preview() {
+        for sizes in [
+            vec![sized("m", 320, 240)],
+            vec![stripped(&[1, 20, 30]), sized("m", 320, 240)],
+            vec![stripped(&[]), sized("m", 320, 240)],
+        ] {
+            let mut wants = Vec::new();
+            let attachment = photo(&a_photo(sizes), false, &mut wants).unwrap();
+            assert!(attachment.preview.is_none());
+            assert!(wants.iter().all(|want| want.file.id != "p6016i"));
+        }
+        // A row's size that came inside the message is on disk as soon as the preview would be.
+        let cached = tl::types::PhotoCachedSize { r#type: "m".to_owned(), w: 320, h: 240, bytes: vec![0xff, 0xd8, 0xff, 0xd9] };
+        let mut wants = Vec::new();
+        let attachment = photo(&a_photo(vec![stripped(RIDGE), cached.into()]), false, &mut wants).unwrap();
+        assert!(attachment.preview.is_none());
+    }
+
     #[test]
     fn a_premium_emoji_keeps_its_alt_glyph_and_names_its_document_for_fetching() {
         let text = "Cast off 🦀 at dawn";
@@ -2253,6 +3176,78 @@ mod tests {
         message.into()
     }
 
+    fn blank_page(url: &str) -> tl::types::WebPage {
+        use grammers_tl_types::{Deserializable, Serializable};
+        let mut bytes = Vec::new();
+        0u32.serialize(&mut bytes);
+        8_801i64.serialize(&mut bytes);
+        url.to_owned().serialize(&mut bytes);
+        "example.org".to_owned().serialize(&mut bytes);
+        1i32.serialize(&mut bytes);
+        tl::types::WebPage::from_bytes(&bytes).expect("a blank page reads back")
+    }
+
+    fn link_message(photo: bool, document: bool) -> tl::enums::Message {
+        let mut message = blank_message();
+        message.id = 32;
+        let mut page = blank_page("https://example.org/ridge");
+        page.site_name = Some("Example".to_owned());
+        page.title = Some("Ridge".to_owned());
+        page.description = Some("The trail.".to_owned());
+        if photo {
+            page.photo = Some(tl::types::Photo {
+                has_stickers: false,
+                id: 8_801,
+                access_hash: 1,
+                file_reference: vec![1],
+                date: 1_700_000_000,
+                sizes: vec![
+                    tl::types::PhotoSize { r#type: "m".to_owned(), w: 320, h: 240, size: 4_000 }.into(),
+                    tl::types::PhotoSize { r#type: "y".to_owned(), w: 1_280, h: 960, size: 200_000 }.into(),
+                ],
+                video_sizes: None,
+                dc_id: 4,
+            }.into());
+        }
+        if document {
+            page.document = Some(tl::types::Document {
+                id: 8_802,
+                access_hash: 1,
+                file_reference: vec![2],
+                date: 1_700_000_000,
+                mime_type: "video/mp4".to_owned(),
+                size: 1_000,
+                thumbs: Some(vec![tl::types::PhotoSize { r#type: "m".to_owned(), w: 320, h: 180, size: 20 }.into()]),
+                video_thumbs: None,
+                dc_id: 2,
+                attributes: Vec::new(),
+            }.into());
+        }
+        message.media = Some(tl::types::MessageMediaWebPage {
+            force_large_media: false,
+            force_small_media: false,
+            manual: false,
+            safe: true,
+            webpage: page.into(),
+        }.into());
+        message.into()
+    }
+
+    #[test]
+    fn a_link_card_names_its_picture_and_asks_for_the_thumb_only() {
+        let card = map(&Directory::new(7_001), &link_message(true, false)).expect("a link maps");
+        let image = card.message.previews[0].image.as_ref().expect("the card names its picture");
+        assert_eq!(image.id, "p8801m");
+        assert!(card.wants.iter().any(|want| want.file.id == "p8801m" && !want.original));
+        assert!(card.wants.iter().all(|want| !want.original));
+        let video = map(&Directory::new(7_001), &link_message(false, true)).expect("a video card maps");
+        assert_eq!(video.message.previews[0].image.as_ref().expect("a video card names its still").id, "d8802m");
+        assert!(video.wants.iter().all(|want| want.file.id == "d8802m" && !want.original));
+        let bare = map(&Directory::new(7_001), &link_message(false, false)).expect("a card without a picture maps");
+        assert!(bare.message.previews[0].image.is_none());
+        assert!(bare.wants.is_empty());
+    }
+
     #[test]
     fn a_dice_roll_keeps_its_value() {
         let rolled = map(&Directory::new(7_001), &dice_message(5)).expect("the roll maps");
@@ -2260,6 +3255,129 @@ mod tests {
         assert_eq!(rolled.message.text, "\u{1F3B2} 5");
         let spinning = map(&Directory::new(7_001), &dice_message(0)).expect("a roll still spinning maps");
         assert_eq!(spinning.message.text, "\u{1F3B2}");
+    }
+
+    fn words(text: &str) -> tl::enums::TextWithEntities {
+        tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities { text: text.to_owned(), entities: Vec::new() })
+    }
+
+    fn poll_answer(text: &str, option: u8) -> tl::enums::PollAnswer {
+        tl::types::PollAnswer {
+            text: words(text),
+            option: vec![option],
+            media: None,
+            added_by: None,
+            date: None,
+        }
+        .into()
+    }
+
+    fn poll_voters(option: u8, count: i32, chosen: bool, correct: bool) -> tl::enums::PollAnswerVoters {
+        tl::types::PollAnswerVoters {
+            chosen,
+            correct,
+            option: vec![option],
+            voters: Some(count),
+            recent_voters: None,
+        }
+        .into()
+    }
+
+    fn poll_message(poll: tl::types::Poll, results: tl::types::PollResults) -> tl::enums::Message {
+        use grammers_tl_types::{Deserializable, Serializable};
+        let mut bytes = Vec::new();
+        0u32.serialize(&mut bytes);
+        0u32.serialize(&mut bytes);
+        21i32.serialize(&mut bytes);
+        Who::Group(8_001).peer().serialize(&mut bytes);
+        1_700_000_000i32.serialize(&mut bytes);
+        String::new().serialize(&mut bytes);
+        let mut message = tl::types::Message::from_bytes(&bytes).expect("a blank message reads back");
+        message.from_id = Some(Who::User(7_003).peer());
+        message.media = Some(
+            tl::enums::MessageMedia::Poll(Box::new(tl::types::MessageMediaPoll {
+                poll: poll.into(),
+                results: results.into(),
+                attached_media: None,
+            })),
+        );
+        message.into()
+    }
+
+    fn open_poll(hide: bool, quiz: bool, closed: bool) -> tl::types::Poll {
+        tl::types::Poll {
+            id: 1,
+            closed,
+            public_voters: false,
+            multiple_choice: false,
+            quiz,
+            open_answers: false,
+            revoting_disabled: false,
+            shuffle_answers: false,
+            hide_results_until_close: hide,
+            creator: false,
+            subscribers_only: false,
+            question: words("Saturday or Sunday?"),
+            answers: vec![poll_answer("Saturday", 0), poll_answer("Sunday", 1)],
+            close_period: None,
+            close_date: None,
+            countries_iso2: None,
+            hash: 0,
+        }
+    }
+
+    /// Options, counts, and the vote already cast are on the card. Voting stays a hand-off.
+    #[test]
+    fn a_poll_is_a_card_with_its_options_and_a_hand_off() {
+        let results = tl::types::PollResults {
+            min: false,
+            has_unread_votes: false,
+            can_view_stats: false,
+            results: Some(vec![poll_voters(0, 3, true, false), poll_voters(1, 1, false, false)]),
+            total_voters: Some(4),
+            recent_voters: None,
+            solution: None,
+            solution_entities: None,
+            solution_media: None,
+        };
+        let mapped = map(&Directory::new(7_001), &poll_message(open_poll(false, false, false), results)).expect("the poll maps");
+        assert_eq!(mapped.message.text, "Poll: Saturday or Sunday?");
+        match &mapped.message.kind {
+            MessageKind::Unsupported { link } => assert!(link.contains("message_id=21"), "{link}"),
+            other => panic!("a poll stays a hand-off, got {other:?}"),
+        }
+        let card = mapped.message.card.as_ref().expect("a poll is a card");
+        assert_eq!(card.title, "Saturday or Sunday?");
+        assert_eq!(card.footer, "Open in Telegram");
+        assert_eq!(card.text, "4 votes");
+        assert_eq!(
+            card.fields,
+            vec![
+                ("3 votes · your vote".to_owned(), "Saturday".to_owned()),
+                ("1 vote".to_owned(), "Sunday".to_owned()),
+            ]
+        );
+
+        let hidden = tl::types::PollResults {
+            min: true,
+            has_unread_votes: false,
+            can_view_stats: false,
+            results: Some(vec![poll_voters(0, 9, false, true), poll_voters(1, 9, true, false)]),
+            total_voters: Some(9),
+            recent_voters: None,
+            solution: Some("The north ridge.".to_owned()),
+            solution_entities: None,
+            solution_media: None,
+        };
+        let quiz = map(&Directory::new(7_001), &poll_message(open_poll(true, true, false), hidden)).expect("the quiz maps");
+        let card = quiz.message.card.as_ref().expect("a quiz is a card");
+        assert_eq!(card.title, "Saturday or Sunday?");
+        assert!(card.text.contains("hidden"), "{}", card.text);
+        assert!(card.text.contains("Quiz"), "{}", card.text);
+        assert!(card.text.contains("The north ridge."), "{}", card.text);
+        assert!(card.fields.iter().all(|(_, value)| !value.chars().any(|ch| ch.is_ascii_digit())), "hidden counts stay off the card");
+        assert!(card.fields.iter().any(|(label, value)| value == "Saturday" && label.to_lowercase().contains("correct")));
+        assert!(card.fields.iter().any(|(label, value)| value == "Sunday" && label.to_lowercase().contains("your vote")));
     }
 
     fn said(action: MessageAction) -> String {
@@ -2317,6 +3435,85 @@ mod tests {
         assert_eq!(card.text, "1 The Embarcadero");
         assert_eq!(card.footer, "Open in Maps");
         assert!(card.fields.iter().any(|(label, value)| label == "Latitude" && value.starts_with("37.7955")));
+    }
+
+    fn bot(id: i64, name: &str, handle: &str) -> tl::types::User {
+        use grammers_tl_types::{Deserializable, Serializable};
+        let mut bytes = Vec::new();
+        0u32.serialize(&mut bytes);
+        0u32.serialize(&mut bytes);
+        id.serialize(&mut bytes);
+        let mut user = tl::types::User::from_bytes(&bytes).expect("a blank user reads back");
+        user.first_name = Some(name.to_owned());
+        user.username = Some(handle.to_owned());
+        user.access_hash = Some(1);
+        user.bot = true;
+        user.bot_info_version = Some(1);
+        user
+    }
+
+    #[test]
+    fn a_message_sent_through_an_inline_bot_names_that_bot() {
+        let mut dir = Directory::new(7_001);
+        dir.learn(&[bot(7_060, "Wiki", "wiki").into()], &[]);
+        let mut message = blank_message();
+        message.message = "Rust".into();
+        message.via_bot_id = Some(7_060);
+        let mapped = map(&dir, &message.into()).expect("the message maps");
+        assert!(mapped.message.sender.name.contains("via @wiki"), "{}", mapped.message.sender.name);
+        let plain = map(&dir, &blank_message().into()).expect("a plain message maps");
+        assert!(!plain.message.sender.name.contains("via @"), "{}", plain.message.sender.name);
+    }
+
+    fn live(id: i32, date: i32, lat: f64, long: f64, period: i32) -> tl::enums::Message {
+        let mut message = blank_message();
+        message.id = id;
+        message.date = date;
+        message.media = Some(
+            tl::types::MessageMediaGeoLive {
+                geo: point(lat, long),
+                heading: Some(90),
+                period,
+                proximity_notification_radius: None,
+            }
+            .into(),
+        );
+        message.into()
+    }
+
+    #[test]
+    fn a_live_location_keeps_its_place_and_says_whether_it_is_still_shared() {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i32;
+        let sharing = map(&Directory::new(7_001), &live(11, now, 37.7, -122.4, 900)).expect("the live location maps");
+        assert!(matches!(sharing.message.kind, MessageKind::Normal), "a live location is the card, not a hand-off");
+        let card = sharing.message.card.expect("a live location is a card");
+        assert_eq!(card.title, "Live location");
+        assert_eq!(card.footer, "Open in Maps");
+        assert!(card.text.contains("geo:37.7,-122.4"), "{}", card.text);
+        assert!(card.fields.iter().any(|(label, value)| label == "Heading" && value == "90°"));
+        assert!(card.fields.iter().any(|(label, value)| label == "Status" && value == "Still sharing"), "{:?}", card.fields);
+
+        let ended = map(&Directory::new(7_001), &live(11, 1_700_000_000, 37.7, -122.4, 900)).expect("an ended live location maps");
+        let card = ended.message.card.expect("an ended live location is a card");
+        assert!(card.fields.iter().any(|(label, value)| label == "Status" && value == "Stopped"), "{:?}", card.fields);
+
+        let moved = map(&Directory::new(7_001), &live(11, now, 37.8, -122.5, 900)).expect("a moved live location maps");
+        let card = moved.message.card.expect("a moved live location is a card");
+        assert!(card.text.contains("geo:37.8,-122.5"), "{}", card.text);
+    }
+
+    #[test]
+    fn coming_within_range_of_a_live_location_is_a_service_line() {
+        let dir = Directory::new(7_001);
+        let reached = tl::types::MessageActionGeoProximityReached {
+            from_id: Who::User(7_002).peer(),
+            to_id: Who::User(7_001).peer(),
+            distance: 50,
+        };
+        let (line, known) = super::action(&dir, "Ada", &reached.into());
+        assert!(known, "{line}");
+        assert!(line.contains("50 m"), "{line}");
+        assert!(line.to_lowercase().contains("you"), "{line}");
     }
 
     #[test]
@@ -2815,5 +4012,224 @@ mod tests {
         assert_eq!(attachment.file.id, "d6412m");
         assert!(attachment.thumb.as_ref().is_some_and(|thumb| thumb.id == "d6412m"));
         assert!(wants.iter().all(|want| want.file.id == "d6412m"));
+    }
+
+    use grammers_tl_types::Serializable;
+
+    type Field<'a> = &'a dyn Fn(&mut Vec<u8>);
+
+    fn blank<T: Deserializable>(fields: &[Field]) -> T {
+        let mut bytes = Vec::new();
+        fields.iter().for_each(|field| field(&mut bytes));
+        T::from_bytes(&bytes).expect("a blank value reads back")
+    }
+
+    fn put<T: Serializable>(value: T) -> impl Fn(&mut Vec<u8>) {
+        move |bytes| value.serialize(bytes)
+    }
+
+    fn wire_message(id: i32, text: &str) -> tl::types::Message {
+        let mut message: tl::types::Message = blank(&[
+            &put(0u32),
+            &put(0u32),
+            &put(id),
+            &put(Who::User(7_002).peer()),
+            &put(1_700_000_000i32),
+            &put(text.to_owned()),
+        ]);
+        message.from_id = Some(Who::User(7_002).peer());
+        message
+    }
+
+    fn photo_message(ttl: Option<i32>) -> tl::enums::Message {
+        let mut message = wire_message(14, "");
+        message.media = Some(
+            tl::types::MessageMediaPhoto {
+                spoiler: false,
+                live_photo: false,
+                photo: Some(
+                    tl::types::Photo {
+                        has_stickers: false,
+                        id: 6_014,
+                        access_hash: 6_015,
+                        file_reference: vec![1],
+                        date: 1_700_000_000,
+                        sizes: vec![tl::types::PhotoSize { r#type: "m".into(), w: 320, h: 240, size: 4_000 }.into()],
+                        video_sizes: None,
+                        dc_id: 4,
+                    }
+                    .into(),
+                ),
+                ttl_seconds: ttl,
+                video: None,
+            }
+            .into(),
+        );
+        message.into()
+    }
+
+    fn voice_message(ttl: Option<i32>) -> tl::enums::Message {
+        let voice = tl::types::Document {
+            id: 6_100,
+            access_hash: 6_101,
+            file_reference: vec![4],
+            date: 1_700_000_000,
+            mime_type: "audio/ogg".into(),
+            size: 18_000,
+            thumbs: None,
+            video_thumbs: None,
+            dc_id: 2,
+            attributes: vec![tl::types::DocumentAttributeAudio {
+                voice: true,
+                duration: 7,
+                title: None,
+                performer: None,
+                waveform: Some(vec![0b0001_1111]),
+            }
+            .into()],
+        };
+        let mut message = wire_message(15, "");
+        message.media = Some(
+            tl::types::MessageMediaDocument {
+                nopremium: false,
+                spoiler: false,
+                video: false,
+                round: false,
+                voice: true,
+                document: Some(voice.into()),
+                alt_documents: None,
+                video_cover: None,
+                video_timestamp: None,
+                ttl_seconds: ttl,
+            }
+            .into(),
+        );
+        message.into()
+    }
+
+    fn video_message(round: bool, ttl: Option<i32>) -> tl::enums::Message {
+        let video = tl::types::Document {
+            id: 6_200,
+            access_hash: 6_201,
+            file_reference: vec![5],
+            date: 1_700_000_000,
+            mime_type: "video/mp4".into(),
+            size: 90_000,
+            thumbs: Some(vec![tl::types::PhotoSize { r#type: "m".into(), w: 320, h: 180, size: 2_000 }.into()]),
+            video_thumbs: None,
+            dc_id: 2,
+            attributes: vec![tl::types::DocumentAttributeVideo {
+                round_message: round,
+                supports_streaming: true,
+                nosound: false,
+                duration: 4.0,
+                w: 320,
+                h: 180,
+                preload_prefix_size: None,
+                video_start_ts: None,
+                video_codec: None,
+            }
+            .into()],
+        };
+        let mut message = wire_message(16, "");
+        message.media = Some(
+            tl::types::MessageMediaDocument {
+                nopremium: false,
+                spoiler: false,
+                video: !round,
+                round,
+                voice: false,
+                document: Some(video.into()),
+                alt_documents: None,
+                video_cover: None,
+                video_timestamp: None,
+                ttl_seconds: ttl,
+            }
+            .into(),
+        );
+        message.into()
+    }
+
+    fn mapped(raw: &tl::enums::Message) -> Mapped {
+        map(&Directory::new(7_001), raw).expect("the message maps")
+    }
+
+    #[test]
+    fn a_view_once_photo_is_not_fetched_and_reads_as_locked() {
+        prove_view_once().unwrap();
+        let ordinary = mapped(&photo_message(None));
+        assert!(!ordinary.wants.is_empty(), "an ordinary photo is still fetched");
+        assert_eq!(ordinary.message.attachments.len(), 1);
+
+        // Telegram's view-once mark is ttl_seconds = 0x7FFFFFFF. A shorter timer is the same
+        // promise: the bytes are not a file this client may keep.
+        let once = mapped(&photo_message(Some(i32::MAX)));
+        assert!(once.wants.is_empty(), "a view-once photo queues no file");
+        assert!(once.message.attachments.is_empty());
+        assert!(once.message.text.contains("View-once photo"), "{}", once.message.text);
+        assert!(matches!(once.message.kind, MessageKind::Unsupported { .. }));
+
+        let timed = mapped(&photo_message(Some(30)));
+        assert!(timed.wants.is_empty(), "a photo with a timer queues no file");
+        assert!(timed.message.text.contains("Photo with a timer"), "{}", timed.message.text);
+
+        let voice = mapped(&voice_message(Some(i32::MAX)));
+        assert!(voice.wants.is_empty(), "a listen-once voice message queues no file");
+        assert!(voice.message.attachments.is_empty());
+        assert!(voice.message.text.contains("View-once voice message"), "{}", voice.message.text);
+
+        let clip = mapped(&video_message(false, Some(i32::MAX)));
+        assert!(clip.wants.is_empty(), "a view-once video queues no file");
+        assert!(clip.message.text.contains("View-once video"), "{}", clip.message.text);
+
+        let round = mapped(&video_message(true, Some(i32::MAX)));
+        assert!(round.wants.is_empty(), "a view-once video message queues no file");
+        assert!(round.message.text.contains("View-once video message"), "{}", round.message.text);
+    }
+
+    #[test]
+    fn a_checklist_lists_its_items_and_marks_the_one_that_is_done() {
+        prove_checklist().unwrap();
+    }
+
+    #[test]
+    fn a_later_name_is_mentioned_when_an_earlier_at_sign_is_not_one() {
+        let nameless = MentionTarget {
+            name: "Ada Stone".into(),
+            first: "Ada".into(),
+            handle: String::new(),
+            user_id: 7_003,
+            access_hash: 7,
+        };
+        let named = MentionTarget {
+            name: "Bea Moss".into(),
+            first: "Bea".into(),
+            handle: "bea_m".into(),
+            user_id: 7_002,
+            access_hash: 8,
+        };
+        // "hi" sits after both names. The address is not a mention, so it must not hide the later one.
+        let text = "ping mail@Ada Stone see @Ada Stone and @Bea Moss hi";
+        let (plain, entities) = apply_mentions(text, vec![bold(49, 2)], &[nameless, named]);
+        assert_eq!(plain, "ping mail@Ada Stone see Ada and @bea_m hi");
+        let mention = entities.iter().find_map(|entity| match entity {
+            MessageEntity::InputMessageEntityMentionName(named) => Some(named),
+            _ => None,
+        });
+        let mention = mention.expect("the person with no username is named");
+        assert_eq!((mention.offset, mention.length), (24, 3));
+        assert!(matches!(&mention.user_id, tl::enums::InputUser::User(user) if user.user_id == 7_003 && user.access_hash == 7));
+        assert_eq!(entities.iter().filter(|entity| matches!(entity, MessageEntity::InputMessageEntityMentionName(_))).count(), 1);
+        let bold = entities.iter().find_map(|entity| match entity {
+            MessageEntity::Bold(bold) => Some((bold.offset, bold.length)),
+            _ => None,
+        });
+        // "@Ada Stone" (10) became "Ada" (3) and "@Bea Moss" (9) became "@bea_m" (6): "hi" moves left by 10.
+        assert_eq!(bold, Some((39, 2)));
+        let shown = spans(&plain, &entities);
+        assert!(shown.iter().any(|span| {
+            matches!(&span.style, Style::Mention { kind: MentionKind::User, id } if id == "u7003")
+                && &plain[span.start as usize..span.end as usize] == "Ada"
+        }));
     }
 }

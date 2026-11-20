@@ -367,7 +367,39 @@ pub(super) fn sign_on(account: &Arc<Account>) -> Result<(), Fault> {
     let _ = account.ctx.spaces(&[]);
     account.live().unread_check = Some(Instant::now());
     retry_unread_channels(account);
-    contacts(account)
+    contacts(account)?;
+    blocked_list(account)
+}
+
+/// People this account has blocked. Recorded one at a time so the contact list `contacts`
+/// just wrote is left as it is.
+fn blocked_list(account: &Account) -> Result<(), Fault> {
+    let mut offset = 0i32;
+    loop {
+        let page = account.ask(&tl::functions::contacts::GetBlocked { my_stories_from: false, offset, limit: 100 })?;
+        let list = page.blocked();
+        let total = match &page {
+            tl::enums::contacts::Blocked::Slice(page) => page.count,
+            tl::enums::contacts::Blocked::Blocked(_) => list.len() as i32,
+        };
+        account.learn(&page.users(), &page.chats());
+        if list.is_empty() {
+            break;
+        }
+        for one in &list {
+            let tl::enums::PeerBlocked::Blocked(one) = one;
+            let who = Who::of(&one.peer_id);
+            if let Who::User(id) = who {
+                account.set_user_blocked(id, true);
+            }
+            let _ = account.ctx.relation(&who.text(), Relation::Blocked);
+        }
+        offset += list.len() as i32;
+        if offset >= total || offset >= 500 {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// A channel or supergroup left while we were offline may be missing from the new dialog list.
@@ -481,8 +513,9 @@ fn contacts(account: &Account) -> Result<(), Fault> {
             continue;
         };
         let id = Who::User(user.id).text();
-        let badge = super::premium::badge(user.premium, user.id == account.me);
-        account.ctx.presence(&id, presence(user.status.as_ref()), badge, true);
+        let mine = user.id == account.me;
+        let line = super::peers::row_status(mine, user.premium, &super::peers::rough_seen(user.status.as_ref()));
+        account.ctx.presence(&id, presence(user.status.as_ref()), &line, true);
         owned.push((id, Relation::Contact));
     }
     let _ = account.ctx.relations(&owned);
@@ -704,7 +737,7 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
         return Ok(None);
     }
     let is_muted = muted(account, who, &dialog.notify_settings);
-    let unread = (dialog.unread_count.max(0) as u32).max(u32::from(dialog.unread_mark));
+    let unread = unread_of(dialog.unread_count, dialog.unread_mark);
     let filing = {
         let mut live = account.live();
         let filed = &mut live.filed;
@@ -763,7 +796,7 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
             super::mark_read(account, &id, &up_to);
             match peer_dialog(account, who) {
                 Some(fresh) => {
-                    unread = (fresh.unread_count.max(0) as u32).max(u32::from(fresh.unread_mark));
+                    unread = unread_of(fresh.unread_count, fresh.unread_mark);
                     mentions = fresh.unread_mentions_count.max(0) as u32;
                     read = (fresh.read_inbox_max_id > 0).then(|| fresh.read_inbox_max_id.to_string());
                     through = Some(fresh.top_message);
@@ -789,8 +822,13 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     Ok(through)
 }
 
+/// A dialog's badge: the unread messages, or one when only the manual mark is set.
+pub(super) fn unread_of(count: i32, mark: bool) -> u32 {
+    (count.max(0) as u32).max(u32::from(mark))
+}
+
 /// One dialog as the network counts it right now, what a read told again leaves.
-fn peer_dialog(account: &Account, who: Who) -> Option<tl::types::Dialog> {
+pub(super) fn peer_dialog(account: &Account, who: Who) -> Option<tl::types::Dialog> {
     let peer = account.input(who).ok()?;
     let request = tl::functions::messages::GetPeerDialogs { peers: vec![tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer })] };
     match account.ask(&request) {

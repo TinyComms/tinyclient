@@ -467,10 +467,9 @@ pub(super) fn apply(account: &Account, update: &Update) {
                 }
             }
         }
-        // Outside a channel a deletion names the messages and not their chat.
-        // CONTRACT: the store cannot be asked which conversation holds a message, so only
-        // messages seen since this connection began are found; an older one goes when its
-        // conversation is next opened and the page shows it missing.
+        // Outside a channel a deletion names the messages and not their chat. The chat is
+        // the one this connection saw, or the note written when the message arrived, which
+        // outlives a reconnect. A channel that is not a forum names itself.
         Update::DeleteMessages(gone) => {
             for chat in &mut account.pending().chats {
                 if matches!(chat.peer, Who::Group(_)) {
@@ -482,6 +481,7 @@ pub(super) fn apply(account: &Account, update: &Update) {
                     if !drop_member(account, &conversation, *id) {
                         let _ = account.ctx.deleted(&conversation, &id.to_string());
                     }
+                    account.forget_placed(None, *id);
                 }
             }
         }
@@ -497,6 +497,9 @@ pub(super) fn apply(account: &Account, update: &Update) {
                     if !drop_member(account, &conversation, *id) {
                         let _ = account.ctx.deleted(&conversation, &id.to_string());
                     }
+                    if forum {
+                        account.forget_placed(Some(who), *id);
+                    }
                 }
             }
         }
@@ -511,9 +514,23 @@ pub(super) fn apply(account: &Account, update: &Update) {
         }
         Update::UserStatus(status) => {
             let who = Who::User(status.user_id);
+            let mine = status.user_id == account.me;
+            let seen = super::peers::rough_seen(Some(&status.status));
+            if !mine {
+                if let Some(row) = account.dir().note_seen(who, seen.clone()) {
+                    let _ = account.ctx.people(std::slice::from_ref(&row));
+                }
+            }
             let (owned, premium) = account.dir().get(who).map(|known| (known.contact, known.premium)).unwrap_or((false, false));
-            let badge = super::premium::badge(premium, status.user_id == account.me);
-            account.ctx.presence(&who.text(), presence(Some(&status.status)), badge, owned || status.user_id == account.me);
+            let line = super::peers::row_status(mine, premium, &seen);
+            account.ctx.presence(&who.text(), presence(Some(&status.status)), &line, owned || mine);
+        }
+        // The name rides the update itself. A short update carries no user object, so the
+        // directory is patched here. A phone change is not stored: the next card reads it.
+        Update::UserName(renamed) => {
+            if let Some(row) = account.dir().rename(renamed.user_id, &renamed.first_name, &renamed.last_name, &renamed.usernames) {
+                let _ = account.ctx.people(std::slice::from_ref(&row));
+            }
         }
         Update::ReadHistoryInbox(seen) => {
             let conversation = place(account, Who::of(&seen.peer), seen.top_msg_id);
@@ -556,7 +573,33 @@ pub(super) fn apply(account: &Account, update: &Update) {
             let message = written_id(account, reacted.msg_id).unwrap_or(reacted.msg_id);
             reactions(account, &conversation, message, &reacted.reactions);
         }
+        // A full poll replaces the card. Counts alone name each option by its bytes, which the
+        // stored card does not keep, so a results-only update is left as it is.
+        Update::MessagePoll(changed) => {
+            let (Some(peer), Some(msg_id), Some(poll)) = (&changed.peer, changed.msg_id, changed.poll.as_ref()) else {
+                return;
+            };
+            let tl::enums::Poll::Poll(poll) = poll;
+            let tl::enums::PollResults::Results(results) = &changed.results;
+            let conversation = place(account, Who::of(peer), changed.top_msg_id);
+            let Ok(Some(mut stored)) = account.ctx.stored_message(&conversation, &msg_id.to_string()) else {
+                return;
+            };
+            let card = content::poll_card(poll, results);
+            stored.text = format!("Poll: {}", card.title);
+            stored.card = Some(Box::new(card));
+            let _ = account.ctx.history(&conversation, std::slice::from_ref(&stored));
+        }
         // A draft typed (or cleared) on the phone while we are here, or ours echoed back.
+        Update::PeerBlocked(changed) => {
+            let who = Who::of(&changed.peer_id);
+            if let Who::User(id) = who {
+                account.set_user_blocked(id, changed.blocked);
+                let contact = account.dir().get(who).is_some_and(|known| known.contact);
+                let relation = super::block_choice(!changed.blocked, contact).1;
+                let _ = account.ctx.relation(&who.text(), relation);
+            }
+        }
         Update::DraftMessage(drafted) => {
             let who = Who::of(&drafted.peer);
             let id = if account.dir().get(who).is_some_and(|known| known.forum) {
@@ -593,6 +636,26 @@ pub(super) fn apply(account: &Account, update: &Update) {
             // reading the chats again shows.
             _ => account.live().stale = true,
         },
+        // A secret chat. Named here and left in Telegram's phone apps. Never accepted.
+        Update::Encryption(changed) => super::secret::apply(account, changed),
+        // Another device marked the chat unread, or took that mark off. The mark is not the
+        // unread count: taking it off asks the dialog what is still unread.
+        Update::DialogUnreadMark(marked) => {
+            if let tl::enums::DialogPeer::Peer(dialog) = &marked.peer {
+                let who = Who::of(&dialog.peer);
+                let id = who.text();
+                if marked.unread {
+                    let _ = account.ctx.mark_unread(&id);
+                    filing::facts_changed(account, who, |facts| facts.read = false);
+                } else if let Some(fresh) = sync::peer_dialog(account, who) {
+                    let unread = sync::unread_of(fresh.unread_count, fresh.unread_mark);
+                    let mentions = fresh.unread_mentions_count.max(0) as u32;
+                    let read = (fresh.read_inbox_max_id > 0).then(|| fresh.read_inbox_max_id.to_string());
+                    let _ = account.ctx.counts(&id, unread, mentions, read.as_deref(), 0);
+                    filing::facts_changed(account, who, |facts| facts.read = unread == 0);
+                }
+            }
+        }
         // A chat joined, left or changed: what changed came with the update's chats, which
         // `learn` has already written.
         _ => {}

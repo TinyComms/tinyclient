@@ -685,6 +685,7 @@ impl Slack {
             name: first(&[&file["name"], &file["title"]]).unwrap_or("untitled").to_owned(),
             file: whole,
             thumb,
+            preview: None,
             mime: mime.to_owned(),
             duration: (file["duration_ms"].as_u64().unwrap_or(0) / 1000) as u32,
             round: false,

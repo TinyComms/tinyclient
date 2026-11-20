@@ -421,9 +421,12 @@ pub enum Command {
         at: Instant,
         reply: Reply<Vec<MessageHit>>,
     },
-    /// The shell asked for these files and the media cache knows none of them. An adapter that
-    /// fetches files over its own session (Telegram) fetches those that are its own, such as the
-    /// original a picture's viewer opened, and records each as the cache would. Others ignore it.
+    /// The shell asked for these files and the media cache knows none of them, or knows them
+    /// only by Telegram's name for a file it kept, since gone from disk. An adapter that fetches
+    /// files over its own session (Telegram, Messages) fetches those that are its own, such as
+    /// the original a picture's viewer opened, and records each as the cache would. Telegram
+    /// also takes it as what is on screen: a picture a message shows goes ahead of those that
+    /// are not, even one no page has named yet. Others ignore it.
     Wanted(Vec<String>),
     /// The link that opens this conversation's call in the official app.
     Handoff { conversation_id: String, reply: Reply<String> },
@@ -690,6 +693,17 @@ impl Context {
     pub fn manual_ack(&self, conversation_id: &str, last_read: &str, mentions: Option<u32>) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().apply_manual_ack(&conversation, last_read, mentions)? {
+            self.hub.changed(Change::Conversation { conversation });
+            self.hub.changed(Change::Status);
+        }
+        Ok(())
+    }
+
+    /// The user marked the conversation unread. The badge becomes at least one; a higher count
+    /// stays. The read marker is left where it is.
+    pub fn mark_unread(&self, conversation_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().mark_unread_badge(&conversation)? {
             self.hub.changed(Change::Conversation { conversation });
             self.hub.changed(Change::Status);
         }
@@ -1638,7 +1652,6 @@ pub fn prove_slack_channel_star() -> Result<(), String> {
 /// with a Join link, and an old Slack call says that it happened.
 pub fn prove_slack_call_cards() -> Result<(), String> {
     slack::prove_call_cards()
-||||||| 95ac1957
 /// The lab's discord-thread-chip driver. A thread chip counts new replies and keeps the
 /// newest faces. A build without this returns to the server and stays up.
 pub fn prove_discord_thread_chip() -> Result<(), String> {
@@ -1703,7 +1716,6 @@ pub fn prove_slack_connect_org() -> Result<(), String> {
 /// The lab's slack-rich-text driver. See `slack::prove_rich_text`.
 pub fn prove_slack_rich_text() -> Result<(), String> {
     slack::prove_rich_text()
-||||||| 95ac1957
 /// The lab's teams-team-info driver. See `teams::prove_team_info`.
 pub fn prove_teams_team_info() -> Result<(), String> {
     teams::prove_team_info()

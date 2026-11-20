@@ -1,0 +1,12 @@
+{
+  "id": "telegram-profile",
+  "title": "A hidden last seen reads in words, and groups in common are listed",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same words are what a hidden last seen maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same words are what a hidden last seen maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

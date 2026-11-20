@@ -1,0 +1,12 @@
+{
+  "id": "telegram-polls",
+  "title": "A poll shows its options and counts, and a quiz hides them until it closes",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same card is what a poll maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same card is what a poll maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

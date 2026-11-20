@@ -1064,6 +1064,7 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
             name: label,
             file,
             thumb,
+            preview: None,
             mime: piece.mime.clone(),
             duration,
             spoiler: false,

@@ -34,6 +34,11 @@ pub(super) fn send_with(account: &Arc<Account>, conversation: &str, client_id: &
     let ctx = account.ctx.clone();
     let opts = options(&with);
     account.here();
+    if super::secret::is_row(conversation) {
+        let fault = Fault::Rpc { code: 400, name: "SECRET_CHAT".to_owned(), value: None };
+        ctx.sent(conversation, client_id, Err(fault.words()));
+        return;
+    }
     if with.files.is_empty() {
         let outcome = match &with.pick {
             Some(pick) => send_pick(account, conversation, client_id, text, reply_to, &pick.id, opts),

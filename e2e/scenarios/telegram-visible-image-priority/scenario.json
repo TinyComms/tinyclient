@@ -1,0 +1,13 @@
+{
+  "id": "telegram-visible-image-priority",
+  "title": "A Telegram chat opened after an image-heavy channel fetches its picture on screen before the channel's waiting thumbnails, and shows it",
+  "platforms": ["windows", "linux"],
+  "not_applicable": {
+    "macos": "The check reads screen pixels and types into the window. The macOS lab's helper reads window text only, and teaching it to save a picture rebuilds the ad hoc signed helper, which drops its Screen Recording grant. The download order is chatd's and the same on every desktop.",
+    "android": "The lab's phone demo build bypasses chatd and cannot run the scripted Telegram wire.",
+    "ios": "The lab's phone demo build bypasses chatd and cannot run the scripted Telegram wire."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 40
+}
