@@ -514,9 +514,23 @@ pub(super) fn apply(account: &Account, update: &Update) {
         }
         Update::UserStatus(status) => {
             let who = Who::User(status.user_id);
+            let mine = status.user_id == account.me;
+            let seen = super::peers::rough_seen(Some(&status.status));
+            if !mine {
+                if let Some(row) = account.dir().note_seen(who, seen.clone()) {
+                    let _ = account.ctx.people(std::slice::from_ref(&row));
+                }
+            }
             let (owned, premium) = account.dir().get(who).map(|known| (known.contact, known.premium)).unwrap_or((false, false));
-            let badge = super::premium::badge(premium, status.user_id == account.me);
-            account.ctx.presence(&who.text(), presence(Some(&status.status)), badge, owned || status.user_id == account.me);
+            let line = super::peers::row_status(mine, premium, &seen);
+            account.ctx.presence(&who.text(), presence(Some(&status.status)), &line, owned || mine);
+        }
+        // The name rides the update itself. A short update carries no user object, so the
+        // directory is patched here. A phone change is not stored: the next card reads it.
+        Update::UserName(renamed) => {
+            if let Some(row) = account.dir().rename(renamed.user_id, &renamed.first_name, &renamed.last_name, &renamed.usernames) {
+                let _ = account.ctx.people(std::slice::from_ref(&row));
+            }
         }
         Update::ReadHistoryInbox(seen) => {
             let conversation = place(account, Who::of(&seen.peer), seen.top_msg_id);

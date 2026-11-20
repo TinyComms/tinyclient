@@ -1329,6 +1329,30 @@ pub fn prove_telegram_polls() -> Result<(), String> {
     content::prove_polls()
 }
 
+/// The lab's telegram-profile driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_profile() -> Result<(), String> {
+    let recently = tl::enums::UserStatus::Recently(tl::types::UserStatusRecently { by_me: false });
+    let week = tl::enums::UserStatus::LastWeek(tl::types::UserStatusLastWeek { by_me: false });
+    let month = tl::enums::UserStatus::LastMonth(tl::types::UserStatusLastMonth { by_me: false });
+    let empty = tl::enums::UserStatus::Empty;
+    if peers::rough_seen(Some(&recently)) != "last seen recently" {
+        return Err("recently did not read as last seen recently".into());
+    }
+    if peers::rough_seen(Some(&week)) != "last seen within a week" || peers::rough_seen(Some(&month)) != "last seen within a month" {
+        return Err("a week or a month was not named".into());
+    }
+    if !peers::rough_seen(Some(&empty)).is_empty() || presence(Some(&recently)) != Presence::Unknown {
+        return Err("a hidden or empty last seen was treated as offline".into());
+    }
+    if !peers::row_status(true, true, "last seen recently").is_empty() {
+        return Err("our own row carried a last seen".into());
+    }
+    if info::birthday_line(14, 3, None).as_deref() != Some("14 March") || info::birthday_line(14, 3, Some(1990)).as_deref() != Some("14 March 1990") {
+        return Err("a birthday was not named".into());
+    }
+    Ok(())
+}
+
 /// The lab's telegram-member-sections driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_member_sections() -> Result<(), String> {
     members::prove()
