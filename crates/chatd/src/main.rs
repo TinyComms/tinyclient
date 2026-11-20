@@ -550,6 +550,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-accounts:0");
         return Ok(());
     }
+    // The lab's telegram-secret-chat driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-secret-chat") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_secret_chat() {
+            eprintln!("telegram-secret-chat: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-secret-chat:0");
+        return Ok(());
+    }
     // The lab's slack-connect-org driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("slack-connect-org") {
         if let Err(err) = chatd::adapters::prove_slack_connect_org() {

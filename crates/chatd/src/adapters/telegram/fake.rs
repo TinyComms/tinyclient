@@ -7,10 +7,10 @@
 //! `scan-other`, `scan-password`), `telegram.ctl` once signed in (`incoming`, `photo`, `react`, `edit`,
 //! `delete`, `ttl`, `ttl-gone`, `topic`, `comments`, `typing`, `typing-stop`, `read`, `status`,
 //! `poll`, `voice`, `forward`, `flood-send N`, `flood-file N`, `photo-pages N`, `revoke`,
-//! `photo-preview`, and the holds of `TINYCLIENT_TELEGRAM_HOLD`, `TINYCLIENT_TELEGRAM_PEER_HOLD`
-//! and `TINYCLIENT_TELEGRAM_FILE_HOLD` through `dialogs-go`, `peer-go` and `file-go`). Every
-//! request it is sent is appended to `telegram.calls`, one line each, so a test can see what
-//! the network would have heard.
+//! `photo-preview`, `secret`, `secret-gone`, and the holds of `TINYCLIENT_TELEGRAM_HOLD`,
+//! `TINYCLIENT_TELEGRAM_PEER_HOLD` and `TINYCLIENT_TELEGRAM_FILE_HOLD` through `dialogs-go`,
+//! `peer-go` and `file-go`). Every request it is sent is appended to `telegram.calls`, one line
+//! each, so a test can see what the network would have heard.
 //!
 //! The account: Mira Kessler (7001); Odalys Brandt (7002, a contact, with a second password on
 //! her own number); Tobin Reyes (7003); a group "Trail crew" (8001); a channel "Field Notes"
@@ -1629,6 +1629,24 @@ impl World {
                 self.revoked = true;
                 vec![Event::Closed("the session was ended from another device".to_owned())]
             }
+            // Odalys asked for a secret chat. The adapter names the row and does not accept it.
+            "secret" => {
+                let chat = tl::types::EncryptedChatRequested {
+                    folder_id: None,
+                    id: 42,
+                    access_hash: 1,
+                    date: t0(),
+                    admin_id: ODALYS,
+                    participant_id: ME,
+                    g_a: vec![1, 2, 3],
+                };
+                vec![update(tl::types::UpdateEncryption { chat: chat.into(), date: t0() }.into())]
+            }
+            // Telegram says that chat is gone. The row leaves with it.
+            "secret-gone" => {
+                let chat = tl::types::EncryptedChatDiscarded { history_deleted: false, id: 42 };
+                vec![update(tl::types::UpdateEncryption { chat: chat.into(), date: t0() }.into())]
+            }
             _ => Vec::new(),
         }
     }
@@ -2271,6 +2289,15 @@ impl World {
         }
         if let Some(answered) = self.panes(body, events) {
             return answered;
+        }
+        // A secret chat is never accepted, started, or discarded from here. Logging the ask is
+        // what lets a test see one: an unknown method is otherwise answered and forgotten.
+        if asked::<f::messages::AcceptEncryption>(body).is_some() {
+            self.log("AcceptEncryption");
+        } else if asked::<f::messages::RequestEncryption>(body).is_some() {
+            self.log("RequestEncryption");
+        } else if asked::<f::messages::DiscardEncryption>(body).is_some() {
+            self.log("DiscardEncryption");
         }
         Err(rpc(400, "METHOD_NOT_IN_THE_SCRIPT", None))
     }

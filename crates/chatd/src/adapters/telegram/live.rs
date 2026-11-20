@@ -605,6 +605,8 @@ pub(super) fn apply(account: &Account, update: &Update) {
             // reading the chats again shows.
             _ => account.live().stale = true,
         },
+        // A secret chat. Named here and left in Telegram's phone apps. Never accepted.
+        Update::Encryption(changed) => super::secret::apply(account, changed),
         // A chat joined, left or changed: what changed came with the update's chats, which
         // `learn` has already written.
         _ => {}
