@@ -1957,6 +1957,11 @@ pub(crate) fn prove_channel_star() -> Result<(), String> {
     Ok(())
 }
 
+/// What the slack-call-cards driver checks, with no workspace and no socket.
+pub(crate) fn prove_call_cards() -> Result<(), String> {
+    message::prove_call_cards()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

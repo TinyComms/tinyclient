@@ -2522,3 +2522,95 @@ fn starring_a_channel_tells_slack_and_a_removal_clears_it() {
     assert!(!removed[0].params.contains_key("timestamp"));
     assert!(!world.conversation(&general).unwrap().starred);
 }
+
+/// A posted `/zoom` (or Meet, Teams, Webex) call is a `call` block. Slack fills `call.v1` when
+/// the message is delivered. An old Slack call is `sh_room_created` with the same room clock a
+/// huddle uses.
+#[test]
+fn a_call_block_is_a_meeting_card_with_a_join_link_and_an_old_call_names_itself() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    let push = |ts: &str, event: Value| {
+        world.fake.push(ALPHA, event);
+        world.until("the call message", || world.message(&general, ts))
+    };
+    let started = 1_700_000_000_i64;
+
+    let zoom = push("1760000600.000100", json!({
+        "type": "message", "channel": "C0GEN", "user": "U0ANA", "text": "", "ts": "1760000600.000100",
+        "blocks": [{
+            "type": "call", "call_id": "R0ZOOM",
+            "call": {
+                "media_backend_type": "zoom",
+                "v1": {
+                    "id": "R0ZOOM", "name": "Standup", "join_url": "https://zoom.us/j/123456789",
+                    "date_start": started,
+                    "active_participants": [{"slack_id": "U0ANA"}, {"slack_id": "U0BEN"}, {"slack_id": "U0ME"}],
+                },
+            },
+        }],
+    }));
+    assert_eq!(zoom.kind, MessageKind::Normal, "a call is not an interactive placeholder: {}", zoom.text);
+    assert!(!zoom.text.contains("interactive message"));
+    let card = zoom.card.as_deref().expect("the call is a card");
+    assert_eq!((card.title.as_str(), card.text.as_str()), ("Standup", "Zoom meeting · 3 people"));
+    let join = zoom.previews.first().expect("Join opens the meeting");
+    assert_eq!((join.title.as_str(), join.url.as_str()), ("Join", "https://zoom.us/j/123456789"));
+
+    let ended = push("1760000600.000200", json!({
+        "type": "message", "channel": "C0GEN", "user": "U0ANA", "text": "", "ts": "1760000600.000200",
+        "blocks": [{
+            "type": "call", "call_id": "R0MEET",
+            "call": {
+                "media_backend_type": "google_meet",
+                "v1": {
+                    "name": "Planning", "join_url": "https://meet.google.com/abc-defg-hij",
+                    "date_start": started, "date_end": started + 25 * 60,
+                    "active_participants": [],
+                },
+            },
+        }],
+    }));
+    let card = ended.card.as_deref().expect("an ended call is still a card");
+    assert_eq!((card.title.as_str(), card.text.as_str()), ("Planning", "Ended · 25 min"));
+    assert_eq!(ended.previews.first().map(|preview| preview.url.as_str()), Some("https://meet.google.com/abc-defg-hij"));
+
+    let teams = push("1760000600.000300", json!({
+        "type": "message", "channel": "C0GEN", "user": "U0BEN", "text": "", "ts": "1760000600.000300",
+        "blocks": [{
+            "type": "call", "call_id": "R0TEAMS",
+            "call": {
+                "v1": {
+                    "media_backend_type": "microsoft_teams", "name": "Review",
+                    "join_url": "https://teams.microsoft.com/l/meetup-join/19:meeting",
+                    "date_start": started, "active_participants": [{"slack_id": "U0BEN"}],
+                },
+            },
+        }],
+    }));
+    assert_eq!(teams.card.as_deref().map(|card| card.text.as_str()), Some("Microsoft Teams meeting · 1 person"));
+
+    let webex = push("1760000600.000400", json!({
+        "type": "message", "channel": "C0GEN", "user": "U0BEN", "text": "", "ts": "1760000600.000400",
+        "blocks": [{
+            "type": "call", "call_id": "R0WEBEX",
+            "call": { "v1": { "media_backend_type": "webex", "name": "Sync", "date_start": started, "join_url": "https://webex.example/meet/sync" } },
+        }],
+    }));
+    assert_eq!(webex.card.as_deref().map(|card| card.text.as_str()), Some("Webex meeting"));
+
+    let old = push("1760000600.000500", json!({
+        "type": "message", "subtype": "sh_room_created", "channel": "C0GEN", "user": "U0ANA", "text": "",
+        "ts": "1760000600.000500",
+        "room": { "date_start": started, "date_end": started + 25 * 60, "has_ended": true },
+    }));
+    assert_eq!((old.kind.clone(), old.text.as_str()), (MessageKind::System, "A call happened · 25 min"));
+
+    let huddle = push("1760000600.000600", json!({
+        "type": "message", "subtype": "huddle_thread", "channel": "C0GEN", "user": "U0ANA", "text": "",
+        "ts": "1760000600.000600",
+        "room": { "date_start": started, "date_end": started + 25 * 60, "has_ended": true, "call_family": "huddle" },
+    }));
+    assert_eq!(huddle.text, "A huddle happened · 25 min");
+}

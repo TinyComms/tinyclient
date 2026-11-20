@@ -1627,6 +1627,12 @@ pub fn prove_slack_channel_star() -> Result<(), String> {
     slack::prove_channel_star()
 }
 
+/// The lab's slack-call-cards driver. A Zoom, Meet, Teams or Webex call block is a card
+/// with a Join link, and an old Slack call says that it happened.
+pub fn prove_slack_call_cards() -> Result<(), String> {
+    slack::prove_call_cards()
+}
+
 /// The lab's failed-start-offline driver. A start that fails leaves the account offline,
 /// so messages() still answers from the cache instead of an empty signed-out page.
 pub fn prove_failed_start_offline() -> Result<(), String> {
