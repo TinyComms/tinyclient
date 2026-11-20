@@ -139,6 +139,31 @@ impl World {
         World { child, dir }
     }
 
+    /// Starts chatd again on the same store. The scripted wire starts fresh; lines already
+    /// taken stay taken, so a restart does not replay them.
+    fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(self.dir.join("chat.sock"));
+        let log = std::fs::File::create(self.dir.join("stderr.log")).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_chatd"))
+            .env("TINYCLIENT_DIR", &self.dir)
+            .env("TINYCLIENT_TELEGRAM_FAKE", "30")
+            .env("TINYCLIENT_TELEGRAM_T0", t0().to_string())
+            .env_remove("TINYCLIENT_SESSION_DISCORD")
+            .env_remove("TINYCLIENT_SESSION_SLACK")
+            .env("TINYCLIENT_SESSION_TELEGRAM", SESSION)
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap();
+        self.child = child;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ChatStream::connect(&self.dir.join("chat.sock")).is_err() {
+            assert!(Instant::now() < deadline, "chatd did not open its socket after a restart");
+            sleep(Duration::from_millis(10));
+        }
+    }
+
     fn ask(&self, request: Request) -> Response {
         let mut stream = ChatStream::connect(&self.dir.join("chat.sock")).unwrap();
         write_frame(&mut stream, &request).unwrap();
@@ -2779,4 +2804,18 @@ fn block_sends_contacts_block_and_the_person_reads_blocked() {
         listed(Relation::Blocked).iter().any(|person| person.key.id == "u7002").then_some(())
     });
     assert_eq!(world.called("contacts.block u7002"), 1, "an update is not another block request");
+}
+
+#[test]
+fn a_private_delete_after_reconnect_removes_the_message() {
+    let mut world = World::signed_in();
+    world.connected();
+    world.steer("incoming");
+    let arrived = world.until("the incoming message", || world.message("u7002", "13"));
+    assert!(arrived.text.contains("dock"));
+    world.restart();
+    world.connected();
+    assert!(world.message("u7002", "13").is_some(), "the message stays until Telegram says it was deleted");
+    world.steer("delete");
+    world.within(Duration::from_secs(5), "the delete after a reconnect", || world.message("u7002", "13").is_none().then_some(()));
 }
