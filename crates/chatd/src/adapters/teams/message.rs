@@ -722,8 +722,9 @@ impl Teams {
     }
 
     /// Records a page. In a channel the posts are its own and each reply goes to its chain; a
-    /// chain, a chat and anything else holds every message itself.
-    fn record(&self, conversation: &str, raws: &[Value]) -> Result<(), Fault> {
+    /// chain, a chat and anything else holds every message itself. `more_before` is true when
+    /// Teams gave a cursor for a still older page.
+    fn record(&self, conversation: &str, raws: &[Value], more_before: bool) -> Result<(), Fault> {
         let channel = chain_of(conversation).is_none() && self.ctx.known(conversation)?.is_some_and(|row| row.kind == ConversationKind::Channel);
         let (mut own, mut replies): (Vec<Message>, Vec<(String, Message)>) = (Vec::new(), Vec::new());
         for raw in raws {
@@ -738,23 +739,22 @@ impl Teams {
             }
         }
         let of = |root: &str| -> Vec<&Message> { replies.iter().filter(|(of, _)| of == root).map(|(_, reply)| reply).collect() };
-        if let Some((parent, root)) = chain_of(conversation) {
-            // The chain whole: the post's summary is exactly what is here.
-            let answers: Vec<&Message> = own.iter().filter(|message| message.id != root).collect();
-            if let Some(mut first) = self.ctx.stored_message(parent, root)?.filter(|_| answers.len() < CHAIN as usize - 1) {
-                let exact = self.summary(parent, root, None, &answers);
-                if exact != first.thread {
-                    first.thread = exact;
-                    self.ctx.history(parent, &[first])?;
-                }
-            }
-        } else if channel {
+        if channel {
             for post in &mut own {
                 let before = self.ctx.stored_message(conversation, &post.id)?.and_then(|stored| stored.thread);
                 post.thread = self.summary(conversation, &post.id, before, &of(&post.id));
             }
         }
         self.ctx.history(conversation, &own)?;
+        if let Some((parent, root)) = chain_of(conversation) {
+            let on_page = own.iter().filter(|message| message.id != root).count();
+            // A short page with no older cursor is the start of the chain. The count is every
+            // reply stored, not only this page, so the last page of a long chain does not
+            // replace the total with itself. No client names a reply-count field on the post.
+            if !more_before && on_page < CHAIN as usize - 1 {
+                self.exact_chain(parent, root)?;
+            }
+        }
         // A chain named "Replies" before its post was read is titled by the post now.
         if channel {
             for post in own.iter().filter(|post| post.thread.is_some()) {
@@ -778,20 +778,52 @@ impl Teams {
         Ok(())
     }
 
-    /// The newest page of a conversation; a reply chain whole, from its post on.
+    /// The newest page. A reply chain keeps the cursor, the same way a chat does, so scrolling
+    /// up reads the pages under it.
     pub(super) fn backfill(&self, conversation: &str) -> Result<(), Fault> {
         if !self.known(conversation)? {
             return Ok(());
         }
         if let Some((channel, root)) = chain_of(conversation) {
             self.chain_known(channel, root)?;
-            let (messages, _) = self.page(conversation, CHAIN, "startTime=1")?;
-            return self.record(conversation, &messages);
+            let (messages, older) = self.page(conversation, CHAIN, "startTime=1")?;
+            self.remember_cursor(conversation, &messages, &older);
+            return self.record(conversation, &messages, !older.is_empty());
         }
         let (messages, older) = self.page(conversation, PAGE, "startTime=1")?;
         self.remember_cursor(conversation, &messages, &older);
-        self.record(conversation, &messages)?;
+        self.record(conversation, &messages, !older.is_empty())?;
         self.seen_by(conversation)
+    }
+
+    /// Every reply stored in a chain, once its first page has been reached.
+    fn exact_chain(&self, parent: &str, root: &str) -> Result<(), Fault> {
+        let Some(mut first) = self.ctx.stored_message(parent, root)? else {
+            return Ok(());
+        };
+        let replies = self.replies_held(&chain_id(parent, root), root)?;
+        let refs: Vec<&Message> = replies.iter().collect();
+        let exact = self.summary(parent, root, None, &refs);
+        if exact != first.thread {
+            first.thread = exact;
+            self.ctx.history(parent, &[first])?;
+        }
+        Ok(())
+    }
+
+    fn replies_held(&self, conversation: &str, root: &str) -> Result<Vec<Message>, Fault> {
+        let newest = self.ctx.newest(conversation)?.unwrap_or_default();
+        if newest.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = self.ctx.stored_ids(conversation, "", &newest, CHAIN.saturating_mul(4))?;
+        let mut replies = Vec::new();
+        for id in ids.into_iter().filter(|id| id != root) {
+            if let Some(message) = self.ctx.stored_message(conversation, &id)? {
+                replies.push(message);
+            }
+        }
+        Ok(replies)
     }
 
     /// Where the page before the oldest message of this one starts, for when it is asked for.
@@ -803,19 +835,25 @@ impl Teams {
     }
 
     /// The page before `before`: by the cursor Teams gave with the page that ended there, or
-    /// by time when another page was read since.
+    /// by time when another page was read since. A reply chain uses that same cursor.
     pub(super) fn older(&self, conversation: &str, before: &str) -> Result<(), Fault> {
-        if chain_of(conversation).is_some() || millis(before) == 0 {
+        if millis(before) == 0 {
+            return Ok(());
+        }
+        let chain = chain_of(conversation).is_some();
+        if chain && self.held_older(conversation, before)? {
             return Ok(());
         }
         let note = self.ctx.note(&format!("older:{conversation}")).unwrap_or_default();
-        let window = match note.split_once(' ') {
-            Some((oldest, cursor)) if oldest == before => format!("startTime=1&syncState={cursor}"),
-            _ => format!("startTime=1&endTime={}", millis(before) - 1),
-        };
-        let (messages, older) = self.page(conversation, PAGE, &window)?;
+        let (messages, older) = self.page(conversation, history_limit(conversation), &older_window(&note, before))?;
         self.remember_cursor(conversation, &messages, &older);
-        self.record(conversation, &messages)
+        self.record(conversation, &messages, !older.is_empty())
+    }
+
+    /// True when a reply older than `before` is already stored, so this scroll was fetched.
+    fn held_older(&self, conversation: &str, before: &str) -> Result<bool, Fault> {
+        let ids = self.ctx.stored_ids(conversation, "", before, 8)?;
+        Ok(ids.iter().any(|id| id != before && millis(id) > 0 && millis(id) < millis(before)))
     }
 
     /// The page after `after`, when the cache has a gap there. Unverified: Teams answers the
@@ -830,16 +868,24 @@ impl Teams {
             return Ok(());
         }
         let (messages, _) = self.page(conversation, PAGE, &format!("startTime={}", millis(after)))?;
-        self.record(conversation, &messages)
+        self.record(conversation, &messages, true)
     }
 
     /// The page that ends just after `around`; what follows it is asked for as it is read.
+    /// A reply chain answers too, and keeps the cursor so scrolling up from there continues.
     pub(super) fn around(&self, conversation: &str, around: &str) -> Result<(), Fault> {
-        if chain_of(conversation).is_some() || millis(around) == 0 {
+        if millis(around) == 0 {
             return Ok(());
         }
-        let (messages, _) = self.page(conversation, PAGE, &format!("startTime=1&endTime={}", millis(around).saturating_add(1)))?;
-        self.record(conversation, &messages)
+        let chain = chain_of(conversation).is_some();
+        if chain && self.ctx.stored_message(conversation, around)?.is_some() {
+            return Ok(());
+        }
+        let (messages, older) = self.page(conversation, history_limit(conversation), &around_window(around))?;
+        if chain {
+            self.remember_cursor(conversation, &messages, &older);
+        }
+        self.record(conversation, &messages, !older.is_empty())
     }
 
     // Acting on messages.
@@ -976,6 +1022,65 @@ impl Teams {
         self.chat(method, &path, Body::Json(&body), false)?;
         Ok(())
     }
+}
+
+/// How many messages one history fetch asks for. A reply chain is 200; a chat or channel is 50.
+fn history_limit(conversation: &str) -> u32 {
+    if chain_of(conversation).is_some() { CHAIN } else { PAGE }
+}
+
+/// The query for the page before `before`. The cursor Teams sent with the page that ended
+/// there wins; otherwise the page ends at that message's time.
+fn older_window(note: &str, before: &str) -> String {
+    match note.split_once(' ') {
+        Some((oldest, cursor)) if oldest == before && !cursor.is_empty() => format!("startTime=1&syncState={cursor}"),
+        _ => format!("startTime=1&endTime={}", millis(before) - 1),
+    }
+}
+
+/// The query for the page that ends just after `around`.
+fn around_window(around: &str) -> String {
+    format!("startTime=1&endTime={}", millis(around).saturating_add(1))
+}
+
+/// The lab's teams-chain-paging driver. Three pages of 200 cover 450 replies, and the page
+/// before a message follows the cursor Teams gave with the page that ended there.
+pub(super) fn prove_chain_paging() -> Result<(), String> {
+    let chain = "19:channel@thread.tacv2;messageid=1760000400400";
+    let chat = "19:chat@unq.gbl.spaces";
+    if history_limit(chain) != CHAIN || history_limit(chat) != PAGE {
+        return Err("a reply chain is not paged at 200".to_owned());
+    }
+    let mut left = 450u32;
+    let mut requests = 0u32;
+    let mut note = String::new();
+    let mut before = String::new();
+    while left > 0 {
+        requests += 1;
+        if requests > 3 {
+            return Err(format!("{left} replies were still unread after three pages"));
+        }
+        if requests > 1 {
+            let window = older_window(&note, &before);
+            if !window.contains("syncState=chaincursor") {
+                return Err(format!("page {requests} ignored the chain cursor: {window}"));
+            }
+        }
+        let take = left.min(history_limit(chain));
+        left -= take;
+        before = format!("{}", 1_760_001_000_000u64 + u64::from(left + 1) * 1000);
+        if left > 0 {
+            note = format!("{before} chaincursor{requests}");
+        }
+    }
+    if requests != 3 {
+        return Err(format!("450 replies took {requests} pages"));
+    }
+    let jump = around_window("1760001010000");
+    if jump != "startTime=1&endTime=1760001010001" {
+        return Err(format!("a jump into a chain did not ask by time: {jump}"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

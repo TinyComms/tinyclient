@@ -1609,6 +1609,11 @@ pub fn prove_discord_code_colors() -> Result<(), String> {
     discord::prove_code_colors()
 }
 
+/// The lab's teams-chain-paging driver. See `teams::prove_chain_paging`.
+pub fn prove_chain_paging() -> Result<(), String> {
+    teams::prove_chain_paging()
+}
+
 /// The lab's failed-start-offline driver. A start that fails leaves the account offline,
 /// so messages() still answers from the cache instead of an empty signed-out page.
 pub fn prove_failed_start_offline() -> Result<(), String> {

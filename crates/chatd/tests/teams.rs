@@ -46,6 +46,15 @@ const CHAT_ANA: &str = "19:00000000-0000-4000-8000-0000000000a1_00000000-0000-40
 const CHAT_DEE: &str = "19:00000000-0000-4000-8000-0000000000aa_00000000-0000-4000-8000-0000000000d4@unq.gbl.spaces";
 /// The post in General the fixtures hang a reply chain off.
 const ROOT: &str = "1760000200200";
+/// A chain of 450 replies, paged 200 at a time, and a second chain opened at an old reply.
+const LONG: &str = "1760000400400";
+const JUMP: &str = "1760000410410";
+const LONG_REPLIES: u64 = 450;
+
+/// Reply `n` in the long-chain fake. 1 is the oldest reply and 450 the newest.
+fn reply_at(n: u64) -> u64 {
+    1_760_001_000_000 + n * 1000
+}
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\nnot really";
 /// What the fake returns for a shared spreadsheet, so a fetch can be told from a sign-in page.
 const SHEET: &[u8] = b"PK\x03\x04shared-file";
@@ -128,6 +137,42 @@ fn message(conversation: &str, root: Option<&str>, id: u64, from: &str, name: &s
         "from": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/{from}"), "imdisplayname": name,
         "composetime": iso(id), "originalarrivaltime": iso(id), "properties": {},
     })
+}
+
+/// One page of a 450-reply chain, newest first. The first page's cursor is `chaincursor1`,
+/// the second's is `chaincursor2`, and the page that reaches reply 1 has no cursor.
+fn long_chain(root: &str, query: &str) -> Value {
+    let end = query.split('&').find_map(|pair| pair.strip_prefix("endTime=")).and_then(|text| text.parse::<u64>().ok());
+    let cursor = query.split('&').find_map(|pair| pair.strip_prefix("syncState="));
+    let mut hi = match cursor {
+        Some("chaincursor1") => 250,
+        Some("chaincursor2") => 50,
+        Some(_) => 0,
+        None => LONG_REPLIES,
+    };
+    if let Some(end) = end {
+        while hi > 0 && reply_at(hi) >= end {
+            hi -= 1;
+        }
+    }
+    if hi == 0 {
+        return json!({"messages": [], "_metadata": {}});
+    }
+    let lo = hi.saturating_sub(199).max(1);
+    let mut messages = Vec::new();
+    for n in (lo..=hi).rev() {
+        messages.push(message(GENERAL, Some(root), reply_at(n), BEN, "Ben Okafor", &format!("<p>reply {n}</p>")));
+    }
+    if lo == 1 {
+        let post = root.parse().unwrap_or(0);
+        messages.push(message(GENERAL, Some(root), post, BEN, "Ben Okafor", "<p>long thread</p>"));
+    }
+    let mut body = json!({"messages": messages, "_metadata": {}});
+    if lo > 1 {
+        let next = if lo > 51 { "chaincursor1" } else { "chaincursor2" };
+        body["_metadata"]["backwardLink"] = json!(format!("https://example.invalid/messages?syncState={next}"));
+    }
+    body
 }
 
 struct Fake {
@@ -386,6 +431,9 @@ impl Fake {
         let (conversation, tail) = rest.split_once('/').unwrap_or((rest, ""));
         match (call.method.as_str(), tail) {
             ("GET", "messages") => {
+                if let Some(root) = [LONG, JUMP].into_iter().find(|root| conversation == format!("{GENERAL};messageid={root}")) {
+                    return ok(long_chain(root, &call.query));
+                }
                 let older = call.query.contains("syncState=3e30cursor1") || call.query.contains("endTime=");
                 let name = match conversation {
                     GENERAL if older => "messages.general.older",
@@ -1367,6 +1415,55 @@ fn mentions_missed_while_closed_info_mute_seen_hidden_chats_and_files_through_on
     assert!(world.fake.calls("POST", ":/createUploadSession").is_empty());
     assert!(world.fake.calls("POST", "/createLink").is_empty());
     let _ = std::fs::remove_dir_all(&staged);
+}
+
+/// Walks toward the start of a chain, asking for the page before each edge.
+fn reached_reply_one(world: &World, chain: &Key) -> bool {
+    let mut page = world.messages(chain);
+    if page.is_empty() {
+        return false;
+    }
+    for _ in 0..8 {
+        if page.iter().any(|message| message.text == "reply 1") {
+            return true;
+        }
+        let oldest = page.iter().min_by_key(|message| message.id.parse::<u64>().unwrap_or(0)).unwrap().id.clone();
+        let asked = Request::Messages { conversation: chain.clone(), page: Page::Before { id: oldest }, limit: 200 };
+        let Response::Messages { messages, .. } = world.ask(asked) else {
+            return false;
+        };
+        if messages.is_empty() {
+            return false;
+        }
+        page = messages;
+    }
+    false
+}
+
+#[test]
+fn a_chain_of_450_replies_loads_in_three_pages_and_an_old_reply_opens() {
+    let world = World::start();
+    world.ready();
+    let chain = key(&format!("{GENERAL};messageid={LONG}"));
+    world.until("the newest replies", || Some(world.messages(&chain)).filter(|messages| messages.iter().any(|message| message.text == "reply 450")));
+    world.until("all 450 replies", || reached_reply_one(&world, &chain).then_some(()));
+    let pages = world.fake.calls("GET", &format!("{GENERAL};messageid={LONG}/messages"));
+    assert_eq!(pages.len(), 3, "{:?}", pages.iter().map(|call| call.query.clone()).collect::<Vec<_>>());
+    assert!(pages[0].query.contains("pageSize=200") && pages[0].query.contains("startTime=1") && !pages[0].query.contains("syncState"), "{}", pages[0].query);
+    assert!(pages[1].query.contains("syncState=chaincursor1") && pages[1].query.contains("pageSize=200"), "{}", pages[1].query);
+    assert!(pages[2].query.contains("syncState=chaincursor2") && pages[2].query.contains("pageSize=200"), "{}", pages[2].query);
+
+    let around = reply_at(10).to_string();
+    let jump = key(&format!("{GENERAL};messageid={JUMP}"));
+    let asked = Request::Messages { conversation: jump.clone(), page: Page::Around { id: around.clone() }, limit: 50 };
+    world.ask(asked.clone());
+    world.until("reply 10", || match world.ask(asked.clone()) {
+        Response::Messages { messages, .. } => messages.into_iter().find(|message| message.id == around),
+        _ => None,
+    });
+    let jumped = world.fake.calls("GET", &format!("{GENERAL};messageid={JUMP}/messages"));
+    assert_eq!(jumped.len(), 1, "{:?}", jumped.iter().map(|call| call.query.clone()).collect::<Vec<_>>());
+    assert!(jumped[0].query.contains("pageSize=200") && jumped[0].query.contains(&format!("endTime={}", reply_at(10) + 1)), "{}", jumped[0].query);
 }
 
 #[test]
