@@ -15,7 +15,7 @@ use presage::libsignal_service::groups_v2::{AccessRequired, Role};
 use presage::libsignal_service::prelude::{Content, GroupMasterKey, GroupSecretParams, PushService, ServiceCredentials, ServiceError, Uuid};
 use presage::libsignal_service::profile_name::ProfileName;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
-use presage::libsignal_service::sender::MessageSenderError;
+use presage::libsignal_service::sender::{AttachmentSpec, AttachmentUploadError, MessageSenderError};
 use presage::libsignal_service::utils::TryIntoE164;
 use presage::libsignal_service::websocket::Identified;
 use presage::libsignal_service::configuration::SignalServers;
@@ -277,6 +277,14 @@ fn unsupported_label(message: &DataMessage) -> Option<String> {
         return Some(gift_badge_label().to_owned());
     }
     None
+}
+
+/// An attachment Signal did not take, in words that name the file and not the address.
+fn attachment_refused(name: &str, err: &AttachmentUploadError) -> Fault {
+    match err {
+        AttachmentUploadError::IoError(_) => Fault::Refused(format!("{name} could not be read.")),
+        AttachmentUploadError::ServiceError(_) => Fault::Refused(format!("{name} could not be sent.")),
+    }
 }
 
 impl Real {
@@ -988,17 +996,45 @@ impl Session {
             Body::Text { text, quote, ranges } => ContentBody::DataMessage(DataMessage {
                 body: Some(text),
                 body_ranges: proto_ranges(&ranges),
-                quote: quote.map(|quote| data_message::Quote {
-                    id: Some(quote.sent),
-                    author_aci: Some(quote.author),
-                    text: Some(quote.text.clone()),
-                    body_ranges: proto_ranges(&span_ranges(&quote.text, &quote.spans)),
-                    r#type: Some(data_message::quote::Type::Normal.into()),
-                    ..Default::default()
-                }),
+                quote: quoted(quote),
                 group_v2,
                 ..Default::default()
             }),
+            Body::Files { text, quote, files } => {
+                let mut attachments = Vec::with_capacity(files.len());
+                for file in files {
+                    let name = file.name.clone();
+                    let gif = file.mime == "image/gif";
+                    let thumb = file.thumb;
+                    let spec = AttachmentSpec {
+                        content_type: file.mime,
+                        length: file.bytes.len(),
+                        file_name: Some(name.clone()),
+                        width: (file.width > 0).then_some(file.width),
+                        height: (file.height > 0).then_some(file.height),
+                        blur_hash: file.blurhash,
+                        ..AttachmentSpec::default()
+                    };
+                    let uploaded = self.manager.upload_attachment(spec, file.bytes).await.map_err(fault)?;
+                    let mut pointer = uploaded.map_err(|err| attachment_refused(&name, &err))?;
+                    if !thumb.is_empty() {
+                        pointer.thumbnail = Some(thumb);
+                    }
+                    if gif {
+                        // SignalService.proto AttachmentPointer.Flags.GIF.
+                        pointer.flags = Some(pointer.flags.unwrap_or(0) | 8);
+                    }
+                    attachments.push(pointer);
+                }
+                ContentBody::DataMessage(DataMessage {
+                    body: (!text.is_empty()).then_some(text),
+                    attachments,
+                    quote: quoted(quote),
+                    timestamp: Some(at),
+                    group_v2,
+                    ..Default::default()
+                })
+            }
             Body::React { author, target, emoji, remove } => ContentBody::DataMessage(DataMessage {
                 reaction: Some(data_message::Reaction {
                     emoji: Some(emoji),
@@ -1129,6 +1165,17 @@ fn mark_of(style: i32) -> Option<Mark> {
 fn aci_of(bytes: &[u8]) -> Option<String> {
     let bytes: [u8; 16] = bytes.try_into().ok()?;
     Some(Uuid::from_bytes(bytes).to_string())
+}
+
+fn quoted(quote: Option<super::wire::Quote>) -> Option<data_message::Quote> {
+    quote.map(|quote| data_message::Quote {
+        id: Some(quote.sent),
+        author_aci: Some(quote.author),
+        body_ranges: proto_ranges(&span_ranges(&quote.text, &quote.spans)),
+        text: Some(quote.text),
+        r#type: Some(data_message::quote::Type::Normal.into()),
+        ..Default::default()
+    })
 }
 
 /// Links this computer to an account, as Signal Desktop is linked.

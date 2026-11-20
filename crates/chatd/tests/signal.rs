@@ -630,6 +630,72 @@ fn a_cancelled_link_stops_and_a_new_one_begins_afresh() {
     world.ask(Request::SignInCancel { network: Network::Signal });
 }
 
+/// One pixel, so a send has a real picture to attach.
+fn card_png() -> Vec<u8> {
+    const PNG: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c4944415408d763f8cfc0000000020001e221bc330000000049454e44ae426082";
+    (0..PNG.len()).step_by(2).map(|at| u8::from_str_radix(&PNG[at..at + 2], 16).unwrap()).collect()
+}
+
+#[test]
+fn a_file_is_sent_with_its_attachment_and_the_phones_copy_does_not_replace_it() {
+    let world = World::linked();
+    world.connected();
+    let (accounts, _) = world.status();
+    let signal = accounts.iter().find(|status| status.key == account()).expect("the Signal account");
+    assert_eq!(signal.can.max_file_bytes, 100 * 1024 * 1024);
+    assert_eq!(signal.can.max_files, 32);
+    assert_eq!(signal.can.caption_limit, 0);
+
+    // A direct chat exists once someone has written in it.
+    world.steer(&format!("incoming grace {} hello", T0 + 5_000));
+    world.arrived(GRACE, &id(T0 + 5_000, GRACE));
+
+    let dir = world.dir.join("outbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("card.png");
+    std::fs::write(&path, card_png()).unwrap();
+    let asked = Request::Send {
+        conversation: key(GRACE),
+        client_id: "5001".into(),
+        text: "the hand".into(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            files: vec![protocol::OutgoingFile {
+                path: path.to_string_lossy().into_owned(),
+                name: "card.png".into(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+            }],
+            ..protocol::Outgoing::default()
+        },
+    };
+    let pending = match world.ask(asked) {
+        Response::Sent { message } => message,
+        other => panic!("{other:?}"),
+    };
+    assert!(matches!(pending.state, SendState::Pending), "{pending:?}");
+    let sent = world.arrived(GRACE, &id(FIRST_SENT, ME));
+    assert_eq!(sent.text.as_str(), "the hand");
+    assert!(matches!(sent.state, SendState::Sent), "{sent:?}");
+    assert_eq!(sent.attachments.len(), 1);
+    let file = &sent.attachments[0];
+    assert_eq!(file.name.as_str(), "card.png");
+    assert_eq!(file.file.kind, protocol::MediaKind::Image);
+    assert!(file.file.path.as_deref().is_some_and(|kept| std::fs::read(kept).is_ok_and(|bytes| !bytes.is_empty())));
+    world.heard(&format!("send {GRACE} files card.png the hand"));
+    assert_eq!(world.messages(GRACE).iter().filter(|message| message.outgoing).count(), 1);
+
+    // The phone's sync of the same send must not become a second row, or wipe the file.
+    world.steer(&format!("mine {FIRST_SENT} from the phone"));
+    sleep(Duration::from_millis(400));
+    let kept: Vec<Message> = world.messages(GRACE).into_iter().filter(|message| message.outgoing).collect();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].text.as_str(), "the hand");
+    assert_eq!(kept[0].attachments.len(), 1);
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn my_own_profile_shows_and_an_edit_reaches_the_wire() {
     let world = World::linked();

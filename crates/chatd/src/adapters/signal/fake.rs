@@ -342,6 +342,10 @@ impl Wire for Fake {
                 format!("send {} text {text}{} (answering {}-{})", describe(to), noted(ranges), quote.sent, quote.author)
             }
             Body::Text { text, quote: None, ranges } => format!("send {} text {text}{}", describe(to), noted(ranges)),
+            Body::Files { text, quote, files } => {
+                let names: Vec<String> = files.iter().map(|file| file.name.clone()).collect();
+                super::files::call_line(&describe(to), &names, text, quote.as_ref())
+            }
             Body::React { author, target, emoji, remove } => format!("send {} react {target}-{author} {emoji} remove={remove}", describe(to)),
             Body::Edit { target, text, ranges } => format!("send {} edit {target} {text}{}", describe(to), noted(ranges)),
             Body::Delete { target } => format!("send {} delete {target}", describe(to)),

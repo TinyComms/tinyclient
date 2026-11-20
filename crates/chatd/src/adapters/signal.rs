@@ -1,6 +1,6 @@
-//! Signal: text first. This computer is linked to the user's account as one more device, the way
-//! Signal Desktop is; it never registers a phone number, which would take the account from the
-//! phone. Calls and voice stay out of chatd.
+//! Signal: text, and the photos, videos and files a person attaches. This computer is linked
+//! to the user's account as one more device, the way Signal Desktop is; it never registers a
+//! phone number, which would take the account from the phone. Calls and voice stay out of chatd.
 //!
 //! # The library: presage, in this process (decided 2026-10-14, by building it on this Mac)
 //!
@@ -32,6 +32,7 @@
 //! Nothing else is sent unasked: no reaction, edit, delete or profile change.
 
 mod fake;
+mod files;
 #[cfg(feature = "signal")]
 mod real;
 mod style;
@@ -41,9 +42,10 @@ mod vault;
 mod wire;
 
 use super::{keep_connected, serve_commands, About, Command, Context, Failure, Refusal, Signed};
+use crate::blobs::upload::{self, Upload};
 use crate::session;
 use crate::store::{ConversationRow, PersonRow};
-use protocol::{Contact, ContactKind, ConversationKind, Link, Message, MessageKind, Reaction, Relation, ReplyTo, Span};
+use protocol::{Attachment, Contact, ContactKind, ConversationKind, Link, MediaFile, MediaKind, Message, MessageKind, Outgoing, Reaction, Relation, ReplyTo, Span};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -523,6 +525,8 @@ struct Live {
     /// The user's own Signal settings. Off until the phone says.
     read_receipts: bool,
     typing: bool,
+    /// File sends, by the time Signal gave them, so the phone's copy does not replace the file.
+    echoed: VecDeque<u64>,
 }
 
 /// What [`Event::Call`] told of, for [`Event::CallEnded`] to end it.
@@ -588,6 +592,18 @@ impl Live {
             }
             self.reactions.insert(key, row.emoji);
         }
+    }
+
+    /// This send carried a file. The phone's later copy of the same send is ignored.
+    fn echoed(&mut self, sent: u64) {
+        if self.echoed.len() >= SENT_KEPT {
+            self.echoed.pop_front();
+        }
+        self.echoed.push_back(sent);
+    }
+
+    fn echoed_file(&self, sent: u64) -> bool {
+        self.echoed.contains(&sent)
     }
 
     /// Records a person's reaction, answering the one it replaced. Both memory and the file on
@@ -810,6 +826,8 @@ fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mute
     if matches!(ctx.known(&account.me), Ok(Some(_))) {
         ensure_row(&account, &Peer::Direct(account.me.clone()), "");
     }
+    // The composer shows attach once a file can go.
+    ctx.capabilities(files::capabilities());
     ctx.link(Link::Connected);
     // One day, which is how long Signal Desktop still sends an edit. There is no delete-window
     // field: a late delete is delete-for-me instead, decided in `delete`.
@@ -990,6 +1008,17 @@ fn apply(account: &Account, event: Event) {
                         let _ = ctx.conversation(&row(&peer, ""));
                     }
                 }
+            }
+            // A file we sent is already stored with that file. The phone's copy of the same
+            // send is text, and would replace the row.
+            let had_file = outgoing
+                && ctx
+                    .stored_message(&conversation, &wire::message_id(text.sent, &account.me))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|stored| !stored.attachments.is_empty());
+            if outgoing && (account.live().echoed_file(text.sent) || files::replace_outgoing_sync(had_file)) {
+                return;
             }
             let message = message(account, &text, outgoing);
             if outgoing {
@@ -1249,7 +1278,10 @@ pub fn prove_signal_username() -> Result<(), String> {
 fn offline(ctx: &Context, command: Command) {
     let down = || Refusal::Refused("Signal is offline.".to_owned());
     match command {
-        Command::Send { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Signal is offline.".to_owned())),
+        Command::Send { conversation_id, client_id, .. } | Command::SendWith { conversation_id, client_id, .. } => {
+            ctx.sent(&conversation_id, &client_id, Err("Signal is offline.".to_owned()));
+        }
+        Command::CancelSend { client_id, .. } => upload::cancel(&ctx.account, &client_id),
         Command::React { reply, .. } | Command::Edit { reply, .. } | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
         Command::StartDirect { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
@@ -1280,6 +1312,10 @@ fn serve(account: &Arc<Account>, command: Command) {
             let outcome = send_text(account, &conversation_id, &text, reply_to.as_deref());
             ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
         }
+        Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+            send_with(account, &conversation_id, &client_id, &text, reply_to.as_deref(), *with);
+        }
+        Command::CancelSend { client_id, .. } => upload::cancel(&account.ctx.account, &client_id),
         Command::React { conversation_id, message_id, emoji, on, reply } => {
             let _ = reply.send(react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
         }
@@ -1426,22 +1462,127 @@ fn quoted_words(text: &str) -> String {
     text.strip_suffix(wire::CONTINUES).map_or_else(|| text.to_owned(), str::to_owned)
 }
 
-fn send_text(account: &Account, conversation: &str, text: &str, reply_to: Option<&str>) -> Result<Message, Fault> {
-    let to = peer(conversation)?;
-    let (plain, ranges) = style::parse(text);
-    let spans = style::spans(&plain, &ranges);
-    let quote = match reply_to.map(target).transpose()? {
+fn quote_of(account: &Account, conversation: &str, reply_to: Option<&str>) -> Result<Option<Quote>, Fault> {
+    Ok(match reply_to.map(target).transpose()? {
         Some((sent, author)) => {
             let stored = account.ctx.stored_message(conversation, &wire::message_id(sent, &author)).ok().flatten();
             let (text, spans) = stored.map_or_else(|| (String::new(), Vec::new()), |message| (quoted_words(&message.text), message.spans));
             Some(Quote { sent, author, text, spans })
         }
         None => None,
-    };
+    })
+}
+
+fn send_text(account: &Account, conversation: &str, text: &str, reply_to: Option<&str>) -> Result<Message, Fault> {
+    let to = peer(conversation)?;
+    let (plain, ranges) = style::parse(text);
+    let spans = style::spans(&plain, &ranges);
+    let quote = quote_of(account, conversation, reply_to)?;
     let sent = account.wire.send(&to, Body::Text { text: plain.clone(), quote: quote.clone(), ranges })?;
     account.live().sent(sent, conversation);
     let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: plain, spans, quote, ..Text::default() };
     Ok(message(account, &words, true))
+}
+
+/// Files go on the upload thread: each is read in parts, then handed to Signal as one message.
+fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: Outgoing) {
+    if let Some(why) = files::refused(&with) {
+        account.ctx.sent(conversation, client_id, Err(why));
+        return;
+    }
+    if with.files.is_empty() {
+        let outcome = send_text(account, conversation, text, reply_to).map_err(|fault| fault.words());
+        account.ctx.sent(conversation, client_id, outcome);
+        return;
+    }
+    let account = Arc::clone(account);
+    let conversation = conversation.to_owned();
+    let text = text.to_owned();
+    let reply_to = reply_to.map(str::to_owned);
+    let client_id_owned = client_id.to_owned();
+    let ctx = account.ctx.clone();
+    let conversation_id = conversation.clone();
+    upload::spawn(&ctx, &conversation_id, client_id, &with.files, move |upload| {
+        send_files(&account, &conversation, &client_id_owned, &text, reply_to.as_deref(), upload)
+    });
+}
+
+fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, upload: &mut Upload) -> Result<Message, String> {
+    if upload.files().len() > files::MAX_FILES as usize {
+        return Err(format!("Signal takes at most {} files in one message.", files::MAX_FILES));
+    }
+    let count = upload.files().len();
+    let mut prepared = Vec::with_capacity(count);
+    for at in 0..count {
+        let name = upload.files()[at].name.clone();
+        let mime = upload.files()[at].mime.to_owned();
+        let keep = upload.files()[at].as_file || upload.files()[at].original;
+        let len = upload.files()[at].bytes;
+        if let Some(why) = files::too_big(&name, len) {
+            return Err(why);
+        }
+        let mut bytes = Vec::new();
+        upload.parts(at, 1024 * 1024, 0, |part| {
+            bytes.extend_from_slice(part.bytes);
+            Ok(())
+        })?;
+        prepared.push(files::prepare(&name, &mime, bytes, keep));
+    }
+    upload.check()?;
+    let to = peer(conversation).map_err(|fault| fault.words())?;
+    let quote = quote_of(account, conversation, reply_to).map_err(|fault| fault.words())?;
+    // Write each file to disk first, then move that one copy to Signal. Cloning `prepared`
+    // would keep every payload in memory a second time for the whole upload.
+    let attachments: Vec<_> = prepared.iter().enumerate().map(|(index, file)| show_file(account, client_id, index, file)).collect();
+    let sent = match account.wire.send(&to, Body::Files { text: text.to_owned(), quote: quote.clone(), files: prepared }) {
+        Ok(sent) => sent,
+        Err(fault) => {
+            forget_landed(&attachments);
+            return Err(fault.words());
+        }
+    };
+    account.live().echoed(sent);
+    account.live().sent(sent, conversation);
+    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: text.to_owned(), quote, ..Text::default() };
+    let mut message = message(account, &words, true);
+    message.attachments = attachments;
+    Ok(message)
+}
+
+/// The file as the row shows it, kept here so it stays after the staged copy is removed.
+/// The id is the shell's client id, known before Signal names the message, so the bytes can
+/// be written once and then moved to the wire.
+fn show_file(account: &Account, client_id: &str, index: usize, file: &wire::File) -> Attachment {
+    let mut media = MediaFile::new(format!("signal:{client_id}:{index}"), files::kind(&file.mime));
+    media.width = file.width;
+    media.height = file.height;
+    media.bytes = file.bytes.len() as u64;
+    if let Some(landed) = account.ctx.landed(&media, &format!("signal://file/{client_id}/{index}"), &file.bytes) {
+        media = landed;
+    }
+    let mut attachment = Attachment::new(file.name.clone(), media);
+    attachment.mime = file.mime.clone();
+    if !file.thumb.is_empty() {
+        let thumb = MediaFile::new(format!("signal:{client_id}:{index}:thumb"), MediaKind::Image);
+        if let Some(landed) = account.ctx.landed(&thumb, &format!("signal://file/{client_id}/{index}/thumb"), &file.thumb) {
+            attachment.thumb = Some(landed);
+        }
+    }
+    attachment
+}
+
+/// A send that did not go must not leave its files on disk.
+fn forget_landed(attachments: &[Attachment]) {
+    for attachment in attachments {
+        if let Some(path) = &attachment.file.path {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(thumb) = &attachment.thumb {
+            if let Some(path) = &thumb.path {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
 }
 
 fn react(account: &Account, conversation: &str, message_id: &str, emoji: &str, on: bool) -> Result<(), Fault> {
@@ -1587,6 +1728,25 @@ pub fn prove_signal_delete_for_me() -> Result<(), String> {
     }
     if !accept_remote(now - 49 * hour, now, true) {
         return Err("note to self keeps an old delete for everyone".into());
+    }
+    Ok(())
+}
+
+/// The lab's signal-send-file driver. A build without the hook stays up, so the driver fails there.
+pub fn prove_signal_send_file() -> Result<(), String> {
+    let can = files::capabilities();
+    if can.max_file_bytes != files::MAX_FILE_BYTES || can.max_files != files::MAX_FILES || can.caption_limit != 0 {
+        return Err("files are not offered".into());
+    }
+    if files::blurhash(&[(255, 0, 0)], 1, 1, 1, 1) != "00TI:j" {
+        return Err("a solid red picture did not hash".into());
+    }
+    if !files::replace_outgoing_sync(true) || files::replace_outgoing_sync(false) {
+        return Err("a phone copy would replace the file".into());
+    }
+    let line = files::call_line("b2b2b2b2-0000-4000-8000-000000000002", &["card.png".into()], "the hand", None);
+    if line != "send b2b2b2b2-0000-4000-8000-000000000002 files card.png the hand" {
+        return Err("the send was not recorded as a file".into());
     }
     Ok(())
 }
