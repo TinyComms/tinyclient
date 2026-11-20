@@ -46,14 +46,19 @@ impl World {
 
     /// A scripted conversation of 100 messages, so a scroll can ask for the pages under the newest.
     fn many() -> World {
-        World::open(Some(SESSION), true)
+        World::open(Some(SESSION), true, false)
+    }
+
+    /// The phone never answers, so sign-out cannot ask it to drop this computer.
+    fn offline_phone() -> World {
+        World::open(Some(SESSION), false, true)
     }
 
     fn start(session: Option<&str>) -> World {
-        World::open(session, false)
+        World::open(session, false, false)
     }
 
-    fn open(session: Option<&str>, many: bool) -> World {
+    fn open(session: Option<&str>, many: bool, offline: bool) -> World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let dir = std::path::absolute(format!(
             "/tmp/tinyclient-msg-{}-{}",
@@ -74,7 +79,11 @@ impl World {
             .env_remove("TINYCLIENT_SESSION_TEAMS")
             .env_remove("TINYCLIENT_SESSION_SIGNAL")
             .env_remove("TINYCLIENT_SESSION_MESSAGES")
+            .env_remove("TINYCLIENT_MESSAGES_OFFLINE")
             .stderr(Stdio::from(log));
+        if offline {
+            command.env("TINYCLIENT_MESSAGES_OFFLINE", "1");
+        }
         if let Some(session) = session {
             command.env("TINYCLIENT_SESSION_MESSAGES", session);
         }
@@ -1330,4 +1339,53 @@ fn three_texts_count_as_three_and_a_chat_read_on_the_phone_clears() {
         world.conversation(GRACE).filter(|row| row.title == "Read")
     });
     assert_eq!(read.unread, 0);
+}
+
+#[test]
+fn signing_out_asks_the_phone_to_drop_this_computer_once() {
+    let world = World::linked();
+    world.connected();
+    match world.ask(Request::SignOut {
+        account: account(),
+        erase: false,
+    }) {
+        Response::Status { accounts, .. } => {
+            assert!(
+                accounts
+                    .iter()
+                    .all(|status| status.key != account() || status.link != Link::Connected),
+                "{accounts:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    world.heard("unpair");
+    assert_eq!(
+        world.calls().iter().filter(|call| *call == "unpair").count(),
+        1
+    );
+}
+
+#[test]
+fn signing_out_offline_says_the_phone_may_still_list_this_computer() {
+    let world = World::offline_phone();
+    // The socket answers before the account's threads exist. Wait until the phone is unreachable.
+    world.heard("offline");
+    match world.ask(Request::SignOut {
+        account: account(),
+        erase: false,
+    }) {
+        Response::Status { accounts, .. } => {
+            assert!(
+                accounts
+                    .iter()
+                    .all(|status| status.key != account() || status.link != Link::Connected),
+                "{accounts:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    world.heard(
+        "This computer may still be listed under Device pairing on your phone. Remove it there.",
+    );
 }

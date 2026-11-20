@@ -717,6 +717,10 @@ impl Drive for Fake {
         record(&format!("delete-chat {conversation}"));
         Ok(())
     }
+    fn unpair(&self) -> Result<(), String> {
+        record("unpair");
+        Ok(())
+    }
     fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
     }

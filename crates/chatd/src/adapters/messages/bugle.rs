@@ -525,6 +525,18 @@ fn outgoing(
     ])
 }
 
+/// Action 46, `UnpairRequest`: the pairing attempt id in field 1. Gaia pairing actions travel
+/// in the clear (field 3 of the envelope), the same as 44, 45 and 47.
+pub fn unpair_request(attempt: &str) -> Vec<u8> {
+    let mut buf = Buf::new();
+    buf.text(1, attempt);
+    buf.0
+}
+
+pub fn clear_action(action: u32) -> bool {
+    matches!(action, 44..=47)
+}
+
 /// Where the next page starts. Field 1 is the last item already seen, field 2 its time in
 /// milliseconds. Message times are stored here as unix seconds, so the request multiplies.
 #[derive(Clone)]
@@ -1501,6 +1513,22 @@ impl Session {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Asks the phone to drop this computer. An empty attempt id has nothing to revoke.
+    pub fn unpair(&self) -> Result<(), String> {
+        let attempt = self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .saved
+            .pairing_id
+            .clone();
+        if attempt.is_empty() {
+            return Ok(());
+        }
+        let _ = self.rpc(46, &unpair_request(&attempt), 2)?;
+        Ok(())
+    }
+
     fn rpc(&self, action: u32, plain: &[u8], message_type: u32) -> Result<Vec<u8>, String> {
         self.rpc_as(&uuid(), action, plain, message_type)
     }
@@ -1542,7 +1570,7 @@ impl Session {
                 .live
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let gaia_pairing = matches!(action, 44 | 45 | 47);
+            let gaia_pairing = clear_action(action);
             let encrypted = if plain.is_empty() || gaia_pairing {
                 Vec::new()
             } else {
@@ -1616,9 +1644,13 @@ impl Session {
                 .retain(|waiter| waiter.request != request);
             return Err(err);
         }
+        // Sign-out waits five seconds and then forgets the account. Unpair has to answer
+        // inside that, or the request is simply best effort.
         let deadline = Instant::now()
             + if action == 45 {
                 Duration::from_secs(180)
+            } else if action == 46 {
+                Duration::from_secs(4)
             } else {
                 PHONE
             };
@@ -3017,6 +3049,19 @@ impl Drop for Scratch {
     }
 }
 
+/// The lab sets `TINYCLIENT_PROVE=messages-sign-out`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub(super) fn prove_sign_out() -> Result<(), String> {
+    let list = fields(&unpair_request("attempt-1"));
+    if field_text(&list, 1) != "attempt-1" {
+        return Err("the unpair request did not name the pairing attempt".into());
+    }
+    if !clear_action(46) {
+        return Err("unpair would be sent as an encrypted message".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3308,5 +3353,16 @@ mod tests {
     #[test]
     fn an_unread_flag_is_not_a_count_and_a_read_chat_clears() {
         prove_messages_unread().unwrap();
+    }
+
+    #[test]
+    fn an_unpair_names_the_pairing_attempt_in_the_clear() {
+        let bytes = unpair_request("attempt-1");
+        let list = fields(&bytes);
+        assert_eq!(field_text(&list, 1), "attempt-1");
+        assert!(field(&list, 3).is_none());
+        assert!(clear_action(46));
+        assert!(clear_action(44));
+        assert!(!clear_action(3));
     }
 }
