@@ -1,8 +1,9 @@
 //! Android Messages: Google Messages on the phone, with this computer paired to it the way
 //! messages.google.com is. The phone stays the account and has to be online; texts (SMS and RCS)
-//! go through it. Photos are shown. Other files are named and can be opened. Reactions can be
-//! read and sent. Calls stay on the phone. When the phone does not answer, texts wait and the
-//! account says so. They go when it answers, unless the user cancelled them.
+//! go through it. Photos are shown. A video is a video, and a voice note carries its
+//! waveform. Other files are named and can be opened. Reactions can be read and sent.
+//! Calls stay on the phone. When the phone does not answer, texts wait and the account
+//! says so. They go when it answers, unless the user cancelled them.
 
 mod bugle;
 mod fake;
@@ -405,6 +406,32 @@ pub fn prove_messages_sign_out() -> Result<(), String> {
         return Err("signing out would keep the saved session".into());
     }
     bugle::prove_sign_out()
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-media`. A build from before this ignores that and
+/// keeps serving, so the same driver fails there.
+pub fn prove_message_media() -> Result<(), String> {
+    if kind_of("video/mp4") != MediaKind::Video || kind_of("audio/amr") != MediaKind::Audio {
+        return Err("a video or a voice note was filed as a plain file".into());
+    }
+    if kind_of("image/png") != MediaKind::Image || kind_of("application/pdf") != MediaKind::File {
+        return Err("a photo or a file was filed as the wrong kind".into());
+    }
+    if image_type(b"not a picture").is_some() {
+        return Err("a video was treated as its own poster".into());
+    }
+    if image_type(b"\x89PNG\r\n\x1a\n").is_none() {
+        return Err("a still was not recognised".into());
+    }
+    let clip = mp4_seconds(&clip_bytes()).ok_or("an mp4 duration was not read")?;
+    if clip != 2 {
+        return Err(format!("an mp4 duration was {clip}, not 2 seconds"));
+    }
+    let (seconds, bars) = amr_voice(&voice_bytes()).ok_or("an AMR voice note was not read")?;
+    if seconds != 1 || bars.is_empty() {
+        return Err("an AMR voice note had no length or waveform".into());
+    }
+    Ok(())
 }
 
 pub fn reaction_rules() -> protocol::ReactionRules {
@@ -935,41 +962,47 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
         } else {
             piece.size
         };
-        if !piece.inline.is_empty() {
+        // Field 7 is the only inline bytes the layout has. On a video they are a poster when
+        // they are a still, and the video itself stays on the media id. They are not a poster
+        // when they are the video.
+        let still = piece.mime.starts_with("video/") && image_type(&piece.inline).is_some();
+        let mut thumb = None;
+        if still {
+            if let Some(poster_mime) = image_type(&piece.inline) {
+                let mut poster = MediaFile::new(format!("{id}:thumb"), kind_of(poster_mime));
+                poster.bytes = piece.inline.len() as u64;
+                if let Some(path) = land(account, &poster, &piece.inline) {
+                    poster.path = Some(path);
+                    thumb = Some(poster);
+                }
+            }
+            if !piece.media_id.is_empty() {
+                remember_held(account, &id, piece, &note.id);
+            }
+        } else if !piece.inline.is_empty() {
             if let Some(path) = land(account, &file, &piece.inline) {
                 file.path = Some(path);
                 file.bytes = piece.inline.len() as u64;
             }
-        } else {
-            account
-                .held
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(
-                    id,
-                    Held {
-                        media_id: piece.media_id.clone(),
-                        key: piece.key.clone(),
-                        message: note.id.clone(),
-                        action: piece.action_id.clone(),
-                        mime: piece.mime.clone(),
-                    },
-                );
+        } else if !piece.media_id.is_empty() {
+            remember_held(account, &id, piece, &note.id);
         }
         let label = if piece.name.is_empty() {
             "File".into()
         } else {
             piece.name.clone()
         };
+        let described = if still { &[][..] } else { piece.inline.as_slice() };
+        let (duration, waveform) = facts(&piece.mime, described);
         shown.push(Attachment {
             name: label,
             file,
-            thumb: None,
+            thumb,
             mime: piece.mime.clone(),
-            duration: 0,
+            duration,
             spoiler: false,
             sticker: false,
-            waveform: Vec::new(),
+            waveform,
             round: false,
         });
     }
@@ -1052,6 +1085,141 @@ fn kind_of(mime: &str) -> MediaKind {
     } else {
         MediaKind::File
     }
+}
+
+fn remember_held(account: &Account, id: &str, piece: &bugle::Piece, message: &str) {
+    account
+        .held
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            id.to_owned(),
+            Held {
+                media_id: piece.media_id.clone(),
+                key: piece.key.clone(),
+                message: message.to_owned(),
+                action: piece.action_id.clone(),
+                mime: piece.mime.clone(),
+            },
+        );
+}
+
+/// A JPEG or PNG, which is the only still a video's inline bytes can be. The layout has no
+/// separate poster field.
+fn image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else {
+        None
+    }
+}
+
+/// Length in seconds, and a voice note's bars. Empty bars mean it is not a voice note.
+fn facts(mime: &str, bytes: &[u8]) -> (u32, Vec<u8>) {
+    if mime.starts_with("audio/") {
+        if let Some(voice) = amr_voice(bytes) {
+            return voice;
+        }
+    }
+    if mime.starts_with("video/") || mime == "audio/mp4" {
+        if let Some(seconds) = mp4_seconds(bytes) {
+            return (seconds, Vec::new());
+        }
+    }
+    (0, Vec::new())
+}
+
+/// An ISO mp4 `mvhd` box: timescale and duration. Nothing else in the file is read.
+fn mp4_seconds(bytes: &[u8]) -> Option<u32> {
+    let at = bytes.windows(4).position(|mark| mark == b"mvhd")?;
+    let rest = bytes.get(at + 4..)?;
+    let version = *rest.first()?;
+    let (scale, ticks) = if version == 1 {
+        let scale = u32::from_be_bytes(rest.get(20..24)?.try_into().ok()?);
+        let ticks = u64::from_be_bytes(rest.get(24..32)?.try_into().ok()?);
+        (scale, ticks)
+    } else {
+        let scale = u32::from_be_bytes(rest.get(12..16)?.try_into().ok()?);
+        let ticks = u64::from(u32::from_be_bytes(rest.get(16..20)?.try_into().ok()?));
+        (scale, ticks)
+    };
+    if scale == 0 {
+        return None;
+    }
+    u32::try_from(ticks / u64::from(scale)).ok()
+}
+
+/// AMR-NB (`#!AMR\n`) or AMR-WB (`#!AMR-WB\n`). Each frame is 20 ms. Sizes include the header
+/// byte (RFC 4867). The bars are the loudness of each frame, folded to the waveform limit.
+fn amr_voice(bytes: &[u8]) -> Option<(u32, Vec<u8>)> {
+    const NB: &[u8] = b"#!AMR\n";
+    const WB: &[u8] = b"#!AMR-WB\n";
+    const NB_SIZES: [usize; 16] = [13, 14, 16, 18, 20, 21, 27, 32, 6, 1, 1, 1, 1, 1, 1, 1];
+    const WB_SIZES: [usize; 16] = [18, 24, 33, 37, 41, 47, 51, 59, 61, 6, 1, 1, 1, 1, 1, 1];
+    let (payload, sizes) = if let Some(rest) = bytes.strip_prefix(WB) {
+        (rest, WB_SIZES)
+    } else {
+        (bytes.strip_prefix(NB)?, NB_SIZES)
+    };
+    let mut at = 0;
+    let mut frames = 0u32;
+    let mut loud = Vec::new();
+    while at < payload.len() {
+        let toc = *payload.get(at)?;
+        let size = sizes[((toc >> 3) & 0x0f) as usize];
+        if size == 0 || at + size > payload.len() {
+            break;
+        }
+        let body = &payload[at + 1..at + size];
+        let energy = body.iter().fold(0u32, |sum, byte| sum + u32::from(*byte))
+            / u32::try_from(body.len().max(1)).unwrap_or(1);
+        loud.push(u8::try_from(energy.min(255)).unwrap_or(255));
+        at += size;
+        frames += 1;
+    }
+    if frames == 0 {
+        return None;
+    }
+    Some((frames.saturating_mul(20) / 1000, fold_bars(&loud)))
+}
+
+fn fold_bars(loud: &[u8]) -> Vec<u8> {
+    if loud.len() <= protocol::WAVEFORM_LIMIT {
+        return loud.to_vec();
+    }
+    let bars = protocol::WAVEFORM_LIMIT;
+    (0..bars)
+        .map(|index| {
+            let start = index * loud.len() / bars;
+            let end = ((index + 1) * loud.len() / bars).max(start + 1);
+            let chunk = &loud[start..end.min(loud.len())];
+            let sum = chunk.iter().fold(0u32, |sum, byte| sum + u32::from(*byte));
+            u8::try_from(sum / u32::try_from(chunk.len().max(1)).unwrap_or(1)).unwrap_or(255)
+        })
+        .collect()
+}
+
+/// Two seconds, timescale 1000. Enough of an `mvhd` for [`mp4_seconds`].
+fn clip_bytes() -> Vec<u8> {
+    let mut bytes = b"mvhd".to_vec();
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    bytes.extend_from_slice(&[0; 8]);
+    bytes.extend_from_slice(&1000u32.to_be_bytes());
+    bytes.extend_from_slice(&2000u32.to_be_bytes());
+    bytes
+}
+
+/// One second of AMR-NB, fifty frames of 20 ms.
+fn voice_bytes() -> Vec<u8> {
+    let mut bytes = b"#!AMR\n".to_vec();
+    for _ in 0..50 {
+        let mut frame = vec![0u8; 13];
+        frame[1] = 80;
+        bytes.extend_from_slice(&frame);
+    }
+    bytes
 }
 
 fn media_root() -> std::path::PathBuf {
@@ -1533,15 +1701,23 @@ fn deliver_files(
         if let Some(path) = land_copy(account, &file, &part.path, part.size) {
             file.path = Some(path);
         }
+        let (duration, waveform) =
+            if part.mime.starts_with("audio/") || part.mime.starts_with("video/") {
+                std::fs::read(&part.path)
+                    .map(|bytes| facts(part.mime, &bytes))
+                    .unwrap_or_default()
+            } else {
+                (0, Vec::new())
+            };
         attachments.push(Attachment {
             name: part.name.clone(),
             file,
             thumb: None,
             mime: part.mime.to_owned(),
-            duration: 0,
+            duration,
             spoiler: false,
             sticker: false,
-            waveform: Vec::new(),
+            waveform,
             round: false,
         });
     }

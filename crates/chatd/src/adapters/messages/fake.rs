@@ -3,8 +3,8 @@
 //! `messages.signin.ctl` while linking: `confirm`, `expire`, `fail`.
 //! `messages.ctl` once linked:
 //! `incoming WHO TEXT…`, `group WHO TEXT…`, `photo WHO`, `caption WHO TEXT…`,
-//! `file WHO NAME`, `remote WHO`, `react WHO TEXT`, `quote WHO ID TEXT…`,
-//! `typing WHO`, `typing-stop WHO`,
+//! `file WHO NAME`, `video WHO`, `poster WHO`, `voice WHO`, `remote WHO`,
+//! `react WHO TEXT`, `quote WHO ID TEXT…`, `typing WHO`, `typing-stop WHO`,
 //! `refuse WORDS…`, `status CODE`, `hold`, `go`, `drop`, `unlinked`, `silent`, `answer`,
 //! `revoke`, `revoke-offline`, `auth`.
 //! `silent` makes the phone stop answering sends, history, and files. `answer` clears that
@@ -305,6 +305,43 @@ fn photo_piece(inline: bool) -> Piece {
     }
 }
 
+/// A video, a video with a still in the inline bytes, or a voice note.
+fn media_note(
+    who_word: &str,
+    text: &str,
+    filename: &str,
+    mime: &str,
+    inline: Vec<u8>,
+    media_id: String,
+) -> Vec<Event> {
+    let Some((author, name)) = who(who_word) else {
+        return Vec::new();
+    };
+    let size = if media_id.is_empty() {
+        inline.len() as u64
+    } else {
+        120_000
+    };
+    let piece = Piece {
+        name: filename.into(),
+        mime: mime.into(),
+        media_id,
+        inline,
+        size,
+        ..Piece::default()
+    };
+    vec![Event::Message(note(
+        author,
+        name,
+        author,
+        &format!("m-{author}-{text}"),
+        text,
+        true,
+        vec![piece],
+        Vec::new(),
+    ))]
+}
+
 fn png() -> Vec<u8> {
     const BYTES: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c4944415408d763f8cfc0000000020001e221bc330000000049454e44ae426082";
     (0..BYTES.len())
@@ -368,6 +405,30 @@ fn steer(line: &str) -> Vec<Event> {
                 Vec::new(),
             ))]
         }
+        "video" => media_note(
+            words.next().unwrap_or(""),
+            "clip",
+            "clip.mp4",
+            "video/mp4",
+            super::clip_bytes(),
+            String::new(),
+        ),
+        "poster" => media_note(
+            words.next().unwrap_or(""),
+            "poster",
+            "clip.mp4",
+            "video/mp4",
+            png(),
+            "clip-1".into(),
+        ),
+        "voice" => media_note(
+            words.next().unwrap_or(""),
+            "voice",
+            "note.amr",
+            "audio/amr",
+            super::voice_bytes(),
+            String::new(),
+        ),
         "file" => {
             let Some((author, name)) = who(words.next().unwrap_or("")) else {
                 return Vec::new();
