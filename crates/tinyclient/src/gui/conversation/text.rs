@@ -51,6 +51,8 @@ pub struct Look<'a> {
     pub selection: Option<Range<usize>>,
     /// A drag that began in another block of this message is under way.
     pub dragging: bool,
+    /// The edited mark opens earlier wordings. Off when this network does not keep them.
+    pub history: bool,
 }
 
 type Handler = Rc<dyn Fn(TextEvent, &mut Window, &mut App)>;
@@ -113,6 +115,9 @@ impl Rich {
             if run.link.is_some() {
                 color = tokens::link().into_color();
                 underline |= look.hovered == Some(ix);
+                hot.push((range.clone(), ix));
+            }
+            if run.mark && look.history {
                 hot.push((range.clone(), ix));
             }
             if let Some((kind, id)) = &run.mention {

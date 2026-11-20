@@ -38,7 +38,7 @@ use super::theme::{self, Type};
 use crate::client::ask;
 use gpui::{
     div, prelude::*, px, Bounds, ClipboardItem, Context, Div, Entity, EventEmitter,
-    FocusHandle, KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, Pixels,
+    FocusHandle, KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, Pixels, Point,
     Subscription, WeakEntity, Window,
 };
 use images::Images;
@@ -191,11 +191,35 @@ impl Selection {
     }
 }
 
+/// Earlier wordings opened from an edited mark.
+struct Earlier {
+    message: String,
+    at: Point<Pixels>,
+    rows: Vec<protocol::Revision>,
+    /// The answer has landed. Until then the list says it is looking.
+    ready: bool,
+}
+
 /// The one rule for telling the network how far the user has read: a real window that is
 /// active, showing the conversation, with the message on screen. A build that takes
 /// screenshots never does, whatever it is showing: a picture of a conversation must not read it.
 pub(super) fn may_mark_read(screenshots: bool, window_active: bool, open: bool, on_screen: bool) -> bool {
     !screenshots && window_active && open && on_screen
+}
+
+/// The edited mark's tooltip. No time: the network only said that it was edited.
+pub(super) fn edited_tip(at: Option<i64>) -> String {
+    match at {
+        Some(at) => format!("Edited {}", crate::gui::time::tooltip(at)),
+        None => "Edited".to_owned(),
+    }
+}
+
+/// One earlier wording in the list a click on the edited mark opens.
+pub(super) fn revision_line(at: i64, text: &str) -> String {
+    let words = text.trim();
+    let words = if words.is_empty() { "(empty)" } else { words };
+    format!("{} · {words}", crate::gui::time::clock(at))
 }
 
 /// Whether the "New" marker follows the newest message as pages land. The line marks the first
@@ -312,6 +336,8 @@ pub struct Pane {
     confirm: Option<Rc<Message>>,
     /// The link a click asked about, until the person opens it or does not.
     link_ask: Option<links::LinkAsk>,
+    /// Earlier wordings of one message, opened from its edited mark.
+    revisions: Option<Earlier>,
     /// After an older page: the message that was on screen and how far below the top of the
     /// viewport it was, to put it back there once the rows above it can be measured.
     hold: Option<(String, f32)>,
@@ -406,6 +432,7 @@ impl Pane {
             picker: None,
             confirm: None,
             link_ask: None,
+            revisions: None,
             hold: None,
             land: false,
             places: crate::gui::pane::Memory::default(),
@@ -473,6 +500,7 @@ impl Pane {
     ) {
         let landing = self.landing.take();
         let around = self.around.take();
+        self.revisions = None;
         // Where the one being left was, for coming back to it.
         if let Some((left, place)) = self.key().cloned().zip(self.place()) {
             self.places.put(left, place);
@@ -1788,6 +1816,15 @@ mod tests {
     /// The open read and the refill can both be in flight. The one asked earlier must not land
     /// last and put an empty or blank page over the rows the later read already showed. The
     /// current newest page still lands, so a store that is really empty still clears the pane.
+    #[test]
+    fn the_edited_mark_names_the_time_and_an_earlier_wording_names_its_own() {
+        assert_eq!(edited_tip(None), "Edited");
+        let at = 1_700_000_000;
+        assert_eq!(edited_tip(Some(at)), format!("Edited {}", crate::gui::time::tooltip(at)));
+        assert_eq!(revision_line(at, "  hello  "), format!("{} · hello", crate::gui::time::clock(at)));
+        assert_eq!(revision_line(at, "   "), format!("{} · (empty)", crate::gui::time::clock(at)));
+    }
+
     #[test]
     fn a_late_newest_page_does_not_replace_a_newer_read() {
         assert!(stale_page(&Purpose::Newest, 1, 2));

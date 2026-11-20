@@ -961,6 +961,18 @@ impl Chat {
         }
     }
 
+    /// Earlier wordings already stored for this message. Does not ask the network and does not
+    /// keep a wording that was only seen as a live edit.
+    fn revisions(&self, conversation: Key, message_id: String) -> Response {
+        if !self.shows(&conversation.account()) {
+            return hidden_history();
+        }
+        match self.hub.store().revisions(&conversation, &message_id) {
+            Ok(revisions) => Response::Revisions { conversation, message_id, revisions },
+            Err(err) => internal(err),
+        }
+    }
+
     fn messages(&self, conversation: Key, page: Page, limit: u32) -> Response {
         if !self.shows(&conversation.account()) {
             // Same refusal as Tree and Conversation. An empty Messages page is a successful
@@ -2515,6 +2527,7 @@ impl Chat {
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
+            Request::Revisions { conversation, message_id } => self.revisions(conversation, message_id),
             Request::MarkRead { conversation, message_id } => self.mark_read(conversation, message_id),
             Request::MarkUnread { conversation, message_id } => self.mark_unread(conversation, message_id),
             Request::MarkAllRead { network, space } => self.mark_all_read(network, space),
@@ -3682,6 +3695,50 @@ pub fn prove_pending_message_identity() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's edit-history driver. An edited message keeps the time the network gave it.
+/// A live edit does not store the words it replaced. A wording the network itself kept is
+/// answered by `Revisions`.
+pub fn prove_edit_history() -> Result<(), String> {
+    let mut store = Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?;
+    let account = AccountKey { network: Network::Signal, account: "me".into() };
+    store
+        .upsert_conversation(&account, &crate::store::ConversationRow::new("chat", ConversationKind::Direct, "Ada"))
+        .map_err(|err| err.to_string())?;
+    let key = Key::new(&account, "chat");
+    let mut message = Message::plain("m1", "Ada", "revised", 1_700_000_100, false);
+    message.edited = true;
+    message.edited_at = Some(1_700_000_200);
+    store.ingest(&key, &message, false).map_err(|err| err.to_string())?;
+    message.text = "revised again".into();
+    message.edited_at = Some(1_700_000_300);
+    store.ingest(&key, &message, false).map_err(|err| err.to_string())?;
+    if !store.revisions(&key, "m1").map_err(|err| err.to_string())?.is_empty() {
+        return Err("a live edit stored text the sender replaced".into());
+    }
+    store.note_revision(&key, "m1", "original", 1_700_000_000).map_err(|err| err.to_string())?;
+    let chat = Chat::new(store);
+    // A scratch directory shows seeded rows. A normal test process does not, until the account is connected.
+    chat.hub.set_link(&account, Link::Connected, "");
+    let shown = chat
+        .hub
+        .store()
+        .message(&key, "m1")
+        .map_err(|err| err.to_string())?
+        .ok_or("the edited message was not stored")?;
+    if shown.text != "revised again" || shown.edited_at != Some(1_700_000_300) || !shown.edited {
+        return Err("the edited message lost its time".into());
+    }
+    match chat.handle(Request::Revisions { conversation: key, message_id: "m1".into() }) {
+        Response::Revisions { revisions, .. }
+            if revisions.len() == 1 && revisions[0].text == "original" && revisions[0].at == 1_700_000_000 =>
+        {
+            Ok(())
+        }
+        Response::Revisions { .. } => Err("revisions did not answer the earlier text".into()),
+        _ => Err("revisions was not answered".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::published_link;
@@ -3699,6 +3756,11 @@ mod tests {
     #[test]
     fn a_pending_message_names_the_cached_self_sender_before_any_ack() {
         assert_eq!(super::prove_pending_message_identity(), Ok(()));
+    }
+
+    #[test]
+    fn an_edited_message_answers_its_time_and_only_a_noted_earlier_wording() {
+        assert_eq!(super::prove_edit_history(), Ok(()));
     }
 
     #[test]
