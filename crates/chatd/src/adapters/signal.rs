@@ -200,6 +200,16 @@ pub fn prove_signal_privacy_local() -> Result<(), String> {
     Ok(())
 }
 
+/// One day, in milliseconds. Signal Desktop still sends an edit or a delete for everyone for this
+/// long (`DAY` in its source) and then does not.
+const SEND_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+/// Two days. An incoming edit or delete for everyone older than this is ignored (`DAY * 2`).
+const RECEIVE_WINDOW_MS: u64 = 2 * SEND_WINDOW_MS;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis() as u64)
+}
+
 /// A test in a scratch directory asked for the scripted wire.
 fn scripted() -> bool {
     !session::enabled() && std::env::var_os("TINYCLIENT_SIGNAL_FAKE").is_some()
@@ -611,6 +621,9 @@ fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mute
         ensure_row(&account, &Peer::Direct(account.me.clone()), "");
     }
     ctx.link(Link::Connected);
+    // One day, which is how long Signal Desktop still sends an edit. There is no delete-window
+    // field: a late delete is delete-for-me instead, decided in `delete`.
+    ctx.capabilities(protocol::Capabilities { edit_window: (SEND_WINDOW_MS / 1_000) as u32, ..protocol::Capabilities::default() });
     let ended = loop {
         match events.recv() {
             Ok(Event::Closed(why)) => break Failure::Dropped(why),
@@ -771,6 +784,11 @@ fn apply(account: &Account, event: Event) {
             let _ = ctx.message(&conversation, &message);
         }
         Event::Edited { peer, author, target, text, spans } => {
+            // A late edit is ignored by every other client. Keeping it here would show words
+            // nobody else has.
+            if !accept_remote(target, now_ms(), note_to_self(account, &peer)) {
+                return;
+            }
             let conversation = peer.conversation();
             if let Ok(Some(mut message)) = ctx.stored_message(&conversation, &wire::message_id(target, &author)) {
                 message.text = text;
@@ -780,7 +798,17 @@ fn apply(account: &Account, event: Event) {
             }
         }
         Event::Deleted { peer, author, target } => {
+            if !accept_remote(target, now_ms(), note_to_self(account, &peer)) {
+                return;
+            }
             let _ = ctx.deleted(&peer.conversation(), &wire::message_id(target, &author));
+        }
+        // Delete for me has no time limit: the phone already decided, and only this account is told.
+        Event::DeletedForMe { peer, author, target } => {
+            let _ = ctx.deleted(&peer.conversation(), &wire::message_id(target, &author));
+        }
+        Event::Forgot(peer) => {
+            let _ = ctx.forget_conversation(&peer.conversation());
         }
         Event::Reacted { peer, by, author, target, emoji, removed } => {
             let conversation = peer.conversation();
@@ -1223,6 +1251,9 @@ fn own(account: &Account, message_id: &str) -> Result<u64, Fault> {
 fn edit(account: &Account, conversation: &str, message_id: &str, text: &str) -> Result<(), Fault> {
     let to = peer(conversation)?;
     let sent = own(account, message_id)?;
+    if !can(sent, now_ms(), true, conversation == account.me).edit {
+        return Err(Fault::Refused("This message can no longer be edited.".to_owned()));
+    }
     let (plain, ranges) = style::parse(text);
     let spans = style::spans(&plain, &ranges);
     account.wire.send(&to, Body::Edit { target: sent, text: plain.clone(), ranges })?;
@@ -1242,10 +1273,18 @@ pub fn prove_signal_styles() -> Result<(), String> {
 
 fn delete(account: &Account, conversation: &str, message_id: &str) -> Result<(), Fault> {
     let to = peer(conversation)?;
-    let sent = own(account, message_id)?;
-    account.wire.send(&to, Body::Delete { target: sent })?;
+    let (sent, author) = target(message_id)?;
+    let offer = can(sent, now_ms(), author == account.me, conversation == account.me);
+    // Past the window, other clients ignore a delete for everyone. Tell only this account's
+    // devices, and remove it here either way.
+    let body = if offer.delete_for_everyone { Body::Delete { target: sent } } else { Body::DeleteForMe { author, target: sent } };
+    account.wire.send(&to, body)?;
     let _ = account.ctx.deleted(conversation, message_id);
     Ok(())
+}
+
+fn note_to_self(account: &Account, peer: &Peer) -> bool {
+    matches!(peer, Peer::Direct(aci) if aci == &account.me)
 }
 
 /// The user read up to a message: the user's other devices are told, and the authors too when
@@ -1283,6 +1322,57 @@ fn typing(account: &Account, conversation: &str) {
         live.typed.insert(conversation.to_owned(), Instant::now());
     }
     let _ = account.wire.typing(&to, true);
+}
+
+/// What the message menu may offer. `sent_ms` and `now_ms` are milliseconds. `own` is a message
+/// this account sent. `note_to_self` is the chat with oneself, which has no delete-for-everyone limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Offer {
+    pub edit: bool,
+    /// Delete for everyone. Note to Self has no time limit; every other chat has one day.
+    pub delete_for_everyone: bool,
+    /// Always. This removes the message on this account's devices only.
+    pub delete_for_me: bool,
+}
+
+/// Signal Desktop sends an edit or a delete for everyone for one day. Delete for me is always offered.
+pub fn can(sent_ms: u64, now_ms: u64, own: bool, note_to_self: bool) -> Offer {
+    let within_day = now_ms.saturating_sub(sent_ms) <= SEND_WINDOW_MS;
+    Offer { edit: own && within_day, delete_for_everyone: own && (note_to_self || within_day), delete_for_me: true }
+}
+
+/// An incoming edit or delete for everyone is kept for two days, and without a limit in Note to Self.
+pub fn accept_remote(sent_ms: u64, now_ms: u64, note_to_self: bool) -> bool {
+    note_to_self || now_ms.saturating_sub(sent_ms) <= RECEIVE_WINDOW_MS
+}
+
+/// The lab driver for `signal-delete-for-me`. A build that offers a late delete for everyone fails.
+pub fn prove_signal_delete_for_me() -> Result<(), String> {
+    let hour = 60 * 60 * 1000;
+    let now = 50 * hour;
+    let recent = can(now - hour, now, true, false);
+    if !recent.edit || !recent.delete_for_everyone || !recent.delete_for_me {
+        return Err("a recent message must offer an edit and both deletes".into());
+    }
+    let late = can(now - 25 * hour, now, true, false);
+    if late.edit || late.delete_for_everyone || !late.delete_for_me {
+        return Err("a day-old message must offer only delete for me".into());
+    }
+    let note = can(now - 25 * hour, now, true, true);
+    if !note.delete_for_everyone || note.edit {
+        return Err("note to self keeps delete for everyone and still closes the edit window".into());
+    }
+    let theirs = can(now - hour, now, false, false);
+    if theirs.edit || theirs.delete_for_everyone || !theirs.delete_for_me {
+        return Err("someone else's message offers only delete for me".into());
+    }
+    if !accept_remote(now - 47 * hour, now, false) || accept_remote(now - 49 * hour, now, false) {
+        return Err("an incoming delete for everyone is kept for two days".into());
+    }
+    if !accept_remote(now - 49 * hour, now, true) {
+        return Err("note to self keeps an old delete for everyone".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

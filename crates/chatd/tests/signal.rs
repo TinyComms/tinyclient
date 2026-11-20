@@ -22,9 +22,8 @@ const GRACE: &str = "b2b2b2b2-0000-4000-8000-000000000002";
 const ALAN: &str = "c3c3c3c3-0000-4000-8000-000000000003";
 const CLUB: &str = "g.5a175a175a175a175a175a175a175a175a175a175a175a175a175a175a175a17";
 const SESSION: &str = r#"{"aci":"a1a1a1a1-0000-4000-8000-000000000001","name":"Ada Quill","vault":"00"}"#;
-/// 2026-10-13 12:00 UTC in milliseconds, and what the fake sends with from there on.
+/// 2026-10-13 12:00 UTC in milliseconds. Scripted lines that name this are outside the windows.
 const T0: u64 = 1_791_892_800_000;
-const FIRST_SENT: u64 = T0 + 1_000_000;
 
 fn key(id: &str) -> Key {
     Key { network: Network::Signal, account: ME.into(), id: id.into() }
@@ -300,7 +299,9 @@ fn text_is_received_sent_answered_and_a_refusal_is_told() {
 
     let pending = world.send(GRACE, "1001", "Yes, seven sharp.", Some(&first.id));
     assert!(matches!(pending.state, SendState::Pending), "{pending:?}");
-    let sent = world.arrived(GRACE, &id(FIRST_SENT, ME));
+    let sent = world.until("our reply", || {
+        world.messages(GRACE).into_iter().find(|message| message.client_id.as_deref() == Some("1001") && message.id != "1001")
+    });
     assert_eq!((sent.text.as_str(), sent.outgoing, sent.sender.name.as_str()), ("Yes, seven sharp.", true, "Ada Quill"));
     assert_eq!(sent.client_id.as_deref(), Some("1001"));
     let answered = sent.reply_to.expect("it answers Grace");
@@ -449,22 +450,26 @@ fn a_newer_offer_takes_the_ring_and_only_its_own_hangup_ends_it() {
 fn reactions_edits_deletes_and_receipts_land_on_the_right_message() {
     let world = World::linked();
     world.connected();
-    world.steer(&format!("incoming grace {} Lunch?", T0 + 1_000));
-    let theirs = world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    let lunch = now_ms();
+    world.steer(&format!("incoming grace {lunch} Lunch?"));
+    let theirs = world.arrived(GRACE, &id(lunch, GRACE));
     world.send(GRACE, "3001", "Sure", None);
-    let ours = world.arrived(GRACE, &id(FIRST_SENT, ME));
+    let ours = world.until("our message", || {
+        world.messages(GRACE).into_iter().find(|message| message.client_id.as_deref() == Some("3001") && message.id != "3001")
+    });
+    let ours_at = ours.id.split_once('-').unwrap().0;
 
     // Theirs: edited, reacted to (one reaction a person: the second replaces the first), deleted.
-    world.steer(&format!("edit grace {} Lunch at noon?", T0 + 1_000));
+    world.steer(&format!("edit grace {lunch} Lunch at noon?"));
     world.until("the edit", || world.messages(GRACE).into_iter().find(|m| m.id == theirs.id && m.edited && m.text == "Lunch at noon?"));
-    world.steer(&format!("react grace me {FIRST_SENT} 👍"));
+    world.steer(&format!("react grace me {ours_at} 👍"));
     world.until("their reaction", || world.messages(GRACE).into_iter().find(|m| m.id == ours.id && m.reactions.iter().any(|r| r.emoji == "👍")));
-    world.steer(&format!("react grace me {FIRST_SENT} ❤️"));
+    world.steer(&format!("react grace me {ours_at} ❤️"));
     let replaced = world.until("the second reaction", || {
         world.messages(GRACE).into_iter().find(|m| m.id == ours.id && m.reactions.iter().any(|r| r.emoji == "❤️"))
     });
     assert!(!replaced.reactions.iter().any(|r| r.emoji == "👍"), "{:?}", replaced.reactions);
-    world.steer(&format!("delete grace {}", T0 + 1_000));
+    world.steer(&format!("delete grace {lunch}"));
     world.until("the delete", || (!world.messages(GRACE).iter().any(|m| m.id == theirs.id)).then_some(()));
 
     // Ours: the user reacts, edits and deletes, and only their own messages can be changed.
@@ -487,18 +492,18 @@ fn reactions_edits_deletes_and_receipts_land_on_the_right_message() {
     assert!(matches!(&custom, Response::Error { code: protocol::ErrorCode::Refused, .. }), "{custom:?}");
     assert!(!world.calls().iter().any(|call| call.contains(":party:")));
     assert_eq!(world.ask(Request::Edit { conversation: key(GRACE), message_id: ours.id.clone(), text: "Sure!".into() }), Response::Ok);
-    world.heard(&format!("send {GRACE} edit {FIRST_SENT} Sure!"));
+    world.heard(&format!("send {GRACE} edit {ours_at} Sure!"));
     assert!(world.messages(GRACE).iter().any(|m| m.id == ours.id && m.edited && m.text == "Sure!"));
     let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: again.id.clone(), text: "Not mine".into() });
     assert!(matches!(&refused, Response::Error { detail, .. } if detail.contains("own messages")), "{refused:?}");
     // Grace's phone has ours, then Grace read it.
     assert!(!world.conversation(GRACE).unwrap().delivered);
-    world.steer(&format!("delivered grace {FIRST_SENT}"));
+    world.steer(&format!("delivered grace {ours_at}"));
     world.until("delivered", || world.conversation(GRACE)?.delivered.then_some(()));
-    world.steer(&format!("seen grace {FIRST_SENT}"));
+    world.steer(&format!("seen grace {ours_at}"));
     world.until("seen", || world.conversation(GRACE)?.seen.then_some(()));
     assert_eq!(world.ask(Request::Delete { conversation: key(GRACE), message_id: ours.id.clone() }), Response::Ok);
-    world.heard(&format!("send {GRACE} delete {FIRST_SENT}"));
+    world.heard(&format!("send {GRACE} delete {ours_at}"));
 }
 
 #[test]
@@ -852,4 +857,95 @@ fn a_username_lookup_opens_a_chat() {
     let grace = people.into_iter().find(|person| person.key.id == GRACE).expect("Grace after username lookup");
     assert_eq!((grace.name.as_str(), grace.handle.as_str()), ("Grace Ombra", "grace.42"));
     assert_eq!(grace.avatar.as_ref().map(|file| &file.id), Some(&avatar.id));
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+/// The phone deleted one message for this device only. It leaves the chat, with no time limit.
+#[test]
+fn delete_for_me_from_the_phone_removes_the_message() {
+    let world = World::linked();
+    world.connected();
+    let sent = now_ms();
+    world.steer(&format!("incoming grace {sent} Keep this?"));
+    let message = world.arrived(GRACE, &id(sent, GRACE));
+    world.steer(&format!("delete-for-me grace {sent}"));
+    world.until("the message to leave", || (!world.messages(GRACE).iter().any(|m| m.id == message.id)).then_some(()));
+    assert!(world.conversation(GRACE).is_some(), "deleting one message keeps the chat");
+}
+
+/// A delete for everyone older than Signal's receive window stays. A fresh one still lands.
+#[test]
+fn a_late_delete_for_everyone_is_ignored() {
+    let world = World::linked();
+    world.connected();
+    world.steer(&format!("incoming grace {T0} Old"));
+    let old = world.arrived(GRACE, &id(T0, GRACE));
+    let fresh = now_ms();
+    world.steer(&format!("incoming grace {fresh} New"));
+    world.arrived(GRACE, &id(fresh, GRACE));
+    world.steer(&format!("delete grace {T0}"));
+    world.steer(&format!("delete grace {fresh}"));
+    world.until("the fresh delete", || (!world.messages(GRACE).iter().any(|m| m.id == id(fresh, GRACE))).then_some(()));
+    assert!(world.messages(GRACE).iter().any(|m| m.id == old.id), "a two-day-old delete for everyone is ignored");
+}
+
+/// Past the send window, Delete removes the message here and tells the phone, and does not tell everyone.
+#[test]
+fn deleting_an_old_message_is_delete_for_me() {
+    let world = World::linked();
+    world.connected();
+    world.steer(&format!("mine {T0} From the phone"));
+    let old = world.arrived(GRACE, &id(T0, ME));
+    let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: old.id.clone(), text: "Too late".into() });
+    assert!(matches!(&refused, Response::Error { detail, .. } if detail.contains("no longer")), "{refused:?}");
+    assert!(!world.calls().iter().any(|call| call.contains(&format!("edit {T0}"))));
+    assert_eq!(world.ask(Request::Delete { conversation: key(GRACE), message_id: old.id.clone() }), Response::Ok);
+    world.heard(&format!("send {GRACE} delete-for-me {T0}"));
+    assert!(!world.calls().iter().any(|call| call == &format!("send {GRACE} delete {T0}")));
+    world.until("the local delete", || (!world.messages(GRACE).iter().any(|m| m.id == old.id)).then_some(()));
+}
+
+/// The phone deleted the whole chat for this device.
+#[test]
+fn delete_chat_for_me_from_the_phone_removes_the_chat() {
+    let world = World::linked();
+    world.connected();
+    world.steer(&format!("incoming grace {} hello", T0 + 1_000));
+    world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    world.steer("delete-chat grace");
+    world.until("the chat to leave the list", || {
+        let row = world.conversation(GRACE)?;
+        (row.hidden && world.messages(GRACE).is_empty()).then_some(())
+    });
+}
+
+/// Signal's edit window is one day. There is no delete-window field to report beside it.
+#[test]
+fn signal_reports_a_one_day_edit_window() {
+    let world = World::linked();
+    world.connected();
+    let (accounts, _) = world.status();
+    let signal = accounts.into_iter().find(|status| status.key == account()).unwrap();
+    assert_eq!(signal.can.edit_window, 24 * 60 * 60);
+}
+
+/// A day-old message is not offered as a delete for everyone. Delete for me stays.
+#[test]
+fn a_delete_older_than_the_window_is_not_offered_for_everyone() {
+    let hour = 60 * 60 * 1000;
+    let now = 50 * hour;
+    let recent = chatd::adapters::signal::can(now - hour, now, true, false);
+    assert!(recent.edit && recent.delete_for_everyone && recent.delete_for_me);
+    let late = chatd::adapters::signal::can(now - 25 * hour, now, true, false);
+    assert!(!late.edit && !late.delete_for_everyone && late.delete_for_me, "{late:?}");
+    let note = chatd::adapters::signal::can(now - 25 * hour, now, true, true);
+    assert!(note.delete_for_everyone && !note.edit && note.delete_for_me);
+    let theirs = chatd::adapters::signal::can(now - hour, now, false, false);
+    assert!(!theirs.edit && !theirs.delete_for_everyone && theirs.delete_for_me);
+    assert!(chatd::adapters::signal::accept_remote(now - 47 * hour, now, false));
+    assert!(!chatd::adapters::signal::accept_remote(now - 49 * hour, now, false));
+    assert!(chatd::adapters::signal::accept_remote(now - 49 * hour, now, true));
 }

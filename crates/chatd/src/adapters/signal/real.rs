@@ -21,9 +21,10 @@ use presage::libsignal_service::configuration::SignalServers;
 use presage::manager::{Registered, RegistrationData};
 use presage::model::messages::Received;
 use presage::proto::{
+    addressable_message,
     body_range::{AssociatedValue, Style as RangeStyle},
-    call_message, data_message, receipt_message, sync_message, typing_message, BodyRange, CallMessage, DataMessage, EditMessage, GroupContextV2,
-    ReceiptMessage, SyncMessage, TypingMessage,
+    call_message, conversation_identifier, data_message, receipt_message, sync_message, typing_message, AddressableMessage, BodyRange, CallMessage,
+    ConversationIdentifier, DataMessage, EditMessage, GroupContextV2, ReceiptMessage, SyncMessage, TypingMessage,
 };
 use presage::store::ContentsStore;
 use presage::Manager;
@@ -75,6 +76,52 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The conversation a delete-for-me names. A group is its public id, not its master key.
+fn conversation_of(to: &Peer) -> Result<ConversationIdentifier, Fault> {
+    let identifier = match to {
+        Peer::Direct(aci) => conversation_identifier::Identifier::ThreadServiceId(aci.clone()),
+        Peer::Group(id) => {
+            let bytes = unhex(id).ok_or_else(|| Fault::Refused("This group isn't one Signal still knows for you.".to_owned()))?;
+            conversation_identifier::Identifier::ThreadGroupId(bytes)
+        }
+    };
+    Ok(ConversationIdentifier { identifier: Some(identifier) })
+}
+
+fn addressable(author: &str, sent: u64) -> AddressableMessage {
+    AddressableMessage {
+        author: Some(addressable_message::Author::AuthorServiceId(author.to_owned())),
+        sent_timestamp: Some(sent),
+        ..Default::default()
+    }
+}
+
+fn peer_of(conversation: Option<ConversationIdentifier>) -> Option<Peer> {
+    match conversation.and_then(|id| id.identifier) {
+        Some(conversation_identifier::Identifier::ThreadServiceId(aci)) if super::wire::is_aci(&aci) => Some(Peer::Direct(aci)),
+        Some(conversation_identifier::Identifier::ThreadGroupId(id)) => Some(Peer::Group(hex(&id))),
+        Some(conversation_identifier::Identifier::ThreadServiceIdBinary(bytes)) => aci_bytes(&bytes).map(Peer::Direct),
+        _ => None,
+    }
+}
+
+fn addressed(message: &AddressableMessage) -> Option<(String, u64)> {
+    let sent = message.sent_timestamp?;
+    let author = match message.author.as_ref()? {
+        addressable_message::Author::AuthorServiceId(aci) if super::wire::is_aci(aci) => aci.clone(),
+        addressable_message::Author::AuthorServiceIdBinary(bytes) => aci_bytes(bytes)?,
+        _ => return None,
+    };
+    Some((author, sent))
+}
+
+/// A 16-byte ACI, as the delete-for-me sync writes one when it does not use the string form.
+fn aci_bytes(bytes: &[u8]) -> Option<String> {
+    let raw: [u8; 16] = bytes.try_into().ok()?;
+    let aci = Uuid::from_bytes(raw).to_string();
+    super::wire::is_aci(&aci).then_some(aci)
 }
 
 /// A group's public id: what the contract and typing messages name it by. Its master key opens
@@ -643,6 +690,45 @@ impl Session {
                 typing: configuration.typing_indicators.unwrap_or(false),
             });
         }
+        if let Some(delete) = sync.delete_for_me {
+            self.deleted_for_me(delete);
+        }
+    }
+
+    /// A delete made on another of the user's devices, for this account only.
+    fn deleted_for_me(&self, delete: sync_message::DeleteForMe) {
+        for batch in delete.message_deletes {
+            let Some(peer) = peer_of(batch.conversation) else {
+                continue;
+            };
+            for message in batch.messages {
+                if let Some((author, target)) = addressed(&message) {
+                    self.tell(Event::DeletedForMe { peer: peer.clone(), author, target });
+                }
+            }
+        }
+        for batch in delete.conversation_deletes {
+            let Some(peer) = peer_of(batch.conversation) else {
+                continue;
+            };
+            if batch.is_full_delete.unwrap_or(false) {
+                self.tell(Event::Forgot(peer));
+                continue;
+            }
+            // A partial delete names the newest messages it covers. Those are the ones removed
+            // here; messages older than them are not listed, and this store has no "up to" delete.
+            let named = batch.most_recent_messages.into_iter().chain(batch.most_recent_non_expiring_messages);
+            for message in named {
+                if let Some((author, target)) = addressed(&message) {
+                    self.tell(Event::DeletedForMe { peer: peer.clone(), author, target });
+                }
+            }
+        }
+        for batch in delete.local_only_conversation_deletes {
+            if let Some(peer) = peer_of(batch.conversation) {
+                self.tell(Event::Forgot(peer));
+            }
+        }
     }
 
     async fn ask(&mut self, ask: Ask) {
@@ -819,6 +905,18 @@ impl Session {
                 group_v2,
                 ..Default::default()
             }),
+            Body::DeleteForMe { author, target } => {
+                let delete_for_me = sync_message::DeleteForMe {
+                    message_deletes: vec![sync_message::delete_for_me::MessageDeletes {
+                        conversation: Some(conversation_of(to)?),
+                        messages: vec![addressable(&author, target)],
+                    }],
+                    ..Default::default()
+                };
+                let sync = SyncMessage { delete_for_me: Some(delete_for_me), ..SyncMessage::with_padding(&mut rand::rng()) };
+                self.sync_to_self(sync).await?;
+                return Ok(at);
+            }
             Body::Edit { target, text, ranges } => ContentBody::EditMessage(EditMessage {
                 target_sent_timestamp: Some(target),
                 data_message: Some(DataMessage {
@@ -852,6 +950,11 @@ impl Session {
             read: read.into_iter().map(|(author, sent)| sync_message::Read { sender_aci: Some(author), timestamp: Some(sent), ..Default::default() }).collect(),
             ..SyncMessage::with_padding(&mut rand::rng())
         };
+        self.sync_to_self(sync).await
+    }
+
+    /// A sync for the user's other devices, sent to this account.
+    async fn sync_to_self(&mut self, sync: SyncMessage) -> Result<(), Fault> {
         let me = Uuid::parse_str(&self.me).map_err(|_| Fault::Net("no account id".into()))?;
         self.manager.send_message(Aci::from(me), sync, now_ms()).await.map_err(fault)
     }
