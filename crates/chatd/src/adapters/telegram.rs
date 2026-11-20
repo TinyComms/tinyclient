@@ -1324,6 +1324,11 @@ pub fn prove_telegram_location() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's telegram-polls driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_polls() -> Result<(), String> {
+    content::prove_polls()
+}
+
 /// The lab's telegram-member-sections driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_member_sections() -> Result<(), String> {
     members::prove()
