@@ -415,6 +415,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-exit:0");
         return Ok(());
     }
+    // The lab's teams-team-info driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("teams-team-info") {
+        if let Err(err) = chatd::adapters::prove_teams_team_info() {
+            eprintln!("teams-team-info: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-teams-team-info:0");
+        return Ok(());
+    }
     // The lab's discord-forum-landing driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-forum-landing") {
         if let Err(err) = chatd::demo::prove_discord_forum_landing() {

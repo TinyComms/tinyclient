@@ -3,7 +3,8 @@
  "type": "Thread",
  "properties": {
   "threadType": "space",
-  "topic": "Platform"
+  "topic": "Platform",
+  "description": "How the platform ships"
  },
  "members": [
   {
@@ -29,6 +30,12 @@
    "userLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/28:deploy-bot",
    "role": "User",
    "friendlyName": "Deploy Bot"
+  },
+  {
+   "id": "8:orgid:00000000-0000-4000-8000-0000000000d4",
+   "userLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000d4",
+   "role": "Guest",
+   "friendlyName": "Dee Park"
   }
  ]
 }

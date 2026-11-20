@@ -1,0 +1,12 @@
+{
+  "id": "teams-team-info",
+  "title": "A Teams team has an info pane and a roster split into owners, members and guests",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same roster check is what this desktop run covers.",
+    "ios": "The phone proof build does not run desktop chatd. The same roster check is what this desktop run covers."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

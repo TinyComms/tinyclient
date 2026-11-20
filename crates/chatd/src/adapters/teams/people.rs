@@ -76,6 +76,78 @@ fn doing(activity: &str) -> Option<ActivityKind> {
     })
 }
 
+/// A team thread, whose roster has owners, members and guests. A chat does not.
+fn team_thread(described: &Value, thread: &str) -> bool {
+    described["properties"]["threadType"] == "space" || thread.contains("@thread.tacv2")
+}
+
+/// Where a thread role sits. `Admin` is an owner. `Guest` is a guest. The rest are members.
+pub(super) fn section_of(role: &str) -> &'static str {
+    match role {
+        "Admin" => "Owners",
+        "Guest" => "Guests",
+        _ => "Members",
+    }
+}
+
+fn section_rank(role: &str) -> u8 {
+    match section_of(role) {
+        "Owners" => 0,
+        "Guests" => 2,
+        _ => 1,
+    }
+}
+
+/// The word a team's info pane uses for the same role.
+pub(super) fn role_label(role: &str) -> Option<&'static str> {
+    Some(match role {
+        "Admin" => "Owner",
+        "User" => "Member",
+        "Guest" => "Guest",
+        _ => return None,
+    })
+}
+
+fn team_sections(roster: &[(&str, &str, &str)]) -> Vec<MemberSection> {
+    let mut owners = 0u32;
+    let mut members = 0u32;
+    let mut guests = 0u32;
+    for (_, _, role) in roster {
+        match section_of(role) {
+            "Owners" => owners += 1,
+            "Guests" => guests += 1,
+            _ => members += 1,
+        }
+    }
+    let mut sections = Vec::new();
+    if owners > 0 {
+        sections.push(MemberSection { name: "Owners".to_owned(), count: owners });
+    }
+    if members > 0 {
+        sections.push(MemberSection { name: "Members".to_owned(), count: members });
+    }
+    if guests > 0 {
+        sections.push(MemberSection { name: "Guests".to_owned(), count: guests });
+    }
+    sections
+}
+
+/// The lab's teams-team-info check: a team roster is owners, members, then guests.
+pub(super) fn prove_team_roster() -> Result<(), String> {
+    let roles = ["Admin", "User", "Guest", "Guest"];
+    let roster: Vec<(&str, &str, &str)> = roles.iter().map(|role| ("", "", *role)).collect();
+    let counts: Vec<(String, u32)> = team_sections(&roster).into_iter().map(|section| (section.name, section.count)).collect();
+    let expected = [("Owners", 1u32), ("Members", 1), ("Guests", 2)];
+    let same = counts.len() == expected.len() && counts.iter().zip(expected).all(|((name, count), (want, n))| name == want && *count == n);
+    if !same {
+        return Err(format!("a team roster was sectioned as {counts:?}"));
+    }
+    if role_label("Admin") != Some("Owner") || role_label("User") != Some("Member") || role_label("Guest") != Some("Guest") {
+        return Err("a team role is not named".to_owned());
+    }
+    Ok(())
+}
+
 impl Teams {
     /// Someone already looked up, from memory or the store. Never asks Teams.
     pub(super) fn cached(&self, id: &str) -> Option<Known> {
@@ -251,17 +323,23 @@ impl Teams {
         }
     }
 
-    /// One window of a conversation's members, in the order Teams lists them.
+    /// One window of a conversation's members. A team is owners, then members, then guests.
+    /// A chat stays one list: there the role is `Admin` for everyone.
     pub(super) fn members(&self, conversation: &str, offset: u32, limit: u32) -> Result<Members, Fault> {
         let thread = super::thread_of(conversation);
         let described = self.chat("GET", &format!("/v1/threads/{}?view=msnp24Equivalent", escaped(thread)), Body::None, true)?.body;
-        let all: Vec<(&str, &str)> = described["members"]
+        let all: Vec<(&str, &str, &str)> = described["members"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|member| Some((member["id"].as_str()?, member["friendlyName"].as_str().unwrap_or(""))))
+            .filter_map(|member| Some((member["id"].as_str()?, member["friendlyName"].as_str().unwrap_or(""), member["role"].as_str().unwrap_or(""))))
             .collect();
-        let window: Vec<(&str, &str)> = all.iter().skip(offset as usize).take(limit as usize).copied().collect();
+        let team = team_thread(&described, thread);
+        let mut ordered = all.clone();
+        if team {
+            ordered.sort_by_key(|(_, _, role)| section_rank(role));
+        }
+        let window: Vec<(&str, &str)> = ordered.iter().skip(offset as usize).take(limit as usize).map(|(id, friendly, _)| (*id, *friendly)).collect();
         let ids: Vec<String> = window.iter().map(|(id, _)| (*id).to_owned()).collect();
         self.lookup(&ids);
         let members = window
@@ -276,12 +354,8 @@ impl Teams {
             })
             .collect();
         Ok(Members {
-        pending: false,
-            // Teams' roster has no sections.
-            sections: vec![MemberSection {
-                name: "Members".to_owned(),
-                count: all.len() as u32,
-            }],
+            pending: false,
+            sections: if team { team_sections(&all) } else { vec![MemberSection { name: "Members".to_owned(), count: all.len() as u32 }] },
             members,
         })
     }
