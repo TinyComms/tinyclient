@@ -37,6 +37,11 @@ pub fn prove_discord_group_dm() -> Result<(), String> {
 pub fn prove_discord_mark_unread() -> Result<(), String> {
     discord::prove_mark_unread()
 }
+
+/// `TINYCLIENT_PROVE=discord-voice-move`. A move to another voice channel in the same server is followed.
+pub fn prove_discord_voice_move() -> Result<(), String> {
+    discord::prove_voice_move()
+}
 mod recovery;
 pub mod net;
 mod script;

@@ -2280,6 +2280,49 @@ fn a_32_kbps_voice_channel_asks_mediad_for_32() {
 }
 
 #[test]
+fn a_move_to_another_voice_channel_is_followed() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let _ = tungstenite::accept(stream);
+        sleep(Duration::from_secs(20));
+    });
+    let world = World::launch(&[("TINYCLIENT_MEDIAD_AUDIO", "null"), ("TINYCLIENT_VOICE_PLAIN", "1")], |_| {});
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    let call = || match world.ask(Request::Status) {
+        Response::Status { call, .. } => call,
+        other => panic!("{other:?}"),
+    };
+    world.ask(Request::CallStart { conversation: world.key("4201") });
+    wait("the join", || world.discord.frames_of(4).pop());
+    let ours = |channel: &str| {
+        json!({"guild_id": "4000", "channel_id": channel, "user_id": "1000", "session_id": "voice-us",
+               "self_mute": false, "self_deaf": false, "mute": false, "deaf": false})
+    };
+    world.discord.push("VOICE_STATE_UPDATE", ours("4201"));
+    world.discord.push("VOICE_SERVER_UPDATE", json!({"token": "voice-token", "guild_id": "4000", "endpoint": endpoint}));
+    let log = world.dir.join("logs").join("chatd.log");
+    wait("the first session", || {
+        let text = std::fs::read_to_string(&log).ok()?;
+        text.contains("discord voice session channel=4201").then_some(())
+    });
+    world.discord.push("VOICE_STATE_UPDATE", ours("4203"));
+    let moved = wait("the call to follow the move", || call().filter(|call| call.conversation.id == "4203"));
+    assert_eq!(moved.conversation, world.key("4203"));
+    wait("the rejoin to carry the new channel", || {
+        let text = std::fs::read_to_string(&log).ok()?;
+        text.contains("discord voice rejoin channel=4203").then_some(())
+    });
+    // Another guild, and a direct call, are not this call.
+    world.discord.push("VOICE_STATE_UPDATE", json!({"guild_id": "9", "channel_id": "9999", "user_id": "1000", "session_id": "voice-us"}));
+    sleep(Duration::from_millis(200));
+    assert_eq!(call().expect("the call stays").conversation.id, "4203");
+}
+
+#[test]
 fn a_voice_channel_lists_its_people_friends_first_then_by_name() {
     let world = World::start();
     let in_voice = || match world.ask(Request::InVoice { network: Some(Network::Discord) }) {
