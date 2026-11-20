@@ -123,6 +123,18 @@ pub fn gift_badge_label() -> &'static str {
     "Gift badge · open Signal on your phone to redeem"
 }
 
+/// What a view-once photo or video says while its media cannot be opened from here (#748): what
+/// it is, and where it opens. The flag goes with an attachment, and the attachment is not a
+/// "Photo" that opens to nothing. The real wire and the fake one say the same words, so a
+/// scripted test exercises what a person is told.
+pub fn view_once_label(content_type: Option<&str>) -> &'static str {
+    match content_type.and_then(|kind| kind.split('/').next()) {
+        Some("image") => "View-once photo · open it on your phone",
+        Some("video") => "View-once video · open it on your phone",
+        _ => "View-once media · open it on your phone",
+    }
+}
+
 /// Something Signal sent unasked, or the end of the connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -274,5 +286,13 @@ mod tests {
         let said = payment_label(Some(long.as_str()));
         assert_eq!(said.chars().count(), "Payment · open Signal on your phone — ".chars().count() + NOTE_LIMIT);
         assert_eq!(gift_badge_label(), "Gift badge · open Signal on your phone to redeem");
+    }
+
+    #[test]
+    fn a_view_once_message_says_where_it_opens() {
+        assert_eq!(view_once_label(Some("image/jpeg")), "View-once photo · open it on your phone");
+        assert_eq!(view_once_label(Some("video/mp4")), "View-once video · open it on your phone");
+        assert_eq!(view_once_label(Some("application/pdf")), "View-once media · open it on your phone");
+        assert_eq!(view_once_label(None), "View-once media · open it on your phone");
     }
 }

@@ -559,6 +559,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-signal-payment-labels:0");
         return Ok(());
     }
+    // The lab's signal-view-once driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-view-once") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_view_once() {
+            eprintln!("signal-view-once: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-view-once:0");
+        return Ok(());
+    }
     // The lab's messages-unpaired driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-unpaired") {
         if let Err(err) = chatd::adapters::messages::prove_messages_unpaired() {

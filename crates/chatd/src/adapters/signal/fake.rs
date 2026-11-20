@@ -14,6 +14,8 @@
 //! | `photo WHO SENT` | WHO sent a photo with no caption |
 //! | `payment WHO SENT NOTE…` | WHO sent a payment notification; its note, when words follow |
 //! | `giftbadge WHO SENT` | WHO sent a gift badge, redeemed on the phone |
+//! | `viewonce WHO SENT` | WHO sent a view-once photo, which opens on the phone |
+//! | `viewonce-video WHO SENT` | WHO sent a view-once video, which opens on the phone |
 //! | `quote WHO SENT QUOTED TEXT…` | WHO answered our message sent at QUOTED |
 //! | `mine SENT TEXT…` | we wrote TEXT to Grace from the phone |
 //! | `note SENT TEXT…` | we wrote TEXT to Note to Self from the phone |
@@ -31,7 +33,7 @@
 //! The account: Ada Quill (us); Grace Ombra and Alan Ferro, both contacts; the group "Bridge
 //! club" with all three of us in it.
 
-use super::wire::{gift_badge_label, payment_label, Body, Contact, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{gift_badge_label, payment_label, view_once_label, Body, Contact, Event, Fault, GroupInfo, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use crate::adapters::script;
 use std::io::Write;
@@ -142,7 +144,7 @@ fn steer(line: &str) -> Vec<Event> {
     let club = || Peer::Group(CLUB.to_owned());
     let rest = |line: &str, skip: usize| line.split_whitespace().skip(skip).collect::<Vec<_>>().join(" ");
     match command {
-        "incoming" | "group" | "mention" | "photo" | "quote" | "payment" | "giftbadge" => {
+        "incoming" | "group" | "mention" | "photo" | "quote" | "payment" | "giftbadge" | "viewonce" | "viewonce-video" => {
             let Some((author, name)) = who(next()) else {
                 return Vec::new();
             };
@@ -155,6 +157,8 @@ fn steer(line: &str) -> Vec<Event> {
                     text.unsupported = Some(payment_label((!note.is_empty()).then_some(note.as_str())));
                 }
                 "giftbadge" => text.unsupported = Some(gift_badge_label().to_owned()),
+                "viewonce" => text.unsupported = Some(view_once_label(Some("image/jpeg")).to_owned()),
+                "viewonce-video" => text.unsupported = Some(view_once_label(Some("video/mp4")).to_owned()),
                 "quote" => {
                     let quoted = next().parse().unwrap_or(0);
                     text.quote = Some(Quote { sent: quoted, author: ME.into(), text: String::new() });

@@ -334,6 +334,27 @@ fn a_group_mention_counts_and_what_cannot_be_drawn_says_so() {
 }
 
 #[test]
+fn a_view_once_message_says_where_it_opens_instead_of_promising_the_media() {
+    let world = World::linked();
+    world.connected();
+    world.steer(&format!("viewonce grace {}", T0 + 4_000));
+    let once = world.arrived(GRACE, &id(T0 + 4_000, GRACE));
+    assert_eq!(
+        (once.text.as_str(), &once.kind),
+        ("View-once photo · open it on your phone", &MessageKind::Unsupported { link: String::new() })
+    );
+    // The media itself is not here: nothing to fetch, nothing to open twice.
+    assert!(once.attachments.is_empty());
+    world.steer(&format!("viewonce-video grace {}", T0 + 5_000));
+    let video = world.arrived(GRACE, &id(T0 + 5_000, GRACE));
+    assert_eq!(video.text.as_str(), "View-once video · open it on your phone");
+    // A photo without the flag is still only labelled.
+    world.steer(&format!("photo grace {}", T0 + 6_000));
+    let photo = world.arrived(GRACE, &id(T0 + 6_000, GRACE));
+    assert_eq!(photo.text.as_str(), "Photo");
+}
+
+#[test]
 fn reactions_edits_deletes_and_receipts_land_on_the_right_message() {
     let world = World::linked();
     world.connected();
