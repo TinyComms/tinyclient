@@ -551,11 +551,12 @@ fn apply(account: &Account, event: Event) {
             }
             let _ = ctx.message(&conversation, &message);
         }
-        Event::Edited { peer, author, target, text } => {
+        Event::Edited { peer, author, target, at, text } => {
             let conversation = peer.conversation();
             if let Ok(Some(mut message)) = ctx.stored_message(&conversation, &wire::message_id(target, &author)) {
                 message.text = text;
                 message.edited = true;
+                message.edited_at = (at > 0).then(|| i64::try_from(at / 1_000).unwrap_or(0));
                 let _ = ctx.message(&conversation, &message);
             }
         }

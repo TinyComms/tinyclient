@@ -1790,6 +1790,7 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
     let mut message = Message::plain(&wire.id, name_of(names, saved, &wire.author_id), if deleted { "" } else { &wire.body }, sent, outgoing);
     message.sender.id = wire.author_id.clone();
     message.edited = present(&wire.edited_at);
+    message.edited_at = wire.edited_at.as_deref().and_then(unix_of);
     message.deleted = deleted;
     message.client_id = wire.client_id.clone().filter(|id| !id.is_empty());
     message.seq = wire.seq;

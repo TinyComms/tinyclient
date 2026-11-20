@@ -861,7 +861,16 @@ impl Pane {
     // Words.
 
     fn content(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let edited = || div().h(px(16.)).type_micro().text_color(theme::text_faint()).child("(edited)").into_any_element();
+        // The mark itself is a run of the text it closes, so the tooltip lives on the block
+        // that owns the words, and on the mark when the mark stands alone.
+        let edited_tip = message.edited_at.map(|at| format!("Edited {}", time::tooltip(at)));
+        let edited = || {
+            let mark = div().h(px(16.)).type_micro().text_color(theme::text_faint()).child("(edited)");
+            match edited_tip.as_deref() {
+                Some(words) => mark.id(name_id("edited", &message.id)).tooltip(tip(words, None)).into_any_element(),
+                None => mark.into_any_element(),
+            }
+        };
         let phone = self.metrics == Metrics::PHONE;
         // An encrypted message this device can't open says so, quietly, and never as its text.
         if message.seal == protocol::Seal::Undecryptable {
@@ -892,17 +901,24 @@ impl Pane {
         }
         let mut out = Vec::with_capacity(blocks.len() + 1);
         for (ix, block) in blocks.iter().enumerate() {
+            // Only the last block carries the mark, so only it says when the edit was made.
+            let edited_words = (ix + 1 == blocks.len()).then(|| edited_tip.clone()).flatten();
             let element = match block {
                 // A flex column, so the text is a flex item that is measured on its own: in a
                 // block its layout belongs to the line box, and `Rich` reads its own layout.
-                Block::Text(inline) => div()
-                    .max_w(px(MEASURE))
-                    .flex()
-                    .flex_col()
-                    .type_body()
-                    .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
-                    .child(self.rich(message, ix, inline, theme::text().into_color(), window, cx))
-                    .into_any_element(),
+                Block::Text(inline) => {
+                    let block = div()
+                        .max_w(px(MEASURE))
+                        .flex()
+                        .flex_col()
+                        .type_body()
+                        .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
+                        .child(self.rich(message, ix, inline, theme::text().into_color(), window, cx));
+                    match edited_words {
+                        Some(words) => block.id(name_id("edited", &message.id)).tooltip(tip(words, None)).into_any_element(),
+                        None => block.into_any_element(),
+                    }
+                }
                 Block::Quote(inline) => div()
                     .max_w(px(MEASURE))
                     .mt(px(3.))

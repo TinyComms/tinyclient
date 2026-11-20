@@ -612,6 +612,7 @@ impl Slack {
         message.card = framed;
         message.forwarded = forwarded;
         message.edited = event["edited"].is_object();
+        message.edited_at = event["edited"]["ts"].as_str().map(seconds).filter(|at| *at > 0);
         message.pinned = event["pinned_to"].as_array().is_some_and(|pinned| !pinned.is_empty());
         if outgoing {
             message.client_id = event["client_msg_id"].as_str().and_then(super::client_id);

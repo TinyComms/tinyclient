@@ -109,8 +109,8 @@ pub enum Event {
     Groups(Vec<GroupInfo>),
     /// A message from someone else, or one we sent from another device (`outgoing`).
     Message { peer: Peer, text: Text, outgoing: bool },
-    /// A message was edited. `target` is when it was first sent.
-    Edited { peer: Peer, author: String, target: u64, text: String },
+    /// A message was edited. `target` is when it was first sent, `at` when the edit was made.
+    Edited { peer: Peer, author: String, target: u64, at: u64, text: String },
     Deleted { peer: Peer, author: String, target: u64 },
     /// `by` reacted to `author`'s message sent at `target`.
     Reacted { peer: Peer, by: String, author: String, target: u64, emoji: String, removed: bool },

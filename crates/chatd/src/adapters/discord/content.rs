@@ -850,6 +850,8 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         thread,
         views: None,
         edited: posted.edited_timestamp.is_some(),
+        edited_at: posted.edited_timestamp.as_deref().and_then(model::iso_seconds),
+        prior_text: None,
         pinned: posted.pinned.unwrap_or(false),
         mentions_me: false,
         kind: message_kind,
@@ -939,6 +941,7 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
     }
     if update.edited_timestamp.is_some() {
         stored.edited = true;
+        stored.edited_at = update.edited_timestamp.as_deref().and_then(model::iso_seconds).or(stored.edited_at);
     }
     rich.files
 }
