@@ -13,7 +13,7 @@ use super::rows::Item;
 use super::text::{Look, Rich, TextEvent};
 use super::tokens::{self, Metrics, MEASURE};
 use super::when;
-use super::{Pane, PaneEvent, Selection, Then};
+use super::{edited_tip, Pane, PaneEvent, Selection, Then};
 use crate::gui::anim::{self, Play};
 use crate::gui::components::{glyph, tip, Avatar, Shape};
 use crate::gui::phone::tokens as tokens_phone;
@@ -23,11 +23,11 @@ use crate::view::{age, now};
 use crate::client::ask;
 use gpui::{
     canvas, div, prelude::*, px, Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, ElementId,
-    FontWeight, HighlightStyle, Hsla, MouseButton, ObjectFit, RenderImage, SharedString, Stateful, StyledText, Window,
+    FontWeight, HighlightStyle, Hsla, MouseButton, ObjectFit, Pixels, Point, RenderImage, SharedString, Stateful, StyledText, Window,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Preview, Receipt, Request, SendState};
+use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Preview, Receipt, Request, Response, SendState};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -916,16 +916,6 @@ impl Pane {
     // Words.
 
     fn content(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        // The mark itself is a run of the text it closes, so the tooltip lives on the block
-        // that owns the words, and on the mark when the mark stands alone.
-        let edited_tip = message.edited_at.map(|at| format!("Edited {}", time::tooltip(at)));
-        let edited = || {
-            let mark = div().h(px(16.)).type_micro().text_color(theme::text_faint()).child("(edited)");
-            match edited_tip.as_deref() {
-                Some(words) => mark.id(name_id("edited", &message.id)).tooltip(tip(words, None)).into_any_element(),
-                None => mark.into_any_element(),
-            }
-        };
         let phone = self.metrics == Metrics::PHONE;
         // An encrypted message this device can't open says so, quietly, and never as its text.
         if message.seal == protocol::Seal::Undecryptable {
@@ -943,7 +933,7 @@ impl Pane {
                 .into_any_element()];
         }
         if message.text.trim().is_empty() {
-            return message.edited.then(edited).into_iter().collect();
+            return message.edited.then(|| self.edited_mark(message, cx)).into_iter().collect();
         }
         if let Some(emoji) = rich::jumbo(&message.text, &message.spans) {
             return vec![self.jumbo(&emoji, window, cx)];
@@ -956,12 +946,11 @@ impl Pane {
         }
         let mut out = Vec::with_capacity(blocks.len() + 1);
         for (ix, block) in blocks.iter().enumerate() {
-            // Only the last block carries the mark, so only it says when the edit was made.
-            let edited_words = (ix + 1 == blocks.len()).then(|| edited_tip.clone()).flatten();
             let element = match block {
                 // A flex column, so the text is a flex item that is measured on its own: in a
                 // block its layout belongs to the line box, and `Rich` reads its own layout.
                 Block::Text(inline) => {
+                    let marked = inline.runs.iter().any(|run| run.mark);
                     let block = div()
                         .max_w(px(MEASURE))
                         .flex()
@@ -969,9 +958,10 @@ impl Pane {
                         .type_body()
                         .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                         .child(self.rich(message, ix, inline, theme::text().into_color(), window, cx));
-                    match edited_words {
-                        Some(words) => block.id(name_id("edited", &message.id)).tooltip(tip(words, None)).into_any_element(),
-                        None => block.into_any_element(),
+                    if marked {
+                        block.id(name_id("edited", &message.id)).tooltip(tip(edited_tip(message.edited_at), None)).into_any_element()
+                    } else {
+                        block.into_any_element()
                     }
                 }
                 Block::Quote(inline) => div()
@@ -1007,9 +997,74 @@ impl Pane {
             out.push(element);
         }
         if edited_alone {
-            out.push(edited());
+            out.push(self.edited_mark(message, cx));
         }
         out
+    }
+
+    /// "(edited)", with the time it was edited. A network that keeps earlier wordings opens them on a click.
+    fn edited_mark(&mut self, message: &Message, cx: &mut Context<Self>) -> AnyElement {
+        let words = edited_tip(message.edited_at);
+        let id = message.id.clone();
+        let history = self.keeps_revisions(cx);
+        div()
+            .id(name_id("edited", &id))
+            .h(px(16.))
+            .type_micro()
+            .text_color(theme::text_faint())
+            .tooltip(tip(words, None))
+            .when(history, |mark| {
+                mark.cursor_pointer().on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                    this.open_revisions(&id, event.position(), cx);
+                }))
+            })
+            .child("(edited)")
+            .into_any_element()
+    }
+
+    /// This account's network keeps earlier wordings (`Capabilities::revisions`).
+    fn keeps_revisions(&self, cx: &gpui::App) -> bool {
+        let Some(key) = self.key().cloned() else {
+            return false;
+        };
+        self.shell
+            .upgrade()
+            .and_then(|shell| {
+                shell.read(cx).snapshot.as_ref().and_then(|snapshot| snapshot.account(&key.account())).map(|account| account.can.revisions)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Asks for earlier wordings and opens the list at the click.
+    fn open_revisions(&mut self, id: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.keeps_revisions(cx) {
+            return;
+        }
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        self.menu = None;
+        let message_id = id.to_owned();
+        self.revisions = Some(super::Earlier { message: message_id.clone(), at, rows: Vec::new(), ready: false });
+        cx.notify();
+        let request = Request::Revisions { conversation, message_id: message_id.clone() };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(open) = this.revisions.as_mut() else {
+                    return;
+                };
+                if open.message != message_id {
+                    return;
+                }
+                open.ready = true;
+                if let Ok(Response::Revisions { revisions, .. }) = answer {
+                    open.rows = revisions;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The decoded picture of a file on disk, `edge` pixels on its longer side. Asking queues
@@ -1043,6 +1098,7 @@ impl Pane {
         let edge = media::square_size(18., window.scale_factor());
         let this = cx.weak_entity();
         let id = message.id.clone();
+        let history = self.keeps_revisions(cx) && message.edited;
         let mut emoji = |file: &MediaFile| match self.still(file, edge, edge, None, cx) {
             Picture::Ready(image) => Some(image),
             _ => None,
@@ -1056,6 +1112,7 @@ impl Pane {
             emoji: &mut emoji,
             selection,
             dragging,
+            history,
         };
         Rich::new(("text", block), inline, look, move |event, window, cx| {
             let _ = this.update(cx, |this, cx| this.text_event(&id, block, event, window, cx));
@@ -1100,7 +1157,10 @@ impl Pane {
                 let Some(message) = self.find(id) else {
                     return;
                 };
-                let blocks = rich::blocks(&message.text, &message.spans);
+                let mut blocks = rich::blocks(&message.text, &message.spans);
+                if let (true, Some(Block::Text(last))) = (message.edited, blocks.last_mut()) {
+                    last.mark_edited();
+                }
                 let inline = match blocks.get(block) {
                     Some(Block::Text(inline) | Block::Quote(inline) | Block::Item { text: inline, .. }) => inline,
                     _ => return,
@@ -1108,6 +1168,10 @@ impl Pane {
                 let Some(run) = inline.runs.get(run) else {
                     return;
                 };
+                if run.mark {
+                    self.open_revisions(id, window.mouse_position(), cx);
+                    return;
+                }
                 if let Some(spoiler) = run.spoiler {
                     if self.revealed.insert((id.to_owned(), spoiler)) {
                         cx.notify();

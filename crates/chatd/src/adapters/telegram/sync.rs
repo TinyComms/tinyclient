@@ -333,6 +333,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         allow_archives: false,
         voice_notes: true,
         direct_calls: false,
+        revisions: false,
     }
 }
 

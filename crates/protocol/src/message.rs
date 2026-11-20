@@ -487,6 +487,16 @@ pub struct Message {
     pub seal: crate::Seal,
 }
 
+/// An earlier wording of one message, oldest first when several are kept. Only a network that
+/// shows its own history has these. A live edit on any other network does not store the words
+/// the sender replaced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revision {
+    pub text: String,
+    /// Unix seconds of this wording.
+    pub at: i64,
+}
+
 impl Message {
     /// The name a row shows for its sender. Mine carry my name from the network once it has
     /// settled; "You" stands in only while a send has no name yet.

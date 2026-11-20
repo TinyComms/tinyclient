@@ -1303,6 +1303,13 @@ pub enum Request {
         page: Page,
         limit: u32,
     },
+    /// Earlier wordings of one message, oldest first. Empty when this network does not keep
+    /// them (`Capabilities::revisions`) or when nothing earlier was stored. A live edit does
+    /// not fill this by itself.
+    Revisions {
+        conversation: Key,
+        message_id: String,
+    },
     /// The user saw the conversation up to this message: the window is active, the conversation is
     /// open and the message is on screen. Read here and on the network. An empty `message_id`
     /// means the newest message chatd knows, for "mark as read" before any message is on screen.
@@ -2114,6 +2121,12 @@ pub enum Response {
         older: bool,
         /// The cache holds messages newer than the last one here.
         newer: bool,
+    },
+    /// Answers `Revisions`: earlier wordings, oldest first.
+    Revisions {
+        conversation: Key,
+        message_id: String,
+        revisions: Vec<Revision>,
     },
     /// Answers `SearchMessages`: the newest hits first, at most the limit asked for.
     MessageHits {

@@ -692,6 +692,7 @@ impl Pane {
     pub(super) fn open_menu(&mut self, message: Rc<Message>, at: Point<Pixels>,
         window: &mut Window, cx: &mut Context<Self>) {
         self.close_picker(cx);
+        self.revisions = None;
         self.hover = Some(message.id.clone());
         self.menu = Some(Menu { message, at,
             cursor: 0, reactor: None });
@@ -704,6 +705,7 @@ impl Pane {
     pub(super) fn open_reactors(&mut self, message: Rc<Message>, reaction: usize, at: Point<Pixels>,
         window: &mut Window, cx: &mut Context<Self>) {
         self.close_picker(cx);
+        self.revisions = None;
         self.hover = Some(message.id.clone());
         self.menu = Some(Menu { message, at,
             cursor: 0, reactor: Some(reaction) });
@@ -1235,6 +1237,33 @@ impl Pane {
         ))
     }
 
+    /// Earlier wordings of the message whose edited mark was clicked.
+    fn revisions_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let open = self.revisions.as_ref()?;
+        let at = open.at;
+        let lines: Vec<String> = if !open.ready {
+            vec!["Looking…".to_owned()]
+        } else if open.rows.is_empty() {
+            vec!["Nothing earlier is kept.".to_owned()]
+        } else {
+            open.rows.iter().map(|row| super::revision_line(row.at, &row.text)).collect()
+        };
+        let panel = popover()
+            .id("earlier-versions")
+            .w(px(280.))
+            .max_h(px(280.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .children(lines.into_iter().map(|line| div().type_small().text_color(theme::text()).child(line)))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.revisions = None;
+                cx.notify();
+            }));
+        Some(placed("revisions", Place::Pointer(at), Layer::Menu, window, panel))
+    }
+
     // The picker.
 
     pub(super) fn open_picker(&mut self, message_id: &str, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
@@ -1401,9 +1430,9 @@ impl Pane {
 
     pub(super) fn action_layers(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if crate::gui::phone::active() {
-            return [self.menu_sheet(window, cx), self.picker_sheet(window, cx), self.confirm_layer(window, cx), self.link_layer(window, cx)].into_iter().flatten().collect();
+            return [self.menu_sheet(window, cx), self.revisions_layer(window, cx), self.picker_sheet(window, cx), self.confirm_layer(window, cx), self.link_layer(window, cx)].into_iter().flatten().collect();
         }
-        [self.menu_layer(window, cx), self.picker_layer(window, cx), self.confirm_layer(window, cx), self.link_layer(window, cx)].into_iter().flatten().collect()
+        [self.menu_layer(window, cx), self.revisions_layer(window, cx), self.picker_layer(window, cx), self.confirm_layer(window, cx), self.link_layer(window, cx)].into_iter().flatten().collect()
     }
 
     /// Keys for whatever floats over the messages. True when the key was theirs.
@@ -1411,6 +1440,11 @@ impl Pane {
     pub(super) fn action_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let key = event.keystroke.key.as_str();
         if self.link_key(event, cx) {
+            return true;
+        }
+        if key == "escape" && self.revisions.is_some() {
+            self.revisions = None;
+            cx.notify();
             return true;
         }
         if let Some(message) = self.confirm.clone() {

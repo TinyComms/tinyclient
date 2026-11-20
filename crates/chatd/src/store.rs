@@ -10,8 +10,8 @@
 use protocol::{
     clip, AccountKey, CallSupport, Conversation, ConversationKind, Folder, Group, InboxCounts,
     InboxFilter, Key, Mark, MediaFile, MediaKind, Message, MessageHit, Network, Page, Person,
-    Presence, Reaction, Relation, Seal, SendState, SharedItem, SharedKind, Shelf, Space, Special,
-    DRAFT_LIMIT, FOLDERS_LIMIT, FOLDERS_PER_ROW, FOLDER_MEMBERS,
+    Presence, Reaction, Relation, Revision, Seal, SendState, SharedItem, SharedKind, Shelf, Space,
+    Special, DRAFT_LIMIT, FOLDERS_LIMIT, FOLDERS_PER_ROW, FOLDER_MEMBERS,
 };
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, Transaction};
@@ -205,6 +205,16 @@ const TABLES: &str = "
     CREATE INDEX message_by_time ON message (network, account, conversation, sent);
     CREATE INDEX message_unsent ON message (pending) WHERE pending != 0;
     CREATE INDEX message_expires ON message (expires) WHERE expires IS NOT NULL;
+    -- Earlier wordings, only where a network's own history was stored. A live edit does not write here.
+    CREATE TABLE revision (
+        network      TEXT NOT NULL,
+        account      TEXT NOT NULL,
+        conversation TEXT NOT NULL,
+        message      TEXT NOT NULL,
+        at           INTEGER NOT NULL,
+        text         TEXT NOT NULL,
+        PRIMARY KEY (network, account, conversation, message, at)
+    ) WITHOUT ROWID;
     CREATE TABLE person (
         network  TEXT NOT NULL,
         account  TEXT NOT NULL,
@@ -1015,7 +1025,24 @@ impl Store {
         let mut store = Store { db };
         store.migrate_settings()?;
         store.migrate_reminders()?;
+        // The revision table is new and must not wipe a cache that is already at this schema.
+        store.ensure_revisions()?;
         Ok(store)
+    }
+
+    /// Creates the revision table on a cache that already matches [`SCHEMA`].
+    fn ensure_revisions(&self) -> rusqlite::Result<()> {
+        self.db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS revision (
+                network      TEXT NOT NULL,
+                account      TEXT NOT NULL,
+                conversation TEXT NOT NULL,
+                message      TEXT NOT NULL,
+                at           INTEGER NOT NULL,
+                text         TEXT NOT NULL,
+                PRIMARY KEY (network, account, conversation, message, at)
+            ) WITHOUT ROWID;",
+        )
     }
 
     // Settings.
@@ -2840,6 +2867,42 @@ impl Store {
         Ok(None)
     }
 
+    /// Stores one earlier wording. Callers are networks that show their own history.
+    /// Ingest does not call this: a live edit must not keep words the sender replaced.
+    pub fn note_revision(&mut self, conversation: &Key, message_id: &str, text: &str, at: i64) -> rusqlite::Result<()> {
+        let mut text = text.to_owned();
+        clip(&mut text, 4_000);
+        self.db.execute(
+            "INSERT INTO revision (network, account, conversation, message, at, text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (network, account, conversation, message, at) DO UPDATE SET text = excluded.text",
+            params![word(&conversation.network), conversation.account, conversation.id, message_id, at, text],
+        )?;
+        Ok(())
+    }
+
+    /// Earlier wordings of one message, oldest first, at most 50.
+    pub fn revisions(&self, conversation: &Key, message_id: &str) -> rusqlite::Result<Vec<Revision>> {
+        let mut query = self.db.prepare(
+            "SELECT text, at FROM revision
+              WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND message = ?4
+              ORDER BY at ASC LIMIT 50",
+        )?;
+        let rows = query.query_map(
+            params![word(&conversation.network), conversation.account, conversation.id, message_id],
+            |row| Ok(Revision { text: row.get(0)?, at: row.get(1)? }),
+        )?;
+        rows.collect()
+    }
+
+    fn forget_revisions(&self, conversation: &Key, id: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "DELETE FROM revision WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND message = ?4",
+            params![word(&conversation.network), conversation.account, conversation.id, id],
+        )?;
+        Ok(())
+    }
+
     /// One message, while its own timer still runs; one that ran out is gone, as if it were
     /// never stored.
     pub fn message(&self, conversation: &Key, id: &str) -> rusqlite::Result<Option<Message>> {
@@ -2863,6 +2926,8 @@ impl Store {
         let Some(mut message) = self.message(conversation, id)? else {
             return Ok(false);
         };
+        // A deleted message takes its earlier wordings with it.
+        self.forget_revisions(conversation, id)?;
         if message.thread.is_some() && message.state == SendState::Sent {
             if message.deleted {
                 return Ok(false);
@@ -3864,6 +3929,28 @@ mod tests {
 
     fn ids(page: &MessagePage) -> Vec<&str> {
         page.messages.iter().map(|message| message.id.as_str()).collect()
+    }
+
+    #[test]
+    fn an_edit_keeps_its_time_and_does_not_keep_the_words_it_replaced() {
+        let (mut store, key) = store();
+        let mut message = said("1", "first", NOW);
+        message.edited = true;
+        message.edited_at = Some(NOW);
+        store.ingest(&key, &message, false).unwrap();
+        message.text = "second".into();
+        message.edited_at = Some(NOW + 60);
+        store.ingest(&key, &message, false).unwrap();
+        let kept = store.message(&key, "1").unwrap().unwrap();
+        assert_eq!(kept.text, "second");
+        assert!(kept.edited);
+        assert_eq!(kept.edited_at, Some(NOW + 60));
+        assert!(store.revisions(&key, "1").unwrap().is_empty(), "a live edit stored text the sender replaced");
+        store.note_revision(&key, "1", "first", NOW).unwrap();
+        let earlier = store.revisions(&key, "1").unwrap();
+        assert_eq!(earlier.len(), 1);
+        assert_eq!(earlier[0].text, "first");
+        assert_eq!(earlier[0].at, NOW);
     }
 
     #[test]
