@@ -929,6 +929,12 @@ impl Context {
         self.hub.store().message(&self.key(conversation_id), message_id)
     }
 
+    /// The conversation a stored message is in. `None` when this account has no such message,
+    /// so a receipt for it is not filed onto some other chat.
+    pub fn conversation_of_message(&self, message_id: &str) -> rusqlite::Result<Option<String>> {
+        self.hub.store().conversation_of_message(&self.account, message_id)
+    }
+
     /// The ids stored between two message ids, both included, oldest first, at most `limit`: a
     /// page from the network is compared against this to find what was deleted while away.
     pub fn stored_ids(&self, conversation_id: &str, oldest: &str, newest: &str, limit: u32) -> rusqlite::Result<Vec<String>> {

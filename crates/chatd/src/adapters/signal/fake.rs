@@ -29,7 +29,9 @@
 //! | `vote WHO AUTHOR TARGET INDEXES`, `unvote WHO AUTHOR TARGET` | WHO voted on AUTHOR's poll (indexes `0` or `0,1`), or took it back |
 //! | `endpoll AUTHOR TARGET` | AUTHOR ended their poll |
 //! | `read WHO SENT` | we read WHO's message on the phone |
-//! | `seen WHO SENT` | WHO read our message |
+//! | `seen WHO SENT`, `delivered WHO SENT`, `viewed WHO SENT` | WHO read our message, their phone has it, or they played it. SENT may list several times, separated by commas |
+//! | `receipts off` | this account stops sharing read receipts |
+//! | `fail WHO` | the next group send does not reach WHO |
 //! | `typing WHO`, `typing-stop WHO` | WHO is typing to us, or stopped |
 //! | `call WHO SENT`, `call-video WHO SENT` | WHO calls us (a voice offer, or a video one), call id SENT |
 //! | `hangup SENT`, `busy SENT` | the call SENT ended, or we were busy on the other side |
@@ -87,6 +89,10 @@ pub struct Fake {
     heard: Mutex<Option<Receiver<Event>>>,
     closed: Arc<AtomicBool>,
     refuse: Arc<Mutex<Option<String>>>,
+    /// One person the next group send does not reach, named by a test.
+    fail_one: Arc<Mutex<Option<String>>>,
+    /// Taken by the adapter after that send.
+    missed: Mutex<Vec<String>>,
     clock: AtomicU64,
     control: PathBuf,
     card: Arc<Mutex<OwnCard>>,
@@ -101,7 +107,14 @@ impl Fake {
         let grace = Contact { id: GRACE.into(), name: "Grace Ombra".into(), phone: "+15550100002".into() };
         let alan = Contact { id: ALAN.into(), name: "Alan Ferro".into(), phone: String::new() };
         let _ = events.send(Event::Contacts(vec![grace, alan]));
-        let club = GroupInfo { id: CLUB.into(), title: "Bridge club".into(), description: "Tuesdays, 7 pm".into(), members: 3, member: true };
+        let club = GroupInfo {
+            id: CLUB.into(),
+            title: "Bridge club".into(),
+            description: "Tuesdays, 7 pm".into(),
+            members: 3,
+            member: true,
+            member_ids: vec![ME.into(), GRACE.into(), ALAN.into()],
+        };
         let _ = events.send(Event::Groups(vec![club]));
         let _ = events.send(Event::Settings { read_receipts: true, typing: true });
         let _ = events.send(Event::Caught);
@@ -110,6 +123,8 @@ impl Fake {
             heard: Mutex::new(Some(heard)),
             closed: Arc::default(),
             refuse: Arc::default(),
+            fail_one: Arc::default(),
+            missed: Mutex::default(),
             clock: AtomicU64::new(super::now_ms()),
             control: script::control("signal.ctl"),
             // A scripted card. The link is invented: nothing here reserves a username.
@@ -129,7 +144,7 @@ impl Fake {
 
     /// Reads the test's lines for as long as this wire lives; closing the wire ends it.
     fn listen(&self) {
-        let (events, closed, refuse, control, lookups) = (self.events.clone(), self.closed.clone(), self.refuse.clone(), self.control.clone(), self.lookups.clone());
+        let (events, closed, refuse, fail_one, control, lookups) = (self.events.clone(), self.closed.clone(), self.refuse.clone(), self.fail_one.clone(), self.control.clone(), self.lookups.clone());
         let _ = std::thread::Builder::new().name("signal-fake".into()).spawn(move || {
             script::follow(&control, |line| {
                 if closed.load(Ordering::Relaxed) {
@@ -149,6 +164,10 @@ impl Fake {
                 }
                 if let Some(words) = line.strip_prefix("refuse ") {
                     *refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(words.to_owned());
+                    return true;
+                }
+                if let Some(who_word) = line.strip_prefix("fail ") {
+                    *fail_one.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = who(who_word.trim()).map(|(id, _)| id.to_owned());
                     return true;
                 }
                 for event in steer(line) {
@@ -287,11 +306,17 @@ fn steer(line: &str) -> Vec<Event> {
             };
             vec![Event::ReadElsewhere(vec![(author.into(), next().parse().unwrap_or(0))])]
         }
-        "seen" | "delivered" => {
+        "seen" | "delivered" | "viewed" => {
             let Some((by, _)) = who(next()) else {
                 return Vec::new();
             };
-            vec![Event::Receipt { by: by.into(), sent: vec![next().parse().unwrap_or(0)], read: command == "seen" }]
+            let sent: Vec<u64> = next().split(',').filter_map(|part| part.parse().ok()).collect();
+            let at = sent.iter().copied().max().unwrap_or(0).saturating_add(60_000);
+            vec![Event::Receipt { by: by.into(), sent, read: command != "delivered", viewed: command == "viewed", at }]
+        }
+        "receipts" => {
+            let read_receipts = next() != "off";
+            vec![Event::Settings { read_receipts, typing: true }]
         }
         "typing" | "typing-stop" => {
             let Some((by, name)) = who(next()) else {
@@ -407,7 +432,16 @@ impl Wire for Fake {
         if let Some(words) = self.refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             return Err(Fault::Refused(words));
         }
+        if matches!(to, Peer::Group(_)) {
+            if let Some(person) = self.fail_one.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+                self.missed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(person);
+            }
+        }
         Ok(self.clock.fetch_add(1_000, Ordering::Relaxed))
+    }
+
+    fn missed(&self) -> Vec<String> {
+        std::mem::take(&mut *self.missed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
     }
 
     fn typing(&self, to: &Peer, started: bool) -> Result<(), Fault> {

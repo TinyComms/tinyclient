@@ -512,6 +512,93 @@ fn reactions_edits_deletes_and_receipts_land_on_the_right_message() {
 }
 
 #[test]
+fn a_group_message_names_who_read_it_and_stays_unseen_until_both_have() {
+    let world = World::linked();
+    world.connected();
+    world.send(CLUB, "7301", "Deal?", None);
+    let ours = world.until("our group message", || {
+        world.messages(CLUB).into_iter().find(|message| message.client_id.as_deref() == Some("7301") && message.id != "7301")
+    });
+    let ours_at = ours.id.split_once('-').unwrap().0;
+    assert!(ours.deliveries.is_empty(), "{:?}", ours.deliveries);
+
+    world.steer(&format!("delivered grace {ours_at}"));
+    let grace = world.until("Grace's delivery", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == ours.id)?;
+        (message.deliveries.len() == 1).then_some(message)
+    });
+    assert_eq!(grace.deliveries[0].person, GRACE);
+    assert!(grace.deliveries[0].delivered.is_some());
+    assert!(!world.conversation(CLUB).unwrap().delivered, "one phone is not the whole group");
+    assert!(!world.conversation(CLUB).unwrap().seen);
+
+    world.steer(&format!("delivered alan {ours_at}"));
+    world.until("both deliveries", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == ours.id)?;
+        (message.deliveries.len() == 2).then_some(())
+    });
+    world.until("delivered once everyone has it", || world.conversation(CLUB)?.delivered.then_some(()));
+    assert!(!world.conversation(CLUB).unwrap().seen);
+
+    world.steer(&format!("seen grace {ours_at}"));
+    world.until("Grace's read", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == ours.id)?;
+        message.deliveries.iter().any(|delivery| delivery.person == GRACE && delivery.read.is_some()).then_some(())
+    });
+    assert!(!world.conversation(CLUB).unwrap().seen, "one reader is not the whole group");
+
+    world.steer(&format!("viewed alan {ours_at}"));
+    let both = world.until("both reads", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == ours.id)?;
+        let read = message.deliveries.iter().filter(|delivery| delivery.read.is_some()).count();
+        (read == 2).then_some(message)
+    });
+    let alan = both.deliveries.iter().find(|delivery| delivery.person == ALAN).expect("Alan");
+    assert!(alan.viewed.is_some() && alan.read.is_some());
+    world.until("seen once everyone has read", || world.conversation(CLUB)?.seen.then_some(()));
+}
+
+#[test]
+fn a_receipt_after_restart_stays_on_the_group_message() {
+    let mut world = World::linked();
+    world.connected();
+    world.send(CLUB, "7302", "Tuesday", None);
+    let ours = world.until("our group message", || {
+        world.messages(CLUB).into_iter().find(|message| message.client_id.as_deref() == Some("7302") && message.id != "7302")
+    });
+    let message_id = ours.id.clone();
+    let ours_at = ours.id.split_once('-').unwrap().0.to_owned();
+    world.restart();
+    world.connected();
+    world.steer(&format!("delivered grace {ours_at}"));
+    let message = world.until("the receipt on the group message", || {
+        let message = world.messages(CLUB).into_iter().find(|message| message.id == message_id)?;
+        message.deliveries.iter().any(|delivery| delivery.person == GRACE).then_some(message)
+    });
+    assert_eq!(message.deliveries.len(), 1);
+    assert!(world.messages(GRACE).iter().all(|message| message.id != message_id), "a group receipt was filed on the reader's direct chat");
+}
+
+#[test]
+fn a_message_says_when_read_receipts_are_off_and_names_who_a_send_missed() {
+    let world = World::linked();
+    world.connected();
+    world.steer(&format!("incoming grace {} hi", T0 + 1_000));
+    world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    world.steer("receipts off");
+    assert_eq!(world.ask(Request::MarkRead { conversation: key(GRACE), message_id: id(T0 + 1_000, GRACE) }), Response::Ok);
+    world.heard(&format!("read receipts=false {}", id(T0 + 1_000, GRACE)));
+    world.steer("fail grace");
+    world.send(CLUB, "7303", "Quiet", None);
+    let ours = world.until("our group message", || {
+        world.messages(CLUB).into_iter().find(|message| message.client_id.as_deref() == Some("7303") && message.id != "7303")
+    });
+    assert_eq!(ours.receipt_note, "Read receipts are off");
+    let missed = ours.deliveries.iter().find(|delivery| delivery.person == GRACE).expect("Grace was missed");
+    assert_eq!(missed.failed, "Signal could not deliver this.");
+}
+
+#[test]
 fn typing_is_heard_and_told_at_most_every_few_seconds() {
     let world = World::linked();
     world.connected();

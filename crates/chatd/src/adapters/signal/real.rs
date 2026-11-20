@@ -529,9 +529,17 @@ impl Session {
             let revision = group.revision;
             let snap = snap_of(&group);
             let member = snap.members.iter().any(|member| member.id == self.me);
+            let member_ids = group.members.iter().map(|member| ServiceId::from(member.aci).raw_uuid().to_string()).collect();
             self.groups.insert(id.clone(), key);
             self.known.seed(id.clone(), revision, snap);
-            told.push(GroupInfo { id, title: group.title, description: group.description.unwrap_or_default(), members: group.members.len() as u32, member });
+            told.push(GroupInfo {
+                id,
+                title: group.title,
+                description: group.description.unwrap_or_default(),
+                members: group.members.len() as u32,
+                member,
+                member_ids,
+            });
         }
         self.tell(Event::Groups(told));
     }
@@ -771,9 +779,11 @@ impl Session {
             ContentBody::SynchronizeMessage(sync) => self.sync(sync).await,
             ContentBody::ReceiptMessage(ReceiptMessage { r#type, timestamp }) => {
                 // A viewed receipt (a voice message or a video played) is read and more.
-                let read = [receipt_message::Type::Read, receipt_message::Type::Viewed].map(|kind| Some(kind.into())).contains(&r#type);
+                let viewed = r#type == Some(receipt_message::Type::Viewed.into());
+                let read = viewed || r#type == Some(receipt_message::Type::Read.into());
                 if read || r#type == Some(receipt_message::Type::Delivery.into()) {
-                    self.tell(Event::Receipt { by: sender, sent: timestamp, read });
+                    // `sent` is when this receipt left their phone. `timestamp` names our messages.
+                    self.tell(Event::Receipt { by: sender, sent: timestamp, read, viewed, at: sent });
                 }
             }
             ContentBody::TypingMessage(TypingMessage { action, group_id, .. }) => {
@@ -1017,6 +1027,7 @@ impl Session {
             }
             Peer::Group(id) => {
                 let key = *self.groups.get(id).ok_or_else(|| Fault::Refused("This group isn't one Signal still knows for you.".to_owned()))?;
+                // The first real error fails the whole send. presage does not say which members were missed.
                 self.manager.send_message_to_group(&key, body, at).await.map_err(fault)
             }
         }

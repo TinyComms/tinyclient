@@ -861,6 +861,8 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         state: protocol::SendState::Sent,
         waiting: false,
         client_id,
+        deliveries: Vec::new(),
+        receipt_note: String::new(),
     };
     (message, rich.files)
 }

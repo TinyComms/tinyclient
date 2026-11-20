@@ -45,7 +45,7 @@ use super::{keep_connected, serve_commands, About, Command, Context, Failure, Re
 use crate::blobs::upload::{self, Upload};
 use crate::session;
 use crate::store::{ConversationRow, PersonRow};
-use protocol::{Attachment, Contact, ContactKind, ConversationKind, Link, MediaFile, MediaKind, Message, MessageKind, Outgoing, Poll, PollBallot, PollDraft, Reaction, Relation, ReplyTo, Span};
+use protocol::{Attachment, Contact, ContactKind, ConversationKind, Delivery, Link, MediaFile, MediaKind, Message, MessageKind, Outgoing, Poll, PollBallot, PollDraft, Reaction, Relation, ReplyTo, Span};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -70,6 +70,8 @@ const CONVERSATIONS_KEPT: usize = 1_024;
 const CALL_STALE: i64 = 120;
 /// Our sent messages remembered, for the receipt that says where one was read.
 const SENT_KEPT: usize = 1_024;
+/// What a message says when this account does not share read receipts.
+const RECEIPTS_OFF: &str = "Read receipts are off";
 /// Reactions remembered, so a new one from the same person replaces their old one.
 const REACTIONS_KEPT: usize = 4_096;
 /// Largest reaction record file read on startup. `REACTIONS_KEPT` rows sit well below this;
@@ -516,6 +518,9 @@ struct Live {
     unread: HashMap<String, VecDeque<(String, u64)>>,
     /// Our sent messages and their conversation, for receipts that name only the time.
     sent: VecDeque<(u64, String)>,
+    /// A group's members, including us, keyed by the conversation id. The read tick waits
+    /// until every member but us has read.
+    groups: HashMap<String, Vec<String>>,
     /// Each person's reaction on a message: (message id, person) → emoji.
     /// Bounded to `REACTIONS_KEPT` in memory and on disk at `reactions_path`.
     reactions: HashMap<(String, String), String>,
@@ -958,6 +963,7 @@ fn apply(account: &Account, event: Event) {
         Event::Groups(groups) => {
             for group in groups {
                 let peer = Peer::Group(group.id.clone());
+                account.live().groups.insert(peer.conversation(), group.member_ids.clone());
                 let mut row = row(&peer, &group.title);
                 row.topic = group.description.chars().take(300).collect();
                 row.read_only = !group.member;
@@ -1115,18 +1121,11 @@ fn apply(account: &Account, event: Event) {
             let _ = ctx.reacted(&conversation, &id, &Reaction { emoji, file: None, count: 1, mine, who: vec![by] }, !removed);
         }
         Event::ReadElsewhere(read) => read_elsewhere(account, &read),
-        Event::Receipt { by, sent, read } => {
-            let Some(newest) = sent.iter().max().copied() else {
-                return;
-            };
-            let conversation = {
-                let live = account.live();
-                live.sent.iter().rev().find(|(at, _)| *at == newest).map(|(_, conversation)| conversation.clone())
-            };
-            let conversation = conversation.unwrap_or_else(|| Peer::Direct(by).conversation());
-            if let Ok(Some(_)) = ctx.known(&conversation) {
-                let id = wire::message_id(newest, &account.me);
-                let _ = if read { ctx.seen(&conversation, &id) } else { ctx.delivered(&conversation, &id) };
+        Event::Receipt { by, sent, read, viewed, at } => {
+            // Every time in the receipt, not only the newest: one receipt can name several messages.
+            let at = i64::try_from(at).unwrap_or(0);
+            for sent_at in sent {
+                file_receipt(account, &by, sent_at, read, viewed, at);
             }
         }
         Event::Typing { peer, by, name, started } => {
@@ -1550,7 +1549,26 @@ fn send_text(account: &Account, conversation: &str, text: &str, reply_to: Option
     let sent = account.wire.send(&to, Body::Text { text: plain.clone(), quote: quote.clone(), ranges })?;
     account.live().sent(sent, conversation);
     let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: plain, spans, quote, ..Text::default() };
-    Ok(message(account, &words, true))
+    let mut message = message(account, &words, true);
+    if !account.live().read_receipts {
+        message.receipt_note = RECEIPTS_OFF.to_owned();
+    }
+    // A hard error fails the whole send above. A scripted wire can also name one person it missed.
+    for person in account.wire.missed() {
+        if message.deliveries.len() >= protocol::DELIVERIES_LIMIT {
+            break;
+        }
+        let name = account.live().name(&person);
+        message.deliveries.push(Delivery {
+            person,
+            name: if name == NO_NAME { String::new() } else { name },
+            delivered: None,
+            read: None,
+            viewed: None,
+            failed: "Signal could not deliver this.".to_owned(),
+        });
+    }
+    Ok(message)
 }
 
 /// Files go on the upload thread: each is read in parts, then handed to Signal as one message.
@@ -1946,6 +1964,160 @@ fn typing(account: &Account, conversation: &str) {
     let _ = account.wire.typing(&to, true);
 }
 
+/// One receipt for one of our messages. A direct chat's tick moves on that one receipt. A
+/// group's tick moves only when every other member has reached that state. A receipt whose
+/// message is no longer among the ones remembered, and is not in the store, is dropped: it is
+/// not filed onto the reader's own chat.
+fn file_receipt(account: &Account, by: &str, sent_at: u64, read: bool, viewed: bool, at: i64) {
+    if by.is_empty() || by == account.me {
+        return;
+    }
+    let id = wire::message_id(sent_at, &account.me);
+    let remembered = {
+        let live = account.live();
+        live.sent.iter().rev().find(|(when, _)| *when == sent_at).map(|(_, conversation)| conversation.clone())
+    };
+    let conversation = match remembered {
+        Some(conversation) => conversation,
+        None => match account.ctx.conversation_of_message(&id) {
+            Ok(Some(conversation)) => conversation,
+            _ => return,
+        },
+    };
+    let Ok(Some(mut message)) = account.ctx.stored_message(&conversation, &id) else {
+        return;
+    };
+    let (delivered, seen) = {
+        let live = account.live();
+        note_receipt(&mut message, by, &live.name(by), read, viewed, at, live.read_receipts);
+        let members = live.groups.get(&conversation).map(Vec::as_slice);
+        let others = others_of(members, &conversation, &account.me);
+        ticks(&message, others, members, &account.me)
+    };
+    let _ = account.ctx.message(&conversation, &message);
+    if delivered {
+        let _ = account.ctx.delivered(&conversation, &id);
+    }
+    if seen {
+        let _ = account.ctx.seen(&conversation, &id);
+    }
+}
+
+/// How many other people a tick waits for. A direct chat is one. A group with no member list
+/// does not move: one receipt must not speak for a group we cannot count.
+fn others_of(members: Option<&[String]>, conversation: &str, me: &str) -> usize {
+    match members {
+        Some(ids) => {
+            let count = ids.iter().filter(|id| id.as_str() != me && !id.is_empty()).count();
+            if count == 0 { usize::MAX } else { count }
+        }
+        None if conversation.starts_with("g.") => usize::MAX,
+        None => 1,
+    }
+}
+
+/// `(delivered, seen)` once `others` distinct members, not us, have reached that state.
+fn ticks(message: &Message, others: usize, members: Option<&[String]>, me: &str) -> (bool, bool) {
+    let count = |read: bool| -> usize {
+        message
+            .deliveries
+            .iter()
+            .filter(|delivery| {
+                delivery.person != me
+                    && delivery.failed.is_empty()
+                    && members.is_none_or(|ids| ids.iter().any(|id| id == &delivery.person))
+                    && if read {
+                        delivery.read.is_some() || delivery.viewed.is_some()
+                    } else {
+                        delivery.delivered.is_some() || delivery.read.is_some() || delivery.viewed.is_some()
+                    }
+            })
+            .count()
+    };
+    (others > 0 && count(false) >= others, others > 0 && count(true) >= others)
+}
+
+fn note_receipt(message: &mut Message, person: &str, name: &str, read: bool, viewed: bool, at: i64, receipts_on: bool) {
+    if let Some(delivery) = entry(&mut message.deliveries, person, name) {
+        if at > 0 {
+            stamp(&mut delivery.delivered, at);
+            if read || viewed {
+                stamp(&mut delivery.read, at);
+            }
+            if viewed {
+                stamp(&mut delivery.viewed, at);
+            }
+        }
+        if delivery.delivered.is_some() {
+            delivery.failed.clear();
+        }
+    }
+    if receipts_on {
+        if message.receipt_note == RECEIPTS_OFF {
+            message.receipt_note.clear();
+        }
+    } else {
+        message.receipt_note = RECEIPTS_OFF.to_owned();
+    }
+}
+
+fn entry<'a>(deliveries: &'a mut Vec<Delivery>, person: &str, name: &str) -> Option<&'a mut Delivery> {
+    if let Some(at) = deliveries.iter().position(|delivery| delivery.person == person) {
+        if deliveries[at].name.is_empty() && !name.is_empty() && name != NO_NAME {
+            deliveries[at].name = name.to_owned();
+        }
+        return Some(&mut deliveries[at]);
+    }
+    if deliveries.len() >= protocol::DELIVERIES_LIMIT {
+        return None;
+    }
+    deliveries.push(Delivery {
+        person: person.to_owned(),
+        name: if name.is_empty() || name == NO_NAME { String::new() } else { name.to_owned() },
+        delivered: None,
+        read: None,
+        viewed: None,
+        failed: String::new(),
+    });
+    deliveries.last_mut()
+}
+
+fn stamp(slot: &mut Option<i64>, at: i64) {
+    if slot.is_none_or(|have| have < at) {
+        *slot = Some(at);
+    }
+}
+
+/// The lab's check: two readers, and the group is seen only once both have read. A played
+/// message counts as read. With read receipts off, the message says so.
+pub fn prove_signal_message_info() -> Result<(), String> {
+    let mut message = Message::plain("1", "Ada", "Deal?", 1, true);
+    note_receipt(&mut message, "grace", "Grace", false, false, 10, true);
+    note_receipt(&mut message, "alan", "Alan", false, false, 11, true);
+    let (delivered, seen) = ticks(&message, 2, None, "me");
+    if !delivered || seen {
+        return Err("two deliveries were not delivered, or were already seen".into());
+    }
+    note_receipt(&mut message, "grace", "Grace", true, false, 12, true);
+    if ticks(&message, 2, None, "me").1 {
+        return Err("one reader marked the group seen".into());
+    }
+    note_receipt(&mut message, "alan", "Alan", true, true, 13, true);
+    if !ticks(&message, 2, None, "me").1 {
+        return Err("both readers did not mark the group seen".into());
+    }
+    let alan = message.deliveries.iter().find(|delivery| delivery.person == "alan").ok_or("Alan is missing")?;
+    if alan.viewed.is_none() || alan.read.is_none() {
+        return Err("a played message was not read".into());
+    }
+    let mut quiet = Message::plain("2", "Ada", "Quiet", 1, true);
+    note_receipt(&mut quiet, "grace", "Grace", true, false, 14, false);
+    if quiet.receipt_note != RECEIPTS_OFF {
+        return Err("read receipts off said nothing".into());
+    }
+    Ok(())
+}
+
 /// What the message menu may offer. `sent_ms` and `now_ms` are milliseconds. `own` is a message
 /// this account sent. `note_to_self` is the chat with oneself, which has no delete-for-everyone limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2139,5 +2311,10 @@ mod tests {
         let back = group_delta(&out, &inside, "me", |_| String::new());
         assert!(!back.left && back.rejoined);
         assert_eq!(back.lines, ["You joined the group"]);
+    }
+
+    #[test]
+    fn a_group_is_seen_only_when_every_other_member_has_read() {
+        super::prove_signal_message_info().unwrap();
     }
 }

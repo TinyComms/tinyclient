@@ -505,6 +505,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-messages-unread:0");
         return Ok(());
     }
+    // The lab's signal-message-info driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-message-info") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_message_info() {
+            eprintln!("signal-message-info: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-message-info:0");
+        return Ok(());
+    }
     // The lab's discord-forum-landing driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-forum-landing") {
         if let Err(err) = chatd::demo::prove_discord_forum_landing() {
