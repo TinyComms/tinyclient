@@ -256,7 +256,15 @@ pub(crate) fn on_live(
                 } else {
                     deliver(ctx, saved, names, &conversation, &wire);
                 }
-                owe_reactions(ctx, saved, &conversation);
+                // Off the socket's thread: owe_reactions takes the device mutex, which
+                // syncs and repairs can hold across network I/O.
+                if e2ee::started(saved).is_some() {
+                    let (ctx, saved, conversation) =
+                        (ctx.clone(), saved.clone(), conversation.clone());
+                    let _ = std::thread::Builder::new()
+                        .name("tiny-e2ee-owed".into())
+                        .spawn(move || owe_reactions(&ctx, &saved, &conversation));
+                }
             }
         }
         "message.deleted" => {
