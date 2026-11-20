@@ -498,7 +498,9 @@ fn a_file_is_sent_with_its_attachment_and_the_phones_copy_does_not_replace_it() 
     world.steer(&format!("incoming grace {} hello", T0 + 5_000));
     world.arrived(GRACE, &id(T0 + 5_000, GRACE));
 
-    let path = std::env::temp_dir().join(format!("tinyclient-signal-card-{}-5001.png", std::process::id()));
+    let dir = world.dir.join("outbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("card.png");
     std::fs::write(&path, card_png()).unwrap();
     let asked = Request::Send {
         conversation: key(GRACE),
