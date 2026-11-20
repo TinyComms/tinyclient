@@ -1614,6 +1614,11 @@ pub fn prove_chain_paging() -> Result<(), String> {
     teams::prove_chain_paging()
 }
 
+/// The lab's teams-copy-link driver. See `teams::prove_share_links`.
+pub fn prove_share_links() -> Result<(), String> {
+    teams::prove_share_links()
+}
+
 /// The lab's failed-start-offline driver. A start that fails leaves the account offline,
 /// so messages() still answers from the cache instead of an empty signed-out page.
 pub fn prove_failed_start_offline() -> Result<(), String> {

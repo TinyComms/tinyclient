@@ -103,6 +103,7 @@ pub fn prove_teams_markdown() -> Result<(), String> {
     html::prove_markdown()
 }
 mod info;
+mod links;
 pub(crate) mod message;
 
 /// The lab's teams-reactions driver. A build without this returns to the server and stays up.
@@ -140,6 +141,11 @@ mod tree;
 /// The lab's teams-chain-paging driver. A build without this returns to the server and stays up.
 pub fn prove_chain_paging() -> Result<(), String> {
     message::prove_chain_paging()
+}
+
+/// The lab's teams-copy-link driver. A build without this returns to the server and stays up.
+pub fn prove_share_links() -> Result<(), String> {
+    links::prove_share_links()
 }
 
 use super::net::{address, browser};

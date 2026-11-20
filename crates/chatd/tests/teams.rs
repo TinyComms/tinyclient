@@ -421,6 +421,7 @@ impl Fake {
             let described = match thread {
                 CHAT_DEE => self.fixture("thread.dee"),
                 GENERAL => self.fixture("thread.general"),
+                "19:grp1@thread.v2" => Some(json!({"id": thread, "properties": {"threadType": "chat"}, "members": [{}, {}, {}]})),
                 _ => None,
             };
             return described.map_or_else(|| answer("404 Not Found", json!({"errorCode": 404, "message": "no such thread"})), ok);
@@ -1358,6 +1359,14 @@ fn mentions_missed_while_closed_info_mute_seen_hidden_chats_and_files_through_on
         panic!("no info");
     };
     assert_eq!((info.members, info.notify), (Some(4), protocol::Notify::All));
+    assert_eq!(
+        info.link,
+        format!("https://teams.microsoft.com/l/channel/19%3Aplatform0general%40thread.tacv2/General?groupId=e0873025-0000-4000-8000-00000000beef&tenantId={HOME}")
+    );
+    let Response::ConversationInfo { info: chat } = world.ask(Request::ConversationInfo { conversation: grp1.clone() }) else {
+        panic!("no chat info");
+    };
+    assert_eq!(chat.link, "https://teams.microsoft.com/l/chat/19%3Agrp1%40thread.v2/conversations");
 
     // Mute is set on Teams, then shown.
     assert_eq!(world.ask(Request::SetMute { conversation: grp1.clone(), notify: protocol::Notify::Nothing, until: None }), Response::Ok);

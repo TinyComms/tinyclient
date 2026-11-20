@@ -7,6 +7,7 @@
 //! - "Seen" is read from `GET /v1/threads/{id}/consumptionhorizons`, the members' read markers.
 //! - A thread's `createdat` and `creator` properties, read off the thread description.
 
+use super::links;
 use super::{escaped, id_of, millis, thread_of, Body, Fault, Teams};
 use crate::adapters::ConversationAbout;
 use protocol::{ConversationKind, Notify};
@@ -40,6 +41,7 @@ impl Teams {
             }
         };
         let created = millis(&id_of(&properties["createdat"])) / 1000;
+        let shared = properties["sharedChannel"] == true || properties["threadType"] == "sharedChannel";
         Ok(ConversationAbout {
             // A chat's topic is its title, already on the row: only a description is more.
             description: text("description"),
@@ -47,9 +49,35 @@ impl Teams {
             created: (created > 0).then_some(created),
             creator,
             notify,
-            external: if properties["sharedChannel"] == true || properties["threadType"] == "sharedChannel" { "Shared channel".to_owned() } else { String::new() },
+            external: if shared { "Shared channel".to_owned() } else { String::new() },
+            link: self.share_link(thread, row.as_ref(), shared),
             ..ConversationAbout::default()
         })
+    }
+
+    /// The https link the info pane copies. A channel and a chat use Microsoft's documented
+    /// forms. A meeting chat uses the join link. A reply chain links its post.
+    fn share_link(&self, thread: &str, row: Option<&protocol::Conversation>, shared: bool) -> String {
+        if thread.starts_with("19:meeting_") {
+            return links::meeting_share(thread);
+        }
+        match row {
+            Some(row) if row.kind == ConversationKind::Channel => {
+                let group = row.space.as_ref().and_then(|team| self.ctx.note(&format!("group:{team}"))).unwrap_or_default();
+                let mut link = links::channel_share(thread, &row.title, &group, &self.session.tenant);
+                if shared {
+                    link.push_str("&ngc=true&allowXTenantAccess=true");
+                } else if row.private {
+                    link.push_str("&ngc=true");
+                }
+                link
+            }
+            Some(row) if row.kind == ConversationKind::Thread => match (row.parent.as_deref(), row.root.as_deref()) {
+                (Some(parent), Some(root)) => links::message_share(parent, root, &self.session.tenant, None),
+                _ => String::new(),
+            },
+            _ => links::chat_share(thread),
+        }
     }
 
     /// Teams has on and off for a chat: `Mentions` keeps the mention alerts, which a muted
