@@ -1008,6 +1008,16 @@ pub struct MessageHit {
     pub outgoing: bool,
 }
 
+/// A reminder the user set on one message ("Remind me…"). Local to this device: no network
+/// hears of it, and it lives until it fires or the user cancels it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageReminder {
+    /// The message the reminder is on.
+    pub message_id: String,
+    /// Unix seconds it is due at.
+    pub due: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -1061,6 +1071,19 @@ pub enum Request {
     Star {
         conversation: Key,
         starred: bool,
+    },
+    /// Puts a reminder on one message, to be told about it when the time comes, or takes it
+    /// back with `remind_at: None`. Local: nothing goes to any network. A time already past is
+    /// refused, and a message that is not in the cache has nothing to remind about.
+    Remind {
+        conversation: Key,
+        message_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remind_at: Option<i64>,
+    },
+    /// The reminders still waiting in one conversation, due first.
+    Reminders {
+        conversation: Key,
     },
     /// Conversations whose title contains `query`, across every Space, most recent first. From
     /// the cache alone: a channel of a Space never opened is not in it.
@@ -2082,6 +2105,11 @@ pub enum Response {
     /// Answers `SearchMessages`: the newest hits first, at most the limit asked for.
     MessageHits {
         hits: Vec<MessageHit>,
+    },
+    /// Answers `Reminders`: what is still waiting in the conversation, due first.
+    Reminders {
+        conversation: Key,
+        reminders: Vec<MessageReminder>,
     },
     Sent {
         message: Message,

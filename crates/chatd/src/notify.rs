@@ -22,7 +22,7 @@ use protocol::{
 };
 use std::collections::{HashMap, VecDeque};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, RecvTimeoutError, Receiver, Sender};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -236,6 +236,11 @@ fn ring_id(conversation: &Key) -> String {
     format!("r:{}:{}:{}", conversation.network.label(), conversation.account, conversation.id)
 }
 
+/// A reminder's notification id: one conversation, one message.
+fn reminder_id(conversation: &Key, message_id: &str) -> String {
+    format!("d:{}:{}:{}:{message_id}", conversation.network.label(), conversation.account, conversation.id)
+}
+
 /// Where a message was said, for the subtitle: a group's name, `#channel · Space`.
 fn place(conversation: &Conversation) -> String {
     match conversation.kind {
@@ -351,6 +356,28 @@ impl Notes {
 
     pub fn has(&self, conversation: &Key) -> bool {
         self.groups.contains_key(conversation)
+    }
+
+    /// A reminder the user asked for: what the message said and where it sits, silent, with no
+    /// buttons. Reading the conversation does not withdraw it; the click opens the conversation.
+    /// The id is the message's, so a second reminder on it replaces this one.
+    pub fn reminder(&mut self, conversation: &Key, message_id: &str, title: &str, subtitle: &str, text: &str) {
+        let id = reminder_id(conversation, message_id);
+        let said = if text.trim().is_empty() { "Saved message".to_owned() } else { text.chars().take(120).collect() };
+        let note = Note {
+            id: id.clone(),
+            title: title.to_owned(),
+            subtitle: subtitle.to_owned(),
+            body: said,
+            kind: Kind::Plain,
+            reply_hint: String::new(),
+            sound: None,
+            locked_body: "Reminder".to_owned(),
+        };
+        if let Err(err) = self.sink.post(&note) {
+            tracing::warn!("chatd: reminder not shown: {err}");
+        }
+        self.ids.insert(id, conversation.clone());
     }
 
     /// The call as it is now. A ring posts its notification; anything else withdraws it.
@@ -499,6 +526,9 @@ pub enum Event {
     Test(Sender<(bool, String)>),
     /// S11: a sound, played once whatever S1 says.
     Play(String),
+    /// A reminder was set or taken back: the next one due is at another time, and one may be
+    /// due already.
+    Remind,
 }
 
 /// Who the notification thread is, to the hub.
@@ -638,7 +668,19 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
     // a second tone over the first.
     let mut back: Option<(String, MediaChild)> = None;
     let mut playing: Vec<MediaChild> = Vec::new();
-    while let Ok(event) = told.recv() {
+    loop {
+        let event = match reminder_wait(hub) {
+            Some(wait) => match told.recv_timeout(wait) {
+                Ok(event) => event,
+                // Reminders are looked at, not answered; the wait says when.
+                Err(RecvTimeoutError::Timeout) => Event::Remind,
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match told.recv() {
+                Ok(event) => event,
+                Err(_) => break,
+            },
+        };
         playing.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
         // Rows change many times a second; most need no settings at all.
         let busy = match &event {
@@ -758,6 +800,44 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                 let _ = answer.send((posted, detail));
             }
             Event::Play(word) => playing.extend(play(&word, volume, None, 0)),
+            Event::Remind => due(hub, &mut notes, &values),
+        }
+    }
+}
+
+/// How long the notification thread sleeps before a reminder needs it: until the earliest one
+/// waiting is due, or [`HUSH_POLL`] once one is due and held back by a pause or quiet hours.
+/// `None`: no reminder waits, and the thread sleeps for events alone.
+fn reminder_wait(hub: &Hub) -> Option<Duration> {
+    let next = hub.store().next_reminder_due().ok().flatten()?;
+    let ahead = u64::try_from(next - now()).unwrap_or(0);
+    Some(if ahead == 0 { HUSH_POLL } else { Duration::from_secs(ahead.min(REMINDER_WAIT_CAP_SECS)) })
+}
+
+/// A due reminder under a hush is checked again about once a minute, until the hush lifts.
+const HUSH_POLL: Duration = Duration::from_secs(60);
+/// The longest single wait. An event wakes the thread sooner, and this keeps the wait inside
+/// what `recv_timeout` accepts on every platform.
+const REMINDER_WAIT_CAP_SECS: u64 = 3_600;
+
+/// Posts the reminders whose time came and takes them out of the store, so a restart does not
+/// post them again. A pause or quiet hours holds one back (N7, N8): it stays stored, and the
+/// wait above wakes for it again. A message the cache let go of is still reminded about.
+fn due(hub: &Arc<Hub>, notes: &mut Notes, values: &Values) {
+    let Ok(waiting) = hub.store().due_reminders(now()) else {
+        return;
+    };
+    for (conversation, message_id, text) in waiting {
+        if hushed(values, &moment(hub, &conversation, notes, Instant::now())) {
+            return;
+        }
+        let (title, subtitle) = match hub.store().conversation(&conversation) {
+            Ok(Some(row)) => (row.title.clone(), place(&row)),
+            _ => (String::new(), String::new()),
+        };
+        notes.reminder(&conversation, &message_id, &title, &subtitle, &text);
+        if let Err(err) = hub.store().remind(&conversation, &message_id, None) {
+            tracing::warn!("chatd: reminder could not be taken out of the store: {err}");
         }
     }
 }
@@ -831,6 +911,94 @@ fn act(hub: &Hub, chat: &Weak<Chat>, notes: &Notes, done: Activation) {
             let _ = chat.handle(Request::CallDecline);
         }
     }
+}
+
+/// The lab's message-remind driver. A reminder set through the protocol is refused in the past,
+/// answers on the wire, survives a restart, posts one silent notification when it is due, is
+/// taken out of the store so no restart posts it twice, and can be cancelled.
+pub fn prove_message_remind() -> Result<(), String> {
+    use notifier::Fake;
+    let path = std::env::temp_dir().join(format!("tc-prove-message-remind-{}-chat.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut store = crate::store::Store::open(&path).map_err(|err| err.to_string())?;
+    let account = protocol::AccountKey { network: Network::Slack, account: "T1".into() };
+    let row = crate::store::ConversationRow::new("later", ConversationKind::Channel, "#later");
+    store.upsert_conversation(&account, &row).map_err(|err| err.to_string())?;
+    let conversation = Key::new(&account, "later");
+    let message: Message = serde_json::from_value(serde_json::json!({
+        "id": "m1", "sender": { "id": "u1", "name": "Mara" }, "sent": now(), "text": "read the document"
+    }))
+    .map_err(|err| err.to_string())?;
+    store.ingest(&conversation, &message, false).map_err(|err| err.to_string())?;
+    // Quiet hours off: this driver runs whenever the lab does, and the hold-under-a-hush rule
+    // has its own test.
+    store.set_setting("", settings::QUIET_HOURS, Some("off")).map_err(|err| err.to_string())?;
+    let chat = Arc::new(Chat::new(store));
+    // The account is signed in as far as the server is concerned, whoever runs this.
+    chat.hub.set_link(&account, protocol::Link::Connected, "");
+    let set = |at: Option<i64>| chat.handle(Request::Remind { conversation: conversation.clone(), message_id: "m1".into(), remind_at: at });
+    if matches!(set(Some(now() - 1)), Response::Ok) {
+        return Err("a time already past was taken".into());
+    }
+    if set(Some(now() + 2)) != Response::Ok {
+        return Err("a reminder ahead of now was refused".into());
+    }
+    let Response::Reminders { reminders, .. } = chat.handle(Request::Reminders { conversation: conversation.clone() }) else {
+        return Err("reminders were not answered".into());
+    };
+    if reminders.len() != 1 || reminders[0].due <= now() {
+        return Err("the wire did not answer the one reminder waiting".into());
+    }
+
+    // The restart: the reminder is in the file, not in the process.
+    drop(chat);
+    let chat = Arc::new(Chat::new(crate::store::Store::open(&path).map_err(|err| err.to_string())?));
+    chat.hub.set_link(&account, protocol::Link::Connected, "");
+    if chat.hub.store().reminders(&conversation).map_err(|err| err.to_string())?.len() != 1 {
+        return Err("a reminder did not survive the restart".into());
+    }
+
+    // When it is due the notification thread posts one silent note and takes the row out.
+    let set = |at: Option<i64>| chat.handle(Request::Remind { conversation: conversation.clone(), message_id: "m1".into(), remind_at: at });
+    let fake = Fake::default();
+    let mut notes = Notes::new(Box::new(fake.clone()));
+    let values = chat.hub.settings().clone();
+    due(&chat.hub, &mut notes, &values);
+    {
+        let log = fake.log();
+        let posted = log.posted.as_slice();
+        if posted.len() != 1 || posted[0].id != reminder_id(&conversation, "m1") {
+            return Err("the due reminder did not post as itself".into());
+        }
+        if posted[0].kind != Kind::Plain || posted[0].sound.is_some() {
+            return Err("a reminder posted loud or with buttons".into());
+        }
+        if posted[0].body != "read the document" || posted[0].subtitle != "#later" {
+            return Err("a reminder did not say what it is about".into());
+        }
+    }
+    if !chat.hub.store().reminders(&conversation).map_err(|err| err.to_string())?.is_empty() {
+        return Err("a fired reminder stayed stored".into());
+    }
+    drop(chat);
+    let store = crate::store::Store::open(&path).map_err(|err| err.to_string())?;
+    if !store.due_reminders(now()).map_err(|err| err.to_string())?.is_empty() {
+        return Err("a fired reminder came back with the restart".into());
+    }
+
+    // Taking it back is answered and empties the conversation again.
+    let chat = Arc::new(Chat::new(store));
+    chat.hub.set_link(&account, protocol::Link::Connected, "");
+    let set = |at: Option<i64>| chat.handle(Request::Remind { conversation: conversation.clone(), message_id: "m1".into(), remind_at: at });
+    if set(Some(now() + 60)) != Response::Ok || set(None) != Response::Ok {
+        return Err("cancelling a reminder was refused".into());
+    }
+    if !chat.hub.store().reminders(&conversation).map_err(|err| err.to_string())?.is_empty() {
+        return Err("a cancelled reminder stayed stored".into());
+    }
+    drop(chat);
+    let _ = std::fs::remove_file(&path);
+    Ok(())
 }
 
 #[cfg(test)]
