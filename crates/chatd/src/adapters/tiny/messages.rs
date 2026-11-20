@@ -1368,7 +1368,7 @@ fn apply_reaction(ctx: &Context, conversation_id: &str, landed: &e2ee::ReactionL
         message.reactions[at].count = landed.count;
         message.reactions[at].mine = landed.mine;
     } else {
-        message.reactions.push(Reaction { emoji: landed.emoji.clone(), file: None, count: landed.count, mine: landed.mine });
+        message.reactions.push(Reaction { emoji: landed.emoji.clone(), file: None, count: landed.count, mine: landed.mine, who: Vec::new() });
     }
     let _ = ctx.message(conversation_id, &message);
     true

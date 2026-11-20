@@ -185,7 +185,7 @@ fn mono(mask: HBITMAP, hot_x: i32, hot_y: i32) -> Option<Pointer> {
         for col in 0..width as usize {
             let (hide, white) = (bit(&masks, row, col, stride(width, 1) as usize), bit(&masks, height as usize + row, col, stride(width, 1) as usize));
             let at = (row * width as usize + col) * 4;
-            pixels[at..at + 4].copy_from_slice(match (hide, white) {
+            pixels[at..at + 4].copy_from_slice(&match (hide, white) {
                 (true, false) => [0, 0, 0, 0],
                 (false, false) => [0, 0, 0, 255],
                 (_, true) => [255, 255, 255, 255],
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn an_opaque_pointer_pixel_replaces_the_frame_and_a_transparent_one_leaves_it() {
-        let mut frame = vec![10, 20, 30, 255; 2 * 2 * 4];
+        let mut frame = [10u8, 20, 30, 255].repeat(2 * 2);
         let pointer = Pointer { hot_x: 0, hot_y: 0, width: 2, height: 1, pixels: vec![90, 100, 110, 255, 90, 100, 110, 0] };
         blend_at(&mut frame, 2, 2, 0, 0, &pointer);
         assert_eq!(frame[0..8], [90, 100, 110, 255, 10, 20, 30, 255]);
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn a_see_through_pointer_pixel_blends_the_screen_behind_it() {
-        let mut frame = vec![40, 40, 40, 255; 2 * 2 * 4];
+        let mut frame = [40u8, 40, 40, 255].repeat(2 * 2);
         // Half alpha white: half way from the grey behind to white, in the frame's BGRA order.
         let pointer = Pointer { hot_x: 0, hot_y: 0, width: 1, height: 1, pixels: vec![0, 0, 255, 128] };
         blend_at(&mut frame, 2, 2, 0, 0, &pointer);

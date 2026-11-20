@@ -1064,6 +1064,8 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, a
                 app_id: Some(APP_ID.into()),
                 ..Default::default()
             };
+            #[cfg(windows)]
+            let tray = prefs.choices.tray;
             let opened = cx.open_window(options, |window, cx| {
                 // The launcher entry and the flash's urgency hint are this window's from now.
                 #[cfg(target_os = "linux")]
@@ -1116,7 +1118,7 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, a
             // what makes closing mean hide, and the click on it the way back in
             // (docs/product/09-settings.md). Off, as prefs ship, nothing is added.
             #[cfg(windows)]
-            notifier::tray::set(prefs.choices.tray);
+            notifier::tray::set(tray);
             if let Some(invite) = invite {
                 links.borrow_mut().push_back(invite);
             }

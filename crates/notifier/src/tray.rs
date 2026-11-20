@@ -130,7 +130,7 @@ pub fn close_into_tray() {
         return;
     }
     let (title, words) = still_running();
-    let mut text = [0u16; 200];
+    let mut text = [0u16; 256];
     for (at, c) in words.encode_utf16().take(text.len() - 1).enumerate() {
         text[at] = c;
     }
@@ -160,7 +160,7 @@ fn add() {
     }
     register_taskbar_created();
     let Some(window) = hidden_window() else {
-        tracing::warn!("tinyclient: tray window refused");
+        eprintln!("tinyclient: tray window refused");
         return;
     };
     let mut tip = [0u16; 128];
@@ -180,7 +180,7 @@ fn add() {
     // SAFETY: a filled-in struct naming our window; the shell keeps the shared icon until
     // NIM_DELETE, and a shared icon is never destroyed.
     if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
-        tracing::warn!("tinyclient: tray icon refused");
+        eprintln!("tinyclient: tray icon refused");
         // SAFETY: the window made here is ours and has done nothing yet.
         unsafe {
             let _ = DestroyWindow(window);
@@ -269,7 +269,7 @@ fn open() {
 /// straight back; the foreground dance before it is the shell's rule for a menu that closes
 /// on a click outside itself.
 fn menu(window: HWND) {
-    let Ok(items) = unsafe { CreatePopupMenu() } else { return };
+    let Ok(items) = (unsafe { CreatePopupMenu() }) else { return };
     for (id, words) in ITEMS {
         let wide: Vec<u16> = words.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: a fresh menu; the string outlives the call.
