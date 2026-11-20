@@ -16,6 +16,8 @@ pub const POLL_OPTIONS: usize = 10;
 pub const POLL_VOTERS: usize = 200;
 /// Most characters a message keeps of the text it said before its last edit.
 pub const PRIOR_LIMIT: usize = 4_000;
+/// Most people a message's info lists. A larger group keeps the first ones named.
+pub const DELIVERIES_LIMIT: usize = 256;
 
 /// Cuts text from a network to at most `chars` characters, so no frame grows with what a
 /// stranger typed.
@@ -344,6 +346,26 @@ pub struct Sender {
     pub bot: bool,
 }
 
+/// One person a message was sent to, and what their phone has said about it. Times are
+/// milliseconds since 1970. A read or a view implies it was delivered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Delivery {
+    /// Their account id on this network.
+    pub person: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<i64>,
+    /// A voice note or a video played.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewed: Option<i64>,
+    /// Why it did not reach them. Empty when it did, or when that is not known yet.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub failed: String,
+}
+
 /// One choice on a [`Poll`], and who currently picked it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollChoice {
@@ -485,6 +507,13 @@ pub struct Message {
     /// network that does not say, and for a plaintext message of a Tiny server.
     #[serde(default, skip_serializing_if = "crate::Seal::is_plain")]
     pub seal: crate::Seal,
+    /// Who this was sent to, and what each phone has said. Empty when the network does not
+    /// say, and on a message that is not ours.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deliveries: Vec<Delivery>,
+    /// Why a read list is empty. "Read receipts are off" when this account does not share them.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub receipt_note: String,
 }
 
 impl Message {
@@ -540,6 +569,8 @@ impl Message {
             waiting: false,
             client_id: None,
             seal: crate::Seal::Plain,
+            deliveries: Vec::new(),
+            receipt_note: String::new(),
         }
     }
 
@@ -598,6 +629,13 @@ impl Message {
                 ballot.choices.truncate(POLL_OPTIONS);
             }
         }
+        self.deliveries.truncate(DELIVERIES_LIMIT);
+        for delivery in &mut self.deliveries {
+            clip(&mut delivery.person, 80);
+            clip(&mut delivery.name, 200);
+            clip(&mut delivery.failed, 200);
+        }
+        clip(&mut self.receipt_note, 200);
     }
 
     /// What is left of a message once it is deleted but must stay: who and when, nothing else.
@@ -611,6 +649,8 @@ impl Message {
         self.forwarded = None;
         self.card = None;
         self.poll = None;
+        self.deliveries.clear();
+        self.receipt_note.clear();
         self.pinned = false;
         self.mentions_me = false;
         self.deleted = true;

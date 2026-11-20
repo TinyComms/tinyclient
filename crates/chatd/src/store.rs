@@ -2856,6 +2856,18 @@ impl Store {
             .optional()
     }
 
+    /// The conversation a stored message is in, when a receipt names the message and not the
+    /// chat. `None` when this account has no such message.
+    pub fn conversation_of_message(&self, account: &AccountKey, id: &str) -> rusqlite::Result<Option<String>> {
+        self.db
+            .query_row(
+                "SELECT conversation FROM message WHERE network = ?1 AND account = ?2 AND id = ?3 LIMIT 1",
+                params![word(&account.network), &account.account, id],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
     /// True if it was there. A message with a thread hanging off it stays as a tombstone, and
     /// every stored reply to the message says its original is gone. The preview is left to the
     /// next message.

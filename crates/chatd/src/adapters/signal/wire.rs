@@ -78,6 +78,8 @@ pub struct GroupInfo {
     pub members: u32,
     /// Whether this account is currently a member of the group.
     pub member: bool,
+    /// Account ids of the members, including us. Empty when the wire has not said who.
+    pub member_ids: Vec<String>,
 }
 
 /// The earlier message a message answers.
@@ -199,7 +201,9 @@ pub enum Event {
     /// The user read these messages (author, sent) on another device.
     ReadElsewhere(Vec<(String, u64)>),
     /// `by`'s phone received our messages sent at these times, or `by` read them (`read`).
-    Receipt { by: String, sent: Vec<u64>, read: bool },
+    /// `viewed` is a voice note or a video played: it counts as read, and says when.
+    /// `at` is when this receipt was sent, in milliseconds.
+    Receipt { by: String, sent: Vec<u64>, read: bool, viewed: bool, at: u64 },
     Typing { peer: Peer, by: String, name: String, started: bool },
     /// Someone is calling: an offer for the person (`by`) in a one-to-one conversation. A
     /// group's ring update is a blob this library cannot open, so a group call stays with the
@@ -290,6 +294,11 @@ pub trait Wire: Send + Sync {
     fn me(&self) -> (String, String);
     /// Sends, and answers the time it went with: the message's id from now on.
     fn send(&self, to: &Peer, body: Body) -> Result<u64, Fault>;
+    /// People the last group send did not reach. Empty when the wire cannot say who: a hard
+    /// error fails the whole send instead.
+    fn missed(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn typing(&self, to: &Peer, started: bool) -> Result<(), Fault>;
     /// The user read these (author, sent): the user's other devices are told, and with `receipts`
     /// the authors too.
