@@ -150,6 +150,7 @@ screen (a row changed, a message appeared, a strip is showing), there is no toas
 ## 8. Dock badge and quit
 
 - **Dock badge** = `N` over all networks. No dot for plain unread: the API takes numbers only. Set by chatd, so it is right with the window closed.
+- **Launcher badge (Linux)** = the same `N`, sent as one `com.canonical.Unity.LauncherEntry.Update` signal on the session bus for `application://dev.tinyclient.app.desktop`; Ubuntu Dock, Dash to Dock and KDE's task manager read it. Cleared at 0 and once more at quit, so a dead app leaves no stale number. A flash asks the window manager for attention (X11's urgency hint) instead of bouncing.
 - **No status item.** Settings search says the menu-bar icon (macOS) or tray icon (Windows and Linux) is not built. The application menus are a separate bar.
 - **Quit.** On macOS, with "Keep receiving when the window is closed" on, closing hides the window and leaves chatd receiving. Elsewhere, closing quits. ⌘Q stops an application-managed chatd. A systemd user unit is left running.
 

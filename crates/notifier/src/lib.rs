@@ -1,8 +1,8 @@
-//! The system's notifications, for chatd, and the taskbar button or Dock icon, for the window
-//! (`docs/design/06-live-signals.md` §6 and §8). What to post is chatd's to decide
-//! (`chatd/src/notify.rs`); this crate only shows it, withdraws it and reports what the user
-//! did with it. Every backend takes the same [`Note`], so the rules are tested once, against
-//! [`Fake`].
+//! The system's notifications, for chatd, and the taskbar button, Dock icon or launcher entry,
+//! for the window (`docs/design/06-live-signals.md` §6 and §8). What to post is chatd's to
+//! decide (`chatd/src/notify.rs`); this crate only shows it, withdraws it and reports what the
+//! user did with it. Every backend takes the same [`Note`], so the rules are tested once,
+//! against [`Fake`].
 //!
 //! - Windows: WinRT toasts under tinyclient's AppUserModelID. An unpackaged app needs the ID
 //!   registered: the installer's Start menu shortcut carries it, and [`App::register`] writes
@@ -26,7 +26,7 @@ mod macos;
 mod linux;
 #[cfg(windows)]
 mod windows;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios")))))]
 pub mod taskbar;
 
 /// What a notification is for, which decides its buttons.

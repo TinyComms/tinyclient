@@ -181,10 +181,22 @@ pub const SHORTCUTS_CAPTION: &str = if cfg!(target_os = "macos") {
 };
 
 /// Settings › Notifications, N10: what draws attention to something new in the background.
-pub const FLASH_LABEL: &str = if cfg!(target_os = "macos") { "Bounce the Dock icon" } else { "Flash the taskbar button" };
+pub const FLASH_LABEL: &str = if cfg!(target_os = "macos") {
+    "Bounce the Dock icon"
+} else if cfg!(target_os = "linux") {
+    "Ask the desktop for attention"
+} else {
+    "Flash the taskbar button"
+};
 
 /// Settings › Notifications, N11: where the unread number is drawn.
-pub const BADGE_LABEL: &str = if cfg!(target_os = "macos") { "Show the unread count on the Dock icon" } else { "Show the unread count on the taskbar button" };
+pub const BADGE_LABEL: &str = if cfg!(target_os = "macos") {
+    "Show the unread count on the Dock icon"
+} else if cfg!(target_os = "linux") {
+    "Show the unread count on the launcher icon"
+} else {
+    "Show the unread count on the taskbar button"
+};
 
 /// Settings › Notifications, N13, after the test notification was posted.
 pub const TEST_SENT: &str = if cfg!(target_os = "macos") {
