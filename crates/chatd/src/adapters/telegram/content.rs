@@ -1811,6 +1811,13 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                     }
                 }
             }
+            // An inline result names the bot it came through. The handle is whatever this
+            // account already knows; mapping a message does not ask the network.
+            if let Some(bot) = raw.via_bot_id {
+                if let Some(handle) = dir.get(Who::User(bot)).map(|known| known.handle.as_str()).filter(|handle| !handle.is_empty()) {
+                    message.sender.name = format!("{} via @{handle}", message.sender.name);
+                }
+            }
             let mut wants = Vec::new();
             match &raw.media {
                 None | Some(MessageMedia::Empty) => {}
@@ -2859,6 +2866,39 @@ pub(super) fn prove_view_once() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's telegram-inline-bots check. A message sent through a bot the account already
+/// knows names that bot. A build from before this leaves the name as the person only.
+pub(super) fn prove_inline_bots() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    7_060i64.serialize(&mut bytes);
+    let mut user = tl::types::User::from_bytes(&bytes).map_err(|_| "a blank user reads back".to_owned())?;
+    user.first_name = Some("Wiki".to_owned());
+    user.username = Some("wiki".to_owned());
+    user.access_hash = Some(1);
+    user.bot = true;
+    user.bot_info_version = Some(1);
+    let mut dir = Directory::new(7_001);
+    dir.learn(&[user.into()], &[]);
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    9i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    "Rust".to_owned().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    message.from_id = Some(Who::User(7_002).peer());
+    message.via_bot_id = Some(7_060);
+    let mapped = map(&dir, &message.into()).ok_or("the message maps")?;
+    if !mapped.message.sender.name.contains("via @wiki") {
+        return Err(format!("an inline result did not name the bot, got {}", mapped.message.sender.name));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3331,6 +3371,34 @@ mod tests {
         assert_eq!(card.text, "1 The Embarcadero");
         assert_eq!(card.footer, "Open in Maps");
         assert!(card.fields.iter().any(|(label, value)| label == "Latitude" && value.starts_with("37.7955")));
+    }
+
+    fn bot(id: i64, name: &str, handle: &str) -> tl::types::User {
+        use grammers_tl_types::{Deserializable, Serializable};
+        let mut bytes = Vec::new();
+        0u32.serialize(&mut bytes);
+        0u32.serialize(&mut bytes);
+        id.serialize(&mut bytes);
+        let mut user = tl::types::User::from_bytes(&bytes).expect("a blank user reads back");
+        user.first_name = Some(name.to_owned());
+        user.username = Some(handle.to_owned());
+        user.access_hash = Some(1);
+        user.bot = true;
+        user.bot_info_version = Some(1);
+        user
+    }
+
+    #[test]
+    fn a_message_sent_through_an_inline_bot_names_that_bot() {
+        let mut dir = Directory::new(7_001);
+        dir.learn(&[bot(7_060, "Wiki", "wiki").into()], &[]);
+        let mut message = blank_message();
+        message.message = "Rust".into();
+        message.via_bot_id = Some(7_060);
+        let mapped = map(&dir, &message.into()).expect("the message maps");
+        assert!(mapped.message.sender.name.contains("via @wiki"), "{}", mapped.message.sender.name);
+        let plain = map(&dir, &blank_message().into()).expect("a plain message maps");
+        assert!(!plain.message.sender.name.contains("via @"), "{}", plain.message.sender.name);
     }
 
     #[test]
