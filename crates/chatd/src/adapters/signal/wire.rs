@@ -158,6 +158,13 @@ pub enum Event {
     /// `by`'s phone received our messages sent at these times, or `by` read them (`read`).
     Receipt { by: String, sent: Vec<u64>, read: bool },
     Typing { peer: Peer, by: String, name: String, started: bool },
+    /// Someone is calling: an offer for the person (`by`) in a one-to-one conversation. A
+    /// group's ring update is a blob this library cannot open, so a group call stays with the
+    /// phone. `name` is the caller's as the user knows them, `sent` when the offer was sent.
+    Call { peer: Peer, by: String, name: String, video: bool, id: u64, sent: u64 },
+    /// A call we heard of is over: its hangup, or the other side telling us it was busy.
+    /// `answered` says someone took it on another device; nobody did when it is false.
+    CallEnded { id: u64, answered: bool },
     /// The user's own settings, as the phone shares them.
     Settings { read_receipts: bool, typing: bool },
     /// Everything that waited while we were away has arrived.

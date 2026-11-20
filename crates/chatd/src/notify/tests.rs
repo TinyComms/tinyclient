@@ -445,6 +445,36 @@ fn a_ring_is_posted_once_with_accept_and_decline_and_withdrawn_when_it_stops() {
 }
 
 #[test]
+fn a_call_answered_on_the_phone_posts_one_action_and_a_newer_ring_takes_the_slot() {
+    let fake = Fake::default();
+    let mut notes = Notes::new(Box::new(fake.clone()));
+    let room = key(Network::Signal, "b2b2");
+    let verdict = |room| decide_ring(&Values::default(), room, &moment());
+    assert_eq!(notes.phone_ring(&room, "Grace Ombra", verdict(&room), "", "Signal").as_deref(), ours("soft_ring"));
+    let id = ring_id(&room);
+    let shown = fake.log().shown[&id].clone();
+    assert_eq!((shown.title.as_str(), shown.subtitle.as_str(), shown.kind), ("Grace Ombra", "Signal · Incoming call", Kind::CallOnPhone));
+    assert_eq!(notes.conversation(&id), Some(&room));
+    // A newer offer takes the one ring: the note that was showing goes with it.
+    let other = key(Network::Signal, "c3c3");
+    assert_eq!(notes.phone_ring(&other, "Alan Trend", verdict(&other), "", "Signal").as_deref(), ours("soft_ring"));
+    assert!(fake.log().shown.get(&id).is_none(), "the newer ring withdraws the note it replaces");
+    assert_eq!(notes.conversation(&ring_id(&other)), Some(&other));
+    // The displaced call's hangup finds nothing of its own: the newer ring still stands.
+    assert_eq!(notes.phone_ring_stopped(&room), None);
+    assert_eq!(notes.conversation(&ring_id(&other)), Some(&other));
+    // The newer caller gave up: withdrawn, and the ring sound stops.
+    assert_eq!(notes.phone_ring_stopped(&other).as_deref(), Some(""));
+    assert!(fake.log().shown.is_empty() && notes.conversation(&ring_id(&other)).is_none());
+    assert_eq!(notes.phone_ring_stopped(&other), None);
+    // A call whose rules are off (calls off) is not shown at all.
+    let mut values = Values::default();
+    set(&mut values, GLOBAL, settings::CALLS, "off");
+    assert_eq!(notes.phone_ring(&room, "Grace Ombra", decide_ring_in(&values, &room, &moment(), true), "", "Signal"), None);
+    assert!(fake.log().shown.is_empty());
+}
+
+#[test]
 fn the_test_notification_uses_the_preview_and_the_message_sound() {
     let fake = Fake::default();
     let mut notes = Notes::new(Box::new(fake.clone()));
