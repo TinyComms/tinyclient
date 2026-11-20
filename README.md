@@ -95,7 +95,7 @@ Not built, on `main`:
 | Work | Where it stands |
 | --- | --- |
 | **Camera and screen share outside Tiny** | Discord sends and receives a camera and a screen share (Go Live). Slack, Teams, Telegram, Signal, and Messages do not. Stage channels, Slack huddles, Teams meetings, Telegram calls, and Messages calls open in the official app. |
-| **Signal attachments, safety numbers, and calls** | A photo or file is a labelled line, not a picture you can open. A new identity key is trusted automatically. Calls are not built. |
+| **Signal attachments, safety numbers, and calls** | A photo or file is a labelled line, not a picture you can open. A payment and a gift badge say to open Signal on your phone: the amount rides in an encrypted receipt only a wallet can read, and redeeming a badge presents a receipt credential — both the phone's work, on purpose. A new identity key is trusted automatically. Calls are not built. |
 | **Teams personal accounts** | Work and school accounts only. |
 | **Telegram secret chats** | Not supported. The library tinyclient uses does not implement them. |
 | **Search on the network** | The cache is searched everywhere. Enter asks Discord (a server or one channel), Slack (a workspace or one conversation), and Telegram (one conversation). Teams, Signal, and Messages are not asked. |

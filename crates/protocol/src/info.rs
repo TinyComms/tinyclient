@@ -394,6 +394,16 @@ pub struct VoiceNote {
     pub waveform: Vec<u8>,
 }
 
+/// A poll the user is starting. Signal: a question of 1 to 100 characters and 2 to 10 choices,
+/// each at most 100 characters. `multiple` lets a person pick more than one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollDraft {
+    pub question: String,
+    pub options: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub multiple: bool,
+}
+
 /// What a `Send` carries besides its text. All of it is off by default, and a plain text
 /// message leaves it off the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,6 +434,10 @@ pub struct Outgoing {
     /// text and stays off the wire, so an older client still reads the send.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spans: Vec<crate::Span>,
+    /// Start a poll instead of a text message. A plain send leaves it off, so `is_plain` stays
+    /// true for text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll: Option<PollDraft>,
 }
 
 impl Default for Outgoing {
@@ -437,6 +451,7 @@ impl Default for Outgoing {
             schedule: None,
             voice: None,
             spans: Vec::new(),
+            poll: None,
         }
     }
 }

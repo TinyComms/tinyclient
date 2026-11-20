@@ -1379,6 +1379,15 @@ pub enum Request {
         conversation: Key,
         message_id: String,
     },
+    /// Vote on a poll, take a vote back, or end one. `votes` of `None` ends it (only the person
+    /// who started it), `Some` replaces our vote, and an empty list takes it back. Signal only.
+    /// The shell's composer menu that starts a poll is separate: that is a `Send` with `poll`.
+    Poll {
+        conversation: Key,
+        message_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        votes: Option<Vec<u32>>,
+    },
 
     /// Custom emoji, stickers or GIFs for the picker, asked when its tab opens and never before,
     /// kept five minutes. `space` narrows custom emoji to one Space's; `query` searches;

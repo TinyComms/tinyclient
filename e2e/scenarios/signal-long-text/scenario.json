@@ -1,0 +1,8 @@
+{
+  "id": "signal-long-text",
+  "title": "A Signal message too long for one body shows as text with a note, not as a file",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

@@ -38,6 +38,8 @@ pub enum Kind {
     ReadOnly,
     /// Accept and Decline, shown as a call.
     Call,
+    /// A call answered on the phone: one action opens the app, and nothing starts here.
+    CallOnPhone,
     /// No buttons: the test notification, a sign-out.
     Plain,
 }
@@ -225,7 +227,7 @@ fn escape(text: &str) -> String {
 #[allow(dead_code)]
 fn toast_xml(note: &Note) -> String {
     let id = escape(&note.id);
-    let scenario = if note.kind == Kind::Call { " scenario=\"incomingCall\"" } else { "" };
+    let scenario = if matches!(note.kind, Kind::Call | Kind::CallOnPhone) { " scenario=\"incomingCall\"" } else { "" };
     let mut xml = format!("<toast launch=\"open:{id}\" activationType=\"foreground\"{scenario}><visual><binding template=\"ToastGeneric\">");
     xml.push_str(&format!("<text>{}</text>", escape(&note.title)));
     if !note.body.is_empty() {
@@ -248,6 +250,9 @@ fn toast_xml(note: &Note) -> String {
         Kind::Call => xml.push_str(&format!(
             "<actions><action content=\"Accept\" arguments=\"accept:{id}\" activationType=\"foreground\"/>\
              <action content=\"Decline\" arguments=\"decline:{id}\" activationType=\"foreground\"/></actions>"
+        )),
+        Kind::CallOnPhone => xml.push_str(&format!(
+            "<actions><action content=\"Answer on your phone\" arguments=\"open:{id}\" activationType=\"foreground\"/></actions>"
         )),
         Kind::Plain => {}
     }
@@ -302,6 +307,9 @@ mod tests {
         assert!(xml.ends_with("<audio silent=\"true\"/></toast>"));
         let call = toast_xml(&note(Kind::Call));
         assert!(call.contains("scenario=\"incomingCall\"") && call.contains("accept:m:1") && call.contains("decline:m:1"));
+        let on_phone = toast_xml(&note(Kind::CallOnPhone));
+        assert!(on_phone.contains("scenario=\"incomingCall\"") && on_phone.contains("content=\"Answer on your phone\"") && on_phone.contains("arguments=\"open:m:1\""), "{on_phone}");
+        assert!(!on_phone.contains("accept:") && !on_phone.contains("decline:"));
         assert!(!toast_xml(&note(Kind::Plain)).contains("<actions>"));
         let locked = toast_xml(&note(Kind::ReadOnly));
         assert!(locked.contains("arguments=\"read:m:1\""), "{locked}");

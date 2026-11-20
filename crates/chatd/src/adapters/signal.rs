@@ -1,6 +1,6 @@
-//! Signal: text first. This computer is linked to the user's account as one more device, the way
-//! Signal Desktop is; it never registers a phone number, which would take the account from the
-//! phone. Calls and voice stay out of chatd.
+//! Signal: text, and the photos, videos and files a person attaches. This computer is linked
+//! to the user's account as one more device, the way Signal Desktop is; it never registers a
+//! phone number, which would take the account from the phone. Calls and voice stay out of chatd.
 //!
 //! # The library: presage, in this process (decided 2026-10-14, by building it on this Mac)
 //!
@@ -32,23 +32,27 @@
 //! Nothing else is sent unasked: no reaction, edit, delete or profile change.
 
 mod fake;
+mod files;
 #[cfg(feature = "signal")]
 mod real;
+mod style;
 pub mod signin;
 #[cfg(feature = "signal")]
 mod vault;
 mod wire;
 
 use super::{keep_connected, serve_commands, About, Command, Context, Failure, Refusal, Signed};
+use crate::blobs::upload::{self, Upload};
 use crate::session;
 use crate::store::{ConversationRow, PersonRow};
-use protocol::{Contact, ContactKind, ConversationKind, Link, Message, MessageKind, Reaction, Relation, ReplyTo};
+use protocol::{Attachment, Contact, ContactKind, ConversationKind, Link, MediaFile, MediaKind, Message, MessageKind, Outgoing, Poll, PollBallot, PollDraft, Reaction, Relation, ReplyTo, Span};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use wire::{Body, Event, Fault, Peer, Quote, Text, Wire};
+use wire::{view_once_label, Body, Event, Fault, Peer, Quote, Text, Wire};
 
 /// Signal has no history to fetch, so nothing is paced.
 const PACE: Duration = Duration::ZERO;
@@ -61,14 +65,224 @@ const TYPING_SHOWN: i64 = 15;
 const UNREAD_KEPT: usize = 500;
 /// Conversations with unread messages remembered.
 const CONVERSATIONS_KEPT: usize = 1_024;
+/// An offer older than this is catch-up from a call that is long over: a line to record when
+/// it ends, not news to ring.
+const CALL_STALE: i64 = 120;
 /// Our sent messages remembered, for the receipt that says where one was read.
 const SENT_KEPT: usize = 1_024;
 /// Reactions remembered, so a new one from the same person replaces their old one.
 const REACTIONS_KEPT: usize = 4_096;
+/// Largest reaction record file read on startup. `REACTIONS_KEPT` rows sit well below this;
+/// anything larger is skipped so an oversized or corrupt file is not parsed under the lock.
+const REACTIONS_FILE_LIMIT: u64 = 2 * 1024 * 1024;
+/// Ballots remembered on one poll. Older ones drop off the list; the choice counts stay.
+const BALLOTS_KEPT: usize = 1_024;
+/// Signal's poll limits, from its desktop schema: a question and each choice are at most this
+/// many characters, and a poll has at most this many choices.
+const POLL_CHARS: usize = 100;
+const POLL_MOST: usize = 10;
+/// A vote or an end, packed into an edit so the command channel already exists. A real edit
+/// never starts with this mark.
+const POLL_VOTE: &str = "\u{1}signal-poll-vote\u{1}";
+const POLL_END: &str = "\u{1}signal-poll-end\u{1}";
 /// What a person with no name we know is called.
 const NO_NAME: &str = "Signal user";
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis() as u64)
+}
+
+/// One member, as a group change compares them. `admin` is Signal's administrator role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberSnap {
+    pub id: String,
+    pub admin: bool,
+}
+
+/// The parts of a group a change can show. Built from the stored group, never from an unsigned change.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupSnap {
+    pub title: String,
+    pub description: String,
+    pub timer_secs: u32,
+    pub avatar: String,
+    pub members: Vec<MemberSnap>,
+    pub pending: Vec<String>,
+    pub requesting: Vec<String>,
+    /// Anyone with the link may join.
+    pub link: bool,
+}
+
+/// What changed between two snapshots of one group.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupDelta {
+    pub lines: Vec<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub left: bool,
+    pub rejoined: bool,
+}
+
+/// Tracks the last revision applied for each group. The first snapshot is recorded silently;
+/// stale or duplicate revisions are skipped; a newer revision yields its prior snapshot once.
+#[derive(Debug, Default)]
+pub struct GroupRevisions {
+    known: HashMap<String, (u32, GroupSnap)>,
+}
+
+impl GroupRevisions {
+    pub fn contains(&self, id: &str) -> bool {
+        self.known.contains_key(id)
+    }
+
+    /// Records the initial snapshot for a group without announcing a change.
+    /// Does not overwrite an already-tracked group.
+    pub fn seed(&mut self, id: String, revision: u32, snap: GroupSnap) {
+        self.known.entry(id).or_insert((revision, snap));
+    }
+
+    /// True only when `id` is tracked and `revision` is strictly newer than the last applied one.
+    pub fn should_check(&self, id: &str, revision: u32) -> bool {
+        self.known.get(id).is_some_and(|(known_rev, _)| revision > *known_rev)
+    }
+
+    /// Advances `id` to `stored_revision` and returns the prior snapshot if `stored_revision`
+    /// is strictly newer than the last applied one.
+    pub fn advance(&mut self, id: &str, stored_revision: u32, after: GroupSnap) -> Option<GroupSnap> {
+        let known_rev = self.known.get(id)?.0;
+        if stored_revision <= known_rev {
+            return None;
+        }
+        let (_, before) = self.known.insert(id.to_owned(), (stored_revision, after))?;
+        Some(before)
+    }
+}
+
+fn person(id: &str, me: &str, name: &impl Fn(&str) -> String) -> String {
+    if id == me {
+        "You".to_owned()
+    } else {
+        let named = name(id);
+        if named.is_empty() { "Someone".to_owned() } else { named }
+    }
+}
+
+fn duration(secs: u32) -> String {
+    if secs >= 86_400 && secs.is_multiple_of(86_400) {
+        let days = secs / 86_400;
+        format!("{days} day{}", if days == 1 { "" } else { "s" })
+    } else if secs >= 3_600 && secs.is_multiple_of(3_600) {
+        let hours = secs / 3_600;
+        format!("{hours} hour{}", if hours == 1 { "" } else { "s" })
+    } else if secs >= 60 && secs.is_multiple_of(60) {
+        let minutes = secs / 60;
+        format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
+    } else {
+        format!("{secs} seconds")
+    }
+}
+
+/// The lines and the row fields for one group revision. The first snapshot of a connection is not
+/// passed here: a connect has no "before", so it shows the current name and no system lines.
+pub fn group_delta(before: &GroupSnap, after: &GroupSnap, me: &str, name: impl Fn(&str) -> String) -> GroupDelta {
+    let mut lines = Vec::new();
+    let title = (before.title != after.title).then(|| {
+        lines.push(format!("The group name is now {}", after.title));
+        after.title.clone()
+    });
+    let description = (before.description != after.description).then(|| {
+        if after.description.is_empty() {
+            lines.push("The group description was cleared".to_owned());
+        } else {
+            lines.push(format!("The group description is now {}", after.description));
+        }
+        after.description.clone()
+    });
+    if before.avatar != after.avatar {
+        lines.push("The group photo changed".to_owned());
+    }
+    if before.timer_secs != after.timer_secs {
+        if after.timer_secs == 0 {
+            lines.push("Disappearing messages are off".to_owned());
+        } else {
+            lines.push(format!("Disappearing messages are set to {}", duration(after.timer_secs)));
+        }
+    }
+    if before.link != after.link {
+        lines.push(if after.link { "The group link is on".to_owned() } else { "The group link is off".to_owned() });
+    }
+    let was: HashMap<&str, bool> = before.members.iter().map(|member| (member.id.as_str(), member.admin)).collect();
+    let now: HashMap<&str, bool> = after.members.iter().map(|member| (member.id.as_str(), member.admin)).collect();
+    let mut joined: Vec<&str> = now.keys().copied().filter(|id| !was.contains_key(id)).collect();
+    joined.sort_unstable();
+    let mut rejoined = false;
+    for id in joined {
+        if id == me {
+            rejoined = true;
+        }
+        lines.push(format!("{} joined the group", person(id, me, &name)));
+    }
+    let mut stayed: Vec<&str> = now.keys().copied().filter(|id| was.get(id).is_some_and(|admin| *admin != now[id])).collect();
+    stayed.sort_unstable();
+    for id in stayed {
+        let admin = now[id];
+        let line = if id == me {
+            if admin { "You are now an admin".to_owned() } else { "You are no longer an admin".to_owned() }
+        } else if admin {
+            format!("{} is now an admin", person(id, me, &name))
+        } else {
+            format!("{} is no longer an admin", person(id, me, &name))
+        };
+        lines.push(line);
+    }
+    let mut gone: Vec<&str> = was.keys().copied().filter(|id| !now.contains_key(id)).collect();
+    gone.sort_unstable();
+    let mut left = false;
+    for id in gone {
+        if id == me {
+            left = true;
+            lines.push("You are no longer in this group".to_owned());
+        } else {
+            lines.push(format!("{} is no longer in the group", person(id, me, &name)));
+        }
+    }
+    let pending: HashSet<&str> = before.pending.iter().map(String::as_str).collect();
+    let mut invited: Vec<&str> = after.pending.iter().map(String::as_str).filter(|id| !pending.contains(id) && !now.contains_key(id)).collect();
+    invited.sort_unstable();
+    for id in invited {
+        lines.push(format!("{} was invited", person(id, me, &name)));
+    }
+    let asking: HashSet<&str> = before.requesting.iter().map(String::as_str).collect();
+    let mut requests: Vec<&str> = after.requesting.iter().map(String::as_str).filter(|id| !asking.contains(id)).collect();
+    requests.sort_unstable();
+    for id in requests {
+        lines.push(format!("{} asked to join", person(id, me, &name)));
+    }
+    GroupDelta { lines, title, description, left, rejoined }
+}
+
+/// The lab driver for `signal-group-rename`. A build that drops a rename fails.
+pub fn prove_signal_group_rename() -> Result<(), String> {
+    let before = GroupSnap { title: "Bridge club".into(), ..GroupSnap::default() };
+    let after = GroupSnap { title: "Wednesday club".into(), ..GroupSnap::default() };
+    let delta = group_delta(&before, &after, "me", |_| String::new());
+    if delta.title.as_deref() != Some("Wednesday club") || delta.lines != ["The group name is now Wednesday club"] || delta.left {
+        return Err("a renamed group must take the new name and one line".into());
+    }
+    let member = GroupSnap { members: vec![MemberSnap { id: "me".into(), admin: false }], ..GroupSnap::default() };
+    let left = group_delta(&member, &GroupSnap::default(), "me", |_| String::new());
+    if !left.left || left.lines != ["You are no longer in this group"] {
+        return Err("leaving the group must say so".into());
+    }
+    Ok(())
+}
+
 /// Most pictures asked of Signal for one change to what is on screen.
 const PICTURES: usize = 25;
+/// What the official apps keep in the message itself of a long text; more travels as Signal's
+/// own plain-text attachment, whose first part the body repeats. Sending that way is still to
+/// come. The composer counts in characters where Signal cuts in bytes on a character boundary.
+const TEXT_LIMIT: u32 = 2_048;
 /// Marks a `SetPresence` status that is really an edit of our own profile. A status a person
 /// typed never starts with this, and the server sends it only for Signal, without changing
 /// presence.
@@ -112,6 +326,18 @@ fn profile_part(part: &str) -> Option<Option<String>> {
     }
 }
 
+/// The lab's signal-long-text driver. A build without the Signal library has no driver, so it stays up and the lab fails.
+pub fn prove_signal_long_text() -> Result<(), String> {
+    #[cfg(feature = "signal")]
+    {
+        real::prove_long_text()
+    }
+    #[cfg(not(feature = "signal"))]
+    {
+        Err(unsupported_reason())
+    }
+}
+
 /// The lab's signal-own-profile driver. A build without this stays up, so the driver fails.
 pub fn prove_signal_own_profile() -> Result<(), String> {
     let packed = profile_status(Some("Ada"), Some("New about"), None);
@@ -127,6 +353,60 @@ pub fn prove_signal_own_profile() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// The lab's signal-payment-labels driver. A build without this stays up, so the driver fails.
+pub fn prove_signal_payment_labels() -> Result<(), String> {
+    #[cfg(feature = "signal")]
+    {
+        real::prove_payment_labels()
+    }
+    #[cfg(not(feature = "signal"))]
+    {
+        Err(unsupported_reason())
+    }
+}
+
+/// The lab's signal-view-once driver. A build without this stays up, so the driver fails.
+pub fn prove_signal_view_once() -> Result<(), String> {
+    let wants = [(Some("image/jpeg"), "View-once photo · open it on your phone"), (Some("video/mp4"), "View-once video · open it on your phone"), (None, "View-once media · open it on your phone")];
+    for (kind, want) in wants {
+        let said = view_once_label(kind);
+        if said != want {
+            return Err(format!("a view-once message is labelled {said:?}, not {want:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// The lab's signal-privacy-local driver. Signal takes a local switch for typing and read
+/// receipts: stored in its account scope, on until chosen, off stops it here. Nothing stored is
+/// the account's own setting, which stays off until the phone says otherwise.
+pub fn prove_signal_privacy_local() -> Result<(), String> {
+    let account = protocol::AccountKey { network: protocol::Network::Signal, account: "prove".to_owned() };
+    let scope = protocol::settings::account_scope(&account);
+    if !protocol::settings::typing_choice(protocol::Network::Signal) {
+        return Err("Signal has no local typing switch".to_owned());
+    }
+    if !protocol::settings::valid(&scope, protocol::settings::TYPING, "off") || !protocol::settings::valid(&scope, protocol::settings::RECEIPTS, "off") {
+        return Err("Signal's account scope takes no local off for typing or receipts".to_owned());
+    }
+    let mut values = protocol::settings::Values::default();
+    if !values.typing(&account) || !values.receipts(&account) {
+        return Err("nothing stored must leave both on".to_owned());
+    }
+    values.set(&scope, protocol::settings::TYPING, Some("off".into()));
+    values.set(&scope, protocol::settings::RECEIPTS, Some("off".into()));
+    if values.typing(&account) || values.receipts(&account) {
+        return Err("off here did not stop it".to_owned());
+    }
+    Ok(())
+}
+
+/// One day, in milliseconds. Signal Desktop still sends an edit or a delete for everyone for this
+/// long (`DAY` in its source) and then does not.
+const SEND_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+/// Two days. An incoming edit or delete for everyone older than this is ignored (`DAY * 2`).
+const RECEIVE_WINDOW_MS: u64 = 2 * SEND_WINDOW_MS;
 
 /// A test in a scratch directory asked for the scripted wire.
 fn scripted() -> bool {
@@ -237,12 +517,31 @@ struct Live {
     /// Our sent messages and their conversation, for receipts that name only the time.
     sent: VecDeque<(u64, String)>,
     /// Each person's reaction on a message: (message id, person) → emoji.
+    /// Bounded to `REACTIONS_KEPT` in memory and on disk at `reactions_path`.
     reactions: HashMap<(String, String), String>,
     reacted_order: VecDeque<(String, String)>,
+    /// `{support}/signal/{aci}.reactions`. Empty when nothing is kept on disk.
+    reactions_path: PathBuf,
+    reactions_loaded: bool,
     typed: HashMap<String, Instant>,
+    /// The one incoming call we ring for: its id, conversation, caller, kind, and when the
+    /// offer was sent. The newest offer replaces an older one, so this stays one entry, and
+    /// only the offer sitting here ends its own ring.
+    ring: Option<Ring>,
     /// The user's own Signal settings. Off until the phone says.
     read_receipts: bool,
     typing: bool,
+    /// File sends, by the time Signal gave them, so the phone's copy does not replace the file.
+    echoed: VecDeque<u64>,
+}
+
+/// What [`Event::Call`] told of, for [`Event::CallEnded`] to end it.
+struct Ring {
+    id: u64,
+    conversation: String,
+    author: String,
+    video: bool,
+    sent: u64,
 }
 
 impl Live {
@@ -284,25 +583,160 @@ impl Live {
         self.sent.push_back((sent, conversation.to_owned()));
     }
 
-    /// Records a person's reaction, answering the one it replaced.
+    /// Loads the reaction record from disk once, keeping at most `REACTIONS_KEPT` newest rows.
+    fn load_reactions(&mut self) {
+        if self.reactions_loaded {
+            return;
+        }
+        self.reactions_loaded = true;
+        let rows = read_reactions(&self.reactions_path);
+        let skip = rows.len().saturating_sub(REACTIONS_KEPT);
+        for row in rows.into_iter().skip(skip) {
+            let key = (row.message, row.person);
+            if !self.reactions.contains_key(&key) {
+                self.reacted_order.push_back(key.clone());
+            }
+            self.reactions.insert(key, row.emoji);
+        }
+    }
+
+    /// This send carried a file. The phone's later copy of the same send is ignored.
+    fn echoed(&mut self, sent: u64) {
+        if self.echoed.len() >= SENT_KEPT {
+            self.echoed.pop_front();
+        }
+        self.echoed.push_back(sent);
+    }
+
+    fn echoed_file(&self, sent: u64) -> bool {
+        self.echoed.contains(&sent)
+    }
+
+    /// Records a person's reaction, answering the one it replaced. Both memory and the file on
+    /// disk are capped at `REACTIONS_KEPT`, oldest evicted first.
     fn react(&mut self, message: &str, by: &str, emoji: Option<&str>) -> Option<String> {
+        self.load_reactions();
         let key = (message.to_owned(), by.to_owned());
+        let mut changed = false;
         let before = match emoji {
             Some(emoji) => {
-                if !self.reactions.contains_key(&key) {
-                    if self.reacted_order.len() >= REACTIONS_KEPT {
-                        if let Some(old) = self.reacted_order.pop_front() {
-                            self.reactions.remove(&old);
+                if self.reactions.get(&key).map(String::as_str) == Some(emoji) {
+                    Some(emoji.to_owned())
+                } else {
+                    changed = true;
+                    if let Some(pos) = self.reacted_order.iter().position(|k| k == &key) {
+                        self.reacted_order.remove(pos);
+                    } else {
+                        while self.reacted_order.len() >= REACTIONS_KEPT {
+                            if let Some(old) = self.reacted_order.pop_front() {
+                                self.reactions.remove(&old);
+                            }
                         }
                     }
                     self.reacted_order.push_back(key.clone());
+                    self.reactions.insert(key, emoji.to_owned())
                 }
-                self.reactions.insert(key, emoji.to_owned())
             }
-            None => self.reactions.remove(&key),
+            None => {
+                let removed = self.reactions.remove(&key);
+                if removed.is_some() {
+                    changed = true;
+                    self.reacted_order.retain(|k| k != &key);
+                }
+                removed
+            }
         };
+        if changed {
+            write_reactions(&self.reactions_path, &self.reacted_order, &self.reactions);
+        }
         before.filter(|before| Some(before.as_str()) != emoji)
     }
+}
+
+/// One kept reaction. The file is a list of these in oldest-to-newest order, owned by this
+/// adapter, not the message store.
+#[derive(Serialize, Deserialize)]
+struct KeptReaction {
+    message: String,
+    person: String,
+    emoji: String,
+}
+
+fn reactions_path(aci: &str) -> PathBuf {
+    protocol::support_dir().join("signal").join(format!("{aci}.reactions"))
+}
+
+fn read_reactions(path: &Path) -> Vec<KeptReaction> {
+    if path.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Vec::new();
+    };
+    if meta.len() > REACTIONS_FILE_LIMIT {
+        tracing::warn!("chatd: Signal: skipping oversized reaction record ({} bytes)", meta.len());
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<Vec<KeptReaction>>(&bytes).unwrap_or_default()
+}
+
+fn write_reactions(path: &Path, order: &VecDeque<(String, String)>, book: &HashMap<(String, String), String>) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            tracing::warn!("chatd: Signal: the reaction record directory could not be created");
+            return;
+        }
+    }
+    let rows: Vec<KeptReaction> = order
+        .iter()
+        .filter_map(|key| {
+            let emoji = book.get(key)?;
+            Some(KeptReaction { message: key.0.clone(), person: key.1.clone(), emoji: emoji.clone() })
+        })
+        .collect();
+    let Ok(bytes) = serde_json::to_vec(&rows) else {
+        return;
+    };
+    let temp = path.with_extension("tmp");
+    if std::fs::write(&temp, bytes).and_then(|()| std::fs::rename(&temp, path)).is_err() {
+        let _ = std::fs::remove_file(&temp);
+        tracing::warn!("chatd: Signal: the reaction record could not be kept");
+    }
+}
+
+/// The lab's signal-reaction-restart driver. A build without this keeps running.
+pub fn prove_signal_reaction_restart() -> Result<(), String> {
+    if std::env::var_os("TINYCLIENT_DIR").is_none() {
+        return Err("a scratch directory is required".into());
+    }
+    let path = protocol::support_dir().join("signal").join("prove-reaction-restart.reactions");
+    let _ = std::fs::remove_file(&path);
+    let message = "1791892801000-b2b2b2b2-0000-4000-8000-000000000002";
+    let person = "b2b2b2b2-0000-4000-8000-000000000002";
+    let mut live = Live { reactions_path: path.clone(), ..Live::default() };
+    if live.react(message, person, Some("👍")).is_some() {
+        return Err("a first reaction replaced one that was not there".into());
+    }
+    // What a restart is: the memory is new, the file is the same.
+    let mut live = Live { reactions_path: path, ..Live::default() };
+    match live.react(message, person, Some("❤️")) {
+        Some(old) if old == "👍" => {}
+        other => return Err(format!("a restart forgot the reaction, got {other:?}")),
+    }
+    let held = read_reactions(&live.reactions_path)
+        .into_iter()
+        .find(|row| row.message == message && row.person == person)
+        .map(|row| row.emoji);
+    if held.as_deref() != Some("❤️") {
+        return Err(format!("the kept reaction is {held:?}"));
+    }
+    Ok(())
 }
 
 /// One connection's worth of an account: what both threads of the adapter share.
@@ -330,8 +764,9 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     if !supported() {
         return Err(unsupported_reason());
     }
-    // What is learned (names, settings, unread) outlives one connection.
-    let live: Arc<Mutex<Live>> = Arc::default();
+    // What is learned (names, settings, unread) outlives one connection. Reactions outlive the
+    // process: the file is what a later reaction replaces, once this memory is gone.
+    let live = Arc::new(Mutex::new(Live { reactions_path: reactions_path(&saved.aci), ..Live::default() }));
     let current: Arc<Mutex<Option<Arc<Account>>>> = Arc::default();
     let (socket_ctx, held, socket_saved, socket_live) = (ctx.clone(), current.clone(), saved.clone(), live.clone());
     std::thread::Builder::new()
@@ -384,6 +819,8 @@ fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mute
     let account = Arc::new(Account { ctx: ctx.clone(), wire, me, name, live: live.clone(), pictured: Mutex::default() });
     let _ = ctx.describe(if account.name.is_empty() { "Signal" } else { &account.name }, &account.me);
     show_self(&account);
+    // Nothing is counted until an adapter says so; Signal counts its own body limit.
+    ctx.capabilities(capabilities());
     *current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(account.clone());
     // Dropped while connecting: the command thread has gone and will not close this wire.
     if ctx.stopped() {
@@ -455,15 +892,18 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
     } else {
         text.name.clone()
     };
-    let words = match (&text.unsupported, text.text.is_empty()) {
-        (Some(what), true) => what.clone(),
-        (Some(what), false) => format!("{what}: {}", text.text),
-        (None, _) => text.text.clone(),
+    let (words, shift) = match (&text.unsupported, text.text.is_empty()) {
+        (Some(what), true) => (what.clone(), None),
+        (Some(what), false) => (format!("{what}: {}", text.text), Some(format!("{what}: ").len() as u32)),
+        (None, _) => (text.text.clone(), Some(0)),
     };
     let sent = i64::try_from(text.sent / 1_000).unwrap_or(0);
     let mut message = Message::plain(wire::message_id(text.sent, author), name, words, sent, outgoing);
     message.sender.id = author.to_owned();
     message.mentions_me = text.mentions_me && !outgoing;
+    if let Some(shift) = shift {
+        message.spans = text.spans.iter().map(|span| Span { start: span.start + shift, end: span.end + shift, style: span.style.clone() }).collect();
+    }
     if text.unsupported.is_some() {
         message.kind = MessageKind::Unsupported { link: String::new() };
     }
@@ -473,10 +913,11 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
 
 fn reply_to(account: &Account, quote: &Quote) -> ReplyTo {
     let sender = if quote.author == account.me { account.name.clone() } else { account.live().name(&quote.author) };
+    let snippet = crate::store::without_spoilers(&quote.text, &quote.spans);
     ReplyTo {
         id: wire::message_id(quote.sent, &quote.author),
         sender,
-        snippet: quote.text.chars().take(200).collect(),
+        snippet: snippet.chars().take(200).collect(),
         person: Some(account.ctx.key(&quote.author)),
         deleted: false,
     }
@@ -519,8 +960,34 @@ fn apply(account: &Account, event: Event) {
                 let peer = Peer::Group(group.id.clone());
                 let mut row = row(&peer, &group.title);
                 row.topic = group.description.chars().take(300).collect();
+                row.read_only = !group.member;
                 row.avatar = ctx.avatar_of(&row.id);
                 let _ = ctx.conversation(&row);
+            }
+        }
+        Event::GroupChanged { peer, changes, title, description, left, rejoined, .. } => {
+            let id = peer.conversation();
+            let known = ctx.known(&id).ok().flatten();
+            if title.is_some() || description.is_some() || left || rejoined {
+                let title = title.unwrap_or_else(|| known.as_ref().map(|row| row.title.clone()).unwrap_or_default());
+                let mut row = row(&peer, &title);
+                row.topic = description.unwrap_or_else(|| known.as_ref().map(|row| row.topic.clone()).unwrap_or_default()).chars().take(300).collect();
+                // A later rename does not put a removed member back, while re-adding clears read-only.
+                row.read_only = if left {
+                    true
+                } else if rejoined {
+                    false
+                } else {
+                    known.as_ref().is_some_and(|row| row.read_only)
+                };
+                row.avatar = ctx.avatar_of(&row.id);
+                let _ = ctx.conversation(&row);
+            }
+            let sent_ms = now_ms();
+            for (at, line) in changes.iter().enumerate() {
+                let mut message = Message::plain(format!("signal-system-{sent_ms}-{at}"), String::new(), line.clone(), (sent_ms / 1_000) as i64, false);
+                message.kind = MessageKind::System;
+                let _ = ctx.message(&id, &message);
             }
         }
         Event::Message { peer, text, outgoing } => {
@@ -543,6 +1010,17 @@ fn apply(account: &Account, event: Event) {
                     }
                 }
             }
+            // A file we sent is already stored with that file. The phone's copy of the same
+            // send is text, and would replace the row.
+            let had_file = outgoing
+                && ctx
+                    .stored_message(&conversation, &wire::message_id(text.sent, &account.me))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|stored| !stored.attachments.is_empty());
+            if outgoing && (account.live().echoed_file(text.sent) || files::replace_outgoing_sync(had_file)) {
+                return;
+            }
             let message = message(account, &text, outgoing);
             if outgoing {
                 account.live().sent(text.sent, &conversation);
@@ -551,16 +1029,79 @@ fn apply(account: &Account, event: Event) {
             }
             let _ = ctx.message(&conversation, &message);
         }
-        Event::Edited { peer, author, target, text } => {
+        Event::Edited { peer, author, target, text, spans } => {
+            // A late edit is ignored by every other client. Keeping it here would show words
+            // nobody else has.
+            if !accept_remote(target, now_ms(), note_to_self(account, &peer)) {
+                return;
+            }
             let conversation = peer.conversation();
             if let Ok(Some(mut message)) = ctx.stored_message(&conversation, &wire::message_id(target, &author)) {
                 message.text = text;
+                message.spans = spans;
                 message.edited = true;
                 let _ = ctx.message(&conversation, &message);
             }
         }
         Event::Deleted { peer, author, target } => {
+            if !accept_remote(target, now_ms(), note_to_self(account, &peer)) {
+                return;
+            }
             let _ = ctx.deleted(&peer.conversation(), &wire::message_id(target, &author));
+        }
+        // Delete for me has no time limit: the phone already decided, and only this account is told.
+        Event::DeletedForMe { peer, author, target } => {
+            let _ = ctx.deleted(&peer.conversation(), &wire::message_id(target, &author));
+        }
+        Event::Forgot(peer) => {
+            let _ = ctx.forget_conversation(&peer.conversation());
+        }
+        Event::Poll { peer, author, name, sent, question, options, multiple, outgoing } => {
+            if !outgoing && !name.is_empty() {
+                let mut live = account.live();
+                if !live.names.contains_key(&author) {
+                    live.names.insert(author.clone(), name.clone());
+                }
+            }
+            let conversation = peer.conversation();
+            match &peer {
+                Peer::Direct(aci) => {
+                    let title = account.live().names.get(aci).cloned().unwrap_or_default();
+                    ensure_row(account, &peer, &title);
+                }
+                Peer::Group(_) => {
+                    if let Ok(None) = ctx.known(&conversation) {
+                        let _ = ctx.conversation(&row(&peer, ""));
+                    }
+                }
+            }
+            let message = with_poll(account, &author, &name, sent, outgoing, Poll::open(question, options, multiple));
+            if outgoing {
+                account.live().sent(sent, &conversation);
+            } else {
+                account.live().unread(&conversation, &author, sent);
+            }
+            let _ = ctx.message(&conversation, &message);
+        }
+        Event::PollVote { peer, by, author, target, indexes, serial } => {
+            let conversation = peer.conversation();
+            let id = wire::message_id(target, &author);
+            if let Ok(Some(mut message)) = ctx.stored_message(&conversation, &id) {
+                let changed = message.poll.as_mut().is_some_and(|poll| apply_ballot(poll, &by, indexes, serial, &account.me));
+                if changed {
+                    let _ = ctx.message(&conversation, &message);
+                }
+            }
+        }
+        Event::PollEnded { peer, author, target } => {
+            let conversation = peer.conversation();
+            let id = wire::message_id(target, &author);
+            if let Ok(Some(mut message)) = ctx.stored_message(&conversation, &id) {
+                if let Some(poll) = message.poll.as_mut().filter(|poll| !poll.closed) {
+                    poll.closed = true;
+                    let _ = ctx.message(&conversation, &message);
+                }
+            }
         }
         Event::Reacted { peer, by, author, target, emoji, removed } => {
             let conversation = peer.conversation();
@@ -596,6 +1137,8 @@ fn apply(account: &Account, event: Event) {
                 ctx.typing_stopped(&conversation, &by);
             }
         }
+        Event::Call { peer, by, name, video, id, sent } => incoming_call(account, &peer, &by, &name, video, id, sent),
+        Event::CallEnded { id, answered } => ended_call(account, id, answered),
         Event::Settings { read_receipts, typing } => {
             let mut live = account.live();
             live.read_receipts = read_receipts;
@@ -637,11 +1180,156 @@ fn read_elsewhere(account: &Account, read: &[(String, u64)]) {
     }
 }
 
+/// Whether an offer sent `sent` (ms) is recent enough to ring for. One from before we
+/// connected is a call that is long over.
+fn fresh_call(sent: u64) -> bool {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis() as u64);
+    sent <= now && now - sent <= (CALL_STALE as u64) * 1_000
+}
+
+/// Someone is calling: their row is recorded (a ring names a conversation the list may not
+/// have yet), and the ring is one notification with one action, "Answer on your phone" —
+/// a Signal call is answered on the phone, never here. An offer that waited while we were
+/// away is remembered for its end, but not replayed as a ring. Only a person calls here: a
+/// group's ring update is a blob the wire cannot open, so it never names a conversation.
+fn incoming_call(account: &Account, peer: &Peer, by: &str, name: &str, video: bool, id: u64, sent: u64) {
+    if by == account.me || !matches!(peer, Peer::Direct(_)) {
+        return;
+    }
+    let conversation = peer.conversation();
+    let caller = if name.is_empty() { account.live().name(by) } else { name.to_owned() };
+    ensure_row(account, peer, &caller);
+    // The newest offer takes the one ring slot. An older or replayed one leaves both the slot
+    // and the ring alone: a displaced call's hangup matches nothing here, and a losing offer
+    // must not ring for a note its own hangup could not end.
+    if account.live().ring.as_ref().is_none_or(|held| held.sent < sent) {
+        account.live().ring = Some(Ring { id, conversation: conversation.clone(), author: by.to_owned(), video, sent });
+        if fresh_call(sent) {
+            account.ctx.phone_ring(&conversation, &caller);
+        }
+    }
+}
+
+/// The call ended: the ring goes, and a call nobody answered here leaves the line the other
+/// networks leave. One answered on the phone leaves none, because it was not missed.
+fn ended_call(account: &Account, id: u64, answered: bool) {
+    if account.live().ring.as_ref().is_none_or(|ring| ring.id != id) {
+        return;
+    }
+    let Some(ring) = account.live().ring.take() else {
+        return;
+    };
+    account.ctx.phone_ring_stopped(&ring.conversation);
+    if answered {
+        return;
+    }
+    let mut line = Message::plain(
+        wire::message_id(ring.sent, &ring.author),
+        account.live().name(&ring.author),
+        if ring.video { "Missed video call" } else { "Missed voice call" },
+        i64::try_from(ring.sent / 1_000).unwrap_or(0),
+        false,
+    );
+    line.kind = MessageKind::System;
+    line.sender.id = ring.author;
+    let _ = account.ctx.quiet_line(&ring.conversation, &line, true);
+}
+
+/// A Signal username as libsignal's `Username::new` accepts one: `nickname.42`, optionally with
+/// one leading `@`. A plain name, a phone number, and a `signal.me` link are not usernames, so
+/// they are not sent to Signal.
+fn username_of(query: &str) -> Option<&str> {
+    let username = query.trim().strip_prefix('@').unwrap_or(query.trim());
+    let (nickname, discriminator) = username.rsplit_once('.')?;
+    (nickname_ok(nickname) && discriminator_ok(discriminator)).then_some(username)
+}
+
+/// Nickname: 1 to 48 of `[_0-9A-Za-z]`, and not starting with a digit. libsignal's hard limit.
+fn nickname_ok(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first.is_ascii_digit() || !nickname_char(first) {
+        return false;
+    }
+    let mut count = 1usize;
+    for ch in chars {
+        if !nickname_char(ch) {
+            return false;
+        }
+        count += 1;
+        if count > 48 {
+            return false;
+        }
+    }
+    true
+}
+
+fn nickname_char(ch: char) -> bool {
+    matches!(ch, '_' | 'a'..='z' | 'A'..='Z' | '0'..='9')
+}
+
+/// Discriminator: at least two digits, not zero, and no leading zero once it is longer than two.
+/// `01` is a username; `1` and `042` are not.
+fn discriminator_ok(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() || bytes.len() == 1 || !bytes.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    if bytes.len() > 2 && bytes[0] == b'0' {
+        return false;
+    }
+    text.parse::<u64>().ok().is_some_and(|value| value != 0)
+}
+
+/// Looks up a username and stores the account it names. Anything else only finishes the search.
+fn search_people(account: &Account, query: &str) {
+    if let Some(username) = username_of(query) {
+        match account.wire.lookup(username) {
+            Ok(Some(aci)) if wire::is_aci(&aci) => {
+                let name = account.live().names.entry(aci.clone()).or_insert_with(|| username.to_owned()).clone();
+                let _ = account.ctx.people(&[PersonRow {
+                    avatar: account.ctx.avatar_of(&aci),
+                    id: aci,
+                    name,
+                    handle: username.to_owned(),
+                    ..PersonRow::default()
+                }]);
+            }
+            Ok(_) => {}
+            Err(fault) => tracing::warn!("chatd: Signal: username: {}", super::net::redact(&fault.to_string())),
+        }
+    }
+    account.ctx.searched(query);
+}
+
+/// The lab checks this without a Signal account: which typed queries are usernames.
+pub fn prove_signal_username() -> Result<(), String> {
+    for username in ["ada.42", "@ada.42", "Ada.42", "@Ada.42", "He110.01", "usr.999999999", "_identifier.42"] {
+        if username_of(username).is_none() {
+            return Err(format!("{username} should be a username"));
+        }
+    }
+    if username_of("@Ada.42") != Some("Ada.42") {
+        return Err("a leading @ is not part of the username".to_owned());
+    }
+    for query in ["Grace", "+15550100002", "https://signal.me/#eu/abc", "ada.1", "ada.042", "1ada.42", "ada.00"] {
+        if username_of(query).is_some() {
+            return Err(format!("{query} should not be looked up"));
+        }
+    }
+    Ok(())
+}
+
 /// Answers a command while there is no connection.
 fn offline(ctx: &Context, command: Command) {
     let down = || Refusal::Refused("Signal is offline.".to_owned());
     match command {
-        Command::Send { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Signal is offline.".to_owned())),
+        Command::Send { conversation_id, client_id, .. } | Command::SendWith { conversation_id, client_id, .. } => {
+            ctx.sent(&conversation_id, &client_id, Err("Signal is offline.".to_owned()));
+        }
+        Command::CancelSend { client_id, .. } => upload::cancel(&ctx.account, &client_id),
         Command::React { reply, .. } | Command::Edit { reply, .. } | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
         Command::StartDirect { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
@@ -657,6 +1345,20 @@ pub fn reaction_rules() -> protocol::ReactionRules {
     protocol::ReactionRules { mine: 1, replaces: true, ..protocol::ReactionRules::default() }
 }
 
+/// What this account may send: text up to the body other clients keep in the message itself,
+/// files up to Signal's limits, and a one-day edit window (how long Signal Desktop still sends an
+/// edit; a late delete is delete-for-me instead, decided in `delete`).
+fn capabilities() -> protocol::Capabilities {
+    let files = files::capabilities();
+    protocol::Capabilities {
+        text_limit: TEXT_LIMIT,
+        edit_window: (SEND_WINDOW_MS / 1_000) as u32,
+        max_file_bytes: files.max_file_bytes,
+        max_files: files.max_files,
+        ..protocol::Capabilities::default()
+    }
+}
+
 fn serve(account: &Arc<Account>, command: Command) {
     let ctx = &account.ctx;
     match command {
@@ -665,12 +1367,29 @@ fn serve(account: &Arc<Account>, command: Command) {
             let outcome = send_text(account, &conversation_id, &text, reply_to.as_deref());
             ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
         }
+        Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+            if let Some(draft) = with.poll.clone() {
+                if !with.files.is_empty() {
+                    ctx.sent(&conversation_id, &client_id, Err("A poll can't carry a file.".to_owned()));
+                } else {
+                    let outcome = send_poll(account, &conversation_id, &draft, reply_to.as_deref());
+                    ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
+                }
+            } else {
+                send_with(account, &conversation_id, &client_id, &text, reply_to.as_deref(), *with);
+            }
+        }
+        Command::CancelSend { client_id, .. } => upload::cancel(&account.ctx.account, &client_id),
         Command::React { conversation_id, message_id, emoji, on, reply } => {
             let _ = reply.send(react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
         }
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
         Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
-            let _ = reply.send(edit(account, &conversation_id, &message_id, &text).map_err(refused));
+            let answered = match poll_action(&text) {
+                Some(act) => poll_act(account, &conversation_id, &message_id, act),
+                None => edit(account, &conversation_id, &message_id, &text),
+            };
+            let _ = reply.send(answered.map_err(refused));
         }
         Command::Delete { conversation_id, message_id, reply } => {
             let _ = reply.send(delete(account, &conversation_id, &message_id).map_err(refused));
@@ -685,8 +1404,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             });
             let _ = reply.send(started.ok_or_else(|| Refusal::Refused("That person can't be messaged from here.".to_owned())));
         }
-        // Signal has no directory to search: the people known are the contacts already stored.
-        Command::SearchPeople(query) => ctx.searched(&query),
+        Command::SearchPeople(query) => search_people(account, &query),
         Command::Watch(watching) => pictures(account, &watching),
         Command::SignOut(reply) => {
             if let Err(fault) = account.wire.unlink() {
@@ -806,19 +1524,133 @@ fn target(message_id: &str) -> Result<(u64, String), Fault> {
     wire::parse_message_id(message_id).ok_or_else(|| Fault::Refused("That message is no longer there.".to_owned()))
 }
 
-fn send_text(account: &Account, conversation: &str, text: &str, reply_to: Option<&str>) -> Result<Message, Fault> {
-    let to = peer(conversation)?;
-    let quote = match reply_to.map(target).transpose()? {
+/// The words a quote quotes of a stored message: without the note that the rest is on the
+/// phone, which is this device's invention for drawing the message and never travels.
+fn quoted_words(text: &str) -> String {
+    text.strip_suffix(wire::CONTINUES).map_or_else(|| text.to_owned(), str::to_owned)
+}
+
+fn quote_of(account: &Account, conversation: &str, reply_to: Option<&str>) -> Result<Option<Quote>, Fault> {
+    Ok(match reply_to.map(target).transpose()? {
         Some((sent, author)) => {
-            let text = account.ctx.stored_message(conversation, &wire::message_id(sent, &author)).ok().flatten().map_or_else(String::new, |m| m.text);
-            Some(Quote { sent, author, text })
+            let stored = account.ctx.stored_message(conversation, &wire::message_id(sent, &author)).ok().flatten();
+            let (text, spans) = stored.map_or_else(|| (String::new(), Vec::new()), |message| (quoted_words(&message.text), message.spans));
+            Some(Quote { sent, author, text, spans })
         }
         None => None,
+    })
+}
+
+fn send_text(account: &Account, conversation: &str, text: &str, reply_to: Option<&str>) -> Result<Message, Fault> {
+    let to = peer(conversation)?;
+    let (plain, ranges) = style::parse(text);
+    let spans = style::spans(&plain, &ranges);
+    let quote = quote_of(account, conversation, reply_to)?;
+    let sent = account.wire.send(&to, Body::Text { text: plain.clone(), quote: quote.clone(), ranges })?;
+    account.live().sent(sent, conversation);
+    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: plain, spans, quote, ..Text::default() };
+    Ok(message(account, &words, true))
+}
+
+/// Files go on the upload thread: each is read in parts, then handed to Signal as one message.
+fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: Outgoing) {
+    if let Some(why) = files::refused(&with) {
+        account.ctx.sent(conversation, client_id, Err(why));
+        return;
+    }
+    if with.files.is_empty() {
+        let outcome = send_text(account, conversation, text, reply_to).map_err(|fault| fault.words());
+        account.ctx.sent(conversation, client_id, outcome);
+        return;
+    }
+    let account = Arc::clone(account);
+    let conversation = conversation.to_owned();
+    let text = text.to_owned();
+    let reply_to = reply_to.map(str::to_owned);
+    let client_id_owned = client_id.to_owned();
+    let ctx = account.ctx.clone();
+    let conversation_id = conversation.clone();
+    upload::spawn(&ctx, &conversation_id, client_id, &with.files, move |upload| {
+        send_files(&account, &conversation, &client_id_owned, &text, reply_to.as_deref(), upload)
+    });
+}
+
+fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, upload: &mut Upload) -> Result<Message, String> {
+    if upload.files().len() > files::MAX_FILES as usize {
+        return Err(format!("Signal takes at most {} files in one message.", files::MAX_FILES));
+    }
+    let count = upload.files().len();
+    let mut prepared = Vec::with_capacity(count);
+    for at in 0..count {
+        let name = upload.files()[at].name.clone();
+        let mime = upload.files()[at].mime.to_owned();
+        let keep = upload.files()[at].as_file || upload.files()[at].original;
+        let len = upload.files()[at].bytes;
+        if let Some(why) = files::too_big(&name, len) {
+            return Err(why);
+        }
+        let mut bytes = Vec::new();
+        upload.parts(at, 1024 * 1024, 0, |part| {
+            bytes.extend_from_slice(part.bytes);
+            Ok(())
+        })?;
+        prepared.push(files::prepare(&name, &mime, bytes, keep));
+    }
+    upload.check()?;
+    let to = peer(conversation).map_err(|fault| fault.words())?;
+    let quote = quote_of(account, conversation, reply_to).map_err(|fault| fault.words())?;
+    // Write each file to disk first, then move that one copy to Signal. Cloning `prepared`
+    // would keep every payload in memory a second time for the whole upload.
+    let attachments: Vec<_> = prepared.iter().enumerate().map(|(index, file)| show_file(account, client_id, index, file)).collect();
+    let sent = match account.wire.send(&to, Body::Files { text: text.to_owned(), quote: quote.clone(), files: prepared }) {
+        Ok(sent) => sent,
+        Err(fault) => {
+            forget_landed(&attachments);
+            return Err(fault.words());
+        }
     };
-    let sent = account.wire.send(&to, Body::Text { text: text.to_owned(), quote: quote.clone() })?;
+    account.live().echoed(sent);
     account.live().sent(sent, conversation);
     let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: text.to_owned(), quote, ..Text::default() };
-    Ok(message(account, &words, true))
+    let mut message = message(account, &words, true);
+    message.attachments = attachments;
+    Ok(message)
+}
+
+/// The file as the row shows it, kept here so it stays after the staged copy is removed.
+/// The id is the shell's client id, known before Signal names the message, so the bytes can
+/// be written once and then moved to the wire.
+fn show_file(account: &Account, client_id: &str, index: usize, file: &wire::File) -> Attachment {
+    let mut media = MediaFile::new(format!("signal:{client_id}:{index}"), files::kind(&file.mime));
+    media.width = file.width;
+    media.height = file.height;
+    media.bytes = file.bytes.len() as u64;
+    if let Some(landed) = account.ctx.landed(&media, &format!("signal://file/{client_id}/{index}"), &file.bytes) {
+        media = landed;
+    }
+    let mut attachment = Attachment::new(file.name.clone(), media);
+    attachment.mime = file.mime.clone();
+    if !file.thumb.is_empty() {
+        let thumb = MediaFile::new(format!("signal:{client_id}:{index}:thumb"), MediaKind::Image);
+        if let Some(landed) = account.ctx.landed(&thumb, &format!("signal://file/{client_id}/{index}/thumb"), &file.thumb) {
+            attachment.thumb = Some(landed);
+        }
+    }
+    attachment
+}
+
+/// A send that did not go must not leave its files on disk.
+fn forget_landed(attachments: &[Attachment]) {
+    for attachment in attachments {
+        if let Some(path) = &attachment.file.path {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(thumb) = &attachment.thumb {
+            if let Some(path) = &thumb.path {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
 }
 
 fn react(account: &Account, conversation: &str, message_id: &str, emoji: &str, on: bool) -> Result<(), Fault> {
@@ -844,21 +1676,40 @@ fn own(account: &Account, message_id: &str) -> Result<u64, Fault> {
 fn edit(account: &Account, conversation: &str, message_id: &str, text: &str) -> Result<(), Fault> {
     let to = peer(conversation)?;
     let sent = own(account, message_id)?;
-    account.wire.send(&to, Body::Edit { target: sent, text: text.to_owned() })?;
+    if !can(sent, now_ms(), true, conversation == account.me).edit {
+        return Err(Fault::Refused("This message can no longer be edited.".to_owned()));
+    }
+    let (plain, ranges) = style::parse(text);
+    let spans = style::spans(&plain, &ranges);
+    account.wire.send(&to, Body::Edit { target: sent, text: plain.clone(), ranges })?;
     if let Ok(Some(mut message)) = account.ctx.stored_message(conversation, message_id) {
-        message.text = text.to_owned();
+        message.text = plain;
+        message.spans = spans;
         message.edited = true;
         let _ = account.ctx.message(conversation, &message);
     }
     Ok(())
 }
 
+/// The lab's signal-text-styles driver. A build without this keeps running.
+pub fn prove_signal_styles() -> Result<(), String> {
+    style::prove()
+}
+
 fn delete(account: &Account, conversation: &str, message_id: &str) -> Result<(), Fault> {
     let to = peer(conversation)?;
-    let sent = own(account, message_id)?;
-    account.wire.send(&to, Body::Delete { target: sent })?;
+    let (sent, author) = target(message_id)?;
+    let offer = can(sent, now_ms(), author == account.me, conversation == account.me);
+    // Past the window, other clients ignore a delete for everyone. Tell only this account's
+    // devices, and remove it here either way.
+    let body = if offer.delete_for_everyone { Body::Delete { target: sent } } else { Body::DeleteForMe { author, target: sent } };
+    account.wire.send(&to, body)?;
     let _ = account.ctx.deleted(conversation, message_id);
     Ok(())
+}
+
+fn note_to_self(account: &Account, peer: &Peer) -> bool {
+    matches!(peer, Peer::Direct(aci) if aci == &account.me)
 }
 
 /// The user read up to a message: the user's other devices are told, and the authors too when
@@ -883,6 +1734,202 @@ fn mark_read(account: &Account, conversation: &str, message_id: &str) {
     }
 }
 
+/// What a `Request::Poll` asked for, once the sentinel is read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollAct {
+    /// Replace our vote. Empty takes it back.
+    Vote(Vec<u32>),
+    /// End the poll. Only its author may.
+    End,
+}
+
+/// Packs a poll request into the edit text the Signal command thread already understands.
+pub fn poll_command(votes: Option<&[u32]>) -> String {
+    match votes {
+        None => POLL_END.to_owned(),
+        Some(votes) => {
+            let list = votes.iter().take(POLL_MOST).map(|index| index.to_string()).collect::<Vec<_>>().join(",");
+            format!("{POLL_VOTE}{list}")
+        }
+    }
+}
+
+/// The other way. `None` is an ordinary edit.
+pub fn poll_action(text: &str) -> Option<PollAct> {
+    if text == POLL_END {
+        return Some(PollAct::End);
+    }
+    let rest = text.strip_prefix(POLL_VOTE)?;
+    if rest.is_empty() {
+        return Some(PollAct::Vote(Vec::new()));
+    }
+    let mut votes = Vec::new();
+    for part in rest.split(',') {
+        votes.push(part.parse().ok()?);
+    }
+    Some(PollAct::Vote(votes))
+}
+
+/// What `TINYCLIENT_PROVE=signal-poll` checks, with no account and no network: a vote, a
+/// retraction and an end pack and unpack, and ordinary text does not.
+pub fn prove_signal_poll() -> Result<(), String> {
+    match poll_action(&poll_command(Some(&[0, 2]))) {
+        Some(PollAct::Vote(indexes)) if indexes == [0, 2] => {}
+        _ => return Err("a vote did not round-trip".into()),
+    }
+    match poll_action(&poll_command(Some(&[]))) {
+        Some(PollAct::Vote(indexes)) if indexes.is_empty() => {}
+        _ => return Err("taking a vote back did not round-trip".into()),
+    }
+    match poll_action(&poll_command(None)) {
+        Some(PollAct::End) => {}
+        _ => return Err("ending a poll did not round-trip".into()),
+    }
+    if poll_action("Dinner?").is_some() {
+        return Err("plain text was read as a poll".into());
+    }
+    Ok(())
+}
+
+fn checked_draft(draft: &PollDraft) -> Result<(String, Vec<String>, bool), Fault> {
+    let question = draft.question.trim();
+    if question.is_empty() {
+        return Err(Fault::Refused("A poll needs a question.".into()));
+    }
+    if question.chars().count() > POLL_CHARS {
+        return Err(Fault::Refused("A poll's question can be at most 100 characters.".into()));
+    }
+    let options: Vec<String> = draft.options.iter().map(|option| option.trim().to_owned()).filter(|option| !option.is_empty()).collect();
+    if options.len() < 2 {
+        return Err(Fault::Refused("A poll needs at least two choices.".into()));
+    }
+    if options.len() > POLL_MOST {
+        return Err(Fault::Refused("A poll can have at most 10 choices.".into()));
+    }
+    if options.iter().any(|option| option.chars().count() > POLL_CHARS) {
+        return Err(Fault::Refused("A poll's choice can be at most 100 characters.".into()));
+    }
+    Ok((question.to_owned(), options, draft.multiple))
+}
+
+fn with_poll(account: &Account, author: &str, name: &str, sent: u64, outgoing: bool, mut poll: Poll) -> Message {
+    protocol::clip(&mut poll.question, POLL_CHARS);
+    let words = Text { author: author.to_owned(), name: name.to_owned(), sent, text: format!("Poll: {}", poll.question), ..Text::default() };
+    let mut message = message(account, &words, outgoing);
+    message.poll = Some(Box::new(poll));
+    message
+}
+
+/// Records one person's vote, replacing their earlier one when `serial` is newer. `serial` of 0
+/// means this vote follows the one we already have.
+fn apply_ballot(poll: &mut Poll, person: &str, mut choices: Vec<u32>, serial: u32, me: &str) -> bool {
+    if poll.closed {
+        return false;
+    }
+    choices.retain(|index| (*index as usize) < poll.choices.len());
+    choices.sort_unstable();
+    choices.dedup();
+    if !poll.multiple {
+        choices.truncate(1);
+    }
+    let serial = if serial == 0 { poll.ballots.iter().find(|ballot| ballot.person == person).map(|ballot| ballot.serial.saturating_add(1)).unwrap_or(1) } else { serial };
+    if let Some(existing) = poll.ballots.iter().find(|ballot| ballot.person == person) {
+        if serial <= existing.serial {
+            return false;
+        }
+    }
+    if poll.ballots.len() >= BALLOTS_KEPT && !poll.ballots.iter().any(|ballot| ballot.person == person) {
+        poll.ballots.remove(0);
+    }
+    poll.ballots.retain(|ballot| ballot.person != person);
+    poll.ballots.push(PollBallot { person: person.to_owned(), choices, serial });
+    recount(poll, me);
+    true
+}
+
+fn recount(poll: &mut Poll, me: &str) {
+    let ballots = poll.ballots.clone();
+    for choice in &mut poll.choices {
+        choice.voters.clear();
+        choice.count = 0;
+    }
+    for ballot in &ballots {
+        for index in &ballot.choices {
+            if let Some(choice) = poll.choices.get_mut(*index as usize) {
+                choice.count = choice.count.saturating_add(1);
+                if choice.voters.len() < protocol::POLL_VOTERS {
+                    choice.voters.push(ballot.person.clone());
+                }
+            }
+        }
+    }
+    poll.mine = ballots.into_iter().find(|ballot| ballot.person == me).map(|ballot| ballot.choices).unwrap_or_default();
+}
+
+fn chosen(poll: &Poll, indexes: &[u32]) -> Result<Vec<u32>, Fault> {
+    if indexes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if indexes.iter().any(|index| *index as usize >= poll.choices.len()) {
+        return Err(Fault::Refused("That choice is not on this poll.".into()));
+    }
+    let mut indexes = indexes.to_vec();
+    indexes.sort_unstable();
+    indexes.dedup();
+    if !poll.multiple && indexes.len() > 1 {
+        return Err(Fault::Refused("This poll takes one choice.".into()));
+    }
+    Ok(indexes)
+}
+
+fn send_poll(account: &Account, conversation: &str, draft: &PollDraft, _reply_to: Option<&str>) -> Result<Message, Fault> {
+    let to = peer(conversation)?;
+    let (question, options, multiple) = checked_draft(draft)?;
+    let sent = account.wire.send(&to, Body::Poll { question: question.clone(), options: options.clone(), multiple })?;
+    account.live().sent(sent, conversation);
+    Ok(with_poll(account, &account.me, &account.name, sent, true, Poll::open(question, options, multiple)))
+}
+
+fn poll_act(account: &Account, conversation: &str, message_id: &str, act: PollAct) -> Result<(), Fault> {
+    let to = peer(conversation)?;
+    let (sent, author) = target(message_id)?;
+    let Some(mut message) = account.ctx.stored_message(conversation, message_id).ok().flatten() else {
+        return Err(Fault::Refused("That message is no longer there.".into()));
+    };
+    let Some(poll) = message.poll.as_ref() else {
+        return Err(Fault::Refused("That is not a poll.".into()));
+    };
+    match act {
+        PollAct::End => {
+            if author != account.me {
+                return Err(Fault::Refused("Only the person who started this poll can end it.".into()));
+            }
+            if poll.closed {
+                return Ok(());
+            }
+            account.wire.send(&to, Body::PollEnd { target: sent })?;
+            if let Some(poll) = message.poll.as_mut() {
+                poll.closed = true;
+            }
+            let _ = account.ctx.message(conversation, &message);
+            Ok(())
+        }
+        PollAct::Vote(indexes) => {
+            if poll.closed {
+                return Err(Fault::Refused("This poll has ended.".into()));
+            }
+            let choices = chosen(poll, &indexes)?;
+            let serial = poll.ballots.iter().find(|ballot| ballot.person == account.me).map(|ballot| ballot.serial.saturating_add(1)).unwrap_or(1);
+            account.wire.send(&to, Body::PollVote { author, target: sent, indexes: choices.clone(), serial })?;
+            if let Some(poll) = message.poll.as_mut() {
+                apply_ballot(poll, &account.me, choices, serial, &account.me);
+            }
+            let _ = account.ctx.message(conversation, &message);
+            Ok(())
+        }
+    }
+}
+
 fn typing(account: &Account, conversation: &str) {
     let Some(to) = Peer::parse(conversation) else {
         return;
@@ -898,9 +1945,84 @@ fn typing(account: &Account, conversation: &str) {
     let _ = account.wire.typing(&to, true);
 }
 
+/// What the message menu may offer. `sent_ms` and `now_ms` are milliseconds. `own` is a message
+/// this account sent. `note_to_self` is the chat with oneself, which has no delete-for-everyone limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Offer {
+    pub edit: bool,
+    /// Delete for everyone. Note to Self has no time limit; every other chat has one day.
+    pub delete_for_everyone: bool,
+    /// Always. This removes the message on this account's devices only.
+    pub delete_for_me: bool,
+}
+
+/// Signal Desktop sends an edit or a delete for everyone for one day. Delete for me is always offered.
+pub fn can(sent_ms: u64, now_ms: u64, own: bool, note_to_self: bool) -> Offer {
+    let within_day = now_ms.saturating_sub(sent_ms) <= SEND_WINDOW_MS;
+    Offer { edit: own && within_day, delete_for_everyone: own && (note_to_self || within_day), delete_for_me: true }
+}
+
+/// An incoming edit or delete for everyone is kept for two days, and without a limit in Note to Self.
+pub fn accept_remote(sent_ms: u64, now_ms: u64, note_to_self: bool) -> bool {
+    note_to_self || now_ms.saturating_sub(sent_ms) <= RECEIVE_WINDOW_MS
+}
+
+/// The lab driver for `signal-delete-for-me`. A build that offers a late delete for everyone fails.
+pub fn prove_signal_delete_for_me() -> Result<(), String> {
+    let hour = 60 * 60 * 1000;
+    let now = 50 * hour;
+    let recent = can(now - hour, now, true, false);
+    if !recent.edit || !recent.delete_for_everyone || !recent.delete_for_me {
+        return Err("a recent message must offer an edit and both deletes".into());
+    }
+    let late = can(now - 25 * hour, now, true, false);
+    if late.edit || late.delete_for_everyone || !late.delete_for_me {
+        return Err("a day-old message must offer only delete for me".into());
+    }
+    let note = can(now - 25 * hour, now, true, true);
+    if !note.delete_for_everyone || note.edit {
+        return Err("note to self keeps delete for everyone and still closes the edit window".into());
+    }
+    let theirs = can(now - hour, now, false, false);
+    if theirs.edit || theirs.delete_for_everyone || !theirs.delete_for_me {
+        return Err("someone else's message offers only delete for me".into());
+    }
+    if !accept_remote(now - 47 * hour, now, false) || accept_remote(now - 49 * hour, now, false) {
+        return Err("an incoming delete for everyone is kept for two days".into());
+    }
+    if !accept_remote(now - 49 * hour, now, true) {
+        return Err("note to self keeps an old delete for everyone".into());
+    }
+    Ok(())
+}
+
+/// The lab's signal-send-file driver. A build without the hook stays up, so the driver fails there.
+pub fn prove_signal_send_file() -> Result<(), String> {
+    let can = files::capabilities();
+    if can.max_file_bytes != files::MAX_FILE_BYTES || can.max_files != files::MAX_FILES || can.caption_limit != 0 {
+        return Err("files are not offered".into());
+    }
+    if files::blurhash(&[(255, 0, 0)], 1, 1, 1, 1) != "00TI:j" {
+        return Err("a solid red picture did not hash".into());
+    }
+    if !files::replace_outgoing_sync(true) || files::replace_outgoing_sync(false) {
+        return Err("a phone copy would replace the file".into());
+    }
+    let line = files::call_line("b2b2b2b2-0000-4000-8000-000000000002", &["card.png".into()], "the hand", None);
+    if line != "send b2b2b2b2-0000-4000-8000-000000000002 files card.png the hand" {
+        return Err("the send was not recorded as a file".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_poll_vote_is_not_an_edit() {
+        prove_signal_poll().unwrap();
+    }
 
     #[test]
     fn a_session_names_one_account_and_says_nothing_of_its_key() {
@@ -923,6 +2045,35 @@ mod tests {
     }
 
     #[test]
+    fn reaction_record_bounds_size_and_skips_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acct.reactions");
+
+        // Pre-populate more than REACTIONS_KEPT rows; loading + writing prunes to REACTIONS_KEPT newest.
+        let rows: Vec<KeptReaction> = (0..=REACTIONS_KEPT)
+            .map(|i| KeptReaction { message: format!("m{i}"), person: "p".into(), emoji: "👍".into() })
+            .collect();
+        std::fs::write(&path, serde_json::to_vec(&rows).unwrap()).unwrap();
+
+        let mut live = Live { reactions_path: path.clone(), ..Live::default() };
+        assert_eq!(live.react("m0", "p", Some("❤️")), None, "oldest row beyond cap was evicted");
+        let kept = read_reactions(&path);
+        assert_eq!(kept.len(), REACTIONS_KEPT);
+        assert_eq!(kept.last().map(|r| (r.message.as_str(), r.emoji.as_str())), Some(("m0", "❤️")));
+        assert!(!path.with_extension("tmp").exists(), "temp file was renamed away");
+
+        // An oversized file is skipped on load rather than read into memory.
+        let oversized = vec![b' '; (REACTIONS_FILE_LIMIT as usize) + 1];
+        std::fs::write(&path, oversized).unwrap();
+        assert!(read_reactions(&path).is_empty());
+    }
+
+    #[test]
+    fn a_username_shape_is_proven() {
+        prove_signal_username().unwrap();
+    }
+
+    #[test]
     fn reading_takes_what_is_older_and_leaves_what_is_newer() {
         let mut live = Live::default();
         for sent in [1, 2, 3] {
@@ -941,5 +2092,51 @@ mod tests {
         assert_eq!((name.as_deref(), about.as_deref(), emoji.as_deref()), (Some("Ada"), Some("New about"), Some("")));
         assert!(profile_edit("Lunch").is_none());
         assert!(prove_signal_own_profile().is_ok());
+    }
+
+    #[test]
+    fn a_quote_quotes_the_words_without_the_note() {
+        let body = "y".repeat(2_048);
+        assert_eq!(quoted_words(&format!("{body}{}", wire::CONTINUES)), body);
+        assert_eq!(quoted_words("Tuesday, seven sharp."), "Tuesday, seven sharp.");
+    }
+
+    #[test]
+    fn group_revisions_gate_connect_stale_duplicate_and_newer() {
+        let mut revisions = GroupRevisions::default();
+        let initial = GroupSnap { title: "Bridge club".into(), ..GroupSnap::default() };
+        assert!(!revisions.contains("g1"));
+        assert!(!revisions.should_check("g1", 1));
+        assert_eq!(revisions.advance("g1", 1, initial.clone()), None);
+
+        // First snapshot is seeded silently and not overwritten by a second seed.
+        revisions.seed("g1".into(), 5, initial.clone());
+        assert!(revisions.contains("g1"));
+        let renamed = GroupSnap { title: "Wednesday club".into(), ..GroupSnap::default() };
+        revisions.seed("g1".into(), 6, renamed.clone());
+
+        // Stale and duplicate revisions are skipped.
+        assert!(!revisions.should_check("g1", 4));
+        assert!(!revisions.should_check("g1", 5));
+        assert_eq!(revisions.advance("g1", 4, renamed.clone()), None);
+        assert_eq!(revisions.advance("g1", 5, renamed.clone()), None);
+
+        // A newer revision is announced once, then skipped on repeat.
+        assert!(revisions.should_check("g1", 6));
+        let before = revisions.advance("g1", 6, renamed.clone()).expect("newer revision");
+        assert_eq!(before, initial);
+        assert!(!revisions.should_check("g1", 6));
+        assert_eq!(revisions.advance("g1", 6, renamed), None);
+    }
+
+    #[test]
+    fn rejoining_a_group_sets_rejoined_and_clears_left() {
+        let out = GroupSnap::default();
+        let inside = GroupSnap { members: vec![MemberSnap { id: "me".into(), admin: false }], ..GroupSnap::default() };
+        let left = group_delta(&inside, &out, "me", |_| String::new());
+        assert!(left.left && !left.rejoined);
+        let back = group_delta(&out, &inside, "me", |_| String::new());
+        assert!(!back.left && back.rejoined);
+        assert_eq!(back.lines, ["You joined the group"]);
     }
 }

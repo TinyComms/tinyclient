@@ -956,6 +956,7 @@ impl Composer {
             pick: None,
             schedule,
             spans: Vec::new(),
+            poll: None,
         };
         let (shown, wire) = match as_file {
             true => (String::new(), String::new()),

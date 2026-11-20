@@ -1209,6 +1209,17 @@ impl Context {
         self.hub.calls.ring_stopped(&self.hub, &self.key(conversation_id));
     }
 
+    /// Someone is calling on a network whose calls are answered on the phone (a Signal call):
+    /// one notification with one action, no call here. The same silence rules as other rings.
+    pub fn phone_ring(&self, conversation_id: &str, from: &str) {
+        self.hub.notify(crate::notify::Event::PhoneRing { conversation: self.key(conversation_id), from: from.to_owned() });
+    }
+
+    /// That call is over; its notification and its sound go.
+    pub fn phone_ring_stopped(&self, conversation_id: &str) {
+        self.hub.notify(crate::notify::Event::PhoneRingStopped(self.key(conversation_id)));
+    }
+
     /// We are ringing the other side of a direct call and nobody has answered yet.
     pub fn ringing_out(&self, conversation_id: &str) {
         self.hub.calls.set_state(&self.hub, &self.key(conversation_id), CallState::RingingOut);

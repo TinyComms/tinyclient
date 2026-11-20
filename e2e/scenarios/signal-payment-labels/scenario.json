@@ -1,0 +1,12 @@
+{
+  "id": "signal-payment-labels",
+  "title": "A payment and a gift badge say where they are acted on",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same words are what a payment maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same words are what a payment maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

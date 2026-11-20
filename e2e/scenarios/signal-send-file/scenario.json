@@ -1,0 +1,12 @@
+{
+  "id": "signal-send-file",
+  "title": "A photo, video or file can be sent in a Signal chat",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd.",
+    "ios": "The phone proof build does not run desktop chatd."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

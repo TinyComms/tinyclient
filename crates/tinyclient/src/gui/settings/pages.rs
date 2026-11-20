@@ -1243,7 +1243,6 @@ impl SettingsWindow {
             // Fixed rows say what the network decides; Discord and Slack have no receipts.
             let (fixed, reason): (Option<&str>, Option<&str>) = match (id, network) {
                 ("P1", Network::Telegram) | ("P2", Network::Telegram) => (Some("Always on"), Some("Telegram does not let an app turn this off.")),
-                ("P1", Network::Signal) | ("P2", Network::Signal) => (Some("Set on your phone"), Some("Signal takes this from your phone's settings.")),
                 ("P1", Network::Messages) => (Some("Sent to the phone"), Some("Messages shows typing on your other devices.")),
                 ("P2", Network::Messages) => (Some("On your devices"), Some("Messages does not let tinyclient change read receipts.")),
                 ("P2", Network::Discord | Network::Slack) | ("P1" | "P2", Network::Tiny) => continue,
@@ -1253,7 +1252,15 @@ impl SettingsWindow {
             let second = if let Some(reason) = reason {
                 Some(reason.to_owned())
             } else if id == "P2" {
-                Some("Off also leaves chats unread on your other devices.".to_owned())
+                Some(if network == Network::Signal {
+                    "Off also leaves chats unread on your other devices. Your phone's setting decides too.".to_owned()
+                } else {
+                    "Off also leaves chats unread on your other devices.".to_owned()
+                })
+            } else if network == Network::Signal {
+                // Signal's switches are a local stop on top of the account: on here never
+                // loosens what the phone keeps off, and nothing is written to the phone.
+                Some("Your phone's setting decides too; this stops only tinyclient.".to_owned())
             } else if several(network) {
                 Some(network_name(network).to_owned())
             } else {

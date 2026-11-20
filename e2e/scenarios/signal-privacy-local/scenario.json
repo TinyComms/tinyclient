@@ -1,0 +1,8 @@
+{
+  "id": "signal-privacy-local",
+  "title": "Signal has a local switch for typing and read receipts: valid in its account scope, on until chosen, off stops it here",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

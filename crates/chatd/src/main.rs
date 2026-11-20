@@ -708,6 +708,51 @@ fn main() -> io::Result<()> {
         eprintln!("prove-signal-own-profile:0");
         return Ok(());
     }
+    // The lab's signal-payment-labels driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-payment-labels") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_payment_labels() {
+            eprintln!("signal-payment-labels: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-payment-labels:0");
+        return Ok(());
+    }
+    // The lab's signal-view-once driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-view-once") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_view_once() {
+            eprintln!("signal-view-once: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-view-once:0");
+        return Ok(());
+    }
+    // The lab's signal-long-text driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-long-text") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_long_text() {
+            eprintln!("signal-long-text: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-long-text:0");
+        return Ok(());
+    }
+    // The lab's signal-privacy-local driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-privacy-local") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_privacy_local() {
+            eprintln!("signal-privacy-local: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-privacy-local:0");
+        return Ok(());
+    }
+    // The lab's signal-poll driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-poll") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_poll() {
+            eprintln!("signal-poll: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-poll:0");
+        return Ok(());
+    }
     // The lab's messages-unpaired driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-unpaired") {
         if let Err(err) = chatd::adapters::messages::prove_messages_unpaired() {
@@ -785,6 +830,58 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-telegram-checklist:0");
+    // The lab's signal-text-styles driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-text-styles") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_styles() {
+            eprintln!("signal-text-styles: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-text-styles:0");
+        return Ok(());
+    }
+    // The lab's signal-reaction-restart driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-reaction-restart") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_reaction_restart() {
+            eprintln!("signal-reaction-restart: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-reaction-restart:0");
+        return Ok(());
+    }
+    // The lab's signal-username driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-username") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_username() {
+            eprintln!("signal-username: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-username:0");
+        return Ok(());
+    }
+    // The lab's signal-delete-for-me driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-delete-for-me") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_delete_for_me() {
+            eprintln!("signal-delete-for-me: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-delete-for-me:0");
+        return Ok(());
+    }
+    // The lab's signal-group-rename driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-group-rename") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_group_rename() {
+            eprintln!("signal-group-rename: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-group-rename:0");
+        return Ok(());
+    }
+    // The lab's signal-send-file driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-send-file") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_send_file() {
+            eprintln!("prove-signal-send-file: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-send-file:0");
         return Ok(());
     }
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());

@@ -736,9 +736,47 @@ pub fn preview_text(message: &Message) -> String {
     preview_of(message)
 }
 
+/// The text with each spoiler range replaced by the word Spoiler, so a row or a notification
+/// does not reveal it. Adjacent spoiler ranges collapse into one word.
+pub fn without_spoilers(text: &str, spans: &[protocol::Span]) -> String {
+    let mut hidden = vec![false; text.len()];
+    for span in spans {
+        if !matches!(span.style, protocol::Style::Spoiler) {
+            continue;
+        }
+        let (Ok(start), Ok(end)) = (usize::try_from(span.start), usize::try_from(span.end)) else {
+            continue;
+        };
+        if start < end && end <= text.len() && text.is_char_boundary(start) && text.is_char_boundary(end) {
+            hidden[start..end].fill(true);
+        }
+    }
+    if !hidden.contains(&true) {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut at = 0;
+    let mut open = false;
+    while at < text.len() {
+        let ch = text[at..].chars().next().unwrap_or(' ');
+        let width = ch.len_utf8();
+        if hidden[at] {
+            if !open {
+                out.push_str("Spoiler");
+                open = true;
+            }
+        } else {
+            open = false;
+            out.push(ch);
+        }
+        at += width;
+    }
+    out
+}
+
 fn preview_of(message: &Message) -> String {
     if !message.text.is_empty() {
-        return message.text.chars().take(120).collect();
+        return without_spoilers(&message.text, &message.spans).chars().take(120).collect();
     }
     let Some(first) = message.attachments.first() else {
         return match &message.card {
