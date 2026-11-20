@@ -10,7 +10,7 @@ The tables under "Information architecture" are the control design. A row marked
 
 | Section | Rows | Notes |
 | --- | --- | --- |
-| General | G1, G2, G4 | G1 starts tinyclient when the person signs in, through each system's own startup entry. G2 "Keep receiving when the window is closed" is in the window on macOS only. Linux uses the systemd user unit when that unit is enabled; quitting the GUI then leaves chatd up either way. G4 is automatic updates from the public GitHub release. |
+| General | G1, G2, G3 (Windows), G4 | G1 starts tinyclient when the person signs in, through each system's own startup entry. G2 "Keep receiving when the window is closed" is in the window on macOS only. Linux uses the systemd user unit when that unit is enabled; quitting the GUI then leaves chatd up either way. G3 is the tray: closing the window hides it into the icon, which exists on Windows so far. G4 is automatic updates from the public GitHub release. |
 | Notifications | N1, N2, ND, NG, NM, NT, N4, NL, N5–N11, N13 | ND / NG / NM / NT are "Direct messages", "Group chats", "Mentions in channels", "Tiny servers". There is no N3 per-account menu. NL is the lock-screen preview and is hidden on macOS, where the OS does that. N10 and N11 use the host's flash and badge labels and are hidden on Linux. |
 | Sounds | S1–S4, SV | Five message sounds, two rings, or None. No "System alert sound". SV is notification volume and is hidden on macOS. |
 | Appearance | A2, A3, A4 | Text size, density, list previews. No theme control. The app is dark. |
@@ -28,7 +28,6 @@ chatd keeps the notification, sound, privacy, voice, and storage values. The she
 
 | Gap | What search says, or what the code does |
 | --- | --- |
-| G3 Menu bar | No tray icon on this commit's search line. |
 | A1 Light theme | "tinyclient is dark only for now." |
 | N3 per-account notify menu | Not a row. ND, NG, NM, and NT are global. chatd can store an account-level notify word; the window does not show N3. |
 | N14, N15 | No reaction or thread-follow notify control. |
@@ -123,12 +122,17 @@ One group per network, a row per account with state in words, Sign out, Sign in 
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | G1 | Open at login | Switch | Off | G | s | On: the system starts tinyclient at sign-in. Windows: the per-user Run key (the uninstaller removes it; a disable in Task Manager's Startup tab wins). macOS: a LaunchAgent in `~/Library/LaunchAgents`. Linux: an XDG autostart file in `~/.config/autostart`. Rewritten with the running path at every launch, so a moved portable copy keeps starting | in |
 | G2 | Keep receiving when the window is closed | Switch | On | G | d | On: closing the window hides it and chatd keeps running. Off: closing the window quits the window and chatd. In the window on macOS only. Linux uses the systemd user unit when that unit is enabled. | in |
-| G3 | Show in menu bar | Switch | Off | G | s | | Later |
+| G3 | Keep tinyclient in the tray when I close the window | Switch | Off | G | s | On (Windows so far): closing the window hides it and chatd keeps running; the icon's click reopens the window, its menu has Open and Quit, and Quit stops chatd like ⌘Q. Off: closing the window quits tinyclient, as it does today. macOS hides behind G2 instead; Linux waits for its StatusNotifierItem. Search answers "no tray icon yet" where the icon does not exist. | in |
 | G4 | Install updates automatically | Switch | On | G | s | On: a newer GitHub release is downloaded while the window is open and replaces this copy on quit. Off: the notice still appears and nothing is downloaded until asked | in |
 
 Caption under G2: "Closing the window leaves tinyclient running. Quit with ⌘Q to
 stop it." ⌘Q stops chatd and the window unless the optional Linux systemd user
 service is enabled; in that mode systemd owns the daemon's lifetime (see below).
+
+Caption under G3 (Windows): off, "Off: closing the window quits tinyclient, as it
+does now."; on, "Closing the window keeps tinyclient running in the tray. Quit
+tinyclient ends it." The first close after a start shows one balloon saying the
+app is still running and that the icon is how it comes back.
 
 ### Notifications
 
@@ -471,6 +475,9 @@ notification delivered by the system, read with `log stream --predicate 'subsyst
   Run value; macOS: the LaunchAgent file; Linux: the autostart file.
 - G2: off, ⌘W: no shell and no chatd within 2 s. On, ⌘W: chatd still answers `ping`; a DM
   posts. ⌘Q in both cases: no tinyclient process within 2 s.
+- G3 (Windows): on, close the window: the window is gone, the process stays, `chatd` still
+  answers `ping`, and the icon's click brings the window back. Quit in the icon's menu: no
+  tinyclient and no chatd within 2 s. Off, closing the window quits as before.
 
 **Notifications**
 - N1: off, inject a DM: nothing posted; `list` shows unread 1; badge 1.
@@ -558,7 +565,7 @@ Still absent, matching `NOT_YET` and the "Not in the window" table above. M5, V8
 
 | Item | Waits on |
 | --- | --- |
-| G3 Show in menu bar | No tray icon on this commit. |
+| G3 on Linux | The tray icon (StatusNotifierItem) and with it the switch; until then the systemd user unit holds chatd. Windows is in. |
 | A1 Light theme | Dark only. |
 | N3 per-account notify menu | Not a row. ND, NG, NM, and NT are global. |
 | N14 Reaction notifications, N15 thread replies | No reaction or thread-follow notify control. |

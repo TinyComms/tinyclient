@@ -40,6 +40,9 @@ pub struct Choices {
     /// G1: tinyclient starts when the user signs in. The switch lives here; what it drives is
     /// the system's own sign-in entry, written and removed to match (`gui/autostart.rs`).
     pub open_at_login: bool,
+    /// G3 (Windows so far): closing the window hides it into the tray; the icon is the way
+    /// back in, and Quit there ends everything exactly as the menu bar's quit does.
+    pub tray: bool,
     /// PL: a click on a web link asks where it goes before the browser opens it.
     pub confirm_links: bool,
     /// PS: tracking parameters (`utm_*`, `fbclid`, ...) are taken out of a link as it opens.
@@ -53,7 +56,7 @@ pub struct Choices {
 
 impl Default for Choices {
     fn default() -> Choices {
-        Choices { compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, updates: true, open_at_login: false, confirm_links: true, strip_tracking: false, spell: true, section: Section::Accounts }
+        Choices { compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, updates: true, open_at_login: false, tray: false, confirm_links: true, strip_tracking: false, spell: true, section: Section::Accounts }
     }
 }
 
@@ -68,6 +71,7 @@ static CHOICES: Mutex<Choices> = Mutex::new(Choices {
     images: true,
     updates: true,
     open_at_login: false,
+    tray: false,
     confirm_links: true,
     strip_tracking: false,
     spell: true,
@@ -274,6 +278,7 @@ pub fn parse(text: &str) -> Prefs {
             "images" => prefs.choices.images = fields.next() != Some("click"),
             "updates" => prefs.choices.updates = fields.next() != Some("off"),
             "login" => prefs.choices.open_at_login = fields.next() == Some("on"),
+            "tray" => prefs.choices.tray = fields.next() == Some("on"),
             "confirm_links" => prefs.choices.confirm_links = fields.next() != Some("off"),
             "strip_tracking" => prefs.choices.strip_tracking = fields.next() == Some("on"),
             "spell" => prefs.choices.spell = fields.next() != Some("off"),
@@ -324,7 +329,7 @@ pub fn write(prefs: &Prefs) -> String {
     text.push_str(&format!("details\t{}\t{}\n", word(prefs.details_channels), word(prefs.details_directs)));
     text.push_str(&format!("text\t{}\n", prefs.text_step));
     let (choices, default) = (prefs.choices, Choices::default());
-    let lines: [(&str, bool, &str); 13] = [
+    let lines: [(&str, bool, &str); 14] = [
         ("density", choices.compact != default.compact, "compact"),
         ("previews", choices.previews != default.previews, "off"),
         ("send", choices.command_return != default.command_return, "cmd-return"),
@@ -334,6 +339,7 @@ pub fn write(prefs: &Prefs) -> String {
         ("images", choices.images != default.images, "click"),
         ("updates", choices.updates != default.updates, "off"),
         ("login", choices.open_at_login != default.open_at_login, "on"),
+        ("tray", choices.tray != default.tray, "on"),
         ("confirm_links", choices.confirm_links != default.confirm_links, "off"),
         ("strip_tracking", choices.strip_tracking != default.strip_tracking, "on"),
         ("spell", choices.spell != default.spell, "off"),
@@ -406,7 +412,7 @@ mod tests {
             details_channels: true,
             details_directs: false,
             text_step: 2,
-            choices: Choices { compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, updates: false, open_at_login: true, confirm_links: false, strip_tracking: true, spell: false, section: Section::Audio },
+            choices: Choices { compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, updates: false, open_at_login: true, tray: true, confirm_links: false, strip_tracking: true, spell: false, section: Section::Audio },
             kept: Vec::new(),
             autoplay: Autoplay::Hover,
             tiny_members: false,
@@ -417,6 +423,7 @@ mod tests {
         let me = Me { name: "Justin S".into(), picture: "me-17.png".into() };
         assert_eq!(read, Prefs { open: Some((key(Network::Discord, "c1"), "#general with a tab".into())), me, ..saved.clone() });
         assert_eq!(read.telegram_folder.as_deref(), Some("2"), "the folder chip last chosen is remembered");
+        assert!(read.choices.tray, "the tray choice survives the round trip");
         assert_eq!(parse(&write(&Prefs { telegram_folder: None, ..Prefs::default() })).telegram_folder, None, "nothing is written for All");
         for mode in [Mode::Inbox, Mode::People, Mode::Network(Network::Telegram)] {
             assert_eq!(parse(&write(&Prefs { mode: mode.clone(), ..Prefs::default() })).mode, mode);
@@ -450,7 +457,7 @@ mod tests {
     #[test]
     fn only_changed_choices_are_written_and_lines_from_a_newer_build_are_kept() {
         let text = write(&Prefs::default());
-        for name in ["density", "previews", "send", "open_at", "typing", "emoticons", "images", "settings_section", "confirm_links", "strip_tracking", "link_ok", "spell", "login"] {
+        for name in ["density", "previews", "send", "open_at", "typing", "emoticons", "images", "settings_section", "confirm_links", "strip_tracking", "link_ok", "spell", "login", "tray"] {
             assert!(!text.contains(name), "{name} is at its default and not written");
         }
         let newer = "sidebar\t300\ntheme\tlight\nbounce\tonce\n";
@@ -460,6 +467,10 @@ mod tests {
         assert!(again.contains("theme\tlight\n") && again.contains("bounce\tonce\n"), "{again}");
         // Junk reads as the default.
         assert_eq!(parse("density\tcosy\nsend\t?\nsettings_section\tx\nlogin\t?\n").choices, Choices::default());
+        // The tray choice is off until it is turned on, and junk reads as off.
+        assert!(write(&Prefs { choices: Choices { tray: true, ..Choices::default() }, ..Prefs::default() }).contains("tray\ton\n"));
+        assert!(parse("tray\ton\n").choices.tray);
+        assert!(!parse("tray\talways\n").choices.tray);
         // A section is kept by its name: an index from an older build, or a section a newer
         // build added, opens Accounts rather than whatever sits at that place now.
         assert!(write(&Prefs { choices: Choices { section: Section::Privacy, ..Choices::default() }, ..Prefs::default() }).contains("settings_section\tprivacy\n"));

@@ -167,6 +167,8 @@ pub fn bind_keys(cx: &mut App) {
 /// ⌘Q. chatd is stopped by `stop_chatd_on_quit`, as for every other way out.
 pub fn quit(cx: &mut App) {
     tracing::warn!("tinyclient: quit asked");
+    #[cfg(windows)]
+    notifier::tray::remove();
     if let Some(guard) = protocol::log_policy::current() {
         guard.flush();
     }
@@ -199,8 +201,8 @@ pub fn stop_chatd_on_quit(cx: &mut App) {
 }
 
 /// Closing the main window quits on Linux and Windows, where application hiding is not
-/// implemented. On macOS, Keep receiving hides the window and leaves chatd receiving;
-/// otherwise closing quits there too.
+/// implemented — unless the tray holds it (G3, Windows only so far). On macOS, Keep receiving
+/// hides the window and leaves chatd receiving; otherwise closing quits there too.
 pub fn close_window(cx: &mut App) {
     if cfg!(target_os = "macos") && super::prefs::values().on(protocol::settings::KEEP_RUNNING) {
         tracing::warn!("tinyclient: close window hides (Keep receiving)");
@@ -208,11 +210,37 @@ pub fn close_window(cx: &mut App) {
             guard.flush();
         }
         cx.hide();
+    } else if holds_in_tray() {
+        tracing::warn!("tinyclient: close window hides (tray)");
+        if let Some(guard) = protocol::log_policy::current() {
+            guard.flush();
+        }
+        close_into_tray();
     } else {
         tracing::warn!("tinyclient: close window quits");
         quit(cx);
     }
 }
+
+/// G3 keeps the window alive in the tray: the choice is on and the icon exists, so the click
+/// on it is the way back in. Windows only so far; `notifier::tray` has no other backend yet.
+#[cfg(windows)]
+fn holds_in_tray() -> bool {
+    super::prefs::choices().tray && notifier::tray::active()
+}
+
+#[cfg(not(windows))]
+fn holds_in_tray() -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn close_into_tray() {
+    notifier::tray::close_into_tray()
+}
+
+#[cfg(not(windows))]
+fn close_into_tray() {}
 
 /// The app-wide handlers: they act on the app, not on what has focus.
 pub fn app_actions(cx: &mut App) {

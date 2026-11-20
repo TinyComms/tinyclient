@@ -15,6 +15,10 @@
 //!   elsewhere nothing is posted and the reason is logged. The bundle carries the sound files.
 //! - Linux: org.freedesktop.Notifications, with `suppress-sound` as on Windows.
 //! - Android and iOS: nothing yet; each post is refused with the reason.
+//!
+//! Beside the notifications, the window's taskbar button or Dock icon lives here
+//! ([`taskbar`]), and so does the tray icon (Windows; G3 in `docs/product/09-settings.md`,
+//! [`tray`]) — both called by the window process on its main thread, never by chatd.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -28,6 +32,8 @@ mod linux;
 mod windows;
 #[cfg(any(windows, target_os = "macos", all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios")))))]
 pub mod taskbar;
+#[cfg(windows)]
+pub mod tray;
 
 /// What a notification is for, which decides its buttons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
