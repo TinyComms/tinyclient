@@ -1366,6 +1366,11 @@ pub fn prove_telegram_inline_bots() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's telegram-live-location driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_live_location() -> Result<(), String> {
+    content::prove_live_location()
+}
+
 /// The lab's telegram-member-sections driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_member_sections() -> Result<(), String> {
     members::prove()

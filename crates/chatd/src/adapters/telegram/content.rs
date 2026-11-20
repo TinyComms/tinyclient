@@ -1342,9 +1342,19 @@ fn place_fields(lat: f64, long: f64, accuracy: Option<i32>) -> Vec<(String, Stri
     fields
 }
 
+/// Still shared when the share's end is ahead of now. This layer has no stopped flag.
+fn still_sharing(date: i32, period: i32) -> bool {
+    if period <= 0 {
+        return false;
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    i64::from(date) + i64::from(period) > now
+}
+
 /// A shared place: the name, the coordinates, and a `geo:` link. A live one says how long it
-/// was shared for. The shell draws the card; this build does not fetch a map tile.
-fn location_card(media: &MessageMedia) -> Option<Card> {
+/// was shared for and whether it is still going. The shell draws the card; this build does not
+/// fetch a map tile.
+fn location_card(media: &MessageMedia, date: i32) -> Option<Card> {
     let mut card = Card { footer: "Open in Maps".to_owned(), ..Card::default() };
     match media {
         MessageMedia::Geo(media) => {
@@ -1381,6 +1391,8 @@ fn location_card(media: &MessageMedia) -> Option<Card> {
             if live.period > 0 {
                 card.fields.push(("Shared for".to_owned(), kept_for(live.period)));
             }
+            let status = if still_sharing(date, live.period) { "Still sharing" } else { "Stopped" };
+            card.fields.push(("Status".to_owned(), status.to_owned()));
         }
         _ => return None,
     }
@@ -1710,6 +1722,14 @@ fn action(dir: &Directory, who: &str, action: &MessageAction) -> (String, bool) 
         } else {
             format!("{who} marked {} not done", count_words(todo.incompleted.len() as i32, "item", "items"))
         }),
+        A::GeoProximityReached(reached) => {
+            let side = |peer: &tl::enums::Peer| {
+                let person = Who::of(peer);
+                if person == Who::User(dir.me) { "you".to_owned() } else { dir.name(person) }
+            };
+            let meters = if reached.distance == 1 { "1 m".to_owned() } else { format!("{} m", reached.distance) };
+            named(format!("{} is within {meters} of {}", side(&reached.from_id), side(&reached.to_id)))
+        }
         _ => (format!("{who} changed something tinyclient cannot show yet"), false),
     }
 }
@@ -1876,7 +1896,7 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                     // An invoice or paid preview is still a hand-off, and also a card: title,
                     // description and price. Paying stays in Telegram's own app. A shared place
                     // is a normal message whose card keeps the coordinates. No map tile is fetched.
-                    if let Some(card) = detail_card(media).or_else(|| location_card(media)) {
+                    if let Some(card) = detail_card(media).or_else(|| location_card(media, raw.date)) {
                         message.card = Some(Box::new(card));
                     } else if let MessageMedia::Poll(media) = media {
                         let tl::enums::Poll::Poll(poll) = &media.poll;
@@ -2899,6 +2919,50 @@ pub(super) fn prove_inline_bots() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's telegram-live-location check. A live share keeps its coordinates and says whether
+/// it is still going, and coming into range is a service line. A build from before this drops
+/// the coordinates.
+pub(super) fn prove_live_location() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    11i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i32;
+    now.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    message.from_id = Some(Who::User(7_002).peer());
+    message.media = Some(
+        tl::types::MessageMediaGeoLive {
+            geo: tl::types::GeoPoint { long: -122.4, lat: 37.7, access_hash: 0, accuracy_radius: None }.into(),
+            heading: Some(90),
+            period: 900,
+            proximity_notification_radius: None,
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &message.into()).ok_or("the live location maps")?;
+    let card = mapped.message.card.ok_or("a live location is a card")?;
+    if card.title != "Live location" || !card.text.contains("geo:37.7,-122.4") || !card.fields.iter().any(|field| field.0 == "Status" && field.1 == "Still sharing") {
+        return Err(format!("the live location dropped its place, got {} {}", card.title, card.text));
+    }
+    if !matches!(mapped.message.kind, MessageKind::Normal) {
+        return Err("a live location still opens only in Telegram".into());
+    }
+    let reached = tl::types::MessageActionGeoProximityReached {
+        from_id: Who::User(7_002).peer(),
+        to_id: Who::User(7_001).peer(),
+        distance: 50,
+    };
+    let (line, known) = action(&Directory::new(7_001), "Ada", &reached.into());
+    if !known || !line.contains("50 m") {
+        return Err(format!("coming into range is unnamed, got {line}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3399,6 +3463,57 @@ mod tests {
         assert!(mapped.message.sender.name.contains("via @wiki"), "{}", mapped.message.sender.name);
         let plain = map(&dir, &blank_message().into()).expect("a plain message maps");
         assert!(!plain.message.sender.name.contains("via @"), "{}", plain.message.sender.name);
+    }
+
+    fn live(id: i32, date: i32, lat: f64, long: f64, period: i32) -> tl::enums::Message {
+        let mut message = blank_message();
+        message.id = id;
+        message.date = date;
+        message.media = Some(
+            tl::types::MessageMediaGeoLive {
+                geo: point(lat, long),
+                heading: Some(90),
+                period,
+                proximity_notification_radius: None,
+            }
+            .into(),
+        );
+        message.into()
+    }
+
+    #[test]
+    fn a_live_location_keeps_its_place_and_says_whether_it_is_still_shared() {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i32;
+        let sharing = map(&Directory::new(7_001), &live(11, now, 37.7, -122.4, 900)).expect("the live location maps");
+        assert!(matches!(sharing.message.kind, MessageKind::Normal), "a live location is the card, not a hand-off");
+        let card = sharing.message.card.expect("a live location is a card");
+        assert_eq!(card.title, "Live location");
+        assert_eq!(card.footer, "Open in Maps");
+        assert!(card.text.contains("geo:37.7,-122.4"), "{}", card.text);
+        assert!(card.fields.iter().any(|(label, value)| label == "Heading" && value == "90°"));
+        assert!(card.fields.iter().any(|(label, value)| label == "Status" && value == "Still sharing"), "{:?}", card.fields);
+
+        let ended = map(&Directory::new(7_001), &live(11, 1_700_000_000, 37.7, -122.4, 900)).expect("an ended live location maps");
+        let card = ended.message.card.expect("an ended live location is a card");
+        assert!(card.fields.iter().any(|(label, value)| label == "Status" && value == "Stopped"), "{:?}", card.fields);
+
+        let moved = map(&Directory::new(7_001), &live(11, now, 37.8, -122.5, 900)).expect("a moved live location maps");
+        let card = moved.message.card.expect("a moved live location is a card");
+        assert!(card.text.contains("geo:37.8,-122.5"), "{}", card.text);
+    }
+
+    #[test]
+    fn coming_within_range_of_a_live_location_is_a_service_line() {
+        let dir = Directory::new(7_001);
+        let reached = tl::types::MessageActionGeoProximityReached {
+            from_id: Who::User(7_002).peer(),
+            to_id: Who::User(7_001).peer(),
+            distance: 50,
+        };
+        let (line, known) = super::action(&dir, "Ada", &reached.into());
+        assert!(known, "{line}");
+        assert!(line.contains("50 m"), "{line}");
+        assert!(line.to_lowercase().contains("you"), "{line}");
     }
 
     #[test]
