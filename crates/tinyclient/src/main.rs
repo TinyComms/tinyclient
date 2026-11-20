@@ -172,6 +172,14 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    // The lab's error-text driver. A build without this opens the window below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("error-text") {
+        if let Err(err) = client::prove_error_text() {
+            eprintln!("error-text: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     // The lab's no-console driver. A build without this opens the window below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("no-console") {
         let swap = update::windows_swap_args(std::path::Path::new("apply.ps1"));
