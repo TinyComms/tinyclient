@@ -346,6 +346,10 @@ pub enum Command {
         until: Option<i64>,
         reply: Reply<()>,
     },
+    /// Star or unstar a conversation on the network. Report the flag through [`Context::starred`]
+    /// before answering, and only after the network has it. Answer `Err` to leave the local flag
+    /// as it was. Networks that do not serve this never receive it: their star stays local.
+    Star { conversation_id: String, starred: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
     Leave { conversation_id: String, reply: Reply<()> },
     /// Close a direct conversation as the network's own × does. Report it through
@@ -448,7 +452,10 @@ impl Command {
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::SetMute { reply, .. } | Command::Leave { reply, .. } | Command::CloseDirect { reply, .. } => {
+            Command::SetMute { reply, .. }
+            | Command::Leave { reply, .. }
+            | Command::CloseDirect { reply, .. }
+            | Command::Star { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -708,6 +715,16 @@ impl Context {
         if self.hub.store().set_muted(&conversation, muted)? {
             self.hub.changed(Change::Conversation { conversation });
             self.hub.changed(Change::Status);
+        }
+        Ok(())
+    }
+
+    /// The network's star on one conversation. On a network that serves stars, this is that
+    /// star; a row that is not on the network is left as it was.
+    pub fn starred(&self, conversation_id: &str, starred: bool) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_starred(&conversation, starred)? {
+            self.hub.changed(Change::Conversation { conversation });
         }
         Ok(())
     }
@@ -1602,6 +1619,12 @@ pub fn prove_slack_custom_emoji() -> Result<(), String> {
 /// two custom fields and a manager link.
 pub fn prove_slack_profile_fields() -> Result<(), String> {
     slack::prove_profile_fields()
+}
+
+/// The lab's slack-star-channel driver. Starring a Slack conversation is `stars.add` on the
+/// channel, a `star_removed` event clears it, and a message star is not the channel's.
+pub fn prove_slack_channel_star() -> Result<(), String> {
+    slack::prove_channel_star()
 }
 
 /// The lab's failed-start-offline driver. A start that fails leaves the account offline,

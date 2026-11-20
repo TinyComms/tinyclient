@@ -430,6 +430,13 @@ impl Fake {
                 "channel": {"id": "D0NEW", "created": 1760000000, "is_im": true, "is_org_shared": false,
                             "user": param("users"), "is_open": true, "priority": 0},
             })),
+            // A conversation star is the channel alone. A timestamp would star a message.
+            "stars.add" | "stars.remove" => {
+                if channel.is_empty() || !param("timestamp").is_empty() {
+                    return refused("invalid_arguments");
+                }
+                Some(json!({"ok": true}))
+            }
             "users.info" => self.user(token, param("user")).map(|user| json!({"ok": true, "user": user})),
             // A team id asks for that workspace. No id is the current one, from the fixture.
             "team.info" if !param("team").is_empty() => {
@@ -2470,4 +2477,48 @@ fn a_custom_emoji_is_a_picture_without_opening_the_picker() {
         world.message(&general, "1760000501.000501").and_then(|message| emoji_span(&message, "party-parrot").map(|file| file.id.clone()))
     });
     assert!(renamed.starts_with("emoji:party-parrot:") && world.fake.calls(ALPHA, "emoji.list").len() == 1, "{renamed}");
+}
+
+#[test]
+fn starring_a_channel_tells_slack_and_a_removal_clears_it() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    assert!(!world.conversation(&general).unwrap().starred);
+
+    let starred = world.ask(Request::Star { conversation: general.clone(), starred: true });
+    assert!(matches!(starred, Response::Ok), "{starred:?}");
+    let added = world.fake.calls(ALPHA, "stars.add");
+    assert_eq!(added.len(), 1, "one star is one stars.add: {added:?}");
+    assert_eq!(added[0].params.get("channel").map(String::as_str), Some("C0GEN"));
+    assert!(!added[0].params.contains_key("timestamp"), "a channel star carries no message timestamp");
+    world.until("#general to be starred", || world.conversation(&general).filter(|row| row.starred).map(|_| ()));
+
+    world.fake.push(ALPHA, json!({
+        "type": "star_removed",
+        "user": "U0ME",
+        "item": {"type": "channel", "channel": "C0GEN"},
+        "event_ts": "1760003000.000000",
+    }));
+    world.until("Slack removing the star to clear it here", || world.conversation(&general).filter(|row| !row.starred).map(|_| ()));
+
+    // A message star is Later, not the channel's star.
+    world.fake.push(ALPHA, json!({
+        "type": "star_added",
+        "user": "U0ME",
+        "item": {"type": "message", "channel": "C0GEN", "message": {"ts": "1760000100.000100"}},
+        "event_ts": "1760003001.000000",
+    }));
+    sleep(Duration::from_millis(400));
+    assert!(!world.conversation(&general).unwrap().starred, "starring a message does not star the channel");
+
+    let again = world.ask(Request::Star { conversation: general.clone(), starred: true });
+    assert!(matches!(again, Response::Ok), "{again:?}");
+    let off = world.ask(Request::Star { conversation: general.clone(), starred: false });
+    assert!(matches!(off, Response::Ok), "{off:?}");
+    let removed = world.fake.calls(ALPHA, "stars.remove");
+    assert_eq!(removed.len(), 1, "{removed:?}");
+    assert_eq!(removed[0].params.get("channel").map(String::as_str), Some("C0GEN"));
+    assert!(!removed[0].params.contains_key("timestamp"));
+    assert!(!world.conversation(&general).unwrap().starred);
 }

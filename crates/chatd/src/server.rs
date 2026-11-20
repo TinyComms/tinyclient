@@ -2358,15 +2358,28 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
-            Request::Star { conversation, starred } => match self.hub.store().set_starred(&conversation, starred) {
-                Ok(changed) => {
-                    if changed {
-                        self.hub.changed(Change::Conversation { conversation });
+            Request::Star { conversation, starred } => {
+                // On Slack the star is Slack's. Other networks keep the local flag and are not asked.
+                if conversation.network == Network::Slack {
+                    if let Err(refused) = self.online(&conversation.account()) {
+                        return *refused;
                     }
-                    Response::Ok
+                    let conversation_id = conversation.id.clone();
+                    return match self.ask(&conversation.account(), |reply| Command::Star { conversation_id, starred, reply }) {
+                        Ok(()) => Response::Ok,
+                        Err(refused) => *refused,
+                    };
                 }
-                Err(err) => internal(err),
-            },
+                match self.hub.store().set_starred(&conversation, starred) {
+                    Ok(changed) => {
+                        if changed {
+                            self.hub.changed(Change::Conversation { conversation });
+                        }
+                        Response::Ok
+                    }
+                    Err(err) => internal(err),
+                }
+            }
 
             Request::People { network, relation, query, offset, limit } => {
                 self.people(network, relation, query, offset, limit)
