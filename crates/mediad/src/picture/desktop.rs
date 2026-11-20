@@ -907,6 +907,13 @@ pub(super) fn capture_source(id: Option<&str>) -> Result<Rgba, String> {
 }
 
 fn grab(id: Option<&str>, allow_portal: bool) -> Result<Rgba, String> {
+    // A headless test run can supply a blank screen when running inside a scratch `TINYCLIENT_DIR`,
+    // just like `TINYCLIENT_MEDIAD_AUDIO=null` replaces audio devices.
+    if crate::out::var_os("TINYCLIENT_DIR").is_some()
+        && crate::out::var("TINYCLIENT_MEDIAD_SCREEN").as_deref() == Some("null")
+    {
+        return Ok(Rgba { width: 64, height: 36, pixels: vec![0; 64 * 36 * 4], bgra: true });
+    }
     #[cfg(windows)]
     {
         let _ = allow_portal;
