@@ -15,7 +15,7 @@ The tables under "Information architecture" are the control design. A row marked
 | Sounds | S1–S4, SV | Five message sounds, two rings, or None. No "System alert sound". SV is notification volume and is hidden on macOS. |
 | Appearance | A2, A3, A4 | Text size, density, list previews. No theme control. The app is dark. |
 | Messages | M1–M6 | Send key, where a conversation opens, typing line, emoticons, GIF and sticker autoplay, spelling. |
-| Privacy | P1–P4, PE | Typing and read receipts per account, image loading, keep-for 7 / 30 / 90 days. Telegram typing and receipts are fixed on. Signal says the phone. Messages says the phone. |
+| Privacy | P1–P4, PE | Typing and read receipts per account, image loading, keep-for 7 / 30 / 90 days. Telegram typing and receipts are fixed on. Signal has a local switch that stops tinyclient only; the phone still decides. Messages says the phone. |
 | Audio & video | V1, V2, V4, V5 | Microphone, speaker, join muted, call volume. |
 | Voice | V3, V6, V8, V10–V19, S7–S10 | Input level, sensitivity, voice activation or push-to-talk, echo cancellation, noise suppression, automatic gain, key recorders, release delay, call cues and their volume. |
 | Storage | D1–D3 | Usage, cap (default 500 MB), clear. Sign-ins, drafts, and settings stay. |
@@ -218,8 +218,8 @@ no control.
 
 | # | Setting | Type | Default | Scope | Home | What it changes | Rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| P1 | Let others see when I am typing | Per account switch; fixed rows for Telegram, Signal, and Messages | Discord off, Slack on, Teams on. Telegram: "Always on", caption "Telegram does not let an app turn this off." Signal: "Set on your phone". Messages: the phone decides. | A | d | Off: the adapter sends no typing signal | in |
-| P2 | Let others see what I have read | Teams switch; fixed rows for Telegram, Signal, and Messages | Teams on. Telegram "Always on". Signal "Set on your phone". Messages: the phone decides. | A | d | Teams off: no consumption-horizon update is sent; the chat is still marked read here. Caption: "Off also leaves chats unread on your other devices." Group caption: "Discord and Slack have no read receipts." | in |
+| P1 | Let others see when I am typing | Per account switch; fixed rows for Telegram and Messages | Discord off, Slack on, Teams on, Signal on. Telegram: "Always on", caption "Telegram does not let an app turn this off." Signal: a local stop only, caption "Your phone's setting decides too; this stops only tinyclient." Messages: the phone decides. | A | d | Off: the adapter sends no typing signal | in |
+| P2 | Let others see what I have read | Teams and Signal switch; fixed rows for Telegram and Messages | Teams on, Signal on. Telegram "Always on". Signal: a local stop; off also skips the read sync to this account's devices, and the phone's setting still decides. Messages: the phone decides. | A | d | Teams off: no consumption-horizon update is sent; the chat is still marked read here. Signal off: no receipt frame leaves, and no read sync either. Caption: "Off also leaves chats unread on your other devices." (Signal: "Off also leaves chats unread on your other devices. Your phone's setting decides too.") Group caption: "Discord and Slack have no read receipts." | in |
 | P3 | Load images and link previews automatically | Switch | On | G | s | Off: each image or preview is one line with its size; a click loads it. Nothing is fetched until clicked | in |
 | PL | Confirm before opening links | Switch | On | G | s | A click on a web link in a message shows the site it really goes to (registrable domain, with punycode decoded and the `xn--` form beside it for an internationalised name) and offers Open, Copy link and Cancel, plus "Don't ask again for <domain>", kept on this device (`link_ok` lines in `shell.prefs`; "Forget all" is PF). Off: links open at once. A name that mixes alphabets or passes for Latin letters, or an address with a user name before the `@`, is always asked about, and never gets "Don't ask again". Only http and https are ever links | in |
 | PS | Strip tracking parameters when opening | Switch | Off | G | s | On: `utm_*`, `fbclid`, `gclid`, `mc_eid`, `igshid` and the like are taken out of the address as it opens; the rest of the address is untouched. The address is handed to the system's opener alone, so no page is the referrer | in |
@@ -405,7 +405,8 @@ the control is not shown on that platform.
 - No setting is read from a network's account settings and copied into tinyclient. What the
   network enforces (mutes, Do Not Disturb, `suppress_everyone`, Signal's receipt and typing
   choices, a Teams admin's policy) is honoured live from the network's events and shown as a
-  fixed row or caption, never stored as a tinyclient value.
+  fixed row or caption, never stored as a tinyclient value. Signal's P1 and P2 switches are a
+  local stop on top of that, stricter than the account, never the account's value itself.
 - No setting is written to a network, except the mute that already exists (N12) and is the
   network's own.
 - No import from the official apps, browsers or other Macs. No export, no sync, no backup.
@@ -521,7 +522,8 @@ notification delivered by the system, read with `log stream --predicate 'subsyst
 **Privacy**
 - P1: Discord off, type in a Discord DM: no `POST /typing` in chatd's request log. On: at most one
   per 8 s.
-- P2: Teams off, read a chat: no consumption-horizon PUT; the row shows read here.
+- P2: Teams off, read a chat: no consumption-horizon PUT; the row shows read here. Signal off,
+  read a chat: no receipt frame and no read sync reaches the wire; the row shows read here.
 - P3: off: opening a conversation with images makes no `Fetch` request until a click.
 - P4: 7 days: rows older than 7 days are gone within 1 min (`sqlite3` count is 0).
 

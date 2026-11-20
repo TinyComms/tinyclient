@@ -447,6 +447,41 @@ fn typing_is_heard_and_told_at_most_every_few_seconds() {
 }
 
 #[test]
+fn typing_and_receipts_have_a_local_switch_that_stops_the_frames_here() {
+    let world = World::linked();
+    world.connected();
+    for (at, text) in [(1, "one"), (2, "two"), (3, "three")] {
+        world.steer(&format!("incoming grace {} {text}", T0 + at * 1_000));
+    }
+    world.arrived(GRACE, &id(T0 + 3_000, GRACE));
+    // Nothing stored: a read tells the author, as the account's own setting says.
+    assert_eq!(world.ask(Request::MarkRead { conversation: key(GRACE), message_id: id(T0 + 1_000, GRACE) }), Response::Ok);
+    world.heard(&format!("read receipts=true {}", id(T0 + 1_000, GRACE)));
+    let scope = protocol::settings::account_scope(&account());
+    let set = |key: &str, value: Option<&str>| Request::Set { scope: scope.clone(), key: key.to_owned(), value: value.map(str::to_owned) };
+    // Receipts off: the chat is read here and nobody is told.
+    assert_eq!(world.ask(set(protocol::settings::RECEIPTS, Some("off"))), Response::Ok);
+    assert_eq!(world.ask(Request::MarkRead { conversation: key(GRACE), message_id: id(T0 + 2_000, GRACE) }), Response::Ok);
+    sleep(Duration::from_millis(400));
+    assert_eq!(world.calls().iter().filter(|call| call.starts_with("read ")).count(), 1, "a read went out with receipts off");
+    // Typing off: the wire is never asked.
+    assert_eq!(world.ask(set(protocol::settings::TYPING, Some("off"))), Response::Ok);
+    world.ask(Request::Typing { conversation: key(GRACE) });
+    sleep(Duration::from_millis(400));
+    assert!(world.calls().iter().all(|call| !call.starts_with("typing")), "a typing signal went out with typing off");
+    // Both back: the rows round-trip, and the frames go again.
+    assert_eq!(world.ask(set(protocol::settings::RECEIPTS, None)), Response::Ok);
+    assert_eq!(world.ask(set(protocol::settings::TYPING, None)), Response::Ok);
+    assert_eq!(world.ask(Request::MarkRead { conversation: key(GRACE), message_id: id(T0 + 3_000, GRACE) }), Response::Ok);
+    world.heard(&format!("read receipts=true {},{}", id(T0 + 2_000, GRACE), id(T0 + 3_000, GRACE)));
+    // A fresh conversation, so the few-seconds memory of Grace's last one does not eat it.
+    world.steer(&format!("incoming alan {} hello", T0 + 4_000));
+    world.arrived(ALAN, &id(T0 + 4_000, ALAN));
+    world.ask(Request::Typing { conversation: key(ALAN) });
+    world.heard(&format!("typing {ALAN} started"));
+}
+
+#[test]
 fn an_unlinked_device_expires_keeps_what_was_read_and_signing_out_unlinks() {
     let world = World::linked();
     world.connected();

@@ -10,7 +10,7 @@ protocol detail taken from memory or a single third-party source, not checked ag
 - `Link::Expired` is not `SignedOut`. The cache stays readable. Send is refused until the person signs in again.
 - Send returns immediately with `SendState::Pending` and a `client_id`. Failure is `Failed { reason }` with retry. If the network is down, the row says "Waiting for {network}…" and is given up after 60 seconds. It is not sent hours later on its own.
 - Notifications are posted by chatd through the `notifier` crate, including while the window is closed: WinRT toasts on Windows, `UNUserNotificationCenter` inside the macOS bundle, and `org.freedesktop.Notifications` on Linux. A bare `osascript` fallback is not the design. Counts and the badge follow the notification settings in `09-settings.md`.
-- Typing for the open conversation is drawn. Whether this client sends typing is Settings › Privacy, per account. Discord defaults off. Telegram cannot be turned off (the terms). Signal and Messages say the phone decides.
+- Typing for the open conversation is drawn. Whether this client sends typing is Settings › Privacy, per account. Discord defaults off. Telegram cannot be turned off (the terms). Signal has a local switch that stops tinyclient only; the phone still decides. Messages says the phone decides.
 - Discord `VIEW_CHANNEL` is computed. Mute and unread follow the visible tree.
 
 The story tables below are the checks for that behavior. They are not a backlog.
@@ -25,7 +25,7 @@ The macOS spike (a second binary in `Contents/MacOS`, launchd, who receives the 
 | T1 | P0 | I see "Ana is typing…" under the messages of the open conversation, within a second, with names for up to two people and "Several people are typing" past that. | Fake adapter emits typing; a new `typing` field for that conversation lists the user; shell shows the line. |
 | T2 | P0 | The line goes away when their message arrives, when they stop, or after the network's timeout (table below), never later. | Emit typing, send nothing: gone at timeout. Emit typing then a message from the same user: gone at once. |
 | T3 | P1 | In the list, a direct message row shows "typing…" in place of its preview. Channels do not (too noisy). | Typing in a DM changes that row only; typing in a channel changes no row. |
-| T4 | P1 | Others see me typing while I type. I can turn this off per account in Settings › Privacy. Discord defaults off. Telegram cannot be turned off. Signal and Messages say the phone decides. | With it on, the adapter sends one typing signal per interval while the draft changes, and none once the draft is empty or sent. With it off, zero. |
+| T4 | P1 | Others see me typing while I type. I can turn this off per account in Settings › Privacy. Discord defaults off. Telegram cannot be turned off. Signal has a local switch that stops tinyclient only; the phone still decides. Messages says the phone decides. | With it on, the adapter sends one typing signal per interval while the draft changes, and none once the draft is empty or sent. With it off, zero. |
 | T5 | P2 | In a thread, typing shows only in that thread. | Depends on threads (area 02). |
 
 Typing is not stored and must not bump `version` in a way that makes the shell refetch the list.
