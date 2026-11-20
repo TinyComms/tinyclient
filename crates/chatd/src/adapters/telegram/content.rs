@@ -904,6 +904,47 @@ fn plain(text: &tl::enums::TextWithEntities) -> &str {
     &text.text
 }
 
+/// View-once is Telegram's `ttl_seconds` of `0x7FFFFFFF`. Anything shorter is a timer.
+fn locked_media(kind: &str, ttl: Option<i32>) -> String {
+    if ttl == Some(i32::MAX) {
+        return format!("View-once {kind}");
+    }
+    let named = match kind {
+        "photo" => "Photo",
+        "video" => "Video",
+        "voice message" => "Voice message",
+        "video message" => "Video message",
+        _ => "File",
+    };
+    format!("{named} with a timer")
+}
+
+/// Voice, a round video, a video, or a file, from the media flags and then the document.
+fn locked_kind(media: &tl::types::MessageMediaDocument) -> &'static str {
+    if media.voice {
+        return "voice message";
+    }
+    if media.round {
+        return "video message";
+    }
+    if media.video {
+        return "video";
+    }
+    let Some(tl::enums::Document::Document(file)) = &media.document else {
+        return "file";
+    };
+    let mut kind = "file";
+    for attribute in &file.attributes {
+        match attribute {
+            DocumentAttribute::Audio(audio) if audio.voice => kind = "voice message",
+            DocumentAttribute::Video(video) if video.round_message => kind = "video message",
+            DocumentAttribute::Video(_) if kind == "file" => kind = "video",
+            _ => {}
+        }
+    }
+    kind
+}
+
 /// What stands in for media tinyclient cannot draw. Never empty.
 fn unsupported(media: &MessageMedia) -> Option<String> {
     Some(match media {
@@ -926,6 +967,10 @@ fn unsupported(media: &MessageMedia) -> Option<String> {
         // A photo or document that has run out (a self-destructing one, once seen).
         MessageMedia::Photo(photo) if photo.photo.is_none() => "Photo that has expired".to_owned(),
         MessageMedia::Document(document) if document.document.is_none() => "File that has expired".to_owned(),
+        // Still on Telegram's servers, but with a timer. Desktop does not open these. Fetching
+        // them would keep a file the sender was promised would not stay.
+        MessageMedia::Photo(photo) if photo.ttl_seconds.is_some() => locked_media("photo", photo.ttl_seconds),
+        MessageMedia::Document(document) if document.ttl_seconds.is_some() => locked_media(locked_kind(document), document.ttl_seconds),
         _ => return None,
     })
 }
@@ -1468,12 +1513,15 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             let mut wants = Vec::new();
             match &raw.media {
                 None | Some(MessageMedia::Empty) => {}
-                Some(MessageMedia::Photo(media)) if media.photo.is_some() => {
+                // `ttl_seconds` is view-once (`0x7FFFFFFF`) or a shorter timer. Either way the
+                // bytes are not queued: the row below is a locked placeholder, opened in
+                // Telegram's own app, and Save has nothing to copy.
+                Some(MessageMedia::Photo(media)) if media.photo.is_some() && media.ttl_seconds.is_none() => {
                     if let Some(tl::enums::Photo::Photo(picture)) = &media.photo {
                         message.attachments.extend(photo(picture, media.spoiler, &mut wants));
                     }
                 }
-                Some(MessageMedia::Document(media)) if media.document.is_some() => {
+                Some(MessageMedia::Document(media)) if media.document.is_some() && media.ttl_seconds.is_none() => {
                     if let Some(tl::enums::Document::Document(file)) = &media.document {
                         message.attachments.push(document(media, file, &mut wants));
                     }
@@ -2198,6 +2246,101 @@ pub(super) fn prove_location() -> Result<(), String> {
     let card = mapped.message.card.ok_or("a live location is a card")?;
     if card.title != "Live location" || !card.text.contains("geo:37.7,-122.4") {
         return Err(format!("the live location dropped its place, got {} {}", card.title, card.text));
+    }
+    Ok(())
+}
+
+/// The lab's telegram-view-once check. A view-once photo and a listen-once voice message
+/// queue no file and read as locked. An ordinary photo is still fetched.
+pub(super) fn prove_view_once() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+
+    fn blank(id: i32) -> tl::types::Message {
+        let mut bytes = Vec::new();
+        0u32.serialize(&mut bytes);
+        0u32.serialize(&mut bytes);
+        id.serialize(&mut bytes);
+        Who::User(7_002).peer().serialize(&mut bytes);
+        1_700_000_000i32.serialize(&mut bytes);
+        String::new().serialize(&mut bytes);
+        let mut message = tl::types::Message::from_bytes(&bytes).expect("a blank message reads back");
+        message.from_id = Some(Who::User(7_002).peer());
+        message
+    }
+
+    let photo = |ttl: Option<i32>| {
+        let mut message = blank(14);
+        message.media = Some(
+            tl::types::MessageMediaPhoto {
+                spoiler: false,
+                live_photo: false,
+                photo: Some(
+                    tl::types::Photo {
+                        has_stickers: false,
+                        id: 6_014,
+                        access_hash: 6_015,
+                        file_reference: vec![1],
+                        date: 1_700_000_000,
+                        sizes: vec![tl::types::PhotoSize { r#type: "m".into(), w: 320, h: 240, size: 4_000 }.into()],
+                        video_sizes: None,
+                        dc_id: 4,
+                    }
+                    .into(),
+                ),
+                ttl_seconds: ttl,
+                video: None,
+            }
+            .into(),
+        );
+        tl::enums::Message::from(message)
+    };
+    let mapped = |raw: &tl::enums::Message| map(&Directory::new(7_001), raw).ok_or("the message maps");
+    let ordinary = mapped(&photo(None))?;
+    if ordinary.wants.is_empty() || ordinary.message.attachments.len() != 1 {
+        return Err("an ordinary photo is still fetched".into());
+    }
+    let once = mapped(&photo(Some(i32::MAX)))?;
+    if !once.wants.is_empty() || !once.message.attachments.is_empty() {
+        return Err("a view-once photo queues no file".into());
+    }
+    if !once.message.text.contains("View-once photo") || !matches!(once.message.kind, MessageKind::Unsupported { .. }) {
+        return Err(format!("a view-once photo reads as locked, got {}", once.message.text));
+    }
+    let timed = mapped(&photo(Some(30)))?;
+    if !timed.wants.is_empty() || !timed.message.text.contains("Photo with a timer") {
+        return Err(format!("a photo with a timer stays locked, got {}", timed.message.text));
+    }
+    let voice_doc = tl::types::Document {
+        id: 6_100,
+        access_hash: 6_101,
+        file_reference: vec![4],
+        date: 1_700_000_000,
+        mime_type: "audio/ogg".into(),
+        size: 18_000,
+        thumbs: None,
+        video_thumbs: None,
+        dc_id: 2,
+        attributes: vec![tl::types::DocumentAttributeAudio { voice: true, duration: 7, title: None, performer: None, waveform: Some(vec![0b0001_1111]) }.into()],
+    };
+    let mut voice = blank(15);
+    voice.media = Some(
+        tl::types::MessageMediaDocument {
+            nopremium: false,
+            spoiler: false,
+            video: false,
+            round: false,
+            voice: true,
+            document: Some(voice_doc.into()),
+            alt_documents: None,
+            video_cover: None,
+            video_timestamp: None,
+            ttl_seconds: Some(i32::MAX),
+        }
+        .into(),
+    );
+    let voice = mapped(&voice.into())?;
+    if !voice.wants.is_empty() || !voice.message.attachments.is_empty() || !voice.message.text.contains("View-once voice message") {
+        return Err(format!("a listen-once voice message stays locked, got {}", voice.message.text));
     }
     Ok(())
 }
@@ -2977,5 +3120,178 @@ mod tests {
         assert_eq!(attachment.file.id, "d6412m");
         assert!(attachment.thumb.as_ref().is_some_and(|thumb| thumb.id == "d6412m"));
         assert!(wants.iter().all(|want| want.file.id == "d6412m"));
+    }
+
+    use grammers_tl_types::Serializable;
+
+    type Field<'a> = &'a dyn Fn(&mut Vec<u8>);
+
+    fn blank<T: Deserializable>(fields: &[Field]) -> T {
+        let mut bytes = Vec::new();
+        fields.iter().for_each(|field| field(&mut bytes));
+        T::from_bytes(&bytes).expect("a blank value reads back")
+    }
+
+    fn put<T: Serializable>(value: T) -> impl Fn(&mut Vec<u8>) {
+        move |bytes| value.serialize(bytes)
+    }
+
+    fn wire_message(id: i32, text: &str) -> tl::types::Message {
+        let mut message: tl::types::Message = blank(&[
+            &put(0u32),
+            &put(0u32),
+            &put(id),
+            &put(Who::User(7_002).peer()),
+            &put(1_700_000_000i32),
+            &put(text.to_owned()),
+        ]);
+        message.from_id = Some(Who::User(7_002).peer());
+        message
+    }
+
+    fn photo_message(ttl: Option<i32>) -> tl::enums::Message {
+        let mut message = wire_message(14, "");
+        message.media = Some(
+            tl::types::MessageMediaPhoto {
+                spoiler: false,
+                live_photo: false,
+                photo: Some(
+                    tl::types::Photo {
+                        has_stickers: false,
+                        id: 6_014,
+                        access_hash: 6_015,
+                        file_reference: vec![1],
+                        date: 1_700_000_000,
+                        sizes: vec![tl::types::PhotoSize { r#type: "m".into(), w: 320, h: 240, size: 4_000 }.into()],
+                        video_sizes: None,
+                        dc_id: 4,
+                    }
+                    .into(),
+                ),
+                ttl_seconds: ttl,
+                video: None,
+            }
+            .into(),
+        );
+        message.into()
+    }
+
+    fn voice_message(ttl: Option<i32>) -> tl::enums::Message {
+        let voice = tl::types::Document {
+            id: 6_100,
+            access_hash: 6_101,
+            file_reference: vec![4],
+            date: 1_700_000_000,
+            mime_type: "audio/ogg".into(),
+            size: 18_000,
+            thumbs: None,
+            video_thumbs: None,
+            dc_id: 2,
+            attributes: vec![tl::types::DocumentAttributeAudio {
+                voice: true,
+                duration: 7,
+                title: None,
+                performer: None,
+                waveform: Some(vec![0b0001_1111]),
+            }
+            .into()],
+        };
+        let mut message = wire_message(15, "");
+        message.media = Some(
+            tl::types::MessageMediaDocument {
+                nopremium: false,
+                spoiler: false,
+                video: false,
+                round: false,
+                voice: true,
+                document: Some(voice.into()),
+                alt_documents: None,
+                video_cover: None,
+                video_timestamp: None,
+                ttl_seconds: ttl,
+            }
+            .into(),
+        );
+        message.into()
+    }
+
+    fn video_message(round: bool, ttl: Option<i32>) -> tl::enums::Message {
+        let video = tl::types::Document {
+            id: 6_200,
+            access_hash: 6_201,
+            file_reference: vec![5],
+            date: 1_700_000_000,
+            mime_type: "video/mp4".into(),
+            size: 90_000,
+            thumbs: Some(vec![tl::types::PhotoSize { r#type: "m".into(), w: 320, h: 180, size: 2_000 }.into()]),
+            video_thumbs: None,
+            dc_id: 2,
+            attributes: vec![tl::types::DocumentAttributeVideo {
+                round_message: round,
+                supports_streaming: true,
+                nosound: false,
+                duration: 4.0,
+                w: 320,
+                h: 180,
+                preload_prefix_size: None,
+                video_start_ts: None,
+                video_codec: None,
+            }
+            .into()],
+        };
+        let mut message = wire_message(16, "");
+        message.media = Some(
+            tl::types::MessageMediaDocument {
+                nopremium: false,
+                spoiler: false,
+                video: !round,
+                round,
+                voice: false,
+                document: Some(video.into()),
+                alt_documents: None,
+                video_cover: None,
+                video_timestamp: None,
+                ttl_seconds: ttl,
+            }
+            .into(),
+        );
+        message.into()
+    }
+
+    fn mapped(raw: &tl::enums::Message) -> Mapped {
+        map(&Directory::new(7_001), raw).expect("the message maps")
+    }
+
+    #[test]
+    fn a_view_once_photo_is_not_fetched_and_reads_as_locked() {
+        prove_view_once().unwrap();
+        let ordinary = mapped(&photo_message(None));
+        assert!(!ordinary.wants.is_empty(), "an ordinary photo is still fetched");
+        assert_eq!(ordinary.message.attachments.len(), 1);
+
+        // Telegram's view-once mark is ttl_seconds = 0x7FFFFFFF. A shorter timer is the same
+        // promise: the bytes are not a file this client may keep.
+        let once = mapped(&photo_message(Some(i32::MAX)));
+        assert!(once.wants.is_empty(), "a view-once photo queues no file");
+        assert!(once.message.attachments.is_empty());
+        assert!(once.message.text.contains("View-once photo"), "{}", once.message.text);
+        assert!(matches!(once.message.kind, MessageKind::Unsupported { .. }));
+
+        let timed = mapped(&photo_message(Some(30)));
+        assert!(timed.wants.is_empty(), "a photo with a timer queues no file");
+        assert!(timed.message.text.contains("Photo with a timer"), "{}", timed.message.text);
+
+        let voice = mapped(&voice_message(Some(i32::MAX)));
+        assert!(voice.wants.is_empty(), "a listen-once voice message queues no file");
+        assert!(voice.message.attachments.is_empty());
+        assert!(voice.message.text.contains("View-once voice message"), "{}", voice.message.text);
+
+        let clip = mapped(&video_message(false, Some(i32::MAX)));
+        assert!(clip.wants.is_empty(), "a view-once video queues no file");
+        assert!(clip.message.text.contains("View-once video"), "{}", clip.message.text);
+
+        let round = mapped(&video_message(true, Some(i32::MAX)));
+        assert!(round.wants.is_empty(), "a view-once video message queues no file");
+        assert!(round.message.text.contains("View-once video message"), "{}", round.message.text);
     }
 }
