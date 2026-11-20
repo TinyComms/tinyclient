@@ -10,7 +10,7 @@
 use crate::dave::Dave;
 use crate::h264::{self, Assembler};
 use crate::media::FromMedia;
-use crate::picture::{CAMERA_HIGH_BPS, SHARE_BPS};
+use crate::picture::CAMERA_HIGH_BPS;
 use crate::rtp::{self, Cipher, VideoSender, H264, RTX};
 use crate::session::Controls;
 use crate::video::{Rates, Received, Video, Wants, Word};
@@ -128,7 +128,7 @@ impl Drive {
                 share: true,
                 camera: false,
                 keep_camera: false,
-                rates: Rates { share: SHARE_BPS, high: 0, low: 0 },
+                rates: Rates { share: crate::picture::share_quality().bps, high: 0, low: 0 },
             }
         } else {
             Wants {
@@ -377,6 +377,36 @@ pub fn run(leg: Leg) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_share_drive_asks_for_the_bitrate_of_the_quality_that_was_picked() {
+        let drive = Drive::new(
+            Arc::new(Controls::default()),
+            "1".into(),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            true,
+            true,
+        );
+        crate::picture::choose_quality(Some(protocol::ShareQuality::Balanced));
+        assert_eq!(drive.wants().rates.share, 4_000_000);
+        crate::picture::choose_quality(Some(protocol::ShareQuality::Low));
+        assert_eq!(drive.wants().rates.share, 1_500_000);
+        crate::picture::choose_quality(Some(protocol::ShareQuality::Best));
+        assert_eq!(drive.wants().rates.share, 8_000_000);
+        let camera = Drive::new(
+            Arc::new(Controls::default()),
+            "1".into(),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            false,
+            true,
+        );
+        assert_eq!(camera.wants().rates.share, 0, "a camera does not spend the share's rate");
+        crate::picture::choose_quality(None);
+    }
 
     #[test]
     fn primary_and_repair_packets_never_reuse_a_transport_nonce() {

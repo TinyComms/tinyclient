@@ -26,6 +26,7 @@ mod video;
 mod viewer;
 mod when;
 mod wiki;
+use protocol::highlight;
 
 pub(in crate::gui) use player::glyph as player_glyph;
 
@@ -284,6 +285,10 @@ pub struct Pane {
     shown: HashSet<String>,
     /// Long code blocks opened, by message and block.
     expanded: HashSet<(String, usize)>,
+    /// Coloured code, by message and block, so a scroll does not colour the same block again.
+    code_colors: HashMap<(String, usize), (u64, Rc<highlight::Lit>)>,
+    /// Blocks whose colouring is already running off this thread.
+    code_coloring: HashSet<(String, usize)>,
     /// The code block just copied, which shows a check for a moment.
     copied: Option<(String, usize)>,
     /// The link under the pointer: message, block, run.
@@ -386,6 +391,8 @@ impl Pane {
             revealed: HashSet::new(),
             shown: HashSet::new(),
             expanded: HashSet::new(),
+            code_colors: HashMap::new(),
+            code_coloring: HashSet::new(),
             copied: None,
             hovered: None,
             selection: None,
@@ -507,6 +514,8 @@ impl Pane {
         self.revealed.clear();
         self.shown.clear();
         self.expanded.clear();
+        self.code_colors.clear();
+        self.code_coloring.clear();
         self.copied = None;
         self.hovered = None;
         self.selection = None;

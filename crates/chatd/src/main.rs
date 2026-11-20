@@ -280,6 +280,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-discord-voice-bitrate:0");
         return Ok(());
     }
+    // The lab's discord-voice-move driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-voice-move") {
+        if let Err(err) = chatd::adapters::prove_discord_voice_move() {
+            eprintln!("discord-voice-move: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-discord-voice-move:0");
+        return Ok(());
+    }
     // The lab's discord-nitro-length driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-nitro-length") {
         if let Err(err) = chatd::adapters::prove_discord_nitro_length() {
@@ -404,6 +413,23 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-slack-custom-emoji:0");
+||||||| 95ac1957
+    // The lab's teams-copy-link driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("teams-copy-link") {
+        if let Err(err) = chatd::adapters::prove_share_links() {
+            eprintln!("teams-copy-link: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
+        return Ok(());
+    }
+    // The lab's teams-team-info driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("teams-team-info") {
+        if let Err(err) = chatd::adapters::prove_teams_team_info() {
+            eprintln!("teams-team-info: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-teams-team-info:0");
         return Ok(());
     }
     // The lab's discord-forum-landing driver. A build without this returns to the server below and stays up.
@@ -611,6 +637,32 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-slack-rich-text:0");
+||||||| 95ac1957
+    // The lab's discord-thread-chip driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-thread-chip") {
+        if let Err(err) = chatd::adapters::prove_discord_thread_chip() {
+            eprintln!("discord-thread-chip: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-discord-thread-chip:0");
+        return Ok(());
+    }
+    // The lab's discord-code-colors driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-code-colors") {
+        if let Err(err) = chatd::adapters::prove_discord_code_colors() {
+            eprintln!("discord-code-colors: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-discord-code-colors:0");
+        return Ok(());
+    }
+    // The lab's teams-chain-paging driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("teams-chain-paging") {
+        if let Err(err) = chatd::adapters::prove_chain_paging() {
+            eprintln!("teams-chain-paging: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-exit:0");
         return Ok(());
     }
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());

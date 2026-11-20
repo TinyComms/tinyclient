@@ -22,8 +22,10 @@ use crate::view::{age, now};
 use crate::client::ask;
 use gpui::{
     canvas, div, prelude::*, px, Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, ElementId,
-    Hsla, MouseButton, ObjectFit, SharedString, Stateful, Window,
+    FontWeight, HighlightStyle, Hsla, MouseButton, ObjectFit, SharedString, Stateful, StyledText, Window,
 };
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Preview, Receipt, Request, SendState};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -38,6 +40,58 @@ pub(crate) fn waiting_line(network: &str) -> String {
 }
 /// Lines of a code block shown before "Show more".
 const CODE_LINES: usize = 20;
+
+fn ink_style(ink: super::highlight::Ink) -> HighlightStyle {
+    let paint = |color: gpui::Rgba| Some(color.into_color());
+    match ink {
+        super::highlight::Ink::Keyword => HighlightStyle { color: paint(tokens::code_keyword()), ..Default::default() },
+        super::highlight::Ink::String => HighlightStyle { color: paint(tokens::code_string()), ..Default::default() },
+        super::highlight::Ink::Comment => HighlightStyle { color: paint(tokens::code_comment()), ..Default::default() },
+        super::highlight::Ink::Number => HighlightStyle { color: paint(tokens::code_number()), ..Default::default() },
+        super::highlight::Ink::Type => HighlightStyle { color: paint(tokens::code_type()), ..Default::default() },
+        super::highlight::Ink::Function => HighlightStyle { color: paint(tokens::code_function()), ..Default::default() },
+        super::highlight::Ink::Added => HighlightStyle {
+            color: paint(tokens::code_added()),
+            background_color: paint(tokens::code_added_bg()),
+            ..Default::default()
+        },
+        super::highlight::Ink::Removed => HighlightStyle {
+            color: paint(tokens::code_removed()),
+            background_color: paint(tokens::code_removed_bg()),
+            ..Default::default()
+        },
+        super::highlight::Ink::Ansi { fg, bg, bold } => HighlightStyle {
+            color: tokens::code_ansi(fg).map(|color| color.into_color()),
+            background_color: tokens::code_ansi(bg).map(|color| color.into_color()),
+            font_weight: bold.then_some(FontWeight::BOLD),
+            ..Default::default()
+        },
+    }
+}
+
+/// The first `count` lines, as a byte prefix, so colour ranges stay on the text that is drawn.
+fn first_lines(text: &str, count: usize) -> &str {
+    let mut lines = 0;
+    for (at, _) in text.match_indices('\n') {
+        lines += 1;
+        if lines == count {
+            return &text[..at];
+        }
+    }
+    text.trim_end_matches(['\n', '\r'])
+}
+
+fn code_highlights(text: &str, runs: &[super::highlight::Paint]) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    let mut highlights = Vec::new();
+    for run in runs {
+        let start = run.start as usize;
+        let end = (run.end as usize).min(text.len());
+        if start < end && text.is_char_boundary(start) && text.is_char_boundary(end) {
+            highlights.push((start..end, ink_style(run.ink)));
+        }
+    }
+    highlights
+}
 /// Link cards drawn per message; further links stay text.
 const CARDS: usize = 3;
 /// Reaction chips drawn before the rest are counted.
@@ -1080,15 +1134,61 @@ impl Pane {
         line.into_any_element()
     }
 
+    /// Colours for this block, started off the UI thread the first time it is drawn.
+    fn code_colors(&mut self, message: &Message, block: usize, language: &str, text: &str, cx: &mut Context<Self>) -> Option<Rc<super::highlight::Lit>> {
+        let mut hasher = DefaultHasher::new();
+        language.hash(&mut hasher);
+        text.hash(&mut hasher);
+        let stamp = hasher.finish();
+        let key = (message.id.clone(), block);
+        if let Some((have, lit)) = self.code_colors.get(&key) {
+            if *have == stamp {
+                return Some(Rc::clone(lit));
+            }
+        }
+        if !self.code_coloring.insert(key.clone()) {
+            return self.code_colors.get(&key).map(|(_, lit)| Rc::clone(lit));
+        }
+        let language = language.to_owned();
+        let source = text.to_owned();
+        let source_len = source.len();
+        let id = message.id.clone();
+        cx.spawn(async move |this, cx| {
+            let lit = cx.background_executor().spawn(async move { super::highlight::highlight(&language, &source) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.code_coloring.remove(&key);
+                if this.code_colors.len() >= 64 {
+                    this.code_colors.clear();
+                }
+                let resized = lit.text.len() != source_len;
+                this.code_colors.insert(key, (stamp, Rc::new(lit)));
+                if resized {
+                    for (ix, item) in this.items.iter().enumerate() {
+                        if item.message().is_some_and(|message| message.id == id) {
+                            this.list.splice(ix..ix + 1, 1);
+                            break;
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        None
+    }
+
     fn code_block(&mut self, message: &Message, block: usize, language: &str, text: &str, cx: &mut Context<Self>) -> AnyElement {
         let key = (message.id.clone(), block);
         let lines = text.lines().count();
         let folded = lines > CODE_LINES && !self.expanded.contains(&key);
-        let shown: String = if folded {
-            text.lines().take(CODE_LINES).collect::<Vec<_>>().join("\n")
-        } else {
-            text.to_owned()
+        let lit = if lines > super::highlight::PLAIN_LINES { None } else { self.code_colors(message, block, language, text, cx) };
+        let shown = match &lit {
+            Some(lit) if folded => first_lines(&lit.text, CODE_LINES).to_owned(),
+            Some(lit) => lit.text.clone(),
+            None if folded => text.lines().take(CODE_LINES).collect::<Vec<_>>().join("\n"),
+            None => text.to_owned(),
         };
+        let highlights = code_highlights(&shown, lit.as_ref().map(|lit| lit.runs.as_slice()).unwrap_or(&[]));
         let copied = self.copied.as_ref() == Some(&key);
         let (copy, text) = (key.clone(), text.to_owned());
         // A phone: the block is the column's width and the code scrolls sideways inside it; its
@@ -1141,7 +1241,11 @@ impl Pane {
                     .type_code()
                     .when(phone, |code| code.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(20.))))
                     .whitespace_nowrap()
-                    .child(shown),
+                    .child(if highlights.is_empty() {
+                        shown.into_any_element()
+                    } else {
+                        StyledText::new(SharedString::from(shown)).with_highlights(highlights).into_any_element()
+                    }),
             )))
             .children(folded.then(|| {
                 div()

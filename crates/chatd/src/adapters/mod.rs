@@ -37,6 +37,11 @@ pub fn prove_discord_group_dm() -> Result<(), String> {
 pub fn prove_discord_mark_unread() -> Result<(), String> {
     discord::prove_mark_unread()
 }
+
+/// `TINYCLIENT_PROVE=discord-voice-move`. A move to another voice channel in the same server is followed.
+pub fn prove_discord_voice_move() -> Result<(), String> {
+    discord::prove_voice_move()
+}
 mod recovery;
 pub mod net;
 mod script;
@@ -1633,6 +1638,27 @@ pub fn prove_slack_channel_star() -> Result<(), String> {
 /// with a Join link, and an old Slack call says that it happened.
 pub fn prove_slack_call_cards() -> Result<(), String> {
     slack::prove_call_cards()
+||||||| 95ac1957
+/// The lab's discord-thread-chip driver. A thread chip counts new replies and keeps the
+/// newest faces. A build without this returns to the server and stays up.
+pub fn prove_discord_thread_chip() -> Result<(), String> {
+    discord::prove_thread_chip()
+}
+
+/// The lab's discord-code-colors driver. A fenced block is coloured from its language.
+/// A build without this returns to the server and stays up.
+pub fn prove_discord_code_colors() -> Result<(), String> {
+    discord::prove_code_colors()
+}
+
+/// The lab's teams-chain-paging driver. See `teams::prove_chain_paging`.
+pub fn prove_chain_paging() -> Result<(), String> {
+    teams::prove_chain_paging()
+}
+
+/// The lab's teams-copy-link driver. See `teams::prove_share_links`.
+pub fn prove_share_links() -> Result<(), String> {
+    teams::prove_share_links()
 }
 
 /// The lab's failed-start-offline driver. A start that fails leaves the account offline,
@@ -1677,6 +1703,10 @@ pub fn prove_slack_connect_org() -> Result<(), String> {
 /// The lab's slack-rich-text driver. See `slack::prove_rich_text`.
 pub fn prove_slack_rich_text() -> Result<(), String> {
     slack::prove_rich_text()
+||||||| 95ac1957
+/// The lab's teams-team-info driver. See `teams::prove_team_info`.
+pub fn prove_teams_team_info() -> Result<(), String> {
+    teams::prove_team_info()
 }
 
 /// An adapter with no network behind it, for whatever serves an account inside chatd (the
