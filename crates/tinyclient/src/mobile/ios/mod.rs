@@ -17,6 +17,7 @@
 mod audio;
 mod auth;
 mod approval;
+mod cover;
 mod camera;
 mod codec;
 mod unified;
@@ -29,6 +30,11 @@ use mediad::platform::{CameraRequest, EncoderConfig, FrameSink, H264Decoder, H26
 use objc2::MainThreadMarker;
 use protocol::web_sign_in::{AuthHandle, AuthRequest, WebPage, WebPageHandle, WebSignIn};
 use std::sync::Arc;
+
+/// An opaque cover while the scene is inactive and the screen lock is armed.
+pub(crate) fn set_cover(on: bool) {
+    cover::set(on);
+}
 
 /// Registers the iOS phone with mediad, chatd's sign-in and the call screen.
 pub(super) fn register() {

@@ -212,6 +212,21 @@ pub fn decide_ring_in(
     })
 }
 
+/// The window writes this file while its screen lock is held. Chatd reads it and
+/// does not ask the protocol for a new field.
+pub const SHELL_LOCK_FILE: &str = "shell-lock";
+
+/// Whether the window is covering itself. A missing file is unlocked.
+pub fn app_locked() -> bool {
+    protocol::support_dir().join(SHELL_LOCK_FILE).is_file()
+}
+
+/// A message notification while the app lock is held: the words "New message",
+/// no sender, no text, and no reply. A ring is left alone.
+pub fn redact_for_app_lock(title: String, subtitle: String, body: String, can_reply: bool, locked: bool) -> (String, String, String, bool) {
+    if locked { ("New message".to_owned(), String::new(), String::new(), false) } else { (title, subtitle, body, can_reply) }
+}
+
 /// The notification's id for a conversation, stable across messages.
 pub fn note_id(conversation: &Key) -> String {
     format!("m:{}:{}:{}", conversation.network.label(), conversation.account, conversation.id)
@@ -297,8 +312,9 @@ impl Notes {
             Preview::Sender => (newest.clone(), place(conversation), what.to_owned()),
             Preview::Nothing => (key.network.label().to_owned(), String::new(), what.to_owned()),
         };
+        let locked = app_locked();
+        let (title, subtitle, body, can_reply) = redact_for_app_lock(title, subtitle, body, !conversation.read_only, locked);
         let id = note_id(key);
-        let can_reply = !conversation.read_only;
         let note = Note {
             id: id.clone(),
             title,
@@ -311,7 +327,7 @@ impl Notes {
                 String::new()
             },
             sound: verdict.sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
-            locked_body: what.to_owned(),
+            locked_body: if locked { "New message".to_owned() } else { what.to_owned() },
         };
         if let Err(err) = self.sink.post(&note) {
             tracing::warn!("chatd: notification not shown: {err}");
@@ -782,6 +798,10 @@ fn act(hub: &Hub, chat: &Weak<Chat>, notes: &Notes, done: Activation) {
         Activation::Open(_) => open(hub, &conversation),
         Activation::MarkRead(_) => read(&chat),
         Activation::Reply { text, .. } => {
+            if app_locked() {
+                tracing::warn!("chatd: reply from a notification not sent: tinyclient is locked");
+                return;
+            }
             if let Response::Conversation { conversation: row } = chat.handle(Request::Conversation { conversation: conversation.clone() }) {
                 if row.read_only {
                     tracing::warn!("chatd: reply from a notification not sent: you can read {} but not post in it", row.title);

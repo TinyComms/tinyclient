@@ -1,0 +1,12 @@
+{
+  "id": "screen-lock",
+  "title": "A minute away covers the window and a message names nothing",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same lock hides the app switcher with FLAG_SECURE.",
+    "ios": "The phone proof build does not run the desktop window. The same lock draws a cover when the scene resigns active."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

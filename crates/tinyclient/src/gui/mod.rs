@@ -21,6 +21,8 @@ mod hotkeys;
 mod input;
 mod keymap;
 mod layout;
+// `pub(crate)` so the mobile layer can read `lock::hides_switcher()`.
+pub(crate) mod lock;
 mod logs;
 mod pane;
 mod people;
@@ -176,6 +178,11 @@ pub(crate) fn prove_command_palette() -> Result<(), &'static str> {
     keymap::prove()
 }
 
+/// The lab's screen-lock driver. Idle past the timeout covers the window and a message names nothing.
+pub(crate) fn prove_screen_lock() -> Result<(), &'static str> {
+    lock::prove()
+}
+
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, MenuItem, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 
@@ -266,6 +273,7 @@ impl Shell {
             .on_action(cx.listener(|this, _: &MarkUnread, _, cx| this.mark_open_unread(cx)))
             .on_action(cx.listener(|this, _: &FocusNext, window, cx| this.focus_region(true, window, cx)))
             .on_action(cx.listener(|this, _: &FocusPrevious, window, cx| this.focus_region(false, window, cx)))
+            .on_key_down(cx.listener(|_, _: &gpui::KeyDownEvent, _, _| lock::touch()))
             .on_key_down(cx.listener(Self::typed))
             .on_key_down(cx.listener(Self::page_sidebar))
             .on_action(cx.listener(|this, _: &CloseRight, window, cx| this.close_right(Some(window), cx)))
@@ -999,6 +1007,7 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, a
     let prefs = if shot_demo::on() { app::prefs::Prefs::default() } else { prefs };
     theme::set_text_step(prefs.text_step);
     app::prefs::set_choices(prefs.choices);
+    lock::install(prefs.lock.clone());
     app::prefs::set_trusted_links(prefs.trusted_links.clone());
     anim::set_autoplay(prefs.autoplay);
     let application = application.with_assets(assets::Assets);

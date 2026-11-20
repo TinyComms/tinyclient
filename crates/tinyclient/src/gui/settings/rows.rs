@@ -69,6 +69,9 @@ pub const ROWS: &[Row] = &[
     row("M4", Messages, "", "Convert emoticons to emoji", &[], &["smiley", "emoji", "emoticon", ":)"]),
     row("M5", Messages, "", "Play GIFs and animated stickers", &["Automatically", "On hover", "Never"], &["gif", "animated", "autoplay", "sticker", "motion", "animation"]),
     row("M6", Messages, "", "Check spelling", &[], &["spell", "spelling", "spellcheck", "dictionary", "underline"]),
+    row("LK", Privacy, "Lock", "Lock tinyclient", &["Off", "After 1 minute", "After 5 minutes", "After 1 hour"], &["touch id", "windows hello", "fingerprint", "face", "passcode", "pin", "biometric", "lock"]),
+    row("LS", Privacy, "Lock", "When the screen locks", &[], &["screen lock", "away"]),
+    row("LP", Privacy, "Lock", "Passphrase", &[], &["passphrase", "password", "linux"]),
     row("P1", Privacy, "Let others see when I am typing", "Let others see when I am typing", &[], &["typing", "indicator", "privacy"]),
     row("P2", Privacy, "Let others see what I have read", "Let others see what I have read", &[], &["receipts", "read receipts", "seen", "privacy"]),
     row("P3", Privacy, "", "Load images and link previews automatically", &[], &["images", "pictures", "previews", "data", "tracking"]),
@@ -119,7 +122,6 @@ pub const NOT_YET: &[(&str, &str)] = &[
     ("theme", "tinyclient is dark only for now."),
     ("light", "tinyclient is dark only for now."),
     ("dark mode", "tinyclient is dark only for now."),
-    ("touch id", "tinyclient has no lock yet."),
     ("accent", "tinyclient keeps one accent colour."),
     ("font", "tinyclient keeps the system font. Text size is in Appearance."),
     ("language", crate::host::FOLLOWS_LANGUAGE),
@@ -201,6 +203,8 @@ pub fn absent(id: &str) -> bool {
         "N10" | "N11" => !cfg!(any(target_os = "android", target_os = "ios")),
         // Nothing to forget until a link's "Don't ask again" has been used.
         "PF" => crate::gui::app::prefs::trusted_links().is_empty(),
+        // The passphrase is the Linux fallback. Other systems use the device prompt.
+        "LP" => !cfg!(target_os = "linux"),
         _ => false,
     }
 }

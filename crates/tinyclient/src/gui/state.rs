@@ -255,6 +255,11 @@ pub struct Shell {
     pub(super) menus_set: RefCell<String>,
     /// Lines of `shell.prefs` this build does not know, written back as they were.
     pub(super) prefs_kept: Vec<String>,
+    /// The passphrase field on the Linux lock screen.
+    #[cfg(target_os = "linux")]
+    pub(super) lock_phrase: Option<gpui::Entity<super::input::TextInput>>,
+    /// Focus held by the lock cover so keys never reach the composer or sidebar behind it.
+    pub(super) lock_focus: FocusHandle,
     /// A window state forced by `--state`, for looking at it.
     #[cfg(feature = "gui-shot")]
     pub(super) forced_state: Option<app::service::Shown>,
@@ -275,6 +280,7 @@ impl Shell {
         let subscriptions = [
             cx.observe_window_activation(window, |this, window, cx| {
                 this.active = window.is_window_active();
+                super::lock::note_active(this.active);
                 this.focus_changed(this.active, cx);
                 cx.notify();
             }),
@@ -295,6 +301,7 @@ impl Shell {
             trouble: HashMap::new(),
             window_at: Cell::new(None),
             focus: cx.focus_handle(),
+            lock_focus: cx.focus_handle(),
             // The other slices' views, placed in this slice's frames.
             slots: Slots {
                 people: Some(people::draw_people),
@@ -321,6 +328,8 @@ impl Shell {
             settling: None,
             menus_set: RefCell::new(String::new()),
             prefs_kept: prefs.kept.clone(),
+            #[cfg(target_os = "linux")]
+            lock_phrase: None,
             #[cfg(feature = "gui-shot")]
             forced_state: None,
             #[cfg(feature = "gui-shot")]
@@ -339,6 +348,7 @@ impl Shell {
         if crate::update::announce().is_some() {
             shell.layout_state.update_alert = true;
         }
+        super::lock::note_active(shell.active);
         shell
     }
 

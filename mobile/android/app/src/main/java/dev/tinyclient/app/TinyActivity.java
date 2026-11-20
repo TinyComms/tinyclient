@@ -15,7 +15,20 @@ public class TinyActivity extends GpuiInputActivity {
     protected void onCreate(Bundle savedInstanceState) {
         TinyPlatform.attach(this);
         super.onCreate(savedInstanceState);
+        applySecure();
         selfTest(getIntent());
+    }
+
+    /** Hides the conversation in the app switcher while the screen lock is on. */
+    private void applySecure() {
+        try {
+            if (TinyPlatform.nativeHidesSwitcher()) {
+                getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);
+            } else {
+                getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);
+            }
+        } catch (UnsatisfiedLinkError ignored) {
+        }
     }
 
     private void selfTest(Intent intent) {
@@ -53,6 +66,7 @@ public class TinyActivity extends GpuiInputActivity {
 
     @Override
     protected void onPause() {
+        applySecure();
         super.onPause();
         AuthSession.onActivityPaused();
     }
@@ -60,6 +74,7 @@ public class TinyActivity extends GpuiInputActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        applySecure();
         AuthSession.onActivityResumed();
     }
 

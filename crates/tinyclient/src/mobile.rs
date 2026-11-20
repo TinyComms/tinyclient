@@ -34,6 +34,12 @@ const NOT_YET: &str = "This isn't available on this phone yet.";
 #[cfg(target_os = "ios")]
 mod ios;
 
+/// Covers the iOS window while it is inactive and the screen lock is on.
+#[cfg(target_os = "ios")]
+pub fn set_cover(on: bool) {
+    ios::set_cover(on);
+}
+
 /// Registers everything. Idempotent enough to call once per launch.
 pub fn register() {
     protocol::media_host::register(mediad::inproc::start);

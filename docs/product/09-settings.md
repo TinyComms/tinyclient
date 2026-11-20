@@ -33,7 +33,7 @@ chatd keeps the notification, sound, privacy, voice, and storage values. The she
 | N14, N15 | No reaction or thread-follow notify control. |
 | S5, S6 pickers | chatd will honor an account or conversation sound if one is stored. No row was found that writes them. |
 | S13 custom files, S14 ring-back | Both are in: sounds of your own in every picker, and a ring back while you call. |
-| P5 screen-share hide, P6 Touch ID, P7 Signal relay | In `NOT_YET` or absent. |
+| P5 screen-share hide, P7 Signal relay | In `NOT_YET` or absent. |
 | V7 camera device | "tinyclient has no camera yet." A Tiny call can still toggle the camera from the call dock. That is `06-calls.md`. |
 | V9 per-person volume | `CallGain` on a Tiny participant row, not a Settings row. |
 | Proxy, accent, font, language, sync | `NOT_YET`. |
@@ -230,7 +230,7 @@ no control.
 | P4 | Keep messages on this computer for | Segmented: "7 days" / "30 days" / "90 days" | 90 days | G | d | The age half of the retention rule (`store.rs`); the 2,000 per conversation cap stays. Pruned within 1 min of the change and daily | in |
 | PE | Only join end-to-end encrypted calls | Switch | Off | G | s | Off on purpose: a server or an app that cannot encrypt calls would stop working. Either way a Tiny call whose server turns encryption off stops sending and playing ("Encryption was turned off" on the call badge); off, the security panel offers "Carry on without encryption", on, it offers only leaving, and a server with no end-to-end calls is not joined. Incognito hosts (`incognito.tinyclient.io` and names under it) and `e2ee_required` rooms behave as on whatever the switch says. Read when a call is joined | in |
 | P5 | Hide tinyclient from screen sharing and recordings | Switch | | G | s | | Later (spike: macOS 15 capture may ignore `sharingType`) |
-| P6 | Lock with Touch ID | Switch | | G | s | | Later |
+| P6 | Lock tinyclient | Off, after 1 minute, after 5 minutes, after 1 hour, and when the screen locks | Off | G | s | Covers the window. A notification then says "New message" with no sender or text, and Reply is refused. A ring can still be answered. Unlock uses device approval; Linux keeps a passphrase hash in the window prefs. The cache is not encrypted. A phone hides the app switcher while the lock is on. | in |
 | P7 | Signal: always relay calls | Switch | | A | d | | Later, with Signal calls |
 
 ### Audio & video
@@ -574,7 +574,6 @@ Still absent, matching `NOT_YET` and the "Not in the window" table above. M5, V8
 | S13 Custom sound files | Built: Settings › Sounds › Your sounds. |
 | S14 Ring-back tone, longer looping ring | Ring back is built; an optional looping ringtone is not. |
 | P5 Hide from screen sharing | `NOT_YET`. |
-| P6 Touch ID lock | `NOT_YET`. |
 | P7 Signal always relay | `NOT_YET`. |
 | V7 Camera device | "tinyclient has no camera yet." The call-dock camera toggle is `06-calls.md`. |
 | Proxy, accent, font, language, sync | `NOT_YET`. A proxy, if it is ever offered, is Telegram only. It is not a setting. |

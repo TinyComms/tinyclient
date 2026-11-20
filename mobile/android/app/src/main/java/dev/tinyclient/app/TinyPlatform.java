@@ -219,4 +219,7 @@ public final class TinyPlatform {
     static native void nativeSelfTest(String what);
     /** Debug builds only: open a Tiny room and join its call (gui/debug_launch.rs). */
     static native void nativeDebugJoin(String join, boolean camera, boolean speaker);
+
+    /** True while the screen lock should hide this window from the app switcher. */
+    static native boolean nativeHidesSwitcher();
 }
