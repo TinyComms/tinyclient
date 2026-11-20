@@ -995,6 +995,7 @@ fn an_sms_chat_says_text_and_an_encrypted_rcs_chat_does_not_claim_this_computer_
     assert_eq!(sms.encryption, Encryption::Unknown);
     world.ask(Request::Typing {
         conversation: key(GRACE),
+        activity: protocol::Compose::Typing,
     });
     let quiet = Instant::now() + Duration::from_secs(1);
     while Instant::now() < quiet {
@@ -1017,6 +1018,7 @@ fn an_sms_chat_says_text_and_an_encrypted_rcs_chat_does_not_claim_this_computer_
     assert_eq!(rcs.encryption, Encryption::Unknown);
     world.ask(Request::Typing {
         conversation: key(GRACE),
+        activity: protocol::Compose::Typing,
     });
     world.heard(&format!("typing {GRACE}"));
     world.steer("tick grace");
@@ -1173,6 +1175,7 @@ fn scrolling_back_reads_every_message_and_then_stops_asking() {
     let _ = world.before(&oldest(&all));
     world.ask(Request::Typing {
         conversation: key(GRACE),
+        activity: protocol::Compose::Typing,
     });
     world.heard(&format!("typing {GRACE}"));
     let after = world

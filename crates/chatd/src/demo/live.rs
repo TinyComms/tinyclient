@@ -67,6 +67,7 @@ impl Plan {
             id: self.yusuf.id.clone(),
             name: self.yusuf.name.clone(),
             until: now() + 8,
+            activity: protocol::Compose::Typing,
         };
         hub.set_typing(self.conversation.clone(), typist, typing);
     }

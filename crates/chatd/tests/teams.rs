@@ -1201,7 +1201,7 @@ fn sending_editing_reacting_deleting_and_reading_go_to_teams() {
 
     // Typing: one signal however often the draft changes.
     for _ in 0..3 {
-        assert_eq!(world.ask(Request::Typing { conversation: ana.clone() }), Response::Ok);
+        assert_eq!(world.ask(Request::Typing { conversation: ana.clone(), activity: protocol::Compose::Typing }), Response::Ok);
     }
     let typed = world.until("the typing signal", || {
         let signals: Vec<Call> = world.fake.calls("POST", &path("/messages")).into_iter().filter(|call| call.json()["messagetype"] == "Control/Typing").collect();

@@ -1572,7 +1572,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Wanted(ids) => wanted(account, &ids),
         Command::Watch(watching) => pictures(account, &watching),
-        Command::Typing(conversation_id) => {
+        Command::Typing { conversation_id, activity: _ } => {
             if bugle::shows_typing(carrier_of(account, &conversation_id)) {
                 let _ = account.drive.typing(&conversation_id);
             }

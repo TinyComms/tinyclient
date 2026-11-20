@@ -1394,7 +1394,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Delete { conversation_id, message_id, reply } => {
             let _ = reply.send(delete(account, &conversation_id, &message_id).map_err(refused));
         }
-        Command::Typing(conversation_id) => typing(account, &conversation_id),
+        Command::Typing { conversation_id, activity: _ } => typing(account, &conversation_id),
         Command::StartDirect { person_id, reply } => {
             // Nothing reaches the other person: the chat exists on Signal once a message does.
             let started = wire::is_aci(&person_id).then(|| {

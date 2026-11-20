@@ -63,7 +63,7 @@ use protocol::{
     AccountKey, Activity, CallFailure, CallState, Capabilities, CatalogItem, CatalogKind, Change,
     Contact, Group, Key, Link, MediaFile, MemberSection, Message, MessageHit, Network, Notify,
     Occupant, Occupants, Outgoing, Participant, Person, Presence, Reaction, RelateAction, Relation,
-    SendState, SharedItem, SharedKind, Typist, VoiceJoin, Warning, Watching,
+    SendState, SharedItem, SharedKind, Compose, Typist, VoiceJoin, Warning, Watching,
 };
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -303,8 +303,9 @@ pub enum Command {
         message_id: String,
         reply: Reply<()>,
     },
-    /// The user's draft is changing. Pace it: at most one signal per 8 s per conversation.
-    Typing(String),
+    /// The user's draft is changing. Pace it: at most one typing signal per 8 s per
+    /// conversation. `activity` is what they are doing; an adapter that only has typing ignores it.
+    Typing { conversation_id: String, activity: Compose },
     /// The user followed a link out of this message (the shell is opening it). Telegram's terms
     /// want a sponsored message's follow told; nothing waits on it.
     FollowLink { conversation_id: String, message_id: String },
@@ -1113,10 +1114,16 @@ impl Context {
 
     /// Someone is typing, for `seconds` unless more is heard (the network's own timeout).
     pub fn typing(&self, conversation_id: &str, person_id: &str, name: &str, seconds: i64) {
+        self.typing_as(conversation_id, person_id, name, seconds, Compose::Typing);
+    }
+
+    /// The same, naming what they are doing. [`Compose::Typing`] is the only kind most networks have.
+    pub fn typing_as(&self, conversation_id: &str, person_id: &str, name: &str, seconds: i64, activity: Compose) {
         let typist = Typist {
             id: person_id.to_owned(),
             name: name.to_owned(),
             until: now() + seconds,
+            activity,
         };
         self.hub.set_typing(self.key(conversation_id), typist, true);
     }
@@ -1126,6 +1133,7 @@ impl Context {
             id: person_id.to_owned(),
             name: String::new(),
             until: 0,
+            activity: Compose::Typing,
         };
         self.hub.set_typing(self.key(conversation_id), typist, false);
     }

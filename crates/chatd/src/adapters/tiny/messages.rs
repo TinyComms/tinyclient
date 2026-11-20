@@ -410,7 +410,7 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             message_id,
             reply,
         } => delete(ctx, saved, &conversation_id, &message_id, reply),
-        Command::Typing(conversation_id) => {
+        Command::Typing { conversation_id, activity: _ } => {
             if super::safe_id(&conversation_id) {
                 live.ask(Ask::Type { conversation_id });
             }
