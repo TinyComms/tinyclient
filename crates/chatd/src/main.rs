@@ -379,6 +379,33 @@ fn main() -> io::Result<()> {
         eprintln!("prove-messages-failed-send:0");
         return Ok(());
     }
+    // The lab's messages-media driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-media") {
+        if let Err(err) = chatd::adapters::messages::prove_message_media() {
+            eprintln!("messages-media: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-media:0");
+        return Ok(());
+    }
+    // The lab's messages-folders driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-folders") {
+        if let Err(err) = chatd::adapters::messages::prove_message_folders() {
+            eprintln!("messages-folders: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-folders:0");
+        return Ok(());
+    }
+    // The lab's messages-search driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-search") {
+        if let Err(err) = chatd::adapters::messages::prove_message_search() {
+            eprintln!("messages-search: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-search:0");
+        return Ok(());
+    }
     // The lab's teams-reactions driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("teams-reactions") {
         if let Err(err) = chatd::adapters::prove_teams_reactions() {
@@ -430,6 +457,14 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-teams-team-info:0");
+||||||| 95ac1957
+    // The lab's messages-unread driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-unread") {
+        if let Err(err) = chatd::adapters::messages::prove_messages_unread() {
+            eprintln!("messages-unread: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-unread:0");
         return Ok(());
     }
     // The lab's discord-forum-landing driver. A build without this returns to the server below and stays up.
@@ -663,6 +698,32 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-exit:0");
+||||||| 95ac1957
+    // The lab's messages-several-files driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-several-files") {
+        if let Err(err) = chatd::adapters::messages::prove_messages_several_files() {
+            eprintln!("messages-several-files: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-several-files:0");
+        return Ok(());
+    }
+    // The lab's messages-mute driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-mute") {
+        if let Err(err) = chatd::adapters::messages::prove_messages_mute() {
+            eprintln!("messages-mute: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-mute:0");
+        return Ok(());
+    }
+    // The lab's messages-sign-out driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-sign-out") {
+        if let Err(err) = chatd::adapters::messages::prove_messages_sign_out() {
+            eprintln!("messages-sign-out: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-sign-out:0");
         return Ok(());
     }
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());

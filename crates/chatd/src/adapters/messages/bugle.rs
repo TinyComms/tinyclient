@@ -23,7 +23,7 @@ const ORIGIN: &str = "https://messages.google.com";
 const RELAY: &str = "https://instantmessaging-pa.googleapis.com/$rpc/google.internal.communications.instantmessaging.v1";
 const UPLOAD: &str = "https://instantmessaging-pa.googleapis.com/upload";
 /// A guard for this client, not a limit Google publishes.
-const FILE_CAP: u64 = 100 * 1024 * 1024;
+pub(super) const FILE_CAP: u64 = 100 * 1024 * 1024;
 const NETWORK: &str = "Bugle";
 /// How long one request waits for the phone to answer on the long-poll.
 const PHONE: Duration = Duration::from_secs(20);
@@ -525,6 +525,18 @@ fn outgoing(
     ])
 }
 
+/// Action 46, `UnpairRequest`: the pairing attempt id in field 1. Gaia pairing actions travel
+/// in the clear (field 3 of the envelope), the same as 44, 45 and 47.
+pub fn unpair_request(attempt: &str) -> Vec<u8> {
+    let mut buf = Buf::new();
+    buf.text(1, attempt);
+    buf.0
+}
+
+pub fn clear_action(action: u32) -> bool {
+    matches!(action, 44..=47)
+}
+
 /// Where the next page starts. Field 1 is the last item already seen, field 2 its time in
 /// milliseconds. Message times are stored here as unix seconds, so the request multiplies.
 #[derive(Clone)]
@@ -552,10 +564,11 @@ fn cursor_message(cursor: &Cursor) -> Vec<u8> {
     buf.0
 }
 
-fn list_request(count: u64, before: Option<&Cursor>) -> Vec<u8> {
+/// `ListConversationsRequest.folder`: inbox, archive, and spam & blocked.
+fn list_request(count: u64, folder: u64, before: Option<&Cursor>) -> Vec<u8> {
     let mut buf = Buf::new();
     buf.int(2, count);
-    buf.int(4, 1); // INBOX
+    buf.int(4, folder);
     if let Some(cursor) = before {
         buf.msg(5, &cursor_message(cursor));
     }
@@ -578,6 +591,62 @@ fn delete_conversation_request(conversation: &str) -> Vec<u8> {
     let mut req = Buf::new();
     req.int(2, 1);
     req.text(3, conversation);
+    req.msg(6, &data.0);
+    req.0
+}
+
+/// Where a `Conversation.status` sits. The layout's cross-country folder has no shelf here,
+/// so it stays off the lists, the same as a deleted chat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Place {
+    Main,
+    Archive,
+    Request,
+    Hidden,
+}
+
+pub(super) fn place(status: u64) -> Place {
+    match status {
+        2 | 4 => Place::Archive,
+        5 | 6 => Place::Request,
+        3 | 7 | 8 => Place::Hidden,
+        _ => Place::Main,
+    }
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-folders`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub(super) fn prove_message_folders() -> Result<(), String> {
+    for folder in [1u64, 2, 5] {
+        let got = field_int(&fields(&list_request(50, folder, None)), 4);
+        if got != folder {
+            return Err(format!("the list asked for folder {got}, not {folder}"));
+        }
+    }
+    if place(1) != Place::Main || place(0) != Place::Main {
+        return Err("an open chat left the main list".into());
+    }
+    if place(2) != Place::Archive || place(4) != Place::Archive {
+        return Err("an archived chat was not filed on the archive".into());
+    }
+    if place(5) != Place::Request || place(6) != Place::Request {
+        return Err("spam or a blocked chat was not filed as a request".into());
+    }
+    if place(3) != Place::Hidden || place(7) != Place::Hidden || place(8) != Place::Hidden {
+        return Err("a deleted chat stayed on a list".into());
+    }
+    Ok(())
+}
+
+fn block_request(conversation: &str) -> Vec<u8> {
+    let mut data = Buf::new();
+    data.text(1, conversation);
+    let mut extra = Buf::new();
+    extra.int(2, 1);
+    let mut req = Buf::new();
+    req.int(2, 7); // BLOCK
+    req.text(3, conversation);
+    req.msg(5, &extra.0);
     req.msg(6, &data.0);
     req.0
 }
@@ -903,31 +972,38 @@ fn file_type_samples() -> Result<(), String> {
     Ok(())
 }
 
+/// One file already sealed and uploaded, named the way the phone shows it.
+pub(super) struct MediaPart<'a> {
+    pub media_id: &'a str,
+    pub key: &'a [u8],
+    pub name: &'a str,
+    pub mime: &'a str,
+    pub size: u64,
+}
+
 fn send_media_request(
     conversation: &str,
     caption: &str,
     tmp: &str,
     mine: &str,
-    media_id: &str,
-    key: &[u8],
-    name: &str,
-    mime: &str,
-    size: u64,
+    parts: &[MediaPart<'_>],
     reply: Option<&str>,
 ) -> Vec<u8> {
-    let mut media = Buf::new();
-    media.text(2, media_id);
-    media.text(4, name);
-    media.int(5, size);
-    media.bytes(11, key);
-    media.text(14, mime);
-    let mut media_info = Buf::new();
-    media_info.msg(3, &media.0);
     let mut payload = Buf::new();
     payload.text(1, tmp);
     payload.text(7, conversation);
     payload.text(9, mine);
-    payload.msg(10, &media_info.0);
+    for part in parts {
+        let mut media = Buf::new();
+        media.text(2, part.media_id);
+        media.text(4, part.name);
+        media.int(5, part.size);
+        media.bytes(11, part.key);
+        media.text(14, part.mime);
+        let mut media_info = Buf::new();
+        media_info.msg(3, &media.0);
+        payload.msg(10, &media_info.0);
+    }
     if !caption.is_empty() {
         let mut content = Buf::new();
         content.text(1, caption);
@@ -1039,8 +1115,9 @@ pub struct Chat {
     /// A tombstone said the phones encrypt the chat. A later conversation update does not
     /// clear it: the conversation message has no such field.
     pub phones: bool,
-    /// Conversation status DELETED (field 12 is 3): the phone no longer has this chat.
-    pub gone: bool,
+    /// `Conversation.status`, field 12. 0 when the phone did not say, which keeps the status
+    /// already stored. 3 is DELETED.
+    pub status: u64,
 }
 
 /// One photo or file on a message. Bytes are already opened when the phone sent them inline.
@@ -1172,7 +1249,7 @@ pub(super) fn prove_messages_delete() -> Result<(), String> {
     let mut list = Buf::new();
     list.msg(2, &conv.0);
     let chats = decode_chats(&list.0);
-    if chats.len() != 1 || !chats[0].gone {
+    if chats.len() != 1 || chats[0].status != 3 {
         return Err("a chat deleted on the phone was kept".into());
     }
     Ok(())
@@ -1494,6 +1571,22 @@ impl Session {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Asks the phone to drop this computer. An empty attempt id has nothing to revoke.
+    pub fn unpair(&self) -> Result<(), String> {
+        let attempt = self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .saved
+            .pairing_id
+            .clone();
+        if attempt.is_empty() {
+            return Ok(());
+        }
+        let _ = self.rpc(46, &unpair_request(&attempt), 2)?;
+        Ok(())
+    }
+
     fn rpc(&self, action: u32, plain: &[u8], message_type: u32) -> Result<Vec<u8>, String> {
         self.rpc_as(&uuid(), action, plain, message_type)
     }
@@ -1535,7 +1628,7 @@ impl Session {
                 .live
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let gaia_pairing = matches!(action, 44 | 45 | 47);
+            let gaia_pairing = clear_action(action);
             let encrypted = if plain.is_empty() || gaia_pairing {
                 Vec::new()
             } else {
@@ -1609,9 +1702,13 @@ impl Session {
                 .retain(|waiter| waiter.request != request);
             return Err(err);
         }
+        // Sign-out waits five seconds and then forgets the account. Unpair has to answer
+        // inside that, or the request is simply best effort.
         let deadline = Instant::now()
             + if action == 45 {
                 Duration::from_secs(180)
+            } else if action == 46 {
+                Duration::from_secs(4)
             } else {
                 PHONE
             };
@@ -1644,10 +1741,27 @@ impl Session {
 
     pub fn refresh(&self) -> Result<(), String> {
         self.activate()?;
-        let first = self.rpc(1, &list_request(CHAT_PAGE, None), 16)?;
+        // The first list after pairing is the annotation. Archive and spam use the ordinary call.
+        let first = self.rpc(1, &list_request(CHAT_PAGE, 1, None), 16)?;
         let chats = decode_chats(&first);
         self.note_inbox(&first, &chats);
-        self.store_chats(chats, true);
+        self.apply_chats(chats);
+        for folder in [2u64, 5] {
+            match self.rpc(1, &list_request(CHAT_PAGE, folder, None), 2) {
+                Ok(page) => self.apply_chats(decode_chats(&page)),
+                Err(why) if why == PHONE_QUIET => return Err(why),
+                Err(why) => tracing::warn!("chatd: Messages: {why}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Block the conversation. The published request is `BLOCK` with the conversation id, and
+    /// the same id again in the delete-shaped data the phone expects. Reporting spam is a
+    /// different action and is not sent from here.
+    pub fn block(&self, conversation: &str) -> Result<(), String> {
+        let bytes = self.rpc(15, &block_request(conversation), 2)?;
+        refused(&bytes)?;
         Ok(())
     }
 
@@ -1670,7 +1784,7 @@ impl Session {
             self.finish_inbox();
             return Ok(Vec::new());
         };
-        let bytes = self.rpc(1, &list_request(CHAT_PAGE, Some(&cursor)), 2)?;
+        let bytes = self.rpc(1, &list_request(CHAT_PAGE, 1, Some(&cursor)), 2)?;
         let chats = decode_chats(&bytes);
         let next = decode_cursor(&bytes).or_else(|| oldest_cursor(&chats));
         let moved = next.as_ref().is_some_and(|next| next.id != cursor.id || next.millis != cursor.millis);
@@ -1679,7 +1793,7 @@ impl Session {
         } else {
             self.note_inbox(&bytes, &chats);
         }
-        self.store_chats(chats.clone(), false);
+        self.apply_chats(chats.clone());
         Ok(chats)
     }
 
@@ -1707,25 +1821,13 @@ impl Session {
         }
     }
 
-    fn store_chats(&self, chats: Vec<Chat>, replace: bool) {
-        if chats.is_empty() {
-            return;
+    fn apply_chats(&self, chats: Vec<Chat>) {
+        let sent = keep_chats(&self.live, chats);
+        if !sent.is_empty() {
+            let _ = self
+                .events
+                .send(crate::adapters::messages::Event::Chats(sent));
         }
-        {
-            let mut live = self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            if replace {
-                live.chats = chats.clone();
-            } else {
-                for chat in &chats {
-                    if let Some(had) = live.chats.iter_mut().find(|had| had.id == chat.id) {
-                        *had = chat.clone();
-                    } else {
-                        live.chats.push(chat.clone());
-                    }
-                }
-            }
-        }
-        let _ = self.events.send(crate::adapters::messages::Event::Chats(chats));
     }
 
     fn mine_of(&self, conversation: &str) -> String {
@@ -1761,49 +1863,27 @@ impl Session {
         refused(&bytes)
     }
 
-    /// Encrypts the file, uploads it, and asks the phone to send it. A large photo may leave as
-    /// an MMS copy; this does not promise an RCS high-quality send.
-    pub fn send_file(
+    /// Uploads one sealed file. A large photo may leave as an MMS copy; this does not promise
+    /// an RCS high-quality send.
+    pub fn upload_bytes(&self, packed: &[u8], mime: &str) -> Result<String, String> {
+        self.upload(packed, mime)
+    }
+
+    /// Asks the phone to send every part as one message. `parts` are already uploaded.
+    pub fn send_media(
         &self,
         conversation: &str,
         caption: &str,
-        path: &str,
-        name: &str,
+        parts: &[MediaPart<'_>],
         reply: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
-        let named = if name.is_empty() { "file" } else { name };
-        let meta =
-            std::fs::metadata(path).map_err(|_| format!("Messages couldn't read {named}."))?;
-        if meta.len() > FILE_CAP {
-            return Err(
-                "That file is larger than 100 MB, which tinyclient won't send through Messages."
-                    .into(),
-            );
-        }
-        let plain = std::fs::read(path).map_err(|_| format!("Messages couldn't read {named}."))?;
-        let mut key = [0u8; 32];
-        getrandom::fill(&mut key).map_err(|_| "Messages could not make a media key.".to_owned())?;
-        let packed = super::media::pack(&key, &plain)?;
-        let mime = mime_of(named, &plain);
-        let media_id = self.upload(&packed, &mime)?;
         let mine = self.mine_of(conversation);
         let tmp = uuid();
         noted(&tmp);
         let bytes = self.rpc(
             3,
-            &send_media_request(
-                conversation,
-                caption,
-                &tmp,
-                &mine,
-                &media_id,
-                &key,
-                named,
-                &mime,
-                plain.len() as u64,
-                reply,
-            ),
+            &send_media_request(conversation, caption, &tmp, &mine, parts, reply),
             2,
         )?;
         refused(&bytes)?;
@@ -2013,6 +2093,29 @@ fn wait_or_stop(stop: &std::sync::atomic::AtomicBool, pause: Duration) {
         std::thread::sleep(step);
         left = left.saturating_sub(step);
     }
+}
+
+/// A later list or update adds to the chats already held. A status of 0 means this message
+/// did not say, so the one already stored stays. Replacing the whole list would drop the inbox
+/// when the archive page arrives, and would put an archived chat back when an update omits it.
+fn keep_chats(live: &Mutex<Live>, incoming: Vec<Chat>) -> Vec<Chat> {
+    if incoming.is_empty() {
+        return Vec::new();
+    }
+    let mut held = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut sent = Vec::with_capacity(incoming.len());
+    for mut chat in incoming {
+        if let Some(slot) = held.chats.iter_mut().find(|had| had.id == chat.id) {
+            if chat.status == 0 {
+                chat.status = slot.status;
+            }
+            *slot = chat.clone();
+        } else {
+            held.chats.push(chat.clone());
+        }
+        sent.push(chat);
+    }
+    sent
 }
 
 /// True when this poll failed before its own close, so the next wait should grow.
@@ -2257,12 +2360,9 @@ fn on_payload(
     }
     match action {
         1 => {
-            let chats = decode_chats(&plain);
-            if !chats.is_empty() {
-                live.lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .chats = chats.clone();
-                let _ = events.send(crate::adapters::messages::Event::Chats(chats));
+            let sent = keep_chats(live, decode_chats(&plain));
+            if !sent.is_empty() {
+                let _ = events.send(crate::adapters::messages::Event::Chats(sent));
             }
         }
         16 => on_updates(&plain, live, events),
@@ -2305,37 +2405,129 @@ fn on_pair(message: &[u8], live: &Mutex<Live>, paired: &Option<Sender<Saved>>) -
     false
 }
 
+/// Messages, then the conversation row, then typing. A read flag in the same batch must not
+/// land before the messages it already includes, or the count flickers.
+pub(super) fn update_field_order() -> [u64; 3] {
+    [3, 2, 4]
+}
+
+/// Field 6 is a bool, not a count. True leaves whatever the messages added. False means the
+/// phone has read the chat, so the badge is cleared. A direct or group row cannot show a dot.
+pub(super) fn flag_count(unread: bool) -> Option<u32> {
+    if unread { None } else { Some(0) }
+}
+
 fn on_updates(bytes: &[u8], live: &Mutex<Live>, events: &Sender<crate::adapters::messages::Event>) {
     let list = fields(bytes);
-    if let Some(conversations) = field(&list, 2) {
-        let chats = decode_chats(&conversations.bytes);
-        if !chats.is_empty() {
-            live.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .chats = chats.clone();
-            let _ = events.send(crate::adapters::messages::Event::Chats(chats));
+    for number in update_field_order() {
+        match number {
+            3 => {
+                if let Some(messages) = field(&list, 3) {
+                    for note in decode_messages(&messages.bytes) {
+                        let _ = events.send(crate::adapters::messages::Event::Message(note));
+                    }
+                }
+            }
+            2 => {
+                if let Some(conversations) = field(&list, 2) {
+                    let sent = keep_chats(live, decode_chats(&conversations.bytes));
+                    if !sent.is_empty() {
+                        let _ = events.send(crate::adapters::messages::Event::Chats(sent));
+                    }
+                }
+            }
+            4 => {
+                if let Some(typing) = field(&list, 4) {
+                    let data = fields(&field_bytes(&fields(&typing.bytes), 2));
+                    let conversation = field_text(&data, 1);
+                    let user = fields(&field_bytes(&data, 2));
+                    let who = field_text(&user, 2);
+                    let started = field_int(&data, 3) == 1;
+                    if !conversation.is_empty() {
+                        let _ = events.send(crate::adapters::messages::Event::Typing {
+                            conversation,
+                            by: who.clone(),
+                            name: who,
+                            started,
+                        });
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    if let Some(messages) = field(&list, 3) {
-        for note in decode_messages(&messages.bytes) {
-            let _ = events.send(crate::adapters::messages::Event::Message(note));
-        }
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-unread`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub(super) fn prove_messages_unread() -> Result<(), String> {
+    if update_field_order() != [3, 2, 4] {
+        return Err("a batch applies the conversation before its messages".into());
     }
-    if let Some(typing) = field(&list, 4) {
-        let data = fields(&field_bytes(&fields(&typing.bytes), 2));
-        let conversation = field_text(&data, 1);
-        let user = fields(&field_bytes(&data, 2));
-        let who = field_text(&user, 2);
-        let started = field_int(&data, 3) == 1;
-        if !conversation.is_empty() {
-            let _ = events.send(crate::adapters::messages::Event::Typing {
-                conversation,
-                by: who.clone(),
-                name: who,
-                started,
-            });
-        }
+    if flag_count(true).is_some() {
+        return Err("an unread flag was published as a count".into());
     }
+    if flag_count(false) != Some(0) {
+        return Err("a chat read on the phone was not cleared".into());
+    }
+    let mut bare = Buf::new();
+    bare.text(1, "club");
+    bare.text(2, "Club");
+    bare.int(6, 1);
+    bare.int(10, 1);
+    let mut list = Buf::new();
+    list.msg(2, &bare.0);
+    let flagged = decode_chats(&list.0);
+    if flagged.len() != 1 || !flagged[0].unread {
+        return Err("the unread flag was not read".into());
+    }
+    let mut quiet = 0u32;
+    if let Some(set) = flag_count(flagged[0].unread) {
+        quiet = set;
+    }
+    if quiet != 0 {
+        return Err("a flag with no messages became a count".into());
+    }
+    let mut notes = Buf::new();
+    for (id, words) in [("m1", "a"), ("m2", "bb"), ("m3", "ccc")] {
+        let mut message = Buf::new();
+        message.text(1, id);
+        message.text(7, "club");
+        let mut body = Buf::new();
+        body.text(1, words);
+        let mut info = Buf::new();
+        info.msg(2, &body.0);
+        message.msg(10, &info.0);
+        notes.msg(1, &message.0);
+    }
+    let arrived = decode_messages(&notes.0);
+    if arrived.len() != 3 {
+        return Err(format!("{} messages decoded, not 3", arrived.len()));
+    }
+    let mut count = arrived.len() as u32;
+    if let Some(set) = flag_count(true) {
+        count = set;
+    }
+    if count != 3 {
+        return Err(format!("three texts counted as {count}"));
+    }
+    let mut read = Buf::new();
+    read.text(1, "club");
+    read.text(2, "Club");
+    read.int(6, 0);
+    let mut read_list = Buf::new();
+    read_list.msg(2, &read.0);
+    let cleared = decode_chats(&read_list.0);
+    if cleared.first().is_some_and(|chat| chat.unread) {
+        return Err("a read chat still looked unread".into());
+    }
+    if let Some(set) = flag_count(false) {
+        count = set;
+    }
+    if count != 0 {
+        return Err("a chat read on the phone kept its count".into());
+    }
+    Ok(())
 }
 
 fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
@@ -2354,9 +2546,8 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
         let mut title = field_text(&conv, 2);
         let group = field_int(&conv, 10) != 0;
         let unread = field_int(&conv, 6) != 0;
-        // ConversationStatus: 3 is DELETED.
-        let gone = field_int(&conv, 12) == 3;
         let carrier = field_int(&conv, 22);
+        let status = field_int(&conv, 12);
         let mut mine = field_text(&conv, 11);
         let mut peer = String::new();
         for person in conv.iter().filter(|field| field.number == 20) {
@@ -2403,7 +2594,7 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
             carrier,
             updated: unix_seconds(field_int(&conv, 5) as i64),
             phones: false,
-            gone,
+            status,
         });
     }
     chats
@@ -2692,11 +2883,13 @@ pub(super) fn prove_message_reply() -> Result<(), String> {
         "",
         "tmp-3",
         "me",
-        "media-1",
-        &[1; 32],
-        "a.png",
-        "image/png",
-        4,
+        &[MediaPart {
+            media_id: "media-1",
+            key: &[1; 32],
+            name: "a.png",
+            mime: "image/png",
+            size: 4,
+        }],
         Some("m-orig"),
     ));
     if field_text(&fields(&field_bytes(&media, 8)), 1) != "m-orig" {
@@ -2736,7 +2929,7 @@ pub(super) fn prove_message_history() -> Result<(), String> {
     if field(&first, 5).is_some() {
         return Err("the newest history page sent a cursor".into());
     }
-    let inbox = fields(&list_request(CHAT_PAGE, Some(&cursor)));
+    let inbox = fields(&list_request(CHAT_PAGE, 1, Some(&cursor)));
     if field_int(&inbox, 2) != CHAT_PAGE || field_int(&inbox, 4) != 1 {
         return Err("the inbox request lost its page or its folder".into());
     }
@@ -2856,6 +3049,98 @@ pub fn prove_unpaired() -> Result<(), String> {
     Ok(())
 }
 
+/// Three files and a caption are one send payload, and a file longer than one chunk seals
+/// without holding the plaintext. Errors from this check do not name the scratch file.
+pub(super) fn prove_several_files() -> Result<(), String> {
+    let keys = [[1u8; 32], [2u8; 32], [3u8; 32]];
+    let parts = [
+        MediaPart {
+            media_id: "m1",
+            key: &keys[0],
+            name: "one.txt",
+            mime: "application/octet-stream",
+            size: 3,
+        },
+        MediaPart {
+            media_id: "m2",
+            key: &keys[1],
+            name: "two.txt",
+            mime: "application/octet-stream",
+            size: 4,
+        },
+        MediaPart {
+            media_id: "m3",
+            key: &keys[2],
+            name: "three.txt",
+            mime: "application/octet-stream",
+            size: 5,
+        },
+    ];
+    let bytes = send_media_request("phone-grace", "picnic", "tmp", "phone-ada", &parts, None);
+    let payload = fields(&field_bytes(&fields(&bytes), 3));
+    let mut media = 0;
+    let mut caption = 0;
+    let mut names = Vec::new();
+    for info in payload.iter().filter(|field| field.number == 10) {
+        let inner = fields(&info.bytes);
+        if field(&inner, 3).is_some() {
+            media += 1;
+            names.push(field_text(&fields(&field_bytes(&inner, 3)), 4));
+        }
+        if let Some(content) = field(&inner, 2) {
+            caption += 1;
+            if field_text(&fields(&content.bytes), 1) != "picnic" {
+                return Err("the caption was not kept with the files".into());
+            }
+        }
+    }
+    if media != 3 || caption != 1 || names != ["one.txt", "two.txt", "three.txt"] {
+        return Err(format!("a message of three files encoded {media} files and {caption} captions"));
+    }
+    let plain: Vec<u8> = (0..super::media::CHUNK as u32 + 20).map(|n| (n % 256) as u8).collect();
+    let scratch = Scratch(std::env::temp_dir().join(format!("messages-several-{}", std::process::id())));
+    let fail = |_| "Messages could not seal that file.".to_owned();
+    std::fs::create_dir_all(&scratch.0).map_err(fail)?;
+    let path = scratch.0.join("photo.bin");
+    std::fs::write(&path, &plain).map_err(fail)?;
+    let mut file = std::fs::File::open(&path).map_err(fail)?;
+    let mut packer = super::media::Packer::open(&[9u8; 32])?;
+    let mut rest = plain.len();
+    while rest > 0 {
+        let want = rest.min(super::media::CHUNK);
+        let mut buf = vec![0u8; want];
+        std::io::Read::read_exact(&mut file, &mut buf).map_err(fail)?;
+        packer.push(&buf)?;
+        rest -= want;
+    }
+    let packed = packer.finish()?;
+    if super::media::unpack(&[9u8; 32], &packed)? != plain {
+        return Err("a sealed file did not open to the same bytes".into());
+    }
+    Ok(())
+}
+
+struct Scratch(std::path::PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-sign-out`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub(super) fn prove_sign_out() -> Result<(), String> {
+    let list = fields(&unpair_request("attempt-1"));
+    if field_text(&list, 1) != "attempt-1" {
+        return Err("the unpair request did not name the pairing attempt".into());
+    }
+    if !clear_action(46) {
+        return Err("unpair would be sent as an encrypted message".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2868,6 +3153,21 @@ mod tests {
     #[test]
     fn a_history_page_carries_the_message_it_starts_after() {
         prove_message_history().unwrap();
+    }
+
+    #[test]
+    fn an_archived_conversation_keeps_its_status_and_each_folder_is_asked() {
+        prove_message_folders().unwrap();
+        let mut conv = Buf::new();
+        conv.text(1, "c-archive");
+        conv.text(2, "Old");
+        conv.int(12, 2);
+        let mut list = Buf::new();
+        list.msg(2, &conv.0);
+        let chats = decode_chats(&list.0);
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].status, 2);
+        assert_eq!(place(2), Place::Archive);
     }
 
     #[test]
@@ -3142,5 +3442,21 @@ mod tests {
     #[test]
     fn a_deleted_message_and_a_deleted_chat_are_read_from_the_published_fields() {
         prove_messages_delete().unwrap();
+    }
+
+    #[test]
+    fn an_unread_flag_is_not_a_count_and_a_read_chat_clears() {
+        prove_messages_unread().unwrap();
+    }
+
+    #[test]
+    fn an_unpair_names_the_pairing_attempt_in_the_clear() {
+        let bytes = unpair_request("attempt-1");
+        let list = fields(&bytes);
+        assert_eq!(field_text(&list, 1), "attempt-1");
+        assert!(field(&list, 3).is_none());
+        assert!(clear_action(46));
+        assert!(clear_action(44));
+        assert!(!clear_action(3));
     }
 }

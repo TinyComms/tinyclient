@@ -1,22 +1,26 @@
 //! Android Messages: Google Messages on the phone, with this computer paired to it the way
 //! messages.google.com is. The phone stays the account and has to be online; texts (SMS and RCS)
-//! go through it. Photos are shown. Other files are named and can be opened. Reactions can be
-//! read and sent. Calls stay on the phone. When the phone does not answer, texts wait and the
-//! account says so. They go when it answers, unless the user cancelled them.
+//! go through it. Photos are shown. A video is a video, and a voice note carries its
+//! waveform. Other files are named and can be opened. Reactions can be read and sent.
+//! Calls stay on the phone. When the phone does not answer, texts wait and the account
+//! says so. They go when it answers, unless the user cancelled them. Older messages are
+//! read after connecting, one page at a time, so a search of this computer covers the chat and
+//! not only the page on screen.
 
 mod bugle;
 mod fake;
 mod media;
 pub mod signin;
 
-use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, Signed};
+use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, SharedPage, Signed};
 use crate::blobs;
+use crate::blobs::upload;
 use crate::session;
-use crate::store::{ConversationRow, PersonRow};
+use crate::store::{ConversationRow, Filing, PersonRow};
 use bugle::Chat;
 use protocol::{
     Attachment, Capabilities, Change, ConversationKind, MediaFile, MediaKind, Message, MessageKind,
-    Reaction, ReactionSet, Relation, ReplyTo, SendState,
+    Reaction, ReactionSet, RelateAction, Relation, ReplyTo, SendState, SharedKind, Special,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -127,12 +131,12 @@ trait Drive: Send + Sync {
         reply: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String>;
-    fn send_file(
+    fn upload_media(&self, packed: &[u8], mime: &str) -> Result<String, String>;
+    fn send_media(
         &self,
         conversation: &str,
         caption: &str,
-        path: &str,
-        name: &str,
+        parts: &[bugle::MediaPart<'_>],
         reply: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String>;
@@ -152,6 +156,8 @@ trait Drive: Send + Sync {
     fn typing(&self, conversation: &str) -> Result<(), String>;
     fn delete_message(&self, message: &str) -> Result<(), String>;
     fn delete_conversation(&self, conversation: &str) -> Result<(), String>;
+    fn unpair(&self) -> Result<(), String>;
+    fn block(&self, conversation: &str) -> Result<(), String>;
     fn close(&self);
 }
 
@@ -188,16 +194,18 @@ impl Drive for LiveDrive {
     ) -> Result<String, String> {
         self.inner.send(conversation, text, reply, noted)
     }
-    fn send_file(
+    fn upload_media(&self, packed: &[u8], mime: &str) -> Result<String, String> {
+        self.inner.upload_bytes(packed, mime)
+    }
+    fn send_media(
         &self,
         conversation: &str,
         caption: &str,
-        path: &str,
-        name: &str,
+        parts: &[bugle::MediaPart<'_>],
         reply: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
-        self.inner.send_file(conversation, caption, path, name, reply, noted)
+        self.inner.send_media(conversation, caption, parts, reply, noted)
     }
     fn resend(&self, message: &str) -> Result<(), String> {
         self.inner.resend(message)
@@ -229,10 +237,20 @@ impl Drive for LiveDrive {
     fn delete_conversation(&self, conversation: &str) -> Result<(), String> {
         self.inner.delete_conversation(conversation)
     }
+    fn unpair(&self) -> Result<(), String> {
+        self.inner.unpair()
+    }
+    fn block(&self, conversation: &str) -> Result<(), String> {
+        self.inner.block(conversation)
+    }
     fn close(&self) {
         self.inner.close();
     }
 }
+
+/// Said when sign-out cannot reach the phone, so this computer may stay in its paired-device list.
+pub const STILL_LISTED: &str =
+    "This computer may still be listed under Device pairing on your phone. Remove it there.";
 
 fn parse(session: &str) -> Result<Saved, String> {
     let saved: Saved = serde_json::from_str(session)
@@ -262,6 +280,10 @@ pub fn without(_session: &str, _account: &str) -> Option<String> {
 
 fn open(saved: &Saved) -> Result<Box<dyn Drive>, String> {
     if scripted() {
+        if std::env::var_os("TINYCLIENT_MESSAGES_OFFLINE").is_some() {
+            fake::record("offline");
+            return Err("Messages is offline.".into());
+        }
         return Ok(Box::new(fake::Fake::open(saved)));
     }
     let real = bugle::Saved {
@@ -315,8 +337,26 @@ pub fn prove_message_reply() -> Result<(), String> {
     bugle::prove_message_reply()
 }
 
+/// The lab sets `TINYCLIENT_PROVE=messages-search`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_message_search() -> Result<(), String> {
+    if !fill_another(bugle::MESSAGE_PAGE as usize, false) {
+        return Err("a full page did not keep reading".into());
+    }
+    if fill_another(20, false) || fill_another(0, false) || fill_another(bugle::MESSAGE_PAGE as usize, true) {
+        return Err("a short page or a finished chat kept reading".into());
+    }
+    Ok(())
+}
+
 /// The lab sets `TINYCLIENT_PROVE=messages-phone-quiet`. A build from before this ignores that
 /// and keeps serving, so the same driver fails there.
+/// The lab sets `TINYCLIENT_PROVE=messages-folders`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_message_folders() -> Result<(), String> {
+    bugle::prove_message_folders()
+}
+
 pub fn prove_phone_quiet() -> Result<(), String> {
     if !phone_quiet(bugle::PHONE_QUIET) {
         return Err("a quiet phone was not recognised".into());
@@ -371,6 +411,53 @@ pub fn prove_messages_failed_send() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab sets `TINYCLIENT_PROVE=messages-unread`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_messages_unread() -> Result<(), String> {
+    bugle::prove_messages_unread()
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-sign-out`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_messages_sign_out() -> Result<(), String> {
+    if STILL_LISTED
+        != "This computer may still be listed under Device pairing on your phone. Remove it there."
+    {
+        return Err("the offline sign-out sentence changed".into());
+    }
+    // Signing out forgets the whole saved session. The generic path deletes it from the keychain.
+    if without(r#"{"account":"phone"}"#, "phone").is_some() {
+        return Err("signing out would keep the saved session".into());
+    }
+    bugle::prove_sign_out()
+}
+
+/// The lab sets `TINYCLIENT_PROVE=messages-media`. A build from before this ignores that and
+/// keeps serving, so the same driver fails there.
+pub fn prove_message_media() -> Result<(), String> {
+    if kind_of("video/mp4") != MediaKind::Video || kind_of("audio/amr") != MediaKind::Audio {
+        return Err("a video or a voice note was filed as a plain file".into());
+    }
+    if kind_of("image/png") != MediaKind::Image || kind_of("application/pdf") != MediaKind::File {
+        return Err("a photo or a file was filed as the wrong kind".into());
+    }
+    if image_type(b"not a picture").is_some() {
+        return Err("a video was treated as its own poster".into());
+    }
+    if image_type(b"\x89PNG\r\n\x1a\n").is_none() {
+        return Err("a still was not recognised".into());
+    }
+    let clip = mp4_seconds(&clip_bytes()).ok_or("an mp4 duration was not read")?;
+    if clip != 2 {
+        return Err(format!("an mp4 duration was {clip}, not 2 seconds"));
+    }
+    let (seconds, bars) = amr_voice(&voice_bytes()).ok_or("an AMR voice note was not read")?;
+    if seconds != 1 || bars.is_empty() {
+        return Err("an AMR voice note had no length or waveform".into());
+    }
+    Ok(())
+}
+
 pub fn reaction_rules() -> protocol::ReactionRules {
     protocol::ReactionRules {
         set: ReactionSet::Any,
@@ -395,9 +482,6 @@ struct WaitingSend {
     conversation: String,
     client_id: String,
     text: String,
-    /// Empty for a text. A file keeps the path the shell handed over.
-    path: String,
-    name: String,
     since: i64,
     /// The message this one answers, when the chat is RCS. Empty otherwise.
     reply: Option<String>,
@@ -410,6 +494,7 @@ struct Span {
     oldest_id: String,
     oldest_sent: i64,
     started: bool,
+    fill_stopped: bool,
 }
 
 /// One history read the phone did not answer. `before` is the cursor. `find` is a message a
@@ -460,6 +545,8 @@ struct Account {
     phone: Mutex<Phone>,
     /// Texts asked of the phone on this connection, by the shell's client id.
     outbox: Mutex<HashMap<String, Attempt>>,
+    /// Newest message seen, so a chat read on the phone can move the marker there.
+    newest: Mutex<HashMap<String, (String, i64)>>,
 }
 
 pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<(), String> {
@@ -502,7 +589,11 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
                 |command| match (account(), command) {
                     (Some(account), command) => serve(&account, command),
                     (None, Command::SignOut(reply)) => {
-                        let _ = reply.send(Ok(()));
+                        if scripted() {
+                            fake::record(STILL_LISTED);
+                        }
+                        tracing::warn!("chatd: Messages: {STILL_LISTED}");
+                        let _ = reply.send(Err(Refusal::Refused(STILL_LISTED.to_owned())));
                     }
                     (None, command) => offline(&ctx, command),
                 },
@@ -541,10 +632,11 @@ fn connect(
         span: Mutex::default(),
         phone: Mutex::default(),
         outbox: Mutex::default(),
+        newest: Mutex::default(),
     });
     ctx.capabilities(Capabilities {
-        max_file_bytes: 100 * 1024 * 1024,
-        max_files: 1,
+        max_file_bytes: bugle::FILE_CAP,
+        max_files: file_limit(),
         ..Capabilities::default()
     });
     let _ = ctx.describe(
@@ -609,7 +701,43 @@ fn row(chat: &Chat) -> ConversationRow {
     // The shell already draws this line. It is not `Encryption::EndToEnd`: those words would
     // claim this computer checked the keys, and the paired browser is a separate hop.
     row.topic = bugle::composer_label(chat.carrier, chat.phones);
+    let mut filing = Filing::default();
+    match bugle::place(chat.status) {
+        bugle::Place::Archive => filing.archived = true,
+        bugle::Place::Request => row.special = Special::Request,
+        bugle::Place::Hidden => filing.hidden = true,
+        bugle::Place::Main => {}
+    }
+    row.filing = Some(filing);
     row
+}
+
+/// File a chat under a status the phone just confirmed, such as blocked.
+fn file_as(account: &Account, id: &str, status: u64) {
+    let chat = {
+        let held = account
+            .chats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut chat = held.get(id).cloned().unwrap_or_else(|| Chat {
+            id: id.to_owned(),
+            title: "Messages".into(),
+            group: false,
+            unread: false,
+            mine: String::new(),
+            peer: String::new(),
+            carrier: 0,
+            updated: 0,
+            phones: false,
+            status,
+        });
+        chat.status = status;
+        chat
+    };
+    let chat = remember(account, std::slice::from_ref(&chat));
+    if let Some(chat) = chat.first() {
+        let _ = account.ctx.conversation(&row(chat));
+    }
 }
 
 fn carrier_of(account: &Account, id: &str) -> u64 {
@@ -634,6 +762,10 @@ fn remember(account: &Account, incoming: &[Chat]) -> Vec<Chat> {
         let mut chat = chat.clone();
         if let Some(had) = held.get(&chat.id) {
             chat.phones = chat.phones || had.phones;
+            // 0 means this update did not say. An archived chat must not bounce back to the inbox.
+            if chat.status == 0 {
+                chat.status = had.status;
+            }
         }
         held.insert(chat.id.clone(), chat.clone());
         kept.push(chat);
@@ -657,7 +789,7 @@ fn seal(account: &Account, conversation: &str, on: bool) {
             carrier: 0,
             updated: 0,
             phones: false,
-            gone: false,
+            status: 0,
         });
         chat.phones = on;
         chat.clone()
@@ -677,15 +809,16 @@ fn apply(account: &Account, event: Event) {
                 }
             }
             for chat in &chats {
-                if chat.gone {
+                if chat.status == 3 {
                     let _ = account.ctx.conversation_gone(&chat.id);
                     continue;
                 }
                 // A picture fetched earlier stays the row's when the row is recorded again.
                 let avatar = account.ctx.avatar_of(&chat.id);
                 let _ = account.ctx.conversation(&ConversationRow { avatar: avatar.clone(), ..row(chat) });
-                if chat.unread {
-                    let _ = account.ctx.counts(&chat.id, 1, 0, None, 0);
+                // The flag is not a count. True leaves what the messages added. False clears.
+                if bugle::flag_count(chat.unread) == Some(0) {
+                    clear_read(account, &chat.id);
                 }
                 if !chat.group {
                     people.push(PersonRow {
@@ -708,6 +841,7 @@ fn apply(account: &Account, event: Event) {
                 let _ = account.ctx.relations(&owned);
             }
             nudge(account);
+            ask_fill(account);
         }
         Event::Message(note) => {
             if note.status != 300
@@ -729,12 +863,19 @@ fn apply(account: &Account, event: Event) {
                     carrier: 0,
                     updated: 0,
                     phones: false,
-                    gone: false,
+                    status: 0,
                 };
                 let chat = remember(account, &[chat]);
                 let _ = account.ctx.conversation(&row(&chat[0]));
             }
             show(account, &note, &[]);
+            if note.status != 300
+                && note.phones.is_none()
+                && bugle::tombstone(note.status).is_none()
+            {
+                saw(account, &note);
+            }
+            heard_live(account, &note);
             nudge(account);
         }
         Event::Typing {
@@ -760,6 +901,45 @@ fn apply(account: &Account, event: Event) {
         }
         Event::Ready | Event::Closed(_) | Event::Ended(_) => {}
     }
+}
+
+fn saw(account: &Account, note: &bugle::Note) {
+    if note.id.is_empty() {
+        return;
+    }
+    let mut newest = account
+        .newest
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let keep = newest
+        .get(&note.conversation)
+        .is_none_or(|(_, sent)| note.sent >= *sent);
+    if keep {
+        newest.insert(note.conversation.clone(), (note.id.clone(), note.sent));
+    }
+}
+
+fn clear_read(account: &Account, conversation: &str) {
+    let newest = account
+        .newest
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(conversation)
+        .cloned();
+    let Some((id, sent)) = newest.or_else(|| {
+        let id = account.ctx.newest(conversation).ok().flatten()?;
+        let sent = account
+            .ctx
+            .known(conversation)
+            .ok()
+            .flatten()
+            .map(|row| row.updated)
+            .unwrap_or(0);
+        Some((id, sent))
+    }) else {
+        return;
+    };
+    let _ = account.ctx.counts(conversation, 0, 0, Some(&id), sent);
 }
 
 fn show(account: &Account, note: &bugle::Note, page: &[bugle::Note]) {
@@ -848,41 +1028,47 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
         } else {
             piece.size
         };
-        if !piece.inline.is_empty() {
+        // Field 7 is the only inline bytes the layout has. On a video they are a poster when
+        // they are a still, and the video itself stays on the media id. They are not a poster
+        // when they are the video.
+        let still = piece.mime.starts_with("video/") && image_type(&piece.inline).is_some();
+        let mut thumb = None;
+        if still {
+            if let Some(poster_mime) = image_type(&piece.inline) {
+                let mut poster = MediaFile::new(format!("{id}:thumb"), kind_of(poster_mime));
+                poster.bytes = piece.inline.len() as u64;
+                if let Some(path) = land(account, &poster, &piece.inline) {
+                    poster.path = Some(path);
+                    thumb = Some(poster);
+                }
+            }
+            if !piece.media_id.is_empty() {
+                remember_held(account, &id, piece, &note.id);
+            }
+        } else if !piece.inline.is_empty() {
             if let Some(path) = land(account, &file, &piece.inline) {
                 file.path = Some(path);
                 file.bytes = piece.inline.len() as u64;
             }
-        } else {
-            account
-                .held
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(
-                    id,
-                    Held {
-                        media_id: piece.media_id.clone(),
-                        key: piece.key.clone(),
-                        message: note.id.clone(),
-                        action: piece.action_id.clone(),
-                        mime: piece.mime.clone(),
-                    },
-                );
+        } else if !piece.media_id.is_empty() {
+            remember_held(account, &id, piece, &note.id);
         }
         let label = if piece.name.is_empty() {
             "File".into()
         } else {
             piece.name.clone()
         };
+        let described = if still { &[][..] } else { piece.inline.as_slice() };
+        let (duration, waveform) = facts(&piece.mime, described);
         shown.push(Attachment {
             name: label,
             file,
-            thumb: None,
+            thumb,
             mime: piece.mime.clone(),
-            duration: 0,
+            duration,
             spoiler: false,
             sticker: false,
-            waveform: Vec::new(),
+            waveform,
             round: false,
         });
     }
@@ -967,6 +1153,141 @@ fn kind_of(mime: &str) -> MediaKind {
     }
 }
 
+fn remember_held(account: &Account, id: &str, piece: &bugle::Piece, message: &str) {
+    account
+        .held
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            id.to_owned(),
+            Held {
+                media_id: piece.media_id.clone(),
+                key: piece.key.clone(),
+                message: message.to_owned(),
+                action: piece.action_id.clone(),
+                mime: piece.mime.clone(),
+            },
+        );
+}
+
+/// A JPEG or PNG, which is the only still a video's inline bytes can be. The layout has no
+/// separate poster field.
+fn image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else {
+        None
+    }
+}
+
+/// Length in seconds, and a voice note's bars. Empty bars mean it is not a voice note.
+fn facts(mime: &str, bytes: &[u8]) -> (u32, Vec<u8>) {
+    if mime.starts_with("audio/") {
+        if let Some(voice) = amr_voice(bytes) {
+            return voice;
+        }
+    }
+    if mime.starts_with("video/") || mime == "audio/mp4" {
+        if let Some(seconds) = mp4_seconds(bytes) {
+            return (seconds, Vec::new());
+        }
+    }
+    (0, Vec::new())
+}
+
+/// An ISO mp4 `mvhd` box: timescale and duration. Nothing else in the file is read.
+fn mp4_seconds(bytes: &[u8]) -> Option<u32> {
+    let at = bytes.windows(4).position(|mark| mark == b"mvhd")?;
+    let rest = bytes.get(at + 4..)?;
+    let version = *rest.first()?;
+    let (scale, ticks) = if version == 1 {
+        let scale = u32::from_be_bytes(rest.get(20..24)?.try_into().ok()?);
+        let ticks = u64::from_be_bytes(rest.get(24..32)?.try_into().ok()?);
+        (scale, ticks)
+    } else {
+        let scale = u32::from_be_bytes(rest.get(12..16)?.try_into().ok()?);
+        let ticks = u64::from(u32::from_be_bytes(rest.get(16..20)?.try_into().ok()?));
+        (scale, ticks)
+    };
+    if scale == 0 {
+        return None;
+    }
+    u32::try_from(ticks / u64::from(scale)).ok()
+}
+
+/// AMR-NB (`#!AMR\n`) or AMR-WB (`#!AMR-WB\n`). Each frame is 20 ms. Sizes include the header
+/// byte (RFC 4867). The bars are the loudness of each frame, folded to the waveform limit.
+fn amr_voice(bytes: &[u8]) -> Option<(u32, Vec<u8>)> {
+    const NB: &[u8] = b"#!AMR\n";
+    const WB: &[u8] = b"#!AMR-WB\n";
+    const NB_SIZES: [usize; 16] = [13, 14, 16, 18, 20, 21, 27, 32, 6, 1, 1, 1, 1, 1, 1, 1];
+    const WB_SIZES: [usize; 16] = [18, 24, 33, 37, 41, 47, 51, 59, 61, 6, 1, 1, 1, 1, 1, 1];
+    let (payload, sizes) = if let Some(rest) = bytes.strip_prefix(WB) {
+        (rest, WB_SIZES)
+    } else {
+        (bytes.strip_prefix(NB)?, NB_SIZES)
+    };
+    let mut at = 0;
+    let mut frames = 0u32;
+    let mut loud = Vec::new();
+    while at < payload.len() {
+        let toc = *payload.get(at)?;
+        let size = sizes[((toc >> 3) & 0x0f) as usize];
+        if size == 0 || at + size > payload.len() {
+            break;
+        }
+        let body = &payload[at + 1..at + size];
+        let energy = body.iter().fold(0u32, |sum, byte| sum + u32::from(*byte))
+            / u32::try_from(body.len().max(1)).unwrap_or(1);
+        loud.push(u8::try_from(energy.min(255)).unwrap_or(255));
+        at += size;
+        frames += 1;
+    }
+    if frames == 0 {
+        return None;
+    }
+    Some((frames.saturating_mul(20) / 1000, fold_bars(&loud)))
+}
+
+fn fold_bars(loud: &[u8]) -> Vec<u8> {
+    if loud.len() <= protocol::WAVEFORM_LIMIT {
+        return loud.to_vec();
+    }
+    let bars = protocol::WAVEFORM_LIMIT;
+    (0..bars)
+        .map(|index| {
+            let start = index * loud.len() / bars;
+            let end = ((index + 1) * loud.len() / bars).max(start + 1);
+            let chunk = &loud[start..end.min(loud.len())];
+            let sum = chunk.iter().fold(0u32, |sum, byte| sum + u32::from(*byte));
+            u8::try_from(sum / u32::try_from(chunk.len().max(1)).unwrap_or(1)).unwrap_or(255)
+        })
+        .collect()
+}
+
+/// Two seconds, timescale 1000. Enough of an `mvhd` for [`mp4_seconds`].
+fn clip_bytes() -> Vec<u8> {
+    let mut bytes = b"mvhd".to_vec();
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    bytes.extend_from_slice(&[0; 8]);
+    bytes.extend_from_slice(&1000u32.to_be_bytes());
+    bytes.extend_from_slice(&2000u32.to_be_bytes());
+    bytes
+}
+
+/// One second of AMR-NB, fifty frames of 20 ms.
+fn voice_bytes() -> Vec<u8> {
+    let mut bytes = b"#!AMR\n".to_vec();
+    for _ in 0..50 {
+        let mut frame = vec![0u8; 13];
+        frame[1] = 80;
+        bytes.extend_from_slice(&frame);
+    }
+    bytes
+}
+
 fn media_root() -> std::path::PathBuf {
     protocol::support_dir().join("media")
 }
@@ -990,6 +1311,36 @@ fn land(account: &Account, file: &MediaFile, bytes: &[u8]) -> Option<String> {
             &file.id,
             &path.to_string_lossy(),
             bytes.len() as u64,
+            crate::hub::now(),
+        )
+        .ok()??;
+    drop(store);
+    ctx.hub.changed(Change::Media {
+        account: ctx.account.clone(),
+        file: landed,
+    });
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// Copies the file the user picked. The plaintext is not held in one buffer.
+fn land_copy(account: &Account, file: &MediaFile, from: &std::path::Path, bytes: u64) -> Option<String> {
+    let ctx = &account.ctx;
+    let path = blobs::path_of(&media_root(), &ctx.account, &file.id);
+    let part = path.with_extension("part");
+    std::fs::create_dir_all(blobs::dir_under(&media_root(), &ctx.account)).ok()?;
+    std::fs::copy(from, &part).ok()?;
+    std::fs::rename(&part, &path).ok()?;
+    let address = format!("messages://file/{}", file.id);
+    let mut store = ctx.hub.store();
+    store
+        .register_media(&ctx.account, &[(file.clone(), address)])
+        .ok()?;
+    let landed = store
+        .media_landed(
+            &ctx.account,
+            &file.id,
+            &path.to_string_lossy(),
+            bytes,
             crate::hub::now(),
         )
         .ok()??;
@@ -1159,44 +1510,49 @@ fn serve(account: &Arc<Account>, command: Command) {
             text,
             reply_to,
             with,
-        } => match with.files.as_slice() {
-            [file] => {
+        } => {
+            if with.files.is_empty() {
+                post_text(account, &conversation_id, &client_id, text, reply_to);
+            } else {
                 warn_mms(account, &conversation_id, &client_id);
-                let name = if file.name.is_empty() {
-                    std::path::Path::new(&file.path)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("file")
-                        .to_owned()
-                } else {
-                    file.name.clone()
-                };
-                post_file(
-                    account,
+                let reply = carried_reply(account, &conversation_id, reply_to);
+                let account = Arc::clone(account);
+                let conversation = conversation_id.clone();
+                let cid = client_id.clone();
+                let caption = text;
+                upload::spawn(
+                    ctx,
                     &conversation_id,
                     &client_id,
-                    text,
-                    file.path.clone(),
-                    name,
-                    reply_to,
+                    &with.files,
+                    move |upload| {
+                        deliver_files(
+                            &account,
+                            upload,
+                            &conversation,
+                            &cid,
+                            &caption,
+                            reply.as_deref(),
+                        )
+                    },
                 );
             }
-            [] => post_text(account, &conversation_id, &client_id, text, reply_to),
-            _ => ctx.sent(
-                &conversation_id,
-                &client_id,
-                Err("Messages takes one file at a time.".into()),
-            ),
-        },
+        }
         Command::OpenHome => catch_up(account),
         Command::CancelSend {
             conversation_id,
             client_id,
         } => {
+            upload::cancel(&ctx.account, &client_id);
+            let mut queued = false;
             phone(account).queue.retain(|held| {
-                held.conversation != conversation_id || held.client_id != client_id
+                let drop = held.conversation == conversation_id && held.client_id == client_id;
+                queued |= drop;
+                !drop
             });
-            ctx.sent(&conversation_id, &client_id, Err("Cancelled".into()));
+            if queued {
+                ctx.sent(&conversation_id, &client_id, Err("Cancelled".into()));
+            }
         }
         Command::React {
             message_id,
@@ -1240,13 +1596,48 @@ fn serve(account: &Arc<Account>, command: Command) {
             }
             let _ = reply.send(answer);
         }
+        Command::SearchShared {
+            conversation_id,
+            kind,
+            before,
+            limit,
+            reply,
+        } => drop(reply.send(shared(account, &conversation_id, kind, before.as_deref(), limit))),
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
+        Command::Relate {
+            person_id,
+            action,
+            reply,
+        } => {
+            let answer = match action {
+                RelateAction::Block => account.drive.block(&person_id).map(|_| {
+                    file_as(account, &person_id, 6);
+                }),
+                _ => Err("Messages cannot do that.".into()),
+            };
+            let _ = reply.send(answer.map_err(Refusal::Refused));
+        }
         Command::Handoff { reply, .. } => {
             let _ = reply.send(Ok("https://messages.google.com/web/".to_owned()));
         }
         Command::SignOut(reply) => {
+            if let Err(why) = account.drive.unpair() {
+                tracing::warn!("chatd: Messages: {why}");
+            }
             account.drive.close();
             let _ = reply.send(Ok(()));
+        }
+        Command::SetMute {
+            conversation_id,
+            notify,
+            until: _,
+            reply,
+        } => {
+            let answer = account
+                .ctx
+                .muted(&conversation_id, quiet(notify))
+                .map_err(|err| Refusal::Refused(err.to_string()));
+            let _ = reply.send(answer);
         }
         other => other.unsupported(ctx),
     }
@@ -1293,7 +1684,182 @@ fn receipt(account: &Account, conversation: &str, note: &bugle::Note, id: &str) 
     }
 }
 
+fn file_limit() -> u32 {
+    protocol::ATTACHMENTS_LIMIT as u32
+}
+
+fn send_failure(name: &str, why: String) -> String {
+    if why == upload::CANCELLED {
+        why
+    } else {
+        format!("{name} could not be sent: {why}")
+    }
+}
+
+struct Prepared {
+    media_id: String,
+    key: Vec<u8>,
+    name: String,
+    mime: &'static str,
+    size: u64,
+    path: std::path::PathBuf,
+}
+
+/// Seals and uploads each file, then asks the phone to send them as one message.
+fn deliver_files(
+    account: &Account,
+    upload: &mut upload::Upload,
+    conversation: &str,
+    client_id: &str,
+    caption: &str,
+    reply: Option<&str>,
+) -> Result<Message, String> {
+    let staged: Vec<(String, u64, std::path::PathBuf)> = upload
+        .files()
+        .iter()
+        .map(|source| (source.name.clone(), source.bytes, source.path.clone()))
+        .collect();
+    let mut prepared = Vec::with_capacity(staged.len());
+    for (at, (name, size, path)) in staged.into_iter().enumerate() {
+        upload.check()?;
+        if size > bugle::FILE_CAP {
+            return Err(format!(
+                "{name} is larger than 100 MB, which tinyclient won't send through Messages."
+            ));
+        }
+        let mut head = [0u8; 64];
+        let n = std::fs::File::open(&path)
+            .and_then(|mut file| std::io::Read::read(&mut file, &mut head))
+            .unwrap_or(0);
+        let mime = bugle::mime_of(&name, &head[..n]);
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).map_err(|_| "Messages could not make a media key.".to_owned())?;
+        let mut packer = media::Packer::open(&key)?;
+        upload
+            .parts(at, media::CHUNK, 0, |part| packer.push(part.bytes))
+            .map_err(|why| send_failure(&name, why))?;
+        let packed = packer.finish().map_err(|why| send_failure(&name, why))?;
+        upload.check().map_err(|why| send_failure(&name, why))?;
+        let media_id = account
+            .drive
+            .upload_media(&packed, mime)
+            .map_err(|why| send_failure(&name, why))?;
+        prepared.push(Prepared {
+            media_id,
+            key: key.to_vec(),
+            name,
+            mime,
+            size,
+            path,
+        });
+    }
+    upload.check()?;
+    let parts: Vec<bugle::MediaPart<'_>> = prepared
+        .iter()
+        .map(|part| bugle::MediaPart {
+            media_id: &part.media_id,
+            key: &part.key,
+            name: &part.name,
+            mime: part.mime,
+            size: part.size,
+        })
+        .collect();
+    let sent = account
+        .drive
+        .send_media(conversation, caption, &parts, reply, &mut |id| {
+            keep_copy(account, client_id, id);
+        });
+    if sent.is_err() {
+        forget(account, client_id);
+    }
+    let id = sent?;
+    let mut message = outgoing(account, client_id.to_owned(), caption.to_owned());
+    if let Some(reply_id) = reply {
+        message.reply_to = Some(quoted(account, conversation, reply_id, &[]));
+    }
+    let mut attachments = Vec::new();
+    for (index, part) in prepared.iter().enumerate() {
+        if part.size == 0 {
+            continue;
+        }
+        let mut file = MediaFile::new(format!("messages:{id}:{index}"), kind_of(part.mime));
+        file.bytes = part.size;
+        if let Some(path) = land_copy(account, &file, &part.path, part.size) {
+            file.path = Some(path);
+        }
+        let (duration, waveform) =
+            if part.mime.starts_with("audio/") || part.mime.starts_with("video/") {
+                std::fs::read(&part.path)
+                    .map(|bytes| facts(part.mime, &bytes))
+                    .unwrap_or_default()
+            } else {
+                (0, Vec::new())
+            };
+        attachments.push(Attachment {
+            name: part.name.clone(),
+            file,
+            thumb: None,
+            mime: part.mime.to_owned(),
+            duration,
+            spoiler: false,
+            sticker: false,
+            waveform,
+            round: false,
+        });
+    }
+    message.attachments = attachments;
+    Ok(finish(account, client_id, message))
+}
+
+/// Proves one Messages send can carry several files.
+/// The lab sets `TINYCLIENT_PROVE=messages-several-files`. A build from before this ignores
+/// that and keeps serving, so the same driver fails there.
+pub fn prove_messages_several_files() -> Result<(), String> {
+    if file_limit() != 10 {
+        return Err("Messages still takes one file at a time.".into());
+    }
+    bugle::prove_several_files()
+}
+
+/// Messages has no mention notifications, so only "all" makes a sound on this computer.
+fn quiet(notify: protocol::Notify) -> bool {
+    notify != protocol::Notify::All
+}
+
+/// A live message on the scripted phone. A muted chat stays quiet; an open one is noted.
+fn heard_live(account: &Account, note: &bugle::Note) {
+    if !scripted() || note.outgoing || note.author == account.me {
+        return;
+    }
+    let key = account.ctx.key(&note.conversation);
+    let muted = account
+        .ctx
+        .hub
+        .store()
+        .conversation(&key)
+        .ok()
+        .flatten()
+        .is_some_and(|row| row.muted);
+    if !muted {
+        fake::record(&format!("notify {}", note.conversation));
+    }
+}
+
+/// Proves a Messages mute is kept on this computer, including mentions-only.
+/// The lab sets `TINYCLIENT_PROVE=messages-mute`. A build from before this ignores that and
+/// keeps serving, so the same driver fails there.
+pub fn prove_messages_mute() -> Result<(), String> {
+    if !quiet(protocol::Notify::Nothing) || !quiet(protocol::Notify::Mentions) || quiet(protocol::Notify::All) {
+        return Err("Messages mute did not stay on this computer.".into());
+    }
+    Ok(())
+}
+
 fn backfill(account: &Account, conversation: &str) {
+    // The newest page is already in this session. Opening the chat again does not ask for it.
+    if reached_start(account, conversation) || resume_cursor(account, conversation).is_some() {
+        return;
+    }
     if phone(account).down {
         remember_due(account, due_of(conversation, None, None), false);
         return;
@@ -1363,10 +1929,10 @@ fn due_of(conversation: &str, before: Option<&str>, find: Option<&str>) -> Due {
 
 /// Reads pages until `find` is on one of them, or one page when `find` is absent. A quiet phone
 /// keeps the cursor it had reached. The next try does not start again at the newest page.
-fn fetch_back(account: &Account, conversation: &str, mut cursor: Option<String>, find: Option<String>) {
+fn fetch_back(account: &Account, conversation: &str, mut cursor: Option<String>, find: Option<String>) -> bool {
     loop {
         if account.ctx.stopped() {
-            return;
+            return false;
         }
         let asked = cursor.clone();
         match ask_history(account, conversation, asked.as_deref()) {
@@ -1382,25 +1948,25 @@ fn fetch_back(account: &Account, conversation: &str, mut cursor: Option<String>,
                 };
                 if found || !moved || !bugle::more_messages(notes.len()) {
                     nudge(account);
-                    return;
+                    return true;
                 }
                 let Some(oldest) = oldest_note(&notes) else {
                     nudge(account);
-                    return;
+                    return true;
                 };
                 cursor = Some(oldest.id.clone());
                 if account.ctx.pause(PACE) {
-                    return;
+                    return false;
                 }
             }
             Err(why) if phone_quiet(&why) => {
                 remember_due(account, due_of(conversation, asked.as_deref(), find.as_deref()), true);
                 lost_phone(account);
-                return;
+                return false;
             }
             Err(why) => {
                 tracing::warn!("chatd: Messages: {why}");
-                return;
+                return false;
             }
         }
     }
@@ -1427,6 +1993,12 @@ fn spans(account: &Account) -> std::sync::MutexGuard<'_, HashMap<String, Span>> 
 
 fn reached_start(account: &Account, conversation: &str) -> bool {
     spans(account).get(conversation).is_some_and(|span| span.started)
+}
+
+fn needs_fill(account: &Account, conversation: &str) -> bool {
+    !spans(account)
+        .get(conversation)
+        .is_some_and(|span| span.started || span.fill_stopped)
 }
 
 /// The oldest message id already read, when a later page should start there.
@@ -1520,10 +2092,22 @@ fn note_span(account: &Account, conversation: &str, notes: &[bugle::Note], asked
         span.oldest_id = oldest.id.clone();
         span.oldest_sent = oldest.sent;
     }
-    if !moved || !bugle::more_messages(notes.len()) {
+    // A page fetched again from the newest end is not the start of the chat. Only a short page,
+    // an empty one, or a cursor that did not move past itself is.
+    if page_ends(notes.len(), asked, moved) {
         span.started = true;
     }
     moved
+}
+
+/// A full page of a chat that has not reached its start is read onward.
+fn fill_another(page: usize, started: bool) -> bool {
+    bugle::more_messages(page) && !started
+}
+
+/// True when this page is the last one the phone will give for this walk.
+fn page_ends(count: usize, asked: Option<&str>, moved: bool) -> bool {
+    !fill_another(count, false) || (asked.is_some() && !moved)
 }
 
 fn phone(account: &Account) -> std::sync::MutexGuard<'_, Phone> {
@@ -1572,29 +2156,6 @@ fn post_text(account: &Account, conversation: &str, client_id: &str, text: Strin
         conversation: conversation.to_owned(),
         client_id: client_id.to_owned(),
         text,
-        path: String::new(),
-        name: String::new(),
-        since: crate::hub::now(),
-        reply: carried_reply(account, conversation, reply),
-    };
-    post(account, item);
-}
-
-fn post_file(
-    account: &Account,
-    conversation: &str,
-    client_id: &str,
-    text: String,
-    path: String,
-    name: String,
-    reply: Option<String>,
-) {
-    let item = WaitingSend {
-        conversation: conversation.to_owned(),
-        client_id: client_id.to_owned(),
-        text,
-        path,
-        name,
         since: crate::hub::now(),
         reply: carried_reply(account, conversation, reply),
     };
@@ -1632,20 +2193,9 @@ fn ask(account: &Account, item: &WaitingSend) -> Result<Message, String> {
         account.drive.resend(&copy)?;
         return Ok(finish(account, &item.client_id, carried(account, item)));
     }
-    let sent = if item.path.is_empty() {
-        account.drive.send(&item.conversation, &item.text, reply, &mut |id| {
-            keep_copy(account, &item.client_id, id);
-        })
-    } else {
-        account.drive.send_file(
-            &item.conversation,
-            &item.text,
-            &item.path,
-            &item.name,
-            reply,
-            &mut |id| keep_copy(account, &item.client_id, id),
-        )
-    };
+    let sent = account.drive.send(&item.conversation, &item.text, reply, &mut |id| {
+        keep_copy(account, &item.client_id, id);
+    });
     if sent.is_err() {
         forget(account, &item.client_id);
     }
@@ -1656,13 +2206,7 @@ fn ask(account: &Account, item: &WaitingSend) -> Result<Message, String> {
 /// The shell's id stays the stored row. The phone's id is only for a later retry.
 fn carried(account: &Account, item: &WaitingSend) -> Message {
     let id = item.client_id.clone();
-    let message = if item.path.is_empty() {
-        outgoing(account, id, item.text.clone())
-    } else {
-        let bytes = std::fs::read(&item.path).unwrap_or_default();
-        let mime = bugle::mime_of(&item.name, &bytes);
-        with_file(account, id, item.text.clone(), &item.name, mime, &bytes)
-    };
+    let message = outgoing(account, id, item.text.clone());
     with_reply(account, message, item)
 }
 
@@ -1791,37 +2335,6 @@ fn with_reply(account: &Account, mut message: Message, item: &WaitingSend) -> Me
     message
 }
 
-fn with_file(
-    account: &Account,
-    id: String,
-    text: String,
-    name: &str,
-    mime: &str,
-    bytes: &[u8],
-) -> Message {
-    let mut message = outgoing(account, id.clone(), text);
-    if bytes.is_empty() {
-        return message;
-    }
-    let mut media = MediaFile::new(format!("messages:{id}:0"), kind_of(mime));
-    media.bytes = bytes.len() as u64;
-    if let Some(path) = land(account, &media, bytes) {
-        media.path = Some(path);
-    }
-    message.attachments = vec![Attachment {
-        name: name.to_owned(),
-        file: media,
-        thumb: None,
-        mime: mime.to_owned(),
-        duration: 0,
-        spoiler: false,
-        sticker: false,
-        waveform: Vec::new(),
-        round: false,
-    }];
-    message
-}
-
 /// The row is still the one we held. A discard or a retry removed it.
 fn still_held(account: &Account, item: &WaitingSend) -> bool {
     let key = account.ctx.key(&item.conversation);
@@ -1936,6 +2449,81 @@ fn catch_up(account: &Arc<Account>) {
         );
     }
     continue_inbox(account);
+    fill_older(account);
+}
+
+/// One older page of one chat, then the next after a pause. Stops when every chat has been read
+/// back to a short page, and when the phone is not answering.
+fn fill_older(account: &Arc<Account>) {
+    if phone(account).down || account.ctx.stopped() {
+        return;
+    }
+    let ids: Vec<String> = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    let Some(conversation) = ids.into_iter().find(|id| needs_fill(account, id)) else {
+        return;
+    };
+    let cursor = resume_cursor(account, &conversation);
+    let ok = fetch_back(account, &conversation, cursor, None);
+    if phone(account).down || account.ctx.stopped() {
+        return;
+    }
+    if !ok {
+        spans(account).entry(conversation).or_default().fill_stopped = true;
+    }
+    let ids: Vec<String> = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    if ids.iter().any(|id| needs_fill(account, id)) && !account.ctx.pause(PACE) {
+        let _ = account.ctx.commands.send(Command::OpenHome);
+    }
+}
+
+/// The command thread reads chats the user has not opened. Nothing, once each has reached its start.
+fn ask_fill(account: &Account) {
+    let ids: Vec<String> = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    if ids.iter().any(|id| needs_fill(account, id)) {
+        let _ = account.ctx.commands.send(Command::OpenHome);
+    }
+}
+
+/// Media, files and links from the messages already read. Only once this chat has been read back
+/// to its start, so the list is the whole chat and not a page that was still loading.
+fn shared(
+    account: &Account,
+    conversation: &str,
+    kind: SharedKind,
+    before: Option<&str>,
+    limit: u32,
+) -> Result<SharedPage, Refusal> {
+    if !reached_start(account, conversation) {
+        return Err(Refusal::Refused("Messages is still reading this chat.".into()));
+    }
+    let key = account.ctx.key(conversation);
+    match account.ctx.hub.store().shared(&key, kind, before, limit) {
+        Ok(Some((items, more))) => Ok(SharedPage {
+            items,
+            more,
+            total: None,
+        }),
+        Ok(None) => Err(Refusal::Refused("no such conversation".into())),
+        Err(err) => Err(Refusal::Refused(err.to_string())),
+    }
 }
 
 /// One more inbox page, on the command thread. A quiet phone waits for the next home open.
@@ -2016,5 +2604,23 @@ mod outbox_tests {
         assert_eq!(failed.len(), 65, "a failed copy was dropped to make room");
         assert!(failed.contains_key("f-new"));
         assert_eq!(failed.keys().filter(|id| *id != "f-new").count(), 64);
+    }
+
+    #[test]
+    fn several_files_are_one_payload() {
+        super::prove_messages_several_files().unwrap();
+    }
+
+    #[test]
+    fn mentions_are_quiet_and_all_is_not() {
+        super::prove_messages_mute().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_full_page_keeps_reading_and_a_short_one_stops() {
+        super::prove_message_search().unwrap();
     }
 }
