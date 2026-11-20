@@ -1430,6 +1430,11 @@ pub fn prove_telegram_secret_chat() -> Result<(), String> {
     secret::prove()
 }
 
+/// The lab's telegram-large-files driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_large_files() -> Result<(), String> {
+    files::prove_large_files()
+}
+
 /// The lab's telegram-dice driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_dice() -> Result<(), String> {
     content::prove_dice_roll()?;

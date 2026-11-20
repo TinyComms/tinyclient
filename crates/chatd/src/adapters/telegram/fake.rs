@@ -6,12 +6,12 @@
 //! scratch directory (`adapters/script.rs`): `telegram.signin.ctl` while signing in (`scan`,
 //! `scan-other`, `scan-password`), `telegram.ctl` once signed in (`incoming`, `photo`, `react`, `edit`,
 //! `delete`, `ttl`, `ttl-gone`, `topic`, `comments`, `typing`, `typing-stop`, `read`, `status`,
-//! `poll`, `poll-full`, `poll-update`, `poll-counts`, `voice`, `forward`, `flood-send N`,
-//! `flood-file N`, `photo-pages N`, `revoke`, `photo-preview`, `secret`, `secret-gone`, and the
-//! holds of `TINYCLIENT_TELEGRAM_HOLD`, `TINYCLIENT_TELEGRAM_PEER_HOLD` and
-//! `TINYCLIENT_TELEGRAM_FILE_HOLD` through `dialogs-go`, `peer-go` and `file-go`). Every request
-//! it is sent is appended to `telegram.calls`, one line each, so a test can see what the network
-//! would have heard.
+//! `poll`, `poll-full`, `poll-update`, `poll-counts`, `voice`, `cdn-file`, `big-file`, `forward`,
+//! `flood-send N`, `flood-file N`, `photo-pages N`, `revoke`, `photo-preview`, `secret`,
+//! `secret-gone`, and the holds of `TINYCLIENT_TELEGRAM_HOLD`, `TINYCLIENT_TELEGRAM_PEER_HOLD`
+//! and `TINYCLIENT_TELEGRAM_FILE_HOLD` through `dialogs-go`, `peer-go` and `file-go`). Every
+//! request it is sent is appended to `telegram.calls`, one line each, so a test can see what the
+//! network would have heard.
 //!
 //! The account: Mira Kessler (7001); Odalys Brandt (7002, a contact, with a second password on
 //! her own number); Tobin Reyes (7003); a group "Trail crew" (8001); a channel "Field Notes"
@@ -29,6 +29,7 @@ use super::wire::{Event, Fault, Wire};
 use crate::adapters::script;
 use grammers_crypto::two_factor_auth::calculate_2fa;
 use grammers_tl_types as tl;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
@@ -445,6 +446,38 @@ fn file_piece(offset: i64, limit: i32) -> Vec<u8> {
     (from..to).map(|at| (at % 251) as u8).collect()
 }
 
+/// A file past one megabyte piece, so a dropped transfer has a part to resume.
+const BIG_FILE: usize = 1024 * 1024 + 64;
+/// What `cdn-file` serves, encrypted on the way out. The home datacenter names its checksum.
+const CDN_PLAIN: &[u8] = b"ridge file from the cdn";
+const CDN_KEY: [u8; 32] = [3; 32];
+const CDN_IV: [u8; 16] = [5; 16];
+
+fn big_piece(offset: i64, limit: i32) -> Vec<u8> {
+    let from = (offset.max(0) as usize).min(BIG_FILE);
+    let to = (from + limit.max(0) as usize).min(BIG_FILE);
+    (from..to).map(|at| (at % 251) as u8).collect()
+}
+
+fn cdn_digest() -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(CDN_PLAIN);
+    hasher.finalize().to_vec()
+}
+
+fn cdn_hash() -> tl::enums::FileHash {
+    tl::enums::FileHash::Hash(tl::types::FileHash { offset: 0, limit: CDN_PLAIN.len() as i32, hash: cdn_digest() })
+}
+
+/// The plaintext slice at `offset`, as the CDN would send it.
+fn cdn_cipher(offset: i64, limit: i32) -> Vec<u8> {
+    let from = (offset.max(0) as usize).min(CDN_PLAIN.len());
+    let to = (from + limit.max(0) as usize).min(CDN_PLAIN.len());
+    let mut bytes = CDN_PLAIN[from..to].to_vec();
+    super::files::cdn_apply(&CDN_KEY, &CDN_IV, from as u64, &mut bytes).expect("the cdn key");
+    bytes
+}
+
 /// A gzip member: what Telegram serves many emoji files (a topic's icon among them) as,
 /// of the file that is inside it. The checks of the container's own trailer are left for
 /// whoever reads it whole: what matters here is the packed body.
@@ -513,6 +546,10 @@ struct World {
     /// tests of the rows' pictures read (`file-count`).
     file_in: usize,
     file_at_once: usize,
+    /// `getCdnFile` has been told to try the file again (`cdn-file`).
+    cdn_reuploaded: bool,
+    /// The first piece of `big-file` past the start has already been dropped once.
+    large_broke: bool,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -571,6 +608,8 @@ impl World {
             file_go: false,
             file_in: 0,
             file_at_once: 0,
+            cdn_reuploaded: false,
+            large_broke: false,
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -1590,6 +1629,23 @@ impl World {
                 self.store(None, message.clone());
                 vec![new(message)]
             }
+            // A small file Telegram keeps on a CDN. The redirect names no checksum; the home
+            // datacenter does, and the first CDN read asks for the file to be sent again.
+            "cdn-file" => {
+                let document = plain_document(9_300, CDN_PLAIN.len() as i64, "ridge.bin");
+                let mut message = message(odalys, 30, ODALYS, t0() + 80, "");
+                message.media = Some(document_media(document));
+                self.store(None, message.clone());
+                vec![new(message)]
+            }
+            // Longer than one megabyte piece, so a drop in the middle leaves a part to resume.
+            "big-file" => {
+                let document = plain_document(9_400, BIG_FILE as i64, "ridge-map.bin");
+                let mut message = message(odalys, 31, ODALYS, t0() + 90, "");
+                message.media = Some(document_media(document));
+                self.store(None, message.clone());
+                vec![new(message)]
+            }
             // A post from the channel, forwarded into the direct chat as an answer to message 12.
             "forward" => {
                 let mut message = message(odalys, 16, ODALYS, t0() + 70, "Snow line is at 1,900 m this week.");
@@ -2344,12 +2400,33 @@ impl World {
                 return Err(rpc(420, "FLOOD_WAIT", Some(seconds)));
             }
             self.log(&format!("GetFile {what} at {}", request.offset));
+            if let tl::enums::InputFileLocation::InputDocumentFileLocation(document) = &request.location {
+                if document.id == 9_300 {
+                    let redirect = tl::types::upload::FileCdnRedirect {
+                        dc_id: 5,
+                        file_token: b"cdn-token".to_vec(),
+                        encryption_key: CDN_KEY.to_vec(),
+                        encryption_iv: CDN_IV.to_vec(),
+                        file_hashes: Vec::new(),
+                    };
+                    self.file_in += 1;
+                    self.file_at_once = self.file_at_once.max(self.file_in);
+                    let answered = answer(tl::enums::upload::File::CdnRedirect(redirect));
+                    self.file_in -= 1;
+                    return answered;
+                }
+                if document.id == 9_400 && request.offset > 0 && !self.large_broke {
+                    self.large_broke = true;
+                    return Err(Fault::Net("the transfer dropped".into()));
+                }
+            }
             let held = match &request.location {
                 tl::enums::InputFileLocation::InputDocumentFileLocation(document) if document.id == 5001 || document.id == 5002 => {
                     packed(br#"{"tg":"the topic's icon"}"#)
                 }
                 location if is_ridge_thumb(location) => piece_of(RIDGE_M, request.offset, request.limit),
                 location if is_crew_thumb(location) => piece_of(CREW_PHOTO_M, request.offset, request.limit),
+                tl::enums::InputFileLocation::InputDocumentFileLocation(document) if document.id == 9_400 => big_piece(request.offset, request.limit),
                 _ => file_piece(request.offset, request.limit),
             };
             let piece = tl::types::upload::File { r#type: tl::enums::storage::FileType::FileJpeg, mtime: t0(), bytes: held };
@@ -2358,6 +2435,26 @@ impl World {
             let answered = answer(tl::enums::upload::File::File(piece));
             self.file_in -= 1;
             return answered;
+        }
+        if let Some(request) = asked::<f::upload::GetCdnFile>(body) {
+            self.log("GetCdnFile");
+            if !self.cdn_reuploaded {
+                self.log("CdnReuploadNeeded");
+                return answer(tl::enums::upload::CdnFile::ReuploadNeeded(tl::types::upload::CdnFileReuploadNeeded {
+                    request_token: b"again".to_vec(),
+                }));
+            }
+            let bytes = cdn_cipher(request.offset, request.limit);
+            return answer(tl::enums::upload::CdnFile::File(tl::types::upload::CdnFile { bytes }));
+        }
+        if asked::<f::upload::ReuploadCdnFile>(body).is_some() {
+            self.cdn_reuploaded = true;
+            self.log("ReuploadCdnFile");
+            return answer(vec![cdn_hash()]);
+        }
+        if asked::<f::upload::GetCdnFileHashes>(body).is_some() {
+            self.log("GetCdnFileHashes");
+            return answer(vec![cdn_hash()]);
         }
         if let Some(request) = asked::<f::auth::ExportAuthorization>(body) {
             self.log(&format!("ExportAuthorization {}", request.dc_id));
@@ -2811,6 +2908,21 @@ fn custom_emoji(id: i64, alt: &str) -> tl::types::Document {
             stickerset: tl::types::InputStickerSetId { id: 910, access_hash: 911 }.into(),
         }
         .into()],
+    }
+}
+
+fn plain_document(id: i64, size: i64, name: &str) -> tl::types::Document {
+    tl::types::Document {
+        id,
+        access_hash: id + 1,
+        file_reference: vec![9],
+        date: t0(),
+        mime_type: "application/octet-stream".to_owned(),
+        size,
+        thumbs: None,
+        video_thumbs: None,
+        dc_id: 2,
+        attributes: vec![tl::types::DocumentAttributeFilename { file_name: name.to_owned() }.into()],
     }
 }
 
