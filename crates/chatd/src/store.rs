@@ -2248,14 +2248,20 @@ impl Store {
     }
 
     /// Every conversation with a badge. The message id is the newest known, for the ack.
-    /// The bool is a message request: read here, and not told to the network.
-    pub fn unread_marks(&self, network: Option<Network>) -> rusqlite::Result<Vec<(Key, String, bool)>> {
+    /// The bool is a message request: read here, and not told to the network. `network` limits
+    /// it to one network; `space` to one Space's conversations, which are that Space's account's.
+    pub fn unread_marks(&self, network: Option<Network>, space: Option<&Key>) -> rusqlite::Result<Vec<(Key, String, bool)>> {
         let mut stmt = self.db.prepare(
             "SELECT network, account, id, preview_id, last_read, special FROM conversation
-              WHERE (unread > 0 OR mentions > 0) AND (?1 IS NULL OR network = ?1)",
+              WHERE (unread > 0 OR mentions > 0) AND (?1 IS NULL OR network = ?1)
+                AND (?2 IS NULL OR (network = ?3 AND account = ?4 AND space = ?2))",
         )?;
         let network = network.map(|network| word(&network));
-        let rows = stmt.query_map(params![network], |row| {
+        let (space_id, space_network, space_account) = match space {
+            Some(space) => (Some(space.id.as_str()), Some(word(&space.network)), Some(space.account.as_str())),
+            None => (None, None, None),
+        };
+        let rows = stmt.query_map(params![network, space_id, space_network, space_account], |row| {
             let key = Key {
                 network: from_word(row.get(0)?)?,
                 account: row.get(1)?,
@@ -3964,7 +3970,7 @@ mod tests {
             store.ingest(&key, &earlier, true).unwrap();
             assert!(store.mark_read(&key, &earlier.id).unwrap());
             store.ingest(&key, &later, true).unwrap();
-            let marks = store.unread_marks(Some(Network::Discord)).unwrap();
+            let marks = store.unread_marks(Some(Network::Discord), None).unwrap();
             assert!(marks.iter().any(|(found, marker, _)| found == &key && marker == &later.id));
             store.set_counts(&key, 0, 0, None, 20).unwrap();
             assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 1);
@@ -4130,7 +4136,7 @@ mod tests {
         let row = store.conversation(&key).unwrap().unwrap();
         assert_eq!((row.unread, row.last_read.as_deref()), (1, Some(earlier)));
         assert_eq!(store.preview_id(&key).unwrap(), later);
-        let marks = store.unread_marks(Some(Network::Discord)).unwrap();
+        let marks = store.unread_marks(Some(Network::Discord), None).unwrap();
         assert!(
             marks.iter().any(|(found, marker, request)| found == &key && marker == later && !request),
             "the ack is the newer message, not the uuid that sorts first"
@@ -4165,7 +4171,7 @@ mod tests {
 
         // A newer live message is unread again; a stale network count must not invent that.
         store.ingest(&dm, &said("30", "again", 30), true).unwrap();
-        let marks = store.unread_marks(Some(Network::Discord)).unwrap();
+        let marks = store.unread_marks(Some(Network::Discord), None).unwrap();
         assert!(marks.iter().any(|(found, marker, request)| found == &dm && marker == "30" && !request));
         assert!(store.forget_conversation(&dm).unwrap());
         let row = store.conversation(&dm).unwrap().unwrap();
@@ -4180,6 +4186,50 @@ mod tests {
         assert!(!row.hidden);
         assert_eq!(row.unread, 1);
         let _ = key;
+    }
+
+    #[test]
+    fn unread_marks_of_one_space_do_not_name_another_spaces_rows() {
+        let (mut store, key) = store();
+        let account = key.account();
+        let mut channel = ConversationRow::new("announcements", ConversationKind::Channel, "#announcements");
+        channel.space = Some("4000".into());
+        store.upsert_conversation(&account, &channel).unwrap();
+        let in_space = Key::new(&account, "announcements");
+        store.ingest(&in_space, &said("8", "hello", 10), true).unwrap();
+        store.ingest(&key, &said("9", "dm hello", 20), true).unwrap();
+
+        let space = Key::new(&account, "4000");
+        let marks = store.unread_marks(None, Some(&space)).unwrap();
+        assert_eq!(marks.len(), 1, "only the space's conversations are named");
+        assert_eq!(marks[0].0, in_space);
+        // Without a space everything with a badge is named, as before.
+        let all = store.unread_marks(None, None).unwrap();
+        assert!(all.iter().any(|(found, _, _)| found == &in_space));
+        assert!(all.iter().any(|(found, _, _)| found == &key));
+        let discord = store.unread_marks(Some(Network::Discord), None).unwrap();
+        assert_eq!(discord.len(), 2);
+    }
+
+    #[test]
+    fn a_local_unread_survives_a_stale_count_and_yields_to_a_newer_read() {
+        let (mut store, key) = store();
+        store.ingest(&key, &said("8", "one", 10), true).unwrap();
+        store.ingest(&key, &said("9", "two", 20), true).unwrap();
+        assert_eq!(
+            store.mark_unread(&key, "9").unwrap().map(|(marker, _)| marker),
+            Some("8".to_owned()),
+            "the marker moves to the message before the one marked"
+        );
+        assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 1);
+        // A network word that is not newer than what is stored cannot undo the mark: nothing
+        // read it, the list is just stale.
+        store.set_counts(&key, 0, 0, None, 20).unwrap();
+        assert!(store.conversation(&key).unwrap().unwrap().unread >= 1, "a stale count cleared a local unread");
+        // Another device read past the mark for real: the badge goes and the marker follows it.
+        store.set_counts(&key, 0, 0, Some("9"), 30).unwrap();
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.unread, row.last_read.as_deref()), (0, Some("9")));
     }
 
     #[test]

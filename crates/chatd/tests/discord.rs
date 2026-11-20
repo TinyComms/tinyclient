@@ -1661,7 +1661,7 @@ fn marking_a_message_unread_moves_the_marker_back_and_a_manual_ack_does_too() {
 fn marking_everything_read_tells_discord_in_one_bulk_ack() {
     let world = World::start();
     assert!(world.conversation("3001").unread > 0);
-    assert_eq!(world.ask(Request::MarkAllRead { network: None }), Response::Ok);
+    assert_eq!(world.ask(Request::MarkAllRead { network: None, space: None }), Response::Ok);
     assert_eq!(world.conversation("3001").unread, 0);
     let bulk = wait("the bulk ack", || {
         let found = world.discord.requests_to("POST", "/read-states/ack-bulk");
@@ -1671,6 +1671,41 @@ fn marking_everything_read_tells_discord_in_one_bulk_ack() {
         seen.body["read_states"].as_array().is_some_and(|rows| rows.iter().any(|row| row["channel_id"] == "3001"))
     });
     assert!(named, "channel 3001 is in the bulk ack");
+}
+
+#[test]
+fn marking_one_space_read_leaves_the_other_spaces_badges_alone() {
+    let world = World::start();
+    // The ready state carries badges in guild 4000 (4101, 4104, and muted 4105), in guild
+    // 5000 (5001) and among the direct messages (3001).
+    wait("the badges from the ready state", || {
+        let (four, five, dm) = (world.conversation("4101").unread, world.conversation("5001").unread, world.conversation("3001").unread);
+        (four > 0 && five > 0 && dm > 0).then_some(())
+    });
+    assert_eq!(
+        world.ask(Request::MarkAllRead { network: Some(Network::Discord), space: Some(world.key("4000")) }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation("4101").unread, 0, "the space's channels are read");
+    assert_eq!(world.conversation("4104").unread, 0);
+    assert_eq!(world.conversation("4105").unread, 0, "a muted channel of the space is read too");
+    assert!(world.conversation("5001").unread > 0, "another space keeps its badge");
+    assert!(world.conversation("3001").unread > 0, "a direct message keeps its badge");
+    let bulks = wait("the bulk ack for the space", || {
+        let found = world.discord.requests_to("POST", "/read-states/ack-bulk");
+        (!found.is_empty()).then_some(found)
+    });
+    assert!(
+        bulks.iter().any(|seen| seen.body["read_states"].as_array().is_some_and(|rows| rows.iter().any(|row| row["channel_id"] == "4101"))),
+        "the space's channel is acked"
+    );
+    for seen in &bulks {
+        let named = |channel: &str| {
+            seen.body["read_states"].as_array().is_some_and(|rows| rows.iter().any(|row| row["channel_id"] == channel))
+        };
+        assert!(!named("5001"), "another space's channel is not acked");
+        assert!(!named("3001"), "a direct message is not acked by a space's read");
+    }
 }
 
 #[test]
