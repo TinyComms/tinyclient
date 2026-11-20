@@ -119,13 +119,22 @@ const TABLE: &[(&str, &str)] = &[
     ("sparkler", "🎇"), ("snowman", "⛄"), ("santa", "🎅"),
 ];
 
+/// Picker emoji this hand table does not already name. Each name is that emoji's gemoji
+/// shortcode (`crates/tinyclient/src/gui/picker/table.rs`). A glyph whose only shortcode is
+/// already the name of a different emoji is left out: sending it would be the other reaction.
+const EXTRA: &[(&str, &str)] = include!("emoji_extra.rs");
+
+fn listed() -> impl Iterator<Item = (&'static str, &'static str)> {
+    TABLE.iter().copied().chain(EXTRA.iter().copied())
+}
+
 /// The emoji for a Slack name, skin tone included: `+1::skin-tone-3`.
 pub fn standard(name: &str) -> Option<String> {
     let (base, tone) = match name.split_once("::") {
         Some((base, tone)) => (base, Some(tone)),
         None => (name, None),
     };
-    let (_, emoji) = TABLE.iter().find(|(known, _)| *known == base)?;
+    let (_, emoji) = listed().find(|(known, _)| *known == base)?;
     let mut emoji = (*emoji).to_owned();
     if let Some(tone) = tone.and_then(skin_tone) {
         // The modifier follows the base character, before any variation selector.
@@ -142,7 +151,7 @@ pub fn standard(name: &str) -> Option<String> {
 /// one emoji the first listed is used; they are the same reaction to Slack.
 pub fn name(emoji: &str) -> Option<String> {
     let plain = |text: &str| text.replace('\u{fe0f}', "");
-    let find = |emoji: &str| TABLE.iter().find(|(_, known)| plain(known) == emoji).map(|(name, _)| *name);
+    let find = |emoji: &str| listed().find(|(_, known)| plain(known) == emoji).map(|(name, _)| name);
     let wanted = plain(emoji);
     if let Some(name) = find(&wanted) {
         return Some(name.to_owned());
@@ -160,12 +169,13 @@ pub fn skin_tone(name: &str) -> Option<char> {
 }
 
 /// Every emoji this table can name, once each, in its order: the only ones a reaction can be
-/// (a custom one aside), since Slack takes a reaction by name.
+/// (a custom one aside), since Slack takes a reaction by name. The hand table comes first, then
+/// every other picker emoji.
 pub fn nameable() -> Vec<String> {
-    let mut all: Vec<String> = Vec::with_capacity(TABLE.len());
-    for (_, emoji) in TABLE {
+    let mut all: Vec<String> = Vec::with_capacity(TABLE.len() + EXTRA.len());
+    for (_, emoji) in listed() {
         if !all.iter().any(|held| held == emoji) {
-            all.push((*emoji).to_owned());
+            all.push(emoji.to_owned());
         }
     }
     all
@@ -181,6 +191,73 @@ pub fn from_code_points(unicode: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gemoji gives these the same shortcode as an emoji this table already names, so there is no
+    /// second name to send. Slack would treat that name as the other emoji.
+    const SHARED_SHORTCODE: &[&str] = &["🤵‍♂️", "🪲", "🚋", "📡"];
+
+    fn plain(text: &str) -> String {
+        text.replace('\u{fe0f}', "")
+    }
+
+    fn quoted<'a>(line: &'a str, mark: &str) -> Option<&'a str> {
+        let start = line.find(mark)? + mark.len();
+        let rest = line.get(start..)?;
+        let end = rest.find('"')?;
+        rest.get(..end)
+    }
+
+    /// Every emoji the picker offers has a Slack name, including each skin tone. A glyph in
+    /// [`SHARED_SHORTCODE`] is the exception: its only shortcode already names a different emoji.
+    fn prove_picker_names() -> Result<(), String> {
+        let table = include_str!("../../../../tinyclient/src/gui/picker/table.rs");
+        let mut seen = 0usize;
+        let mut shared = 0usize;
+        for line in table.lines() {
+            let Some(glyph) = quoted(line, "glyph: \"") else { continue };
+            let Some(code) = quoted(line, "code: \"") else { continue };
+            let tones = line.split("tones: ").nth(1).is_some_and(|rest| rest.starts_with("true"));
+            seen += 1;
+            if SHARED_SHORTCODE.contains(&glyph) {
+                if name(glyph).is_some() {
+                    return Err(format!("{glyph} ({code}) was a shared shortcode and now has its own name"));
+                }
+                shared += 1;
+                continue;
+            }
+            let Some(named) = name(glyph) else {
+                return Err(format!("no Slack name for {glyph} ({code})"));
+            };
+            let Some(back) = standard(&named) else {
+                return Err(format!("{named} does not read back"));
+            };
+            if plain(&back) != plain(glyph) {
+                return Err(format!("{named} reads back as {back}, not {glyph}"));
+            }
+            if !tones {
+                continue;
+            }
+            for level in 2..=6 {
+                let tone_name = format!("{named}::skin-tone-{level}");
+                let Some(toned) = standard(&tone_name) else {
+                    return Err(format!("{tone_name} is not an emoji"));
+                };
+                if name(&toned).as_deref() != Some(tone_name.as_str()) {
+                    return Err(format!("{toned} is not named {tone_name}"));
+                }
+            }
+        }
+        if seen < 1800 {
+            return Err(format!("the picker table parsed as {seen} emoji"));
+        }
+        if shared != SHARED_SHORTCODE.len() {
+            return Err(format!("shared shortcodes found {shared}, expected {}", SHARED_SHORTCODE.len()));
+        }
+        if nameable().len() > protocol::REACTIONS_LISTED {
+            return Err("the reaction list is longer than the protocol keeps".to_owned());
+        }
+        Ok(())
+    }
 
     #[test]
     fn names_tones_and_code_points_become_the_emoji_itself() {
@@ -199,17 +276,23 @@ mod tests {
         // With or without the variation selector a keyboard may add.
         assert_eq!(name("❤").as_deref(), Some("heart"));
         assert_eq!(name("❤️").as_deref(), Some("heart"));
-        assert_eq!(name("🫥"), None);
-        for (known, emoji) in TABLE {
+        assert_eq!(name("\u{E000}"), None);
+        for (known, emoji) in listed() {
             let back = name(emoji).unwrap();
-            assert_eq!(standard(&back).as_deref(), Some(*emoji), "{known}");
+            assert_eq!(standard(&back).as_deref(), Some(emoji), "{known}");
         }
     }
 
     #[test]
     fn no_name_is_listed_twice() {
-        for (at, (name, _)) in TABLE.iter().enumerate() {
-            assert!(!TABLE[..at].iter().any(|(earlier, _)| earlier == name), "{name}");
+        let all: Vec<_> = listed().collect();
+        for (at, (name, _)) in all.iter().enumerate() {
+            assert!(!all[..at].iter().any(|(earlier, _)| earlier == name), "{name}");
         }
+    }
+
+    #[test]
+    fn every_picker_emoji_has_a_slack_name() {
+        prove_picker_names().unwrap();
     }
 }
