@@ -612,6 +612,141 @@ fn a_mov_is_sent_as_a_video() {
 }
 
 #[test]
+fn three_files_are_one_message_and_a_cancel_stops_the_send() {
+    let world = World::linked();
+    world.connected();
+    let mine = world
+        .status()
+        .0
+        .into_iter()
+        .find(|status| status.key == account())
+        .expect("the Messages account");
+    assert_eq!(mine.can.max_files, 10);
+
+    let dir = world.dir.join("outbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut files = Vec::new();
+    for (name, bytes) in [
+        ("one.txt", b"aaa".as_slice()),
+        ("two.txt", b"bbbb"),
+        ("three.txt", b"ccccc"),
+    ] {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        files.push(OutgoingFile {
+            path: path.to_string_lossy().into_owned(),
+            name: name.into(),
+            spoiler: false,
+            as_file: false,
+            original: false,
+        });
+    }
+    let too_many = vec![files[0].clone(); 11];
+    match world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "too-many".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            files: too_many,
+            ..Outgoing::default()
+        },
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("10"), "{detail}"),
+        other => panic!("{other:?}"),
+    }
+
+    let (_, seq) = world.status();
+    match world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "three".into(),
+        text: "picnic".into(),
+        reply_to: None,
+        with: Outgoing {
+            files,
+            ..Outgoing::default()
+        },
+    }) {
+        Response::Sent { message } => {
+            assert!(matches!(message.state, SendState::Pending), "{message:?}")
+        }
+        other => panic!("{other:?}"),
+    }
+    for (name, len) in [("one.txt", 3), ("two.txt", 4), ("three.txt", 5)] {
+        world.heard(&format!("file {GRACE} {name} {len} picnic"));
+    }
+    let sent = world.until("the three files", || {
+        world.messages(GRACE).into_iter().find(|message| {
+            message.text == "picnic"
+                && message.attachments.len() == 3
+                && message
+                    .attachments
+                    .iter()
+                    .all(|file| file.file.id.starts_with("messages:"))
+        })
+    });
+    let one = sent
+        .attachments
+        .iter()
+        .find(|file| file.name == "one.txt")
+        .expect("one.txt");
+    let path = one.file.path.as_deref().expect("one.txt on disk");
+    assert_eq!(std::fs::read(path).unwrap(), b"aaa");
+    world.changed(seq, "upload progress", |change| match change {
+        Change::Upload {
+            client_id,
+            sent,
+            total,
+            ..
+        } if client_id == "three" && *sent == *total && *total == 12 => Some(()),
+        _ => None,
+    });
+
+    world.steer("hold");
+    world.heard("hold");
+    let later = dir.join("later.txt");
+    std::fs::write(&later, b"zzzz").unwrap();
+    match world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "stop".into(),
+        text: "nope".into(),
+        reply_to: None,
+        with: Outgoing {
+            files: vec![OutgoingFile {
+                path: later.to_string_lossy().into_owned(),
+                name: "later.txt".into(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+            }],
+            ..Outgoing::default()
+        },
+    }) {
+        Response::Sent { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        world.ask(Request::CancelSend {
+            conversation: key(GRACE),
+            client_id: "stop".into(),
+        }),
+        Response::Ok
+    );
+    world.steer("go");
+    world.until("the cancelled send", || {
+        world.messages(GRACE).into_iter().find(|message| {
+            message.client_id.as_deref() == Some("stop")
+                && matches!(&message.state, SendState::Failed { reason } if reason == "Cancelled")
+        })
+    });
+    assert!(
+        !world.calls().iter().any(|call| call.contains("later.txt")),
+        "{:?}",
+        world.calls()
+    );
+}
+
+#[test]
 fn pairing_uses_google_browser_then_phone_emoji_confirmation() {
     let world = World::start(None);
     assert!(world

@@ -23,7 +23,7 @@ const ORIGIN: &str = "https://messages.google.com";
 const RELAY: &str = "https://instantmessaging-pa.googleapis.com/$rpc/google.internal.communications.instantmessaging.v1";
 const UPLOAD: &str = "https://instantmessaging-pa.googleapis.com/upload";
 /// A guard for this client, not a limit Google publishes.
-const FILE_CAP: u64 = 100 * 1024 * 1024;
+pub(super) const FILE_CAP: u64 = 100 * 1024 * 1024;
 const NETWORK: &str = "Bugle";
 /// How long one request waits for the phone to answer on the long-poll.
 const PHONE: Duration = Duration::from_secs(20);
@@ -903,31 +903,38 @@ fn file_type_samples() -> Result<(), String> {
     Ok(())
 }
 
+/// One file already sealed and uploaded, named the way the phone shows it.
+pub(super) struct MediaPart<'a> {
+    pub media_id: &'a str,
+    pub key: &'a [u8],
+    pub name: &'a str,
+    pub mime: &'a str,
+    pub size: u64,
+}
+
 fn send_media_request(
     conversation: &str,
     caption: &str,
     tmp: &str,
     mine: &str,
-    media_id: &str,
-    key: &[u8],
-    name: &str,
-    mime: &str,
-    size: u64,
+    parts: &[MediaPart<'_>],
     reply: Option<&str>,
 ) -> Vec<u8> {
-    let mut media = Buf::new();
-    media.text(2, media_id);
-    media.text(4, name);
-    media.int(5, size);
-    media.bytes(11, key);
-    media.text(14, mime);
-    let mut media_info = Buf::new();
-    media_info.msg(3, &media.0);
     let mut payload = Buf::new();
     payload.text(1, tmp);
     payload.text(7, conversation);
     payload.text(9, mine);
-    payload.msg(10, &media_info.0);
+    for part in parts {
+        let mut media = Buf::new();
+        media.text(2, part.media_id);
+        media.text(4, part.name);
+        media.int(5, part.size);
+        media.bytes(11, part.key);
+        media.text(14, part.mime);
+        let mut media_info = Buf::new();
+        media_info.msg(3, &media.0);
+        payload.msg(10, &media_info.0);
+    }
     if !caption.is_empty() {
         let mut content = Buf::new();
         content.text(1, caption);
@@ -1761,49 +1768,27 @@ impl Session {
         refused(&bytes)
     }
 
-    /// Encrypts the file, uploads it, and asks the phone to send it. A large photo may leave as
-    /// an MMS copy; this does not promise an RCS high-quality send.
-    pub fn send_file(
+    /// Uploads one sealed file. A large photo may leave as an MMS copy; this does not promise
+    /// an RCS high-quality send.
+    pub fn upload_bytes(&self, packed: &[u8], mime: &str) -> Result<String, String> {
+        self.upload(packed, mime)
+    }
+
+    /// Asks the phone to send every part as one message. `parts` are already uploaded.
+    pub fn send_media(
         &self,
         conversation: &str,
         caption: &str,
-        path: &str,
-        name: &str,
+        parts: &[MediaPart<'_>],
         reply: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
-        let named = if name.is_empty() { "file" } else { name };
-        let meta =
-            std::fs::metadata(path).map_err(|_| format!("Messages couldn't read {named}."))?;
-        if meta.len() > FILE_CAP {
-            return Err(
-                "That file is larger than 100 MB, which tinyclient won't send through Messages."
-                    .into(),
-            );
-        }
-        let plain = std::fs::read(path).map_err(|_| format!("Messages couldn't read {named}."))?;
-        let mut key = [0u8; 32];
-        getrandom::fill(&mut key).map_err(|_| "Messages could not make a media key.".to_owned())?;
-        let packed = super::media::pack(&key, &plain)?;
-        let mime = mime_of(named, &plain);
-        let media_id = self.upload(&packed, &mime)?;
         let mine = self.mine_of(conversation);
         let tmp = uuid();
         noted(&tmp);
         let bytes = self.rpc(
             3,
-            &send_media_request(
-                conversation,
-                caption,
-                &tmp,
-                &mine,
-                &media_id,
-                &key,
-                named,
-                &mime,
-                plain.len() as u64,
-                reply,
-            ),
+            &send_media_request(conversation, caption, &tmp, &mine, parts, reply),
             2,
         )?;
         refused(&bytes)?;
@@ -2787,11 +2772,13 @@ pub(super) fn prove_message_reply() -> Result<(), String> {
         "",
         "tmp-3",
         "me",
-        "media-1",
-        &[1; 32],
-        "a.png",
-        "image/png",
-        4,
+        &[MediaPart {
+            media_id: "media-1",
+            key: &[1; 32],
+            name: "a.png",
+            mime: "image/png",
+            size: 4,
+        }],
         Some("m-orig"),
     ));
     if field_text(&fields(&field_bytes(&media, 8)), 1) != "m-orig" {
@@ -2949,6 +2936,85 @@ pub fn prove_unpaired() -> Result<(), String> {
         return Err("an empty long-poll close counted as a failure".into());
     }
     Ok(())
+}
+
+/// Three files and a caption are one send payload, and a file longer than one chunk seals
+/// without holding the plaintext. Errors from this check do not name the scratch file.
+pub(super) fn prove_several_files() -> Result<(), String> {
+    let keys = [[1u8; 32], [2u8; 32], [3u8; 32]];
+    let parts = [
+        MediaPart {
+            media_id: "m1",
+            key: &keys[0],
+            name: "one.txt",
+            mime: "application/octet-stream",
+            size: 3,
+        },
+        MediaPart {
+            media_id: "m2",
+            key: &keys[1],
+            name: "two.txt",
+            mime: "application/octet-stream",
+            size: 4,
+        },
+        MediaPart {
+            media_id: "m3",
+            key: &keys[2],
+            name: "three.txt",
+            mime: "application/octet-stream",
+            size: 5,
+        },
+    ];
+    let bytes = send_media_request("phone-grace", "picnic", "tmp", "phone-ada", &parts, None);
+    let payload = fields(&field_bytes(&fields(&bytes), 3));
+    let mut media = 0;
+    let mut caption = 0;
+    let mut names = Vec::new();
+    for info in payload.iter().filter(|field| field.number == 10) {
+        let inner = fields(&info.bytes);
+        if field(&inner, 3).is_some() {
+            media += 1;
+            names.push(field_text(&fields(&field_bytes(&inner, 3)), 4));
+        }
+        if let Some(content) = field(&inner, 2) {
+            caption += 1;
+            if field_text(&fields(&content.bytes), 1) != "picnic" {
+                return Err("the caption was not kept with the files".into());
+            }
+        }
+    }
+    if media != 3 || caption != 1 || names != ["one.txt", "two.txt", "three.txt"] {
+        return Err(format!("a message of three files encoded {media} files and {caption} captions"));
+    }
+    let plain: Vec<u8> = (0..super::media::CHUNK as u32 + 20).map(|n| (n % 256) as u8).collect();
+    let scratch = Scratch(std::env::temp_dir().join(format!("messages-several-{}", std::process::id())));
+    let fail = |_| "Messages could not seal that file.".to_owned();
+    std::fs::create_dir_all(&scratch.0).map_err(fail)?;
+    let path = scratch.0.join("photo.bin");
+    std::fs::write(&path, &plain).map_err(fail)?;
+    let mut file = std::fs::File::open(&path).map_err(fail)?;
+    let mut packer = super::media::Packer::open(&[9u8; 32])?;
+    let mut rest = plain.len();
+    while rest > 0 {
+        let want = rest.min(super::media::CHUNK);
+        let mut buf = vec![0u8; want];
+        std::io::Read::read_exact(&mut file, &mut buf).map_err(fail)?;
+        packer.push(&buf)?;
+        rest -= want;
+    }
+    let packed = packer.finish()?;
+    if super::media::unpack(&[9u8; 32], &packed)? != plain {
+        return Err("a sealed file did not open to the same bytes".into());
+    }
+    Ok(())
+}
+
+struct Scratch(std::path::PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[cfg(test)]

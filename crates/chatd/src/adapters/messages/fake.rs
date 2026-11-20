@@ -5,14 +5,15 @@
 //! `incoming WHO TEXT…`, `group WHO TEXT…`, `photo WHO`, `caption WHO TEXT…`,
 //! `file WHO NAME`, `remote WHO`, `react WHO TEXT`, `quote WHO ID TEXT…`,
 //! `typing WHO`, `typing-stop WHO`,
-//! `refuse WORDS…`, `status CODE`, `drop`, `unlinked`, `silent`, `answer`,
+//! `refuse WORDS…`, `status CODE`, `hold`, `go`, `drop`, `unlinked`, `silent`, `answer`,
 //! `revoke`, `revoke-offline`, `auth`.
 //! `silent` makes the phone stop answering sends, history, and files. `answer` clears that
 //! and tells the adapter the phone is back.
+//! `hold` pauses a file upload until `go`, so a cancel can land while it is still unsent.
 //! WHO is `grace` or `alan`. `status` reports that code on the last text this computer sent.
 
 use super::{Drive, Event, Saved};
-use crate::adapters::messages::bugle::{Chat, Mark, Note, Piece, MESSAGE_PAGE, PHONE_QUIET, UNPAIRED};
+use crate::adapters::messages::bugle::{Chat, Mark, MediaPart, Note, Piece, MESSAGE_PAGE, PHONE_QUIET, UNPAIRED};
 use crate::adapters::script;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -56,6 +57,8 @@ pub struct Fake {
     quiet: Arc<AtomicBool>,
     sent: AtomicU32,
     last: Arc<Mutex<Option<SentCopy>>>,
+    /// A scripted upload waits while this is set (`hold` / `go` on `messages.ctl`).
+    hold: Arc<AtomicBool>,
 }
 
 impl Fake {
@@ -74,6 +77,7 @@ impl Fake {
                 quiet: Arc::default(),
                 sent: AtomicU32::new(0),
                 last: Arc::default(),
+                hold: Arc::default(),
             };
         }
         let (events, heard) = channel();
@@ -112,13 +116,15 @@ impl Fake {
             quiet: Arc::default(),
             sent: AtomicU32::new(0),
             last: Arc::default(),
+            hold: Arc::default(),
         };
-        let (events, closed, refuse, quiet, last) = (
+        let (events, closed, refuse, quiet, last, hold) = (
             fake.events.clone(),
             fake.closed.clone(),
             fake.refuse.clone(),
             fake.quiet.clone(),
             fake.last.clone(),
+            fake.hold.clone(),
         );
         let control = script::control("messages.ctl");
         let _ = std::thread::Builder::new()
@@ -172,6 +178,16 @@ impl Fake {
                             spoken.sent = crate::hub::now();
                             let _ = events.send(Event::Message(spoken));
                         }
+                        return true;
+                    }
+                    if line == "hold" {
+                        hold.store(true, Ordering::Release);
+                        record("hold");
+                        return true;
+                    }
+                    if line == "go" {
+                        hold.store(false, Ordering::Release);
+                        record("go");
                         return true;
                     }
                     for event in steer(line) {
@@ -610,12 +626,21 @@ impl Drive for Fake {
         }
         Ok(relay_id)
     }
-    fn send_file(
+    fn upload_media(&self, _packed: &[u8], _mime: &str) -> Result<String, String> {
+        while self.hold.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        self.unanswered()?;
+        if let Some(words) = self.refusal() {
+            return Err(words);
+        }
+        Ok("media".into())
+    }
+    fn send_media(
         &self,
         conversation: &str,
         caption: &str,
-        path: &str,
-        name: &str,
+        parts: &[MediaPart<'_>],
         reply: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
@@ -623,13 +648,14 @@ impl Drive for Fake {
         if let Some(words) = self.refusal() {
             return Err(words);
         }
-        let bytes = std::fs::read(path).map_err(|_| format!("Messages couldn't read {name}."))?;
         let relay_id = self.remember(conversation, caption);
         noted(&relay_id);
-        record(&format!(
-            "file {conversation} {name} {} {caption}",
-            bytes.len()
-        ));
+        for part in parts {
+            record(&format!(
+                "file {conversation} {} {} {caption}",
+                part.name, part.size
+            ));
+        }
         if let Some(id) = reply.filter(|id| !id.is_empty()) {
             record(&format!("reply {conversation} {id}"));
         }

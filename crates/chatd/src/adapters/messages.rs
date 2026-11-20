@@ -11,6 +11,7 @@ pub mod signin;
 
 use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, Signed};
 use crate::blobs;
+use crate::blobs::upload;
 use crate::session;
 use crate::store::{ConversationRow, PersonRow};
 use bugle::Chat;
@@ -127,12 +128,12 @@ trait Drive: Send + Sync {
         reply: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String>;
-    fn send_file(
+    fn upload_media(&self, packed: &[u8], mime: &str) -> Result<String, String>;
+    fn send_media(
         &self,
         conversation: &str,
         caption: &str,
-        path: &str,
-        name: &str,
+        parts: &[bugle::MediaPart<'_>],
         reply: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String>;
@@ -188,16 +189,18 @@ impl Drive for LiveDrive {
     ) -> Result<String, String> {
         self.inner.send(conversation, text, reply, noted)
     }
-    fn send_file(
+    fn upload_media(&self, packed: &[u8], mime: &str) -> Result<String, String> {
+        self.inner.upload_bytes(packed, mime)
+    }
+    fn send_media(
         &self,
         conversation: &str,
         caption: &str,
-        path: &str,
-        name: &str,
+        parts: &[bugle::MediaPart<'_>],
         reply: Option<&str>,
         noted: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
-        self.inner.send_file(conversation, caption, path, name, reply, noted)
+        self.inner.send_media(conversation, caption, parts, reply, noted)
     }
     fn resend(&self, message: &str) -> Result<(), String> {
         self.inner.resend(message)
@@ -401,9 +404,6 @@ struct WaitingSend {
     conversation: String,
     client_id: String,
     text: String,
-    /// Empty for a text. A file keeps the path the shell handed over.
-    path: String,
-    name: String,
     since: i64,
     /// The message this one answers, when the chat is RCS. Empty otherwise.
     reply: Option<String>,
@@ -552,8 +552,8 @@ fn connect(
         newest: Mutex::default(),
     });
     ctx.capabilities(Capabilities {
-        max_file_bytes: 100 * 1024 * 1024,
-        max_files: 1,
+        max_file_bytes: bugle::FILE_CAP,
+        max_files: file_limit(),
         ..Capabilities::default()
     });
     let _ = ctx.describe(
@@ -1056,6 +1056,36 @@ fn land(account: &Account, file: &MediaFile, bytes: &[u8]) -> Option<String> {
     Some(path.to_string_lossy().into_owned())
 }
 
+/// Copies the file the user picked. The plaintext is not held in one buffer.
+fn land_copy(account: &Account, file: &MediaFile, from: &std::path::Path, bytes: u64) -> Option<String> {
+    let ctx = &account.ctx;
+    let path = blobs::path_of(&media_root(), &ctx.account, &file.id);
+    let part = path.with_extension("part");
+    std::fs::create_dir_all(blobs::dir_under(&media_root(), &ctx.account)).ok()?;
+    std::fs::copy(from, &part).ok()?;
+    std::fs::rename(&part, &path).ok()?;
+    let address = format!("messages://file/{}", file.id);
+    let mut store = ctx.hub.store();
+    store
+        .register_media(&ctx.account, &[(file.clone(), address)])
+        .ok()?;
+    let landed = store
+        .media_landed(
+            &ctx.account,
+            &file.id,
+            &path.to_string_lossy(),
+            bytes,
+            crate::hub::now(),
+        )
+        .ok()??;
+    drop(store);
+    ctx.hub.changed(Change::Media {
+        account: ctx.account.clone(),
+        file: landed,
+    });
+    Some(path.to_string_lossy().into_owned())
+}
+
 fn wanted(account: &Account, ids: &[String]) {
     for id in ids {
         let held = account
@@ -1214,44 +1244,49 @@ fn serve(account: &Arc<Account>, command: Command) {
             text,
             reply_to,
             with,
-        } => match with.files.as_slice() {
-            [file] => {
+        } => {
+            if with.files.is_empty() {
+                post_text(account, &conversation_id, &client_id, text, reply_to);
+            } else {
                 warn_mms(account, &conversation_id, &client_id);
-                let name = if file.name.is_empty() {
-                    std::path::Path::new(&file.path)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("file")
-                        .to_owned()
-                } else {
-                    file.name.clone()
-                };
-                post_file(
-                    account,
+                let reply = carried_reply(account, &conversation_id, reply_to);
+                let account = Arc::clone(account);
+                let conversation = conversation_id.clone();
+                let cid = client_id.clone();
+                let caption = text;
+                upload::spawn(
+                    ctx,
                     &conversation_id,
                     &client_id,
-                    text,
-                    file.path.clone(),
-                    name,
-                    reply_to,
+                    &with.files,
+                    move |upload| {
+                        deliver_files(
+                            &account,
+                            upload,
+                            &conversation,
+                            &cid,
+                            &caption,
+                            reply.as_deref(),
+                        )
+                    },
                 );
             }
-            [] => post_text(account, &conversation_id, &client_id, text, reply_to),
-            _ => ctx.sent(
-                &conversation_id,
-                &client_id,
-                Err("Messages takes one file at a time.".into()),
-            ),
-        },
+        }
         Command::OpenHome => catch_up(account),
         Command::CancelSend {
             conversation_id,
             client_id,
         } => {
+            upload::cancel(&ctx.account, &client_id);
+            let mut queued = false;
             phone(account).queue.retain(|held| {
-                held.conversation != conversation_id || held.client_id != client_id
+                let drop = held.conversation == conversation_id && held.client_id == client_id;
+                queued |= drop;
+                !drop
             });
-            ctx.sent(&conversation_id, &client_id, Err("Cancelled".into()));
+            if queued {
+                ctx.sent(&conversation_id, &client_id, Err("Cancelled".into()));
+            }
         }
         Command::React {
             message_id,
@@ -1346,6 +1381,135 @@ fn receipt(account: &Account, conversation: &str, note: &bugle::Note, id: &str) 
     if mark.is_some() {
         settle_map(&mut outbox_mut(account), id, note.status);
     }
+}
+
+fn file_limit() -> u32 {
+    protocol::ATTACHMENTS_LIMIT as u32
+}
+
+fn send_failure(name: &str, why: String) -> String {
+    if why == upload::CANCELLED {
+        why
+    } else {
+        format!("{name} could not be sent: {why}")
+    }
+}
+
+struct Prepared {
+    media_id: String,
+    key: Vec<u8>,
+    name: String,
+    mime: &'static str,
+    size: u64,
+    path: std::path::PathBuf,
+}
+
+/// Seals and uploads each file, then asks the phone to send them as one message.
+fn deliver_files(
+    account: &Account,
+    upload: &mut upload::Upload,
+    conversation: &str,
+    client_id: &str,
+    caption: &str,
+    reply: Option<&str>,
+) -> Result<Message, String> {
+    let staged: Vec<(String, u64, std::path::PathBuf)> = upload
+        .files()
+        .iter()
+        .map(|source| (source.name.clone(), source.bytes, source.path.clone()))
+        .collect();
+    let mut prepared = Vec::with_capacity(staged.len());
+    for (at, (name, size, path)) in staged.into_iter().enumerate() {
+        upload.check()?;
+        if size > bugle::FILE_CAP {
+            return Err(format!(
+                "{name} is larger than 100 MB, which tinyclient won't send through Messages."
+            ));
+        }
+        let mut head = [0u8; 64];
+        let n = std::fs::File::open(&path)
+            .and_then(|mut file| std::io::Read::read(&mut file, &mut head))
+            .unwrap_or(0);
+        let mime = bugle::mime_of(&name, &head[..n]);
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).map_err(|_| "Messages could not make a media key.".to_owned())?;
+        let mut packer = media::Packer::open(&key)?;
+        upload
+            .parts(at, media::CHUNK, 0, |part| packer.push(part.bytes))
+            .map_err(|why| send_failure(&name, why))?;
+        let packed = packer.finish().map_err(|why| send_failure(&name, why))?;
+        upload.check().map_err(|why| send_failure(&name, why))?;
+        let media_id = account
+            .drive
+            .upload_media(&packed, mime)
+            .map_err(|why| send_failure(&name, why))?;
+        prepared.push(Prepared {
+            media_id,
+            key: key.to_vec(),
+            name,
+            mime,
+            size,
+            path,
+        });
+    }
+    upload.check()?;
+    let parts: Vec<bugle::MediaPart<'_>> = prepared
+        .iter()
+        .map(|part| bugle::MediaPart {
+            media_id: &part.media_id,
+            key: &part.key,
+            name: &part.name,
+            mime: part.mime,
+            size: part.size,
+        })
+        .collect();
+    let sent = account
+        .drive
+        .send_media(conversation, caption, &parts, reply, &mut |id| {
+            keep_copy(account, client_id, id);
+        });
+    if sent.is_err() {
+        forget(account, client_id);
+    }
+    let id = sent?;
+    let mut message = outgoing(account, client_id.to_owned(), caption.to_owned());
+    if let Some(reply_id) = reply {
+        message.reply_to = Some(quoted(account, conversation, reply_id, &[]));
+    }
+    let mut attachments = Vec::new();
+    for (index, part) in prepared.iter().enumerate() {
+        if part.size == 0 {
+            continue;
+        }
+        let mut file = MediaFile::new(format!("messages:{id}:{index}"), kind_of(part.mime));
+        file.bytes = part.size;
+        if let Some(path) = land_copy(account, &file, &part.path, part.size) {
+            file.path = Some(path);
+        }
+        attachments.push(Attachment {
+            name: part.name.clone(),
+            file,
+            thumb: None,
+            mime: part.mime.to_owned(),
+            duration: 0,
+            spoiler: false,
+            sticker: false,
+            waveform: Vec::new(),
+            round: false,
+        });
+    }
+    message.attachments = attachments;
+    Ok(finish(account, client_id, message))
+}
+
+/// Proves one Messages send can carry several files.
+/// The lab sets `TINYCLIENT_PROVE=messages-several-files`. A build from before this ignores
+/// that and keeps serving, so the same driver fails there.
+pub fn prove_messages_several_files() -> Result<(), String> {
+    if file_limit() != 10 {
+        return Err("Messages still takes one file at a time.".into());
+    }
+    bugle::prove_several_files()
 }
 
 fn backfill(account: &Account, conversation: &str) {
@@ -1627,29 +1791,6 @@ fn post_text(account: &Account, conversation: &str, client_id: &str, text: Strin
         conversation: conversation.to_owned(),
         client_id: client_id.to_owned(),
         text,
-        path: String::new(),
-        name: String::new(),
-        since: crate::hub::now(),
-        reply: carried_reply(account, conversation, reply),
-    };
-    post(account, item);
-}
-
-fn post_file(
-    account: &Account,
-    conversation: &str,
-    client_id: &str,
-    text: String,
-    path: String,
-    name: String,
-    reply: Option<String>,
-) {
-    let item = WaitingSend {
-        conversation: conversation.to_owned(),
-        client_id: client_id.to_owned(),
-        text,
-        path,
-        name,
         since: crate::hub::now(),
         reply: carried_reply(account, conversation, reply),
     };
@@ -1687,20 +1828,9 @@ fn ask(account: &Account, item: &WaitingSend) -> Result<Message, String> {
         account.drive.resend(&copy)?;
         return Ok(finish(account, &item.client_id, carried(account, item)));
     }
-    let sent = if item.path.is_empty() {
-        account.drive.send(&item.conversation, &item.text, reply, &mut |id| {
-            keep_copy(account, &item.client_id, id);
-        })
-    } else {
-        account.drive.send_file(
-            &item.conversation,
-            &item.text,
-            &item.path,
-            &item.name,
-            reply,
-            &mut |id| keep_copy(account, &item.client_id, id),
-        )
-    };
+    let sent = account.drive.send(&item.conversation, &item.text, reply, &mut |id| {
+        keep_copy(account, &item.client_id, id);
+    });
     if sent.is_err() {
         forget(account, &item.client_id);
     }
@@ -1711,13 +1841,7 @@ fn ask(account: &Account, item: &WaitingSend) -> Result<Message, String> {
 /// The shell's id stays the stored row. The phone's id is only for a later retry.
 fn carried(account: &Account, item: &WaitingSend) -> Message {
     let id = item.client_id.clone();
-    let message = if item.path.is_empty() {
-        outgoing(account, id, item.text.clone())
-    } else {
-        let bytes = std::fs::read(&item.path).unwrap_or_default();
-        let mime = bugle::mime_of(&item.name, &bytes);
-        with_file(account, id, item.text.clone(), &item.name, mime, &bytes)
-    };
+    let message = outgoing(account, id, item.text.clone());
     with_reply(account, message, item)
 }
 
@@ -1843,37 +1967,6 @@ fn with_reply(account: &Account, mut message: Message, item: &WaitingSend) -> Me
     if let Some(id) = item.reply.as_deref() {
         message.reply_to = Some(quoted(account, &item.conversation, id, &[]));
     }
-    message
-}
-
-fn with_file(
-    account: &Account,
-    id: String,
-    text: String,
-    name: &str,
-    mime: &str,
-    bytes: &[u8],
-) -> Message {
-    let mut message = outgoing(account, id.clone(), text);
-    if bytes.is_empty() {
-        return message;
-    }
-    let mut media = MediaFile::new(format!("messages:{id}:0"), kind_of(mime));
-    media.bytes = bytes.len() as u64;
-    if let Some(path) = land(account, &media, bytes) {
-        media.path = Some(path);
-    }
-    message.attachments = vec![Attachment {
-        name: name.to_owned(),
-        file: media,
-        thumb: None,
-        mime: mime.to_owned(),
-        duration: 0,
-        spoiler: false,
-        sticker: false,
-        waveform: Vec::new(),
-        round: false,
-    }];
     message
 }
 
@@ -2071,5 +2164,10 @@ mod outbox_tests {
         assert_eq!(failed.len(), 65, "a failed copy was dropped to make room");
         assert!(failed.contains_key("f-new"));
         assert_eq!(failed.keys().filter(|id| *id != "f-new").count(), 64);
+    }
+
+    #[test]
+    fn several_files_are_one_payload() {
+        super::prove_messages_several_files().unwrap();
     }
 }
