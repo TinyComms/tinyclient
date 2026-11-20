@@ -613,6 +613,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-signal-text-styles:0");
         return Ok(());
     }
+    // The lab's signal-reaction-restart driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-reaction-restart") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_reaction_restart() {
+            eprintln!("signal-reaction-restart: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-reaction-restart:0");
+        return Ok(());
+    }
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());
     protocol::crash::install_panic_hook("chatd");
     let dir = protocol::support_dir();

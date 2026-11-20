@@ -78,6 +78,31 @@ impl World {
         World { child, dir }
     }
 
+    /// Stops chatd and starts it again on the same directory, so a reaction remembered only in
+    /// memory is gone and the store is what the next reaction has to replace against.
+    fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(self.dir.join("chat.sock"));
+        let log = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("stderr.log")).unwrap();
+        self.child = Command::new(env!("CARGO_BIN_EXE_chatd"))
+            .env("TINYCLIENT_DIR", &self.dir)
+            .env("TINYCLIENT_SIGNAL_FAKE", "1")
+            .env("TINYCLIENT_SESSION_SIGNAL", SESSION)
+            .env_remove("TINYCLIENT_SESSION_DISCORD")
+            .env_remove("TINYCLIENT_SESSION_SLACK")
+            .env_remove("TINYCLIENT_SESSION_TELEGRAM")
+            .env_remove("TINYCLIENT_SESSION_TEAMS")
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ChatStream::connect(&self.dir.join("chat.sock")).is_err() {
+            assert!(Instant::now() < deadline, "chatd did not open its socket again: {}", self.stderr());
+            sleep(Duration::from_millis(10));
+        }
+    }
+
     fn ask(&self, request: Request) -> Response {
         let mut stream = ChatStream::connect(&self.dir.join("chat.sock")).unwrap();
         write_frame(&mut stream, &request).unwrap();
@@ -736,4 +761,40 @@ fn styled_text_is_sent_as_ranges_and_a_spoiler_stays_out_of_the_preview() {
         world.messages(GRACE).into_iter().find(|message| message.text == "no" && message.spans.iter().any(|span| span.style == protocol::Style::Strike))
     });
     assert_eq!(edited.text.get(edited.spans[0].start as usize..edited.spans[0].end as usize), Some("no"));
+}
+
+#[test]
+fn a_changed_reaction_after_restart_replaces_the_old_emoji() {
+    let mut world = World::linked();
+    world.connected();
+    world.steer(&format!("incoming grace {} Lunch?", T0 + 1_000));
+    let theirs = world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    world.steer(&format!("incoming grace {} Still there?", T0 + 2_000));
+    let again = world.arrived(GRACE, &id(T0 + 2_000, GRACE));
+
+    world.steer(&format!("react grace grace {} 👍", T0 + 1_000));
+    world.until("Grace's first reaction", || {
+        world.messages(GRACE).into_iter().find(|message| message.id == theirs.id && message.reactions.iter().any(|reaction| reaction.emoji == "👍"))
+    });
+    assert_eq!(world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: "👍".into(), on: true }), Response::Ok);
+    world.until("our first reaction", || {
+        world.messages(GRACE).into_iter().find(|message| message.id == again.id && message.reactions.iter().any(|reaction| reaction.emoji == "👍" && reaction.mine))
+    });
+
+    world.restart();
+    world.connected();
+
+    world.steer(&format!("react grace grace {} ❤️", T0 + 1_000));
+    let replaced = world.until("Grace's new reaction", || {
+        world.messages(GRACE).into_iter().find(|message| message.id == theirs.id && message.reactions.iter().any(|reaction| reaction.emoji == "❤️"))
+    });
+    let emojis: Vec<&str> = replaced.reactions.iter().map(|reaction| reaction.emoji.as_str()).collect();
+    assert_eq!(emojis, ["❤️"], "{:?}", replaced.reactions);
+
+    assert_eq!(world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: "❤️".into(), on: true }), Response::Ok);
+    let held = world.until("our new reaction", || {
+        world.messages(GRACE).into_iter().find(|message| message.id == again.id && message.reactions.iter().any(|reaction| reaction.emoji == "❤️" && reaction.mine))
+    });
+    let mine: Vec<&str> = held.reactions.iter().map(|reaction| reaction.emoji.as_str()).collect();
+    assert_eq!(mine, ["❤️"], "{:?}", held.reactions);
 }

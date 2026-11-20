@@ -46,6 +46,7 @@ use crate::store::{ConversationRow, PersonRow};
 use protocol::{Contact, ContactKind, ConversationKind, Link, Message, MessageKind, Reaction, Relation, ReplyTo, Span};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -69,6 +70,9 @@ const CALL_STALE: i64 = 120;
 const SENT_KEPT: usize = 1_024;
 /// Reactions remembered, so a new one from the same person replaces their old one.
 const REACTIONS_KEPT: usize = 4_096;
+/// Largest reaction record file read on startup. `REACTIONS_KEPT` rows sit well below this;
+/// anything larger is skipped so an oversized or corrupt file is not parsed under the lock.
+const REACTIONS_FILE_LIMIT: u64 = 2 * 1024 * 1024;
 /// What a person with no name we know is called.
 const NO_NAME: &str = "Signal user";
 /// Most pictures asked of Signal for one change to what is on screen.
@@ -305,8 +309,12 @@ struct Live {
     /// Our sent messages and their conversation, for receipts that name only the time.
     sent: VecDeque<(u64, String)>,
     /// Each person's reaction on a message: (message id, person) → emoji.
+    /// Bounded to `REACTIONS_KEPT` in memory and on disk at `reactions_path`.
     reactions: HashMap<(String, String), String>,
     reacted_order: VecDeque<(String, String)>,
+    /// `{support}/signal/{aci}.reactions`. Empty when nothing is kept on disk.
+    reactions_path: PathBuf,
+    reactions_loaded: bool,
     typed: HashMap<String, Instant>,
     /// The one incoming call we ring for: its id, conversation, caller, kind, and when the
     /// offer was sent. The newest offer replaces an older one, so this stays one entry, and
@@ -365,25 +373,148 @@ impl Live {
         self.sent.push_back((sent, conversation.to_owned()));
     }
 
-    /// Records a person's reaction, answering the one it replaced.
+    /// Loads the reaction record from disk once, keeping at most `REACTIONS_KEPT` newest rows.
+    fn load_reactions(&mut self) {
+        if self.reactions_loaded {
+            return;
+        }
+        self.reactions_loaded = true;
+        let rows = read_reactions(&self.reactions_path);
+        let skip = rows.len().saturating_sub(REACTIONS_KEPT);
+        for row in rows.into_iter().skip(skip) {
+            let key = (row.message, row.person);
+            if !self.reactions.contains_key(&key) {
+                self.reacted_order.push_back(key.clone());
+            }
+            self.reactions.insert(key, row.emoji);
+        }
+    }
+
+    /// Records a person's reaction, answering the one it replaced. Both memory and the file on
+    /// disk are capped at `REACTIONS_KEPT`, oldest evicted first.
     fn react(&mut self, message: &str, by: &str, emoji: Option<&str>) -> Option<String> {
+        self.load_reactions();
         let key = (message.to_owned(), by.to_owned());
+        let mut changed = false;
         let before = match emoji {
             Some(emoji) => {
-                if !self.reactions.contains_key(&key) {
-                    if self.reacted_order.len() >= REACTIONS_KEPT {
-                        if let Some(old) = self.reacted_order.pop_front() {
-                            self.reactions.remove(&old);
+                if self.reactions.get(&key).map(String::as_str) == Some(emoji) {
+                    Some(emoji.to_owned())
+                } else {
+                    changed = true;
+                    if let Some(pos) = self.reacted_order.iter().position(|k| k == &key) {
+                        self.reacted_order.remove(pos);
+                    } else {
+                        while self.reacted_order.len() >= REACTIONS_KEPT {
+                            if let Some(old) = self.reacted_order.pop_front() {
+                                self.reactions.remove(&old);
+                            }
                         }
                     }
                     self.reacted_order.push_back(key.clone());
+                    self.reactions.insert(key, emoji.to_owned())
                 }
-                self.reactions.insert(key, emoji.to_owned())
             }
-            None => self.reactions.remove(&key),
+            None => {
+                let removed = self.reactions.remove(&key);
+                if removed.is_some() {
+                    changed = true;
+                    self.reacted_order.retain(|k| k != &key);
+                }
+                removed
+            }
         };
+        if changed {
+            write_reactions(&self.reactions_path, &self.reacted_order, &self.reactions);
+        }
         before.filter(|before| Some(before.as_str()) != emoji)
     }
+}
+
+/// One kept reaction. The file is a list of these in oldest-to-newest order, owned by this
+/// adapter, not the message store.
+#[derive(Serialize, Deserialize)]
+struct KeptReaction {
+    message: String,
+    person: String,
+    emoji: String,
+}
+
+fn reactions_path(aci: &str) -> PathBuf {
+    protocol::support_dir().join("signal").join(format!("{aci}.reactions"))
+}
+
+fn read_reactions(path: &Path) -> Vec<KeptReaction> {
+    if path.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Vec::new();
+    };
+    if meta.len() > REACTIONS_FILE_LIMIT {
+        tracing::warn!("chatd: Signal: skipping oversized reaction record ({} bytes)", meta.len());
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<Vec<KeptReaction>>(&bytes).unwrap_or_default()
+}
+
+fn write_reactions(path: &Path, order: &VecDeque<(String, String)>, book: &HashMap<(String, String), String>) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            tracing::warn!("chatd: Signal: the reaction record directory could not be created");
+            return;
+        }
+    }
+    let rows: Vec<KeptReaction> = order
+        .iter()
+        .filter_map(|key| {
+            let emoji = book.get(key)?;
+            Some(KeptReaction { message: key.0.clone(), person: key.1.clone(), emoji: emoji.clone() })
+        })
+        .collect();
+    let Ok(bytes) = serde_json::to_vec(&rows) else {
+        return;
+    };
+    let temp = path.with_extension("tmp");
+    if std::fs::write(&temp, bytes).and_then(|()| std::fs::rename(&temp, path)).is_err() {
+        let _ = std::fs::remove_file(&temp);
+        tracing::warn!("chatd: Signal: the reaction record could not be kept");
+    }
+}
+
+/// The lab's signal-reaction-restart driver. A build without this keeps running.
+pub fn prove_signal_reaction_restart() -> Result<(), String> {
+    if std::env::var_os("TINYCLIENT_DIR").is_none() {
+        return Err("a scratch directory is required".into());
+    }
+    let path = protocol::support_dir().join("signal").join("prove-reaction-restart.reactions");
+    let _ = std::fs::remove_file(&path);
+    let message = "1791892801000-b2b2b2b2-0000-4000-8000-000000000002";
+    let person = "b2b2b2b2-0000-4000-8000-000000000002";
+    let mut live = Live { reactions_path: path.clone(), ..Live::default() };
+    if live.react(message, person, Some("👍")).is_some() {
+        return Err("a first reaction replaced one that was not there".into());
+    }
+    // What a restart is: the memory is new, the file is the same.
+    let mut live = Live { reactions_path: path, ..Live::default() };
+    match live.react(message, person, Some("❤️")) {
+        Some(old) if old == "👍" => {}
+        other => return Err(format!("a restart forgot the reaction, got {other:?}")),
+    }
+    let held = read_reactions(&live.reactions_path)
+        .into_iter()
+        .find(|row| row.message == message && row.person == person)
+        .map(|row| row.emoji);
+    if held.as_deref() != Some("❤️") {
+        return Err(format!("the kept reaction is {held:?}"));
+    }
+    Ok(())
 }
 
 /// One connection's worth of an account: what both threads of the adapter share.
@@ -411,8 +542,9 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     if !supported() {
         return Err(unsupported_reason());
     }
-    // What is learned (names, settings, unread) outlives one connection.
-    let live: Arc<Mutex<Live>> = Arc::default();
+    // What is learned (names, settings, unread) outlives one connection. Reactions outlive the
+    // process: the file is what a later reaction replaces, once this memory is gone.
+    let live = Arc::new(Mutex::new(Live { reactions_path: reactions_path(&saved.aci), ..Live::default() }));
     let current: Arc<Mutex<Option<Arc<Account>>>> = Arc::default();
     let (socket_ctx, held, socket_saved, socket_live) = (ctx.clone(), current.clone(), saved.clone(), live.clone());
     std::thread::Builder::new()
@@ -1089,6 +1221,30 @@ mod tests {
         assert_eq!(live.react("m", "p", Some("❤️")), Some("👍".to_owned()));
         assert_eq!(live.react("m", "p", Some("❤️")), None);
         assert_eq!(live.react("m", "p", None), Some("❤️".to_owned()));
+    }
+
+    #[test]
+    fn reaction_record_bounds_size_and_skips_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acct.reactions");
+
+        // Pre-populate more than REACTIONS_KEPT rows; loading + writing prunes to REACTIONS_KEPT newest.
+        let rows: Vec<KeptReaction> = (0..=REACTIONS_KEPT)
+            .map(|i| KeptReaction { message: format!("m{i}"), person: "p".into(), emoji: "👍".into() })
+            .collect();
+        std::fs::write(&path, serde_json::to_vec(&rows).unwrap()).unwrap();
+
+        let mut live = Live { reactions_path: path.clone(), ..Live::default() };
+        assert_eq!(live.react("m0", "p", Some("❤️")), None, "oldest row beyond cap was evicted");
+        let kept = read_reactions(&path);
+        assert_eq!(kept.len(), REACTIONS_KEPT);
+        assert_eq!(kept.last().map(|r| (r.message.as_str(), r.emoji.as_str())), Some(("m0", "❤️")));
+        assert!(!path.with_extension("tmp").exists(), "temp file was renamed away");
+
+        // An oversized file is skipped on load rather than read into memory.
+        let oversized = vec![b' '; (REACTIONS_FILE_LIMIT as usize) + 1];
+        std::fs::write(&path, oversized).unwrap();
+        assert!(read_reactions(&path).is_empty());
     }
 
     #[test]
