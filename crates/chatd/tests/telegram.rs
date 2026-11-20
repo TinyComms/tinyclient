@@ -3005,3 +3005,26 @@ fn a_dropped_large_file_resumes_from_the_part() {
     assert_eq!(world.called("GetFile document 9400 at 0"), 1, "{:#?}", world.calls());
     assert!(world.called("GetFile document 9400 at 1048576") >= 1, "{:#?}", world.calls());
 }
+
+#[test]
+fn a_link_card_fetches_its_picture_and_not_the_full_photo() {
+    let world = World::signed_in();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.until("history", || world.message("u7002", "12"));
+    world.steer("link");
+    let message = world.arrived("u7002", "32");
+    let card = &message.previews[0];
+    assert_eq!((card.url.as_str(), card.title.as_str(), card.site.as_str()), ("https://example.org/ridge", "Ridge", "Example"));
+    let image = card.image.as_ref().expect("the card names its picture");
+    assert_eq!((image.id.as_str(), image.width, image.height), ("p8801m", 320, 240));
+    let landed = world.until("the card's picture on disk", || {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["p8801m".into()], size: None, retry: false }) {
+            Response::Media { mut files } => files.pop().and_then(|file| file.path),
+            other => panic!("{other:?}"),
+        }
+    });
+    assert_eq!(std::fs::metadata(&landed).unwrap().len(), FILE_BYTES);
+    assert_eq!(world.called("GetFile photo 8801 m"), 2, "{:#?}", world.calls());
+    assert_eq!(world.called("GetFile photo 8801 y"), 0, "{:#?}", world.calls());
+}

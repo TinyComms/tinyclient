@@ -6,12 +6,12 @@
 //! scratch directory (`adapters/script.rs`): `telegram.signin.ctl` while signing in (`scan`,
 //! `scan-other`, `scan-password`), `telegram.ctl` once signed in (`incoming`, `photo`, `react`, `edit`,
 //! `delete`, `ttl`, `ttl-gone`, `topic`, `comments`, `typing`, `typing-stop`, `read`, `status`,
-//! `poll`, `poll-full`, `poll-update`, `poll-counts`, `voice`, `cdn-file`, `big-file`, `forward`,
-//! `flood-send N`, `flood-file N`, `photo-pages N`, `revoke`, `photo-preview`, `secret`,
-//! `secret-gone`, and the holds of `TINYCLIENT_TELEGRAM_HOLD`, `TINYCLIENT_TELEGRAM_PEER_HOLD`
-//! and `TINYCLIENT_TELEGRAM_FILE_HOLD` through `dialogs-go`, `peer-go` and `file-go`). Every
-//! request it is sent is appended to `telegram.calls`, one line each, so a test can see what the
-//! network would have heard.
+//! `poll`, `poll-full`, `poll-update`, `poll-counts`, `voice`, `link`, `cdn-file`, `big-file`,
+//! `forward`, `flood-send N`, `flood-file N`, `photo-pages N`, `revoke`, `photo-preview`,
+//! `secret`, `secret-gone`, and the holds of `TINYCLIENT_TELEGRAM_HOLD`,
+//! `TINYCLIENT_TELEGRAM_PEER_HOLD` and `TINYCLIENT_TELEGRAM_FILE_HOLD` through `dialogs-go`,
+//! `peer-go` and `file-go`). Every request it is sent is appended to `telegram.calls`, one line
+//! each, so a test can see what the network would have heard.
 //!
 //! The account: Mira Kessler (7001); Odalys Brandt (7002, a contact, with a second password on
 //! her own number); Tobin Reyes (7003); a group "Trail crew" (8001); a channel "Field Notes"
@@ -1589,6 +1589,24 @@ impl World {
                     }
                     .into(),
                 )]
+            }
+            // A link card with the row-sized still and a larger photo that a row does not fetch.
+            "link" => {
+                let mut page: tl::types::WebPage = blank(&[&put(0u32), &put(8_801i64), &put("https://example.org/ridge".to_owned()), &put("example.org".to_owned()), &put(1i32)]);
+                page.site_name = Some("Example".to_owned());
+                page.title = Some("Ridge".to_owned());
+                page.description = Some("The trail.".to_owned());
+                page.photo = Some(photo(8_801));
+                let mut message = message(odalys, 32, ODALYS, t0() + 80, "https://example.org/ridge");
+                message.media = Some(tl::types::MessageMediaWebPage {
+                    force_large_media: false,
+                    force_small_media: false,
+                    manual: false,
+                    safe: true,
+                    webpage: page.into(),
+                }.into());
+                self.store(None, message.clone());
+                vec![new(message)]
             }
             "voice" => {
                 let voice = tl::types::Document {
