@@ -22,11 +22,12 @@ use crate::view::{age, now};
 use crate::client::ask;
 use gpui::{
     canvas, div, prelude::*, px, Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, ElementId,
-    Hsla, MouseButton, ObjectFit, SharedString, Stateful, Window,
+    Hsla, MouseButton, ObjectFit, RenderImage, SharedString, Stateful, Window,
 };
 use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Preview, Receipt, Request, SendState};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How long the tint on a jump's target takes to fade.
@@ -1281,6 +1282,19 @@ impl Pane {
         }
     }
 
+    /// The few pixels of a picture that came inside its message (`Attachment::preview`),
+    /// decoded at their own size: stretched to the still's box they draw soft. `None` while
+    /// they are not on disk, and when they could not be read: the box keeps its placeholder.
+    /// A spoiler not yet revealed and a picture Load images holds back never get this far.
+    fn preview(&mut self, attachment: &Attachment, crop: Option<f32>, cx: &mut Context<Self>) -> Option<Arc<RenderImage>> {
+        let preview = attachment.preview.as_ref()?;
+        let edge = preview.width.max(preview.height).max(1);
+        match self.still(preview, edge, edge, crop, cx) {
+            Picture::Ready(image) => Some(image),
+            Picture::Loading | Picture::Failed => None,
+        }
+    }
+
     /// What a picture's box shows when its file could not be fetched: the reason on hover, and
     /// a Retry that asks once per click.
     fn failed_box(&self, holder: Stateful<Div>, file: &MediaFile, words: bool, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -1361,26 +1375,35 @@ impl Pane {
         let crop = (fit == Fit::CoverTop).then_some(height / width);
         // Whether the picture moves, and whether its frames are here to move in place.
         let (mut moves, mut frames) = (false, false);
+        // A picture smaller than its box sits in the middle at its own size. Its preview takes
+        // the same place, so the sharper picture lands exactly where the soft one was.
+        let (wide, tall) = match fit {
+            Fit::Contain if natural.0 > 0 && natural.1 > 0 => {
+                let scale = (width / natural.0 as f32).min(height / natural.1 as f32).min(1.);
+                ((natural.0 as f32 * scale).round(), (natural.1 as f32 * scale).round())
+            }
+            _ => (width, height),
+        };
+        let placed = |tile: Stateful<Div>, image, object_fit| {
+            tile.child(
+                div().absolute().inset_0().flex().items_center().justify_center().child(
+                    div().w(px(wide)).h(px(tall)).flex_none().child(anim::picture(image, object_fit, theme::R_CARD, Play::Inline)),
+                ),
+            )
+        };
         let tile = match self.still(&still, size, edge, crop, cx) {
             Picture::Ready(image) => {
-                // A picture smaller than its box sits in the middle at its own size.
-                let (wide, tall) = match fit {
-                    Fit::Contain if natural.0 > 0 && natural.1 > 0 => {
-                        let scale = (width / natural.0 as f32).min(height / natural.1 as f32).min(1.);
-                        ((natural.0 as f32 * scale).round(), (natural.1 as f32 * scale).round())
-                    }
-                    _ => (width, height),
-                };
                 let object_fit = if fit == Fit::Contain { ObjectFit::Contain } else { ObjectFit::Cover };
                 frames = image.frame_count() > 1;
                 moves = self.images.moves(&image);
-                tile.child(
-                    div().absolute().inset_0().flex().items_center().justify_center().child(
-                        div().w(px(wide)).h(px(tall)).flex_none().child(anim::picture(image, object_fit, theme::R_CARD, Play::Inline)),
-                    ),
-                )
+                placed(tile, image, object_fit)
             }
-            Picture::Loading => tile.child(in_box(Icon::Image, None)),
+            // Until the still is decoded, the few pixels the message carried stand in for it,
+            // stretched over its whole place.
+            Picture::Loading => match self.preview(attachment, crop, cx) {
+                Some(preview) => placed(tile, preview, ObjectFit::Cover),
+                None => tile.child(in_box(Icon::Image, None)),
+            },
             Picture::Failed => {
                 let tile = self.failed_box(tile, &still, height >= 100. && width >= 180., cx);
                 return tile.child(edge_line()).into_any_element();

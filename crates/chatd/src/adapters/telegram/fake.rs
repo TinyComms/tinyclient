@@ -6,10 +6,11 @@
 //! scratch directory (`adapters/script.rs`): `telegram.signin.ctl` while signing in (`scan`,
 //! `scan-other`, `scan-password`), `telegram.ctl` once signed in (`incoming`, `photo`, `react`, `edit`,
 //! `delete`, `ttl`, `ttl-gone`, `topic`, `comments`, `typing`, `typing-stop`, `read`, `status`,
-//! `poll`, `voice`, `forward`, `flood-send N`, `revoke`, and the holds of
-//! `TINYCLIENT_TELEGRAM_HOLD` and `TINYCLIENT_TELEGRAM_PEER_HOLD` through `dialogs-go` and
-//! `peer-go`). Every request it is sent is appended to `telegram.calls`, one line each, so a
-//! test can see what the network would have heard.
+//! `poll`, `voice`, `forward`, `flood-send N`, `revoke`, `photo-preview`, and the holds of
+//! `TINYCLIENT_TELEGRAM_HOLD`, `TINYCLIENT_TELEGRAM_PEER_HOLD` and
+//! `TINYCLIENT_TELEGRAM_FILE_HOLD` through `dialogs-go`, `peer-go` and `file-go`). Every
+//! request it is sent is appended to `telegram.calls`, one line each, so a test can see what
+//! the network would have heard.
 //!
 //! The account: Mira Kessler (7001); Odalys Brandt (7002, a contact, with a second password on
 //! her own number); Tobin Reyes (7003); a group "Trail crew" (8001); a channel "Field Notes"
@@ -330,6 +331,28 @@ fn photo(id: i64) -> tl::enums::Photo {
 /// than one piece so the adapter has to ask twice.
 pub const FILE_BYTES: usize = 256 * 1024 + 9;
 
+/// A photo whose row's size is a real picture, sent with the stripped thumbnail Telegram puts
+/// inside a message: what `photo-preview` posts. Orange beside blue, under fine dark stripes the
+/// stripped thumbnail is too small to keep, so a test can tell the two apart on screen.
+const RIDGE: i64 = 6_016;
+const RIDGE_M: &[u8] = include_bytes!("fake_ridge_m.jpg");
+/// Telegram's form: version 1, height 30, width 40, then the JPEG's picture without its header.
+const RIDGE_STRIPPED: &[u8] = include_bytes!("fake_ridge_i.bin");
+
+fn ridge() -> tl::enums::Photo {
+    let tl::enums::Photo::Photo(mut kept) = photo(RIDGE) else { unreachable!() };
+    kept.sizes[0] = tl::types::PhotoStrippedSize { r#type: "i".to_owned(), bytes: RIDGE_STRIPPED.to_vec() }.into();
+    kept.sizes[1] = tl::types::PhotoSize { r#type: "m".to_owned(), w: 320, h: 240, size: RIDGE_M.len() as i32 }.into();
+    kept.into()
+}
+
+/// The asked piece of a file that is these bytes.
+fn piece_of(bytes: &[u8], offset: i64, limit: i32) -> Vec<u8> {
+    let from = (offset.max(0) as usize).min(bytes.len());
+    let to = (from + limit.max(0) as usize).min(bytes.len());
+    bytes[from..to].to_vec()
+}
+
 fn file_piece(offset: i64, limit: i32) -> Vec<u8> {
     let from = (offset.max(0) as usize).min(FILE_BYTES);
     let to = (from + limit.max(0) as usize).min(FILE_BYTES);
@@ -394,6 +417,8 @@ struct World {
     /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
     dialogs_go: bool,
     peer_go: bool,
+    /// The test let the held thumbnail of `photo-preview` through (`file-go`).
+    file_go: bool,
     /// The `upload.GetFile` asks being answered now, and the most at once, which the
     /// tests of the rows' pictures read (`file-count`).
     file_in: usize,
@@ -451,6 +476,7 @@ impl World {
             calls: protocol::support_dir().join("telegram.calls"),
             dialogs_go: false,
             peer_go: false,
+            file_go: false,
             file_in: 0,
             file_at_once: 0,
         };
@@ -910,6 +936,9 @@ pub struct Fake {
     /// `TINYCLIENT_TELEGRAM_PEER_HOLD`), until a line steers it through.
     hold_pages: bool,
     hold_peer_dialogs: bool,
+    /// And the row's size of `photo-preview`'s photo (`TINYCLIENT_TELEGRAM_FILE_HOLD`), until
+    /// `file-go`: what a slow download looks like while the stripped preview is on screen.
+    hold_files: bool,
     /// Wakes an answer held at the wire when the test steers.
     wake: Arc<Condvar>,
 }
@@ -933,6 +962,7 @@ impl Fake {
             control,
             hold_pages: held_at_wire("TINYCLIENT_TELEGRAM_HOLD"),
             hold_peer_dialogs: held_at_wire("TINYCLIENT_TELEGRAM_PEER_HOLD"),
+            hold_files: held_at_wire("TINYCLIENT_TELEGRAM_FILE_HOLD"),
             wake: Arc::new(Condvar::new()),
         };
         fake.listen();
@@ -961,10 +991,10 @@ impl Fake {
         });
     }
 
-    /// Sleeps on the asks whose answers the test holds (`dialogs-go`, `peer-go`), saying what
-    /// Telegram was asked as it is asked, whatever the hold.
+    /// Sleeps on the asks whose answers the test holds (`dialogs-go`, `peer-go`, `file-go`),
+    /// saying what Telegram was asked as it is asked, whatever the hold.
     fn hold_back(&self, body: &[u8]) {
-        if !self.hold_pages && !self.hold_peer_dialogs {
+        if !self.hold_pages && !self.hold_peer_dialogs && !self.hold_files {
             return;
         }
         let world = self.world.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -979,7 +1009,13 @@ impl Fake {
         // asked again until the `peer-go`.
         (self.hold_pages && asked::<f::messages::GetDialogs>(body).is_some_and(|request| !matches!(request.offset_peer, tl::enums::InputPeer::Empty)) && !world.dialogs_go)
             || (self.hold_peer_dialogs && asked::<f::messages::GetPeerDialogs>(body).is_some() && !world.peer_go)
+            || (self.hold_files && asked::<f::upload::GetFile>(body).is_some_and(|request| is_ridge_thumb(&request.location)) && !world.file_go)
     }
+}
+
+/// The row's size of `photo-preview`'s photo.
+fn is_ridge_thumb(location: &tl::enums::InputFileLocation) -> bool {
+    matches!(location, tl::enums::InputFileLocation::InputPhotoFileLocation(photo) if photo.id == RIDGE && photo.thumb_size == "m")
 }
 
 impl Drop for Fake {
@@ -1037,6 +1073,10 @@ impl World {
                 self.peer_go = true;
                 Vec::new()
             }
+            "file-go" => {
+                self.file_go = true;
+                Vec::new()
+            }
             // The most file asks the wire held at once, for the tests of the rows' pictures.
             "file-count" => {
                 self.log(&format!("file at once {}", self.file_at_once));
@@ -1080,6 +1120,13 @@ impl World {
             "photo" => {
                 let mut message = message(odalys, 14, ODALYS, t0() + 20, "The view from the ridge");
                 message.media = Some(tl::types::MessageMediaPhoto { spoiler: false, live_photo: false, photo: Some(photo(6_014)), ttl_seconds: None, video: None }.into());
+                self.store(None, message.clone());
+                vec![new(message)]
+            }
+            // A photo with a stripped thumbnail inside it, whose row's size is a real picture.
+            "photo-preview" => {
+                let mut message = message(odalys, 24, ODALYS, t0() + 110, "The ridge at dusk");
+                message.media = Some(tl::types::MessageMediaPhoto { spoiler: false, live_photo: false, photo: Some(ridge()), ttl_seconds: None, video: None }.into());
                 self.store(None, message.clone());
                 vec![new(message)]
             }
@@ -2066,6 +2113,7 @@ impl World {
                 tl::enums::InputFileLocation::InputDocumentFileLocation(document) if document.id == 5001 || document.id == 5002 => {
                     packed(br#"{"tg":"the topic's icon"}"#)
                 }
+                location if is_ridge_thumb(location) => piece_of(RIDGE_M, request.offset, request.limit),
                 _ => file_piece(request.offset, request.limit),
             };
             let piece = tl::types::upload::File { r#type: tl::enums::storage::FileType::FileJpeg, mtime: t0(), bytes: held };

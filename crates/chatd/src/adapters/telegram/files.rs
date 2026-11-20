@@ -62,6 +62,7 @@ enum Job {
 }
 
 pub struct Files {
+    ctx: Context,
     jobs: Sender<Job>,
     waiting: Arc<AtomicUsize>,
     /// Where each original is, by its id, until the shell asks for it.
@@ -73,6 +74,7 @@ impl Files {
     pub fn start(ctx: &Context) -> Files {
         let (jobs, inbox) = channel::<Job>();
         let waiting = Arc::new(AtomicUsize::new(0));
+        let keeper = ctx.clone();
         let (ctx, counted) = (ctx.clone(), waiting.clone());
         let spawned = std::thread::Builder::new().name("telegram-files".into()).spawn(move || {
             let mut account = Weak::new();
@@ -161,7 +163,7 @@ impl Files {
         if let Err(err) = spawned {
             tracing::warn!("chatd: Telegram: files: {err}");
         }
-        Files { jobs, waiting, held: Mutex::default() }
+        Files { ctx: keeper, jobs, waiting, held: Mutex::default() }
     }
 
     pub fn attach(&self, account: &Arc<Account>) {
@@ -176,8 +178,17 @@ impl Files {
 
     /// Queues what rows on screen show, and keeps the originals' places for [`Files::asked`].
     /// Nothing is fetched twice: a file already on disk is passed over when its turn comes.
+    /// What came inside the message (a stripped preview, a cached size) is kept at once, here:
+    /// it asks Telegram nothing, so it never waits in line behind the downloads it stands in for.
     pub fn want(&self, wants: Vec<Want>) {
         let (originals, wants): (Vec<Want>, Vec<Want>) = wants.into_iter().partition(|want| want.original);
+        let (inline, wants): (Vec<Want>, Vec<Want>) = wants.into_iter().partition(|want| want.inline.is_some());
+        for want in inline {
+            let bytes = want.inline.as_deref().unwrap_or_default();
+            if let Err(fault) = keep(&self.ctx, &want, |out| write_inline(out, bytes)) {
+                tracing::warn!("chatd: Telegram: file {}: {fault}", want.file.id);
+            }
+        }
         if !originals.is_empty() {
             let mut held = crate::hub::lock(&self.held);
             if held.len() + originals.len() > HELD {
@@ -249,7 +260,28 @@ fn rows_back(account: &Weak<Account>, parked: &mut Vec<(Instant, Box<Want>)>, qu
 
 /// One file, from Telegram to the cache's directory.
 fn fetch(account: &Account, want: &Want, carried: &mut HashSet<i32>) -> Result<(), Fault> {
-    let ctx = &account.ctx;
+    let written = keep(&account.ctx, want, |out| match &want.inline {
+        Some(bytes) => write_inline(out, bytes),
+        None => download(account, want, carried, out),
+    })?;
+    if written {
+        account.keep_session();
+    }
+    Ok(())
+}
+
+fn local(err: std::io::Error) -> Fault {
+    Fault::Net(format!("the file could not be kept: {err}"))
+}
+
+/// The bytes a message carried, as the file they are.
+fn write_inline(out: &mut std::fs::File, bytes: &[u8]) -> Result<u64, Fault> {
+    out.write_all(bytes).map(|()| bytes.len() as u64).map_err(local)
+}
+
+/// One file into the cache's directory, written by `write`, and recorded as the cache records
+/// a file that landed. `false` when it was on disk already and nothing was written.
+fn keep(ctx: &Context, want: &Want, write: impl FnOnce(&mut std::fs::File) -> Result<u64, Fault>) -> Result<bool, Fault> {
     let id = std::slice::from_ref(&want.file.id);
     let on_disk = |ctx: &Context| {
         let known = ctx.hub.store().media(&ctx.account, id).unwrap_or_default();
@@ -265,17 +297,16 @@ fn fetch(account: &Account, want: &Want, carried: &mut HashSet<i32>) -> Result<(
         }
     }
     if on_disk(ctx) {
-        return Ok(());
+        return Ok(false);
     }
-    let local = |err: std::io::Error| Fault::Net(format!("the file could not be kept: {err}"));
+    // Each write has its own part: a page and a live update may keep the same preview at once,
+    // and neither cuts the other's short.
+    static PARTS: AtomicUsize = AtomicUsize::new(0);
     let path = blobs::path_of(&media_dir(), &ctx.account, &want.file.id);
-    let part = path.with_extension("part");
+    let part = path.with_extension(format!("part{}", PARTS.fetch_add(1, Ordering::Relaxed)));
     std::fs::create_dir_all(blobs::dir_under(&media_dir(), &ctx.account)).map_err(local)?;
     let mut out = std::fs::File::create(&part).map_err(local)?;
-    let written = match &want.inline {
-        Some(bytes) => out.write_all(bytes).map(|()| bytes.len() as u64).map_err(local),
-        None => download(account, want, carried, &mut out),
-    };
+    let written = write(&mut out);
     drop(out);
     let bytes = match written {
         Ok(bytes) => bytes,
@@ -322,8 +353,7 @@ fn fetch(account: &Account, want: &Want, carried: &mut HashSet<i32>) -> Result<(
             ctx.hub.changed(Change::Conversation { conversation: ctx.key(row) });
         }
     }
-    account.keep_session();
-    Ok(())
+    Ok(true)
 }
 
 /// The pieces of one file, in order, from the datacenter that holds it.

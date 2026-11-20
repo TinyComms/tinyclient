@@ -139,6 +139,13 @@ pub struct Attachment {
     /// What an image, video or GIF shows inline. Small enough to fetch when on screen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumb: Option<MediaFile>,
+    /// A few dozen pixels of the picture that came inside the message (Telegram's stripped
+    /// thumbnail), on disk as soon as the message is. Drawn soft, stretched to `thumb`'s box,
+    /// until `thumb` is ready to draw; never fetched over the network. `None` from every other
+    /// network, and from a shell's point of view always optional: a box without it shows the
+    /// usual placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<MediaFile>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mime: String,
     /// Seconds, for audio and video.
@@ -166,6 +173,7 @@ impl Attachment {
             name: name.into(),
             file,
             thumb: None,
+            preview: None,
             mime: String::new(),
             duration: 0,
             spoiler: false,
@@ -506,7 +514,7 @@ impl Message {
         let attached = self
             .attachments
             .iter()
-            .flat_map(|attachment| std::iter::once(&attachment.file).chain(&attachment.thumb));
+            .flat_map(|attachment| std::iter::once(&attachment.file).chain(&attachment.thumb).chain(&attachment.preview));
         let emoji = self.spans.iter().filter_map(|span| match &span.style {
             Style::Emoji { file } => Some(file),
             _ => None,
@@ -523,7 +531,7 @@ impl Message {
         let attached = self
             .attachments
             .iter_mut()
-            .flat_map(|attachment| std::iter::once(&mut attachment.file).chain(&mut attachment.thumb));
+            .flat_map(|attachment| std::iter::once(&mut attachment.file).chain(&mut attachment.thumb).chain(&mut attachment.preview));
         let emoji = self.spans.iter_mut().filter_map(|span| match &mut span.style {
             Style::Emoji { file } => Some(file),
             _ => None,

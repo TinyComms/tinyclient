@@ -86,7 +86,8 @@ for the network, one account per server, and `TinyLocalServers` reads those orig
   `private`, the user's `draft`, and for a `Thread` its `parent` conversation and `root` message.
   A voice channel's row carries `occupants` when anyone is in it.
 - **Messages** are one model: `text` plus `spans` (byte ranges on character boundaries: styles,
-  links, mentions, custom emoji), `attachments` (file and thumbnail, dimensions known, `spoiler`,
+  links, mentions, custom emoji), `attachments` (file and thumbnail, dimensions known, the
+  preview a network sent inside the message (Telegram's stripped thumbnail), `spoiler`,
   `sticker`, a voice message's `waveform` and `duration`), `previews`, `reactions`, `reply_to`
   (with the sender's `Key`, and `deleted` when the original is gone), `thread` (replies, the last
   three `participants`, `unread`), `forwarded` (where from; what was forwarded is the message's
@@ -105,7 +106,9 @@ for the network, one account per server, and `TinyLocalServers` reads those orig
 - **Media** is `MediaFile {id, kind, width, height, bytes, path, failed}`. `path` is `None` until
   the file is on disk. The shell asks `Fetch` for what is on screen; a file landing is
   `Change::Media`. A file that could not be fetched says why in `failed`, in plain words, and is
-  not fetched again until `Fetch` says `retry` or the adapter registers a fresh address.
+  not fetched again until `Fetch` says `retry` or the adapter registers a fresh address. A file
+  Telegram fetched over its own session is never marked failed by the cache: once gone from
+  disk it is simply not fetched, until Telegram keeps it again when it next reads the message.
   `Fetch.size` is the longest side, in device pixels, of the whole picture at the scale it is
   drawn (for a cropped tile, the uncropped picture; points times the screen's scale). An adapter
   registers a file once at the size a row normally shows (`Context::media`) and then the other
