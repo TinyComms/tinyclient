@@ -239,6 +239,7 @@ fn failure_words(row: &str, reachable: bool) -> &'static str {
         ("V3", _) => "Couldn't start the test. Try again.",
         ("D3", _) => "Couldn't clear. Try again.",
         ("B3", _) => "Couldn't reset every setting. Try again.",
+        ("G1", _) => "Couldn't change the sign-in entry. Try again.",
         _ => "Couldn't save. Try again.",
     }
 }
@@ -353,6 +354,7 @@ impl SettingsWindow {
             Section::Accounts => return column.child(self.accounts(window, cx)),
             Section::General => {
                 let mut groups = Vec::new();
+                groups.push(self.group(&["G1"], None, window, cx).child(caption(self.login_caption())));
                 if cfg!(target_os = "macos") {
                     groups.push(self.group(&["G2"], None, window, cx).child(caption(self.keep_running_caption())));
                 }
@@ -478,6 +480,26 @@ impl SettingsWindow {
         }
     }
 
+    fn login_caption(&self) -> String {
+        if prefs::choices().open_at_login {
+            format!("tinyclient starts when you sign in to {}.", crate::host::HERE)
+        } else {
+            "tinyclient opens only when you start it yourself.".to_owned()
+        }
+    }
+
+    fn set_open_at_login(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.choose(|choices| choices.open_at_login = on, cx);
+        self.off_thread(cx, move || crate::gui::autostart::apply(on), move |this, answer, cx| {
+            if answer.is_err() {
+                // The entry did not change: the switch goes back, and the row says so.
+                this.choose(|choices| choices.open_at_login = !on, cx);
+                this.failed = Some("G1");
+            }
+            cx.notify();
+        });
+    }
+
     fn set_updates(&mut self, on: bool, cx: &mut Context<Self>) {
         self.choose(|choices| choices.updates = on, cx);
         if on {
@@ -538,6 +560,10 @@ impl SettingsWindow {
         let choices = prefs::choices();
         let label = label_of(id);
         let built = match id {
+            "G1" => {
+                let on = choices.open_at_login;
+                self.switch_row(id, on, false, None, move |this, on, cx| this.set_open_at_login(on, cx), cx)
+            }
             "G2" => {
                 let on = values.on(KEEP_RUNNING);
                 self.switch_row(id, on, true, None, move |this, on, cx| this.set_switch(id, KEEP_RUNNING, on, true, cx), cx)

@@ -79,6 +79,11 @@ Name: "{autodesktop}\tinyclient"; Filename: "{app}\tinyclient.exe"; IconFilename
 Root: HKA; Subkey: "Software\Classes\AppUserModelId\dev.tinyclient.app"; ValueType: string; ValueName: "DisplayName"; ValueData: "tinyclient"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\AppUserModelId\dev.tinyclient.app"; ValueType: string; ValueName: "IconUri"; ValueData: "{app}\tinyclient.ico"
 
+; G1 "Open at login" writes this Run value from the app itself (crates/tinyclient/src/gui/autostart.rs),
+; so it follows the copy the person is running and honours a disable in Task Manager's Startup tab.
+; The installer creates nothing here; the uninstaller removes whatever the app wrote.
+Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "tinyclient"; Flags: uninsdeletevalue
+
 [Registry]
 Root: HKA; Subkey: "Software\Classes\tinyclient"; ValueType: string; ValueName: ""; ValueData: "URL:tinyclient invitation"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\tinyclient"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""

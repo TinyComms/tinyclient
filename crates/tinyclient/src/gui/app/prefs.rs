@@ -37,6 +37,9 @@ pub struct Choices {
     pub images: bool,
     /// G4: a newer release is downloaded and installed on quit. Off, the notice still appears.
     pub updates: bool,
+    /// G1: tinyclient starts when the user signs in. The switch lives here; what it drives is
+    /// the system's own sign-in entry, written and removed to match (`gui/autostart.rs`).
+    pub open_at_login: bool,
     /// PL: a click on a web link asks where it goes before the browser opens it.
     pub confirm_links: bool,
     /// PS: tracking parameters (`utm_*`, `fbclid`, ...) are taken out of a link as it opens.
@@ -50,7 +53,7 @@ pub struct Choices {
 
 impl Default for Choices {
     fn default() -> Choices {
-        Choices { compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, updates: true, confirm_links: true, strip_tracking: false, spell: true, section: Section::Accounts }
+        Choices { compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, updates: true, open_at_login: false, confirm_links: true, strip_tracking: false, spell: true, section: Section::Accounts }
     }
 }
 
@@ -64,6 +67,7 @@ static CHOICES: Mutex<Choices> = Mutex::new(Choices {
     emoticons: false,
     images: true,
     updates: true,
+    open_at_login: false,
     confirm_links: true,
     strip_tracking: false,
     spell: true,
@@ -269,6 +273,7 @@ pub fn parse(text: &str) -> Prefs {
             "emoticons" => prefs.choices.emoticons = fields.next() == Some("on"),
             "images" => prefs.choices.images = fields.next() != Some("click"),
             "updates" => prefs.choices.updates = fields.next() != Some("off"),
+            "login" => prefs.choices.open_at_login = fields.next() == Some("on"),
             "confirm_links" => prefs.choices.confirm_links = fields.next() != Some("off"),
             "strip_tracking" => prefs.choices.strip_tracking = fields.next() == Some("on"),
             "spell" => prefs.choices.spell = fields.next() != Some("off"),
@@ -319,7 +324,7 @@ pub fn write(prefs: &Prefs) -> String {
     text.push_str(&format!("details\t{}\t{}\n", word(prefs.details_channels), word(prefs.details_directs)));
     text.push_str(&format!("text\t{}\n", prefs.text_step));
     let (choices, default) = (prefs.choices, Choices::default());
-    let lines: [(&str, bool, &str); 12] = [
+    let lines: [(&str, bool, &str); 13] = [
         ("density", choices.compact != default.compact, "compact"),
         ("previews", choices.previews != default.previews, "off"),
         ("send", choices.command_return != default.command_return, "cmd-return"),
@@ -328,6 +333,7 @@ pub fn write(prefs: &Prefs) -> String {
         ("emoticons", choices.emoticons != default.emoticons, "on"),
         ("images", choices.images != default.images, "click"),
         ("updates", choices.updates != default.updates, "off"),
+        ("login", choices.open_at_login != default.open_at_login, "on"),
         ("confirm_links", choices.confirm_links != default.confirm_links, "off"),
         ("strip_tracking", choices.strip_tracking != default.strip_tracking, "on"),
         ("spell", choices.spell != default.spell, "off"),
@@ -400,7 +406,7 @@ mod tests {
             details_channels: true,
             details_directs: false,
             text_step: 2,
-            choices: Choices { compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, updates: false, confirm_links: false, strip_tracking: true, spell: false, section: Section::Audio },
+            choices: Choices { compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, updates: false, open_at_login: true, confirm_links: false, strip_tracking: true, spell: false, section: Section::Audio },
             kept: Vec::new(),
             autoplay: Autoplay::Hover,
             tiny_members: false,
@@ -444,7 +450,7 @@ mod tests {
     #[test]
     fn only_changed_choices_are_written_and_lines_from_a_newer_build_are_kept() {
         let text = write(&Prefs::default());
-        for name in ["density", "previews", "send", "open_at", "typing", "emoticons", "images", "settings_section", "confirm_links", "strip_tracking", "link_ok", "spell"] {
+        for name in ["density", "previews", "send", "open_at", "typing", "emoticons", "images", "settings_section", "confirm_links", "strip_tracking", "link_ok", "spell", "login"] {
             assert!(!text.contains(name), "{name} is at its default and not written");
         }
         let newer = "sidebar\t300\ntheme\tlight\nbounce\tonce\n";
@@ -453,7 +459,7 @@ mod tests {
         let again = write(&read);
         assert!(again.contains("theme\tlight\n") && again.contains("bounce\tonce\n"), "{again}");
         // Junk reads as the default.
-        assert_eq!(parse("density\tcosy\nsend\t?\nsettings_section\tx\n").choices, Choices::default());
+        assert_eq!(parse("density\tcosy\nsend\t?\nsettings_section\tx\nlogin\t?\n").choices, Choices::default());
         // A section is kept by its name: an index from an older build, or a section a newer
         // build added, opens Accounts rather than whatever sits at that place now.
         assert!(write(&Prefs { choices: Choices { section: Section::Privacy, ..Choices::default() }, ..Prefs::default() }).contains("settings_section\tprivacy\n"));
@@ -461,6 +467,10 @@ mod tests {
         assert_eq!(parse("settings_section\t6\n").choices.section, Section::Accounts);
         assert_eq!(parse("settings_section\tnotifications\n").choices.section, Section::Notifications);
         assert_eq!(parse("settings_section\tintegrations\n").choices.section, Section::Accounts);
+        // Open at login is off until it is switched on, and only "on" is written.
+        assert!(write(&Prefs { choices: Choices { open_at_login: true, ..Choices::default() }, ..Prefs::default() }).contains("login\ton\n"));
+        assert!(parse("login\ton\n").choices.open_at_login);
+        assert!(!parse("login\toff\n").choices.open_at_login);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! call runs off the main thread.
 
 use super::app::{self, service::Service};
+use super::autostart;
 use super::layout::{self, Slots};
 use super::sidebar::{self, pages::PAGE, Mode};
 use super::{call, composer, conversation, people};
@@ -268,6 +269,7 @@ impl Shell {
         Self::watch(cx);
         Self::watch_updates(cx);
         Self::wake_at_thresholds(cx);
+        Self::repair_sign_in_entry(cx);
         #[cfg(debug_assertions)]
         Self::debug_launch_watch(cx);
         let subscriptions = [
@@ -338,6 +340,21 @@ impl Shell {
             shell.layout_state.update_alert = true;
         }
         shell
+    }
+
+    /// Open at login (G1): while the switch is on, the sign-in entry is rewritten with this
+    /// build's path at every launch, so a copy that moved or was replaced keeps starting.
+    /// Off the main thread, and a screenshot run writes nothing, as `save_prefs` does not.
+    fn repair_sign_in_entry(cx: &mut Context<Self>) {
+        if cfg!(feature = "gui-shot") || !app::prefs::choices().open_at_login {
+            return;
+        }
+        cx.spawn(async move |_, cx| {
+            if let Err(word) = cx.background_executor().spawn(async { autostart::apply(true) }).await {
+                tracing::warn!("tinyclient: {word}");
+            }
+        })
+        .detach();
     }
 
     /// Runs `work` off the main thread and hands its answer back to the shell.
