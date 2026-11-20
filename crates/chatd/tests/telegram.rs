@@ -9,7 +9,8 @@
 
 use protocol::{
     read_frame, write_frame, AccountKey, Change, CodeVia, Conversation, ConversationKind, ErrorCode, Key, Link,
-    EmojiScope, MediaKind, MentionKind, Message, MessageKind, Network, Page, Presence, Relation, Request, Response,
+    EmojiScope, MediaKind, MentionKind, Message, MessageKind, Network, Page, Presence, RelateAction, Relation, Request,
+    Response,
     SendState, SignInInput, SignInProblem, SignInStep, Style, Watching, Shelf, Special, Mark, ReactionSet,
 };
 use std::io::Write;
@@ -2714,4 +2715,68 @@ fn a_second_sign_in_keeps_the_telegram_account_already_there() {
         panic!("the second account has no chat");
     };
     assert_eq!(conversation.key, lea_key("u7002"));
+}
+
+#[test]
+fn block_sends_contacts_block_and_the_person_reads_blocked() {
+    let world = World::signed_in();
+    world.connected();
+    assert_eq!(world.called("GetContacts"), 1, "{:#?}", world.calls());
+    assert_eq!(world.called("contacts.getBlocked"), 1, "{:#?}", world.calls());
+
+    let listed = |relation: Relation| match world.ask(Request::People {
+        network: Some(Network::Telegram),
+        relation: Some(relation),
+        query: None,
+        offset: 0,
+        limit: 50,
+    }) {
+        Response::People { people, .. } => people,
+        other => panic!("{other:?}"),
+    };
+    assert!(listed(Relation::Blocked).is_empty());
+    assert!(listed(Relation::Contact).iter().any(|person| person.key.id == "u7002"));
+
+    assert_eq!(world.ask(Request::Relate { person: key("u7002"), action: RelateAction::Block }), Response::Ok);
+    assert_eq!(world.called("contacts.block u7002"), 1, "{:#?}", world.calls());
+    world.until("odalys blocked", || {
+        listed(Relation::Blocked)
+            .iter()
+            .any(|person| person.key.id == "u7002" && person.relation == Relation::Blocked)
+            .then_some(())
+    });
+    assert!(listed(Relation::Contact).iter().all(|person| person.key.id != "u7002"));
+
+    world.ask(Request::People {
+        network: Some(Network::Telegram),
+        relation: None,
+        query: Some("wren".into()),
+        offset: 0,
+        limit: 20,
+    });
+    world.until("the search to reach Telegram", || {
+        world.calls().contains(&"contacts.Search wren".to_owned()).then_some(())
+    });
+    assert_eq!(world.ask(Request::Relate { person: key("u7010"), action: RelateAction::Add }), Response::Ok);
+    assert!(
+        world.calls().iter().any(|call| call.starts_with("contacts.addContact u7010 ")),
+        "{:#?}",
+        world.calls()
+    );
+    assert!(listed(Relation::Contact).iter().any(|person| person.key.id == "u7010" && person.relation == Relation::Contact));
+
+    assert_eq!(world.ask(Request::Relate { person: key("u7010"), action: RelateAction::Remove }), Response::Ok);
+    assert_eq!(world.called("contacts.deleteContacts u7010"), 1, "{:#?}", world.calls());
+    assert!(listed(Relation::Contact).iter().all(|person| person.key.id != "u7010"));
+
+    assert_eq!(world.ask(Request::Relate { person: key("u7002"), action: RelateAction::Block }), Response::Ok);
+    assert_eq!(world.called("contacts.unblock u7002"), 1, "{:#?}", world.calls());
+    assert!(listed(Relation::Blocked).iter().all(|person| person.key.id != "u7002"));
+    assert!(listed(Relation::Contact).iter().any(|person| person.key.id == "u7002"));
+
+    world.steer("peer-blocked 7002");
+    world.until("the block update", || {
+        listed(Relation::Blocked).iter().any(|person| person.key.id == "u7002").then_some(())
+    });
+    assert_eq!(world.called("contacts.block u7002"), 1, "an update is not another block request");
 }

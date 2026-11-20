@@ -72,7 +72,7 @@ use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, 
 use crate::session;
 use grammers_tl_types as tl;
 use peers::{Directory, Who};
-use protocol::{Link, Person, Presence, Relation};
+use protocol::{Link, Person, Presence, RelateAction, Relation};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -228,6 +228,8 @@ struct Live {
     /// Where recent messages are, for the updates that name a message and not its place: a
     /// deletion outside a channel, anything inside a forum.
     placed: VecDeque<((Who, i32), String)>,
+    /// Users blocked on this connection. A second Block of one of them unblocks them.
+    blocked: HashSet<i64>,
     /// Messages we sent and the id the shell knows each by, until the echo has passed.
     sent: VecDeque<(i32, String)>,
     random: VecDeque<(i64, String)>,
@@ -379,6 +381,19 @@ impl Account {
             None => !matches!(peer, Who::Channel(_)),
         });
         found.map(|(_, conversation)| conversation.clone())
+    }
+
+    fn user_blocked(&self, id: i64) -> bool {
+        self.live().blocked.contains(&id)
+    }
+
+    fn set_user_blocked(&self, id: i64, blocked: bool) {
+        let mut live = self.live();
+        if blocked {
+            live.blocked.insert(id);
+        } else {
+            live.blocked.remove(&id);
+        }
     }
 
     /// Writes the session out again when a key was made for another datacenter. The stored
@@ -763,6 +778,15 @@ fn serve(account: &Arc<Account>, command: Command) {
                 }
             });
             let _ = reply.send(link.ok_or(Refusal::Unsupported));
+        }
+        Command::Relate { person_id, action, reply } => {
+            let answer = match action {
+                RelateAction::Accept | RelateAction::Ignore | RelateAction::Cancel => {
+                    Err(Refusal::Refused("Telegram has no friend request.".to_owned()))
+                }
+                action => relate(account, &person_id, action).map_err(refused),
+            };
+            let _ = reply.send(answer);
         }
         Command::SignOut(reply) => {
             // Ends the session on Telegram, so the device list no longer shows it. What the
@@ -1225,6 +1249,100 @@ pub fn prove_telegram_dice() -> Result<(), String> {
     }
     if send::dice_emoticon("\u{1F3B2} please").is_some() {
         return Err("words around a dice emoji stay ordinary text".into());
+    }
+    Ok(())
+}
+
+/// Whether `Block` blocks or, when they are already blocked, unblocks, and the relation that leaves.
+fn block_choice(already: bool, contact: bool) -> (bool, Relation) {
+    if already {
+        (true, if contact { Relation::Contact } else { Relation::None })
+    } else {
+        (false, Relation::Blocked)
+    }
+}
+
+fn split_name(name: &str) -> (String, String) {
+    match name.split_once(' ') {
+        Some((first, last)) => (first.to_owned(), last.to_owned()),
+        None => (name.to_owned(), String::new()),
+    }
+}
+
+fn learn_updates(account: &Account, answer: &tl::enums::Updates) {
+    match answer {
+        tl::enums::Updates::Updates(updates) => account.learn(&updates.users, &updates.chats),
+        tl::enums::Updates::Combined(updates) => account.learn(&updates.users, &updates.chats),
+        _ => {}
+    }
+}
+
+fn relate(account: &Account, person_id: &str, action: RelateAction) -> Result<(), Fault> {
+    let invalid = || Fault::Rpc { code: 400, name: "USER_ID_INVALID".to_owned(), value: None };
+    let (who @ Who::User(user_id), None) = Who::parse(person_id).ok_or_else(invalid)? else {
+        return Err(invalid());
+    };
+    match action {
+        RelateAction::Block => {
+            let peer = account.input(who)?;
+            let contact = account.dir().get(who).is_some_and(|known| known.contact);
+            let (unblock, relation) = block_choice(account.user_blocked(user_id), contact);
+            if unblock {
+                account.ask(&tl::functions::contacts::Unblock { my_stories_from: false, id: peer })?;
+            } else {
+                account.ask(&tl::functions::contacts::Block { my_stories_from: false, id: peer })?;
+            }
+            account.set_user_blocked(user_id, !unblock);
+            let _ = account.ctx.relation(person_id, relation);
+        }
+        RelateAction::Add => {
+            let id = account.dir().input_user(who).ok_or_else(invalid)?;
+            let known = account.dir().get(who).cloned().unwrap_or_default();
+            let (first_name, last_name) = split_name(&known.name);
+            let answer = account.ask(&tl::functions::contacts::AddContact {
+                add_phone_privacy_exception: false,
+                id,
+                first_name,
+                last_name,
+                phone: String::new(),
+                note: None,
+            })?;
+            learn_updates(account, &answer);
+            let _ = account.ctx.relation(person_id, Relation::Contact);
+        }
+        RelateAction::Remove => {
+            let id = account.dir().input_user(who).ok_or_else(invalid)?;
+            let answer = account.ask(&tl::functions::contacts::DeleteContacts { id: vec![id] })?;
+            learn_updates(account, &answer);
+            if !account.user_blocked(user_id) {
+                let _ = account.ctx.relation(person_id, Relation::None);
+            }
+        }
+        RelateAction::Accept | RelateAction::Ignore | RelateAction::Cancel => {}
+    }
+    Ok(())
+}
+
+/// The lab's telegram-block-contact driver. A build without this returns to the server below and stays up.
+pub fn prove_telegram_block_contact() -> Result<(), String> {
+    let (unblock, relation) = block_choice(false, true);
+    if unblock || relation != Relation::Blocked {
+        return Err("block did not mark the person blocked".into());
+    }
+    let (unblock, relation) = block_choice(true, true);
+    if !unblock || relation != Relation::Contact {
+        return Err("blocking someone already blocked did not unblock a contact".into());
+    }
+    let (unblock, relation) = block_choice(true, false);
+    if !unblock || relation != Relation::None {
+        return Err("unblocking a stranger did not clear the block".into());
+    }
+    let (first, last) = split_name("Wren Halloran");
+    if first != "Wren" || last != "Halloran" {
+        return Err(format!("contact name split left {first} {last}"));
+    }
+    if !split_name("Wren").1.is_empty() {
+        return Err("a one-word name invented a last name".into());
     }
     Ok(())
 }

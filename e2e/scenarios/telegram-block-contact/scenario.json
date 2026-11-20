@@ -1,0 +1,12 @@
+{
+  "id": "telegram-block-contact",
+  "title": "Blocking a Telegram person marks them blocked, and blocking them again clears it",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same block check is what a phone block would keep.",
+    "ios": "The phone proof build does not run desktop chatd. The same block check is what a phone block would keep."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
