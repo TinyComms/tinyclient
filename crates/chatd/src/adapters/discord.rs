@@ -12,6 +12,10 @@
 
 mod content;
 mod events;
+
+pub(super) fn prove_code_colors() -> Result<(), String> {
+    protocol::highlight::prove_code_colors()
+}
 /// Its socket waits are shared with the Tiny server's live socket.
 pub(super) mod gateway;
 mod info;

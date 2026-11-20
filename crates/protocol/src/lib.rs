@@ -16,6 +16,7 @@ mod call;
 pub mod crash;
 pub mod device_approval;
 mod e2ee;
+pub mod highlight;
 pub mod hotkey;
 pub mod log_policy;
 pub mod media_host;
