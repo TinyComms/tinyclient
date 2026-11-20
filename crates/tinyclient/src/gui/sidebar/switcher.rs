@@ -48,6 +48,8 @@ pub enum Target {
     Search(String),
     /// "Asking Slack and Telegram…": not a place.
     Asking(String),
+    /// A `>` command. The id is one `keymap` knows how to run.
+    Command(&'static str),
 }
 
 impl Target {
@@ -59,6 +61,7 @@ impl Target {
             Target::Person(person) => format!("p/{:?}/{}/{}", person.key.network, person.key.account, person.key.id),
             Target::Search(_) => "search".into(),
             Target::Asking(_) => "asking".into(),
+            Target::Command(id) => format!("cmd/{id}"),
         }
     }
 }
@@ -342,7 +345,7 @@ impl Shell {
         }
         self.layout_state.menu = None;
         let input = cx.new(|cx| {
-            let mut input = TextInput::new("Jump to a conversation, a person or a server", cx);
+            let mut input = TextInput::new("Jump to a conversation, a person or a server, or type > for a command", cx);
             input.set_text(prefix, cx);
             input
         });
@@ -407,13 +410,28 @@ impl Shell {
             .snapshot
             .as_ref()
             .map(|snapshot| live_networks(&snapshot.accounts, None));
+        let query = {
+            let Some(switcher) = &mut self.sidebar_state.switcher else {
+                return;
+            };
+            if let Some(live) = &live {
+                switcher.asking.retain(|network| live.contains(network));
+            }
+            switcher.input.read(cx).text().to_owned()
+        };
+        if query.trim_start().starts_with('>') {
+            let hits = self.command_hits(query.trim());
+            if let Some(switcher) = &mut self.sidebar_state.switcher {
+                let selected = if keep { switcher.selected.min(hits.len().saturating_sub(1)) } else { 0 };
+                switcher.hits = hits;
+                switcher.selected = selected;
+            }
+            cx.notify();
+            return;
+        }
         let Some(switcher) = &mut self.sidebar_state.switcher else {
             return;
         };
-        if let Some(live) = &live {
-            switcher.asking.retain(|network| live.contains(network));
-        }
-        let query = switcher.input.read(cx).text().to_owned();
         let fresh = if narrowed(query.trim()).1.trim_start_matches(['#', '@']).is_empty() && !query.trim().starts_with('@') {
             waiting_and_recent(&switcher.conversations, &switcher.recent, open.as_ref())
         } else {
@@ -444,6 +462,9 @@ impl Shell {
             return;
         };
         let query = switcher.input.read(cx).text().trim().to_owned();
+        if query.starts_with('>') {
+            return;
+        }
         let name = narrowed(&query).1.trim_start_matches(['#', '@']).to_owned();
         switcher.found_asked += 1;
         switcher.people_asked += 1;
@@ -565,7 +586,88 @@ impl Shell {
                 }
             }
             Target::Asking(_) => {}
+            Target::Command(id) => self.run_command(id, window, cx),
         }
+    }
+
+    /// A `>` row: status, a pause, mute, sign-in, a settings page, or a menu action.
+    fn run_command(&mut self, id: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(run) = crate::gui::keymap::run_of(id) else {
+            return;
+        };
+        match run {
+            crate::gui::keymap::CommandRun::Status(word) => self.set_command_status(word, cx),
+            crate::gui::keymap::CommandRun::Pause(word) => self.pause_command(word, cx),
+            crate::gui::keymap::CommandRun::Mute => self.call_mute(cx),
+            crate::gui::keymap::CommandRun::SignIn(network) => self.sign_in(network, cx),
+            crate::gui::keymap::CommandRun::OpenSettings(name) => {
+                if let Some(section) = crate::gui::settings::Section::ALL.into_iter().find(|section| section.name() == name) {
+                    crate::gui::settings::open(section, cx);
+                }
+            }
+            crate::gui::keymap::CommandRun::Binding(binding) => {
+                crate::gui::dispatch_binding(binding, window, cx);
+            }
+        }
+    }
+
+    fn set_command_status(&mut self, word: &str, cx: &mut Context<Self>) {
+        let presence = match word {
+            "idle" => protocol::Presence::Idle,
+            "dnd" => protocol::Presence::Dnd,
+            "offline" => protocol::Presence::Offline,
+            _ => protocol::Presence::Online,
+        };
+        let accounts = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.accounts.iter().filter(|account| account.link == Link::Connected).map(|account| account.key.clone()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for account in accounts {
+            let request = Request::SetPresence { account, presence, status: None };
+            cx.background_executor().spawn(async move { ask(&request) }).detach();
+        }
+    }
+
+    fn pause_command(&mut self, word: &str, cx: &mut Context<Self>) {
+        let now = now();
+        let value = match word {
+            "hour" => Some((now + 3_600).to_string()),
+            "morning" => Some(command_morning(now).to_string()),
+            "resume" => Some("resume".to_owned()),
+            _ => None,
+        };
+        let request = Request::Set { scope: protocol::settings::GLOBAL.to_owned(), key: protocol::settings::PAUSED_UNTIL.to_owned(), value };
+        cx.background_executor().spawn(async move { ask(&request) }).detach();
+    }
+
+    fn command_hits(&self, query: &str) -> Vec<Hit> {
+        let needle = query.trim().trim_start_matches('>').trim().to_lowercase();
+        let fits = |title: &str| needle.is_empty() || title.to_lowercase().contains(&needle);
+        let mut rows = Vec::new();
+        let push = |rows: &mut Vec<Hit>, title: String, context: String, id: &'static str| {
+            if !fits(&title) {
+                return;
+            }
+            let section = rows.is_empty().then_some("Commands");
+            rows.push(Hit { title, context, matched: Vec::new(), target: Target::Command(id), section, trailing: None });
+        };
+        for (ix, mode) in self.places().into_iter().enumerate().skip(2) {
+            let Some(id) = crate::gui::keymap::place_id(ix) else {
+                continue;
+            };
+            let name = match &mode {
+                Mode::Network(network) => network.label().to_owned(),
+                Mode::Space(key) => self.spaces.iter().find(|space| &space.key == key).map(|space| space.name.clone()).unwrap_or_else(|| key.id.clone()),
+                Mode::Inbox => "Inbox".to_owned(),
+                Mode::People => "People".to_owned(),
+            };
+            push(&mut rows, format!("Go to {name}"), "Place".to_owned(), id);
+        }
+        for command in crate::gui::keymap::with_live(|map| map.commands(query)) {
+            push(&mut rows, command.title, command.detail.to_owned(), command.id);
+        }
+        rows
     }
 
     fn hit_row(&self, ix: usize, hit: &Hit, selected: bool, marks: bool, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -579,6 +681,7 @@ impl Shell {
             }
             Target::Person(person) => Avatar::new(&person.key, &person.name, 28.).image_at(self.person_picture(&person.key, cx)).build(),
             Target::Search(_) => div().size(px(28.)).flex_none().flex().items_center().justify_center().child(glyph("icons/search.svg", 16., theme::text_soft())),
+            Target::Command(_) => div().size(px(28.)).flex_none().flex().items_center().justify_center().child(glyph("icons/command.svg", 16., theme::text_soft())),
             Target::Asking(words) => {
                 return div().id(("asking", ix)).h(px(28.)).px(px(10.)).flex().items_center().type_small().text_color(theme::text_soft()).child(words.clone());
             }
@@ -667,7 +770,10 @@ impl Shell {
         };
         let hint = |keys: &'static str, words: &'static str| div().flex().items_center().gap(px(6.)).child(keycap(keys)).child(words);
         let nothing = switcher.hits.iter().all(|hit| matches!(hit.target, Target::Search(_) | Target::Asking(_)));
-        let said = if switcher.down {
+        let commands = query.starts_with('>');
+        let said = if commands && switcher.hits.is_empty() {
+            Some("No command by that name".to_owned())
+        } else if switcher.down {
             Some("tinyclient isn't answering".to_owned())
         } else if nothing && !query.is_empty() {
             Some(format!("No one and nothing called “{query}”"))
@@ -749,7 +855,8 @@ impl Shell {
                     .child(hint("↑↓", "Move"))
                     .child(hint("↵", "Open"))
                     .child(hint("#", "Channels"))
-                    .child(hint("@", "People")),
+                    .child(hint("@", "People"))
+                    .child(hint(">", "Commands")),
             ));
         Some(
             div()
@@ -777,6 +884,15 @@ fn prefix(target: &Target) -> (bool, bool) {
         }
         _ => (false, false),
     }
+}
+
+/// The next 08:00 local after `now`. Settings uses the same sum for "Until tomorrow".
+fn command_morning(now: i64) -> i64 {
+    let local = crate::gui::time::local(now);
+    let minutes = (local.hour * 60 + local.minute) as i64;
+    let until = (8 * 60 - minutes).rem_euclid(24 * 60);
+    let until = if until == 0 { 24 * 60 } else { until };
+    now - now.rem_euclid(60) + until * 60
 }
 
 fn name_is_empty(input: &Entity<TextInput>, cx: &gpui::App) -> bool {

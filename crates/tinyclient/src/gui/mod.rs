@@ -19,6 +19,7 @@ mod conversation;
 pub(crate) mod debug_launch;
 mod hotkeys;
 mod input;
+mod keymap;
 mod layout;
 mod logs;
 mod pane;
@@ -170,6 +171,11 @@ pub(crate) fn prove_open_at_login() -> Result<(), &'static str> {
     autostart::prove()
 }
 
+/// The lab's command-palette driver. Rebinding Quick Switcher moves the chord and the label.
+pub(crate) fn prove_command_palette() -> Result<(), &'static str> {
+    keymap::prove()
+}
+
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, MenuItem, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 
@@ -313,6 +319,15 @@ fn typed_text(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|c| !c.is_control()) && text != " "
 }
 
+/// Drops every chord and binds the stock map plus whatever Settings saved.
+pub(crate) fn rebind_keys(cx: &mut App) {
+    cx.clear_key_bindings();
+    input::bind_keys(cx);
+    call::bind_keys(cx);
+    bind_keys(cx);
+    settings::bind_keys(cx);
+}
+
 fn bind_keys(cx: &mut App) {
     app::menubar::bind_keys(cx);
     cx.bind_keys(shell_bindings());
@@ -331,38 +346,125 @@ fn bind_keys(cx: &mut App) {
 }
 
 fn shell_bindings() -> Vec<KeyBinding> {
+    let mut out = Vec::new();
     let shell = Some("Shell");
-    vec![
-        KeyBinding::new("secondary-q", Quit, None),
-        KeyBinding::new("secondary-k", Switcher, None),
-        KeyBinding::new("secondary-[", Back, None),
-        KeyBinding::new("secondary-]", Forward, None),
-        KeyBinding::new("secondary-up", UpLevel, shell),
-        KeyBinding::new("secondary-\\", ToggleSidebar, None),
-        KeyBinding::new("secondary-.", CloseRight, None),
-        KeyBinding::new("escape", CloseTop, shell),
-        KeyBinding::new("shift-escape", MarkRead, shell),
-        KeyBinding::new("tab", FocusNext, shell),
-        KeyBinding::new("shift-tab", FocusPrevious, shell),
-        KeyBinding::new("alt-down", NextRow, None),
-        KeyBinding::new("alt-up", PreviousRow, None),
-        KeyBinding::new("alt-shift-down", NextUnread, None),
-        KeyBinding::new("alt-shift-up", PreviousUnread, None),
-        KeyBinding::new("down", ListDown, shell),
-        KeyBinding::new("up", ListUp, shell),
-        KeyBinding::new("enter", ListOpen, shell),
-        KeyBinding::new("left", ListFold, shell),
-        KeyBinding::new("right", ListUnfold, shell),
-        KeyBinding::new("secondary-1", Place1, None),
-        KeyBinding::new("secondary-2", Place2, None),
-        KeyBinding::new("secondary-3", Place3, None),
-        KeyBinding::new("secondary-4", Place4, None),
-        KeyBinding::new("secondary-5", Place5, None),
-        KeyBinding::new("secondary-6", Place6, None),
-        KeyBinding::new("secondary-7", Place7, None),
-        KeyBinding::new("secondary-8", Place8, None),
-        KeyBinding::new("secondary-9", Place9, None),
-    ]
+    macro_rules! bind {
+        ($id:literal, $action:expr, $context:expr) => {
+            for chord in keymap::chords($id) {
+                out.push(KeyBinding::new(&chord, $action, $context));
+            }
+        };
+    }
+    bind!("quit", Quit, None);
+    bind!("quick-switcher", Switcher, None);
+    bind!("back", Back, None);
+    bind!("forward", Forward, None);
+    bind!("up-level", UpLevel, shell);
+    bind!("hide-sidebar", ToggleSidebar, None);
+    bind!("close-right", CloseRight, None);
+    bind!("close-top", CloseTop, shell);
+    bind!("mark-read", MarkRead, shell);
+    bind!("focus-next", FocusNext, shell);
+    bind!("focus-previous", FocusPrevious, shell);
+    bind!("next", NextRow, None);
+    bind!("previous", PreviousRow, None);
+    bind!("next-unread", NextUnread, None);
+    bind!("previous-unread", PreviousUnread, None);
+    bind!("list-down", ListDown, shell);
+    bind!("list-up", ListUp, shell);
+    bind!("list-open", ListOpen, shell);
+    bind!("list-fold", ListFold, shell);
+    bind!("list-unfold", ListUnfold, shell);
+    bind!("place-1", Place1, None);
+    bind!("place-2", Place2, None);
+    bind!("place-3", Place3, None);
+    bind!("place-4", Place4, None);
+    bind!("place-5", Place5, None);
+    bind!("place-6", Place6, None);
+    bind!("place-7", Place7, None);
+    bind!("place-8", Place8, None);
+    bind!("place-9", Place9, None);
+    out
+}
+
+/// Runs a palette row that is one of the menu actions.
+pub(crate) fn dispatch_binding(id: &str, window: &mut gpui::Window, cx: &mut App) -> bool {
+    use gpui::Action;
+    macro_rules! go {
+        ($action:expr) => {
+            Some(Box::new($action) as Box<dyn Action>)
+        };
+    }
+    let action: Option<Box<dyn Action>> = match id {
+        "quit" => go!(Quit),
+        "quick-switcher" => go!(Switcher),
+        "back" => go!(Back),
+        "forward" => go!(Forward),
+        "up-level" => go!(UpLevel),
+        "hide-sidebar" => go!(ToggleSidebar),
+        "close-right" => go!(CloseRight),
+        "close-top" => go!(CloseTop),
+        "mark-read" => go!(MarkRead),
+        "focus-next" => go!(FocusNext),
+        "focus-previous" => go!(FocusPrevious),
+        "next" => go!(NextRow),
+        "previous" => go!(PreviousRow),
+        "next-unread" => go!(NextUnread),
+        "previous-unread" => go!(PreviousUnread),
+        "list-down" => go!(ListDown),
+        "list-up" => go!(ListUp),
+        "list-open" => go!(ListOpen),
+        "list-fold" => go!(ListFold),
+        "list-unfold" => go!(ListUnfold),
+        "place-1" => go!(Place1),
+        "place-2" => go!(Place2),
+        "place-3" => go!(Place3),
+        "place-4" => go!(Place4),
+        "place-5" => go!(Place5),
+        "place-6" => go!(Place6),
+        "place-7" => go!(Place7),
+        "place-8" => go!(Place8),
+        "place-9" => go!(Place9),
+        "settings" => go!(Settings),
+        "new-message" => go!(NewMessage),
+        "attach" => go!(AttachFile),
+        "close-window" => go!(CloseWindow),
+        "search-here" => go!(SearchConversation),
+        "search-all" => go!(SearchEverywhere),
+        "bigger-text" => go!(BiggerText),
+        "smaller-text" => go!(SmallerText),
+        "actual-size" => go!(ActualSize),
+        "full-screen" => go!(FullScreen),
+        "details" => go!(ShowDetails),
+        "start-call" => go!(StartCall),
+        "open-in" => go!(OpenInNetwork),
+        "minimize" => go!(Minimize),
+        "shortcuts-page" => go!(KeyboardShortcuts),
+        "show-logs" => go!(ShowLogs),
+        "hide" => go!(Hide),
+        "hide-others" => go!(HideOthers),
+        "mute" | "toggle-mute" => go!(call::ToggleMute),
+        "deafen" => go!(call::ToggleDeafen),
+        "leave-call" => go!(call::Leave),
+        "accept" => go!(call::Accept),
+        "decline" => go!(call::Decline),
+        "go-to-call" => go!(call::Jump),
+        "about" => go!(About),
+        "check-updates" => go!(CheckForUpdates),
+        "add-account" => go!(AddAccount),
+        "copy-diagnostics" => go!(CopyDiagnostics),
+        "star" => go!(Star),
+        "conversation-mute" => go!(Mute),
+        "show-all" => go!(ShowAll),
+        "zoom" => go!(Zoom),
+        "show-window" => go!(ShowWindow),
+        _ => None,
+    };
+    let Some(action) = action else {
+        return false;
+    };
+    window.dispatch_action(action, cx);
+    true
 }
 
 /// `--shot out.png` draws one state with live data, writes the frame and quits, so every state
@@ -915,9 +1017,8 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, a
     // The Dock icon brings the hidden window back unchanged.
     application.on_reopen(|cx| cx.activate(true));
     application.run(move |cx: &mut App| {
-            input::bind_keys(cx);
-            call::bind_keys(cx);
-            bind_keys(cx);
+            keymap::load();
+            rebind_keys(cx);
             app::menubar::app_actions(cx);
             if !cfg!(feature = "gui-shot") {
                 crate::update::recall();

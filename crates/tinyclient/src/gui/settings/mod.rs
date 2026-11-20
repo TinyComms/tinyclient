@@ -249,15 +249,19 @@ pub fn note_changed(cx: &mut App) {
     }
 }
 
-/// Called by the shell when it starts: Settings reads its accounts from it.
-pub fn attach(shell: WeakEntity<Shell>, cx: &mut App) {
-    cx.default_global::<Host>().shell = Some(shell);
+/// The keys of the Settings window itself. Shortcut rebinding clears the map and binds these again.
+pub(crate) fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("secondary-f", Find, Some("Settings")),
         KeyBinding::new("escape", Dismiss, Some("Settings")),
         KeyBinding::new("tab", NextControl, Some("Settings")),
         KeyBinding::new("shift-tab", PreviousControl, Some("Settings")),
     ]);
+}
+
+/// Called by the shell when it starts: Settings reads its accounts from it.
+pub fn attach(shell: WeakEntity<Shell>, cx: &mut App) {
+    cx.default_global::<Host>().shell = Some(shell);
 }
 
 /// The microphone test's level, from `Change::Meter`; `None` once it is over.
@@ -417,6 +421,10 @@ pub struct SettingsWindow {
     pub(super) held_modifiers: gpui::Modifiers,
     /// A key that is already another action's, refused, and the words that say so.
     pub(super) clash: Option<(&'static str, String)>,
+    /// The shortcut row waiting for a new chord, and the words when that chord is taken.
+    pub(super) chord: Option<&'static str>,
+    pub(super) chord_focus: FocusHandle,
+    pub(super) chord_clash: Option<String>,
     /// V18: the microphone test also plays the microphone back. The window's alone.
     pub(super) loopback: bool,
     /// Shared by the page, scrollbar, and screenshot harness.
@@ -493,6 +501,9 @@ impl SettingsWindow {
             recorder_focus: cx.focus_handle(),
             held_modifiers: gpui::Modifiers::default(),
             clash: None,
+            chord: None,
+            chord_focus: cx.focus_handle(),
+            chord_clash: None,
             loopback: false,
             pane_scroll: gpui::ScrollHandle::new(),
             _subscriptions: subscriptions,
