@@ -388,6 +388,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-messages-folders:0");
         return Ok(());
     }
+    // The lab's messages-search driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-search") {
+        if let Err(err) = chatd::adapters::messages::prove_message_search() {
+            eprintln!("messages-search: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-search:0");
+        return Ok(());
+    }
     // The lab's teams-reactions driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("teams-reactions") {
         if let Err(err) = chatd::adapters::prove_teams_reactions() {

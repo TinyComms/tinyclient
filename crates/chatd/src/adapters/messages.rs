@@ -3,14 +3,16 @@
 //! go through it. Photos are shown. A video is a video, and a voice note carries its
 //! waveform. Other files are named and can be opened. Reactions can be read and sent.
 //! Calls stay on the phone. When the phone does not answer, texts wait and the account
-//! says so. They go when it answers, unless the user cancelled them.
+//! says so. They go when it answers, unless the user cancelled them. Older messages are
+//! read after connecting, one page at a time, so a search of this computer covers the chat and
+//! not only the page on screen.
 
 mod bugle;
 mod fake;
 mod media;
 pub mod signin;
 
-use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, Signed};
+use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, SharedPage, Signed};
 use crate::blobs;
 use crate::blobs::upload;
 use crate::session;
@@ -18,7 +20,7 @@ use crate::store::{ConversationRow, Filing, PersonRow};
 use bugle::Chat;
 use protocol::{
     Attachment, Capabilities, Change, ConversationKind, MediaFile, MediaKind, Message, MessageKind,
-    Reaction, ReactionSet, RelateAction, Relation, ReplyTo, SendState, Special,
+    Reaction, ReactionSet, RelateAction, Relation, ReplyTo, SendState, SharedKind, Special,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -335,6 +337,18 @@ pub fn prove_message_reply() -> Result<(), String> {
     bugle::prove_message_reply()
 }
 
+/// The lab sets `TINYCLIENT_PROVE=messages-search`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_message_search() -> Result<(), String> {
+    if !fill_another(bugle::MESSAGE_PAGE as usize, false) {
+        return Err("a full page did not keep reading".into());
+    }
+    if fill_another(20, false) || fill_another(0, false) || fill_another(bugle::MESSAGE_PAGE as usize, true) {
+        return Err("a short page or a finished chat kept reading".into());
+    }
+    Ok(())
+}
+
 /// The lab sets `TINYCLIENT_PROVE=messages-phone-quiet`. A build from before this ignores that
 /// and keeps serving, so the same driver fails there.
 /// The lab sets `TINYCLIENT_PROVE=messages-folders`. A build from before this ignores that
@@ -480,6 +494,7 @@ struct Span {
     oldest_id: String,
     oldest_sent: i64,
     started: bool,
+    fill_stopped: bool,
 }
 
 /// One history read the phone did not answer. `before` is the cursor. `find` is a message a
@@ -826,6 +841,7 @@ fn apply(account: &Account, event: Event) {
                 let _ = account.ctx.relations(&owned);
             }
             nudge(account);
+            ask_fill(account);
         }
         Event::Message(note) => {
             if note.status != 300
@@ -1580,6 +1596,13 @@ fn serve(account: &Arc<Account>, command: Command) {
             }
             let _ = reply.send(answer);
         }
+        Command::SearchShared {
+            conversation_id,
+            kind,
+            before,
+            limit,
+            reply,
+        } => drop(reply.send(shared(account, &conversation_id, kind, before.as_deref(), limit))),
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
         Command::Relate {
             person_id,
@@ -1833,6 +1856,10 @@ pub fn prove_messages_mute() -> Result<(), String> {
 }
 
 fn backfill(account: &Account, conversation: &str) {
+    // The newest page is already in this session. Opening the chat again does not ask for it.
+    if reached_start(account, conversation) || resume_cursor(account, conversation).is_some() {
+        return;
+    }
     if phone(account).down {
         remember_due(account, due_of(conversation, None, None), false);
         return;
@@ -1902,10 +1929,10 @@ fn due_of(conversation: &str, before: Option<&str>, find: Option<&str>) -> Due {
 
 /// Reads pages until `find` is on one of them, or one page when `find` is absent. A quiet phone
 /// keeps the cursor it had reached. The next try does not start again at the newest page.
-fn fetch_back(account: &Account, conversation: &str, mut cursor: Option<String>, find: Option<String>) {
+fn fetch_back(account: &Account, conversation: &str, mut cursor: Option<String>, find: Option<String>) -> bool {
     loop {
         if account.ctx.stopped() {
-            return;
+            return false;
         }
         let asked = cursor.clone();
         match ask_history(account, conversation, asked.as_deref()) {
@@ -1921,25 +1948,25 @@ fn fetch_back(account: &Account, conversation: &str, mut cursor: Option<String>,
                 };
                 if found || !moved || !bugle::more_messages(notes.len()) {
                     nudge(account);
-                    return;
+                    return true;
                 }
                 let Some(oldest) = oldest_note(&notes) else {
                     nudge(account);
-                    return;
+                    return true;
                 };
                 cursor = Some(oldest.id.clone());
                 if account.ctx.pause(PACE) {
-                    return;
+                    return false;
                 }
             }
             Err(why) if phone_quiet(&why) => {
                 remember_due(account, due_of(conversation, asked.as_deref(), find.as_deref()), true);
                 lost_phone(account);
-                return;
+                return false;
             }
             Err(why) => {
                 tracing::warn!("chatd: Messages: {why}");
-                return;
+                return false;
             }
         }
     }
@@ -1966,6 +1993,12 @@ fn spans(account: &Account) -> std::sync::MutexGuard<'_, HashMap<String, Span>> 
 
 fn reached_start(account: &Account, conversation: &str) -> bool {
     spans(account).get(conversation).is_some_and(|span| span.started)
+}
+
+fn needs_fill(account: &Account, conversation: &str) -> bool {
+    !spans(account)
+        .get(conversation)
+        .is_some_and(|span| span.started || span.fill_stopped)
 }
 
 /// The oldest message id already read, when a later page should start there.
@@ -2059,10 +2092,22 @@ fn note_span(account: &Account, conversation: &str, notes: &[bugle::Note], asked
         span.oldest_id = oldest.id.clone();
         span.oldest_sent = oldest.sent;
     }
-    if !moved || !bugle::more_messages(notes.len()) {
+    // A page fetched again from the newest end is not the start of the chat. Only a short page,
+    // an empty one, or a cursor that did not move past itself is.
+    if page_ends(notes.len(), asked, moved) {
         span.started = true;
     }
     moved
+}
+
+/// A full page of a chat that has not reached its start is read onward.
+fn fill_another(page: usize, started: bool) -> bool {
+    bugle::more_messages(page) && !started
+}
+
+/// True when this page is the last one the phone will give for this walk.
+fn page_ends(count: usize, asked: Option<&str>, moved: bool) -> bool {
+    !fill_another(count, false) || (asked.is_some() && !moved)
 }
 
 fn phone(account: &Account) -> std::sync::MutexGuard<'_, Phone> {
@@ -2404,6 +2449,81 @@ fn catch_up(account: &Arc<Account>) {
         );
     }
     continue_inbox(account);
+    fill_older(account);
+}
+
+/// One older page of one chat, then the next after a pause. Stops when every chat has been read
+/// back to a short page, and when the phone is not answering.
+fn fill_older(account: &Arc<Account>) {
+    if phone(account).down || account.ctx.stopped() {
+        return;
+    }
+    let ids: Vec<String> = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    let Some(conversation) = ids.into_iter().find(|id| needs_fill(account, id)) else {
+        return;
+    };
+    let cursor = resume_cursor(account, &conversation);
+    let ok = fetch_back(account, &conversation, cursor, None);
+    if phone(account).down || account.ctx.stopped() {
+        return;
+    }
+    if !ok {
+        spans(account).entry(conversation).or_default().fill_stopped = true;
+    }
+    let ids: Vec<String> = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    if ids.iter().any(|id| needs_fill(account, id)) && !account.ctx.pause(PACE) {
+        let _ = account.ctx.commands.send(Command::OpenHome);
+    }
+}
+
+/// The command thread reads chats the user has not opened. Nothing, once each has reached its start.
+fn ask_fill(account: &Account) {
+    let ids: Vec<String> = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    if ids.iter().any(|id| needs_fill(account, id)) {
+        let _ = account.ctx.commands.send(Command::OpenHome);
+    }
+}
+
+/// Media, files and links from the messages already read. Only once this chat has been read back
+/// to its start, so the list is the whole chat and not a page that was still loading.
+fn shared(
+    account: &Account,
+    conversation: &str,
+    kind: SharedKind,
+    before: Option<&str>,
+    limit: u32,
+) -> Result<SharedPage, Refusal> {
+    if !reached_start(account, conversation) {
+        return Err(Refusal::Refused("Messages is still reading this chat.".into()));
+    }
+    let key = account.ctx.key(conversation);
+    match account.ctx.hub.store().shared(&key, kind, before, limit) {
+        Ok(Some((items, more))) => Ok(SharedPage {
+            items,
+            more,
+            total: None,
+        }),
+        Ok(None) => Err(Refusal::Refused("no such conversation".into())),
+        Err(err) => Err(Refusal::Refused(err.to_string())),
+    }
 }
 
 /// One more inbox page, on the command thread. A quiet phone waits for the next home open.
@@ -2494,5 +2614,13 @@ mod outbox_tests {
     #[test]
     fn mentions_are_quiet_and_all_is_not() {
         super::prove_messages_mute().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_full_page_keeps_reading_and_a_short_one_stops() {
+        super::prove_message_search().unwrap();
     }
 }
