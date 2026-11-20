@@ -1006,6 +1006,15 @@ fn detail_card(media: &MessageMedia) -> Option<Card> {
 
 fn reactions(reactions: &tl::enums::MessageReactions) -> Vec<Reaction> {
     let tl::enums::MessageReactions::Reactions(reactions) = reactions;
+    // Telegram hides who reacted in channels and large groups: `can_see_list` unset, or a
+    // `min` message that carries only part of it. There the chip stays a number and says so.
+    let listed = !reactions.min && reactions.can_see_list;
+    let same = |a: &tl::enums::Reaction, b: &tl::enums::Reaction| match (a, b) {
+        (tl::enums::Reaction::Emoji(a), tl::enums::Reaction::Emoji(b)) => a.emoticon == b.emoticon,
+        (tl::enums::Reaction::CustomEmoji(a), tl::enums::Reaction::CustomEmoji(b)) => a.document_id == b.document_id,
+        (tl::enums::Reaction::Paid, tl::enums::Reaction::Paid) => true,
+        _ => false,
+    };
     let one = |count: &tl::enums::ReactionCount| {
         let tl::enums::ReactionCount::Count(count) = count;
         let (emoji, file) = match &count.reaction {
@@ -1016,11 +1025,28 @@ fn reactions(reactions: &tl::enums::MessageReactions) -> Vec<Reaction> {
             tl::enums::Reaction::Paid => ("⭐".to_owned(), None),
             tl::enums::Reaction::Empty => return None,
         };
+        // The list Telegram already sent with the message names each reactor's peer.
+        let who = listed
+            .then(|| {
+                reactions
+                    .recent_reactions
+                    .iter()
+                    .flatten()
+                    .filter_map(|reacted| match reacted {
+                        tl::enums::MessagePeerReaction::Reaction(reacted) => Some(reacted),
+                    })
+                    .filter(|reacted| same(&reacted.reaction, &count.reaction))
+                    .map(|reacted| Who::of(&reacted.peer_id).text())
+                    .take(protocol::REACTION_REACTORS)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         Some(Reaction {
             emoji,
             file,
             count: count.count.max(0) as u32,
             mine: count.chosen_order.is_some(),
+            who,
         })
     };
     reactions.results.iter().filter_map(one).collect()
@@ -2199,6 +2225,43 @@ mod tests {
         // An emoji of another network is not a Telegram document, so it names no id to ask for.
         message.spans[0].style = Style::Emoji { file: MediaFile::new("emoji:7001", MediaKind::Emoji) };
         assert!(text_emoji_ids(&message).is_empty());
+    }
+
+    #[test]
+    fn a_reaction_names_its_reactors_only_where_telegram_shows_the_list() {
+        let emoji = |emoticon: &str| tl::enums::Reaction::Emoji(tl::types::ReactionEmoji { emoticon: emoticon.to_owned() }.into());
+        let reacted = |user: i64, emoticon: &str| tl::types::MessagePeerReaction {
+            big: false,
+            unread: false,
+            my: false,
+            peer_id: tl::enums::Peer::User(tl::types::PeerUser { user_id: user }),
+            date: 0,
+            reaction: emoji(emoticon),
+        };
+        let results = |count: i32, emoticon: &str| tl::enums::ReactionCount::Count(tl::types::ReactionCount {
+            chosen_order: None,
+            reaction: emoji(emoticon),
+            count,
+        });
+        let listed = |shown: &tl::types::MessageReactions| -> Vec<Vec<String>> {
+            reactions(&shown.clone().into()).iter().map(|one| one.who.clone()).collect()
+        };
+        let mut shown = tl::types::MessageReactions {
+            min: false,
+            can_see_list: true,
+            reactions_as_tags: false,
+            results: vec![results(2, "👍"), results(1, "❤")],
+            recent_reactions: Some(vec![reacted(42, "👍").into(), reacted(43, "👍").into(), reacted(44, "❤").into()]),
+            top_reactors: None,
+        };
+        // `can_see_list` set: the list already sent with the message names each reactor.
+        assert_eq!(listed(&shown), [vec!["u42".to_owned(), "u43".to_owned()], vec!["u44".to_owned()]]);
+        // A channel or a large group hides the list: the chip stays a number.
+        shown.can_see_list = false;
+        assert!(listed(&shown).iter().all(|one| one.is_empty()));
+        // A `min` message carries only part of the picture: nothing is named either.
+        let partial = tl::types::MessageReactions { min: true, ..shown.clone() };
+        assert!(listed(&partial).iter().all(|one| one.is_empty()));
     }
 
     #[test]

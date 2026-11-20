@@ -1616,6 +1616,39 @@ pub fn prove_teams_reactions() -> Result<(), String> {
     teams::prove_reactions()
 }
 
+/// The lab's reaction-reactors driver. A reaction keeps who the network named with it: events
+/// fold into the list one person at a time, and a taking-back lets that person go. Telegram's
+/// half is in `telegram::prove_telegram_reactors`.
+pub fn prove_reactors() -> Result<(), String> {
+    let mut store = crate::store::Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?;
+    let account = AccountKey { network: Network::Slack, account: "T1".to_owned() };
+    let conversation = Key::new(&account, "c1");
+    let said = Message::plain("m1", "Ada", "hello", 1_700_000_000, false);
+    store.ingest(&conversation, &said, false).map_err(|err| err.to_string())?;
+    let by = |id: &str| protocol::Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: vec![id.to_owned()] };
+    store.react(&conversation, "m1", &by("u-ana"), true).map_err(|err| err.to_string())?;
+    store.react(&conversation, "m1", &by("u-bea"), true).map_err(|err| err.to_string())?;
+    let who = |store: &crate::store::Store| -> Result<Vec<String>, String> {
+        Ok(store
+            .message(&conversation, "m1")
+            .map_err(|err| err.to_string())?
+            .ok_or("the message is gone")?
+            .reactions
+            .into_iter()
+            .next()
+            .ok_or("the reaction is gone")?
+            .who)
+    };
+    if who(&store)? != ["u-ana", "u-bea"] {
+        return Err(format!("the reactions the events named were not kept: {:?}", who(&store)?));
+    }
+    store.react(&conversation, "m1", &by("u-ana"), false).map_err(|err| err.to_string())?;
+    if who(&store)? != ["u-bea"] {
+        return Err(format!("taking a reaction back did not let its person go: {:?}", who(&store)?));
+    }
+    telegram::prove_telegram_reactors()
+}
+
 /// The lab's teams-file-download driver. See `teams::prove_shared_file`.
 pub fn prove_teams_shared_file() -> Result<(), String> {
     teams::prove_shared_file()

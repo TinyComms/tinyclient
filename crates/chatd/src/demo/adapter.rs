@@ -215,12 +215,14 @@ impl Demo {
                 file: Some(file),
                 count: 1,
                 mine: true,
+                who: Vec::new(),
             },
             None => Reaction {
                 emoji: emoji.to_owned(),
                 file: None,
                 count: 1,
                 mine: true,
+                who: Vec::new(),
             },
         }
     }

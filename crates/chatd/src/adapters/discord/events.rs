@@ -377,6 +377,9 @@ impl Discord {
                     file: file.as_ref().map(|(file, _)| file.clone()),
                     count: 1,
                     mine: *user == me,
+                    // An event names one id, but a message read from history carries counts
+                    // only, so the store keeps no list for Discord.
+                    who: Vec::new(),
                 };
                 self.ctx.reacted(&reacting.channel_id, &reacting.message_id, &reaction, added)?;
             }

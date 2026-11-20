@@ -132,6 +132,7 @@ impl Plan {
                     file: None,
                     count: 1,
                     mine: false,
+                    who: Vec::new(),
                 };
                 let reacted = hub.store().react(&self.conversation, &message.id, &reaction, true);
                 if matches!(reacted, Ok(true)) {
