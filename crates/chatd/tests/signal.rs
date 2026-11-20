@@ -798,3 +798,58 @@ fn a_changed_reaction_after_restart_replaces_the_old_emoji() {
     let mine: Vec<&str> = held.reactions.iter().map(|reaction| reaction.emoji.as_str()).collect();
     assert_eq!(mine, ["❤️"], "{:?}", held.reactions);
 }
+
+#[test]
+fn a_username_lookup_opens_a_chat() {
+    let world = World::linked();
+    world.connected();
+    let ada = "d4d4d4d4-0000-4000-8000-000000000004";
+    world.steer(&format!("lookup ada.42 {ada}"));
+    let search = |query: &str| Request::People {
+        network: Some(Network::Signal),
+        relation: None,
+        query: Some(query.into()),
+        offset: 0,
+        limit: 20,
+    };
+    let Response::People { people, .. } = world.ask(search("ada.42")) else {
+        panic!("no people");
+    };
+    assert!(people.iter().all(|person| person.handle != "ada.42"));
+    let found = world.until("ada.42", || match world.ask(search("ada.42")) {
+        Response::People { people, .. } => people.into_iter().find(|person| person.handle == "ada.42" && person.key.id == ada),
+        _ => None,
+    });
+    world.heard("lookup ada.42");
+    let Response::Conversation { conversation } = world.ask(Request::StartDirect { person: found.key }) else {
+        panic!("no conversation");
+    };
+    assert_eq!((conversation.key.id.as_str(), conversation.kind, conversation.title.as_str()), (ada, ConversationKind::Direct, "ada.42"));
+    let (_, seq) = world.status();
+    world.ask(search("Grace"));
+    world.changed(seq, "the name search to finish", |change| match change {
+        Change::Searched { query, .. } if query == "Grace" => Some(()),
+        _ => None,
+    });
+    assert!(!world.calls().iter().any(|call| call.contains("Grace")), "{:?}", world.calls());
+
+    // Looking up a username that resolves to an already-known contact keeps their name and avatar.
+    world.ask(Request::Watch(protocol::Watching { people: vec![key(GRACE)], ..Default::default() }));
+    let avatar = world.until("Grace's picture", || match world.ask(search("Grace")) {
+        Response::People { people, .. } => people.into_iter().find(|person| person.key.id == GRACE).and_then(|person| person.avatar),
+        _ => None,
+    });
+    world.steer(&format!("lookup grace.42 {GRACE}"));
+    let (_, seq) = world.status();
+    world.ask(search("grace.42"));
+    world.changed(seq, "grace.42 lookup to finish", |change| match change {
+        Change::Searched { query, .. } if query == "grace.42" => Some(()),
+        _ => None,
+    });
+    let Response::People { people, .. } = world.ask(search("grace.42")) else {
+        panic!("no people");
+    };
+    let grace = people.into_iter().find(|person| person.key.id == GRACE).expect("Grace after username lookup");
+    assert_eq!((grace.name.as_str(), grace.handle.as_str()), ("Grace Ombra", "grace.42"));
+    assert_eq!(grace.avatar.as_ref().map(|file| &file.id), Some(&avatar.id));
+}

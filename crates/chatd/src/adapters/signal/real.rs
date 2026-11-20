@@ -53,6 +53,7 @@ enum Ask {
     Picture { of: Peer, answer: Sender<Result<Option<Vec<u8>>, Fault>> },
     Card { answer: Sender<Result<OwnCard, Fault>> },
     SetCard { name: Option<String>, about: Option<String>, emoji: Option<String>, answer: Sender<Result<(), Fault>> },
+    Lookup { username: String, answer: Sender<Result<Option<String>, Fault>> },
 }
 
 pub struct Real {
@@ -283,6 +284,10 @@ impl Wire for Real {
 
     fn set_card(&self, name: Option<String>, about: Option<String>, emoji: Option<String>) -> Result<(), Fault> {
         self.ask(|answer| Ask::SetCard { name, about, emoji, answer })
+    }
+
+    fn lookup(&self, username: &str) -> Result<Option<String>, Fault> {
+        self.ask(|answer| Ask::Lookup { username: username.to_owned(), answer })
     }
 
     fn close(&self) {
@@ -668,6 +673,13 @@ impl Session {
             }
             Ask::SetCard { name, about, emoji, answer } => {
                 let _ = answer.send(self.set_card(name, about, emoji).await);
+            }
+            Ask::Lookup { username, answer } => {
+                let found = match self.manager.lookup_username(&username).await {
+                    Ok(aci) => Ok(aci.map(|aci| aci.service_id_string())),
+                    Err(err) => Err(fault(err)),
+                };
+                let _ = answer.send(found);
             }
         }
     }
