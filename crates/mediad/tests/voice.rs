@@ -126,6 +126,7 @@ impl Mediad {
             .env_remove("TINYCLIENT_VOICE_PLAIN")
             .env_remove("TINYCLIENT_DIR")
             .env_remove("TINYCLIENT_VOICE_TRUST")
+            .env_remove("TINYCLIENT_MEDIAD_SCREEN")
             .env(home, tls().dir.join("home"))
             .env("TINYCLIENT_MEDIAD_AUDIO", hears)
             .envs(env.iter().copied())
@@ -1473,7 +1474,17 @@ fn hang_up_while_still_connecting_exits_cleanly() {
 #[test]
 fn a_balanced_share_tells_the_voice_server_1080p_at_30_and_a_later_pick_is_told_again() {
     let mut fake = Fake::new();
-    let mut mediad = Mediad::start("null", None);
+    let tls = tls();
+    let null_screen = PathBuf::from("null");
+    let mut mediad = Mediad::start_in(
+        "null",
+        None,
+        &[
+            ("TINYCLIENT_DIR", &tls.dir),
+            ("TINYCLIENT_VOICE_TRUST", &tls.certificate),
+            ("TINYCLIENT_MEDIAD_SCREEN", &null_screen),
+        ],
+    );
     // The voice call only has to exist, so a share is allowed. It is not readied, and sends no UDP.
     mediad.join(&fake.endpoint(), NO_DAVE);
     let voice = fake.accept();
