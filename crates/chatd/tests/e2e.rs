@@ -715,7 +715,7 @@ fn what_only_a_network_can_answer_is_refused_in_words_and_the_cache_answers_the_
     assert_eq!(fetched, Response::Media { files: vec![icon] });
 
     // Typing to a network that is not connected is dropped quietly; it is not an error to type.
-    assert_eq!(chatd.ask(Request::Typing { conversation }), Response::Ok);
+    assert_eq!(chatd.ask(Request::Typing { conversation, activity: protocol::Compose::Typing }), Response::Ok);
     let missing = chatd.ask(Request::Tree { space: key(Network::Discord, "G2"), offset: 0, limit: 50, peek: false });
     assert!(matches!(missing, Response::Error { code: ErrorCode::NotFound, .. }), "{missing:?}");
 }

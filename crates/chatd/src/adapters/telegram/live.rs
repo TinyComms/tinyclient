@@ -404,14 +404,46 @@ fn past_read(account: &Account, conversation: &str, id: i32) -> bool {
     account.ctx.read_up_to(conversation).and_then(|read| read.parse::<i32>().ok()).is_none_or(|read| id > read)
 }
 
+/// What an incoming action is. `None` means they stopped.
+pub(super) fn noted(action: &tl::enums::SendMessageAction) -> Option<protocol::Compose> {
+    use tl::enums::SendMessageAction::*;
+    match action {
+        SendMessageCancelAction => None,
+        SendMessageRecordAudioAction => Some(protocol::Compose::RecordingVoice),
+        SendMessageRecordVideoAction | SendMessageRecordRoundAction => Some(protocol::Compose::RecordingVideo),
+        SendMessageUploadPhotoAction(_) => Some(protocol::Compose::UploadingPhoto),
+        SendMessageUploadVideoAction(_) | SendMessageUploadRoundAction(_) => Some(protocol::Compose::UploadingVideo),
+        SendMessageUploadAudioAction(_) => Some(protocol::Compose::UploadingAudio),
+        SendMessageUploadDocumentAction(_) | SendMessageHistoryImportAction(_) => Some(protocol::Compose::UploadingFile),
+        SendMessageChooseStickerAction => Some(protocol::Compose::ChoosingSticker),
+        SendMessageGamePlayAction => Some(protocol::Compose::PlayingGame),
+        _ => Some(protocol::Compose::Typing),
+    }
+}
+
+/// The word a scripted wire logs for an action.
+pub(super) fn action_word(action: &tl::enums::SendMessageAction) -> &'static str {
+    match noted(action) {
+        None => "cancel",
+        Some(protocol::Compose::Typing) => "typing",
+        Some(protocol::Compose::RecordingVoice) => "record-audio",
+        Some(protocol::Compose::RecordingVideo) => "record-video",
+        Some(protocol::Compose::UploadingPhoto) => "upload-photo",
+        Some(protocol::Compose::UploadingVideo) => "upload-video",
+        Some(protocol::Compose::UploadingAudio) => "upload-audio",
+        Some(protocol::Compose::UploadingFile) => "upload-file",
+        Some(protocol::Compose::ChoosingSticker) => "sticker",
+        Some(protocol::Compose::PlayingGame) => "game",
+    }
+}
+
 fn typing(account: &Account, conversation: String, from: Who, action: &tl::enums::SendMessageAction) {
     if from == Who::User(account.me) {
         return;
     }
-    match action {
-        tl::enums::SendMessageAction::SendMessageCancelAction => account.ctx.typing_stopped(&conversation, &from.text()),
-        // Recording a voice note, choosing a sticker and the rest all read as "is typing".
-        _ => account.ctx.typing(&conversation, &from.text(), &account.dir().name(from), TYPING_SHOWN),
+    match noted(action) {
+        None => account.ctx.typing_stopped(&conversation, &from.text()),
+        Some(activity) => account.ctx.typing_as(&conversation, &from.text(), &account.dir().name(from), TYPING_SHOWN, activity),
     }
 }
 

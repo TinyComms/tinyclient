@@ -918,7 +918,7 @@ impl Teams {
             Command::Delete { conversation_id, message_id, reply } => {
                 let _ = reply.send(self.delete(&conversation_id, &message_id).map_err(refuse));
             }
-            Command::Typing(conversation) => self.typing(&conversation),
+            Command::Typing { conversation_id: conversation, activity: _ } => self.typing(&conversation),
             Command::Watch(_) => self.report(self.watch().map_err(Failure::from)),
             Command::SearchPeople(query) => {
                 self.report(self.search(&query).map_err(Failure::from));

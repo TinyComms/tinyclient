@@ -878,6 +878,28 @@ pub enum RelateAction {
     Block,
 }
 
+/// What someone is doing in a composer. Networks that only have typing leave this as [`Typing`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Compose {
+    #[default]
+    Typing,
+    RecordingVoice,
+    RecordingVideo,
+    UploadingPhoto,
+    UploadingVideo,
+    UploadingAudio,
+    UploadingFile,
+    ChoosingSticker,
+    PlayingGame,
+}
+
+impl Compose {
+    pub(crate) fn is_typing(&self) -> bool {
+        matches!(self, Compose::Typing)
+    }
+}
+
 /// Someone typing in a conversation right now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Typist {
@@ -886,6 +908,9 @@ pub struct Typist {
     /// Unix seconds at which the line goes away if nothing more is heard. The shell times this
     /// out itself; chatd sends no change for it.
     pub until: i64,
+    /// What they are doing. Absent on an older frame, which means typing.
+    #[serde(default, skip_serializing_if = "Compose::is_typing")]
+    pub activity: Compose,
 }
 
 /// One section of a member list, with how many people it holds on the network.
@@ -1369,8 +1394,11 @@ pub enum Request {
         client_id: String,
     },
     /// The user's draft is changing. chatd decides how often the network hears of it.
+    /// `activity` is what they are doing. Absent means typing.
     Typing {
         conversation: Key,
+        #[serde(default, skip_serializing_if = "Compose::is_typing")]
+        activity: Compose,
     },
     /// The user followed a link out of this message (the shell is opening it). Telegram's terms
     /// want a sponsored message's follow told to it; other networks have nothing to do.
@@ -2574,7 +2602,7 @@ mod tests {
             conversation: key(id),
             typists: names
                 .iter()
-                .map(|name| Typist { id: (*name).into(), name: (*name).into(), until: 0 })
+                .map(|name| Typist { id: (*name).into(), name: (*name).into(), until: 0, activity: Compose::Typing })
                 .collect(),
         };
         assert!(typing("a", &["ana"]).same_scope(&typing("a", &[])));

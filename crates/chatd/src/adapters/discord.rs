@@ -1591,7 +1591,7 @@ impl Discord {
             // Never: a fetch per DM is the burst that flags accounts. chatd does not send it,
             // and it is refused here too should it ever arrive.
             Command::Previews(_) => {}
-            Command::Typing(conversation_id) => self.typing(&conversation_id),
+            Command::Typing { conversation_id, activity: _ } => self.typing(&conversation_id),
             Command::Watch(watching) => {
                 self.watch(&watching);
                 self.voice_watch(&watching);

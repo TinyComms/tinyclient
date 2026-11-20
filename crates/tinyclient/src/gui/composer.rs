@@ -824,7 +824,7 @@ impl Composer {
             return;
         }
         self.told_typing = Some((target.key.clone(), Instant::now()));
-        ask_later(cx, Request::Typing { conversation: target.key.clone() }, |_, _| {});
+        ask_later(cx, Request::Typing { conversation: target.key.clone(), activity: protocol::Compose::Typing }, |_, _| {});
     }
 
     /// Escape: the first that applies. It never clears what was typed.

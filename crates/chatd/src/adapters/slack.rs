@@ -1367,7 +1367,7 @@ impl Slack {
             }
             Command::SetPresence { presence, status, reply } => answer(reply, self.set_presence(presence, status)),
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id)),
-            Command::Typing(conversation) => self.typing(&conversation),
+            Command::Typing { conversation_id: conversation, activity: _ } => self.typing(&conversation),
             Command::Watch(_) => self.watch(),
             Command::SearchPeople(query) => self.search(&query),
             Command::Members { conversation_id, offset, limit, reply } => {

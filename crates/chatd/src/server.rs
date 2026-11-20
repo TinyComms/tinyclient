@@ -2560,11 +2560,11 @@ impl Chat {
                 };
                 self.drop_unsent(conversation, &client_id, &message)
             }
-            Request::Typing { conversation } => {
+            Request::Typing { conversation, activity } => {
                 let account = conversation.account();
                 // P1: off, the network never hears it.
                 if self.hub.link(&account) == Link::Connected && self.hub.settings().typing(&account) {
-                    self.command(&account, Command::Typing(conversation.id));
+                    self.command(&account, Command::Typing { conversation_id: conversation.id, activity });
                 }
                 Response::Ok
             }

@@ -755,7 +755,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
             send::send_with(account, &conversation_id, &client_id, &text, reply_to.as_deref(), *with);
         }
-        Command::CancelSend { client_id, .. } => send::cancel(account, &client_id),
+        Command::CancelSend { conversation_id, client_id } => send::cancel(account, &conversation_id, &client_id),
         Command::React { conversation_id, message_id, emoji, on, reply } => {
             let _ = reply.send(react::react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
         }
@@ -768,7 +768,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Delete { conversation_id, message_id, reply } => {
             let _ = reply.send(delete(account, &conversation_id, &message_id).map_err(refused));
         }
-        Command::Typing(conversation_id) => typing(account, &conversation_id),
+        Command::Typing { conversation_id, activity } => typing(account, &conversation_id, activity),
         Command::FollowLink { conversation_id, message_id } => sync::followed(account, &conversation_id, &message_id),
         Command::Draft { conversation_id, text } => save_draft(account, &conversation_id, &text),
         Command::SearchPeople(query) => {
@@ -1056,11 +1056,26 @@ fn delete(account: &Account, conversation: &str, message: &str) -> Result<(), Fa
     Ok(())
 }
 
-fn typing(account: &Account, conversation: &str) {
+fn typing(account: &Account, conversation: &str, activity: protocol::Compose) {
+    // Keystrokes are paced. A recording or an upload is not: the other person should see it now.
+    deliver(account, conversation, activity_action(activity, 0), activity == protocol::Compose::Typing);
+}
+
+/// An upload's progress, 0 to 100. Not paced: each new percent is one signal.
+pub(super) fn show_upload(account: &Account, conversation: &str, activity: protocol::Compose, progress: i32) {
+    deliver(account, conversation, activity_action(activity, progress), false);
+}
+
+/// The other person should see that an upload was abandoned.
+pub(super) fn deliver_cancel(account: &Account, conversation: &str) {
+    deliver(account, conversation, tl::enums::SendMessageAction::SendMessageCancelAction, false);
+}
+
+fn deliver(account: &Account, conversation: &str, action: tl::enums::SendMessageAction, paced: bool) {
     let Some((who, topic)) = Who::parse(conversation) else {
         return;
     };
-    {
+    if paced {
         let mut live = account.live();
         if live.typed.get(conversation).is_some_and(|told| told.elapsed() < TYPING_EVERY) {
             return;
@@ -1070,13 +1085,25 @@ fn typing(account: &Account, conversation: &str) {
     }
     account.here();
     if let Ok(peer) = account.input(who) {
-        let request = tl::functions::messages::SetTyping {
-            peer,
-            top_msg_id: topic,
-            action: tl::enums::SendMessageAction::SendMessageTypingAction,
-        };
+        let request = tl::functions::messages::SetTyping { peer, top_msg_id: topic, action };
         // Not `ask`: a typing signal is not worth waiting out a flood for.
         let _ = wire::call(account.wire.as_ref(), &request);
+    }
+}
+
+fn activity_action(activity: protocol::Compose, progress: i32) -> tl::enums::SendMessageAction {
+    let progress = progress.clamp(0, 100);
+    use tl::enums::SendMessageAction::*;
+    match activity {
+        protocol::Compose::Typing => SendMessageTypingAction,
+        protocol::Compose::RecordingVoice => SendMessageRecordAudioAction,
+        protocol::Compose::RecordingVideo => SendMessageRecordVideoAction,
+        protocol::Compose::UploadingPhoto => SendMessageUploadPhotoAction(tl::types::SendMessageUploadPhotoAction { progress }),
+        protocol::Compose::UploadingVideo => SendMessageUploadVideoAction(tl::types::SendMessageUploadVideoAction { progress }),
+        protocol::Compose::UploadingAudio => SendMessageUploadAudioAction(tl::types::SendMessageUploadAudioAction { progress }),
+        protocol::Compose::UploadingFile => SendMessageUploadDocumentAction(tl::types::SendMessageUploadDocumentAction { progress }),
+        protocol::Compose::ChoosingSticker => SendMessageChooseStickerAction,
+        protocol::Compose::PlayingGame => SendMessageGamePlayAction,
     }
 }
 
@@ -1534,6 +1561,28 @@ pub fn prove_telegram_large_files() -> Result<(), String> {
 /// The lab's telegram-link-preview driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_link_preview() -> Result<(), String> {
     content::prove_link_preview()
+}
+
+/// The lab's telegram-typing-activity driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_typing_activity() -> Result<(), String> {
+    use tl::enums::SendMessageAction::*;
+    if live::noted(&SendMessageRecordAudioAction) != Some(protocol::Compose::RecordingVoice) {
+        return Err("a voice recording was read as typing".into());
+    }
+    if live::noted(&SendMessageCancelAction).is_some() {
+        return Err("a cancelled action was still shown".into());
+    }
+    let photo = SendMessageUploadPhotoAction(tl::types::SendMessageUploadPhotoAction { progress: 40 });
+    if live::noted(&photo) != Some(protocol::Compose::UploadingPhoto) {
+        return Err("sending a photo was read as typing".into());
+    }
+    if live::noted(&SendMessageChooseStickerAction) != Some(protocol::Compose::ChoosingSticker) {
+        return Err("choosing a sticker was read as typing".into());
+    }
+    if live::action_word(&activity_action(protocol::Compose::RecordingVoice, 0)) != "record-audio" {
+        return Err("recording a voice note was not told as a recording".into());
+    }
+    Ok(())
 }
 
 /// The lab's telegram-dice driver. A build without this stays up and the driver fails.

@@ -1857,7 +1857,7 @@ fn typing_reading_and_presence_go_both_ways_and_are_never_withheld() {
     // Ours: typing is told while the user types, paced; reading is told when the shell says a
     // message was seen; and acting says we are here. No setting holds any of it back.
     for _ in 0..3 {
-        world.ask(Request::Typing { conversation: key("u7003") });
+        world.ask(Request::Typing { conversation: key("u7003"), activity: protocol::Compose::Typing });
     }
     world.until("typing to be told", || (world.called("SetTyping u7003") == 1).then_some(()));
     world.ask(Request::MarkRead { conversation: key("g8001"), message_id: "20".into() });
@@ -1871,6 +1871,24 @@ fn typing_reading_and_presence_go_both_ways_and_are_never_withheld() {
     let connect_here = calls.iter().position(|call| call == "UpdateStatus");
     let acting = calls.iter().position(|call| call.starts_with("SetTyping u7003"));
     assert!(connect_here.is_some_and(|at| acting.is_some_and(|last| at < last)), "the connect must say we are here before acting does");
+}
+
+#[test]
+fn a_voice_recording_is_told_as_a_recording_and_heard_as_one() {
+    let world = World::signed_in();
+    world.connected();
+    let watch = || match world.ask(Request::Watch(Watching { conversation: Some(key("u7002")), people: vec![key("u7002")], ..Watching::default() })) {
+        Response::Watching { typists, .. } => typists,
+        other => panic!("{other:?}"),
+    };
+    world.steer("record-audio");
+    let typists = world.until("a voice recording", || Some(watch()).filter(|typists| !typists.is_empty()));
+    assert_eq!(typists[0].activity, protocol::Compose::RecordingVoice);
+    assert_eq!(
+        world.ask(Request::Typing { conversation: key("u7003"), activity: protocol::Compose::RecordingVoice }),
+        Response::Ok
+    );
+    world.until("the recording to be told", || (world.called("SetTyping u7003 record-audio") == 1).then_some(()));
 }
 
 #[test]
@@ -2413,6 +2431,7 @@ fn pickers_and_sending_with_files_options_and_picks() {
     let sent = send("8105", "the ridge", protocol::Outgoing { files: vec![one(photo.clone(), true, false)], ..Default::default() });
     assert_eq!(sent.state, SendState::Sent, "{:?}", world.calls());
     assert_eq!((world.called("SaveFilePart 0 524288"), world.called("SaveFilePart 1 192512")), (1, 1));
+    assert!(world.called("SetTyping u7002 upload-photo") >= 1, "{:?}", world.calls());
     assert_eq!(world.called("SendMedia u7002 photo+spoiler the ridge"), 1);
     let with = vec![one(photo.clone(), false, false), one(file("map.png", 1_000), false, false), one(file("plan.pdf", 2_000), false, true)];
     let album = send("8106", "trip", protocol::Outgoing { files: with, ..Default::default() });
@@ -2505,6 +2524,7 @@ fn a_recorded_voice_message_is_sent_as_a_telegram_voice_note() {
     let sent = send("8201", "", protocol::Outgoing { files: vec![one], voice: Some(voice), ..Default::default() });
     assert_eq!(sent.state, SendState::Sent, "{:?}", world.calls());
     assert_eq!(world.called("SaveFilePart 0 2048"), 1, "{:?}", world.calls());
+    assert!(world.called("SetTyping u7002 upload-audio") >= 1, "{:?}", world.calls());
     assert_eq!(world.called("SendMedia u7002 voice-note:7"), 1, "the audio attribute, and no file name: {:?}", world.calls());
     let attachment = sent.attachments.first().unwrap();
     assert_eq!((attachment.name.as_str(), attachment.mime.as_str()), ("Voice message", "audio/ogg"));

@@ -1526,6 +1526,9 @@ impl World {
             "typing" => vec![update(
                 tl::types::UpdateUserTyping { user_id: ODALYS, top_msg_id: None, action: tl::enums::SendMessageAction::SendMessageTypingAction }.into(),
             )],
+            "record-audio" => vec![update(
+                tl::types::UpdateUserTyping { user_id: ODALYS, top_msg_id: None, action: tl::enums::SendMessageAction::SendMessageRecordAudioAction }.into(),
+            )],
             "typing-stop" => vec![update(
                 tl::types::UpdateUserTyping { user_id: ODALYS, top_msg_id: None, action: tl::enums::SendMessageAction::SendMessageCancelAction }.into(),
             )],
@@ -2467,7 +2470,7 @@ impl World {
             return answer(true);
         }
         if let Some(request) = asked::<f::messages::SetTyping>(body) {
-            self.log(&format!("SetTyping {}", input_who(&request.peer).text()));
+            self.log(&format!("SetTyping {} {}", input_who(&request.peer).text(), super::live::action_word(&request.action)));
             return answer(true);
         }
         if let Some(request) = asked::<f::upload::GetFile>(body) {

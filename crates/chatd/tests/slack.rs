@@ -1402,7 +1402,7 @@ fn a_thread_is_a_conversation_that_can_be_read_and_answered() {
     });
 
     // Typing in the thread says where.
-    assert_eq!(world.ask(Request::Typing { conversation: thread.clone() }), Response::Ok);
+    assert_eq!(world.ask(Request::Typing { conversation: thread.clone(), activity: protocol::Compose::Typing }), Response::Ok);
     let typing = world.until("typing to reach Slack", || world.fake.heard(ALPHA, "user_typing").pop());
     assert_eq!((typing["channel"].as_str(), typing["thread_ts"].as_str()), (Some("C0GEN"), Some(ROOT)));
 
@@ -1530,15 +1530,15 @@ fn sending_typing_presence_and_people_go_through_slack() {
     // fast the draft changes, and each conversation is paced on its own.
     let typed = |channel: &str| world.fake.heard(ALPHA, "user_typing").iter().filter(|frame| frame["channel"] == channel).count();
     for _ in 0..3 {
-        assert_eq!(world.ask(Request::Typing { conversation: general.clone() }), Response::Ok);
+        assert_eq!(world.ask(Request::Typing { conversation: general.clone(), activity: protocol::Compose::Typing }), Response::Ok);
     }
     let typing = world.until("typing to reach Slack", || world.fake.heard(ALPHA, "user_typing").pop());
     let first_typed = Instant::now();
     assert_eq!((typing["channel"].as_str(), typing.get("thread_ts")), (Some("C0GEN"), None));
-    assert_eq!(world.ask(Request::Typing { conversation: alpha("D0ANA") }), Response::Ok);
+    assert_eq!(world.ask(Request::Typing { conversation: alpha("D0ANA"), activity: protocol::Compose::Typing }), Response::Ok);
     world.until("typing in another conversation", || (typed("D0ANA") == 1).then_some(()));
     sleep(Duration::from_millis(4000));
-    assert_eq!(world.ask(Request::Typing { conversation: general.clone() }), Response::Ok);
+    assert_eq!(world.ask(Request::Typing { conversation: general.clone(), activity: protocol::Compose::Typing }), Response::Ok);
     sleep(Duration::from_millis(500));
     assert_eq!((typed("C0GEN"), typed("D0ANA")), (1, 1), "three seconds on is still too soon");
     assert!(world.fake.heard(BETA, "user_typing").is_empty());
@@ -1640,7 +1640,7 @@ fn sending_typing_presence_and_people_go_through_slack() {
 
     // Eight seconds after the first signal the next one goes out.
     sleep(Duration::from_millis(8200).saturating_sub(first_typed.elapsed()));
-    assert_eq!(world.ask(Request::Typing { conversation: general.clone() }), Response::Ok);
+    assert_eq!(world.ask(Request::Typing { conversation: general.clone(), activity: protocol::Compose::Typing }), Response::Ok);
     world.until("typing again once the eight seconds are over", || (typed("C0GEN") == 2).then_some(()));
 
     // A huddle opens in the official app.

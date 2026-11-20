@@ -61,8 +61,9 @@ pub(super) fn send_with(account: &Arc<Account>, conversation: &str, client_id: &
     });
 }
 
-pub(super) fn cancel(account: &Account, client_id: &str) {
+pub(super) fn cancel(account: &Account, conversation: &str, client_id: &str) {
     upload::cancel(&account.ctx.account, client_id);
+    super::deliver_cancel(account, conversation);
 }
 
 /// Where a send goes and what it answers.
@@ -266,7 +267,7 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
     let mut uploaded = Vec::with_capacity(up.files().len());
     for at in 0..up.files().len() {
         // `voice` is only set for a send of one file: a voice message is one file.
-        uploaded.push(file(account, client_id, at, voice, up)?);
+        uploaded.push(file(account, conversation, client_id, at, voice, up)?);
     }
     up.check()?;
     let random = random_id(client_id);
@@ -346,16 +347,32 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
 
 /// One file of a send, in parts, as Telegram's `InputMedia`. A voice send carries its facts in
 /// `voice` and is sent as a voice note, as Telegram's apps send one.
-fn file(account: &Account, client_id: &str, at: usize, voice: Option<&VoiceNote>, up: &mut Upload) -> Result<Uploaded, String> {
+fn file(account: &Account, conversation: &str, client_id: &str, at: usize, voice: Option<&VoiceNote>, up: &mut Upload) -> Result<Uploaded, String> {
     let (name, bytes, mime, spoiler, as_file) = {
         let source = &up.files()[at];
         (source.name.clone(), source.bytes, source.mime, source.spoiler, source.as_file)
     };
+    let photo = !as_file && PHOTOS.contains(&mime) && bytes <= BIG;
+    let activity = if voice.is_some() {
+        protocol::Compose::UploadingAudio
+    } else if photo {
+        protocol::Compose::UploadingPhoto
+    } else if !as_file && mime.starts_with("video/") {
+        protocol::Compose::UploadingVideo
+    } else {
+        protocol::Compose::UploadingFile
+    };
     let file_id = random_id(&format!("{client_id}/{at}/{name}"));
     let big = bytes > BIG;
     let mut parts = 1;
+    let mut told = -1i32;
     up.parts(at, PART, 0, |part| {
         parts = part.count as i32;
+        let progress = if part.count == 0 { 0 } else { (((part.index as u64 + 1) * 100) / part.count as u64).min(100) as i32 };
+        if progress != told {
+            told = progress;
+            super::show_upload(account, conversation, activity, progress);
+        }
         let saved = match big {
             true => account.ask(&tl::functions::upload::SaveBigFilePart {
                 file_id,
@@ -376,7 +393,6 @@ fn file(account: &Account, client_id: &str, at: usize, voice: Option<&VoiceNote>
         // The checksum is optional; Telegram checks the parts itself.
         false => tl::types::InputFile { id: file_id, parts, name: name.clone(), md5_checksum: String::new() }.into(),
     };
-    let photo = !as_file && PHOTOS.contains(&mime) && bytes <= BIG;
     // A voice note is one Ogg Opus file and its own attribute: no file name, which Telegram's
     // own voice notes carry none of (their rows read "Voice message"). The loudness bars go
     // from the contract's byte a bar to Telegram's five bits a bar.

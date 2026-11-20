@@ -1484,7 +1484,7 @@ fn typing_appears_expires_and_is_paced_on_the_way_out() {
     allow_typing(&world, &dm);
     // The draft changing three times is one signal to Discord.
     for _ in 0..3 {
-        assert_eq!(world.ask(Request::Typing { conversation: dm.clone() }), Response::Ok);
+        assert_eq!(world.ask(Request::Typing { conversation: dm.clone(), activity: protocol::Compose::Typing }), Response::Ok);
     }
     wait("the typing signal", || (!world.discord.requests_to("POST", "/channels/3001/typing").is_empty()).then_some(()));
     sleep(Duration::from_secs(1));
@@ -2930,7 +2930,7 @@ fn a_run_of_refusals_stops_every_request_and_says_so() {
     let why = world.failure("3002", "1730000000000000031");
     assert!(why.contains("refused too many requests") && why.contains("10 min"), "{why}");
     allow_typing(&world, &world.key("3002"));
-    world.ask(Request::Typing { conversation: world.key("3002") });
+    world.ask(Request::Typing { conversation: world.key("3002"), activity: protocol::Compose::Typing });
     settled(&world);
     assert_eq!(world.discord.requests.lock().unwrap().len(), before);
 }
@@ -2943,7 +2943,7 @@ fn a_rate_limit_that_is_not_json_is_waited_out_from_its_headers_and_tried_once_m
         world.discord.script_raw("/channels/3002/typing", 429, "Retry-After: 2\r\nContent-Type: text/html\r\n", "<html>error code: 1015</html>");
     }
     allow_typing(&world, &world.key("3002"));
-    world.ask(Request::Typing { conversation: world.key("3002") });
+    world.ask(Request::Typing { conversation: world.key("3002"), activity: protocol::Compose::Typing });
     let typed = wait("the second attempt", || Some(world.discord.requests_to("POST", "/channels/3002/typing")).filter(|typed| typed.len() == 2));
     let waited = typed[1].at.duration_since(typed[0].at);
     assert!(waited >= Duration::from_millis(1950), "tried again after {waited:?}");
@@ -3366,7 +3366,7 @@ fn a_challenge_stops_every_request_and_shows_on_the_account() {
     world.send("3002", "1730000000000000042", "hello again", None);
     world.failure("3002", "1730000000000000042");
     allow_typing(&world, &world.key("3002"));
-    world.ask(Request::Typing { conversation: world.key("3002") });
+    world.ask(Request::Typing { conversation: world.key("3002"), activity: protocol::Compose::Typing });
     world.messages("3004");
     settled(&world);
     assert_eq!(world.discord.requests.lock().unwrap().len(), asked);

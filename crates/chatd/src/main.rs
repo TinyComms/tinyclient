@@ -703,6 +703,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-message-remind:0");
         return Ok(());
     }
+    // The lab's telegram-typing-activity driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-typing-activity") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_typing_activity() {
+            eprintln!("telegram-typing-activity: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-typing-activity:0");
+        return Ok(());
+    }
     // The lab's telegram-accounts driver. A build without this stays up and the driver fails.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-accounts") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_accounts() {

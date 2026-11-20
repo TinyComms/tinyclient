@@ -525,7 +525,7 @@ fn typing_is_heard_and_told_at_most_every_few_seconds() {
     });
     assert_eq!(typists.iter().map(|typist| typist.name.as_str()).collect::<Vec<_>>(), ["Grace Ombra"]);
     for _ in 0..3 {
-        world.ask(Request::Typing { conversation: key(GRACE) });
+        world.ask(Request::Typing { conversation: key(GRACE), activity: protocol::Compose::Typing });
     }
     world.heard(&format!("typing {GRACE} started"));
     sleep(Duration::from_millis(300));
@@ -552,7 +552,7 @@ fn typing_and_receipts_have_a_local_switch_that_stops_the_frames_here() {
     assert_eq!(world.calls().iter().filter(|call| call.starts_with("read ")).count(), 1, "a read went out with receipts off");
     // Typing off: the wire is never asked.
     assert_eq!(world.ask(set(protocol::settings::TYPING, Some("off"))), Response::Ok);
-    world.ask(Request::Typing { conversation: key(GRACE) });
+    world.ask(Request::Typing { conversation: key(GRACE), activity: protocol::Compose::Typing });
     sleep(Duration::from_millis(400));
     assert!(world.calls().iter().all(|call| !call.starts_with("typing")), "a typing signal went out with typing off");
     // Both back: the rows round-trip, and the frames go again.
@@ -563,7 +563,7 @@ fn typing_and_receipts_have_a_local_switch_that_stops_the_frames_here() {
     // A fresh conversation, so the few-seconds memory of Grace's last one does not eat it.
     world.steer(&format!("incoming alan {} hello", T0 + 4_000));
     world.arrived(ALAN, &id(T0 + 4_000, ALAN));
-    world.ask(Request::Typing { conversation: key(ALAN) });
+    world.ask(Request::Typing { conversation: key(ALAN), activity: protocol::Compose::Typing });
     world.heard(&format!("typing {ALAN} started"));
 }
 
