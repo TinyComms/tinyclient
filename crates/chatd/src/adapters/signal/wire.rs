@@ -6,6 +6,8 @@
 //! Signal names a message by who wrote it and the millisecond they sent it, and has no list of
 //! conversations or history on its servers: what arrives is all there is.
 
+use super::style::Range;
+use protocol::Span;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -82,6 +84,8 @@ pub struct Quote {
     pub sent: u64,
     pub author: String,
     pub text: String,
+    /// Styles of `text` after any mention in the quote was substituted.
+    pub spans: Vec<Span>,
 }
 
 /// One message's words.
@@ -96,6 +100,8 @@ pub struct Text {
     pub text: String,
     pub quote: Option<Quote>,
     pub mentions_me: bool,
+    /// Styles of `text`, byte offsets, after mention substitution.
+    pub spans: Vec<Span>,
     /// What it carries that is not text and is not drawn here ("Photo", "Sticker"), in words.
     pub unsupported: Option<String>,
 }
@@ -149,7 +155,7 @@ pub enum Event {
     /// A message from someone else, or one we sent from another device (`outgoing`).
     Message { peer: Peer, text: Text, outgoing: bool },
     /// A message was edited. `target` is when it was first sent.
-    Edited { peer: Peer, author: String, target: u64, text: String },
+    Edited { peer: Peer, author: String, target: u64, text: String, spans: Vec<Span> },
     Deleted { peer: Peer, author: String, target: u64 },
     /// `by` reacted to `author`'s message sent at `target`.
     Reacted { peer: Peer, by: String, author: String, target: u64, emoji: String, removed: bool },
@@ -178,9 +184,9 @@ pub enum Event {
 /// What is sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
-    Text { text: String, quote: Option<Quote> },
+    Text { text: String, quote: Option<Quote>, ranges: Vec<Range> },
     React { author: String, target: u64, emoji: String, remove: bool },
-    Edit { target: u64, text: String },
+    Edit { target: u64, text: String, ranges: Vec<Range> },
     Delete { target: u64 },
 }
 
