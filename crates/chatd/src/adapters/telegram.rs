@@ -1121,8 +1121,9 @@ fn person(account: &Account, who: Who, relation: Relation, rank: &str) -> Person
     }
 }
 
-/// Composer text as Telegram should receive it: markers become entities, and a custom emoji
-/// the catalog offered (`:alt:`) becomes that emoji's fallback glyph.
+/// Composer text as Telegram should receive it: markers become entities, a custom emoji
+/// the catalog offered (`:alt:`) becomes that emoji's fallback glyph, and `@Display Name`
+/// becomes a username or a text mention.
 fn prepared(account: &Account, conversation: &str, text: &str) -> (String, Option<Vec<tl::enums::MessageEntity>>) {
     let (plain, entities) = content::outgoing(text);
     dress(account, conversation, plain, entities)
@@ -1134,16 +1135,19 @@ fn dress(
     plain: String,
     entities: Option<Vec<tl::enums::MessageEntity>>,
 ) -> (String, Option<Vec<tl::enums::MessageEntity>>) {
-    if !plain.contains(':') {
-        return (plain, entities);
-    }
-    let labels: Vec<content::EmojiLabel> = account.live().emoji_labels.iter().cloned().collect();
-    if labels.is_empty() {
-        return (plain, entities);
-    }
-    let allow = custom_allowed(account, conversation);
-    let (plain, entities) = content::apply_emoji(&plain, entities.unwrap_or_default(), &labels, allow);
-    (plain, (!entities.is_empty()).then_some(entities))
+    let (plain, entities) = if plain.contains(':') {
+        let labels: Vec<content::EmojiLabel> = account.live().emoji_labels.iter().cloned().collect();
+        if labels.is_empty() {
+            (plain, entities)
+        } else {
+            let allow = custom_allowed(account, conversation);
+            let (plain, entities) = content::apply_emoji(&plain, entities.unwrap_or_default(), &labels, allow);
+            (plain, (!entities.is_empty()).then_some(entities))
+        }
+    } else {
+        (plain, entities)
+    };
+    named(account, plain, entities)
 }
 
 /// Premium may send a custom emoji in any chat. Anyone may send one in Saved Messages.
@@ -1153,6 +1157,50 @@ fn custom_allowed(account: &Account, conversation: &str) -> bool {
         return true;
     }
     matches!(Who::parse(conversation), Some((Who::User(id), _)) if id == account.me)
+}
+
+fn named(account: &Account, plain: String, entities: Option<Vec<tl::enums::MessageEntity>>) -> (String, Option<Vec<tl::enums::MessageEntity>>) {
+    if !plain.contains('@') {
+        return (plain, entities);
+    }
+    let people = mention_people(account);
+    if people.is_empty() {
+        return (plain, entities);
+    }
+    let (plain, entities) = content::apply_mentions(&plain, entities.unwrap_or_default(), &people);
+    (plain, (!entities.is_empty()).then_some(entities))
+}
+
+/// People a typed `@Full Name` can notify. The same name twice is skipped: a send cannot know which.
+fn mention_people(account: &Account) -> Vec<content::MentionTarget> {
+    let dir = account.dir();
+    let mut people = Vec::new();
+    for (id, known) in dir.users() {
+        if id == account.me || known.deleted {
+            continue;
+        }
+        let Some(access_hash) = known.hash else {
+            continue;
+        };
+        let name = known.name.trim();
+        if name.is_empty() || name == "Unknown" || name == "Deleted Account" {
+            continue;
+        }
+        let first = name.split_once(' ').map(|(first, _)| first).unwrap_or(name);
+        if first.is_empty() {
+            continue;
+        }
+        people.push(content::MentionTarget {
+            name: name.to_owned(),
+            first: first.to_owned(),
+            handle: known.handle.clone(),
+            user_id: id,
+            access_hash,
+        });
+    }
+    let names: Vec<String> = people.iter().map(|person| person.name.clone()).collect();
+    people.retain(|person| names.iter().filter(|name| *name == &person.name).count() == 1);
+    people
 }
 
 /// The lab's telegram-markers driver. A build without this returns to the server below and stays up.
@@ -1306,6 +1354,43 @@ pub fn prove_telegram_mute_until() -> Result<(), String> {
     let soon = (crate::hub::now() + 3_600).clamp(0, i64::from(i32::MAX)) as i32;
     if !filing::mute_holds(soon) {
         return Err("a mute until a later time is not muted".into());
+    }
+    Ok(())
+}
+
+/// The lab's telegram-mention-name driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_mention_name() -> Result<(), String> {
+    let nameless = content::MentionTarget {
+        name: "Ada Stone".to_owned(),
+        first: "Ada".to_owned(),
+        handle: String::new(),
+        user_id: 7_003,
+        access_hash: 7,
+    };
+    let named = content::MentionTarget {
+        name: "Bea Moss".to_owned(),
+        first: "Bea".to_owned(),
+        handle: "bea_m".to_owned(),
+        user_id: 7_002,
+        access_hash: 8,
+    };
+    let (plain, entities) = content::apply_mentions("see @Ada Stone", Vec::new(), std::slice::from_ref(&nameless));
+    if plain != "see Ada" {
+        return Err(format!("a person with no username was not reduced to their first name: {plain}"));
+    }
+    let told = entities.iter().any(|entity| {
+        matches!(entity, tl::enums::MessageEntity::InputMessageEntityMentionName(mention)
+            if mention.offset == 4 && mention.length == 3 && matches!(&mention.user_id, tl::enums::InputUser::User(user) if user.user_id == 7_003))
+    });
+    if !told {
+        return Err("the text mention was not named on the send".into());
+    }
+    let (plain, entities) = content::apply_mentions("see @Ada Stone and @Bea Moss", Vec::new(), &[nameless, named]);
+    if plain != "see Ada and @bea_m" {
+        return Err(format!("a username was not written as the handle: {plain}"));
+    }
+    if entities.iter().filter(|entity| matches!(entity, tl::enums::MessageEntity::InputMessageEntityMentionName(_))).count() != 1 {
+        return Err("a person with a username was also given a text mention".into());
     }
     Ok(())
 }

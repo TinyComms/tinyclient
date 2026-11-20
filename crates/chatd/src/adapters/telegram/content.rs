@@ -148,6 +148,14 @@ pub fn spans(text: &str, entities: &[MessageEntity]) -> Vec<Span> {
             // A mention by username names nobody the account has an id for: it opens in Telegram.
             E::Mention(_) => Style::Link { url: format!("https://t.me/{}", said.trim_start_matches('@')) },
             E::MentionName(named) => Style::Mention { kind: MentionKind::User, id: Who::User(named.user_id).text() },
+            // A send names the person with an input user. The echo carries that until Telegram
+            // stores the incoming form.
+            E::InputMessageEntityMentionName(named) => {
+                let tl::enums::InputUser::User(user) = &named.user_id else {
+                    continue;
+                };
+                Style::Mention { kind: MentionKind::User, id: Who::User(user.user_id).text() }
+            }
             // The text under it is the plain emoji Telegram chose as its fallback.
             E::CustomEmoji(emoji) => Style::Emoji { file: MediaFile::new(format!("e{}", emoji.document_id), MediaKind::Emoji) },
             _ => continue,
@@ -353,6 +361,137 @@ fn shift_for_emoji(entities: Vec<MessageEntity>, swaps: &[EmojiSwap], allow: boo
     out
 }
 
+/// Someone the directory can notify. `handle` is empty when they have no username.
+#[derive(Debug, Clone)]
+pub(super) struct MentionTarget {
+    pub name: String,
+    pub first: String,
+    pub handle: String,
+    pub user_id: i64,
+    pub access_hash: i64,
+}
+
+struct MentionSwap {
+    old_start: i32,
+    old_len: i32,
+    new_len: i32,
+    /// Set when the replacement is a text mention. A username is plain `@handle` and notifies on its own.
+    mention: Option<(i64, i64)>,
+}
+
+fn boundary_before(text: &str, at: usize) -> bool {
+    text[..at].chars().next_back().is_none_or(char::is_whitespace)
+}
+
+fn boundary_after(text: &str, at: usize) -> bool {
+    text[at..].chars().next().is_none_or(|c| !c.is_alphanumeric() && c != '_')
+}
+
+/// The next `@Display Name` that stands on its own. An earlier `@` glued to other text is skipped.
+fn mention_at(plain: &str, from: usize, person: &MentionTarget) -> Option<usize> {
+    let needle = format!("@{}", person.name);
+    let mut search = from;
+    while let Some(at) = plain[search..].find(&needle) {
+        let start = search + at;
+        let end = start + needle.len();
+        if boundary_before(plain, start) && boundary_after(plain, end) {
+            return Some(start);
+        }
+        search = start + 1;
+    }
+    None
+}
+
+/// `@Display Name` as the composer inserts it. A person with a username becomes `@username`.
+/// A person without one becomes their first name, covered by a text mention Telegram notifies on.
+/// Two people with the same name are left as typed. Entities that covered a replaced run are
+/// dropped; ones after it move by how much the text shrank or grew.
+pub(super) fn apply_mentions(plain: &str, entities: Vec<MessageEntity>, people: &[MentionTarget]) -> (String, Vec<MessageEntity>) {
+    if people.is_empty() || !plain.contains('@') {
+        return (plain.to_owned(), entities);
+    }
+    let mut people: Vec<&MentionTarget> = people.iter().filter(|person| !person.name.is_empty()).collect();
+    people.sort_by(|left, right| right.name.len().cmp(&left.name.len()).then(left.name.cmp(&right.name)));
+    let mut out = String::with_capacity(plain.len());
+    let mut swaps = Vec::new();
+    let mut from = 0usize;
+    let mut old_utf16 = 0i32;
+    while from < plain.len() {
+        let mut best: Option<(usize, usize)> = None;
+        for (index, person) in people.iter().enumerate() {
+            let Some(start) = mention_at(plain, from, person) else {
+                continue;
+            };
+            // The same place keeps the longer name, which was sorted first.
+            let earlier = best.is_none_or(|(prev, _)| start < prev);
+            if earlier {
+                best = Some((start, index));
+            }
+        }
+        let Some((start, index)) = best else {
+            out.push_str(&plain[from..]);
+            break;
+        };
+        let person = people[index];
+        let needle_len = 1 + person.name.len();
+        out.push_str(&plain[from..start]);
+        old_utf16 += utf16_len(&plain[from..start]);
+        let old_len = utf16_len(&plain[start..start + needle_len]);
+        let (spoken, mention) = match person.handle.is_empty() {
+            true => (person.first.clone(), Some((person.user_id, person.access_hash))),
+            false => (format!("@{}", person.handle), None),
+        };
+        let new_len = utf16_len(&spoken);
+        out.push_str(&spoken);
+        if old_len > 0 {
+            swaps.push(MentionSwap { old_start: old_utf16, old_len, new_len, mention });
+        }
+        old_utf16 += old_len;
+        from = start + needle_len;
+    }
+    (out, shift_for_mentions(entities, &swaps))
+}
+
+fn mention_delta(swaps: &[MentionSwap], at: i32) -> i32 {
+    swaps.iter().filter(|swap| swap.old_start + swap.old_len <= at).map(|swap| swap.new_len - swap.old_len).sum()
+}
+
+fn shift_for_mentions(entities: Vec<MessageEntity>, swaps: &[MentionSwap]) -> Vec<MessageEntity> {
+    if swaps.is_empty() {
+        return entities;
+    }
+    let mut out = Vec::new();
+    for entity in entities {
+        let (offset, length) = place(&entity);
+        if length <= 0 {
+            continue;
+        }
+        let end = offset + length;
+        let overlaps = swaps.iter().any(|swap| offset < swap.old_start + swap.old_len && end > swap.old_start);
+        if overlaps {
+            continue;
+        }
+        let delta = mention_delta(swaps, offset);
+        match retarget(&entity, offset + delta, length) {
+            Some(next) => out.push(next),
+            None if delta == 0 => out.push(entity),
+            None => {}
+        }
+    }
+    for swap in swaps {
+        let Some((user_id, access_hash)) = swap.mention else {
+            continue;
+        };
+        if swap.new_len <= 0 {
+            continue;
+        }
+        let offset = swap.old_start + mention_delta(swaps, swap.old_start);
+        let user = tl::types::InputUser { user_id, access_hash };
+        out.push(tl::types::InputMessageEntityMentionName { offset, length: swap.new_len, user_id: user.into() }.into());
+    }
+    out
+}
+
 /// The same entity at a new UTF-16 offset. Kinds a send does not produce stay as they are
 /// when nothing moved, and are dropped when it did.
 fn retarget(entity: &MessageEntity, offset: i32, length: i32) -> Option<MessageEntity> {
@@ -368,6 +507,7 @@ fn retarget(entity: &MessageEntity, offset: i32, length: i32) -> Option<MessageE
         E::Spoiler(_) => tl::types::MessageEntitySpoiler { offset, length }.into(),
         E::TextUrl(link) => tl::types::MessageEntityTextUrl { offset, length, url: link.url.clone() }.into(),
         E::MentionName(named) => tl::types::MessageEntityMentionName { offset, length, user_id: named.user_id }.into(),
+        E::InputMessageEntityMentionName(named) => tl::types::InputMessageEntityMentionName { offset, length, user_id: named.user_id.clone() }.into(),
         E::CustomEmoji(emoji) => tl::types::MessageEntityCustomEmoji { offset, length, document_id: emoji.document_id }.into(),
         _ => return None,
     })
@@ -404,6 +544,13 @@ pub fn entity_note(entities: &[MessageEntity]) -> String {
             MessageEntity::Spoiler(_) => note.push_str(&format!(" spoiler:{offset}+{length}")),
             MessageEntity::TextUrl(link) => note.push_str(&format!(" link:{offset}+{length}:{}", link.url)),
             MessageEntity::CustomEmoji(emoji) => note.push_str(&format!(" emoji:{offset}+{length}:{}", emoji.document_id)),
+            MessageEntity::InputMessageEntityMentionName(named) => {
+                let id = match &named.user_id {
+                    tl::enums::InputUser::User(user) => user.user_id,
+                    _ => 0,
+                };
+                note.push_str(&format!(" mention:{offset}+{length}:{id}"));
+            }
             _ => {}
         }
     }
@@ -3401,5 +3548,46 @@ mod tests {
     #[test]
     fn a_checklist_lists_its_items_and_marks_the_one_that_is_done() {
         prove_checklist().unwrap();
+    }
+
+    #[test]
+    fn a_later_name_is_mentioned_when_an_earlier_at_sign_is_not_one() {
+        let nameless = MentionTarget {
+            name: "Ada Stone".into(),
+            first: "Ada".into(),
+            handle: String::new(),
+            user_id: 7_003,
+            access_hash: 7,
+        };
+        let named = MentionTarget {
+            name: "Bea Moss".into(),
+            first: "Bea".into(),
+            handle: "bea_m".into(),
+            user_id: 7_002,
+            access_hash: 8,
+        };
+        // "hi" sits after both names. The address is not a mention, so it must not hide the later one.
+        let text = "ping mail@Ada Stone see @Ada Stone and @Bea Moss hi";
+        let (plain, entities) = apply_mentions(text, vec![bold(49, 2)], &[nameless, named]);
+        assert_eq!(plain, "ping mail@Ada Stone see Ada and @bea_m hi");
+        let mention = entities.iter().find_map(|entity| match entity {
+            MessageEntity::InputMessageEntityMentionName(named) => Some(named),
+            _ => None,
+        });
+        let mention = mention.expect("the person with no username is named");
+        assert_eq!((mention.offset, mention.length), (24, 3));
+        assert!(matches!(&mention.user_id, tl::enums::InputUser::User(user) if user.user_id == 7_003 && user.access_hash == 7));
+        assert_eq!(entities.iter().filter(|entity| matches!(entity, MessageEntity::InputMessageEntityMentionName(_))).count(), 1);
+        let bold = entities.iter().find_map(|entity| match entity {
+            MessageEntity::Bold(bold) => Some((bold.offset, bold.length)),
+            _ => None,
+        });
+        // "@Ada Stone" (10) became "Ada" (3) and "@Bea Moss" (9) became "@bea_m" (6): "hi" moves left by 10.
+        assert_eq!(bold, Some((39, 2)));
+        let shown = spans(&plain, &entities);
+        assert!(shown.iter().any(|span| {
+            matches!(&span.style, Style::Mention { kind: MentionKind::User, id } if id == "u7003")
+                && &plain[span.start as usize..span.end as usize] == "Ada"
+        }));
     }
 }

@@ -2819,3 +2819,39 @@ fn a_private_delete_after_reconnect_removes_the_message() {
     world.steer("delete");
     world.within(Duration::from_secs(5), "the delete after a reconnect", || world.message("u7002", "13").is_none().then_some(()));
 }
+
+#[test]
+fn mentioning_someone_with_no_username_names_them_on_the_send() {
+    let world = World::signed_in();
+    world.connected();
+    world.send("u7002", "5341", "see @Tobin Reyes", None);
+    let sent = world.until("the name mention to be sent", || {
+        world.messages("u7002").into_iter().find(|message| message.text == "see Tobin" && message.state == SendState::Sent)
+    });
+    assert!(
+        ranges(&sent).iter().any(|(text, style)| *text == "Tobin" && matches!(style, Style::Mention { kind: MentionKind::User, id } if id == "u7003")),
+        "{:?}",
+        ranges(&sent)
+    );
+    assert!(
+        world.calls().iter().any(|call| call.contains("SendMessage u7002 see Tobin") && call.contains("mention:4+5:7003")),
+        "{:#?}",
+        world.calls()
+    );
+
+    world.send("u7002", "5342", "see @Tobin Reyes and @Odalys Brandt", None);
+    let both = world.until("the username to stay a handle", || {
+        world.messages("u7002").into_iter().find(|message| message.text == "see Tobin and @odalys" && message.state == SendState::Sent)
+    });
+    assert_eq!(both.text, "see Tobin and @odalys");
+    let shown = ranges(&both);
+    let mentions = shown.iter().filter(|(_, style)| matches!(style, Style::Mention { .. })).count();
+    assert_eq!(mentions, 1, "{shown:?}");
+    assert!(
+        world.calls().iter().any(|call| {
+            call.contains("SendMessage u7002 see Tobin and @odalys") && call.contains("mention:4+5:7003") && call.matches("mention:").count() == 1
+        }),
+        "{:#?}",
+        world.calls()
+    );
+}
