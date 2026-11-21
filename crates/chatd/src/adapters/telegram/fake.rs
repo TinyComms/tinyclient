@@ -571,6 +571,9 @@ struct World {
     me_birthday: Option<tl::enums::Birthday>,
     me_emoji_status: Option<i64>,
     me_photo_id: Option<i64>,
+    /// Groups and channels created during this test (`messages.createChat` / `channels.createChannel`).
+    created_chats: Vec<tl::enums::Chat>,
+    next_chat_id: i64,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -647,6 +650,8 @@ impl World {
             me_birthday: None,
             me_emoji_status: None,
             me_photo_id: Some(5_001),
+            created_chats: Vec::new(),
+            next_chat_id: 9_100,
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -2316,6 +2321,7 @@ impl World {
             }
             let chats = chats().into_iter()
                 .chain([discussion_group(self.discussion_left).into(), off_page_group().into()])
+                .chain(self.created_chats.iter().cloned())
                 .filter(|chat| ids.contains(&chat.id())).collect();
             return answer(tl::enums::messages::Chats::Chats(tl::types::messages::Chats { chats }));
         }
@@ -2838,6 +2844,176 @@ impl World {
                 })
                 .collect();
             return answer(ids);
+        }
+        if let Some(request) = asked::<f::messages::CreateChat>(body) {
+            self.next_chat_id += 1;
+            let chat_id = self.next_chat_id;
+            let user_ids: Vec<i64> = request
+                .users
+                .iter()
+                .filter_map(|u| match u {
+                    tl::enums::InputUser::User(u) => Some(u.user_id),
+                    _ => None,
+                })
+                .collect();
+            self.log(&format!("CreateChat {} users={:?}", request.title, user_ids));
+            let chat = tl::types::Chat {
+                creator: true,
+                left: false,
+                deactivated: false,
+                call_active: false,
+                call_not_empty: false,
+                noforwards: false,
+                id: chat_id,
+                title: request.title.clone(),
+                photo: tl::enums::ChatPhoto::Empty,
+                participants_count: 1 + user_ids.len() as i32,
+                date: crate::hub::now() as i32,
+                version: 1,
+                migrated_to: None,
+                admin_rights: None,
+                default_banned_rights: None,
+            };
+            let chat_enum: tl::enums::Chat = chat.into();
+            self.created_chats.push(chat_enum.clone());
+            self.next += 1;
+            let sys = tl::types::MessageService {
+                out: true,
+                mentioned: false,
+                media_unread: false,
+                reactions_are_possible: false,
+                silent: false,
+                post: false,
+                legacy: false,
+                id: self.next,
+                from_id: Some(Who::User(ME).peer()),
+                peer_id: Who::Group(chat_id).peer(),
+                saved_peer_id: None,
+                reply_to: None,
+                date: crate::hub::now() as i32,
+                action: tl::types::MessageActionChatCreate { title: request.title, users: user_ids.clone() }.into(),
+                reactions: None,
+                ttl_period: None,
+            };
+            let upd = tl::types::Updates {
+                updates: vec![tl::types::UpdateNewMessage { message: sys.into(), pts: 0, pts_count: 0 }.into()],
+                users: users(),
+                chats: vec![chat_enum],
+                date: crate::hub::now() as i32,
+                seq: 0,
+            };
+            let missing: Vec<tl::enums::MissingInvitee> = user_ids
+                .iter()
+                .filter(|&&id| id == SCAM)
+                .map(|&user_id| {
+                    tl::types::MissingInvitee {
+                        premium_would_allow_invite: false,
+                        premium_required_for_pm: false,
+                        user_id,
+                    }
+                    .into()
+                })
+                .collect();
+            let result = tl::types::messages::InvitedUsers {
+                updates: tl::enums::Updates::Updates(upd),
+                missing_invitees: missing,
+            };
+            return answer(tl::enums::messages::InvitedUsers::Users(result));
+        }
+        if let Some(request) = asked::<f::channels::CreateChannel>(body) {
+            self.next_chat_id += 1;
+            let chan_id = self.next_chat_id;
+            self.log(&format!(
+                "CreateChannel {} broadcast={} megagroup={} about={}",
+                request.title, request.broadcast, request.megagroup, request.about
+            ));
+            let mut ch = a_channel(chan_id, &request.title, request.broadcast, request.forum, "");
+            ch.creator = true;
+            ch.megagroup = request.megagroup;
+            let chat_enum: tl::enums::Chat = tl::enums::Chat::Channel(ch);
+            self.created_chats.push(chat_enum.clone());
+            let upd = tl::types::Updates {
+                updates: Vec::new(),
+                users: users(),
+                chats: vec![chat_enum],
+                date: crate::hub::now() as i32,
+                seq: 0,
+            };
+            return answer(tl::enums::Updates::Updates(upd));
+        }
+        if let Some(request) = asked::<f::channels::CheckUsername>(body) {
+            self.log(&format!("ChannelCheckUsername {}", request.username));
+            let ok = !matches!(request.username.to_ascii_lowercase().as_str(), "taken_chan" | "fieldnotes");
+            return answer(ok);
+        }
+        if let Some(request) = asked::<f::channels::UpdateUsername>(body) {
+            let chan_id = match request.channel {
+                tl::enums::InputChannel::Channel(c) => c.channel_id,
+                _ => 0,
+            };
+            self.log(&format!("ChannelUpdateUsername c{chan_id} {}", request.username));
+            for chat in &mut self.created_chats {
+                if let tl::enums::Chat::Channel(c) = chat {
+                    if c.id == chan_id {
+                        c.username = (!request.username.is_empty()).then(|| request.username.clone());
+                    }
+                }
+            }
+            return answer(true);
+        }
+        if let Some(request) = asked::<f::messages::AddChatUser>(body) {
+            let uid = match request.user_id {
+                tl::enums::InputUser::User(u) => u.user_id,
+                _ => 0,
+            };
+            self.log(&format!("AddChatUser g{} u{uid}", request.chat_id));
+            let missing = if uid == SCAM {
+                vec![tl::types::MissingInvitee {
+                    premium_would_allow_invite: false,
+                    premium_required_for_pm: false,
+                    user_id: uid,
+                }
+                .into()]
+            } else {
+                Vec::new()
+            };
+            let result = tl::types::messages::InvitedUsers {
+                updates: updates(Vec::new()),
+                missing_invitees: missing,
+            };
+            return answer(tl::enums::messages::InvitedUsers::Users(result));
+        }
+        if let Some(request) = asked::<f::channels::InviteToChannel>(body) {
+            let chan_id = match request.channel {
+                tl::enums::InputChannel::Channel(c) => c.channel_id,
+                _ => 0,
+            };
+            let uids: Vec<i64> = request
+                .users
+                .iter()
+                .filter_map(|u| match u {
+                    tl::enums::InputUser::User(u) => Some(u.user_id),
+                    _ => None,
+                })
+                .collect();
+            self.log(&format!("InviteToChannel c{chan_id} {uids:?}"));
+            let missing: Vec<tl::enums::MissingInvitee> = uids
+                .iter()
+                .filter(|&&id| id == SCAM)
+                .map(|&user_id| {
+                    tl::types::MissingInvitee {
+                        premium_would_allow_invite: false,
+                        premium_required_for_pm: false,
+                        user_id,
+                    }
+                    .into()
+                })
+                .collect();
+            let result = tl::types::messages::InvitedUsers {
+                updates: updates(Vec::new()),
+                missing_invitees: missing,
+            };
+            return answer(tl::enums::messages::InvitedUsers::Users(result));
         }
         if let Some(request) = asked::<f::messages::GetCommonChats>(body) {
             let id = match &request.user_id {

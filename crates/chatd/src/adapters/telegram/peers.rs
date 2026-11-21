@@ -240,11 +240,16 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 &chat.default_banned_rights,
                 Some(tl::enums::ChatBannedRights::Rights(r)) if r.pin_messages
             );
+            let invite_banned = matches!(
+                &chat.default_banned_rights,
+                Some(tl::enums::ChatBannedRights::Rights(r)) if r.invite_users
+            );
             let active = !chat.left && !chat.deactivated;
             let rights = protocol::ConversationRights {
                 pin: active && (chat.creator || admin.is_some_and(|r| r.pin_messages) || !pin_banned),
                 delete_others: active && (chat.creator || admin.is_some_and(|r| r.delete_messages)),
                 manage_members: active && (chat.creator || admin.is_some_and(|r| r.ban_users || r.invite_users)),
+                add_members: active && (chat.creator || admin.is_some_and(|r| r.invite_users) || !invite_banned),
                 ..protocol::ConversationRights::default()
             };
             let known = Known {
@@ -284,6 +289,13 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 &channel.banned_rights,
                 Some(tl::enums::ChatBannedRights::Rights(r)) if r.pin_messages
             );
+            let invite_banned = matches!(
+                &channel.default_banned_rights,
+                Some(tl::enums::ChatBannedRights::Rights(r)) if r.invite_users
+            ) || matches!(
+                &channel.banned_rights,
+                Some(tl::enums::ChatBannedRights::Rights(r)) if r.invite_users
+            );
             let active = !channel.left;
             let rights = protocol::ConversationRights {
                 pin: active
@@ -294,6 +306,12 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                     },
                 delete_others: active && (channel.creator || admin.is_some_and(|r| r.delete_messages)),
                 manage_members: active && (channel.creator || admin.is_some_and(|r| r.ban_users || r.invite_users)),
+                add_members: active
+                    && if channel.broadcast {
+                        channel.creator || admin.is_some_and(|r| r.invite_users)
+                    } else {
+                        channel.creator || admin.is_some_and(|r| r.invite_users) || !invite_banned
+                    },
                 ..protocol::ConversationRights::default()
             };
             let known = Known {

@@ -867,7 +867,7 @@ impl Demo {
                 })();
                 let _ = reply.send(outcome);
             }
-            Command::CreateChannel { space_id, name, kind, private, group, reply } => {
+            Command::CreateChannel { space_id, name, kind, private, group, reply, .. } => {
                 let outcome = (|| -> Result<String, Refusal> {
                     let id = format!("chan-{}", demo.made.fetch_add(1, Ordering::Relaxed) + 1);
                     let row = ConversationRow {

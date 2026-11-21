@@ -1514,6 +1514,10 @@ pub enum Request {
         private: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
     },
     /// Starts a new group conversation with two or more members (by person id or phone number)
     /// and an optional group name. Answers `Response::Conversation`.

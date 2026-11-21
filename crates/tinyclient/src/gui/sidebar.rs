@@ -82,6 +82,8 @@ pub struct CreateChannelModal {
     pub space: Key,
     pub group: Option<String>,
     pub name: gpui::Entity<crate::gui::input::TextInput>,
+    pub description: gpui::Entity<crate::gui::input::TextInput>,
+    pub username: gpui::Entity<crate::gui::input::TextInput>,
     pub kind: ConversationKind,
     pub private: bool,
 }
@@ -2391,11 +2393,16 @@ impl Shell {
     }
 
     pub(super) fn open_create_channel(&mut self, space: Key, group: Option<String>, cx: &mut Context<Self>) {
-        let name = cx.new(|cx| crate::gui::input::TextInput::new("channel-name", cx));
+        let placeholder = if space.network == Network::Telegram { "Channel name" } else { "channel-name" };
+        let name = cx.new(|cx| crate::gui::input::TextInput::new(placeholder, cx));
+        let description = cx.new(|cx| crate::gui::input::TextInput::new("Description (optional)", cx));
+        let username = cx.new(|cx| crate::gui::input::TextInput::new("@public_link (optional)", cx));
         self.sidebar_state.create_channel = Some(CreateChannelModal {
             space,
             group,
             name,
+            description,
+            username,
             kind: ConversationKind::Channel,
             private: false,
         });
@@ -2411,6 +2418,16 @@ impl Shell {
             self.sidebar_state.create_channel = Some(modal);
             return;
         }
+        let description = {
+            let d = modal.description.read(cx).text().trim().to_owned();
+            (!d.is_empty()).then_some(d)
+        };
+        let username = if modal.private {
+            None
+        } else {
+            let u = modal.username.read(cx).text().trim().to_owned();
+            (!u.is_empty()).then_some(u)
+        };
         cx.notify();
         let req = Request::CreateChannel {
             space: modal.space,
@@ -2418,6 +2435,8 @@ impl Shell {
             kind: modal.kind,
             private: modal.private,
             group: modal.group,
+            description,
+            username,
         };
         cx.spawn(async move |shell, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
@@ -2436,7 +2455,19 @@ impl Shell {
         let modal = self.sidebar_state.create_channel.as_ref()?;
         let ready = !modal.name.read(cx).text().trim().is_empty();
         let is_voice = modal.kind == ConversationKind::Voice;
+        let is_telegram = modal.space.network == Network::Telegram;
         let is_private = modal.private;
+        let field_wrap = |input: Entity<crate::gui::input::TextInput>| {
+            div()
+                .px(px(8.))
+                .py(px(6.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::canvas())
+                .border_1()
+                .border_color(theme::border())
+                .type_ui()
+                .child(input)
+        };
         let card = div()
             .id("create-channel-card")
             .w(px(360.))
@@ -2450,24 +2481,16 @@ impl Shell {
             .flex_col()
             .gap(px(10.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(div().type_title().text_color(theme::text()).child("Create channel"))
-            .child(
-                div()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(theme::canvas())
-                    .border_1()
-                    .border_color(theme::border())
-                    .type_ui()
-                    .child(modal.name.clone()),
-            )
+            .child(div().type_title().text_color(theme::text()).child(if is_telegram { "New channel" } else { "Create channel" }))
+            .child(field_wrap(modal.name.clone()))
+            .when(is_telegram, |card| card.child(field_wrap(modal.description.clone())))
+            .when(is_telegram && !is_private, |card| card.child(field_wrap(modal.username.clone())))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .when(modal.space.network != Network::Slack, |row| {
+                    .when(modal.space.network != Network::Slack && !is_telegram, |row| {
                         row.child(
                             div()
                                 .id("create-chan-kind")

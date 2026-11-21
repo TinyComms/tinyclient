@@ -725,7 +725,12 @@ fn offline(ctx: &Context, command: Command) {
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::SaveGif { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
-        Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
+        Command::StartDirect { reply, .. }
+        | Command::StartGroup { reply, .. }
+        | Command::CreateGroup { reply, .. }
+        | Command::CreateChannel { reply, .. }
+        | Command::MembersAdd { reply, .. }
+        | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
         Command::SetProfile { reply, .. } | Command::SetAvatar { reply, .. } | Command::SetPresence { reply, .. } => {
             drop(reply.send(Err(down())))
         }
@@ -814,6 +819,21 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Members { conversation_id, offset, limit, reply } => {
             let _ = reply.send(members::list(account, &conversation_id, offset, limit).map_err(refused));
+        }
+        Command::MembersAdd { conversation_id, people, reply } => {
+            let _ = reply.send(members::add_members(account, &conversation_id, &people).map_err(refused));
+        }
+        Command::StartGroup { people, title, reply } => {
+            let _ = reply.send(members::start_group(account, &people, title.as_deref()).map_err(refused));
+        }
+        Command::CreateGroup { members: people, name, reply } => {
+            let _ = reply.send(members::start_group(account, &people, name.as_deref()).map_err(refused));
+        }
+        Command::CreateChannel { name, kind, private, description, username, reply, .. } => {
+            let _ = reply.send(
+                members::create_channel(account, &name, kind, private, description.as_deref(), username.as_deref())
+                    .map_err(refused),
+            );
         }
         Command::StartDirect { person_id, reply } => {
             // Nothing reaches the other person: the chat exists on Telegram once a message does.

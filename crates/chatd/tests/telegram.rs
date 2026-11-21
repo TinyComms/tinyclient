@@ -4058,3 +4058,100 @@ fn edit_own_profile_name_bio_username_avatar_birthday_and_emoji_status() {
     assert_eq!(world.called("UpdateEmojiStatus clear"), 1);
     assert_eq!(world.called("UpdateStatus"), 0, "never send account.updateStatus offline from status edits");
 }
+
+#[test]
+fn create_group_channel_and_add_members_with_missing_invitees() {
+    let world = World::signed_in();
+    world.connected();
+
+    let account = key("u7001").account();
+
+    // 1. Create a basic group with two people via StartGroup.
+    let Response::Conversation { conversation: group } = world.ask(Request::StartGroup {
+        account: account.clone(),
+        people: vec![key("u7002"), key("u7003")],
+        title: Some("Summit Team".into()),
+    }) else {
+        panic!("expected Conversation from StartGroup");
+    };
+    assert_eq!(group.title, "Summit Team");
+    assert_eq!(group.kind, ConversationKind::Group);
+    assert!(group.rights.add_members);
+    assert_eq!(world.called("CreateChat Summit Team users=[7002, 7003]"), 1);
+    let group_msgs = world.messages(&group.key.id);
+    assert!(
+        group_msgs.iter().any(|m| m.kind == MessageKind::System),
+        "expected creation system message in new group: {group_msgs:?}"
+    );
+
+    // 2. Create a public broadcast channel with description and public @username.
+    let Response::Conversation { conversation: pub_chan } = world.ask(Request::CreateChannel {
+        space: Key::new(&account, ""),
+        name: "Trail Bulletins".into(),
+        kind: ConversationKind::Channel,
+        private: false,
+        group: None,
+        description: Some("Weekly snowpack updates".into()),
+        username: Some("@trail_bulletins".into()),
+    }) else {
+        panic!("expected Conversation from public CreateChannel");
+    };
+    assert_eq!(pub_chan.title, "Trail Bulletins");
+    assert_eq!(pub_chan.kind, ConversationKind::Channel);
+    assert!(pub_chan.rights.add_members);
+    assert_eq!(world.called("CreateChannel Trail Bulletins broadcast=true megagroup=false about=Weekly snowpack updates"), 1);
+    assert_eq!(world.called("ChannelCheckUsername trail_bulletins"), 1);
+    assert!(
+        world.calls().iter().any(|c| c.starts_with("ChannelUpdateUsername") && c.ends_with(" trail_bulletins")),
+        "{:#?}",
+        world.calls()
+    );
+
+    // 3. Create a private channel (must not claim a public username).
+    let Response::Conversation { conversation: priv_chan } = world.ask(Request::CreateChannel {
+        space: Key::new(&account, ""),
+        name: "Private Log".into(),
+        kind: ConversationKind::Channel,
+        private: true,
+        group: None,
+        description: None,
+        username: Some("should_be_ignored".into()),
+    }) else {
+        panic!("expected Conversation from private CreateChannel");
+    };
+    assert_eq!(priv_chan.title, "Private Log");
+    assert_eq!(world.called("ChannelCheckUsername should_be_ignored"), 0);
+
+    // 4. Add a member to a basic group and to the new channel.
+    assert_eq!(
+        world.ask(Request::MembersAdd {
+            conversation: key("g8001"),
+            people: vec!["u7002".into()],
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("AddChatUser g8001 u7002"), 1);
+
+    assert_eq!(
+        world.ask(Request::MembersAdd {
+            conversation: pub_chan.key.clone(),
+            people: vec!["u7002".into()],
+        }),
+        Response::Ok
+    );
+    assert!(
+        world.calls().iter().any(|c| c.starts_with("InviteToChannel ") && c.contains("[7002]")),
+        "{:#?}",
+        world.calls()
+    );
+
+    // 5. Missing invitees (privacy-restricted person u7005) produce a clear refusal suggesting an invite link.
+    let privacy = world.ask(Request::MembersAdd {
+        conversation: pub_chan.key.clone(),
+        people: vec!["u7005".into()],
+    });
+    assert!(
+        matches!(privacy, Response::Error { code: ErrorCode::Refused, ref detail } if detail.contains("invite link")),
+        "expected privacy refusal naming invite link, got {privacy:?}"
+    );
+}

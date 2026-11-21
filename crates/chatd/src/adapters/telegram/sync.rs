@@ -410,6 +410,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         archive: true,
         folders_edit: true,
         disappearing: true,
+        groups: 200,
         effects: false,
         view_once: false,
         blocks: true,

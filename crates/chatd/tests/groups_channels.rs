@@ -135,6 +135,8 @@ fn start_group_and_send_message_and_create_channel() {
         kind: ConversationKind::Channel,
         private: true,
         group: None,
+        description: None,
+        username: None,
     }) else {
         panic!("expected Conversation from CreateChannel");
     };

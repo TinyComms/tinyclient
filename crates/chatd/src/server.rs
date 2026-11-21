@@ -3223,7 +3223,7 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
-            Request::CreateChannel { space, name, kind, private, group } => {
+            Request::CreateChannel { space, name, kind, private, group, description, username } => {
                 let account = space.account();
                 if let Err(refused) = self.online(&account) {
                     return *refused;
@@ -3233,8 +3233,22 @@ impl Chat {
                 if name.is_empty() {
                     return error(ErrorCode::Refused, "Channel name cannot be empty.");
                 }
+                let description = description.map(|mut d| {
+                    protocol::clip(&mut d, 255);
+                    d.trim().to_owned()
+                }).filter(|d| !d.is_empty());
+                let username = username.map(|u| u.trim().to_owned()).filter(|u| !u.is_empty());
                 let space_id = space.id.clone();
-                let id = match self.ask(&account, |reply| Command::CreateChannel { space_id, name, kind, private, group, reply }) {
+                let id = match self.ask(&account, |reply| Command::CreateChannel {
+                    space_id,
+                    name,
+                    kind,
+                    private,
+                    group,
+                    description,
+                    username,
+                    reply,
+                }) {
                     Ok(id) => id,
                     Err(refused) => return *refused,
                 };

@@ -447,6 +447,8 @@ pub enum Command {
         kind: protocol::ConversationKind,
         private: bool,
         group: Option<String>,
+        description: Option<String>,
+        username: Option<String>,
         reply: Reply<String>,
     },
     /// Create a group conversation with two or more members (person ids or phone numbers) and an optional name.
