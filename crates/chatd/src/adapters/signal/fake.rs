@@ -50,8 +50,8 @@ use super::wire::{
     call_link_room_id, format_call_link, format_group_invite_link, gift_badge_label, parse_call_link,
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
     CallOutcome, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
-    GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, MessageRequestAction, OwnCard, Peer, Quote,
-    StorageSnapshot, Text, Wire,
+    GroupMember, GroupMembers, IdentityState, InviteLinkMode, Linked, Linker, MessageRequestAction, OwnCard, Peer, Quote,
+    SafetyNumber, StorageSnapshot, Text, Wire,
 };
 use super::Saved;
 use crate::adapters::script;
@@ -138,6 +138,27 @@ impl FakeGroup {
     }
 }
 
+#[derive(Clone)]
+struct FakeIdentity {
+    key: [u8; 33],
+    state: IdentityState,
+    changed: bool,
+}
+
+fn fake_key(seed: u8) -> [u8; 33] {
+    let mut key = [seed; 33];
+    key[0] = 0x05;
+    key
+}
+
+fn initial_identities() -> HashMap<String, FakeIdentity> {
+    let mut map = HashMap::new();
+    map.insert(GRACE.to_owned(), FakeIdentity { key: fake_key(0x22), state: IdentityState::Default, changed: false });
+    map.insert(ALAN.to_owned(), FakeIdentity { key: fake_key(0x33), state: IdentityState::Default, changed: false });
+    map.insert(STRANGER.to_owned(), FakeIdentity { key: fake_key(0x44), state: IdentityState::Default, changed: false });
+    map
+}
+
 pub struct Fake {
     events: Sender<Event>,
     heard: Mutex<Option<Receiver<Event>>>,
@@ -156,6 +177,8 @@ pub struct Fake {
     club: Arc<Mutex<FakeGroup>>,
     /// Fake call links created or synced in tests.
     call_links: Arc<Mutex<HashMap<[u8; 32], CallLink>>>,
+    /// Per-contact identity keys and verification states for safety numbers.
+    identities: Arc<Mutex<HashMap<String, FakeIdentity>>>,
 }
 
 impl Fake {
@@ -196,6 +219,7 @@ impl Fake {
             lookups: Arc::default(),
             club: Arc::new(Mutex::new(club_state)),
             call_links: Arc::default(),
+            identities: Arc::new(Mutex::new(initial_identities())),
         };
         fake.listen();
         fake
@@ -203,7 +227,7 @@ impl Fake {
 
     /// Reads the test's lines for as long as this wire lives; closing the wire ends it.
     fn listen(&self) {
-        let (events, closed, refuse, fail_one, control, lookups, club) = (
+        let (events, closed, refuse, fail_one, control, lookups, club, identities) = (
             self.events.clone(),
             self.closed.clone(),
             self.refuse.clone(),
@@ -211,6 +235,7 @@ impl Fake {
             self.control.clone(),
             self.lookups.clone(),
             self.club.clone(),
+            self.identities.clone(),
         );
         let _ = std::thread::Builder::new().name("signal-fake".into()).spawn(move || {
             script::follow(&control, |line| {
@@ -308,7 +333,7 @@ impl Fake {
                     let _ = events.send(Event::Groups(vec![g.info.clone()]));
                     return true;
                 }
-                for event in steer(line) {
+                for event in steer(line, &identities) {
                     let _ = events.send(event);
                 }
                 true
@@ -318,7 +343,7 @@ impl Fake {
 }
 
 /// One line from the test: what Signal then says unasked.
-fn steer(line: &str) -> Vec<Event> {
+fn steer(line: &str, identities: &Mutex<HashMap<String, FakeIdentity>>) -> Vec<Event> {
     let mut words = line.split_whitespace();
     let command = words.next().unwrap_or("");
     let mut next = || words.next().unwrap_or("");
@@ -784,6 +809,57 @@ fn steer(line: &str) -> Vec<Event> {
             };
             vec![Event::Groups(vec![club])]
         }
+        "identity-change" => {
+            let target = next();
+            let aci = if let Some((id, _)) = who(target) {
+                id.to_owned()
+            } else if target == "stranger" {
+                STRANGER.to_owned()
+            } else if super::wire::is_aci(target) {
+                target.to_owned()
+            } else {
+                return Vec::new();
+            };
+            {
+                let mut map = identities.lock().unwrap_or_else(|p| p.into_inner());
+                let entry = map
+                    .entry(aci.clone())
+                    .or_insert_with(|| FakeIdentity { key: fake_key(0x55), state: IdentityState::Default, changed: false });
+                entry.key[32] = entry.key[32].wrapping_add(1);
+                if entry.state == IdentityState::Verified {
+                    entry.state = IdentityState::Unverified;
+                    entry.changed = true;
+                }
+            }
+            vec![Event::IdentityChanged { peer: Peer::Direct(aci) }]
+        }
+        "verified" => {
+            let target = next();
+            let aci = if let Some((id, _)) = who(target) {
+                id.to_owned()
+            } else if target == "stranger" {
+                STRANGER.to_owned()
+            } else if super::wire::is_aci(target) {
+                target.to_owned()
+            } else {
+                return Vec::new();
+            };
+            let state = match next() {
+                "verified" => IdentityState::Verified,
+                "unverified" => IdentityState::Unverified,
+                "default" => IdentityState::Default,
+                _ => return Vec::new(),
+            };
+            {
+                let mut map = identities.lock().unwrap_or_else(|p| p.into_inner());
+                let entry = map
+                    .entry(aci.clone())
+                    .or_insert_with(|| FakeIdentity { key: fake_key(0x55), state: IdentityState::Default, changed: false });
+                entry.state = state;
+                entry.changed = false;
+            }
+            vec![Event::VerifiedChanged { aci, state }]
+        }
         "drop" => vec![Event::Closed("the fake dropped the connection".into())],
         "unlinked" => vec![Event::Ended("This computer was removed from your Signal account.".into())],
         _ => Vec::new(),
@@ -849,6 +925,19 @@ impl Wire for Fake {
             Body::Contact { contact, timer } => format!("send {} contact {}{}", describe(to), contact.name, exp(*timer)),
         };
         record(&line);
+        if let Peer::Direct(aci) = to {
+            let blocked = self
+                .identities
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(aci)
+                .is_some_and(|id| id.changed);
+            if blocked {
+                return Err(Fault::Refused(
+                    "Your safety number with this contact has changed. Review and approve their safety number before sending.".to_owned(),
+                ));
+            }
+        }
         if let Some(words) = self.refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             return Err(Fault::Refused(words));
         }
@@ -1348,6 +1437,47 @@ impl Wire for Fake {
             name: stored.as_ref().map(|l| l.name.clone()).unwrap_or_default(),
             waiting_for_approval: stored.as_ref().is_some_and(|l| l.approve_all),
         })
+    }
+
+    fn safety_number(&self, aci: &str) -> Result<Option<SafetyNumber>, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let map = self.identities.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = map.get(aci) else {
+            return Ok(None);
+        };
+        let me_key = fake_key(0x11);
+        let Some(digits) = super::wire::safety_number_for_acis(ME, &me_key, aci, &entry.key) else {
+            return Ok(None);
+        };
+        Ok(Some(SafetyNumber {
+            digits,
+            state: entry.state,
+            changed: entry.changed,
+        }))
+    }
+
+    fn set_verified(&self, aci: &str, state: IdentityState) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        {
+            let mut map = self.identities.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = map
+                .entry(aci.to_owned())
+                .or_insert_with(|| FakeIdentity { key: fake_key(0x55), state: IdentityState::Default, changed: false });
+            entry.state = state;
+            entry.changed = false;
+        }
+        let label = match state {
+            IdentityState::Default => "default",
+            IdentityState::Verified => "verified",
+            IdentityState::Unverified => "unverified",
+        };
+        record(&format!("verify {aci} {label}"));
+        let _ = self.events.send(Event::VerifiedChanged { aci: aci.to_owned(), state });
+        Ok(())
     }
 
     fn close(&self) {

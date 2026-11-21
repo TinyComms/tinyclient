@@ -2246,3 +2246,100 @@ fn storage_service_manifest_seeds_contacts_groups_pins_archive_and_mutes_on_firs
         (g.title == "G. Ombra" && g.pin.is_none() && c.pin == Some(0)).then_some(())
     });
 }
+
+#[test]
+fn safety_number_change_writes_system_rows_and_blocks_verified_send_until_approved() {
+    let world = World::linked();
+    world.connected();
+
+    // Mark Grace verified via the Handoff verify command; returns formatted 60-digit safety number
+    // (12 groups of 5 digits) and applies Mark::Verified to Grace's person row.
+    let before_digits = match world.ask(Request::Handoff {
+        conversation: key(&chatd::adapters::signal::safety_verify_command(GRACE)),
+    }) {
+        Response::Link { url } => url,
+        other => panic!("expected formatted safety number, got {other:?}"),
+    };
+    let groups: Vec<&str> = before_digits.split(' ').collect();
+    assert_eq!(groups.len(), 12, "expected 12 groups of 5 digits, got {before_digits:?}");
+    assert!(groups.iter().all(|g| g.len() == 5 && g.bytes().all(|b| b.is_ascii_digit())));
+
+    world.until("Grace gets Verified mark", || {
+        let Response::People { people, .. } = world.ask(Request::People {
+            network: Some(Network::Signal),
+            relation: None,
+            query: Some("Grace".into()),
+            offset: 0,
+            limit: 10,
+        }) else {
+            return None;
+        };
+        let grace = people.iter().find(|p| p.key.id == GRACE)?;
+        (grace.mark == Some(protocol::Mark::Verified)).then_some(())
+    });
+
+    // Simulate Grace's identity key changing: system row appears in DM and shared group,
+    // Verified mark is removed, and sending to Grace is refused until approved.
+    world.steer("identity-change grace");
+    world.until("safety number change system line appears in DM and group", || {
+        let dm = world.messages(GRACE);
+        let grp = world.messages(CLUB);
+        let dm_has = dm.iter().any(|m| {
+            m.kind == MessageKind::System && m.text == "Your safety number with Grace Ombra has changed"
+        });
+        let grp_has = grp.iter().any(|m| {
+            m.kind == MessageKind::System && m.text == "Your safety number with Grace Ombra has changed"
+        });
+        (dm_has && grp_has).then_some(())
+    });
+    world.until("Grace Verified mark cleared after key change", || {
+        let Response::People { people, .. } = world.ask(Request::People {
+            network: Some(Network::Signal),
+            relation: None,
+            query: Some("Grace".into()),
+            offset: 0,
+            limit: 10,
+        }) else {
+            return None;
+        };
+        let grace = people.iter().find(|p| p.key.id == GRACE)?;
+        grace.mark.is_none().then_some(())
+    });
+
+    // Sending to Grace while changed & unapproved must be refused.
+    world.send(GRACE, "blocked-id-1", "secret before approval", None);
+    let failed = world.until("send refused while identity change unapproved", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("blocked-id-1") && matches!(m.state, SendState::Failed { .. }))
+    });
+    let SendState::Failed { reason } = failed.state else {
+        unreachable!();
+    };
+    assert!(
+        reason.to_lowercase().contains("safety number"),
+        "expected safety number refusal, got: {reason}"
+    );
+
+    // Approve the new safety number: returns new 60-digit safety number (different from before),
+    // clears the send block, and allows sending again.
+    let after_digits = match world.ask(Request::Handoff {
+        conversation: key(&chatd::adapters::signal::safety_approve_command(GRACE)),
+    }) {
+        Response::Link { url } => url,
+        other => panic!("expected approved safety number, got {other:?}"),
+    };
+    assert_ne!(before_digits, after_digits, "rotated key must produce a different safety number");
+
+    world.send(GRACE, "allowed-id-2", "after approval", None);
+    world.until("send succeeds after approval", || {
+        world
+            .messages(GRACE)
+            .iter()
+            .any(|m| m.text == "after approval" && m.id != "allowed-id-2" && matches!(m.state, SendState::Sent))
+            .then_some(())
+    });
+    assert!(world.calls().contains(&format!("verify {GRACE} verified")));
+    assert!(world.calls().contains(&format!("verify {GRACE} default")));
+}

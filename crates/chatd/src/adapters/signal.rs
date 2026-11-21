@@ -44,10 +44,10 @@ mod wire;
 use super::{keep_connected, serve_commands, About, CatalogPage, Command, Context, ConversationAbout, Failure, Members, Refusal, Signed};
 use crate::blobs::upload::{self, Upload};
 use crate::session;
-use crate::store::{ConversationRow, Filing, FolderRow, PersonRow};
+use crate::store::{ConversationRow, Filing, FolderRow, PersonDetails, PersonRow};
 use protocol::{
     Attachment, CatalogItem, CatalogKind, Contact, ContactKind, ConversationKind, ConversationRights, Delivery, Link,
-    MediaFile, MediaKind, MemberSection, Message, MessageKind, Outgoing, Person, Poll, PollBallot, PollDraft,
+    Mark, MediaFile, MediaKind, MemberSection, Message, MessageKind, Outgoing, Person, Poll, PollBallot, PollDraft,
     Reaction, RelateAction, Relation, ReplyTo, ReportReason, ReportTarget, Span, Special,
 };
 use serde::{Deserialize, Serialize};
@@ -116,6 +116,28 @@ const CALL_LINK_CREATE: &str = "\u{1}signal-call-link-create\u{1}";
 const CALL_LINK_UPDATE: &str = "\u{1}signal-call-link-update\u{1}";
 const CALL_LINK_JOIN: &str = "\u{1}signal-call-link-join\u{1}";
 const CALL_LINK_DELETE: &str = "\u{1}signal-call-link-delete\u{1}";
+/// Signal safety-number actions packed into `Handoff.conversation_id`:
+/// - `\u{1}signal-safety-verify\u{1}<aci>` -> mark contact Verified, returns formatted 60-digit safety number
+/// - `\u{1}signal-safety-approve\u{1}<aci>` -> approve changed key (Default), clears send block
+/// - `\u{1}signal-safety-unverify\u{1}<aci>` -> clear Verified mark back to Default
+const SAFETY_VERIFY: &str = "\u{1}signal-safety-verify\u{1}";
+const SAFETY_APPROVE: &str = "\u{1}signal-safety-approve\u{1}";
+const SAFETY_UNVERIFY: &str = "\u{1}signal-safety-unverify\u{1}";
+
+/// Packs a Signal safety-number verify request for `Request::Handoff`.
+pub fn safety_verify_command(aci: &str) -> String {
+    format!("{SAFETY_VERIFY}{aci}")
+}
+
+/// Packs a Signal safety-number approve (clear changed-key send block) request for `Request::Handoff`.
+pub fn safety_approve_command(aci: &str) -> String {
+    format!("{SAFETY_APPROVE}{aci}")
+}
+
+/// Packs a Signal safety-number unverify request for `Request::Handoff`.
+pub fn safety_unverify_command(aci: &str) -> String {
+    format!("{SAFETY_UNVERIFY}{aci}")
+}
 
 /// Packs a Signal call link creation request for `Request::Handoff`.
 pub fn call_link_create_command(name: &str, approve_all: bool) -> String {
@@ -645,6 +667,10 @@ struct Live {
     default_timer: u32,
     /// Account's "Generate link previews" setting (from configuration sync or AccountRecord).
     link_previews: bool,
+    /// Per-contact identity verification state (`Default`, `Verified`, `Unverified`).
+    identity_states: HashMap<String, wire::IdentityState>,
+    /// Verified contacts whose identity key changed and has not yet been approved.
+    identity_changed: HashSet<String>,
     /// Unread incoming messages per conversation, (author, sent), oldest first.
     unread: HashMap<String, VecDeque<(String, u64)>>,
     /// Our sent messages and their conversation, for receipts that name only the time.
@@ -1772,6 +1798,51 @@ fn apply(account: &Account, event: Event) {
                 }
             }
         }
+        Event::IdentityChanged { peer } => {
+            if let Peer::Direct(aci) = peer {
+                let (name, was_verified, shared_groups) = {
+                    let mut live = account.live();
+                    let was_verified = live.identity_states.get(&aci) == Some(&wire::IdentityState::Verified);
+                    if was_verified {
+                        live.identity_states.insert(aci.clone(), wire::IdentityState::Unverified);
+                        live.identity_changed.insert(aci.clone());
+                    }
+                    let name = live.name(&aci);
+                    let shared: Vec<String> = live
+                        .groups
+                        .iter()
+                        .filter(|(_, members)| members.iter().any(|m| m == &aci))
+                        .map(|(conv, _)| conv.clone())
+                        .collect();
+                    (name, was_verified, shared)
+                };
+                if was_verified {
+                    let _ = ctx.details(&[(aci.clone(), PersonDetails { mark: None, ..PersonDetails::default() })]);
+                }
+                let line = format!("Your safety number with {name} has changed");
+                let sent_ms = now_ms();
+                let sent_s = (sent_ms / 1_000) as i64;
+                let direct_title = account.live().known_name(&aci);
+                ensure_row(account, &Peer::Direct(aci.clone()), &direct_title);
+                let mut dm_msg = Message::plain(format!("signal-identity-{sent_ms}-{aci}"), String::new(), line.clone(), sent_s, false);
+                dm_msg.kind = MessageKind::System;
+                let _ = ctx.message(&aci, &dm_msg);
+                for conv in shared_groups {
+                    let mut grp_msg = Message::plain(format!("signal-identity-{sent_ms}-{aci}-{conv}"), String::new(), line.clone(), sent_s, false);
+                    grp_msg.kind = MessageKind::System;
+                    let _ = ctx.message(&conv, &grp_msg);
+                }
+            }
+        }
+        Event::VerifiedChanged { aci, state } => {
+            {
+                let mut live = account.live();
+                live.identity_states.insert(aci.clone(), state);
+                live.identity_changed.remove(&aci);
+            }
+            let mark = (state == wire::IdentityState::Verified).then_some(Mark::Verified);
+            let _ = ctx.details(&[(aci, PersonDetails { mark, ..PersonDetails::default() })]);
+        }
         Event::Caught | Event::Closed(_) | Event::Ended(_) => {}
     }
 }
@@ -1782,6 +1853,7 @@ fn apply_storage_sync(account: &Account, snapshot: wire::StorageSnapshot) {
     let mut mutes: Vec<(String, bool)> = Vec::new();
     let mut mark_unreads: Vec<String> = Vec::new();
     let mut relation_updates: Vec<(String, Relation)> = Vec::new();
+    let mut mark_updates: Vec<(String, Option<Mark>)> = Vec::new();
     let mut people_rows: Vec<PersonRow> = Vec::new();
     let mut seed_rows: Vec<(Peer, String)> = Vec::new();
     {
@@ -1839,6 +1911,13 @@ fn apply_storage_sync(account: &Account, snapshot: wire::StorageSnapshot) {
             }
             if !contact.username.is_empty() {
                 live.usernames.insert(aci.clone(), contact.username);
+            }
+            live.identity_states.insert(aci.clone(), contact.identity_state);
+            if contact.identity_state == wire::IdentityState::Verified {
+                live.identity_changed.remove(&aci);
+                mark_updates.push((aci.clone(), Some(Mark::Verified)));
+            } else {
+                mark_updates.push((aci.clone(), None));
             }
             live.contacts.insert(aci.clone());
             if contact.whitelisted {
@@ -1935,6 +2014,13 @@ fn apply_storage_sync(account: &Account, snapshot: wire::StorageSnapshot) {
     }
     for (person_id, rel) in relation_updates {
         let _ = ctx.relation(&person_id, rel);
+    }
+    if !mark_updates.is_empty() {
+        let details: Vec<(String, PersonDetails)> = mark_updates
+            .into_iter()
+            .map(|(id, mark)| (id, PersonDetails { mark, ..PersonDetails::default() }))
+            .collect();
+        let _ = ctx.details(&details);
     }
     for (peer, title) in seed_rows {
         let conv = peer.conversation();
@@ -3179,7 +3265,38 @@ fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
         account.live().call_links.remove(&root_key);
         return Ok("deleted".to_owned());
     }
+    if let Some(aci) = raw.strip_prefix(SAFETY_VERIFY) {
+        return set_safety_state(account, aci.trim(), wire::IdentityState::Verified);
+    }
+    if let Some(aci) = raw.strip_prefix(SAFETY_APPROVE) {
+        return set_safety_state(account, aci.trim(), wire::IdentityState::Default);
+    }
+    if let Some(aci) = raw.strip_prefix(SAFETY_UNVERIFY) {
+        return set_safety_state(account, aci.trim(), wire::IdentityState::Default);
+    }
     Err(Refusal::Unsupported)
+}
+
+fn set_safety_state(account: &Account, aci: &str, state: wire::IdentityState) -> Result<String, Refusal> {
+    if !wire::is_aci(aci) {
+        return Err(Refusal::Refused("That person isn't one Signal knows.".to_owned()));
+    }
+    account.wire.set_verified(aci, state).map_err(refused)?;
+    {
+        let mut live = account.live();
+        live.identity_states.insert(aci.to_owned(), state);
+        live.identity_changed.remove(aci);
+    }
+    let mark = (state == wire::IdentityState::Verified).then_some(Mark::Verified);
+    let _ = account.ctx.details(&[(aci.to_owned(), PersonDetails { mark, ..PersonDetails::default() })]);
+    let formatted = account
+        .wire
+        .safety_number(aci)
+        .ok()
+        .flatten()
+        .map(|s| wire::format_safety_number(&s.digits))
+        .unwrap_or_default();
+    Ok(formatted)
 }
 
 fn send_gif(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, pick_id: &str) -> Result<Message, Fault> {

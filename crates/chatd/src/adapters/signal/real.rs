@@ -12,7 +12,7 @@ use super::wire::{
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
     CallOutcome, ChatFolder, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
     GroupMember, GroupMembers, IdentityState, InviteLinkMode, Linked, Linker, MessageRequestAction, OwnCard, Peer, Quote,
-    StorageAccount, StorageContact, StorageGroup, StorageSnapshot, Text, Wire,
+    SafetyNumber, StorageAccount, StorageContact, StorageGroup, StorageSnapshot, Text, Wire,
 };
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
@@ -35,8 +35,9 @@ use presage::proto::{
     account_record, addressable_message,
     body_range::{AssociatedValue, Style as RangeStyle},
     call_message, chat_folder_record, contact_record, conversation_identifier, data_message, receipt_message, recipient,
-    storage_record, sync_message, typing_message, AddressableMessage, BodyRange, CallMessage,
+    storage_record, sync_message, typing_message, verified, AddressableMessage, BodyRange, CallMessage,
     ConversationIdentifier, DataMessage, EditMessage, GroupContextV2, ReceiptMessage, SyncMessage, TypingMessage,
+    Verified,
 };
 use presage::store::{ContentsStore, StateStore};
 use presage::Manager;
@@ -91,6 +92,8 @@ enum Ask {
     UpdateCallLink { root_key: [u8; 32], name: Option<String>, approve_all: Option<bool>, answer: Sender<Result<CallLink, Fault>> },
     DeleteCallLink { root_key: [u8; 32], answer: Sender<Result<(), Fault>> },
     JoinCallLink { url: String, answer: Sender<Result<CallLinkJoin, Fault>> },
+    SafetyNumber { aci: String, answer: Sender<Result<Option<SafetyNumber>, Fault>> },
+    SetVerified { aci: String, state: IdentityState, answer: Sender<Result<(), Fault>> },
 }
 
 pub struct Real {
@@ -276,6 +279,12 @@ fn fault<E: std::error::Error>(err: presage::Error<E>) -> Fault {
             "Signal wants to check this is a person. Send a message from Signal on your phone, then try again.".to_owned(),
         ),
         (_, Some(MessageSenderError::NotFound { .. })) => Fault::Refused("That person is no longer on Signal.".to_owned()),
+        (_, Some(MessageSenderError::UntrustedIdentity { .. }))
+        | (_, Some(MessageSenderError::ProtocolError(presage::libsignal_service::protocol::SignalProtocolError::UntrustedIdentity(_)))) => {
+            Fault::Refused(
+                "Your safety number with this contact has changed. Review and approve their safety number before sending.".to_owned(),
+            )
+        }
         (P::ServiceError(ServiceError::RateLimitExceeded { .. }), _) => Fault::Refused("Signal asked for a pause. Try again in a minute.".to_owned()),
         (P::UnknownGroup, _) => Fault::Refused("This group isn't one Signal still knows for you.".to_owned()),
         _ => Fault::Net(err.to_string()),
@@ -374,6 +383,8 @@ impl Real {
                     };
                     let aci = manager.registration_data().service_ids.aci.to_string();
                     let name = own_name(&mut manager).await.unwrap_or(fallback);
+                    let (id_tx, mut id_rx) = async_mpsc::unbounded_channel();
+                    vault.set_identity_change_sink(id_tx);
                     let mut wire = Session { manager, vault, me: aci.clone(), events, names: HashMap::new(), groups: HashMap::new(), known: GroupRevisions::default(), blocked_acis: HashSet::new(), blocked_groups: HashSet::new() };
                     let _ = ready.send(Ok((aci, name)));
                     wire.first_run().await;
@@ -384,6 +395,11 @@ impl Real {
                                 Some(received) => wire.received(received).await,
                                 None => break wire.why_closed().await,
                             },
+                            Some(changed_aci) = id_rx.recv() => {
+                                if super::wire::is_aci(&changed_aci) {
+                                    wire.tell(Event::IdentityChanged { peer: Peer::Direct(changed_aci) });
+                                }
+                            }
                             Some(ask) = asked.recv() => wire.ask(ask).await,
                             _ = &mut stopped => break Event::Closed("closed".to_owned()),
                         }
@@ -611,6 +627,14 @@ impl Wire for Real {
         self.ask(|answer| Ask::JoinCallLink { url: url.to_owned(), answer })
     }
 
+    fn safety_number(&self, aci: &str) -> Result<Option<SafetyNumber>, Fault> {
+        self.ask(|answer| Ask::SafetyNumber { aci: aci.to_owned(), answer })
+    }
+
+    fn set_verified(&self, aci: &str, state: IdentityState) -> Result<(), Fault> {
+        self.ask(|answer| Ask::SetVerified { aci: aci.to_owned(), state, answer })
+    }
+
     fn close(&self) {
         if let Some(stop) = self.stop.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             let _ = stop.send(());
@@ -796,6 +820,7 @@ impl Session {
                             Ok(contact_record::IdentityState::Unverified) => IdentityState::Unverified,
                             _ => IdentityState::Default,
                         };
+                        self.vault.sync_storage_identity(&aci, identity_state, &contact.identity_key);
                         contacts.push(StorageContact {
                             aci,
                             name,
@@ -1328,6 +1353,21 @@ impl Session {
                 typing: configuration.typing_indicators.unwrap_or(false),
             });
         }
+        if let Some(verified_sync) = sync.verified {
+            let aci = verified_sync
+                .destination_aci
+                .filter(|s| super::wire::is_aci(s))
+                .or_else(|| verified_sync.destination_aci_binary.as_deref().and_then(aci_bytes));
+            if let Some(aci) = aci {
+                let state = match verified_sync.state.and_then(|v| verified::State::try_from(v).ok()) {
+                    Some(verified::State::Verified) => IdentityState::Verified,
+                    Some(verified::State::Unverified) => IdentityState::Unverified,
+                    _ => IdentityState::Default,
+                };
+                let _ = self.vault.set_identity_state(&aci, state, verified_sync.identity_key.as_deref(), true);
+                self.tell(Event::VerifiedChanged { aci, state });
+            }
+        }
         if let Some(delete) = sync.delete_for_me {
             self.deleted_for_me(delete);
         }
@@ -1613,7 +1653,39 @@ impl Session {
             Ask::JoinCallLink { url, answer } => {
                 let _ = answer.send(self.join_call_link(&url).await);
             }
+            Ask::SafetyNumber { aci, answer } => {
+                let _ = answer.send(Ok(self.vault.safety_number(&self.me, &aci)));
+            }
+            Ask::SetVerified { aci, state, answer } => {
+                let _ = answer.send(self.set_verified(&aci, state).await);
+            }
         }
+    }
+
+    async fn set_verified(&mut self, aci: &str, state: IdentityState) -> Result<(), Fault> {
+        let uuid = Uuid::parse_str(aci).map_err(|_| Fault::Refused("That person isn't one Signal knows.".to_owned()))?;
+        let key = self.vault.peer_identity_key(aci);
+        self.vault
+            .set_identity_state(aci, state, key.as_deref(), true)
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        let proto_state = match state {
+            IdentityState::Default => verified::State::Default,
+            IdentityState::Verified => verified::State::Verified,
+            IdentityState::Unverified => verified::State::Unverified,
+        };
+        let sync = SyncMessage {
+            verified: Some(Verified {
+                destination_aci: Some(aci.to_owned()),
+                destination_aci_binary: Some(uuid.as_bytes().to_vec()),
+                identity_key: key,
+                state: Some(proto_state.into()),
+                null_message: None,
+            }),
+            ..SyncMessage::with_padding(&mut rand::rng())
+        };
+        let _ = self.sync_to_self(sync).await;
+        self.tell(Event::VerifiedChanged { aci: aci.to_owned(), state });
+        Ok(())
     }
 
     async fn create_group(&mut self, title: &str, members: &[String]) -> Result<GroupInfo, Fault> {
