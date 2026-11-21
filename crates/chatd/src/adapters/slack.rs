@@ -1534,12 +1534,12 @@ impl Slack {
     /// thread. Slack has no reply outside threads, so a reply to a message in a channel is a
     /// reply in its thread that is also shown in the channel.
     fn send(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool) {
-        let outcome = self.post(conversation, client_id, text, reply_to, suppress, &[]);
+        let outcome = self.post(conversation, client_id, text, reply_to, suppress, &[], false);
         self.ctx.sent(conversation, client_id, outcome);
     }
 
     /// The post itself, answering what Slack accepted.
-    fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool, spans: &[protocol::Span]) -> Result<Message, String> {
+    fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool, spans: &[protocol::Span], broadcast: bool) -> Result<Message, String> {
         let (channel, thread) = match thread_of(conversation) {
             Some((channel, root)) => (channel, Some(root)),
             None => (conversation, None),
@@ -1552,10 +1552,11 @@ impl Slack {
             params.push(("blocks", blocks));
         }
         let shown = reply_to.filter(|_| thread.is_none());
+        let broadcast_thread = broadcast && thread.is_some();
         if let Some(root) = thread.or(shown) {
             params.push(("thread_ts", root));
         }
-        if shown.is_some() {
+        if shown.is_some() || broadcast_thread {
             params.push(("reply_broadcast", "true"));
         }
         // The preview chip dismissed: Slack is asked not to unfurl the links.
@@ -1575,6 +1576,11 @@ impl Slack {
         outcome.map(|mut message| {
             if let Some(root) = thread {
                 self.report(self.bump(channel, root, &message));
+                if broadcast_thread {
+                    let mut in_channel = message.clone();
+                    in_channel.reply_to = self.quote(channel, root);
+                    self.report(self.ctx.message(channel, &in_channel).map_err(Into::into));
+                }
             }
             if let Some(root) = shown {
                 message.reply_to = self.quote(channel, root);
@@ -2028,6 +2034,7 @@ fn capabilities() -> protocol::Capabilities {
         delete: true,
         threads: true,
         direct_threads: true,
+        thread_broadcast: true,
         pins: true,
         forward: true,
         polls: None,

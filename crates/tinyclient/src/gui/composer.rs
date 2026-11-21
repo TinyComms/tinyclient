@@ -713,6 +713,7 @@ impl Composer {
             self.caption = self.scan_caption_for(&target.key).or(note);
             self.sending = false;
             self.no_preview = false;
+            self.broadcast = false;
             self.armed = None;
             self.focus_next = true;
             picker::emoji::set_account(Some(&target.key.account()));
@@ -1645,6 +1646,19 @@ impl Composer {
         }
         if show_broadcast {
             let on = self.broadcast;
+            let dest = self.target.as_ref().map(|t| t.title.as_str()).unwrap_or("");
+            let dest = dest
+                .strip_prefix("Thread in ")
+                .or_else(|| dest.strip_prefix("Thread with "))
+                .unwrap_or(dest)
+                .trim();
+            let label = if dest.is_empty() || dest == "Thread" {
+                if on { "☑ Also send to channel".to_owned() } else { "☐ Also send to channel".to_owned() }
+            } else if on {
+                format!("☑ Also send to {dest}")
+            } else {
+                format!("☐ Also send to {dest}")
+            };
             bar = bar.child(
                 div()
                     .id("opt-broadcast")
@@ -1660,7 +1674,7 @@ impl Composer {
                         this.broadcast = !this.broadcast;
                         cx.notify();
                     }))
-                    .child(if on { "☑ Also send to channel" } else { "☐ Also send to channel" }),
+                    .child(label),
             );
         }
         if show_effects {

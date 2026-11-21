@@ -2775,3 +2775,59 @@ fn slack_dnd_snooze_sets_presence_dnd_and_dnd_updated_clears_it() {
         (world.account("T01ALPHA").presence == Presence::Online).then_some(())
     });
 }
+
+#[test]
+fn slack_thread_broadcast_posts_to_thread_and_channel() {
+    let world = World::start();
+    world.ready();
+
+    // Slack advertises thread_broadcast capability.
+    assert!(world.account("T01ALPHA").can.thread_broadcast, "Slack should advertise thread_broadcast");
+
+    let general = alpha("C0GEN");
+    let thread = alpha(&format!("C0GEN:{ROOT}"));
+    // Load general history so the root message is cached for quoting.
+    world.messages(&general);
+    world.until("root message cached", || world.message(&general, ROOT));
+
+    // Plain reply in thread (broadcast: false) must NOT set reply_broadcast and must NOT appear in #general.
+    let plain_cid = "cid-plain-thread";
+    let Response::Sent { .. } = world.ask(Request::Send {
+        conversation: thread.clone(),
+        text: "only in thread".into(),
+        client_id: plain_cid.into(),
+        reply_to: None,
+        with: protocol::Outgoing::default(),
+    }) else {
+        panic!("expected Sent");
+    };
+    let plain = world.until("plain thread reply sent", || {
+        world.messages(&thread).into_iter().find(|m| m.client_id.as_deref() == Some(plain_cid) && m.state == SendState::Sent)
+    });
+    let post_plain = world.fake.calls(ALPHA, "chat.postMessage").into_iter().find(|c| c.params.get("text").map(String::as_str) == Some("only in thread")).unwrap();
+    assert_eq!(post_plain.params.get("thread_ts").map(String::as_str), Some(ROOT));
+    assert!(!post_plain.params.contains_key("reply_broadcast"));
+    assert!(world.message(&general, &plain.id).is_none(), "non-broadcast reply should not appear in channel");
+
+    // Broadcast reply in thread (broadcast: true) must set reply_broadcast=true and appear in both thread and #general with a quote.
+    let bc_cid = "cid-broadcast-thread";
+    let Response::Sent { .. } = world.ask(Request::Send {
+        conversation: thread.clone(),
+        text: "also in channel".into(),
+        client_id: bc_cid.into(),
+        reply_to: None,
+        with: protocol::Outgoing { broadcast: true, ..protocol::Outgoing::default() },
+    }) else {
+        panic!("expected Sent");
+    };
+    let bc = world.until("broadcast thread reply sent", || {
+        world.messages(&thread).into_iter().find(|m| m.client_id.as_deref() == Some(bc_cid) && m.state == SendState::Sent)
+    });
+    let post_bc = world.fake.calls(ALPHA, "chat.postMessage").into_iter().find(|c| c.params.get("text").map(String::as_str) == Some("also in channel")).unwrap();
+    assert_eq!(post_bc.params.get("thread_ts").map(String::as_str), Some(ROOT));
+    assert_eq!(post_bc.params.get("reply_broadcast").map(String::as_str), Some("true"));
+
+    let in_channel = world.until("broadcast reply recorded in parent channel", || world.message(&general, &bc.id));
+    assert_eq!(in_channel.text, "also in channel");
+    assert_eq!(in_channel.reply_to.as_ref().map(|q| q.id.as_str()), Some(ROOT));
+}
