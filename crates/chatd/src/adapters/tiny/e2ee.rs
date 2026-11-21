@@ -482,6 +482,10 @@ pub(crate) struct Opened {
     pub attachments: Vec<OpenedFile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mentions: Vec<::e2ee::envelope::MentionRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emoji: Vec<::e2ee::envelope::EmojiRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticker_id: Option<String>,
     /// An edit: the message it edits. Its text replaces the target's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edits: Option<String>,
@@ -2787,6 +2791,8 @@ impl Device {
                     .map(OpenedFile::of)
                     .collect(),
                 mentions: incoming.envelope.mentions.clone(),
+                emoji: incoming.envelope.emoji.clone(),
+                sticker_id: incoming.envelope.sticker_id.clone(),
                 edits: incoming.target_id.clone().filter(|_| kind == Kind::Edit),
                 edited_by: None,
                 at: super::messages::unix_of(row.created_at).unwrap_or(0),
@@ -2850,6 +2856,8 @@ impl Device {
             sent_at: envelope.sent_at,
             attachments: envelope.attachments.iter().map(OpenedFile::of).collect(),
             mentions: envelope.mentions.clone(),
+            emoji: envelope.emoji.clone(),
+            sticker_id: envelope.sticker_id.clone(),
             edits: target_id.map(str::to_owned),
             edited_by: None,
             at: std::time::SystemTime::now()

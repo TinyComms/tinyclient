@@ -183,11 +183,11 @@ pub(super) enum Dragged {
 /// What the server page holds. An invite's token stays until Done and is never logged.
 pub struct State {
     seen: bool,
-    account: Option<AccountKey>,
+    pub(crate) account: Option<AccountKey>,
     load_epoch: u64,
     action_epoch: u64,
     loading: bool,
-    community: Option<TinyCommunity>,
+    pub(crate) community: Option<TinyCommunity>,
     error: Option<String>,
     busy: bool,
     /// The action whose buttons stay quiet until a read started after it returns. Any such read

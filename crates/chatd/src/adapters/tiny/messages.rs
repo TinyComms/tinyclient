@@ -35,7 +35,11 @@ pub(crate) fn refresh(ctx: &Context, saved: &Saved) {
 
 /// The same as [`refresh`], with names the caller already loaded (a fresh `ready` has them).
 pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, String>) {
-    ctx.capabilities(account_caps(saved));
+    let caps = account_caps(saved);
+    ctx.capabilities(caps);
+    if caps.custom_emoji != protocol::EmojiScope::None || caps.stickers {
+        sync_emoji(ctx, saved);
+    }
     let _ = ctx.spaces(&[SpaceRow {
         id: SPACE.to_owned(),
         name: join_host(&saved.base_url),
@@ -329,6 +333,7 @@ pub(crate) fn on_live(
             }
         }
         "read.updated" => read_updated(ctx, saved, frame),
+        "emoji.updated" => { let _ = sync_emoji(ctx, saved); }
         "server.updated" => ctx.capabilities(account_caps(saved)),
         // The group of an encrypted conversation changed, this device's key packages ran low, or
         // someone's devices changed. Off the socket's thread: it asks the server. A row that did
@@ -364,6 +369,7 @@ pub(crate) fn live_kind(kind: &str) -> bool {
             | "reaction.updated"
             | "e2ee.reaction"
             | "read.updated"
+            | "emoji.updated"
             | "e2ee.handshake"
             | "e2ee.keys_low"
             | "e2ee.device"
@@ -468,12 +474,41 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             };
             let _ = reply.send(answer);
         }
-        Command::Catalog { kind, reply, .. } => match kind {
-            CatalogKind::Emoji | CatalogKind::Gifs => {
-                let _ = reply.send(Ok(CatalogPage::default()));
+        Command::Catalog { kind, query, reply, .. } => match kind {
+            CatalogKind::Emoji | CatalogKind::Stickers => {
+                let want_kind = if kind == CatalogKind::Stickers { "sticker" } else { "emoji" };
+                let known = super::manage::known(saved);
+                let items_src = if known.emoji.is_empty()
+                    && (server_has_feature(saved, protocol::TINY_FEATURE_CUSTOM_EMOJI)
+                        || server_has_feature(saved, protocol::TINY_FEATURE_STICKERS))
+                {
+                    sync_emoji(ctx, saved)
+                } else {
+                    known.emoji
+                };
+                let q = query.trim().to_ascii_lowercase();
+                let items = items_src
+                    .into_iter()
+                    .filter(|item| item.kind == want_kind && (q.is_empty() || item.name.to_ascii_lowercase().contains(&q)))
+                    .map(|item| {
+                        let file_id = emoji_media_id(&item.id);
+                        let mut file = MediaFile::new(&file_id, if item.animated { MediaKind::Gif } else { MediaKind::Image });
+                        if !item.path.is_empty() {
+                            file.path = Some(item.path.clone());
+                        }
+                        protocol::CatalogItem {
+                            id: if kind == CatalogKind::Stickers { item.id.clone() } else { file_id },
+                            name: if kind == CatalogKind::Stickers { item.name } else { format!(":{}:", item.name) },
+                            file: Some(file),
+                            pack: join_host(&saved.base_url),
+                            animated: item.animated,
+                        }
+                    })
+                    .collect();
+                let _ = reply.send(Ok(CatalogPage { items, cursor: None }));
             }
-            _ => {
-                let _ = reply.send(Err(Refusal::Unsupported));
+            CatalogKind::Gifs => {
+                let _ = reply.send(Ok(CatalogPage::default()));
             }
         },
         Command::Download { id, url, reply } => {
@@ -1575,10 +1610,20 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
 /// encrypted conversation can wait for the people of a new group to join it (`e2ee::send`), so
 /// it has a thread of its own, and does not hold up the plain ones.
 fn send(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>) {
-    send_spans(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new());
+    send_spans(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new(), None);
 }
 
-fn send_spans(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>, spans: Vec<protocol::Span>) {
+#[allow(clippy::too_many_arguments)]
+fn send_spans(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: String,
+    client_id: String,
+    text: String,
+    reply_to: Option<String>,
+    spans: Vec<protocol::Span>,
+    sticker_id: Option<String>,
+) {
     if !super::safe_id(&conversation_id) {
         let outcome = Err(super::CHECK.to_owned());
         ctx.sent(&conversation_id, &client_id, outcome);
@@ -1590,7 +1635,7 @@ fn send_spans(ctx: &Context, saved: &Saved, conversation_id: String, client_id: 
     let (posting, saved) = (ctx.clone(), saved.clone());
     in_order(account, Box::new(move || {
         let _ = crate::sendtime::run(&client_id, || {
-            let outcome = post_message(&posting, &saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[], &spans);
+            let outcome = post_message(&posting, &saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[], &spans, sticker_id.as_deref());
             let sent = outcome.is_ok();
             posting.sent(&conversation_id, &client_id, outcome);
             crate::sendtime::stage("store");
@@ -1641,6 +1686,59 @@ fn in_order(account: (String, String), job: Job) {
     }
 }
 
+fn emoji_media_id(id: &str) -> String {
+    format!("tiny-emoji-{id}")
+}
+
+fn strip_emoji_media_id(id: &str) -> &str {
+    id.strip_prefix("tiny-emoji-").unwrap_or(id)
+}
+
+/// Fetches the server's custom emoji & sticker set and registers + downloads every image up front
+/// so encrypted conversations never trigger on-demand fetches when rendering a message.
+fn sync_emoji(ctx: &Context, saved: &Saved) -> Vec<protocol::TinyEmoji> {
+    let items = super::manage::fetch_emoji_set(saved, &ctx.account);
+    let media: Vec<(MediaFile, String)> = items
+        .iter()
+        .map(|item| {
+            let mut file = MediaFile::new(emoji_media_id(&item.id), if item.animated { MediaKind::Gif } else { MediaKind::Image });
+            if !item.path.is_empty() {
+                file.path = Some(item.path.clone());
+            }
+            (file, format!("{}/v1/emoji/{}", saved.base_url.trim_end_matches('/'), item.id))
+        })
+        .collect();
+    if !media.is_empty() {
+        let _ = ctx.media(&media);
+    }
+    items
+}
+
+fn emoji_from_spans(text: &str, spans: &[protocol::Span]) -> Vec<e2ee_core::envelope::EmojiRef> {
+    let mut out = Vec::new();
+    for span in spans {
+        if out.len() >= 50 {
+            break;
+        }
+        let (start, end) = (span.start as usize, span.end as usize);
+        if start >= end || end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        let protocol::Style::Emoji { file } = &span.style else {
+            continue;
+        };
+        let id = strip_emoji_media_id(&file.id);
+        if super::safe_id(id) {
+            out.push(e2ee_core::envelope::EmojiRef {
+                id: id.to_owned(),
+                start: span.start,
+                end: span.end,
+            });
+        }
+    }
+    out
+}
+
 fn server_has_feature(saved: &Saved, feature: &str) -> bool {
     let was = super::manage::known(saved);
     if was.checked {
@@ -1688,12 +1786,13 @@ fn post_message(
     reply_to: Option<&str>,
     attachment_ids: &[String],
     spans: &[protocol::Span],
+    sticker_id: Option<&str>,
 ) -> Result<Message, String> {
     if !super::safe_id(conversation_id) {
         return Err(super::CHECK.to_owned());
     }
     if sealed_here(ctx, saved, conversation_id)? {
-        return post_sealed(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new(), attachment_ids, spans);
+        return post_sealed(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new(), attachment_ids, spans, sticker_id);
     }
     let mut body = serde_json::Map::new();
     body.insert("body".to_owned(), Value::String(text.to_owned()));
@@ -1707,6 +1806,15 @@ fn post_message(
     let mentions = mentions_from_spans(text, spans);
     if !mentions.is_empty() && server_has_feature(saved, protocol::TINY_FEATURE_MENTIONS) {
         body.insert("mentions".to_owned(), json!(mentions));
+    }
+    let emoji = emoji_from_spans(text, spans);
+    if !emoji.is_empty() && server_has_feature(saved, protocol::TINY_FEATURE_CUSTOM_EMOJI) {
+        body.insert("emoji".to_owned(), json!(emoji));
+    }
+    if let Some(sticker_id) = sticker_id.filter(|id| super::safe_id(id)) {
+        if server_has_feature(saved, protocol::TINY_FEATURE_STICKERS) {
+            body.insert("sticker_id".to_owned(), Value::String(sticker_id.to_owned()));
+        }
     }
     let path = format!("/v1/conversations/{conversation_id}/messages");
     let answer = super::asked("POST", saved, &path, Some(Value::Object(body)));
@@ -1750,20 +1858,24 @@ fn post_sealed(
     attachments: Vec<e2ee_core::AttachmentRef>,
     attachment_ids: &[String],
     spans: &[protocol::Span],
+    sticker_id: Option<&str>,
 ) -> Result<Message, String> {
     let device = e2ee::started(saved).ok_or(NOT_SET_UP)?;
     let mut envelope = e2ee_core::Envelope::message(text);
     envelope.reply_to = reply_to.filter(|id| super::safe_id(id)).map(str::to_owned);
     envelope.attachments = attachments;
     envelope.mentions = mentions_from_spans(text, spans);
+    envelope.emoji = emoji_from_spans(text, spans);
+    envelope.sticker_id = sticker_id.filter(|id| super::safe_id(id)).map(str::to_owned);
     envelope.sent_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_millis() as i64);
     let answer = e2ee::send(&device, conversation_id, client_id, e2ee_core::Kind::Message, None, &envelope, attachment_ids)?;
     accept_message(ctx, saved, conversation_id, &answer)
 }
 
 fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>, outgoing: Outgoing) {
+    let sticker_id = outgoing.pick.as_ref().filter(|p| p.kind == CatalogKind::Stickers).map(|p| strip_emoji_media_id(&p.id).to_owned());
     if outgoing.files.is_empty() {
-        send_spans(ctx, saved, conversation_id, client_id, text, reply_to, outgoing.spans);
+        send_spans(ctx, saved, conversation_id, client_id, text, reply_to, outgoing.spans, sticker_id);
         return;
     }
     if outgoing.files.len() > protocol::ATTACHMENTS_LIMIT {
@@ -1828,7 +1940,7 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
             }
             upload.check()?;
             let ids: Vec<String> = refs.iter().map(|file| file.id.clone()).collect();
-            post_sealed(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), refs, &ids, &spans)
+            post_sealed(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), refs, &ids, &spans, None)
         });
         return;
     }
@@ -1852,12 +1964,19 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
             ids.push(id.to_owned());
         }
         upload.check()?;
-        post_message(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), &ids, &spans)
+        post_message(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), &ids, &spans, None)
     });
 }
 
 fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, emoji: &str, on: bool, reply: crate::adapters::Reply<()>) {
-    if !unicode_emoji(emoji) {
+    let custom_id = if unicode_emoji(emoji) {
+        None
+    } else {
+        let raw = strip_emoji_media_id(emoji);
+        let known = super::manage::known(saved);
+        known.emoji.iter().find(|e| e.kind == "emoji" && (e.id == raw || format!(":{}:", e.name) == emoji)).map(|e| e.id.clone())
+    };
+    if custom_id.is_none() && !unicode_emoji(emoji) {
         let _ = reply.send(Err(Refusal::Refused("That reaction isn't allowed here.".to_owned())));
         return;
     }
@@ -1905,7 +2024,11 @@ fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, 
     }
     let path = format!("/v1/messages/{message_id}/reactions");
     let method = if on { "PUT" } else { "DELETE" };
-    let answer = super::asked(method, saved, &path, Some(json!({ "emoji": emoji })));
+    let body = match custom_id {
+        Some(id) => json!({ "emoji_id": id }),
+        None => json!({ "emoji": emoji }),
+    };
+    let answer = super::asked(method, saved, &path, Some(body));
     answer_ok(answer, reply);
 }
 
@@ -2166,16 +2289,77 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
         }
     }
     for reaction in &wire.reactions {
-        if reaction.count == 0 || !unicode_emoji(&reaction.emoji) {
+        if reaction.count == 0 {
             continue;
         }
-        message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new() });
+        if let Some(emoji_id) = reaction.emoji_id.as_deref().filter(|id| super::safe_id(id)) {
+            let file = emoji_media_for(saved, emoji_id);
+            let label = reaction.name.as_deref().map(|n| format!(":{n}:")).unwrap_or_else(|| reaction.emoji.clone());
+            message.reactions.push(Reaction { emoji: label, file, count: reaction.count, mine: reaction.me, who: Vec::new() });
+        } else if unicode_emoji(&reaction.emoji) {
+            message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new() });
+        }
     }
     if !deleted {
         apply_mentions(&mut message, saved, &wire.mentions, false);
+        apply_emoji(&mut message, saved, &wire.emoji);
+        if let Some(sticker_id) = wire.sticker_id.as_deref() {
+            apply_sticker(&mut message, saved, sticker_id);
+        }
     }
     relink(&mut message);
     Some(message)
+}
+
+fn emoji_media_for(saved: &Saved, emoji_id: &str) -> Option<MediaFile> {
+    let known = super::manage::known(saved);
+    let item = known.emoji.iter().find(|e| e.id == emoji_id)?;
+    let mut file = MediaFile::new(emoji_media_id(&item.id), if item.animated { MediaKind::Gif } else { MediaKind::Image });
+    if !item.path.is_empty() {
+        file.path = Some(item.path.clone());
+    }
+    Some(file)
+}
+
+fn apply_emoji(message: &mut Message, saved: &Saved, spans: &[e2ee_core::envelope::EmojiRef]) {
+    if spans.is_empty() || message.text.is_empty() {
+        return;
+    }
+    for span in spans.iter().take(50) {
+        let (start, end) = (span.start as usize, span.end as usize);
+        if start >= end
+            || end > message.text.len()
+            || !message.text.is_char_boundary(start)
+            || !message.text.is_char_boundary(end)
+        {
+            continue;
+        }
+        // An emoji id no longer in the community list stays as `:name:` plain text.
+        if let Some(file) = emoji_media_for(saved, &span.id) {
+            message.spans.push(protocol::Span {
+                start: span.start,
+                end: span.end,
+                style: protocol::Style::Emoji { file },
+            });
+        }
+    }
+}
+
+fn apply_sticker(message: &mut Message, saved: &Saved, sticker_id: &str) {
+    if !super::safe_id(sticker_id) {
+        return;
+    }
+    let known = super::manage::known(saved);
+    let Some(item) = known.emoji.iter().find(|e| e.id == sticker_id && e.kind == "sticker") else {
+        return;
+    };
+    let mut file = MediaFile::new(emoji_media_id(&item.id), if item.animated { MediaKind::Gif } else { MediaKind::Image });
+    if !item.path.is_empty() {
+        file.path = Some(item.path.clone());
+    }
+    let mut attachment = Attachment::new(item.name.clone(), file);
+    attachment.sticker = true;
+    message.attachments.push(attachment);
 }
 
 /// Maps structured mentions onto `Style::Mention` spans, validates UTF-8 byte ranges against
@@ -2276,6 +2460,10 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
                 message.reply_to = reply_of(opened.reply_to.as_ref().map(|id| Value::String(id.clone())).as_ref());
                 message.attachments = sealed_attachments(saved, opened, media);
                 apply_mentions(&mut message, saved, &opened.mentions, true);
+                apply_emoji(&mut message, saved, &opened.emoji);
+                if let Some(sticker_id) = opened.sticker_id.as_deref() {
+                    apply_sticker(&mut message, saved, sticker_id);
+                }
             }
             Some(Read::Edit) => return None,
             Some(Read::Undecryptable) | None => {
@@ -2404,6 +2592,12 @@ fn account_caps(saved: &Saved) -> Capabilities {
         abuse_reports: server_caps.has(protocol::TINY_FEATURE_ABUSE_REPORTS),
         voice_notes: max_file_bytes > 0,
         mention_spans: server_caps.has(protocol::TINY_FEATURE_MENTIONS),
+        custom_emoji: if server_caps.has(protocol::TINY_FEATURE_CUSTOM_EMOJI) {
+            protocol::EmojiScope::Space
+        } else {
+            protocol::EmojiScope::None
+        },
+        stickers: server_caps.has(protocol::TINY_FEATURE_STICKERS),
         reply: true,
         edit: true,
         delete: true,
@@ -3104,6 +3298,10 @@ struct WireMessage {
     reactions: Vec<WireReaction>,
     #[serde(default)]
     mentions: Vec<e2ee_core::envelope::MentionRef>,
+    #[serde(default)]
+    emoji: Vec<e2ee_core::envelope::EmojiRef>,
+    #[serde(default)]
+    sticker_id: Option<String>,
     /// An end-to-end encrypted row: `body` is empty, and these say what it is.
     #[serde(default)]
     e2ee: bool,
@@ -3163,7 +3361,12 @@ struct WireFile {
 
 #[derive(Deserialize)]
 struct WireReaction {
+    #[serde(default)]
     emoji: String,
+    #[serde(default)]
+    emoji_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default, deserialize_with = "flex_u32")]
     count: u32,
     #[serde(default)]
@@ -3599,7 +3802,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let body: Value = serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body["e2ee"], true, "call setup never creates plaintext text history");
-        assert_eq!(post_message(&ctx, &saved, "first-call", "client-call", "secret", None, &[], &[]).unwrap_err(), NOT_SET_UP, "text enrollment is still required");
+        assert_eq!(post_message(&ctx, &saved, "first-call", "client-call", "secret", None, &[], &[], None).unwrap_err(), NOT_SET_UP, "text enrollment is still required");
     }
 
     #[test]
@@ -4436,7 +4639,7 @@ mod tests {
         let stored = ctx.stored_message("sealed-1", "s-1").unwrap().unwrap();
         assert_eq!(stored.text, protocol::UNDECRYPTABLE, "never a blank, and never the server's body");
         assert_eq!(stored.seal, Seal::Undecryptable);
-        let outcome = post_message(&ctx, &saved, "sealed-1", "client-9", "secret words", None, &[], &[]);
+        let outcome = post_message(&ctx, &saved, "sealed-1", "client-9", "secret words", None, &[], &[], None);
         assert_eq!(outcome.err().as_deref(), Some(NOT_SET_UP));
         assert!(!posted.load(std::sync::atomic::Ordering::SeqCst), "nothing was posted in plain text");
     }
@@ -4522,7 +4725,7 @@ mod tests {
         pending.sender.id = ME.to_owned();
         pending.state = SendState::Pending;
         ctx.hub.store().ingest(&ctx.key("direct-1"), &pending, false).unwrap();
-        let outcome = post_message(&ctx, &saved, "direct-1", "client-1", "hi", None, &[], &[]);
+        let outcome = post_message(&ctx, &saved, "direct-1", "client-1", "hi", None, &[], &[], None);
         ctx.sent("direct-1", "client-1", outcome);
         assert!(ctx.stored_message("direct-1", "client-1").unwrap().is_none());
         let stored = ctx.stored_message("direct-1", "server-1").unwrap().unwrap();
@@ -4881,7 +5084,7 @@ mod tests {
             end: 7,
             style: protocol::Style::Mention { kind: protocol::MentionKind::User, id: PEER.to_owned() },
         }];
-        let sent = post_message(&ctx, &saved, "chan-1", "c-1", "hi @Bea", None, &[], &spans).unwrap();
+        let sent = post_message(&ctx, &saved, "chan-1", "c-1", "hi @Bea", None, &[], &spans, None).unwrap();
         assert_eq!(sent.spans.len(), 1);
         assert!(matches!(&sent.spans[0].style, protocol::Style::Mention { kind: protocol::MentionKind::User, id } if id == PEER));
         assert!(!sent.mentions_me, "own message does not set mentions_me");
@@ -4937,5 +5140,95 @@ mod tests {
         let sealed_msg = map_message(&saved, &HashMap::new(), &sealed_wire, &opened, &mut media).unwrap();
         assert!(sealed_msg.mentions_me);
         assert!(sealed_msg.spans.iter().any(|s| matches!(&s.style, protocol::Style::Mention { kind: protocol::MentionKind::User, id } if id == ME)));
+    }
+
+    #[test]
+    fn custom_emoji_and_stickers_catalog_send_receive_and_reactions() {
+        use std::sync::{Arc, Mutex};
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log_srv = log.clone();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            log_srv.lock().unwrap().push(request.to_owned());
+            if request.starts_with("GET /v1/capabilities") {
+                return Some(http(200, "OK", r#"{"version":"0.6.0","features":["custom_emoji","stickers"]}"#));
+            }
+            if request.starts_with("GET /v1/me ") {
+                return Some(http(200, "OK", r#"{"user_id":"11111111-1111-1111-1111-111111111111","owner":true,"roles":[],"permissions":8388607,"rank":2147483647}"#));
+            }
+            if request.starts_with("GET /v1/server ") {
+                return Some(http(200, "OK", r#"{"name":"Tiny"}"#));
+            }
+            if request.starts_with("GET /v1/emoji ") {
+                return Some(http(200, "OK", r#"[{"id":"e-1","kind":"emoji","name":"party","animated":false,"sha256":"aabb"},{"id":"s-1","kind":"sticker","name":"wave","animated":false,"sha256":"ccdd"}]"#));
+            }
+            if request.starts_with("GET /v1/emoji/e-1 ") || request.starts_with("GET /v1/emoji/s-1 ") {
+                let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 8\r\nConnection: close\r\n\r\n".to_vec();
+                resp.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+                return Some(resp);
+            }
+            if request.starts_with("POST /v1/conversations/chan-1/messages ") {
+                return Some(http(201, "Created", &json!({
+                    "id": "m-20",
+                    "author_id": ME,
+                    "body": "yay :party:",
+                    "created_at": WHEN,
+                    "emoji": [{"id": "e-1", "start": 4, "end": 11}],
+                    "sticker_id": "s-1",
+                    "reactions": [{"emoji": ":party:", "emoji_id": "e-1", "name": "party", "count": 1, "me": true}]
+                }).to_string()));
+            }
+            if request.starts_with("PUT /v1/messages/m-20/reactions ") {
+                return Some(http(200, "OK", r#"{"emoji":":party:","emoji_id":"e-1","name":"party","count":1,"me":true}"#));
+            }
+            None
+        });
+        let caps = account_caps(&saved);
+        assert_eq!(caps.custom_emoji, protocol::EmojiScope::Space);
+        assert!(caps.stickers);
+
+        // Catalog returns custom emoji and stickers filtered by query, and downloads images up front.
+        let (tx, rx) = std::sync::mpsc::channel();
+        serve(&ctx, &saved, &Live::new().unwrap(), Command::Catalog { kind: CatalogKind::Emoji, space_id: None, query: "par".into(), cursor: None, reply: tx });
+        let page = rx.recv().unwrap().unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].name, ":party:");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        serve(&ctx, &saved, &Live::new().unwrap(), Command::Catalog { kind: CatalogKind::Stickers, space_id: None, query: "".into(), cursor: None, reply: tx });
+        let page = rx.recv().unwrap().unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, "s-1");
+
+        // Send message with custom emoji span + sticker_id.
+        let spans = vec![protocol::Span {
+            start: 4,
+            end: 11,
+            style: protocol::Style::Emoji { file: MediaFile::new("tiny-emoji-e-1", MediaKind::Image) },
+        }];
+        let msg = post_message(&ctx, &saved, "chan-1", "c-20", "yay :party:", None, &[], &spans, Some("s-1")).unwrap();
+        assert!(msg.spans.iter().any(|s| matches!(&s.style, protocol::Style::Emoji { file } if file.id == "tiny-emoji-e-1")));
+        assert!(msg.attachments.iter().any(|a| a.sticker && a.file.id == "tiny-emoji-s-1"));
+        assert_eq!(msg.reactions.len(), 1);
+        assert!(msg.reactions[0].file.is_some());
+
+        // Custom reaction sends {emoji_id}.
+        let (tx, rx) = std::sync::mpsc::channel();
+        react(&ctx, &saved, "chan-1", "m-20", "tiny-emoji-e-1", true, tx);
+        assert!(rx.recv().unwrap().is_ok());
+        let react_req = log.lock().unwrap().iter().find(|r| r.starts_with("PUT /v1/messages/m-20/reactions ")).cloned().unwrap();
+        let react_body: Value = serde_json::from_str(react_req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(react_body["emoji_id"], "e-1");
+
+        // Deleted/unknown emoji id stays as plain `:gone:` text (no Style::Emoji span).
+        let wire: WireMessage = serde_json::from_value(json!({
+            "id": "m-21",
+            "author_id": PEER,
+            "body": ":gone:",
+            "created_at": WHEN,
+            "emoji": [{"id": "e-deleted", "start": 0, "end": 6}]
+        })).unwrap();
+        let mut media = Vec::new();
+        let fallback = map_message(&saved, &HashMap::new(), &wire, &HashMap::new(), &mut media).unwrap();
+        assert!(!fallback.spans.iter().any(|s| matches!(s.style, protocol::Style::Emoji { .. })));
     }
 }

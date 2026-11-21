@@ -101,6 +101,14 @@ pub struct MentionRef {
     pub end: u32,
 }
 
+/// A custom emoji span carried inside a sealed envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmojiRef {
+    pub id: String,
+    pub start: u32,
+    pub end: u32,
+}
+
 /// A message or an edit.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Envelope {
@@ -110,6 +118,10 @@ pub struct Envelope {
     pub attachments: Vec<AttachmentRef>,
     /// Structured @mentions in `text` (UTF-8 byte offsets). Messages and edits.
     pub mentions: Vec<MentionRef>,
+    /// Community custom emoji spans in `text` (UTF-8 byte offsets). Messages and edits.
+    pub emoji: Vec<EmojiRef>,
+    /// Community sticker id when the message is a sticker. Messages only.
+    pub sticker_id: Option<String>,
     /// Milliseconds since the Unix epoch, as the sender's clock said. Messages only. Unverified:
     /// the server's `created_at` is the order.
     pub sent_at: Option<i64>,
@@ -149,6 +161,10 @@ struct Wire {
     attachments: Vec<WireAttachment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     mentions: Vec<MentionRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    emoji: Vec<EmojiRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sticker_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sent_at: Option<i64>,
     /// Reactions only, and always written there: absent means nothing on a message or an edit.
@@ -223,6 +239,16 @@ impl Envelope {
             } else {
                 self.mentions.iter().take(MAX_MENTIONS).cloned().collect()
             },
+            emoji: if kind == Kind::Reaction {
+                Vec::new()
+            } else {
+                self.emoji.iter().take(MAX_MENTIONS).cloned().collect()
+            },
+            sticker_id: if kind == Kind::Message {
+                self.sticker_id.clone()
+            } else {
+                None
+            },
             sent_at: if kind == Kind::Message {
                 self.sent_at
             } else {
@@ -296,11 +322,23 @@ impl Envelope {
         } else {
             wire.mentions.into_iter().take(MAX_MENTIONS).collect()
         };
+        let emoji = if kind == Kind::Reaction {
+            Vec::new()
+        } else {
+            wire.emoji.into_iter().take(MAX_MENTIONS).collect()
+        };
+        let sticker_id = if kind == Kind::Message {
+            wire.sticker_id.filter(|id| !id.is_empty() && id.len() <= MAX_ID)
+        } else {
+            None
+        };
         Ok(Envelope {
             text: wire.text,
             reply_to,
             attachments,
             mentions,
+            emoji,
+            sticker_id,
             sent_at,
             on,
         })

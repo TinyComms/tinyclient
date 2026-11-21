@@ -338,3 +338,18 @@ fn mention_refs_roundtrip_in_message_and_edit_envelopes() {
     let edit_decoded = Envelope::decode(Kind::Edit, &edit_encoded).unwrap();
     assert_eq!(edit_decoded.mentions, vec![mention]);
 }
+
+#[test]
+fn custom_emoji_and_sticker_roundtrip_in_envelope() {
+    let env = Envelope {
+        text: "hi :party:".into(),
+        emoji: vec![e2ee::envelope::EmojiRef { id: "e-1".into(), start: 3, end: 10 }],
+        sticker_id: Some("s-1".into()),
+        ..Envelope::default()
+    };
+    let encoded = env.encode(Kind::Message).unwrap();
+    let decoded = Envelope::decode(Kind::Message, &encoded).unwrap();
+    assert_eq!(decoded.emoji.len(), 1);
+    assert_eq!(decoded.emoji[0].id, "e-1");
+    assert_eq!(decoded.sticker_id.as_deref(), Some("s-1"));
+}

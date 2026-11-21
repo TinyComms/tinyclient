@@ -3135,6 +3135,10 @@ impl Chat {
             Request::TinyReport { account, kind, target_id, category, note, evidence } => {
                 adapters::tiny::manage::report_create(account, kind, target_id, category, note, evidence)
             }
+            Request::TinyEmojiList { account } => adapters::tiny::manage::emoji_list(account),
+            Request::TinyEmojiCreate { account, name, kind, path } => adapters::tiny::manage::emoji_create(account, name, kind, path),
+            Request::TinyEmojiRename { account, emoji_id, name } => adapters::tiny::manage::emoji_rename(account, emoji_id, name),
+            Request::TinyEmojiDelete { account, emoji_id } => adapters::tiny::manage::emoji_delete(account, emoji_id),
             Request::TinyServerUpdate { account, edit } => adapters::tiny::manage::server_update(account, edit),
             Request::TinyServerIcon { account, path } => adapters::tiny::manage::server_icon(account, path),
             Request::TinyAvatar { account, path } => adapters::tiny::manage::user_avatar(account, path),

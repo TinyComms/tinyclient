@@ -128,6 +128,24 @@ pub struct TinyBot {
     pub created_at: String,
 }
 
+/// One community custom emoji or sticker (`GET /v1/emoji`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyEmoji {
+    pub id: String,
+    /// `"emoji"` or `"sticker"`.
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub kind: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub name: String,
+    #[serde(default)]
+    pub animated: bool,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub sha256: String,
+    /// Local cached file path filled in by chatd; omitted on the server wire.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+}
+
 /// One room, and who is in its call now, in the order they joined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TinyRoom {
@@ -375,6 +393,10 @@ pub const TINY_FEATURE_FILE_SCAN: &str = "file_scan";
 pub const TINY_FEATURE_ABUSE_REPORTS: &str = "abuse_reports";
 /// Structured @mentions (`mentions` on messages and unread mention counts).
 pub const TINY_FEATURE_MENTIONS: &str = "mentions";
+/// Community custom emoji (`GET/POST/PATCH/DELETE /v1/emoji`).
+pub const TINY_FEATURE_CUSTOM_EMOJI: &str = "custom_emoji";
+/// Community stickers (`kind=sticker` on `/v1/emoji` and `sticker_id` on messages).
+pub const TINY_FEATURE_STICKERS: &str = "stickers";
 /// Images and GIFs, until an admin changes it.
 pub const TINY_IMAGE_MAX_DEFAULT: i64 = 8 * 1024 * 1024;
 /// Video and every other file, until an admin changes it.
