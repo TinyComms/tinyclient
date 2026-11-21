@@ -299,6 +299,10 @@ pub struct State {
     /// The Discord participant whose camera we last asked mediad to paint (`MediaRequest::Speaker`),
     /// and when we switched to them (for 800 ms speaker debounce).
     pub(in crate::gui) discord_speaker: Option<(String, Instant)>,
+    /// When the user asked to watch a specific stream, so the tile can escalate past "Connecting…"
+    /// at 3 s and 10 s without waiting for a frame to arrive.
+    pub(in crate::gui) watch_asked: Option<(String, Instant)>,
+    watch_timer: Option<Task<()>>,
 }
 
 const DISCORD_SPEAKER_DEBOUNCE: Duration = Duration::from_millis(800);
@@ -476,6 +480,7 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         picture: None,
         self_view: None,
         share_view: None,
+        picture_source: None,
     }
 }
 
@@ -716,6 +721,8 @@ impl Shell {
                 state.cued = None;
                 state.auto_watch = None;
                 state.discord_speaker = None;
+                state.watch_asked = None;
+                state.watch_timer = None;
                 // A call that was up and went without our asking: the other side ended it.
                 let was = state.was.take();
                 if let Some(was) = was.filter(|_| !std::mem::take(&mut state.leaving)) {
@@ -748,6 +755,12 @@ impl Shell {
                 self.call_cue_join(call, cx);
                 self.call_auto_watch(call, cx);
                 self.call_discord_speaker(call, cx);
+                if let Some((asked_id, _)) = &self.call_state.watch_asked {
+                    if call.picture.as_ref().is_some_and(|p| !p.path.is_empty() && p.user_id == *asked_id) {
+                        self.call_state.watch_asked = None;
+                        self.call_state.watch_timer = None;
+                    }
+                }
                 if !in_call(call) {
                     // Ringing, connecting or failed: not a call that can end.
                     self.call_state.was = None;
@@ -1167,6 +1180,32 @@ impl Shell {
                     .flex_col()
                     .children(rows),
             )
+    }
+
+    /// Ask mediad to watch `user_id`'s stream and schedule 3 s / 10 s redraws so the tile never
+    /// stays on "Connecting…" silently.
+    pub(in crate::gui) fn call_watch(&mut self, user_id: String, cx: &mut Context<Self>) {
+        self.call_state.watch_asked = Some((user_id.clone(), Instant::now()));
+        self.call_state.watch_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(3)).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+            cx.background_executor().timer(Duration::from_secs(7)).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        }));
+        self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: Some(user_id) }), cx);
+    }
+
+    /// Reset the decoder and ask for a fresh keyframe for `user_id`.
+    pub(in crate::gui) fn call_retry_watch(&mut self, user_id: String, cx: &mut Context<Self>) {
+        self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: None }), cx);
+        self.call_watch(user_id, cx);
+    }
+
+    /// Stop watching the current stream and clear any pending connecting timer.
+    pub(in crate::gui) fn call_unwatch(&mut self, cx: &mut Context<Self>) {
+        self.call_state.watch_asked = None;
+        self.call_state.watch_timer = None;
+        self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: None }), cx);
     }
 
     /// In a 1:1 Tiny direct call, automatically watch the peer's screen share or camera as soon

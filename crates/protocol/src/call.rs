@@ -249,6 +249,10 @@ pub struct Call {
     /// `user_id` is empty. Apart from `self_view`: a camera and a share can be on together.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share_view: Option<CallPicture>,
+    /// Who the server's video slot currently carries (`call.slots` `video`), even before a frame
+    /// has been decoded and painted. `None` when the slot is empty or unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture_source: Option<(String, PictureKind)>,
 }
 
 /// A Tiny server call's protection (tinyserver's `docs/calls.md`, "End-to-end encryption").

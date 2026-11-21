@@ -274,6 +274,7 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         picture: None,
         self_view: None,
         share_view: sharing.then(screen_picture).flatten(),
+        picture_source: None,
     })
 }
 
@@ -407,6 +408,7 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joi
         picture: None,
         self_view: None,
         share_view: None,
+        picture_source: None,
     }
 }
 

@@ -33,6 +33,10 @@ Under the support directory (`TINYCLIENT_DIR`, otherwise the platform data dir):
 
 Each operator line is flushed as it is written. The window also records lifecycle lines (`logging to`, `window open`, `window should close`, `close window`, `quit asked`, `window gone`) so a hang or a vanished HWND still leaves a reason on disk.
 
+Video lifecycle lines at `info` (never per frame):
+- `mediad`: `share started`, `share stopped`, `camera started`, `camera stopped`, `first keyframe sent`, `keyframe asked of us`, `watch on`, `watch off`, `picture slot`, `first keyframe received`, `keyframe asked`, `frames dropped unwatched`, `frames not painted`.
+- `chatd`: `share refused`.
+
 The old `chatd.log` at the top of the support directory is not opened, copied, or deleted.
 
 Save debug log in Settings › About writes the window ring and asks chatd, which also asks a live mediad. Export off writes nothing and the window says "Debug logs are turned off." Bundles older than 24 hours are removed on the next save. On Unix the log directory is mode `0700`, and the operator files and the bundle are mode `0600`.

@@ -524,7 +524,60 @@ impl Shell {
                 .into_any_element();
         }
         let name = model::name_by_id(page.community, &stream.user_id);
+        if !stream.watchable {
+            return body
+                .when(!small, |body| body.child(Avatar::new(&page.key(&stream.user_id), &name, if large { 72. } else { 40. }).image_at(page.picture(&stream.user_id)).build()))
+                .child(div().type_small().text_color(theme::text_soft()).child("Camera on"))
+                .into_any_element();
+        }
         let asked = call.is_some_and(|call| watching(call, &stream.user_id));
+        let since = self
+            .call_state
+            .watch_asked
+            .as_ref()
+            .filter(|(id, _)| *id == stream.user_id)
+            .map(|(_, at)| at.elapsed())
+            .unwrap_or_default();
+        let trouble = asked
+            .then(|| call.and_then(|c| stage::watch_trouble(c, &stream.user_id, |id| model::name_by_id(page.community, id), since)))
+            .flatten();
+        if let Some(trouble) = trouble {
+            let words = match &trouble {
+                stage::Trouble::OtherSource { name: who, kind } => {
+                    let what = if *kind == protocol::PictureKind::Share { "screen" } else { "camera" };
+                    format!("The room is showing {who}'s {what} right now.")
+                }
+                stage::Trouble::Deafened => "Undeafen to watch.".to_owned(),
+                stage::Trouble::Slow => format!("Waiting for {name}'s picture… Your connection may be too slow for video."),
+                stage::Trouble::Failed => format!("Couldn't get {name}'s picture."),
+            };
+            let retry_id = stream.user_id.clone();
+            let retry = matches!(trouble, stage::Trouble::Slow | stage::Trouble::Failed).then(|| {
+                div()
+                    .id(SharedString::from(format!("tiny-stream-retry-{}", stream.user_id)))
+                    .h(px(if small { 22. } else { 28. }))
+                    .px(px(if small { 8. } else { 12. }))
+                    .rounded_full()
+                    .bg(theme::accent())
+                    .text_color(theme::on_accent())
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .type_micro()
+                    .font_weight(theme::SEMIBOLD)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.call_retry_watch(retry_id.clone(), cx);
+                    }))
+                    .child("Try again")
+            });
+            return body
+                .when(!small, |body| body.child(Avatar::new(&page.key(&stream.user_id), &name, if large { 72. } else { 40. }).image_at(page.picture(&stream.user_id)).build()))
+                .child(div().max_w(px(260.)).text_center().whitespace_normal().type_small().text_color(theme::text_soft()).child(words))
+                .children(retry)
+                .into_any_element();
+        }
         let pill = div()
             .h(px(if small { 22. } else { 30. }))
             .px(px(if small { 8. } else { 14. }))
@@ -1150,6 +1203,7 @@ mod tests {
             picture: None,
             self_view: None,
             share_view: None,
+            picture_source: None,
         }
     }
 

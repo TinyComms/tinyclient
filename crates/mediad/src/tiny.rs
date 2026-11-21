@@ -790,6 +790,21 @@ struct Call {
     watching: bool,
     share_noted: bool,
     camera_noted: bool,
+    /// Video lifecycle logging state (info-level, never per frame).
+    share_started_at: Option<Instant>,
+    camera_started_at: Option<Instant>,
+    share_first_key_sent: bool,
+    camera_first_key_sent: bool,
+    watch_started_at: Option<Instant>,
+    first_key_received_for: Option<String>,
+    unwatched_count: u64,
+    unwatched_bytes: u64,
+    unwatched_logged: Option<Instant>,
+    pli_count: u64,
+    pli_logged: Option<Instant>,
+    key_asked_share: u64,
+    key_asked_camera: u64,
+    key_asked_logged: Option<Instant>,
 }
 
 /// The RFC 6464 level of a frame, in dBov: 0 is the loudest, -127 silence.
@@ -960,17 +975,22 @@ impl Call {
             Event::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }) => self.estimate = Some(estimate.as_u64()),
             Event::MediaData(data) if self.link.is_picture(data.mid) => self.picture_in(data),
             Event::KeyframeRequest(request) if request.mid == self.link.share_mid() => {
-                tracing::debug!(kind = ?request.kind, sending = self.sending_share, "keyframe asked for the share");
+                self.key_asked_share += 1;
+                self.flush_key_asked();
                 self.video.ask_key(Track::Share);
             }
-            Event::KeyframeRequest(request) if request.mid == self.link.camera_mid() => match request.rid {
-                Some(rid) if rid == Rid::from("l") => self.video.ask_key(Track::Low),
-                Some(_) => self.video.ask_key(Track::High),
-                None => {
-                    self.video.ask_key(Track::High);
-                    self.video.ask_key(Track::Low);
+            Event::KeyframeRequest(request) if request.mid == self.link.camera_mid() => {
+                self.key_asked_camera += 1;
+                self.flush_key_asked();
+                match request.rid {
+                    Some(rid) if rid == Rid::from("l") => self.video.ask_key(Track::Low),
+                    Some(_) => self.video.ask_key(Track::High),
+                    None => {
+                        self.video.ask_key(Track::High);
+                        self.video.ask_key(Track::Low);
+                    }
                 }
-            },
+            }
             Event::MediaData(data) => {
                 stages::mark("first_media_frame");
                 if self.unopened.len() >= HELD_IN {
@@ -1264,11 +1284,33 @@ impl Call {
             let refused = sdp.is_empty();
             let offered_share = self.offered == Some(true);
             let _ = self.link.take_answer(&sdp);
+            let prev_share = self.sending_share;
+            let prev_camera = self.sending_camera;
             self.sending_share = self.link.direction(true) == Direction::SendOnly;
             self.sending_camera = self.link.direction(false) == Direction::SendOnly;
             self.offered = None;
+            let now = Instant::now();
+            if self.sending_share && !prev_share {
+                self.share_started_at = Some(now);
+                self.share_first_key_sent = false;
+                tracing::info!("share started");
+            } else if !self.sending_share && prev_share {
+                self.share_started_at = None;
+                self.share_first_key_sent = false;
+                tracing::info!("share stopped");
+            }
+            if self.sending_camera && !prev_camera {
+                self.camera_started_at = Some(now);
+                self.camera_first_key_sent = false;
+                tracing::info!("camera started");
+            } else if !self.sending_camera && prev_camera {
+                self.camera_started_at = None;
+                self.camera_first_key_sent = false;
+                tracing::info!("camera stopped");
+            }
             if refused {
                 if offered_share {
+                    tracing::info!(reason = "share_taken", "share refused");
                     self.controls.set_share(self.sending_share);
                     out::send(&MediaResponse::Notice { detail: "Someone else is already sharing.".to_owned() });
                 } else {
@@ -1281,12 +1323,23 @@ impl Call {
             let changed = slot.as_ref().map(|pictured| (pictured.user_id.clone(), pictured.kind)) != self.shown.as_ref().map(|pictured| (pictured.user_id.clone(), pictured.kind));
             self.shown = slot;
             if changed {
+                match &self.shown {
+                    Some(pictured) => tracing::info!(user_id = %pictured.user_id, kind = ?pictured.kind, "picture slot"),
+                    None => tracing::info!(user_id = "", kind = "none", "picture slot"),
+                }
+                self.first_key_received_for = None;
                 self.video.reset();
                 self.ask_keyframe();
             }
         }
         let watching = self.controls.watch();
+        if !self.watching && watching {
+            self.watch_started_at = Some(Instant::now());
+            self.first_key_received_for = None;
+        }
         if self.watching && !watching {
+            self.watch_started_at = None;
+            self.first_key_received_for = None;
             self.video.clear();
         }
         if watching {
@@ -1396,17 +1449,64 @@ impl Call {
         let size = payload.len() as u64;
         if writer.write(pt, at, MediaTime::new(rtp, Frequency::NINETY_KHZ), payload).is_ok() {
             self.video_bytes += size;
+            match track {
+                Track::Share if !self.share_first_key_sent => {
+                    self.share_first_key_sent = true;
+                    let ms = self.share_started_at.map_or(0, |s| at.saturating_duration_since(s).as_millis() as u64);
+                    tracing::info!(track = "share", ms_since_start = ms, "first keyframe sent");
+                }
+                Track::High | Track::Low if !self.camera_first_key_sent => {
+                    self.camera_first_key_sent = true;
+                    let ms = self.camera_started_at.map_or(0, |s| at.saturating_duration_since(s).as_millis() as u64);
+                    tracing::info!(track = "camera", ms_since_start = ms, "first keyframe sent");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn flush_key_asked(&mut self) {
+        let now = Instant::now();
+        if self.key_asked_logged.is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(1)) {
+            return;
+        }
+        self.key_asked_logged = Some(now);
+        if self.key_asked_share > 0 {
+            tracing::info!(track = "share", count = self.key_asked_share, "keyframe asked of us");
+            self.key_asked_share = 0;
+        }
+        if self.key_asked_camera > 0 {
+            tracing::info!(track = "camera", count = self.key_asked_camera, "keyframe asked of us");
+            self.key_asked_camera = 0;
         }
     }
 
     fn picture_in(&mut self, data: MediaData) {
-        if data.mid != self.link.screen_mid() || !self.controls.watch() {
+        if data.mid != self.link.screen_mid() {
+            return;
+        }
+        if !self.controls.watch() {
+            self.unwatched_count += 1;
+            self.unwatched_bytes += data.data.len() as u64;
+            let now = Instant::now();
+            if self.unwatched_logged.is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(10)) {
+                tracing::info!(count = self.unwatched_count, bytes = self.unwatched_bytes, "frames dropped unwatched");
+                self.unwatched_count = 0;
+                self.unwatched_bytes = 0;
+                self.unwatched_logged = Some(now);
+            }
             return;
         }
         let user = self.shown.as_ref().map(|pictured| pictured.user_id.clone()).unwrap_or_default();
         let kind = self.shown.as_ref().map(|pictured| pictured.kind).unwrap_or_default();
         let key = data.is_keyframe();
-        self.controls.video_stats.lock().unwrap().received(data.data.len(), Instant::now());
+        let now = Instant::now();
+        if key && self.first_key_received_for.as_deref() != Some(user.as_str()) {
+            self.first_key_received_for = Some(user.clone());
+            let ms = self.watch_started_at.map_or(0, |s| now.saturating_duration_since(s).as_millis() as u64);
+            tracing::info!(user_id = %user, kind = ?kind, ms_since_watch = ms, "first keyframe received");
+        }
+        self.controls.video_stats.lock().unwrap().received(data.data.len(), now);
         let frame = Received { key, contiguous: data.contiguous, data: data.data, user, kind };
         if !self.video.picture(frame) {
             self.ask_keyframe();
@@ -1422,6 +1522,12 @@ impl Call {
         let screen = self.link.screen_mid();
         if let Some(stream) = self.link.rtc.direct_api().stream_rx_by_mid(screen, None) {
             stream.request_keyframe(KeyframeRequestKind::Pli);
+            self.pli_count += 1;
+            if self.pli_logged.is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(1)) {
+                tracing::info!(count = self.pli_count, "keyframe asked");
+                self.pli_count = 0;
+                self.pli_logged = Some(now);
+            }
         }
     }
 
@@ -1731,6 +1837,20 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         watching: false,
         share_noted: false,
         camera_noted: false,
+        share_started_at: None,
+        camera_started_at: None,
+        share_first_key_sent: false,
+        camera_first_key_sent: false,
+        watch_started_at: None,
+        first_key_received_for: None,
+        unwatched_count: 0,
+        unwatched_bytes: 0,
+        unwatched_logged: None,
+        pli_count: 0,
+        pli_logged: None,
+        key_asked_share: 0,
+        key_asked_camera: 0,
+        key_asked_logged: None,
     };
     if let Err(err) = call.register() {
         tracing::warn!("mediad: the call's socket: {err}");

@@ -840,6 +840,16 @@ impl DecodeCost {
 impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
     fn lost(&mut self, reason: &'static str, frame: &Received) {
         tracing::debug!(reason, key = frame.key, contiguous = frame.contiguous, bytes = frame.data.len(), "a received frame was not painted");
+        static NOT_PAINTED: std::sync::Mutex<Option<(Instant, u64)>> = std::sync::Mutex::new(None);
+        if let Ok(mut guard) = NOT_PAINTED.lock() {
+            let now = Instant::now();
+            let entry = guard.get_or_insert((now, 0));
+            entry.1 += 1;
+            if now.saturating_duration_since(entry.0) >= Duration::from_secs(10) {
+                tracing::info!(reason, count = entry.1, "frames not painted");
+                *entry = (now, 0);
+            }
+        }
         self.wait_key = true;
         self.inbox.want_key.store(true, Ordering::Relaxed);
     }
@@ -1047,6 +1057,9 @@ impl Video {
         if let Err(err) = started {
             self.refused = true;
             tracing::warn!("mediad: a video thread did not start: {err}");
+            out::send(&MediaResponse::Notice {
+                detail: "Video couldn't start on this computer.".to_owned(),
+            });
         }
     }
 

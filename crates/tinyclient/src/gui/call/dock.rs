@@ -1332,6 +1332,7 @@ mod tests {
             picture: None,
             self_view: None,
             share_view: None,
+            picture_source: None,
         }
     }
 
