@@ -1486,11 +1486,11 @@ impl Slack {
             Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
                 answer(reply, self.forward(&from_conversation_id, &message_ids, &to_conversation_ids, &note))
             }
-            Command::Search { query, scope, at, reply, .. } => {
+            Command::Search { query, scope, filters, at, reply, .. } => {
                 if at.elapsed() >= SEARCH_PATIENCE {
                     drop(reply);
                 } else {
-                    answer(reply, self.search_messages(&query, &scope));
+                    answer(reply, self.search_messages(&query, &scope, &filters));
                 }
             }
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {

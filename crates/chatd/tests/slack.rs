@@ -4708,3 +4708,55 @@ fn slack_scheduled_messages_list_cancel_and_reschedule() {
     };
     assert!(messages.is_empty());
 }
+
+#[test]
+fn slack_search_filters_and_no_duplicate_in_modifier() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    let filters = protocol::SearchFilters {
+        from: Some(alpha("U0ANA")),
+        has: Some(protocol::SearchHas::Links),
+        before: Some(1_767_225_600),
+        after: Some(1_735_689_600),
+        mentions_me: false,
+    };
+    let Response::MessageHits { .. } = world.ask(Request::SearchNetwork {
+        conversation: Some(general.clone()),
+        space: None,
+        account: None,
+        network: None,
+        query: "deploy".into(),
+        filters: filters.clone(),
+        cursor: None,
+    }) else {
+        panic!("expected Response::MessageHits");
+    };
+    let call = world.fake.calls(ALPHA, "search.messages").pop().expect("search.messages call");
+    let sent = &call.params["query"];
+    assert!(sent.contains("deploy"), "{sent}");
+    assert!(sent.contains("in:#general"), "{sent}");
+    assert!(sent.contains("from:<@U0ANA>"), "{sent}");
+    assert!(sent.contains("has:link"), "{sent}");
+    assert!(sent.contains("before:2026-01-01"), "{sent}");
+    assert!(sent.contains("after:2025-01-01"), "{sent}");
+
+    // When user already typed `in:#deployments`, do not append a duplicate `in:#general`.
+    let Response::MessageHits { .. } = world.ask(Request::SearchNetwork {
+        conversation: Some(general.clone()),
+        space: None,
+        account: None,
+        network: None,
+        query: "in:#deployments during:2026-11 release".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) else {
+        panic!("expected Response::MessageHits");
+    };
+    let call2 = world.fake.calls(ALPHA, "search.messages").pop().expect("second search.messages call");
+    let sent2 = &call2.params["query"];
+    assert!(sent2.contains("in:#deployments"), "{sent2}");
+    assert!(!sent2.contains("in:#general"), "must not duplicate in: modifier: {sent2}");
+    assert!(sent2.contains("during:2026-11"), "{sent2}");
+}
