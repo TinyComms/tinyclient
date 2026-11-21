@@ -82,9 +82,26 @@ pub(super) fn opens_at_once(dest: &Destination, confirm: bool, trusted: bool) ->
     !suspicious && (!confirm || trusted)
 }
 
+/// Builds a compact label for a message/channel link when the target conversation is already
+/// present in the local snapshot (zero network prefetch).
+pub(super) fn network_link_chip(url: &str, conversations: &[protocol::Conversation]) -> Option<String> {
+    let parsed = protocol::link::parse_network_link(url)?;
+    let hit = conversations
+        .iter()
+        .find(|c| c.key.network == parsed.network && c.key.id == parsed.channel)?;
+    let name = if hit.title.is_empty() { &hit.key.id } else { &hit.title };
+    let label = match hit.kind {
+        protocol::ConversationKind::Channel | protocol::ConversationKind::Announcement | protocol::ConversationKind::Forum => {
+            if name.starts_with('#') { name.to_owned() } else { format!("#{name}") }
+        }
+        _ => name.to_owned(),
+    };
+    Some(if parsed.message_id.is_some() { format!("{label} ↗") } else { label })
+}
+
 impl Pane {
-    /// A click on a link in a message. Anything that is not a web address does nothing.
-    pub(super) fn open_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens a link externally (in the system browser), asking for confirmation per preferences.
+    pub(super) fn open_external_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         // An e-mail address Telegram or Slack made a link of: the mail app's, not a site.
         if is_mailto(url) {
             cx.open_url(url);
@@ -103,6 +120,32 @@ impl Pane {
         self.hovered = None;
         window.focus(&self.focus, cx);
         cx.notify();
+    }
+
+    /// A click on a link in a message. If `external` is false and the URL names a conversation
+    /// or message on a signed-in network, asks chatd to resolve it and opens it in-app; otherwise
+    /// falls through to the external browser. Alt-click (`external == true`) always opens outside.
+    pub(super) fn open_link(&mut self, url: &str, external: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !external && protocol::link::parse_network_link(url).is_some() {
+            let owned = url.to_owned();
+            let request = protocol::Request::Resolve { url: owned.clone() };
+            let window_handle = window.window_handle();
+            cx.spawn(async move |this, cx| {
+                let answer = cx.background_executor().spawn(async move { crate::client::ask(&request) }).await;
+                if let Ok(protocol::Response::Resolved { conversation: Some(key), message_id, title }) = answer {
+                    let _ = this.update(cx, |this, cx| {
+                        let _ = this.shell.update(cx, |shell, cx| shell.open_resolved_link(key, message_id, &title, cx));
+                    });
+                    return;
+                }
+                let _ = cx.update_window(window_handle, |_, window, cx| {
+                    let _ = this.update(cx, |this, cx| this.open_external_link(&owned, window, cx));
+                });
+            })
+            .detach();
+            return;
+        }
+        self.open_external_link(url, window, cx);
     }
 
     /// Opens what is asked about, and remembers its domain if that was ticked.
@@ -308,5 +351,50 @@ mod tests {
         let idn = dest("https://bücher.example/");
         assert!(opens_at_once(&idn, true, true));
         assert!(LinkAsk { dest: idn, remember: false }.can_remember());
+    }
+
+    #[test]
+    fn message_link_round_trips_through_parse_network_link() {
+        let mut key = protocol::Key { network: protocol::Network::Discord, account: "1".into(), id: "12345".into() };
+        let said = protocol::Message::plain("67890", "Mara", "hello", 1, false);
+        let url = message_link(&key, Some("G7"), &said).unwrap();
+        assert_eq!(url, "https://discord.com/channels/G7/12345/67890");
+        let parsed = protocol::link::parse_network_link(&url).unwrap();
+        assert_eq!(parsed.network, protocol::Network::Discord);
+        assert_eq!(parsed.space.as_deref(), Some("G7"));
+        assert_eq!(parsed.channel, "12345");
+        assert_eq!(parsed.message_id.as_deref(), Some("67890"));
+
+        let dm_url = message_link(&key, None, &said).unwrap();
+        let parsed_dm = protocol::link::parse_network_link(&dm_url).unwrap();
+        assert_eq!(parsed_dm.space, None);
+        assert_eq!(parsed_dm.channel, "12345");
+
+        key.network = protocol::Network::Slack;
+        key.id = "C9".into();
+        let slack_url = message_link(&key, Some("T1"), &said).unwrap();
+        assert_eq!(slack_url, "slack://channel?team=T1&id=C9&message=67890");
+        let parsed_slack = protocol::link::parse_network_link(&slack_url).unwrap();
+        assert_eq!(parsed_slack.network, protocol::Network::Slack);
+        assert_eq!(parsed_slack.space.as_deref(), Some("T1"));
+        assert_eq!(parsed_slack.channel, "C9");
+        assert_eq!(parsed_slack.message_id.as_deref(), Some("67890"));
+    }
+
+    #[test]
+    fn network_link_chip_labels_known_channel_without_prefetch() {
+        let conv = protocol::Conversation::new(
+            protocol::Key { network: protocol::Network::Discord, account: "1".into(), id: "12345".into() },
+            protocol::ConversationKind::Channel,
+            "engineering",
+        );
+        assert_eq!(
+            network_link_chip("https://discord.com/channels/G7/12345/67890", &[conv.clone()]).as_deref(),
+            Some("#engineering ↗")
+        );
+        assert_eq!(
+            network_link_chip("https://discord.com/channels/G7/99999/67890", &[conv]),
+            None
+        );
     }
 }

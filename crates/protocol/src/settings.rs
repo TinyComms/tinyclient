@@ -28,6 +28,9 @@ pub const LOG_RING: &str = "log_ring";
 /// Whether Save debug log may write that ring to disk.
 pub const LOG_EXPORT: &str = "log_export";
 
+/// Register as a handler for networks' own URI schemes (`discord://`, `slack://`, `tg://`, `msteams://`).
+/// Off by default so tinyclient never silently takes over links from an official app.
+pub const HANDLE_NETWORK_SCHEMES: &str = "handle_network_schemes";
 /// G2. Closing the window leaves chatd running. Read by the shell.
 pub const KEEP_RUNNING: &str = "keep_running";
 /// S1. Off: calls make no sounds.

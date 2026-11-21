@@ -1387,6 +1387,11 @@ pub enum Request {
         conversation: Key,
         message_id: String,
     },
+    /// Resolves a network message or channel URL against signed-in accounts' cached conversations.
+    /// Never triggers a join.
+    Resolve {
+        url: String,
+    },
     /// The user saw the conversation up to this message: the window is active, the conversation is
     /// open and the message is on screen. Read here and on the network. An empty `message_id`
     /// means the newest message chatd knows, for "mark as read" before any message is on screen.
@@ -2211,6 +2216,15 @@ pub enum Response {
     /// Answers `Source`: the raw source text of the message as the network holds it.
     Source {
         text: String,
+    },
+    /// Answers `Resolve`: the matching cached conversation and optional message id on a signed-in account.
+    Resolved {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        title: String,
     },
     /// Answers `SearchMessages`: the newest hits first, at most the limit asked for.
     MessageHits {

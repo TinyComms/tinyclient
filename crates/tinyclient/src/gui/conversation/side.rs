@@ -932,6 +932,29 @@ impl Shell {
         cx.notify();
     }
 
+    /// Opens a conversation resolved from an in-app message/channel link, landing on `message_id`
+    /// when supplied.
+    pub(in crate::gui) fn open_resolved_link(
+        &mut self,
+        key: Key,
+        message_id: Option<String>,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let pane = self.pane(cx);
+        if self.open.as_ref() == Some(&key) {
+            if let Some(id) = message_id {
+                pane.update(cx, |pane, cx| pane.jump_to(&id, cx));
+            }
+            return;
+        }
+        if let Some(id) = message_id {
+            pane.update(cx, |pane, _| pane.land_next(id));
+        }
+        let title = if title.is_empty() { key.id.clone() } else { title.to_owned() };
+        self.select(key, &title, cx);
+    }
+
     /// A search hit was clicked: its conversation opens on the message, or, being open already,
     /// jumps to it.
     pub(in crate::gui) fn open_search_hit(&mut self, hit: &MessageHit, cx: &mut Context<Self>) {

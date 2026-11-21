@@ -1324,7 +1324,7 @@ impl Pane {
                     cx.notify();
                 }
             }
-            TextEvent::Click(run) => {
+            TextEvent::Click(run, alt) => {
                 let Some(message) = self.find(id) else {
                     return;
                 };
@@ -1357,7 +1357,7 @@ impl Pane {
                             cx.background_executor().spawn(async move { ask(&request) }).detach();
                         }
                     }
-                    self.open_link(url, window, cx);
+                    self.open_link(url, alt, window, cx);
                 } else if let Some((MentionKind::User, person)) = &run.mention {
                     let (Some(person), at) = (self.person(person), window.mouse_position()) else {
                         return;
@@ -2032,7 +2032,7 @@ impl Pane {
             .border_1()
             .border_color(theme::hairline())
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, window, cx| this.open_link(&url, window, cx)));
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| this.open_link(&url, event.modifiers().alt, window, cx)));
         let Some(image) = image.cloned() else {
             return card.child(words).into_any_element();
         };

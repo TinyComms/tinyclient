@@ -23,7 +23,8 @@ pub enum TextEvent {
     /// The pointer is over this run, or over none of the ones that act.
     Hover(Option<usize>),
     /// A click on this run.
-    Click(usize),
+    /// Clicked on a run (index, alt_held).
+    Click(usize, bool),
     /// The button went down on this byte of the shown text.
     Down(usize),
     /// The pointer is at this byte with the button held, in this block or one dragged into.
@@ -481,7 +482,7 @@ impl Element for Rich {
                 let run = over(event.position, &layout, &hot);
                 let pressed = hot.iter().find(|(range, _)| range.contains(&anchor)).map(|(_, run)| *run);
                 if let (Some(run), true) = (run, run == pressed) {
-                    handler(TextEvent::Click(run), window, cx);
+                    handler(TextEvent::Click(run, event.modifiers.alt), window, cx);
                 }
             }
         });

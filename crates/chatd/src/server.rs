@@ -1816,6 +1816,21 @@ impl Chat {
         }
     }
 
+    fn resolve_link(&self, url: &str) -> Response {
+        let Some(parsed) = protocol::link::parse_network_link(url) else {
+            return Response::Resolved { conversation: None, message_id: None, title: String::new() };
+        };
+        match self.hub.store().resolve_link(&parsed) {
+            Ok(Some(conv)) => Response::Resolved {
+                conversation: Some(conv.key),
+                message_id: parsed.message_id,
+                title: conv.title,
+            },
+            Ok(None) => Response::Resolved { conversation: None, message_id: None, title: String::new() },
+            Err(err) => internal(err),
+        }
+    }
+
     fn source(&self, conversation: Key, message_id: String) -> Response {
         let account = conversation.account();
         if let Err(refused) = self.online(&account) {
@@ -2569,6 +2584,7 @@ impl Chat {
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
             Request::Revisions { conversation, message_id } => self.revisions(conversation, message_id),
             Request::Source { conversation, message_id } => self.source(conversation, message_id),
+            Request::Resolve { url } => self.resolve_link(&url),
             Request::MarkRead { conversation, message_id } => self.mark_read(conversation, message_id),
             Request::MarkUnread { conversation, message_id } => self.mark_unread(conversation, message_id),
             Request::MarkAllRead { network, space } => self.mark_all_read(network, space),

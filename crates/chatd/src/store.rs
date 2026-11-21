@@ -1520,6 +1520,67 @@ impl Store {
             .optional()
     }
 
+    /// Resolves a parsed network message/channel link against cached conversations across
+    /// signed-in accounts. Never creates or joins a conversation.
+    pub fn resolve_link(&self, link: &protocol::link::NetworkLink) -> rusqlite::Result<Option<Conversation>> {
+        let net = word(&link.network);
+        let mut stmt = self.db.prepare(&format!(
+            "{CONVERSATION} WHERE c.network = ?1 AND c.id = ?2 ORDER BY c.updated DESC LIMIT 16"
+        ))?;
+        let candidates: Vec<Conversation> = stmt
+            .query_map(params![net, link.channel], conversation_from)?
+            .collect::<rusqlite::Result<_>>()?;
+        if !candidates.is_empty() {
+            if let Some(space) = &link.space {
+                let lower = space.to_ascii_lowercase();
+                if let Some(hit) = candidates.iter().find(|c| {
+                    c.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(space))
+                        || c.space_title.to_ascii_lowercase().contains(&lower)
+                        || c.key.account.to_ascii_lowercase().contains(&lower)
+                }) {
+                    return Ok(Some(hit.clone()));
+                }
+            }
+            return Ok(Some(candidates.into_iter().next().unwrap()));
+        }
+        if let Some(thread_id) = &link.thread_id {
+            let threaded = format!("{}:{thread_id}", link.channel);
+            if let Some(hit) = self
+                .db
+                .query_row(
+                    &format!("{CONVERSATION} WHERE c.network = ?1 AND c.id = ?2 LIMIT 1"),
+                    params![net, threaded],
+                    conversation_from,
+                )
+                .optional()?
+            {
+                return Ok(Some(hit));
+            }
+        }
+        if link.network == Network::Telegram {
+            let bare = link.channel.trim_start_matches('@');
+            let at = format!("@{bare}");
+            if let Some(hit) = self
+                .db
+                .query_row(
+                    &format!(
+                        "{CONVERSATION}
+                         LEFT JOIN person p ON p.network = c.network AND p.account = c.account AND p.id = c.peer
+                         WHERE c.network = 'telegram'
+                           AND (lower(p.handle) = lower(?1) OR lower(p.handle) = lower(?2) OR lower(c.title) = lower(?1))
+                         ORDER BY c.updated DESC LIMIT 1"
+                    ),
+                    params![bare, at],
+                    conversation_from,
+                )
+                .optional()?
+            {
+                return Ok(Some(hit));
+            }
+        }
+        Ok(None)
+    }
+
     /// Cached Telegram channels and supergroups still contributing unread counts. The adapter verifies
     /// membership for rows its paged dialog list did not confirm.
     pub(crate) fn unread_telegram_channels(&self, account: &AccountKey, after: &str, limit: u32) -> rusqlite::Result<Vec<String>> {

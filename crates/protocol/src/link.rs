@@ -515,6 +515,271 @@ impl Trusted {
     }
 }
 
+/// A message or conversation reference parsed from a network's web or app URL.
+/// Invite links (`discord.gg`, `t.me/+...`, Slack shared invites) return `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkLink {
+    pub network: crate::Network,
+    /// Guild / workspace / server / handle hint when present in the URL.
+    pub space: Option<String>,
+    /// Channel / conversation id (or Telegram public username for `t.me/{name}`).
+    pub channel: String,
+    /// Optional message id within the conversation.
+    pub message_id: Option<String>,
+    /// Optional thread root id (e.g. Slack `thread_ts`).
+    pub thread_id: Option<String>,
+}
+
+/// Converts a Slack archive message segment `p1700000000123456` into `1700000000.123456`.
+fn slack_archive_ts(segment: &str) -> Option<String> {
+    let digits = segment.strip_prefix('p')?;
+    if digits.len() <= 6 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let split = digits.len() - 6;
+    Some(format!("{}.{}", &digits[..split], &digits[split..]))
+}
+
+/// Percent-decodes a single URL path/query component into UTF-8.
+fn pct_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(val) = u8::from_str_radix(hex, 16) {
+                    out.push(val);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parses a message or conversation link for any supported network (the inverse of `message_link`).
+/// Invite links (`discord.gg`, `t.me/+...`, `t.me/joinchat/...`, Slack invites) return `None`.
+pub fn parse_network_link(raw: &str) -> Option<NetworkLink> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > LINK_LIMIT {
+        return None;
+    }
+    // Tiny room / channel links (tinyclient://... or https://host/r/{room}[/{msg}]).
+    if let Some((origin, room)) = crate::parse_room_link(trimmed) {
+        return Some(NetworkLink {
+            network: crate::Network::Tiny,
+            space: Some(origin),
+            channel: room,
+            message_id: None,
+            thread_id: None,
+        });
+    }
+    let parsed = Url::parse(trimmed).ok()?;
+    let scheme = parsed.scheme();
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    let segments: Vec<&str> = parsed.path_segments().map(|s| s.filter(|p| !p.is_empty()).collect()).unwrap_or_default();
+    let query = |name: &str| -> Option<String> {
+        parsed.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned()).filter(|v| !v.is_empty())
+    };
+
+    // Discord: https://[ptb.|canary.]discord[app].com/channels/{guild|@me}/{channel}[/{message}]
+    // or discord://[discord.com|-]/channels/{guild|@me}/{channel}[/{message}]
+    let is_discord_web = matches!(scheme, "http" | "https")
+        && matches!(
+            host.as_str(),
+            "discord.com"
+                | "www.discord.com"
+                | "ptb.discord.com"
+                | "canary.discord.com"
+                | "discordapp.com"
+                | "www.discordapp.com"
+                | "ptb.discordapp.com"
+                | "canary.discordapp.com"
+        );
+    let is_discord_app = scheme == "discord";
+    if is_discord_web || is_discord_app {
+        let mut iter = segments.iter().copied();
+        let first = iter.next()?;
+        if first != "channels" {
+            return None;
+        }
+        let guild = iter.next()?;
+        let channel = iter.next()?;
+        let message_id = iter.next().map(str::to_owned);
+        if channel.is_empty() || !channel.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if let Some(ref mid) = message_id {
+            if !mid.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+        }
+        let space = (guild != "@me").then(|| guild.to_owned());
+        return Some(NetworkLink {
+            network: crate::Network::Discord,
+            space,
+            channel: channel.to_owned(),
+            message_id,
+            thread_id: None,
+        });
+    }
+
+    // Slack app scheme: slack://channel?team={team}&id={channel}[&message={ts}][&thread_ts={tts}]
+    if scheme == "slack" && host == "channel" {
+        let channel = query("id")?;
+        let space = query("team");
+        let message_id = query("message");
+        let thread_id = query("thread_ts");
+        return Some(NetworkLink {
+            network: crate::Network::Slack,
+            space,
+            channel,
+            message_id,
+            thread_id,
+        });
+    }
+
+    // Slack web archive: https://{team}.slack.com/archives/{channel}[/p{ts}][?thread_ts={tts}]
+    if matches!(scheme, "http" | "https") && host.ends_with(".slack.com") {
+        let team = host.strip_suffix(".slack.com").filter(|t| !t.is_empty() && !t.contains('.'))?;
+        if segments.first().copied() == Some("archives") {
+            let channel = (*segments.get(1)?).to_owned();
+            if channel.is_empty() {
+                return None;
+            }
+            let message_id = segments.get(2).and_then(|seg| slack_archive_ts(seg));
+            let thread_id = query("thread_ts");
+            return Some(NetworkLink {
+                network: crate::Network::Slack,
+                space: Some(team.to_owned()),
+                channel,
+                message_id,
+                thread_id,
+            });
+        }
+        return None;
+    }
+
+    // Telegram: https://t.me/c/{id}[/{msg}] or https://t.me/{name}[/{msg}] or tg://resolve?domain={name}[&post={msg}]
+    if scheme == "tg" && host == "resolve" {
+        let domain = query("domain")?;
+        let message_id = query("post").filter(|m| m.bytes().all(|b| b.is_ascii_digit()));
+        return Some(NetworkLink {
+            network: crate::Network::Telegram,
+            space: None,
+            channel: domain,
+            message_id,
+            thread_id: None,
+        });
+    }
+    if matches!(scheme, "http" | "https") && matches!(host.as_str(), "t.me" | "telegram.me" | "telegram.dog") {
+        let first = *segments.first()?;
+        // Invite links and Telegram utility routes stay external.
+        if first.starts_with('+')
+            || matches!(
+                first.to_ascii_lowercase().as_str(),
+                "joinchat" | "addstickers" | "addemoji" | "addlist" | "addtheme" | "proxy" | "socks" | "share" | "login" | "iv" | "bg" | "setlanguage" | "boost" | "giftcode"
+            )
+        {
+            return None;
+        }
+        if first == "c" {
+            let id = *segments.get(1)?;
+            if !id.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let message_id = segments.get(2).filter(|s| s.bytes().all(|b| b.is_ascii_digit())).map(|s| (*s).to_owned());
+            return Some(NetworkLink {
+                network: crate::Network::Telegram,
+                space: Some("c".to_owned()),
+                channel: format!("c{id}"),
+                message_id,
+                thread_id: None,
+            });
+        }
+        // Public username: t.me/{name}[/{msg}] (skip t.me/s/{name} preview wrapper if present)
+        let (name, msg_seg) = if first == "s" {
+            (*segments.get(1)?, segments.get(2).copied())
+        } else {
+            (first, segments.get(1).copied())
+        };
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return None;
+        }
+        let message_id = msg_seg.filter(|s| s.bytes().all(|b| b.is_ascii_digit())).map(str::to_owned);
+        return Some(NetworkLink {
+            network: crate::Network::Telegram,
+            space: None,
+            channel: name.to_owned(),
+            message_id,
+            thread_id: None,
+        });
+    }
+
+    // Teams: https://teams.microsoft.com/l/message/{channel}/{msg} or /l/channel/{channel}/... or msteams:/l/message/...
+    let is_teams_web = matches!(scheme, "http" | "https")
+        && matches!(host.as_str(), "teams.microsoft.com" | "teams.live.com");
+    let is_teams_app = scheme == "msteams";
+    if is_teams_web || is_teams_app {
+        if segments.first().copied() == Some("l") {
+            match segments.get(1).copied() {
+                Some("message") => {
+                    let channel = pct_decode(segments.get(2)?);
+                    let message_id = segments.get(3).map(|s| pct_decode(s)).filter(|s| !s.is_empty());
+                    let thread_id = query("parentMessageId");
+                    let space = query("groupId").or_else(|| query("tenantId"));
+                    if !channel.is_empty() {
+                        return Some(NetworkLink {
+                            network: crate::Network::Teams,
+                            space,
+                            channel,
+                            message_id,
+                            thread_id,
+                        });
+                    }
+                }
+                Some("channel") => {
+                    let channel = pct_decode(segments.get(2)?);
+                    let space = query("groupId").or_else(|| query("tenantId"));
+                    if !channel.is_empty() {
+                        return Some(NetworkLink {
+                            network: crate::Network::Teams,
+                            space,
+                            channel,
+                            message_id: None,
+                            thread_id: None,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        return None;
+    }
+
+    // Tiny web message/channel link: https://{host}/r/{room}[/{message}]
+    if matches!(scheme, "http" | "https") && segments.first().copied() == Some("r") {
+        let room = (*segments.get(1)?).to_owned();
+        if !room.is_empty() {
+            let message_id = segments.get(2).map(|s| (*s).to_owned());
+            let origin = format!("{}://{}", parsed.scheme(), host);
+            return Some(NetworkLink {
+                network: crate::Network::Tiny,
+                space: Some(origin),
+                channel: room,
+                message_id,
+                thread_id: None,
+            });
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,5 +1042,104 @@ mod tests {
             full.add(&format!("d{n}.example"));
         }
         assert_eq!(full.len(), TRUSTED_LIMIT);
+    }
+
+    #[test]
+    fn network_links_parse_and_reject_invites() {
+        use crate::Network;
+
+        // Discord guild & DM message links
+        assert_eq!(
+            parse_network_link("https://discord.com/channels/G7/12345/67890"),
+            Some(NetworkLink {
+                network: Network::Discord,
+                space: Some("G7".into()),
+                channel: "12345".into(),
+                message_id: Some("67890".into()),
+                thread_id: None,
+            })
+        );
+        assert_eq!(
+            parse_network_link("https://ptb.discord.com/channels/@me/12345"),
+            Some(NetworkLink {
+                network: Network::Discord,
+                space: None,
+                channel: "12345".into(),
+                message_id: None,
+                thread_id: None,
+            })
+        );
+        assert_eq!(
+            parse_network_link("discord://discord.com/channels/99/12345/67890"),
+            Some(NetworkLink {
+                network: Network::Discord,
+                space: Some("99".into()),
+                channel: "12345".into(),
+                message_id: Some("67890".into()),
+                thread_id: None,
+            })
+        );
+        assert_eq!(parse_network_link("https://discord.gg/abc123"), None);
+
+        // Slack web archive & slack:// scheme
+        assert_eq!(
+            parse_network_link("https://harbor.slack.com/archives/C9/p1700000000123456?thread_ts=1700000000.000100"),
+            Some(NetworkLink {
+                network: Network::Slack,
+                space: Some("harbor".into()),
+                channel: "C9".into(),
+                message_id: Some("1700000000.123456".into()),
+                thread_id: Some("1700000000.000100".into()),
+            })
+        );
+        assert_eq!(
+            parse_network_link("slack://channel?team=T1&id=C9&message=1700000000.123456"),
+            Some(NetworkLink {
+                network: Network::Slack,
+                space: Some("T1".into()),
+                channel: "C9".into(),
+                message_id: Some("1700000000.123456".into()),
+                thread_id: None,
+            })
+        );
+
+        // Telegram private supergroup, public username, tg://, and invite rejection
+        assert_eq!(
+            parse_network_link("https://t.me/c/1234567890/42"),
+            Some(NetworkLink {
+                network: Network::Telegram,
+                space: Some("c".into()),
+                channel: "c1234567890".into(),
+                message_id: Some("42".into()),
+                thread_id: None,
+            })
+        );
+        assert_eq!(
+            parse_network_link("https://t.me/rustlang/99"),
+            Some(NetworkLink {
+                network: Network::Telegram,
+                space: None,
+                channel: "rustlang".into(),
+                message_id: Some("99".into()),
+                thread_id: None,
+            })
+        );
+        assert_eq!(parse_network_link("https://t.me/+secretInviteHash"), None);
+        assert_eq!(parse_network_link("https://t.me/joinchat/abc"), None);
+
+        // Teams message link
+        assert_eq!(
+            parse_network_link("https://teams.microsoft.com/l/message/19%3Aabc%40thread.tacv2/1700000000000?groupId=g1"),
+            Some(NetworkLink {
+                network: Network::Teams,
+                space: Some("g1".into()),
+                channel: "19:abc@thread.tacv2".into(),
+                message_id: Some("1700000000000".into()),
+                thread_id: None,
+            })
+        );
+
+        // Non-network web links stay None
+        assert_eq!(parse_network_link("https://example.com/channels/1/2/3"), None);
     }
 }
