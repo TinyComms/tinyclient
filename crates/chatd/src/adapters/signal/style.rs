@@ -223,6 +223,24 @@ pub fn parse_with_mentions(source: &str, mentions: &[Span]) -> (String, Vec<Rang
     (built.text, built.ranges)
 }
 
+/// The composer's markdown plus inline `<@aci>` tokens (from `MentionFormat::Signal`) or explicit
+/// user mention spans, as Signal's wire body (with U+FFFC placeholders) and UTF-16 ranges.
+pub fn parse_with_inline_mentions(
+    source: &str,
+    mentions: &[Span],
+    resolve: impl Fn(&str) -> String,
+) -> (String, Vec<Range>) {
+    if !mentions.is_empty() && !source.contains("<@") {
+        return parse_with_mentions(source, mentions);
+    }
+    let mut built = Built {
+        text: String::with_capacity(source.len()),
+        ranges: Vec::new(),
+    };
+    inline_with(&mut built, source, &Some(&resolve));
+    (built.text, built.ranges)
+}
+
 /// Byte spans for `ranges` on `text`, which has no mention placeholders left.
 pub fn spans(text: &str, ranges: &[Range]) -> Vec<Span> {
     apply(text, ranges, "").spans
@@ -266,6 +284,11 @@ const PAIRS: [(&str, Mark); 3] = [
 ];
 
 fn inline(built: &mut Built, source: &str) {
+    let none: Option<&fn(&str) -> String> = None;
+    inline_with(built, source, &none);
+}
+
+fn inline_with<F: Fn(&str) -> String>(built: &mut Built, source: &str, resolve: &Option<&F>) {
     let mut at = 0;
     while at < source.len() {
         let rest = &source[at..];
@@ -276,6 +299,32 @@ fn inline(built: &mut Built, source: &str) {
                 continue;
             }
         }
+        if let Some(resolver) = resolve {
+            if let Some(after) = rest.strip_prefix("<@") {
+                if let Some(close) = after.find('>') {
+                    let aci = &after[..close];
+                    if super::wire::is_aci(aci) {
+                        let start = utf16_len(&built.text);
+                        built.text.push('\u{FFFC}');
+                        let resolved = resolver(aci);
+                        let label = if resolved.is_empty() {
+                            "@Signal user".to_owned()
+                        } else if resolved.starts_with('@') {
+                            resolved
+                        } else {
+                            format!("@{resolved}")
+                        };
+                        built.ranges.push(Range::Mention {
+                            start,
+                            aci: aci.to_owned(),
+                            label,
+                        });
+                        at += 2 + close + 1;
+                        continue;
+                    }
+                }
+            }
+        }
         if let Some((delimiter, mark)) = PAIRS
             .iter()
             .find(|(delimiter, _)| rest.starts_with(delimiter))
@@ -284,7 +333,7 @@ fn inline(built: &mut Built, source: &str) {
                 let inner = &rest[delimiter.len()..close];
                 if fits(inner) {
                     let start = utf16_len(&built.text);
-                    inline(built, inner);
+                    inline_with(built, inner, resolve);
                     let end = utf16_len(&built.text);
                     if end > start {
                         built.ranges.push(Range::Style {
@@ -331,7 +380,7 @@ fn inline(built: &mut Built, source: &str) {
                         .is_some_and(char::is_alphanumeric);
                     if fits(inner) && !(first == '_' && word_follows) {
                         let start = utf16_len(&built.text);
-                        inline(built, inner);
+                        inline_with(built, inner, resolve);
                         let end = utf16_len(&built.text);
                         if end > start {
                             built.ranges.push(Range::Style {
@@ -477,5 +526,43 @@ mod tests {
         assert!(!drawn
             .iter()
             .any(|span| plain.get(span.start as usize..span.end as usize) == Some("b")));
+    }
+
+    #[test]
+    fn inline_aci_mentions_compute_utf16_offsets_including_surrogate_pairs_and_styles() {
+        let grace = "b2b2b2b2-0000-4000-8000-000000000002";
+        // 🎉 is 2 UTF-16 code units + " hi " (4) = UTF-16 offset 6.
+        let (wire_body, ranges) =
+            parse_with_inline_mentions(&format!("🎉 hi <@{grace}>"), &[], |_| "Grace Ombra".to_owned());
+        assert_eq!(wire_body, "🎉 hi \u{FFFC}");
+        assert_eq!(
+            ranges,
+            vec![Range::Mention {
+                start: 6,
+                aci: grace.to_owned(),
+                label: "@Grace Ombra".to_owned(),
+            }]
+        );
+        let styled = apply(&wire_body, &ranges, "");
+        assert_eq!(styled.text, "🎉 hi @Grace Ombra");
+        assert!(styled.spans.iter().any(|s| {
+            matches!(&s.style, Style::Mention { kind: MentionKind::User, id } if id == grace)
+                && styled.text.get(s.start as usize..s.end as usize) == Some("@Grace Ombra")
+        }));
+
+        // Nested inside bold markdown keeps both bold and mention ranges.
+        let (wire_bold, ranges_bold) =
+            parse_with_inline_mentions(&format!("**hi <@{grace}>**"), &[], |_| "Grace".to_owned());
+        assert_eq!(wire_bold, "hi \u{FFFC}");
+        assert!(ranges_bold.contains(&Range::Mention {
+            start: 3,
+            aci: grace.to_owned(),
+            label: "@Grace".to_owned(),
+        }));
+        assert!(ranges_bold.contains(&Range::Style {
+            start: 0,
+            length: 4,
+            style: Mark::Bold,
+        }));
     }
 }

@@ -100,7 +100,7 @@ pub fn tabs(network: Network) -> Vec<Tab> {
 
 pub fn tabs_for(network: Network, has_pins: bool) -> Vec<Tab> {
     let mut tabs = vec![Tab::Kind(SharedKind::Media), Tab::Kind(SharedKind::Files), Tab::Kind(SharedKind::Links)];
-    if !matches!(network, Network::Teams | Network::Tiny | Network::Signal)
+    if !matches!(network, Network::Teams | Network::Tiny)
         || (network == Network::Tiny && has_pins)
     {
         tabs.push(Tab::Pinned);
@@ -546,9 +546,9 @@ mod tests {
     }
 
     #[test]
-    fn signal_has_no_pinned_tab_or_shared_search() {
-        assert_eq!(tabs(Network::Signal).len(), 3);
-        assert!(!tabs(Network::Signal).contains(&Tab::Pinned));
+    fn signal_has_pinned_tab_and_no_shared_search() {
+        assert_eq!(tabs(Network::Signal).len(), 4);
+        assert_eq!(tabs(Network::Signal).last(), Some(&Tab::Pinned));
         let empty = Page { read: true, ..Page::default() };
         let cached = Page { items: vec![item(), item()], read: true, ..Page::default() };
         let media = source(Network::Signal, Tab::Kind(SharedKind::Media), &empty);

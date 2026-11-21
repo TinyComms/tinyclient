@@ -276,6 +276,188 @@ pub struct ChatState {
     pub whitelisted: bool,
 }
 
+/// Verification state of a contact's Signal identity key (from storage service or `SyncMessage.verified`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityState {
+    #[default]
+    Default,
+    Verified,
+    Unverified,
+}
+
+/// A contact's computed 60-digit Signal safety number and verification status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyNumber {
+    /// Raw 60 numeric digits (Signal fingerprint v2, 5200 iterations).
+    pub digits: String,
+    pub state: IdentityState,
+    /// True when the contact was verified and their identity key changed without approval yet.
+    pub changed: bool,
+}
+
+/// Standard iteration count for Signal numeric safety numbers (v1/v2).
+pub const SAFETY_NUMBER_ITERATIONS: u32 = 5200;
+
+/// Parses a lowercase dashed UUID string (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) into 16 raw bytes.
+pub fn aci_uuid_bytes(aci: &str) -> Option<[u8; 16]> {
+    if !is_aci(aci) {
+        return None;
+    }
+    let hex_only: String = aci.chars().filter(|&c| c != '-').collect();
+    if hex_only.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex_only[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Computes Signal's 60-digit numeric safety number (fingerprint algorithm matching libsignal's
+/// `DisplayableFingerprint`, 5200 SHA-512 iterations).
+///
+/// For Signal v2 ACI-based safety numbers, pass each side's 16-byte raw ACI UUID as `local_id` /
+/// `remote_id` and their 33-byte serialized `IdentityKey` as `local_key` / `remote_key`.
+pub fn compute_safety_number(local_id: &[u8], local_key: &[u8], remote_id: &[u8], remote_key: &[u8]) -> String {
+    use sha2::{Digest, Sha512};
+    use std::fmt::Write as _;
+
+    fn hash_half(stable_id: &[u8], key_bytes: &[u8]) -> String {
+        let mut sha = Sha512::new();
+        sha.update([0u8, 0u8]);
+        sha.update(key_bytes);
+        sha.update(stable_id);
+        sha.update(key_bytes);
+        let mut buf = sha.finalize();
+        for _ in 1..SAFETY_NUMBER_ITERATIONS {
+            let mut sha = Sha512::new();
+            sha.update(&buf[..]);
+            sha.update(key_bytes);
+            buf = sha.finalize();
+        }
+        let mut out = String::with_capacity(30);
+        for chunk in buf[..30].chunks_exact(5) {
+            let val = chunk.iter().fold(0u64, |acc, &b| (acc << 8) | (b as u64));
+            let _ = write!(out, "{:05}", val % 100_000);
+        }
+        out
+    }
+
+    let local = hash_half(local_id, local_key);
+    let remote = hash_half(remote_id, remote_key);
+    if local < remote {
+        format!("{local}{remote}")
+    } else {
+        format!("{remote}{local}")
+    }
+}
+
+/// Computes Signal's v2 ACI-based 60-digit safety number from two ACI strings and their serialized
+/// 33-byte identity keys.
+pub fn safety_number_for_acis(local_aci: &str, local_key: &[u8], remote_aci: &str, remote_key: &[u8]) -> Option<String> {
+    if local_key.is_empty() || remote_key.is_empty() {
+        return None;
+    }
+    let local_id = aci_uuid_bytes(local_aci)?;
+    let remote_id = aci_uuid_bytes(remote_aci)?;
+    Some(compute_safety_number(&local_id, local_key, &remote_id, remote_key))
+}
+
+/// Formats 60 safety-number digits into Signal's standard 12 groups of 5 digits.
+pub fn format_safety_number(digits: &str) -> String {
+    let clean: String = digits.chars().filter(|c| c.is_ascii_digit()).collect();
+    if clean.is_empty() {
+        return String::new();
+    }
+    clean
+        .as_bytes()
+        .chunks(5)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One contact record decrypted from Signal's Storage Service (`ContactRecord`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StorageContact {
+    pub aci: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub nickname: String,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub phone: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub identity_state: IdentityState,
+    #[serde(default)]
+    pub blocked: bool,
+    #[serde(default)]
+    pub whitelisted: bool,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub marked_unread: bool,
+    #[serde(default)]
+    pub muted_until: u64,
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+/// One Groups v2 record decrypted from Signal's Storage Service (`GroupV2Record`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StorageGroup {
+    /// Group public id, hex (without `g.` prefix).
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub blocked: bool,
+    #[serde(default)]
+    pub whitelisted: bool,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub marked_unread: bool,
+    #[serde(default)]
+    pub muted_until: u64,
+    #[serde(default)]
+    pub dont_notify_for_mentions_if_muted: bool,
+}
+
+/// Account-level settings decrypted from Signal's Storage Service (`AccountRecord`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StorageAccount {
+    /// Ordered conversation ids (`<aci>` or `g.<hex>`) pinned on the account.
+    #[serde(default)]
+    pub pinned: Vec<String>,
+    #[serde(default)]
+    pub keep_muted_archived: Option<bool>,
+    #[serde(default)]
+    pub link_previews: Option<bool>,
+    /// Universal default disappearing-messages timer in seconds (0 = off).
+    #[serde(default)]
+    pub universal_expire_timer: u32,
+    #[serde(default)]
+    pub note_to_self_marked_unread: bool,
+}
+
+/// Full read-only snapshot decrypted from Signal's Storage Service manifest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StorageSnapshot {
+    #[serde(default)]
+    pub contacts: Vec<StorageContact>,
+    #[serde(default)]
+    pub groups: Vec<StorageGroup>,
+    #[serde(default)]
+    pub account: Option<StorageAccount>,
+}
+
 /// One Signal chat folder from the storage service (`ChatFolderRecord`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatFolder {
@@ -311,6 +493,29 @@ pub struct Quote {
     pub spans: Vec<Span>,
 }
 
+/// One link preview carried on a Signal `DataMessage.preview`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkPreview {
+    pub url: String,
+    pub title: String,
+    pub description: String,
+    pub date: u64,
+    /// Decrypted preview thumbnail bytes (JPEG/PNG/WebP), when attached.
+    pub image: Option<Vec<u8>>,
+    pub image_width: u32,
+    pub image_height: u32,
+}
+
+/// Returns true only when `url` is a valid `http://` or `https://` URL that actually appears
+/// in the message `body` (matching Signal Desktop/Android/iOS validation).
+pub fn preview_url_in_body(body: &str, url: &str) -> bool {
+    let url = url.trim();
+    if url.is_empty() || !(url.starts_with("https://") || url.starts_with("http://")) {
+        return false;
+    }
+    body.contains(url)
+}
+
 /// One message's words.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Text {
@@ -333,6 +538,8 @@ pub struct Text {
     pub expire_timer_version: u32,
     /// Shared contact cards attached to this message.
     pub contacts: Vec<protocol::SharedContact>,
+    /// Link previews attached to this message (`DataMessage.preview`).
+    pub previews: Vec<LinkPreview>,
 }
 
 /// Longest payment note shown in its label: what a sender typed joins the words after an em dash.
@@ -459,7 +666,7 @@ pub enum Event {
         admin_passkey: Option<Vec<u8>>,
     },
     /// The user's own settings, as the phone shares them.
-    Settings { read_receipts: bool, typing: bool },
+    Settings { read_receipts: bool, typing: bool, link_previews: Option<bool> },
     /// A conversation's disappearing-messages timer changed (0 turns it off).
     TimerChanged { peer: Peer, seconds: u32, version: u32 },
     /// Per-conversation mute, archive, pin, and mark-unread state from the phone / storage service.
@@ -470,12 +677,22 @@ pub enum Event {
         /// Account setting: keep muted chats archived when new messages arrive.
         keep_muted_archived: Option<bool>,
     },
+    /// Read-only Storage Service snapshot (contacts, groups, account record) fetched on connect or `fetchLatest`.
+    StorageSync(StorageSnapshot),
     /// Chat folders synced from the phone's storage service.
     Folders(Vec<ChatFolder>),
     /// Block list synced from the phone (`SyncMessage.blocked`): blocked ACIs and group public ids.
     Blocked { people: Vec<String>, groups: Vec<String> },
     /// A message request was answered on another device (`SyncMessage.messageRequestResponse`).
     MessageRequestResponse { peer: Peer, action: MessageRequestAction },
+    /// A contact's identity key changed (`IdentityChange::ReplacedExisting`).
+    IdentityChanged { peer: Peer },
+    /// A contact's verification state changed (locally or synced via `SyncMessage.verified`).
+    VerifiedChanged { aci: String, state: IdentityState },
+    /// `by` pinned `author`'s message sent at `target`. `duration_secs == None` means forever.
+    Pinned { peer: Peer, by: String, author: String, target: u64, duration_secs: Option<u32> },
+    /// `by` unpinned `author`'s message sent at `target`.
+    Unpinned { peer: Peer, by: String, author: String, target: u64 },
     /// Everything that waited while we were away has arrived.
     Caught,
     /// The connection is gone; a new wire is needed.
@@ -602,7 +819,7 @@ pub struct File {
 /// What is sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
-    Text { text: String, quote: Option<Quote>, ranges: Vec<Range>, timer: Timer },
+    Text { text: String, quote: Option<Quote>, ranges: Vec<Range>, timer: Timer, previews: Vec<LinkPreview> },
     /// Files, with the caption in `text` (empty when there is none).
     Files { text: String, quote: Option<Quote>, files: Vec<File>, timer: Timer },
     React { author: String, target: u64, emoji: String, remove: bool },
@@ -619,6 +836,10 @@ pub enum Body {
     PollEnd { target: u64 },
     /// Share a contact card.
     Contact { contact: protocol::SharedContact, timer: Timer },
+    /// Pin a message in a conversation (`duration_secs == None` pins forever).
+    Pin { author: String, target: u64, duration_secs: Option<u32> },
+    /// Unpin a message in a conversation.
+    Unpin { author: String, target: u64 },
 }
 
 /// Why something failed.
@@ -768,6 +989,23 @@ pub trait Wire: Send + Sync {
     fn join_call_link(&self, _url: &str) -> Result<CallLinkJoin, Fault> {
         Err(Fault::Refused("Joining call links is not available.".to_owned()))
     }
+    /// Computes the 60-digit Signal safety number and verification state for a contact ACI.
+    fn safety_number(&self, _aci: &str) -> Result<Option<SafetyNumber>, Fault> {
+        Ok(None)
+    }
+    /// Sets a contact's verification state (Default, Verified, Unverified), clearing any
+    /// unapproved key-change block and syncing `SyncMessage.verified` to other devices.
+    fn set_verified(&self, _aci: &str, _state: IdentityState) -> Result<(), Fault> {
+        Err(Fault::Refused("Safety number verification is not available.".to_owned()))
+    }
+    /// Fetches and decrypts another person's versioned Signal profile using their stored profile key.
+    fn person_profile(&self, _aci: &str) -> Result<PersonProfile, Fault> {
+        Ok(PersonProfile::default())
+    }
+    /// Fetches a link preview strictly through Signal's content proxy (NEVER directly).
+    fn fetch_link_preview(&self, _url: &str) -> Result<Option<LinkPreview>, Fault> {
+        Ok(None)
+    }
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);
 }
@@ -784,6 +1022,18 @@ pub struct OwnCard {
     pub phone: String,
     /// A signal.me link when a username is known. Empty otherwise. The shell draws the QR.
     pub link: String,
+}
+
+/// Another person's decrypted versioned Signal profile.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PersonProfile {
+    pub name: String,
+    pub about: String,
+    pub emoji: String,
+    /// Visible donation / sustainer badges reported by Signal.
+    pub badges: Vec<String>,
+    /// False when no profile key is stored for this person yet ("Name not shared yet").
+    pub key_known: bool,
 }
 
 /// What a finished link produced.
@@ -871,5 +1121,47 @@ mod tests {
         assert_eq!(found_url, url);
         assert_eq!(found_key, key);
         assert!(parse_call_link("https://signal.link/call/#key=too-short").is_none());
+    }
+
+    #[test]
+    fn safety_number_matches_libsignal_test_vector_and_formats_in_groups_of_five() {
+        let decode_hex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        // Official libsignal test vector (`rust/protocol/src/fingerprint.rs` testVectorsVersion1).
+        let alice_key = decode_hex("0506863bc66d02b40d27b8d49ca7c09e9239236f9d7d25d6fcca5ce13c7064d868");
+        let bob_key = decode_hex("05f781b6fb32fed9ba1cf2de978d4d5da28dc34046ae814402b5c0dbd96fda907b");
+        let expected = "300354477692869396892869876765458257569162576843440918079131";
+
+        let ab = compute_safety_number(b"+14152222222", &alice_key, b"+14153333333", &bob_key);
+        let ba = compute_safety_number(b"+14153333333", &bob_key, b"+14152222222", &alice_key);
+        assert_eq!(ab, expected);
+        assert_eq!(ba, expected);
+        assert_eq!(ab.len(), 60);
+
+        let formatted = format_safety_number(&ab);
+        let groups: Vec<&str> = formatted.split(' ').collect();
+        assert_eq!(groups.len(), 12);
+        assert!(groups.iter().all(|g| g.len() == 5 && g.bytes().all(|b| b.is_ascii_digit())));
+
+        // ACI v2 symmetry with 16-byte UUID identifiers.
+        let a_aci = "a1a1a1a1-0000-4000-8000-000000000001";
+        let b_aci = "b2b2b2b2-0000-4000-8000-000000000002";
+        let v2_ab = safety_number_for_acis(a_aci, &alice_key, b_aci, &bob_key).unwrap();
+        let v2_ba = safety_number_for_acis(b_aci, &bob_key, a_aci, &alice_key).unwrap();
+        assert_eq!(v2_ab.len(), 60);
+        assert_eq!(v2_ab, v2_ba);
+    }
+
+    #[test]
+    fn preview_url_must_appear_in_message_body() {
+        assert!(preview_url_in_body("See https://example.org/post for details", "https://example.org/post"));
+        assert!(!preview_url_in_body("See https://example.org/post for details", "https://evil.example.net/phish"));
+        assert!(!preview_url_in_body("No links here", "https://example.org/post"));
+        assert!(!preview_url_in_body("javascript:alert(1)", "javascript:alert(1)"));
+        assert!(!preview_url_in_body("anything", ""));
     }
 }

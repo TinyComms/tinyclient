@@ -50,7 +50,8 @@ use super::wire::{
     call_link_room_id, format_call_link, format_group_invite_link, gift_badge_label, parse_call_link,
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
     CallOutcome, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
-    GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, MessageRequestAction, OwnCard, Peer, Quote, Text, Wire,
+    GroupMember, GroupMembers, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker, MessageRequestAction, OwnCard,
+    Peer, PersonProfile, Quote, SafetyNumber, StorageSnapshot, Text, Wire,
 };
 use super::Saved;
 use crate::adapters::script;
@@ -137,6 +138,62 @@ impl FakeGroup {
     }
 }
 
+#[derive(Clone)]
+struct FakeIdentity {
+    key: [u8; 33],
+    state: IdentityState,
+    changed: bool,
+}
+
+fn fake_key(seed: u8) -> [u8; 33] {
+    let mut key = [seed; 33];
+    key[0] = 0x05;
+    key
+}
+
+fn initial_identities() -> HashMap<String, FakeIdentity> {
+    let mut map = HashMap::new();
+    map.insert(GRACE.to_owned(), FakeIdentity { key: fake_key(0x22), state: IdentityState::Default, changed: false });
+    map.insert(ALAN.to_owned(), FakeIdentity { key: fake_key(0x33), state: IdentityState::Default, changed: false });
+    map.insert(STRANGER.to_owned(), FakeIdentity { key: fake_key(0x44), state: IdentityState::Default, changed: false });
+    map
+}
+
+fn initial_profiles() -> HashMap<String, PersonProfile> {
+    let mut map = HashMap::new();
+    map.insert(
+        GRACE.to_owned(),
+        PersonProfile {
+            name: "Grace Ombra".into(),
+            about: "Likes bridge".into(),
+            emoji: "🃏".into(),
+            badges: vec!["Sustainer".into()],
+            key_known: true,
+        },
+    );
+    map.insert(
+        ALAN.to_owned(),
+        PersonProfile {
+            name: "Alan Ferro".into(),
+            about: "Leads trumps".into(),
+            emoji: "♠️".into(),
+            badges: Vec::new(),
+            key_known: true,
+        },
+    );
+    map.insert(
+        STRANGER.to_owned(),
+        PersonProfile {
+            name: String::new(),
+            about: String::new(),
+            emoji: String::new(),
+            badges: Vec::new(),
+            key_known: false,
+        },
+    );
+    map
+}
+
 pub struct Fake {
     events: Sender<Event>,
     heard: Mutex<Option<Receiver<Event>>>,
@@ -155,6 +212,10 @@ pub struct Fake {
     club: Arc<Mutex<FakeGroup>>,
     /// Fake call links created or synced in tests.
     call_links: Arc<Mutex<HashMap<[u8; 32], CallLink>>>,
+    /// Per-contact identity keys and verification states for safety numbers.
+    identities: Arc<Mutex<HashMap<String, FakeIdentity>>>,
+    /// Scripted decrypted profiles for other Signal accounts.
+    profiles: Arc<Mutex<HashMap<String, PersonProfile>>>,
 }
 
 impl Fake {
@@ -166,7 +227,13 @@ impl Fake {
         let _ = events.send(Event::Contacts(vec![grace, alan]));
         let club_state = FakeGroup::initial();
         let _ = events.send(Event::Groups(vec![club_state.info.clone()]));
-        let _ = events.send(Event::Settings { read_receipts: true, typing: true });
+        let _ = events.send(Event::Settings { read_receipts: true, typing: true, link_previews: Some(true) });
+        let manifest_path = protocol::support_dir().join("signal.storage.json");
+        if let Ok(raw) = std::fs::read_to_string(&manifest_path) {
+            if let Ok(snapshot) = serde_json::from_str::<StorageSnapshot>(&raw) {
+                let _ = events.send(Event::StorageSync(snapshot));
+            }
+        }
         let _ = events.send(Event::Caught);
         let fake = Fake {
             events,
@@ -189,6 +256,8 @@ impl Fake {
             lookups: Arc::default(),
             club: Arc::new(Mutex::new(club_state)),
             call_links: Arc::default(),
+            identities: Arc::new(Mutex::new(initial_identities())),
+            profiles: Arc::new(Mutex::new(initial_profiles())),
         };
         fake.listen();
         fake
@@ -196,7 +265,7 @@ impl Fake {
 
     /// Reads the test's lines for as long as this wire lives; closing the wire ends it.
     fn listen(&self) {
-        let (events, closed, refuse, fail_one, control, lookups, club) = (
+        let (events, closed, refuse, fail_one, control, lookups, club, identities, profiles) = (
             self.events.clone(),
             self.closed.clone(),
             self.refuse.clone(),
@@ -204,6 +273,8 @@ impl Fake {
             self.control.clone(),
             self.lookups.clone(),
             self.club.clone(),
+            self.identities.clone(),
+            self.profiles.clone(),
         );
         let _ = std::thread::Builder::new().name("signal-fake".into()).spawn(move || {
             script::follow(&control, |line| {
@@ -213,6 +284,38 @@ impl Fake {
                 let Some(line) = line.map(str::trim) else {
                     return true;
                 };
+                if let Some(rest) = line.strip_prefix("profile ") {
+                    let mut parts = rest.splitn(2, ' ');
+                    let target = parts.next().unwrap_or("").trim();
+                    let body = parts.next().unwrap_or("");
+                    let aci = if let Some((id, _)) = who(target) {
+                        Some(id.to_owned())
+                    } else if target == "stranger" {
+                        Some(STRANGER.to_owned())
+                    } else if super::wire::is_aci(target) {
+                        Some(target.to_owned())
+                    } else {
+                        None
+                    };
+                    if let Some(aci) = aci {
+                        let fields: Vec<&str> = body.split('|').map(str::trim).collect();
+                        let mut map = profiles.lock().unwrap_or_else(|p| p.into_inner());
+                        let entry = map.entry(aci).or_default();
+                        entry.key_known = true;
+                        entry.about = fields.first().copied().unwrap_or("").to_owned();
+                        entry.emoji = fields.get(1).copied().unwrap_or("").to_owned();
+                        entry.badges = fields
+                            .get(2)
+                            .copied()
+                            .unwrap_or("")
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                            .collect();
+                    }
+                    return true;
+                }
                 if let Some(rest) = line.strip_prefix("lookup ") {
                     let mut parts = rest.split_whitespace();
                     let username = parts.next().unwrap_or("");
@@ -301,7 +404,7 @@ impl Fake {
                     let _ = events.send(Event::Groups(vec![g.info.clone()]));
                     return true;
                 }
-                for event in steer(line) {
+                for event in steer(line, &identities) {
                     let _ = events.send(event);
                 }
                 true
@@ -311,7 +414,7 @@ impl Fake {
 }
 
 /// One line from the test: what Signal then says unasked.
-fn steer(line: &str) -> Vec<Event> {
+fn steer(line: &str, identities: &Mutex<HashMap<String, FakeIdentity>>) -> Vec<Event> {
     let mut words = line.split_whitespace();
     let command = words.next().unwrap_or("");
     let mut next = || words.next().unwrap_or("");
@@ -475,7 +578,40 @@ fn steer(line: &str) -> Vec<Event> {
         }
         "receipts" => {
             let read_receipts = next() != "off";
-            vec![Event::Settings { read_receipts, typing: true }]
+            vec![Event::Settings { read_receipts, typing: true, link_previews: None }]
+        }
+        "link-previews" => {
+            let enabled = next() != "off";
+            vec![Event::Settings { read_receipts: true, typing: true, link_previews: Some(enabled) }]
+        }
+        "preview" => {
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let payload = rest(line, 3);
+            let parts: Vec<&str> = payload.split('|').map(str::trim).collect();
+            let url = parts.first().copied().unwrap_or("").to_owned();
+            let title = parts.get(1).copied().unwrap_or("").to_owned();
+            let description = parts.get(2).copied().unwrap_or("").to_owned();
+            let body = parts.get(3).copied().unwrap_or("").to_owned();
+            let text = Text {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                text: body,
+                previews: vec![LinkPreview {
+                    url,
+                    title,
+                    description,
+                    date: sent,
+                    image: None,
+                    image_width: 0,
+                    image_height: 0,
+                }],
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(author), text, outgoing: false }]
         }
         "typing" | "typing-stop" => {
             let Some((by, name)) = who(next()) else {
@@ -619,6 +755,13 @@ fn steer(line: &str) -> Vec<Event> {
         "keep-muted-archived" => {
             let on = next() == "on";
             vec![Event::ChatStates { chats: Vec::new(), pinned: None, keep_muted_archived: Some(on) }]
+        }
+        "storage-manifest" => {
+            let json = line.strip_prefix("storage-manifest ").unwrap_or("").trim();
+            match serde_json::from_str::<StorageSnapshot>(json) {
+                Ok(snapshot) => vec![Event::StorageSync(snapshot)],
+                Err(_) => Vec::new(),
+            }
         }
         "folders" => {
             // Format: folders id:Name:opts... ; id2:Name2:opts...
@@ -770,6 +913,96 @@ fn steer(line: &str) -> Vec<Event> {
             };
             vec![Event::Groups(vec![club])]
         }
+        "identity-change" => {
+            let target = next();
+            let aci = if let Some((id, _)) = who(target) {
+                id.to_owned()
+            } else if target == "stranger" {
+                STRANGER.to_owned()
+            } else if super::wire::is_aci(target) {
+                target.to_owned()
+            } else {
+                return Vec::new();
+            };
+            {
+                let mut map = identities.lock().unwrap_or_else(|p| p.into_inner());
+                let entry = map
+                    .entry(aci.clone())
+                    .or_insert_with(|| FakeIdentity { key: fake_key(0x55), state: IdentityState::Default, changed: false });
+                entry.key[32] = entry.key[32].wrapping_add(1);
+                if entry.state == IdentityState::Verified {
+                    entry.state = IdentityState::Unverified;
+                    entry.changed = true;
+                }
+            }
+            vec![Event::IdentityChanged { peer: Peer::Direct(aci) }]
+        }
+        "verified" => {
+            let target = next();
+            let aci = if let Some((id, _)) = who(target) {
+                id.to_owned()
+            } else if target == "stranger" {
+                STRANGER.to_owned()
+            } else if super::wire::is_aci(target) {
+                target.to_owned()
+            } else {
+                return Vec::new();
+            };
+            let state = match next() {
+                "verified" => IdentityState::Verified,
+                "unverified" => IdentityState::Unverified,
+                "default" => IdentityState::Default,
+                _ => return Vec::new(),
+            };
+            {
+                let mut map = identities.lock().unwrap_or_else(|p| p.into_inner());
+                let entry = map
+                    .entry(aci.clone())
+                    .or_insert_with(|| FakeIdentity { key: fake_key(0x55), state: IdentityState::Default, changed: false });
+                entry.state = state;
+                entry.changed = false;
+            }
+            vec![Event::VerifiedChanged { aci, state }]
+        }
+        "pin-msg" | "unpin-msg" => {
+            let where_word = next();
+            let peer = if where_word == "club" {
+                club()
+            } else if let Some((id, _)) = who(where_word) {
+                direct(id)
+            } else if super::wire::is_aci(where_word) {
+                direct(where_word)
+            } else {
+                return Vec::new();
+            };
+            let by_word = next();
+            let by = if by_word == "me" {
+                ME.to_owned()
+            } else if let Some((id, _)) = who(by_word) {
+                id.to_owned()
+            } else if super::wire::is_aci(by_word) {
+                by_word.to_owned()
+            } else {
+                return Vec::new();
+            };
+            let author_word = next();
+            let author = if author_word == "me" {
+                ME.to_owned()
+            } else if let Some((id, _)) = who(author_word) {
+                id.to_owned()
+            } else if super::wire::is_aci(author_word) {
+                author_word.to_owned()
+            } else {
+                return Vec::new();
+            };
+            let target = next().parse().unwrap_or(0);
+            if command == "pin-msg" {
+                let duration_secs = next().parse::<u32>().ok().filter(|&s| s > 0);
+                vec![Event::Pinned { peer, by, author, target, duration_secs }]
+            } else {
+                vec![Event::Unpinned { peer, by, author, target }]
+            }
+        }
         "drop" => vec![Event::Closed("the fake dropped the connection".into())],
         "unlinked" => vec![Event::Ended("This computer was removed from your Signal account.".into())],
         _ => Vec::new(),
@@ -813,11 +1046,29 @@ impl Wire for Fake {
         let exp = |timer: super::wire::Timer| {
             if timer.seconds > 0 { format!(" expire={}", timer.seconds) } else { String::new() }
         };
-        let line = match &body {
-            Body::Text { text, quote: Some(quote), ranges, timer } => {
-                format!("send {} text {text}{}{} (answering {}-{})", describe(to), noted(ranges), exp(*timer), quote.sent, quote.author)
+        let prev = |previews: &[LinkPreview]| {
+            if previews.is_empty() {
+                String::new()
+            } else {
+                let urls: Vec<&str> = previews.iter().map(|p| p.url.as_str()).collect();
+                format!(" previews={}", urls.join(","))
             }
-            Body::Text { text, quote: None, ranges, timer } => format!("send {} text {text}{}{}", describe(to), noted(ranges), exp(*timer)),
+        };
+        let line = match &body {
+            Body::Text { text, quote: Some(quote), ranges, timer, previews } => {
+                format!(
+                    "send {} text {text}{}{}{} (answering {}-{})",
+                    describe(to),
+                    noted(ranges),
+                    exp(*timer),
+                    prev(previews),
+                    quote.sent,
+                    quote.author
+                )
+            }
+            Body::Text { text, quote: None, ranges, timer, previews } => {
+                format!("send {} text {text}{}{}{}", describe(to), noted(ranges), exp(*timer), prev(previews))
+            }
             Body::Files { text, quote, files, timer } => {
                 let names: Vec<String> = files.iter().map(|file| file.name.clone()).collect();
                 format!("{}{}", super::files::call_line(&describe(to), &names, text, quote.as_ref()), exp(*timer))
@@ -833,8 +1084,26 @@ impl Wire for Fake {
             }
             Body::PollEnd { target } => format!("send {} endpoll {target}", describe(to)),
             Body::Contact { contact, timer } => format!("send {} contact {}{}", describe(to), contact.name, exp(*timer)),
+            Body::Pin { author, target, duration_secs } => {
+                let dur = duration_secs.map_or_else(|| "forever".to_owned(), |s| s.to_string());
+                format!("send {} pin {target}-{author} dur={dur}", describe(to))
+            }
+            Body::Unpin { author, target } => format!("send {} unpin {target}-{author}", describe(to)),
         };
         record(&line);
+        if let Peer::Direct(aci) = to {
+            let blocked = self
+                .identities
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(aci)
+                .is_some_and(|id| id.changed);
+            if blocked {
+                return Err(Fault::Refused(
+                    "Your safety number with this contact has changed. Review and approve their safety number before sending.".to_owned(),
+                ));
+            }
+        }
         if let Some(words) = self.refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             return Err(Fault::Refused(words));
         }
@@ -1334,6 +1603,82 @@ impl Wire for Fake {
             name: stored.as_ref().map(|l| l.name.clone()).unwrap_or_default(),
             waiting_for_approval: stored.as_ref().is_some_and(|l| l.approve_all),
         })
+    }
+
+    fn safety_number(&self, aci: &str) -> Result<Option<SafetyNumber>, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let map = self.identities.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = map.get(aci) else {
+            return Ok(None);
+        };
+        let me_key = fake_key(0x11);
+        let Some(digits) = super::wire::safety_number_for_acis(ME, &me_key, aci, &entry.key) else {
+            return Ok(None);
+        };
+        Ok(Some(SafetyNumber {
+            digits,
+            state: entry.state,
+            changed: entry.changed,
+        }))
+    }
+
+    fn set_verified(&self, aci: &str, state: IdentityState) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        {
+            let mut map = self.identities.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = map
+                .entry(aci.to_owned())
+                .or_insert_with(|| FakeIdentity { key: fake_key(0x55), state: IdentityState::Default, changed: false });
+            entry.state = state;
+            entry.changed = false;
+        }
+        let label = match state {
+            IdentityState::Default => "default",
+            IdentityState::Verified => "verified",
+            IdentityState::Unverified => "unverified",
+        };
+        record(&format!("verify {aci} {label}"));
+        let _ = self.events.send(Event::VerifiedChanged { aci: aci.to_owned(), state });
+        Ok(())
+    }
+
+    fn person_profile(&self, aci: &str) -> Result<PersonProfile, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        record(&format!("person-profile {aci}"));
+        let found = self
+            .profiles
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(aci)
+            .cloned()
+            .unwrap_or(PersonProfile { key_known: false, ..PersonProfile::default() });
+        Ok(found)
+    }
+
+    fn fetch_link_preview(&self, url: &str) -> Result<Option<LinkPreview>, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        record(&format!("preview-fetch {url}"));
+        let host = crate::adapters::tiny::preview::real_host(url);
+        if host.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(LinkPreview {
+            url: url.to_owned(),
+            title: format!("Preview for {host}"),
+            description: "Fetched via Signal content proxy".to_owned(),
+            date: 0,
+            image: None,
+            image_width: 0,
+            image_height: 0,
+        }))
     }
 
     fn close(&self) {

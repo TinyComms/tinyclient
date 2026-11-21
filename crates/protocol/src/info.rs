@@ -313,7 +313,7 @@ impl EmojiScope {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MentionFormat {
-    /// Mentions stay as their plain display label (Telegram, Signal, Messages, Tiny).
+    /// Mentions stay as their plain display label (Telegram, Messages, Tiny).
     #[default]
     Plain,
     /// `<@id>`, `<@&id>`, `<#id>`, `<:name:id>` / `<a:name:id>`.
@@ -322,6 +322,8 @@ pub enum MentionFormat {
     Slack,
     /// `<@id|label>`, `<@&id|label>`, `<#id|label>`; custom emoji stay `:name:`.
     Teams,
+    /// `<@aci>` for person mentions; adapter replaces with U+FFFC and UTF-16 `BodyRange(MentionAci)`.
+    Signal,
 }
 
 impl MentionFormat {

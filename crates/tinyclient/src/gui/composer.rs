@@ -2492,6 +2492,10 @@ impl Composer {
                 }
                 rows
             }
+            (Ok(Response::Members { members, .. }), _) => {
+                self.hub.learn(&members);
+                complete::people(self.known(&target.key), members, &account, &trigger.query)
+            }
             (Ok(Response::Conversations { conversations, .. }), Some(space)) => complete::channels(conversations, &account, space, &trigger.query),
             _ => Vec::new(),
         };
