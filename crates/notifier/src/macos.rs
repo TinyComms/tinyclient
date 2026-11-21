@@ -22,7 +22,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 const MESSAGE: &str = "message";
+const MESSAGE_OTP: &str = "message_otp";
 const READONLY: &str = "readonly";
+const READONLY_OTP: &str = "readonly_otp";
 const CALL: &str = "call";
 const CALL_ON_PHONE: &str = "call_on_phone";
 
@@ -45,6 +47,7 @@ define_class!(
             let done_with = match action.as_str() {
                 "reply" => reply.filter(|text| !text.trim().is_empty()).map(|text| Activation::Reply { id: id.clone(), text }),
                 "read" => Some(Activation::MarkRead(id.clone())),
+                "copy" => Some(Activation::CopyCode(id.clone())),
                 "accept" => Some(Activation::Accept(id.clone())),
                 "decline" => Some(Activation::Decline(id.clone())),
                 // A call answered on the phone: the one action opens the conversation.
@@ -109,24 +112,31 @@ impl Center {
         let center = UNUserNotificationCenter::currentNotificationCenter();
         let delegate = Delegate::new(tell);
         center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-        let reply = UNTextInputNotificationAction::actionWithIdentifier_title_options_textInputButtonTitle_textInputPlaceholder(
-            &NSString::from_str("reply"),
-            &NSString::from_str("Reply"),
-            UNNotificationActionOptions::empty(),
-            &NSString::from_str("Send"),
-            &NSString::from_str("Reply"),
-        );
+        let reply = || {
+            UNTextInputNotificationAction::actionWithIdentifier_title_options_textInputButtonTitle_textInputPlaceholder(
+                &NSString::from_str("reply"),
+                &NSString::from_str("Reply"),
+                UNNotificationActionOptions::empty(),
+                &NSString::from_str("Send"),
+                &NSString::from_str("Reply"),
+            )
+        };
         let read = || {
             UNNotificationAction::actionWithIdentifier_title_options(&NSString::from_str("read"), &NSString::from_str("Mark as Read"), UNNotificationActionOptions::empty())
+        };
+        let copy = || {
+            UNNotificationAction::actionWithIdentifier_title_options(&NSString::from_str("copy"), &NSString::from_str("Copy code"), UNNotificationActionOptions::empty())
         };
         let accept = UNNotificationAction::actionWithIdentifier_title_options(&NSString::from_str("accept"), &NSString::from_str("Accept"), UNNotificationActionOptions::Foreground);
         let decline = UNNotificationAction::actionWithIdentifier_title_options(&NSString::from_str("decline"), &NSString::from_str("Decline"), UNNotificationActionOptions::Destructive);
         let answer = UNNotificationAction::actionWithIdentifier_title_options(&NSString::from_str("answer"), &NSString::from_str("Answer on your phone"), UNNotificationActionOptions::Foreground);
-        let message = category(MESSAGE, &[Retained::into_super(reply), read()], "New message");
+        let message = category(MESSAGE, &[Retained::into_super(reply()), read()], "New message");
+        let message_otp = category(MESSAGE_OTP, &[Retained::into_super(reply()), copy(), read()], "New message");
         let readonly = category(READONLY, &[read()], "New message");
+        let readonly_otp = category(READONLY_OTP, &[copy(), read()], "New message");
         let call = category(CALL, &[accept, decline], "Incoming call");
         let on_phone = category(CALL_ON_PHONE, &[answer], "Incoming call");
-        center.setNotificationCategories(&NSSet::from_retained_slice(&[message, readonly, call, on_phone]));
+        center.setNotificationCategories(&NSSet::from_retained_slice(&[message, message_otp, readonly, readonly_otp, call, on_phone]));
         let asked = RcBlock::new(|granted: Bool, error: *mut NSError| {
             if !granted.as_bool() {
                 // SAFETY: the framework passes a valid error or null.
@@ -150,8 +160,8 @@ impl Sink for Center {
         content.setBody(&NSString::from_str(&note.body));
         content.setThreadIdentifier(&NSString::from_str(&note.id));
         match note.kind {
-            Kind::Message => content.setCategoryIdentifier(&NSString::from_str(MESSAGE)),
-            Kind::ReadOnly => content.setCategoryIdentifier(&NSString::from_str(READONLY)),
+            Kind::Message => content.setCategoryIdentifier(&NSString::from_str(if note.copy_code.is_some() { MESSAGE_OTP } else { MESSAGE })),
+            Kind::ReadOnly => content.setCategoryIdentifier(&NSString::from_str(if note.copy_code.is_some() { READONLY_OTP } else { READONLY })),
             Kind::Call => content.setCategoryIdentifier(&NSString::from_str(CALL)),
             Kind::CallOnPhone => content.setCategoryIdentifier(&NSString::from_str(CALL_ON_PHONE)),
             Kind::Plain => {}

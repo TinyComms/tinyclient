@@ -139,6 +139,8 @@ pub struct Can {
     pub delete_everyone: bool,
     /// May delete this message on this user's side only (Telegram DM/group, Signal, Google Messages).
     pub delete_me: bool,
+    /// Google Messages: message can be starred/unstarred.
+    pub star: bool,
     /// Never left: deleting it is local, and it can be sent again.
     pub unsent: bool,
 }
@@ -213,6 +215,32 @@ pub fn can_with_rights(
     can_with_network(message, network, &caps, rights, kind, in_thread, 0)
 }
 
+/// Same as [`can_with_rights`], with the conversation's topic (used to tell RCS from SMS on
+/// Google Messages) and the account's `edit_window` in seconds (0 = no limit).
+pub fn can_in(
+    message: &Message,
+    network: Network,
+    kind: ConversationKind,
+    in_thread: bool,
+    topic: &str,
+    edit_window: u32,
+    now: i64,
+) -> Can {
+    let caps = Capabilities {
+        reply: network != Network::Slack,
+        edit: true,
+        edit_window,
+        delete: network != Network::Messages,
+        threads: matches!(network, Network::Discord | Network::Slack | Network::Teams | Network::Tiny),
+        direct_threads: matches!(network, Network::Slack),
+        pins: network != Network::Messages,
+        forward: network != Network::Messages,
+        reactions: true,
+        ..Capabilities::default()
+    };
+    can_with_network_topic(message, network, &caps, ConversationRights::default(), kind, in_thread, topic, now)
+}
+
 /// Full capability + network + rights check used by the conversation pane.
 pub fn can_with_network(
     message: &Message,
@@ -223,16 +251,31 @@ pub fn can_with_network(
     in_thread: bool,
     now: i64,
 ) -> Can {
+    can_with_network_topic(message, network, caps, rights, kind, in_thread, "", now)
+}
+
+/// Full capability + network + rights + topic check used by the conversation pane.
+pub fn can_with_network_topic(
+    message: &Message,
+    network: Network,
+    caps: &Capabilities,
+    rights: ConversationRights,
+    kind: ConversationKind,
+    in_thread: bool,
+    topic: &str,
+    now: i64,
+) -> Can {
     let sent = message.state == SendState::Sent;
     let said = matches!(message.kind, MessageKind::Normal | MessageKind::Unsupported { .. }) && !message.deleted;
     let act = sent && said;
     let own = message.outgoing && message.kind == MessageKind::Normal && !message.deleted;
+    let messages_rcs = network != Network::Messages || topic.starts_with("RCS message");
     let edit = sent
         && !message.deleted
         && !message.saved_history
         && match message.can_edit {
             Some(allowed) => allowed,
-            None => own && caps.edit && within_edit_window(message, caps, now),
+            None => own && caps.edit && messages_rcs && within_edit_window(message, caps, now),
         };
     let delete_everyone = !message.deleted
         && sent
@@ -259,6 +302,7 @@ pub fn can_with_network(
         forward: act && caps.forward,
         delete_everyone,
         delete_me,
+        star: act && network == Network::Messages,
         unsent,
     }
 }
@@ -316,6 +360,8 @@ enum MenuAct {
     Unread,
     /// Enter multi-message selection mode with this message ticked.
     Select,
+    /// Star or unstar a message (Google Messages).
+    Star,
     /// A sent message: ask, unless the click held Shift.
     Delete,
 }
@@ -499,6 +545,9 @@ fn menu_acts(
         acts.push(MenuAct::Unread);
         acts.push(MenuAct::Select);
     }
+    if can.star {
+        acts.push(MenuAct::Star);
+    }
     if can.delete {
         acts.push(MenuAct::Delete);
     }
@@ -523,7 +572,16 @@ impl Pane {
                 if open.can_pin {
                     rights.pin = true;
                 }
-                can_with_network(message, open.key.network, &open.can, rights, open.kind, self.is_thread(), now)
+                can_with_network_topic(
+                    message,
+                    open.key.network,
+                    &open.can,
+                    rights,
+                    open.kind,
+                    self.is_thread(),
+                    &open.topic,
+                    now,
+                )
             }
             None => can_with_network(
                 message,
@@ -1022,7 +1080,7 @@ impl Pane {
             self.adds(message),
             !message.text.is_empty(),
             has_link,
-            has_link && self.network() != Network::Tiny,
+            has_link && self.open.as_ref().is_some_and(|open| open.key.network != Network::Tiny),
             self.saveable_file(message).is_some(),
         );
         let cursor = if acts.is_empty() {
@@ -1108,6 +1166,16 @@ impl Pane {
                 self.multi_select.enter(&message.id);
                 window.focus(&self.focus, cx);
                 cx.notify();
+            }
+            MenuAct::Star => {
+                if let Some(conversation) = self.key().cloned() {
+                    let request = Request::StarMessage {
+                        conversation,
+                        message_id: message.id.clone(),
+                        starred: !message.starred,
+                    };
+                    cx.background_executor().spawn(async move { let _ = ask(&request); }).detach();
+                }
             }
             MenuAct::Delete => self.delete(&message, at_once, window, cx),
         }
@@ -1250,7 +1318,7 @@ impl Pane {
                         }))
                         .into_any_element(),
                 );
-                if self.network() != Network::Tiny {
+                if self.open.as_ref().is_some_and(|open| open.key.network != Network::Tiny) {
                     rows.push(
                         row("sheet-open-in", "icons/external-link.svg", format!("Open in {network}").into(), false)
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1497,7 +1565,7 @@ impl Pane {
                 items = items
                     .child(menu_item("link", Some("icons/link.svg"), "Copy link", None).when(lit(MenuAct::Link), |row| row.bg(theme::selected()))
                             .on_click(go(MenuAct::Link)));
-                if self.network() != Network::Tiny {
+                if self.open.as_ref().is_some_and(|open| open.key.network != Network::Tiny) {
                     items = items
                         .child(menu_separator())
                         .child(menu_item("open-in", Some("icons/external-link.svg"), format!("Open in {network}"), None).when(lit(MenuAct::Open), |row| row.bg(theme::selected()))
@@ -1521,6 +1589,14 @@ impl Pane {
                     menu_item("select", Some("icons/check.svg"), "Select", None)
                         .when(lit(MenuAct::Select), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::Select)),
+                );
+            }
+            if can.star {
+                let label = if message.starred { "Unstar message" } else { "Star message" };
+                items = items.child(
+                    menu_item("star", Some("icons/star.svg"), label, None)
+                        .when(lit(MenuAct::Star), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Star)),
                 );
             }
             if can.delete {
@@ -2674,5 +2750,20 @@ mod tests {
         let mut gone = theirs.clone();
         gone.deleted = true;
         assert!(!can_with_rights(&gone, Network::Tiny, ConversationKind::Channel, false, mod_rights).delete);
+    }
+
+    #[test]
+    fn messages_edit_is_only_offered_for_own_rcs_messages_inside_the_window() {
+        let now = 1_791_893_000;
+        let mine = Message::plain("m1", "Ada", "hi", now - 60, true);
+        let theirs = Message::plain("m2", "Grace", "hi", now - 60, false);
+        let old = Message::plain("m3", "Ada", "old", now - 1200, true);
+
+        assert!(can_in(&mine, Network::Messages, ConversationKind::Direct, false, "RCS message", 900, now).edit);
+        assert!(can_in(&mine, Network::Messages, ConversationKind::Direct, false, "RCS message · Encrypted between phones", 900, now).edit);
+        assert!(!can_in(&theirs, Network::Messages, ConversationKind::Direct, false, "RCS message", 900, now).edit);
+        assert!(!can_in(&old, Network::Messages, ConversationKind::Direct, false, "RCS message", 900, now).edit);
+        assert!(!can_in(&mine, Network::Messages, ConversationKind::Direct, false, "Text message", 900, now).edit);
+        assert!(!can_in(&mine, Network::Messages, ConversationKind::Direct, false, "", 900, now).edit);
     }
 }

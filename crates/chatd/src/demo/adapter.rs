@@ -911,7 +911,10 @@ impl Demo {
             Command::AnswerMessageRequest { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
-            Command::Source { reply, .. } => {
+            Command::Source { reply, .. } | Command::CreateGroup { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
+            }
+            Command::StarMessage { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
             Command::SetDisappearing { conversation_id, seconds, reply } => {

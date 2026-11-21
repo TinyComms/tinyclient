@@ -39,11 +39,12 @@ pub struct Source {
     pub open_in: bool,
 }
 
-fn none_words(tab: Tab) -> &'static str {
+fn none_words(network: Network, tab: Tab) -> &'static str {
     match tab {
         Tab::Kind(SharedKind::Media) => "No photos or videos in this chat",
         Tab::Kind(SharedKind::Files) => "No files in this chat",
         Tab::Kind(SharedKind::Links) => "No links in this chat",
+        Tab::Pinned if network == Network::Messages => "No starred messages in this chat",
         Tab::Pinned => "Nothing pinned in this chat",
     }
 }
@@ -55,7 +56,7 @@ pub fn source(network: Network, tab: Tab, page: &Page) -> Source {
     // Pinned is the network's own list, asked of it.
     if page.complete || tab == Tab::Pinned {
         let line = match (count, page.total.unwrap_or(count)) {
-            (0, _) => none_words(tab).to_owned(),
+            (0, _) => none_words(network, tab).to_owned(),
             (_, total) => format!("All on {net} · {total}"),
         };
         return Source { line, search: false, open_in: false };
@@ -91,7 +92,7 @@ pub fn tab_count(page: &Page) -> Option<u32> {
     page.total
 }
 
-/// The tabs a network has. Pinned is hidden where the network does not serve it
+/// The tabs a network has. Pinned (or Starred on Messages) is hidden where the network does not serve it
 /// (for Tiny, only shown when the server advertises the `pins` capability).
 pub fn tabs(network: Network) -> Vec<Tab> {
     tabs_for(network, false)
@@ -99,7 +100,7 @@ pub fn tabs(network: Network) -> Vec<Tab> {
 
 pub fn tabs_for(network: Network, has_pins: bool) -> Vec<Tab> {
     let mut tabs = vec![Tab::Kind(SharedKind::Media), Tab::Kind(SharedKind::Files), Tab::Kind(SharedKind::Links)];
-    if !matches!(network, Network::Teams | Network::Messages | Network::Tiny | Network::Signal)
+    if !matches!(network, Network::Teams | Network::Tiny | Network::Signal)
         || (network == Network::Tiny && has_pins)
     {
         tabs.push(Tab::Pinned);
@@ -314,6 +315,7 @@ pub fn draw(shared: &Shared, network: Network, has_pins: bool, hub: &Hub, width:
                 Tab::Kind(SharedKind::Media) => "Media",
                 Tab::Kind(SharedKind::Files) => "Files",
                 Tab::Kind(SharedKind::Links) => "Links",
+                Tab::Pinned if network == Network::Messages => "Starred",
                 Tab::Pinned => "Pinned",
             };
             let count = shared.total_of(tab);
@@ -524,7 +526,9 @@ mod tests {
         let none = Page { complete: true, total: Some(0), read: true, ..Page::default() };
         assert_eq!(source(Network::Telegram, links, &none).line, "No links in this chat");
         assert_eq!(tabs(Network::Teams).len(), 3);
-        assert_eq!(tabs(Network::Messages).len(), 3);
+        assert_eq!(tabs(Network::Messages).len(), 4);
+        assert_eq!(tabs(Network::Messages).last(), Some(&Tab::Pinned));
+        assert_eq!(source(Network::Messages, Tab::Pinned, &none).line, "No starred messages in this chat");
         assert_eq!(tabs(Network::Tiny).len(), 3);
         assert_eq!(tabs_for(Network::Tiny, true).last(), Some(&Tab::Pinned));
         assert_eq!(tabs(Network::Slack).last(), Some(&Tab::Pinned));

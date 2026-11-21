@@ -26,6 +26,7 @@ pub mod ipc;
 pub mod launch;
 pub mod link;
 mod message;
+pub mod otp;
 mod play;
 mod record;
 pub mod quarantine;
@@ -1190,6 +1191,10 @@ impl DeleteScope {
     }
 }
 
+fn default_starred_limit() -> u32 {
+    50
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -1257,6 +1262,21 @@ pub enum Request {
         folder_add: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         folder_remove: Option<String>,
+    },
+    /// Star or unstar one message on the network (Google Messages).
+    StarMessage {
+        conversation: Key,
+        message_id: String,
+        starred: bool,
+    },
+    /// Starred messages across an account (or one conversation when set), newest first.
+    /// Answers `Response::Pinned { messages }`.
+    StarredMessages {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+        #[serde(default = "default_starred_limit")]
+        limit: u32,
     },
     /// Puts a reminder on one message, to be told about it when the time comes, or takes it
     /// back with `remind_at: None`. Local: nothing goes to any network. A time already past is
@@ -1440,6 +1460,14 @@ pub enum Request {
         private: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<String>,
+    },
+    /// Starts a new group conversation with two or more members (by person id or phone number)
+    /// and an optional group name. Answers `Response::Conversation`.
+    CreateGroup {
+        account: AccountKey,
+        members: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     /// The thread a channel message starts. Discord only: its thread is a new channel, so this
     /// creates it and answers with that conversation. Slack and Teams name a thread from the

@@ -34,6 +34,7 @@ fn main() {
         reply_hint: "Reply".to_owned(),
         sound: None,
         locked_body: "New message".to_owned(),
+        copy_code: None,
     };
     match sink.post(&note) {
         Ok(()) => println!("posted"),

@@ -17,6 +17,7 @@ pub mod sendtime;
 pub mod session;
 pub mod store;
 pub mod tls;
+pub mod unfurl;
 pub mod verified;
 
 use protocol::{chat_sock_path_in, ChatListener};

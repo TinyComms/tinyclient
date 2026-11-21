@@ -573,6 +573,9 @@ pub struct Message {
     pub prior_text: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub pinned: bool,
+    /// Starred on the network (Google Messages).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub starred: bool,
     /// How many people saw a channel's post, when the network counts them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub views: Option<u32>,
@@ -698,6 +701,7 @@ impl Message {
             edited_at: None,
             prior_text: None,
             pinned: false,
+            starred: false,
             views: None,
             mentions_me: false,
             kind: MessageKind::Normal,

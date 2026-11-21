@@ -69,6 +69,8 @@ pub struct Note {
     /// What the system should show while the screen is locked, when it decides that itself
     /// (macOS's hidden-preview placeholder): "New message".
     pub locked_body: String,
+    /// Detected one-time code to offer a "Copy code" action, only when previews are shown.
+    pub copy_code: Option<String>,
 }
 
 /// What the user did with a notification, by its [`Note::id`].
@@ -78,6 +80,7 @@ pub enum Activation {
     Open(String),
     Reply { id: String, text: String },
     MarkRead(String),
+    CopyCode(String),
     Accept(String),
     Decline(String),
 }
@@ -152,6 +155,66 @@ pub fn screen_locked() -> bool {
     return windows::locked();
     #[cfg(not(windows))]
     false
+}
+
+/// Copies `text` to the system clipboard (used by the notification "Copy code" action).
+pub fn copy_text(text: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        use std::os::windows::process::CommandExt;
+        let mut child = std::process::Command::new("clip.exe")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .map_err(|err| err.to_string())?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes()).map_err(|err| err.to_string())?;
+        }
+        let _ = child.wait();
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        let mut child = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|err| err.to_string())?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes()).map_err(|err| err.to_string())?;
+        }
+        let _ = child.wait();
+        Ok(())
+    }
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios"))))]
+    {
+        use std::io::Write;
+        let try_cmd = |program: &str, args: &[&str]| -> Result<(), String> {
+            let mut child = std::process::Command::new(program)
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|err| err.to_string())?;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(text.as_bytes()).map_err(|err| err.to_string())?;
+            }
+            let _ = child.wait();
+            Ok(())
+        };
+        try_cmd("wl-copy", &[]).or_else(|_| try_cmd("xclip", &["-selection", "clipboard"]))
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = text;
+        Err("clipboard copy from background notifications is unsupported on mobile".to_owned())
+    }
 }
 
 #[allow(dead_code)]
@@ -243,15 +306,21 @@ fn toast_xml(note: &Note) -> String {
         xml.push_str(&format!("<text placement=\"attribution\">{}</text>", escape(&note.subtitle)));
     }
     xml.push_str("</binding></visual>");
+    let copy_action = if note.copy_code.is_some() {
+        format!("<action content=\"Copy code\" arguments=\"copy:{id}\" activationType=\"foreground\"/>")
+    } else {
+        String::new()
+    };
     match note.kind {
         Kind::Message => xml.push_str(&format!(
             "<actions><input id=\"reply\" type=\"text\" placeHolderContent=\"{}\"/>\
              <action content=\"Send\" arguments=\"reply:{id}\" hint-inputId=\"reply\" activationType=\"foreground\"/>\
+             {copy_action}\
              <action content=\"Mark as read\" arguments=\"read:{id}\" activationType=\"foreground\"/></actions>",
             escape(&note.reply_hint)
         )),
         Kind::ReadOnly => xml.push_str(&format!(
-            "<actions><action content=\"Mark as read\" arguments=\"read:{id}\" activationType=\"foreground\"/></actions>"
+            "<actions>{copy_action}<action content=\"Mark as read\" arguments=\"read:{id}\" activationType=\"foreground\"/></actions>"
         )),
         Kind::Call => xml.push_str(&format!(
             "<actions><action content=\"Accept\" arguments=\"accept:{id}\" activationType=\"foreground\"/>\
@@ -279,6 +348,7 @@ fn activation(arguments: &str, reply: Option<String>) -> Option<Activation> {
             None => Activation::Open(id),
         },
         "read" => Activation::MarkRead(id),
+        "copy" => Activation::CopyCode(id),
         "accept" => Activation::Accept(id),
         "decline" => Activation::Decline(id),
         _ => return None,
@@ -299,6 +369,7 @@ mod tests {
             reply_hint: "Reply to Ines".into(),
             sound: None,
             locked_body: "New message".into(),
+            copy_code: None,
         }
     }
 
@@ -310,7 +381,13 @@ mod tests {
         assert!(xml.contains("placement=\"attribution\">#platform · Northwind"));
         assert!(xml.contains("arguments=\"reply:m:1\" hint-inputId=\"reply\""));
         assert!(xml.contains("arguments=\"read:m:1\""));
+        assert!(!xml.contains("arguments=\"copy:m:1\""));
         assert!(xml.ends_with("<audio silent=\"true\"/></toast>"));
+        let mut otp = note(Kind::ReadOnly);
+        otp.copy_code = Some("482910".into());
+        let otp_xml = toast_xml(&otp);
+        assert!(otp_xml.contains("content=\"Copy code\"") && otp_xml.contains("arguments=\"copy:m:1\""), "{otp_xml}");
+        assert_eq!(activation("copy:m:1", None), Some(Activation::CopyCode("m:1".into())));
         let call = toast_xml(&note(Kind::Call));
         assert!(call.contains("scenario=\"incomingCall\"") && call.contains("accept:m:1") && call.contains("decline:m:1"));
         let on_phone = toast_xml(&note(Kind::CallOnPhone));

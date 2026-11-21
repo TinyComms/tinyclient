@@ -2084,7 +2084,7 @@ fn search(
             path.push_str("&conversation_id=");
             path.push_str(conv_id);
         }
-        crate::adapters::SearchScope::Space(_) => {}
+        crate::adapters::SearchScope::Space(_) | crate::adapters::SearchScope::Account => {}
     }
     match super::asked("GET", saved, &path, None) {
         Ok((200, body)) => {
