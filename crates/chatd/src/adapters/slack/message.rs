@@ -4,8 +4,10 @@ use super::emoji;
 use super::text::{emoji_end, Custom, Names, Rich};
 use super::{fnv, seconds, thread_id, Slack};
 use protocol::{
-    Attachment, Card, Forwarded, MediaFile, MediaKind, Message, MessageKind, Preview, Reaction,
-    Sender, Span, Style, ThreadSummary, CARD_FIELDS, THREAD_FACES, WAVEFORM_LIMIT,
+    Attachment, Card, ConfirmDialog, ControlKind, ControlOption, ControlStyle, Forwarded,
+    MediaFile, MediaKind, Message, MessageControl, MessageKind, Preview, Reaction, Sender, Span,
+    Style, ThreadSummary, CARD_FIELDS, CONTROL_OPTIONS_LIMIT, MESSAGE_CONTROLS_LIMIT, THREAD_FACES,
+    WAVEFORM_LIMIT,
 };
 use serde_json::{json, Value};
 
@@ -268,6 +270,319 @@ fn push_card(framed: &mut Option<Box<Card>>, extra: &mut Vec<Card>, card: Card) 
     } else {
         extra.push(card);
     }
+}
+
+fn parse_confirm(raw: &Value) -> Option<ConfirmDialog> {
+    if !raw.is_object() {
+        return None;
+    }
+    let title = raw["title"]["text"].as_str().or_else(|| raw["title"].as_str()).unwrap_or("").trim().to_owned();
+    let text = raw["text"]["text"].as_str().or_else(|| raw["text"].as_str()).unwrap_or("").trim().to_owned();
+    let confirm = raw["confirm"]["text"]
+        .as_str()
+        .or_else(|| raw["confirm"].as_str())
+        .or_else(|| raw["ok_text"].as_str())
+        .unwrap_or("Confirm")
+        .trim()
+        .to_owned();
+    let deny = raw["deny"]["text"]
+        .as_str()
+        .or_else(|| raw["deny"].as_str())
+        .or_else(|| raw["dismiss_text"].as_str())
+        .unwrap_or("Cancel")
+        .trim()
+        .to_owned();
+    if title.is_empty() && text.is_empty() {
+        return None;
+    }
+    Some(ConfirmDialog { title, text, confirm, deny })
+}
+
+fn parse_options(el: &Value) -> Vec<ControlOption> {
+    let mut out = Vec::new();
+    let push_opt = |opt: &Value, out: &mut Vec<ControlOption>| {
+        if out.len() >= CONTROL_OPTIONS_LIMIT {
+            return;
+        }
+        let label = opt["text"]["text"]
+            .as_str()
+            .or_else(|| opt["text"].as_str())
+            .or_else(|| opt["label"].as_str())
+            .unwrap_or("")
+            .trim();
+        let value = opt["value"].as_str().unwrap_or(label).trim();
+        if !label.is_empty() || !value.is_empty() {
+            out.push(ControlOption {
+                label: if label.is_empty() { value.to_owned() } else { label.to_owned() },
+                value: value.to_owned(),
+            });
+        }
+    };
+    for opt in el["options"].as_array().into_iter().flatten() {
+        push_opt(opt, &mut out);
+    }
+    for group in el["option_groups"].as_array().into_iter().flatten() {
+        for opt in group["options"].as_array().into_iter().flatten() {
+            push_opt(opt, &mut out);
+        }
+    }
+    out
+}
+
+fn parse_button_style(raw: Option<&str>) -> ControlStyle {
+    match raw {
+        Some("primary") => ControlStyle::Primary,
+        Some("danger") => ControlStyle::Danger,
+        _ => ControlStyle::Default,
+    }
+}
+
+fn parse_element(block_id: &str, el: &Value, label_override: Option<&str>, fallback_idx: usize) -> Option<MessageControl> {
+    let kind = el["type"].as_str().filter(|s| !s.is_empty())?;
+    let action_id = el["action_id"]
+        .as_str()
+        .or_else(|| el["name"].as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{kind}_{fallback_idx}"));
+    let confirm = parse_confirm(&el["confirm"]);
+    match kind {
+        "button" => {
+            let label = el["text"]["text"]
+                .as_str()
+                .or_else(|| el["text"].as_str())
+                .or(label_override)
+                .unwrap_or("Action")
+                .trim()
+                .to_owned();
+            let url = el["url"]
+                .as_str()
+                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .unwrap_or("")
+                .to_owned();
+            let value = el["value"].as_str().unwrap_or("").to_owned();
+            let style = parse_button_style(el["style"].as_str());
+            Some(MessageControl {
+                block_id: block_id.to_owned(),
+                action_id,
+                element_type: kind.to_owned(),
+                label,
+                value,
+                confirm,
+                kind: ControlKind::Button { url, style },
+            })
+        }
+        "static_select"
+        | "external_select"
+        | "users_select"
+        | "conversations_select"
+        | "channels_select"
+        | "multi_static_select"
+        | "multi_external_select"
+        | "multi_users_select"
+        | "multi_conversations_select"
+        | "multi_channels_select" => {
+            let placeholder = el["placeholder"]["text"]
+                .as_str()
+                .or_else(|| el["placeholder"].as_str())
+                .or(label_override)
+                .unwrap_or("Select an option")
+                .trim()
+                .to_owned();
+            let options = parse_options(el);
+            let selected = el["initial_option"]["value"]
+                .as_str()
+                .or_else(|| el["initial_user"].as_str())
+                .or_else(|| el["initial_conversation"].as_str())
+                .or_else(|| el["initial_channel"].as_str())
+                .map(str::to_owned);
+            let external = matches!(
+                kind,
+                "external_select"
+                    | "multi_external_select"
+                    | "users_select"
+                    | "conversations_select"
+                    | "channels_select"
+                    | "multi_users_select"
+                    | "multi_conversations_select"
+                    | "multi_channels_select"
+            );
+            Some(MessageControl {
+                block_id: block_id.to_owned(),
+                action_id,
+                element_type: kind.to_owned(),
+                label: label_override.unwrap_or("").trim().to_owned(),
+                value: selected.clone().unwrap_or_default(),
+                confirm,
+                kind: ControlKind::Select { placeholder, options, selected, external },
+            })
+        }
+        "overflow" => {
+            let options = parse_options(el);
+            if options.is_empty() {
+                return None;
+            }
+            Some(MessageControl {
+                block_id: block_id.to_owned(),
+                action_id,
+                element_type: kind.to_owned(),
+                label: label_override.unwrap_or("More…").trim().to_owned(),
+                value: String::new(),
+                confirm,
+                kind: ControlKind::Select {
+                    placeholder: "More…".to_owned(),
+                    options,
+                    selected: None,
+                    external: false,
+                },
+            })
+        }
+        "datepicker" => {
+            let placeholder = el["placeholder"]["text"]
+                .as_str()
+                .or(label_override)
+                .unwrap_or("Select a date")
+                .trim()
+                .to_owned();
+            let initial = el["initial_date"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+            Some(MessageControl {
+                block_id: block_id.to_owned(),
+                action_id,
+                element_type: kind.to_owned(),
+                label: label_override.unwrap_or("").trim().to_owned(),
+                value: initial.clone().unwrap_or_default(),
+                confirm,
+                kind: ControlKind::DatePicker { placeholder, initial },
+            })
+        }
+        "timepicker" => {
+            let placeholder = el["placeholder"]["text"]
+                .as_str()
+                .or(label_override)
+                .unwrap_or("Select a time")
+                .trim()
+                .to_owned();
+            let initial = el["initial_time"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+            Some(MessageControl {
+                block_id: block_id.to_owned(),
+                action_id,
+                element_type: kind.to_owned(),
+                label: label_override.unwrap_or("").trim().to_owned(),
+                value: initial.clone().unwrap_or_default(),
+                confirm,
+                kind: ControlKind::TimePicker { placeholder, initial },
+            })
+        }
+        "checkboxes" => {
+            let options = parse_options(el);
+            if options.is_empty() {
+                return None;
+            }
+            let selected: Vec<String> = el["initial_options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|o| o["value"].as_str().map(str::to_owned))
+                .collect();
+            Some(MessageControl {
+                block_id: block_id.to_owned(),
+                action_id,
+                element_type: kind.to_owned(),
+                label: label_override.unwrap_or("").trim().to_owned(),
+                value: String::new(),
+                confirm,
+                kind: ControlKind::Checkboxes { options, selected },
+            })
+        }
+        "radio_buttons" => {
+            let options = parse_options(el);
+            if options.is_empty() {
+                return None;
+            }
+            let selected = el["initial_option"]["value"].as_str().map(str::to_owned);
+            Some(MessageControl {
+                block_id: block_id.to_owned(),
+                action_id,
+                element_type: kind.to_owned(),
+                label: label_override.unwrap_or("").trim().to_owned(),
+                value: selected.clone().unwrap_or_default(),
+                confirm,
+                kind: ControlKind::RadioButtons { options, selected },
+            })
+        }
+        _ => None,
+    }
+}
+
+fn collect_block_controls(blocks: &[Value], out: &mut Vec<MessageControl>) {
+    for block in blocks {
+        if out.len() >= MESSAGE_CONTROLS_LIMIT {
+            break;
+        }
+        let block_id = block["block_id"].as_str().unwrap_or("");
+        match block["type"].as_str() {
+            Some("actions") => {
+                for el in block["elements"].as_array().into_iter().flatten() {
+                    if out.len() >= MESSAGE_CONTROLS_LIMIT {
+                        break;
+                    }
+                    if let Some(ctrl) = parse_element(block_id, el, None, out.len()) {
+                        out.push(ctrl);
+                    }
+                }
+            }
+            Some("section") => {
+                let acc = &block["accessory"];
+                if acc.is_object() && acc["type"].as_str() != Some("image") {
+                    if let Some(ctrl) = parse_element(block_id, acc, None, out.len()) {
+                        out.push(ctrl);
+                    }
+                }
+            }
+            Some("input") => {
+                let label = block["label"]["text"].as_str();
+                if let Some(ctrl) = parse_element(block_id, &block["element"], label, out.len()) {
+                    out.push(ctrl);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn parse_controls(event: &Value) -> Vec<MessageControl> {
+    let mut out = Vec::new();
+    if let Some(blocks) = event["blocks"].as_array() {
+        collect_block_controls(blocks, &mut out);
+    }
+    for att in event["attachments"].as_array().into_iter().flatten() {
+        if out.len() >= MESSAGE_CONTROLS_LIMIT {
+            break;
+        }
+        if let Some(blocks) = att["blocks"].as_array() {
+            collect_block_controls(blocks, &mut out);
+        }
+        let callback_id = att["callback_id"].as_str().unwrap_or("");
+        for act in att["actions"].as_array().into_iter().flatten() {
+            if out.len() >= MESSAGE_CONTROLS_LIMIT {
+                break;
+            }
+            let kind = act["type"].as_str().unwrap_or("");
+            if kind == "button" {
+                if let Some(ctrl) = parse_element(callback_id, act, None, out.len()) {
+                    out.push(ctrl);
+                }
+            } else if kind == "select" {
+                let mut normalized = act.clone();
+                normalized["type"] = "static_select".into();
+                if let Some(ctrl) = parse_element(callback_id, &normalized, None, out.len()) {
+                    out.push(ctrl);
+                }
+            }
+        }
+    }
+    out.truncate(MESSAGE_CONTROLS_LIMIT);
+    out
 }
 
 /// What a stored custom-emoji note stands for: `=glyph` is an alias of a standard emoji.
@@ -1597,11 +1912,21 @@ impl Slack {
                 }
             }
         }
+        let controls = parse_controls(event);
+        if !controls.is_empty() {
+            if let Some(app_id) = first(&[&event["app_id"], &event["bot_id"]]) {
+                let mut state = self.state();
+                if state.message_apps.len() >= 512 {
+                    state.message_apps.clear();
+                }
+                state.message_apps.insert((channel.to_owned(), ts.to_owned()), app_id.to_owned());
+            }
+        }
         if subtype == Some("channel_canvas_updated") && rich.text.trim().is_empty() {
             rich.text = "Updated the channel canvas".to_owned();
         }
-        if rich.undrawn && !rich.text.is_empty() {
-            // Buttons and menus are not drawn; the official app has them.
+        if rich.undrawn && controls.is_empty() && !rich.text.is_empty() {
+            // Controls we could not parse still link out to Slack.
             rich.line();
             rich.link(&link, Some("Open in Slack"));
         }
@@ -1657,7 +1982,7 @@ impl Slack {
             (suppress, kw)
         };
         message.mentions_me = !outgoing && (rich.mentioned || (rich.broadcast && !suppress_broadcast) || keyword_hit);
-        let empty = rich.text.is_empty() && attachments.is_empty() && previews.is_empty() && framed.is_none();
+        let empty = rich.text.is_empty() && attachments.is_empty() && previews.is_empty() && framed.is_none() && controls.is_empty();
         // What Slack leaves of a deleted message that a thread still hangs off.
         let tombstone = subtype == Some("tombstone");
         message.kind = if tombstone {
@@ -1682,6 +2007,7 @@ impl Slack {
         message.thread = summary;
         message.card = framed;
         message.cards = extra_cards;
+        message.controls = controls;
         message.forwarded = forwarded;
         message.edited = event["edited"].is_object();
         message.edited_at = event["edited"]["ts"].as_str().map(seconds).filter(|at| *at > 0);

@@ -215,6 +215,8 @@ fn reason(fault: Fault) -> String {
             // takes. Slack's own search is one such: its web client may use an internal call.
             "not_allowed_token_type" => "Slack's own search isn't reachable with this session.",
             "external_email" => return info::EXTERNAL_EMAIL.to_owned(),
+            "action_not_found" | "invalid_action" | "invalid_blocks" => "That app action is no longer available.",
+            "trigger_expired" => "That app interaction expired. Try clicking again.",
             "restricted_action" => "This workspace does not let you do that.",
             error if error.starts_with("restricted_action_") => "This workspace does not let you post here.",
             error => return format!("Slack refused ({error})."),
@@ -311,6 +313,8 @@ struct State {
     drafts: HashMap<String, DraftEntry>,
     drafts_by_id: HashMap<String, String>,
     drafts_loaded: bool,
+    /// App/bot id per `(channel, ts)` for messages carrying interactive Block Kit controls.
+    message_apps: HashMap<(String, String), String>,
 }
 
 /// `users.info` is asked about one person at most this often.
@@ -1035,6 +1039,10 @@ impl Slack {
                 let draft = if event["draft"].is_object() { &event["draft"] } else { event };
                 self.apply_remote_draft(draft, true)
             }
+            "view_opened" | "view_updated" | "view_closed" => {
+                tracing::debug!(event_type = event["type"].as_str().unwrap_or(""), "chatd: Slack modal view event");
+                Ok(())
+            }
             "goodbye" => Err(Failure::Dropped("Slack asked for a new connection".to_owned())),
             "error" => {
                 let error = &event["error"];
@@ -1261,6 +1269,11 @@ impl Slack {
                 return Ok(());
             }
             let counted = self.state().warm.remove(conversation);
+            // A conversation already in the tree when warming was queued (`counted.is_none()`)
+            // that has since been closed or left must not be resurrected by warming.
+            if counted.is_none() && self.ctx.known(conversation)?.is_none() {
+                return Ok(());
+            }
             if !self.known(conversation)? {
                 return Ok(());
             }
@@ -1475,6 +1488,27 @@ impl Slack {
             Command::Pin { conversation_id, message_id, pinned, reply, .. } => {
                 answer(reply, self.pin(&conversation_id, &message_id, pinned))
             }
+            Command::MessageAction {
+                conversation_id,
+                message_id,
+                block_id,
+                action_id,
+                element_type,
+                value,
+                values,
+                reply,
+            } => answer(
+                reply,
+                self.message_action(
+                    &conversation_id,
+                    &message_id,
+                    &block_id,
+                    &action_id,
+                    &element_type,
+                    &value,
+                    &values,
+                ),
+            ),
             Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
                 answer(reply, self.forward(&from_conversation_id, &message_ids, &to_conversation_ids, &note))
             }
@@ -2030,6 +2064,7 @@ impl Slack {
             return Err(Fault::Slack("not_a_channel".to_owned()));
         }
         self.api("conversations.close", &[("channel", conversation_id)])?;
+        self.state().warm.remove(conversation_id);
         self.forget_partner(conversation_id);
         self.ctx.conversation_gone(conversation_id).map_err(|err| Fault::Net(err.to_string()))
     }
@@ -2044,6 +2079,7 @@ impl Slack {
             return self.close_direct(conversation_id);
         }
         self.api("conversations.leave", &[("channel", conversation_id)])?;
+        self.state().warm.remove(conversation_id);
         self.ctx.conversation_gone(conversation_id).map_err(|err| Fault::Net(err.to_string()))
     }
 
@@ -2237,6 +2273,100 @@ impl Slack {
             self.ctx.pinned(conversation, ts, pinned).map_err(|err| Fault::Net(err.to_string()))?;
         }
         self.ctx.info_stale(channel);
+        Ok(())
+    }
+
+    /// Fires a Slack Block Kit interactive control (`blocks.actions`). The app responds
+    /// asynchronously with a `message_changed`, ephemeral message, or `view_opened` event.
+    #[allow(clippy::too_many_arguments)]
+    fn message_action(
+        &self,
+        conversation: &str,
+        ts: &str,
+        block_id: &str,
+        action_id: &str,
+        element_type: &str,
+        value: &str,
+        values: &[String],
+    ) -> Result<(), Fault> {
+        let channel = thread_of(conversation).map_or(conversation, |(ch, _)| ch);
+        if channel.is_empty() || ts.is_empty() || action_id.trim().is_empty() {
+            return Err(Fault::Slack("invalid_action".to_owned()));
+        }
+        let now = crate::hub::now();
+        let action_ts = format!("{now}.000000");
+        let kind = if element_type.trim().is_empty() { "button" } else { element_type.trim() };
+        let mut action = json!({
+            "type": kind,
+            "action_id": action_id,
+            "action_ts": action_ts,
+        });
+        if !block_id.is_empty() {
+            action["block_id"] = block_id.into();
+        }
+        match kind {
+            "static_select" | "external_select" | "overflow" | "radio_buttons" => {
+                action["selected_option"] = json!({"value": value});
+            }
+            "users_select" => {
+                action["selected_user"] = value.into();
+            }
+            "conversations_select" => {
+                action["selected_conversation"] = value.into();
+            }
+            "channels_select" => {
+                action["selected_channel"] = value.into();
+            }
+            "datepicker" => {
+                action["selected_date"] = value.into();
+            }
+            "timepicker" => {
+                action["selected_time"] = value.into();
+            }
+            "checkboxes" | "multi_static_select" | "multi_external_select" => {
+                let selected: Vec<Value> = values.iter().map(|v| json!({"value": v})).collect();
+                action["selected_options"] = Value::Array(selected);
+            }
+            "multi_users_select" => {
+                action["selected_users"] = json!(values);
+            }
+            "multi_conversations_select" => {
+                action["selected_conversations"] = json!(values);
+            }
+            "multi_channels_select" => {
+                action["selected_channels"] = json!(values);
+            }
+            _ => {
+                if !value.is_empty() {
+                    action["value"] = value.into();
+                }
+            }
+        }
+        let actions = json!([action]).to_string();
+        let container = json!({
+            "type": "message",
+            "message_ts": ts,
+            "channel_id": channel,
+            "is_ephemeral": false,
+        })
+        .to_string();
+        let client_token = format!("tiny-{now}");
+        let service_id = self
+            .state()
+            .message_apps
+            .get(&(channel.to_owned(), ts.to_owned()))
+            .cloned()
+            .unwrap_or_default();
+        let mut params = vec![
+            ("actions", actions.as_str()),
+            ("container", container.as_str()),
+            ("channel_id", channel),
+            ("client_token", client_token.as_str()),
+        ];
+        if !service_id.is_empty() {
+            params.push(("service_id", service_id.as_str()));
+        }
+        self.api("blocks.actions", &params)?;
         Ok(())
     }
 

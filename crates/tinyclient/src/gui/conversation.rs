@@ -211,6 +211,31 @@ struct Earlier {
     ready: bool,
 }
 
+/// A Block Kit control waiting for user confirmation before firing (`ConfirmDialog`).
+#[derive(Clone)]
+pub(super) struct PendingControlAction {
+    pub message_id: String,
+    pub block_id: String,
+    pub action_id: String,
+    pub element_type: String,
+    pub value: String,
+    pub values: Vec<String>,
+    pub confirm: protocol::ConfirmDialog,
+}
+
+/// An open popover menu for a Block Kit select/overflow/date/time control.
+#[derive(Clone)]
+pub(super) struct OpenSelect {
+    pub message_id: String,
+    pub block_id: String,
+    pub action_id: String,
+    pub element_type: String,
+    pub options: Vec<protocol::ControlOption>,
+    pub selected: Option<String>,
+    pub confirm: Option<protocol::ConfirmDialog>,
+    pub at: Point<Pixels>,
+}
+
 /// The one rule for telling the network how far the user has read: a real window that is
 /// active, showing the conversation, with the message on screen. A build that takes
 /// screenshots never does, whatever it is showing: a picture of a conversation must not read it.
@@ -359,6 +384,12 @@ pub struct Pane {
     link_ask: Option<links::LinkAsk>,
     /// Earlier wordings of one message, opened from its edited mark.
     revisions: Option<Earlier>,
+    /// Interactive Block Kit controls currently in flight, keyed by `(message_id, action_id)`.
+    pending_actions: HashMap<(String, String), Instant>,
+    /// Pending confirmation dialog for a Block Kit control.
+    action_confirm: Option<PendingControlAction>,
+    /// Currently open select/overflow/date/time picker popover for a Block Kit control.
+    open_select: Option<OpenSelect>,
     /// After an older page: the message that was on screen and how far below the top of the
     /// viewport it was, to put it back there once the rows above it can be measured.
     hold: Option<(String, f32)>,
@@ -459,6 +490,9 @@ impl Pane {
             multi_select: actions::MultiSelect::default(),
             link_ask: None,
             revisions: None,
+            pending_actions: HashMap::new(),
+            action_confirm: None,
+            open_select: None,
             hold: None,
             land: false,
             places: crate::gui::pane::Memory::default(),
@@ -1569,6 +1603,79 @@ impl Pane {
         let message = self.find(message_id)?;
         let blocks = rich::blocks(&message.text, &message.spans);
         Some(rich::plain(&blocks, (0, 0), (blocks.len(), usize::MAX)))
+    }
+
+    /// Triggers an interactive message control, showing its confirmation dialog first if required.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn trigger_control(
+        &mut self,
+        message_id: String,
+        block_id: String,
+        action_id: String,
+        element_type: String,
+        value: String,
+        values: Vec<String>,
+        confirm: Option<protocol::ConfirmDialog>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_select = None;
+        if let Some(confirm) = confirm {
+            self.action_confirm = Some(PendingControlAction {
+                message_id,
+                block_id,
+                action_id,
+                element_type,
+                value,
+                values,
+                confirm,
+            });
+            cx.notify();
+            return;
+        }
+        self.execute_control(message_id, block_id, action_id, element_type, value, values, cx);
+    }
+
+    /// Sends `Request::MessageAction` off-thread, tracking pending state and toasting any refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn execute_control(
+        &mut self,
+        message_id: String,
+        block_id: String,
+        action_id: String,
+        element_type: String,
+        value: String,
+        values: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        let key = (message_id.clone(), action_id.clone());
+        self.pending_actions.insert(key.clone(), Instant::now());
+        cx.notify();
+        let request = Request::MessageAction {
+            conversation,
+            message_id,
+            block_id,
+            action_id,
+            element_type,
+            value,
+            values,
+        };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.pending_actions.remove(&key);
+                match answer {
+                    Ok(Response::Ok) => {}
+                    Ok(Response::Error { detail, .. }) => this.say(detail, cx),
+                    Err(err) => this.say(crate::client::trouble_words("run action", &err), cx),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
     fn live_call_row(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         if self.thread {

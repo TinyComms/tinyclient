@@ -329,7 +329,7 @@ pub(crate) fn call_line_spec(message: &Message, peer_title: &str) -> CallRowSpec
         (protocol::CallOutcome::Missed, true) => CallRowSpec {
             icon: "icons/phone-outgoing.svg",
             missed: false,
-            label: format!("You called {other} · no answer"),
+            label: format!("You called {other} Â· no answer"),
             pill: Some("Call again"),
         },
         (protocol::CallOutcome::Declined, false) => CallRowSpec {
@@ -364,7 +364,7 @@ pub(crate) fn call_line_spec(message: &Message, peer_title: &str) -> CallRowSpec
         },
         (protocol::CallOutcome::Ended, _) => {
             let label = match note.seconds.filter(|&s| s > 0) {
-                Some(secs) => format!("{cap_noun} with {other} · {}", format_call_duration(secs)),
+                Some(secs) => format!("{cap_noun} with {other} Â· {}", format_call_duration(secs)),
                 None => format!("{cap_noun} with {other}"),
             };
             CallRowSpec {
@@ -433,6 +433,21 @@ pub(super) fn play_disc() -> Div {
             .justify_center()
             .child(icon(Icon::Play, 18., gpui::white())),
     )
+}
+
+/// Formats Unix seconds as UTC `YYYY-MM-DD` (Howard Hinnant's civil-from-days algorithm).
+fn format_ymd(secs: i64) -> String {
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02}")
 }
 
 /// A small square button inside a row or a bar.
@@ -696,9 +711,9 @@ impl Pane {
             .type_small()
             .text_color(theme::text_faint());
         match &self.older_failed {
-            None if self.window.messages.is_empty() => row.child("Loading messages…"),
-            None => row.child("Loading earlier messages…"),
-            Some(_) => row.child(if self.window.messages.is_empty() { "Couldn't load messages ·" } else { "Couldn't load earlier messages ·" }).child(
+            None if self.window.messages.is_empty() => row.child("Loading messagesâ€¦"),
+            None => row.child("Loading earlier messagesâ€¦"),
+            Some(_) => row.child(if self.window.messages.is_empty() { "Couldn't load messages Â·" } else { "Couldn't load earlier messages Â·" }).child(
                 div()
                     .id("older-retry")
                     .text_color(theme::accent_text())
@@ -989,7 +1004,7 @@ impl Pane {
                                 .bg(tokens::card())
                                 .type_micro()
                                 .text_color(theme::accent())
-                                .child(format!("✨ {effect}")),
+                                .child(format!("âœ¨ {effect}")),
                         )
                 }))
                 .children(message.sent_via.as_deref().map(|via| {
@@ -1010,6 +1025,7 @@ impl Pane {
                 .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(message, ix, card, cx)))
                 .children(message.poll.as_deref().map(|poll| self.poll_card(message, poll, cx)))
                 .children(message.contacts.iter().enumerate().map(|(idx, contact)| self.contact_card(message, contact, idx, cx)))
+                .children(self.message_controls(message, cx))
                 .children(self.cards(message, window, cx));
         }
         if pending {
@@ -1046,7 +1062,7 @@ impl Pane {
             .when(!head, |row| row.py(px(if metrics == Metrics::PHONE { 6. } else { 1. })))
             .when(editing, |row| row.bg(theme::accent_soft()))
             .when(mentioned && !editing, |row| row.bg(theme::accent_wash()))
-            // The row that owns an open menu, picker or dialog keeps `selected` (polish/01 §2).
+            // The row that owns an open menu, picker or dialog keeps `selected` (polish/01 Â§2).
             .when(owns && !editing, |row| row.bg(theme::selected()))
             .when(!mentioned && !editing && !owns, |row| row.hover(|style| style.bg(tokens::row_hover())))
             .on_mouse_down(
@@ -1295,7 +1311,7 @@ impl Pane {
                     .gap(px(4.))
                     .type_micro()
                     .text_color(theme::text_faint())
-                    .child("★")
+                    .child("â˜…")
                     .child("Starred")
             }))
     }
@@ -1368,7 +1384,7 @@ impl Pane {
                     )
                     .into_any_element(),
                 Block::Item { ordered, depth, number, text } => {
-                    let marker = if *ordered { format!("{number}.") } else { "•".to_owned() };
+                    let marker = if *ordered { format!("{number}.") } else { "â€¢".to_owned() };
                     div()
                         .max_w(px(MEASURE))
                         .pl(px(22. * f32::from(*depth)))
@@ -1886,7 +1902,7 @@ impl Pane {
             .collect()
     }
 
-    /// Settings › Privacy › Load images (P3) off: a picture not on disk waits for a click, so
+    /// Settings â€º Privacy â€º Load images (P3) off: a picture not on disk waits for a click, so
     /// nothing is fetched until then.
     fn held_back(&self, file: &MediaFile) -> bool {
         !crate::gui::app::prefs::choices().images && file.path.is_none() && !self.known.contains_key(&file.id) && !self.shown.contains(&file.id)
@@ -1899,8 +1915,8 @@ impl Pane {
         let tap = if crate::gui::phone::active() { "Tap to load" } else { "Click to load" };
         let line = match (words, bytes) {
             (false, _) => "Load".to_owned(),
-            (true, 0) => format!("{what} · {tap}"),
-            (true, bytes) => format!("{what} · {} · {tap}", media::size_label(bytes)),
+            (true, 0) => format!("{what} Â· {tap}"),
+            (true, bytes) => format!("{what} Â· {} Â· {tap}", media::size_label(bytes)),
         };
         holder
             .child(div().absolute().inset_0().flex().items_center().justify_center().type_small().text_color(theme::text_soft()).child(line))
@@ -1945,7 +1961,7 @@ impl Pane {
         let reason = file.failed.clone().unwrap_or_else(|| "The file could not be read.".to_owned());
         let retry = file.clone();
         holder
-            .child(in_box(Icon::ImageOff, words.then_some("Couldn't load image · Retry")))
+            .child(in_box(Icon::ImageOff, words.then_some("Couldn't load image Â· Retry")))
             .tooltip(tip(format!("{reason} Click to try again."), None))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1993,7 +2009,7 @@ impl Pane {
                         .justify_center()
                         .type_small()
                         .text_color(theme::text_faint())
-                        .child(if width >= 160. { "Spoiler · click to show" } else { "Spoiler" }),
+                        .child(if width >= 160. { "Spoiler Â· click to show" } else { "Spoiler" }),
                 )
                 .child(edge_line())
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -2115,12 +2131,12 @@ impl Pane {
         let reason = file.failed.clone();
         let mut meta = media::type_label(attachment);
         if file.bytes > 0 {
-            meta = format!("{meta} · {}", media::size_label(file.bytes));
+            meta = format!("{meta} Â· {}", media::size_label(file.bytes));
         }
         let (meta, tone) = match (failed, fetching, on_disk.is_some()) {
-            (true, ..) => ("Couldn't download · Retry".to_owned(), theme::danger()),
-            (_, true, _) => (format!("{meta} · Downloading…"), theme::text_faint()),
-            (_, _, true) => (format!("{meta} · Downloaded"), theme::text_faint()),
+            (true, ..) => ("Couldn't download Â· Retry".to_owned(), theme::danger()),
+            (_, true, _) => (format!("{meta} Â· Downloadingâ€¦"), theme::text_faint()),
+            (_, _, true) => (format!("{meta} Â· Downloaded"), theme::text_faint()),
             _ => (meta, theme::text_faint()),
         };
         let look = attachment.clone();
@@ -2377,6 +2393,329 @@ impl Pane {
         div().pt(px(5.)).flex().child(framed).into_any_element()
     }
 
+    /// Interactive Block Kit controls attached to a message (buttons, menus, pickers, radios, checkboxes).
+    fn message_controls(&self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if message.controls.is_empty() {
+            return None;
+        }
+        let mut row = div().pt(px(6.)).flex().flex_wrap().items_center().gap(px(6.));
+        for (idx, control) in message.controls.iter().enumerate() {
+            let pending = self
+                .pending_actions
+                .get(&(message.id.clone(), control.action_id.clone()))
+                .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(10));
+            let el_id = SharedString::from(format!("ctrl-{}-{idx}", message.id));
+            match &control.kind {
+                protocol::ControlKind::Button { url, style } => {
+                    let label = if pending {
+                        format!("{}â€¦", control.label)
+                    } else if !url.is_empty() {
+                        format!("{} â†—", control.label)
+                    } else {
+                        control.label.clone()
+                    };
+                    let (bg, fg, border, hover_bg) = match style {
+                        protocol::ControlStyle::Primary => (theme::accent(), theme::on_accent(), theme::accent(), theme::accent()),
+                        protocol::ControlStyle::Danger => (theme::danger(), gpui::white(), theme::danger(), theme::danger()),
+                        protocol::ControlStyle::Default => (tokens::card(), theme::text(), tokens::border_strong(), theme::hover()),
+                    };
+                    let mut btn = div()
+                        .id(el_id)
+                        .h(px(28.))
+                        .px(px(10.))
+                        .rounded(px(theme::R_CONTROL))
+                        .bg(bg)
+                        .border_1()
+                        .border_color(border)
+                        .flex()
+                        .items_center()
+                        .type_small()
+                        .font_weight(theme::MEDIUM)
+                        .text_color(fg)
+                        .cursor_pointer()
+                        .when(pending, |d| d.opacity(0.6))
+                        .hover(move |s| s.bg(hover_bg))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(label);
+                    if !url.is_empty() {
+                        let target = url.clone();
+                        btn = btn.on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            cx.open_url(&target);
+                        });
+                    } else if !pending {
+                        let msg_id = message.id.clone();
+                        let block_id = control.block_id.clone();
+                        let action_id = control.action_id.clone();
+                        let element_type = control.element_type.clone();
+                        let value = control.value.clone();
+                        let confirm = control.confirm.clone();
+                        btn = btn.on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.trigger_control(
+                                msg_id.clone(),
+                                block_id.clone(),
+                                action_id.clone(),
+                                element_type.clone(),
+                                value.clone(),
+                                Vec::new(),
+                                confirm.clone(),
+                                cx,
+                            );
+                        }));
+                    }
+                    row = row.child(btn);
+                }
+                protocol::ControlKind::Select { placeholder, options, selected, external } => {
+                    let current_label = selected
+                        .as_deref()
+                        .and_then(|val| options.iter().find(|o| o.value == val).map(|o| o.label.as_str()))
+                        .unwrap_or_else(|| if placeholder.is_empty() { "Selectâ€¦" } else { placeholder.as_str() });
+                    let shown = if pending {
+                        format!("{current_label}â€¦")
+                    } else {
+                        format!("{current_label} â–¾")
+                    };
+                    let mut chip = div()
+                        .id(el_id)
+                        .h(px(28.))
+                        .px(px(10.))
+                        .rounded(px(theme::R_CONTROL))
+                        .bg(tokens::card())
+                        .border_1()
+                        .border_color(tokens::border_strong())
+                        .flex()
+                        .items_center()
+                        .type_small()
+                        .text_color(theme::text())
+                        .cursor_pointer()
+                        .when(pending, |d| d.opacity(0.6))
+                        .hover(|s| s.bg(theme::hover()))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(shown);
+                    if !options.is_empty() && !pending {
+                        let open = super::OpenSelect {
+                            message_id: message.id.clone(),
+                            block_id: control.block_id.clone(),
+                            action_id: control.action_id.clone(),
+                            element_type: control.element_type.clone(),
+                            options: options.clone(),
+                            selected: selected.clone(),
+                            confirm: control.confirm.clone(),
+                            at: gpui::Point::default(),
+                        };
+                        chip = chip.on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            let mut next = open.clone();
+                            next.at = event.position();
+                            this.open_select = Some(next);
+                            cx.notify();
+                        }));
+                    } else if *external && !message.permalink.is_empty() {
+                        let link = message.permalink.clone();
+                        chip = chip.on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            cx.open_url(&link);
+                        });
+                    }
+                    row = row.child(chip);
+                }
+                protocol::ControlKind::DatePicker { placeholder, initial } => {
+                    let label = initial
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(if placeholder.is_empty() { "Pick a date" } else { placeholder.as_str() });
+                    let shown = if pending { format!("ðŸ“… {label}â€¦") } else { format!("ðŸ“… {label} â–¾") };
+                    let now = crate::view::now();
+                    let mut opts = Vec::new();
+                    if let Some(init) = initial.as_ref().filter(|s| !s.is_empty()) {
+                        opts.push(protocol::ControlOption { label: format!("Keep ({init})"), value: init.clone() });
+                    }
+                    for (name, days) in [("Today", 0i64), ("Tomorrow", 1), ("In 3 days", 3), ("In 7 days", 7)] {
+                        let ymd = format_ymd(now + days * 86_400);
+                        if !opts.iter().any(|o| o.value == ymd) {
+                            opts.push(protocol::ControlOption { label: format!("{name} ({ymd})"), value: ymd });
+                        }
+                    }
+                    let open = super::OpenSelect {
+                        message_id: message.id.clone(),
+                        block_id: control.block_id.clone(),
+                        action_id: control.action_id.clone(),
+                        element_type: control.element_type.clone(),
+                        options: opts,
+                        selected: initial.clone(),
+                        confirm: control.confirm.clone(),
+                        at: gpui::Point::default(),
+                    };
+                    row = row.child(
+                        div()
+                            .id(el_id)
+                            .h(px(28.))
+                            .px(px(10.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(tokens::card())
+                            .border_1()
+                            .border_color(tokens::border_strong())
+                            .flex()
+                            .items_center()
+                            .type_small()
+                            .text_color(theme::text())
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::hover()))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                let mut next = open.clone();
+                                next.at = event.position();
+                                this.open_select = Some(next);
+                                cx.notify();
+                            }))
+                            .child(shown),
+                    );
+                }
+                protocol::ControlKind::TimePicker { placeholder, initial } => {
+                    let label = initial
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(if placeholder.is_empty() { "Pick a time" } else { placeholder.as_str() });
+                    let shown = if pending { format!("ðŸ•’ {label}â€¦") } else { format!("ðŸ•’ {label} â–¾") };
+                    let mut opts = Vec::new();
+                    if let Some(init) = initial.as_ref().filter(|s| !s.is_empty()) {
+                        opts.push(protocol::ControlOption { label: init.clone(), value: init.clone() });
+                    }
+                    for slot in ["09:00", "12:00", "14:00", "17:00"] {
+                        if !opts.iter().any(|o| o.value == slot) {
+                            opts.push(protocol::ControlOption { label: slot.to_owned(), value: slot.to_owned() });
+                        }
+                    }
+                    let open = super::OpenSelect {
+                        message_id: message.id.clone(),
+                        block_id: control.block_id.clone(),
+                        action_id: control.action_id.clone(),
+                        element_type: control.element_type.clone(),
+                        options: opts,
+                        selected: initial.clone(),
+                        confirm: control.confirm.clone(),
+                        at: gpui::Point::default(),
+                    };
+                    row = row.child(
+                        div()
+                            .id(el_id)
+                            .h(px(28.))
+                            .px(px(10.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(tokens::card())
+                            .border_1()
+                            .border_color(tokens::border_strong())
+                            .flex()
+                            .items_center()
+                            .type_small()
+                            .text_color(theme::text())
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::hover()))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                let mut next = open.clone();
+                                next.at = event.position();
+                                this.open_select = Some(next);
+                                cx.notify();
+                            }))
+                            .child(shown),
+                    );
+                }
+                protocol::ControlKind::Checkboxes { options, selected } => {
+                    for (opt_ix, opt) in options.iter().enumerate() {
+                        let checked = selected.iter().any(|v| v == &opt.value);
+                        let mut next = selected.clone();
+                        if checked {
+                            next.retain(|v| v != &opt.value);
+                        } else {
+                            next.push(opt.value.clone());
+                        }
+                        let msg_id = message.id.clone();
+                        let block_id = control.block_id.clone();
+                        let action_id = control.action_id.clone();
+                        let element_type = control.element_type.clone();
+                        let confirm = control.confirm.clone();
+                        row = row.child(
+                            div()
+                                .id(SharedString::from(format!("ctrl-chk-{}-{idx}-{opt_ix}", message.id)))
+                                .h(px(26.))
+                                .px(px(8.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(if checked { theme::accent_soft() } else { tokens::card() })
+                                .border_1()
+                                .border_color(if checked { theme::accent() } else { tokens::border_strong() })
+                                .flex()
+                                .items_center()
+                                .type_small()
+                                .text_color(theme::text())
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.trigger_control(
+                                        msg_id.clone(),
+                                        block_id.clone(),
+                                        action_id.clone(),
+                                        element_type.clone(),
+                                        String::new(),
+                                        next.clone(),
+                                        confirm.clone(),
+                                        cx,
+                                    );
+                                }))
+                                .child(format!("{} {}", if checked { "â˜‘" } else { "â˜" }, opt.label)),
+                        );
+                    }
+                }
+                protocol::ControlKind::RadioButtons { options, selected } => {
+                    for (opt_ix, opt) in options.iter().enumerate() {
+                        let chosen = selected.as_deref() == Some(opt.value.as_str());
+                        let msg_id = message.id.clone();
+                        let block_id = control.block_id.clone();
+                        let action_id = control.action_id.clone();
+                        let element_type = control.element_type.clone();
+                        let val = opt.value.clone();
+                        let confirm = control.confirm.clone();
+                        row = row.child(
+                            div()
+                                .id(SharedString::from(format!("ctrl-rad-{}-{idx}-{opt_ix}", message.id)))
+                                .h(px(26.))
+                                .px(px(8.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(if chosen { theme::accent_soft() } else { tokens::card() })
+                                .border_1()
+                                .border_color(if chosen { theme::accent() } else { tokens::border_strong() })
+                                .flex()
+                                .items_center()
+                                .type_small()
+                                .text_color(theme::text())
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.trigger_control(
+                                        msg_id.clone(),
+                                        block_id.clone(),
+                                        action_id.clone(),
+                                        element_type.clone(),
+                                        val.clone(),
+                                        Vec::new(),
+                                        confirm.clone(),
+                                        cx,
+                                    );
+                                }))
+                                .child(format!("{} {}", if chosen { "â—‰" } else { "â—‹" }, opt.label)),
+                        );
+                    }
+                }
+            }
+        }
+        Some(row.into_any_element())
+    }
+
     /// Shared contact card: name, organization, masked phone numbers (click to reveal), emails, and copy actions.
     fn contact_card(&self, message: &Rc<Message>, contact: &protocol::SharedContact, idx: usize, cx: &mut Context<Self>) -> AnyElement {
         let title = if contact.name.trim().is_empty() { "Shared contact" } else { contact.name.trim() };
@@ -2401,7 +2740,7 @@ impl Pane {
                             .text_color(theme::text_soft())
                             .hover(|s| s.text_color(theme::text()))
                             .on_click(cx.listener(move |this, _, _, cx| this.toggle_contact_reveal(toggle_key.clone(), cx)))
-                            .child(if revealed { shown } else { format!("{shown} · Show") }),
+                            .child(if revealed { shown } else { format!("{shown} Â· Show") }),
                     )
                     .child(
                         div()
@@ -2490,7 +2829,7 @@ impl Pane {
                     }
                 }
             }
-            parts.join(" · ")
+            parts.join(" Â· ")
         };
 
         let mut rows = div().mt(px(6.)).flex().flex_col().gap(px(5.));
@@ -2543,7 +2882,7 @@ impl Pane {
                         .min_w_0()
                         .flex_1()
                         .when(picked, |el| {
-                            el.child(div().type_small().font_weight(theme::SEMIBOLD).text_color(theme::accent()).child("✓"))
+                            el.child(div().type_small().font_weight(theme::SEMIBOLD).text_color(theme::accent()).child("âœ“"))
                         })
                         .child(div().type_ui().truncate().text_color(theme::text()).child(choice.text.clone())),
                 )
@@ -2969,7 +3308,7 @@ impl Pane {
         Some(div().flex().child(line).into_any_element())
     }
 
-    /// Under one of my messages still going: "Sending…", or for files the bar of what has
+    /// Under one of my messages still going: "Sendingâ€¦", or for files the bar of what has
     /// gone, moved only by chatd's `Upload` changes, and Cancel.
     fn sending(&self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
         if message.state != SendState::Pending {
@@ -2982,7 +3321,7 @@ impl Pane {
         let client_id = message.client_id.clone()?;
         let words = div().type_small().text_color(theme::text_faint()).font_family(theme::FONT);
         let Some(&(sent, total)) = self.uploads.get(&client_id) else {
-            return Some(div().h(px(18.)).flex().items_center().child(words.child("Sending…")).into_any_element());
+            return Some(div().h(px(18.)).flex().items_center().child(words.child("Sendingâ€¦")).into_any_element());
         };
         let conversation = self.key()?.clone();
         let done = if total == 0 { 0. } else { (sent as f32 / total as f32).clamp(0., 1.) };
@@ -3024,7 +3363,7 @@ impl Pane {
     }
 
     /// Under one of my messages written while the account was offline: a clock, who it is
-    /// waiting for, and Cancel. Not "Sending…", which is a send the adapter already has.
+    /// waiting for, and Cancel. Not "Sendingâ€¦", which is a send the adapter already has.
     fn waiting_mark(&self, client_id: String, cx: &mut Context<Self>) -> Option<AnyElement> {
         let conversation = self.key()?.clone();
         let network = conversation.network.label();
@@ -3099,7 +3438,7 @@ impl Pane {
             .child(
                 div().min_w_0().max_w_full().flex().items_start().gap(px(6.)).text_color(theme::danger())
                     .child(div().pt(px(2.)).child(icon(Icon::Alert, 13., theme::danger())))
-                    .child(div().flex_1().min_w_0().max_w_full().whitespace_normal().child(format!("Not sent · {reason}"))),
+                    .child(div().flex_1().min_w_0().max_w_full().whitespace_normal().child(format!("Not sent Â· {reason}"))),
             )
             .child(actions);
         Some(line.into_any_element())
@@ -3107,11 +3446,11 @@ impl Pane {
 }
 
 /// Bytes as the upload line says them: "3.1 MB", "820 KB".
-/// "Uploading 2 of 3 · 3.1 of 5.4 MB" while a message's files go, "Uploading · …" for one.
+/// "Uploading 2 of 3 Â· 3.1 of 5.4 MB" while a message's files go, "Uploading Â· â€¦" for one.
 fn uploading_words(sizes: &[u64], sent: u64, total: u64) -> String {
     let amount = format!("{} of {}", megabytes(sent), megabytes(total));
     if sizes.len() < 2 {
-        return format!("Uploading · {amount}");
+        return format!("Uploading Â· {amount}");
     }
     // The file under way: the first whose end the bytes sent have not reached.
     let mut end = 0;
@@ -3119,7 +3458,7 @@ fn uploading_words(sizes: &[u64], sent: u64, total: u64) -> String {
         end += bytes;
         sent < end
     });
-    format!("Uploading {} of {} · {amount}", at.map_or(sizes.len(), |at| at + 1), sizes.len())
+    format!("Uploading {} of {} Â· {amount}", at.map_or(sizes.len(), |at| at + 1), sizes.len())
 }
 
 /// The row's receipt, if this message is my newest and the newest of all, sent and not gone.
@@ -3129,7 +3468,7 @@ fn receipt_for(message: &Message, window: &super::pages::Window, receipt: Option
     receipt.filter(|receipt| mine && *receipt != Receipt::Sending)
 }
 
-/// The 12 px glyph on my newest message (`design/06-live-signals.md` §4): one check once sent,
+/// The 12 px glyph on my newest message (`design/06-live-signals.md` Â§4): one check once sent,
 /// on every network; two once the other side's device has it; two in `accent` once read.
 fn receipt_mark(id: &str, receipt: Receipt) -> AnyElement {
     let (icon, color, words) = match receipt {
@@ -3315,7 +3654,7 @@ mod tests {
         assert_eq!(receipt_for(&answered.messages[0], &answered, Some(Receipt::Sent)), None);
         let partial = window(vec![mine("1", None)], true);
         assert_eq!(receipt_for(&partial.messages[0], &partial, Some(Receipt::Sent)), None);
-        // One still going says "Sending…" instead.
+        // One still going says "Sendingâ€¦" instead.
         let going = window(vec![Rc::new(sending())], false);
         assert_eq!(receipt_for(&going.messages[0], &going, Some(Receipt::Sent)), None);
         assert_eq!(receipt_for(&all.messages[1], &all, Some(Receipt::Sending)), None);
@@ -3364,7 +3703,7 @@ mod tests {
 
         let missed_out = call_line_spec(&make(protocol::CallOutcome::Missed, true, None), "Bea");
         assert!(!missed_out.missed);
-        assert_eq!(missed_out.label, "You called Bea · no answer");
+        assert_eq!(missed_out.label, "You called Bea Â· no answer");
         assert_eq!(missed_out.pill, Some("Call again"));
 
         let dec_in = call_line_spec(&make(protocol::CallOutcome::Declined, false, None), "Bea");
@@ -3381,7 +3720,7 @@ mod tests {
         assert_eq!(can_out.label, "You cancelled the call");
 
         let ended_dur = call_line_spec(&make(protocol::CallOutcome::Ended, false, Some(720)), "Bea");
-        assert_eq!(ended_dur.label, "Call with Bea · 12 min");
+        assert_eq!(ended_dur.label, "Call with Bea Â· 12 min");
         let ended_plain = call_line_spec(&make(protocol::CallOutcome::Ended, true, None), "Bea");
         assert_eq!(ended_plain.label, "Call with Bea");
         assert_eq!(ended_plain.pill, Some("Call back"));

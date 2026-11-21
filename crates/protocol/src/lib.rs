@@ -2513,6 +2513,20 @@ pub enum Request {
         account: AccountKey,
         file_id: String,
     },
+    /// Execute an interactive control on a message (Slack Block Kit `blocks.actions`).
+    /// Answers `Response::Ok` when accepted; message updates arrive asynchronously.
+    MessageAction {
+        conversation: Key,
+        message_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        block_id: String,
+        action_id: String,
+        element_type: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        value: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        values: Vec<String>,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their

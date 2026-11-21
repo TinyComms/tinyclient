@@ -3720,6 +3720,24 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::MessageAction {
+                conversation,
+                message_id,
+                block_id,
+                action_id,
+                element_type,
+                value,
+                values,
+            } => self.act(&conversation, |conversation_id, reply| Command::MessageAction {
+                conversation_id,
+                message_id,
+                block_id,
+                action_id,
+                element_type,
+                value,
+                values,
+                reply,
+            }),
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

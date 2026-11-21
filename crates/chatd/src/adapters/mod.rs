@@ -576,6 +576,17 @@ pub enum Command {
         me_only: bool,
         reply: Reply<()>,
     },
+    /// Executes an interactive Block Kit control on a message (Slack `blocks.actions`).
+    MessageAction {
+        conversation_id: String,
+        message_id: String,
+        block_id: String,
+        action_id: String,
+        element_type: String,
+        value: String,
+        values: Vec<String>,
+        reply: Reply<()>,
+    },
     /// Forwards one or more messages to target conversations on the same account.
     /// Answers with `(target_conversation_id, Ok(()) | Err(reason))` per target.
     Forward {
@@ -776,6 +787,7 @@ impl Command {
             Command::StarredMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

@@ -1078,6 +1078,16 @@ impl Fake {
                     "response_metadata": {"next_cursor": ""}
                 }))
             }
+            "blocks.actions" => {
+                let actions = param("actions");
+                if actions.contains("\"fail_action\"") {
+                    return refused("action_not_found");
+                }
+                if actions.is_empty() || param("container").is_empty() {
+                    return refused("invalid_action");
+                }
+                Some(json!({"ok": true}))
+            }
             method => self.fixture(token, method),
         };
         found.map_or_else(|| refused("unknown_method"), ok)
@@ -1725,11 +1735,14 @@ fn a_channel_reads_as_it_does_in_slack_and_stays_current() {
     assert_eq!(post.image.as_ref().map(|image| (image.width, image.height)), Some((800, 418)));
     assert_eq!(other.image, None);
 
-    // Buttons are not drawn: one line and the way to the real thing.
+    // Block Kit buttons render as interactive MessageControls instead of Unsupported placeholders.
     let buttons = by_id("1760000090.000090");
-    let link = "https://acme.slack.com/archives/C0GEN/p1760000090000090".to_owned();
-    assert_eq!(buttons.kind, MessageKind::Unsupported { link });
-    assert_eq!(buttons.text, "An interactive message from Deploy Bot");
+    assert_eq!(buttons.kind, MessageKind::Normal);
+    assert_eq!(buttons.controls.len(), 1);
+    assert_eq!(buttons.controls[0].block_id, "a1");
+    assert_eq!(buttons.controls[0].action_id, "approve");
+    assert_eq!(buttons.controls[0].label, "Approve");
+    assert_eq!(buttons.controls[0].value, "42");
 
     // Live: a message with a photo arrives on the socket.
     let before = world.conversation(&general).unwrap().unread;
@@ -2593,6 +2606,7 @@ fn connecting_asks_little_spaces_what_it_warms_and_a_reconnect_asks_less() {
             ("client.counts", connections),
             ("conversations.history", history),
             ("dnd.info", connections),
+            ("drafts.list", connections),
             ("edge:users/info", 1),
             ("team.info", 1),
             ("usergroups.list", connections),
@@ -5199,4 +5213,222 @@ fn slack_gif_picker_catalog_and_send() {
         })
     });
     assert!(matches!(failed.state, SendState::Failed { .. }));
+}
+
+#[test]
+fn slack_block_kit_interactive_controls_and_actions() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    world.general();
+
+    let ts = "1760000980.000980";
+    world.fake.push(
+        ALPHA,
+        json!({
+            "type": "message",
+            "subtype": "bot_message",
+            "bot_id": "B0DEP",
+            "app_id": "A0DEPLOY",
+            "username": "Deploy Bot",
+            "channel": "C0GEN",
+            "text": "Release v2.1 ready",
+            "ts": ts,
+            "event_ts": ts,
+            "blocks": [
+                {
+                    "type": "section",
+                    "block_id": "sec1",
+                    "text": {"type": "mrkdwn", "text": "*Release v2.1* ready for approval"},
+                    "accessory": {
+                        "type": "overflow",
+                        "action_id": "more_opts",
+                        "options": [
+                            {"text": {"type": "plain_text", "text": "View logs"}, "value": "logs"},
+                            {"text": {"type": "plain_text", "text": "Rollback"}, "value": "rollback"}
+                        ]
+                    }
+                },
+                {
+                    "type": "actions",
+                    "block_id": "act1",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "action_id": "approve_btn",
+                            "text": {"type": "plain_text", "text": "Approve"},
+                            "style": "primary",
+                            "value": "rel-2.1",
+                            "confirm": {
+                                "title": {"type": "plain_text", "text": "Ship release?"},
+                                "text": {"type": "mrkdwn", "text": "Deploy v2.1 to production."},
+                                "confirm": {"type": "plain_text", "text": "Ship it"},
+                                "deny": {"type": "plain_text", "text": "Cancel"}
+                            }
+                        },
+                        {
+                            "type": "button",
+                            "action_id": "open_pr",
+                            "text": {"type": "plain_text", "text": "Open PR"},
+                            "url": "https://example.com/pr/42"
+                        },
+                        {
+                            "type": "static_select",
+                            "action_id": "env_pick",
+                            "placeholder": {"type": "plain_text", "text": "Environment"},
+                            "initial_option": {"text": {"type": "plain_text", "text": "Staging"}, "value": "staging"},
+                            "options": [
+                                {"text": {"type": "plain_text", "text": "Staging"}, "value": "staging"},
+                                {"text": {"type": "plain_text", "text": "Production"}, "value": "prod"}
+                            ]
+                        },
+                        {
+                            "type": "datepicker",
+                            "action_id": "ship_date",
+                            "initial_date": "2026-12-01",
+                            "placeholder": {"type": "plain_text", "text": "Ship date"}
+                        },
+                        {
+                            "type": "timepicker",
+                            "action_id": "ship_time",
+                            "initial_time": "14:30"
+                        },
+                        {
+                            "type": "checkboxes",
+                            "action_id": "checks",
+                            "initial_options": [{"text": {"type": "plain_text", "text": "Notify team"}, "value": "notify"}],
+                            "options": [
+                                {"text": {"type": "plain_text", "text": "Notify team"}, "value": "notify"},
+                                {"text": {"type": "plain_text", "text": "Tag release"}, "value": "tag"}
+                            ]
+                        },
+                        {
+                            "type": "radio_buttons",
+                            "action_id": "strategy",
+                            "initial_option": {"text": {"type": "plain_text", "text": "Canary"}, "value": "canary"},
+                            "options": [
+                                {"text": {"type": "plain_text", "text": "Canary"}, "value": "canary"},
+                                {"text": {"type": "plain_text", "text": "Full"}, "value": "full"}
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }),
+    );
+
+    let msg = world.until("interactive Block Kit message stored", || world.message(&general, ts));
+    assert_eq!(msg.kind, MessageKind::Normal);
+    assert!(!msg.text.contains("Open in Slack"), "parsed controls should not append fallback Open in Slack link");
+    assert_eq!(msg.controls.len(), 8);
+    assert_eq!(msg.controls[0].element_type, "overflow");
+    assert_eq!(msg.controls[1].action_id, "approve_btn");
+    assert_eq!(msg.controls[1].confirm.as_ref().map(|c| c.title.as_str()), Some("Ship release?"));
+    assert_eq!(
+        msg.controls[2].kind,
+        protocol::ControlKind::Button { url: "https://example.com/pr/42".into(), style: protocol::ControlStyle::Default }
+    );
+    assert!(matches!(msg.controls[3].kind, protocol::ControlKind::Select { ref selected, .. } if selected.as_deref() == Some("staging")));
+    assert!(matches!(msg.controls[4].kind, protocol::ControlKind::DatePicker { ref initial, .. } if initial.as_deref() == Some("2026-12-01")));
+    assert!(matches!(msg.controls[5].kind, protocol::ControlKind::TimePicker { ref initial, .. } if initial.as_deref() == Some("14:30")));
+    assert!(matches!(msg.controls[6].kind, protocol::ControlKind::Checkboxes { ref selected, .. } if selected == &["notify"]));
+    assert!(matches!(msg.controls[7].kind, protocol::ControlKind::RadioButtons { ref selected, .. } if selected.as_deref() == Some("canary")));
+
+    // 1. Button action dispatches `blocks.actions` with container, action payload, and remembered service_id.
+    assert_eq!(
+        world.ask(Request::MessageAction {
+            conversation: general.clone(),
+            message_id: ts.into(),
+            block_id: "act1".into(),
+            action_id: "approve_btn".into(),
+            element_type: "button".into(),
+            value: "rel-2.1".into(),
+            values: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let call = world.fake.calls(ALPHA, "blocks.actions").pop().expect("blocks.actions called");
+    assert_eq!(call.params.get("channel_id").map(String::as_str), Some("C0GEN"));
+    assert_eq!(call.params.get("service_id").map(String::as_str), Some("A0DEPLOY"));
+    let actions: Value = serde_json::from_str(&call.params["actions"]).unwrap();
+    assert_eq!(actions[0]["action_id"], "approve_btn");
+    assert_eq!(actions[0]["value"], "rel-2.1");
+    let container: Value = serde_json::from_str(&call.params["container"]).unwrap();
+    assert_eq!(container["message_ts"], ts);
+
+    // 2. Select menu & checkboxes format `selected_option` / `selected_options` properly.
+    assert_eq!(
+        world.ask(Request::MessageAction {
+            conversation: general.clone(),
+            message_id: ts.into(),
+            block_id: "act1".into(),
+            action_id: "env_pick".into(),
+            element_type: "static_select".into(),
+            value: "prod".into(),
+            values: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let sel_call = world.fake.calls(ALPHA, "blocks.actions").pop().unwrap();
+    let sel_actions: Value = serde_json::from_str(&sel_call.params["actions"]).unwrap();
+    assert_eq!(sel_actions[0]["selected_option"]["value"], "prod");
+
+    assert_eq!(
+        world.ask(Request::MessageAction {
+            conversation: general.clone(),
+            message_id: ts.into(),
+            block_id: "act1".into(),
+            action_id: "checks".into(),
+            element_type: "checkboxes".into(),
+            value: String::new(),
+            values: vec!["notify".into(), "tag".into()],
+        }),
+        Response::Ok
+    );
+    let chk_call = world.fake.calls(ALPHA, "blocks.actions").pop().unwrap();
+    let chk_actions: Value = serde_json::from_str(&chk_call.params["actions"]).unwrap();
+    assert_eq!(chk_actions[0]["selected_options"].as_array().map(Vec::len), Some(2));
+
+    // 3. Socket `view_opened` does not disrupt the socket, and `message_changed` updates controls in place.
+    world.fake.push(ALPHA, json!({"type": "view_opened", "view": {"id": "V0MODAL1", "type": "modal"}}));
+    world.fake.push(
+        ALPHA,
+        json!({
+            "type": "message",
+            "subtype": "message_changed",
+            "hidden": true,
+            "channel": "C0GEN",
+            "ts": "1760000981.000000",
+            "event_ts": "1760000981.000000",
+            "message": {
+                "type": "message",
+                "subtype": "bot_message",
+                "bot_id": "B0DEP",
+                "username": "Deploy Bot",
+                "text": "Release v2.1 approved!",
+                "ts": ts,
+                "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "✅ Release v2.1 approved!"}}]
+            }
+        }),
+    );
+    let updated = world.until("message updated after action", || {
+        world.message(&general, ts).filter(|m| m.controls.is_empty() && m.text.contains("approved"))
+    });
+    assert!(updated.controls.is_empty());
+
+    // 4. Failed action returns a human-readable refusal.
+    match world.ask(Request::MessageAction {
+        conversation: general,
+        message_id: ts.into(),
+        block_id: "act1".into(),
+        action_id: "fail_action".into(),
+        element_type: "button".into(),
+        value: String::new(),
+        values: Vec::new(),
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("no longer available"), "unexpected refusal: {detail}");
+        }
+        other => panic!("expected Refused for action_not_found, got {other:?}"),
+    }
 }
