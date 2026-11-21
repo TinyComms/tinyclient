@@ -344,6 +344,13 @@ pub struct Capabilities {
     /// and chatd does not keep words a sender replaced on a network that has no history.
     #[serde(default, skip_serializing_if = "is_false")]
     pub revisions: bool,
+    /// This account supports closing a direct conversation (`Request::CloseDirect`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub close_direct: bool,
+    /// This account supports clearing a chat's history or deleting a chat on the network
+    /// (`Request::ClearHistory`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clear_history: bool,
 }
 
 impl Capabilities {

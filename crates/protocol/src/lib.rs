@@ -1271,6 +1271,15 @@ pub enum Request {
     CloseDirect {
         conversation: Key,
     },
+    /// Clears a conversation's history on the network, or deletes the chat when `delete_chat` is
+    /// true. `revoke` also removes the other side's copy where the network allows it.
+    ClearHistory {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "is_false")]
+        delete_chat: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        revoke: bool,
+    },
     /// The messages pinned in a conversation, asked of the network, newest first, at most
     /// [`PINNED_LIMIT`].
     Pinned {

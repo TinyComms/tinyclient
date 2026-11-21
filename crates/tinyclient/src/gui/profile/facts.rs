@@ -34,6 +34,8 @@ pub struct Seen {
     pub direct: Option<(CallSupport, bool)>,
     /// Their network is connected. Off: what shows is the cache.
     pub online: bool,
+    /// The account supports closing a direct conversation (`Request::CloseDirect`).
+    pub close_direct: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -600,7 +602,7 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
     if !pane && !person.link.is_empty() {
         items.push(Item::OpenIn);
     }
-    if seen.in_their_dm && seen.direct.is_some() {
+    if seen.in_their_dm && seen.direct.is_some() && seen.close_direct {
         items.push(Item::CloseDirect);
     }
     let (remove, block) = offers(person);
@@ -612,6 +614,16 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
         items.push(Item::Block);
     }
     tidy(items)
+}
+
+/// A direct conversation whose account serves `CloseDirect` (Discord, Messages).
+pub fn can_close_direct(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
+    conversation.kind == ConversationKind::Direct && can.close_direct
+}
+
+/// A conversation whose account serves `ClearHistory` (Telegram) and is not read-only.
+pub fn can_clear_history(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
+    can.clear_history && !conversation.read_only
 }
 
 /// A group DM, or a Telegram group or channel: the user can leave it from the pane.
@@ -884,7 +896,7 @@ mod tests {
         }
     }
 
-    const DM: Seen = Seen { native_calls: false, in_their_dm: true, direct: Some((CallSupport::Native, false)), online: true };
+    const DM: Seen = Seen { native_calls: false, in_their_dm: true, direct: Some((CallSupport::Native, false)), online: true, close_direct: true };
 
     #[test]
     fn friendship_buttons_follow_discord_relationship_state() {
@@ -934,7 +946,7 @@ mod tests {
 
     #[test]
     fn calls_are_native_handed_off_or_absent_by_network_and_never_for_apps() {
-        let seen = |call| Seen { native_calls: false, in_their_dm: false, direct: Some((call, false)), online: true };
+        let seen = |call| Seen { native_calls: false, in_their_dm: false, direct: Some((call, false)), online: true, close_direct: false };
         let tess = person(Network::Slack, Relation::Contact);
         assert_eq!(actions(&tess, &seen(CallSupport::Handoff), Surface::Pane).call, Some(Call::Handoff("Huddle in Slack".into())));
         let omar = person(Network::Teams, Relation::Contact);
@@ -1041,7 +1053,7 @@ mod tests {
     #[test]
     fn menus_follow_the_designs_order_and_destructive_items_come_last() {
         let juno = person(Network::Discord, Relation::Friend);
-        let from_channel = Seen { native_calls: false, in_their_dm: false, direct: Some((CallSupport::Native, true)), online: true };
+        let from_channel = Seen { native_calls: false, in_their_dm: false, direct: Some((CallSupport::Native, true)), online: true, close_direct: true };
         assert_eq!(
             person_menu(&juno, &from_channel, true, false),
             vec![Item::Mute { muted: true }, Item::Separator, Item::CopyHandle, Item::CopyLink, Item::CopyId, Item::OpenIn, Item::Separator, Item::RemoveFriend, Item::Block]
@@ -1049,6 +1061,9 @@ mod tests {
         // In their DM: no Mute (the switch has it), Close DM instead, Copy ID only with ⌥. The
         // pane's foot opens them in the app, so its menu does not.
         assert_eq!(person_menu(&juno, &DM, false, true), vec![Item::CopyHandle, Item::CopyLink, Item::CloseDirect, Item::Separator, Item::RemoveFriend, Item::Block]);
+        let nadia = person(Network::Telegram, Relation::Contact);
+        let telegram_dm = Seen { in_their_dm: true, direct: Some((CallSupport::Handoff, false)), online: true, ..Seen::default() };
+        assert!(!person_menu(&nadia, &telegram_dm, false, true).contains(&Item::CloseDirect), "Telegram does not serve CloseDirect");
         let tess = person(Network::Slack, Relation::Contact);
         assert_eq!(person_menu(&tess, &Seen::default(), false, false), vec![Item::CopyHandle, Item::CopyLink, Item::OpenIn]);
         assert_eq!(person_menu(&tess, &Seen::default(), false, true), vec![Item::CopyHandle, Item::CopyLink]);
@@ -1060,6 +1075,12 @@ mod tests {
         assert_eq!(conversation_menu(&channel, None, false), Vec::<Item>::new());
         assert!(can_leave(&row(Network::Telegram, ConversationKind::Announcement)));
         assert!(!can_leave(&row(Network::Discord, ConversationKind::Channel)));
+        let tg_caps = protocol::Capabilities { close_direct: false, clear_history: true, ..Default::default() };
+        let dc_caps = protocol::Capabilities { close_direct: true, clear_history: false, ..Default::default() };
+        assert!(!can_close_direct(&row(Network::Telegram, ConversationKind::Direct), &tg_caps));
+        assert!(can_close_direct(&row(Network::Discord, ConversationKind::Direct), &dc_caps));
+        assert!(can_clear_history(&row(Network::Telegram, ConversationKind::Direct), &tg_caps));
+        assert!(!can_clear_history(&row(Network::Discord, ConversationKind::Direct), &dc_caps));
     }
 
     #[test]

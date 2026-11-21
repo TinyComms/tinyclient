@@ -708,7 +708,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::Members { reply, .. } => drop(reply.send(Err(down()))),
         Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(down()))),
         Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
-        Command::SetMute { reply, .. } | Command::Leave { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SetMute { reply, .. } | Command::Leave { reply, .. } | Command::ClearHistory { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchShared { reply, .. } => drop(reply.send(Err(down()))),
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
@@ -816,6 +816,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Leave { conversation_id, reply } => {
             let _ = reply.send(info::leave(account, &conversation_id).map_err(refused));
+        }
+        Command::ClearHistory { conversation_id, delete_chat, revoke, reply } => {
+            let _ = reply.send(info::clear_history(account, &conversation_id, delete_chat, revoke).map_err(refused));
         }
         Command::Pinned { conversation_id, reply } => {
             let _ = reply.send(info::pinned(account, &conversation_id).map_err(refused));

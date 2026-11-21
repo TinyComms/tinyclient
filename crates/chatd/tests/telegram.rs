@@ -3145,3 +3145,36 @@ fn a_link_card_fetches_its_picture_and_not_the_full_photo() {
     assert_eq!(world.called("GetFile photo 8801 m"), 2, "{:#?}", world.calls());
     assert_eq!(world.called("GetFile photo 8801 y"), 0, "{:#?}", world.calls());
 }
+
+#[test]
+fn delete_chat_and_clear_history_loop_over_offset_and_update_store() {
+    let world = World::signed_in();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.until("u7002 history", || world.message("u7002", "12"));
+
+    // Clear history on a DM with revoke=true: loops over non-zero offset, clears stored messages,
+    // and keeps the conversation row.
+    assert_eq!(
+        world.ask(Request::ClearHistory { conversation: key("u7002"), delete_chat: false, revoke: true }),
+        Response::Ok
+    );
+    assert_eq!(world.called("DeleteHistory u7002 just_clear=true revoke=true max_id=0"), 2, "{:#?}", world.calls());
+    assert!(world.conversation("u7002").is_some(), "clear history keeps the chat row");
+    assert!(world.messages("u7002").is_empty(), "clear history removes stored messages");
+
+    // Delete chat on a DM: removes the row and its stored messages.
+    assert_eq!(
+        world.ask(Request::ClearHistory { conversation: key("u7002"), delete_chat: true, revoke: false }),
+        Response::Ok
+    );
+    assert_eq!(world.called("DeleteHistory u7002 just_clear=false revoke=false max_id=0"), 1, "{:#?}", world.calls());
+    assert!(world.conversation("u7002").is_none(), "delete chat removes the row");
+
+    // Clear history on a supergroup/channel uses channels.deleteHistory.
+    assert_eq!(
+        world.ask(Request::ClearHistory { conversation: key("c9001"), delete_chat: false, revoke: false }),
+        Response::Ok
+    );
+    assert_eq!(world.called("ChannelDeleteHistory c9001 for_everyone=false max_id=0"), 1, "{:#?}", world.calls());
+}

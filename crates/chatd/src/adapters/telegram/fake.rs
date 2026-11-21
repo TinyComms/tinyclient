@@ -2819,6 +2819,40 @@ impl World {
             self.log(&format!("DeleteChatUser g{}", request.chat_id));
             return Some(answer(updates(Vec::new())));
         }
+        if let Some(request) = asked::<f::messages::DeleteHistory>(body) {
+            let peer = match &request.peer {
+                tl::enums::InputPeer::User(user) => format!("u{}", user.user_id),
+                tl::enums::InputPeer::Chat(chat) => format!("g{}", chat.chat_id),
+                tl::enums::InputPeer::Channel(channel) => format!("c{}", channel.channel_id),
+                tl::enums::InputPeer::PeerSelf => "self".to_owned(),
+                _ => "other".to_owned(),
+            };
+            let entry = format!(
+                "DeleteHistory {peer} just_clear={} revoke={} max_id={}",
+                request.just_clear, request.revoke, request.max_id
+            );
+            let prior = std::fs::read_to_string(&self.calls)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| *line == entry)
+                .count();
+            self.log(&entry);
+            // Simulate Telegram's paged offset loop on the first call for just_clear so tests
+            // prove the adapter loops while offset != 0.
+            let offset = if request.just_clear && prior == 0 { 1 } else { 0 };
+            let affected = tl::types::messages::AffectedHistory { pts: 1, pts_count: 0, offset };
+            return Some(answer(tl::enums::messages::AffectedHistory::History(affected)));
+        }
+        if let Some(request) = asked::<f::channels::DeleteHistory>(body) {
+            let tl::enums::InputChannel::Channel(channel) = &request.channel else {
+                return Some(Err(rpc(400, "CHANNEL_INVALID", None)));
+            };
+            self.log(&format!(
+                "ChannelDeleteHistory c{} for_everyone={} max_id={}",
+                channel.channel_id, request.for_everyone, request.max_id
+            ));
+            return Some(answer(updates(Vec::new())));
+        }
         if asked::<f::messages::GetSavedGifs>(body).is_some() {
             self.log("GetSavedGifs");
             let found = tl::types::messages::SavedGifs { hash: 1, gifs: vec![gif(6_200).into()] };
