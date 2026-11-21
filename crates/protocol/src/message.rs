@@ -514,6 +514,30 @@ pub struct Message {
     /// Why a read list is empty. "Read receipts are off" when this account does not share them.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub receipt_note: String,
+    /// Structured metadata for a call transcript row (`MessageKind::System`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<CallNote>,
+}
+
+/// How a direct or group call ended, or that it is live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CallOutcome {
+    Missed,
+    Declined,
+    Cancelled,
+    Ended,
+    Live,
+}
+
+/// Structured call metadata attached to a `MessageKind::System` call row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallNote {
+    pub outcome: CallOutcome,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caller_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<u32>,
 }
 
 /// An earlier wording of one message, oldest first when several are kept. Only a network that
@@ -581,6 +605,7 @@ impl Message {
             seal: crate::Seal::Plain,
             deliveries: Vec::new(),
             receipt_note: String::new(),
+            call: None,
         }
     }
 

@@ -1357,4 +1357,21 @@ mod tests {
         assert!(owned_by("guild:81:900:111", "111"));
         assert!(!owned_by("call:3001:222", "111"));
     }
+
+    #[test]
+    fn heard_keeps_camera_and_sharing_separate() {
+        let cam_only = Heard {
+            guild: Some("g".into()),
+            channel: "c".into(),
+            name: "Ada".into(),
+            muted: false,
+            deafened: false,
+            camera: true,
+            sharing: false,
+            live: false,
+        };
+        let share_only = Heard { camera: false, sharing: true, ..cam_only };
+        assert!(!share_only.camera && share_only.sharing);
+        assert!(share_only.sharing || share_only.camera);
+    }
 }

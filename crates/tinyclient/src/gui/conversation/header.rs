@@ -86,6 +86,7 @@ impl Shell {
             .tooltip(tip("Search in conversation", Some("⌘F")))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, window, cx| this.toggle_conversation_search(window, cx)));
+        let live_hint = self.snapshot.as_ref().and_then(|snapshot| self.call_live_hint(snapshot, cx));
         let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, cx)).map(|call| {
             let call = call.h(px(28.)).rounded(px(theme::R_CONTROL)).whitespace_nowrap();
             if compact {
@@ -204,6 +205,7 @@ impl Shell {
                     .children(line)
                     .children(trouble.map(|words| div().flex_none().type_small().text_color(theme::text_faint()).child(words))),
             )
+            .children(live_hint.map(|hint| div().flex_none().ml(px(8.)).child(hint)))
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
             .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).child(search).children(members).children(details))
     }

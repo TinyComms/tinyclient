@@ -278,6 +278,102 @@ fn system_line(message: &Message) -> Div {
         .child(div().max_w(px(MEASURE)).child(message.text.clone()))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallRowSpec {
+    pub icon: &'static str,
+    pub missed: bool,
+    pub label: String,
+    pub pill: Option<&'static str>,
+}
+
+fn format_call_duration(seconds: u32) -> String {
+    if seconds >= 3600 {
+        let h = seconds / 3600;
+        let m = (seconds % 3600) / 60;
+        if m == 0 { format!("{h} hr") } else { format!("{h} hr {m} min") }
+    } else if seconds >= 60 {
+        format!("{} min", seconds / 60)
+    } else {
+        format!("{seconds} sec")
+    }
+}
+
+pub(crate) fn call_line_spec(message: &Message, peer_title: &str) -> CallRowSpec {
+    let other = if message.outgoing {
+        if !peer_title.is_empty() { peer_title } else { "Someone" }
+    } else if !message.sender.name.is_empty() {
+        message.sender.name.as_str()
+    } else if !peer_title.is_empty() {
+        peer_title
+    } else {
+        "Someone"
+    };
+    let Some(note) = &message.call else {
+        return CallRowSpec {
+            icon: "icons/phone.svg",
+            missed: false,
+            label: message.text.clone(),
+            pill: None,
+        };
+    };
+    match (note.outcome, message.outgoing) {
+        (protocol::CallOutcome::Missed, false) => CallRowSpec {
+            icon: "icons/phone-missed.svg",
+            missed: true,
+            label: format!("Missed call from {other}"),
+            pill: Some("Call back"),
+        },
+        (protocol::CallOutcome::Missed, true) => CallRowSpec {
+            icon: "icons/phone-outgoing.svg",
+            missed: false,
+            label: format!("You called {other} · no answer"),
+            pill: Some("Call again"),
+        },
+        (protocol::CallOutcome::Declined, false) => CallRowSpec {
+            icon: "icons/phone-off.svg",
+            missed: false,
+            label: format!("You declined a call from {other}"),
+            pill: None,
+        },
+        (protocol::CallOutcome::Declined, true) => CallRowSpec {
+            icon: "icons/phone-off.svg",
+            missed: false,
+            label: format!("{other} declined the call"),
+            pill: Some("Call again"),
+        },
+        (protocol::CallOutcome::Cancelled, false) => CallRowSpec {
+            icon: "icons/phone-off.svg",
+            missed: false,
+            label: format!("{other} cancelled the call"),
+            pill: None,
+        },
+        (protocol::CallOutcome::Cancelled, true) => CallRowSpec {
+            icon: "icons/phone-off.svg",
+            missed: false,
+            label: "You cancelled the call".to_owned(),
+            pill: Some("Call again"),
+        },
+        (protocol::CallOutcome::Ended, _) => {
+            let label = match note.seconds.filter(|&s| s > 0) {
+                Some(secs) => format!("Call with {other} · {}", format_call_duration(secs)),
+                None => format!("Call with {other}"),
+            };
+            CallRowSpec {
+                icon: if message.outgoing { "icons/phone-outgoing.svg" } else { "icons/phone-incoming.svg" },
+                missed: false,
+                label,
+                pill: None,
+            }
+        }
+        (protocol::CallOutcome::Live, _) => CallRowSpec {
+            icon: "icons/phone.svg",
+            missed: false,
+            label: format!("Call in progress with {other}"),
+            pill: Some("Join"),
+        },
+    }
+}
+
 /// A glyph and a line of words in the middle of a media box.
 fn in_box(which: Icon, words: Option<&'static str>) -> Div {
     div()
@@ -354,6 +450,7 @@ impl Pane {
             Item::Day(at) => day_line(*at, metrics).into_any_element(),
             Item::New => new_line(metrics).into_any_element(),
             Item::Message { message, head } => self.message_row(message, *head, false, window, cx),
+            Item::System(message) if message.call.is_some() => self.call_line(message, cx).into_any_element(),
             Item::System(message) => system_line(message).into_any_element(),
         };
         let seen = self.seen.clone();
@@ -377,6 +474,80 @@ impl Pane {
         } else {
             self.metrics.media.min(room).max(120.).floor()
         }
+    }
+
+    fn call_line(&self, message: &Message, cx: &mut Context<Self>) -> Div {
+        let peer_title = self.open.as_ref().map_or("", |open| open.title.as_str());
+        let spec = call_line_spec(message, peer_title);
+        let disc_bg = if spec.missed { theme::danger_soft() } else { theme::quiet_fill() };
+        let disc_fg = if spec.missed { theme::danger() } else { theme::text_soft() };
+        let label_fg = if spec.missed { theme::danger() } else { theme::text_soft() };
+        let open_key = self.open.as_ref().map(|open| open.key.clone());
+        let shell = self.shell.clone();
+        let pill = spec.pill.and_then(|words| {
+            let key = open_key?;
+            Some(
+                div()
+                    .id(SharedString::from(format!("call-row-act-{}", message.id)))
+                    .flex_none()
+                    .h(px(24.))
+                    .px(px(10.))
+                    .rounded_full()
+                    .bg(if spec.missed { theme::danger_soft() } else { theme::accent_soft() })
+                    .text_color(if spec.missed { theme::danger() } else { theme::accent_text() })
+                    .hover(|style| style.bg(if spec.missed { theme::danger_fill() } else { theme::accent_wash() }))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .type_micro()
+                    .font_weight(theme::SEMIBOLD)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        let _ = shell.update(cx, |shell, cx| shell.call_start(key.clone(), cx));
+                    }))
+                    .child(words),
+            )
+        });
+        div()
+            .w_full()
+            .px(px(self.metrics.inset))
+            .py(px(6.))
+            .flex()
+            .items_center()
+            .gap(px(self.metrics.gap))
+            .child(
+                div()
+                    .w(px(self.metrics.avatar))
+                    .flex_none()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .size(px(30.))
+                            .rounded_full()
+                            .bg(disc_bg)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(glyph(spec.icon, 14., disc_fg)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .type_small()
+                            .font_weight(if spec.missed { theme::SEMIBOLD } else { theme::REGULAR })
+                            .text_color(label_fg)
+                            .child(spec.label),
+                    )
+                    .child(div().type_micro().text_color(theme::text_faint()).child(short_clock(message.sent))),
+            )
+            .children(pill)
     }
 
     fn start_row(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -2521,5 +2692,42 @@ mod tests {
         theirs.sender.avatar = Some(picture("mara"));
         assert_eq!(face(&sending(), &[Rc::new(theirs)], None), None);
         assert_eq!(own_face(&sending(), None, &messages, "", || None), None);
+    }
+
+    #[test]
+    fn call_line_spec_formats_each_outcome_and_direction() {
+        let make = |outcome, outgoing, seconds| {
+            let mut m = Message::plain("r1", "Bea", "fallback", 100, outgoing);
+            m.kind = MessageKind::System;
+            m.call = Some(protocol::CallNote { outcome, caller_id: "u1".into(), seconds });
+            m
+        };
+        let missed_in = call_line_spec(&make(protocol::CallOutcome::Missed, false, None), "Bea");
+        assert!(missed_in.missed);
+        assert_eq!(missed_in.label, "Missed call from Bea");
+        assert_eq!(missed_in.pill, Some("Call back"));
+
+        let missed_out = call_line_spec(&make(protocol::CallOutcome::Missed, true, None), "Bea");
+        assert!(!missed_out.missed);
+        assert_eq!(missed_out.label, "You called Bea · no answer");
+        assert_eq!(missed_out.pill, Some("Call again"));
+
+        let dec_in = call_line_spec(&make(protocol::CallOutcome::Declined, false, None), "Bea");
+        assert_eq!(dec_in.label, "You declined a call from Bea");
+        assert_eq!(dec_in.pill, None);
+
+        let dec_out = call_line_spec(&make(protocol::CallOutcome::Declined, true, None), "Bea");
+        assert_eq!(dec_out.label, "Bea declined the call");
+        assert_eq!(dec_out.pill, Some("Call again"));
+
+        let can_in = call_line_spec(&make(protocol::CallOutcome::Cancelled, false, None), "Bea");
+        assert_eq!(can_in.label, "Bea cancelled the call");
+        let can_out = call_line_spec(&make(protocol::CallOutcome::Cancelled, true, None), "Bea");
+        assert_eq!(can_out.label, "You cancelled the call");
+
+        let ended_dur = call_line_spec(&make(protocol::CallOutcome::Ended, false, Some(720)), "Bea");
+        assert_eq!(ended_dur.label, "Call with Bea · 12 min");
+        let ended_plain = call_line_spec(&make(protocol::CallOutcome::Ended, true, None), "Bea");
+        assert_eq!(ended_plain.label, "Call with Bea");
     }
 }

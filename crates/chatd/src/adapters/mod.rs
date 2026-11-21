@@ -1321,6 +1321,10 @@ impl Context {
     /// Tells the call's mediad, if there is one: who holds priority speech.
     pub fn tell_media(&self, conversation_id: &str, request: protocol::MediaRequest) {
         if self.in_call(conversation_id) {
+            if let protocol::MediaRequest::TinyPicture { ref picture } = request {
+                let source = picture.as_ref().map(|p| (p.user_id.clone(), p.kind));
+                self.hub.calls.set_picture_source(&self.hub, &self.key(conversation_id), source);
+            }
             let _ = self.hub.calls.request(&self.hub, &request);
         }
     }

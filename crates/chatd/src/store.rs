@@ -2792,15 +2792,17 @@ impl Store {
         if here.is_none() {
             return Ok(false);
         }
-        let already: Option<i64> = tx
+        let already: Option<Message> = tx
             .query_row(
-                "SELECT 1 FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
+                "SELECT id, text, body FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
                 params![network, account, id, message.id],
-                |row| row.get(0),
+                message_from,
             )
             .optional()?;
-        if already.is_some() {
-            return Ok(false);
+        if let Some(existing) = &already {
+            if existing.text == message.text && existing.call == message.call {
+                return Ok(false);
+            }
         }
         let mut stored = message.clone();
         stored.bound();
@@ -2830,7 +2832,7 @@ impl Store {
                 message.seq,
             ],
         )?;
-        if bump_unread && !message.outgoing {
+        if already.is_none() && bump_unread && !message.outgoing {
             tx.execute(
                 "UPDATE conversation SET unread = unread + 1 WHERE network = ?1 AND account = ?2 AND id = ?3",
                 params![network, account, id],

@@ -42,7 +42,7 @@ use crate::gui::call::health;
 use gpui::{prelude::*, Bounds, ClipboardItem, Context, Entity, Focusable, PathPromptOptions, Pixels, Point, Task, Window};
 use protocol::{AccountKey, CallStats, Change, Key, Link, Network, Presence, Request, Response, TinyCommunity};
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -228,16 +228,10 @@ pub struct State {
     ban_days: Option<u32>,
     copied: bool,
 
-    /// Each person's volume and mute for me as last set here, by server and user, until chatd's
-    /// settings (which keep it, `CallGain`) are read again with it.
-    gains: Gains,
     /// Mute and deafen chosen while not in a call, for the next one.
     preset: (bool, bool),
     /// The call the presets were last sent to.
     applied: Option<Key>,
-    /// The volume slider's track, as last drawn, and whose volume is being dragged.
-    slider: Rc<Cell<Option<Bounds<Pixels>>>>,
-    sliding: Option<String>,
 
     stats: Option<CallStats>,
     /// The poll before `stats`, so the audio counters (counts over the whole call) can be read
@@ -332,11 +326,8 @@ impl State {
             invite: InviteDraft::default(),
             ban_days: Some(7),
             copied: false,
-            gains: HashMap::new(),
             preset: (false, false),
             applied: None,
-            slider: Rc::default(),
-            sliding: None,
             stats: None,
             stats_before: None,
             stats_chart: VecDeque::new(),
@@ -372,18 +363,6 @@ impl State {
         self.passkeys = settings::Passkeys::default();
     }
 
-    /// The volume and mute for me kept for someone, else 100 % and heard: what was just set
-    /// here, else what chatd keeps for this account.
-    pub(super) fn gain(&self, user_id: &str) -> (u16, bool) {
-        let Some(account) = self.account.as_ref() else {
-            return (100, false);
-        };
-        if let Some(set) = self.gains.get(&(account.account.clone(), user_id.to_owned())) {
-            return *set;
-        }
-        kept_gain(&crate::gui::app::prefs::values().gains(account), user_id)
-    }
-
     pub(super) fn members_open(&self) -> bool {
         self.members_open
     }
@@ -391,13 +370,10 @@ impl State {
     pub(super) fn set_members_open(&mut self, open: bool) {
         self.members_open = open;
     }
-}
 
-type Gains = HashMap<(String, String), (u16, bool)>;
-
-/// Someone's volume and mute among what chatd keeps, else 100 % and heard.
-fn kept_gain(kept: &[(String, u16, bool)], user_id: &str) -> (u16, bool) {
-    kept.iter().find(|(id, _, _)| id == user_id).map_or((100, false), |(_, percent, muted)| (*percent, *muted))
+    pub(in crate::gui) fn channel(&self) -> Option<String> {
+        self.channel.clone()
+    }
 }
 
 /// The server on show. The one already open stays, including while it is still connecting.
@@ -1054,26 +1030,6 @@ impl Shell {
         }));
     }
 
-    /// One person's volume and mute for me. With `send`, chatd keeps it for this account and
-    /// applies it to the call at once (`CallGain`); without, it is only drawn (a slider being
-    /// dragged).
-    pub(super) fn tiny_set_gain(&mut self, user_id: &str, percent: u16, muted: bool, send: bool, cx: &mut Context<Self>) {
-        let Some(account) = self.tiny_state.account.clone() else {
-            return;
-        };
-        let percent = percent.min(protocol::GAIN_MAX);
-        self.tiny_state.gains.insert((account.account.clone(), user_id.to_owned()), (percent, muted));
-        if send {
-            let request = Request::CallGain { account, user_id: user_id.to_owned(), percent, muted };
-            self.off_thread(cx, move || ask(&request), |this, answer, cx| {
-                if let Ok(Response::Error { detail, .. }) = answer {
-                    this.toast(Some(("icons/circle-alert.svg", super::theme::danger())), detail, cx);
-                }
-            });
-        }
-        cx.notify();
-    }
-
     pub(super) fn tiny_copy(&mut self, text: String, words: &'static str, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         self.toast(Some(("icons/check.svg", super::theme::text_soft())), words, cx);
@@ -1106,16 +1062,13 @@ impl Shell {
         self.tiny_state.float = Some(float);
         self.tiny_state.sub = None;
         self.tiny_state.card = None;
-        self.tiny_state.sliding = None;
+        self.call_state.sliding = None;
         cx.notify();
     }
 
     pub(super) fn tiny_close_float(&mut self, cx: &mut Context<Self>) {
         // A volume being dragged is kept where it was let go.
-        if let Some(user_id) = self.tiny_state.sliding.take() {
-            let (percent, muted) = self.tiny_state.gain(&user_id);
-            self.tiny_set_gain(&user_id, percent, muted, true, cx);
-        }
+        self.call_slide_end(cx);
         self.tiny_state.float = None;
         self.tiny_state.sub = None;
         cx.notify();
@@ -1725,8 +1678,8 @@ mod tests {
     #[test]
     fn a_volume_is_what_chatd_keeps_else_the_default() {
         let kept = [("a".to_owned(), 150u16, false), ("b".to_owned(), 100u16, true)];
-        assert_eq!(kept_gain(&kept, "a"), (150, false));
-        assert_eq!(kept_gain(&kept, "b"), (100, true));
-        assert_eq!(kept_gain(&kept, "c"), (100, false));
+        assert_eq!(crate::gui::call::kept_gain(&kept, "a"), (150, false));
+        assert_eq!(crate::gui::call::kept_gain(&kept, "b"), (100, true));
+        assert_eq!(crate::gui::call::kept_gain(&kept, "c"), (100, false));
     }
 }

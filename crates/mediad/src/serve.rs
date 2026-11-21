@@ -118,6 +118,10 @@ impl Call {
                 }
             }
             MediaRequest::ShareWatch { source } => {
+                match &source {
+                    Some(user_id) => tracing::info!(user_id = %user_id, "watch on"),
+                    None => tracing::info!("watch off"),
+                }
                 self.video.share_decode = source.clone();
                 if self.voice.is_some() || self.tiny.is_some() {
                     self.controls.set_watch(source.is_some());

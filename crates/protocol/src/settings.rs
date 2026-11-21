@@ -824,6 +824,8 @@ mod tests {
         assert!(valid(&tiny, &key, "150") && valid(&tiny, &key, "0 muted") && valid(&tiny, &key, "200"));
         assert!(!valid(&tiny, &key, "201") && !valid(&tiny, &key, "loud") && !valid(GLOBAL, &key, "50"));
         assert!(!valid(&tiny, "gain:", "50") && !valid(&tiny, "gain:a b", "50"));
+        let discord = account_scope(&AccountKey { network: Network::Discord, account: "acc".into() });
+        assert!(valid(&discord, "gain:u1", "140") && valid(&discord, "gain:u1", "0 muted"));
         assert!(known(&tiny, &key));
         assert_eq!((gain_value(100, false), gain_value(250, false), gain_value(30, true)), (None, Some("200".into()), Some("30 muted".into())));
         let mut values = Values::default();

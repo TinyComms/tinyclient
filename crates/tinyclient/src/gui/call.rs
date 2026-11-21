@@ -25,21 +25,24 @@ pub(crate) use phone::hooks::{
 pub(super) use people::occupants;
 pub(super) use people::ringed;
 
-use super::components::{glyph, network_icon, tip};
+use super::components::{glyph, menu_item, menu_label, menu_separator, network_icon, slider, tip};
 use super::state::{Shell, Snapshot};
-use super::theme;
+use super::theme::{self, Type};
 use crate::client::ask;
 use gpui::{
-    div, prelude::*, px, Action, AnyElement, App, Context, Div, Entity, FontWeight, Global, KeyBinding,
-    MouseButton, Rgba, SharedString, Stateful, Svg, Task, WeakEntity, Window,
+    canvas, div, prelude::*, px, Action, AnyElement, App, Bounds, Context, Div, Entity, FontWeight,
+    Global, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Rgba, SharedString,
+    Stateful, Svg, Task, WeakEntity, Window,
 };
 use protocol::settings::MUTED_TALK;
 use protocol::{
-    Call, CallFailure, CallState, CallSupport, Change, ConversationKind, Key, MediaFile, Network,
-    Occupants, Request, Response,
+    AccountKey, Call, CallFailure, CallState, CallSupport, Change, ConversationKind, Key,
+    MediaFile, Network, Occupants, Request, Response,
 };
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
+use std::collections::HashMap;
 use std::mem::{discriminant, Discriminant};
+use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 gpui::actions!(call, [ToggleMute, ToggleDeafen, Leave, Accept, Decline, Jump]);
@@ -96,12 +99,14 @@ fn now() -> i64 {
 }
 
 /// The popover open above the dock.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) enum Menu {
     Devices,
     People,
     /// How the call is protected (`security`).
     Security,
+    /// Per-person volume and local mute for someone in any call.
+    Person { account: AccountKey, user_id: String, name: String },
 }
 
 /// What a counter in the dock is counting.
@@ -282,6 +287,122 @@ pub struct State {
     notice: Option<String>,
     /// Clears `ended` or `notice` when its few seconds are up.
     brief: Option<Task<()>>,
+    /// Per-person volume and local mute, keyed by `(AccountKey, user_id)` so it works in any call
+    /// regardless of which server page is open.
+    pub(in crate::gui) gains: HashMap<(AccountKey, String), (u16, bool)>,
+    /// The volume slider's track bounds, as last drawn, and whose volume is being dragged.
+    pub(in crate::gui) slider: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub(in crate::gui) sliding: Option<(AccountKey, String)>,
+    /// `(conversation, peer_id)` that `call_auto_watch` already asked to watch, so we ask once
+    /// per start and respect a manual "Stop watching" until the peer stops and starts again.
+    pub(in crate::gui) auto_watch: Option<(Key, String)>,
+    /// The Discord participant whose camera we last asked mediad to paint (`MediaRequest::Speaker`),
+    /// and when we switched to them (for 800 ms speaker debounce).
+    pub(in crate::gui) discord_speaker: Option<(String, Instant)>,
+    /// When the user asked to watch a specific stream, so the tile can escalate past "Connecting…"
+    /// at 3 s and 10 s without waiting for a frame to arrive.
+    pub(in crate::gui) watch_asked: Option<(String, Instant)>,
+    watch_timer: Option<Task<()>>,
+}
+
+const DISCORD_SPEAKER_DEBOUNCE: Duration = Duration::from_millis(800);
+
+/// Pure camera-speaker selection for Discord calls (where the shell names whose camera to paint).
+/// Returns `Some(Some(id))` to switch camera speaker, `Some(None)` to clear, or `None` for no change.
+fn discord_speaker_step(
+    call: &Call,
+    focused: Option<&str>,
+    current: Option<(&str, Instant)>,
+    now: Instant,
+) -> Option<Option<String>> {
+    if call.state != CallState::Joined || call.conversation.network != Network::Discord {
+        return None;
+    }
+    let cur_id = current.map(|(id, _)| id);
+    let cur_still_camera = cur_id.is_some_and(|id| call.participants.iter().any(|p| p.id == id && p.camera));
+    let target = if let Some(foc) = focused.filter(|id| call.participants.iter().any(|p| p.id == *id && p.camera)) {
+        Some(foc)
+    } else if let Some(speaker) = call.participants.iter().find(|p| p.camera && p.speaking) {
+        if cur_id == Some(speaker.id.as_str()) {
+            return None;
+        }
+        if cur_still_camera && current.is_some_and(|(_, at)| now.saturating_duration_since(at) < DISCORD_SPEAKER_DEBOUNCE) {
+            return None;
+        }
+        Some(speaker.id.as_str())
+    } else if cur_still_camera {
+        return None;
+    } else {
+        call.participants.iter().find(|p| p.camera).map(|p| p.id.as_str())
+    };
+    match target {
+        Some(id) if cur_id == Some(id) => None,
+        Some(id) => Some(Some(id.to_owned())),
+        None if cur_id.is_some() => Some(None),
+        None => None,
+    }
+}
+
+/// A decode of this person was asked for, or their picture is on screen.
+pub(in crate::gui) fn watching(call: &Call, user_id: &str) -> bool {
+    call.video.iter().any(|stream| {
+        stream.direction == protocol::Direction::Decode
+            && stream.content == protocol::Content::Share
+            && stream.source == user_id
+    }) || call
+        .picture
+        .as_ref()
+        .is_some_and(|picture| !picture.path.is_empty() && picture.user_id == user_id)
+}
+
+/// Pure auto-watch decision for a 1:1 Tiny direct call.
+/// Returns `Some(Some(peer_id))` to start watching, `Some(None)` to stop watching, or `None` for no-op.
+fn auto_watch_step(
+    call: &Call,
+    is_room: bool,
+    prev: &mut Option<(Key, String)>,
+) -> Option<Option<String>> {
+    if call.state != CallState::Joined
+        || call.conversation.network != Network::Tiny
+        || is_room
+        || call.participants.len() != 1
+    {
+        if prev.as_ref().is_some_and(|(k, _)| k == &call.conversation) {
+            *prev = None;
+            return Some(None);
+        }
+        return None;
+    }
+    let peer = &call.participants[0];
+    if peer.sharing || peer.camera {
+        let target = (call.conversation.clone(), peer.id.clone());
+        if prev.as_ref() == Some(&target) {
+            return None;
+        }
+        *prev = Some(target);
+        if !watching(call, &peer.id) {
+            return Some(Some(peer.id.clone()));
+        }
+        return None;
+    }
+    if prev.take().is_some() {
+        return Some(None);
+    }
+    None
+}
+
+/// Someone's volume and mute among what chatd keeps, else 100 % and heard.
+pub(in crate::gui) fn kept_gain(kept: &[(String, u16, bool)], user_id: &str) -> (u16, bool) {
+    kept.iter().find(|(id, _, _)| id == user_id).map_or((100, false), |(_, percent, muted)| (*percent, *muted))
+}
+
+impl State {
+    pub(in crate::gui) fn gain(&self, account: &AccountKey, user_id: &str) -> (u16, bool) {
+        if let Some(set) = self.gains.get(&(account.clone(), user_id.to_owned())) {
+            return *set;
+        }
+        kept_gain(&crate::gui::app::prefs::values().gains(account), user_id)
+    }
 }
 
 /// What a call is of: the conversation's name, kind and picture.
@@ -359,6 +480,7 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         picture: None,
         self_view: None,
         share_view: None,
+        picture_source: None,
     }
 }
 
@@ -574,6 +696,20 @@ pub(super) fn dock(shell: &Shell, _: &mut Window, cx: &mut Context<Shell>) -> Op
     shell.call_dock(snapshot, cx).map(IntoElement::into_any_element)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CallGoTarget {
+    TinyRoom(protocol::AccountKey, String),
+    Conversation,
+}
+
+fn call_go_target(key: &Key, is_tiny_room: bool) -> CallGoTarget {
+    if key.network == Network::Tiny && is_tiny_room {
+        CallGoTarget::TinyRoom(key.account(), key.id.clone())
+    } else {
+        CallGoTarget::Conversation
+    }
+}
+
 impl Shell {
     /// The speaker chosen (V2), in the call's menu or in Settings, which a voice message plays
     /// through too. `None` is the automatic choice.
@@ -606,6 +742,10 @@ impl Shell {
                 state.muted_talk_task = None;
                 state.metering = None;
                 state.cued = None;
+                state.auto_watch = None;
+                state.discord_speaker = None;
+                state.watch_asked = None;
+                state.watch_timer = None;
                 // A call that was up and went without our asking: the other side ended it.
                 let was = state.was.take();
                 if let Some(was) = was.filter(|_| !std::mem::take(&mut state.leaving)) {
@@ -636,6 +776,14 @@ impl Shell {
                 }
                 self.call_watch_muted_talk(call, cx);
                 self.call_cue_join(call, cx);
+                self.call_auto_watch(call, cx);
+                self.call_discord_speaker(call, cx);
+                if let Some((asked_id, _)) = &self.call_state.watch_asked {
+                    if call.picture.as_ref().is_some_and(|p| !p.path.is_empty() && p.user_id == *asked_id) {
+                        self.call_state.watch_asked = None;
+                        self.call_state.watch_timer = None;
+                    }
+                }
                 if !in_call(call) {
                     // Ringing, connecting or failed: not a call that can end.
                     self.call_state.was = None;
@@ -825,24 +973,529 @@ impl Shell {
     }
 
     /// Goes where the call is: its conversation, or for a Tiny room the server's page on it.
-    /// A direct message is not a room, so its title opens the conversation.
+    /// Only a known Tiny room goes to the server page; any direct call (even unlisted) opens its conversation.
     pub(in crate::gui) fn call_go(&mut self, key: Key, title: &str, cx: &mut Context<Self>) {
-        let open_direct = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.open.as_ref())
-            .is_some_and(|row| row.key == key && row.kind.is_direct());
-        let listed_direct = self
-            .sidebar_state
-            .find(&self.trees, &key)
-            .is_some_and(|row| row.kind.is_direct());
-        if key.network == Network::Tiny && !open_direct && !listed_direct {
-            self.go(super::sidebar::Mode::Network(Network::Tiny), cx);
-            self.prefer_tiny(key.account(), cx);
-            self.tiny_pick_channel(Some(key.id), cx);
+        let is_room = key.network == Network::Tiny && self.tiny_room(&key).is_some();
+        match call_go_target(&key, is_room) {
+            CallGoTarget::TinyRoom(account, room_id) => {
+                self.remember();
+                self.go(super::sidebar::Mode::Network(Network::Tiny), cx);
+                self.prefer_tiny(account, cx);
+                self.tiny_pick_channel(Some(room_id), cx);
+            }
+            CallGoTarget::Conversation => {
+                self.select(key, title, cx);
+            }
+        }
+    }
+
+    /// One person's volume and mute for me on a given account.
+    pub(in crate::gui) fn call_gain(&self, account: &AccountKey, user_id: &str) -> (u16, bool) {
+        self.call_state.gain(account, user_id)
+    }
+
+    /// Sets one person's volume and local mute on `account`. With `send`, chatd persists it and
+    /// applies it to the active call (`CallGain`).
+    pub(in crate::gui) fn call_set_gain(
+        &mut self,
+        account: AccountKey,
+        user_id: &str,
+        percent: u16,
+        muted: bool,
+        send: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let percent = percent.min(protocol::GAIN_MAX);
+        self.call_state.gains.insert((account.clone(), user_id.to_owned()), (percent, muted));
+        if send {
+            let request = Request::CallGain { account, user_id: user_id.to_owned(), percent, muted };
+            self.off_thread(cx, move || ask(&request), |this, answer, cx| {
+                if let Ok(Response::Error { detail, .. }) = answer {
+                    this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn call_slide(&mut self, x: f32, cx: &mut Context<Self>) {
+        let (Some((account, user_id)), Some(bounds)) = (self.call_state.sliding.clone(), self.call_state.slider.get()) else {
+            return;
+        };
+        let at = super::components::slider_value(x, f32::from(bounds.origin.x), f32::from(bounds.size.width));
+        let mut percent = (at * f32::from(protocol::GAIN_MAX)).round() as u16;
+        if percent.abs_diff(100) <= 4 {
+            percent = 100;
+        }
+        let muted = self.call_gain(&account, &user_id).1;
+        self.call_set_gain(account, &user_id, percent, muted, false, cx);
+    }
+
+    pub(in crate::gui) fn call_slide_end(&mut self, cx: &mut Context<Self>) {
+        if let Some((account, user_id)) = self.call_state.sliding.take() {
+            let (percent, muted) = self.call_gain(&account, &user_id);
+            self.call_set_gain(account, &user_id, percent, muted, true, cx);
+        }
+    }
+
+    pub(in crate::gui) fn call_track(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.call_state.sliding.is_none() {
             return;
         }
-        self.select(key, title, cx);
+        if event.pressed_button == Some(MouseButton::Left) {
+            self.call_slide(f32::from(event.position.x), cx);
+        } else {
+            self.call_slide_end(cx);
+        }
+    }
+
+    /// Reusable per-person volume slider and "Mute for me" toggle, shared by the call-owned person
+    /// popover, the device menu (for 1:1 calls), and the Tiny server person menu.
+    pub(in crate::gui) fn call_volume_controls(&self, account: AccountKey, user_id: &str, cx: &mut Context<Self>) -> Div {
+        const SLIDER: f32 = 132.;
+        let (percent, muted) = self.call_gain(&account, user_id);
+        let slide_account = account.clone();
+        let slide_id = user_id.to_owned();
+        let bounds = self.call_state.slider.clone();
+        let track = div()
+            .id(SharedString::from(format!("call-volume-{user_id}")))
+            .relative()
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.call_state.sliding = Some((slide_account.clone(), slide_id.clone()));
+                    this.call_slide(f32::from(event.position.x), cx);
+                }),
+            )
+            .child(slider(f32::from(percent) / f32::from(protocol::GAIN_MAX), SLIDER, Some(0.5)))
+            .child(canvas(move |at, _, _| bounds.set(Some(at)), |_, _, _, _| {}).absolute().top_0().left_0().size_full());
+        let mute_account = account;
+        let mute_id = user_id.to_owned();
+        let mute_icon = if muted { "icons/volume-2.svg" } else { "icons/volume-x.svg" };
+        let mute_label = if muted { "Unmute for me" } else { "Mute for me" };
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(32.))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(glyph(if muted || percent == 0 { "icons/volume-x.svg" } else { "icons/volume-2.svg" }, 16., theme::text_soft()))
+                    .child(track)
+                    .child(div().flex_1().flex().justify_end().type_small().text_color(theme::text_soft()).child(format!("{percent} %"))),
+            )
+            .child(
+                menu_item(SharedString::from(format!("call-mute-local-{user_id}")), Some(mute_icon), mute_label, None).on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    let (percent, muted) = this.call_gain(&mute_account, &mute_id);
+                    this.call_set_gain(mute_account.clone(), &mute_id, percent, !muted, true, cx);
+                })),
+            )
+    }
+
+    pub(super) fn call_person_menu(&self, account: AccountKey, user_id: &str, name: &str, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.call_track(event, cx)))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.call_slide_end(cx)))
+            .child(menu_label(name.to_owned()))
+            .child(menu_separator().mx(px(8.)))
+            .child(self.call_volume_controls(account, user_id, cx))
+    }
+
+    pub(super) fn call_people_list(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
+        let account = call.conversation.account();
+        let mut people: Vec<&protocol::Participant> = call.participants.iter().collect();
+        people.sort_by_key(|who| who.name.to_lowercase());
+        let count = people.len() + 1;
+        let noun = if count == 1 { "PERSON" } else { "PEOPLE" };
+        let own = super::components::Avatar::named("You", 22.).build();
+        let heard = call.speaking && !call.muted && !call.deafened;
+        let mut rows = Vec::with_capacity(count);
+        rows.push(
+            div()
+                .w_full()
+                .h(px(32.))
+                .flex_none()
+                .pl(px(12.))
+                .pr(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .text_size(px(13.))
+                .text_color(if heard { theme::text() } else { theme::text_soft() })
+                .child(ringed(own, 22., heard))
+                .child(div().flex_1().min_w_0().truncate().child("You"))
+                .into_any_element(),
+        );
+        for who in people {
+            let (percent, muted) = self.call_gain(&account, &who.id);
+            let gain_tag = if muted {
+                Some("Muted for you".to_owned())
+            } else if percent != 100 {
+                Some(format!("{percent} %"))
+            } else {
+                None
+            };
+            let key = Key { network: call.conversation.network, account: call.conversation.account.clone(), id: who.id.clone() };
+            let avatar = super::components::Avatar::new(&key, &who.name, 22.).build();
+            let menu_account = account.clone();
+            let menu_id = who.id.clone();
+            let menu_name = who.name.clone();
+            let open_person = move |this: &mut Shell, cx: &mut Context<Shell>| {
+                cx.stop_propagation();
+                this.call_menu_set(Some(Menu::Person { account: menu_account.clone(), user_id: menu_id.clone(), name: menu_name.clone() }), cx);
+            };
+            let open_click = open_person.clone();
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("call-person-row-{}", who.id)))
+                    .w_full()
+                    .h(px(32.))
+                    .flex_none()
+                    .pl(px(12.))
+                    .pr(px(10.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .text_size(px(13.))
+                    .text_color(if who.speaking { theme::text() } else { theme::text_soft() })
+                    .tooltip(tip("Adjust volume", None))
+                    .on_click(cx.listener(move |this, _, _, cx| open_click(this, cx)))
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| open_person(this, cx)))
+                    .child(ringed(avatar, 22., who.speaking))
+                    .child(div().flex_1().min_w_0().truncate().child(who.name.clone()))
+                    .children(gain_tag.map(|tag| div().flex_none().type_micro().text_color(if muted { theme::warning() } else { theme::text_faint() }).child(tag)))
+                    .when(who.muted, |r| r.child(glyph("icons/mic-off.svg", 13., theme::text_faint())))
+                    .when(who.deafened, |r| r.child(glyph("icons/headphone-off.svg", 13., theme::text_faint())))
+                    .into_any_element(),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(26.))
+                    .flex_none()
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::text_faint())
+                    .child(format!("{} · {count} {noun}", subject.title.to_uppercase())),
+            )
+            .child(
+                div()
+                    .id("call-people-rows")
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .children(rows),
+            )
+    }
+
+    /// Ask mediad to watch `user_id`'s stream and schedule 3 s / 10 s redraws so the tile never
+    /// stays on "Connecting…" silently.
+    pub(in crate::gui) fn call_watch(&mut self, user_id: String, cx: &mut Context<Self>) {
+        self.call_state.watch_asked = Some((user_id.clone(), Instant::now()));
+        self.call_state.watch_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(3)).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+            cx.background_executor().timer(Duration::from_secs(7)).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        }));
+        self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: Some(user_id) }), cx);
+    }
+
+    /// Reset the decoder and ask for a fresh keyframe for `user_id`.
+    pub(in crate::gui) fn call_retry_watch(&mut self, user_id: String, cx: &mut Context<Self>) {
+        self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: None }), cx);
+        self.call_watch(user_id, cx);
+    }
+
+    /// Stop watching the current stream and clear any pending connecting timer.
+    pub(in crate::gui) fn call_unwatch(&mut self, cx: &mut Context<Self>) {
+        self.call_state.watch_asked = None;
+        self.call_state.watch_timer = None;
+        self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: None }), cx);
+    }
+
+    /// In a 1:1 Tiny direct call, automatically watch the peer's screen share or camera as soon
+    /// as they start sending, and stop decoding when they stop.
+    fn call_auto_watch(&mut self, call: &Call, cx: &mut Context<Self>) {
+        let is_room = self.tiny_room(&call.conversation).is_some();
+        if let Some(source) = auto_watch_step(call, is_room, &mut self.call_state.auto_watch) {
+            self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source }), cx);
+        }
+    }
+
+    /// For a joined Discord call, tell mediad whose camera to paint (`MediaRequest::Speaker`),
+    /// debouncing active-speaker switches by 800 ms.
+    fn call_discord_speaker(&mut self, call: &Call, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let current = self.call_state.discord_speaker.as_ref().map(|(id, at)| (id.as_str(), *at));
+        if let Some(next) = discord_speaker_step(call, None, current, now) {
+            self.call_state.discord_speaker = next.clone().map(|id| (id, now));
+            self.call_ask(Request::Media(protocol::MediaRequest::Speaker { source: next }), cx);
+        }
+    }
+
+    /// The received video frame on screen, when it belongs to `user_id`.
+    pub(in crate::gui) fn call_frame(
+        &self,
+        call: Option<&Call>,
+        user_id: &str,
+    ) -> Option<std::sync::Arc<gpui::RenderImage>> {
+        call?.picture
+            .as_ref()
+            .filter(|picture| !picture.path.is_empty() && picture.user_id == user_id)?;
+        self.call_state.feed.shown().cloned()
+    }
+
+    /// My own camera, or with `share` my own screen, as it is sent, while it is on.
+    pub(in crate::gui) fn call_self_frame(
+        &self,
+        call: Option<&Call>,
+        share: bool,
+    ) -> Option<std::sync::Arc<gpui::RenderImage>> {
+        let (picture, feed) = if share {
+            (call?.share_view.as_ref(), &self.call_state.screen_feed)
+        } else {
+            (call?.self_view.as_ref(), &self.call_state.self_feed)
+        };
+        picture.filter(|picture| !picture.path.is_empty())?;
+        feed.shown().cloned()
+    }
+
+    /// Video picture area shown above the messages when the open conversation is a non-room call
+    /// carrying a peer picture or local self-view.
+    pub(in crate::gui) fn call_conversation_picture(
+        &self,
+        snapshot: &Snapshot,
+        open: &protocol::Conversation,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let call = self.call_shown(snapshot).filter(|call| {
+            call.state == CallState::Joined
+                && call.conversation == open.key
+                && self.tiny_room(&call.conversation).is_none()
+        })?;
+        self.call_picture_box(&call, false, cx)
+    }
+
+    /// Compact picture tile shown above the dock card when a non-room call has live video while
+    /// another conversation is open.
+    pub(super) fn call_dock_picture(
+        &self,
+        snapshot: &Snapshot,
+        call: &Call,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        if call.state != CallState::Joined || self.tiny_room(&call.conversation).is_some() {
+            return None;
+        }
+        if snapshot.open.as_ref().is_some_and(|open| open.key == call.conversation) {
+            return None;
+        }
+        self.call_picture_box(call, true, cx)
+    }
+
+    fn call_picture_box(&self, call: &Call, compact: bool, cx: &mut Context<Self>) -> Option<Div> {
+        let peer_picture = call.picture.as_ref().filter(|p| !p.path.is_empty());
+        let peer_sender = call.participants.iter().find(|p| p.sharing || p.camera);
+        let peer_id = peer_picture
+            .map(|p| p.user_id.as_str())
+            .or_else(|| peer_sender.map(|p| p.id.as_str()));
+        let peer_name = peer_id
+            .and_then(|id| call.participants.iter().find(|p| p.id == id))
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "Peer".to_owned());
+        let peer_is_share = peer_picture
+            .map(|p| p.kind == protocol::PictureKind::Share)
+            .or_else(|| peer_sender.map(|p| p.sharing))
+            .unwrap_or(false);
+        let peer_frame = peer_id.and_then(|id| self.call_frame(Some(call), id));
+        let my_share = self.call_self_frame(Some(call), true);
+        let my_camera = self.call_self_frame(Some(call), false);
+        let self_frame = my_share.clone().or_else(|| my_camera.clone());
+        let self_is_share = my_share.is_some();
+
+        let has_peer = peer_frame.is_some() || peer_sender.is_some();
+        if !has_peer && self_frame.is_none() {
+            return None;
+        }
+        let main_is_peer = has_peer;
+        let height = if compact { 126. } else { 260. };
+
+        let main_body = if main_is_peer {
+            if let Some(frame) = peer_frame {
+                gpui::img(frame).size_full().object_fit(gpui::ObjectFit::Contain).into_any_element()
+            } else {
+                let id = peer_id.unwrap_or_default().to_owned();
+                let is_watching = watching(call, &id);
+                let label = if is_watching { "Connecting…" } else if peer_is_share { "Watch stream" } else { "Watch camera" };
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(8.))
+                    .child(div().type_small().text_color(theme::text_soft()).child(format!(
+                        "{peer_name} is {}",
+                        if peer_is_share { "sharing their screen" } else { "on camera" }
+                    )))
+                    .child(
+                        div()
+                            .id("call-picture-watch")
+                            .h(px(28.))
+                            .px(px(12.))
+                            .rounded_full()
+                            .bg(if is_watching { theme::overlay() } else { theme::accent() })
+                            .text_color(if is_watching { theme::text_soft() } else { theme::on_accent() })
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .type_micro()
+                            .font_weight(theme::SEMIBOLD)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: Some(id.clone()) }), cx);
+                            }))
+                            .child(label),
+                    )
+                    .into_any_element()
+            }
+        } else {
+            gpui::img(self_frame.clone().unwrap())
+                .size_full()
+                .object_fit(gpui::ObjectFit::Contain)
+                .into_any_element()
+        };
+
+        let caption = if main_is_peer {
+            format!("{peer_name}'s {}", if peer_is_share { "screen" } else { "camera" })
+        } else if self_is_share {
+            "Your screen".to_owned()
+        } else {
+            "Your camera".to_owned()
+        };
+        let badge = (main_is_peer && peer_is_share).then(|| {
+            div()
+                .px(px(6.))
+                .py(px(1.))
+                .rounded(px(4.))
+                .bg(theme::danger())
+                .text_color(theme::on_accent())
+                .text_size(px(10.))
+                .font_weight(FontWeight::BOLD)
+                .child("LIVE")
+        });
+        let action_btn = if main_is_peer && peer_id.is_some_and(|id| watching(call, id)) {
+            Some(
+                div()
+                    .id("call-picture-stop-watch")
+                    .h(px(24.))
+                    .px(px(8.))
+                    .rounded(px(6.))
+                    .bg(theme::overlay())
+                    .text_color(theme::text())
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .type_micro()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: None }), cx);
+                    }))
+                    .child("Stop watching"),
+            )
+        } else if !main_is_peer {
+            Some(
+                div()
+                    .id("call-picture-stop-self")
+                    .h(px(24.))
+                    .px(px(8.))
+                    .rounded(px(6.))
+                    .bg(theme::danger())
+                    .text_color(theme::on_accent())
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .type_micro()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if self_is_share {
+                            this.tiny_stop_share(cx);
+                        } else {
+                            this.call_ask(Request::Media(protocol::MediaRequest::Camera { on: false }), cx);
+                        }
+                    }))
+                    .child("Stop"),
+            )
+        } else {
+            None
+        };
+        let pip = (main_is_peer && !compact).then(|| self_frame).flatten().map(|frame| {
+            div()
+                .absolute()
+                .bottom(px(8.))
+                .right(px(8.))
+                .w(px(112.))
+                .h(px(64.))
+                .rounded(px(8.))
+                .overflow_hidden()
+                .border_1()
+                .border_color(theme::border())
+                .bg(gpui::rgb(0x0b0b0d))
+                .child(gpui::img(frame).size_full().object_fit(gpui::ObjectFit::Contain))
+        });
+
+        let box_div = div()
+            .relative()
+            .w_full()
+            .h(px(height))
+            .flex_none()
+            .rounded(px(if compact { theme::R_CARD } else { 10. }))
+            .bg(gpui::rgb(0x0b0b0d))
+            .border_1()
+            .border_color(theme::hairline())
+            .overflow_hidden()
+            .child(main_body)
+            .child(
+                div()
+                    .absolute()
+                    .top(px(8.))
+                    .left(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(6.))
+                    .bg(theme::overlay())
+                    .children(badge)
+                    .child(div().type_micro().text_color(theme::text()).child(caption)),
+            )
+            .children(action_btn.map(|btn| div().absolute().top(px(8.)).right(px(8.)).child(btn)))
+            .children(pip);
+
+        if compact {
+            Some(div().w_full().pb(px(6.)).child(box_div))
+        } else {
+            Some(div().w_full().flex_none().px(px(16.)).pt(px(10.)).pb(px(4.)).child(box_div))
+        }
     }
 
     /// A join was asked for here: a new room that follows is not a moderator's move.
@@ -1036,7 +1689,7 @@ impl Shell {
 
     /// Rings or joins. A failed call in the dock is replaced by the new one. A call that is up
     /// somewhere else is not left without a word: the dock asks first.
-    pub(super) fn call_start(&mut self, conversation: Key, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn call_start(&mut self, conversation: Key, cx: &mut Context<Self>) {
         if let Some(call) = self.call_now() {
             if call.conversation == conversation && !matches!(call.state, CallState::Failed { .. })
             {
@@ -1165,6 +1818,39 @@ impl Shell {
             });
         })
         .detach();
+    }
+
+    /// A small header pill while a call is live elsewhere, taking you back to it in one click.
+    pub(super) fn call_live_hint(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        if super::phone::active() {
+            return None;
+        }
+        let open = snapshot.open.as_ref()?;
+        let call = self.call_shown(snapshot).filter(|call| in_call(call) && call.conversation != open.key)?;
+        let subject = Subject::of(self, snapshot, &call);
+        let label = format!("In call · {}", subject.title);
+        Some(
+            div()
+                .id("call-live-hint")
+                .flex_none()
+                .h(px(28.))
+                .px(px(10.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::positive_soft())
+                .text_color(theme::positive())
+                .hover(|style| style.bg(theme::hover()))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .tooltip(tip("Open the call", Some("⌘⇧J")))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| this.call_jump(cx)))
+                .child(glyph("icons/phone.svg", 13., theme::positive()))
+                .child(div().max_w(px(160.)).truncate().child(label)),
+        )
     }
 
     /// The header pill, by what the open conversation can do (07 §1). Its look is the capability:
@@ -1483,5 +2169,85 @@ mod tests {
             handoff_tooltip(Network::Teams),
             "Teams calls open in the Teams app. tinyclient doesn't carry them."
         );
+
+    #[test]
+    fn call_go_target_opens_only_known_tiny_rooms_on_server_page() {
+        let tiny_room = Key { network: Network::Tiny, account: "srv".into(), id: "room-1".into() };
+        let tiny_direct = Key { network: Network::Tiny, account: "srv".into(), id: "dm-unlisted".into() };
+        let discord_dm = Key { network: Network::Discord, account: "acc".into(), id: "dm-1".into() };
+        assert_eq!(
+            call_go_target(&tiny_room, true),
+            CallGoTarget::TinyRoom(tiny_room.account(), "room-1".into())
+        );
+        assert_eq!(call_go_target(&tiny_direct, false), CallGoTarget::Conversation);
+        assert_eq!(call_go_target(&discord_dm, false), CallGoTarget::Conversation);
+    }
+
+    #[test]
+    fn gain_cache_is_keyed_by_call_account_not_shown_server() {
+        let mut state = State::default();
+        let tiny_a = AccountKey { network: Network::Tiny, account: "srv-a".into() };
+        let tiny_b = AccountKey { network: Network::Tiny, account: "srv-b".into() };
+        let discord = AccountKey { network: Network::Discord, account: "acc-1".into() };
+        state.gains.insert((tiny_a.clone(), "u1".into()), (140, false));
+        state.gains.insert((tiny_b.clone(), "u1".into()), (60, true));
+        state.gains.insert((discord.clone(), "u1".into()), (180, false));
+        assert_eq!(state.gain(&tiny_a, "u1"), (140, false));
+        assert_eq!(state.gain(&tiny_b, "u1"), (60, true));
+        assert_eq!(state.gain(&discord, "u1"), (180, false));
+        assert_eq!(state.gain(&tiny_a, "other"), (100, false));
+    }
+
+    #[test]
+    fn auto_watch_starts_once_for_direct_peer_ignores_rooms_and_respects_manual_stop() {
+        let mut call: Call = serde_json::from_value(serde_json::json!({
+            "conversation": { "network": "tiny", "account": "srv", "id": "dm-1" },
+            "state": "joined",
+            "participants": [{ "id": "peer-1", "name": "Bea", "sharing": true, "camera": false }],
+            "muted": false, "deafened": false, "joined": 1, "engine_linked": true, "video": []
+        })).unwrap();
+        let mut prev = None;
+        // Room call never auto-watches.
+        assert_eq!(auto_watch_step(&call, true, &mut prev), None);
+        assert_eq!(prev, None);
+        // Direct call auto-watches once.
+        assert_eq!(auto_watch_step(&call, false, &mut prev), Some(Some("peer-1".into())));
+        // Subsequent Call changes (including after a manual Stop watching) do not re-ask.
+        assert_eq!(auto_watch_step(&call, false, &mut prev), None);
+        // When peer stops sharing, decoder stops and prev clears.
+        call.participants[0].sharing = false;
+        assert_eq!(auto_watch_step(&call, false, &mut prev), Some(None));
+        assert_eq!(prev, None);
+        // When peer turns on camera, auto-watch triggers again.
+        call.participants[0].camera = true;
+        assert_eq!(auto_watch_step(&call, false, &mut prev), Some(Some("peer-1".into())));
+    }
+
+    #[test]
+    fn discord_speaker_picks_focused_then_debounced_speaker_then_first_camera_and_clears() {
+        let mut call: Call = serde_json::from_value(serde_json::json!({
+            "conversation": { "network": "discord", "account": "acc", "id": "vc-1" },
+            "state": "joined",
+            "participants": [
+                { "id": "u1", "name": "Ada", "camera": true, "speaking": false },
+                { "id": "u2", "name": "Bea", "camera": true, "speaking": true }
+            ],
+            "muted": false, "deafened": false, "joined": 1, "engine_linked": true, "video": []
+        })).unwrap();
+        let t0 = Instant::now();
+        // Focused person with camera wins immediately.
+        assert_eq!(discord_speaker_step(&call, Some("u1"), None, t0), Some(Some("u1".into())));
+        // Otherwise speaking person with camera wins.
+        assert_eq!(discord_speaker_step(&call, None, None, t0), Some(Some("u2".into())));
+        // Switching speakers within 800 ms is debounced while current still has camera.
+        call.participants[0].speaking = true;
+        call.participants[1].speaking = false;
+        assert_eq!(discord_speaker_step(&call, None, Some(("u2", t0)), t0 + Duration::from_millis(300)), None);
+        // After 800 ms, switches to new speaker.
+        assert_eq!(discord_speaker_step(&call, None, Some(("u2", t0)), t0 + Duration::from_millis(900)), Some(Some("u1".into())));
+        // When nobody has camera on, clears speaker to None.
+        call.participants[0].camera = false;
+        call.participants[1].camera = false;
+        assert_eq!(discord_speaker_step(&call, None, Some(("u1", t0)), t0 + Duration::from_secs(2)), Some(None));
     }
 }

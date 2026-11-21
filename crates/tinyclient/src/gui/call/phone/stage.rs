@@ -368,9 +368,10 @@ impl Shell {
             .gap(px(4.))
             .children(tile.deafened.then(|| chip().px(px(6.)).child(glyph("icons/headphone-off.svg", 13., theme::text_soft()))))
             .children(tile.sharing.then(|| chip().px(px(6.)).child(glyph("icons/monitor-up.svg", 13., theme::accent_text()))));
-        // Their camera is on and someone else's picture is the one on screen: Watch theirs.
-        let watch = (tile.camera && tile.frame.is_none() && !tile.me).then(|| {
+        // Their camera or screen share is on and someone else's picture is the one on screen: Watch theirs.
+        let watch = ((tile.camera || tile.sharing) && tile.frame.is_none() && !tile.me).then(|| {
             let source = tile.id.clone();
+            let icon = if tile.sharing && !tile.camera { "icons/monitor-up.svg" } else { "icons/video.svg" };
             div()
                 .id(SharedString::from(format!("call-phone-watch-{}", tile.id)))
                 .h(px(30.))
@@ -386,7 +387,7 @@ impl Shell {
                 .active(|style| style.bg(theme::pressed()))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| this.call_ask(Request::Media(MediaRequest::ShareWatch { source: Some(source.clone()) }), cx)))
-                .child(glyph("icons/video.svg", 14., theme::text()))
+                .child(glyph(icon, 14., theme::text()))
                 .child(div().phone_stamp().child("Watch"))
         });
         let body = match &tile.frame {

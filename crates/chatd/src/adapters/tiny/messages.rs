@@ -2452,10 +2452,24 @@ struct WireCall {
     #[serde(default)]
     outcome: String,
     #[serde(default)]
+    duration_s: Option<u32>,
+    #[serde(default)]
     ended_at: String,
 }
 
-/// The grey line for a finished call. Nothing about the conversation row changes except the
+fn format_call_duration(seconds: u32) -> String {
+    if seconds >= 3600 {
+        let h = seconds / 3600;
+        let m = (seconds % 3600) / 60;
+        if m == 0 { format!("{h} hr") } else { format!("{h} hr {m} min") }
+    } else if seconds >= 60 {
+        format!("{} min", seconds / 60)
+    } else {
+        format!("{seconds} sec")
+    }
+}
+
+/// The transcript line for a finished call. Nothing about the conversation row changes except the
 /// unread count, and only for a missed call we did not place.
 fn record_call(
     ctx: &Context,
@@ -2472,27 +2486,61 @@ fn record_call(
     if !super::safe_id(direct_id) || !super::safe_id(ring_id) || !super::safe_id(&call.caller_id) {
         return;
     }
-    if !matches!(
-        call.outcome.as_str(),
-        "missed" | "declined" | "cancelled" | "ended"
-    ) {
+    let outcome = match call.outcome.as_str() {
+        "missed" => protocol::CallOutcome::Missed,
+        "declined" => protocol::CallOutcome::Declined,
+        "cancelled" => protocol::CallOutcome::Cancelled,
+        "ended" => protocol::CallOutcome::Ended,
+        _ => return,
+    };
+    let Some(row) = ctx.known(direct_id).ok().flatten() else {
         return;
-    }
-    if ctx.known(direct_id).ok().flatten().is_none() {
-        return;
-    }
+    };
     let outgoing = call.caller_id == saved.user_id;
     let name = caller_name(ctx, saved, names, direct_id, &call.caller_id);
+    let other = if outgoing {
+        if !row.title.is_empty() {
+            row.title.clone()
+        } else {
+            row.peer
+                .as_deref()
+                .and_then(|peer| names.get(peer))
+                .filter(|n| !n.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "Someone".to_owned())
+        }
+    } else {
+        name.clone()
+    };
+    let seconds = call.duration_s.filter(|&s| s > 0);
+    let text = match (outcome, outgoing) {
+        (protocol::CallOutcome::Missed, false) => format!("Missed call from {other}"),
+        (protocol::CallOutcome::Missed, true) => format!("You called {other} · no answer"),
+        (protocol::CallOutcome::Declined, false) => format!("You declined a call from {other}"),
+        (protocol::CallOutcome::Declined, true) => format!("{other} declined the call"),
+        (protocol::CallOutcome::Cancelled, false) => format!("{other} cancelled the call"),
+        (protocol::CallOutcome::Cancelled, true) => "You cancelled the call".to_owned(),
+        (protocol::CallOutcome::Ended, _) => match seconds {
+            Some(secs) => format!("Call with {other} · {}", format_call_duration(secs)),
+            None => format!("Call with {other}"),
+        },
+        (protocol::CallOutcome::Live, _) => "Call in progress".to_owned(),
+    };
     let mut message = Message::plain(
         ring_id,
-        name.clone(),
-        format!("{name} started a call."),
+        name,
+        text,
         rfc3339(&call.ended_at).unwrap_or(0),
         outgoing,
     );
     message.kind = MessageKind::System;
     message.sender.id = call.caller_id.clone();
-    let _ = ctx.quiet_line(direct_id, &message, call.outcome == "missed" && !outgoing);
+    message.call = Some(protocol::CallNote {
+        outcome,
+        caller_id: call.caller_id.clone(),
+        seconds,
+    });
+    let _ = ctx.quiet_line(direct_id, &message, outcome == protocol::CallOutcome::Missed && !outgoing);
 }
 
 fn caller_name(
@@ -3529,8 +3577,9 @@ mod tests {
         assert!(direct.preview_mine);
         assert_eq!(direct.unread, 2);
         let stored = ctx.stored_message("direct-1", "ring-1").unwrap().unwrap();
-        assert_eq!(stored.text, "Bea started a call.");
+        assert_eq!(stored.text, "Missed call from Bea");
         assert_eq!(stored.kind, MessageKind::System);
+        assert_eq!(stored.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Missed));
         assert_eq!(stored.sender.id, PEER);
         assert!(!stored.outgoing);
 
@@ -3555,12 +3604,85 @@ mod tests {
         });
         on_live(&ctx, &saved, &HashMap::new(), "direct.call", &ended);
         let mine = ctx.stored_message("direct-1", "ring-2").unwrap().unwrap();
-        assert_eq!(mine.text, "Ada started a call.");
+        assert_eq!(mine.text, "Call with Bea");
+        assert_eq!(mine.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Ended));
         assert!(mine.outgoing);
         assert_eq!(mine.kind, MessageKind::System);
         let after = ctx.known("direct-1").unwrap().unwrap();
         assert_eq!(after.preview, "mine");
         assert_eq!(after.unread, 2);
+    }
+
+    #[test]
+    fn record_call_sets_outcome_wording_and_replaces_ring_in_place() {
+        let (_adapter, ctx, saved) = fixture(|request| {
+            if request.starts_with("GET /v1/capabilities ") {
+                return Some(http(200, "OK", r#"{"features":["direct_calls"]}"#));
+            }
+            if request.starts_with("GET /v1/directs ") {
+                return Some(http(
+                    200,
+                    "OK",
+                    &format!(
+                        r#"{{"directs":[{{"id":"direct-1","peer":{{"user_id":"{PEER}","display_name":"Bea"}},"unread":0,"last_read":"m-1","last_message":{{"id":"m-2","author_id":"{ME}","body":"hi","created_at":"{WHEN}"}}}}]}}"#
+                    ),
+                ));
+            }
+            None
+        });
+        let names = HashMap::from([(PEER.to_owned(), "Bea".to_owned())]);
+
+        // 1. Incoming missed
+        on_live(&ctx, &saved, &names, "direct.call", &json!({
+            "direct_id": "direct-1", "ring_id": "r-miss-in", "caller_id": PEER, "outcome": "missed", "ended_at": WHEN
+        }));
+        let m = ctx.stored_message("direct-1", "r-miss-in").unwrap().unwrap();
+        assert_eq!(m.call, Some(protocol::CallNote { outcome: protocol::CallOutcome::Missed, caller_id: PEER.into(), seconds: None }));
+        assert_eq!(m.text, "Missed call from Bea");
+        assert_eq!(ctx.known("direct-1").unwrap().unwrap().unread, 1);
+
+        // 2. Outgoing missed (no answer)
+        on_live(&ctx, &saved, &names, "direct.call", &json!({
+            "direct_id": "direct-1", "ring_id": "r-miss-out", "caller_id": ME, "outcome": "missed", "ended_at": WHEN
+        }));
+        let m = ctx.stored_message("direct-1", "r-miss-out").unwrap().unwrap();
+        assert_eq!(m.call, Some(protocol::CallNote { outcome: protocol::CallOutcome::Missed, caller_id: ME.into(), seconds: None }));
+        assert_eq!(m.text, "You called Bea · no answer");
+
+        // 3. Incoming declined
+        on_live(&ctx, &saved, &names, "direct.call", &json!({
+            "direct_id": "direct-1", "ring_id": "r-dec-in", "caller_id": PEER, "outcome": "declined", "ended_at": WHEN
+        }));
+        let m = ctx.stored_message("direct-1", "r-dec-in").unwrap().unwrap();
+        assert_eq!(m.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Declined));
+        assert_eq!(m.text, "You declined a call from Bea");
+
+        // 4. Outgoing declined
+        on_live(&ctx, &saved, &names, "direct.call", &json!({
+            "direct_id": "direct-1", "ring_id": "r-dec-out", "caller_id": ME, "outcome": "declined", "ended_at": WHEN
+        }));
+        let m = ctx.stored_message("direct-1", "r-dec-out").unwrap().unwrap();
+        assert_eq!(m.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Declined));
+        assert_eq!(m.text, "Bea declined the call");
+
+        // 5. Cancelled (both directions)
+        on_live(&ctx, &saved, &names, "direct.call", &json!({
+            "direct_id": "direct-1", "ring_id": "r-can-in", "caller_id": PEER, "outcome": "cancelled", "ended_at": WHEN
+        }));
+        assert_eq!(ctx.stored_message("direct-1", "r-can-in").unwrap().unwrap().text, "Bea cancelled the call");
+        on_live(&ctx, &saved, &names, "direct.call", &json!({
+            "direct_id": "direct-1", "ring_id": "r-can-out", "caller_id": ME, "outcome": "cancelled", "ended_at": WHEN
+        }));
+        assert_eq!(ctx.stored_message("direct-1", "r-can-out").unwrap().unwrap().text, "You cancelled the call");
+
+        // 6. Ended with duration, and replacing same ring_id in place without double-bumping unread
+        on_live(&ctx, &saved, &names, "direct.call", &json!({
+            "direct_id": "direct-1", "ring_id": "r-miss-in", "caller_id": PEER, "outcome": "ended", "duration_s": 720, "ended_at": WHEN
+        }));
+        let replaced = ctx.stored_message("direct-1", "r-miss-in").unwrap().unwrap();
+        assert_eq!(replaced.call, Some(protocol::CallNote { outcome: protocol::CallOutcome::Ended, caller_id: PEER.into(), seconds: Some(720) }));
+        assert_eq!(replaced.text, "Call with Bea · 12 min");
+        assert_eq!(ctx.known("direct-1").unwrap().unwrap().unread, 1);
     }
 
     #[test]

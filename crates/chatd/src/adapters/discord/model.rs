@@ -992,6 +992,17 @@ pub struct Posted {
     /// A string from our own client, a number from some others.
     #[serde(default, deserialize_with = "nonce")]
     pub nonce: Option<String>,
+    #[serde(default)]
+    pub call: Option<CallPayload>,
+}
+
+/// Discord's `call` object on a type-3 call system message.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct CallPayload {
+    #[serde(default, deserialize_with = "nullable")]
+    pub participants: Vec<String>,
+    #[serde(default)]
+    pub ended_timestamp: Option<String>,
 }
 
 fn nonce<'de, D: Deserializer<'de>>(de: D) -> Result<Option<String>, D::Error> {
