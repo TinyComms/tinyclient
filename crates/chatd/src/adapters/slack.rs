@@ -1362,6 +1362,12 @@ impl Slack {
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Star { conversation_id, starred, reply } => answer(reply, self.star(&conversation_id, starred)),
             Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
+            Command::Pin { conversation_id, message_id, pinned, reply, .. } => {
+                answer(reply, self.pin(&conversation_id, &message_id, pinned))
+            }
+            Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
+                answer(reply, self.forward(&from_conversation_id, &message_ids, &to_conversation_ids, &note))
+            }
             Command::Search { query, scope, at, reply } => {
                 if at.elapsed() >= SEARCH_PATIENCE {
                     drop(reply);
@@ -1678,6 +1684,52 @@ impl Slack {
         gone.map_err(|err| Fault::Net(err.to_string()))
     }
 
+    fn pin(&self, conversation: &str, ts: &str, pinned: bool) -> Result<(), Fault> {
+        let channel = thread_of(conversation).map_or(conversation, |(channel, _)| channel);
+        let method = if pinned { "pins.add" } else { "pins.remove" };
+        self.api(method, &[("channel", channel), ("timestamp", ts)])?;
+        self.ctx.pinned(channel, ts, pinned).map_err(|err| Fault::Net(err.to_string()))
+    }
+
+    fn forward(
+        &self,
+        from: &str,
+        message_ids: &[String],
+        targets: &[String],
+        note: &str,
+    ) -> Result<Vec<(String, Result<(), String>)>, Fault> {
+        let from_channel = thread_of(from).map_or(from, |(channel, _)| channel);
+        let from_key = self.ctx.key(from);
+        let mut snippets = Vec::new();
+        for mid in message_ids {
+            let permalink = self
+                .api("chat.getPermalink", &[("channel", from_channel), ("message_ts", mid)])
+                .ok()
+                .and_then(|v| v["permalink"].as_str().map(str::to_owned));
+            if let Some(link) = permalink {
+                snippets.push(link);
+            } else if let Ok(Some(msg)) = self.ctx.hub.store().message(&from_key, mid) {
+                snippets.push(format!("> {}", msg.text));
+            }
+        }
+        let note = note.trim();
+        let mut text = String::new();
+        if !note.is_empty() {
+            text.push_str(note);
+            if !snippets.is_empty() {
+                text.push('\n');
+            }
+        }
+        text.push_str(&snippets.join("\n"));
+        let mut results = Vec::with_capacity(targets.len());
+        for target in targets {
+            let channel = thread_of(target).map_or(target.as_str(), |(c, _)| c);
+            let res = self.api("chat.postMessage", &[("channel", channel), ("text", text.as_str())]);
+            results.push((target.clone(), res.map(|_| ()).map_err(|e| reason(e))));
+        }
+        Ok(results)
+    }
+
     /// Our own presence, and the status text when one is given (empty clears it).
     fn set_presence(&self, presence: Presence, status: Option<String>) -> Result<(), Fault> {
         let word = match presence {
@@ -1967,6 +2019,17 @@ fn capabilities() -> protocol::Capabilities {
         suppress_embeds: true,
         search: true,
         close_direct: true,
+        reply: false,
+        edit: true,
+        delete: true,
+        threads: true,
+        direct_threads: true,
+        pins: true,
+        forward: true,
+        polls: false,
+        reactions: true,
+        mention_format: protocol::MentionFormat::Slack,
+        mention_spans: false,
         ..protocol::Capabilities::default()
     }
 }

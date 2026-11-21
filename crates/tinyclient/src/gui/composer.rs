@@ -662,7 +662,7 @@ impl Composer {
 
     fn controls(&self) -> Controls {
         match &self.target {
-            Some(target) => controls(target.key.network, &target.can, self.editing.is_some()),
+            Some(target) => controls(&target.can, self.editing.is_some()),
             None => Controls::default(),
         }
     }
@@ -711,7 +711,7 @@ impl Composer {
                 cx.notify();
             });
         }
-        let silent = controls(target.key.network, &target.can, false).silent;
+        let silent = controls(&target.can, false).silent;
         self.input.update(cx, |input, cx| {
             input.set_alt_submits(silent);
             input.set_format_discord(discord, cx);
@@ -916,7 +916,7 @@ impl Composer {
         }
         let network = target.key.network;
         let emoticons = super::app::prefs::choices().emoticons;
-        let (wired, mention_spans) = length::wire_with_spans(&field, &self.tokens, network, emoticons);
+        let (wired, mention_spans) = length::wire_with_spans(&field, &self.tokens, &target.can, emoticons);
         let Some(as_file) = self.stage_over_limit(&field, &wired, &target, cx) else {
             return;
         };
@@ -1395,7 +1395,7 @@ impl Composer {
         if paths.is_empty() {
             return;
         }
-        if !controls(target.key.network, &target.can, false).attach {
+        if !controls(&target.can, false).attach {
             let why = format!("{} can't take files here.", target.key.network.label());
             self.tell(&target.key, (why, Tone::Note), cx);
             if owned {
@@ -1904,7 +1904,7 @@ impl Composer {
             return;
         }
         let key = target.key.clone();
-        let (wire, spans) = length::wire_with_spans(&field, &self.tokens, key.network, false);
+        let (wire, spans) = length::wire_with_spans(&field, &self.tokens, &target.can, false);
         if let Some(words) = length::edit_refusal(wire.chars().count(), target.can.text_limit) {
             self.caption = Some((words, Tone::Refused));
             cx.notify();
@@ -2735,7 +2735,7 @@ impl Composer {
             // count only where the send would convert them.
             let editing = self.editing.is_some();
             let emoticons = !editing && super::app::prefs::choices().emoticons;
-            let counted = length::wire_text(&text, &self.tokens, target.key.network, emoticons).chars().count();
+            let counted = length::wire_text(&text, &self.tokens, &target.can, emoticons).chars().count();
             if editing {
                 if let Some(words) = length::edit_refusal(counted, target.can.text_limit) {
                     return Some((words, Tone::Refused));

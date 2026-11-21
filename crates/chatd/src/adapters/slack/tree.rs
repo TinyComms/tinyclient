@@ -114,6 +114,7 @@ impl Slack {
         // Unverified: `is_read_only` is the documented flag; a channel only some may post in
         // (`posting_restricted_to`) is not told apart from one I may post in.
         row.read_only = ["is_read_only", "is_archived", "is_frozen"].iter().any(|flag| channel[*flag] == true);
+        row.rights.pin = !row.read_only;
         Some(row)
     }
 
@@ -134,6 +135,7 @@ impl Slack {
             bot: known.bot,
             special: known.special,
             mark: known.mark,
+            rights: known.rights,
             ..ConversationRow::new(&known.key.id, known.kind, &known.title)
         }
     }

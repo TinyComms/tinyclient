@@ -4,7 +4,8 @@
 use super::super::{Command, Failure};
 use super::model::{
     self, number, seconds, Channel, Guild, GuildSettings, Kept, Member, MuteConfig, PresenceUpdate,
-    ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, CONNECT, SEND_MESSAGES, VIEW_CHANNEL,
+    ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, BAN_MEMBERS, CONNECT,
+    KICK_MEMBERS, MANAGE_MESSAGES, MANAGE_ROLES, PIN_MESSAGES, SEND_MESSAGES, VIEW_CHANNEL,
 };
 use super::{proto, Discord, GuildInfo, Quiet, Resumable, RoleInfo, WARM};
 use crate::hub::now;
@@ -261,6 +262,11 @@ impl GuildInfo {
         let can_connect = perms & CONNECT != 0;
         let read_only_reason = timed_out.map(|until| timeout_reason(until, clock)).unwrap_or_default();
         let read_only = timed_out.is_some() || (written && perms & SEND_MESSAGES == 0);
+        let rights = protocol::ConversationRights {
+            pin: timed_out.is_none() && (perms & (MANAGE_MESSAGES | PIN_MESSAGES) != 0),
+            delete_others: timed_out.is_none() && (perms & MANAGE_MESSAGES != 0),
+            manage_members: timed_out.is_none() && (perms & (KICK_MEMBERS | BAN_MEMBERS | MANAGE_ROLES) != 0),
+        };
         let call = if timed_out.is_some() || (channel.kind == model::VOICE && !can_connect) {
             CallSupport::None
         } else {
@@ -275,6 +281,7 @@ impl GuildInfo {
             topic: one_line(channel.topic.as_deref()),
             read_only,
             read_only_reason,
+            rights,
             private: self.private(guild, channel) || (channel.kind == model::VOICE && !can_connect),
             opted_out: self.quiet.opted_out(&channel.id, parent),
             max_file_bytes: super::send::tier_upload_limit(self.premium_tier),
@@ -809,6 +816,18 @@ impl Discord {
             revisions: false,
             close_direct: true,
             clear_history: false,
+            reply: true,
+            edit: true,
+            delete: true,
+            threads: true,
+            direct_threads: false,
+            pins: true,
+            forward: true,
+            polls: true,
+            reactions: true,
+            gif_file: false,
+            mention_format: protocol::MentionFormat::Discord,
+            mention_spans: false,
         });
         self.state.lock().unwrap().premium = premium;
     }

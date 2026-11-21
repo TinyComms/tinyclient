@@ -641,6 +641,7 @@ fn connect(
         max_file_bytes: bugle::FILE_CAP,
         max_files: file_limit(),
         close_direct: true,
+        reactions: true,
         ..Capabilities::default()
     });
     let _ = ctx.describe(

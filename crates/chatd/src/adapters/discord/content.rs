@@ -903,6 +903,8 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         deliveries: Vec::new(),
         receipt_note: String::new(),
         call: call_note,
+        can_edit: None,
+        can_delete: None,
     };
     (message, rich.files)
 }

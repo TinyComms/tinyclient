@@ -2,7 +2,7 @@
 //! one is a token, a range of the text with the id it names. At send the tokens become what the
 //! network takes. All of it is plain functions over text, so it is tested without a window.
 
-use protocol::{MentionKind, Message, Network, Style};
+use protocol::{MentionFormat, MentionKind, Message, Style};
 use std::ops::Range;
 
 /// The longest run after `@` or `#` that is still looked up.
@@ -27,8 +27,8 @@ pub struct Token {
 }
 
 /// The text as the network takes it: every token that still reads as its label is replaced by
-/// the network's own form. A token whose text was edited is ordinary text.
-pub fn wire(text: &str, tokens: &[Token], network: Network) -> String {
+/// the format reported in `Capabilities::mention_format`. A token whose text was edited is ordinary text.
+pub fn wire(text: &str, tokens: &[Token], format: MentionFormat) -> String {
     let mut live: Vec<&Token> = tokens.iter().filter(|token| text.get(token.range.clone()) == Some(token.label.as_str())).collect();
     live.sort_by_key(|token| token.range.start);
     let mut out = String::with_capacity(text.len());
@@ -38,14 +38,14 @@ pub fn wire(text: &str, tokens: &[Token], network: Network) -> String {
             continue;
         }
         out.push_str(&text[at..token.range.start]);
-        match (network, token.kind) {
-            (Network::Discord, Kind::Person) => out.push_str(&format!("<@{}>", token.id)),
-            (Network::Discord, Kind::Role) => out.push_str(&format!("<@&{}>", token.id)),
-            (Network::Discord, Kind::Channel) => out.push_str(&format!("<#{}>", token.id)),
-            (Network::Slack, Kind::Person) => out.push_str(&format!("<@{}>", token.id)),
-            (Network::Slack, Kind::Role) => out.push_str(&format!("<!subteam^{}>", token.id)),
-            (Network::Slack, Kind::Channel) => out.push_str(&format!("<#{}>", token.id)),
-            (Network::Discord, Kind::Emoji) => {
+        match (format, token.kind) {
+            (MentionFormat::Discord, Kind::Person) => out.push_str(&format!("<@{}>", token.id)),
+            (MentionFormat::Discord, Kind::Role) => out.push_str(&format!("<@&{}>", token.id)),
+            (MentionFormat::Discord, Kind::Channel) => out.push_str(&format!("<#{}>", token.id)),
+            (MentionFormat::Slack, Kind::Person) => out.push_str(&format!("<@{}>", token.id)),
+            (MentionFormat::Slack, Kind::Role) => out.push_str(&format!("<!subteam^{}>", token.id)),
+            (MentionFormat::Slack, Kind::Channel) => out.push_str(&format!("<#{}>", token.id)),
+            (MentionFormat::Discord, Kind::Emoji) => {
                 let name = token.label.trim_matches(':');
                 match token.id.strip_prefix("a:") {
                     Some(id) => out.push_str(&format!("<a:{name}:{id}>")),
@@ -53,23 +53,22 @@ pub fn wire(text: &str, tokens: &[Token], network: Network) -> String {
                 }
             }
             // Slack takes the name as typed.
-            (Network::Slack, Kind::Emoji) => out.push_str(&token.label),
+            (MentionFormat::Slack, Kind::Emoji) => out.push_str(&token.label),
             // Teams takes id and display name so the adapter can emit the mention span and properties.mentions.
-            (Network::Teams, Kind::Person) => {
+            (MentionFormat::Teams, Kind::Person) => {
                 let label = token.label.trim_start_matches(['@', '#']);
                 out.push_str(&format!("<@{}|{label}>", token.id));
             }
-            (Network::Teams, Kind::Role) => {
+            (MentionFormat::Teams, Kind::Role) => {
                 let label = token.label.trim_start_matches(['@', '#']);
                 out.push_str(&format!("<@&{}|{label}>", token.id));
             }
-            (Network::Teams, Kind::Channel) => {
+            (MentionFormat::Teams, Kind::Channel) => {
                 let label = token.label.trim_start_matches(['@', '#']);
                 out.push_str(&format!("<#{}|{label}>", token.id));
             }
-            (Network::Teams, Kind::Emoji) => out.push_str(&token.label),
-            // No adapter yet says what these take, so the name goes as it reads.
-            (Network::Telegram | Network::Signal | Network::Messages | Network::Tiny, _) => out.push_str(&token.label),
+            (MentionFormat::Teams, Kind::Emoji) => out.push_str(&token.label),
+            (MentionFormat::Plain, _) => out.push_str(&token.label),
         }
         at = token.range.end;
     }
@@ -77,10 +76,10 @@ pub fn wire(text: &str, tokens: &[Token], network: Network) -> String {
     out
 }
 
-/// Structured mention spans for networks that carry mentions out-of-band (Telegram, Teams, Signal)
-/// rather than inline markup. Discord and Slack expand mentions inside `wire`; Messages has none.
-pub fn spans(text: &str, tokens: &[Token], network: Network) -> Vec<protocol::Span> {
-    if !matches!(network, Network::Telegram | Network::Teams | Network::Signal) {
+/// Structured mention spans for accounts with `Capabilities::mention_spans` (carrying mentions
+/// out-of-band rather than inline markup).
+pub fn spans(text: &str, tokens: &[Token], structured: bool) -> Vec<protocol::Span> {
+    if !structured {
         return Vec::new();
     }
     let mut live: Vec<&Token> = tokens
@@ -333,36 +332,31 @@ mod tests {
             token(text, "#platform", Kind::Channel, "5"),
             token(text, "@admins", Kind::Role, "3"),
         ];
-        assert_eq!(wire(text, &tokens, Network::Discord), "ask <@77> in <#5>, cc <@&3>");
-        assert_eq!(wire(text, &tokens, Network::Slack), "ask <@77> in <#5>, cc <!subteam^3>");
-        assert_eq!(wire(text, &tokens, Network::Teams), "ask <@77|Mara Okafor> in <#5|platform>, cc <@&3|admins>");
-        assert_eq!(wire(text, &tokens, Network::Telegram), text);
-        assert_eq!(wire("no tokens <here>", &[], Network::Discord), "no tokens <here>");
+        assert_eq!(wire(text, &tokens, MentionFormat::Discord), "ask <@77> in <#5>, cc <@&3>");
+        assert_eq!(wire(text, &tokens, MentionFormat::Slack), "ask <@77> in <#5>, cc <!subteam^3>");
+        assert_eq!(wire(text, &tokens, MentionFormat::Teams), "ask <@77|Mara Okafor> in <#5|platform>, cc <@&3|admins>");
+        assert_eq!(wire(text, &tokens, MentionFormat::Plain), text);
+        assert_eq!(wire("no tokens <here>", &[], MentionFormat::Discord), "no tokens <here>");
         let text = "nice :mossparrot: :party:";
         let emoji = [token(text, ":mossparrot:", Kind::Emoji, "11"), token(text, ":party:", Kind::Emoji, "a:12")];
-        assert_eq!(wire(text, &emoji, Network::Discord), "nice <:mossparrot:11> <a:party:12>");
-        assert_eq!(wire(text, &emoji, Network::Slack), text);
+        assert_eq!(wire(text, &emoji, MentionFormat::Discord), "nice <:mossparrot:11> <a:party:12>");
+        assert_eq!(wire(text, &emoji, MentionFormat::Slack), text);
     }
 
     #[test]
-    fn spans_extracts_structured_mentions_for_telegram_teams_and_signal() {
+    fn spans_extracts_structured_mentions_when_capability_is_enabled() {
         let text = "hi @Mara Okafor!";
         let tokens = [token(text, "@Mara Okafor", Kind::Person, "u77")];
-        for network in [Network::Telegram, Network::Teams, Network::Signal] {
-            let out = spans(text, &tokens, network);
-            assert_eq!(
-                out,
-                vec![Span {
-                    start: 3,
-                    end: 15,
-                    style: Style::Mention { kind: MentionKind::User, id: "u77".into() },
-                }],
-                "expected mention span for {network:?}"
-            );
-        }
-        assert!(spans(text, &tokens, Network::Discord).is_empty());
-        assert!(spans(text, &tokens, Network::Slack).is_empty());
-        assert!(spans(text, &tokens, Network::Messages).is_empty());
+        let out = spans(text, &tokens, true);
+        assert_eq!(
+            out,
+            vec![Span {
+                start: 3,
+                end: 15,
+                style: Style::Mention { kind: MentionKind::User, id: "u77".into() },
+            }],
+        );
+        assert!(spans(text, &tokens, false).is_empty());
     }
 
     #[test]
@@ -370,7 +364,7 @@ mod tests {
         let text = "hi @Mara Okafor and @Dev";
         let stale = Token { range: 3..15, label: "@Mara Okafur".into(), kind: Kind::Person, id: "77".into() };
         let past = Token { range: 20..99, label: "@Dev".into(), kind: Kind::Person, id: "8".into() };
-        assert_eq!(wire(text, &[stale, past, token(text, "@Dev", Kind::Person, "8")], Network::Discord), "hi @Mara Okafor and <@8>");
+        assert_eq!(wire(text, &[stale, past, token(text, "@Dev", Kind::Person, "8")], MentionFormat::Discord), "hi @Mara Okafor and <@8>");
     }
 
     #[test]
@@ -392,7 +386,7 @@ mod tests {
         shift(&mut tokens, before, cut);
         assert_eq!(tokens.len(), 1);
         assert_eq!(&cut[tokens[0].range.clone()], "#platform");
-        assert_eq!(wire(cut, &tokens, Network::Discord), "oh hi @Mara Okaor!, see é<#5>");
+        assert_eq!(wire(cut, &tokens, MentionFormat::Discord), "oh hi @Mara Okaor!, see é<#5>");
         // Selecting everything and typing leaves none.
         shift(&mut tokens, cut, "x");
         assert!(tokens.is_empty());
@@ -452,7 +446,7 @@ mod tests {
         ];
         let (text, tokens) = source(&message);
         assert_eq!(text, "**hold _20_ minutes**, @Dev owns `the switch` in #ops");
-        assert_eq!(wire(&text, &tokens, Network::Discord), "**hold _20_ minutes**, <@8> owns `the switch` in <#5>");
+        assert_eq!(wire(&text, &tokens, MentionFormat::Discord), "**hold _20_ minutes**, <@8> owns `the switch` in <#5>");
 
         // A mention that is itself bold stays inside the markers.
         let mut bold = Message::plain("2", "me", "cc @Dev", 0, true);
@@ -464,7 +458,7 @@ mod tests {
         ];
         let (text, tokens) = source(&bold);
         assert_eq!(text, "cc **@Dev**");
-        assert_eq!(wire(&text, &tokens, Network::Discord), "cc **<@8>**");
+        assert_eq!(wire(&text, &tokens, MentionFormat::Discord), "cc **<@8>**");
     }
 
     #[test]
@@ -487,6 +481,6 @@ mod tests {
         assert!(field.contains("[docs](https://example.com)"));
         assert!(field.contains("@Dev") && field.contains("#ops") && field.contains("@core"));
         assert!(field.contains(":ferris:") && field.contains(":party:"));
-        assert_eq!(wire(&field, &tokens, Network::Discord), raw);
+        assert_eq!(wire(&field, &tokens, MentionFormat::Discord), raw);
     }
 }

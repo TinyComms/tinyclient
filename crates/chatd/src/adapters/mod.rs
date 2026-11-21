@@ -374,6 +374,24 @@ pub enum Command {
     ClearHistory { conversation_id: String, delete_chat: bool, revoke: bool, reply: Reply<()> },
     /// The messages pinned in a conversation, newest first, at most 50.
     Pinned { conversation_id: String, reply: Reply<Vec<Message>> },
+    /// Pins or unpins a message on the network.
+    Pin {
+        conversation_id: String,
+        message_id: String,
+        pinned: bool,
+        notify: bool,
+        me_only: bool,
+        reply: Reply<()>,
+    },
+    /// Forwards one or more messages to target conversations on the same account.
+    /// Answers with `(target_conversation_id, Ok(()) | Err(reason))` per target.
+    Forward {
+        from_conversation_id: String,
+        message_ids: Vec<String>,
+        to_conversation_ids: Vec<String>,
+        note: String,
+        reply: Reply<Vec<(String, Result<(), String>)>>,
+    },
     /// What was shared in a conversation, from the network's own search, because the user
     /// clicked "Search all". `before` continues below an item already listed.
     SearchShared {
@@ -480,6 +498,8 @@ impl Command {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -952,6 +972,15 @@ impl Context {
     /// page from the network is compared against this to find what was deleted while away.
     pub fn stored_ids(&self, conversation_id: &str, oldest: &str, newest: &str, limit: u32) -> rusqlite::Result<Vec<String>> {
         self.hub.store().ids_between(&self.key(conversation_id), oldest, newest, limit.min(KEEP_MESSAGES))
+    }
+
+    /// A message was pinned or unpinned on the network.
+    pub fn pinned(&self, conversation_id: &str, message_id: &str, pinned: bool) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_pinned(&conversation, message_id, pinned)? {
+            self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(())
     }
 
     /// A message is gone. One with a thread hanging off it stays as a tombstone, and replies to

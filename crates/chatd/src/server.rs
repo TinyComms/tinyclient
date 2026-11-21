@@ -1816,6 +1816,94 @@ impl Chat {
         }
     }
 
+    fn export_cache(
+        &self,
+        scope: protocol::ExportScope,
+        destination: String,
+        since: Option<i64>,
+        until: Option<i64>,
+        include_files: bool,
+    ) -> Response {
+        let dest = destination.trim();
+        if dest.is_empty() {
+            return error(ErrorCode::Refused, "Choose a destination folder for the export.");
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let store = self.hub.store();
+        match crate::export::run(&store, &scope, std::path::Path::new(dest), since, until, include_files, now) {
+            Ok(summary) => Response::Exported {
+                path: summary.path.to_string_lossy().into_owned(),
+                conversations: summary.conversations,
+                messages: summary.messages,
+                files: summary.files,
+                earliest: summary.earliest,
+                latest: summary.latest,
+            },
+            Err(why) => error(ErrorCode::Refused, why),
+        }
+    }
+
+    fn forward(&self, from: Key, message_ids: Vec<String>, to: Vec<Key>, note: String) -> Response {
+        if message_ids.is_empty() || to.is_empty() {
+            return error(ErrorCode::Refused, "Choose at least one message and one conversation.");
+        }
+        if to.len() > protocol::FORWARD_LIMIT {
+            return error(
+                ErrorCode::Refused,
+                format!("You can forward to at most {} conversations at once.", protocol::FORWARD_LIMIT),
+            );
+        }
+        let account = from.account();
+        if to.iter().any(|target| target.account() != account) {
+            return error(
+                ErrorCode::Refused,
+                "Forwarding only works within the same account. Use Copy to… for another account.",
+            );
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let to_ids: Vec<String> = to.iter().map(|k| k.id.clone()).collect();
+        let from_id = from.id.clone();
+        match self.ask(&account, |reply| Command::Forward {
+            from_conversation_id: from_id,
+            message_ids,
+            to_conversation_ids: to_ids,
+            note,
+            reply,
+        }) {
+            Ok(outcomes) => {
+                let results = outcomes
+                    .into_iter()
+                    .map(|(id, res)| protocol::ForwardOutcome {
+                        conversation: Key { id, ..from.clone() },
+                        ok: res.is_ok(),
+                        error: res.err(),
+                    })
+                    .collect();
+                Response::Forwarded { results }
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn resolve_link(&self, url: &str) -> Response {
+        let Some(parsed) = protocol::link::parse_network_link(url) else {
+            return Response::Resolved { conversation: None, message_id: None, title: String::new() };
+        };
+        match self.hub.store().resolve_link(&parsed) {
+            Ok(Some(conv)) => Response::Resolved {
+                conversation: Some(conv.key),
+                message_id: parsed.message_id,
+                title: conv.title,
+            },
+            Ok(None) => Response::Resolved { conversation: None, message_id: None, title: String::new() },
+            Err(err) => internal(err),
+        }
+    }
+
     fn source(&self, conversation: Key, message_id: String) -> Response {
         let account = conversation.account();
         if let Err(refused) = self.online(&account) {
@@ -2558,6 +2646,16 @@ impl Chat {
                 self.act(&conversation, |conversation_id, reply| Command::AnswerMessageRequest { conversation_id, accept, reply })
             }
             Request::Pinned { conversation } => self.pinned(conversation),
+            Request::Pin { conversation, message_id, pinned, notify, me_only } => {
+                self.act(&conversation, |conversation_id, reply| Command::Pin {
+                    conversation_id,
+                    message_id,
+                    pinned,
+                    notify,
+                    me_only,
+                    reply,
+                })
+            }
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::Relate { person, action } => self.relate(person, action),
             Request::SetPresence { account, presence, status } => self.set_presence(account, presence, status),
@@ -2569,6 +2667,7 @@ impl Chat {
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
             Request::Revisions { conversation, message_id } => self.revisions(conversation, message_id),
             Request::Source { conversation, message_id } => self.source(conversation, message_id),
+            Request::Resolve { url } => self.resolve_link(&url),
             Request::MarkRead { conversation, message_id } => self.mark_read(conversation, message_id),
             Request::MarkUnread { conversation, message_id } => self.mark_unread(conversation, message_id),
             Request::MarkAllRead { network, space } => self.mark_all_read(network, space),
@@ -2634,6 +2733,7 @@ impl Chat {
             Request::Reactions { conversation } => self.reactions(conversation),
             Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans),
             Request::Delete { conversation, message_id } => self.rewrite(conversation, message_id, None, Vec::new()),
+            Request::Forward { from, message_ids, to, note } => self.forward(from, message_ids, to, note),
 
             Request::Poll { conversation, message_id, votes } => self.poll(conversation, message_id, votes),
 
@@ -2910,6 +3010,9 @@ impl Chat {
             Request::Shutdown => self.shutdown(),
             Request::Storage => self.storage(),
             Request::Clear => self.clear(),
+            Request::Export { scope, destination, since, until, include_files } => {
+                self.export_cache(scope, destination, since, until, include_files)
+            }
             Request::Prunable { days } => match self.hub.store().prunable(now(), days) {
                 Ok((messages, bytes)) => Response::Prunable { messages, bytes },
                 Err(err) => internal(err),

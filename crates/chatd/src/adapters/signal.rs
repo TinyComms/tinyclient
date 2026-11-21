@@ -1430,6 +1430,14 @@ fn capabilities() -> protocol::Capabilities {
         edit_window: (SEND_WINDOW_MS / 1_000) as u32,
         max_file_bytes: files.max_file_bytes,
         max_files: files.max_files,
+        reply: true,
+        edit: true,
+        delete: true,
+        pins: true,
+        forward: true,
+        polls: true,
+        reactions: true,
+        mention_spans: true,
         ..protocol::Capabilities::default()
     }
 }

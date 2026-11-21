@@ -525,6 +525,9 @@ pub struct Conversation {
     /// Flagged as spam by the network (e.g. Discord spam message request).
     #[serde(default, skip_serializing_if = "is_false")]
     pub spam: bool,
+    /// Per-conversation moderation / pin rights for this account.
+    #[serde(default, skip_serializing_if = "ConversationRights::is_none")]
+    pub rights: ConversationRights,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -588,7 +591,13 @@ impl Conversation {
             max_file_bytes: 0,
             read_only_reason: String::new(),
             spam: false,
+            rights: ConversationRights::default(),
         }
+    }
+
+    /// Whether this account may post messages in this conversation.
+    pub fn can_post(&self) -> bool {
+        !self.read_only
     }
 
     /// The mark on my newest message. `None` when the newest is not mine.
@@ -1067,6 +1076,30 @@ pub struct MessageReminder {
     pub due: i64,
 }
 
+/// What cached data `Request::Export` writes to disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum ExportScope {
+    /// One conversation.
+    Conversation { conversation: Key },
+    /// Every cached conversation of one account.
+    Account { account: AccountKey },
+    /// Every cached conversation on this device, organized per account.
+    All,
+}
+
+/// Most targets a single `Request::Forward` may name (official apps cap around 5).
+pub const FORWARD_LIMIT: usize = 5;
+
+/// Per-target outcome of a `Request::Forward`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardOutcome {
+    pub conversation: Key,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -1313,6 +1346,17 @@ pub enum Request {
     Pinned {
         conversation: Key,
     },
+    /// Pins or unpins a message on the network, waiting for the network's answer.
+    /// `notify` and `me_only` are used on networks that support them (Telegram).
+    Pin {
+        conversation: Key,
+        message_id: String,
+        pinned: bool,
+        #[serde(default)]
+        notify: bool,
+        #[serde(default)]
+        me_only: bool,
+    },
     /// The pictures, files or links said in a conversation, newest first, from what is cached:
     /// what the info pane lists under a person or a channel. `before` continues below a
     /// message already listed. With `search`, the network is asked instead, because the user
@@ -1377,6 +1421,11 @@ pub enum Request {
     Source {
         conversation: Key,
         message_id: String,
+    },
+    /// Resolves a network message or channel URL against signed-in accounts' cached conversations.
+    /// Never triggers a join.
+    Resolve {
+        url: String,
     },
     /// The user saw the conversation up to this message: the window is active, the conversation is
     /// open and the message is on screen. Read here and on the network. An empty `message_id`
@@ -1484,6 +1533,15 @@ pub enum Request {
     Delete {
         conversation: Key,
         message_id: String,
+    },
+    /// Forwards one or more messages to up to [`FORWARD_LIMIT`] conversations on the same account.
+    /// Cross-account targets are refused; callers use a separate re-send for "Copy to…".
+    Forward {
+        from: Key,
+        message_ids: Vec<String>,
+        to: Vec<Key>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        note: String,
     },
     /// Vote on a poll, take a vote back, or end one. `votes` of `None` ends it (only the person
     /// who started it), `Some` replaces our vote, and an empty list takes it back. Signal only.
@@ -1607,6 +1665,18 @@ pub enum Request {
     Storage,
     /// Deletes every cached message and file. Sessions, drafts and settings stay.
     Clear,
+    /// Exports cached messages (and optionally on-disk media) to an unencrypted folder at
+    /// `destination`. Never fetches history from any network and never exports member lists.
+    Export {
+        scope: ExportScope,
+        destination: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+        #[serde(default)]
+        include_files: bool,
+    },
     /// How much a retention of `days` would delete now.
     Prunable {
         days: u32,
@@ -2202,6 +2272,30 @@ pub enum Response {
     /// Answers `Source`: the raw source text of the message as the network holds it.
     Source {
         text: String,
+    },
+    /// Answers `Resolve`: the matching cached conversation and optional message id on a signed-in account.
+    Resolved {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        title: String,
+    },
+    /// Answers `Export`: where the unencrypted export was written and what cached range it covered.
+    Exported {
+        path: String,
+        conversations: u32,
+        messages: u64,
+        files: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        earliest: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        latest: Option<i64>,
+    },
+    /// Answers `Forward`: one outcome per target conversation.
+    Forwarded {
+        results: Vec<ForwardOutcome>,
     },
     /// Answers `SearchMessages`: the newest hits first, at most the limit asked for.
     MessageHits {

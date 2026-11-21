@@ -18,7 +18,7 @@ use gpui::{
     anchored, deferred, div, point, prelude::*, px, AnyElement, Bounds, ClipboardItem, Context, Div, ElementId, Entity,
     KeyDownEvent, MouseButton, Pixels, Point, SharedString, Stateful, Subscription, Window,
 };
-use protocol::{ConversationKind, ErrorCode, Message, MessageKind, Network, ReactionRules, Request, Response, SendState};
+use protocol::{Capabilities, ConversationKind, ConversationRights, ErrorCode, Message, MessageKind, ReactionRules, Request, Response, SendState};
 use std::rc::Rc;
 
 /// How far the toolbar rises above its row, and how wide the strip it can occupy is.
@@ -98,6 +98,19 @@ pub struct Menu {
     pub reactor: Option<usize>,
 }
 
+/// The forward / copy-to picker, open for one message.
+pub struct Forwarding {
+    pub message: Rc<Message>,
+    /// True when the account supports native `Request::Forward`; false for "Copy to…" fallback.
+    pub native: bool,
+    /// Same-account candidate conversations from chatd's switcher list (`Request::Find`).
+    pub candidates: Vec<protocol::Conversation>,
+    /// Chosen target conversations, capped at [`protocol::FORWARD_LIMIT`].
+    pub selected: Vec<protocol::Key>,
+    /// Optional note sent along with the forwarded message.
+    pub note: String,
+}
+
 /// The reaction picker, open for a message.
 pub struct Picking {
     pub message: String,
@@ -109,12 +122,18 @@ pub struct Picking {
 /// What may be done to a message, decided apart from any drawing.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Can {
-    /// It is on the network: the toolbar shows and it can be reacted to.
+    /// It is on the network: the toolbar shows and it can be acted on.
     pub act: bool,
+    /// Reactions may be added to this message (`Capabilities::reactions`).
+    pub react: bool,
     pub reply: bool,
     pub thread: bool,
     pub edit: bool,
     pub delete: bool,
+    /// Pin or unpin this message (`Capabilities::pins` and `ConversationRights::pin`).
+    pub pin: bool,
+    /// Forward this message natively (`Capabilities::forward`).
+    pub forward: bool,
     /// Never left: deleting it is local, and it can be sent again.
     pub unsent: bool,
 }
@@ -133,63 +152,68 @@ fn thread_root(message: &Message) -> bool {
         && matches!(message.kind, MessageKind::Normal | MessageKind::Unsupported { .. })
 }
 
-/// Whether this message can start a thread that does not exist yet. Slack names one in a
-/// channel or a direct message. Teams and Discord do, in a channel. A thread, a voice channel
-/// and a forum do not start another. Telegram topics, Signal, Messages and Tiny have no such
-/// thread.
-pub(super) fn starts_thread(message: &Message, network: Network, kind: ConversationKind) -> bool {
-    if !thread_root(message) || matches!(kind, ConversationKind::Thread | ConversationKind::Voice | ConversationKind::Forum) {
+/// Whether this message can start a thread that does not exist yet, driven by account
+/// capabilities (`Capabilities::threads` and `Capabilities::direct_threads`).
+pub(super) fn starts_thread(message: &Message, caps: &Capabilities, kind: ConversationKind) -> bool {
+    if !caps.threads
+        || !thread_root(message)
+        || matches!(kind, ConversationKind::Thread | ConversationKind::Voice | ConversationKind::Forum)
+    {
         return false;
     }
-    match network {
-        Network::Slack => true,
-        Network::Teams | Network::Discord => matches!(kind, ConversationKind::Channel | ConversationKind::Announcement),
-        Network::Telegram | Network::Signal | Network::Messages | Network::Tiny => false,
-    }
+    caps.direct_threads || matches!(kind, ConversationKind::Channel | ConversationKind::Announcement)
+}
+
+/// Whether `message` is still within `caps.edit_window` at unix second `now`.
+fn within_edit_window(message: &Message, caps: &Capabilities, now: i64) -> bool {
+    caps.edit_window == 0
+        || now <= 0
+        || message.sent <= 0
+        || now.saturating_sub(message.sent) <= caps.edit_window as i64
 }
 
 /// `in_thread`: the row is in the thread pane, where a thread cannot be opened again.
-pub fn can(message: &Message, network: Network, kind: ConversationKind, in_thread: bool) -> Can {
+/// `now`: current unix seconds, for checking `Capabilities::edit_window` (0 skips the window check).
+pub fn can(
+    message: &Message,
+    caps: &Capabilities,
+    rights: ConversationRights,
+    kind: ConversationKind,
+    in_thread: bool,
+    now: i64,
+) -> Can {
     let sent = message.state == SendState::Sent;
     let said = matches!(message.kind, MessageKind::Normal | MessageKind::Unsupported { .. }) && !message.deleted;
     let act = sent && said;
     let own = message.outgoing && message.kind == MessageKind::Normal && !message.deleted;
+    let edit = sent
+        && !message.deleted
+        && !message.saved_history
+        && match message.can_edit {
+            Some(allowed) => allowed,
+            None => own && caps.edit && within_edit_window(message, caps, now),
+        };
+    let delete = !message.deleted
+        && match message.can_delete {
+            Some(allowed) => allowed,
+            None => {
+                if !sent {
+                    own
+                } else {
+                    caps.delete && (own || (said && rights.delete_others))
+                }
+            }
+        };
     Can {
         act,
-        // Slack has no inline reply: its reply is the thread.
-        reply: act && network != Network::Slack,
-        thread: !in_thread && ((sent && message.thread.is_some()) || starts_thread(message, network, kind)),
-        // CONTRACT: nothing says how long a network lets a message be edited, so Edit is offered
-        // on every message of mine and a refusal is the network's answer. Messages never edits
-        // or deletes, so those items stay off.
-        edit: sent && own && !message.saved_history && network != Network::Messages,
-        delete: own && network != Network::Messages,
+        react: act && caps.reactions,
+        reply: act && caps.reply,
+        thread: !in_thread && ((sent && message.thread.is_some()) || starts_thread(message, caps, kind)),
+        edit,
+        delete,
+        pin: act && caps.pins && rights.pin,
+        forward: act && caps.forward,
         unsent: !sent && message.outgoing,
-    }
-}
-
-/// Where a message leads in the network's own app, for "Copy link" and "Open in <network>".
-/// An unsupported message names its own; Discord's and Slack's are built from ids, as the
-/// conversation's are (`profile/facts.rs`).
-// CONTRACT: `Message` carries no permalink. Telegram's needs a public username the shell does
-// not hold, and Teams has none, so those offer neither item.
-pub fn message_link(conversation: &protocol::Key, space: Option<&str>, message: &Message) -> Option<String> {
-    if let MessageKind::Unsupported { link } = &message.kind {
-        if !link.is_empty() {
-            return Some(link.clone());
-        }
-    }
-    if message.state != SendState::Sent || message.deleted {
-        return None;
-    }
-    let (channel, id) = (&conversation.id, &message.id);
-    match conversation.network {
-        Network::Discord => {
-            let place = space.unwrap_or("@me");
-            Some(format!("https://discord.com/channels/{place}/{channel}/{id}"))
-        }
-        Network::Slack => space.map(|team| format!("slack://channel?team={team}&id={channel}&message={id}")),
-        Network::Telegram | Network::Teams | Network::Signal | Network::Messages | Network::Tiny => None,
     }
 }
 
@@ -234,6 +258,10 @@ enum MenuAct {
     Thread,
     React,
     Edit,
+    /// Pin or unpin a message when `can.pin` is true.
+    Pin,
+    /// Forward natively (`can.forward`) or "Copy to…" fallback (`can.act && !can.forward`).
+    Forward,
     Link,
     Open,
     /// A file attachment that is already on disk.
@@ -280,6 +308,12 @@ fn menu_acts(
     if can.edit {
         acts.push(MenuAct::Edit);
     }
+    if can.pin {
+        acts.push(MenuAct::Pin);
+    }
+    if can.act {
+        acts.push(MenuAct::Forward);
+    }
     if has_text {
         acts.push(MenuAct::Copy);
     }
@@ -300,14 +334,18 @@ fn menu_acts(
 }
 
 impl Pane {
-    fn network(&self) -> Network {
-        self.open.as_ref().map_or(Network::Discord, |open| open.key.network)
+    fn network_label(&self) -> &'static str {
+        self.open.as_ref().map_or("", |open| open.key.network.label())
     }
 
     pub(super) fn can(&self, message: &Message) -> Can {
-        // No open conversation is not a place a thread can be started from.
-        let kind = self.open.as_ref().map(|open| open.kind).unwrap_or(ConversationKind::Thread);
-        can(message, self.network(), kind, self.is_thread())
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        match self.open.as_ref() {
+            Some(open) => can(message, &open.can, open.rights, open.kind, self.is_thread(), now),
+            None => can(message, &Capabilities::default(), ConversationRights::default(), ConversationKind::Thread, self.is_thread(), now),
+        }
     }
 
     // Reactions.
@@ -577,7 +615,7 @@ impl Pane {
 
     // Requests.
 
-    fn say(&self, words: String, cx: &mut Context<Self>) {
+    pub(super) fn say(&self, words: String, cx: &mut Context<Self>) {
         let _ = self.shell.update(cx, |shell, cx| shell.toast(Some(("icons/circle-alert.svg", theme::danger())), words, cx));
     }
 
@@ -713,6 +751,41 @@ impl Pane {
         cx.notify();
     }
 
+    /// Pins or unpins a message on the network. Never mutates `message.pinned` optimistically:
+    /// chatd emits `Change::Messages` and the pins pane reloads once the network confirms.
+    fn toggle_pin(&mut self, message: &Message, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        let pinned = !message.pinned;
+        let request = Request::Pin {
+            conversation: conversation.clone(),
+            message_id: message.id.clone(),
+            pinned,
+            notify: true,
+            me_only: false,
+        };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                match answer {
+                    Ok(Response::Ok) => {
+                        let _ = this.shell.update(cx, |shell, cx| shell.refresh_pins(&conversation, cx));
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        this.say(detail, cx);
+                    }
+                    Err(err) => {
+                        let why = crate::client::trouble_words(if pinned { "pin" } else { "unpin" }, &err);
+                        this.say(why, cx);
+                    }
+                    _ => {}
+                }
+            });
+        })
+        .detach();
+    }
+
     fn close_menu(&mut self, cx: &mut Context<Self>) {
         if self.menu.take().is_some() {
             cx.notify();
@@ -800,6 +873,11 @@ impl Pane {
             MenuAct::Thread => cx.emit(PaneEvent::OpenThread(message)),
             MenuAct::React => self.open_picker(&message.id, at, window, cx),
             MenuAct::Edit => self.edit(&message, window, cx),
+            MenuAct::Pin => self.toggle_pin(&message, cx),
+            MenuAct::Forward => {
+                let native = self.can(&message).forward;
+                self.open_forward(message, native, window, cx);
+            }
             MenuAct::Link => {
                 if let Some(link) = link {
                     cx.write_to_clipboard(ClipboardItem::new_string(link));
@@ -836,12 +914,7 @@ impl Pane {
         let shell = self.shell.upgrade()?;
         let shell = shell.read(cx);
         let open = shell.snapshot.as_ref()?.open.as_ref()?;
-        // A Slack thread's replies are linked in their channel; a Discord thread is a channel.
-        let key = match (&self.open, open.key.network) {
-            (Some(mine), protocol::Network::Discord) => &mine.key,
-            _ => &open.key,
-        };
-        message_link(key, open.space.as_deref(), message)
+        super::links::message_link_for(self.open.as_ref().map(|mine| &mine.key), open, message)
     }
 
     /// A phone's message menu: a sheet from the bottom with the message it is about, the quick
@@ -851,7 +924,7 @@ impl Pane {
         use crate::gui::phone::tokens::{self, PhoneType};
         let Menu { message, at, .. } = self.menu.as_ref()?;
         let can = self.can(message);
-        let network = self.network().label();
+        let network = self.network_label();
         let row_height = (tokens::scaled(22.) + 26.).max(48.);
         let row = |id: &'static str, icon: &'static str, words: SharedString, danger: bool| {
             let tone = if danger { theme::danger() } else { theme::text() };
@@ -973,6 +1046,25 @@ impl Pane {
                         .into_any_element(),
                 );
             }
+            if can.pin {
+                let label = if message.pinned { "Unpin" } else { "Pin" };
+                rows.push(
+                    row("sheet-pin", "icons/pin.svg", label.into(), false)
+                        .on_click(then(|this, message, _, cx| this.toggle_pin(message, cx)))
+                        .into_any_element(),
+                );
+            }
+            if can.act {
+                let label = if can.forward { "Forward…" } else { "Copy to…" };
+                rows.push(
+                    row("sheet-forward", "icons/corner-up-right.svg", label.into(), false)
+                        .on_click(then(|this, message, window, cx| {
+                            let native = this.can(message).forward;
+                            this.open_forward(message.clone(), native, window, cx);
+                        }))
+                        .into_any_element(),
+                );
+            }
             if message.state == SendState::Sent {
                 rows.push(
                     row("sheet-unread", "icons/mail.svg", "Mark unread".into(), false)
@@ -1088,7 +1180,7 @@ impl Pane {
             return self.reactors_layer(&message, reactor, at, window, cx);
         }
         let can = self.can(&message);
-        let network = self.network().label();
+        let network = self.network_label();
         let chosen = self
             .menu_state(cx)
             .and_then(|(acts, cursor)| acts.get(cursor).copied());
@@ -1140,6 +1232,22 @@ impl Pane {
             if can.edit {
                 items = items.child(menu_item("edit", Some("icons/pencil.svg"), "Edit", None).when(lit(MenuAct::Edit), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::Edit)));
+            }
+            if can.pin {
+                let label = if message.pinned { "Unpin" } else { "Pin" };
+                items = items.child(
+                    menu_item("pin", Some("icons/pin.svg"), label, None)
+                        .when(lit(MenuAct::Pin), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Pin)),
+                );
+            }
+            if can.act {
+                let label = if can.forward { "Forward…" } else { "Copy to…" };
+                items = items.child(
+                    menu_item("forward", Some("icons/corner-up-right.svg"), label, None)
+                        .when(lit(MenuAct::Forward), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Forward)),
+                );
             }
             let selected = self.selection.as_ref().is_some_and(|selection| {
                 selection.message == message.id && selection.head.is_some()
@@ -1428,11 +1536,213 @@ impl Pane {
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
     }
 
+    /// Opens the Forward / Copy-to conversation picker, loading same-account conversations
+    /// from chatd's quick switcher list (`Request::Find`).
+    fn open_forward(&mut self, message: Rc<Message>, native: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(from) = self.key().cloned() else {
+            return;
+        };
+        let account = from.account();
+        self.forward = Some(Forwarding {
+            message,
+            native,
+            candidates: Vec::new(),
+            selected: Vec::new(),
+            note: String::new(),
+        });
+        window.focus(&self.focus, cx);
+        cx.notify();
+        let request = Request::Find {
+            network: Some(from.network),
+            query: String::new(),
+            limit: 60,
+        };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            if let Ok(Response::Conversations { conversations, .. }) = answer {
+                let same_account: Vec<protocol::Conversation> = conversations
+                    .into_iter()
+                    .filter(|c| c.key.account() == account && !c.read_only)
+                    .collect();
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(fwd) = this.forward.as_mut() {
+                        fwd.candidates = same_account;
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn toggle_forward_target(&mut self, key: protocol::Key, cx: &mut Context<Self>) {
+        let Some(fwd) = self.forward.as_mut() else {
+            return;
+        };
+        if let Some(ix) = fwd.selected.iter().position(|k| *k == key) {
+            fwd.selected.remove(ix);
+        } else if fwd.selected.len() < protocol::FORWARD_LIMIT {
+            fwd.selected.push(key);
+        }
+        cx.notify();
+    }
+
+    fn submit_forward(&mut self, cx: &mut Context<Self>) {
+        let Some(from) = self.key().cloned() else {
+            return;
+        };
+        let Some(fwd) = self.forward.take() else {
+            return;
+        };
+        cx.notify();
+        if fwd.selected.is_empty() {
+            return;
+        }
+        if fwd.native {
+            let request = Request::Forward {
+                from,
+                message_ids: vec![fwd.message.id.clone()],
+                to: fwd.selected,
+                note: fwd.note,
+            };
+            cx.spawn(async move |this, cx| {
+                let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+                let _ = this.update(cx, |this, cx| match answer {
+                    Ok(Response::Forwarded { results }) => {
+                        let failed: Vec<String> = results.into_iter().filter_map(|r| r.error).collect();
+                        if let Some(first) = failed.first() {
+                            this.say(format!("Couldn't forward: {first}"), cx);
+                        }
+                    }
+                    Ok(Response::Error { detail, .. }) => this.say(detail, cx),
+                    Err(err) => this.say(crate::client::trouble_words("forward", &err), cx),
+                    _ => {}
+                });
+            })
+            .detach();
+        } else {
+            // "Copy to…" fallback: re-send text and cached on-disk files as a new message per target.
+            let files: Vec<protocol::OutgoingFile> = fwd
+                .message
+                .attachments
+                .iter()
+                .filter_map(|att| {
+                    let path = att.file.path.clone().or_else(|| self.known.get(&att.file.id).cloned())?;
+                    Some(protocol::OutgoingFile { path, name: att.name.clone(), ..protocol::OutgoingFile::default() })
+                })
+                .collect();
+            let text = if fwd.note.trim().is_empty() {
+                fwd.message.text.clone()
+            } else if fwd.message.text.is_empty() {
+                fwd.note.trim().to_owned()
+            } else {
+                format!("{}\n{}", fwd.note.trim(), fwd.message.text)
+            };
+            let targets = fwd.selected;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            cx.spawn(async move |this, cx| {
+                for (ix, target) in targets.into_iter().enumerate() {
+                    let req = Request::Send {
+                        conversation: target,
+                        client_id: format!("copy-{now}-{ix}"),
+                        text: text.clone(),
+                        reply_to: None,
+                        with: protocol::Outgoing { files: files.clone(), ..protocol::Outgoing::default() },
+                    };
+                    let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+                    if let Ok(Response::Error { detail, .. }) = answer {
+                        let _ = this.update(cx, |this, cx| this.say(detail, cx));
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
+    fn forward_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let fwd = self.forward.as_ref()?;
+        let heading = if fwd.native { "Forward message" } else { "Copy message to…" };
+        let count = fwd.selected.len();
+        let action_label = if fwd.native {
+            if count > 1 { format!("Forward ({count})") } else { "Forward".to_owned() }
+        } else if count > 1 {
+            format!("Copy ({count})")
+        } else {
+            "Copy".to_owned()
+        };
+        let rows = fwd.candidates.iter().take(40).map(|conv| {
+            let key = conv.key.clone();
+            let picked = fwd.selected.contains(&key);
+            let title = if conv.title.is_empty() { conv.key.id.clone() } else { conv.title.clone() };
+            div()
+                .id(ElementId::Name(format!("fwd-{}", conv.key.id).into()))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .justify_between()
+                .cursor_pointer()
+                .when(picked, |d| d.bg(theme::selected()))
+                .hover(|s| s.bg(theme::hover()))
+                .child(div().min_w_0().truncate().type_ui().text_color(theme::text()).child(title))
+                .when(picked, |d| d.child(div().type_micro().text_color(theme::accent_text()).child("Selected")))
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_forward_target(key.clone(), cx)))
+        });
+        let panel = modal(heading)
+            .w(px(400.))
+            .child(modal_body(format!(
+                "Choose up to {} conversations on this account.",
+                protocol::FORWARD_LIMIT
+            )))
+            .child(
+                div()
+                    .id("forward-candidates")
+                    .mt(px(8.))
+                    .max_h(px(260.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .children(rows),
+            )
+            .child(
+                modal_buttons()
+                    .child(button("forward-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.forward = None;
+                        cx.notify();
+                    })))
+                    .child(
+                        button("forward-go", ButtonKind::Primary, action_label)
+                            .when(count > 0, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_forward(cx)))),
+                    ),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let size = window.viewport_size();
+        let scrim = div()
+            .id("forward-scrim")
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.forward = None;
+                cx.notify();
+            }))
+            .child(fade_in("forward-panel", 160, panel));
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+    }
+
     pub(super) fn action_layers(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if crate::gui::phone::active() {
-            return [self.menu_sheet(window, cx), self.revisions_layer(window, cx), self.picker_sheet(window, cx), self.confirm_layer(window, cx), self.link_layer(window, cx)].into_iter().flatten().collect();
+            return [self.menu_sheet(window, cx), self.revisions_layer(window, cx), self.picker_sheet(window, cx), self.confirm_layer(window, cx), self.forward_layer(window, cx), self.link_layer(window, cx)].into_iter().flatten().collect();
         }
-        [self.menu_layer(window, cx), self.revisions_layer(window, cx), self.picker_layer(window, cx), self.confirm_layer(window, cx), self.link_layer(window, cx)].into_iter().flatten().collect()
+        [self.menu_layer(window, cx), self.revisions_layer(window, cx), self.picker_layer(window, cx), self.confirm_layer(window, cx), self.forward_layer(window, cx), self.link_layer(window, cx)].into_iter().flatten().collect()
     }
 
     /// Keys for whatever floats over the messages. True when the key was theirs.
@@ -1440,6 +1750,11 @@ impl Pane {
     pub(super) fn action_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let key = event.keystroke.key.as_str();
         if self.link_key(event, cx) {
+            return true;
+        }
+        if key == "escape" && self.forward.is_some() {
+            self.forward = None;
+            cx.notify();
             return true;
         }
         if key == "escape" && self.revisions.is_some() {
@@ -1573,11 +1888,84 @@ mod tests {
         );
     }
 
+    fn discord_caps() -> Capabilities {
+        Capabilities {
+            reply: true,
+            edit: true,
+            delete: true,
+            threads: true,
+            pins: true,
+            forward: true,
+            polls: true,
+            reactions: true,
+            ..Capabilities::default()
+        }
+    }
+
+    fn slack_caps() -> Capabilities {
+        Capabilities {
+            edit: true,
+            delete: true,
+            threads: true,
+            direct_threads: true,
+            pins: true,
+            forward: true,
+            reactions: true,
+            ..Capabilities::default()
+        }
+    }
+
+    fn teams_caps() -> Capabilities {
+        Capabilities {
+            reply: true,
+            edit: true,
+            delete: true,
+            threads: true,
+            pins: true,
+            forward: true,
+            reactions: true,
+            ..Capabilities::default()
+        }
+    }
+
+    fn telegram_caps() -> Capabilities {
+        Capabilities {
+            reply: true,
+            edit: true,
+            delete: true,
+            edit_window: 48 * 3_600,
+            pins: true,
+            forward: true,
+            polls: true,
+            reactions: true,
+            ..Capabilities::default()
+        }
+    }
+
+    fn messages_caps() -> Capabilities {
+        Capabilities {
+            reactions: true,
+            ..Capabilities::default()
+        }
+    }
+
+    fn tiny_caps() -> Capabilities {
+        Capabilities {
+            reply: true,
+            edit: true,
+            delete: true,
+            pins: true,
+            reactions: true,
+            ..Capabilities::default()
+        }
+    }
+
     #[test]
     fn a_menu_lists_what_the_message_can_do_in_one_order() {
         let channel = ConversationKind::Channel;
+        let rights = ConversationRights::default();
         let said = Message::plain("1", "Mara", "hello", 1, false);
-        let on = can(&said, Network::Discord, channel, false);
+        let on = can(&said, &discord_caps(), rights, channel, false, 10);
         assert_eq!(
             menu_acts(on, false, 2, true, true, true, false),
             vec![
@@ -1586,6 +1974,7 @@ mod tests {
                 MenuAct::Reply,
                 MenuAct::Thread,
                 MenuAct::React,
+                MenuAct::Forward,
                 MenuAct::Copy,
                 MenuAct::Link,
                 MenuAct::Open,
@@ -1596,13 +1985,13 @@ mod tests {
         mine.state = SendState::Failed {
             reason: "Slow mode".into(),
         };
-        let failed = can(&mine, Network::Discord, channel, false);
+        let failed = can(&mine, &discord_caps(), rights, channel, false, 10);
         assert_eq!(
             menu_acts(failed, true, 3, true, true, false, true),
             vec![MenuAct::Retry, MenuAct::Copy, MenuAct::Drop]);
         assert_eq!(
             menu_acts(on, false, 0, false, false, false, true),
-            vec![MenuAct::Reply, MenuAct::Thread, MenuAct::SaveAs, MenuAct::Unread],
+            vec![MenuAct::Reply, MenuAct::Thread, MenuAct::Forward, MenuAct::SaveAs, MenuAct::Unread],
         );
     }
 
@@ -1616,45 +2005,31 @@ mod tests {
     }
 
     #[test]
-    fn a_message_link_is_built_from_ids_where_the_network_has_one() {
-        let mut key = protocol::Key { network: Network::Discord, account: "1".into(), id: "C9".into() };
-        let said = Message::plain("M3", "Mara", "hello", 1, false);
-        assert_eq!(message_link(&key, Some("G7"), &said).as_deref(), Some("https://discord.com/channels/G7/C9/M3"));
-        assert_eq!(message_link(&key, None, &said).as_deref(), Some("https://discord.com/channels/@me/C9/M3"));
-        key.network = Network::Slack;
-        assert_eq!(message_link(&key, None, &said), None, "a Slack link needs its workspace");
-        assert_eq!(message_link(&key, Some("T1"), &said).as_deref(), Some("slack://channel?team=T1&id=C9&message=M3"));
-        key.network = Network::Telegram;
-        assert_eq!(message_link(&key, Some("x"), &said), None);
-        // One that never left has no place on the network; an unsupported one names its own.
-        key.network = Network::Discord;
-        let mut pending = said.clone();
-        pending.state = SendState::Pending;
-        assert_eq!(message_link(&key, None, &pending), None);
-        let mut odd = said.clone();
-        odd.kind = MessageKind::Unsupported { link: "https://x.test/1".into() };
-        assert_eq!(message_link(&key, None, &odd).as_deref(), Some("https://x.test/1"));
-    }
-
-    #[test]
-    fn what_a_message_offers_follows_whose_it_is_and_whether_it_left() {
+    fn what_a_message_offers_follows_capabilities_rights_and_edit_window() {
         let channel = ConversationKind::Channel;
-        let theirs = Message::plain("1", "Mara", "hello", 1, false);
-        let on = can(&theirs, Network::Discord, channel, false);
-        assert_eq!((on.act, on.reply, on.edit, on.delete, on.thread), (true, true, false, false, true));
+        let none = ConversationRights::default();
+        let theirs = Message::plain("1", "Mara", "hello", 1_000, false);
+
+        // Discord fixture: inline reply + channel threads, no edit/delete on others without mod rights.
+        let on = can(&theirs, &discord_caps(), none, channel, false, 1_100);
+        assert_eq!((on.act, on.react, on.reply, on.edit, on.delete, on.thread, on.pin, on.forward), (true, true, true, false, false, true, false, true));
         assert_eq!(thread_label(&theirs), "Reply in thread");
-        let discord_dm = can(&theirs, Network::Discord, ConversationKind::Direct, false);
-        assert!(discord_dm.reply && !discord_dm.thread, "a Discord direct message stays an inline reply");
-        assert!(!can(&theirs, Network::Discord, ConversationKind::Voice, false).thread);
-        assert!(!can(&theirs, Network::Discord, ConversationKind::Forum, false).thread);
-        // Slack answers in a thread, never inline. The thread can be started before any reply exists:
-        // Slack names it by the parent message, in a channel and in a direct message.
-        let slack = can(&theirs, Network::Slack, channel, false);
-        assert!(!slack.reply);
-        assert!(slack.thread);
-        assert!(can(&theirs, Network::Slack, ConversationKind::Direct, false).thread);
-        assert!(!can(&theirs, Network::Slack, channel, true).thread, "a thread does not open inside a thread");
-        assert!(!can(&theirs, Network::Slack, ConversationKind::Thread, false).thread);
+        let discord_dm = can(&theirs, &discord_caps(), none, ConversationKind::Direct, false, 1_100);
+        assert!(discord_dm.reply && !discord_dm.thread, "channel-only threads stay inline in DMs");
+        assert!(!can(&theirs, &discord_caps(), none, ConversationKind::Voice, false, 1_100).thread);
+        assert!(!can(&theirs, &discord_caps(), none, ConversationKind::Forum, false, 1_100).thread);
+
+        // Moderator rights grant delete on others' messages and pin.
+        let mod_rights = ConversationRights { pin: true, delete_others: true, manage_members: true };
+        let moderated = can(&theirs, &discord_caps(), mod_rights, channel, false, 1_100);
+        assert!(moderated.delete && moderated.pin && !moderated.edit);
+
+        // Slack fixture: no inline reply, threads in both channels and DMs.
+        let slack = can(&theirs, &slack_caps(), none, channel, false, 1_100);
+        assert!(!slack.reply && slack.thread);
+        assert!(can(&theirs, &slack_caps(), none, ConversationKind::Direct, false, 1_100).thread);
+        assert!(!can(&theirs, &slack_caps(), none, channel, true, 1_100).thread, "a thread does not open inside a thread");
+        assert!(!can(&theirs, &slack_caps(), none, ConversationKind::Thread, false, 1_100).thread);
         let mut broadcast = theirs.clone();
         broadcast.reply_to = Some(protocol::ReplyTo {
             id: "parent".into(),
@@ -1663,56 +2038,68 @@ mod tests {
             person: None,
             deleted: false,
         });
-        assert!(!can(&broadcast, Network::Slack, channel, false).thread, "a channel copy of a reply belongs to its parent's thread");
+        assert!(!can(&broadcast, &slack_caps(), none, channel, false, 1_100).thread, "a channel copy of a reply belongs to its parent's thread");
         let mut pending = theirs.clone();
         pending.state = SendState::Pending;
-        assert!(!can(&pending, Network::Slack, channel, false).thread);
+        assert!(!can(&pending, &slack_caps(), none, channel, false, 1_100).thread);
         let mut joined = theirs.clone();
         joined.kind = MessageKind::System;
-        assert!(!can(&joined, Network::Slack, channel, false).thread);
+        assert!(!can(&joined, &slack_caps(), none, channel, false, 1_100).thread);
 
-        // Teams channels thread. A chat stays an inline reply.
-        let teams = can(&theirs, Network::Teams, channel, false);
+        // Teams fixture: inline reply + channel/announcement threads, not direct/group.
+        let teams = can(&theirs, &teams_caps(), none, channel, false, 1_100);
         assert!(teams.reply && teams.thread);
-        assert!(can(&theirs, Network::Teams, ConversationKind::Announcement, false).thread);
-        assert!(!can(&theirs, Network::Teams, ConversationKind::Direct, false).thread);
-        assert!(!can(&theirs, Network::Teams, ConversationKind::Group, false).thread);
-        for network in [Network::Telegram, Network::Signal, Network::Messages, Network::Tiny] {
-            assert!(!can(&theirs, network, channel, false).thread, "{network:?} has no thread to start");
-        }
+        assert!(can(&theirs, &teams_caps(), none, ConversationKind::Announcement, false, 1_100).thread);
+        assert!(!can(&theirs, &teams_caps(), none, ConversationKind::Direct, false, 1_100).thread);
+        assert!(!can(&theirs, &teams_caps(), none, ConversationKind::Group, false, 1_100).thread);
+
+        // Google Messages fixture: no reply, no edit, no delete, no thread, no pin, no forward; reactions only.
+        let mut mine_sms = Message::plain("s1", "Me", "hey", 1_000, true);
+        let sms = can(&mine_sms, &messages_caps(), mod_rights, ConversationKind::Direct, false, 1_100);
+        assert!(sms.act && sms.react && !sms.reply && !sms.edit && !sms.delete && !sms.thread && !sms.pin && !sms.forward);
+        // Per-message override can still grant or deny edit/delete explicitly.
+        mine_sms.can_edit = Some(true);
+        mine_sms.can_delete = Some(true);
+        let overridden = can(&mine_sms, &messages_caps(), none, ConversationKind::Direct, false, 1_100);
+        assert!(overridden.edit && overridden.delete);
+
+        // Telegram edit_window (48h): edit offered inside window, hidden past window.
+        let mine_tg = Message::plain("t1", "Me", "hi", 1_000, true);
+        assert!(can(&mine_tg, &telegram_caps(), none, ConversationKind::Direct, false, 1_000 + 3_600).edit);
+        assert!(!can(&mine_tg, &telegram_caps(), none, ConversationKind::Direct, false, 1_000 + 48 * 3_600 + 1).edit);
 
         let mut mine = Message::plain("2", "Robin", "on it", 2, true);
-        let own = can(&mine, Network::Discord, channel, false);
+        let own = can(&mine, &discord_caps(), none, channel, false, 100);
         assert!(own.edit && own.delete && !own.unsent);
         mine.thread = Some(protocol::ThreadSummary { id: "t".into(), replies: 1, last: 3, participants: Vec::new(), unread: 0 });
-        assert!(can(&mine, Network::Discord, channel, false).thread);
+        assert!(can(&mine, &discord_caps(), none, channel, false, 100).thread);
         assert_eq!(thread_label(&mine), "Open thread");
-        assert!(can(&mine, Network::Discord, ConversationKind::Direct, false).thread, "a thread that exists still opens");
-        assert!(!can(&mine, Network::Discord, channel, true).thread, "a thread does not open inside a thread");
+        assert!(can(&mine, &discord_caps(), none, ConversationKind::Direct, false, 100).thread, "a thread that exists still opens");
+        assert!(!can(&mine, &discord_caps(), none, channel, true, 100).thread, "a thread does not open inside a thread");
 
         // Not on the network yet: no toolbar, nothing to edit, and deleting is local.
         mine.state = SendState::Failed { reason: "Slow mode".into() };
-        let failed = can(&mine, Network::Discord, channel, false);
+        let failed = can(&mine, &discord_caps(), none, channel, false, 100);
         assert_eq!((failed.act, failed.edit, failed.delete, failed.unsent), (false, false, true, true));
 
         // A tombstone and a system line say nothing that can be acted on.
         let mut gone = Message::plain("3", "Wren", "", 4, true);
         gone.tombstone();
-        assert_eq!(can(&gone, Network::Discord, channel, false), Can { thread: false, ..Can::default() });
+        assert_eq!(can(&gone, &discord_caps(), none, channel, false, 100), Can::default());
         let mut joined = Message::plain("4", "Wren", "joined", 5, false);
         joined.kind = MessageKind::System;
-        assert!(!can(&joined, Network::Discord, channel, false).act);
+        assert!(!can(&joined, &discord_caps(), none, channel, false, 100).act);
     }
 
     #[test]
     fn saved_history_cannot_offer_edits_but_keeps_the_owners_delete_action() {
         let mut saved = Message::plain("saved", "Ada", "past", 1, true);
         saved.saved_history = true;
-        let actions = can(&saved, Network::Tiny, ConversationKind::Direct, false);
+        let actions = can(&saved, &tiny_caps(), ConversationRights::default(), ConversationKind::Direct, false, 10);
         assert!(!actions.edit);
         assert!(actions.delete && actions.reply);
         saved.outgoing = false;
-        let neutral = can(&saved, Network::Tiny, ConversationKind::Direct, false);
+        let neutral = can(&saved, &tiny_caps(), ConversationRights::default(), ConversationKind::Direct, false, 10);
         assert!(!neutral.edit && !neutral.delete);
     }
 }

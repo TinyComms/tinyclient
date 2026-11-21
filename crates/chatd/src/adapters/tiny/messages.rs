@@ -2149,6 +2149,12 @@ fn account_caps(saved: &Saved) -> Capabilities {
         direct_calls: directs_callable(saved),
         file_scan: scans,
         allow_archives: scans && limits.archives,
+        reply: true,
+        edit: true,
+        delete: true,
+        pins: true,
+        reactions: true,
+        gif_file: true,
         ..Capabilities::default()
     }
 }

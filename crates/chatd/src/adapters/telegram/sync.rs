@@ -82,6 +82,11 @@ fn row(account: &Account, who: Who, known: &Known) -> ConversationRow {
     let mut row = ConversationRow::new(who.text(), kind(who, known), known.name.clone());
     row.avatar = known.avatar();
     row.read_only = known.read_only;
+    row.rights = if matches!(who, Who::User(_)) {
+        protocol::ConversationRights { pin: !known.read_only, ..protocol::ConversationRights::default() }
+    } else {
+        known.rights
+    };
     row.mark = known.mark;
     row.bot = known.bot;
     // People, bots, groups and the service chat are the Inbox's; a broadcast channel only when
@@ -336,6 +341,18 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         revisions: false,
         close_direct: false,
         clear_history: true,
+        reply: true,
+        edit: true,
+        delete: true,
+        threads: false,
+        direct_threads: false,
+        pins: true,
+        forward: true,
+        polls: true,
+        reactions: true,
+        gif_file: false,
+        mention_format: protocol::MentionFormat::Plain,
+        mention_spans: true,
     }
 }
 
