@@ -246,14 +246,14 @@ impl Slack {
             let permalink = file["permalink"]
                 .as_str()
                 .map(str::trim)
-                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .filter(|u| u.starts_with("https://"))
                 .unwrap_or("")
                 .to_owned();
             if self.is_external(file) {
                 let url = file["url_private"]
                     .as_str()
                     .map(str::trim)
-                    .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                    .filter(|u| u.starts_with("https://"))
                     .unwrap_or(&permalink)
                     .to_owned();
                 items.push(SharedItem {

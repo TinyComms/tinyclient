@@ -293,8 +293,6 @@ struct State {
     my_groups: HashSet<String>,
     /// Our workspace role from `users.info`, so an admin write does not ask Slack again.
     role: Option<info::WorkspaceRole>,
-    /// `emoji_only_admins` from `team.info`, once that field has been seen.
-    emoji_only_admins: Option<bool>,
     /// Do Not Disturb state per user id (`dnd.info`, `dnd.teamInfo`, `dnd_updated`, `dnd_updated_user`).
     dnd: HashMap<String, people::DndState>,
     /// Underlying Slack presence (`Online`, `Idle`, `Offline`) before DND overlay.

@@ -81,14 +81,6 @@ impl WorkspaceRole {
     }
 }
 
-/// `emoji_only_admins` once Slack has sent that field. Absent is not a yes.
-fn emoji_only_admins(team: &Value) -> Option<bool> {
-    team.get("prefs")
-        .and_then(|prefs| prefs.get("emoji_only_admins"))
-        .or_else(|| team.get("emoji_only_admins"))
-        .and_then(Value::as_bool)
-}
-
 /// PNG, GIF, JPEG, or WEBP, from the file bytes.
 fn image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -453,14 +445,14 @@ impl Slack {
             let permalink = file["permalink"]
                 .as_str()
                 .map(str::trim)
-                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .filter(|u| u.starts_with("https://"))
                 .unwrap_or("")
                 .to_owned();
             if kind == SharedKind::Files && self.is_external(file) {
                 let url = file["url_private"]
                     .as_str()
                     .map(str::trim)
-                    .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                    .filter(|u| u.starts_with("https://"))
                     .unwrap_or(&permalink)
                     .to_owned();
                 if !url.is_empty() {
@@ -559,14 +551,14 @@ impl Slack {
             let permalink = file["permalink"]
                 .as_str()
                 .map(str::trim)
-                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .filter(|u| u.starts_with("https://"))
                 .unwrap_or("")
                 .to_owned();
             if self.is_external(file) {
                 let url = file["url_private"]
                     .as_str()
                     .map(str::trim)
-                    .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                    .filter(|u| u.starts_with("https://"))
                     .unwrap_or(&permalink)
                     .to_owned();
                 items.push(SharedItem {
@@ -1105,31 +1097,6 @@ impl Slack {
         }
     }
 
-    /// Members may upload only when Slack has said `emoji_only_admins` is false.
-    fn members_may_add_emoji(&self) -> Result<bool, Fault> {
-        if let Some(only_admins) = self.state().emoji_only_admins {
-            return Ok(!only_admins);
-        }
-        let info = self.api("team.info", &[])?;
-        let flag = emoji_only_admins(&info["team"]);
-        if let Some(flag) = flag {
-            self.state().emoji_only_admins = Some(flag);
-        }
-        Ok(flag == Some(false))
-    }
-
-    /// Admins may upload. Guests may not. Members may only when the workspace pref allows it.
-    fn require_emoji_upload(&self) -> Result<(), Fault> {
-        let role = self.workspace_role()?;
-        if role.is_workspace_admin() {
-            return Ok(());
-        }
-        if role.is_guest() || !self.members_may_add_emoji()? {
-            return Err(Fault::Slack("no_permission".to_owned()));
-        }
-        Ok(())
-    }
-
     /// Workspace info for `Request::SpaceInfo`: calls `team.info` for name/domain/email_domain
     /// and reads our own user record for workspace role (`Primary owner`, `Owner`, `Workspace admin`,
     /// `Guest`, or `Member`).
@@ -1151,13 +1118,10 @@ impl Slack {
             team["url"]
                 .as_str()
                 .map(str::trim)
-                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .filter(|u| u.starts_with("https://"))
                 .map(|u| u.trim_end_matches('/').to_owned())
                 .unwrap_or_default()
         };
-        if let Some(flag) = emoji_only_admins(team) {
-            self.state().emoji_only_admins = Some(flag);
-        }
         let email_domain = team["email_domain"].as_str().unwrap_or("").trim();
         let description = if email_domain.is_empty() {
             String::new()
@@ -1246,7 +1210,7 @@ impl Slack {
         }
         let bytes = std::fs::read(&real).map_err(|err| Fault::Net(format!("emoji: {err}")))?;
         let mime = image_mime(&bytes).ok_or_else(|| Fault::Slack("error_invalid_image".to_owned()))?;
-        self.require_emoji_upload()?;
+        self.require_workspace_admin()?;
         let filename = real
             .file_name()
             .and_then(|n| n.to_str())

@@ -6312,6 +6312,32 @@ fn slack_guest_role_refuses_invite_emoji_upload_and_user_group_create() {
 }
 
 #[test]
+fn slack_member_role_refuses_emoji_upload() {
+    let world = World::start_with(|fake| {
+        *fake.self_user.lock().unwrap() = Some(json!({
+            "is_primary_owner": false,
+            "is_owner": false,
+            "is_admin": false,
+            "is_ultra_restricted": false,
+            "is_restricted": false
+        }));
+    });
+    world.ready();
+    let acct = alpha("T01ALPHA").account();
+    let dir = world.dir.with_extension("emoji-member");
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("member.png");
+    std::fs::write(&img, b"\x89PNG\r\n\x1a\nmember").unwrap();
+    let emoji = world.ask(Request::AddCustomEmoji {
+        account: acct,
+        name: "member_pic".into(),
+        path: img.to_string_lossy().into_owned(),
+    });
+    assert!(matches!(emoji, Response::Error { code: ErrorCode::Refused, .. }), "{emoji:?}");
+    assert!(world.fake.calls(ALPHA, "emoji.add").is_empty());
+}
+
+#[test]
 fn slack_app_home_about_and_recent_apps_sidebar_group() {
     let world = World::start_with(|fake| {
         fake.extra_users.lock().unwrap().push(json!({
