@@ -7,7 +7,7 @@ use base64::Engine;
 use protocol::{
     AccountKey, Attachment, Card, ControlKind, ControlOption, ControlStyle, Forwarded, Key, MediaFile, MediaKind,
     MentionKind, Message, MessageControl, MessageKind, Preview, Reaction, ReplyTo, Sender, Span, Style, ThreadSummary,
-    MESSAGE_CONTROLS_LIMIT,
+    Via, MESSAGE_CONTROLS_LIMIT,
 };
 
 /// Names for what a message only gives ids for.
@@ -781,6 +781,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     let content = posted.content.as_deref().unwrap_or("");
     let kind = posted.kind.unwrap_or(0);
     let link = jump_link(place.guild, &posted.channel_id, &posted.id);
+    let flags = posted.flags.unwrap_or(0);
 
     let forwarded = posted.message_snapshots.first().map(|snapshot| &*snapshot.message);
     let mut message_kind = MessageKind::Normal;
@@ -811,6 +812,13 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     let composed = carried.author.as_ref().is_some_and(|author| author.bot) || carried.webhook_id.is_some();
     let (card, previews, moving_pictures) = cards(&mut rich, &posted.id, embeds, place.names, composed);
     attachments.extend(moving_pictures);
+    if flags & model::FLAG_IS_VOICE_MESSAGE != 0 {
+        for attachment in &mut attachments {
+            if attachment.file.kind == MediaKind::File {
+                attachment.file.kind = MediaKind::Audio;
+            }
+        }
+    }
     let reactions = reactions(&mut rich, posted.reactions.as_deref().unwrap_or(&[]));
     let app_id = posted.application_id.as_deref().unwrap_or(&author.id);
     let (controls, _dropped_components) = match carried.components.as_deref() {
@@ -818,7 +826,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
             comps,
             &posted.id,
             app_id,
-            posted.flags,
+            flags,
             &link,
             place.names,
             &mut rich,
@@ -827,19 +835,10 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         _ => (Vec::new(), false),
     };
     let origin = posted.message_reference.as_ref().filter(|reference| reference.kind == 1 && forwarded.is_some());
-    let forwarded_from = origin.map(|origin| {
-        let channel = origin.channel_id.as_deref().unwrap_or("");
-        let elsewhere = origin.guild_id.as_deref().filter(|guild| Some(*guild) != place.guild);
-        Box::new(Forwarded {
-            from_title: place.names.channel(channel).map_or_else(String::new, |name| format!("#{name}")),
-            from_space: elsewhere.and_then(|guild| place.names.space(guild)).unwrap_or_default(),
-            link: match &origin.message_id {
-                Some(message) if !channel.is_empty() => jump_link(origin.guild_id.as_deref(), channel, message),
-                _ => String::new(),
-            },
-            ..Forwarded::default()
-        })
-    });
+    let mut forwarded_from = origin.map(|origin| Box::new(referenced(origin, place)));
+    if forwarded_from.is_none() && flags & model::FLAG_IS_CROSSPOST != 0 {
+        forwarded_from = posted.message_reference.as_ref().map(|origin| Box::new(referenced(origin, place)));
+    }
 
     if let Some(poll) = &posted.poll {
         let question = poll.question.as_ref().and_then(|question| question.text.as_deref()).unwrap_or("");
@@ -853,14 +852,18 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         && card.is_none()
         && controls.is_empty()
     {
-        // Buttons, menus, or something newer than this build: never a blank row.
-        let has_components = posted.components.as_deref().is_some_and(|c| !c.is_empty());
-        rich.text = if !has_components {
-            "A message tinyclient cannot show.".to_owned()
+        if flags & model::FLAG_LOADING != 0 {
+            rich.text = format!("{who} is thinking…");
         } else {
-            "Interactive message".to_owned()
-        };
-        message_kind = MessageKind::Unsupported { link: link.clone() };
+            // Buttons, menus, or something newer than this build: never a blank row.
+            let has_components = posted.components.as_deref().is_some_and(|c| !c.is_empty());
+            rich.text = if !has_components {
+                "A message tinyclient cannot show.".to_owned()
+            } else {
+                "Interactive message".to_owned()
+            };
+            message_kind = MessageKind::Unsupported { link: link.clone() };
+        }
     }
 
     let reply_to = match (&posted.message_reference, &posted.referenced_message) {
@@ -961,8 +964,59 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         sent_via: None,
         permalink: link,
         controls,
+        via: command_via(posted),
+        ephemeral: flags & model::FLAG_EPHEMERAL != 0,
+        silent: flags & model::FLAG_SUPPRESS_NOTIFICATIONS != 0,
+        loading: flags & model::FLAG_LOADING != 0,
     };
     (message, rich.files)
+}
+
+/// Where a crosspost or a forward was first said.
+fn referenced(origin: &model::Reference, place: &Place) -> Forwarded {
+    let channel = origin.channel_id.as_deref().unwrap_or("");
+    let elsewhere = origin.guild_id.as_deref().filter(|guild| Some(*guild) != place.guild);
+    Forwarded {
+        from_title: place.names.channel(channel).map_or_else(String::new, |name| format!("#{name}")),
+        from_space: elsewhere.and_then(|guild| place.names.space(guild)).unwrap_or_default(),
+        link: match &origin.message_id {
+            Some(message) if !channel.is_empty() => jump_link(origin.guild_id.as_deref(), channel, message),
+            _ => String::new(),
+        },
+        ..Forwarded::default()
+    }
+}
+
+/// The person and command behind an application-command reply. Component interactions have no command name here.
+fn command_via(posted: &Posted) -> Option<Via> {
+    let meta = posted.interaction_metadata.as_ref().or(posted.interaction.as_ref())?;
+    if meta.kind != 0 && meta.kind != 2 {
+        return None;
+    }
+    let command = meta.name.as_deref().filter(|name| !name.is_empty())?;
+    let who = meta.user.as_ref().map(|user| user.name().to_owned()).filter(|name| !name.is_empty())?;
+    Some(Via { who, command: command.trim_start_matches('/').to_owned() })
+}
+
+/// Flags a partial update left out, rebuilt from what the row already stored.
+fn remembered_flags(message: &Message) -> u64 {
+    let mut flags = message
+        .controls
+        .iter()
+        .find_map(|control| {
+            control.block_id.starts_with("discord:").then(|| super::interactions::parse_block_meta(&control.block_id).1)
+        })
+        .unwrap_or(0);
+    if message.ephemeral {
+        flags |= model::FLAG_EPHEMERAL;
+    }
+    if message.loading {
+        flags |= model::FLAG_LOADING;
+    }
+    if message.silent {
+        flags |= model::FLAG_SUPPRESS_NOTIFICATIONS;
+    }
+    flags
 }
 
 /// The first embed a bot or webhook composed (`by_bot`, type `rich`) is the message's card;
@@ -1056,7 +1110,7 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
             components,
             &stored.id,
             app_id,
-            update.flags,
+            update.flags.unwrap_or_else(|| remembered_flags(stored)),
             &link,
             place.names,
             &mut comp_rich,
@@ -1080,6 +1134,20 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
     }
     if let Some(pinned) = update.pinned {
         stored.pinned = pinned;
+    }
+    if let Some(flags) = update.flags {
+        stored.ephemeral = flags & model::FLAG_EPHEMERAL != 0;
+        stored.silent = flags & model::FLAG_SUPPRESS_NOTIFICATIONS != 0;
+        stored.loading = flags & model::FLAG_LOADING != 0;
+        if stored.loading && stored.text.is_empty() && stored.attachments.is_empty() {
+            stored.text = format!("{} is thinking…", stored.sender.name);
+            if matches!(stored.kind, MessageKind::Unsupported { .. }) {
+                stored.kind = MessageKind::Normal;
+            }
+        }
+    }
+    if update.interaction_metadata.is_some() || update.interaction.is_some() {
+        stored.via = command_via(update);
     }
     if update.edited_timestamp.is_some() {
         stored.edited = true;
@@ -1797,5 +1865,66 @@ mod tests {
         assert_eq!(m2.controls[0].label, "Ship");
         assert_eq!(m2.attachments.len(), 1);
         assert!(files2.files.iter().any(|(_, url)| url == "https://cdn.discordapp.com/a.png"));
+    }
+
+    #[test]
+    fn a_command_reply_names_who_used_it_and_marks_ephemeral_silent_and_thinking() {
+        let account = AccountKey { network: protocol::Network::Discord, account: "test".into() };
+        let place = Place { account: &account, me: "400", guild: Some("4000"), names: &Nobody, author: None };
+        let posted: Posted = serde_json::from_value(serde_json::json!({
+            "id": "1300000000000000200",
+            "channel_id": "4101",
+            "type": 20,
+            "content": "shipped",
+            "flags": 64,
+            "author": {"id": "9001", "username": "helper", "global_name": "Helper", "bot": true},
+            "interaction_metadata": {
+                "id": "9100",
+                "type": 2,
+                "name": "ship",
+                "user": {"id": "7", "username": "priya", "global_name": "Priya"}
+            },
+            "message_reference": {"type": 0, "channel_id": "4101", "guild_id": "5000", "message_id": "1300000000000000100"}
+        }))
+        .unwrap();
+        let (mut decoded, _) = message(&posted, &place);
+        assert!(decoded.ephemeral);
+        assert!(!decoded.loading && !decoded.silent);
+        assert_eq!(decoded.kind, MessageKind::Normal);
+        assert_eq!(decoded.text, "shipped");
+        let via = decoded.via.as_ref().unwrap();
+        assert_eq!((via.who.as_str(), via.command.as_str()), ("Priya", "ship"));
+
+        let mut quiet = posted.clone();
+        quiet.flags = Some(model::FLAG_SUPPRESS_NOTIFICATIONS | 2);
+        quiet.interaction_metadata = None;
+        quiet.content = Some("followed".into());
+        let (cross, _) = message(&quiet, &place);
+        assert!(cross.silent);
+        let from = cross.forwarded.unwrap();
+        assert_eq!((from.from_title.as_str(), from.from_space.as_str()), ("#deploys", "Moss"));
+
+        let mut thinking = posted.clone();
+        thinking.content = Some(String::new());
+        thinking.flags = Some(model::FLAG_LOADING);
+        thinking.interaction = Some(model::InteractionMeta {
+            kind: 2,
+            name: Some("ship".into()),
+            user: Some(model::User { id: "7".into(), username: "priya".into(), global_name: Some("Priya".into()), ..Default::default() }),
+        });
+        thinking.interaction_metadata = None;
+        let (thought, _) = message(&thinking, &place);
+        assert!(thought.loading);
+        assert_eq!(thought.text, "Helper is thinking…");
+        assert_eq!(thought.kind, MessageKind::Normal);
+        assert_eq!(thought.via.unwrap().command, "ship");
+
+        // A partial update that omits flags must not clear the only-you mark.
+        let update = Posted { content: Some("still here".into()), ..Posted::default() };
+        assert!(update.flags.is_none());
+        patch(&mut decoded, &update, &place);
+        assert!(decoded.ephemeral);
+        assert_eq!(decoded.text, "still here");
+        assert_eq!(decoded.via.as_ref().map(|via| via.command.as_str()), Some("ship"));
     }
 }

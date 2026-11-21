@@ -858,6 +858,8 @@ impl Discord {
 
     /// Takes READY apart into the store. Only [`super::State`] outlives this call.
     pub(super) fn ready(&self, ready: Ready) -> Result<(), Failure> {
+        // Ephemeral replies exist only for the session that received them.
+        self.ctx.drop_ephemeral()?;
         let me = ready.user.id.clone();
         self.myself(&ready.user)?;
         self.capabilities(ready.user.premium_type);

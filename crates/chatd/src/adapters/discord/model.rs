@@ -1058,6 +1058,25 @@ pub struct Component {
     pub required: Option<bool>,
 }
 
+/// Message flags the row reads. The rest are left in the raw bit set on a control's block id.
+pub const FLAG_IS_CROSSPOST: u64 = 1 << 1;
+pub const FLAG_EPHEMERAL: u64 = 1 << 6;
+pub const FLAG_LOADING: u64 = 1 << 7;
+pub const FLAG_SUPPRESS_NOTIFICATIONS: u64 = 1 << 12;
+pub const FLAG_IS_VOICE_MESSAGE: u64 = 1 << 13;
+
+/// Who ran a command, from `interaction` or `interaction_metadata`. Extra fields are ignored.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct InteractionMeta {
+    /// 2 is an application command. Anything else is not a slash or context-menu command.
+    #[serde(rename = "type", default)]
+    pub kind: u8,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub user: Option<User>,
+}
+
 /// A message, whole or (in `MESSAGE_UPDATE`) only the fields that changed.
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct Posted {
@@ -1095,8 +1114,13 @@ pub struct Posted {
     pub pinned: Option<bool>,
     #[serde(rename = "type", default)]
     pub kind: Option<u8>,
-    #[serde(default, deserialize_with = "nullable")]
-    pub flags: u64,
+    /// Absent on a partial update, which must not clear flags already stored.
+    #[serde(default)]
+    pub flags: Option<u64>,
+    #[serde(default)]
+    pub interaction: Option<InteractionMeta>,
+    #[serde(default)]
+    pub interaction_metadata: Option<InteractionMeta>,
     #[serde(default)]
     pub message_reference: Option<Reference>,
     #[serde(default)]

@@ -1147,7 +1147,14 @@ impl Discord {
     }
 
     fn delete(&self, channel: &str, message: &str) -> Result<(), Refusal> {
-        self.call("DELETE", &format!("/channels/{channel}/messages/{message}"), None).map_err(refusal)?;
+        let ephemeral = self.ctx.stored_message(channel, message).ok().flatten().is_some_and(|stored| stored.ephemeral);
+        let removed = self.call("DELETE", &format!("/channels/{channel}/messages/{message}"), None).map_err(refusal);
+        // Dismiss always drops an only-you reply. Discord may refuse the DELETE.
+        if ephemeral {
+            self.ctx.deleted(channel, message).map_err(|err| Refusal::Refused(err.to_string()))?;
+            return Ok(());
+        }
+        removed?;
         self.ctx.deleted(channel, message).map_err(|err| Refusal::Refused(err.to_string()))
     }
 
@@ -1951,6 +1958,9 @@ impl Discord {
             // The user asked to sign out, so the token should stop working, not just be
             // forgotten: the answer goes once Discord has ended the session, or refused to.
             Command::SignOut(done) => {
+                if let Err(err) = self.ctx.drop_ephemeral() {
+                    self.log("sign out", err);
+                }
                 let body = json!({"provider": null, "voip_provider": null});
                 if let Err(refused) = self.call("POST", "/auth/logout", Some(body)) {
                     self.log("sign out", refused);

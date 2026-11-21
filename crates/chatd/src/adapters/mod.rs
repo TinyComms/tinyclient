@@ -1445,6 +1445,15 @@ impl Context {
         Ok(())
     }
 
+    /// Drops every ephemeral message of this account and tells the shell which chats changed.
+    pub fn drop_ephemeral(&self) -> rusqlite::Result<Vec<String>> {
+        let conversations = self.hub.store().drop_ephemeral(&self.account)?;
+        for id in &conversations {
+            self.hub.changed(Change::Messages { conversation: self.key(id) });
+        }
+        Ok(conversations)
+    }
+
     /// A message is gone. One with a thread hanging off it stays as a tombstone, and replies to
     /// it say their original was deleted.
     pub fn deleted(&self, conversation_id: &str, message_id: &str) -> Stores {

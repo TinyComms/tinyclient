@@ -818,6 +818,13 @@ pub struct ModalField {
     pub max_length: Option<u16>,
 }
 
+/// Who ran the command a message answers, and that command's name without a leading slash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Via {
+    pub who: String,
+    pub command: String,
+}
+
 /// A form popped up by a bot/app in response to a button, select menu, or command.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InteractionModal {
@@ -975,6 +982,18 @@ pub struct Message {
     /// Interactive app/bot controls (Slack Block Kit buttons, menus, pickers, checkboxes, radios).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub controls: Vec<MessageControl>,
+    /// Who ran the command this message answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<Via>,
+    /// Only this account can see it. Dropped at the end of the session.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ephemeral: bool,
+    /// Sent without a notification (`@silent`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub silent: bool,
+    /// The app is still writing this reply.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub loading: bool,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -1084,6 +1103,10 @@ impl Message {
             sent_via: None,
             permalink: String::new(),
             controls: Vec::new(),
+            via: None,
+            ephemeral: false,
+            silent: false,
+            loading: false,
         }
     }
 
@@ -1159,6 +1182,10 @@ impl Message {
         }
         if let Some(via) = &mut self.sent_via {
             clip(via, 64);
+        }
+        if let Some(via) = &mut self.via {
+            clip(&mut via.who, 200);
+            clip(&mut via.command, 100);
         }
         self.controls.truncate(MESSAGE_CONTROLS_LIMIT);
         for control in &mut self.controls {

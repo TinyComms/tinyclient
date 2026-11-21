@@ -3398,6 +3398,45 @@ fn forwards_voice_messages_spoilers_stickers_and_replies_fill_the_model() {
 }
 
 #[test]
+fn a_command_reply_says_who_used_it_and_an_ephemeral_one_is_only_for_this_session() {
+    let world = World::start();
+    let dm = "3002";
+    let id = world.incoming(dm, None, "done", json!({
+        "type": 20,
+        "flags": 64,
+        "author": {"id": "9001", "username": "helper", "global_name": "Helper", "discriminator": "0", "bot": true},
+        "interaction_metadata": {
+            "id": "9100",
+            "type": 2,
+            "name": "ship",
+            "user": {"id": "2001", "username": "ada", "global_name": "Ada"}
+        }
+    }));
+    let message = wait("the command reply", || world.messages(dm).into_iter().find(|message| message.id == id));
+    assert!(message.ephemeral && !message.silent && !message.loading);
+    assert_eq!(message.kind, MessageKind::Normal);
+    assert_eq!(message.text, "done");
+    let via = message.via.unwrap();
+    assert_eq!((via.who.as_str(), via.command.as_str()), ("Ada", "ship"));
+
+    let thinking = world.incoming(dm, None, "", json!({
+        "type": 20,
+        "flags": 128,
+        "author": {"id": "9001", "username": "helper", "global_name": "Helper", "discriminator": "0", "bot": true},
+        "interaction_metadata": {
+            "id": "9101",
+            "type": 2,
+            "name": "ship",
+            "user": {"id": "2001", "username": "ada", "global_name": "Ada"}
+        }
+    }));
+    let message = wait("the thinking reply", || world.messages(dm).into_iter().find(|message| message.id == thinking));
+    assert!(message.loading);
+    assert_eq!(message.text, "Helper is thinking…");
+    assert_eq!(message.kind, MessageKind::Normal);
+}
+
+#[test]
 fn a_challenge_stops_every_request_and_shows_on_the_account() {
     let world = World::start();
     // Discord answers a send with a captcha. It is never retried, and nothing else is asked.

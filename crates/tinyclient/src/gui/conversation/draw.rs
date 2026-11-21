@@ -27,7 +27,7 @@ use gpui::{
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Preview, Receipt, Request, Response, SendState};
+use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Preview, Receipt, Request, Response, SendState, Via};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1065,6 +1065,7 @@ impl Pane {
             .min_w_0()
             .flex()
             .flex_col()
+            .children(message.via.as_ref().map(command_used))
             .children(head.then(|| self.header(message, in_header, cx)))
             .child(sent)
             .children(self.otp_chip(message, cx))
@@ -1072,7 +1073,8 @@ impl Pane {
             .children(self.reactions(message, window, cx))
             .children(self.thread_line(message, window, cx))
             .children(self.sending(message, cx))
-            .children(self.unsent(message, cx));
+            .children(self.unsent(message, cx))
+            .children(self.ephemeral_note(message, cx));
 
         let menu = message.clone();
         let inner = div()
@@ -1089,6 +1091,7 @@ impl Pane {
             // The row that owns an open menu, picker or dialog keeps `selected` (polish/01 §2).
             .when(owns && !editing, |row| row.bg(theme::selected()))
             .when(!mentioned && !editing && !owns, |row| row.hover(|style| style.bg(tokens::row_hover())))
+            .when(message.ephemeral && !editing, |row| row.bg(theme::warning_soft()))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
@@ -3593,6 +3596,42 @@ impl Pane {
             .child(actions);
         Some(line.into_any_element())
     }
+
+    /// The tinted foot of an only-you reply. Dismiss removes it here, and on Discord when that is allowed.
+    fn ephemeral_note(&self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !message.ephemeral || message.deleted {
+            return None;
+        }
+        let conversation = self.key()?.clone();
+        let message_id = message.id.clone();
+        let dismiss = div()
+            .id(name_id("dismiss", &message.id))
+            .flex_none()
+            .cursor_pointer()
+            .text_color(tokens::link())
+            .hover(|style| style.underline())
+            .child("Dismiss")
+            .on_click(cx.listener(move |_, _, _, cx| {
+                let request = Request::Delete {
+                    conversation: conversation.clone(),
+                    message_id: message_id.clone(),
+                    scope: protocol::DeleteScope::Everyone,
+                };
+                cx.background_executor().spawn(async move { crate::client::ask(&request) }).detach();
+            }));
+        Some(
+            div()
+                .mt(px(4.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .type_small()
+                .text_color(theme::text_faint())
+                .child("Only you can see this ·")
+                .child(dismiss)
+                .into_any_element(),
+        )
+    }
 }
 
 /// Bytes as the upload line says them: "3.1 MB", "820 KB".
@@ -3638,17 +3677,34 @@ fn receipt_mark(id: &str, receipt: Receipt) -> AnyElement {
 
 /// The bell-off after a message's time when it went without notification.
 fn silent_mark(message: &Message) -> Option<AnyElement> {
-    let client_id = message.client_id.as_deref()?;
-    crate::gui::composer::sent_silently(client_id).then(|| {
+    let from_send = message.client_id.as_deref().is_some_and(crate::gui::composer::sent_silently);
+    if !message.silent && !from_send {
+        return None;
+    }
+    let id = message.client_id.as_deref().unwrap_or(message.id.as_str());
+    Some(
         div()
-            .id(name_id("silent", client_id))
+            .id(name_id("silent", id))
             .flex_none()
             .flex()
             .items_center()
             .tooltip(tip("Sent without notification", None))
             .child(glyph("icons/bell-off.svg", 12., theme::text_faint()))
-            .into_any_element()
-    })
+            .into_any_element(),
+    )
+}
+
+/// "<person> used /command" above a bot's answer.
+fn command_used(via: &Via) -> Div {
+    let command = via.command.trim_start_matches('/');
+    div()
+        .h(px(18.))
+        .mb(px(2.))
+        .flex()
+        .items_center()
+        .type_small()
+        .text_color(theme::text_faint())
+        .child(format!("{} used /{command}", via.who))
 }
 
 fn megabytes(bytes: u64) -> String {
