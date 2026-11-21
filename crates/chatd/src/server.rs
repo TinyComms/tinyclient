@@ -1268,11 +1268,20 @@ impl Chat {
         for file in &with.files {
             self.hub.player.stop_file(&self.hub, std::path::Path::new(&file.path));
         }
-        let (conversation_id, text) = (conversation.id, message.text.clone());
+        let (conversation_id, text) = (conversation.id.clone(), message.text.clone());
+        let scheduled = with.schedule.is_some();
         let command = match with.is_plain() {
             true => Command::Send { conversation_id, client_id, text, reply_to },
             false => Command::SendWith { conversation_id, client_id, text, reply_to, with: Box::new(with) },
         };
+        if !scheduled {
+            if let Some(mut rules) = self.hub.send_rules.get(&conversation) {
+                if rules.slowmode_seconds > 0 {
+                    rules.slowmode_next_send = Some(now() + i64::from(rules.slowmode_seconds));
+                    self.hub.send_rules.keep(conversation.clone(), rules);
+                }
+            }
+        }
         self.command(&account, command);
         Response::Sent { message }
     }
@@ -1516,6 +1525,23 @@ impl Chat {
     fn reactions(&self, conversation: Key) -> Response {
         match self.reaction_rules(&conversation) {
             Ok(rules) => Response::Reactions { conversation, rules },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn send_rules(&self, conversation: Key) -> Response {
+        if let Some(rules) = self.hub.send_rules.get(&conversation) {
+            return Response::SendRules { conversation, rules };
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&conversation.account(), |reply| Command::SendRules { conversation_id, reply }) {
+            Ok(rules) => {
+                self.hub.send_rules.keep(conversation.clone(), rules.clone());
+                Response::SendRules { conversation, rules }
+            }
+            Err(refused) if matches!(&*refused, Response::Error { code: ErrorCode::Unsupported, .. }) => {
+                Response::SendRules { conversation, rules: protocol::SendRules::default() }
+            }
             Err(refused) => *refused,
         }
     }
@@ -3403,6 +3429,7 @@ impl Chat {
 
             Request::React { conversation, message_id, emoji, on, burst } => self.react(conversation, message_id, emoji, on, burst),
             Request::Reactions { conversation } => self.reactions(conversation),
+            Request::SendRules { conversation } => self.send_rules(conversation),
             Request::Reactors { conversation, message_id, emoji, burst, after, limit } => {
                 self.reactors(conversation, message_id, emoji, burst, after, limit)
             }

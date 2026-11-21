@@ -1131,6 +1131,10 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             conversation: conversation.clone(),
             rules: serde_json::from_value(serde_json::json!({})).expect("the default rules"),
         },
+        Request::SendRules { conversation } => Response::SendRules {
+            conversation: conversation.clone(),
+            rules: protocol::SendRules::default(),
+        },
         Request::Catalog { .. } => Response::Catalog { items: Vec::new(), cursor: None },
         Request::SaveGif { .. } => Response::Ok,
         Request::Watch(watching) => {

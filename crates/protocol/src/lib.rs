@@ -1860,6 +1860,11 @@ pub enum Request {
     Reactions {
         conversation: Key,
     },
+    /// What this account may send in one conversation: per-chat media restrictions, slow mode,
+    /// timed mute expiry, and paid-message star price. Asked when the conversation opens.
+    SendRules {
+        conversation: Key,
+    },
     /// Who reacted to a message with `emoji`, paged. Fetched only on demand (clicking or
     /// opening the reactors list), never prefetched.
     Reactors {
@@ -2943,6 +2948,11 @@ pub enum Response {
     Reactions {
         conversation: Key,
         rules: ReactionRules,
+    },
+    /// Answers `SendRules`: per-conversation send permissions, slow mode, timed mute, paid stars.
+    SendRules {
+        conversation: Key,
+        rules: SendRules,
     },
     /// Answers `Reactors`: one page of people who reacted with `emoji`.
     Reactors {

@@ -991,6 +991,97 @@ pub struct SendAs {
     pub detail: String,
 }
 
+/// What this account may send in one conversation right now: per-chat media restrictions,
+/// slow mode, timed mute expiry, and paid-message star price (`Request::SendRules`).
+///
+/// Every permission defaults to `true`, so an empty JSON object or an adapter that does not
+/// report per-chat rules leaves sending up to account [`Capabilities`] and the network.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendRules {
+    /// May send messages at all (`false` when muted/banned or read-only).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_messages: bool,
+    /// May send plain text messages.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_plain: bool,
+    /// May send media/attachments in general.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_media: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_photos: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_videos: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_round_videos: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_audios: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_voices: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_files: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_stickers: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_gifs: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub embed_links: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_polls: bool,
+    /// Slow-mode interval in seconds (`0` means slow mode is off).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub slowmode_seconds: u32,
+    /// Unix seconds when the next message may be sent under slow mode (`None` when ready now).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slowmode_next_send: Option<i64>,
+    /// Unix seconds when a timed mute / send ban expires (`None` if permanent or not muted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ban_until: Option<i64>,
+    /// Telegram Stars charged per message (`send_paid_messages_stars`). `None` or `Some(0)` is free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid_stars: Option<u64>,
+}
+
+impl Default for SendRules {
+    fn default() -> SendRules {
+        SendRules {
+            send_messages: true,
+            send_plain: true,
+            send_media: true,
+            send_photos: true,
+            send_videos: true,
+            send_round_videos: true,
+            send_audios: true,
+            send_voices: true,
+            send_files: true,
+            send_stickers: true,
+            send_gifs: true,
+            embed_links: true,
+            send_polls: true,
+            slowmode_seconds: 0,
+            slowmode_next_send: None,
+            ban_until: None,
+            paid_stars: None,
+        }
+    }
+}
+
+impl SendRules {
+    /// True when at least one file/media attachment category is allowed.
+    pub fn allows_any_attachment(&self) -> bool {
+        self.send_media && (self.send_photos || self.send_videos || self.send_audios || self.send_files)
+    }
+
+    /// Whole seconds remaining before slow mode allows another send at unix timestamp `now`.
+    pub fn slowmode_remaining(&self, now: i64) -> u32 {
+        self.slowmode_next_send
+            .map_or(0, |until| until.saturating_sub(now).max(0).min(i64::from(u32::MAX)) as u32)
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == SendRules::default()
+    }
+}
+
 /// What a `Send` carries besides its text. All of it is off by default, and a plain text
 /// message leaves it off the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1048,6 +1139,10 @@ pub struct Outgoing {
     /// Optional one-line subject for a new channel post (Teams).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
+    /// Explicit consent to pay up to this many Telegram Stars for a paid message. Never set
+    /// without the user confirming the price first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_paid_stars: Option<u64>,
 }
 
 impl Default for Outgoing {
@@ -1069,6 +1164,7 @@ impl Default for Outgoing {
             send_as: None,
             snippet_type: None,
             subject: None,
+            allow_paid_stars: None,
         }
     }
 }
@@ -1206,5 +1302,37 @@ mod tests {
         };
         let back_opt: SendAs = serde_json::from_str(&serde_json::to_string(&opt).unwrap()).unwrap();
         assert_eq!(back_opt, opt);
+    }
+
+    #[test]
+    fn send_rules_defaults_to_all_allowed_and_round_trips() {
+        let default: SendRules = serde_json::from_str("{}").unwrap();
+        assert_eq!(default, SendRules::default());
+        assert!(default.is_default());
+        assert!(default.allows_any_attachment());
+        assert_eq!(default.slowmode_remaining(1_000), 0);
+        assert_eq!(serde_json::to_string(&default).unwrap(), "{}");
+
+        let restricted = SendRules {
+            send_media: false,
+            send_stickers: false,
+            send_gifs: false,
+            slowmode_seconds: 30,
+            slowmode_next_send: Some(1_025),
+            ban_until: Some(2_000),
+            paid_stars: Some(50),
+            ..SendRules::default()
+        };
+        assert!(!restricted.allows_any_attachment());
+        assert_eq!(restricted.slowmode_remaining(1_000), 25);
+        assert_eq!(restricted.slowmode_remaining(1_030), 0);
+        let wire = serde_json::to_string(&restricted).unwrap();
+        let back: SendRules = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, restricted);
+
+        let paid = Outgoing { allow_paid_stars: Some(50), ..Outgoing::default() };
+        assert!(!paid.is_plain());
+        let back_paid: Outgoing = serde_json::from_str(&serde_json::to_string(&paid).unwrap()).unwrap();
+        assert_eq!(back_paid, paid);
     }
 }

@@ -82,6 +82,100 @@ pub struct CallFlags {
     pub video_available: bool,
 }
 
+/// Subset of Telegram's `ChatBannedRights` flags relevant to composing and sending.
+/// Stored as a plain `Eq` struct so [`Known`] keeps `Eq` without depending on TL derives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BannedRights {
+    pub send_messages: bool,
+    pub send_plain: bool,
+    pub send_media: bool,
+    pub send_photos: bool,
+    pub send_videos: bool,
+    pub send_roundvideos: bool,
+    pub send_audios: bool,
+    pub send_voices: bool,
+    pub send_docs: bool,
+    pub send_stickers: bool,
+    pub send_gifs: bool,
+    pub embed_links: bool,
+    pub send_polls: bool,
+    pub until_date: i32,
+}
+
+impl BannedRights {
+    pub fn from_tl(rights: &tl::enums::ChatBannedRights) -> BannedRights {
+        let tl::enums::ChatBannedRights::Rights(r) = rights;
+        BannedRights {
+            send_messages: r.send_messages,
+            send_plain: r.send_plain,
+            send_media: r.send_media,
+            send_photos: r.send_photos,
+            send_videos: r.send_videos,
+            send_roundvideos: r.send_roundvideos,
+            send_audios: r.send_audios,
+            send_voices: r.send_voices,
+            send_docs: r.send_docs,
+            send_stickers: r.send_stickers,
+            send_gifs: r.send_gifs,
+            embed_links: r.embed_links,
+            send_polls: r.send_polls,
+            until_date: r.until_date,
+        }
+    }
+
+    pub fn active(&self, now: i64) -> bool {
+        self.until_date == 0 || i64::from(self.until_date) > now
+    }
+
+    fn apply(&self, rules: &mut protocol::SendRules) {
+        if self.send_messages {
+            rules.send_messages = false;
+        }
+        if self.send_plain {
+            rules.send_plain = false;
+        }
+        if self.send_media {
+            rules.send_media = false;
+            rules.send_photos = false;
+            rules.send_videos = false;
+            rules.send_round_videos = false;
+            rules.send_audios = false;
+            rules.send_voices = false;
+            rules.send_files = false;
+        }
+        if self.send_photos {
+            rules.send_photos = false;
+        }
+        if self.send_videos {
+            rules.send_videos = false;
+        }
+        if self.send_roundvideos {
+            rules.send_round_videos = false;
+        }
+        if self.send_audios {
+            rules.send_audios = false;
+        }
+        if self.send_voices {
+            rules.send_voices = false;
+        }
+        if self.send_docs {
+            rules.send_files = false;
+        }
+        if self.send_stickers {
+            rules.send_stickers = false;
+        }
+        if self.send_gifs {
+            rules.send_gifs = false;
+        }
+        if self.embed_links {
+            rules.embed_links = false;
+        }
+        if self.send_polls {
+            rules.send_polls = false;
+        }
+    }
+}
+
 /// What is remembered of one peer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Known {
@@ -99,6 +193,14 @@ pub struct Known {
     pub member: Option<bool>,
     /// We may read but not write: a channel we do not run, a group we were removed from.
     pub read_only: bool,
+    /// We created this group or channel.
+    pub creator: bool,
+    /// We hold admin rights in this group or channel.
+    pub admin: bool,
+    /// Group-wide default send restrictions (apply to non-admin members).
+    pub default_banned: Option<BannedRights>,
+    /// Personal send restrictions placed on us in a supergroup/channel.
+    pub personal_banned: Option<BannedRights>,
     /// Per-conversation moderation / pin rights from Telegram's creator/admin/banned flags.
     pub rights: protocol::ConversationRights,
     /// The picture's id and the datacenter that serves it. 0 for none.
@@ -137,6 +239,50 @@ impl Known {
     /// As a note in the store: the hash, then the name.
     fn note(&self) -> Option<String> {
         Some(format!("{}\t{}", self.hash?, self.name))
+    }
+
+    /// Merges group `default_banned` (for non-admins) and `personal_banned` (for non-creators),
+    /// slow-mode fields from `ChannelFull`, and paid-message star price into [`protocol::SendRules`].
+    pub fn send_rules(
+        &self,
+        now: i64,
+        slowmode_seconds: u32,
+        slowmode_next_send: Option<i64>,
+        paid_stars: Option<u64>,
+    ) -> protocol::SendRules {
+        let mut rules = protocol::SendRules::default();
+        if self.broadcast && self.read_only {
+            rules.send_messages = false;
+            return rules;
+        }
+        if !self.creator && !self.admin {
+            if let Some(default_banned) = self.default_banned.filter(|r| r.active(now)) {
+                default_banned.apply(&mut rules);
+                if default_banned.send_messages && default_banned.until_date > 0 {
+                    rules.ban_until = Some(i64::from(default_banned.until_date));
+                }
+            }
+            if slowmode_seconds > 0 {
+                rules.slowmode_seconds = slowmode_seconds;
+                rules.slowmode_next_send = slowmode_next_send.filter(|&ts| ts > now);
+            }
+            if let Some(stars) = paid_stars.filter(|&s| s > 0) {
+                rules.paid_stars = Some(stars);
+            }
+        }
+        if !self.creator {
+            if let Some(personal) = self.personal_banned.filter(|r| r.active(now)) {
+                personal.apply(&mut rules);
+                if personal.send_messages && personal.until_date > 0 {
+                    let until = i64::from(personal.until_date);
+                    rules.ban_until = Some(rules.ban_until.map_or(until, |prev| prev.max(until)));
+                }
+            }
+        }
+        if self.read_only {
+            rules.send_messages = false;
+        }
+        rules
     }
 }
 
@@ -251,6 +397,9 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 name: chat.title.clone(),
                 member: Some(active),
                 read_only: chat.left || chat.deactivated || member_cannot_send(chat.creator, chat.admin_rights.is_some(), chat.default_banned_rights.as_ref(), None),
+                creator: chat.creator,
+                admin: chat.admin_rights.is_some(),
+                default_banned: chat.default_banned_rights.as_ref().map(BannedRights::from_tl),
                 rights,
                 photo,
                 photo_dc,
@@ -304,6 +453,10 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 forum: channel.forum,
                 member: (!channel.min).then_some(!channel.left),
                 read_only: channel.left || restricted,
+                creator: channel.creator,
+                admin: channel.admin_rights.is_some(),
+                default_banned: channel.default_banned_rights.as_ref().map(BannedRights::from_tl),
+                personal_banned: channel.banned_rights.as_ref().map(BannedRights::from_tl),
                 rights,
                 photo,
                 photo_dc,
@@ -416,6 +569,10 @@ impl Directory {
                 known.member = before.and_then(|before| before.member);
                 if let Some(before) = before {
                     known.read_only = before.read_only;
+                    known.creator = before.creator;
+                    known.admin = before.admin;
+                    known.default_banned = before.default_banned;
+                    known.personal_banned = before.personal_banned;
                     known.rights = before.rights;
                 }
             }
@@ -673,5 +830,67 @@ mod tests {
         assert_eq!(Who::Group(7).text(), "g7");
         assert_eq!(message_link(Who::Channel(9), None, 4), "https://t.me/c/9/4");
         assert_eq!(message_link(Who::User(3), None, 4), "tg://openmessage?user_id=3&message_id=4");
+    }
+
+    #[test]
+    fn send_rules_merges_default_and_personal_bans_and_exempts_admins() {
+        let mut channel = megagroup("trail");
+        let default_rights = tl::types::ChatBannedRights {
+            view_messages: false,
+            send_messages: false,
+            send_media: true,
+            send_stickers: true,
+            send_gifs: false,
+            send_games: false,
+            send_inline: false,
+            embed_links: true,
+            send_polls: true,
+            change_info: false,
+            invite_users: false,
+            pin_messages: false,
+            manage_topics: false,
+            send_photos: false,
+            send_videos: false,
+            send_roundvideos: false,
+            send_audios: false,
+            send_voices: false,
+            send_docs: false,
+            send_plain: false,
+            edit_rank: false,
+            send_reactions: false,
+            until_date: 0,
+        };
+        let personal_rights = tl::types::ChatBannedRights {
+            send_gifs: true,
+            send_messages: true,
+            until_date: 2_000,
+            ..default_rights.clone()
+        };
+        channel.default_banned_rights = Some(default_rights.into());
+        channel.banned_rights = Some(personal_rights.into());
+        let known = of_chat(&channel.clone().into()).expect("a chat").1;
+        let rules = known.send_rules(1_500, 30, Some(1_520), Some(15));
+        assert!(!rules.send_messages);
+        assert!(!rules.send_media);
+        assert!(!rules.send_photos && !rules.send_voices && !rules.send_files);
+        assert!(!rules.send_stickers && !rules.send_gifs && !rules.embed_links && !rules.send_polls);
+        assert_eq!(rules.ban_until, Some(2_000));
+        assert_eq!(rules.slowmode_seconds, 30);
+        assert_eq!(rules.slowmode_next_send, Some(1_520));
+        assert_eq!(rules.paid_stars, Some(15));
+
+        // After the personal mute expires, only group default bans remain.
+        let after = known.send_rules(2_500, 30, None, None);
+        assert!(!after.send_media && !after.send_stickers && after.send_gifs);
+        assert_eq!(after.ban_until, None);
+
+        // Admins bypass default bans, slow mode, and paid stars.
+        let mut as_admin = channel.clone();
+        as_admin.banned_rights = None;
+        as_admin.admin_rights = Some(admin(false));
+        let admin_rules = of_chat(&as_admin.into()).expect("a chat").1.send_rules(1_500, 30, Some(1_520), Some(15));
+        assert!(admin_rules.send_messages && admin_rules.send_media && admin_rules.send_stickers);
+        assert_eq!(admin_rules.slowmode_seconds, 0);
+        assert_eq!(admin_rules.paid_stars, None);
     }
 }

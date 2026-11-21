@@ -22,10 +22,11 @@ impl Fault {
         matches!(self, Fault::Rpc { name: have, .. } if have == name)
     }
 
-    /// The seconds Telegram said to wait before asking again.
+    /// The seconds Telegram said to wait before asking again. Slow-mode waits carry code 420 too,
+    /// so exclude them: a slow-mode wait belongs to the chat's cooldown, not a global flood retry.
     pub fn flood(&self) -> Option<u64> {
         match self {
-            Fault::Rpc { code: 420, value: Some(seconds), .. } => Some(u64::from(*seconds)),
+            Fault::Rpc { code: 420, name, value: Some(seconds) } if name != "SLOWMODE_WAIT" => Some(u64::from(*seconds)),
             _ => None,
         }
     }
@@ -49,11 +50,31 @@ impl Fault {
     pub fn words(&self) -> String {
         match self {
             Fault::Rpc { .. } if self.flood().is_some() => wait_words(self.flood().unwrap_or(0)),
-            Fault::Rpc { name, .. } => match name.as_str() {
+            Fault::Rpc { name, value, .. } => match name.as_str() {
                 "CHAT_WRITE_FORBIDDEN" | "CHAT_SEND_PLAIN_FORBIDDEN" => "You can't write in this chat.".to_owned(),
                 "USER_IS_BLOCKED" | "YOU_BLOCKED_USER" => "You can't message this person.".to_owned(),
                 "USER_BANNED_IN_CHANNEL" => "You are not allowed to post here.".to_owned(),
-                "SLOWMODE_WAIT" => "Slow mode is on in this chat. Try again in a moment.".to_owned(),
+                "SLOWMODE_WAIT" => match value {
+                    Some(secs) if *secs >= 90 => format!("Slow mode is on in this chat. Try again in {} minutes.", secs.div_ceil(60)),
+                    Some(secs) if *secs > 0 => format!("Slow mode is on in this chat. Try again in {secs} seconds."),
+                    _ => "Slow mode is on in this chat. Try again in a moment.".to_owned(),
+                },
+                "CHAT_SEND_MEDIA_FORBIDDEN" => "Admins don't allow media in this chat.".to_owned(),
+                "CHAT_SEND_PHOTOS_FORBIDDEN" => "Admins don't allow photos in this chat.".to_owned(),
+                "CHAT_SEND_VIDEOS_FORBIDDEN" => "Admins don't allow videos in this chat.".to_owned(),
+                "CHAT_SEND_ROUNDVIDEOS_FORBIDDEN" => "Admins don't allow video messages in this chat.".to_owned(),
+                "CHAT_SEND_AUDIOS_FORBIDDEN" => "Admins don't allow audio files in this chat.".to_owned(),
+                "CHAT_SEND_VOICES_FORBIDDEN" => "Admins don't allow voice messages in this chat.".to_owned(),
+                "CHAT_SEND_DOCS_FORBIDDEN" => "Admins don't allow files in this chat.".to_owned(),
+                "CHAT_SEND_STICKERS_FORBIDDEN" => "Admins don't allow stickers in this chat.".to_owned(),
+                "CHAT_SEND_GIFS_FORBIDDEN" => "Admins don't allow GIFs in this chat.".to_owned(),
+                "CHAT_SEND_POLL_FORBIDDEN" => "Admins don't allow polls in this chat.".to_owned(),
+                "CHAT_SEND_INLINE_FORBIDDEN" => "Admins don't allow inline bots in this chat.".to_owned(),
+                "CHAT_SEND_WEBPAGE_FORBIDDEN" => "Admins don't allow link previews in this chat.".to_owned(),
+                "ALLOW_PAYMENT_REQUIRED" => match value {
+                    Some(stars) if *stars > 0 => format!("Sending a message here costs {stars} Telegram Stars."),
+                    _ => "Sending a message here requires Telegram Stars.".to_owned(),
+                },
                 "MESSAGE_TOO_LONG" => "That message is too long for Telegram.".to_owned(),
                 "MESSAGE_EDIT_TIME_EXPIRED" => "This message is too old to edit.".to_owned(),
                 "MESSAGE_NOT_MODIFIED" => "Nothing was changed.".to_owned(),
@@ -212,5 +233,18 @@ mod tests {
         assert!(compat.words().contains("protocol"), "{}", compat.words());
         let outdated = Fault::Rpc { code: 400, name: "PARTICIPANT_VERSION_OUTDATED".into(), value: None };
         assert!(outdated.words().contains("update"), "{}", outdated.words());
+    }
+
+    #[test]
+    fn slowmode_media_and_paid_errors_map_to_plain_words() {
+        let slow = Fault::Rpc { code: 420, name: "SLOWMODE_WAIT".into(), value: Some(25) };
+        assert_eq!(slow.flood(), None, "slow mode is not a global flood wait");
+        assert!(slow.words().contains("25 seconds"), "{}", slow.words());
+        let media = Fault::Rpc { code: 403, name: "CHAT_SEND_MEDIA_FORBIDDEN".into(), value: None };
+        assert!(media.words().contains("media"), "{}", media.words());
+        let stickers = Fault::Rpc { code: 403, name: "CHAT_SEND_STICKERS_FORBIDDEN".into(), value: None };
+        assert!(stickers.words().contains("stickers"), "{}", stickers.words());
+        let paid = Fault::Rpc { code: 403, name: "ALLOW_PAYMENT_REQUIRED".into(), value: Some(50) };
+        assert!(paid.words().contains("50 Telegram Stars"), "{}", paid.words());
     }
 }

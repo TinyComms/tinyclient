@@ -27,6 +27,7 @@ fn options(with: &Outgoing) -> Options {
         silent: with.silent,
         no_webpage: with.suppress_embeds,
         schedule: with.schedule.and_then(|at| i32::try_from(at).ok()),
+        allow_paid_stars: with.allow_paid_stars.and_then(|n| i64::try_from(n).ok()).filter(|&n| n > 0),
     }
 }
 
@@ -123,7 +124,7 @@ fn send_pick(account: &Account, conversation: &str, client_id: &str, text: &str,
                 schedule_date: opts.schedule,
                 send_as: None,
                 quick_reply_shortcut: None,
-                allow_paid_stars: None,
+                allow_paid_stars: opts.allow_paid_stars,
             })?;
             (sent, "")
         }
@@ -286,7 +287,7 @@ fn send_media(
         send_as: None,
         quick_reply_shortcut: None,
         effect: None,
-        allow_paid_stars: None,
+        allow_paid_stars: opts.allow_paid_stars,
         suggested_post: None,
     }
 }
@@ -380,7 +381,7 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
                     send_as: None,
                     quick_reply_shortcut: None,
                     effect: None,
-                    allow_paid_stars: None,
+                    allow_paid_stars: opts.allow_paid_stars,
                 })
                 .map_err(words)?;
             if first.is_none() {

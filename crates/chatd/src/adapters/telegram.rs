@@ -290,6 +290,8 @@ pub(super) struct Options {
     pub no_webpage: bool,
     /// Unix seconds: Telegram sends it then.
     pub schedule: Option<i32>,
+    /// Explicit consent to pay up to this many Stars for a paid message.
+    pub allow_paid_stars: Option<i64>,
 }
 
 /// One connection's worth of an account: what every thread of the adapter shares.
@@ -774,6 +776,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::ReactionRules { conversation_id, reply } => {
             let _ = reply.send(react::rules(account, &conversation_id).map_err(refused));
         }
+        Command::SendRules { conversation_id, reply } => {
+            let _ = reply.send(info::send_rules(account, &conversation_id).map_err(refused));
+        }
         Command::Edit { conversation_id, message_id, text, spans, reply } => {
             let _ = reply.send(edit(account, &conversation_id, &message_id, &text, &spans).map_err(refused));
         }
@@ -1094,7 +1099,7 @@ fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str,
         send_as: None,
         quick_reply_shortcut: None,
         effect: None,
-        allow_paid_stars: None,
+        allow_paid_stars: opts.allow_paid_stars,
         suggested_post: None,
         rich_message: None,
     };

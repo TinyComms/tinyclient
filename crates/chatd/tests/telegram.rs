@@ -3907,3 +3907,67 @@ fn voice_and_round_video_messages_track_listened_state_and_send_read_contents() 
     world.steer("read-contents 62");
     assert_eq!(world.conversation("g8001").unwrap().mentions, before_mentions - 1);
 }
+
+#[test]
+fn send_rules_reflect_media_bans_slow_mode_and_paid_stars() {
+    let world = World::signed_in();
+    world.connected();
+
+    // 1. Group with media banned + 30s slow mode reports those rules and starts countdown on send.
+    world.steer("ban-media");
+    world.steer("slowmode 30");
+    let Response::SendRules { rules, .. } = world.ask(Request::SendRules { conversation: key("c9002_31") }) else {
+        panic!("expected SendRules");
+    };
+    assert!(!rules.send_media && !rules.allows_any_attachment());
+    assert!(!rules.send_stickers && !rules.send_gifs && !rules.send_voices);
+    assert!(rules.send_messages && rules.send_plain);
+    assert_eq!(rules.slowmode_seconds, 30);
+    assert_eq!(rules.slowmode_next_send, None);
+
+    // Sending a message in the slow-mode chat sets the cached next-send timestamp.
+    world.send("c9002_31", "5351", "Checked the bearings", None);
+    let _ = world.until("slowmode message sent", || {
+        world.messages("c9002_31").into_iter().find(|m| m.text == "Checked the bearings" && m.state == SendState::Sent)
+    });
+    let Response::SendRules { rules: after_send, .. } = world.ask(Request::SendRules { conversation: key("c9002_31") }) else {
+        panic!("expected SendRules after send");
+    };
+    assert!(after_send.slowmode_next_send.is_some(), "slow mode cooldown must start after send");
+
+    // 2. Paid messages (send_paid_messages_stars): price is reported, silent send fails, explicit
+    //    allow_paid_stars succeeds and passes allow_paid_stars on the wire.
+    world.steer("paid-stars 25");
+    let Response::SendRules { rules: paid_rules, .. } = world.ask(Request::SendRules { conversation: key("u7003") }) else {
+        panic!("expected SendRules for paid user");
+    };
+    assert_eq!(paid_rules.paid_stars, Some(25));
+
+    // Sending without allow_paid_stars fails with a plain-English Stars error.
+    world.send("u7003", "5352", "unpaid hello", None);
+    let failed = world.until("unpaid send fails", || {
+        world.messages("u7003").into_iter().find(|m| {
+            m.text == "unpaid hello" && matches!(m.state, SendState::Failed { .. })
+        })
+    });
+    let SendState::Failed { reason } = failed.state else { unreachable!() };
+    assert!(reason.contains("25 Telegram Stars"), "{reason}");
+
+    // Sending with explicit allow_paid_stars succeeds and passes allow_paid_stars on the wire.
+    let res = world.ask(Request::Send {
+        conversation: key("u7003"),
+        client_id: "5353".into(),
+        text: "paid hello".into(),
+        reply_to: None,
+        with: protocol::Outgoing { allow_paid_stars: Some(25), ..protocol::Outgoing::default() },
+    });
+    assert!(matches!(res, Response::Sent { .. }), "{res:?}");
+    let _ = world.until("paid send succeeds", || {
+        world.messages("u7003").into_iter().find(|m| m.text == "paid hello" && m.state == SendState::Sent)
+    });
+    assert!(
+        world.calls().iter().any(|c| c.contains("SendMessage u7003 paid hello") && c.contains("[stars=25]")),
+        "{:#?}",
+        world.calls()
+    );
+}
