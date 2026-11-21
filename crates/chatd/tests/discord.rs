@@ -328,6 +328,8 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             (200, ch)
         }
         ("PATCH", ["guilds", _guild, "channels"]) => (204, Value::Null),
+        ("PUT", ["channels", _channel, "permissions", _target]) => (204, Value::Null),
+        ("DELETE", ["channels", _channel, "permissions", _target]) => (204, Value::Null),
         ("PUT", ["channels", channel, "recipients", "@me"]) => (200, json!({"id": channel, "type": 1, "is_message_request": false})),
         ("GET", ["channels", channel, "messages", "pins"]) => {
             let pinned = json!({
@@ -5413,4 +5415,155 @@ fn channel_and_category_create_edit_move_delete_and_permissions() {
     assert_eq!(world.discord.requests_to("DELETE", &format!("/channels/{ch_id}")).len(), 1);
     assert_eq!(world.ask(Request::DeleteChannel { conversation: world.key(&cat_id) }), Response::Ok);
     assert_eq!(world.discord.requests_to("DELETE", &format!("/channels/{cat_id}")).len(), 1);
+}
+
+#[test]
+fn channel_permissions_overwrites_sync_unknown_bits_and_lockout_guard() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Grant user 1000 VIEW_CHANNEL (1<<10) + SEND_MESSAGES (1<<11) + MANAGE_ROLES (1<<28) on guild 4000 (not owner/admin).
+    let perms = (1u64 << 10) | (1u64 << 11) | (1u64 << 28);
+    ready["guilds"][0]["roles"][0]["permissions"] = json!(perms.to_string());
+    // Give category 4100 (parent of 4101) a custom overwrite with an unknown high bit (1<<60) so we test sync + unknown bit preservation.
+    let unknown_bit = 1u64 << 60;
+    if let Some(channels) = ready["guilds"][0]["channels"].as_array_mut() {
+        for ch in channels.iter_mut() {
+            if ch["id"] == "4100" {
+                ch["permission_overwrites"] = json!([
+                    {"id": "4010", "type": 0, "allow": ((1u64 << 10) | unknown_bit).to_string(), "deny": "0"}
+                ]);
+            }
+        }
+    }
+    // Guild 4888 has no MANAGE_ROLES.
+    ready["guilds"].as_array_mut().unwrap().push(json!({
+        "id": "4888",
+        "properties": {"id": "4888", "name": "ReadOnly", "owner_id": "2001", "icon": null},
+        "roles": [{"id": "4888", "name": "@everyone", "permissions": "1024"}],
+        "channels": [{"id": "4881", "type": 0, "name": "lobby", "position": 0, "permission_overwrites": []}],
+        "members": [{"user": me(), "roles": []}],
+        "voice_states": []
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // 1. Without MANAGE_ROLES on 4888, all 4 permission requests are refused locally with no HTTP calls.
+    for req in [
+        Request::ChannelPermissions { conversation: world.key("4881") },
+        Request::SetOverwrite {
+            conversation: world.key("4881"),
+            target_id: "4888".into(),
+            target_kind: protocol::OverwriteTargetKind::Role,
+            allow: 0,
+            deny: 1024,
+        },
+        Request::DeleteOverwrite { conversation: world.key("4881"), target_id: "4888".into() },
+        Request::SyncChannelPermissions { conversation: world.key("4881") },
+    ] {
+        match world.ask(req) {
+            Response::Error { code: ErrorCode::Refused, detail } => {
+                assert!(detail.contains("permission"), "expected permission refusal, got {detail}");
+            }
+            other => panic!("expected Refused without MANAGE_ROLES, got {other:?}"),
+        }
+    }
+    assert!(world.discord.requests_to("PUT", "/channels/4881/permissions/").is_empty());
+
+    // 2. Reading permissions on channel 4101 (child of category 4050) reports roles and unsynced status.
+    let info = match world.ask(Request::ChannelPermissions { conversation: world.key("4101") }) {
+        Response::ChannelPermissions { info } => *info,
+        other => panic!("expected ChannelPermissions, got {other:?}"),
+    };
+    assert_eq!(info.everyone_role_id, "4000");
+    assert_eq!(info.synced_with_category, Some(false));
+    assert!(info.roles.iter().any(|r| r.id == "4010" && r.name == "mods"));
+
+    // 3. Self-lockout guard blocks denying VIEW_CHANNEL to @everyone while we have no compensating allow overwrite.
+    match world.ask(Request::SetOverwrite {
+        conversation: world.key("4101"),
+        target_id: "4000".into(),
+        target_kind: protocol::OverwriteTargetKind::Role,
+        allow: 0,
+        deny: protocol::PERM_VIEW_CHANNEL,
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("lock you out"), "got: {detail}");
+        }
+        other => panic!("expected self-lockout refusal, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("PUT", "/channels/4101/permissions/4000").is_empty());
+
+    // 4. First allow role 4010 (which user 1000 holds) to VIEW_CHANNEL + unknown bit, then deny @everyone VIEW_CHANNEL.
+    let allow_with_unknown = protocol::PERM_VIEW_CHANNEL | unknown_bit;
+    assert_eq!(
+        world.ask(Request::SetOverwrite {
+            conversation: world.key("4101"),
+            target_id: "4010".into(),
+            target_kind: protocol::OverwriteTargetKind::Role,
+            allow: allow_with_unknown,
+            deny: 0,
+        }),
+        Response::Ok
+    );
+    let puts = world.discord.requests_to("PUT", "/channels/4101/permissions/4010");
+    assert_eq!(puts.len(), 1);
+    assert_eq!(puts[0].body["type"], 0);
+    assert_eq!(puts[0].body["allow"], allow_with_unknown.to_string());
+    assert_eq!(puts[0].body["deny"], "0");
+
+    assert_eq!(
+        world.ask(Request::SetOverwrite {
+            conversation: world.key("4101"),
+            target_id: "4000".into(),
+            target_kind: protocol::OverwriteTargetKind::Role,
+            allow: 0,
+            deny: protocol::PERM_VIEW_CHANNEL,
+        }),
+        Response::Ok
+    );
+    match world.ask(Request::ChannelPermissions { conversation: world.key("4101") }) {
+        Response::ChannelPermissions { info } => {
+            assert!(info.private, "denying VIEW_CHANNEL to @everyone must mark channel private");
+            let mod_ov = info.overwrites.iter().find(|o| o.id == "4010").expect("4010 overwrite");
+            assert_eq!(mod_ov.allow & unknown_bit, unknown_bit, "unknown bit must survive round-trip");
+        }
+        other => panic!("expected ChannelPermissions, got {other:?}"),
+    }
+
+    // 5. DeleteOverwrite removes @everyone overwrite and restores public visibility.
+    assert_eq!(
+        world.ask(Request::DeleteOverwrite {
+            conversation: world.key("4101"),
+            target_id: "4000".into(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/channels/4101/permissions/4000").len(), 1);
+
+    // 6. SyncChannelPermissions copies category 4100's overwrites onto 4101 via PATCH /channels/4101.
+    assert_eq!(
+        world.ask(Request::SyncChannelPermissions { conversation: world.key("4101") }),
+        Response::Ok
+    );
+    let sync_patches = world.discord.requests_to("PATCH", "/channels/4101");
+    assert_eq!(sync_patches.len(), 1);
+    assert_eq!(sync_patches[0].body["permission_overwrites"][0]["id"], "4010");
+    assert_eq!(sync_patches[0].body["permission_overwrites"][0]["allow"], allow_with_unknown.to_string());
+    match world.ask(Request::ChannelPermissions { conversation: world.key("4101") }) {
+        Response::ChannelPermissions { info } => {
+            assert_eq!(info.synced_with_category, Some(true));
+        }
+        other => panic!("expected ChannelPermissions, got {other:?}"),
+    }
+
+    // 7. Category permissions themselves can be read via category id 4100.
+    match world.ask(Request::ChannelPermissions { conversation: world.key("4100") }) {
+        Response::ChannelPermissions { info } => {
+            assert!(info.is_category);
+            assert_eq!(info.overwrites.len(), 1);
+            assert_eq!(info.overwrites[0].id, "4010");
+        }
+        other => panic!("expected category ChannelPermissions, got {other:?}"),
+    }
 }

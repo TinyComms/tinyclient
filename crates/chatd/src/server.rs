@@ -3258,6 +3258,57 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::ChannelPermissions { conversation } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::ChannelPermissions { conversation_id, reply }) {
+                    Ok(info) => Response::ChannelPermissions { info: Box::new(info) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SetOverwrite { conversation, target_id, target_kind, allow, deny } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::SetOverwrite {
+                    conversation_id,
+                    target_id,
+                    target_kind,
+                    allow,
+                    deny,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteOverwrite { conversation, target_id } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::DeleteOverwrite { conversation_id, target_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SyncChannelPermissions { conversation } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::SyncChannelPermissions { conversation_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::CreateGroup { account, members, name } => {
                 let started = self.ask(&account, |reply| Command::CreateGroup {
                     members,

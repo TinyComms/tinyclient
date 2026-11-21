@@ -463,6 +463,31 @@ pub enum Command {
         conversation_id: String,
         reply: Reply<()>,
     },
+    /// Read a channel's or category's permission overwrites and roles.
+    ChannelPermissions {
+        conversation_id: String,
+        reply: Reply<protocol::ChannelPermissionsInfo>,
+    },
+    /// Set a role or member permission overwrite on a channel or category.
+    SetOverwrite {
+        conversation_id: String,
+        target_id: String,
+        target_kind: protocol::OverwriteTargetKind,
+        allow: u64,
+        deny: u64,
+        reply: Reply<()>,
+    },
+    /// Delete a role or member permission overwrite from a channel or category.
+    DeleteOverwrite {
+        conversation_id: String,
+        target_id: String,
+        reply: Reply<()>,
+    },
+    /// Sync a channel's permission overwrites with its parent category.
+    SyncChannelPermissions {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
     /// Create a group conversation with two or more members (person ids or phone numbers) and an optional name.
     CreateGroup {
         members: Vec<String>,
@@ -879,7 +904,11 @@ impl Command {
             | Command::ConversationPicture { reply, .. }
             | Command::EditChannel { reply, .. }
             | Command::MoveChannels { reply, .. }
-            | Command::DeleteChannel { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::DeleteChannel { reply, .. }
+            | Command::SetOverwrite { reply, .. }
+            | Command::DeleteOverwrite { reply, .. }
+            | Command::SyncChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateCategory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StartDirect { reply, .. }
             | Command::StartDirectCall { reply, .. }

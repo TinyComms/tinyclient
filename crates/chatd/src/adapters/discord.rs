@@ -1917,6 +1917,18 @@ impl Discord {
             Command::DeleteChannel { conversation_id, reply } => {
                 answer(reply, self.delete_channel(&conversation_id))
             }
+            Command::ChannelPermissions { conversation_id, reply } => {
+                answer(reply, self.channel_permissions(&conversation_id))
+            }
+            Command::SetOverwrite { conversation_id, target_id, target_kind, allow, deny, reply } => {
+                answer(reply, self.set_overwrite(&conversation_id, &target_id, target_kind, allow, deny))
+            }
+            Command::DeleteOverwrite { conversation_id, target_id, reply } => {
+                answer(reply, self.delete_overwrite(&conversation_id, &target_id))
+            }
+            Command::SyncChannelPermissions { conversation_id, reply } => {
+                answer(reply, self.sync_channel_permissions(&conversation_id))
+            }
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),
             Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true)),

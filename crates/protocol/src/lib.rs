@@ -15,6 +15,7 @@ pub mod browser;
 mod call;
 pub mod crash;
 pub mod device_approval;
+pub mod discord_perms;
 mod e2ee;
 pub mod highlight;
 pub mod hotkey;
@@ -39,6 +40,7 @@ pub mod web_sign_in;
 
 pub use call::*;
 pub use crash::redact;
+pub use discord_perms::*;
 pub use e2ee::*;
 pub use info::*;
 pub use ipc::{ChatListener, ChatStream};
@@ -1566,6 +1568,30 @@ pub enum Request {
     },
     /// Permanently delete a channel or category in a Space (`DELETE /channels/{id}`).
     DeleteChannel {
+        conversation: Key,
+    },
+    /// Read a channel's or category's permission overwrites and role list (`#397`).
+    /// Answers `Response::ChannelPermissions`.
+    ChannelPermissions {
+        conversation: Key,
+    },
+    /// Create or update one role/member permission overwrite on a channel or category
+    /// (`PUT /channels/{id}/permissions/{target}`).
+    SetOverwrite {
+        conversation: Key,
+        target_id: String,
+        target_kind: OverwriteTargetKind,
+        allow: u64,
+        deny: u64,
+    },
+    /// Delete one role/member permission overwrite from a channel or category
+    /// (`DELETE /channels/{id}/permissions/{target}`).
+    DeleteOverwrite {
+        conversation: Key,
+        target_id: String,
+    },
+    /// Copy the parent category's permission overwrites onto a channel (`PATCH /channels/{id}`).
+    SyncChannelPermissions {
         conversation: Key,
     },
     /// Starts a new group conversation with two or more members (by person id or phone number)
@@ -3173,6 +3199,10 @@ pub enum Response {
     /// One updated/rescheduled message (`Request::RescheduleMessage`).
     ScheduledMessage {
         message: ScheduledMessage,
+    },
+    /// Permission overwrites and role list for a channel or category (`Request::ChannelPermissions`).
+    ChannelPermissions {
+        info: Box<ChannelPermissionsInfo>,
     },
 }
 

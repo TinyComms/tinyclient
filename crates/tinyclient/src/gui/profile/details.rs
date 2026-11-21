@@ -321,6 +321,25 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         }
         top = top.child(manage_bar);
     }
+    if network == Network::Discord
+        && row.rights.manage_permissions
+        && !row.kind.is_direct()
+        && row.kind != ConversationKind::Thread
+    {
+        let perm_key = row.key.clone();
+        top = top.child(
+            div().mt(px(8.)).child(
+                button_with_icon("details-discord-perms", ButtonKind::Secondary, "icons/lock.svg", "Permissions…")
+                    .h(px(28.))
+                    .px(px(10.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        let key = perm_key.clone();
+                        pane.shell_do(cx, move |shell, cx| shell.open_channel_permissions(key, cx));
+                    })),
+            ),
+        );
+    }
     if let Some((mkey, _, input)) = pane.managing() {
         if mkey == &row.key {
             top = top.child(

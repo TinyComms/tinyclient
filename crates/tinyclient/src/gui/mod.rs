@@ -17,6 +17,7 @@ mod composer;
 mod conversation;
 #[cfg(debug_assertions)]
 pub(crate) mod debug_launch;
+mod discord_admin;
 mod hotkeys;
 mod input;
 mod keymap;

@@ -1042,7 +1042,11 @@ impl Demo {
             Command::CreateCategory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::EditChannel { reply, .. }
             | Command::MoveChannels { reply, .. }
-            | Command::DeleteChannel { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::DeleteChannel { reply, .. }
+            | Command::SetOverwrite { reply, .. }
+            | Command::DeleteOverwrite { reply, .. }
+            | Command::SyncChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

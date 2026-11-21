@@ -397,6 +397,8 @@ impl Shell {
         }
         if self.sidebar_state.switcher.is_some() {
             self.close_switcher(window, cx);
+        } else if self.close_discord_admin(cx) {
+            return true;
         } else if self.sidebar_state.delete_channel.is_some() {
             self.sidebar_state.delete_channel = None;
         } else if self.sidebar_state.move_channels.is_some() {
@@ -1001,39 +1003,56 @@ impl Shell {
             }
             Menu::Group { space, id, name, muted, .. } => {
                 if space.network == Network::Discord {
-                    let manage_channels = self.spaces.iter().any(|s| &s.key == space && s.rights.manage_channels);
-                    if manage_channels {
-                        let create_space = space.clone();
-                        let create_cat = id.clone();
-                        items.push(
-                            menu_item("group-create-channel", Some("icons/plus.svg"), "Create channel…", None)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.close_menu(cx);
-                                    this.open_create_channel(create_space.clone(), Some(create_cat.clone()), cx);
-                                }))
-                                .into_any_element(),
-                        );
-                        let rename_space = space.clone();
-                        let rename_id = id.clone();
-                        let rename_name = name.clone();
-                        items.push(
-                            menu_item("group-rename", Some("icons/pencil.svg"), "Rename category…", None)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.close_menu(cx);
-                                    this.open_edit_category(rename_space.clone(), rename_id.clone(), rename_name.clone(), cx);
-                                }))
-                                .into_any_element(),
-                        );
-                        let delete_key = Key { id: id.clone(), ..space.clone() };
-                        let delete_name = name.clone();
-                        items.push(
-                            menu_item_danger("group-delete", Some("icons/trash-2.svg"), "Delete category…")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.close_menu(cx);
-                                    this.open_delete_channel(delete_key.clone(), delete_name.clone(), true, cx);
-                                }))
-                                .into_any_element(),
-                        );
+                    let space_row = self.spaces.iter().find(|s| &s.key == space);
+                    let manage_channels = space_row.is_some_and(|s| s.rights.manage_channels);
+                    let manage_roles = space_row.is_some_and(|s| s.rights.manage_roles);
+                    if manage_channels || manage_roles {
+                        if manage_channels {
+                            let create_space = space.clone();
+                            let create_cat = id.clone();
+                            items.push(
+                                menu_item("group-create-channel", Some("icons/plus.svg"), "Create channel…", None)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.close_menu(cx);
+                                        this.open_create_channel(create_space.clone(), Some(create_cat.clone()), cx);
+                                    }))
+                                    .into_any_element(),
+                            );
+                            let rename_space = space.clone();
+                            let rename_id = id.clone();
+                            let rename_name = name.clone();
+                            items.push(
+                                menu_item("group-rename", Some("icons/pencil.svg"), "Rename category…", None)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.close_menu(cx);
+                                        this.open_edit_category(rename_space.clone(), rename_id.clone(), rename_name.clone(), cx);
+                                    }))
+                                    .into_any_element(),
+                            );
+                        }
+                        if manage_roles {
+                            let perm_key = Key { id: id.clone(), ..space.clone() };
+                            items.push(
+                                menu_item("group-permissions", Some("icons/lock.svg"), "Category permissions…", None)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.close_menu(cx);
+                                        this.open_channel_permissions(perm_key.clone(), cx);
+                                    }))
+                                    .into_any_element(),
+                            );
+                        }
+                        if manage_channels {
+                            let delete_key = Key { id: id.clone(), ..space.clone() };
+                            let delete_name = name.clone();
+                            items.push(
+                                menu_item_danger("group-delete", Some("icons/trash-2.svg"), "Delete category…")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.close_menu(cx);
+                                        this.open_delete_channel(delete_key.clone(), delete_name.clone(), true, cx);
+                                    }))
+                                    .into_any_element(),
+                            );
+                        }
                         items.push(menu_separator().into_any_element());
                     }
                     if *muted {
@@ -1234,7 +1253,7 @@ impl Shell {
                 if conversation.key.network == Network::Discord
                     && !conversation.kind.is_direct()
                     && conversation.kind != protocol::ConversationKind::Thread
-                    && (conversation.rights.rename || conversation.rights.delete_channel)
+                    && (conversation.rights.rename || conversation.rights.manage_permissions || conversation.rights.delete_channel)
                 {
                     items.push(menu_separator().into_any_element());
                     if conversation.rights.rename {
@@ -1244,6 +1263,17 @@ impl Shell {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.close_menu(cx);
                                     this.open_edit_channel(&edited, cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                    if conversation.rights.manage_permissions {
+                        let perm_key = conversation.key.clone();
+                        items.push(
+                            menu_item("discord-channel-perms", Some("icons/lock.svg"), "Permissions…", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.open_channel_permissions(perm_key.clone(), cx);
                                 }))
                                 .into_any_element(),
                         );
@@ -1820,6 +1850,7 @@ impl Render for Shell {
             .children(self.join_server_modal(cx))
             .children(self.leave_space_modal(cx))
             .children(self.browse_channels_modal(cx))
+            .children(self.discord_admin_layer(cx))
             .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))

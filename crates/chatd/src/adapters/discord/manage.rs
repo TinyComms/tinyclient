@@ -2,10 +2,13 @@
 //! channels and categories (#410).
 
 use super::super::Refusal;
-use super::model::{self, number, Channel, Kept, ADMINISTRATOR, MANAGE_CHANNELS, VIEW_CHANNEL};
+use super::model::{self, number, Channel, Kept, ADMINISTRATOR, MANAGE_CHANNELS, MANAGE_ROLES, VIEW_CHANNEL};
 use super::{ready, refusal, Discord};
 use crate::hub::now;
-use protocol::{ChannelPosition, ConversationKind, Group};
+use protocol::{
+    would_lock_self_out, ChannelOverwrite, ChannelPermissionsInfo, ChannelPosition, ConversationKind, Group,
+    OverwriteTargetKind, SpaceRoleSummary,
+};
 use serde_json::{json, Map, Value};
 
 /// Validates and maps a channel name (trimmed, 1..=100 chars).
@@ -341,6 +344,327 @@ impl Discord {
         self.channel_deleted(gone).map_err(|err| Refusal::Refused(err.to_string()))?;
         Ok(())
     }
+
+    /// Reads a channel's or category's permission overwrites and role list (`#397`).
+    pub(super) fn channel_permissions(&self, channel_id: &str) -> Result<ChannelPermissionsInfo, Refusal> {
+        let Some(guild) = self.guild_of_channel_or_category(channel_id) else {
+            return Err(Refusal::Refused("That channel is no longer available.".to_owned()));
+        };
+        self.require_channel_perm(&guild, channel_id, MANAGE_ROLES, "manage permissions for this channel")?;
+        let kept_list: Vec<Kept> = self
+            .ctx
+            .note(&format!("kept:{guild}"))
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        let channel = match kept_list.iter().find(|k| k.id == channel_id) {
+            Some(found) => Channel {
+                id: found.id.clone(),
+                kind: found.kind,
+                name: found.name.clone(),
+                position: found.position,
+                user_limit: found.limit,
+                bitrate: found.bitrate,
+                parent_id: found.parent.clone(),
+                topic: found.topic.clone(),
+                permission_overwrites: found
+                    .overwrites
+                    .iter()
+                    .map(|(id, member, allow, deny)| model::Overwrite {
+                        id: id.clone(),
+                        member: *member,
+                        allow: *allow,
+                        deny: *deny,
+                    })
+                    .collect(),
+                ..Channel::default()
+            },
+            None => {
+                let raw = self.call("GET", &format!("/channels/{channel_id}"), None).map_err(refusal)?;
+                serde_json::from_str(&raw)
+                    .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?
+            }
+        };
+        let parent_id = channel.parent_id.clone().filter(|p| !p.is_empty());
+        let parent_kept = parent_id.as_deref().and_then(|pid| kept_list.iter().find(|k| k.id == pid));
+        let current_tuples: Vec<(String, bool, u64, u64)> = channel
+            .permission_overwrites
+            .iter()
+            .map(|o| (o.id.clone(), o.member, o.allow, o.deny))
+            .collect();
+        let synced_with_category = parent_kept.map(|parent| overwrites_equal(&current_tuples, &parent.overwrites));
+
+        let (name, is_category, private, my_permissions, is_owner, guild_permissions, my_roles, me_id, parent_name, roles, member_names) = {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(&guild) else {
+                return Err(Refusal::Refused("That server is no longer available.".to_owned()));
+            };
+            let me = state.me.clone();
+            let name = channel.name.clone().unwrap_or_else(|| channel_id.to_owned());
+            let is_category = channel.kind == model::CATEGORY;
+            let private = info.private(&guild, &channel);
+            let my_permissions = info.permissions(&guild, &me, &channel);
+            let guild_permissions = info.guild_permissions(&guild);
+            let my_roles: Vec<String> = info.my_roles.iter().map(u64::to_string).collect();
+            let parent_name = parent_id
+                .as_deref()
+                .and_then(|pid| info.categories.get(pid).map(|(_, n)| n.clone()));
+            let mut roles: Vec<SpaceRoleSummary> = info
+                .roles
+                .iter()
+                .map(|(rid, r)| SpaceRoleSummary {
+                    id: rid.to_string(),
+                    name: r.name.clone(),
+                    permissions: r.permissions,
+                })
+                .collect();
+            roles.sort_by(|a, b| {
+                let a_ev = a.id == guild;
+                let b_ev = b.id == guild;
+                b_ev.cmp(&a_ev).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            });
+            let mut member_names = std::collections::HashMap::new();
+            for ov in &channel.permission_overwrites {
+                if ov.member {
+                    if let Some(n) = state.users.get(&ov.id) {
+                        member_names.insert(ov.id.clone(), n.clone());
+                    }
+                }
+            }
+            (
+                name,
+                is_category,
+                private,
+                my_permissions,
+                info.owner,
+                guild_permissions,
+                my_roles,
+                me,
+                parent_name,
+                roles,
+                member_names,
+            )
+        };
+
+        let mut overwrites: Vec<ChannelOverwrite> = channel
+            .permission_overwrites
+            .iter()
+            .map(|ov| {
+                let kind = if ov.member { OverwriteTargetKind::Member } else { OverwriteTargetKind::Role };
+                let label = if ov.member {
+                    member_names
+                        .get(&ov.id)
+                        .cloned()
+                        .or_else(|| self.ctx.person(&ov.id).ok().flatten().map(|p| p.name))
+                        .unwrap_or_else(|| format!("Member {}", ov.id))
+                } else if ov.id == guild {
+                    "@everyone".to_owned()
+                } else {
+                    roles
+                        .iter()
+                        .find(|r| r.id == ov.id)
+                        .map(|r| r.name.clone())
+                        .unwrap_or_else(|| format!("Role {}", ov.id))
+                };
+                ChannelOverwrite {
+                    id: ov.id.clone(),
+                    kind,
+                    name: label,
+                    allow: ov.allow,
+                    deny: ov.deny,
+                }
+            })
+            .collect();
+        overwrites.sort_by(|a, b| {
+            let a_ev = a.id == guild && a.kind == OverwriteTargetKind::Role;
+            let b_ev = b.id == guild && b.kind == OverwriteTargetKind::Role;
+            b_ev.cmp(&a_ev)
+                .then_with(|| (a.kind != OverwriteTargetKind::Role).cmp(&(b.kind != OverwriteTargetKind::Role)))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+
+        Ok(ChannelPermissionsInfo {
+            conversation: self.ctx.key(channel_id),
+            name,
+            is_category,
+            private,
+            synced_with_category,
+            parent_id,
+            parent_name,
+            my_permissions,
+            is_owner,
+            guild_permissions,
+            my_roles,
+            me_id,
+            everyone_role_id: guild,
+            overwrites,
+            roles,
+        })
+    }
+
+    /// Creates or updates one permission overwrite (`PUT /channels/{id}/permissions/{target}`).
+    pub(super) fn set_overwrite(
+        &self,
+        channel_id: &str,
+        target_id: &str,
+        target_kind: OverwriteTargetKind,
+        allow: u64,
+        deny: u64,
+    ) -> Result<(), Refusal> {
+        let target_id = target_id.trim();
+        if target_id.is_empty() {
+            return Err(Refusal::Refused("Choose a role or member for this overwrite.".to_owned()));
+        }
+        let Some(guild) = self.guild_of_channel_or_category(channel_id) else {
+            return Err(Refusal::Refused("That channel is no longer available.".to_owned()));
+        };
+        self.require_channel_perm(&guild, channel_id, MANAGE_ROLES, "edit permissions for this channel")?;
+        // Server-side self-lockout check so direct requests cannot strip our own access.
+        let current = self.channel_permissions(channel_id)?;
+        if would_lock_self_out(
+            current.is_owner,
+            current.guild_permissions,
+            &current.me_id,
+            &current.everyone_role_id,
+            &current.my_roles,
+            &current.overwrites,
+            target_id,
+            target_kind,
+            Some((allow, deny)),
+        ) {
+            return Err(Refusal::Refused(
+                "That change would lock you out of viewing or managing permissions on this channel.".to_owned(),
+            ));
+        }
+        let body = set_overwrite_body(target_kind, allow, deny);
+        self.call("PUT", &format!("/channels/{channel_id}/permissions/{target_id}"), Some(body))
+            .map_err(refusal)?;
+        let is_member = target_kind == OverwriteTargetKind::Member;
+        self.keep(&guild, |kept| {
+            if let Some(ch) = kept.iter_mut().find(|k| k.id == channel_id) {
+                match ch.overwrites.iter_mut().find(|(id, m, _, _)| id == target_id && *m == is_member) {
+                    Some(existing) => {
+                        existing.2 = allow;
+                        existing.3 = deny;
+                    }
+                    None => ch.overwrites.push((target_id.to_owned(), is_member, allow, deny)),
+                }
+            }
+        });
+        self.replant(&guild).map_err(|err| Refusal::Refused(err.to_string()))?;
+        Ok(())
+    }
+
+    /// Removes one permission overwrite (`DELETE /channels/{id}/permissions/{target}`).
+    pub(super) fn delete_overwrite(&self, channel_id: &str, target_id: &str) -> Result<(), Refusal> {
+        let target_id = target_id.trim();
+        if target_id.is_empty() {
+            return Err(Refusal::Refused("Overwrite target id cannot be empty.".to_owned()));
+        }
+        let Some(guild) = self.guild_of_channel_or_category(channel_id) else {
+            return Err(Refusal::Refused("That channel is no longer available.".to_owned()));
+        };
+        self.require_channel_perm(&guild, channel_id, MANAGE_ROLES, "edit permissions for this channel")?;
+        let current = self.channel_permissions(channel_id)?;
+        if let Some(existing) = current.overwrites.iter().find(|o| o.id == target_id) {
+            if would_lock_self_out(
+                current.is_owner,
+                current.guild_permissions,
+                &current.me_id,
+                &current.everyone_role_id,
+                &current.my_roles,
+                &current.overwrites,
+                target_id,
+                existing.kind,
+                None,
+            ) {
+                return Err(Refusal::Refused(
+                    "Removing that overwrite would lock you out of viewing or managing permissions on this channel.".to_owned(),
+                ));
+            }
+        }
+        self.call("DELETE", &format!("/channels/{channel_id}/permissions/{target_id}"), None)
+            .map_err(refusal)?;
+        self.keep(&guild, |kept| {
+            if let Some(ch) = kept.iter_mut().find(|k| k.id == channel_id) {
+                ch.overwrites.retain(|(id, _, _, _)| id != target_id);
+            }
+        });
+        self.replant(&guild).map_err(|err| Refusal::Refused(err.to_string()))?;
+        Ok(())
+    }
+
+    /// Copies the parent category's permission overwrites onto a channel (`PATCH /channels/{id}`).
+    pub(super) fn sync_channel_permissions(&self, channel_id: &str) -> Result<(), Refusal> {
+        let Some(guild) = self.guild_of_channel_or_category(channel_id) else {
+            return Err(Refusal::Refused("That channel is no longer available.".to_owned()));
+        };
+        self.require_channel_perm(&guild, channel_id, MANAGE_ROLES, "sync permissions for this channel")?;
+        let kept_list: Vec<Kept> = self
+            .ctx
+            .note(&format!("kept:{guild}"))
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        let Some(channel) = kept_list.iter().find(|k| k.id == channel_id) else {
+            return Err(Refusal::Refused("That channel is no longer available.".to_owned()));
+        };
+        let Some(parent_id) = channel.parent.as_deref().filter(|p| !p.is_empty()) else {
+            return Err(Refusal::Refused("This channel is not in a category.".to_owned()));
+        };
+        let Some(parent) = kept_list.iter().find(|k| k.id == parent_id) else {
+            return Err(Refusal::Refused("That channel's parent category is not available.".to_owned()));
+        };
+        let synced = parent.overwrites.clone();
+        let body = sync_overwrites_body(&synced);
+        self.call("PATCH", &format!("/channels/{channel_id}"), Some(body)).map_err(refusal)?;
+        self.keep(&guild, |kept| {
+            if let Some(ch) = kept.iter_mut().find(|k| k.id == channel_id) {
+                ch.overwrites = synced;
+            }
+        });
+        self.replant(&guild).map_err(|err| Refusal::Refused(err.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Builds the JSON body for `PUT /channels/{id}/permissions/{target}` with 64-bit decimal strings.
+pub(super) fn set_overwrite_body(target_kind: OverwriteTargetKind, allow: u64, deny: u64) -> Value {
+    let kind_num = match target_kind {
+        OverwriteTargetKind::Role => 0u8,
+        OverwriteTargetKind::Member => 1u8,
+    };
+    json!({
+        "type": kind_num,
+        "allow": allow.to_string(),
+        "deny": deny.to_string(),
+    })
+}
+
+/// Builds the JSON body for `PATCH /channels/{id}` when syncing overwrites with a parent category.
+pub(super) fn sync_overwrites_body(overwrites: &[(String, bool, u64, u64)]) -> Value {
+    let list: Vec<Value> = overwrites
+        .iter()
+        .map(|(id, member, allow, deny)| {
+            json!({
+                "id": id,
+                "type": if *member { 1u8 } else { 0u8 },
+                "allow": allow.to_string(),
+                "deny": deny.to_string(),
+            })
+        })
+        .collect();
+    json!({ "permission_overwrites": list })
+}
+
+/// Compares two channel overwrite lists ignoring ordering.
+pub(super) fn overwrites_equal(a: &[(String, bool, u64, u64)], b: &[(String, bool, u64, u64)]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut left = a.to_vec();
+    let mut right = b.to_vec();
+    left.sort();
+    right.sort();
+    left == right
 }
 
 #[cfg(test)]
@@ -431,5 +755,33 @@ mod tests {
                 {"id": "4102", "position": 1, "parent_id": null}
             ])
         );
+    }
+
+    #[test]
+    fn set_overwrite_and_sync_bodies_encode_64bit_decimal_strings() {
+        let high_bit = (1u64 << 51) | (1u64 << 60);
+        let body = set_overwrite_body(OverwriteTargetKind::Member, high_bit, 1u64 << 10);
+        assert_eq!(body["type"], 1);
+        assert_eq!(body["allow"], high_bit.to_string());
+        assert_eq!(body["deny"], "1024");
+
+        let sync = sync_overwrites_body(&[
+            ("4000".into(), false, 0, 1024),
+            ("2001".into(), true, 1024, 0),
+        ]);
+        assert_eq!(
+            sync,
+            json!({
+                "permission_overwrites": [
+                    {"id": "4000", "type": 0, "allow": "0", "deny": "1024"},
+                    {"id": "2001", "type": 1, "allow": "1024", "deny": "0"}
+                ]
+            })
+        );
+        assert!(overwrites_equal(
+            &[("4000".into(), false, 0, 1024), ("2001".into(), true, 1024, 0)],
+            &[("2001".into(), true, 1024, 0), ("4000".into(), false, 0, 1024)],
+        ));
+        assert!(!overwrites_equal(&[("4000".into(), false, 0, 1024)], &[]));
     }
 }
