@@ -374,10 +374,19 @@ pub fn conversation_scope(conversation: &Key) -> String {
 
 /// The network of a conversation's scope, `conv:<network>:<account>:<id>` with every part.
 pub fn conversation_of(scope: &str) -> Option<Network> {
+    conversation_key_of(scope).map(|key| key.network)
+}
+
+/// The full conversation key named by a `conv:<network>:<account>:<id>` scope.
+pub fn conversation_key_of(scope: &str) -> Option<Key> {
     let (word, rest) = scope.strip_prefix("conv:")?.split_once(':')?;
     let network = Network::ALL.into_iter().find(|n| network_word(*n) == word)?;
-    let (account, id) = rest.split_once(':')?;
-    (!account.is_empty() && !id.is_empty()).then_some(network)
+    let (account, id) = rest.rsplit_once(':')?;
+    (!account.is_empty() && !id.is_empty()).then(|| Key {
+        network,
+        account: account.to_owned(),
+        id: id.to_owned(),
+    })
 }
 
 /// The account an `account:` scope names.

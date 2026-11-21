@@ -184,7 +184,9 @@ pub fn decide_ring(values: &Values, conversation: &Key, moment: &Moment) -> Opti
 }
 
 /// `direct` is a one-to-one conversation. A Tiny direct rings even when Tiny server
-/// notifications are off, the same way a Tiny direct message does.
+/// notifications are off, the same way a Tiny direct message does. A muted direct message
+/// (conversation-scoped `NOTIFY_ABOUT = "off"`) still rings for calls; only silencing the whole
+/// account or turning incoming calls off stops it.
 pub fn decide_ring_in(
     values: &Values,
     conversation: &Key,
@@ -192,7 +194,12 @@ pub fn decide_ring_in(
     direct: bool,
 ) -> Option<Verdict> {
     let calls = values.word(GLOBAL, settings::CALLS);
-    if calls == "off" || level(values, conversation) == "off" || moment.dnd {
+    let silenced = if direct {
+        values.stored(&settings::account_scope(&conversation.account()), settings::NOTIFY_ABOUT) == Some("off")
+    } else {
+        level(values, conversation) == "off"
+    };
+    if calls == "off" || silenced || moment.dnd {
         return None;
     }
     if conversation.network == Network::Tiny && !direct && !values.on(settings::NOTIFY_TINY) {

@@ -507,14 +507,28 @@ impl InfoPane {
         }
         if actions.notifications {
             if let Some(row) = self.row.clone() {
-                let on = self.notify_of(&row, None) != Notify::Nothing;
+                let local = row.key.network == Network::Tiny;
+                let on = if local {
+                    profile::details::local_notify_shown(&row) != Notify::Nothing
+                } else {
+                    self.notify_of(&row, None) != Notify::Nothing
+                };
                 let key = row.key.clone();
                 top = top.child(
                     draw::notifications_row(draw::switch("info-notify", on).on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_notify(key.clone(), if on { Notify::Nothing } else { Notify::All }, cx)
+                        let to = if on { Notify::Nothing } else { Notify::All };
+                        if local {
+                            profile::details::set_local_notify(&key, to, cx);
+                            cx.notify();
+                        } else {
+                            this.set_notify(key.clone(), to, cx);
+                        }
                     })))
                     .mt(px(12.)),
                 );
+                if local {
+                    top = top.child(div().type_small().text_color(theme::text_faint()).child("Kept on this device."));
+                }
             }
         }
         if let Some(heads_up) = facts::heads_up(person, profile, online) {
@@ -1026,9 +1040,14 @@ impl Shell {
     }
 
     /// A row's notifications, from its menu: everything, or nothing. The row changes when the
-    /// network says so.
+    /// network says so (or immediately in local settings for Tiny).
     pub(in crate::gui) fn set_row_mute(&mut self, conversation: Key, mute: bool, cx: &mut Context<Self>) {
         let notify = if mute { Notify::Nothing } else { Notify::All };
+        if conversation.network == Network::Tiny {
+            profile::details::set_local_notify(&conversation, notify, cx);
+            cx.notify();
+            return;
+        }
         self.conversation_act(Request::SetMute { conversation, notify, until: None }, "Can't change notifications".to_owned(), cx);
     }
 

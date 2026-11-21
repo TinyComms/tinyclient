@@ -50,9 +50,51 @@ fn sound_row(row: &Conversation, cx: &mut Context<InfoPane>) -> Div {
     div().flex().flex_col().gap(px(6.)).child(div().type_ui().child("Sound")).child(chips).children(muted)
 }
 
+/// Local notification level stored on this device for a Tiny conversation.
+pub(in crate::gui) fn local_notify_shown(row: &Conversation) -> Notify {
+    use protocol::settings::{self, GLOBAL};
+    let values = crate::gui::app::prefs::values();
+    let scope = settings::conversation_scope(&row.key);
+    let stored = values
+        .stored(&scope, settings::NOTIFY_ABOUT)
+        .or_else(|| values.stored(&settings::account_scope(&row.key.account()), settings::NOTIFY_ABOUT));
+    match stored {
+        Some("off") => Notify::Nothing,
+        Some("all") => Notify::All,
+        Some(_) => Notify::Mentions,
+        None if row.muted => Notify::Nothing,
+        None if row.kind.is_direct() => Notify::All,
+        None => match values.word(GLOBAL, settings::NOTIFY_ABOUT) {
+            "all" => Notify::All,
+            "off" => Notify::Nothing,
+            _ => Notify::Mentions,
+        },
+    }
+}
+
+/// Writes `settings::NOTIFY_ABOUT` locally for a conversation without sending `Request::SetMute`.
+pub(in crate::gui) fn set_local_notify(key: &Key, notify: Notify, cx: &mut gpui::App) {
+    use protocol::settings;
+    let word = match notify {
+        Notify::All => "all",
+        Notify::Mentions => "mentions",
+        Notify::Nothing => "off",
+    };
+    let scope = settings::conversation_scope(key);
+    let mut values = crate::gui::app::prefs::values();
+    values.set(&scope, settings::NOTIFY_ABOUT, Some(word.to_owned()));
+    crate::gui::app::prefs::set_values(values);
+    let set = Request::Set {
+        scope,
+        key: settings::NOTIFY_ABOUT.to_owned(),
+        value: Some(word.to_owned()),
+    };
+    crate::gui::people::ask_later(cx, set, |_, _| {});
+}
+
 /// Notifications' segmented choice for a channel.
-fn notify_segments(pane: &InfoPane, row: &Conversation, cx: &mut Context<InfoPane>) -> Div {
-    let shown = pane.notify_shown(row);
+fn notify_segments(pane: &InfoPane, row: &Conversation, local: bool, cx: &mut Context<InfoPane>) -> Div {
+    let shown = if local { local_notify_shown(row) } else { pane.notify_shown(row) };
     // Teams stores anything other than All as muted, so Mentions would silence the channel.
     let teams = row.key.network == Network::Teams;
     let now = if teams && shown == Notify::Mentions { Notify::Nothing } else { shown };
@@ -60,7 +102,14 @@ fn notify_segments(pane: &InfoPane, row: &Conversation, cx: &mut Context<InfoPan
         let key = row.key.clone();
         segment(("details-notify", ix), words, now == notify)
             .px(px(8.))
-            .on_click(cx.listener(move |pane, _, _, cx| pane.notify_to(key.clone(), notify, cx)))
+            .on_click(cx.listener(move |pane, _, _, cx| {
+                if local {
+                    set_local_notify(&key, notify, cx);
+                    cx.notify();
+                } else {
+                    pane.notify_to(key.clone(), notify, cx);
+                }
+            }))
     };
     let mut choices = segmented().child(choice(0, "All", Notify::All, cx));
     if !teams {
@@ -147,7 +196,8 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         top = top.child(div().mt(px(16.)).flex().items_center().gap(px(8.)).child(call).children(more));
     }
     let control = facts::notify_control(row);
-    let notify = pane.notify_shown(row);
+    let local = matches!(control, NotifyControl::LocalSwitch | NotifyControl::LocalSegmented);
+    let notify = if local { local_notify_shown(row) } else { pane.notify_shown(row) };
     let key = row.key.clone();
     top = top.child(
         draw::notifications_row(match control {
@@ -157,11 +207,22 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                     pane.notify_to(key.clone(), to, cx)
                 }))
                 .into_any_element(),
-            NotifyControl::Segmented => notify_segments(pane, row, cx).into_any_element(),
+            NotifyControl::LocalSwitch => draw::switch("details-switch", notify != Notify::Nothing)
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    let to = if notify == Notify::Nothing { Notify::All } else { Notify::Nothing };
+                    set_local_notify(&key, to, cx);
+                    cx.notify();
+                }))
+                .into_any_element(),
+            NotifyControl::Segmented => notify_segments(pane, row, false, cx).into_any_element(),
+            NotifyControl::LocalSegmented => notify_segments(pane, row, true, cx).into_any_element(),
             NotifyControl::Held(words) => div().type_small().text_color(theme::text_soft()).child(words).into_any_element(),
         })
         .mt(px(12.)),
     );
+    if local {
+        top = top.child(div().type_small().text_color(theme::text_faint()).child("Kept on this device."));
+    }
     top = top.child(sound_row(row, cx).mt(px(8.)));
     if !online {
         let words = facts::heads_up_words(&facts::HeadsUp::Offline, &row.title, network, crate::view::now());

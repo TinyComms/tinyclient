@@ -588,8 +588,8 @@ fn tidy(mut items: Vec<Item>) -> Vec<Item> {
 /// already opens them in the network's app; a row's menu has no foot, so it says it here.
 pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<Item> {
     let mut items = Vec::new();
-    // Signal, Messages, and Tiny do not serve mute. A switch that snaps back is left out.
-    if let Some((_, muted)) = seen.direct.filter(|_| !seen.in_their_dm && !matches!(person.key.network, Network::Signal | Network::Messages | Network::Tiny)) {
+    // Signal and Messages do not serve mute. A switch that snaps back is left out.
+    if let Some((_, muted)) = seen.direct.filter(|_| !seen.in_their_dm && !matches!(person.key.network, Network::Signal | Network::Messages)) {
         items.extend([Item::Mute { muted }, Item::Separator]);
     }
     if !person.handle.trim_start_matches('@').is_empty() {
@@ -738,20 +738,30 @@ pub enum NotifyControl {
     Switch,
     /// All · Mentions · Nothing: channels on Discord and Slack. Teams is All · Nothing.
     Segmented,
+    /// On or off, stored locally on this device (Tiny DMs and groups).
+    LocalSwitch,
+    /// All · Mentions · Nothing, stored locally on this device (Tiny channels).
+    LocalSegmented,
     /// The phone or the server owns this. The words are shown and nothing is sent.
     Held(&'static str),
 }
 
 pub fn notify_control(conversation: &Conversation) -> NotifyControl {
+    let channel = matches!(
+        conversation.kind,
+        ConversationKind::Channel | ConversationKind::Announcement | ConversationKind::Voice | ConversationKind::Forum
+    );
     match conversation.key.network {
         Network::Signal => NotifyControl::Held("Set on your phone"),
         Network::Messages => NotifyControl::Held("Stays on your phone"),
-        Network::Tiny => NotifyControl::Held("Not available on Tiny"),
+        Network::Tiny => {
+            if channel {
+                NotifyControl::LocalSegmented
+            } else {
+                NotifyControl::LocalSwitch
+            }
+        }
         _ => {
-            let channel = matches!(
-                conversation.kind,
-                ConversationKind::Channel | ConversationKind::Announcement | ConversationKind::Voice | ConversationKind::Forum
-            );
             if channel && conversation.key.network != Network::Telegram {
                 NotifyControl::Segmented
             } else {
@@ -1144,6 +1154,8 @@ mod tests {
         assert!(!can_leave(&row(Network::Messages, ConversationKind::Group)));
         assert_eq!(notify_control(&row(Network::Messages, ConversationKind::Direct)), NotifyControl::Held("Stays on your phone"));
         assert_eq!(notify_control(&row(Network::Teams, ConversationKind::Channel)), NotifyControl::Segmented);
+        assert_eq!(notify_control(&row(Network::Tiny, ConversationKind::Channel)), NotifyControl::LocalSegmented);
+        assert_eq!(notify_control(&row(Network::Tiny, ConversationKind::Direct)), NotifyControl::LocalSwitch);
         info.external = "Northwind".into();
         assert_eq!(conversation_tag(&slack, Some(&info)).as_deref(), Some("External · Northwind"));
         info.creator = "Dev Patel".into();
