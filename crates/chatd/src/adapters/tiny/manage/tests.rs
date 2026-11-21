@@ -711,3 +711,43 @@ fn a_passkey_already_gone_is_said_so_and_not_blamed_on_the_server() {
     });
     assert_eq!(PASSKEY_GONE, "That passkey is gone.");
 }
+
+#[test]
+fn delete_account_sends_confirm_and_handles_last_owner() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log_ok = log.clone();
+    let base_ok = serve(move |request| {
+        log_ok.lock().unwrap().push(request.to_owned());
+        if request.starts_with("DELETE /v1/me ") {
+            http(204, "No Content", "")
+        } else {
+            http(404, "Not Found", r#"{"error":"not_found"}"#)
+        }
+    });
+    with_session(&base_ok, "member", |account| {
+        assert_eq!(delete_account(&account), Ok(()));
+    });
+    let req = last(&log, "DELETE /v1/me ");
+    assert_eq!(json_body(&req)["confirm"], "delete my account");
+    assert!(sent(&log, "DELETE /v1/session ").is_empty(), "must not call session close route");
+
+    // 409 last_owner maps to the owner message and leaves the session readable.
+    let base_owner = serve(|request| {
+        if request.starts_with("DELETE /v1/me ") {
+            http(409, "Conflict", r#"{"error":"last_owner"}"#)
+        } else {
+            http(404, "Not Found", r#"{"error":"not_found"}"#)
+        }
+    });
+    with_session(&base_owner, "owner", |account| {
+        assert_eq!(delete_account(&account), Err(said(DELETE_LAST_OWNER)));
+        assert!(open(&account).is_ok(), "session remains in place on 409");
+    });
+
+    // Other failure also leaves the session readable.
+    let base_err = serve(|_| http(500, "Internal Server Error", r#"{"error":"unavailable"}"#));
+    with_session(&base_err, "member", |account| {
+        assert!(delete_account(&account).is_err());
+        assert!(open(&account).is_ok(), "session remains in place on 500");
+    });
+}

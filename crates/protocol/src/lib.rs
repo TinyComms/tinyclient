@@ -1923,6 +1923,11 @@ pub enum Request {
     TinySignOutEverywhere {
         account: AccountKey,
     },
+    /// Permanently deletes this account on the Tiny server (`DELETE /v1/me` with confirmation),
+    /// then wipes this install's local session, keys, and cache for that server. Answers `Status`.
+    TinyDeleteAccount {
+        account: AccountKey,
+    },
     /// Makes a room, for an owner or an admin. Its call is empty until someone joins.
     TinyRoomCreate {
         account: AccountKey,

@@ -292,6 +292,25 @@ impl Shell {
                 .child(words(format!("Every session of yours on {} ends, on every computer, this one too. Sign in again with your provider when you want back in.", page.name)))
                 .children(self.modal_error())
                 .child(self.buttons("Sign out everywhere", ButtonKind::Danger, cx, |this, cx| this.tiny_sign_out_everywhere(cx))),
+            Modal::DeleteAccount => {
+                let last_owner = self.tiny_state.modal_error.as_deref() == Some("You're the only owner. Hand the server to someone first.");
+                let panel = modal(format!("Delete your account on {}?", page.name))
+                    .w(px(460.))
+                    .child(words(
+                        "Every message you wrote is emptied and its files are deleted; others see “Deleted user”. Your membership, sessions, sign-in identity, reactions, read marks, bots, and unused invites are deleted, and your encryption devices are revoked. A ban on you survives, and reports you filed lose your name. Backups and copies already stored on other devices are not reached. This can't be undone.",
+                    ))
+                    .when(last_owner, |panel| {
+                        panel.child(
+                            div().mt(px(12.)).child(
+                                button("tiny-delete-account-danger", ButtonKind::Secondary, "Open Danger zone").h(px(30.)).on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_modal(cx);
+                                    this.tiny_open_settings(super::settings::Page::Danger, None, window, cx);
+                                })),
+                            ),
+                        )
+                    });
+                self.tiny_typed_confirm(panel, page, "Delete my account", window, cx, |this, cx| this.tiny_delete_account(cx))
+            }
         }
     }
 

@@ -94,6 +94,8 @@ pub(super) enum Modal {
     SignOut {
         erase: bool,
     },
+    /// Permanently deleting this account on the server, the server's name typed first.
+    DeleteAccount,
     /// Server Settings' confirmations.
     DeleteRole(String),
     KickMany(Vec<String>),
@@ -851,6 +853,35 @@ impl Shell {
         );
     }
 
+    /// Permanently deletes this account on the server and wipes local session, keys, and cache.
+    pub(super) fn tiny_delete_account(&mut self, cx: &mut Context<Self>) {
+        let Some(account) = self.with_account() else {
+            return;
+        };
+        if self.tiny_state.busy {
+            return;
+        }
+        self.tiny_state.busy = true;
+        self.tiny_state.modal_error = None;
+        cx.notify();
+        self.off_thread(
+            cx,
+            move || ask(&Request::TinyDeleteAccount { account }),
+            |this, answer, cx| {
+                this.tiny_state.busy = false;
+                match answer {
+                    Ok(Response::Error { detail, .. }) => this.tiny_state.modal_error = Some(detail),
+                    Ok(_) => {
+                        this.tiny_state.modal = None;
+                        this.tiny_state.settings = None;
+                    }
+                    Err(err) => this.tiny_state.modal_error = Some(crate::client::trouble_words("tiny", &err)),
+                }
+                cx.notify();
+            },
+        );
+    }
+
     /// Ends every session of this account on the server, then forgets it here, as signing out does.
     pub(super) fn tiny_sign_out_everywhere(&mut self, cx: &mut Context<Self>) {
         let Some(account) = self.with_account() else {
@@ -1387,7 +1418,7 @@ impl Shell {
                 self.tiny_state.name_input.update(cx, |input, cx| input.set_text(&now, cx));
                 Some(self.tiny_state.name_input.clone())
             }
-            Modal::Transfer(_) | Modal::RevokeInvites { typed: true } => {
+            Modal::Transfer(_) | Modal::RevokeInvites { typed: true } | Modal::DeleteAccount => {
                 let confirm = self.tiny_state.settings_fields.confirm.clone();
                 confirm.update(cx, |input, cx| input.set_text("", cx));
                 Some(confirm)

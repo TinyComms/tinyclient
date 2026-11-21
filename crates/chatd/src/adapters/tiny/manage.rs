@@ -49,6 +49,7 @@ const ICON_SIZE: &str = "That picture is too big. The most is 256 KB.";
 const ICON_KIND: &str = "That picture isn't a PNG, JPEG or WebP.";
 const PASSKEY_LABEL_MAX: usize = 60;
 const PASSKEY_GONE: &str = "That passkey is gone.";
+pub(crate) const DELETE_LAST_OWNER: &str = "You're the only owner. Hand the server to someone first.";
 /// The longest reason the audit keeps from here.
 const REASON_MAX: usize = 500;
 /// The longest value of a setup choice, such as `activity_visibility`'s `everyone`, and the longest
@@ -1199,6 +1200,25 @@ fn created_bot(body: Value) -> Option<(TinyBot, String)> {
     let token = body.get("token").and_then(Value::as_str).filter(|token| !token.is_empty())?.to_owned();
     let bot = serde_json::from_value(body).ok()?;
     Some((bot, token))
+}
+
+/// Permanently deletes this account on the server (`DELETE /v1/me`). On 2xx, wipes local E2EE
+/// state and cached knowledge for this server without calling `DELETE /v1/session`. On any refusal
+/// (including `409 last_owner`), nothing local is wiped.
+pub(crate) fn delete_account(account: &AccountKey) -> Result<(), Response> {
+    let saved = open(account)?;
+    match asked("DELETE", &saved, "/v1/me", Some(json!({ "confirm": "delete my account" }))) {
+        Err(detail) => Err(refused(detail)),
+        Ok((200..=299, _)) => {
+            super::e2ee::forget_local(&saved);
+            crate::hub::lock(&KNOWN).remove(&key(&saved));
+            Ok(())
+        }
+        Ok((409, body)) if body.get("error").and_then(Value::as_str) == Some("last_owner") => {
+            Err(refused(DELETE_LAST_OWNER))
+        }
+        Ok((status, body)) => Err(refused(explain(status, &body, Missing::Plain))),
+    }
 }
 
 /// The checks before a call request goes to the live socket: the server has the feature, this

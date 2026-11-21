@@ -29,7 +29,8 @@ or move; Kick removes, Roles is Owner / Admin / Member.
   its menu is open (the chevron becomes a close glyph). The menu, below it, 240 wide: Invite
   people · Server settings · — · Create channel · Create category · — · Copy server address ·
   — · Servers (a check per signed-in server, when there are several) · Join another server ·
-  Sign out of this server… (`danger`, asks first). Only what is allowed shows; Server settings
+  Sign out of this server… (`danger`, asks first) · Delete my account on this server… (`danger`,
+  asks for the server's name first). Only what is allowed shows; Server settings
   always shows, its pages read-only where they must be.
 - **Before the server answers,** the column is its own list as shapes: a section label, four text
   channel rows, then two categories with their rooms and a seat under the first, all at the

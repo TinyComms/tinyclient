@@ -1446,6 +1446,15 @@ pub(crate) fn sign_out(saved: &Saved) {
     start_over(&dir_of(saved));
 }
 
+/// Local wipe after the account itself was deleted on the server: drops in-memory state and erases
+/// this account's local directory and kept history key without calling any server route.
+pub(crate) fn forget_local(saved: &Saved) {
+    let key = (saved.base_url.clone(), saved.user_id.clone());
+    lock(devices()).remove(&key);
+    lock(scratch_secrets()).remove(&key);
+    erase_history(&saved.user_id);
+}
+
 /// The keychain item that keeps the cache keys of accounts signed out with their history kept:
 /// `{"<user id> <server>": "<base64 cache key>"}`. Taken back by the next sign-in of that account
 /// on this install, and dropped from here then.
