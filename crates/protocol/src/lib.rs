@@ -1282,6 +1282,31 @@ pub enum Request {
         offset: u32,
         limit: u32,
     },
+    /// Adds or invites people (by person id) to a group or channel.
+    MembersAdd {
+        conversation: Key,
+        people: Vec<String>,
+    },
+    /// Removes one person (by person id) from a group or channel.
+    MembersRemove {
+        conversation: Key,
+        person: String,
+    },
+    /// Renames a conversation or updates its topic or description. Unset fields are left alone.
+    ConversationUpdate {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topic: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// Sets a conversation's picture from a local file path (empty clears it).
+    ConversationPicture {
+        conversation: Key,
+        path: String,
+    },
     /// The direct conversation with a person, created if there is none. Nothing reaches the other
     /// person until a message is sent.
     StartDirect {
@@ -2827,7 +2852,7 @@ mod tests {
         assert_eq!(legacy, everyone);
 
         // ConversationRights bitmask + serde round-trip.
-        let rights = ConversationRights { delete_others: true };
+        let rights = ConversationRights { delete_others: true, ..ConversationRights::default() };
         assert_eq!(ConversationRights::from_bits(rights.to_bits()), rights);
         assert!(ConversationRights::default().is_empty());
         assert!(!rights.is_empty());
@@ -2848,6 +2873,39 @@ mod tests {
         assert_eq!(format_disappearing(604_800), "1w");
         assert!(disappearing_presets(Network::Signal).contains(&30));
         assert!(disappearing_presets(Network::Telegram).contains(&86_400));
+    }
+
+    #[test]
+    fn conversation_management_requests_and_rights_round_trip() {
+        let key = Key::new(&AccountKey { network: Network::Slack, account: "w1".into() }, "C1");
+        let add = Request::MembersAdd { conversation: key.clone(), people: vec!["U1".into(), "U2".into()] };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&add).unwrap()).unwrap(), add);
+
+        let remove = Request::MembersRemove { conversation: key.clone(), person: "U2".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&remove).unwrap()).unwrap(), remove);
+
+        let update = Request::ConversationUpdate {
+            conversation: key.clone(),
+            title: Some("ops-new".into()),
+            topic: Some("deployments".into()),
+            description: None,
+        };
+        let ujson = serde_json::to_string(&update).unwrap();
+        assert!(!ujson.contains("description"), "{ujson}");
+        assert_eq!(serde_json::from_str::<Request>(&ujson).unwrap(), update);
+
+        let pic = Request::ConversationPicture { conversation: key, path: "/tmp/icon.png".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&pic).unwrap()).unwrap(), pic);
+
+        let all = ConversationRights {
+            delete_others: true,
+            add_members: true,
+            remove_members: true,
+            rename: true,
+            edit_topic: true,
+            edit_picture: true,
+        };
+        assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
     }
 }
 

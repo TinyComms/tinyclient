@@ -663,6 +663,36 @@ pub fn network_pin_label(conversation: &Conversation) -> String {
     }
 }
 
+/// Whether this account may add people to this group or channel.
+pub fn can_add_members(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.add_members
+}
+
+/// Whether this account may remove a person from this group or channel.
+pub fn can_remove_members(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.remove_members
+}
+
+/// Whether this account may rename this group or channel.
+pub fn can_rename(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.rename
+}
+
+/// Whether this account may edit this conversation's topic or description.
+pub fn can_edit_topic(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.edit_topic
+}
+
+/// Whether this account may change this conversation's picture.
+pub fn can_edit_picture(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.edit_picture
+}
+
+/// Confirmation sentence for removing a member; names the person explicitly.
+pub fn remove_member_confirm_text(person_name: &str, group_title: &str) -> String {
+    format!("Remove {person_name} from {group_title}? Others in the conversation may see this.")
+}
+
 /// A group DM, or a Telegram group or channel: the user can leave it from the pane.
 pub fn can_leave(conversation: &Conversation) -> bool {
     // A linked Signal device and paired Messages cannot leave a group. The item stays off until they can.
@@ -1144,6 +1174,22 @@ mod tests {
         assert!(!can_archive(&dc_chan, &tg_file), "channel inside a space is not archived via home filing");
         assert_eq!(network_pin_label(&tg_dm), "Pin on Telegram");
         assert_eq!(network_pin_label(&tg_pinned), "Unpin on Telegram");
+
+        let mut grp = row(Network::Slack, ConversationKind::Group);
+        assert!(!can_add_members(&grp) && !can_remove_members(&grp) && !can_rename(&grp) && !can_edit_topic(&grp) && !can_edit_picture(&grp));
+        grp.rights = protocol::ConversationRights {
+            add_members: true,
+            remove_members: true,
+            rename: true,
+            edit_topic: true,
+            edit_picture: true,
+            ..Default::default()
+        };
+        assert!(can_add_members(&grp) && can_remove_members(&grp) && can_rename(&grp) && can_edit_topic(&grp) && can_edit_picture(&grp));
+        let mut dm_with_rights = row(Network::Slack, ConversationKind::Direct);
+        dm_with_rights.rights = grp.rights;
+        assert!(!can_add_members(&dm_with_rights) && !can_rename(&dm_with_rights), "direct chats are not managed as groups");
+        assert!(remove_member_confirm_text("Mina", "Design").contains("Mina"));
     }
 
     #[test]

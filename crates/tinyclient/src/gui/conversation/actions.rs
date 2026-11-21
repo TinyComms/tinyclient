@@ -1778,7 +1778,7 @@ mod tests {
     fn moderator_can_delete_others_and_delete_for_me_follows_network() {
         let theirs = Message::plain("10", "Wren", "hello", 1, false);
         let mine = Message::plain("11", "Robin", "hi", 2, true);
-        let mod_rights = protocol::ConversationRights { delete_others: true };
+        let mod_rights = protocol::ConversationRights { delete_others: true, ..protocol::ConversationRights::default() };
         let plain = protocol::ConversationRights::default();
 
         // Discord moderator sees Delete (for everyone) on another person's row; non-mod does not.

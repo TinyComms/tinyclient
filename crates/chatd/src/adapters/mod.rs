@@ -332,6 +332,32 @@ pub enum Command {
         limit: u32,
         reply: Reply<Members>,
     },
+    /// Add or invite people to a group or channel.
+    MembersAdd {
+        conversation_id: String,
+        people: Vec<String>,
+        reply: Reply<()>,
+    },
+    /// Remove one person from a group or channel.
+    MembersRemove {
+        conversation_id: String,
+        person: String,
+        reply: Reply<()>,
+    },
+    /// Rename a conversation or update its topic or description.
+    ConversationUpdate {
+        conversation_id: String,
+        title: Option<String>,
+        topic: Option<String>,
+        description: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Set or clear a conversation's picture from a local file path.
+    ConversationPicture {
+        conversation_id: String,
+        path: String,
+        reply: Reply<()>,
+    },
     /// The id of the direct conversation with a person, created if there is none.
     StartDirect { person_id: String, reply: Reply<String> },
     /// Tiny call setup can create encrypted text history without enrolling a text device.
@@ -485,6 +511,10 @@ impl Command {
     pub fn unsupported(self, ctx: &Context) {
         match self {
             Command::Members { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MembersAdd { reply, .. }
+            | Command::MembersRemove { reply, .. }
+            | Command::ConversationUpdate { reply, .. }
+            | Command::ConversationPicture { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StartDirect { reply, .. } | Command::StartDirectCall { reply, .. } | Command::StartThread { reply, .. } | Command::Handoff { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }

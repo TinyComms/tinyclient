@@ -410,6 +410,21 @@ pub struct ConversationRights {
     /// Teams owner).
     #[serde(default, skip_serializing_if = "is_false")]
     pub delete_others: bool,
+    /// This account may add/invite people to this conversation (`Request::MembersAdd`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub add_members: bool,
+    /// This account may remove people from this conversation (`Request::MembersRemove`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub remove_members: bool,
+    /// This account may rename this conversation (`Request::ConversationUpdate`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rename: bool,
+    /// This account may edit this conversation's topic or description (`Request::ConversationUpdate`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edit_topic: bool,
+    /// This account may change this conversation's picture (`Request::ConversationPicture`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edit_picture: bool,
 }
 
 impl ConversationRights {
@@ -422,12 +437,32 @@ impl ConversationRights {
         if self.delete_others {
             bits |= 1 << 0;
         }
+        if self.add_members {
+            bits |= 1 << 1;
+        }
+        if self.remove_members {
+            bits |= 1 << 2;
+        }
+        if self.rename {
+            bits |= 1 << 3;
+        }
+        if self.edit_topic {
+            bits |= 1 << 4;
+        }
+        if self.edit_picture {
+            bits |= 1 << 5;
+        }
         bits
     }
 
     pub fn from_bits(bits: i64) -> Self {
         Self {
             delete_others: (bits & (1 << 0)) != 0,
+            add_members: (bits & (1 << 1)) != 0,
+            remove_members: (bits & (1 << 2)) != 0,
+            rename: (bits & (1 << 3)) != 0,
+            edit_topic: (bits & (1 << 4)) != 0,
+            edit_picture: (bits & (1 << 5)) != 0,
         }
     }
 }

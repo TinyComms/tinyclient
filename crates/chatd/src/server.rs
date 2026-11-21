@@ -2531,6 +2531,52 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::MembersAdd { conversation, people } => {
+                if people.is_empty() {
+                    return error(ErrorCode::Refused, "Pick at least one person to add.");
+                }
+                let res = self.act(&conversation, |conversation_id, reply| Command::MembersAdd { conversation_id, people, reply });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
+            }
+            Request::MembersRemove { conversation, person } => {
+                if person.trim().is_empty() {
+                    return error(ErrorCode::Refused, "No person named to remove.");
+                }
+                let res = self.act(&conversation, |conversation_id, reply| Command::MembersRemove { conversation_id, person, reply });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
+            }
+            Request::ConversationUpdate { conversation, title, topic, description } => {
+                if title.is_none() && topic.is_none() && description.is_none() {
+                    return Response::Ok;
+                }
+                if title.as_deref().is_some_and(|t| t.trim().is_empty()) {
+                    return error(ErrorCode::Refused, "A conversation name cannot be empty.");
+                }
+                let res = self.act(&conversation, |conversation_id, reply| Command::ConversationUpdate {
+                    conversation_id,
+                    title,
+                    topic,
+                    description,
+                    reply,
+                });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
+            }
+            Request::ConversationPicture { conversation, path } => {
+                let res = self.act(&conversation, |conversation_id, reply| Command::ConversationPicture { conversation_id, path, reply });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
+            }
             request @ (Request::StartDirect { .. } | Request::StartDirectCall { .. }) => {
                 let (person, call) = match request {
                     Request::StartDirect { person } => (person, false),
@@ -4206,7 +4252,7 @@ mod tests {
         lock(&chat.adapters).insert(account.clone(), adapter);
         chat.hub.set_link(&account, Link::Connected, "");
         let mut row = ConversationRow::new("g:1", ConversationKind::Group, "Mods");
-        row.rights = ConversationRights { delete_others: true };
+        row.rights = ConversationRights { delete_others: true, ..ConversationRights::default() };
         ctx.conversation(&row).unwrap();
         let other_msg = Message::plain("m1", "other", "remove me", 1_700_000_000, false);
         let other_msg2 = Message::plain("m2", "other", "remove locally", 1_700_000_001, false);
@@ -4303,6 +4349,105 @@ mod tests {
             panic!("expected Conversation");
         };
         assert_eq!(cleared.disappearing, None);
+
+        lock(&chat.adapters).remove(&account);
+        drop(ctx);
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn conversation_management_requests_update_conversation_and_members() {
+        use crate::adapters::{self, Command};
+        use crate::hub::lock;
+        use crate::store::{ConversationRow, Store};
+        use protocol::{AccountKey, ConversationKind, ConversationRights, ErrorCode, Key, Link, Network, Request, Response};
+        use std::sync::{Arc, Mutex};
+
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let chat = Arc::new(super::Chat::new(store));
+        let account = AccountKey { network: Network::Slack, account: "w1".into() };
+        let conv = Key::new(&account, "C1");
+        let (adapter, ctx, rx) = adapters::local(account.clone(), Arc::clone(&chat.hub));
+        lock(&chat.adapters).insert(account.clone(), adapter);
+        chat.hub.set_link(&account, Link::Connected, "");
+        let mut row = ConversationRow::new("C1", ConversationKind::Group, "Old Name");
+        row.rights = ConversationRights {
+            add_members: true,
+            remove_members: true,
+            rename: true,
+            edit_topic: true,
+            edit_picture: true,
+            ..ConversationRights::default()
+        };
+        ctx.conversation(&row).unwrap();
+
+        let members = Arc::new(Mutex::new(vec!["U1".to_owned()]));
+        let members_worker = Arc::clone(&members);
+        let worker_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || {
+            for cmd in rx {
+                match cmd {
+                    Command::MembersAdd { people, reply, .. } => {
+                        members_worker.lock().unwrap().extend(people);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::MembersRemove { person, reply, .. } => {
+                        members_worker.lock().unwrap().retain(|p| p != &person);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+                        let cur = worker_ctx.known(&conversation_id).unwrap().unwrap();
+                        let mut next = ConversationRow::new(conversation_id, cur.kind, title.unwrap_or(cur.title));
+                        next.topic = topic.or(description).unwrap_or(cur.topic);
+                        next.rights = cur.rights;
+                        worker_ctx.conversation(&next).unwrap();
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::ConversationPicture { reply, .. } => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::Stop => break,
+                    other => other.unsupported(&worker_ctx),
+                }
+            }
+        });
+
+        // Empty people list and empty title are refused cleanly.
+        assert!(matches!(
+            chat.handle(Request::MembersAdd { conversation: conv.clone(), people: vec![] }),
+            Response::Error { code: ErrorCode::Refused, .. }
+        ));
+        assert!(matches!(
+            chat.handle(Request::ConversationUpdate {
+                conversation: conv.clone(),
+                title: Some("   ".into()),
+                topic: None,
+                description: None,
+            }),
+            Response::Error { code: ErrorCode::Refused, .. }
+        ));
+
+        // Add, remove, rename + topic, and picture succeed.
+        assert_eq!(chat.handle(Request::MembersAdd { conversation: conv.clone(), people: vec!["U2".into()] }), Response::Ok);
+        assert_eq!(*members.lock().unwrap(), vec!["U1".to_owned(), "U2".to_owned()]);
+        assert_eq!(chat.handle(Request::MembersRemove { conversation: conv.clone(), person: "U2".into() }), Response::Ok);
+        assert_eq!(*members.lock().unwrap(), vec!["U1".to_owned()]);
+        assert_eq!(
+            chat.handle(Request::ConversationUpdate {
+                conversation: conv.clone(),
+                title: Some("New Name".into()),
+                topic: Some("Ship week".into()),
+                description: None,
+            }),
+            Response::Ok
+        );
+        let Response::Conversation { conversation: updated } = chat.handle(Request::Conversation { conversation: conv.clone() }) else {
+            panic!("expected Conversation");
+        };
+        assert_eq!(updated.title, "New Name");
+        assert_eq!(updated.topic, "Ship week");
+        assert!(updated.rights.add_members && updated.rights.remove_members && updated.rights.rename && updated.rights.edit_topic && updated.rights.edit_picture);
+        assert_eq!(chat.handle(Request::ConversationPicture { conversation: conv, path: "/tmp/pic.png".into() }), Response::Ok);
 
         lock(&chat.adapters).remove(&account);
         drop(ctx);

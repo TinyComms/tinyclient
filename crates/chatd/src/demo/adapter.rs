@@ -760,6 +760,33 @@ impl Demo {
                 }
                 let _ = reply.send(outcome);
             }
+            Command::MembersAdd { reply, .. } | Command::MembersRemove { reply, .. } | Command::ConversationPicture { reply, .. } => {
+                let _ = reply.send(Ok(()));
+            }
+            Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+                let outcome = match demo.ctx.known(&conversation_id) {
+                    Ok(Some(row)) => {
+                        let mut updated = crate::store::ConversationRow::new(
+                            conversation_id.clone(),
+                            row.kind,
+                            title.unwrap_or(row.title),
+                        );
+                        updated.space = row.space;
+                        updated.group = row.group;
+                        updated.position = row.position;
+                        updated.peer = row.peer;
+                        updated.call = row.call;
+                        updated.topic = topic.or(description).unwrap_or(row.topic);
+                        updated.read_only = row.read_only;
+                        updated.private = row.private;
+                        updated.rights = row.rights;
+                        updated.disappearing = row.disappearing;
+                        demo.ctx.conversation(&updated).map_err(|err| Refusal::Refused(err.to_string()))
+                    }
+                    _ => Err(Refusal::Refused("no such conversation".to_owned())),
+                };
+                let _ = reply.send(outcome);
+            }
             Command::File { conversation_id, pinned, archived, folder_add, folder_remove, reply } => {
                 let outcome = match demo.ctx.known(&conversation_id) {
                     Ok(Some(row)) => {
