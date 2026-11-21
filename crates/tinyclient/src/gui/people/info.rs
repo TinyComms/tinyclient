@@ -59,6 +59,7 @@ pub(in crate::gui) enum ManageKind {
     Topic,
     Description,
     AddMembers,
+    Nickname,
 }
 
 pub struct InfoPane {
@@ -514,6 +515,22 @@ impl InfoPane {
             top = top.child(self.person_actions(person, &actions, &seen, more_in_row, cx).mt(px(16.)));
         }
         let is_self = self.scene.accounts.iter().any(|own| own.key == person.key.account() && own.me == person.key.id);
+        let can_edit_self = is_self
+            && self
+                .scene
+                .accounts
+                .iter()
+                .any(|own| own.key == person.key.account() && own.can.can_edit_profile());
+        if can_edit_self {
+            top = top.child(
+                button("info-edit-profile", ButtonKind::Secondary, "Edit profile")
+                    .w_full()
+                    .mt(px(12.))
+                    .on_click(|_, _, cx| {
+                        crate::gui::settings::open(crate::gui::settings::Section::Accounts, cx);
+                    }),
+            );
+        }
         if let Some((action, label)) = facts::friendship_action(person).filter(|_| !is_self) {
             let who = person.clone();
             let friendship = button("info-friendship", ButtonKind::Secondary, label).w_full();
@@ -1268,6 +1285,27 @@ impl InfoPane {
                     return;
                 }
                 Request::MembersAdd { conversation, people }
+            }
+            ManageKind::Nickname => {
+                let space = conversation.clone();
+                let req = Request::SetNickname {
+                    space: space.clone(),
+                    nickname: (!value.is_empty()).then_some(value),
+                };
+                let this = cx.weak_entity();
+                super::ask_later(cx, req, move |answer, cx| {
+                    if matches!(answer, Ok(Response::Ok)) {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.subject == Some(Subject::Space(space.clone())) {
+                                this.space_info = Answer::Waiting;
+                                let known = this.space.clone();
+                                this.show_space(space, known, cx);
+                            }
+                        });
+                    }
+                });
+                cx.notify();
+                return;
             }
             _ => {
                 cx.notify();

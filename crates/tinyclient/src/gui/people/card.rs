@@ -333,6 +333,23 @@ impl Floating {
                 top.child(self.card_actions(person, &actions, cx).mt(px(16.)))
             });
         let is_self = self.scene.accounts.iter().any(|own| own.key == person.key.account() && own.me == person.key.id);
+        let can_edit_self = is_self
+            && self
+                .scene
+                .accounts
+                .iter()
+                .any(|own| own.key == person.key.account() && own.can.can_edit_profile());
+        if can_edit_self {
+            top = top.child(
+                button("card-edit-profile", ButtonKind::Secondary, "Edit profile")
+                    .w_full()
+                    .mt(px(12.))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.close(cx);
+                        crate::gui::settings::open(crate::gui::settings::Section::Accounts, cx);
+                    })),
+            );
+        }
         if let Some((action, label)) = facts::friendship_action(person).filter(|_| !is_self) {
             let who = person.clone();
             let friendship = button("card-friendship", ButtonKind::Secondary, label).w_full();

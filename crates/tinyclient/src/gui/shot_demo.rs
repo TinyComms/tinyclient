@@ -1208,6 +1208,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
                     nickname: String::new(),
                     roles: vec!["Member".into()],
                     notify: Notify::Mentions,
+                    can_change_nickname: found.key.network == Network::Discord,
                 }),
             },
             None => Response::Error { code: protocol::ErrorCode::NotFound, detail: "Not in the demo.".into() },

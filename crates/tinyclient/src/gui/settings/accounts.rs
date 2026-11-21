@@ -456,6 +456,64 @@ impl SettingsWindow {
                     ))),
             );
         }
+        if can.profile_banner {
+            let banner_key = key.clone();
+            fields = fields.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().type_small().text_color(theme::text_soft()).child("Profile banner"))
+                    .child(button("profile-pick-banner", ButtonKind::Secondary, "Choose banner…").on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            let banner_key = banner_key.clone();
+                            let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
+                                files: true,
+                                directories: false,
+                                multiple: false,
+                                prompt: Some("Choose profile banner".into()),
+                            });
+                            cx.spawn(async move |this, cx| {
+                                if let Ok(Ok(Some(paths))) = asked.await {
+                                    if let Some(path) = paths.into_iter().next() {
+                                        let path_str = path.to_string_lossy().into_owned();
+                                        let req = protocol::Request::SetProfile {
+                                            account: banner_key,
+                                            name: None,
+                                            about: None,
+                                            pronouns: None,
+                                            emoji: None,
+                                            username: None,
+                                            photo: false,
+                                            accent: None,
+                                            banner: Some(path_str),
+                                            space: None,
+                                        };
+                                        let _ = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+                                        let _ = this.update(cx, |_, cx| cx.notify());
+                                    }
+                                }
+                            })
+                            .detach();
+                        },
+                    ))),
+            );
+        }
+        if account.key.network == Network::Discord {
+            fields = fields.child(
+                div()
+                    .pt(px(4.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().type_small().text_color(theme::text_faint()).child("Username & email"))
+                    .child(
+                        button("profile-open-discord", ButtonKind::Ghost, "Change in Discord ↗").on_click(|_, _, cx| {
+                            cx.open_url("https://discord.com/channels/@me");
+                        }),
+                    ),
+            );
+        }
         let save_key = key.clone();
         let save = button("profile-save", ButtonKind::Primary, "Save").on_click(cx.listener(move |this, _, _, cx| {
             let name = can.profile_name.then(|| this.profile_name.read(cx).text().trim().to_owned()).filter(|s| !s.is_empty());
@@ -469,6 +527,9 @@ impl SettingsWindow {
                 emoji: None,
                 username: None,
                 photo: false,
+                accent: None,
+                banner: None,
+                space: None,
             };
             this.confirm = None;
             this.off_thread(cx, move || crate::client::ask(&req), |_, _, cx| cx.notify());

@@ -217,6 +217,7 @@ pub struct SpaceAbout {
     pub nickname: String,
     pub roles: Vec<String>,
     pub notify: Notify,
+    pub can_change_nickname: bool,
 }
 
 /// A page of what was shared, from the network's own search.
@@ -759,6 +760,9 @@ pub enum Command {
         name: Option<String>,
         about: Option<String>,
         pronouns: Option<String>,
+        accent: Option<u32>,
+        banner: Option<String>,
+        space_id: Option<String>,
         reply: Reply<()>,
     },
     /// Set (or clear, when `path` is empty) our own profile picture from a local file path.

@@ -1795,6 +1795,9 @@ impl Chat {
         emoji: Option<String>,
         username: Option<String>,
         photo: bool,
+        accent: Option<u32>,
+        banner: Option<String>,
+        space: Option<Key>,
     ) -> Response {
         if account.network == Network::Signal {
             if photo {
@@ -1818,9 +1821,10 @@ impl Chat {
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
-        match self.ask(&account, |reply| Command::SetProfile { name, about, pronouns, reply }) {
+        let space_id = space.as_ref().filter(|s| s.account() == account).map(|s| s.id.clone());
+        match self.ask(&account, |reply| Command::SetProfile { name, about, pronouns, accent, banner, space_id, reply }) {
             Ok(()) => {
-                self.forget_own_profile(&account, None);
+                self.forget_own_profile(&account, space);
                 Response::Ok
             }
             Err(refused) => *refused,
@@ -1861,6 +1865,7 @@ impl Chat {
         });
         match self.ask(&account, |reply| Command::SetNickname { space_id, nickname, reply }) {
             Ok(()) => {
+                self.hub.space_infos.forget(&space);
                 self.forget_own_profile(&account, Some(space));
                 Response::Ok
             }
@@ -1994,6 +1999,7 @@ impl Chat {
             nickname: about.nickname,
             roles: about.roles,
             notify: about.notify,
+            can_change_nickname: about.can_change_nickname,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.nickname, 100);
@@ -3276,8 +3282,8 @@ impl Chat {
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
             Request::ReportReasons { target } => self.report_reasons(target),
             Request::SetPresence { account, presence, status, status_emoji, clear_at } => self.set_presence(account, presence, status, status_emoji, clear_at),
-            Request::SetProfile { account, name, about, pronouns, emoji, username, photo } => {
-                self.set_profile(account, name, about, pronouns, emoji, username, photo)
+            Request::SetProfile { account, name, about, pronouns, emoji, username, photo, accent, banner, space } => {
+                self.set_profile(account, name, about, pronouns, emoji, username, photo, accent, banner, space)
             }
             Request::SetAvatar { account, path } => self.set_avatar(account, path),
             Request::SetNickname { space, nickname } => self.set_nickname(space, nickname),

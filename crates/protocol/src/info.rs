@@ -375,6 +375,9 @@ pub struct SpaceInfo {
     pub roles: Vec<String>,
     #[serde(default)]
     pub notify: Notify,
+    /// Whether this account may change its own nickname in this Space.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_change_nickname: bool,
 }
 
 /// Which of a custom emoji set this account may send.
@@ -644,6 +647,14 @@ pub struct Capabilities {
     pub profile_avatar: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub profile_nickname: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_accent: bool,
+    /// Own profile banner image (Nitro-only on Discord).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_banner: bool,
+    /// Per-server profile overrides (Nitro-only on Discord).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_server: bool,
     /// Most chats this account may pin on the network (`Request::File`). 0: cannot pin.
     /// Telegram allows 5 without Premium and 10 with Premium.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -1188,6 +1199,9 @@ mod tests {
                 emoji: None,
                 username: None,
                 photo: false,
+                accent: Some(0x5865F2),
+                banner: None,
+                space: None,
             },
             Request::SetAvatar { account: account.clone(), path: "/tmp/avatar.png".into() },
             Request::SetNickname { space: Key::new(&account, "guild-1"), nickname: Some("Ada!".into()) },

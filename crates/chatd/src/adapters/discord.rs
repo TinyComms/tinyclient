@@ -1853,6 +1853,11 @@ impl Discord {
                 answer(reply, self.set_friend_nickname(&person_id, nickname))
             }
             Command::SetPresence { presence, status, status_emoji: _, clear_at: _, reply } => answer(reply, self.set_presence(presence, status)),
+            Command::SetProfile { name, about, pronouns, accent, banner, space_id, reply } => {
+                answer(reply, self.set_profile(name, about, pronouns, accent, banner, space_id))
+            }
+            Command::SetAvatar { path, reply } => answer(reply, self.set_avatar(&path)),
+            Command::SetNickname { space_id, nickname, reply } => answer(reply, self.set_nickname(&space_id, nickname)),
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id, None)),
             Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),

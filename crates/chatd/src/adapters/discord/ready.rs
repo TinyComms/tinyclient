@@ -209,18 +209,29 @@ impl GuildInfo {
         self.timeout_until.filter(|until| *until > now)
     }
 
-    /// Discord's permission rule for a channel: the roles' own permissions, then the channel's
-    /// overwrites for everyone, for our roles, and for us.
-    pub(super) fn permissions(&self, guild: &str, me: &str, channel: &Channel) -> u64 {
+    /// Base server-wide permissions from `@everyone` and our roles (without channel overwrites).
+    pub(super) fn base_permissions(&self, guild: &str) -> u64 {
         if self.owner {
             return u64::MAX;
         }
         let everyone = number(guild);
         let of = |role: &u64| self.roles.get(role).map_or(0, |role| role.permissions);
-        let mut allowed = self.my_roles.iter().fold(of(&everyone), |all, role| all | of(role));
+        let allowed = self.my_roles.iter().fold(of(&everyone), |all, role| all | of(role));
         if allowed & ADMINISTRATOR != 0 {
+            u64::MAX
+        } else {
+            allowed
+        }
+    }
+
+    /// Discord's permission rule for a channel: the roles' own permissions, then the channel's
+    /// overwrites for everyone, for our roles, and for us.
+    pub(super) fn permissions(&self, guild: &str, me: &str, channel: &Channel) -> u64 {
+        let mut allowed = self.base_permissions(guild);
+        if allowed == u64::MAX {
             return u64::MAX;
         }
+        let everyone = number(guild);
         let overwrites = &channel.permission_overwrites;
         if let Some(all) = overwrites.iter().find(|over| !over.member && number(&over.id) == everyone) {
             allowed = (allowed & !all.deny) | all.allow;
@@ -617,6 +628,7 @@ impl Discord {
             };
             let mut before = std::mem::replace(&mut info.my_roles, roles.clone());
             before.sort_unstable();
+            info.nick = member.nick.clone().unwrap_or_default();
             let prev_timeout = std::mem::replace(&mut info.timeout_until, timeout_until);
             (before != roles, prev_timeout != timeout_until)
         };
@@ -836,6 +848,14 @@ impl Discord {
             friend_nickname: true,
             join_space_by_invite: true,
             leave_space: true,
+            profile_name: true,
+            profile_about: true,
+            profile_pronouns: true,
+            profile_avatar: true,
+            profile_nickname: true,
+            profile_accent: true,
+            profile_banner: premium > 0,
+            profile_server: premium > 0,
             ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;

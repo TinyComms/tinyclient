@@ -51,6 +51,7 @@ pub const SPEAK: u64 = 1 << 21;
 pub const MOVE_MEMBERS: u64 = 1 << 24;
 #[allow(dead_code)]
 pub const USE_VAD: u64 = 1 << 25;
+pub const CHANGE_NICKNAME: u64 = 1 << 26;
 pub const MANAGE_ROLES: u64 = 1 << 28;
 pub const PIN_MESSAGES: u64 = 1 << 51;
 

@@ -7,6 +7,7 @@ use super::super::{About, ConversationAbout, Refusal, Reply, SearchScope, Shared
 use super::model::{self, number, GuildSettings, Posted};
 use super::rest::Refused;
 use super::{escaped, refusal, Discord};
+use base64::Engine;
 use crate::hub::now;
 use protocol::{ConversationKind, MediaKind, Message, MessageHit, Notify, SharedItem, SharedKind, Style};
 use serde::Deserialize;
@@ -358,6 +359,8 @@ impl Discord {
             _ if info.quiet.level == 2 => Notify::Nothing,
             _ => Notify::All,
         };
+        let can_change_nickname = info.owner
+            || (info.base_permissions(guild) & (model::ADMINISTRATOR | model::CHANGE_NICKNAME)) != 0;
         Ok(SpaceAbout {
             description: counts.description.unwrap_or_default(),
             members: counts.approximate_member_count,
@@ -365,7 +368,143 @@ impl Discord {
             nickname: info.nick.clone(),
             roles: roles.map(|role| role.name.clone()).take(protocol::PROFILE_ROLES).collect(),
             notify,
+            can_change_nickname,
         })
+    }
+
+    /// Edits our own Discord display name (`PATCH /users/@me`), global profile (`PATCH /users/@me/profile`),
+    /// or Nitro per-server profile (`PATCH /guilds/{id}/profile/@me`).
+    pub(super) fn set_profile(
+        &self,
+        name: Option<String>,
+        about: Option<String>,
+        pronouns: Option<String>,
+        accent: Option<u32>,
+        banner: Option<String>,
+        space_id: Option<String>,
+    ) -> Result<(), Refusal> {
+        let premium = crate::hub::lock(&self.state).premium;
+        if let Some(guild) = space_id {
+            if premium == 0 {
+                return Err(refused("Per-server profiles require Discord Nitro."));
+            }
+            if !crate::hub::lock(&self.state).guilds.contains_key(&guild) {
+                return Err(refused("This server is gone."));
+            }
+            let mut body = serde_json::Map::new();
+            if let Some(mut bio) = about {
+                let trimmed = bio.trim().to_owned();
+                bio = trimmed;
+                protocol::clip(&mut bio, 190);
+                body.insert("bio".into(), json!(bio));
+            }
+            if let Some(mut p) = pronouns {
+                let trimmed = p.trim().to_owned();
+                p = trimmed;
+                protocol::clip(&mut p, 40);
+                body.insert("pronouns".into(), json!(p));
+            }
+            if let Some(color) = accent {
+                body.insert("accent_color".into(), json!(color & 0xFF_FFFF));
+            }
+            if let Some(path) = banner {
+                let trimmed = path.trim();
+                if trimmed.is_empty() {
+                    body.insert("banner".into(), serde_json::Value::Null);
+                } else {
+                    let uri = image_data_uri(trimmed, true)?;
+                    body.insert("banner".into(), json!(uri));
+                }
+            }
+            if !body.is_empty() {
+                self.call("PATCH", &format!("/guilds/{guild}/profile/@me"), Some(serde_json::Value::Object(body)))
+                    .map_err(profile_refusal)?;
+            }
+            return Ok(());
+        }
+
+        if let Some(name) = name {
+            let mut trimmed = name.trim().to_owned();
+            protocol::clip(&mut trimmed, 32);
+            let value = if trimmed.is_empty() { serde_json::Value::Null } else { json!(trimmed) };
+            self.call("PATCH", "/users/@me", Some(json!({"global_name": value})))
+                .map_err(profile_refusal)?;
+        }
+
+        let mut profile_body = serde_json::Map::new();
+        if let Some(about) = about {
+            let mut trimmed = about.trim().to_owned();
+            protocol::clip(&mut trimmed, 190);
+            profile_body.insert("bio".into(), json!(trimmed));
+        }
+        if let Some(pronouns) = pronouns {
+            let mut trimmed = pronouns.trim().to_owned();
+            protocol::clip(&mut trimmed, 40);
+            profile_body.insert("pronouns".into(), json!(trimmed));
+        }
+        if let Some(color) = accent {
+            profile_body.insert("accent_color".into(), json!(color & 0xFF_FFFF));
+        }
+        if let Some(path) = banner {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                profile_body.insert("banner".into(), serde_json::Value::Null);
+            } else {
+                if premium == 0 {
+                    return Err(refused("Profile banners require Discord Nitro."));
+                }
+                let uri = image_data_uri(trimmed, true)?;
+                profile_body.insert("banner".into(), json!(uri));
+            }
+        }
+        if !profile_body.is_empty() {
+            self.call("PATCH", "/users/@me/profile", Some(serde_json::Value::Object(profile_body)))
+                .map_err(profile_refusal)?;
+        }
+        Ok(())
+    }
+
+    /// Sets or clears our own Discord avatar via `PATCH /users/@me`.
+    pub(super) fn set_avatar(&self, path: &str) -> Result<(), Refusal> {
+        let premium = crate::hub::lock(&self.state).premium;
+        let trimmed = path.trim();
+        let value = if trimmed.is_empty() {
+            serde_json::Value::Null
+        } else {
+            let uri = image_data_uri(trimmed, premium > 0)?;
+            json!(uri)
+        };
+        self.call("PATCH", "/users/@me", Some(json!({"avatar": value})))
+            .map_err(profile_refusal)?;
+        Ok(())
+    }
+
+    /// Sets or clears our nickname in a Discord server via `PATCH /guilds/{id}/members/@me`.
+    pub(super) fn set_nickname(&self, guild: &str, nickname: Option<String>) -> Result<(), Refusal> {
+        {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
+            let allowed = info.owner
+                || (info.base_permissions(guild) & (model::ADMINISTRATOR | model::CHANGE_NICKNAME)) != 0;
+            if !allowed {
+                return Err(refused("You don't have permission to change your nickname in this server."));
+            }
+        }
+        let cleaned = nickname.and_then(|n| {
+            let mut trimmed = n.trim().to_owned();
+            protocol::clip(&mut trimmed, 32);
+            (!trimmed.is_empty()).then_some(trimmed)
+        });
+        let value = match &cleaned {
+            Some(nick) => json!(nick),
+            None => serde_json::Value::Null,
+        };
+        self.call("PATCH", &format!("/guilds/{guild}/members/@me"), Some(json!({"nick": value})))
+            .map_err(profile_refusal)?;
+        if let Some(info) = crate::hub::lock(&self.state).guilds.get_mut(guild) {
+            info.nick = cleaned.unwrap_or_default();
+        }
+        Ok(())
     }
 
     /// Sets a conversation's notifications as Discord's own menu does: one settings change for
@@ -627,5 +766,80 @@ impl Discord {
             });
         }
         Ok(found_hits)
+    }
+}
+
+/// Largest avatar or banner image file accepted before base64-encoding into a Discord data URI.
+const MAX_PROFILE_IMAGE_BYTES: usize = 10 << 20;
+
+fn profile_refusal(failed: Refused) -> Refusal {
+    match failed {
+        Refused::Status { code: 50035, ref message, .. } if !message.is_empty() => {
+            Refusal::Refused(format!("Discord rejected the profile change: {message}"))
+        }
+        other => refusal(other),
+    }
+}
+
+/// Reads a local image file, validates its magic bytes and size, and encodes it as a
+/// `data:image/{png,jpeg,webp,gif};base64,...` URI for Discord's profile endpoints.
+fn image_data_uri(path: &str, allow_gif: bool) -> Result<String, Refusal> {
+    let bytes = std::fs::read(path).map_err(|err| refused(format!("Could not read image: {err}")))?;
+    if bytes.is_empty() {
+        return Err(refused("The chosen image file is empty."));
+    }
+    if bytes.len() > MAX_PROFILE_IMAGE_BYTES {
+        return Err(refused("Profile images must be 10 MB or smaller."));
+    }
+    let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        "image/png"
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        if !allow_gif {
+            return Err(refused("Animated avatars and banners require Discord Nitro."));
+        }
+        "image/gif"
+    } else {
+        return Err(refused("Choose a PNG, JPEG, WebP, or GIF image."));
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{encoded}"))
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn image_data_uri_validates_format_and_nitro_gif_gate() {
+        let dir = std::env::temp_dir().join(format!("tinyclient-discord-img-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let png = dir.join("a.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        let uri = image_data_uri(png.to_str().unwrap(), false).unwrap();
+        assert!(uri.starts_with("data:image/png;base64,"), "{uri}");
+
+        let jpg = dir.join("a.jpg");
+        std::fs::write(&jpg, b"\xFF\xD8\xFF\xE0jpg").unwrap();
+        assert!(image_data_uri(jpg.to_str().unwrap(), false).unwrap().starts_with("data:image/jpeg;base64,"));
+
+        let webp = dir.join("a.webp");
+        std::fs::write(&webp, b"RIFF1234WEBPdata").unwrap();
+        assert!(image_data_uri(webp.to_str().unwrap(), false).unwrap().starts_with("data:image/webp;base64,"));
+
+        let gif = dir.join("a.gif");
+        std::fs::write(&gif, b"GIF89adata").unwrap();
+        assert!(image_data_uri(gif.to_str().unwrap(), false).is_err(), "GIF requires Nitro");
+        assert!(image_data_uri(gif.to_str().unwrap(), true).unwrap().starts_with("data:image/gif;base64,"));
+
+        let txt = dir.join("a.txt");
+        std::fs::write(&txt, b"not an image").unwrap();
+        assert!(image_data_uri(txt.to_str().unwrap(), true).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

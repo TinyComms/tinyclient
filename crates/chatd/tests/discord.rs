@@ -5280,3 +5280,155 @@ fn profile_returns_mutual_friends_and_mutual_spaces_with_nicknames() {
     assert_eq!(profile.mutual_space_items[0].name, "Rustaceans");
     assert_eq!(profile.mutual_space_items[0].nickname, "Sammy");
 }
+
+#[test]
+fn edit_own_profile_avatar_banner_and_server_nickname() {
+    let world = World::start();
+    let account = world.account();
+
+    // 1. Free account capabilities: global profile fields enabled, Nitro-only banner/server profile disabled.
+    let can = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key == account).unwrap().can,
+        other => panic!("{other:?}"),
+    };
+    assert!(can.profile_name && can.profile_about && can.profile_pronouns && can.profile_avatar && can.profile_nickname && can.profile_accent);
+    assert!(!can.profile_banner && !can.profile_server);
+
+    // 2. Edit display name, bio, pronouns, and accent color.
+    world.discord.script("/users/@me", 200, json!({"id": "1000", "global_name": "Justin S."}));
+    world.discord.script("/users/@me/profile", 200, json!({"bio": "Rust builder", "pronouns": "he/him", "accent_color": 5793266}));
+    assert_eq!(
+        world.ask(Request::SetProfile {
+            account: account.clone(),
+            name: Some("Justin S.".into()),
+            about: Some("Rust builder".into()),
+            pronouns: Some("he/him".into()),
+            emoji: None,
+            username: None,
+            photo: false,
+            accent: Some(0x5865F2),
+            banner: None,
+            space: None,
+        }),
+        Response::Ok
+    );
+    let me_patches = world.discord.requests_to("PATCH", "/users/@me");
+    assert!(me_patches.iter().any(|r| r.path == "/users/@me" && r.body["global_name"] == "Justin S."));
+    let prof_patches = world.discord.requests_to("PATCH", "/users/@me/profile");
+    assert_eq!(prof_patches.len(), 1);
+    assert_eq!(prof_patches[0].body, json!({"bio": "Rust builder", "pronouns": "he/him", "accent_color": 0x5865F2}));
+
+    // 3. Set PNG avatar -> base64 data URI; GIF avatar refused on free account without hitting Discord.
+    let files_dir = world.dir.with_extension("files");
+    std::fs::create_dir_all(&files_dir).unwrap();
+    let png = files_dir.join("me.png");
+    std::fs::write(&png, b"\x89PNG\r\n\x1a\npayload").unwrap();
+    let gif = files_dir.join("me.gif");
+    std::fs::write(&gif, b"GIF89apayload").unwrap();
+
+    world.discord.script("/users/@me", 200, json!({"id": "1000", "avatar": "newhash"}));
+    assert_eq!(world.ask(Request::SetAvatar { account: account.clone(), path: png.to_string_lossy().into_owned() }), Response::Ok);
+    let avatar_patch = world.discord.requests_to("PATCH", "/users/@me").into_iter().filter(|r| r.path == "/users/@me").last().unwrap();
+    assert!(avatar_patch.body["avatar"].as_str().unwrap_or("").starts_with("data:image/png;base64,"));
+
+    match world.ask(Request::SetAvatar { account: account.clone(), path: gif.to_string_lossy().into_owned() }) {
+        Response::Error { detail, .. } => assert!(detail.contains("Nitro"), "got {detail}"),
+        other => panic!("expected Nitro refusal for GIF avatar, got {other:?}"),
+    }
+
+    // 4. Banner & per-server profile refused locally on free account.
+    match world.ask(Request::SetProfile {
+        account: account.clone(),
+        name: None,
+        about: None,
+        pronouns: None,
+        emoji: None,
+        username: None,
+        photo: false,
+        accent: None,
+        banner: Some(png.to_string_lossy().into_owned()),
+        space: None,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("Nitro"), "got {detail}"),
+        other => panic!("expected Nitro refusal for banner, got {other:?}"),
+    }
+    match world.ask(Request::SetProfile {
+        account: account.clone(),
+        name: None,
+        about: Some("Server bio".into()),
+        pronouns: None,
+        emoji: None,
+        username: None,
+        photo: false,
+        accent: None,
+        banner: None,
+        space: Some(world.key("4000")),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("Nitro"), "got {detail}"),
+        other => panic!("expected Nitro refusal for server profile, got {other:?}"),
+    }
+
+    // 5. SpaceInfo reports can_change_nickname; set and clear server nickname on guild 4000.
+    // Give @everyone CHANGE_NICKNAME (1 << 26 = 67108864) in guild 4000 via ROLE_UPDATE or use a Nitro+perm world.
+    world.discord.push(
+        "GUILD_ROLE_UPDATE",
+        json!({
+            "guild_id": "4000",
+            "role": {"id": "4000", "name": "@everyone", "permissions": "1071765638721"}
+        }),
+    );
+    sleep(Duration::from_millis(200));
+    let space_info = match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
+        Response::SpaceInfo { info } => info,
+        other => panic!("expected SpaceInfo, got {other:?}"),
+    };
+    assert!(space_info.can_change_nickname);
+
+    world.discord.script("/guilds/4000/members/@me", 200, json!({"nick": "CrabCaptain"}));
+    assert_eq!(
+        world.ask(Request::SetNickname { space: world.key("4000"), nickname: Some("CrabCaptain".into()) }),
+        Response::Ok
+    );
+    let nick_patches = world.discord.requests_to("PATCH", "/guilds/4000/members/@me");
+    assert_eq!(nick_patches.len(), 1);
+    assert_eq!(nick_patches[0].body, json!({"nick": "CrabCaptain"}));
+
+    // Clear nickname sends null.
+    world.discord.script("/guilds/4000/members/@me", 200, json!({"nick": null}));
+    assert_eq!(world.ask(Request::SetNickname { space: world.key("4000"), nickname: None }), Response::Ok);
+    let nick_patches = world.discord.requests_to("PATCH", "/guilds/4000/members/@me");
+    assert_eq!(nick_patches.len(), 2);
+    assert_eq!(nick_patches[1].body, json!({"nick": null}));
+
+    // 6. Nitro account enables banner & server profile and sends PATCH /guilds/4000/profile/@me.
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["user"]["premium_type"] = json!(2);
+    let nitro = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("nitro account to connect", || (nitro.link() == Link::Connected).then_some(()));
+    let nitro_can = match nitro.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key == nitro.account()).unwrap().can,
+        other => panic!("{other:?}"),
+    };
+    assert!(nitro_can.profile_banner && nitro_can.profile_server);
+    nitro.discord.script("/guilds/4000/profile/@me", 200, json!({"bio": "Nitro guild bio"}));
+    assert_eq!(
+        nitro.ask(Request::SetProfile {
+            account: nitro.account(),
+            name: None,
+            about: Some("Nitro guild bio".into()),
+            pronouns: None,
+            emoji: None,
+            username: None,
+            photo: false,
+            accent: None,
+            banner: None,
+            space: Some(nitro.key("4000")),
+        }),
+        Response::Ok
+    );
+    let srv_patches = nitro.discord.requests_to("PATCH", "/guilds/4000/profile/@me");
+    assert_eq!(srv_patches.len(), 1);
+    assert_eq!(srv_patches[0].body, json!({"bio": "Nitro guild bio"}));
+}

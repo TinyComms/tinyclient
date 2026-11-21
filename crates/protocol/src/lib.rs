@@ -1715,6 +1715,15 @@ pub enum Request {
         username: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         photo: bool,
+        /// Optional 0xRRGGBB profile accent colour (Discord).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accent: Option<u32>,
+        /// Optional local image path for a profile banner; empty clears it (Nitro-only on Discord).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        banner: Option<String>,
+        /// Optional Space for per-server profile overrides (Nitro-only on Discord).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
     },
     /// Sets our own profile picture on a network from a local file path (empty clears it).
     /// Maps Tiny's `TinyAvatar` onto the shared request.
