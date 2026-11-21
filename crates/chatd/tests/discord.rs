@@ -2529,7 +2529,7 @@ fn reactions_edits_and_deletes_go_to_discord_and_the_store_follows_its_word() {
     wait("history of the conversation", || Some(world.messages(dm)).filter(|messages| messages.len() == 5));
     let (rich, mine) = ("1300000010000000010", "1300000000000000009");
     let react = |message: &str, emoji: &str, on: bool| {
-        world.ask(Request::React { conversation: world.key(dm), message_id: message.to_owned(), emoji: emoji.to_owned(), on })
+        world.ask(Request::React { conversation: world.key(dm), message_id: message.to_owned(), emoji: emoji.to_owned(), on , burst: false })
     };
     let reaction = |message: &str, emoji: &str| {
         let stored = world.messages(dm).into_iter().find(|stored| stored.id == message).unwrap();
@@ -2650,7 +2650,7 @@ fn reactions_follow_the_channels_permissions_and_what_they_refuse_never_reaches_
     let held = |channel: &str, id: &str| world.messages(channel).iter().any(|message| message.id == id);
     wait("the messages", || (held("4101", &full) && held("4105", &said) && held("4102", &news)).then_some(()));
     let react = |channel: &str, message: &str, emoji: &str| {
-        world.ask(Request::React { conversation: world.key(channel), message_id: message.to_owned(), emoji: emoji.to_owned(), on: true })
+        world.ask(Request::React { conversation: world.key(channel), message_id: message.to_owned(), emoji: emoji.to_owned(), on: true , burst: false })
     };
     let refused = |answer: Response| match answer {
         Response::Error { code: ErrorCode::Refused, detail } => detail,
@@ -2921,7 +2921,7 @@ fn a_run_of_refusals_stops_every_request_and_says_so() {
     wait("history of the conversation", || Some(world.messages(dm)).filter(|messages| messages.len() == 5));
     let mine = "1300000000000000009";
     world.discord.forbidden.lock().unwrap().push(format!("/channels/{dm}/messages/{mine}/reactions"));
-    let react = || world.ask(Request::React { conversation: world.key(dm), message_id: mine.to_owned(), emoji: "👀".to_owned(), on: true });
+    let react = || world.ask(Request::React { conversation: world.key(dm), message_id: mine.to_owned(), emoji: "👀".to_owned(), on: true , burst: false });
 
     // Discord bans an address at 10,000 refusals in ten minutes. This stops at 50.
     for _ in 0..49 {
@@ -3723,8 +3723,8 @@ fn info_mute_leave_pins_and_the_shared_search_ask_discord_once_each_and_only_whe
 fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_index_still_building() {
     let world = polished();
     // A Space's own search: the server's, one request, the hits mapped like the cache's.
-    let hits = match world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "rules".into() }) {
-        Response::MessageHits { hits } => hits,
+    let hits = match world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "rules".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  }) {
+        Response::MessageHits { hits, .. } => hits,
         other => panic!("{other:?}"),
     };
     assert_eq!(hits.len(), 1);
@@ -3742,7 +3742,7 @@ fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_ind
 
     // A server channel as the conversation: the server's search narrowed to the channel.
     let before = world.discord.requests_to("GET", "/guilds/4000/messages/search").len();
-    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("4101")), space: None, query: "hello".into() });
+    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("4101")), space: None, query: "hello".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
     assert!(matches!(answer, Response::MessageHits { .. }), "{answer:?}");
     let asked = world.discord.requests_to("GET", "/guilds/4000/messages/search");
     assert_eq!(asked.len(), before + 1, "the channel search is asked");
@@ -3751,7 +3751,7 @@ fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_ind
     // One conversation: the DM's own channel search.
     sleep(Duration::from_millis(400));
     let before = world.discord.requests_to("GET", "/channels/3001/messages/search").len();
-    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("3001")), space: None, query: "hello".into() });
+    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("3001")), space: None, query: "hello".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
     assert!(matches!(answer, Response::MessageHits { .. }), "{answer:?}");
     let asked = world.discord.requests_to("GET", "/channels/3001/messages/search");
     assert_eq!(asked.len(), before + 1, "the DM's channel search is asked");
@@ -3759,11 +3759,11 @@ fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_ind
 
     // A 202: the index is still building, and the words say so.
     sleep(Duration::from_millis(400));
-    let not_ready = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "index".into() });
+    let not_ready = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "index".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
     assert!(matches!(&not_ready, Response::Error { detail, .. } if detail.contains("isn't ready")), "{not_ready:?}");
 
     // Paced: Enter again at once is refused in words, so no client can turn it into a burst.
-    let paced = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "again".into() });
+    let paced = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "again".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
     assert!(matches!(&paced, Response::Error { detail, .. } if detail.contains("paced")), "{paced:?}");
 }
 

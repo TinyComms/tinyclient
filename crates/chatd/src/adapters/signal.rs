@@ -1437,10 +1437,16 @@ fn capabilities() -> protocol::Capabilities {
         delete: true,
         pins: true,
         forward: true,
-        polls: true,
+        polls: Some(protocol::PollCapabilities {
+            max_options: protocol::POLL_OPTIONS as u8,
+            max_duration_secs: 0,
+            multiple: true,
+            anonymous: false,
+        }),
         reactions: true,
         mention_spans: true,
         disappearing: true,
+        view_once: true,
         ..protocol::Capabilities::default()
     }
 }
@@ -1466,7 +1472,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             }
         }
         Command::CancelSend { client_id, .. } => upload::cancel(&account.ctx.account, &client_id),
-        Command::React { conversation_id, message_id, emoji, on, reply } => {
+        Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
             let _ = reply.send(react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
         }
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
@@ -1486,6 +1492,13 @@ fn serve(account: &Arc<Account>, command: Command) {
                 }
             };
             let _ = reply.send(answer);
+        }
+        Command::Vote { conversation_id, message_id, votes, reply } => {
+            let act = match votes {
+                Some(indexes) => PollAct::Vote(indexes),
+                None => PollAct::End,
+            };
+            let _ = reply.send(poll_act(account, &conversation_id, &message_id, act).map_err(refused));
         }
         Command::Typing { conversation_id, activity: _ } => typing(account, &conversation_id),
         Command::StartDirect { person_id, reply } => {

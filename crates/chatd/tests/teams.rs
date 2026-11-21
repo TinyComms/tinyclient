@@ -1152,7 +1152,7 @@ fn sending_editing_reacting_deleting_and_reading_go_to_teams() {
     assert_eq!((edited.text.as_str(), edited.edited), ("hello Ana", true));
 
     // React and take it back, under Teams' name for the emoji.
-    let react = |emoji: &str, on: bool| Request::React { conversation: ana.clone(), message_id: "1760000500500".to_owned(), emoji: emoji.to_owned(), on };
+    let react = |emoji: &str, on: bool| Request::React { conversation: ana.clone(), message_id: "1760000500500".to_owned(), emoji: emoji.to_owned(), on , burst: false };
     assert_eq!(world.ask(react("👍", true)), Response::Ok);
     let given = world.until("the reaction to reach Teams", || world.fake.calls("PUT", &path("/messages/1760000500500/properties")).pop());
     assert_eq!((given.query.as_str(), given.json()["emotions"]["key"].as_str()), ("name=emotions", Some("like")));

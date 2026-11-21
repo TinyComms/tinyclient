@@ -431,9 +431,13 @@ pub struct Capabilities {
     #[serde(default, skip_serializing_if = "is_false")]
     pub stickers: bool,
     /// The network searches its own messages (`SearchNetwork`), which the search pane's Enter
-    /// asks. Everywhere stays the cache alone.
+    /// asks. Everywhere stays the cache alone unless `search_global` is also set.
     #[serde(default, skip_serializing_if = "is_false")]
     pub search: bool,
+    /// The network supports account-wide search (Slack `search.messages`, Telegram
+    /// `messages.searchGlobal`), so Search Everywhere fans out to this account on Enter.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub search_global: bool,
     #[serde(default)]
     pub custom_emoji: EmojiScope,
     /// `Outgoing::silent`, `Outgoing::schedule`, `Outgoing::suppress_embeds` and
@@ -492,9 +496,9 @@ pub struct Capabilities {
     /// This account supports forwarding messages natively.
     #[serde(default, skip_serializing_if = "is_false")]
     pub forward: bool,
-    /// This account supports polls.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub polls: bool,
+    /// This account supports creating and voting in polls, with its limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polls: Option<PollCapabilities>,
     /// This account supports message reactions.
     #[serde(default, skip_serializing_if = "is_false")]
     pub reactions: bool,
@@ -529,6 +533,24 @@ pub struct Capabilities {
     /// This account supports setting a conversation's disappearing-messages timer (`Request::SetDisappearing`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub disappearing: bool,
+    /// Maximum members in a group chat this account can create (`Request::StartGroup`). 0: unsupported.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub groups: u32,
+    /// This account supports marking messages as Important or Urgent (`Outgoing::importance`, Teams).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub importance: bool,
+    /// This account supports broadcasting a thread reply to the channel (`Outgoing::broadcast`, Slack).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub thread_broadcast: bool,
+    /// This account supports Telegram-style message effects (`Outgoing::effect`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub effects: bool,
+    /// This account supports view-once media attachments (`OutgoingFile::view_once`, Signal/Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_once: bool,
+    /// This account supports super / burst reactions (`Request::React { burst: true }`, Discord Nitro).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub burst_reactions: bool,
 }
 
 /// Allowed disappearing-messages timer presets (in seconds, `0` = off) for a network.
@@ -556,6 +578,73 @@ pub fn format_disappearing(seconds: u32) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+/// Content-type filter for network message search (`SearchFilters::has`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchHas {
+    Files,
+    Links,
+    Images,
+}
+
+/// Optional filters on `Request::SearchNetwork`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchFilters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<Key>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has: Option<SearchHas>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<i64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mentions_me: bool,
+}
+
+impl SearchFilters {
+    pub fn is_empty(&self) -> bool {
+        *self == SearchFilters::default()
+    }
+}
+
+/// Message urgency level (Teams: Normal, Important, Urgent).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Importance {
+    #[default]
+    Normal,
+    Important,
+    Urgent,
+}
+
+impl Importance {
+    pub fn is_normal(&self) -> bool {
+        *self == Importance::Normal
+    }
+}
+
+/// What a network allows when creating a poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PollCapabilities {
+    /// Maximum number of options (e.g. 10).
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub max_options: u8,
+    /// Longest duration in seconds. 0 means no duration setting / network default.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_duration_secs: u32,
+    /// Whether multi-select polls are supported.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub multiple: bool,
+    /// Whether anonymous polls are supported.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anonymous: bool,
+}
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 impl Capabilities {
@@ -608,6 +697,9 @@ pub struct OutgoingFile {
     /// Send the file as it is (a HEIC rather than the JPEG made at staging).
     #[serde(default, skip_serializing_if = "is_false")]
     pub original: bool,
+    /// View-once media (Signal, Telegram): hidden until opened and cannot be kept.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_once: bool,
     /// Optional video/audio metadata and poster thumbnail path staged by the shell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<OutgoingMedia>,
@@ -644,12 +736,18 @@ pub struct VoiceNote {
 
 /// A poll the user is starting. Signal: a question of 1 to 100 characters and 2 to 10 choices,
 /// each at most 100 characters. `multiple` lets a person pick more than one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollDraft {
     pub question: String,
     pub options: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub multiple: bool,
+    /// Optional duration in seconds before the poll closes automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<u32>,
+    /// Whether votes are anonymous.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anonymous: bool,
 }
 
 /// What a `Send` carries besides its text. All of it is off by default, and a plain text
@@ -686,6 +784,15 @@ pub struct Outgoing {
     /// true for text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll: Option<PollDraft>,
+    /// Message importance (Teams: Normal / Important / Urgent).
+    #[serde(default, skip_serializing_if = "Importance::is_normal")]
+    pub importance: Importance,
+    /// Also send a thread reply to the parent channel (Slack).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub broadcast: bool,
+    /// Optional message effect identifier from the account's catalog (Telegram).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<String>,
 }
 
 impl Default for Outgoing {
@@ -700,6 +807,9 @@ impl Default for Outgoing {
             voice: None,
             spans: Vec::new(),
             poll: None,
+            importance: Importance::Normal,
+            broadcast: false,
+            effect: None,
         }
     }
 }

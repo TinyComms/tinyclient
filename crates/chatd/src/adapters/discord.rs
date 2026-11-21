@@ -476,7 +476,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
             // A search can wait on Discord's tight search limits: it runs on a thread of its
             // own, so the sends and reactions behind it are not held up, and one queued past
             // the shell's patience does not ask at all.
-            Command::Search { query, scope, at, reply } => {
+            Command::Search { query, scope, at, reply, .. } => {
                 discord.asked();
                 if at.elapsed() < SEARCH_PATIENCE {
                     Discord::search_queued(&discord, query, scope, at, reply);
@@ -1654,7 +1654,7 @@ impl Discord {
                 let outcome = self.send(&conversation_id, &client_id, &text, reply_to.as_deref());
                 self.ctx.sent(&conversation_id, &client_id, outcome);
             }
-            Command::React { conversation_id, message_id, emoji, on, reply } => {
+            Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
                 answer(reply, self.react(&conversation_id, &message_id, &emoji, on))
             }
             Command::Edit { conversation_id, message_id, text, spans: _, reply } => {

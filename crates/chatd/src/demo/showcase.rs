@@ -496,11 +496,24 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     }));
     feed.push(report);
 
-    let mut poll = s.message(account, who(INES), step(20), "Poll: Where should the autumn foray go?");
-    poll.kind = MessageKind::Unsupported {
+    let mut poll_msg = s.message(account, who(INES), step(20), "Poll: Where should the autumn foray go?");
+    let mut poll_data = protocol::Poll::open(
+        "Where should the autumn foray go?",
+        ["Creek ridge trail", "Old cedar hollow", "North bog boardwalk"],
+        false,
+    );
+    poll_data.closes_at = Some(s.now + 86_400);
+    poll_data.apply_vote(&who(INES).id, vec![0], &me.id);
+    poll_data.apply_vote(&who(TOMASZ).id, vec![0], &me.id);
+    poll_data.apply_vote(&who(HARUTO).id, vec![1], &me.id);
+    poll_msg.poll = Some(Box::new(poll_data));
+    feed.push(poll_msg);
+
+    let mut quiz = s.message(account, who(WREN), step(5), "Quiz: Name that moss (open in official app)");
+    quiz.kind = MessageKind::Unsupported {
         link: format!("https://discord.com/channels/{}/{}", discord::MOSS, discord::SHOWCASE),
     };
-    feed.push(poll);
+    feed.push(quiz);
 
     let text = "@Robin Vale can you check #trail-cams with @Field Team before Saturday? @Tomasz Brandt has the keys. Heads up @everyone: the creek route is on.";
     let mut called = s.message(account, who(INES), step(30), text);

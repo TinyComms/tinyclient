@@ -22,6 +22,16 @@ pub struct Controls {
     pub voice: bool,
     /// Right-click on Send can hand the network a time (`Outgoing::schedule`).
     pub schedule: bool,
+    /// The "Create poll" button beside Attach (`Capabilities::polls`).
+    pub poll: bool,
+    /// Mark message as Important or Urgent (`Capabilities::importance`, Teams).
+    pub importance: bool,
+    /// "Also send to #channel" on a thread reply (`Capabilities::thread_broadcast`, Slack).
+    pub broadcast: bool,
+    /// Telegram message effects selector (`Capabilities::effects`).
+    pub effects: bool,
+    /// View-once per-file toggle (`Capabilities::view_once`, Signal/Telegram).
+    pub view_once: bool,
 }
 
 /// `editing`: edit mode is text only on every network.
@@ -46,6 +56,11 @@ pub fn controls(can: &Capabilities, editing: bool) -> Controls {
         custom_emoji: can.custom_emoji != EmojiScope::None,
         voice: super::rec::available(can) && !editing,
         schedule: can.schedule && !editing,
+        poll: can.polls.is_some() && !editing,
+        importance: can.importance && !editing,
+        broadcast: can.thread_broadcast && !editing,
+        effects: can.effects && !editing,
+        view_once: can.view_once && !editing,
     }
 }
 
@@ -118,5 +133,33 @@ mod tests {
         let edit = controls(&slack, true);
         assert!(!edit.schedule && !edit.silent, "edit mode is text only");
         assert!(!controls(&discord(), false).schedule);
+    }
+
+    #[test]
+    fn poll_button_follows_capability_and_hides_when_editing() {
+        let with_polls = Capabilities {
+            polls: Some(protocol::PollCapabilities { max_options: 10, max_duration_secs: 86_400, multiple: true, anonymous: false }),
+            ..Capabilities::default()
+        };
+        assert!(controls(Network::Discord, &with_polls, false).poll);
+        assert!(!controls(Network::Discord, &with_polls, true).poll);
+        assert!(!controls(Network::Slack, &Capabilities::default(), false).poll);
+    }
+
+    #[test]
+    fn send_option_controls_follow_capabilities_and_hide_when_editing() {
+        let teams = Capabilities { importance: true, ..Capabilities::default() };
+        let m = controls(Network::Teams, &teams, false);
+        assert!(m.importance && !m.broadcast && !m.effects && !m.view_once);
+        assert!(!controls(Network::Teams, &teams, true).importance);
+
+        let slack = Capabilities { thread_broadcast: true, ..Capabilities::default() };
+        let s = controls(Network::Slack, &slack, false);
+        assert!(s.broadcast && !s.importance && !s.effects && !s.view_once);
+
+        let telegram = Capabilities { effects: true, view_once: true, ..Capabilities::default() };
+        let t = controls(Network::Telegram, &telegram, false);
+        assert!(t.effects && t.view_once && !t.importance && !t.broadcast);
+        assert!(!controls(Network::Telegram, &telegram, true).effects);
     }
 }

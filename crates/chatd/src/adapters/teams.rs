@@ -923,7 +923,7 @@ impl Teams {
             Command::Send { conversation_id, client_id, text, reply_to } => {
                 self.post(&conversation_id, &client_id, &text, reply_to.as_deref())
             }
-            Command::React { conversation_id, message_id, emoji, on, reply } => {
+            Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
                 let _ = reply.send(self.react(&conversation_id, &message_id, &emoji, on).map_err(refuse));
             }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(message::reaction_rules()))),

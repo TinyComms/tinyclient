@@ -1368,7 +1368,7 @@ impl Slack {
             Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
                 answer(reply, self.forward(&from_conversation_id, &message_ids, &to_conversation_ids, &note))
             }
-            Command::Search { query, scope, at, reply } => {
+            Command::Search { query, scope, at, reply, .. } => {
                 if at.elapsed() >= SEARCH_PATIENCE {
                     drop(reply);
                 } else {
@@ -1388,7 +1388,7 @@ impl Slack {
             }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
             Command::OpenThreads(_) => self.report(self.open_threads()),
-            Command::React { conversation_id, message_id, emoji, on, reply } => {
+            Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
                 answer(reply, self.react(&conversation_id, &message_id, &emoji, on));
             }
             Command::Edit { conversation_id, message_id, text, spans, reply } => {

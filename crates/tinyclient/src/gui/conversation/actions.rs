@@ -845,7 +845,7 @@ impl Pane {
                 emoji::used(emoji);
             }
         }
-        let request = Request::React { conversation, message_id: message_id.to_owned(), emoji: emoji.to_owned(), on };
+        let request = Request::React { conversation, message_id: message_id.to_owned(), emoji: emoji.to_owned(), on, burst: false };
         self.act_then(request, "Couldn't react", |this, cx| this.ask_reactions(cx), cx);
         cx.notify();
     }

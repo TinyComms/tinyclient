@@ -81,6 +81,7 @@ const TABLES: &str = "
         position INTEGER NOT NULL DEFAULT 0,
         muted    INTEGER NOT NULL DEFAULT 0,
         hide_muted INTEGER NOT NULL DEFAULT 0,
+        can_create_channels INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     -- A folder: of chats (Telegram, membership on the conversation) or of Spaces (Discord,
@@ -1079,6 +1080,9 @@ impl Store {
         store.migrate_reminders()?;
         // The revision table is new and must not wipe a cache that is already at this schema.
         store.ensure_revisions()?;
+        if !column(&store.db, "space", "can_create_channels")? {
+            store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_channels INTEGER NOT NULL DEFAULT 0")?;
+        }
         Ok(store)
     }
 
@@ -1289,7 +1293,7 @@ impl Store {
                     (SELECT f.id FROM folder f
                       WHERE f.network = s.network AND f.account = s.account
                         AND instr(f.spaces, ',' || s.id || ',') > 0 LIMIT 1),
-                    s.muted, s.hide_muted
+                    s.muted, s.hide_muted, s.can_create_channels
              FROM space s
              LEFT JOIN media m ON m.network = s.network AND m.account = s.account AND m.id = s.icon
              WHERE ?1 IS NULL OR s.network = ?1
@@ -1306,6 +1310,7 @@ impl Store {
                 folder: row.get(14)?,
                 muted: row.get(15)?,
                 hide_muted: row.get(16)?,
+                can_create_channels: row.get(17)?,
             })
         })?;
         rows.collect()
@@ -2122,6 +2127,15 @@ impl Store {
         Ok(changed == 1)
     }
 
+    pub fn set_space_can_create_channels(&mut self, space: &Key, can: bool) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE space SET can_create_channels = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3 AND can_create_channels != ?4",
+            params![word(&space.network), space.account, space.id, can],
+        )?;
+        Ok(changed == 1)
+    }
+
     // Previews.
 
     /// The newest message as a line, for a network that lists only that. Kept only when it is
@@ -2198,6 +2212,104 @@ impl Store {
             ))?
             .query_map(params![network.map(|network| word(&network)), pattern, limit], conversation_from)?
             .collect()
+    }
+
+    /// Filtered search within one account's cached messages, used by the Demo adapter and
+    /// filtered network search. Applies `from`, `has` (Files/Links/Images), `before`, `after`,
+    /// and `mentions_me`.
+    pub fn search_account_filtered(
+        &self,
+        account: &AccountKey,
+        conversation: Option<&str>,
+        space: Option<&str>,
+        query: &str,
+        filters: &protocol::SearchFilters,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<MessageHit>> {
+        let pattern = format!("%{}%", like_prefix(query));
+        let mut stmt = self.db.prepare(
+            "SELECT m.network, m.account, m.conversation, m.id, m.sent, m.text, m.body, c.title,
+                    COALESCE(s.name, '')
+               FROM message m
+               JOIN conversation c ON c.network = m.network AND c.account = m.account
+                  AND c.id = m.conversation
+               LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
+               WHERE m.pending = 0
+                 AND m.network = ?1 AND m.account = ?2
+                 AND (?3 = '' OR m.text LIKE ?3 ESCAPE '\\')
+                 AND (?4 IS NULL OR m.conversation = ?4)
+                 AND (?5 IS NULL OR c.space = ?5)
+                 AND (?6 IS NULL OR m.sent < ?6)
+                 AND (?7 IS NULL OR m.sent > ?7)
+                 AND (m.expires IS NULL OR m.expires > ?8)
+                 AND NOT c.hidden AND c.special != 'request'
+               ORDER BY m.sent DESC, length(m.id) DESC, m.id DESC",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                word(&account.network),
+                account.account,
+                if query.is_empty() { "" } else { pattern.as_str() },
+                conversation,
+                space,
+                filters.before,
+                filters.after,
+                crate::hub::now(),
+            ],
+            |row| {
+                let text: String = row.get(5)?;
+                let body: String = row.get(6)?;
+                let message: Message = serde_json::from_str(&body).map_err(broken)?;
+                Ok((
+                    MessageHit {
+                        conversation: key_at(row)?,
+                        message_id: row.get(3)?,
+                        sent: row.get(4)?,
+                        sender: message.sender.name.clone(),
+                        snippet: snippet(&text, query),
+                        title: row.get(7)?,
+                        space_title: row.get(8)?,
+                        outgoing: message.outgoing,
+                    },
+                    message,
+                ))
+            },
+        )?;
+        let mut out = Vec::new();
+        for item in rows {
+            let (hit, msg) = item?;
+            if let Some(from) = &filters.from {
+                if msg.sender.id != from.id {
+                    continue;
+                }
+            }
+            if filters.mentions_me && !msg.mentions_me {
+                continue;
+            }
+            if let Some(has) = filters.has {
+                let ok = match has {
+                    protocol::SearchHas::Files => !msg.attachments.is_empty(),
+                    protocol::SearchHas::Images => msg
+                        .attachments
+                        .iter()
+                        .any(|a| matches!(a.file.kind, protocol::MediaKind::Image | protocol::MediaKind::Gif)),
+                    protocol::SearchHas::Links => {
+                        !msg.previews.is_empty()
+                            || msg.text.contains("http://")
+                            || msg.text.contains("https://")
+                            || msg.spans.iter().any(|s| matches!(s.style, protocol::Style::Link { .. }))
+                    }
+                };
+                if !ok {
+                    continue;
+                }
+            }
+            out.push(hit);
+            if out.len() >= limit as usize {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Cached messages whose text contains `query`, newest first. Hidden conversations and

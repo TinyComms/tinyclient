@@ -139,6 +139,12 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
 
     // What each account may send, as its session would say.
     let mb = 1 << 20;
+    let demo_polls = Some(protocol::PollCapabilities {
+        max_options: protocol::POLL_OPTIONS as u8,
+        max_duration_secs: 7 * 86_400,
+        multiple: true,
+        anonymous: false,
+    });
     s.capabilities.push((discord::account(), Capabilities {
         max_file_bytes: 10 * mb,
         max_files: 10,
@@ -155,9 +161,12 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
         threads: true,
         pins: true,
         forward: true,
-        polls: true,
         reactions: true,
         mention_format: protocol::MentionFormat::Discord,
+        search: true,
+        polls: demo_polls.clone(),
+        groups: 10,
+        burst_reactions: true,
         ..Capabilities::default()
     }));
     for account in [slack::harbor(), slack::fernhill()] {
@@ -175,6 +184,10 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
             forward: true,
             reactions: true,
             mention_format: protocol::MentionFormat::Slack,
+            search: true,
+            search_global: true,
+            groups: 8,
+            thread_broadcast: true,
             ..Capabilities::default()
         }));
     }
@@ -189,6 +202,8 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
         silent: true,
         schedule: true,
         suppress_embeds: true,
+        search: true,
+        search_global: true,
         edit_window: 48 * 3_600,
         voice_notes: true,
         reply: true,
@@ -196,9 +211,17 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
         delete: true,
         pins: true,
         forward: true,
-        polls: true,
         reactions: true,
         mention_spans: true,
+        polls: Some(protocol::PollCapabilities {
+            max_options: protocol::POLL_OPTIONS as u8,
+            max_duration_secs: 0,
+            multiple: true,
+            anonymous: true,
+        }),
+        groups: 200,
+        effects: true,
+        view_once: true,
         ..Capabilities::default()
     }));
     s.capabilities.push((teams::account(), Capabilities {
@@ -213,6 +236,8 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
         reactions: true,
         mention_format: protocol::MentionFormat::Teams,
         mention_spans: true,
+        groups: 20,
+        importance: true,
         ..Capabilities::default()
     }));
     s.capabilities.push((super::signal::account(), Capabilities {
@@ -224,9 +249,11 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
         delete: true,
         pins: true,
         forward: true,
-        polls: true,
+        polls: demo_polls,
         reactions: true,
         mention_spans: true,
+        groups: 100,
+        view_once: true,
         ..Capabilities::default()
     }));
     s.capabilities.push((super::tiny::account(), Capabilities {
@@ -240,6 +267,8 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
         gif_file: true,
         ..Capabilities::default()
     }));
+    let _ = s.store.set_space_can_create_channels(&Key::new(&discord::account(), discord::MOSS), true);
+    let _ = s.store.set_space_can_create_channels(&Key::new(&slack::harbor(), slack::harbor().account), true);
     Ok(())
 }
 

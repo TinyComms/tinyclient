@@ -311,6 +311,8 @@ pub struct Pane {
     revealed: HashSet<(String, u32)>,
     /// Spoilered pictures opened, by file.
     shown: HashSet<String>,
+    /// Polls where the user toggled "Show results" before voting, by message id.
+    poll_results: HashSet<String>,
     /// Long code blocks opened, by message and block.
     expanded: HashSet<(String, usize)>,
     /// Coloured code, by message and block, so a scroll does not colour the same block again.
@@ -424,6 +426,7 @@ impl Pane {
             then: HashMap::new(),
             revealed: HashSet::new(),
             shown: HashSet::new(),
+            poll_results: HashSet::new(),
             expanded: HashSet::new(),
             code_colors: HashMap::new(),
             code_coloring: HashSet::new(),
@@ -464,6 +467,38 @@ impl Pane {
 
     fn is_thread(&self) -> bool {
         self.thread
+    }
+
+    pub(super) fn toggle_poll_results(&mut self, message_id: String, cx: &mut Context<Self>) {
+        if !self.poll_results.remove(&message_id) {
+            self.poll_results.insert(message_id);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn vote_poll(&mut self, message_id: String, votes: Option<Vec<u32>>, cx: &mut Context<Self>) {
+        if SCREENSHOTS {
+            return;
+        }
+        let Some(conversation) = self.open.as_ref().map(|open| open.key.clone()) else {
+            return;
+        };
+        cx.spawn(async move |pane, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move { ask(&Request::Poll { conversation, message_id, votes }) })
+                .await;
+            let _ = pane.update(cx, |this, cx| {
+                if let Ok(Response::Error { detail, .. }) = answer {
+                    let shell = this.shell.clone();
+                    cx.defer(move |cx| {
+                        let _ = shell.update(cx, |shell, cx| shell.toast(None, detail, cx));
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Shows this conversation. The same one again only takes its new title, picture and the

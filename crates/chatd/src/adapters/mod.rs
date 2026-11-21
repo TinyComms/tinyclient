@@ -116,11 +116,12 @@ impl std::fmt::Debug for SealedFile {
     }
 }
 
-/// What the search's ask names: a Space's own search, or one conversation's.
+/// What the search's ask names: a Space's own search, one conversation's, or the whole account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchScope {
     Space(String),
     Conversation(String),
+    Account,
 }
 
 /// One window of a member list.
@@ -281,6 +282,7 @@ pub enum Command {
         message_id: String,
         emoji: String,
         on: bool,
+        burst: bool,
         reply: Reply<()>,
     },
     /// What reactions a conversation takes from this account, from what the network says of
@@ -309,6 +311,14 @@ pub enum Command {
         conversation_id: String,
         message_id: String,
         scope: protocol::DeleteScope,
+        reply: Reply<()>,
+    },
+    /// Vote on a poll, retract a vote (`Some(vec![])`), or end a poll (`None`). Report the
+    /// updated message through [`Context::message`] before answering.
+    Vote {
+        conversation_id: String,
+        message_id: String,
+        votes: Option<Vec<u32>>,
         reply: Reply<()>,
     },
     /// The user's draft is changing. Pace it: at most one typing signal per 8 s per
@@ -362,6 +372,21 @@ pub enum Command {
     StartDirect { person_id: String, reply: Reply<String> },
     /// Tiny call setup can create encrypted text history without enrolling a text device.
     StartDirectCall { person_id: String, reply: Reply<String> },
+    /// Start a group conversation with several people; record it and answer with its id.
+    StartGroup {
+        people: Vec<String>,
+        title: Option<String>,
+        reply: Reply<String>,
+    },
+    /// Create a channel in a Space; record it and answer with its id.
+    CreateChannel {
+        space_id: String,
+        name: String,
+        kind: protocol::ConversationKind,
+        private: bool,
+        group: Option<String>,
+        reply: Reply<String>,
+    },
     /// The id of the thread a channel message starts. Discord only: create the thread channel,
     /// record it, and answer with its id. `name` is already one line, at most 100 characters.
     StartThread {
@@ -522,6 +547,8 @@ pub enum Command {
     Search {
         query: String,
         scope: SearchScope,
+        filters: protocol::SearchFilters,
+        cursor: Option<String>,
         at: Instant,
         reply: Reply<Vec<MessageHit>>,
     },
@@ -564,7 +591,12 @@ impl Command {
             | Command::MembersRemove { reply, .. }
             | Command::ConversationUpdate { reply, .. }
             | Command::ConversationPicture { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::StartDirect { reply, .. } | Command::StartDirectCall { reply, .. } | Command::StartThread { reply, .. } | Command::Handoff { reply, .. } => {
+            Command::StartDirect { reply, .. }
+            | Command::StartDirectCall { reply, .. }
+            | Command::StartGroup { reply, .. }
+            | Command::CreateChannel { reply, .. }
+            | Command::StartThread { reply, .. }
+            | Command::Handoff { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -592,6 +624,7 @@ impl Command {
             Command::React { reply, .. }
             | Command::Edit { reply, .. }
             | Command::Delete { reply, .. }
+            | Command::Vote { reply, .. }
             | Command::Relate { reply, .. }
             | Command::Report { reply, .. }
             | Command::SetPresence { reply, .. }

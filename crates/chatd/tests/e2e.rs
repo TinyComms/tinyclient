@@ -929,7 +929,7 @@ fn what_the_user_does_to_a_message_is_shown_and_settled_by_the_network() {
     };
     let reaction = |message: &Message, emoji: &str| message.reactions.iter().find(|have| have.emoji == emoji).map(|have| (have.count, have.mine));
     let react = |message: &Message, emoji: &str, on| {
-        chatd.ask(Request::React { conversation: room.clone(), message_id: message.id.clone(), emoji: emoji.into(), on })
+        chatd.ask(Request::React { conversation: room.clone(), message_id: message.id.clone(), emoji: emoji.into(), on , burst: false })
     };
 
     // A reaction of ours is one reaction, however many times it is told: once by the request
@@ -948,7 +948,7 @@ fn what_the_user_does_to_a_message_is_shown_and_settled_by_the_network() {
     let custom = find("County recorder confirmed");
     let named = custom.reactions.iter().find(|have| have.emoji == ":lichen_ok:").expect("the custom reaction");
     assert_eq!((named.count, named.mine, named.file.as_ref().map(|file| file.id.as_str())), (1, true, Some("emoji-lichen_ok")));
-    let nowhere = chatd.ask(Request::React { conversation: room.clone(), message_id: "1".into(), emoji: "👍".into(), on: true });
+    let nowhere = chatd.ask(Request::React { conversation: room.clone(), message_id: "1".into(), emoji: "👍".into(), on: true , burst: false });
     assert!(matches!(nowhere, Response::Error { code: ErrorCode::NotFound, .. }), "{nowhere:?}");
 
     // An edit waits for the network and then reads as edited. Someone else's is refused here.

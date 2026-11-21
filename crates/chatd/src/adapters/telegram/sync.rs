@@ -326,6 +326,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         gifs: true,
         stickers: true,
         search: true,
+        search_global: true,
         custom_emoji: EmojiScope::All,
         silent: true,
         schedule: true,
@@ -348,7 +349,12 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         direct_threads: false,
         pins: true,
         forward: true,
-        polls: true,
+        polls: Some(protocol::PollCapabilities {
+            max_options: protocol::POLL_OPTIONS as u8,
+            max_duration_secs: 0,
+            multiple: true,
+            anonymous: true,
+        }),
         reactions: true,
         gif_file: false,
         mention_format: protocol::MentionFormat::Plain,
@@ -357,7 +363,9 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         archive: true,
         folders_edit: true,
         disappearing: true,
-        ..Default::default()
+        effects: true,
+        view_once: true,
+        ..Capabilities::default()
     }
 }
 

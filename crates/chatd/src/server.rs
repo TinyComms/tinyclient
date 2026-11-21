@@ -1193,7 +1193,7 @@ impl Chat {
         }
         message.waiting = false;
         if with.poll.is_some() {
-            if account.network != Network::Signal {
+            if self.hub.capabilities(&account).polls.is_none() {
                 return error(ErrorCode::Unsupported, "Polls are not built for this network yet.");
             }
             if !with.files.is_empty() {
@@ -1463,10 +1463,13 @@ impl Chat {
     /// conversation's rules refuse is refused here and never sent; one that replaces mine (a
     /// network with one reaction a person) takes mine off at once too. A custom emoji that is
     /// not on the message yet has no name here to draw, so that one waits for the network's word.
-    fn react(&self, conversation: Key, message_id: String, emoji: String, on: bool) -> Response {
+    fn react(&self, conversation: Key, message_id: String, emoji: String, on: bool, burst: bool) -> Response {
         let account = conversation.account();
         if let Err(refused) = self.online(&account) {
             return *refused;
+        }
+        if burst && !self.hub.capabilities(&account).burst_reactions {
+            return error(ErrorCode::Unsupported, "Super reactions are not available on this account.");
         }
         let ours = |emoji: &str| Reaction {
             emoji: emoji.to_owned(),
@@ -1518,6 +1521,7 @@ impl Chat {
             message_id: id,
             emoji: emoji.clone(),
             on,
+            burst,
             reply,
         });
         match asked {
@@ -1745,20 +1749,15 @@ impl Chat {
         }
     }
 
-    /// A vote, a retraction, or ending a poll. Not an edit: the poll may be someone else's, and
-    /// the message's text stays "Poll: …". Signal only; the adapter reads the sentinel.
+    /// A vote, a retraction, or ending a poll. Dispatched to the account's adapter via `Command::Vote`.
     fn poll(&self, conversation: Key, message_id: String, votes: Option<Vec<u32>>) -> Response {
         let account = conversation.account();
-        if account.network != Network::Signal {
-            return error(ErrorCode::Unsupported, "Polls are not built for this network yet.");
-        }
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
-        let votes = votes.map(|votes| votes.into_iter().take(10).collect::<Vec<_>>());
-        let text = adapters::signal::poll_command(votes.as_deref());
+        let votes = votes.map(|votes| votes.into_iter().take(protocol::POLL_OPTIONS).collect::<Vec<_>>());
         let conversation_id = conversation.id;
-        match self.ask(&account, |reply| Command::Edit { conversation_id, message_id, text, spans: Vec::new(), reply }) {
+        match self.ask(&account, |reply| Command::Vote { conversation_id, message_id, votes, reply }) {
             Ok(()) => Response::Ok,
             Err(refused) => *refused,
         }
@@ -2531,30 +2530,83 @@ impl Chat {
                 match found {
                     Ok(hits) => {
                         let hits: Vec<_> = hits.into_iter().filter(|hit| self.shows(&hit.conversation.account())).collect();
-                        Response::MessageHits { hits }
+                        Response::MessageHits { hits, cursor: None, not_searched: Vec::new() }
                     }
                     Err(err) => internal(err),
                 }
             }
-            Request::SearchNetwork { conversation, space, query } => {
+            Request::SearchNetwork { conversation, space, account, network, query, filters, cursor } => {
                 let query = query.trim().to_owned();
-                if query.is_empty() {
-                    Response::MessageHits { hits: Vec::new() }
-                } else {
-                    let (account, scope) = match (&conversation, &space) {
+                if query.is_empty() && filters.is_empty() {
+                    Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new() }
+                } else if conversation.is_some() || space.is_some() {
+                    let (target_account, scope) = match (&conversation, &space) {
                         (Some(key), _) => (key.account(), SearchScope::Conversation(key.id.clone())),
                         (None, Some(key)) => (key.account(), SearchScope::Space(key.id.clone())),
-                        (None, None) => {
-                            return error(ErrorCode::Unsupported, "a search on the network names a conversation or a Space")
-                        }
+                        (None, None) => unreachable!(),
                     };
-                    if !self.shows(&account) {
-                        return Response::MessageHits { hits: Vec::new() };
+                    if !self.shows(&target_account) {
+                        return Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new() };
                     }
-                    match self.ask(&account, |reply| Command::Search { query, scope, at: std::time::Instant::now(), reply }) {
-                        Ok(hits) => Response::MessageHits { hits },
+                    match self.ask(&target_account, |reply| Command::Search {
+                        query,
+                        scope,
+                        filters,
+                        cursor,
+                        at: std::time::Instant::now(),
+                        reply,
+                    }) {
+                        Ok(hits) => Response::MessageHits { hits, cursor: None, not_searched: Vec::new() },
                         Err(refused) => *refused,
                     }
+                } else {
+                    // Everywhere, or scoped to one account or one network: fan out once to each
+                    // connected account whose adapter supports account-wide search, merge by time,
+                    // and honestly list connected networks that were not asked.
+                    const PAGE: usize = 25;
+                    let offset: usize = cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(0);
+                    let accounts: Vec<AccountKey> = match self.hub.store().accounts() {
+                        Ok(rows) => rows
+                            .into_iter()
+                            .map(|row| row.key)
+                            .filter(|k| self.shows(k))
+                            .filter(|k| account.as_ref().is_none_or(|a| a == k))
+                            .filter(|k| network.is_none_or(|n| n == k.network))
+                            .collect(),
+                        Err(err) => return internal(err),
+                    };
+                    let mut merged: Vec<protocol::MessageHit> = Vec::new();
+                    let mut not_searched: Vec<Network> = Vec::new();
+                    let mut asked_networks: Vec<Network> = Vec::new();
+                    for acct in accounts {
+                        let can = self.hub.capabilities(&acct);
+                        if self.hub.link(&acct) == Link::Connected && can.search_global {
+                            if let Ok(hits) = self.ask(&acct, |reply| Command::Search {
+                                query: query.clone(),
+                                scope: SearchScope::Account,
+                                filters: filters.clone(),
+                                cursor: None,
+                                at: std::time::Instant::now(),
+                                reply,
+                            }) {
+                                if !asked_networks.contains(&acct.network) {
+                                    asked_networks.push(acct.network);
+                                }
+                                merged.extend(hits);
+                                continue;
+                            }
+                        }
+                        if !not_searched.contains(&acct.network) {
+                            not_searched.push(acct.network);
+                        }
+                    }
+                    not_searched.retain(|n| !asked_networks.contains(n));
+                    merged.sort_by(|a, b| b.sent.cmp(&a.sent).then_with(|| b.message_id.cmp(&a.message_id)));
+                    let mut seen = std::collections::HashSet::new();
+                    merged.retain(|hit| seen.insert((hit.conversation.clone(), hit.message_id.clone())));
+                    let next_cursor = (offset + PAGE < merged.len()).then(|| (offset + PAGE).to_string());
+                    let page: Vec<protocol::MessageHit> = merged.into_iter().skip(offset).take(PAGE).collect();
+                    Response::MessageHits { hits: page, cursor: next_cursor, not_searched }
                 }
             }
             Request::SetDraft { conversation, text } => {
@@ -2776,6 +2828,64 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::StartGroup { account, people, title } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let cap = self.hub.capabilities(&account).groups;
+                if cap == 0 {
+                    return error(ErrorCode::Unsupported, "Creating group chats is not supported on this account.");
+                }
+                let mut ids: Vec<String> = Vec::new();
+                for p in people {
+                    if p.account() != account {
+                        return error(ErrorCode::Refused, "Everyone in a group must be on the same account.");
+                    }
+                    if !ids.contains(&p.id) {
+                        ids.push(p.id);
+                    }
+                }
+                if ids.is_empty() {
+                    return error(ErrorCode::Refused, "Pick at least one person for the group.");
+                }
+                if ids.len() > cap as usize {
+                    return error(ErrorCode::Refused, format!("This account allows at most {cap} people in a group."));
+                }
+                let title = title.map(|mut t| {
+                    protocol::clip(&mut t, 100);
+                    t.trim().to_owned()
+                }).filter(|t| !t.is_empty());
+                let id = match self.ask(&account, |reply| Command::StartGroup { people: ids, title, reply }) {
+                    Ok(id) => id,
+                    Err(refused) => return *refused,
+                };
+                match self.hub.store().conversation(&Key::new(&account, id)) {
+                    Ok(Some(conversation)) => Response::Conversation { conversation: self.row(conversation) },
+                    Ok(None) => error(ErrorCode::Internal, "group created, but not recorded"),
+                    Err(err) => internal(err),
+                }
+            }
+            Request::CreateChannel { space, name, kind, private, group } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let mut name = name.trim().to_owned();
+                protocol::clip(&mut name, 100);
+                if name.is_empty() {
+                    return error(ErrorCode::Refused, "Channel name cannot be empty.");
+                }
+                let space_id = space.id.clone();
+                let id = match self.ask(&account, |reply| Command::CreateChannel { space_id, name, kind, private, group, reply }) {
+                    Ok(id) => id,
+                    Err(refused) => return *refused,
+                };
+                match self.hub.store().conversation(&Key::new(&account, id)) {
+                    Ok(Some(conversation)) => Response::Conversation { conversation: self.row(conversation) },
+                    Ok(None) => error(ErrorCode::Internal, "channel created, but not recorded"),
+                    Err(err) => internal(err),
+                }
+            }
             Request::StartThread { conversation, message } => self.start_thread(conversation, message),
             Request::Profile { person, space } => self.profile(person, space),
             Request::ConversationInfo { conversation } => self.conversation_info(conversation),
@@ -2888,7 +2998,7 @@ impl Chat {
                 Response::Ok
             }
 
-            Request::React { conversation, message_id, emoji, on } => self.react(conversation, message_id, emoji, on),
+            Request::React { conversation, message_id, emoji, on, burst } => self.react(conversation, message_id, emoji, on, burst),
             Request::Reactions { conversation } => self.reactions(conversation),
             Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans, protocol::DeleteScope::Everyone),
             Request::Delete { conversation, message_id, scope } => self.rewrite(conversation, message_id, None, Vec::new(), scope),
@@ -3367,6 +3477,7 @@ fn outgoing_files(message: &Message) -> Vec<protocol::OutgoingFile> {
             spoiler: attachment.spoiler,
             as_file: false,
             original: false,
+            view_once: attachment.view_once,
             media: None,
         })
     })
@@ -3685,6 +3796,7 @@ pub fn prove_offline_queue() -> Result<(), String> {
                 spoiler: false,
                 as_file: false,
                 original: false,
+                view_once: false,
                 media: None,
             }],
             ..Outgoing::default()
@@ -3709,6 +3821,7 @@ pub fn prove_offline_queue() -> Result<(), String> {
         message_id: "1".into(),
         emoji: "👍".into(),
         on: true,
+        burst: false,
     });
     let delete = chat.handle(Request::Delete { conversation: conversation.clone(), message_id: "1".into(), scope: protocol::DeleteScope::Everyone });
     if !matches!(edit, Response::Error { code: ErrorCode::Offline, .. })

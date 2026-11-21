@@ -81,6 +81,12 @@ pub struct SearchPage {
     /// What the network answered on Enter, with where it was asked. `None` until asked, gone
     /// when the words or the scope change.
     pub network: Option<NetworkFound>,
+    /// Active search filters (has file/image/link, mentions me, etc.).
+    pub filters: protocol::SearchFilters,
+    /// Cursor for "Load more" network results.
+    pub network_cursor: Option<String>,
+    /// Connected networks that could not be asked during an everywhere search.
+    pub not_searched: Vec<Network>,
 }
 
 /// What the network said on Enter: where that was, and its hits, or its word for why not.
@@ -102,11 +108,14 @@ pub enum Scope {
 /// it searches, and the scope is one the network takes. Slack and Discord search a Space or
 /// one conversation, Telegram only one conversation. Everywhere is the cache alone.
 fn network_searches(can: &Capabilities, network: Network, scope: Scope) -> bool {
+    if scope == Scope::Everywhere {
+        return can.search_global;
+    }
     if !can.search {
         return false;
     }
     match network {
-        Network::Discord | Network::Slack => scope != Scope::Everywhere,
+        Network::Discord | Network::Slack => true,
         Network::Telegram => scope == Scope::Conversation,
         _ => false,
     }
@@ -188,6 +197,8 @@ impl SearchPage {
         self.network_asking = None;
         self.network_asked_for = None;
         self.network_asked = 0;
+        self.network_cursor = None;
+        self.not_searched.clear();
     }
 
     /// Moves the keyboard pick up or down in the merged list. Up from row 0 clears the pick so
@@ -794,7 +805,7 @@ impl Shell {
                     return;
                 };
                 match answer {
-                    Ok(Response::MessageHits { hits }) => page.hits = Some(hits),
+                    Ok(Response::MessageHits { hits, .. }) => page.hits = Some(hits),
                     Ok(_) | Err(_) => page.failed = true,
                 }
                 cx.notify();
@@ -832,34 +843,54 @@ impl Shell {
             self.open_search_hit(&hit, cx);
             return;
         }
-        let can_ask_network = self.open_key().is_some_and(|key| {
-            let can = self.snapshot.as_ref().and_then(|snapshot| snapshot.account(&key.account())).map(|account| account.can).unwrap_or_default();
-            network_searches(&can, key.network, scope)
-        });
+        let can_ask_network = if scope == Scope::Everywhere {
+            self.snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.accounts.iter().any(|a| a.link == Link::Connected && a.can.search_global))
+        } else {
+            self.open_key().is_some_and(|key| {
+                let can = self.snapshot.as_ref().and_then(|snapshot| snapshot.account(&key.account())).map(|account| account.can).unwrap_or_default();
+                network_searches(&can, key.network, scope)
+            })
+        };
         if !can_ask_network {
             if let Some(hit) = first {
                 self.open_search_hit(&hit, cx);
             }
             return;
         }
-        self.ask_network(cx);
+        self.ask_network(None, cx);
     }
 
-    /// Asks the network itself for the page's words: a Space's own search, or the open
-    /// conversation's channel search.
-    fn ask_network(&mut self, cx: &mut Context<Self>) {
+    fn toggle_search_has(&mut self, has: protocol::SearchHas, cx: &mut Context<Self>) {
+        if let Some(page) = self.conversation_state.side.search.as_mut() {
+            page.filters.has = if page.filters.has == Some(has) { None } else { Some(has) };
+            page.reset_network();
+        }
+        cx.notify();
+    }
+
+    fn toggle_search_mentions_me(&mut self, cx: &mut Context<Self>) {
+        if let Some(page) = self.conversation_state.side.search.as_mut() {
+            page.filters.mentions_me = !page.filters.mentions_me;
+            page.reset_network();
+        }
+        cx.notify();
+    }
+
+    /// Asks the network itself for the page's words: a Space's own search, one conversation's, or
+    /// everywhere across connected accounts that support global search.
+    fn ask_network(&mut self, cursor: Option<String>, cx: &mut Context<Self>) {
         let Some(page) = self.conversation_state.side.search.as_ref() else {
             return;
         };
-        let (words, scope) = (page.words.clone(), page.scope);
+        let (words, scope, filters) = (page.words.clone(), page.scope, page.filters.clone());
         let trimmed: String = words.trim().chars().take(1024).collect();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() && filters.is_empty() {
             return;
         }
-        // The same words in the same scope are asked once while in flight or after a
-        // successful answer: Enter again, key repeats included, changes nothing until the
-        // words or the scope change.
-        if page.network_asked_for.as_deref() == Some(trimmed.as_str()) {
+        let load_more = cursor.is_some();
+        if !load_more && page.network_asked_for.as_deref() == Some(trimmed.as_str()) {
             return;
         }
         let (conversation, space, where_at) = match scope {
@@ -885,7 +916,7 @@ impl Shell {
                 let space = Key { network: key.network, account: key.account.clone(), id: space };
                 (None, Some(space), where_at)
             }
-            Scope::Everywhere => return,
+            Scope::Everywhere => (None, None, "connected networks".to_owned()),
         };
         let asked = {
             let side = &mut self.conversation_state.side;
@@ -898,7 +929,15 @@ impl Shell {
             side.search_asks
         };
         cx.notify();
-        let request = Request::SearchNetwork { conversation, space, query: trimmed };
+        let request = Request::SearchNetwork {
+            conversation,
+            space,
+            account: None,
+            network: None,
+            query: trimmed,
+            filters,
+            cursor,
+        };
         self.off_thread(
             cx,
             move || ask(&request),
@@ -907,16 +946,35 @@ impl Shell {
                     return;
                 };
                 page.network_asking = None;
-                let result = match answer {
-                    Ok(Response::MessageHits { hits }) => Ok(hits),
-                    Ok(Response::Error { code, detail }) => Err(asked_words(code, &detail)),
-                    Ok(_) => Err(crate::client::OTHER_ANSWER.to_owned()),
-                    Err(err) => Err(crate::client::trouble_words("page", &err)),
-                };
-                if result.is_err() {
-                    page.network_asked_for = None;
+                match answer {
+                    Ok(Response::MessageHits { hits, cursor, not_searched }) => {
+                        page.network_cursor = cursor;
+                        if !not_searched.is_empty() || !load_more {
+                            page.not_searched = not_searched;
+                        }
+                        if load_more {
+                            if let Some(NetworkFound { result: Ok(existing), .. }) = page.network.as_mut() {
+                                existing.extend(hits);
+                            } else {
+                                page.network = Some(NetworkFound { where_at, result: Ok(hits) });
+                            }
+                        } else {
+                            page.network = Some(NetworkFound { where_at, result: Ok(hits) });
+                        }
+                    }
+                    Ok(Response::Error { code, detail }) => {
+                        page.network_asked_for = None;
+                        page.network = Some(NetworkFound { where_at, result: Err(asked_words(code, &detail)) });
+                    }
+                    Ok(_) => {
+                        page.network_asked_for = None;
+                        page.network = Some(NetworkFound { where_at, result: Err(crate::client::OTHER_ANSWER.to_owned()) });
+                    }
+                    Err(err) => {
+                        page.network_asked_for = None;
+                        page.network = Some(NetworkFound { where_at, result: Err(crate::client::trouble_words("page", &err)) });
+                    }
                 }
-                page.network = Some(NetworkFound { where_at, result });
                 cx.notify();
             },
         );
@@ -1421,6 +1479,86 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
         }
         crate::gui::components::scroll::scroll_page("search-scroll-frame", rows).into_any_element()
     };
+    let mut filter_chips = div().flex_none().px(px(8.)).pb(px(4.)).flex().flex_wrap().gap(px(4.));
+    for (id, label, has) in [
+        ("sf-files", "Has file", protocol::SearchHas::Files),
+        ("sf-images", "Has image", protocol::SearchHas::Images),
+        ("sf-links", "Has link", protocol::SearchHas::Links),
+    ] {
+        let on = page.filters.has == Some(has);
+        filter_chips = filter_chips.child(
+            div()
+                .id(id)
+                .px(px(8.))
+                .h(px(22.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .type_micro()
+                .cursor_pointer()
+                .text_color(if on { theme::on_accent() } else { theme::text_faint() })
+                .bg(if on { theme::accent() } else { theme::raised() })
+                .hover(|s| if on { s } else { s.bg(theme::hover()) })
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_search_has(has, cx)))
+                .child(label),
+        );
+    }
+    let mentions_on = page.filters.mentions_me;
+    filter_chips = filter_chips.child(
+        div()
+            .id("sf-mentions")
+            .px(px(8.))
+            .h(px(22.))
+            .rounded(px(theme::R_CONTROL))
+            .flex()
+            .items_center()
+            .type_micro()
+            .cursor_pointer()
+            .text_color(if mentions_on { theme::on_accent() } else { theme::text_faint() })
+            .bg(if mentions_on { theme::accent() } else { theme::raised() })
+            .hover(|s| if mentions_on { s } else { s.bg(theme::hover()) })
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_search_mentions_me(cx)))
+            .child("Mentions me"),
+    );
+
+    let load_more = page.network_cursor.clone().map(|cursor| {
+        div()
+            .flex_none()
+            .px(px(12.))
+            .py(px(6.))
+            .border_t_1()
+            .border_color(theme::hairline())
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .id("search-load-more")
+                    .px(px(12.))
+                    .py(px(4.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::raised())
+                    .type_small()
+                    .text_color(theme::accent_text())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_click(cx.listener(move |this, _, _, cx| this.ask_network(Some(cursor.clone()), cx)))
+                    .child("Load more"),
+            )
+    });
+
+    let footer = (!page.not_searched.is_empty()).then(|| {
+        let names: Vec<&'static str> = page.not_searched.iter().map(|n| n.label()).collect();
+        div()
+            .flex_none()
+            .px(px(12.))
+            .py(px(6.))
+            .border_t_1()
+            .border_color(theme::hairline())
+            .type_micro()
+            .text_color(theme::text_faint())
+            .child(format!("Not searched: {} — only what is on this PC", names.join(", ")))
+    });
+
     div()
         .size_full()
         .flex()
@@ -1428,8 +1566,11 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
         .bg(theme::canvas())
         .child(head)
         .child(chips)
+        .child(filter_chips)
         .children(said.map(|line| div().flex_none().px(px(12.)).pb(px(4.)).type_small().text_color(theme::text_soft()).child(line)))
         .child(body)
+        .children(load_more)
+        .children(footer)
         .into_any_element()
 }
 

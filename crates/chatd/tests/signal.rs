@@ -476,20 +476,20 @@ fn reactions_edits_deletes_and_receipts_land_on_the_right_message() {
     // Ours: the user reacts, edits and deletes, and only their own messages can be changed.
     world.steer(&format!("incoming grace {} Still there?", T0 + 2_000));
     let again = world.arrived(GRACE, &id(T0 + 2_000, GRACE));
-    assert_eq!(world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: "👋".into(), on: true }), Response::Ok);
+    assert_eq!(world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: "👋".into(), on: true , burst: false }), Response::Ok);
     world.heard(&format!("send {GRACE} react {}-{GRACE} 👋 remove=false", T0 + 2_000));
     // One reaction a person: another replaces mine at once and on Signal, and is the only one.
     let Response::Reactions { rules, .. } = world.ask(Request::Reactions { conversation: key(GRACE) }) else {
         panic!("no rules");
     };
     assert_eq!((rules.mine, rules.replaces, rules.custom), (1, true, protocol::EmojiScope::None));
-    assert_eq!(world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: "🎉".into(), on: true }), Response::Ok);
+    assert_eq!(world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: "🎉".into(), on: true , burst: false }), Response::Ok);
     let held = world.messages(GRACE).into_iter().find(|m| m.id == again.id).unwrap();
     let mine: Vec<String> = held.reactions.into_iter().filter(|r| r.mine).map(|r| r.emoji).collect();
     assert_eq!(mine, ["🎉"]);
     world.heard(&format!("send {GRACE} react {}-{GRACE} 🎉 remove=false", T0 + 2_000));
     // A custom emoji is nothing Signal can carry, so it is never sent.
-    let custom = world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: ":party:".into(), on: true });
+    let custom = world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: ":party:".into(), on: true , burst: false });
     assert!(matches!(&custom, Response::Error { code: protocol::ErrorCode::Refused, .. }), "{custom:?}");
     assert!(!world.calls().iter().any(|call| call.contains(":party:")));
     assert_eq!(
@@ -951,7 +951,7 @@ fn a_changed_reaction_after_restart_replaces_the_old_emoji() {
     world.until("Grace's first reaction", || {
         world.messages(GRACE).into_iter().find(|message| message.id == theirs.id && message.reactions.iter().any(|reaction| reaction.emoji == "👍"))
     });
-    assert_eq!(world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: "👍".into(), on: true }), Response::Ok);
+    assert_eq!(world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: "👍".into(), on: true , burst: false }), Response::Ok);
     world.until("our first reaction", || {
         world.messages(GRACE).into_iter().find(|message| message.id == again.id && message.reactions.iter().any(|reaction| reaction.emoji == "👍" && reaction.mine))
     });
@@ -966,7 +966,7 @@ fn a_changed_reaction_after_restart_replaces_the_old_emoji() {
     let emojis: Vec<&str> = replaced.reactions.iter().map(|reaction| reaction.emoji.as_str()).collect();
     assert_eq!(emojis, ["❤️"], "{:?}", replaced.reactions);
 
-    assert_eq!(world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: "❤️".into(), on: true }), Response::Ok);
+    assert_eq!(world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: "❤️".into(), on: true , burst: false }), Response::Ok);
     let held = world.until("our new reaction", || {
         world.messages(GRACE).into_iter().find(|message| message.id == again.id && message.reactions.iter().any(|reaction| reaction.emoji == "❤️" && reaction.mine))
     });
@@ -1204,7 +1204,7 @@ fn a_group_poll_shows_its_counts_and_a_vote_reaches_the_wire() {
         text: String::new(),
         reply_to: None,
         with: Outgoing {
-            poll: Some(PollDraft { question: "Dinner?".into(), options: vec!["Thai".into(), "Pizza".into()], multiple: false }),
+            poll: Some(PollDraft { question: "Dinner?".into(), options: vec!["Thai".into(), "Pizza".into()], multiple: false, ..PollDraft::default() }),
             files: vec![OutgoingFile { path: "missing.txt".into(), name: String::new(), spoiler: false, as_file: false, original: false, media: None }],
             ..Outgoing::default()
         },
@@ -1241,7 +1241,7 @@ fn a_group_poll_shows_its_counts_and_a_vote_reaches_the_wire() {
         text: String::new(),
         reply_to: None,
         with: Outgoing {
-            poll: Some(PollDraft { question: "Next week?".into(), options: vec!["Yes".into(), "No".into()], multiple: false }),
+            poll: Some(PollDraft { question: "Next week?".into(), options: vec!["Yes".into(), "No".into()], multiple: false, ..PollDraft::default() }),
             ..Outgoing::default()
         },
     };

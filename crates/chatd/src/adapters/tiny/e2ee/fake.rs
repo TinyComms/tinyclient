@@ -710,6 +710,7 @@ fn encrypted_reaction_round_trip() -> Result<(), String> {
             message_id: first.clone(),
             emoji: "\u{1f44d}".to_owned(),
             on: true,
+            burst: false,
             reply,
         },
     );
@@ -770,6 +771,7 @@ fn encrypted_reaction_round_trip() -> Result<(), String> {
             message_id: first.clone(),
             emoji: "\u{1f44d}".to_owned(),
             on: false,
+            burst: false,
             reply,
         },
     );
@@ -954,6 +956,7 @@ fn a_conversation_reopened_keeps_its_sealed_reaction_chips() {
             message_id: first.clone(),
             emoji: "\u{1f44d}".to_owned(),
             on: true,
+            burst: false,
             reply,
         },
     );

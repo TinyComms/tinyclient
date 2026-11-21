@@ -517,6 +517,7 @@ fn attachment(rich: &mut Rich, attached: &Attached) -> Attachment {
         mime: mime.to_owned(),
         duration: attached.duration_secs.round() as u32,
         round: false,
+        view_once: false,
     }
 }
 
@@ -550,6 +551,7 @@ fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
         mime: mime.to_owned(),
         duration: 0,
         round: false,
+        view_once: false,
     }
 }
 
@@ -905,6 +907,8 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         call: call_note,
         can_edit: None,
         can_delete: None,
+        importance: protocol::Importance::Normal,
+        effect: None,
     };
     (message, rich.files)
 }
