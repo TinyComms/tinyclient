@@ -365,6 +365,8 @@ struct State {
     /// Our own presence and status line as the settings have them, and those settings as
     /// Discord sent them (`proto::status_settings`), to change one part and send back the rest.
     own: (Presence, String),
+    /// The "Playing" name this session publishes. Only `SetActivity` writes it.
+    own_activity: String,
     status_settings: Vec<u8>,
     /// Per conversation, the stretches of history fetched whole in this session, as message
     /// ids from and to: reading on inside one asks Discord nothing.
@@ -1651,30 +1653,40 @@ impl Discord {
     /// community's (`proto.rs`), and the whole status block is sent back so nothing in it is
     /// lost if Discord replaces rather than merges it.
     fn set_presence(&self, presence: Presence, status: Option<String>) -> Result<(), Refusal> {
-        let word = match presence {
-            Presence::Idle => "idle",
-            Presence::Dnd => "dnd",
-            Presence::Offline => "invisible",
-            Presence::Online | Presence::Unknown | Presence::Busy => "online",
-        };
-        let (kept, text) = {
+        let word = presence_word(presence);
+        let (kept, text, playing) = {
             let state = crate::hub::lock(&self.state);
-            (state.status_settings.clone(), status.clone().unwrap_or_else(|| state.own.1.clone()))
+            (
+                state.status_settings.clone(),
+                status.clone().unwrap_or_else(|| state.own.1.clone()),
+                state.own_activity.clone(),
+            )
         };
         let settings = proto::with_status(&kept, word, status.as_deref());
         let body = json!({"settings": proto::settings(&settings)});
         self.call("PATCH", "/users/@me/settings-proto/1", Some(body)).map_err(refusal)?;
-        let custom = match text.is_empty() {
-            true => json!([]),
-            false => json!([{"name": "Custom Status", "type": 4, "state": text, "emoji": null}]),
-        };
-        self.tell(3, json!({"status": word, "since": 0, "activities": custom, "afk": false}));
+        self.tell(3, json!({"status": word, "since": 0, "activities": session_activities(&text, &playing), "afk": false}));
         {
             let mut state = crate::hub::lock(&self.state);
             state.status_settings = settings;
             state.own = (presence, text.clone());
         }
         self.ctx.presence(&self.me(), presence, &text, true);
+        Ok(())
+    }
+
+    /// Publishes the local user's "Playing" name on this session. Empty clears it.
+    /// A later status change sends it again, and a presence that names us does not replace it.
+    fn set_activity(&self, mut name: String) -> Result<(), Refusal> {
+        protocol::clip(&mut name, 128);
+        let (presence, text, playing) = {
+            let mut state = crate::hub::lock(&self.state);
+            state.own_activity = name;
+            let (presence, text) = state.own.clone();
+            (presence, text, state.own_activity.clone())
+        };
+        let word = presence_word(presence);
+        self.tell(3, json!({"status": word, "since": 0, "activities": session_activities(&text, &playing), "afk": false}));
         Ok(())
     }
 
@@ -2122,6 +2134,7 @@ impl Discord {
                 answer(reply, self.set_friend_nickname(&person_id, nickname))
             }
             Command::SetPresence { presence, status, status_emoji: _, clear_at: _, reply } => answer(reply, self.set_presence(presence, status)),
+            Command::SetActivity { name, reply } => answer(reply, self.set_activity(name)),
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id, None)),
             Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
@@ -2305,6 +2318,28 @@ fn add_friend_refusal(err: Refused) -> Refusal {
         }
         other => refusal(other),
     }
+}
+
+fn presence_word(presence: Presence) -> &'static str {
+    match presence {
+        Presence::Idle => "idle",
+        Presence::Dnd => "dnd",
+        Presence::Offline => "invisible",
+        Presence::Online | Presence::Unknown | Presence::Busy => "online",
+    }
+}
+
+/// This session's gateway activities: the custom status, then the local "Playing" name.
+/// Empty is an empty list, which clears only this session. No application id is invented.
+fn session_activities(status: &str, playing: &str) -> Value {
+    let mut activities = Vec::new();
+    if !status.is_empty() {
+        activities.push(json!({"name": "Custom Status", "type": 4, "state": status, "emoji": null}));
+    }
+    if !playing.is_empty() {
+        activities.push(json!({"name": playing, "type": 0}));
+    }
+    Value::Array(activities)
 }
 
 fn parse_body(text: &str) -> Value {

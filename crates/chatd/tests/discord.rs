@@ -2779,6 +2779,99 @@ fn friendships_presence_and_profiles_are_asked_of_discord_only_when_the_user_doe
 }
 
 #[test]
+fn playing_is_this_sessions_name_and_not_one_someone_else_sends() {
+    let world = World::start();
+    settled(&world);
+    let present = |status: &str| {
+        world.ask(Request::SetPresence {
+            account: world.account(),
+            presence: Presence::Online,
+            status: Some(status.to_owned()),
+            status_emoji: None,
+            clear_at: None,
+        })
+    };
+    let play = |name: &str| world.ask(Request::SetActivity { account: world.account(), name: name.to_owned() });
+    let playing = |name: &str| {
+        world.discord.frames_of(3).into_iter().rev().find(|frame| {
+            frame["d"]["activities"].as_array().is_some_and(|items| {
+                items.iter().any(|item| item["type"] == json!(0) && item["name"] == name)
+            })
+        })
+    };
+    assert_eq!(present("heads down"), Response::Ok);
+    let patches = world.discord.requests_to("PATCH", "/users/@me/settings-proto/1").len();
+    assert_eq!(play("Celeste"), Response::Ok);
+    assert_eq!(world.discord.requests_to("PATCH", "/users/@me/settings-proto/1").len(), patches, "playing is not a settings write");
+    let told = wait("playing beside the status", || playing("Celeste"));
+    let items = told["d"]["activities"].as_array().unwrap();
+    assert!(items.iter().any(|item| item["type"] == json!(4) && item["state"] == "heads down"));
+    let game = items.iter().find(|item| item["type"] == json!(0)).unwrap();
+    assert_eq!(game["name"], "Celeste");
+    assert!(game.get("application_id").is_none(), "no invented application id");
+    assert!(world.discord.asked().iter().all(|line| !line.contains("Celeste")), "{:?}", world.discord.asked());
+
+    assert_eq!(present("back"), Response::Ok);
+    let told = wait("a status change to keep the game", || {
+        playing("Celeste").filter(|frame| frame["d"]["activities"].as_array().is_some_and(|items| items.iter().any(|item| item["state"] == "back")))
+    });
+    assert_eq!(told["d"]["status"], "online");
+
+    world.discord.push("PRESENCE_UPDATE", json!({
+        "user": {"id": "1000"},
+        "status": "online",
+        "activities": [
+            {"name": "Custom Status", "type": 4, "state": "stolen"},
+            {"name": "https://evil.example/play", "type": 0}
+        ]
+    }));
+    world.discord.push("PRESENCE_UPDATE", json!({
+        "user": {"id": "2001"},
+        "status": "online",
+        "activities": [
+            {"name": "Custom Status", "type": 4, "state": "from-them"},
+            {"name": "https://evil.example/theirs", "type": 0}
+        ]
+    }));
+    wait("a friend's own status to arrive", || {
+        world.people(Some(Relation::Friend), None).iter().any(|person| person.key.id == "2001" && person.status == "from-them").then_some(())
+    });
+    assert_eq!(present("still"), Response::Ok);
+    let told = wait("our game to stay ours", || {
+        playing("Celeste").filter(|frame| frame["d"]["activities"].as_array().is_some_and(|items| items.iter().any(|item| item["state"] == "still")))
+    });
+    let items = told["d"]["activities"].as_array().unwrap();
+    assert!(items.iter().all(|item| item["name"] != "https://evil.example/play"));
+    assert!(world.discord.frames_of(3).iter().all(|frame| !frame.to_string().contains("evil.example")));
+    assert!(world.discord.asked().iter().all(|line| !line.contains("evil.example")), "{:?}", world.discord.asked());
+
+    let long = "a".repeat(200);
+    assert_eq!(play(&long), Response::Ok);
+    let told = wait("a long name to be cut", || playing(&"a".repeat(128)));
+    let game = told["d"]["activities"].as_array().unwrap().iter().find(|item| item["type"] == json!(0)).unwrap();
+    assert_eq!(game["name"].as_str().unwrap().chars().count(), 128);
+    assert!(told["d"]["activities"].as_array().unwrap().iter().any(|item| item["state"] == "still"));
+
+    assert_eq!(play(""), Response::Ok);
+    wait("clearing the game to leave the status", || {
+        world.discord.frames_of(3).pop().filter(|frame| {
+            let items = frame["d"]["activities"].as_array()?;
+            items.iter().all(|item| item["type"] != json!(0)) && items.iter().any(|item| item["state"] == "still")
+        })
+    });
+
+    match world.ask(Request::SetActivity {
+        account: AccountKey { network: Network::Slack, account: "T0".into() },
+        name: "https://evil.example/join".into(),
+    }) {
+        Response::Error { .. } => {}
+        other => panic!("another network cannot set it, got {other:?}"),
+    }
+    assert!(world.discord.frames_of(3).iter().all(|frame| !frame.to_string().contains("evil.example")));
+    assert!(world.discord.asked().iter().all(|line| !line.contains("evil.example")));
+}
+
+#[test]
 fn reading_forward_and_jumping_ask_discord_once_and_what_was_deleted_meanwhile_goes() {
     let world = World::start();
     let dm = "3001";

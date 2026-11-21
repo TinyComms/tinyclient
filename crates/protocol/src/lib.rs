@@ -1696,6 +1696,13 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         clear_at: Option<i64>,
     },
+    /// What this session says it is playing. Empty clears it. The name is the local user's;
+    /// another member cannot set it.
+    SetActivity {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        name: String,
+    },
     /// Our own profile on one account. `None` leaves that part. An empty about or emoji clears
     /// it. A username, or `photo`, is refused: those are still changed on the phone. Signal is
     /// the account that accepts a name, about, and about emoji.

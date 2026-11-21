@@ -1864,6 +1864,22 @@ impl Chat {
         }
     }
 
+    /// This session's "Playing" line. Empty clears it. The name is text, never a page to open,
+    /// and it is only the account the local user named.
+    fn set_activity(&self, account: AccountKey, mut name: String) -> Response {
+        if account.network != Network::Discord {
+            return error(ErrorCode::Refused, "Sharing an activity is a Discord status.");
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        clip(&mut name, 128);
+        match self.ask(&account, |reply| Command::SetActivity { name, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
     /// Our own profile. `None` leaves that part. Signal uses its encrypted profile-status wire;
     /// other networks dispatch `Command::SetProfile` with unsupported defaults.
     fn set_profile(
@@ -3534,6 +3550,7 @@ impl Chat {
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
             Request::ReportReasons { target } => self.report_reasons(target),
             Request::SetPresence { account, presence, status, status_emoji, clear_at } => self.set_presence(account, presence, status, status_emoji, clear_at),
+            Request::SetActivity { account, name } => self.set_activity(account, name),
             Request::SetProfile { account, name, about, pronouns, emoji, username, photo } => {
                 self.set_profile(account, name, about, pronouns, emoji, username, photo)
             }

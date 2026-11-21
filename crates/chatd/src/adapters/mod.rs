@@ -829,6 +829,11 @@ pub enum Command {
         clear_at: Option<i64>,
         reply: Reply<()>,
     },
+    /// This session's "Playing" name. Empty clears it. Not another member's text.
+    SetActivity {
+        name: String,
+        reply: Reply<()>,
+    },
     /// Edit our own profile fields on the network. `None` leaves a field unchanged.
     SetProfile {
         name: Option<String>,
@@ -1001,6 +1006,7 @@ impl Command {
             | Command::AddFriend { reply, .. }
             | Command::Report { reply, .. }
             | Command::SetPresence { reply, .. }
+            | Command::SetActivity { reply, .. }
             | Command::SetProfile { reply, .. }
             | Command::SetAvatar { reply, .. }
             | Command::SetNickname { reply, .. }

@@ -1626,4 +1626,13 @@ mod tests {
             other => panic!("{other:?}"),
         }
     }
+
+    #[test]
+    fn set_activity_round_trips_and_an_omitted_name_is_empty() {
+        let account = AccountKey { network: Network::Discord, account: "1".into() };
+        let set = Request::SetActivity { account: account.clone(), name: "Celeste".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&set).unwrap()).unwrap(), set);
+        let bare = format!(r#"{{"op":"set_activity","account":{}}}"#, serde_json::to_string(&account).unwrap());
+        assert!(matches!(serde_json::from_str::<Request>(&bare).unwrap(), Request::SetActivity { name, .. } if name.is_empty()));
+    }
 }

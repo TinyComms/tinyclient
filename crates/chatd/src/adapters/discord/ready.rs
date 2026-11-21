@@ -1150,6 +1150,11 @@ impl Discord {
             }
         }
         self.ctx.presence(id, update.presence(), update.status(), owned);
+        // This session's playing line is only what the local user set. A presence that names
+        // us does not replace it, and is not shown as our activity.
+        if id == self.me() {
+            return;
+        }
         let (emoji, doing) = (update.emoji().to_owned(), update.doing());
         if owned {
             self.state.lock().unwrap().doing.insert(id.to_owned(), (emoji.clone(), doing.clone()));
