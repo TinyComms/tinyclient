@@ -668,6 +668,19 @@ pub struct BrowsedChannel {
     pub archived: bool,
 }
 
+/// One pending scheduled message returned by [`crate::Request::ScheduledMessages`] or
+/// [`crate::Request::RescheduleMessage`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledMessage {
+    pub id: String,
+    pub conversation: Key,
+    #[serde(default)]
+    pub text: String,
+    pub post_at: i64,
+    #[serde(default)]
+    pub created: i64,
+}
+
 /// What kind of event an [`ActivityItem`] represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

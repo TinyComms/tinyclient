@@ -183,6 +183,110 @@ impl Slack {
         Ok(message)
     }
 
+    /// Lists pending scheduled messages for a channel or thread (`chat.scheduledMessages.list`).
+    pub(super) fn scheduled_messages(&self, conversation: &str) -> Result<Vec<protocol::ScheduledMessage>, super::Fault> {
+        let (channel, thread) = match thread_of(conversation) {
+            Some((channel, root)) => (channel, Some(root)),
+            None => (conversation, None),
+        };
+        let listed = self.api("chat.scheduledMessages.list", &[("channel", channel), ("limit", "50")])?;
+        let mut out = Vec::new();
+        for item in listed["scheduled_messages"].as_array().into_iter().flatten() {
+            let Some(id) = item["id"].as_str().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let item_thread = item["thread_ts"].as_str().filter(|s| !s.is_empty());
+            if thread.is_some() && item_thread != thread {
+                continue;
+            }
+            let conv_id = match item_thread {
+                Some(root) => super::thread_id(channel, root),
+                None => channel.to_owned(),
+            };
+            out.push(protocol::ScheduledMessage {
+                id: id.to_owned(),
+                conversation: self.ctx.key(&conv_id),
+                text: item["text"].as_str().unwrap_or("").to_owned(),
+                post_at: item["post_at"].as_i64().unwrap_or(0),
+                created: item["date_created"].as_i64().unwrap_or(0),
+            });
+        }
+        out.sort_by_key(|m| m.post_at);
+        Ok(out)
+    }
+
+    /// Cancels a pending scheduled message (`chat.deleteScheduledMessage`) and drops its local placeholder if any.
+    pub(super) fn cancel_scheduled(&self, conversation: &str, scheduled_id: &str) -> Result<(), super::Fault> {
+        let channel = thread_of(conversation).map_or(conversation, |(c, _)| c);
+        let raw_id = scheduled_id.strip_prefix("scheduled:").unwrap_or(scheduled_id);
+        self.api(
+            "chat.deleteScheduledMessage",
+            &[("channel", channel), ("scheduled_message_id", raw_id)],
+        )?;
+        let placeholder = format!("scheduled:{raw_id}");
+        let _ = self.ctx.deleted(conversation, &placeholder);
+        if conversation != channel {
+            let _ = self.ctx.deleted(channel, &placeholder);
+        }
+        Ok(())
+    }
+
+    /// Edits and/or reschedules a pending scheduled message: Slack has no update endpoint, so this
+    /// deletes the old scheduled message (`chat.deleteScheduledMessage`) and schedules the replacement
+    /// (`chat.scheduleMessage`).
+    pub(super) fn reschedule_message(
+        &self,
+        conversation: &str,
+        scheduled_id: &str,
+        text: Option<&str>,
+        post_at: i64,
+    ) -> Result<protocol::ScheduledMessage, super::Fault> {
+        let now = crate::hub::now();
+        if post_at <= now || post_at > now + SCHEDULE_AHEAD {
+            return Err(super::Fault::Slack("time_in_past".to_owned()));
+        }
+        let raw_id = scheduled_id.strip_prefix("scheduled:").unwrap_or(scheduled_id);
+        let resolved_text = match text {
+            Some(t) => t.to_owned(),
+            None => self
+                .scheduled_messages(conversation)?
+                .into_iter()
+                .find(|m| m.id == raw_id)
+                .map(|m| m.text)
+                .ok_or_else(|| super::Fault::Slack("invalid_scheduled_message_id".to_owned()))?,
+        };
+        if resolved_text.trim().is_empty() {
+            return Err(super::Fault::Slack("no_text".to_owned()));
+        }
+        self.cancel_scheduled(conversation, raw_id)?;
+        let (channel, thread) = match thread_of(conversation) {
+            Some((channel, root)) => (channel, Some(root)),
+            None => (conversation, None),
+        };
+        let escaped = escape(&resolved_text);
+        let post_at_str = post_at.to_string();
+        let mut asked = vec![
+            ("channel", channel),
+            ("text", escaped.as_str()),
+            ("post_at", post_at_str.as_str()),
+        ];
+        if let Some(root) = thread {
+            asked.push(("thread_ts", root));
+        }
+        let scheduled = self.api("chat.scheduleMessage", &asked)?;
+        let new_id = scheduled["scheduled_message_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| super::Fault::Slack("invalid_scheduled_message_id".to_owned()))?;
+        Ok(protocol::ScheduledMessage {
+            id: new_id.to_owned(),
+            conversation: self.ctx.key(conversation),
+            text: resolved_text,
+            post_at: scheduled["post_at"].as_i64().unwrap_or(post_at),
+            created: now,
+        })
+    }
+
     /// A message on the socket that holds a file a send of ours is waiting to see shared.
     /// True when it was handed to that send, which records it as its own.
     pub(super) fn shared_here(&self, event: &Value, message: &Message) -> bool {

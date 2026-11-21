@@ -536,6 +536,25 @@ pub enum Command {
         remind_at: Option<i64>,
         reply: Reply<()>,
     },
+    /// Lists pending scheduled messages for one conversation (Slack `chat.scheduledMessages.list`).
+    ScheduledList {
+        conversation_id: String,
+        reply: Reply<Vec<protocol::ScheduledMessage>>,
+    },
+    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage`).
+    CancelScheduled {
+        conversation_id: String,
+        scheduled_id: String,
+        reply: Reply<()>,
+    },
+    /// Edits/reschedules a pending scheduled message (Slack delete + `chat.scheduleMessage`).
+    Reschedule {
+        conversation_id: String,
+        scheduled_id: String,
+        text: Option<String>,
+        post_at: i64,
+        reply: Reply<protocol::ScheduledMessage>,
+    },
     /// Accept or decline/ignore a message request (Discord).
     AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
@@ -749,9 +768,12 @@ impl Command {
             | Command::Star { reply, .. }
             | Command::File { reply, .. }
             | Command::StarMessage { reply, .. }
-            | Command::Remind { reply, .. } => {
+            | Command::Remind { reply, .. }
+            | Command::CancelScheduled { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarredMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

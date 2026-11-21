@@ -2847,6 +2847,46 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::ScheduledMessages { conversation } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::ScheduledList {
+                    conversation_id: conversation.id.clone(),
+                    reply,
+                }) {
+                    Ok(messages) => Response::ScheduledMessages { messages },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CancelScheduled { conversation, scheduled_id } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::CancelScheduled {
+                    conversation_id: conversation.id.clone(),
+                    scheduled_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::RescheduleMessage { conversation, scheduled_id, text, post_at } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::Reschedule {
+                    conversation_id: conversation.id.clone(),
+                    scheduled_id,
+                    text,
+                    post_at,
+                    reply,
+                }) {
+                    Ok(message) => Response::ScheduledMessage { message },
+                    Err(refused) => *refused,
+                }
+            }
 
             Request::People { network, relation, query, offset, limit } => {
                 self.people(network, relation, query, offset, limit)

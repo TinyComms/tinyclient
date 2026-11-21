@@ -132,6 +132,8 @@ struct Fake {
     bookmarks: Mutex<HashMap<String, Vec<Value>>>,
     /// Optional override for `drafts.list` response.
     drafts_list: Mutex<Option<Value>>,
+    /// Scheduled messages keyed by scheduled_message_id.
+    scheduled: Mutex<Vec<Value>>,
 }
 
 fn unescape(text: &str) -> String {
@@ -184,6 +186,7 @@ impl Fake {
                 ],
             )])),
             drafts_list: Mutex::default(),
+            scheduled: Mutex::default(),
         });
         let socket_url = format!("ws://{}/", socket.local_addr().unwrap());
         for (listener, serve) in [(http, Fake::http as fn(Arc<Fake>, TcpStream)), (socket, Fake::socket)] {
@@ -388,10 +391,49 @@ impl Fake {
                 echo(event);
                 Some(json!({"ok": true, "files": files}))
             }
-            "chat.scheduleMessage" => Some(json!({
-                "ok": true, "channel": channel, "scheduled_message_id": "Q0SCHED", "post_at": param("post_at").parse::<i64>().unwrap(),
-                "message": {"type": "message", "user": me(token), "text": param("text"), "bot_id": null},
-            })),
+            "chat.scheduleMessage" => {
+                let mut list = self.scheduled.lock().unwrap();
+                let id = if list.is_empty() {
+                    "Q0SCHED".to_owned()
+                } else {
+                    format!("Q0SCHED{}", list.len() + 1)
+                };
+                let post_at = param("post_at").parse::<i64>().unwrap();
+                let mut entry = json!({
+                    "id": id,
+                    "channel_id": channel,
+                    "post_at": post_at,
+                    "date_created": 1760000900,
+                    "text": param("text"),
+                });
+                if !param("thread_ts").is_empty() {
+                    entry["thread_ts"] = param("thread_ts").into();
+                }
+                list.push(entry);
+                Some(json!({
+                    "ok": true, "channel": channel, "scheduled_message_id": id, "post_at": post_at,
+                    "message": {"type": "message", "user": me(token), "text": param("text"), "bot_id": null},
+                }))
+            }
+            "chat.scheduledMessages.list" => {
+                let list = self.scheduled.lock().unwrap();
+                let filtered: Vec<Value> = list
+                    .iter()
+                    .filter(|item| channel.is_empty() || item["channel_id"].as_str() == Some(channel))
+                    .cloned()
+                    .collect();
+                Some(json!({"ok": true, "scheduled_messages": filtered}))
+            }
+            "chat.deleteScheduledMessage" => {
+                let target = param("scheduled_message_id");
+                let mut list = self.scheduled.lock().unwrap();
+                let before = list.len();
+                list.retain(|item| item["id"].as_str() != Some(target));
+                if list.len() == before {
+                    return refused("invalid_scheduled_message_id");
+                }
+                Some(json!({"ok": true}))
+            }
             "users.profile.set" => {
                 let asked: Value = serde_json::from_str(param("profile")).unwrap();
                 let mut profile = self.user(token, me(token)).unwrap()["profile"].clone();
@@ -4594,4 +4636,75 @@ fn slack_dnd_snooze_resume_and_live_dnd_updated() {
     world.until("live dnd_updated clears Dnd", || {
         (world.account("T01ALPHA").presence == Presence::Online).then_some(())
     });
+}
+
+#[test]
+fn slack_scheduled_messages_list_cancel_and_reschedule() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    assert!(world.account("T01ALPHA").can.schedule, "Slack should advertise schedule capability");
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let first_at = now + 3600;
+    let later_at = now + 7200;
+
+    // 1. Schedule a message.
+    let mut with = protocol::Outgoing::default();
+    with.schedule = Some(first_at);
+    let sent = world.ask(Request::Send {
+        conversation: general.clone(),
+        client_id: "sched1".into(),
+        text: "Standup notes".into(),
+        reply_to: None,
+        with,
+    });
+    assert!(matches!(sent, Response::Sent { .. }), "{sent:?}");
+    world.until("chat.scheduleMessage called", || {
+        (!world.fake.calls(ALPHA, "chat.scheduleMessage").is_empty()).then_some(())
+    });
+
+    // 2. List scheduled messages via chat.scheduledMessages.list.
+    let Response::ScheduledMessages { messages } = world.ask(Request::ScheduledMessages {
+        conversation: general.clone(),
+    }) else {
+        panic!("expected Response::ScheduledMessages");
+    };
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, "Q0SCHED");
+    assert_eq!(messages[0].text, "Standup notes");
+    assert_eq!(messages[0].post_at, first_at);
+
+    // 3. Edit & reschedule via delete + chat.scheduleMessage.
+    let Response::ScheduledMessage { message: updated } = world.ask(Request::RescheduleMessage {
+        conversation: general.clone(),
+        scheduled_id: "Q0SCHED".into(),
+        text: Some("Updated standup notes".into()),
+        post_at: later_at,
+    }) else {
+        panic!("expected Response::ScheduledMessage");
+    };
+    assert_eq!(updated.text, "Updated standup notes");
+    assert_eq!(updated.post_at, later_at);
+    assert_eq!(world.fake.calls(ALPHA, "chat.deleteScheduledMessage").len(), 1);
+    assert_eq!(world.fake.calls(ALPHA, "chat.scheduleMessage").len(), 2);
+
+    // 4. Cancel the rescheduled message via chat.deleteScheduledMessage.
+    assert_eq!(
+        world.ask(Request::CancelScheduled {
+            conversation: general.clone(),
+            scheduled_id: updated.id.clone(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.fake.calls(ALPHA, "chat.deleteScheduledMessage").len(), 2);
+
+    // 5. List is now empty.
+    let Response::ScheduledMessages { messages } = world.ask(Request::ScheduledMessages {
+        conversation: general.clone(),
+    }) else {
+        panic!("expected Response::ScheduledMessages");
+    };
+    assert!(messages.is_empty());
 }

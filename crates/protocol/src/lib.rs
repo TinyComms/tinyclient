@@ -1325,6 +1325,23 @@ pub enum Request {
     Reminders {
         conversation: Key,
     },
+    /// Lists pending scheduled messages for one conversation (Slack `chat.scheduledMessages.list`).
+    ScheduledMessages {
+        conversation: Key,
+    },
+    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage`).
+    CancelScheduled {
+        conversation: Key,
+        scheduled_id: String,
+    },
+    /// Edits and/or reschedules a pending scheduled message (Slack delete + `chat.scheduleMessage`).
+    RescheduleMessage {
+        conversation: Key,
+        scheduled_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        post_at: i64,
+    },
     /// Conversations whose title contains `query`, across every Space, most recent first. From
     /// the cache alone: a channel of a Space never opened is not in it.
     Find {
@@ -2972,6 +2989,14 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
     },
+    /// Pending scheduled messages for a conversation (`Request::ScheduledMessages`).
+    ScheduledMessages {
+        messages: Vec<ScheduledMessage>,
+    },
+    /// One updated/rescheduled message (`Request::RescheduleMessage`).
+    ScheduledMessage {
+        message: ScheduledMessage,
+    },
 }
 
 /// The phone's app-private data directory, set once by the mobile entry (`set_support_dir`).
@@ -3481,5 +3506,36 @@ mod sock_path_tests {
         let err = ChatStream::connect(&long).err().expect("a path past sun_path cannot connect");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("bytes"), "{err}");
+    }
+
+    #[test]
+    fn scheduled_message_requests_and_responses_round_trip() {
+        let conv = Key::new(&AccountKey { network: Network::Slack, account: "T1".into() }, "C1");
+        let reqs = [
+            Request::ScheduledMessages { conversation: conv.clone() },
+            Request::CancelScheduled { conversation: conv.clone(), scheduled_id: "Q1".into() },
+            Request::RescheduleMessage {
+                conversation: conv.clone(),
+                scheduled_id: "Q1".into(),
+                text: Some("Later".into()),
+                post_at: 1_900_000_000,
+            },
+        ];
+        for req in reqs {
+            let encoded = serde_json::to_string(&req).unwrap();
+            let decoded: Request = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, req);
+        }
+        let msg = ScheduledMessage {
+            id: "Q2".into(),
+            conversation: conv,
+            text: "Later".into(),
+            post_at: 1_900_000_000,
+            created: 1_899_999_000,
+        };
+        let resp = Response::ScheduledMessages { messages: vec![msg.clone()] };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp).unwrap()).unwrap(), resp);
+        let one = Response::ScheduledMessage { message: msg };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&one).unwrap()).unwrap(), one);
     }
 }

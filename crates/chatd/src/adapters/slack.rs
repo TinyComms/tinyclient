@@ -200,6 +200,7 @@ fn reason(fault: Fault) -> String {
             "cannot_add_bot" => "Slack cannot set reminders for bots.",
             "cannot_add_others" => "This workspace does not let you set reminders for other people.",
             "not_found" => "Slack could not find that reminder.",
+            "invalid_scheduled_message_id" => "That scheduled message was already sent or cancelled.",
             "no_item_specified" => "Slack needs a message to save for later.",
             "too_long" => "That text is too long for Slack (250 character limit).",
             "msg_too_long" => "The message is too long for Slack.",
@@ -1468,6 +1469,15 @@ impl Slack {
             }
             Command::Remind { conversation_id, message_id, remind_at, reply } => {
                 answer(reply, self.remind_message(&conversation_id, &message_id, remind_at))
+            }
+            Command::ScheduledList { conversation_id, reply } => {
+                answer(reply, self.scheduled_messages(&conversation_id))
+            }
+            Command::CancelScheduled { conversation_id, scheduled_id, reply } => {
+                answer(reply, self.cancel_scheduled(&conversation_id, &scheduled_id))
+            }
+            Command::Reschedule { conversation_id, scheduled_id, text, post_at, reply } => {
+                answer(reply, self.reschedule_message(&conversation_id, &scheduled_id, text.as_deref(), post_at))
             }
             Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
             Command::Pin { conversation_id, message_id, pinned, reply, .. } => {
