@@ -78,6 +78,8 @@ impl Fault {
                 "PARTICIPANT_VERSION_OUTDATED" => "The other person's Telegram app needs an update for this call.".to_owned(),
                 "PREMIUM_ACCOUNT_REQUIRED" => "This needs Telegram Premium.".to_owned(),
                 "BOOSTS_EMPTY" => "No boost is free to give.".to_owned(),
+                "BOT_INVALID" => "This bot cannot be started.".to_owned(),
+                "PHONE_NUMBER_INVALID" => "Telegram did not share a phone number.".to_owned(),
                 "TRANSCRIPTION_FAILED" => "Couldn't transcribe this message.".to_owned(),
                 "MSG_VOICE_MISSING" => "This message has no voice or video to transcribe.".to_owned(),
                 // A length or a count past the free plan. `MESSAGE_TOO_LONG` and

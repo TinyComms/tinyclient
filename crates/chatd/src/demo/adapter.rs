@@ -1038,6 +1038,13 @@ impl Demo {
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::FollowThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetAutoDownload { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetAutoDownload { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetBoosts { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ApplyBoost { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetBotMenu { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StartBot { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SharePhone { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

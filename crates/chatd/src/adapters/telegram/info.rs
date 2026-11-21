@@ -1036,6 +1036,98 @@ pub(super) fn apply_boost(account: &Account, conversation: &str) -> Result<proto
     boosts_of(account, who)
 }
 
+fn http_url(url: &str) -> Option<String> {
+    (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_owned())
+}
+
+fn menu_of(info: Option<&tl::enums::BotInfo>) -> protocol::BotMenu {
+    let Some(tl::enums::BotInfo::Info(info)) = info else {
+        return protocol::BotMenu::default();
+    };
+    let commands = info
+        .commands
+        .iter()
+        .flatten()
+        .filter_map(|cmd| {
+            let tl::enums::BotCommand::Command(cmd) = cmd;
+            let command = cmd.command.trim().trim_start_matches('/').to_owned();
+            (!command.is_empty()).then(|| protocol::BotCommand { command, description: cmd.description.clone() })
+        })
+        .take(32)
+        .collect();
+    let (menu_label, menu_url) = match &info.menu_button {
+        Some(tl::enums::BotMenuButton::Button(button)) => match http_url(&button.url) {
+            Some(url) => (button.text.clone(), url),
+            None => (String::new(), String::new()),
+        },
+        _ => (String::new(), String::new()),
+    };
+    protocol::BotMenu { description: info.description.clone().unwrap_or_default(), commands, menu_label, menu_url }
+}
+
+/// Commands and the menu button of a user-bot. A chat that is not one is refused.
+pub(super) fn bot_menu(account: &Account, conversation: &str) -> Result<protocol::BotMenu, Fault> {
+    let (who @ Who::User(_), None) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))? else {
+        return Err(invalid("PEER_ID_INVALID"));
+    };
+    let input = {
+        let dir = account.dir();
+        if !dir.get(who).is_some_and(|known| known.bot) {
+            return Err(invalid("BOT_INVALID"));
+        }
+        dir.input_user(who).ok_or_else(|| invalid("PEER_ID_INVALID"))?
+    };
+    let tl::enums::users::UserFull::Full(found) = account.ask(&tl::functions::users::GetFullUser { id: input })?;
+    account.learn(&found.users, &found.chats);
+    let tl::enums::UserFull::Full(user) = found.full_user;
+    Ok(menu_of(user.bot_info.as_ref()))
+}
+
+/// `messages.startBot` in this bot's chat. The peer is the bot.
+pub(super) fn start_bot(account: &Account, conversation: &str, start_param: &str) -> Result<(), Fault> {
+    let (who @ Who::User(_), None) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))? else {
+        return Err(invalid("PEER_ID_INVALID"));
+    };
+    let bot = {
+        let dir = account.dir();
+        if !dir.get(who).is_some_and(|known| known.bot) {
+            return Err(invalid("BOT_INVALID"));
+        }
+        dir.input_user(who).ok_or_else(|| invalid("PEER_ID_INVALID"))?
+    };
+    let peer = account.input(who)?;
+    let random_id = super::random_id(&format!("start:{conversation}:{start_param}"));
+    let _: tl::enums::Updates = account.ask(&tl::functions::messages::StartBot { bot, peer, random_id, start_param: start_param.to_owned() })?;
+    Ok(())
+}
+
+/// Sends this account's own phone as a contact, after the shell confirmed. No phone is a refusal.
+pub(super) fn share_phone(account: &Account, conversation: &str) -> Result<(), Fault> {
+    let (who @ Who::User(_), None) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))? else {
+        return Err(invalid("PEER_ID_INVALID"));
+    };
+    let (name, me) = {
+        let dir = account.dir();
+        if !dir.get(who).is_some_and(|known| known.bot) {
+            return Err(invalid("BOT_INVALID"));
+        }
+        let name = dir.name(Who::User(account.me));
+        let me = dir.input_user(Who::User(account.me)).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+        (name, me)
+    };
+    let users = account.ask(&tl::functions::users::GetUsers { id: vec![me] })?;
+    let phone = users.into_iter().find_map(|user| {
+        let tl::enums::User::User(user) = user else { return None };
+        (user.id == account.me).then_some(user.phone).flatten().filter(|phone| !phone.is_empty())
+    });
+    let Some(phone) = phone else {
+        return Err(invalid("PHONE_NUMBER_INVALID"));
+    };
+    let contact = protocol::SharedContact { name, phones: vec![phone], ..protocol::SharedContact::default() };
+    super::send::send_contact(account, conversation, &format!("phone-{}", crate::hub::now()), "", None, &contact, super::Options::default())?;
+    Ok(())
+}
+
 fn tl_report_reason(reason: protocol::ReportReason) -> tl::enums::ReportReason {
     match reason {
         protocol::ReportReason::Spam => tl::enums::ReportReason::InputReportReasonSpam,

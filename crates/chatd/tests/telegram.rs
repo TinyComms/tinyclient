@@ -3716,6 +3716,71 @@ fn channel_boosts_read_the_level_and_applying_one_can_be_refused() {
 }
 
 #[test]
+fn bot_commands_keyboard_and_start_can_be_refused() {
+    use protocol::BotKeyKind;
+    let world = World::signed_in();
+    world.connected();
+
+    let Response::BotMenu { menu, .. } = world.ask(Request::GetBotMenu { conversation: key("u7004") }) else {
+        panic!("expected BotMenu");
+    };
+    assert_eq!(menu.description, "Trail reports.");
+    assert_eq!(menu.menu_label, "Map");
+    assert_eq!(menu.menu_url, "https://t.me/trail_bot");
+    assert_eq!(
+        menu.commands.iter().map(|cmd| cmd.command.as_str()).collect::<Vec<_>>(),
+        ["start", "report", "closures"]
+    );
+
+    match world.ask(Request::GetBotMenu { conversation: key("u7003") }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("cannot be started"), "{detail}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    let trail = world.message("u7004", "4").expect("trail message");
+    let board = trail.keyboard.expect("reply keyboard");
+    assert!(board.resize);
+    assert_eq!(board.placeholder.as_deref(), Some("Ask the trail"));
+    assert_eq!(board.rows[0][0].text, "Ridge");
+    assert_eq!(board.rows[0][0].kind, BotKeyKind::Text);
+
+    world.send("u7004", "1", "Ridge", None);
+    assert!(
+        world.calls().iter().any(|call| call.contains("SendMessage u7004 Ridge")),
+        "expected the keyboard text on the wire, got: {:#?}",
+        world.calls()
+    );
+
+    assert!(matches!(
+        world.ask(Request::StartBot { conversation: key("u7004"), start_param: "ridge".into() }),
+        Response::Ok
+    ));
+    assert!(
+        world.calls().iter().any(|call| call.contains("messages.startBot u7004 ridge")),
+        "expected startBot on the wire, got: {:#?}",
+        world.calls()
+    );
+
+    world.steer("start-refuse");
+    match world.ask(Request::StartBot { conversation: key("u7004"), start_param: "ridge".into() }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("cannot be started"), "{detail}");
+        }
+        other => panic!("expected a start refusal, got {other:?}"),
+    }
+    assert!(world.calls().iter().any(|call| call.contains("messages.startBot refused")));
+
+    match world.ask(Request::SharePhone { conversation: key("u7004") }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("phone"), "{detail}");
+        }
+        other => panic!("expected a phone refusal, got {other:?}"),
+    }
+}
+
+#[test]
 fn shared_contact_send_and_receive() {
     let world = World::signed_in();
     world.connected();

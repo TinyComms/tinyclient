@@ -5,8 +5,8 @@
 use super::peers::{is_replies, message_link, thread_id, Directory, DownloadClass, DownloadRules, Who};
 use grammers_tl_types as tl;
 use protocol::{
-    Attachment, Card, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview, Reaction, ReplyTo, Sender, Span,
-    Style, ThreadSummary,
+    Attachment, BotKey, BotKeyKind, Card, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview, Reaction, ReplyKeyboard,
+    ReplyTo, Sender, Span, Style, ThreadSummary,
 };
 use std::collections::HashSet;
 use tl::enums::{DocumentAttribute, MessageAction, MessageEntity, MessageMedia, PhotoSize};
@@ -2143,6 +2143,7 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 _ => None,
             };
             let reply_note = if replies { None } else { reply_note(dir, peer, raw.reply_to.as_ref()) };
+            message.keyboard = raw.reply_markup.as_ref().and_then(reply_keyboard);
             Some(Mapped {
                 peer,
                 id: raw.id,
@@ -2157,6 +2158,54 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             })
         }
     }
+}
+
+fn http_url(url: &str) -> Option<String> {
+    (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_owned())
+}
+
+fn bot_key(button: &tl::enums::KeyboardButton) -> BotKey {
+    use tl::enums::KeyboardButton as Key;
+    let text = button.text();
+    let (kind, url) = match button {
+        Key::Url(one) => (BotKeyKind::Url, http_url(&one.url)),
+        Key::WebView(one) => (BotKeyKind::Url, http_url(&one.url)),
+        Key::SimpleWebView(one) => (BotKeyKind::Url, http_url(&one.url)),
+        Key::UrlAuth(one) => (BotKeyKind::Url, http_url(&one.url)),
+        Key::RequestPhone(_) => (BotKeyKind::Phone, None),
+        Key::RequestGeoLocation(_) => (BotKeyKind::Location, None),
+        Key::RequestPeer(_) | Key::InputKeyboardButtonRequestPeer(_) => (BotKeyKind::Peer, None),
+        _ => (BotKeyKind::Text, None),
+    };
+    BotKey { text, url, kind }
+}
+
+/// Only `replyKeyboardMarkup`. Inline callback keyboards stay off the message.
+fn reply_keyboard(markup: &tl::enums::ReplyMarkup) -> Option<ReplyKeyboard> {
+    let tl::enums::ReplyMarkup::ReplyKeyboardMarkup(board) = markup else {
+        return None;
+    };
+    let rows = board
+        .rows
+        .iter()
+        .filter_map(|row| {
+            let tl::enums::KeyboardButtonRow::Row(row) = row;
+            let keys: Vec<BotKey> = row.buttons.iter().map(bot_key).filter(|key| !key.text.is_empty()).take(8).collect();
+            (!keys.is_empty()).then_some(keys)
+        })
+        .take(8)
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return None;
+    }
+    Some(ReplyKeyboard {
+        rows,
+        resize: board.resize,
+        single_use: board.single_use,
+        selective: board.selective,
+        persistent: board.persistent,
+        placeholder: board.placeholder.clone().filter(|hint| !hint.is_empty()),
+    })
 }
 
 fn user_id(who: Who) -> String {

@@ -173,6 +173,29 @@ pub struct ChannelBoosts {
     pub can_boost: bool,
 }
 
+/// One command a bot lists for `/` completion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotCommand {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+/// A bot's description, commands, and menu button, from `users.getFullUser`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotMenu {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<BotCommand>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub menu_label: String,
+    /// An `http` or `https` menu button. Anything else is left empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub menu_url: String,
+}
+
 /// Cached files one conversation is using, when those files can be attributed to it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatCache {

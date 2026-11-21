@@ -1980,6 +1980,32 @@ impl Render for Pane {
             .children(self.action_layers(window, cx))
             .children(self.viewer_layer(window, cx))
     }
+
+    /// The latest reply keyboard while `key` is the open conversation.
+    /// A selective one stays hidden unless it mentions the reader or answers one of theirs,
+    /// and an older keyboard is not used in its place.
+    pub(super) fn reply_keyboard(&self, key: &Key) -> Option<(String, protocol::ReplyKeyboard)> {
+        let open = self.open.as_ref()?;
+        if &open.key != key {
+            return None;
+        }
+        let message = self.window.messages.iter().rev().find(|message| message.keyboard.is_some())?;
+        let board = message.keyboard.clone()?;
+        if board.selective {
+            let answers_me = message.reply_to.as_ref().is_some_and(|reply| {
+                self.window.messages.iter().any(|held| held.id == reply.id && held.outgoing)
+            });
+            if !message.mentions_me && !answers_me {
+                return None;
+            }
+        }
+        Some((message.id.clone(), board))
+    }
+
+    /// Start belongs on an empty bot chat. A thread, or a window that still has older history, has none.
+    pub(super) fn bot_can_start(&self, key: &Key) -> bool {
+        self.open.as_ref().is_some_and(|open| &open.key == key) && self.window.messages.is_empty() && !self.window.older && !self.thread
+    }
 }
 
 impl Shell {
@@ -1996,6 +2022,30 @@ impl Shell {
         self.subscribe_pane(&pane, cx);
         self.follow_changes(cx);
         pane
+    }
+
+    /// The reply keyboard under the composer, from the open pane.
+    pub(in crate::gui) fn bot_reply_keyboard(&self, key: &Key, cx: &gpui::App) -> Option<(String, protocol::ReplyKeyboard)> {
+        self.conversation_state.pane.get()?.read(cx).reply_keyboard(key)
+    }
+
+    /// Whether the open pane should offer Start for this bot chat.
+    pub(in crate::gui) fn bot_can_start(&self, key: &Key, cx: &gpui::App) -> bool {
+        self.conversation_state.pane.get().is_some_and(|pane| pane.read(cx).bot_can_start(key))
+    }
+
+    /// `messages.startBot`. An empty `start_param` is the Start button; a deep link passes its payload.
+    pub(in crate::gui) fn start_bot(&mut self, conversation: Key, start_param: String, cx: &mut Context<Self>) {
+        super::people::ask_later(cx, Request::StartBot { conversation, start_param }, |_, _| {});
+    }
+
+    /// A bot menu or keyboard URL, through the pane's link confirm.
+    pub(in crate::gui) fn open_pane_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pane) = self.conversation_state.pane.get().cloned() else {
+            return;
+        };
+        let url = url.to_owned();
+        pane.update(cx, |pane, cx| pane.open_external_link(&url, window, cx));
     }
 
     /// My own id on the account a conversation belongs to.

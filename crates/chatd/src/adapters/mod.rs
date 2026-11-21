@@ -721,6 +721,22 @@ pub enum Command {
         conversation_id: String,
         reply: Reply<protocol::ChannelBoosts>,
     },
+    /// A bot's commands and menu button.
+    GetBotMenu {
+        conversation_id: String,
+        reply: Reply<protocol::BotMenu>,
+    },
+    /// Starts a bot, with the deep-link payload when there is one.
+    StartBot {
+        conversation_id: String,
+        start_param: String,
+        reply: Reply<()>,
+    },
+    /// Shares this account's phone number with a bot.
+    SharePhone {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
     /// A picker's catalog: custom emoji (of one Space when `space_id` is set), stickers, or GIFs
     /// for `query`. Register every preview through [`Context::media`]. Only on a key press:
     /// never ahead.
@@ -911,6 +927,9 @@ impl Command {
             Command::SetAutoDownload { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetBoosts { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ApplyBoost { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetBotMenu { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StartBot { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SharePhone { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

@@ -2319,6 +2319,39 @@ impl Chat {
         }
     }
 
+    fn bot_menu(&self, conversation: Key) -> Response {
+        if let Err(refused) = self.online(&conversation.account()) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&conversation.account(), |reply| Command::GetBotMenu { conversation_id, reply }) {
+            Ok(menu) => Response::BotMenu { conversation, menu },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn start_bot(&self, conversation: Key, start_param: String) -> Response {
+        if let Err(refused) = self.online(&conversation.account()) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&conversation.account(), |reply| Command::StartBot { conversation_id, start_param, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn share_phone(&self, conversation: Key) -> Response {
+        if let Err(refused) = self.online(&conversation.account()) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&conversation.account(), |reply| Command::SharePhone { conversation_id, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
     fn apply_boost(&self, conversation: Key) -> Response {
         if let Err(refused) = self.online(&conversation.account()) {
             return *refused;
@@ -3340,6 +3373,9 @@ impl Chat {
             Request::SetAutoDownload { account, settings } => self.set_auto_download(account, settings),
             Request::GetBoosts { conversation } => self.get_boosts(conversation),
             Request::ApplyBoost { conversation } => self.apply_boost(conversation),
+            Request::GetBotMenu { conversation } => self.bot_menu(conversation),
+            Request::StartBot { conversation, start_param } => self.start_bot(conversation, start_param),
+            Request::SharePhone { conversation } => self.share_phone(conversation),
             Request::Relate { person, action } => self.relate(person, action),
             Request::AddFriend { account, username } => self.add_friend(account, username),
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),

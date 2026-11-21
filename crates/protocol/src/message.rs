@@ -701,6 +701,51 @@ pub enum ControlKind {
     },
 }
 
+/// What a Telegram reply-keyboard button does. Text is the default and stays off the wire.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BotKeyKind {
+    #[default]
+    Text,
+    Url,
+    Phone,
+    Location,
+    Peer,
+}
+
+fn is_text_key(kind: &BotKeyKind) -> bool {
+    matches!(kind, BotKeyKind::Text)
+}
+
+/// One button on a Telegram reply keyboard. Inline callback buttons stay unmapped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotKey {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "is_text_key")]
+    pub kind: BotKeyKind,
+}
+
+/// A bot's reply keyboard, drawn under the composer. `selective` hides it unless the
+/// message mentions the reader or answers one of theirs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyKeyboard {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<Vec<BotKey>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resize: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub single_use: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub selective: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub persistent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+}
+
 /// One interactive Block Kit control attached to a bot/app message (button, menu, picker, etc.).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageControl {
@@ -861,6 +906,9 @@ pub struct Message {
     /// Interactive app/bot controls (Slack Block Kit buttons, menus, pickers, checkboxes, radios).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub controls: Vec<MessageControl>,
+    /// Telegram reply keyboard for this message. Inline keyboards are not carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard: Option<ReplyKeyboard>,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -970,6 +1018,7 @@ impl Message {
             sent_via: None,
             permalink: String::new(),
             controls: Vec::new(),
+            keyboard: None,
         }
     }
 
@@ -1047,6 +1096,21 @@ impl Message {
             clip(via, 64);
         }
         self.controls.truncate(MESSAGE_CONTROLS_LIMIT);
+        if let Some(keyboard) = &mut self.keyboard {
+            keyboard.rows.truncate(8);
+            for row in &mut keyboard.rows {
+                row.truncate(8);
+                for key in row.iter_mut() {
+                    clip(&mut key.text, 64);
+                    if let Some(url) = &mut key.url {
+                        clip(url, 2_000);
+                    }
+                }
+            }
+            if let Some(hint) = &mut keyboard.placeholder {
+                clip(hint, 64);
+            }
+        }
         for control in &mut self.controls {
             clip(&mut control.block_id, 255);
             clip(&mut control.action_id, 255);
@@ -1120,6 +1184,7 @@ impl Message {
         self.card = None;
         self.cards.clear();
         self.controls.clear();
+        self.keyboard = None;
         self.poll = None;
         self.deliveries.clear();
         self.receipt_note.clear();

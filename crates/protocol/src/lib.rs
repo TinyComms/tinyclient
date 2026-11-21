@@ -1661,6 +1661,16 @@ pub enum Request {
     GetBoosts { conversation: Key },
     /// Gives this Premium account's free boost to the channel (`premium.applyBoost`).
     ApplyBoost { conversation: Key },
+    /// A bot's description, commands, and menu button (`users.getFullUser`).
+    GetBotMenu { conversation: Key },
+    /// `messages.startBot`. An empty `start_param` is the Start button.
+    StartBot {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        start_param: String,
+    },
+    /// Shares this account's phone number with a bot, after the shell has confirmed.
+    SharePhone { conversation: Key },
     /// Answer, withdraw or end a friendship, or block. The list changes when the network says so
     /// (a `People` change).
     Relate {
@@ -2940,6 +2950,11 @@ pub enum Response {
     Boosts {
         conversation: Key,
         status: ChannelBoosts,
+    },
+    /// A bot's command menu for the composer's `/` list.
+    BotMenu {
+        conversation: Key,
+        menu: BotMenu,
     },
     Folders {
         folders: Vec<Folder>,

@@ -156,12 +156,16 @@ impl Pane {
             cx.spawn(async move |this, cx| {
                 let answer = cx.background_executor().spawn(async move { crate::client::ask(&request) }).await;
                 if let Ok(protocol::Response::Resolved { conversation: Some(key), message_id, title }) = answer {
-                    let boost = protocol::link::parse_network_link(&owned).is_some_and(|link| link.space.as_deref() == Some("boost"));
+                    let parsed = protocol::link::parse_network_link(&owned);
+                    let boost = parsed.as_ref().is_some_and(|link| link.space.as_deref() == Some("boost"));
+                    let start = parsed.and_then(|link| (link.space.as_deref() == Some("start")).then(|| link.thread_id.unwrap_or_default()));
                     let _ = this.update(cx, |this, cx| {
                         let _ = this.shell.update(cx, |shell, cx| {
                             shell.open_resolved_link(key.clone(), message_id, &title, cx);
                             if boost {
                                 shell.details_conversation(key, cx);
+                            } else if let Some(param) = start {
+                                shell.start_bot(key, param, cx);
                             }
                         });
                     });

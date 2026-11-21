@@ -278,6 +278,46 @@ fn crew_poll(counts: &[(u8, i32)], total: i32) -> (tl::enums::Poll, tl::enums::P
     (poll.into(), results.into())
 }
 
+fn trail_keyboard() -> tl::enums::ReplyMarkup {
+    tl::types::ReplyKeyboardMarkup {
+        resize: true,
+        single_use: false,
+        selective: false,
+        persistent: false,
+        rows: vec![tl::types::KeyboardButtonRow {
+            buttons: vec![tl::types::KeyboardButton { style: None, text: "Ridge".to_owned() }.into()],
+        }
+        .into()],
+        placeholder: Some("Ask the trail".to_owned()),
+    }
+    .into()
+}
+
+fn trail_bot_info() -> tl::enums::BotInfo {
+    let command = |name: &str, description: &str| {
+        tl::enums::BotCommand::Command(tl::types::BotCommand { command: name.to_owned(), description: description.to_owned() })
+    };
+    tl::enums::BotInfo::Info(tl::types::BotInfo {
+        has_preview_medias: false,
+        user_id: Some(BOT),
+        description: Some("Trail reports.".to_owned()),
+        description_photo: None,
+        description_document: None,
+        commands: Some(vec![
+            command("start", "Open the trail"),
+            command("report", "Today's report"),
+            command("closures", "Weekend closures"),
+        ]),
+        menu_button: Some(tl::enums::BotMenuButton::Button(tl::types::BotMenuButton {
+            text: "Map".to_owned(),
+            url: "https://t.me/trail_bot".to_owned(),
+        })),
+        privacy_policy_url: None,
+        app_settings: None,
+        verifier_settings: None,
+    })
+}
+
 fn message(peer: Who, id: i32, from: i64, date: i32, text: &str) -> tl::types::Message {
     let mut message: tl::types::Message = blank(&[&put(0u32), &put(0u32), &put(id), &put(peer.peer()), &put(date), &put(text.to_owned())]);
     message.out = from == ME;
@@ -560,6 +600,8 @@ struct World {
     boost_count: i32,
     /// The next `premium.applyBoost` returns `PREMIUM_ACCOUNT_REQUIRED`.
     boost_refuse: bool,
+    /// The next `messages.startBot` returns `BOT_INVALID`.
+    start_refuse: bool,
     calls: PathBuf,
     /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
     dialogs_go: bool,
@@ -658,6 +700,7 @@ impl World {
             boost_level: 3,
             boost_count: 12,
             boost_refuse: false,
+            start_refuse: false,
             calls: protocol::support_dir().join("telegram.calls"),
             dialogs_go: false,
             peer_go: false,
@@ -689,7 +732,9 @@ impl World {
         world.store(None, message(Who::User(TOBIN), 31, ME, t0() - 80_000, "Trailhead at seven, then."));
         world.store(None, message(Who::User(ME), 2, ME, t0() - 100_000, "Packing list: stove, map, headlamp."));
         world.store(None, message(Who::User(SERVICE), 3, SERVICE, t0() - 110_000, "Login code: 24680. Do not give this code to anyone."));
-        world.store(None, message(Who::User(BOT), 4, BOT, t0() - 120_000, "Trail report: all clear."));
+        let mut trail = message(Who::User(BOT), 4, BOT, t0() - 120_000, "Trail report: all clear.");
+        trail.reply_markup = Some(trail_keyboard());
+        world.store(None, trail);
         // My newest word to the bot, which its dialog's read-outbox stops below: ✓ without ✓✓.
         world.store(None, message(Who::User(BOT), 5, ME, t0() - 115_000, "Any closures this weekend?"));
         world.store(None, message(Who::User(SCAM), 6, SCAM, t0() - 130_000, "You won a prize!"));
@@ -1619,6 +1664,10 @@ impl World {
             }
             "boost-refuse" => {
                 self.boost_refuse = words.next().map_or(true, |v| v != "0" && v != "off");
+                Vec::new()
+            }
+            "start-refuse" => {
+                self.start_refuse = words.next().map_or(true, |v| v != "0" && v != "off");
                 Vec::new()
             }
             "transcribe-update" => {
@@ -2845,6 +2894,9 @@ impl World {
             full.phone_calls_private = phone_priv;
             full.video_calls_available = video_avail;
             full.voice_messages_forbidden = self.voice_forbidden.contains(&id);
+            if id == BOT {
+                full.bot_info = Some(trail_bot_info());
+            }
             let mut people = users();
             if id == TOBIN {
                 full.birthday = Some(tl::types::Birthday { day: 14, month: 3, year: None }.into());
@@ -2999,6 +3051,23 @@ impl World {
             }
             let mine = tl::types::premium::MyBoosts { my_boosts: vec![one_boost(slot, Some(id))], chats: Vec::new(), users: Vec::new() };
             return answer(tl::enums::premium::MyBoosts::Boosts(mine));
+        }
+        if let Some(request) = asked::<f::messages::StartBot>(body) {
+            if self.start_refuse {
+                self.log("messages.startBot refused");
+                return Err(rpc(400, "BOT_INVALID", None));
+            }
+            let bot = match &request.bot {
+                tl::enums::InputUser::User(user) => user.user_id,
+                tl::enums::InputUser::UserSelf => self.me,
+                _ => 0,
+            };
+            if bot != BOT {
+                self.log("messages.startBot refused");
+                return Err(rpc(400, "PEER_ID_INVALID", None));
+            }
+            self.log(&format!("messages.startBot u{bot} {}", request.start_param));
+            return answer(updates(Vec::new()));
         }
         if let Some(answered) = self.panes(body, events) {
             return answered;

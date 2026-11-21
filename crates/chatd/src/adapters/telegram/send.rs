@@ -215,7 +215,7 @@ fn send_dice(account: &Account, conversation: &str, client_id: &str, text: &str,
 }
 
 /// Shares a contact card via `messages.sendMedia` (`InputMediaContact`).
-fn send_contact(
+pub(super) fn send_contact(
     account: &Account,
     conversation: &str,
     client_id: &str,
