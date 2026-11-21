@@ -413,6 +413,19 @@ pub enum Command {
         action: RelateAction,
         reply: Reply<()>,
     },
+    /// Report a message, person, or conversation to the network.
+    Report {
+        target: protocol::ReportTarget,
+        reason: protocol::ReportReason,
+        note: String,
+        block: bool,
+        reply: Reply<()>,
+    },
+    /// Ask the network's supported report reasons for `target`.
+    ReportReasons {
+        target: protocol::ReportTarget,
+        reply: Reply<Vec<protocol::ReportReason>>,
+    },
     /// The user set their own presence, and their status text unless it is `None` (empty clears
     /// it). The hub already shows it; answer `Err` and it is put back.
     SetPresence {
@@ -509,6 +522,7 @@ impl Command {
             | Command::Edit { reply, .. }
             | Command::Delete { reply, .. }
             | Command::Relate { reply, .. }
+            | Command::Report { reply, .. }
             | Command::SetPresence { reply, .. }
             | Command::SetProfile { reply, .. }
             | Command::SetAvatar { reply, .. }
@@ -516,6 +530,7 @@ impl Command {
             | Command::AnswerMessageRequest { reply, .. }
             | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Source { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReportReasons { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

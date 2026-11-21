@@ -1590,6 +1590,39 @@ impl Chat {
         }
     }
 
+    fn report(
+        &self,
+        target: protocol::ReportTarget,
+        reason: protocol::ReportReason,
+        mut note: String,
+        block: bool,
+    ) -> Response {
+        let account = target.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        clip(&mut note, 1000);
+        match self.ask(&account, |reply| Command::Report { target, reason, note, block, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn report_reasons(&self, target: protocol::ReportTarget) -> Response {
+        let account = target.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::ReportReasons { target, reply }) {
+            Ok(reasons) if !reasons.is_empty() => Response::ReportReasons { reasons },
+            Ok(_) => Response::ReportReasons { reasons: protocol::ReportReason::ALL.to_vec() },
+            Err(refused) if matches!(&*refused, Response::Error { code: ErrorCode::Unsupported, .. }) => {
+                Response::ReportReasons { reasons: protocol::ReportReason::ALL.to_vec() }
+            }
+            Err(refused) => *refused,
+        }
+    }
+
     /// Our own presence, shown at once and put back if the network refuses it.
     fn set_presence(&self, account: AccountKey, presence: Presence, status: Option<String>) -> Response {
         if let Err(refused) = self.online(&account) {
@@ -1665,7 +1698,7 @@ impl Chat {
     /// Sets our own avatar from a local file path. Maps Tiny onto its existing avatar upload.
     fn set_avatar(&self, account: AccountKey, path: String) -> Response {
         if account.network == Network::Tiny {
-            let response = adapters::tiny::manage::user_avatar(account.clone(), path);
+            let response = adapters::tiny::manage::user_avatar(account.clone(), (!path.is_empty()).then_some(path));
             if matches!(response, Response::Ok) {
                 self.forget_own_profile(&account, None);
             }
@@ -2614,6 +2647,8 @@ impl Chat {
             Request::Pinned { conversation } => self.pinned(conversation),
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::Relate { person, action } => self.relate(person, action),
+            Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
+            Request::ReportReasons { target } => self.report_reasons(target),
             Request::SetPresence { account, presence, status } => self.set_presence(account, presence, status),
             Request::SetProfile { account, name, about, pronouns, emoji, username, photo } => {
                 self.set_profile(account, name, about, pronouns, emoji, username, photo)

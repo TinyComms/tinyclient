@@ -809,6 +809,7 @@ impl Discord {
             revisions: false,
             close_direct: true,
             clear_history: false,
+            ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;
     }

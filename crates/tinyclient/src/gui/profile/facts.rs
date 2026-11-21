@@ -558,6 +558,7 @@ pub enum Item {
     UnignoreUser,
     Block,
     Unblock,
+    Report,
     Leave,
 }
 
@@ -624,6 +625,9 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
         items.push(Item::Block);
     } else if person.relation == Relation::Blocked && matches!(person.key.network, Network::Discord | Network::Telegram) {
         items.push(Item::Unblock);
+    }
+    if !person.bot && (block || matches!(person.key.network, Network::Signal | Network::Messages | Network::Teams)) {
+        items.push(Item::Report);
     }
     tidy(items)
 }
@@ -1071,11 +1075,11 @@ mod tests {
         let from_channel = Seen { native_calls: false, in_their_dm: false, direct: Some((CallSupport::Native, true)), online: true, close_direct: true };
         assert_eq!(
             person_menu(&juno, &from_channel, true, false),
-            vec![Item::Mute { muted: true }, Item::Separator, Item::CopyHandle, Item::CopyLink, Item::CopyId, Item::OpenIn, Item::Separator, Item::RemoveFriend, Item::IgnoreUser, Item::Block]
+            vec![Item::Mute { muted: true }, Item::Separator, Item::CopyHandle, Item::CopyLink, Item::CopyId, Item::OpenIn, Item::Separator, Item::RemoveFriend, Item::IgnoreUser, Item::Block, Item::Report]
         );
         // In their DM: no Mute (the switch has it), Close DM instead, Copy ID only with ⌥. The
         // pane's foot opens them in the app, so its menu does not.
-        assert_eq!(person_menu(&juno, &DM, false, true), vec![Item::CopyHandle, Item::CopyLink, Item::CloseDirect, Item::Separator, Item::RemoveFriend, Item::IgnoreUser, Item::Block]);
+        assert_eq!(person_menu(&juno, &DM, false, true), vec![Item::CopyHandle, Item::CopyLink, Item::CloseDirect, Item::Separator, Item::RemoveFriend, Item::IgnoreUser, Item::Block, Item::Report]);
         let nadia = person(Network::Telegram, Relation::Contact);
         let telegram_dm = Seen { in_their_dm: true, direct: Some((CallSupport::Handoff, false)), online: true, ..Seen::default() };
         assert!(!person_menu(&nadia, &telegram_dm, false, true).contains(&Item::CloseDirect), "Telegram does not serve CloseDirect");

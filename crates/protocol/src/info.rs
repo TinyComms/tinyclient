@@ -594,4 +594,30 @@ mod tests {
             assert_eq!(got, req);
         }
     }
+
+    #[test]
+    fn report_requests_and_reasons_round_trip() {
+        use crate::{ReportReason, ReportTarget, Response};
+        let account = AccountKey { network: Network::Telegram, account: "1".into() };
+        let conv = Key::new(&account, "c1");
+        let target = ReportTarget::Message { conversation: conv.clone(), message_id: "m42".into() };
+        assert_eq!(target.account(), account);
+        let req = Request::Report {
+            target: target.clone(),
+            reason: ReportReason::Spam,
+            note: "unsolicited links".into(),
+            block: true,
+        };
+        let got: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(got, req);
+
+        let reasons_req = Request::ReportReasons { target };
+        let got_r: Request = serde_json::from_str(&serde_json::to_string(&reasons_req).unwrap()).unwrap();
+        assert_eq!(got_r, reasons_req);
+
+        let resp = Response::ReportReasons { reasons: ReportReason::ALL.to_vec() };
+        let got_resp: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(got_resp, resp);
+        assert_eq!(ReportReason::ALL.len(), 6);
+    }
 }

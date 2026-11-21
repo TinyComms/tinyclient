@@ -901,6 +901,59 @@ pub enum RelateAction {
     UnignoreUser,
 }
 
+/// What is being reported to a network (`Request::Report`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReportTarget {
+    Message { conversation: Key, message_id: String },
+    Person(Key),
+    Conversation(Key),
+}
+
+impl ReportTarget {
+    pub fn account(&self) -> AccountKey {
+        match self {
+            ReportTarget::Message { conversation, .. } => conversation.account(),
+            ReportTarget::Person(key) | ReportTarget::Conversation(key) => key.account(),
+        }
+    }
+}
+
+/// Shared report reason categories (`Request::Report`, `Request::ReportReasons`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportReason {
+    #[default]
+    Spam,
+    Harassment,
+    Violence,
+    Illegal,
+    Impersonation,
+    Other,
+}
+
+impl ReportReason {
+    pub const ALL: [ReportReason; 6] = [
+        ReportReason::Spam,
+        ReportReason::Harassment,
+        ReportReason::Violence,
+        ReportReason::Illegal,
+        ReportReason::Impersonation,
+        ReportReason::Other,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ReportReason::Spam => "Spam",
+            ReportReason::Harassment => "Harassment",
+            ReportReason::Violence => "Violence or threats",
+            ReportReason::Illegal => "Illegal content",
+            ReportReason::Impersonation => "Impersonation",
+            ReportReason::Other => "Other",
+        }
+    }
+}
+
 /// What someone is doing in a composer. Networks that only have typing leave this as [`Typing`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1336,6 +1389,19 @@ pub enum Request {
     Relate {
         person: Key,
         action: RelateAction,
+    },
+    /// Report a message, person, or conversation to the network. Never sent without a confirm sheet.
+    Report {
+        target: ReportTarget,
+        reason: ReportReason,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        note: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        block: bool,
+    },
+    /// Asks what report reasons the network offers for `target`; defaults to [`ReportReason::ALL`].
+    ReportReasons {
+        target: ReportTarget,
     },
     /// Our own presence on one account, and the status text beside it: `None` leaves the text
     /// as it is, empty clears it.
@@ -2123,6 +2189,10 @@ pub enum Response {
     Pong,
     /// Done, with nothing to say.
     Ok,
+    /// The report reasons a network offers for a target (`Request::ReportReasons`).
+    ReportReasons {
+        reasons: Vec<ReportReason>,
+    },
     /// `NotifyTest`: whether the system took the notification, and its words when it did not
     /// (notifications turned off for tinyclient, no notification service).
     NotifyTested {

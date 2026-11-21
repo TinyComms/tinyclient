@@ -336,6 +336,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         revisions: false,
         close_direct: false,
         clear_history: true,
+        ..Default::default()
     }
 }
 

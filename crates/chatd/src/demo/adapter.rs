@@ -650,15 +650,34 @@ impl Demo {
                 let related = demo.ctx.relation(&person_id, relation);
                 let _ = reply.send(related.map_err(|err| Refusal::Refused(err.to_string())));
             }
+            Command::Report { target, reason: _, note: _, block, reply } => {
+                if block {
+                    let person_id = match &target {
+                        protocol::ReportTarget::Person(key) => Some(key.id.clone()),
+                        protocol::ReportTarget::Message { conversation, message_id } => demo
+                            .hub
+                            .store()
+                            .message(conversation, message_id)
+                            .ok()
+                            .flatten()
+                            .map(|m| m.sender.id),
+                        protocol::ReportTarget::Conversation(_) => None,
+                    };
+                    if let Some(id) = person_id {
+                        let _ = demo.ctx.relation(&id, Relation::Blocked);
+                    }
+                }
+                let _ = reply.send(Ok(()));
+            }
+            Command::ReportReasons { reply, .. } => {
+                let _ = reply.send(Ok(protocol::ReportReason::ALL.to_vec()));
+            }
             Command::SetPresence { presence, status, reply } => {
                 let (_, old) = demo.hub.shown(&demo.key(&demo.me.id));
                 demo.ctx.presence(&demo.me.id, presence, status.as_deref().unwrap_or(&old), true);
                 let _ = reply.send(Ok(()));
             }
-            Command::SetProfile { name, about, pronouns: _, reply } => {
-                if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
-                    demo.me.name = name;
-                }
+            Command::SetProfile { name: _, about, pronouns: _, reply } => {
                 if let Some(about) = about {
                     let (presence, _) = demo.hub.shown(&demo.key(&demo.me.id));
                     demo.ctx.presence(&demo.me.id, presence, &about, true);
