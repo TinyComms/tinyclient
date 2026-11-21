@@ -34,6 +34,8 @@ pub struct Seen {
     pub direct: Option<(CallSupport, bool)>,
     /// Their network is connected. Off: what shows is the cache.
     pub online: bool,
+    /// The account supports closing a direct conversation (`Request::CloseDirect`).
+    pub close_direct: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +60,7 @@ pub struct Actions {
 pub fn handoff_words(network: Network) -> String {
     match network {
         Network::Slack => "Huddle in Slack".to_owned(),
+        Network::Telegram => "Open chat in Telegram".to_owned(),
         other => format!("Call in {}", other.label()),
     }
 }
@@ -69,6 +72,7 @@ pub fn call_label(call: &Call, network: Network, beside_message: bool) -> String
         (Call::Native, _) => "Call".to_owned(),
         (Call::Handoff(words), false) => words.clone(),
         (Call::Handoff(_), true) if network == Network::Slack => "Huddle".to_owned(),
+        (Call::Handoff(_), true) if network == Network::Telegram => "Telegram".to_owned(),
         (Call::Handoff(_), true) => "Call".to_owned(),
     }
 }
@@ -550,7 +554,10 @@ pub enum Item {
     CloseDirect,
     Separator,
     RemoveFriend,
+    IgnoreUser,
+    UnignoreUser,
     Block,
+    Unblock,
     Leave,
 }
 
@@ -598,7 +605,7 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
     if !pane && !person.link.is_empty() {
         items.push(Item::OpenIn);
     }
-    if seen.in_their_dm && seen.direct.is_some() {
+    if seen.in_their_dm && seen.direct.is_some() && seen.close_direct {
         items.push(Item::CloseDirect);
     }
     let (remove, block) = offers(person);
@@ -606,16 +613,35 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
     if remove {
         items.push(Item::RemoveFriend);
     }
+    if person.key.network == Network::Discord && !person.bot && person.relation != Relation::Blocked {
+        if person.relation == Relation::Ignored {
+            items.push(Item::UnignoreUser);
+        } else {
+            items.push(Item::IgnoreUser);
+        }
+    }
     if block {
         items.push(Item::Block);
+    } else if person.relation == Relation::Blocked && matches!(person.key.network, Network::Discord | Network::Telegram) {
+        items.push(Item::Unblock);
     }
     tidy(items)
 }
 
+/// A direct conversation whose account serves `CloseDirect` (Discord, Messages).
+pub fn can_close_direct(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
+    conversation.kind == ConversationKind::Direct && can.close_direct
+}
+
+/// A conversation whose account serves `ClearHistory` (Telegram) and is not read-only.
+pub fn can_clear_history(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
+    can.clear_history && !conversation.read_only
+}
+
 /// A group DM, or a Telegram group or channel: the user can leave it from the pane.
 pub fn can_leave(conversation: &Conversation) -> bool {
-    // A linked Signal device cannot leave a group. The item stays off until it can.
-    if conversation.key.network == Network::Signal {
+    // A linked Signal device and paired Messages cannot leave a group. The item stays off until they can.
+    if matches!(conversation.key.network, Network::Signal | Network::Messages) {
         return false;
     }
     conversation.kind == ConversationKind::Group
@@ -687,7 +713,7 @@ pub fn confirm_words(act: Act, name: &str, network: Network) -> (String, String,
         Act::Block => (
             format!("Block {name} on {net}?"),
             match network {
-                Network::Discord => "They won't be able to message you, and their messages in shared servers are hidden. You can unblock them in Discord.".to_owned(),
+                Network::Discord => "They won't be able to message you, and their messages in shared servers are hidden. You can unblock them from their profile or Blocked.".to_owned(),
                 _ => format!("They won't be able to message or call you on {net}. You can unblock them in {net}."),
             },
             "Block",
@@ -879,10 +905,13 @@ mod tests {
             seen: false,
             delivered: false,
             sending: false,
+            max_file_bytes: 0,
+            read_only_reason: String::new(),
+            spam: false,
         }
     }
 
-    const DM: Seen = Seen { native_calls: false, in_their_dm: true, direct: Some((CallSupport::Native, false)), online: true };
+    const DM: Seen = Seen { native_calls: false, in_their_dm: true, direct: Some((CallSupport::Native, false)), online: true, close_direct: true };
 
     #[test]
     fn friendship_buttons_follow_discord_relationship_state() {
@@ -932,7 +961,7 @@ mod tests {
 
     #[test]
     fn calls_are_native_handed_off_or_absent_by_network_and_never_for_apps() {
-        let seen = |call| Seen { native_calls: false, in_their_dm: false, direct: Some((call, false)), online: true };
+        let seen = |call| Seen { native_calls: false, in_their_dm: false, direct: Some((call, false)), online: true, close_direct: false };
         let tess = person(Network::Slack, Relation::Contact);
         assert_eq!(actions(&tess, &seen(CallSupport::Handoff), Surface::Pane).call, Some(Call::Handoff("Huddle in Slack".into())));
         let omar = person(Network::Teams, Relation::Contact);
@@ -942,10 +971,10 @@ mod tests {
         let unseen = Seen { online: true, ..Seen::default() };
         assert_eq!(actions(&tess, &unseen, Surface::Pane).call, None);
         assert_eq!(actions(&person(Network::Discord, Relation::None), &unseen, Surface::Pane).call, Some(Call::Native));
-        // A Telegram person's call is a hand-off, DM held or not; their service account has none.
+        // A Telegram person's hand-off opens the chat in Telegram, DM held or not; their service account has none.
         let nadia = person(Network::Telegram, Relation::Contact);
-        assert_eq!(actions(&nadia, &unseen, Surface::Card).call, Some(Call::Handoff("Call in Telegram".into())));
-        assert_eq!(actions(&nadia, &seen(CallSupport::Handoff), Surface::Pane).call, Some(Call::Handoff("Call in Telegram".into())));
+        assert_eq!(actions(&nadia, &unseen, Surface::Card).call, Some(Call::Handoff("Open chat in Telegram".into())));
+        assert_eq!(actions(&nadia, &seen(CallSupport::Handoff), Surface::Pane).call, Some(Call::Handoff("Open chat in Telegram".into())));
         let mut service = nadia.clone();
         service.mark = Some(Mark::Verified);
         assert_eq!(actions(&service, &unseen, Surface::Card).call, None);
@@ -1039,14 +1068,17 @@ mod tests {
     #[test]
     fn menus_follow_the_designs_order_and_destructive_items_come_last() {
         let juno = person(Network::Discord, Relation::Friend);
-        let from_channel = Seen { native_calls: false, in_their_dm: false, direct: Some((CallSupport::Native, true)), online: true };
+        let from_channel = Seen { native_calls: false, in_their_dm: false, direct: Some((CallSupport::Native, true)), online: true, close_direct: true };
         assert_eq!(
             person_menu(&juno, &from_channel, true, false),
-            vec![Item::Mute { muted: true }, Item::Separator, Item::CopyHandle, Item::CopyLink, Item::CopyId, Item::OpenIn, Item::Separator, Item::RemoveFriend, Item::Block]
+            vec![Item::Mute { muted: true }, Item::Separator, Item::CopyHandle, Item::CopyLink, Item::CopyId, Item::OpenIn, Item::Separator, Item::RemoveFriend, Item::IgnoreUser, Item::Block]
         );
         // In their DM: no Mute (the switch has it), Close DM instead, Copy ID only with ⌥. The
         // pane's foot opens them in the app, so its menu does not.
-        assert_eq!(person_menu(&juno, &DM, false, true), vec![Item::CopyHandle, Item::CopyLink, Item::CloseDirect, Item::Separator, Item::RemoveFriend, Item::Block]);
+        assert_eq!(person_menu(&juno, &DM, false, true), vec![Item::CopyHandle, Item::CopyLink, Item::CloseDirect, Item::Separator, Item::RemoveFriend, Item::IgnoreUser, Item::Block]);
+        let nadia = person(Network::Telegram, Relation::Contact);
+        let telegram_dm = Seen { in_their_dm: true, direct: Some((CallSupport::Handoff, false)), online: true, ..Seen::default() };
+        assert!(!person_menu(&nadia, &telegram_dm, false, true).contains(&Item::CloseDirect), "Telegram does not serve CloseDirect");
         let tess = person(Network::Slack, Relation::Contact);
         assert_eq!(person_menu(&tess, &Seen::default(), false, false), vec![Item::CopyHandle, Item::CopyLink, Item::OpenIn]);
         assert_eq!(person_menu(&tess, &Seen::default(), false, true), vec![Item::CopyHandle, Item::CopyLink]);
@@ -1058,6 +1090,19 @@ mod tests {
         assert_eq!(conversation_menu(&channel, None, false), Vec::<Item>::new());
         assert!(can_leave(&row(Network::Telegram, ConversationKind::Announcement)));
         assert!(!can_leave(&row(Network::Discord, ConversationKind::Channel)));
+        assert!(can_leave(&row(Network::Teams, ConversationKind::Group)));
+        assert!(!can_leave(&row(Network::Teams, ConversationKind::Channel)));
+        assert!(conversation_menu(&row(Network::Slack, ConversationKind::Group), Some("l"), false).contains(&Item::Leave));
+        let dm_with_close = Seen { close_direct: true, ..DM };
+        let dm_without_close = Seen { close_direct: false, ..DM };
+        assert!(person_menu(&tess, &dm_with_close, false, true).contains(&Item::CloseDirect));
+        assert!(!person_menu(&tess, &dm_without_close, false, true).contains(&Item::CloseDirect));
+        let tg_caps = protocol::Capabilities { close_direct: false, clear_history: true, ..Default::default() };
+        let dc_caps = protocol::Capabilities { close_direct: true, clear_history: false, ..Default::default() };
+        assert!(!can_close_direct(&row(Network::Telegram, ConversationKind::Direct), &tg_caps));
+        assert!(can_close_direct(&row(Network::Discord, ConversationKind::Direct), &dc_caps));
+        assert!(can_clear_history(&row(Network::Telegram, ConversationKind::Direct), &tg_caps));
+        assert!(!can_clear_history(&row(Network::Discord, ConversationKind::Direct), &dc_caps));
     }
 
     #[test]
@@ -1096,6 +1141,7 @@ mod tests {
         assert_eq!(conversation_tag(&signal, None), None);
         assert_eq!(notify_control(&signal), NotifyControl::Held("Set on your phone"));
         assert!(!can_leave(&row(Network::Signal, ConversationKind::Group)));
+        assert!(!can_leave(&row(Network::Messages, ConversationKind::Group)));
         assert_eq!(notify_control(&row(Network::Messages, ConversationKind::Direct)), NotifyControl::Held("Stays on your phone"));
         assert_eq!(notify_control(&row(Network::Teams, ConversationKind::Channel)), NotifyControl::Segmented);
         info.external = "Northwind".into();
@@ -1168,9 +1214,27 @@ mod tests {
     #[test]
     fn a_hand_off_beside_message_is_one_word() {
         let handoff = Call::Handoff(handoff_words(Network::Telegram));
-        assert_eq!(call_label(&handoff, Network::Telegram, false), "Call in Telegram");
-        assert_eq!(call_label(&handoff, Network::Telegram, true), "Call");
+        assert_eq!(call_label(&handoff, Network::Telegram, false), "Open chat in Telegram");
+        assert_eq!(call_label(&handoff, Network::Telegram, true), "Telegram");
+        assert_eq!(call_label(&Call::Handoff(handoff_words(Network::Teams)), Network::Teams, false), "Call in Teams");
+        assert_eq!(call_label(&Call::Handoff(handoff_words(Network::Teams)), Network::Teams, true), "Call");
         assert_eq!(call_label(&Call::Handoff(handoff_words(Network::Slack)), Network::Slack, true), "Huddle");
         assert_eq!(call_label(&Call::Native, Network::Discord, false), "Call");
+    }
+
+    #[test]
+    fn tiny_person_menu_omits_refused_actions() {
+        let mut p = person(Network::Tiny, Relation::None);
+        p.handle = "@bea".into();
+        let seen = Seen {
+            direct: Some((CallSupport::None, false)),
+            in_their_dm: true,
+            ..Seen::default()
+        };
+        let items = person_menu(&p, &seen, false, false);
+        assert!(!items.contains(&Item::CloseDirect), "Tiny cannot close a DM");
+        assert!(!items.iter().any(|item| matches!(item, Item::Mute { .. })), "Tiny has no mute");
+        assert!(!items.contains(&Item::RemoveFriend));
+        assert!(!items.contains(&Item::Block));
     }
 }

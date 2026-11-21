@@ -15,18 +15,18 @@ pub(in crate::gui) fn available(can: &Capabilities) -> bool {
 /// What a press on the mic is: the first on a conversation records, the next stops. A press
 /// while another recording holds starts over instead: one recording at a time, and the pushed
 /// one goes (chatd ends it and says so).
-pub(in crate::gui) fn on_press(recording: &Option<Recording>, target: &Key) -> RecordRequest {
+pub(in crate::gui) fn on_press(recording: &Option<Recording>, target: &Key, input: Option<String>) -> RecordRequest {
     let recording = recording.as_ref().map(|recording| (recording.conversation == *target, recording));
     match recording {
         Some((true, recording)) if matches!(recording.state, RecordState::Active) => RecordRequest::Stop,
-        _ => RecordRequest::Start { conversation: target.clone() },
+        _ => RecordRequest::Start { conversation: target.clone(), input },
     }
 }
 
 /// What a held mic is: the down records. Every down is a start, like a press where nothing of
 /// this conversation's runs — chatd ends whatever ran, and what it kept goes with it.
-pub(in crate::gui) fn on_hold_down(target: &Key) -> RecordRequest {
-    RecordRequest::Start { conversation: target.clone() }
+pub(in crate::gui) fn on_hold_down(target: &Key, input: Option<String>) -> RecordRequest {
+    RecordRequest::Start { conversation: target.clone(), input }
 }
 
 /// What letting the mic go asks, once the release grace has run: the stop, while this
@@ -68,8 +68,8 @@ pub(in crate::gui) fn on_owed_stop(recording: &Option<Recording>, owed: &Key) ->
 /// arrive, and the one that says the recording runs is answered with the stop.
 pub(in crate::gui) fn prove_push_to_talk_release() -> Result<(), &'static str> {
     let key = Key { network: protocol::Network::Telegram, account: "1".into(), id: "7002".into() };
-    let running = Recording { conversation: key.clone(), since: 10_000, state: RecordState::Active };
-    if !matches!(on_hold_down(&key), RecordRequest::Start { .. }) {
+    let running = Recording { conversation: key.clone(), since: 10_000, device: None, notice: None, state: RecordState::Active };
+    if !matches!(on_hold_down(&key, None), RecordRequest::Start { .. }) {
         return Err("holding the mic did not start a recording");
     }
     if on_hold_up(&Some(running.clone()), &key) != Some(RecordRequest::Stop) {
@@ -98,8 +98,16 @@ pub(in crate::gui) fn foot(recording: &Option<Recording>, target: &Key, now: u64
     let recording = recording.as_ref().filter(|recording| recording.conversation == *target)?;
     Some(match &recording.state {
         RecordState::Active => {
-            let how = if push { "release the mic to stop" } else { "press the mic again to stop" };
-            (format!("Recording · {} — {}", clock(now.saturating_sub(recording.since)), how), Tone::Note)
+            let elapsed = clock(now.saturating_sub(recording.since));
+            if let Some(notice) = recording.notice.as_deref().filter(|s| !s.is_empty()) {
+                (format!("Recording · {elapsed} — {notice}"), Tone::Warning)
+            } else {
+                let how = if push { "release the mic to stop" } else { "press the mic again to stop" };
+                match recording.device.as_deref().filter(|s| !s.is_empty()) {
+                    Some(device) => (format!("Recording · {elapsed} on {device} — {how}"), Tone::Note),
+                    None => (format!("Recording · {elapsed} — {how}"), Tone::Note),
+                }
+            }
         }
         RecordState::Recorded { duration, .. } => {
             (format!("Voice note · {} kept. It goes with your message.", clock(u64::from(*duration))), Tone::Note)
@@ -176,13 +184,15 @@ mod tests {
     }
 
     fn active() -> Recording {
-        Recording { conversation: target(), since: 10_000, state: RecordState::Active }
+        Recording { conversation: target(), since: 10_000, device: None, notice: None, state: RecordState::Active }
     }
 
     fn kept(path: &str) -> Recording {
         Recording {
             conversation: target(),
             since: 10_000,
+            device: None,
+            notice: None,
             state: RecordState::Recorded { path: path.into(), duration: 12_000, waveform: vec![31, 0] },
         }
     }
@@ -224,8 +234,12 @@ mod tests {
     #[test]
     fn a_press_starts_a_recording_and_the_next_one_stops_it() {
         let key = target();
-        assert!(matches!(on_press(&None, &key), RecordRequest::Start { .. }), "the first press records");
-        assert!(matches!(on_press(&Some(active()), &key), RecordRequest::Stop), "the second press stops");
+        assert_eq!(
+            on_press(&None, &key, Some("Blue Yeti\tusb-mic".into())),
+            RecordRequest::Start { conversation: key.clone(), input: Some("Blue Yeti\tusb-mic".into()) },
+            "the first press records with the chosen microphone"
+        );
+        assert!(matches!(on_press(&Some(active()), &key, None), RecordRequest::Stop), "the second press stops");
     }
 
     /// A press in the conversation already recording stops it; one elsewhere starts over.
@@ -233,9 +247,9 @@ mod tests {
     fn the_press_names_the_recording_of_this_conversation() {
         let key = target();
         let elsewhere = Recording { conversation: Key { account: key.account.clone(), network: key.network, id: "9001".into() }, ..active() };
-        assert!(matches!(on_press(&Some(elsewhere), &key), RecordRequest::Start { .. }), "another's recording is no stop");
+        assert!(matches!(on_press(&Some(elsewhere), &key, None), RecordRequest::Start { .. }), "another's recording is no stop");
         // A finished note is not running either: the press records a new one.
-        assert!(matches!(on_press(&Some(kept("voice-1.opus")), &key), RecordRequest::Start { .. }));
+        assert!(matches!(on_press(&Some(kept("voice-1.opus")), &key, None), RecordRequest::Start { .. }));
     }
 
     #[test]
@@ -244,8 +258,20 @@ mod tests {
         let (words, tone) = foot(&Some(active()), &key, 79_000, false).unwrap();
         assert_eq!(words, "Recording · 1:09 — press the mic again to stop");
         assert_eq!(tone, Tone::Note);
-        let (words, tone) = foot(&Some(active()), &key, 79_000, true).unwrap();
+        let (words, _tone) = foot(&Some(active()), &key, 79_000, true).unwrap();
         assert_eq!(words, "Recording · 1:09 — release the mic to stop");
+        let named = Recording { device: Some("Blue Yeti".into()), ..active() };
+        let (words, tone) = foot(&Some(named), &key, 79_000, false).unwrap();
+        assert_eq!(words, "Recording · 1:09 on Blue Yeti — press the mic again to stop");
+        assert_eq!(tone, Tone::Note);
+        let fallback = Recording {
+            device: Some("Built-in Mic".into()),
+            notice: Some("Blue Yeti isn't connected. Using Built-in Mic until it's back.".into()),
+            ..active()
+        };
+        let (words, tone) = foot(&Some(fallback), &key, 79_000, false).unwrap();
+        assert_eq!(words, "Recording · 1:09 — Blue Yeti isn't connected. Using Built-in Mic until it's back.");
+        assert_eq!(tone, Tone::Warning);
         let (words, tone) = foot(&Some(kept("voice-1.opus")), &key, 80_000, false).unwrap();
         assert_eq!(words, "Voice note · 0:12 kept. It goes with your message.");
         assert_eq!(tone, Tone::Note);
@@ -259,7 +285,11 @@ mod tests {
     #[test]
     fn a_hold_down_records_and_its_release_stops_what_still_runs() {
         let key = target();
-        assert!(matches!(on_hold_down(&key), RecordRequest::Start { .. }), "every down records");
+        assert_eq!(
+            on_hold_down(&key, Some("Headset Mic".into())),
+            RecordRequest::Start { conversation: key.clone(), input: Some("Headset Mic".into()) },
+            "every down records with the chosen microphone"
+        );
         assert_eq!(on_hold_up(&Some(active()), &key), Some(RecordRequest::Stop), "the release stops the run");
     }
 
@@ -305,7 +335,7 @@ mod tests {
 
     #[test]
     fn the_send_of_the_recorded_file_carries_its_facts() {
-        let file = |path: &str| OutgoingFile { path: path.into(), name: String::new(), spoiler: false, as_file: false, original: false };
+        let file = |path: &str| OutgoingFile { path: path.into(), name: String::new(), spoiler: false, as_file: false, original: false, media: None };
         let files = vec![file("voice-1.opus")];
         assert_eq!(sent_as(&Some(kept("voice-1.opus")), &files).unwrap(), VoiceNote { duration: 12_000, waveform: vec![31, 0] });
         // A send of anything else carries no facts.

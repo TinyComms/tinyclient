@@ -256,7 +256,7 @@ pub fn sound_word(value: &str) -> bool {
 fn scoped(key: &str, scope: &str) -> bool {
     match key {
         TYPING => account_of(scope).is_some_and(|account| typing_choice(account.network)),
-        RECEIPTS => account_of(scope).is_some_and(|account| matches!(account.network, Network::Teams | Network::Signal)),
+        RECEIPTS => account_of(scope).is_some_and(|account| matches!(account.network, Network::Teams | Network::Signal | Network::Tiny)),
         _ if gain_user(key).is_some() => account_of(scope).is_some(),
         NOTIFY_ABOUT => scope == GLOBAL || account_of(scope).is_some() || conversation_of(scope).is_some(),
         SOUND => account_of(scope).is_some() || conversation_of(scope).is_some(),
@@ -391,7 +391,7 @@ pub fn account_of(scope: &str) -> Option<AccountKey> {
 /// has no switch (P1). Signal has one, but it is a local stop only: the phone's setting still
 /// decides on top of it, and nothing here is written back to the account.
 pub fn typing_choice(network: Network) -> bool {
-    matches!(network, Network::Discord | Network::Slack | Network::Teams | Network::Signal)
+    matches!(network, Network::Discord | Network::Slack | Network::Teams | Network::Signal | Network::Tiny)
 }
 
 /// P1's default: Discord off (its typing is loud in busy channels), the rest on.
@@ -745,6 +745,8 @@ mod tests {
         assert!(valid(&account_scope(&account(Network::Teams)), RECEIPTS, "off"));
         let signal = account_scope(&account(Network::Signal));
         assert!(valid(&signal, TYPING, "off") && valid(&signal, RECEIPTS, "off"), "Signal takes a local switch for both");
+        let tiny = account_scope(&account(Network::Tiny));
+        assert!(valid(&tiny, TYPING, "off") && valid(&tiny, RECEIPTS, "off"), "Tiny takes a switch for both");
         assert!(valid(GLOBAL, INPUT, "Studio Display Microphone") && !valid(GLOBAL, INPUT, ""));
     }
 
@@ -766,11 +768,13 @@ mod tests {
     #[test]
     fn typing_defaults_follow_the_network_and_the_switch_overrides_it() {
         let mut values = Values::default();
-        let (discord, slack, telegram) = (account(Network::Discord), account(Network::Slack), account(Network::Telegram));
-        assert!(!values.typing(&discord) && values.typing(&slack) && values.typing(&telegram));
+        let (discord, slack, telegram, tiny) = (account(Network::Discord), account(Network::Slack), account(Network::Telegram), account(Network::Tiny));
+        assert!(!values.typing(&discord) && values.typing(&slack) && values.typing(&telegram) && values.typing(&tiny));
         values.set(&account_scope(&discord), TYPING, Some("on".into()));
         values.set(&account_scope(&slack), TYPING, Some("off".into()));
-        assert!(values.typing(&discord) && !values.typing(&slack));
+        values.set(&account_scope(&tiny), TYPING, Some("off".into()));
+        values.set(&account_scope(&tiny), RECEIPTS, Some("off".into()));
+        assert!(values.typing(&discord) && !values.typing(&slack) && !values.typing(&tiny) && !values.receipts(&tiny));
         assert_eq!(account_of(&account_scope(&slack)), Some(slack));
         assert_eq!(account_of("account:myspace:1"), None);
     }
@@ -824,6 +828,8 @@ mod tests {
         assert!(valid(&tiny, &key, "150") && valid(&tiny, &key, "0 muted") && valid(&tiny, &key, "200"));
         assert!(!valid(&tiny, &key, "201") && !valid(&tiny, &key, "loud") && !valid(GLOBAL, &key, "50"));
         assert!(!valid(&tiny, "gain:", "50") && !valid(&tiny, "gain:a b", "50"));
+        let discord = account_scope(&AccountKey { network: Network::Discord, account: "acc".into() });
+        assert!(valid(&discord, "gain:u1", "140") && valid(&discord, "gain:u1", "0 muted"));
         assert!(known(&tiny, &key));
         assert_eq!((gain_value(100, false), gain_value(250, false), gain_value(30, true)), (None, Some("200".into()), Some("30 muted".into())));
         let mut values = Values::default();

@@ -708,7 +708,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::Members { reply, .. } => drop(reply.send(Err(down()))),
         Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(down()))),
         Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
-        Command::SetMute { reply, .. } | Command::Leave { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SetMute { reply, .. } | Command::Leave { reply, .. } | Command::ClearHistory { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchShared { reply, .. } => drop(reply.send(Err(down()))),
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
@@ -749,7 +749,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::MarkUnread { conversation_id, .. } => mark_dialog_unread(account, &conversation_id, true),
         Command::Send { conversation_id, client_id, text, reply_to } => {
             account.here();
-            let outcome = send_text(account, &conversation_id, &client_id, &text, reply_to.as_deref(), Options::default());
+            let outcome = send_text(account, &conversation_id, &client_id, &text, reply_to.as_deref(), Options::default(), &[]);
             ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
         }
         Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
@@ -762,8 +762,8 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::ReactionRules { conversation_id, reply } => {
             let _ = reply.send(react::rules(account, &conversation_id).map_err(refused));
         }
-        Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
-            let _ = reply.send(edit(account, &conversation_id, &message_id, &text).map_err(refused));
+        Command::Edit { conversation_id, message_id, text, spans, reply } => {
+            let _ = reply.send(edit(account, &conversation_id, &message_id, &text, &spans).map_err(refused));
         }
         Command::Delete { conversation_id, message_id, reply } => {
             let _ = reply.send(delete(account, &conversation_id, &message_id).map_err(refused));
@@ -817,6 +817,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Leave { conversation_id, reply } => {
             let _ = reply.send(info::leave(account, &conversation_id).map_err(refused));
         }
+        Command::ClearHistory { conversation_id, delete_chat, revoke, reply } => {
+            let _ = reply.send(info::clear_history(account, &conversation_id, delete_chat, revoke).map_err(refused));
+        }
         Command::Pinned { conversation_id, reply } => {
             let _ = reply.send(info::pinned(account, &conversation_id).map_err(refused));
         }
@@ -849,6 +852,9 @@ fn serve(account: &Arc<Account>, command: Command) {
             let answer = match action {
                 RelateAction::Accept | RelateAction::Ignore | RelateAction::Cancel => {
                     Err(Refusal::Refused("Telegram has no friend request.".to_owned()))
+                }
+                RelateAction::IgnoreUser | RelateAction::UnignoreUser => {
+                    Err(Refusal::Refused("Telegram does not support ignoring users.".to_owned()))
                 }
                 action => relate(account, &person_id, action).map_err(refused),
             };
@@ -963,7 +969,7 @@ fn remember_random(account: &Account, random: i64, client_id: &str) {
     live.random.push_back((random, client_id.to_owned()));
 }
 
-fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, opts: Options) -> Result<protocol::Message, Fault> {
+fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, opts: Options, spans: &[protocol::Span]) -> Result<protocol::Message, Fault> {
     let invalid = || Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None };
     let (who, topic) = Who::parse(conversation).ok_or_else(invalid)?;
     // The comments of a channel post are held in the discussion group behind it: the send
@@ -973,7 +979,7 @@ fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str,
     let reply = reply_to.and_then(|id| id.parse::<i32>().ok());
     let random = random_id(client_id);
     remember_random(account, random, client_id);
-    let (plain, entities) = prepared(account, conversation, text);
+    let (plain, entities) = prepared_with_spans(account, conversation, text, spans);
     let request = tl::functions::messages::SendMessage {
         no_webpage: opts.no_webpage,
         silent: opts.silent,
@@ -1004,7 +1010,7 @@ fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str,
         .ok_or_else(|| Fault::Net("Telegram accepted the message but did not name it".to_owned()))
 }
 
-fn edit(account: &Account, conversation: &str, message: &str, text: &str) -> Result<(), Fault> {
+fn edit(account: &Account, conversation: &str, message: &str, text: &str, spans: &[protocol::Span]) -> Result<(), Fault> {
     let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
     let ((who, _), id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
     let (plain, mut entities) = content::outgoing(text);
@@ -1013,7 +1019,15 @@ fn edit(account: &Account, conversation: &str, message: &str, text: &str) -> Res
             entities = content::with_stored(&plain, &stored.spans);
         }
     }
-    let (plain, entities) = dress(account, conversation, plain, entities);
+    let (plain, entities) = if spans.is_empty() {
+        dress(account, conversation, plain, entities)
+    } else {
+        let dir = account.dir();
+        let next = content::apply_mention_spans(&plain, entities.unwrap_or_default(), spans, |uid| {
+            dir.get(Who::User(uid)).and_then(|known| known.hash)
+        });
+        (plain, (!next.is_empty()).then_some(next))
+    };
     let request = tl::functions::messages::EditMessage {
         no_webpage: false,
         invert_media: false,
@@ -1201,6 +1215,23 @@ fn dress(
         (plain, entities)
     };
     named(account, plain, entities)
+}
+
+fn prepared_with_spans(
+    account: &Account,
+    conversation: &str,
+    text: &str,
+    spans: &[protocol::Span],
+) -> (String, Option<Vec<tl::enums::MessageEntity>>) {
+    if spans.is_empty() {
+        return prepared(account, conversation, text);
+    }
+    let (plain, entities) = content::outgoing(text);
+    let dir = account.dir();
+    let next = content::apply_mention_spans(&plain, entities.unwrap_or_default(), spans, |uid| {
+        dir.get(Who::User(uid)).and_then(|known| known.hash)
+    });
+    (plain, (!next.is_empty()).then_some(next))
 }
 
 /// Premium may send a custom emoji in any chat. Anyone may send one in Saved Messages.
@@ -1662,7 +1693,14 @@ fn relate(account: &Account, person_id: &str, action: RelateAction) -> Result<()
                 let _ = account.ctx.relation(person_id, Relation::None);
             }
         }
-        RelateAction::Accept | RelateAction::Ignore | RelateAction::Cancel => {}
+        RelateAction::Unblock => {
+            let peer = account.input(who)?;
+            let contact = account.dir().get(who).is_some_and(|known| known.contact);
+            account.ask(&tl::functions::contacts::Unblock { my_stories_from: false, id: peer })?;
+            account.set_user_blocked(user_id, false);
+            let _ = account.ctx.relation(person_id, if contact { Relation::Contact } else { Relation::None });
+        }
+        RelateAction::Accept | RelateAction::Ignore | RelateAction::Cancel | RelateAction::IgnoreUser | RelateAction::UnignoreUser => {}
     }
     Ok(())
 }

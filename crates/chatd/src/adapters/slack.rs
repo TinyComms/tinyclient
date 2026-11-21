@@ -232,6 +232,14 @@ struct State {
     searched: HashSet<String>,
     search_at: Option<Instant>,
     groups_listed: bool,
+    /// User groups I belong to, learned once per connection and kept current on the socket.
+    my_groups: HashSet<String>,
+    /// Do Not Disturb state per user id (`dnd.info`, `dnd.teamInfo`, `dnd_updated`, `dnd_updated_user`).
+    dnd: HashMap<String, people::DndState>,
+    /// Underlying Slack presence (`Online`, `Idle`, `Offline`) before DND overlay.
+    raw_presence: HashMap<String, Presence>,
+    /// Earliest Unix timestamp at which any tracked DND window starts or ends.
+    dnd_next: Option<i64>,
     partners_read: bool,
     /// When the followed threads were last asked for.
     threads_at: Option<Instant>,
@@ -826,6 +834,7 @@ impl Slack {
             state.watched.clear();
             state.expired = None;
             state.resync = true;
+            state.groups_listed = false;
             // What was whole may have a hole now: the socket was down.
             state.covered.clear();
         }
@@ -852,6 +861,7 @@ impl Slack {
                     self.event(&event)?;
                 }
             }
+            self.tick_dnd();
             if heard.elapsed() > SILENCE {
                 return Err(Failure::Dropped("socket went quiet".to_owned()));
             }
@@ -910,11 +920,27 @@ impl Slack {
                 self.own_presence(event["presence"].as_str().unwrap_or(""));
                 Ok(())
             }
+            "dnd_updated" | "dnd_updated_user" => {
+                self.dnd_updated(event);
+                Ok(())
+            }
             "pref_change" => self.muted(event["name"].as_str().unwrap_or(""), &event["value"]),
             // A conversation star. A message, file, or comment star is not the row's.
             "star_added" | "star_removed" => self.star_heard(event),
             "emoji_changed" => {
                 self.emoji_changed(event);
+                Ok(())
+            }
+            "subteam_self_added" => {
+                self.subteam_self(event, true);
+                Ok(())
+            }
+            "subteam_self_removed" => {
+                self.subteam_self(event, false);
+                Ok(())
+            }
+            "subteam_created" | "subteam_updated" => {
+                self.subteam_updated(event);
                 Ok(())
             }
             "goodbye" => Err(Failure::Dropped("Slack asked for a new connection".to_owned())),
@@ -1374,6 +1400,9 @@ impl Slack {
                 answer(reply, self.members(&conversation_id, offset, limit));
             }
             Command::StartDirect { person_id, reply } => answer(reply, self.start_direct(&person_id)),
+            Command::CloseDirect { conversation_id, reply } | Command::Leave { conversation_id, reply } => {
+                answer(reply, self.close_direct(&conversation_id));
+            }
             Command::Download { url, reply, .. } => {
                 let _ = reply.send(Ok(self.download(url)));
             }
@@ -1407,6 +1436,8 @@ impl Slack {
         if connected {
             self.partners();
             self.tell_partners();
+            self.load_usergroups();
+            self.load_dnd();
             return match self.ctx.note("tree") {
                 Some(_) => self.resync(),
                 None => self.load_tree(),
@@ -1573,6 +1604,17 @@ impl Slack {
         self.ctx.starred(conversation_id, starred).map_err(|err| Fault::Net(err.to_string()))
     }
 
+    /// Closes a direct conversation or group DM (`conversations.close`), removes its partner
+    /// from `partners`, and removes the row from the tree.
+    fn close_direct(&self, conversation_id: &str) -> Result<(), Fault> {
+        if thread_of(conversation_id).is_some() {
+            return Err(Fault::Slack("not_a_channel".to_owned()));
+        }
+        self.api("conversations.close", &[("channel", conversation_id)])?;
+        self.forget_partner(conversation_id);
+        self.ctx.conversation_gone(conversation_id).map_err(|err| Fault::Net(err.to_string()))
+    }
+
     /// A `star_added` or `star_removed` for a conversation. A message star changes nothing here.
     fn star_heard(&self, event: &Value) -> Result<(), Failure> {
         let Some((id, starred)) = conversation_star(event) else {
@@ -1665,7 +1707,14 @@ impl Slack {
             (Some(user), _) => user.status,
             (None, status) => status.unwrap_or_default(),
         };
-        self.ctx.presence(&me, presence, &shown, true);
+        self.state().raw_presence.insert(me.clone(), presence);
+        let now = crate::hub::now();
+        let effective = if self.state().dnd.get(&me).is_some_and(|dnd| dnd.active(now)) {
+            Presence::Dnd
+        } else {
+            presence
+        };
+        self.ctx.presence(&me, effective, &shown, true);
         Ok(())
     }
 
@@ -1917,6 +1966,7 @@ fn capabilities() -> protocol::Capabilities {
         schedule: true,
         suppress_embeds: true,
         search: true,
+        close_direct: true,
         ..protocol::Capabilities::default()
     }
 }

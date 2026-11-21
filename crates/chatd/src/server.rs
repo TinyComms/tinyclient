@@ -1200,7 +1200,7 @@ impl Chat {
                 return error(ErrorCode::Refused, "A poll can't carry a file.");
             }
         }
-        if let Err(refused) = self.allowed(&account, &with) {
+        if let Err(refused) = self.allowed(&conversation, &with) {
             return *refused;
         }
         if let Err(err) = self.ensure_thread(&conversation) {
@@ -1212,7 +1212,14 @@ impl Chat {
         let stored = {
             let mut store = self.hub.store();
             match store.conversation(&conversation) {
-                Ok(Some(row)) if row.read_only => return error(ErrorCode::Refused, format!("You can read {} but not post in it.", row.title)),
+                Ok(Some(row)) if row.read_only => {
+                    let why = if row.read_only_reason.is_empty() {
+                        format!("You can read {} but not post in it.", row.title)
+                    } else {
+                        row.read_only_reason
+                    };
+                    return error(ErrorCode::Refused, why);
+                }
                 Ok(Some(_)) => store.ingest(&conversation, &message, true),
                 Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
                 Err(err) => Err(err),
@@ -1255,7 +1262,14 @@ impl Chat {
         let stored = {
             let mut store = self.hub.store();
             match store.conversation(&conversation) {
-                Ok(Some(row)) if row.read_only => return error(ErrorCode::Refused, format!("You can read {} but not post in it.", row.title)),
+                Ok(Some(row)) if row.read_only => {
+                    let why = if row.read_only_reason.is_empty() {
+                        format!("You can read {} but not post in it.", row.title)
+                    } else {
+                        row.read_only_reason
+                    };
+                    return error(ErrorCode::Refused, why);
+                }
                 Ok(Some(_)) => store.ingest(&conversation, &message, true),
                 Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
                 Err(err) => Err(err),
@@ -1333,14 +1347,22 @@ impl Chat {
 
     /// What the account may send, checked before anything is stored: a file too large or too
     /// many is refused here, naming the limit, and the network hears nothing.
-    fn allowed(&self, account: &AccountKey, with: &Outgoing) -> Result<(), Refused> {
+    fn allowed(&self, conversation: &Key, with: &Outgoing) -> Result<(), Refused> {
+        let account = conversation.account();
         let refuse = |why: String| Err(Box::new(error(ErrorCode::Refused, why)));
         let name = account.network.label();
-        let can = self.hub.capabilities(account);
+        let can = self.hub.capabilities(&account);
         if with.files.is_empty() {
             return Ok(());
         }
-        if can.max_file_bytes == 0 {
+        let max_file_bytes = self
+            .hub
+            .store()
+            .conversation(conversation)
+            .ok()
+            .flatten()
+            .map_or(can.max_file_bytes, |row| can.max_file_bytes.max(row.max_file_bytes));
+        if max_file_bytes == 0 {
             return refuse(format!("Files can't be sent to {name} from tinyclient yet."));
         }
         let most = (can.max_files.max(1) as usize).min(protocol::ATTACHMENTS_LIMIT);
@@ -1357,8 +1379,8 @@ impl Chat {
             };
             match std::fs::metadata(&real) {
                 Ok(meta) if meta.is_dir() => return refuse(format!("{named}: folders can't be sent. Zip it first.")),
-                Ok(meta) if meta.len() > can.max_file_bytes => {
-                    return refuse(format!("{named} is too big for {name} (limit {}).", megabytes(can.max_file_bytes)))
+                Ok(meta) if meta.len() > max_file_bytes => {
+                    return refuse(format!("{named} is too big for {name} (limit {}).", megabytes(max_file_bytes)))
                 }
                 Ok(_) => {}
                 Err(_) => return refuse(format!("{named} is no longer there.")),
@@ -1790,6 +1812,18 @@ impl Chat {
                 messages.iter_mut().for_each(Message::bound);
                 Response::Pinned { conversation, messages }
             }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn source(&self, conversation: Key, message_id: String) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let conversation_id = conversation.id;
+        match self.ask(&account, |reply| Command::Source { conversation_id, message_id, reply }) {
+            Ok(text) => Response::Source { text },
             Err(refused) => *refused,
         }
     }
@@ -2517,6 +2551,12 @@ impl Chat {
             Request::CloseDirect { conversation } => {
                 self.act(&conversation, |conversation_id, reply| Command::CloseDirect { conversation_id, reply })
             }
+            Request::ClearHistory { conversation, delete_chat, revoke } => {
+                self.act(&conversation, |conversation_id, reply| Command::ClearHistory { conversation_id, delete_chat, revoke, reply })
+            }
+            Request::AnswerMessageRequest { conversation, accept } => {
+                self.act(&conversation, |conversation_id, reply| Command::AnswerMessageRequest { conversation_id, accept, reply })
+            }
             Request::Pinned { conversation } => self.pinned(conversation),
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::Relate { person, action } => self.relate(person, action),
@@ -2528,6 +2568,7 @@ impl Chat {
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
             Request::Revisions { conversation, message_id } => self.revisions(conversation, message_id),
+            Request::Source { conversation, message_id } => self.source(conversation, message_id),
             Request::MarkRead { conversation, message_id } => self.mark_read(conversation, message_id),
             Request::MarkUnread { conversation, message_id } => self.mark_unread(conversation, message_id),
             Request::MarkAllRead { network, space } => self.mark_all_read(network, space),
@@ -3064,6 +3105,7 @@ fn outgoing_files(message: &Message) -> Vec<protocol::OutgoingFile> {
             spoiler: attachment.spoiler,
             as_file: false,
             original: false,
+            media: None,
         })
     })
     .collect()
@@ -3381,6 +3423,7 @@ pub fn prove_offline_queue() -> Result<(), String> {
                 spoiler: false,
                 as_file: false,
                 original: false,
+                media: None,
             }],
             ..Outgoing::default()
         },

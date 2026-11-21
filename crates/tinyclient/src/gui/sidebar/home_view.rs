@@ -159,6 +159,15 @@ impl Shell {
     pub(super) fn rebuild_home(&mut self, cx: &mut Context<Self>) {
         let state = &self.sidebar_state;
         let items: Vec<Item> = match (&state.mode, &state.drill) {
+            (Mode::Network(_), Some(Drill::Requests)) => {
+                let mut out: Vec<Item> = state.home.drilled.iter().filter(|c| !c.spam).cloned().map(Item::Chat).collect();
+                let spam: Vec<Item> = state.home.drilled.iter().filter(|c| c.spam).cloned().map(Item::Chat).collect();
+                if !spam.is_empty() {
+                    out.push(Item::Header { label: "Spam", first: out.is_empty() });
+                    out.extend(spam);
+                }
+                out
+            }
             (Mode::Network(_), Some(_)) => state.home.drilled.iter().cloned().map(Item::Chat).collect(),
             (Mode::Network(Network::Discord), None) | (Mode::Space(Key { network: Network::Discord, .. }), None) => {
                 let spaces: Vec<protocol::Space> = self.spaces.iter().filter(|s| s.key.network == Network::Discord).cloned().collect();

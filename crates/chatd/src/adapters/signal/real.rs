@@ -528,6 +528,7 @@ impl Session {
             let id = group_id(&key);
             let revision = group.revision;
             let snap = snap_of(&group);
+            let timer_secs = snap.timer_secs;
             let member = snap.members.iter().any(|member| member.id == self.me);
             let member_ids = group.members.iter().map(|member| ServiceId::from(member.aci).raw_uuid().to_string()).collect();
             self.groups.insert(id.clone(), key);
@@ -539,6 +540,7 @@ impl Session {
                 members: group.members.len() as u32,
                 member,
                 member_ids,
+                timer_secs,
             });
         }
         self.tell(Event::Groups(told));
@@ -687,7 +689,18 @@ impl Session {
             None => None,
         };
         let name = if author == self.me { String::new() } else { self.name_of(author).await };
-        Text { author: author.to_owned(), name, sent, text, quote, mentions_me, unsupported, spans }
+        Text {
+            author: author.to_owned(),
+            name,
+            sent,
+            text,
+            quote,
+            mentions_me,
+            unsupported,
+            spans,
+            expire_timer: message.expire_timer.unwrap_or(0),
+            expire_timer_version: message.expire_timer_version.unwrap_or(0),
+        }
     }
 
     /// One data message, from someone (`outgoing` false) or from us on another device.
@@ -739,7 +752,16 @@ impl Session {
             self.tell(Event::Deleted { peer, author: author.to_owned(), target: delete.target_sent_timestamp.unwrap_or(0) });
             return;
         }
-        // A group change is noticed in `peer`, from the stored group. What remains here with no words is a timer or a profile key.
+        // DataMessage.Flags.EXPIRATION_TIMER_UPDATE == 2.
+        if message.flags.unwrap_or(0) & 2 != 0 {
+            self.tell(Event::TimerChanged {
+                peer,
+                seconds: message.expire_timer.unwrap_or(0),
+                version: message.expire_timer_version.unwrap_or(0),
+            });
+            return;
+        }
+        // A group change is noticed in `peer`, from the stored group. What remains here with no words is a profile key.
         let empty = message.body.as_deref().unwrap_or("").is_empty();
         let carries = !message.attachments.is_empty() || message.sticker.is_some() || !message.contact.is_empty() || message.payment.is_some() || message.gift_badge.is_some();
         if empty && !carries {
@@ -1037,14 +1059,16 @@ impl Session {
         let at = now_ms();
         let group_v2 = self.group_context(to)?;
         let content = match body {
-            Body::Text { text, quote, ranges } => ContentBody::DataMessage(DataMessage {
+            Body::Text { text, quote, ranges, timer } => ContentBody::DataMessage(DataMessage {
                 body: Some(text),
                 body_ranges: proto_ranges(&ranges),
                 quote: quoted(quote),
                 group_v2,
+                expire_timer: (timer.seconds > 0).then_some(timer.seconds),
+                expire_timer_version: (timer.version > 0).then_some(timer.version),
                 ..Default::default()
             }),
-            Body::Files { text, quote, files } => {
+            Body::Files { text, quote, files, timer } => {
                 let mut attachments = Vec::with_capacity(files.len());
                 for file in files {
                     let name = file.name.clone();
@@ -1076,6 +1100,8 @@ impl Session {
                     quote: quoted(quote),
                     timestamp: Some(at),
                     group_v2,
+                    expire_timer: (timer.seconds > 0).then_some(timer.seconds),
+                    expire_timer_version: (timer.version > 0).then_some(timer.version),
                     ..Default::default()
                 })
             }
@@ -1107,21 +1133,25 @@ impl Session {
                 self.sync_to_self(sync).await?;
                 return Ok(at);
             }
-            Body::Edit { target, text, ranges } => ContentBody::EditMessage(EditMessage {
+            Body::Edit { target, text, ranges, timer } => ContentBody::EditMessage(EditMessage {
                 target_sent_timestamp: Some(target),
                 data_message: Some(DataMessage {
                     body: Some(text),
                     body_ranges: proto_ranges(&ranges),
                     timestamp: Some(at),
                     group_v2,
+                    expire_timer: (timer.seconds > 0).then_some(timer.seconds),
+                    expire_timer_version: (timer.version > 0).then_some(timer.version),
                     ..Default::default()
                 }),
             }),
-            Body::Poll { question, options, multiple } => ContentBody::DataMessage(DataMessage {
+            Body::Poll { question, options, multiple, timer } => ContentBody::DataMessage(DataMessage {
                 poll_create: Some(data_message::PollCreate { question: Some(question), allow_multiple: Some(multiple), options }),
                 timestamp: Some(at),
                 required_protocol_version: Some(8),
                 group_v2,
+                expire_timer: (timer.seconds > 0).then_some(timer.seconds),
+                expire_timer_version: (timer.version > 0).then_some(timer.version),
                 ..Default::default()
             }),
             Body::PollVote { author, target, indexes, serial } => {
@@ -1206,18 +1236,26 @@ fn span_ranges(text: &str, spans: &[protocol::Span]) -> Vec<Range> {
 fn proto_ranges(ranges: &[Range]) -> Vec<BodyRange> {
     ranges
         .iter()
-        .filter_map(|range| {
-            let Range::Style { start, length, style } = range else {
-                return None;
-            };
-            let style = match style {
-                Mark::Bold => RangeStyle::Bold,
-                Mark::Italic => RangeStyle::Italic,
-                Mark::Strike => RangeStyle::Strikethrough,
-                Mark::Monospace => RangeStyle::Monospace,
-                Mark::Spoiler => RangeStyle::Spoiler,
-            };
-            Some(BodyRange { start: Some(*start), length: Some(*length), associated_value: Some(AssociatedValue::Style(style as i32)) })
+        .filter_map(|range| match range {
+            Range::Style { start, length, style } => {
+                let style = match style {
+                    Mark::Bold => RangeStyle::Bold,
+                    Mark::Italic => RangeStyle::Italic,
+                    Mark::Strike => RangeStyle::Strikethrough,
+                    Mark::Monospace => RangeStyle::Monospace,
+                    Mark::Spoiler => RangeStyle::Spoiler,
+                };
+                Some(BodyRange {
+                    start: Some(*start),
+                    length: Some(*length),
+                    associated_value: Some(AssociatedValue::Style(style as i32)),
+                })
+            }
+            Range::Mention { start, aci, .. } => Some(BodyRange {
+                start: Some(*start),
+                length: Some(1),
+                associated_value: Some(AssociatedValue::MentionAci(aci.clone())),
+            }),
         })
         .collect()
 }

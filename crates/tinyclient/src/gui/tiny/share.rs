@@ -62,7 +62,7 @@ impl Shell {
         self.tiny_keep_keys(window, cx);
         let focus = stage::toggle(self.tiny_state.focus.as_ref(), Focus::Stream(user_id.to_owned()));
         if focus.is_some() && !mine && !self.tiny_call().is_some_and(|call| watching(&call, user_id)) {
-            self.call_ask(Request::Media(MediaRequest::ShareWatch { source: Some(user_id.to_owned()) }), cx);
+            self.call_watch(user_id.to_owned(), cx);
         }
         self.tiny_state.focus = focus;
         cx.notify();
@@ -73,7 +73,7 @@ impl Shell {
         if matches!(self.tiny_state.focus, Some(Focus::Stream(_))) {
             self.tiny_state.focus = None;
         }
-        self.call_ask(Request::Media(MediaRequest::ShareWatch { source: None }), cx);
+        self.call_unwatch(cx);
     }
 
     /// The people under the focused stream, over it, or gone.

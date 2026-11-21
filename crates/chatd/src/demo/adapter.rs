@@ -508,6 +508,7 @@ impl Demo {
             muted: false,
             deafened: false,
             streaming: false,
+            camera: false,
             speaking: false,
         });
         change(&mut occupants.people, me);
@@ -641,7 +642,10 @@ impl Demo {
                     RelateAction::Add => Relation::Outgoing,
                     RelateAction::Accept => Relation::Friend,
                     RelateAction::Block => Relation::Blocked,
-                    RelateAction::Ignore | RelateAction::Cancel | RelateAction::Remove => Relation::None,
+                    RelateAction::IgnoreUser => Relation::Ignored,
+                    RelateAction::Ignore | RelateAction::Cancel | RelateAction::Remove | RelateAction::Unblock | RelateAction::UnignoreUser => {
+                        Relation::None
+                    }
                 };
                 let related = demo.ctx.relation(&person_id, relation);
                 let _ = reply.send(related.map_err(|err| Refusal::Refused(err.to_string())));
@@ -672,6 +676,14 @@ impl Demo {
             Command::CloseDirect { conversation_id, reply } => {
                 let closed = demo.ctx.filing(&conversation_id, &Filing { hidden: true, ..Filing::default() });
                 let _ = reply.send(closed.map_err(|err| Refusal::Refused(err.to_string())));
+            }
+            Command::ClearHistory { conversation_id, delete_chat, reply, .. } => {
+                let done = if delete_chat {
+                    demo.ctx.conversation_gone(&conversation_id)
+                } else {
+                    demo.ctx.clear_messages(&conversation_id)
+                };
+                let _ = reply.send(done.map_err(|err| Refusal::Refused(err.to_string())));
             }
             Command::Pinned { conversation_id, reply } => drop(reply.send(Ok(demo.pinned(&conversation_id)))),
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
@@ -722,6 +734,12 @@ impl Demo {
             // reads it from there.
             Command::OpenForum { reply, .. } => {
                 let _ = reply.send(Ok(()));
+            }
+            Command::AnswerMessageRequest { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
+            }
+            Command::Source { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
             }
             // Nothing is behind these: what is stored is all there is.
             Command::Backfill(_)

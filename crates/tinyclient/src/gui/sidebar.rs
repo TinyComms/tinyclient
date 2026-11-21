@@ -70,10 +70,11 @@ impl Mode {
 }
 
 /// Somewhere the user has been.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Location {
     mode: Mode,
     open: Option<(Key, String)>,
+    tiny_channel: Option<String>,
 }
 
 pub struct State {
@@ -510,7 +511,11 @@ impl Shell {
 
     fn here(&self) -> Location {
         let open = self.snapshot.as_ref().and_then(|s| s.open.as_ref());
-        Location { mode: self.sidebar_state.mode.clone(), open: open.map(|open| (open.key.clone(), open.title.clone())) }
+        Location {
+            mode: self.sidebar_state.mode.clone(),
+            open: open.map(|open| (open.key.clone(), open.title.clone())),
+            tiny_channel: self.tiny_state.channel(),
+        }
     }
 
     /// Notes where the user is, before they go somewhere else.
@@ -525,8 +530,18 @@ impl Shell {
         let Some(there) = self.sidebar_state.history.travel(back, here) else {
             return;
         };
+        let returning_to_tiny = matches!(there.mode, Mode::Network(Network::Tiny));
         if self.sidebar_state.mode != there.mode {
             self.set_mode(there.mode, cx);
+        }
+        if returning_to_tiny {
+            if there.open.is_none() {
+                self.open = None;
+                if let Some(snapshot) = &mut self.snapshot {
+                    snapshot.open = None;
+                }
+            }
+            self.tiny_pick_channel(there.tiny_channel, cx);
         }
         match there.open {
             Some((key, title)) if self.open.as_ref() != Some(&key) => self.open_now(key, &title, cx),
@@ -1221,6 +1236,7 @@ impl Shell {
                     .child(Avatar::new(&occupant.person, &occupant.name, 20.).image_at(self.person_picture(&occupant.person, cx)).build())
                     .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text_soft()).child(occupant.name.clone()))
                     .when(occupant.streaming, |row| row.child(glyph("icons/monitor-up.svg", 14., theme::text_soft())))
+                    .when(occupant.camera, |row| row.child(glyph("icons/video.svg", 14., theme::text_soft())))
                     .when(occupant.muted && !occupant.deafened, |row| row.child(glyph("icons/mic-off.svg", 14., theme::danger())))
                     .when(occupant.deafened, |row| row.child(glyph("icons/headphone-off.svg", 14., theme::danger())));
                 list_row(row_id("occupant", &occupant.person), height, false, false, content)
@@ -2289,7 +2305,7 @@ pub(crate) mod tests {
         Occupants {
             people: speaking
                 .iter()
-                .map(|live| protocol::Occupant { person: person.clone(), name: "Mara O".into(), muted: false, deafened: false, streaming: false, speaking: *live })
+                .map(|live| protocol::Occupant { person: person.clone(), name: "Mara O".into(), muted: false, deafened: false, streaming: false, camera: false, speaking: *live })
                 .collect(),
             total: speaking.len() as u32,
         }
@@ -2351,5 +2367,15 @@ pub(crate) mod tests {
         assert_eq!(inbox_strip_fit(326., true, 1.3, true), InboxStripFit { stacked: true, counts: false, mark_all: false });
         assert_eq!(inbox_strip_fit(326., true, 1., true), InboxStripFit { stacked: false, counts: true, mark_all: false });
         assert_eq!(inbox_strip_fit(296., true, 1., true), InboxStripFit { stacked: false, counts: false, mark_all: false });
+    }
+
+    #[test]
+    fn location_round_trips_tiny_channel_in_history() {
+        let mut history = history::History::default();
+        let inbox = Location { mode: Mode::Inbox, open: Some((Key { network: Network::Tiny, account: "a".into(), id: "dm-1".into() }, "Bea".into())), tiny_channel: None };
+        let room = Location { mode: Mode::Network(Network::Tiny), open: None, tiny_channel: Some("lounge".into()) };
+        history.leave(inbox.clone());
+        assert_eq!(history.travel(true, room.clone()), Some(inbox.clone()));
+        assert_eq!(history.travel(false, inbox), Some(room));
     }
 }

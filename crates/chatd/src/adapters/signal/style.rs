@@ -169,6 +169,60 @@ pub fn parse(source: &str) -> (String, Vec<Range>) {
     (built.text, built.ranges)
 }
 
+/// The composer's markdown plus explicit user mention spans, as Signal's wire body (with
+/// U+FFFC placeholders) and UTF-16 ranges (both styles and mentions).
+pub fn parse_with_mentions(source: &str, mentions: &[Span]) -> (String, Vec<Range>) {
+    let mut live: Vec<(usize, usize, &str)> = mentions
+        .iter()
+        .filter_map(|span| {
+            let Style::Mention { kind: MentionKind::User, id } = &span.style else {
+                return None;
+            };
+            let (Ok(start), Ok(end)) = (usize::try_from(span.start), usize::try_from(span.end)) else {
+                return None;
+            };
+            if start >= end
+                || end > source.len()
+                || !source.is_char_boundary(start)
+                || !source.is_char_boundary(end)
+                || id.is_empty()
+            {
+                return None;
+            }
+            Some((start, end, id.as_str()))
+        })
+        .collect();
+    if live.is_empty() {
+        return parse(source);
+    }
+    live.sort_by_key(|(start, _, _)| *start);
+    let mut built = Built {
+        text: String::with_capacity(source.len()),
+        ranges: Vec::new(),
+    };
+    let mut cursor = 0;
+    for (start, end, aci) in live {
+        if start < cursor {
+            continue;
+        }
+        if start > cursor {
+            inline(&mut built, &source[cursor..start]);
+        }
+        let utf16_start = utf16_len(&built.text);
+        built.text.push('\u{FFFC}');
+        built.ranges.push(Range::Mention {
+            start: utf16_start,
+            aci: aci.to_owned(),
+            label: source[start..end].to_owned(),
+        });
+        cursor = end;
+    }
+    if cursor < source.len() {
+        inline(&mut built, &source[cursor..]);
+    }
+    (built.text, built.ranges)
+}
+
 /// Byte spans for `ranges` on `text`, which has no mention placeholders left.
 pub fn spans(text: &str, ranges: &[Range]) -> Vec<Span> {
     apply(text, ranges, "").spans

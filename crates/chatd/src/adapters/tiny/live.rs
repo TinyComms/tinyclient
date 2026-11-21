@@ -1888,7 +1888,8 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
             name: name(&who.user),
             muted: who.muted,
             deafened: who.deafened,
-            streaming: who.camera || who.sharing,
+            streaming: who.sharing,
+            camera: who.camera,
             speaking: seat.speaking.contains(&who.user),
         })
         .collect();

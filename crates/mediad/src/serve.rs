@@ -118,6 +118,10 @@ impl Call {
                 }
             }
             MediaRequest::ShareWatch { source } => {
+                match &source {
+                    Some(user_id) => tracing::info!(user_id = %user_id, "watch on"),
+                    None => tracing::info!("watch off"),
+                }
                 self.video.share_decode = source.clone();
                 if self.voice.is_some() || self.tiny.is_some() {
                     self.controls.set_watch(source.is_some());
@@ -499,7 +503,12 @@ pub fn run(args: &[String]) -> u8 {
                 tracing::warn!("mediad: --rec needs a file to record to");
                 return 2;
             };
-            return match crate::rec::run(path) {
+            let input = args
+                .get(2)
+                .filter(|flag| flag.as_str() == "--input")
+                .and_then(|_| args.get(3))
+                .cloned();
+            return match crate::rec::run(path, input) {
                 Ok(()) => 0,
                 Err(err) => {
                     tracing::warn!("mediad: {err}");

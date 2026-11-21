@@ -274,6 +274,7 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         picture: None,
         self_view: None,
         share_view: sharing.then(screen_picture).flatten(),
+        picture_source: None,
     })
 }
 
@@ -348,6 +349,7 @@ pub(super) fn running() -> Option<Occupants> {
         muted: false,
         deafened: false,
         streaming: false,
+        camera: false,
         speaking: false,
     };
     (named()? == "join_call").then(|| Occupants { people: vec![there("Iris Navarro"), there("Jun Aoki")], total: 3 })
@@ -407,6 +409,7 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joi
         picture: None,
         self_view: None,
         share_view: None,
+        picture_source: None,
     }
 }
 

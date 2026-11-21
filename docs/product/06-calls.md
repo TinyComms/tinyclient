@@ -34,8 +34,8 @@ DAVE seals the picture as well as the voice. The transport encryption is the sam
 | --- | --- |
 | Slack | Huddles open in Slack. |
 | Teams | Calls and meetings open in Teams. |
-| Telegram | Calls open in Telegram. |
-| Android Messages | Opens in Messages. |
+| Telegram | Opens the chat in Telegram so you can start a call there. |
+| Android Messages | In 1:1 chats with a phone number, opens a `tel:` link in the system's phone app. Group chats have no call control. Incoming phone calls are not carried by the relay. |
 | Signal | No call control. An incoming call rings as one notification with "Answer on your phone"; a call nobody answered here leaves a missed-call line in the conversation. |
 | Discord stage | Opens in Discord. |
 

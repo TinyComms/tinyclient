@@ -1,0 +1,12 @@
+{
+  "id": "wave-2-bugs",
+  "title": "Wave 2 bug sweep across Calls, Tiny, Discord, Telegram, Slack, Teams, Messages, and Signal",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop bug sweep verified by unit and integration test suites.",
+    "ios": "Desktop bug sweep verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

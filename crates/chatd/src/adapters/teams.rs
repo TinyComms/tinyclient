@@ -321,6 +321,8 @@ struct State {
     resync: bool,
     /// Out-of-office notes from presence, and until when: what a card says under "away".
     away: HashMap<String, (String, Option<i64>)>,
+    /// Subject and inline image HTML remembered for our own messages so edits keep them.
+    own_meta: HashMap<(String, String), message::OwnMeta>,
 }
 
 /// What a call presents.
@@ -912,8 +914,8 @@ impl Teams {
                 let _ = reply.send(self.react(&conversation_id, &message_id, &emoji, on).map_err(refuse));
             }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(message::reaction_rules()))),
-            Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
-                let _ = reply.send(self.edit(&conversation_id, &message_id, &text).map_err(refuse));
+            Command::Edit { conversation_id, message_id, text, spans, reply } => {
+                let _ = reply.send(self.edit(&conversation_id, &message_id, &text, &spans).map_err(refuse));
             }
             Command::Delete { conversation_id, message_id, reply } => {
                 let _ = reply.send(self.delete(&conversation_id, &message_id).map_err(refuse));
@@ -941,6 +943,9 @@ impl Teams {
             }
             Command::SetMute { conversation_id, notify, until: _, reply } => {
                 let _ = reply.send(self.set_mute(&conversation_id, notify).map_err(refuse));
+            }
+            Command::Leave { conversation_id, reply } => {
+                let _ = reply.send(self.leave(&conversation_id).map_err(refuse));
             }
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
                 self.send_with(&conversation_id, &client_id, &text, reply_to.as_deref(), *with);
@@ -1023,6 +1028,9 @@ impl Teams {
         let path = format!("/v1/users/ME/conversations/{}/properties?name=consumptionhorizon", escaped(thread_of(conversation)));
         let horizon = json!({"consumptionhorizon": format!("{message};{};{message}", now_ms())});
         self.chat("PUT", &path, Body::Json(&horizon), true)?;
+        if let Some((channel, root)) = chain_of(conversation) {
+            self.clear_chain_unread(channel, root)?;
+        }
         Ok(())
     }
 }

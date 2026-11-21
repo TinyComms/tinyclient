@@ -85,6 +85,10 @@ pub struct Source {
     /// The shell staged it in `outbox/`, so it goes once the message went.
     outbox: bool,
     file: File,
+    /// Optional video/audio metadata staged by the shell.
+    pub media: Option<protocol::OutgoingMedia>,
+    /// Validated path to a JPEG poster thumbnail on disk, when staged.
+    pub thumb: Option<PathBuf>,
 }
 
 /// Where one request goes. Only the headers named here are sent, and only to a host the
@@ -216,6 +220,13 @@ impl Upload {
             if !meta.is_file() {
                 return Err(format!("{name} is not a file. Folders can't be sent."));
             }
+            let thumb = match staged.media.as_ref().and_then(|m| m.thumb.as_deref()).filter(|s| !s.is_empty()) {
+                Some(thumb_path) => {
+                    let (resolved, _) = allowed(thumb_path).map_err(|why| format!("{name} thumbnail {why}"))?;
+                    Some(resolved)
+                }
+                None => None,
+            };
             sources.push(Source {
                 mime: mime_of(&name),
                 name,
@@ -226,6 +237,8 @@ impl Upload {
                 original: staged.original,
                 outbox,
                 file,
+                media: staged.media.clone(),
+                thumb,
             });
         }
         let total = sources.iter().map(|source| source.bytes).sum();
@@ -819,6 +832,7 @@ mod tests {
             spoiler: false,
             as_file: false,
             original: false,
+            media: None,
         };
         assert_eq!(shown(&staged("/a/b/cat.PNG", "")), "cat.PNG");
         assert_eq!(shown(&staged("/a/b/cat.png", "../../x\ny")), ".._.._x_y");

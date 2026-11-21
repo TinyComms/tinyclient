@@ -16,7 +16,7 @@
 //! WHO is `grace` or `alan`. `status` reports that code on the last text this computer sent.
 
 use super::{Drive, Event, Saved};
-use crate::adapters::messages::bugle::{Chat, Mark, MediaPart, Note, Piece, MESSAGE_PAGE, PHONE_QUIET, UNPAIRED};
+use crate::adapters::messages::bugle::{Chat, Mark, MediaPart, Note, Participant, Piece, MESSAGE_PAGE, PHONE_QUIET, UNPAIRED};
 use crate::adapters::script;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -97,6 +97,20 @@ impl Fake {
                 updated: 0,
                 phones: false,
                 status: 1,
+                participants: vec![
+                    Participant {
+                        id: ME.into(),
+                        name: "Ada Quill".into(),
+                        number: "+15550100001".into(),
+                        is_me: true,
+                    },
+                    Participant {
+                        id: GRACE_PARTICIPANT.into(),
+                        name: "Grace Ombra".into(),
+                        number: "+15550100002".into(),
+                        is_me: false,
+                    },
+                ],
             },
             Chat {
                 id: CLUB.into(),
@@ -109,6 +123,26 @@ impl Fake {
                 updated: 0,
                 phones: false,
                 status: 1,
+                participants: vec![
+                    Participant {
+                        id: ME.into(),
+                        name: "Ada Quill".into(),
+                        number: "+15550100001".into(),
+                        is_me: true,
+                    },
+                    Participant {
+                        id: GRACE_PARTICIPANT.into(),
+                        name: "Grace Ombra".into(),
+                        number: "+15550100002".into(),
+                        is_me: false,
+                    },
+                    Participant {
+                        id: "participant-alan".into(),
+                        name: "Alan Ferro".into(),
+                        number: "+15550100003".into(),
+                        is_me: false,
+                    },
+                ],
             },
         ]));
         let fake = Fake {
@@ -374,6 +408,7 @@ fn listed(id: &str, title: &str, status: u64) -> Chat {
         updated: 0,
         phones: false,
         status,
+        participants: Vec::new(),
     }
 }
 
@@ -542,6 +577,19 @@ fn steer(line: &str) -> Vec<Event> {
                 started: command == "typing",
             }]
         }
+        "typing-raw" => {
+            let conv = words.next().unwrap_or("");
+            let raw = words.next().unwrap_or("");
+            if conv.is_empty() || raw.is_empty() {
+                return Vec::new();
+            }
+            vec![Event::Typing {
+                conversation: conv.into(),
+                by: raw.into(),
+                name: raw.into(),
+                started: true,
+            }]
+        }
         "drop" => vec![Event::Closed("the connection dropped".into())],
         "unlinked" => vec![Event::Ended("This device was removed in Messages.".into())],
         "revoke" => vec![Event::Ended(UNPAIRED.to_owned())],
@@ -575,6 +623,7 @@ fn steer(line: &str) -> Vec<Event> {
                 updated: 0,
                 phones,
                 status: 0,
+                participants: Vec::new(),
             }])]
         }
         "archive" | "spam" | "again" => {
@@ -650,6 +699,7 @@ fn steer(line: &str) -> Vec<Event> {
                 updated: 0,
                 phones: false,
                 status: 3,
+                participants: Vec::new(),
             }])]
         }
         "hold" | "read" => {
@@ -672,6 +722,7 @@ fn steer(line: &str) -> Vec<Event> {
                 updated: 0,
                 phones: false,
                 status: 1,
+                participants: Vec::new(),
             }])]
         }
         _ => Vec::new(),

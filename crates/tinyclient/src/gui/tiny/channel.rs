@@ -157,8 +157,7 @@ fn sending(call: &Call, content: Content) -> bool {
 
 /// A decode of this person was asked for, or their picture is on screen.
 pub(super) fn watching(call: &Call, user_id: &str) -> bool {
-    call.video.iter().any(|stream| stream.direction == Direction::Decode && stream.content == Content::Share && stream.source == user_id)
-        || call.picture.as_ref().is_some_and(|picture| !picture.path.is_empty() && picture.user_id == user_id)
+    crate::gui::call::watching(call, user_id)
 }
 
 /// What my call sends, when it is up.
@@ -206,23 +205,26 @@ fn caption(words: String, small: bool) -> Div {
 
 impl Shell {
     /// What the top bar says of a channel after its name.
-    pub(super) fn tiny_channel_facts(&self, room: &TinyRoom) -> Div {
+    pub(super) fn tiny_channel_facts(&self, page: &Page, room: &TinyRoom) -> Div {
+        let seated_here = self.tiny_call_here(room).is_some_and(|call| matches!(call.state, CallState::Joined | CallState::Reconnecting));
+        let seated = seated_here.then(|| with_me(room, page.me)).flatten();
+        let shown = seated.as_ref().unwrap_or(room);
         let mut facts = div().flex().items_center().gap(px(6.)).min_w_0();
-        if !room.topic.trim().is_empty() {
+        if !shown.topic.trim().is_empty() {
             facts = facts.child(div().flex_none().w(px(1.)).h(px(16.)).bg(theme::hairline())).child(
-                div().min_w_0().truncate().type_ui().text_color(theme::text_soft()).child(room.topic.clone()),
+                div().min_w_0().truncate().type_ui().text_color(theme::text_soft()).child(shown.topic.clone()),
             );
         }
         facts = facts.child(chip(
-            if room.user_limit > 0 { format!("{} of {}", room.participants.len(), room.user_limit) } else { format!("{} in call", room.participants.len()) },
-            if model::full(room) { theme::warning() } else { theme::text_soft() },
-            if model::full(room) { theme::warning_soft() } else { theme::hover() },
+            model::channel_occupancy(shown),
+            if model::full(shown) { theme::warning() } else { theme::text_soft() },
+            if model::full(shown) { theme::warning_soft() } else { theme::hover() },
         ));
-        if room.ptt_only {
+        if shown.ptt_only {
             facts = facts.child(chip("Push to talk", theme::accent_text(), theme::accent_soft()));
         }
-        if room.bitrate_kbps > 0 {
-            facts = facts.child(chip(format!("{} kb/s", room.bitrate()), theme::text_soft(), theme::hover()));
+        if shown.bitrate_kbps > 0 {
+            facts = facts.child(chip(format!("{} kb/s", shown.bitrate()), theme::text_soft(), theme::hover()));
         }
         facts
     }
@@ -453,15 +455,12 @@ impl Shell {
 
     /// The frame on screen, when it is this person's.
     fn tiny_frame(&self, call: Option<&Call>, user_id: &str) -> Option<Arc<RenderImage>> {
-        call?.picture.as_ref().filter(|picture| !picture.path.is_empty() && picture.user_id == user_id)?;
-        self.call_state.feed.shown().cloned()
+        self.call_frame(call, user_id)
     }
 
     /// My own camera, or with `share` my own screen, as it is sent, while it is on.
     fn tiny_self_frame(&self, call: Option<&Call>, share: bool) -> Option<Arc<RenderImage>> {
-        let (picture, feed) = if share { (call?.share_view.as_ref(), &self.call_state.screen_feed) } else { (call?.self_view.as_ref(), &self.call_state.self_feed) };
-        picture.filter(|picture| !picture.path.is_empty())?;
-        feed.shown().cloned()
+        self.call_self_frame(call, share)
     }
 
     /// What a stream shows: its picture; mine, the same small live view of it that I send, with
@@ -528,7 +527,60 @@ impl Shell {
                 .into_any_element();
         }
         let name = model::name_by_id(page.community, &stream.user_id);
+        if !stream.watchable {
+            return body
+                .when(!small, |body| body.child(Avatar::new(&page.key(&stream.user_id), &name, if large { 72. } else { 40. }).image_at(page.picture(&stream.user_id)).build()))
+                .child(div().type_small().text_color(theme::text_soft()).child("Camera on"))
+                .into_any_element();
+        }
         let asked = call.is_some_and(|call| watching(call, &stream.user_id));
+        let since = self
+            .call_state
+            .watch_asked
+            .as_ref()
+            .filter(|(id, _)| *id == stream.user_id)
+            .map(|(_, at)| at.elapsed())
+            .unwrap_or_default();
+        let trouble = asked
+            .then(|| call.and_then(|c| stage::watch_trouble(c, &stream.user_id, |id| model::name_by_id(page.community, id), since)))
+            .flatten();
+        if let Some(trouble) = trouble {
+            let words = match &trouble {
+                stage::Trouble::OtherSource { name: who, kind } => {
+                    let what = if *kind == protocol::PictureKind::Share { "screen" } else { "camera" };
+                    format!("The room is showing {who}'s {what} right now.")
+                }
+                stage::Trouble::Deafened => "Undeafen to watch.".to_owned(),
+                stage::Trouble::Slow => format!("Waiting for {name}'s picture… Your connection may be too slow for video."),
+                stage::Trouble::Failed => format!("Couldn't get {name}'s picture."),
+            };
+            let retry_id = stream.user_id.clone();
+            let retry = matches!(trouble, stage::Trouble::Slow | stage::Trouble::Failed).then(|| {
+                div()
+                    .id(SharedString::from(format!("tiny-stream-retry-{}", stream.user_id)))
+                    .h(px(if small { 22. } else { 28. }))
+                    .px(px(if small { 8. } else { 12. }))
+                    .rounded_full()
+                    .bg(theme::accent())
+                    .text_color(theme::on_accent())
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .type_micro()
+                    .font_weight(theme::SEMIBOLD)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.call_retry_watch(retry_id.clone(), cx);
+                    }))
+                    .child("Try again")
+            });
+            return body
+                .when(!small, |body| body.child(Avatar::new(&page.key(&stream.user_id), &name, if large { 72. } else { 40. }).image_at(page.picture(&stream.user_id)).build()))
+                .child(div().max_w(px(260.)).text_center().whitespace_normal().type_small().text_color(theme::text_soft()).child(words))
+                .children(retry)
+                .into_any_element();
+        }
         let pill = div()
             .h(px(if small { 22. } else { 30. }))
             .px(px(if small { 8. } else { 14. }))
@@ -684,9 +736,11 @@ impl Shell {
         let color = page.community.member(&seat.user_id).and_then(|member| model::color_of(page.community, member)).map(gpui::rgb).unwrap_or(theme::text());
         let states = model::seat_states(seat);
         let mut glyphs = super::column::seat_glyphs(seat);
-        let (percent, local_mute) = self.tiny_state.gain(&seat.user_id);
+        let (percent, local_mute) = self.call_gain(page.account, &seat.user_id);
         if local_mute && !me {
             glyphs.push(("icons/volume-x.svg", theme::warning(), "Muted for you"));
+        } else if percent != 100 && !me {
+            glyphs.push(("icons/volume-2.svg", theme::text_soft(), "Volume adjusted"));
         }
         let focused = self.tiny_state.focus.as_ref() == Some(&Focus::Person(seat.user_id.clone()));
         let group: SharedString = format!("tiny-tile-{}", seat.user_id).into();
@@ -1152,6 +1206,7 @@ mod tests {
             picture: None,
             self_view: None,
             share_view: None,
+            picture_source: None,
         }
     }
 

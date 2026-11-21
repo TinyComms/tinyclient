@@ -281,6 +281,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         picture: None,
         self_view: None,
         share_view: None,
+        picture_source: None,
     };
     Live {
         intent: NEXT_INTENT.fetch_add(1, Ordering::Relaxed),
@@ -1895,6 +1896,26 @@ impl Calls {
         let (call, running) = self.describe();
         if running && call.is_some_and(|call| call.conversation == *conversation) {
             let _ = self.request(hub, &MediaRequest::TinySlots { audio });
+        }
+    }
+
+    /// Updates who the server's video slot carries (`call.slots` `video`) so the shell can tell
+    /// "slot carries someone else" apart from "slot is empty".
+    pub fn set_picture_source(
+        &self,
+        hub: &Hub,
+        conversation: &Key,
+        source: Option<(String, protocol::PictureKind)>,
+    ) {
+        let mut changed = false;
+        if self.update(hub, conversation, |live| {
+            if live.call.picture_source != source {
+                live.call.picture_source = source;
+                changed = true;
+            }
+        }) && changed
+        {
+            self.tell(hub);
         }
     }
 

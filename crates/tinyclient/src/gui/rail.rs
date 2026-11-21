@@ -53,6 +53,7 @@ impl Shell {
     fn rail_button(&self, id: impl Into<ElementId>, place: Place, cx: &mut Context<Self>) -> Stateful<Div> {
         let Place { mode, content, waiting: (attention, unread), mention, counted, faint, name, index: place } = place;
         let lit = self.sidebar_state.mode == mode;
+        let call_here = matches!(mode, Mode::Network(net) if self.snapshot.as_ref().and_then(|s| s.call.as_ref()).is_some_and(|c| c.conversation.network == net && matches!(c.state, protocol::CallState::Joined | protocol::CallState::Reconnecting)));
         let phone = super::phone::active();
         const KEYS: [&str; 9] = ["⌘1", "⌘2", "⌘3", "⌘4", "⌘5", "⌘6", "⌘7", "⌘8", "⌘9"];
         div()
@@ -72,6 +73,19 @@ impl Shell {
             .on_click(cx.listener(move |this, _, window, cx| this.visit(mode.clone(), window, cx)))
             .child(div().when(faint, |content| content.opacity(0.4)).child(content))
             .children(rail_badge(attention, unread, mention, counted))
+            .when(call_here, |button| {
+                button.child(
+                    div()
+                        .absolute()
+                        .bottom(px(6.))
+                        .right(px(6.))
+                        .size(px(8.))
+                        .rounded_full()
+                        .bg(theme::positive())
+                        .border_1()
+                        .border_color(theme::rail()),
+                )
+            })
     }
 
     /// A rail click: the place opens in the sidebar. In a window too narrow to keep the

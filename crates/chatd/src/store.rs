@@ -26,7 +26,7 @@ use std::time::Duration;
 /// was added without a version change, so Win+K died with `no such column: c.voice_limit`.
 /// 9 adds the expiry columns to an 8. 10 adds `message.seq` to a 9. Those two steps keep
 /// the rows, because the opened text is not on the server once a chat is end-to-end encrypted.
-const SCHEMA: i32 = 10;
+const SCHEMA: i32 = 11;
 
 /// Retention: the newest messages kept per conversation.
 pub const KEEP_MESSAGES: u32 = 2_000;
@@ -174,6 +174,9 @@ const TABLES: &str = "
         -- Telegram's own topic color for a forum topic row (a palette index), never absent for
         -- a topic and always empty for anything else.
         icon INTEGER,
+        max_file_bytes INTEGER NOT NULL DEFAULT 0,
+        read_only_reason TEXT NOT NULL DEFAULT '',
+        spam INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -293,7 +296,7 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit, c.encryption, c.icon
+           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -381,6 +384,12 @@ pub struct ConversationRow {
     /// Telegram's own topic color for a forum topic row (a palette index), `None`
     /// otherwise.
     pub icon: Option<i32>,
+    /// Per-conversation upload limit in bytes (0: use account default).
+    pub max_file_bytes: u64,
+    /// Why this conversation is read-only (empty uses the default sentence).
+    pub read_only_reason: String,
+    /// Flagged as spam by the network (e.g. Discord spam message request).
+    pub spam: bool,
     /// How the network files it. `None` leaves what is stored, so a tree that does not know
     /// (a Slack tree reload) never undoes a pin or a follow; `Some` replaces it.
     pub filing: Option<Filing>,
@@ -474,6 +483,9 @@ impl ConversationRow {
             opted_out: false,
             filing: None,
             icon: None,
+            max_file_bytes: 0,
+            read_only_reason: String::new(),
+            spam: false,
         }
     }
 }
@@ -707,6 +719,9 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         sending: row.get(47)?,
         encryption: from_word(row.get(49)?)?,
         topic_icon: row.get(50)?,
+        max_file_bytes: row.get::<_, i64>(51)? as u64,
+        read_only_reason: row.get(52)?,
+        spam: row.get(53)?,
     })
 }
 
@@ -861,9 +876,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed, voice_limit, encryption, icon)
+              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -874,6 +889,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              opted_out = excluded.opted_out, voice_limit = excluded.voice_limit,
              encryption = CASE WHEN excluded.encryption = 'unknown' THEN encryption ELSE excluded.encryption END,
              icon = excluded.icon,
+             max_file_bytes = excluded.max_file_bytes,
+             read_only_reason = excluded.read_only_reason,
+             spam = excluded.spam,
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -911,6 +929,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             row.limit,
             word(&row.encryption),
             row.icon,
+            row.max_file_bytes as i64,
+            row.read_only_reason,
+            row.spam,
         ],
     )?;
     Ok(())
@@ -950,7 +971,7 @@ const SETTINGS_VERSION: u32 = 1;
 /// caller should drop the cache and create it again. A shape that is not the real 8 or 9
 /// still rebuilds.
 fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
-    if version != 8 && version != 9 {
+    if version != 8 && version != 9 && version != 10 {
         return Ok(false);
     }
     if !column(db, "message", "text")? || !column(db, "conversation", "title")? {
@@ -970,6 +991,15 @@ fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
     }
     if !column(db, "message", "seq")? {
         db.execute_batch("ALTER TABLE message ADD COLUMN seq INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !column(db, "conversation", "max_file_bytes")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN max_file_bytes INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !column(db, "conversation", "read_only_reason")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN read_only_reason TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !column(db, "conversation", "spam")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN spam INTEGER NOT NULL DEFAULT 0")?;
     }
     Ok(true)
 }
@@ -1456,6 +1486,20 @@ impl Store {
         tx.commit()
     }
 
+    /// Drops the stored messages of a conversation while keeping its row in the list.
+    pub fn clear_messages(&mut self, conversation: &Key) -> rusqlite::Result<bool> {
+        let tx = self.db.transaction()?;
+        let key = params![word(&conversation.network), conversation.account, conversation.id];
+        tx.execute("DELETE FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3", key)?;
+        let changed = tx.execute(
+            "UPDATE conversation SET unread = 0, mentions = 0, preview = '', preview_from = '', preview_mine = 0, preview_id = ''
+              WHERE network = ?1 AND account = ?2 AND id = ?3",
+            key,
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
     pub fn conversation(&self, conversation: &Key) -> rusqlite::Result<Option<Conversation>> {
         self.db
             .query_row(
@@ -1511,6 +1555,78 @@ impl Store {
             |row| row.get(0),
         )?;
         Ok((channels, directs, voice))
+    }
+
+    /// Stored top-level rows of the given kinds in `space`, ordered by position and id. Used when
+    /// a refresh gets an empty list for one kind and probes survivors before `replace_tree`.
+    pub fn space_rows_of_kinds(
+        &self,
+        space: &Key,
+        kinds: &[ConversationKind],
+    ) -> rusqlite::Result<Vec<ConversationRow>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: Vec<String> = kinds.iter().map(|kind| word(kind).to_owned()).collect();
+        let mut stmt = self.db.prepare(
+            "SELECT id, kind, title, space, section, position, avatar, peer, call, voice_limit,
+                    listed, topic, read_only, private, encryption, bot, meeting, special, mark,
+                    opted_out, icon, max_file_bytes, read_only_reason, spam
+               FROM conversation
+              WHERE network = ?1 AND account = ?2 AND space = ?3 AND parent = ''
+              ORDER BY position, id",
+        )?;
+        let rows = stmt
+            .query_map(params![word(&space.network), space.account, space.id], |row| {
+                let kind_word: String = row.get(1)?;
+                let kind: ConversationKind = from_word(kind_word.clone())?;
+                let space_id: String = row.get(3)?;
+                let section: String = row.get(4)?;
+                let avatar: String = row.get(6)?;
+                let peer: String = row.get(7)?;
+                let call: String = row.get(8)?;
+                let encryption: String = row.get(14)?;
+                let special: String = row.get(17)?;
+                let mark: String = row.get(18)?;
+                Ok((
+                    kind_word,
+                    ConversationRow {
+                        id: row.get(0)?,
+                        kind,
+                        title: row.get(2)?,
+                        space: (!space_id.is_empty()).then_some(space_id),
+                        group: (!section.is_empty()).then_some(section),
+                        position: row.get(5)?,
+                        avatar: (!avatar.is_empty()).then_some(avatar),
+                        peer: (!peer.is_empty()).then_some(peer),
+                        call: from_word(call)?,
+                        limit: row.get(9)?,
+                        listed: row.get(10)?,
+                        topic: row.get(11)?,
+                        parent: None,
+                        root: None,
+                        read_only: row.get(12)?,
+                        private: row.get(13)?,
+                        encryption: from_word(encryption)?,
+                        bot: row.get(15)?,
+                        meeting: row.get(16)?,
+                        special: from_word(special)?,
+                        mark: (!mark.is_empty()).then(|| from_word(mark)).transpose()?,
+                        opted_out: row.get(19)?,
+                        icon: row.get(20)?,
+                        filing: None,
+                        max_file_bytes: row.get::<_, i64>(21)?.max(0) as u64,
+                        read_only_reason: row.get(22)?,
+                        spam: row.get(23)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(kind_word, _)| wanted.contains(kind_word))
+            .map(|(_, row)| row)
+            .collect())
     }
 
     /// Whether a conversation may appear where the user asked for what is listed: hidden
@@ -2748,15 +2864,17 @@ impl Store {
         if here.is_none() {
             return Ok(false);
         }
-        let already: Option<i64> = tx
+        let already: Option<Message> = tx
             .query_row(
-                "SELECT 1 FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
+                "SELECT id, text, body FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
                 params![network, account, id, message.id],
-                |row| row.get(0),
+                message_from,
             )
             .optional()?;
-        if already.is_some() {
-            return Ok(false);
+        if let Some(existing) = &already {
+            if existing.text == message.text && existing.call == message.call {
+                return Ok(false);
+            }
         }
         let mut stored = message.clone();
         stored.bound();
@@ -2786,7 +2904,7 @@ impl Store {
                 message.seq,
             ],
         )?;
-        if bump_unread && !message.outgoing {
+        if already.is_none() && bump_unread && !message.outgoing {
             tx.execute(
                 "UPDATE conversation SET unread = unread + 1 WHERE network = ?1 AND account = ?2 AND id = ?3",
                 params![network, account, id],

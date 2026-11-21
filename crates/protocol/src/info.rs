@@ -344,6 +344,13 @@ pub struct Capabilities {
     /// and chatd does not keep words a sender replaced on a network that has no history.
     #[serde(default, skip_serializing_if = "is_false")]
     pub revisions: bool,
+    /// This account supports closing a direct conversation (`Request::CloseDirect`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub close_direct: bool,
+    /// This account supports clearing a chat's history or deleting a chat on the network
+    /// (`Request::ClearHistory`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clear_history: bool,
 }
 
 impl Capabilities {
@@ -352,9 +359,32 @@ impl Capabilities {
     }
 }
 
+/// Optional media facts staged by the shell for video or audio uploads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutgoingMedia {
+    /// Duration in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u32>,
+    /// Video width in pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Video height in pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// Path to a JPEG poster image on disk (validated by chatd like any upload).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumb: Option<String>,
+    /// Audio track title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Audio performer / artist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performer: Option<String>,
+}
+
 /// One file the user attached: the shell names a path on disk and chatd streams it from there.
 /// Bytes never cross the socket.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutgoingFile {
     pub path: String,
     /// The name the network shows. Empty: the path's file name.
@@ -368,6 +398,9 @@ pub struct OutgoingFile {
     /// Send the file as it is (a HEIC rather than the JPEG made at staging).
     #[serde(default, skip_serializing_if = "is_false")]
     pub original: bool,
+    /// Optional video/audio metadata and poster thumbnail path staged by the shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<OutgoingMedia>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

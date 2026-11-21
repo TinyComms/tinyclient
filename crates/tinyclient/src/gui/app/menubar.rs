@@ -33,6 +33,7 @@ pub fn menus(places: &[(String, usize)], open_network: Option<Network>, update_i
         }
     };
     let open_in = match open_network {
+        Some(Network::Telegram) => "Open chat in Telegram".to_owned(),
         Some(network) => format!("Open in {}", network.label()),
         None => "Open in App".to_owned(),
     };
@@ -340,5 +341,7 @@ mod tests {
         }
         assert!(all.contains(&"Check for Updates…".to_owned()));
         assert!(all.contains(&"Settings…".to_owned()) && all.contains(&"About tinyclient".to_owned()));
+        let tg_bar = menus(&places, Some(Network::Telegram), "Check for Updates…");
+        assert!(items(&tg_bar[4]).contains(&"Open chat in Telegram".to_owned()));
     }
 }

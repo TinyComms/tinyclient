@@ -259,6 +259,8 @@ struct Target {
     /// The Space it is in, for `#` completion and the Space's own emoji. A thread pane is not told.
     space: Option<String>,
     read_only: bool,
+    read_only_reason: String,
+    special: protocol::Special,
     /// What the account may send.
     can: Capabilities,
 }
@@ -268,6 +270,7 @@ enum Locked {
     SignedOut,
     Expired,
     ReadOnly(String),
+    MessageRequest,
 }
 
 impl Target {
@@ -275,8 +278,16 @@ impl Target {
         match (self.link, self.kind) {
             (Link::SignedOut, _) => Some(Locked::SignedOut),
             (Link::Expired, _) => Some(Locked::Expired),
+            _ if self.special == protocol::Special::Request => Some(Locked::MessageRequest),
             (_, ConversationKind::Forum) => Some(Locked::ReadOnly("Posts in a forum are started in the network's app.".to_owned())),
-            _ if self.read_only => Some(Locked::ReadOnly(format!("You can read {} but not post in it.", self.title))),
+            _ if self.read_only => {
+                let why = if self.read_only_reason.is_empty() {
+                    format!("You can read {} but not post in it.", self.title)
+                } else {
+                    self.read_only_reason.clone()
+                };
+                Some(Locked::ReadOnly(why))
+            }
             _ => None,
         }
     }
@@ -905,7 +916,7 @@ impl Composer {
         }
         let network = target.key.network;
         let emoticons = super::app::prefs::choices().emoticons;
-        let wired = length::wire_text(&field, &self.tokens, network, emoticons);
+        let (wired, mention_spans) = length::wire_with_spans(&field, &self.tokens, network, emoticons);
         let Some(as_file) = self.stage_over_limit(&field, &wired, &target, cx) else {
             return;
         };
@@ -955,7 +966,7 @@ impl Composer {
             ping: reply_to.is_none() || !controls.ping || !self.ping_off.contains(&target.key.account()),
             pick: None,
             schedule,
-            spans: Vec::new(),
+            spans: if as_file { Vec::new() } else { mention_spans },
             poll: None,
         };
         let (shown, wire) = match as_file {
@@ -1806,6 +1817,31 @@ impl Composer {
         self.caption = None;
         self.armed = None;
         self.focus_next = true;
+        if live() {
+            if let Some(target) = self.target.as_ref().filter(|t| t.key.network == Network::Discord) {
+                let key = target.key.clone();
+                let id = message.id.clone();
+                let msg = message.clone();
+                let this = cx.weak_entity();
+                ask_later(cx, Request::Source { conversation: key.clone(), message_id: id.clone() }, move |answer, cx| {
+                    let Ok(Response::Source { text: raw }) = answer else {
+                        return;
+                    };
+                    let _ = this.update(cx, |this, cx| {
+                        let same_target = this.target.as_ref().is_some_and(|t| t.key == key);
+                        let unchanged = this.editing.as_ref().is_some_and(|e| e.id == id && this.input.read(cx).text() == e.original);
+                        if same_target && unchanged {
+                            let (field, tokens) = mention::from_source(&raw, &msg);
+                            if let Some(editing) = this.editing.as_mut() {
+                                editing.original = field.clone();
+                            }
+                            this.set_field(&Draft { text: field, tokens, files: Vec::new(), note: None, reply: None }, cx);
+                            cx.notify();
+                        }
+                    });
+                });
+            }
+        }
         cx.notify();
     }
 
@@ -1868,7 +1904,7 @@ impl Composer {
             return;
         }
         let key = target.key.clone();
-        let wire = length::wire_text(&field, &self.tokens, key.network, false);
+        let (wire, spans) = length::wire_with_spans(&field, &self.tokens, key.network, false);
         if let Some(words) = length::edit_refusal(wire.chars().count(), target.can.text_limit) {
             self.caption = Some((words, Tone::Refused));
             cx.notify();
@@ -1878,7 +1914,7 @@ impl Composer {
             conversation: key.clone(),
             message_id: id.clone(),
             text: wire,
-            spans: Vec::new(),
+            spans,
         };
         self.sending = true;
         cx.notify();
@@ -2136,6 +2172,38 @@ impl Composer {
 
     /// The 40 pt bar that stands where the card would be.
     fn bar(&self, locked: Locked, network: Network, cx: &mut Context<Self>) -> Div {
+        if matches!(locked, Locked::MessageRequest) {
+            let key = self.target.as_ref().map(|t| t.key.clone());
+            let (accept_key, decline_key) = (key.clone(), key);
+            return div()
+                .h(px(card_height()))
+                .pl(px(12.))
+                .pr(px(6.))
+                .rounded(px(theme::R_FLOAT))
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .type_ui()
+                .text_color(theme::text_soft())
+                .child(glyph("icons/mail.svg", 16., theme::text_faint()))
+                .child(div().flex_1().min_w_0().truncate().child("Message request"))
+                .child(
+                    button("request-ignore", ButtonKind::Secondary, "Ignore").on_click(cx.listener(move |_, _, _, cx| {
+                        if let Some(conversation) = decline_key.clone() {
+                            ask_later(cx, Request::AnswerMessageRequest { conversation, accept: false }, |_, _| {});
+                        }
+                    })),
+                )
+                .child(
+                    button("request-accept", ButtonKind::Primary, "Accept").on_click(cx.listener(move |_, _, _, cx| {
+                        if let Some(conversation) = accept_key.clone() {
+                            ask_later(cx, Request::AnswerMessageRequest { conversation, accept: true }, |_, _| {});
+                        }
+                    })),
+                );
+        }
         let name = network.label();
         let (icon, words, action) = match locked {
             Locked::SignedOut => ("icons/lock.svg", format!("{name} is signed out."), Some("Sign in")),
@@ -2145,6 +2213,7 @@ impl Composer {
                 Some("Sign in again"),
             ),
             Locked::ReadOnly(sentence) => ("icons/lock.svg", sentence, None),
+            Locked::MessageRequest => unreachable!(),
         };
         let expired = action == Some("Sign in again");
         div()
@@ -2385,7 +2454,8 @@ impl Composer {
         let Some(target) = self.record_target() else {
             return;
         };
-        ask_later(cx, Request::Record(rec::on_press(&self.recording, &target)), |_, _| {});
+        let input = crate::gui::app::prefs::values().device(protocol::settings::INPUT);
+        ask_later(cx, Request::Record(rec::on_press(&self.recording, &target, input)), |_, _| {});
     }
 
     /// Push-to-talk, the press: record now. A press inside the previous release's grace drops
@@ -2396,7 +2466,8 @@ impl Composer {
         let Some(target) = self.record_target() else {
             return;
         };
-        ask_later(cx, Request::Record(rec::on_hold_down(&target)), |_, _| {});
+        let input = crate::gui::app::prefs::values().device(protocol::settings::INPUT);
+        ask_later(cx, Request::Record(rec::on_hold_down(&target, input)), |_, _| {});
         self.holding = Some(target);
     }
 
@@ -3285,6 +3356,10 @@ impl Shell {
         let link = if staged("offline") || staged("waiting") { Link::Offline } else { link };
         #[cfg(not(feature = "gui-shot"))]
         let kind = open.kind;
+        let mut can = self.can_of(&open.key);
+        if open.max_file_bytes > 0 {
+            can.max_file_bytes = can.max_file_bytes.max(open.max_file_bytes);
+        }
         let target = Target {
             key: open.key.clone(),
             title: open.title.clone(),
@@ -3292,7 +3367,9 @@ impl Shell {
             link,
             space: open.space.clone(),
             read_only: open.read_only,
-            can: self.can_of(&open.key),
+            read_only_reason: open.read_only_reason.clone(),
+            special: open.special,
+            can,
         };
         let composer = self.composer_in(false, cx);
         composer.update(cx, |composer, cx| composer.aim(target, &open.draft, cx));
@@ -3318,6 +3395,8 @@ impl Shell {
             link,
             space: None,
             read_only: false,
+            read_only_reason: String::new(),
+            special: protocol::Special::None,
             can: self.can_of(thread),
         };
         let composer = self.composer_in(true, cx);
@@ -3917,7 +3996,17 @@ mod tests {
 
     fn target(link: Link, kind: ConversationKind, read_only: bool) -> Target {
         let key = Key { network: Network::Slack, account: "T1".into(), id: "C1".into() };
-        Target { key, title: "#announcements".into(), kind, link, space: None, read_only, can: Capabilities::default() }
+        Target {
+            key,
+            title: "#announcements".into(),
+            kind,
+            link,
+            space: None,
+            read_only,
+            read_only_reason: String::new(),
+            special: protocol::Special::None,
+            can: Capabilities::default(),
+        }
     }
 
     #[test]

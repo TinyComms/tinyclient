@@ -306,17 +306,13 @@ impl Names for Slack {
         if let Some(handle) = self.ctx.note(&note) {
             return Some(handle);
         }
-        // One listing a run names every group; they are few.
-        if std::mem::replace(&mut self.state().groups_listed, true) {
-            return None;
-        }
-        let listed = self.api("usergroups.list", &[]).ok()?;
-        for group in listed["usergroups"].as_array().into_iter().flatten() {
-            if let (Some(id), Some(handle)) = (group["id"].as_str(), group["handle"].as_str()) {
-                self.ctx.set_note(&format!("g:{id}"), handle);
-            }
-        }
+        self.load_usergroups();
         self.ctx.note(&note)
+    }
+
+    fn in_usergroup(&self, id: &str) -> bool {
+        self.load_usergroups();
+        self.state().my_groups.contains(id)
     }
 
     /// A custom emoji as the workspace's list names it. The first message that names one with no
@@ -339,6 +335,71 @@ impl Names for Slack {
 }
 
 impl Slack {
+    /// Reads the workspace's active user groups once per connection (`usergroups.list` with
+    /// `include_users=true`), records their handles, and remembers which ones include me.
+    /// Disabled groups (`date_delete > 0`) are ignored.
+    pub(super) fn load_usergroups(&self) {
+        if std::mem::replace(&mut self.state().groups_listed, true) {
+            return;
+        }
+        let Ok(listed) = self.api("usergroups.list", &[("include_users", "true")]) else {
+            return;
+        };
+        let me = self.me.get().map_or("", String::as_str);
+        let mut mine = std::collections::HashSet::new();
+        for group in listed["usergroups"].as_array().into_iter().flatten() {
+            let disabled = group["date_delete"].as_i64().unwrap_or(0) > 0
+                || group["deleted_by"].as_str().is_some_and(|by| !by.is_empty());
+            if disabled {
+                continue;
+            }
+            let Some(id) = group["id"].as_str().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            if let Some(handle) = group["handle"].as_str().filter(|handle| !handle.is_empty()) {
+                self.ctx.set_note(&format!("g:{id}"), handle);
+            }
+            let member = !me.is_empty()
+                && group["users"]
+                    .as_array()
+                    .is_some_and(|users| users.iter().any(|user| user.as_str() == Some(me)));
+            if member {
+                mine.insert(id.to_owned());
+            }
+        }
+        self.state().my_groups = mine;
+    }
+
+    /// `subteam_self_added` / `subteam_self_removed`: updates the set of user groups I belong to.
+    pub(super) fn subteam_self(&self, event: &Value, added: bool) {
+        let Some(id) = event["subteam_id"].as_str().filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let mut state = self.state();
+        if added {
+            state.my_groups.insert(id.to_owned());
+        } else {
+            state.my_groups.remove(id);
+        }
+    }
+
+    /// `subteam_created` / `subteam_updated`: keeps handles current and drops disabled groups.
+    pub(super) fn subteam_updated(&self, event: &Value) {
+        let subteam = &event["subteam"];
+        let Some(id) = subteam["id"].as_str().filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let disabled = subteam["date_delete"].as_i64().unwrap_or(0) > 0
+            || subteam["deleted_by"].as_str().is_some_and(|by| !by.is_empty());
+        if disabled {
+            self.state().my_groups.remove(id);
+            return;
+        }
+        if let Some(handle) = subteam["handle"].as_str().filter(|handle| !handle.is_empty()) {
+            self.ctx.set_note(&format!("g:{id}"), handle);
+        }
+    }
+
     fn custom_known(&self, name: &str, known: &str) -> Option<Custom> {
         match custom_picture(name, known) {
             Custom::Unicode(emoji) => Some(Custom::Unicode(emoji)),

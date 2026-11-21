@@ -233,6 +233,51 @@ pub fn with_stored(plain: &str, stored: &[Span]) -> Option<Vec<MessageEntity>> {
     (!entities.is_empty()).then_some(entities)
 }
 
+/// Explicit mention spans from the composer, turned into Telegram `InputMessageEntityMentionName`
+/// entities using UTF-16 offsets on `plain`.
+pub(super) fn apply_mention_spans(
+    plain: &str,
+    mut entities: Vec<MessageEntity>,
+    spans: &[Span],
+    resolve: impl Fn(i64) -> Option<i64>,
+) -> Vec<MessageEntity> {
+    if spans.is_empty() {
+        return entities;
+    }
+    let map = utf16_map(plain);
+    for span in spans {
+        let Style::Mention { kind: MentionKind::User, id } = &span.style else {
+            continue;
+        };
+        if !span_fits(plain, span) {
+            continue;
+        }
+        let Some(user_id) = id.strip_prefix('u').unwrap_or(id).parse::<i64>().ok() else {
+            continue;
+        };
+        let (Some(offset), Some(end)) = (utf16_index(&map, span.start), utf16_index(&map, span.end)) else {
+            continue;
+        };
+        let length = end - offset;
+        if length <= 0 {
+            continue;
+        }
+        if let Some(access_hash) = resolve(user_id) {
+            entities.push(
+                tl::types::InputMessageEntityMentionName {
+                    offset,
+                    length,
+                    user_id: tl::types::InputUser { user_id, access_hash }.into(),
+                }
+                .into(),
+            );
+        } else {
+            entities.push(tl::types::MessageEntityMentionName { offset, length, user_id }.into());
+        }
+    }
+    entities
+}
+
 /// The text a send or a draft tells Telegram, and the entities for its markers. Telegram
 /// does not read `**` itself, so the markers are taken out and named.
 pub fn outgoing(text: &str) -> (String, Option<Vec<MessageEntity>>) {
@@ -4349,5 +4394,35 @@ mod tests {
             matches!(&span.style, Style::Mention { kind: MentionKind::User, id } if id == "u7003")
                 && &plain[span.start as usize..span.end as usize] == "Ada"
         }));
+    }
+
+    #[test]
+    fn explicit_mention_spans_produce_input_mention_name_entities() {
+        // Emoji before the mention takes 2 UTF-16 units (4 UTF-8 bytes), verifying UTF-16 offset conversion.
+        let text = "👋 @Ada Stone!";
+        let start = text.find("@Ada Stone").unwrap() as u32;
+        let end = start + "@Ada Stone".len() as u32;
+        let entities = apply_mention_spans(
+            text,
+            Vec::new(),
+            &[Span {
+                start,
+                end,
+                style: Style::Mention { kind: MentionKind::User, id: "u7003".into() },
+            }],
+            |uid| (uid == 7_003).then_some(99),
+        );
+        assert_eq!(entities.len(), 1);
+        match &entities[0] {
+            MessageEntity::InputMessageEntityMentionName(named) => {
+                // "👋 " is 2 + 1 = 3 UTF-16 units; "@Ada Stone" is 10 UTF-16 units.
+                assert_eq!((named.offset, named.length), (3, 10));
+                assert!(matches!(
+                    &named.user_id,
+                    tl::enums::InputUser::User(user) if user.user_id == 7_003 && user.access_hash == 99
+                ));
+            }
+            other => panic!("expected InputMessageEntityMentionName, got {other:?}"),
+        }
     }
 }

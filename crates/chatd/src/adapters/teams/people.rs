@@ -478,26 +478,33 @@ impl Teams {
         Ok(())
     }
 
-    /// Sets our own availability. A status note is not written: none of the clients read shows
-    /// how Teams wants one, so it is refused rather than guessed at.
+    /// Sets our own availability and/or status message note.
     pub(super) fn set_presence(&self, presence: Presence, status: Option<&str>) -> Result<(), Fault> {
         let refuse = |message: &str| Fault::Refused {
             status: 400,
             message: message.to_owned(),
         };
-        if status.is_some_and(|status| !status.is_empty()) {
-            return Err(refuse("a status message is set in Teams itself"));
+        if presence == Presence::Unknown && status.is_none() {
+            return Err(refuse("Teams decides that one itself"));
         }
-        let availability = match presence {
-            Presence::Online => "Available",
-            Presence::Idle => "Away",
-            Presence::Dnd => "DoNotDisturb",
-            Presence::Busy => "Busy",
-            Presence::Offline => "Offline",
-            Presence::Unknown => return Err(refuse("Teams decides that one itself")),
-        };
-        let url = format!("{}/v1/me/forceavailability/", self.place()?.presence);
-        self.call("PUT", &url, Auth::Bearer(PRESENCE), Body::Json(&json!({"availability": availability})), false)?;
+        let place = self.place()?;
+        if presence != Presence::Unknown {
+            let availability = match presence {
+                Presence::Online => "Available",
+                Presence::Idle => "Away",
+                Presence::Dnd => "DoNotDisturb",
+                Presence::Busy => "Busy",
+                Presence::Offline => "Offline",
+                Presence::Unknown => unreachable!(),
+            };
+            let url = format!("{}/v1/me/forceavailability/", place.presence);
+            self.call("PUT", &url, Auth::Bearer(PRESENCE), Body::Json(&json!({"availability": availability})), false)?;
+        }
+        if let Some(note) = status {
+            let url = format!("{}/v1/me/publishnote", place.presence);
+            let body = json!({"message": note, "expiry": "9999-12-30T23:00:00.000Z"});
+            self.call("PUT", &url, Auth::Bearer(PRESENCE), Body::Json(&body), false)?;
+        }
         Ok(())
     }
 }

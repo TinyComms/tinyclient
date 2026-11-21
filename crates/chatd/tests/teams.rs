@@ -347,6 +347,7 @@ impl Fake {
             }
             "/presence/v1/presence/getpresence/" if bearer("presence") => ok(self.fixture("presence").unwrap()),
             "/presence/v1/me/forceavailability/" if bearer("presence") => ok(json!({})),
+            "/presence/v1/me/publishnote" if bearer("presence") => ok(json!({})),
             // A shared file's bytes. The cache asks Graph's shares route; this stands in for it.
             _ if call.method == "GET" && path.contains("/shares/u!") && path.ends_with("/driveItem/content") => Reply {
                 status: "200 OK",
@@ -418,6 +419,9 @@ impl Fake {
             return ok(json!({"id": thread, "consumptionhorizons": horizons}));
         }
         if let Some(thread) = path.strip_prefix("/v1/threads/") {
+            if call.method == "DELETE" && thread.contains("/members/") {
+                return ok(json!({}));
+            }
             let described = match thread {
                 CHAT_DEE => self.fixture("thread.dee"),
                 GENERAL => self.fixture("thread.general"),
@@ -471,6 +475,9 @@ impl Fake {
         let root = root.or_else(|| thread.contains("@thread.tacv2").then(|| arrived.to_string()));
         let mut echo = message(thread, root.as_deref(), arrived, ME, sent["imdisplayname"].as_str().unwrap_or(""), sent["content"].as_str().unwrap_or(""));
         echo["clientmessageid"] = sent["clientmessageid"].clone();
+        if sent["properties"].is_object() {
+            echo["properties"] = sent["properties"].clone();
+        }
         let socket = self.socket.lock().unwrap().clone();
         let frame = self.frame(&json!({"time": iso(arrived), "type": "EventMessage", "resourceType": "NewMessage", "resource": echo}), false);
         std::thread::spawn(move || {
@@ -1431,7 +1438,7 @@ fn mentions_missed_while_closed_info_mute_seen_hidden_chats_and_files_through_on
     let path = staged.join("notes.txt");
     std::fs::write(&path, b"standup notes").unwrap();
     let with = protocol::Outgoing {
-        files: vec![protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false }],
+        files: vec![protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, media: None }],
         ..Default::default()
     };
     let asked = Request::Send { conversation: key(CHAT_ANA), client_id: "88001".into(), text: "notes attached".into(), reply_to: None, with };
@@ -1507,4 +1514,173 @@ fn presence_is_asked_only_for_who_is_watched_and_a_rate_limit_is_waited_out_once
     world.until("the second try", || (world.fake.calls("POST", "/presence/v1/presence/getpresence/").len() >= 2).then_some(()));
     sleep(Duration::from_millis(1600));
     assert_eq!(world.fake.calls("POST", "/presence/v1/presence/getpresence/").len(), 2);
+}
+
+#[test]
+fn leaving_a_group_chat_removes_myself_and_drops_the_row() {
+    let world = World::start();
+    world.ready();
+    let grp1 = key("19:grp1@thread.v2");
+    assert!(world.conversation(&grp1).is_some());
+
+    assert_eq!(world.ask(Request::Leave { conversation: grp1.clone() }), Response::Ok);
+    let left = world.fake.calls("DELETE", &format!("/v1/threads/19:grp1@thread.v2/members/{ME}"));
+    assert_eq!(left.len(), 1);
+    assert!(world.conversation(&grp1).is_none());
+}
+
+#[test]
+fn setting_a_status_message_publishes_the_note_and_availability() {
+    let world = World::start();
+    world.ready();
+
+    let set = Request::SetPresence {
+        account: key("").account(),
+        presence: Presence::Dnd,
+        status: Some("Heads down until 3".to_owned()),
+    };
+    assert_eq!(world.ask(set), Response::Ok);
+    let avail = world.fake.calls("PUT", "/presence/v1/me/forceavailability/").pop().expect("availability set");
+    assert_eq!(avail.json(), json!({"availability": "DoNotDisturb"}));
+    let note = world.fake.calls("PUT", "/presence/v1/me/publishnote").pop().expect("note published");
+    assert_eq!(note.json()["message"], json!("Heads down until 3"));
+    assert!(note.json()["expiry"].as_str().is_some_and(|e| !e.is_empty()));
+
+    // Clearing the status message publishes an empty note.
+    let clear = Request::SetPresence {
+        account: key("").account(),
+        presence: Presence::Online,
+        status: Some(String::new()),
+    };
+    assert_eq!(world.ask(clear), Response::Ok);
+    let cleared = world.fake.calls("PUT", "/presence/v1/me/publishnote").pop().expect("note cleared");
+    assert_eq!(cleared.json()["message"], json!(""));
+}
+
+#[test]
+fn sending_a_mention_writes_the_span_and_properties_mentions() {
+    let world = World::start();
+    world.ready();
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+
+    let client_id = "1760000999000444";
+    world.send(&ana, client_id, &format!("hi <@{ANA}|Ana Ruiz> check <#{GENERAL}|General>"));
+    let sent = world.until("the mention message to be accepted", || {
+        world.messages(&ana).into_iter().find(|message| message.client_id.as_deref() == Some(client_id) && message.state == SendState::Sent)
+    });
+    let posted = world.fake.calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages")).pop().expect("posted");
+    let body = posted.json();
+    assert_eq!(
+        body["content"].as_str(),
+        Some("<p>hi <span itemscope=\"\" itemtype=\"http://schema.skype.com/Mention\" itemid=\"0\">Ana Ruiz</span> check <span itemscope=\"\" itemtype=\"http://schema.skype.com/Mention\" itemid=\"1\">General</span></p>")
+    );
+    let mentions: Vec<Value> = serde_json::from_str(body["properties"]["mentions"].as_str().expect("properties.mentions string")).unwrap();
+    assert_eq!(mentions.len(), 2);
+    assert_eq!((mentions[0]["itemid"].as_u64(), mentions[0]["mri"].as_str(), mentions[0]["mentionType"].as_str(), mentions[0]["displayName"].as_str()), (Some(0), Some(ANA), Some("person"), Some("Ana Ruiz")));
+    assert_eq!((mentions[1]["itemid"].as_u64(), mentions[1]["mri"].as_str(), mentions[1]["mentionType"].as_str(), mentions[1]["displayName"].as_str()), (Some(1), Some(GENERAL), Some("channel"), Some("General")));
+    assert_eq!(sent.text, "hi @Ana Ruiz check @General");
+    let found = ranges(&sent);
+    assert!(found.contains(&("@Ana Ruiz", &Style::Mention { kind: MentionKind::User, id: ANA.into() })));
+    assert!(found.contains(&("@General", &Style::Mention { kind: MentionKind::Everyone, id: GENERAL.into() })));
+}
+
+#[test]
+fn editing_a_message_preserves_formatting_mentions_images_and_subject() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    world.open(&general, 6);
+
+    let img_url = format!("{}/ams/v1/objects/0-weu-d1-editimg/views/imgo", world.fake.base);
+    let post_id = 1_760_000_800_800u64;
+    let mut post = message(
+        GENERAL,
+        Some(&post_id.to_string()),
+        post_id,
+        ME,
+        "Me Myself",
+        &format!(
+            "<p>Ship <b>today</b> with <span itemscope=\"\" itemtype=\"http://schema.skype.com/Mention\" itemid=\"0\">Ana Ruiz</span></p>\
+             <p><img src=\"{img_url}\" alt=\"chart\" itemtype=\"http://schema.skype.com/AMSImage\" width=\"400\" height=\"300\"></p>"
+        ),
+    );
+    post["properties"] = json!({
+        "subject": "Release plan",
+        "mentions": json!([{"@type": "http://schema.skype.com/Mention", "itemid": 0, "mri": ANA, "mentionType": "person", "displayName": "Ana Ruiz"}]).to_string(),
+    });
+    world.fake.push("NewMessage", post, false);
+    let stored = world.until("the outgoing post to arrive", || world.message(&general, &post_id.to_string()));
+    assert_eq!(stored.attachments.len(), 1);
+
+    let edit = Request::Edit {
+        conversation: general.clone(),
+        message_id: post_id.to_string(),
+        text: format!("**Release plan**\nShip **tomorrow** with <@{ANA}|Ana Ruiz>"),
+        spans: Vec::new(),
+    };
+    assert_eq!(world.ask(edit), Response::Ok);
+    let put = world.fake.calls("PUT", &format!("/chat/v1/users/ME/conversations/{GENERAL}/messages/{post_id}")).pop().expect("edit PUT");
+    let body = put.json();
+    let html = body["content"].as_str().unwrap_or("");
+    assert!(html.contains("<strong>tomorrow</strong>"), "bold stripped: {html}");
+    assert!(html.contains("itemtype=\"http://schema.skype.com/Mention\""), "mention markup stripped: {html}");
+    assert!(html.contains("0-weu-d1-editimg/views/imgo"), "inline image stripped: {html}");
+    assert!(!html.contains("Release plan"), "subject doubled in body: {html}");
+    assert_eq!(body["properties"]["subject"].as_str(), Some("Release plan"));
+    let mentions: Vec<Value> = serde_json::from_str(body["properties"]["mentions"].as_str().expect("properties.mentions")).unwrap();
+    assert_eq!(mentions.len(), 1);
+    assert_eq!((mentions[0]["mri"].as_str(), mentions[0]["displayName"].as_str()), (Some(ANA), Some("Ana Ruiz")));
+
+    let updated = world.message(&general, &post_id.to_string()).unwrap();
+    assert_eq!(updated.text, "Release plan\nShip tomorrow with @Ana Ruiz");
+    let found = ranges(&updated);
+    assert!(found.contains(&("Release plan", &Style::Bold)));
+    assert!(found.contains(&("tomorrow", &Style::Bold)));
+    assert!(found.contains(&("@Ana Ruiz", &Style::Mention { kind: MentionKind::User, id: ANA.into() })));
+    assert_eq!(updated.attachments.len(), 1);
+}
+
+#[test]
+fn reply_to_my_channel_post_marks_chain_and_channel_unread_while_untouched_post_does_not() {
+    let world = World::start();
+    world.ready();
+    let deploys = key(DEPLOYS);
+    world.open(&deploys, 1);
+    assert_eq!(world.conversation(&deploys).unwrap().unread, 0);
+
+    // 1. A reply to someone else's post I never touched does not raise unread on the chain or channel.
+    let ben_root = "1760000400400";
+    let ben_chain = key(&format!("{DEPLOYS};messageid={ben_root}"));
+    world.fake.push("NewMessage", message(DEPLOYS, Some(ben_root), 1_760_000_850_000, ANA, "Ana Ruiz", "<p>nice</p>"), false);
+    let ben_post = world.until("Ben's post to count the reply", || {
+        world.message(&deploys, ben_root).filter(|post| post.thread.as_ref().is_some_and(|thread| thread.replies == 1))
+    });
+    assert_eq!(ben_post.thread.unwrap().unread, 0);
+    assert_eq!(world.conversation(&ben_chain).unwrap().unread, 0);
+    assert_eq!(world.conversation(&deploys).unwrap().unread, 0);
+
+    // 2. A reply to a post I wrote raises unread on the chain, the post's thread summary, and the channel.
+    let client_id = "1760000999000555";
+    world.send(&deploys, client_id, "deploying v514?");
+    let mine = world.until("my post to be accepted", || {
+        world.messages(&deploys).into_iter().find(|message| message.client_id.as_deref() == Some(client_id) && message.state == SendState::Sent)
+    });
+    assert_eq!(world.conversation(&deploys).unwrap().unread, 0);
+    let my_chain = key(&format!("{DEPLOYS};messageid={}", mine.id));
+    let reply_id = 1_760_001_500_000u64;
+    world.fake.push("NewMessage", message(DEPLOYS, Some(&mine.id), reply_id, ANA, "Ana Ruiz", "<p>go ahead</p>"), false);
+    let my_post = world.until("my post to count the reply", || {
+        world.message(&deploys, &mine.id).filter(|post| post.thread.as_ref().is_some_and(|thread| thread.replies == 1))
+    });
+    assert_eq!(my_post.thread.unwrap().unread, 1);
+    assert_eq!(world.conversation(&my_chain).unwrap().unread, 1);
+    assert!(world.conversation(&deploys).unwrap().unread >= 1);
+
+    // 3. Marking the chain read clears ThreadSummary.unread on the post.
+    assert_eq!(world.ask(Request::MarkRead { conversation: my_chain.clone(), message_id: reply_id.to_string() }), Response::Ok);
+    let read_post = world.until("my post thread unread to clear", || {
+        world.message(&deploys, &mine.id).filter(|post| post.thread.as_ref().is_some_and(|thread| thread.unread == 0))
+    });
+    assert_eq!(read_post.thread.unwrap().unread, 0);
 }

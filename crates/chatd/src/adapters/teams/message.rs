@@ -270,6 +270,13 @@ fn giphy_gif(gif: &html::Image, media: &mut Vec<(MediaFile, String)>) -> Attachm
     }
 }
 
+/// Metadata remembered for our own messages so editing them preserves subject and inline images.
+#[derive(Debug, Clone, Default)]
+pub(super) struct OwnMeta {
+    pub subject: Option<String>,
+    pub images_html: String,
+}
+
 /// What one of Teams' message objects turned out to be.
 enum Read {
     Message(Box<Message>),
@@ -442,6 +449,17 @@ impl Teams {
         };
         // A channel post's headline is part of what it says.
         let subject = [&props["subject"], &props["title"]].into_iter().filter_map(Value::as_str).find(|subject| !subject.trim().is_empty());
+        if message.outgoing {
+            let subject_owned = subject.map(|s| s.trim().to_owned());
+            let images_html = html::inline_images_html(content, |url| self.pictures(url));
+            if subject_owned.is_some() || !images_html.is_empty() {
+                let mut state = self.state();
+                if state.own_meta.len() >= super::REMEMBERED {
+                    state.own_meta.clear();
+                }
+                state.own_meta.insert((conversation.to_owned(), id.clone()), OwnMeta { subject: subject_owned, images_html });
+            }
+        }
         if let Some(subject) = subject.map(str::trim) {
             let shift = (subject.len() + usize::from(!parsed.text.is_empty())) as u32;
             for span in &mut parsed.spans {
@@ -619,7 +637,7 @@ impl Teams {
         }
     }
 
-    fn arrived(&self, place: &str, root: Option<&str>, message: Message) -> Result<(), Fault> {
+    fn arrived(&self, place: &str, root: Option<&str>, mut message: Message) -> Result<(), Fault> {
         if !self.known(place)? {
             return Ok(());
         }
@@ -629,21 +647,44 @@ impl Teams {
             self.ctx.filing(place, &filing)?;
         }
         let Some(root) = root.filter(|root| *root != message.id) else {
+            if let Some(stored) = self.ctx.stored_message(place, &message.id)? {
+                message.thread = stored.thread;
+            }
             self.ctx.message(place, &message)?;
             return Ok(());
         };
         // A reply lives in its chain, not in the channel's own pages.
         let chain = chain_id(place, root);
         self.chain_known(place, root)?;
-        if message.mentions_me || message.outgoing {
+        let followed = self.followed_chain(place, root)?;
+        let unread_reply = !message.outgoing && (message.mentions_me || followed);
+        if message.mentions_me || message.outgoing || followed {
             self.ctx.message(&chain, &message)?;
+            if unread_reply {
+                self.ctx.mark_unread(place)?;
+            }
         } else {
-            // Teams tells nobody of a reply unless it names them or they follow the post, and
-            // does not say who follows. Opening the chain shows it.
+            // Teams tells nobody of a reply unless it names them or they follow the post.
+            // Opening the chain shows it.
             self.ctx.history(&chain, std::slice::from_ref(&message))?;
             self.ctx.typing_stopped(&chain, &message.sender.id);
         }
-        self.bump(place, root, &[&message])
+        self.bump(place, root, &[&message], unread_reply)
+    }
+
+    /// True when I wrote this post or have replied in its chain, matching Teams' default follow rule.
+    fn followed_chain(&self, channel: &str, root: &str) -> Result<bool, Fault> {
+        let me = self.ctx.key(&self.me());
+        if let Some(post) = self.ctx.stored_message(channel, root)? {
+            if post.outgoing || post.thread.as_ref().is_some_and(|thread| thread.participants.contains(&me)) {
+                return Ok(true);
+            }
+        }
+        let chain = chain_id(channel, root);
+        if self.ctx.stored_message(&chain, root)?.is_some_and(|post| post.outgoing) {
+            return Ok(true);
+        }
+        Ok(self.replies_held(&chain, root)?.iter().any(|reply| reply.outgoing))
     }
 
     /// An edit, or a reaction given or taken back: Teams sends the whole message again. Only
@@ -688,14 +729,37 @@ impl Teams {
     }
 
     /// Replies arrived for a post that is stored: its summary counts them.
-    fn bump(&self, channel: &str, root: &str, replies: &[&Message]) -> Result<(), Fault> {
+    fn bump(&self, channel: &str, root: &str, replies: &[&Message], unread: bool) -> Result<(), Fault> {
         let Some(mut first) = self.ctx.stored_message(channel, root)? else {
             return Ok(());
         };
-        let after = self.summary(channel, root, first.thread.clone(), replies);
+        let before_replies = first.thread.as_ref().map_or(0, |thread| thread.replies);
+        let mut after = self.summary(channel, root, first.thread.clone(), replies);
+        if unread {
+            if let Some(summary) = after.as_mut() {
+                let added = summary.replies.saturating_sub(before_replies);
+                if added > 0 {
+                    summary.unread = summary.unread.saturating_add(added);
+                }
+            }
+        }
         if after != first.thread {
             first.thread = after;
             self.ctx.history(channel, &[first])?;
+        }
+        Ok(())
+    }
+
+    /// Clears `ThreadSummary.unread` on the parent post when its reply chain is marked read.
+    pub(super) fn clear_chain_unread(&self, channel: &str, root: &str) -> Result<(), Fault> {
+        let Some(mut first) = self.ctx.stored_message(channel, root)? else {
+            return Ok(());
+        };
+        if let Some(thread) = first.thread.as_mut() {
+            if thread.unread > 0 {
+                thread.unread = 0;
+                self.ctx.history(channel, &[first])?;
+            }
         }
         Ok(())
     }
@@ -773,7 +837,7 @@ impl Teams {
             self.ctx.history(&chain_id(conversation, root), &answers)?;
             // A post older than this page still counts what was just seen of its chain.
             if !own.iter().any(|post| post.id == root) {
-                self.bump(conversation, root, &of(root))?;
+                self.bump(conversation, root, &of(root), false)?;
             }
         }
         Ok(())
@@ -804,7 +868,10 @@ impl Teams {
         };
         let replies = self.replies_held(&chain_id(parent, root), root)?;
         let refs: Vec<&Message> = replies.iter().collect();
-        let exact = self.summary(parent, root, None, &refs);
+        let mut exact = self.summary(parent, root, None, &refs);
+        if let (Some(summary), Some(prev)) = (exact.as_mut(), first.thread.as_ref()) {
+            summary.unread = prev.unread;
+        }
         if exact != first.thread {
             first.thread = exact;
             self.ctx.history(parent, &[first])?;
@@ -922,17 +989,29 @@ impl Teams {
     /// in that chain. A reply to a message in a chat quotes it, as Teams does; a reply to a
     /// post in a channel goes into the post's chain and is shown in the channel as a reply.
     pub(super) fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>) {
-        let outcome = self.posted(conversation, client_id, text, reply_to).map_err(super::reason);
+        self.post_with_spans(conversation, client_id, text, reply_to, &[]);
+    }
+
+    pub(super) fn post_with_spans(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, spans: &[Span]) {
+        let outcome = self.posted_with(conversation, client_id, text, reply_to, spans, None).map_err(super::reason);
         self.ctx.sent(conversation, client_id, outcome);
     }
 
-    fn posted(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>) -> Result<Message, Fault> {
-        self.posted_with(conversation, client_id, text, reply_to, None)
-    }
-
     /// The same, with `properties` (the files a message names) beside the body.
-    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, properties: Option<Value>) -> Result<Message, Fault> {
-        let mut content = html::compose(text);
+    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, mention_spans: &[Span], mut properties: Option<Value>) -> Result<Message, Fault> {
+        let (mut content, mentions_json) = if !mention_spans.is_empty() {
+            let (c, m) = html::compose_with_mentions(text, mention_spans);
+            (c, (!m.is_empty()).then(|| Value::Array(m).to_string()))
+        } else {
+            let (c, m) = html::compose_rich(text);
+            (c, (!m.is_empty()).then(|| html::mentions_property(&m)))
+        };
+        if let Some(encoded) = mentions_json {
+            let props = properties.get_or_insert_with(|| json!({}));
+            if let Some(map) = props.as_object_mut() {
+                map.insert("mentions".to_owned(), Value::String(encoded));
+            }
+        }
         let mut target = conversation.to_owned();
         let quote = match reply_to {
             Some(original) => self.quoted(conversation, original)?,
@@ -957,7 +1036,10 @@ impl Teams {
         let me = self.me();
         let name = self.own_name();
         let sent = millis(&id) / 1000;
-        let (shown, spans) = html::styled(text);
+        let (shown, mut spans) = html::styled(text);
+        if !mention_spans.is_empty() && shown == text {
+            spans.extend(mention_spans.iter().cloned());
+        }
         let mut message = Message::plain(id, name.clone(), shown, sent, true);
         message.spans = spans;
         message.sender.avatar = self.picture(&me, &name);
@@ -967,7 +1049,7 @@ impl Teams {
                 self.chain_known(channel, root)?;
                 self.ctx.history(&target, std::slice::from_ref(&message))?;
             }
-            self.bump(channel, root, &[&message])?;
+            self.bump(channel, root, &[&message], false)?;
         }
         message.reply_to = quote;
         Ok(message)
@@ -977,17 +1059,75 @@ impl Teams {
         format!("/v1/users/ME/conversations/{}/messages/{}", escaped(conversation), escaped(id))
     }
 
-    pub(super) fn edit(&self, conversation: &str, id: &str, text: &str) -> Result<(), Fault> {
+    pub(super) fn edit(&self, conversation: &str, id: &str, text: &str, mention_spans: &[Span]) -> Result<(), Fault> {
         let stored = self.ctx.stored_message(conversation, id)?;
-        let mut content = html::compose(text);
+        let meta = self.state().own_meta.get(&(conversation.to_owned(), id.to_owned())).cloned();
+        let (kept_subject, body_text) = match meta.as_ref().and_then(|meta| meta.subject.as_deref()) {
+            Some(subject) => {
+                let bold_line = format!("**{subject}**\n");
+                let plain_line = format!("{subject}\n");
+                let bold_only = format!("**{subject}**");
+                if let Some(rest) = text.strip_prefix(&bold_line) {
+                    (Some(subject.to_owned()), rest)
+                } else if let Some(rest) = text.strip_prefix(&plain_line) {
+                    (Some(subject.to_owned()), rest)
+                } else if text == bold_only || text == subject {
+                    (Some(subject.to_owned()), "")
+                } else {
+                    (Some(subject.to_owned()), text)
+                }
+            }
+            None => (None, text),
+        };
+        let prefix = (text.len().saturating_sub(body_text.len())) as u32;
+        let rebased_mentions: Vec<Span> = mention_spans
+            .iter()
+            .filter_map(|span| {
+                let start = span.start.checked_sub(prefix)?;
+                let end = span.end.checked_sub(prefix)?;
+                (end as usize <= body_text.len()).then(|| Span { start, end, style: span.style.clone() })
+            })
+            .collect();
+        let (mut content, mentions_json) = if !rebased_mentions.is_empty() {
+            let (c, m) = html::compose_with_mentions(body_text, &rebased_mentions);
+            (c, (!m.is_empty()).then(|| Value::Array(m).to_string()))
+        } else {
+            let (c, m) = html::compose_rich(body_text);
+            (c, (!m.is_empty()).then(|| html::mentions_property(&m)))
+        };
+        if let Some(images_html) = meta.as_ref().map(|meta| meta.images_html.as_str()).filter(|html| !html.is_empty()) {
+            content.push_str(images_html);
+        }
         // The quote above a reply is part of the body, so it is written again.
         if let Some(quote) = stored.as_ref().and_then(|stored| stored.reply_to.as_ref()).filter(|_| chain_of(conversation).is_none()) {
             content = format!("{}{content}", quote_markup(quote));
         }
-        let body = self.body(&now_ms().to_string(), &content);
+        let mut body = self.body(&now_ms().to_string(), &content);
+        if mentions_json.is_some() || kept_subject.is_some() {
+            let mut props = serde_json::Map::new();
+            if let Some(encoded) = mentions_json {
+                props.insert("mentions".to_owned(), Value::String(encoded));
+            }
+            if let Some(subject) = &kept_subject {
+                props.insert("subject".to_owned(), Value::String(subject.clone()));
+            }
+            body["properties"] = Value::Object(props);
+        }
         self.chat("PUT", &self.message_path(conversation, id), Body::Json(&body), false)?;
         if let Some(mut edited) = stored {
-            let (shown, spans) = html::styled(text);
+            let (mut shown, mut spans) = html::styled(body_text);
+            if !rebased_mentions.is_empty() && shown == body_text {
+                spans.extend(rebased_mentions.iter().cloned());
+            }
+            if let Some(subject) = &kept_subject {
+                let shift = (subject.len() + usize::from(!shown.is_empty())) as u32;
+                for span in &mut spans {
+                    span.start += shift;
+                    span.end += shift;
+                }
+                shown = if shown.is_empty() { subject.clone() } else { format!("{subject}\n{shown}") };
+                spans.insert(0, Span { start: 0, end: subject.len() as u32, style: Style::Bold });
+            }
             edited.text = shown;
             edited.spans = spans;
             edited.edited = true;

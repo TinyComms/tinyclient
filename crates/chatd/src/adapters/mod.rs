@@ -297,6 +297,12 @@ pub enum Command {
         spans: Vec<protocol::Span>,
         reply: Reply<()>,
     },
+    /// Fetch the raw source text of a message for lossless editing.
+    Source {
+        conversation_id: String,
+        message_id: String,
+        reply: Reply<String>,
+    },
     /// Delete a message for everyone. Report it through [`Context::deleted`] before answering.
     Delete {
         conversation_id: String,
@@ -358,11 +364,14 @@ pub enum Command {
     /// before answering, and only after the network has it. Answer `Err` to leave the local flag
     /// as it was. Networks that do not serve this never receive it: their star stays local.
     Star { conversation_id: String, starred: bool, reply: Reply<()> },
+    /// Accept or decline/ignore a message request (Discord).
+    AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
     Leave { conversation_id: String, reply: Reply<()> },
     /// Close a direct conversation as the network's own × does. Report it through
     /// [`Context::filing`] (hidden) or [`Context::conversation_gone`].
     CloseDirect { conversation_id: String, reply: Reply<()> },
+    ClearHistory { conversation_id: String, delete_chat: bool, revoke: bool, reply: Reply<()> },
     /// The messages pinned in a conversation, newest first, at most 50.
     Pinned { conversation_id: String, reply: Reply<Vec<Message>> },
     /// What was shared in a conversation, from the network's own search, because the user
@@ -466,6 +475,7 @@ impl Command {
             Command::SetMute { reply, .. }
             | Command::Leave { reply, .. }
             | Command::CloseDirect { reply, .. }
+            | Command::ClearHistory { reply, .. }
             | Command::Star { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
@@ -482,7 +492,9 @@ impl Command {
             | Command::Delete { reply, .. }
             | Command::Relate { reply, .. }
             | Command::SetPresence { reply, .. }
+            | Command::AnswerMessageRequest { reply, .. }
             | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Source { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1015,6 +1027,17 @@ impl Context {
         Ok(())
     }
 
+    /// Drops the cached messages of a conversation while keeping its row.
+    pub fn clear_messages(&self, conversation_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().clear_messages(&conversation)? {
+            self.hub.changed(Change::Messages { conversation: conversation.clone() });
+            self.hub.changed(Change::Conversation { conversation });
+            self.hub.changed(Change::Status);
+        }
+        Ok(())
+    }
+
     /// Drops the cached messages and hides a direct or group conversation. The network is not
     /// told. A newer live message brings the row back.
     pub fn forget_conversation(&self, conversation_id: &str) -> Stores {
@@ -1298,6 +1321,10 @@ impl Context {
     /// Tells the call's mediad, if there is one: who holds priority speech.
     pub fn tell_media(&self, conversation_id: &str, request: protocol::MediaRequest) {
         if self.in_call(conversation_id) {
+            if let protocol::MediaRequest::TinyPicture { ref picture } = request {
+                let source = picture.as_ref().map(|p| (p.user_id.clone(), p.kind));
+                self.hub.calls.set_picture_source(&self.hub, &self.key(conversation_id), source);
+            }
             let _ = self.hub.calls.request(&self.hub, &request);
         }
     }

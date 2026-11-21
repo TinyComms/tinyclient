@@ -34,13 +34,15 @@ pub enum Float {
     Confirm(Key, RelateAction),
     /// Asked once before leaving a group.
     Leave(Conversation),
+    /// Asked once before clearing history or deleting a chat on the network.
+    ClearHistory { conversation: Conversation, delete_chat: bool, revoke: bool },
 }
 
 impl Float {
     fn person(&self) -> Option<&Key> {
         match self {
             Float::Card(person) | Float::Menu(person) | Float::Person { person, .. } | Float::Confirm(person, _) => Some(person),
-            Float::Conversation { .. } | Float::Leave(_) => None,
+            Float::Conversation { .. } | Float::Leave(_) | Float::ClearHistory { .. } => None,
         }
     }
 }
@@ -254,6 +256,7 @@ impl Floating {
             in_their_dm: self.scene.peer.as_ref() == Some(person),
             direct: self.direct.as_ref().map(|row| (row.call, row.muted)),
             online: self.online(person),
+            close_direct: super::scene_can_close_direct(&self.scene, person),
         }
     }
 
@@ -510,12 +513,39 @@ impl Floating {
                     }
                 })))
             }
+            Item::IgnoreUser => {
+                let person = person.cloned();
+                div().child(menu_item("menu-ignore-user", Some("icons/eye-off.svg"), "Ignore", None).on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(person) = person.clone() {
+                        this.shell_do(cx, move |shell, cx| shell.relate(&person, RelateAction::IgnoreUser, cx));
+                    }
+                    this.close(cx);
+                })))
+            }
+            Item::UnignoreUser => {
+                let person = person.cloned();
+                div().child(menu_item("menu-unignore-user", Some("icons/eye.svg"), "Stop ignoring", None).on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(person) = person.clone() {
+                        this.shell_do(cx, move |shell, cx| shell.relate(&person, RelateAction::UnignoreUser, cx));
+                    }
+                    this.close(cx);
+                })))
+            }
             Item::Block => {
                 let key = person.map(|person| person.key.clone());
                 div().child(menu_item_danger("menu-block", Some("icons/circle-alert.svg"), "Block").on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(key) = key.clone() {
                         this.turn_to(Float::Confirm(key, RelateAction::Block), cx);
                     }
+                })))
+            }
+            Item::Unblock => {
+                let person = person.cloned();
+                div().child(menu_item("menu-unblock", Some("icons/circle-alert.svg"), "Unblock", None).on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(person) = person.clone() {
+                        this.shell_do(cx, move |shell, cx| shell.relate(&person, RelateAction::Unblock, cx));
+                    }
+                    this.close(cx);
                 })))
             }
             Item::Leave => {
@@ -598,6 +628,71 @@ impl Floating {
             .child(scrim().id("confirm-scrim").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
             .child(div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().pb(px(80.)).child(panel))
     }
+
+    fn confirm_clear_history(&self, row: &Conversation, delete_chat: bool, revoke: bool, window: &Window, cx: &mut Context<Self>) -> Div {
+        let title = if delete_chat { format!("Delete chat with {}?", row.title) } else { format!("Clear history with {}?", row.title) };
+        let words = if delete_chat {
+            format!("This permanently deletes your copy of the chat with {} on {} and removes it from tinyclient.", row.title, row.key.network.label())
+        } else {
+            format!("This permanently clears your message history in {} on {}.", row.title, row.key.network.label())
+        };
+        let verb = if delete_chat { "Delete chat" } else { "Clear history" };
+        let size = window.viewport_size();
+        let wide = if crate::gui::phone::active() { CONFIRM_WIDTH.min(f32::from(size.width) - 32.) } else { CONFIRM_WIDTH };
+        let can_revoke = row.kind == protocol::ConversationKind::Direct;
+        let toggle_row = row.clone();
+        let target = row.clone();
+        let mut panel = div()
+            .w(px(wide))
+            .p(px(20.))
+            .rounded(px(theme::R_MODAL))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
+            .font_family(theme::FONT)
+            .text_color(theme::text())
+            .occlude()
+            .flex()
+            .flex_col()
+            .child(div().type_title().child(title))
+            .child(modal_body(words));
+        if can_revoke {
+            panel = panel.child(
+                div()
+                    .id("confirm-revoke")
+                    .mt(px(12.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .text_size(px(13.))
+                    .text_color(theme::text())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.turn_to(
+                            Float::ClearHistory { conversation: toggle_row.clone(), delete_chat, revoke: !revoke },
+                            cx,
+                        );
+                    }))
+                    .child(crate::gui::components::glyph(if revoke { "icons/square-check.svg" } else { "icons/square.svg" }, 16., if revoke { theme::danger() } else { theme::text_soft() }))
+                    .child(format!("Also delete for {} (cannot be undone)", row.title)),
+            );
+        }
+        panel = panel.child(
+            modal_buttons()
+                .child(button("confirm-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
+                .child(button("confirm-do", ButtonKind::Danger, verb).on_click(cx.listener(move |this, _, _, cx| {
+                    let target = target.clone();
+                    this.shell_do(cx, move |shell, cx| shell.clear_history(&target, delete_chat, revoke, cx));
+                }))),
+        );
+        div()
+            .w(size.width)
+            .h(size.height)
+            .relative()
+            .child(scrim().id("confirm-scrim").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
+            .child(div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().pb(px(80.)).child(panel))
+    }
 }
 
 impl Render for Floating {
@@ -623,6 +718,9 @@ impl Render for Floating {
             (Float::Leave(row), _) => {
                 let target = row.clone();
                 (self.confirm(Act::Leave, &row.title, row.key.network, window, cx, move |shell, cx| shell.leave(&target, cx)), true)
+            }
+            (Float::ClearHistory { conversation, delete_chat, revoke }, _) => {
+                (self.confirm_clear_history(conversation, *delete_chat, *revoke, window, cx), true)
             }
             _ => return div(),
         };

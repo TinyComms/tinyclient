@@ -20,6 +20,10 @@ pub trait Names {
     /// The channel's title, `#name` included.
     fn channel(&self, id: &str) -> Option<String>;
     fn usergroup(&self, id: &str) -> Option<String>;
+    /// Whether I belong to this user group.
+    fn in_usergroup(&self, _id: &str) -> bool {
+        false
+    }
     fn custom(&self, name: &str) -> Option<Custom>;
 }
 
@@ -116,6 +120,7 @@ impl<'a> Rich<'a> {
             Some(label) => self.text.push_str(label.trim_start_matches('@')),
             None => self.text.push_str(&self.names.usergroup(id).unwrap_or_else(|| "group".to_owned())),
         }
+        self.mentioned |= self.names.in_usergroup(id);
         let kind = MentionKind::Role;
         self.span(start, Style::Mention { kind, id: id.to_owned() });
     }
@@ -866,7 +871,14 @@ mod tests {
             (id == "C9").then(|| "#platform".to_owned())
         }
         fn usergroup(&self, id: &str) -> Option<String> {
-            (id == "S1").then(|| "oncall".to_owned())
+            match id {
+                "S1" => Some("oncall".to_owned()),
+                "S2" => Some("design".to_owned()),
+                _ => None,
+            }
+        }
+        fn in_usergroup(&self, id: &str) -> bool {
+            id == "S1"
         }
         fn custom(&self, name: &str) -> Option<Custom> {
             (name == "partyparrot").then(|| Custom::File(MediaFile::new("emoji:partyparrot", MediaKind::Emoji)))
@@ -981,4 +993,34 @@ mod tests {
     #[test]
     fn sending_rich_text_reads_back_as_the_same_text_and_spans() {
         super::prove_rich_text().unwrap();
-    }}
+    }
+
+    #[test]
+    fn usergroup_mention_marks_mentioned_only_for_groups_i_belong_to() {
+        let mut mine = Rich::new(&Book);
+        mine.mrkdwn("ping <!subteam^S1>");
+        mine.finish();
+        assert_eq!(mine.text, "ping @oncall");
+        assert!(mine.mentioned, "S1 is my group");
+
+        let mut other = Rich::new(&Book);
+        other.mrkdwn("ping <!subteam^S2>");
+        other.finish();
+        assert_eq!(other.text, "ping @design");
+        assert!(!other.mentioned, "S2 is not my group");
+
+        let blocks = json!([{"type": "rich_text", "elements": [
+            {"type": "rich_text_section", "elements": [{"type": "usergroup", "usergroup_id": "S1"}]}
+        ]}]);
+        let mut rich_mine = Rich::new(&Book);
+        assert!(rich_mine.blocks(blocks.as_array().unwrap()));
+        assert!(rich_mine.mentioned);
+
+        let other_blocks = json!([{"type": "rich_text", "elements": [
+            {"type": "rich_text_section", "elements": [{"type": "usergroup", "usergroup_id": "S2"}]}
+        ]}]);
+        let mut rich_other = Rich::new(&Book);
+        assert!(rich_other.blocks(other_blocks.as_array().unwrap()));
+        assert!(!rich_other.mentioned);
+    }
+}

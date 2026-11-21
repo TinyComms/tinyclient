@@ -6,7 +6,9 @@
 use super::hub::Leaves;
 use super::presence::Ring;
 use super::{can_call, in_call, person_avatar, shown_presence, Hub, Scene};
-use crate::gui::components::{badge_count_unread, empty_state, glyph, icon_button, search_field, section_header, segment, segmented, tip};
+use crate::gui::components::{
+    badge_count_unread, button, empty_state, glyph, icon_button, search_field, section_header, segment, segmented, tip, ButtonKind,
+};
 use crate::gui::input::{InputEvent, InputKey, TextInput};
 use crate::gui::sidebar::{on_screen, Mode};
 use crate::gui::state::Shell;
@@ -138,6 +140,10 @@ pub fn search_settled(waiting: &mut Vec<AccountKey>, settled: &[AccountKey]) {
 
 /// The network agreed to an action: the person's row becomes what they now are, where it is.
 pub fn apply_related(owned: &mut Vec<Rc<Person>>, blocked: &mut Vec<Rc<Person>>, person: &Key, action: RelateAction) {
+    if action == RelateAction::Unblock {
+        blocked.retain(|held| &held.key != person);
+        return;
+    }
     let Some(at) = owned.iter().position(|held| &held.key == person) else {
         return;
     };
@@ -888,7 +894,17 @@ impl PeopleList {
         let hovered = if selected { rest } else { theme::over(theme::hover(), theme::sidebar()) };
         let trailing = match person.relation {
             Relation::Incoming | Relation::Outgoing => self.request_actions(ix, person, cx),
-            Relation::Blocked => div(),
+            Relation::Blocked => {
+                let unblock = person.clone();
+                div()
+                    .flex_none()
+                    .when(self.relating.contains(&person.key), |el| el.opacity(0.45))
+                    .child(
+                        button(("unblock", ix), ButtonKind::Secondary, "Unblock")
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, _, cx| this.relate(&unblock, RelateAction::Unblock, cx))),
+                    )
+            }
             _ => self.hover_actions(ix, person, cx).invisible().group_hover("person", |style| style.visible()),
         };
         let target = person.clone();

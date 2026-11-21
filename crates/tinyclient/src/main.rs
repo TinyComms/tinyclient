@@ -46,7 +46,12 @@ fn unexpected(_response: Response) -> io::Error {
 
 /// Only a valid Tiny app link is accepted from the operating system.
 fn launch_invite(args: &[String]) -> Option<String> {
-    args.iter().find(|arg| arg.starts_with("tinyclient://join#") && protocol::parse_invite_link(arg).is_some()).cloned()
+    args.iter()
+        .find(|arg| {
+            (arg.starts_with("tinyclient://join#") && protocol::parse_invite_link(arg).is_some())
+                || protocol::parse_room_link(arg).is_some()
+        })
+        .cloned()
 }
 
 /// The shell without a window: the same states, as lines.
@@ -415,6 +420,8 @@ mod invite_launch_tests {
         let link = protocol::invite_url("https://example.org", "token").unwrap();
         let app = link.replacen("https://tinyclient.io/invite#", "tinyclient://join#", 1);
         assert_eq!(launch_invite(&[app.clone()]), Some(app));
-        assert_eq!(launch_invite(&[link, "tinyclient://join#broken".into()]), None);
+        let room = protocol::room_link("https://example.org", "lounge").unwrap();
+        assert_eq!(launch_invite(&[room.clone()]), Some(room));
+        assert_eq!(launch_invite(&[link, "tinyclient://join#broken".into(), "tinyclient://room?server=example.org&id=..".into()]), None);
     }
 }

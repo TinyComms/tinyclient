@@ -59,7 +59,8 @@ pub fn broadcast(text: &str, network: Network) -> Option<Broadcast> {
     let words: &[(&str, Broadcast)] = match network {
         Network::Discord => &[("@everyone", Broadcast::All), ("@here", Broadcast::Here)],
         Network::Slack => &[("@channel", Broadcast::All), ("@everyone", Broadcast::All), ("@here", Broadcast::Here)],
-        Network::Telegram | Network::Teams | Network::Signal | Network::Messages | Network::Tiny => &[],
+        Network::Teams => &[("@everyone", Broadcast::All), ("@team", Broadcast::All), ("@channel", Broadcast::All)],
+        Network::Telegram | Network::Signal | Network::Messages | Network::Tiny => &[],
     };
     let found = |word: &str| {
         text.match_indices(word).any(|(at, _)| {
@@ -169,6 +170,9 @@ mod tests {
         assert_eq!(broadcast("ping @here please", Network::Discord), Some(Broadcast::Here));
         assert_eq!(broadcast("@here and @everyone", Network::Discord), Some(Broadcast::All));
         assert_eq!(broadcast("@channel", Network::Slack), Some(Broadcast::All));
+        assert_eq!(broadcast("@everyone", Network::Teams), Some(Broadcast::All));
+        assert_eq!(broadcast("@team", Network::Teams), Some(Broadcast::All));
+        assert_eq!(broadcast("@channel", Network::Teams), Some(Broadcast::All));
         assert_eq!(broadcast("@channel", Network::Discord), None);
         assert_eq!(broadcast("mail me@everyone.com", Network::Discord), None);
         assert_eq!(broadcast("@heresy", Network::Discord), None);

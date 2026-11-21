@@ -538,6 +538,30 @@ impl Builder<'_> {
     }
 }
 
+/// Extracts raw hosted `<img ...>` tags from a message's original HTML so editing the message
+/// does not drop inline pictures.
+pub(super) fn inline_images_html(html: &str, hosted: impl Fn(&str) -> bool) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some((token, after)) = next(rest) {
+        let consumed = rest.len() - after.len();
+        let slice = &rest[..consumed];
+        rest = after;
+        if let Token::Open { name, attrs, .. } = token {
+            if name == "img" {
+                let kind = attr(&attrs, "itemtype");
+                let src = attr(&attrs, "src");
+                if kind != EMOJI && kind != CUSTOM_EMOJI && kind != GIPHY && hosted(src) {
+                    out.push_str("<p>");
+                    out.push_str(slice);
+                    out.push_str("</p>");
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Reads a message body. `me` is our own id, to know a mention of us.
 pub(super) fn parse(html: &str, lookup: &dyn Lookup, me: &str) -> Parsed {
     let mut builder = Builder {
@@ -566,11 +590,44 @@ pub(super) fn parse(html: &str, lookup: &dyn Lookup, me: &str) -> Parsed {
     builder.finish(me)
 }
 
-struct Quiet;
+/// An outgoing mention parsed from the composer's wire markers (`<@id|Name>`, `<@&id|Name>`, `<#id|Name>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct OutMention {
+    pub itemid: usize,
+    pub mri: String,
+    pub kind: &'static str,
+    pub display_name: String,
+}
 
-impl Lookup for Quiet {
-    fn mention(&self, _: &str) -> Option<(MentionKind, String)> {
-        None
+/// Serializes outgoing mentions as the JSON string Teams expects in `properties.mentions`.
+pub(super) fn mentions_property(mentions: &[OutMention]) -> String {
+    let entries: Vec<serde_json::Value> = mentions
+        .iter()
+        .map(|mention| {
+            serde_json::json!({
+                "@type": MENTION,
+                "itemid": mention.itemid,
+                "mri": mention.mri,
+                "mentionType": mention.kind,
+                "displayName": mention.display_name,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(entries).to_string()
+}
+
+struct ComposedLookup<'a>(&'a [OutMention]);
+
+impl Lookup for ComposedLookup<'_> {
+    fn mention(&self, item: &str) -> Option<(MentionKind, String)> {
+        let itemid: usize = item.parse().ok()?;
+        let found = self.0.iter().find(|mention| mention.itemid == itemid)?;
+        let kind = match found.kind {
+            "person" | "bot" => MentionKind::User,
+            "tag" => MentionKind::Role,
+            _ => MentionKind::Everyone,
+        };
+        Some((kind, found.mri.clone()))
     }
 
     fn hosted(&self, _: &str) -> bool {
@@ -584,7 +641,8 @@ impl Lookup for Quiet {
 
 /// The text and spans a sent message shows. The same reading as Teams gives the HTML we post.
 pub(super) fn styled(text: &str) -> (String, Vec<Span>) {
-    let parsed = parse(&compose(text), &Quiet, "");
+    let (html, mentions) = compose_rich(text);
+    let parsed = parse(&html, &ComposedLookup(&mentions), "");
     (parsed.text, parsed.spans)
 }
 
@@ -691,7 +749,7 @@ fn edged(text: &str) -> bool {
     text.chars().next().is_some_and(char::is_whitespace) || text.chars().next_back().is_some_and(char::is_whitespace)
 }
 
-fn take_wrap(out: &mut String, text: &str, delimiter: &str, open: &str, close: &str) -> Option<usize> {
+fn take_wrap(out: &mut String, text: &str, delimiter: &str, open: &str, close: &str, mentions: &mut Vec<OutMention>) -> Option<usize> {
     if !text.starts_with(delimiter) {
         return None;
     }
@@ -701,7 +759,7 @@ fn take_wrap(out: &mut String, text: &str, delimiter: &str, open: &str, close: &
         return None;
     }
     out.push_str(open);
-    inline_into(out, inner);
+    inline_into(out, inner, mentions);
     out.push_str(close);
     Some(close_at + delimiter.len())
 }
@@ -727,7 +785,7 @@ fn allowed_href(url: &str) -> bool {
     scheme && !url.chars().any(|c| c.is_ascii_whitespace() || matches!(c, '"' | '<' | '>' | '\u{0}'))
 }
 
-fn take_link(out: &mut String, text: &str) -> Option<usize> {
+fn take_link(out: &mut String, text: &str, mentions: &mut Vec<OutMention>) -> Option<usize> {
     if !text.starts_with('[') {
         return None;
     }
@@ -745,7 +803,7 @@ fn take_link(out: &mut String, text: &str) -> Option<usize> {
     out.push_str("<a href=\"");
     escape_text(out, url, false);
     out.push_str("\">");
-    inline_into(out, label);
+    inline_into(out, label, mentions);
     out.push_str("</a>");
     Some(label_end + 2 + target_end + 1)
 }
@@ -784,7 +842,44 @@ fn take_autolink(out: &mut String, text: &str, after_word: bool) -> Option<usize
     Some(end)
 }
 
-fn take_underscore(out: &mut String, text: &str, after_word: bool) -> Option<usize> {
+fn take_mention(out: &mut String, text: &str, mentions: &mut Vec<OutMention>) -> Option<usize> {
+    let (prefix_len, kind_hint) = if text.starts_with("<@&") {
+        (3, "tag")
+    } else if text.starts_with("<@") {
+        (2, "person")
+    } else if text.starts_with("<#") {
+        (2, "channel")
+    } else {
+        return None;
+    };
+    let close_at = text[prefix_len..].find('>')? + prefix_len;
+    let inside = &text[prefix_len..close_at];
+    if inside.contains(['\n', '<']) {
+        return None;
+    }
+    let (id, label) = inside.split_once('|')?;
+    if id.is_empty() || label.is_empty() || id.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let kind = if kind_hint == "person" && id.starts_with("28:") { "bot" } else { kind_hint };
+    let itemid = mentions.len();
+    mentions.push(OutMention {
+        itemid,
+        mri: id.to_owned(),
+        kind,
+        display_name: label.to_owned(),
+    });
+    out.push_str("<span itemscope=\"\" itemtype=\"");
+    out.push_str(MENTION);
+    out.push_str("\" itemid=\"");
+    out.push_str(&itemid.to_string());
+    out.push_str("\">");
+    escape_text(out, label, false);
+    out.push_str("</span>");
+    Some(close_at + 1)
+}
+
+fn take_underscore(out: &mut String, text: &str, after_word: bool, mentions: &mut Vec<OutMention>) -> Option<usize> {
     if after_word || !text.starts_with('_') || text.starts_with("__") {
         return None;
     }
@@ -797,12 +892,12 @@ fn take_underscore(out: &mut String, text: &str, after_word: bool) -> Option<usi
         return None;
     }
     out.push_str("<em>");
-    inline_into(out, inner);
+    inline_into(out, inner, mentions);
     out.push_str("</em>");
     Some(close_at + 1)
 }
 
-fn inline_into(out: &mut String, text: &str) {
+fn inline_into(out: &mut String, text: &str, mentions: &mut Vec<OutMention>) {
     let mut at = 0;
     while at < text.len() {
         let rest = &text[at..];
@@ -813,12 +908,13 @@ fn inline_into(out: &mut String, text: &str) {
             continue;
         }
         let taken = take_code(out, rest)
-            .or_else(|| take_wrap(out, rest, "~~", "<s>", "</s>"))
-            .or_else(|| take_wrap(out, rest, "***", "<strong><em>", "</em></strong>"))
-            .or_else(|| take_wrap(out, rest, "**", "<strong>", "</strong>"))
-            .or_else(|| take_wrap(out, rest, "*", "<em>", "</em>"))
-            .or_else(|| take_underscore(out, rest, after_word))
-            .or_else(|| take_link(out, rest))
+            .or_else(|| take_mention(out, rest, mentions))
+            .or_else(|| take_wrap(out, rest, "~~", "<s>", "</s>", mentions))
+            .or_else(|| take_wrap(out, rest, "***", "<strong><em>", "</em></strong>", mentions))
+            .or_else(|| take_wrap(out, rest, "**", "<strong>", "</strong>", mentions))
+            .or_else(|| take_wrap(out, rest, "*", "<em>", "</em>", mentions))
+            .or_else(|| take_underscore(out, rest, after_word, mentions))
+            .or_else(|| take_link(out, rest, mentions))
             .or_else(|| take_autolink(out, rest, after_word));
         if let Some(taken) = taken {
             at += taken;
@@ -972,16 +1068,16 @@ fn split_blocks(text: &str) -> Vec<Block> {
     blocks
 }
 
-fn write_run(out: &mut String, items: &[Item], mut index: usize) -> usize {
+fn write_run(out: &mut String, items: &[Item], mut index: usize, mentions: &mut Vec<OutMention>) -> usize {
     let depth = items[index].depth;
     let ordered = items[index].ordered;
     out.push_str(if ordered { "<ol>" } else { "<ul>" });
     while index < items.len() && items[index].depth == depth && items[index].ordered == ordered {
         out.push_str("<li>");
-        inline_into(out, &items[index].body);
+        inline_into(out, &items[index].body, mentions);
         index += 1;
         while index < items.len() && items[index].depth > depth {
-            index = write_run(out, items, index);
+            index = write_run(out, items, index, mentions);
         }
         out.push_str("</li>");
     }
@@ -989,19 +1085,19 @@ fn write_run(out: &mut String, items: &[Item], mut index: usize) -> usize {
     index
 }
 
-fn write_list(out: &mut String, items: &[Item]) {
+fn write_list(out: &mut String, items: &[Item], mentions: &mut Vec<OutMention>) {
     let mut index = 0;
     while index < items.len() {
-        index = write_run(out, items, index);
+        index = write_run(out, items, index, mentions);
     }
 }
 
-fn emit_paragraph(out: &mut String, body: &str, quote: bool) {
+fn emit_paragraph(out: &mut String, body: &str, quote: bool, mentions: &mut Vec<OutMention>) {
     if quote {
         out.push_str("<blockquote>");
     }
     out.push_str("<p>");
-    inline_into(out, body);
+    inline_into(out, body, mentions);
     out.push_str("</p>");
     if quote {
         out.push_str("</blockquote>");
@@ -1020,35 +1116,109 @@ fn emit_code(out: &mut String, language: &str, body: &str) {
     out.push_str("</codeblock>");
 }
 
-fn emit_block(out: &mut String, block: Block) {
+fn emit_block(out: &mut String, block: Block, mentions: &mut Vec<OutMention>) {
     match block {
-        Block::Para(body) => emit_paragraph(out, &body, false),
-        Block::Quote(body) => emit_paragraph(out, &body, true),
+        Block::Para(body) => emit_paragraph(out, &body, false, mentions),
+        Block::Quote(body) => emit_paragraph(out, &body, true, mentions),
         Block::Code { language, body } => emit_code(out, &language, &body),
-        Block::List(items) => write_list(out, &items),
+        Block::List(items) => write_list(out, &items, mentions),
     }
+}
+
+/// The text the user typed, as HTML Teams will show, along with any outgoing mentions extracted
+/// from wire markers (`<@id|Name>`, `<@&id|Name>`, `<#id|Name>`).
+pub(super) fn compose_rich(text: &str) -> (String, Vec<OutMention>) {
+    let text = normalized(text);
+    let mut mentions = Vec::new();
+    if !structured(&text) {
+        let mut out = String::with_capacity(text.len() + 7);
+        out.push_str("<p>");
+        inline_into(&mut out, &text, &mut mentions);
+        out.push_str("</p>");
+        return (out, mentions);
+    }
+    let mut out = String::new();
+    for block in split_blocks(&text) {
+        emit_block(&mut out, block, &mut mentions);
+    }
+    if out.is_empty() {
+        out.push_str("<p></p>");
+    }
+    (out, mentions)
 }
 
 /// The text the user typed, as HTML Teams will show. Bold, italic, strike, code, quotes,
 /// lists and links become tags. Underline, headings, colour and tables have no markdown, so
 /// they stay as typed. Only http, https and mailto become links; everything else is escaped.
+#[cfg(test)]
 pub(super) fn compose(text: &str) -> String {
-    let text = normalized(text);
-    if !structured(&text) {
-        let mut out = String::with_capacity(text.len() + 7);
-        out.push_str("<p>");
-        inline_into(&mut out, &text);
-        out.push_str("</p>");
-        return out;
+    compose_rich(text).0
+}
+
+/// Composes HTML with Teams `<span itemscope="" itemtype="http://schema.skype.com/Mention" itemid="N">`
+/// markup and returns the matching `properties.mentions` JSON entries for explicit mention spans.
+pub(super) fn compose_with_mentions(text: &str, spans: &[Span]) -> (String, Vec<serde_json::Value>) {
+    let mut live: Vec<(usize, usize, MentionKind, &str)> = spans
+        .iter()
+        .filter_map(|span| {
+            let Style::Mention { kind, id } = &span.style else {
+                return None;
+            };
+            let (Ok(start), Ok(end)) = (usize::try_from(span.start), usize::try_from(span.end)) else {
+                return None;
+            };
+            if start >= end
+                || end > text.len()
+                || !text.is_char_boundary(start)
+                || !text.is_char_boundary(end)
+                || id.is_empty()
+            {
+                return None;
+            }
+            Some((start, end, *kind, id.as_str()))
+        })
+        .collect();
+    if live.is_empty() {
+        return (compose_rich(text).0, Vec::new());
     }
-    let mut out = String::new();
-    for block in split_blocks(&text) {
-        emit_block(&mut out, block);
+    live.sort_by_key(|(start, _, _, _)| *start);
+    let mut out = String::with_capacity(text.len() + live.len() * 80);
+    out.push_str("<p>");
+    let mut mentions = Vec::new();
+    let mut cursor = 0usize;
+    for (start, end, kind, id) in live {
+        if start < cursor {
+            continue;
+        }
+        if start > cursor {
+            inline_into(&mut out, &normalized(&text[cursor..start]), &mut Vec::new());
+        }
+        let item_id = mentions.len().to_string();
+        let display = text[start..end].trim_start_matches('@');
+        let mention_type = match kind {
+            MentionKind::User => "person",
+            MentionKind::Role => "tag",
+            MentionKind::Channel | MentionKind::Everyone => "channel",
+        };
+        out.push_str("<span itemscope=\"\" itemtype=\"http://schema.skype.com/Mention\" itemid=\"");
+        out.push_str(&item_id);
+        out.push_str("\">");
+        escape_text(&mut out, display, false);
+        out.push_str("</span>");
+        mentions.push(serde_json::json!({
+            "@type": MENTION,
+            "itemid": item_id,
+            "mri": id,
+            "mentionType": mention_type,
+            "displayName": display,
+        }));
+        cursor = end;
     }
-    if out.is_empty() {
-        out.push_str("<p></p>");
+    if cursor < text.len() {
+        inline_into(&mut out, &normalized(&text[cursor..]), &mut Vec::new());
     }
-    out
+    out.push_str("</p>");
+    (out, mentions)
 }
 
 #[cfg(test)]
@@ -1244,5 +1414,29 @@ mod tests {
         let (shown, spans) = styled("**today**");
         assert_eq!(shown, "today");
         assert!(spans.iter().any(|span| span.style == Style::Bold));
+    }
+
+    #[test]
+    fn compose_with_mentions_writes_mention_markup_and_properties() {
+        let text = "hi @Ana Ruiz, check this";
+        let start = text.find("@Ana Ruiz").unwrap() as u32;
+        let end = start + "@Ana Ruiz".len() as u32;
+        let (html, mentions) = compose_with_mentions(
+            text,
+            &[Span {
+                start,
+                end,
+                style: Style::Mention { kind: MentionKind::User, id: "8:orgid:ana".into() },
+            }],
+        );
+        assert_eq!(
+            html,
+            "<p>hi <span itemscope=\"\" itemtype=\"http://schema.skype.com/Mention\" itemid=\"0\">Ana Ruiz</span>, check this</p>"
+        );
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0]["itemid"], "0");
+        assert_eq!(mentions[0]["mri"], "8:orgid:ana");
+        assert_eq!(mentions[0]["mentionType"], "person");
+        assert_eq!(mentions[0]["displayName"], "Ana Ruiz");
     }
 }

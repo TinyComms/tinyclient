@@ -208,6 +208,10 @@ struct GuildInfo {
     quiet: Quiet,
     /// Our own nickname there.
     nick: String,
+    /// Server boost tier (0..=3), which can raise the file upload limit for everyone in it.
+    premium_tier: u8,
+    /// Unix seconds until our own server timeout ends, if timed out.
+    timeout_until: Option<i64>,
     emojis: Vec<Pickable>,
     stickers: Vec<Pickable>,
 }
@@ -298,6 +302,9 @@ pub(super) fn renamed(known: &protocol::Conversation, title: &str) -> crate::sto
     row.mark = known.mark;
     row.opted_out = known.opted_out;
     row.limit = known.limit;
+    row.max_file_bytes = known.max_file_bytes;
+    row.read_only_reason = known.read_only_reason.clone();
+    row.spam = known.spam;
     row
 }
 
@@ -1068,6 +1075,16 @@ impl Discord {
         })
     }
 
+    /// Fetches the raw markdown source of a single message for lossless editing.
+    fn source(&self, channel: &str, message: &str) -> Result<String, Refusal> {
+        let path = format!("/channels/{channel}/messages?around={message}&limit=1");
+        let body = self.call("GET", &path, None).map_err(refusal)?;
+        let found: Vec<Posted> =
+            serde_json::from_str(&body).map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        let posted = found.into_iter().find(|p| p.id == message).ok_or_else(|| Refusal::Refused("That message is gone.".to_owned()))?;
+        Ok(posted.content.unwrap_or_default())
+    }
+
     fn delete(&self, channel: &str, message: &str) -> Result<(), Refusal> {
         self.call("DELETE", &format!("/channels/{channel}/messages/{message}"), None).map_err(refusal)?;
         self.ctx.deleted(channel, message).map_err(|err| Refusal::Refused(err.to_string()))
@@ -1076,6 +1093,30 @@ impl Discord {
     /// Sends or answers a friend request, withdraws or ends a friendship, or blocks. One request:
     /// managing friends is what Discord's anti-abuse system watches most closely.
     ///
+    /// Accepts or declines/ignores a message request.
+    fn answer_message_request(&self, channel: &str, accept: bool) -> Result<(), Refusal> {
+        if accept {
+            self.call("PUT", &format!("/channels/{channel}/recipients/@me"), Some(json!({"consent_status": 2})))
+                .map_err(refusal)?;
+            if let Ok(Some(known)) = self.ctx.known(channel) {
+                let mut row = renamed(&known, &known.title);
+                row.special = protocol::Special::None;
+                row.spam = false;
+                self.ctx.conversation(&row).map_err(|err| Refusal::Refused(err.to_string()))?;
+            }
+            Ok(())
+        } else {
+            self.call("DELETE", &format!("/channels/{channel}"), None).map_err(refusal)?;
+            {
+                let mut state = crate::hub::lock(&self.state);
+                state.privates.remove(channel);
+                state.directs.retain(|_, id| id != channel);
+                state.covered.remove(channel);
+            }
+            self.ctx.conversation_gone(channel).map_err(|err| Refusal::Refused(err.to_string()))
+        }
+    }
+
     /// The bodies and the context header are the web client's as the community documents them,
     /// unconfirmed against a real account.
     fn relate(&self, person: &str, action: RelateAction) -> Result<(), Refusal> {
@@ -1085,13 +1126,17 @@ impl Discord {
                 return Err(Refusal::Refused("A friend request cannot be sent to this person.".into()));
             }
         }
-        let path = format!("/users/@me/relationships/{person}");
         let context = |location: &str| base64::engine::general_purpose::STANDARD.encode(json!({"location": location}).to_string());
-        let (method, body, location, becomes) = match action {
-            RelateAction::Add => ("PUT", Some(json!({})), "User Profile", Relation::Outgoing),
-            RelateAction::Accept => ("PUT", Some(json!({})), "Friends", Relation::Friend),
-            RelateAction::Block => ("PUT", Some(json!({"type": 2})), "ContextMenu", Relation::Blocked),
-            RelateAction::Ignore | RelateAction::Cancel | RelateAction::Remove => ("DELETE", None, "Friends", Relation::None),
+        let (method, path, body, location, becomes) = match action {
+            RelateAction::Add => ("PUT", format!("/users/@me/relationships/{person}"), Some(json!({})), "User Profile", Relation::Outgoing),
+            RelateAction::Accept => ("PUT", format!("/users/@me/relationships/{person}"), Some(json!({})), "Friends", Relation::Friend),
+            RelateAction::Block => ("PUT", format!("/users/@me/relationships/{person}"), Some(json!({"type": 2})), "ContextMenu", Relation::Blocked),
+            RelateAction::Unblock => ("DELETE", format!("/users/@me/relationships/{person}"), None, "Blocked", Relation::None),
+            RelateAction::IgnoreUser => ("PUT", format!("/users/@me/relationships/{person}/ignore"), None, "ContextMenu", Relation::Ignored),
+            RelateAction::UnignoreUser => ("DELETE", format!("/users/@me/relationships/{person}/ignore"), None, "ContextMenu", Relation::None),
+            RelateAction::Ignore | RelateAction::Cancel | RelateAction::Remove => {
+                ("DELETE", format!("/users/@me/relationships/{person}"), None, "Friends", Relation::None)
+            }
         };
         let context = context(location);
         self.rest.call_with(method, &path, body, &[("X-Context-Properties", &context)]).map_err(refusal)?;
@@ -1568,6 +1613,9 @@ impl Discord {
             Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
                 answer(reply, self.edit(&conversation_id, &message_id, &text))
             }
+            Command::Source { conversation_id, message_id, reply } => {
+                answer(reply, self.source(&conversation_id, &message_id))
+            }
             Command::Delete { conversation_id, message_id, reply } => answer(reply, self.delete(&conversation_id, &message_id)),
             Command::Relate { person_id, action, reply } => answer(reply, self.relate(&person_id, action)),
             Command::SetPresence { presence, status, reply } => answer(reply, self.set_presence(presence, status)),
@@ -1578,6 +1626,9 @@ impl Discord {
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true)),
+            Command::AnswerMessageRequest { conversation_id, accept, reply } => {
+                answer(reply, self.answer_message_request(&conversation_id, accept))
+            }
             Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 answer(reply, self.search_shared(&conversation_id, kind, before.as_deref(), limit))

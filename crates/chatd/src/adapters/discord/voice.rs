@@ -30,7 +30,7 @@ const NO_ANSWER: &str = "Nobody picked up.";
 // CONTRACT: `CallFailure` has one reason, `NoAnswer`, for "declined" and "rang out".
 const DECLINED: &str = "They declined the call.";
 const REMOVED: &str = "Discord took you out of the call. You were removed, or the channel is gone.";
-const NO_SESSION: &str = "No reply from Discord after 10 seconds.";
+const NO_SESSION: &str = "No reply from Discord after 15 seconds.";
 
 /// What pressing the call button of a server channel does. A voice channel is joined here. A
 /// stage is not: a listener there cannot simply speak, so it opens in Discord.
@@ -175,7 +175,8 @@ pub struct Heard {
     name: String,
     muted: bool,
     deafened: bool,
-    streaming: bool,
+    camera: bool,
+    sharing: bool,
     /// On a stage's platform (`suppress` false there): who the channel hears. A voice
     /// channel's states never have it true, whatever `suppress` says there.
     live: bool,
@@ -329,6 +330,8 @@ impl Discord {
                     speaking: false,
                     muted: heard.muted,
                     deafened: heard.deafened,
+                    camera: heard.camera,
+                    sharing: heard.sharing,
                     ..Participant::default()
                 })
                 .collect();
@@ -383,7 +386,8 @@ impl Discord {
                     name: heard.name.clone(),
                     muted: heard.muted,
                     deafened: heard.deafened,
-                    streaming: heard.streaming,
+                    streaming: heard.sharing,
+                    camera: heard.camera,
                     speaking: heard.live,
                 });
                 let people: Vec<Occupant> = people.collect();
@@ -472,7 +476,8 @@ impl Discord {
                     name: named.or(before.map(|before| before.name)).or(me).unwrap_or_default(),
                     muted: voice.self_mute || voice.mute,
                     deafened: voice.self_deaf || voice.deaf,
-                    streaming: voice.self_stream || voice.self_video,
+                    camera: voice.self_video,
+                    sharing: voice.self_stream,
                     live: stages.contains(channel.as_str()) && !voice.suppress,
                 };
                 changed.insert(channel.clone());
@@ -650,6 +655,44 @@ impl Discord {
             return refuse("This conversation has no call tinyclient can join.");
         }
         let guild = conversation.space.clone();
+        let mut can_speak = true;
+        if let Some(guild_id) = guild.as_deref() {
+            let kept_channel = self
+                .ctx
+                .note(&format!("kept:{guild_id}"))
+                .and_then(|kept| serde_json::from_str::<Vec<model::Kept>>(&kept).ok())
+                .and_then(|kept| kept.into_iter().find(|ch| ch.id == conversation_id))
+                .map(model::Kept::channel);
+            let me = self.me();
+            let clock = crate::hub::now();
+            let state = self.state.lock().unwrap();
+            let mut can_move = false;
+            if let Some(info) = state.guilds.get(guild_id) {
+                if let Some(until) = info.timed_out(clock) {
+                    return refuse(&super::ready::timeout_reason(until, clock));
+                }
+                if let Some(ch) = kept_channel.as_ref() {
+                    let perms = info.permissions(guild_id, &me, ch);
+                    if perms & model::CONNECT == 0 {
+                        return refuse("You don't have permission to connect to this voice channel.");
+                    }
+                    can_move = perms & model::MOVE_MEMBERS != 0;
+                    can_speak = perms & model::SPEAK != 0;
+                }
+            }
+            if conversation.limit > 0 && !can_move {
+                let others = state
+                    .voice
+                    .states
+                    .iter()
+                    .filter(|(user, heard)| heard.channel == conversation_id && user.as_str() != state.me)
+                    .count();
+                if others >= conversation.limit as usize {
+                    return refuse("This channel is full.");
+                }
+            }
+        }
+        let start_muted = !can_speak;
         let ring = {
             let mut state = self.state.lock().unwrap();
             let ring = direct && !state.voice.calls.contains(conversation_id);
@@ -660,7 +703,7 @@ impl Discord {
                 server: None,
                 reported: false,
                 since: Instant::now(),
-                muted: false,
+                muted: start_muted,
                 deafened: false,
                 ring,
                 saw_ringing: false,
@@ -676,7 +719,7 @@ impl Discord {
         if ring {
             self.ctx.ringing_out(conversation_id);
         }
-        self.tell(4, voice_state(guild.as_deref(), Some(conversation_id), false, false, false));
+        self.tell(4, voice_state(guild.as_deref(), Some(conversation_id), start_muted, false, false));
         // Whoever is already there, before anyone's state changes.
         self.roster();
         self.occupancy(BTreeSet::from([conversation_id.to_owned()]));
@@ -1313,5 +1356,22 @@ mod tests {
         assert_eq!(stream_key(None, "3001", "111"), "call:3001:111");
         assert!(owned_by("guild:81:900:111", "111"));
         assert!(!owned_by("call:3001:222", "111"));
+    }
+
+    #[test]
+    fn heard_keeps_camera_and_sharing_separate() {
+        let cam_only = Heard {
+            guild: Some("g".into()),
+            channel: "c".into(),
+            name: "Ada".into(),
+            muted: false,
+            deafened: false,
+            camera: true,
+            sharing: false,
+            live: false,
+        };
+        let share_only = Heard { camera: false, sharing: true, ..cam_only };
+        assert!(!share_only.camera && share_only.sharing);
+        assert!(share_only.sharing || share_only.camera);
     }
 }

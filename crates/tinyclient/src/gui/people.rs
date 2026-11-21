@@ -31,6 +31,7 @@
 mod card;
 mod hub;
 mod info;
+pub(in crate::gui) use info::profile::facts::{can_clear_history, can_close_direct};
 mod list;
 mod members;
 pub mod presence;
@@ -103,6 +104,7 @@ pub(in crate::gui) struct Scene {
     pub in_call: Vec<Key>,
     /// Tiny accounts that can ring any member, including before a direct exists.
     pub callable_accounts: Vec<AccountKey>,
+    pub close_direct_accounts: Vec<AccountKey>,
 }
 
 /// True when this run only draws a state for `--shot`: nothing that changes the user's state on
@@ -172,6 +174,10 @@ fn can_call(scene: &Scene, person: &Key) -> bool {
         Network::Tiny => scene.callable_accounts.contains(&person.account()),
         _ => false,
     }
+}
+
+fn scene_can_close_direct(scene: &Scene, person: &Key) -> bool {
+    scene.close_direct_accounts.contains(&person.account())
 }
 
 impl State {
@@ -361,6 +367,9 @@ impl Shell {
                 .collect(),
             callable_accounts: snapshot.accounts.iter()
                 .filter(|account| account.key.network == Network::Tiny && account.can.direct_calls)
+                .map(|account| account.key.clone()).collect(),
+            close_direct_accounts: snapshot.accounts.iter()
+                .filter(|account| account.can.close_direct)
                 .map(|account| account.key.clone()).collect(),
         }
     }
@@ -715,6 +724,9 @@ fn relate_failed(action: RelateAction, name: &str) -> String {
         RelateAction::Cancel => format!("Can't cancel the request to {name}"),
         RelateAction::Remove => format!("Can't remove {name}"),
         RelateAction::Block => format!("Can't block {name}"),
+        RelateAction::Unblock => format!("Can't unblock {name}"),
+        RelateAction::IgnoreUser => format!("Can't ignore {name}"),
+        RelateAction::UnignoreUser => format!("Can't stop ignoring {name}"),
     }
 }
 
@@ -785,7 +797,7 @@ mod tests {
             private: false,
             encryption: protocol::Encryption::Unknown,
             draft: String::new(),
-            folders: Vec::new(), archived: false, pin: None, hidden: false, followed: false, bot: false, meeting: false, special: Default::default(), mark: None, topic_icon: None, opted_out: false, quiet: false, preview_from: String::new(), preview_mine: false, seen: false, delivered: false, sending: false,
+            folders: Vec::new(), archived: false, pin: None, hidden: false, followed: false, bot: false, meeting: false, special: Default::default(), mark: None, topic_icon: None, opted_out: false, quiet: false, preview_from: String::new(), preview_mine: false, seen: false, delivered: false, sending: false, max_file_bytes: 0, read_only_reason: String::new(), spam: false,
         }
     }
 
