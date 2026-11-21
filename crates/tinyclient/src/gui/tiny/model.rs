@@ -158,6 +158,17 @@ pub fn occupancy(room: &TinyRoom) -> String {
     }
 }
 
+/// The chip after a voice channel's name: `"Empty"` (or `"Empty · up to 12"`), else `"3 in call"`
+/// (or `"3 of 12"`).
+pub fn channel_occupancy(room: &TinyRoom) -> String {
+    match (room.participants.len(), room.user_limit) {
+        (0, 0) => "Empty".to_owned(),
+        (0, limit) => format!("Empty · up to {limit}"),
+        (count, 0) => format!("{count} in call"),
+        (count, limit) => format!("{count} of {limit}"),
+    }
+}
+
 pub fn full(room: &TinyRoom) -> bool {
     room.user_limit > 0 && room.participants.len() >= room.user_limit as usize
 }
@@ -852,5 +863,18 @@ mod tests {
         draw_role(&mut roles, "crew");
         draw_role(&mut roles, "mod");
         assert_eq!(roles, ["crew"]);
+    }
+
+    #[test]
+    fn channel_header_says_empty_instead_of_zero_in_call() {
+        let mut empty = seated("r", &[]);
+        assert_eq!(channel_occupancy(&empty), "Empty");
+        empty.user_limit = 12;
+        assert_eq!(channel_occupancy(&empty), "Empty · up to 12");
+
+        let mut busy = seated("r", &["a", "b", "c"]);
+        assert_eq!(channel_occupancy(&busy), "3 in call");
+        busy.user_limit = 12;
+        assert_eq!(channel_occupancy(&busy), "3 of 12");
     }
 }
