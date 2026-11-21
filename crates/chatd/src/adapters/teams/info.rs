@@ -987,6 +987,7 @@ impl Teams {
         out.sort_by_key(|m| std::cmp::Reverse(m.sent));
         out.truncate(count as usize);
         Ok(out)
+    }
 
     /// Returns who has read `message_id` in a Teams chat (up to [`SMALL`] members).
     pub(super) fn read_by(&self, conversation: &str, message_id: &str) -> Result<Vec<protocol::ReadBy>, Fault> {
