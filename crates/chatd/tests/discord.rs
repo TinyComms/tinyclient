@@ -4601,3 +4601,46 @@ fn invite_preview_join_and_error_translation() {
         }
     }
 }
+
+#[test]
+fn leave_space_sends_delete_refuses_owner_and_cleans_tree() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Add an owned guild 4999 (owner_id == "1000") alongside non-owned guild 4000.
+    ready["guilds"].as_array_mut().unwrap().push(json!({
+        "id": "4999",
+        "properties": {"id": "4999", "name": "My Owned Server", "owner_id": "1000", "icon": null},
+        "roles": [{"id": "4999", "name": "@everyone", "permissions": "1071698529857"}],
+        "channels": [{"id": "4991", "type": 0, "name": "general", "position": 0, "permission_overwrites": []}],
+        "members": [{"user": me(), "roles": []}],
+        "voice_states": []
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // 1. Owned server 4999 is refused locally with clear owner explanation and no HTTP DELETE.
+    match world.ask(Request::LeaveSpace { space: world.key("4999") }) {
+        Response::Error { detail, .. } => {
+            assert!(detail.contains("own this server") || detail.contains("Transfer ownership"), "got: {detail}");
+        }
+        other => panic!("expected refusal for owned server, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("DELETE", "/users/@me/guilds/4999").is_empty());
+
+    // 2. Non-owned server 4000 sends DELETE /users/@me/guilds/4000 with {"lurking": false} and drops from Spaces.
+    world.discord.script("/users/@me/guilds/4000", 204, json!(null));
+    assert_eq!(world.ask(Request::LeaveSpace { space: world.key("4000") }), Response::Ok);
+    let deletes = world.discord.requests_to("DELETE", "/users/@me/guilds/4000");
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0].body, json!({"lurking": false}));
+
+    // Space 4000 is gone from Spaces list immediately.
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            assert!(spaces.iter().all(|s| s.key.id != "4000"), "left server 4000 should be removed from Spaces");
+            assert!(spaces.iter().any(|s| s.key.id == "4999"), "other server 4999 should remain");
+        }
+        other => panic!("expected Response::Spaces, got {other:?}"),
+    }
+}

@@ -165,6 +165,8 @@ pub struct State {
     pub switcher: Option<switcher::Switcher>,
     pub create_channel: Option<CreateChannelModal>,
     pub join_server: Option<JoinServerModal>,
+    /// Confirmation modal before leaving a Space (`(space_key, space_name)`).
+    pub leave_space: Option<(Key, String)>,
 }
 
 pub struct JoinServerModal {
@@ -296,6 +298,7 @@ impl State {
             switcher: None,
             create_channel: None,
             join_server: None,
+            leave_space: None,
         }
     }
 
@@ -2072,6 +2075,88 @@ impl Shell {
     }
 
     /// Open the "Create channel…" modal for a Space (optionally inside a section/group).
+    pub(super) fn open_leave_space(&mut self, space: Key, name: String, cx: &mut Context<Self>) {
+        self.sidebar_state.leave_space = Some((space, name));
+        cx.notify();
+    }
+
+    fn confirm_leave_space(&mut self, cx: &mut Context<Self>) {
+        let Some((space, name)) = self.sidebar_state.leave_space.take() else {
+            return;
+        };
+        cx.notify();
+        let network = space.network;
+        let req = Request::LeaveSpace { space: space.clone() };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => {
+                    this.sidebar_state.pins.retain(|pin| pin != &space);
+                    this.open_network(network, cx);
+                    this.toast(Some(("icons/check.svg", theme::text_soft())), format!("Left {name}"), cx);
+                    cx.notify();
+                }
+                Ok(Response::Error { detail, .. }) => this.toast(None, detail, cx),
+                Ok(_) => this.toast(None, format!("Could not leave {name}."), cx),
+                Err(err) => this.toast(None, err.to_string(), cx),
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn leave_space_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let (_, name) = self.sidebar_state.leave_space.as_ref()?;
+        let card = div()
+            .id("leave-space-card")
+            .w(px(360.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child(format!("Leave {name}?")))
+            .child(
+                div()
+                    .type_small()
+                    .text_color(theme::text_soft())
+                    .child("You will lose access to its channels and need a new invite to rejoin."),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(button("leave-space-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.leave_space = None;
+                        cx.notify();
+                    })))
+                    .child(button("leave-space-confirm", ButtonKind::Danger, "Leave server").on_click(
+                        cx.listener(|this, _, _, cx| this.confirm_leave_space(cx)),
+                    )),
+            );
+        Some(
+            div()
+                .id("leave-space-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x0000_0066))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.leave_space = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
     pub(super) fn open_join_server(&mut self, account: AccountKey, cx: &mut Context<Self>) {
         let input = cx.new(|cx| crate::gui::input::TextInput::new("discord.gg/… or invite code", cx));
         self.sidebar_state.join_server = Some(JoinServerModal {

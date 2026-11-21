@@ -869,6 +869,27 @@ impl Shell {
                         }))
                         .into_any_element(),
                 );
+                let can_leave = snapshot.accounts.iter().any(|a| {
+                    a.key == space.account() && a.link == Link::Connected && a.capabilities.leave_space
+                });
+                if can_leave {
+                    let leave_key = space.clone();
+                    let leave_name = self
+                        .spaces
+                        .iter()
+                        .find(|s| &s.key == space)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| "this server".to_owned());
+                    items.push(menu_separator().into_any_element());
+                    items.push(
+                        menu_item_danger("space-leave", Some("icons/log-out.svg"), "Leave server…")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.open_leave_space(leave_key.clone(), leave_name.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
             }
             Menu::Row(conversation, _) => {
                 let (key, starred) = (conversation.key.clone(), conversation.starred);
@@ -1576,6 +1597,7 @@ impl Render for Shell {
             .children(self.switcher(window, cx))
             .children(self.create_channel_modal(cx))
             .children(self.join_server_modal(cx))
+            .children(self.leave_space_modal(cx))
             .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))

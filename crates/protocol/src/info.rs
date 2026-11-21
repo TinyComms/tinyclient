@@ -607,6 +607,9 @@ pub struct Capabilities {
     /// This account supports previewing and joining a Space from an invite link (`InvitePreview`, `InviteJoin`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub join_space_by_invite: bool,
+    /// This account supports leaving a Space (`Request::LeaveSpace`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub leave_space: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).

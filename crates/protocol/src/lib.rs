@@ -1647,6 +1647,10 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nickname: Option<String>,
     },
+    /// Leaves a Space (e.g. a Discord server). Never sent without a confirm dialog.
+    LeaveSpace {
+        space: Key,
+    },
     /// Preview a Space invite link or code before joining (e.g. Discord `GET /invites/{code}`).
     InvitePreview {
         account: AccountKey,

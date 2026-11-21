@@ -835,6 +835,7 @@ impl Discord {
             add_friend_by_username: true,
             friend_nickname: true,
             join_space_by_invite: true,
+            leave_space: true,
             ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;

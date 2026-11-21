@@ -1706,6 +1706,17 @@ impl Chat {
         }
     }
 
+    fn leave_space(&self, space: Key) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::LeaveSpace { space_id: space.id.clone(), reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
     fn report(
         &self,
         target: protocol::ReportTarget,
@@ -3058,6 +3069,7 @@ impl Chat {
                 res
             }
             Request::Leave { conversation } => self.act(&conversation, |conversation_id, reply| Command::Leave { conversation_id, reply }),
+            Request::LeaveSpace { space } => self.leave_space(space),
             Request::CloseDirect { conversation } => {
                 self.act(&conversation, |conversation_id, reply| Command::CloseDirect { conversation_id, reply })
             }
