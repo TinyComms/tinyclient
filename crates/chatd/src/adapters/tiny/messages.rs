@@ -116,6 +116,7 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         row.space = Some(SPACE.to_owned());
         row.topic = channel.topic.clone();
         row.position = channel.position;
+        row.moderate = channel.my_permissions.unwrap_or(0) & protocol::TINY_MANAGE_MESSAGES != 0;
         let (e2ee, history) =
             sealed_state(saved, &channel.id, channel.e2ee, channel.plaintext_history);
         row.encryption = encryption_of(saved, &channel.id, e2ee, history);
@@ -291,8 +292,13 @@ pub(crate) fn on_live(
         "message.deleted" => {
             let conversation = nested_str(frame, "conversation_id");
             let message = nested_id(frame, "message", "message_id").unwrap_or("");
+            let deleted_by = nested_str(frame, "deleted_by");
             if super::safe_id(conversation) && super::safe_id(message) {
-                let _ = ctx.deleted(conversation, message);
+                if !deleted_by.is_empty() {
+                    let _ = ctx.deleted_by_moderator(conversation, message);
+                } else {
+                    let _ = ctx.deleted(conversation, message);
+                }
             }
         }
         "reaction.updated" => merge_reaction(ctx, saved, frame),
@@ -1960,6 +1966,11 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
     message.edited = present(&wire.edited_at);
     message.edited_at = wire.edited_at.as_deref().and_then(unix_of);
     message.deleted = deleted;
+    message.moderated = deleted
+        && wire
+            .deleted_by
+            .as_deref()
+            .is_some_and(|by| !by.is_empty() && by != wire.author_id);
     message.client_id = wire.client_id.clone().filter(|id| !id.is_empty());
     message.seq = wire.seq;
     message.reply_to = reply_of(wire.reply_to.as_ref());
@@ -2006,6 +2017,11 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
     let mut message = Message::plain(&wire.id, sender, "", sent, outgoing);
     message.sender.id = wire.author_id.clone();
     message.deleted = deleted;
+    message.moderated = deleted
+        && wire
+            .deleted_by
+            .as_deref()
+            .is_some_and(|by| !by.is_empty() && by != wire.author_id);
     message.client_id = wire.client_id.clone().filter(|id| !id.is_empty());
     message.seq = wire.seq;
     message.seal = Seal::Encrypted;
@@ -2643,6 +2659,9 @@ struct WireChannel {
     /// Per-role permission overrides on this channel, when the server includes them.
     #[serde(default)]
     overrides: Vec<protocol::TinyOverride>,
+    /// Caller's effective permission bits in this channel, when the server includes them.
+    #[serde(default)]
+    my_permissions: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -2832,6 +2851,8 @@ struct WireMessage {
     edited_at: Option<String>,
     #[serde(default)]
     deleted_at: Option<String>,
+    #[serde(default)]
+    deleted_by: Option<String>,
     #[serde(default)]
     attachments: Vec<WireFile>,
     #[serde(default)]

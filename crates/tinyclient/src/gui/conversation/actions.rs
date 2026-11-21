@@ -150,6 +150,12 @@ pub(super) fn starts_thread(message: &Message, network: Network, kind: Conversat
 
 /// `in_thread`: the row is in the thread pane, where a thread cannot be opened again.
 pub fn can(message: &Message, network: Network, kind: ConversationKind, in_thread: bool) -> Can {
+    can_with(message, network, kind, in_thread, false)
+}
+
+/// Like [`can`], with per-conversation moderation permission (`moderate` allows deleting
+/// another member's sent message while keeping Edit author-only).
+pub fn can_with(message: &Message, network: Network, kind: ConversationKind, in_thread: bool, moderate: bool) -> Can {
     let sent = message.state == SendState::Sent;
     let said = matches!(message.kind, MessageKind::Normal | MessageKind::Unsupported { .. }) && !message.deleted;
     let act = sent && said;
@@ -163,7 +169,7 @@ pub fn can(message: &Message, network: Network, kind: ConversationKind, in_threa
         // on every message of mine and a refusal is the network's answer. Messages never edits
         // or deletes, so those items stay off.
         edit: sent && own && !message.saved_history && network != Network::Messages,
-        delete: own && network != Network::Messages,
+        delete: (own || (moderate && act)) && network != Network::Messages,
         unsent: !sent && message.outgoing,
     }
 }
@@ -311,7 +317,8 @@ impl Pane {
     pub(super) fn can(&self, message: &Message) -> Can {
         // No open conversation is not a place a thread can be started from.
         let kind = self.open.as_ref().map(|open| open.kind).unwrap_or(ConversationKind::Thread);
-        can(message, self.network(), kind, self.is_thread())
+        let moderate = self.open.as_ref().is_some_and(|open| open.moderate);
+        can_with(message, self.network(), kind, self.is_thread(), moderate)
     }
 
     // Reactions.
@@ -1405,7 +1412,12 @@ impl Pane {
         let target = message.clone();
         // A phone's dialog keeps 16 pt of the window either side.
         let room = f32::from(window.viewport_size().width) - 32.;
-        let panel = modal("Delete this message?")
+        let title = if message.outgoing {
+            "Delete this message?".to_owned()
+        } else {
+            format!("Delete {}'s message for everyone?", message.shown_sender())
+        };
+        let panel = modal(title)
             .w(px(if crate::gui::phone::active() { room.min(400.) } else { 400. }))
             .child(modal_body(consequence))
             .child(quoted)
@@ -1740,5 +1752,17 @@ mod tests {
         saved.outgoing = false;
         let neutral = can(&saved, Network::Tiny, ConversationKind::Direct, false);
         assert!(!neutral.edit && !neutral.delete);
+    }
+
+    #[test]
+    fn moderator_can_delete_others_sent_message_but_not_edit_it() {
+        let theirs = Message::plain("m1", "Mara", "hello", 1, false);
+        let plain = can_with(&theirs, Network::Tiny, ConversationKind::Channel, false, false);
+        assert!(!plain.delete && !plain.edit);
+        let mod_can = can_with(&theirs, Network::Tiny, ConversationKind::Channel, false, true);
+        assert!(mod_can.delete && !mod_can.edit);
+        let mut gone = theirs.clone();
+        gone.deleted = true;
+        assert!(!can_with(&gone, Network::Tiny, ConversationKind::Channel, false, true).delete);
     }
 }

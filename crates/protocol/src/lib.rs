@@ -525,6 +525,9 @@ pub struct Conversation {
     /// Flagged as spam by the network (e.g. Discord spam message request).
     #[serde(default, skip_serializing_if = "is_false")]
     pub spam: bool,
+    /// This account may delete other members' messages in this conversation (Tiny `manage_messages`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub moderate: bool,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -588,6 +591,7 @@ impl Conversation {
             max_file_bytes: 0,
             read_only_reason: String::new(),
             spam: false,
+            moderate: false,
         }
     }
 

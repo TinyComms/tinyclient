@@ -411,8 +411,9 @@ pub const TINY_DISCONNECT_MEMBERS: u64 = 1 << 17;
 pub const TINY_VIEW_AUDIT_LOG: u64 = 1 << 18;
 pub const TINY_MANAGE_SERVER: u64 = 1 << 19;
 pub const TINY_MANAGE_REPORTS: u64 = 1 << 20;
+pub const TINY_MANAGE_MESSAGES: u64 = 1 << 21;
 /// Every bit there is.
-pub const TINY_ALL: u64 = (1 << 21) - 1;
+pub const TINY_ALL: u64 = (1 << 22) - 1;
 /// The bits a room's override may change.
 pub const TINY_CHANNEL_SCOPED: u64 = TINY_VIEW_CHANNEL
     | TINY_CONNECT
@@ -425,13 +426,14 @@ pub const TINY_CHANNEL_SCOPED: u64 = TINY_VIEW_CHANNEL
     | TINY_MUTE_MEMBERS
     | TINY_DEAFEN_MEMBERS
     | TINY_MOVE_MEMBERS
-    | TINY_DISCONNECT_MEMBERS;
+    | TINY_DISCONNECT_MEMBERS
+    | TINY_MANAGE_MESSAGES;
 /// What @everyone has on a server that was never changed.
 pub const TINY_EVERYONE_DEFAULT: u64 = TINY_VIEW_CHANNEL | TINY_CONNECT | TINY_SPEAK | TINY_VIDEO | TINY_SHARE_SCREEN | TINY_VOICE_ACTIVITY;
 
 /// Every permission, in the server's order, with its wire name: for the settings page's
 /// toggles. Bit `n` is `1 << n`.
-pub const TINY_PERMISSIONS: [(u64, &str); 21] = [
+pub const TINY_PERMISSIONS: [(u64, &str); 22] = [
     (TINY_VIEW_CHANNEL, "view_channel"),
     (TINY_CONNECT, "connect"),
     (TINY_SPEAK, "speak"),
@@ -453,6 +455,7 @@ pub const TINY_PERMISSIONS: [(u64, &str); 21] = [
     (TINY_VIEW_AUDIT_LOG, "view_audit_log"),
     (TINY_MANAGE_SERVER, "manage_server"),
     (TINY_MANAGE_REPORTS, "manage_reports"),
+    (TINY_MANAGE_MESSAGES, "manage_messages"),
 ];
 
 /// The server's identity and settings, from `GET /v1/server`.
@@ -1947,7 +1950,7 @@ mod tests {
         let options = TinyInviteOptions { max_uses: Some(5), ..TinyInviteOptions::default() };
         assert_eq!(serde_json::to_string(&options).unwrap(), r#"{"max_uses":5}"#);
         let names: Vec<&str> = TINY_PERMISSIONS.iter().map(|(_, name)| *name).collect();
-        assert_eq!(names.len(), 21);
+        assert_eq!(names.len(), 22);
         assert!(TINY_PERMISSIONS.iter().enumerate().all(|(n, (bit, _))| *bit == 1 << n));
     }
 

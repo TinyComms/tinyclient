@@ -964,6 +964,16 @@ impl Context {
         Ok(())
     }
 
+    /// A moderator removed another member's message. Kept as a tombstone with `moderated = true`
+    /// and its text, attachments, and reactions cleared.
+    pub fn deleted_by_moderator(&self, conversation_id: &str, message_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().delete_message_moderated(&conversation, message_id)? {
+            self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(())
+    }
+
     /// One person added or removed one reaction. Set `reaction.mine` when it was us.
     pub fn reacted(&self, conversation_id: &str, message_id: &str, reaction: &Reaction, added: bool) -> Stores {
         let conversation = self.key(conversation_id);

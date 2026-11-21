@@ -918,6 +918,7 @@ mod tests {
             max_file_bytes: 0,
             read_only_reason: String::new(),
             spam: false,
+            moderate: false,
         }
     }
 

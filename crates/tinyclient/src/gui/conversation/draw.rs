@@ -819,7 +819,8 @@ impl Pane {
         let mut sent = div().flex().flex_col();
         if message.deleted {
             // What it said is gone; the row stays for the thread that hangs off it.
-            sent = sent.child(div().type_body().italic().text_color(theme::text_faint()).child("Message deleted"));
+            let tombstone = if message.moderated { "Removed by a moderator" } else { "Message deleted" };
+            sent = sent.child(div().type_body().italic().text_color(theme::text_faint()).child(tombstone));
         } else {
             let said = match &message.kind {
                 MessageKind::Unsupported { link } => vec![self.unsupported(message, link, cx).into_any_element()],
