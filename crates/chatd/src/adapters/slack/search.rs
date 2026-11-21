@@ -121,12 +121,21 @@ const MODIFIERS: &[&str] = &[
     "in:", "from:", "to:", "has:", "is:", "before:", "after:", "on:", "during:", "with:",
 ];
 
-/// True when `query` already contains a whitespace-separated token with `prefix` (case-insensitive).
+/// True when `query` already contains an unquoted whitespace-separated token with `prefix` (case-insensitive).
 pub(super) fn has_modifier(query: &str, prefix: &str) -> bool {
     let want = prefix.to_ascii_lowercase();
-    query
-        .split_whitespace()
-        .any(|token| token.trim_start_matches('-').to_ascii_lowercase().starts_with(&want))
+    let mut in_quotes = false;
+    for token in query.split_whitespace() {
+        let starts_quoted = in_quotes || token.starts_with('"');
+        let quotes = token.bytes().filter(|&b| b == b'"').count();
+        if quotes % 2 == 1 {
+            in_quotes = !in_quotes;
+        }
+        if !starts_quoted && token.trim_start_matches('-').to_ascii_lowercase().starts_with(&want) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Returns the plain search words with Slack modifier tokens (`in:`, `from:`, `has:`, etc.) removed.

@@ -1265,6 +1265,13 @@ pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped,
     content::quote_pin(&mut mapped.message);
     account.place(mapped.peer, mapped.id, conversation);
     comment_thread(account, conversation, mapped);
+    for want in &mapped.wants {
+        if let tl::enums::InputFileLocation::InputDocumentFileLocation(loc) = &want.location {
+            if loc.thumb_size.is_empty() {
+                super::catalog::remember_document(account, loc);
+            }
+        }
+    }
 }
 
 /// The thread a channel post's comments hang off. The post carries the count; the row it opens
@@ -1842,13 +1849,6 @@ pub(super) fn mapped(account: &Account, conversation: &str, raw: &[tl::enums::Me
     let mut wants = Vec::new();
     for one in &mut mapped {
         finish(account, conversation, one, &page);
-        for want in &one.wants {
-            if let tl::enums::InputFileLocation::InputDocumentFileLocation(loc) = &want.location {
-                if loc.thumb_size.is_empty() {
-                    super::catalog::remember_document(account, loc);
-                }
-            }
-        }
         wants.append(&mut one.wants);
     }
     (mapped.into_iter().map(|one| one.message).collect(), wants)

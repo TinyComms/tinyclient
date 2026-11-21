@@ -2546,18 +2546,16 @@ fn draft_updated_ts(draft: &Value) -> (String, i64) {
     (String::new(), 0)
 }
 
-/// Conflict rule: newest edit wins; never overwrite a non-empty local draft with an older remote one.
+/// Conflict rule: newest edit wins; never overwrite a local draft (or a recent local clear) with
+/// an older remote draft.
 fn should_apply_remote_draft(local_text: &str, local_updated_at: Option<i64>, remote_updated_at: i64) -> bool {
+    if let Some(local_at) = local_updated_at {
+        return remote_updated_at > local_at;
+    }
     if local_text.is_empty() {
         return true;
     }
-    if remote_updated_at <= 0 {
-        return false;
-    }
-    match local_updated_at {
-        Some(local_at) => remote_updated_at > local_at,
-        None => true,
-    }
+    remote_updated_at > 0
 }
 
 /// A person's card from their user object. Custom fields are the labelled ones
@@ -3110,8 +3108,10 @@ mod tests {
         assert_eq!(thread_dest[0]["channel_id"], "C0GEN");
         assert_eq!(thread_dest[0]["thread_ts"], "1760000200.000200");
 
-        // Conflict rule: newest edit wins; never overwrite non-empty local draft with older/undated remote.
-        assert!(should_apply_remote_draft("", Some(100), 50));
+        // Conflict rule: newest edit wins; never resurrect a locally cleared draft from an older remote one.
+        assert!(!should_apply_remote_draft("", Some(100), 50));
+        assert!(should_apply_remote_draft("", Some(100), 120));
+        assert!(should_apply_remote_draft("", None, 50));
         assert!(!should_apply_remote_draft("local", Some(100), 90));
         assert!(!should_apply_remote_draft("local", Some(100), 100));
         assert!(should_apply_remote_draft("local", Some(100), 120));
