@@ -2186,7 +2186,23 @@ impl Shell {
     }
 
     pub(super) fn open_join_server(&mut self, account: AccountKey, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| crate::gui::input::TextInput::new("discord.gg/… or invite code", cx));
+        self.open_join_invite(account, None, cx);
+    }
+
+    pub(in crate::gui) fn open_join_invite(&mut self, account: AccountKey, link: Option<String>, cx: &mut Context<Self>) {
+        let placeholder = if account.network == Network::Telegram {
+            "t.me/+… or invite link"
+        } else {
+            "discord.gg/… or invite code"
+        };
+        let prefill = link.clone();
+        let input = cx.new(|cx| {
+            let mut field = crate::gui::input::TextInput::new(placeholder, cx);
+            if let Some(ref text) = prefill {
+                field.set_text(text, cx);
+            }
+            field
+        });
         self.sidebar_state.join_server = Some(JoinServerModal {
             account,
             input,
@@ -2194,7 +2210,41 @@ impl Shell {
             error: None,
             busy: false,
         });
-        cx.notify();
+        if link.is_some() {
+            self.preview_join_server(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Opens the Telegram invite join sheet for a clicked `t.me/+…` or `t.me/joinchat/…` link.
+    /// Returns `true` if a connected Telegram account was found to preview the invite.
+    pub(in crate::gui) fn open_telegram_invite(
+        &mut self,
+        preferred: Option<AccountKey>,
+        url: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let account = preferred
+            .filter(|k| {
+                self.snapshot
+                    .as_ref()
+                    .and_then(|s| s.account(k))
+                    .is_some_and(|a| a.link == Link::Connected)
+            })
+            .or_else(|| {
+                self.snapshot.as_ref().and_then(|s| {
+                    s.accounts
+                        .iter()
+                        .find(|a| a.key.network == Network::Telegram && a.link == Link::Connected)
+                        .map(|a| a.key.clone())
+                })
+            });
+        let Some(account) = account else {
+            return false;
+        };
+        self.open_join_invite(account, Some(url), cx);
+        true
     }
 
     fn preview_join_server(&mut self, cx: &mut Context<Self>) {
@@ -2260,12 +2310,23 @@ impl Shell {
         cx.spawn(async move |shell, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
             let _ = shell.update(cx, |this, cx| match answer {
-                Ok(Response::InviteJoined { space, .. }) => {
+                Ok(Response::InviteJoined { space, conversation, pending }) => {
                     this.sidebar_state.join_server = None;
-                    if let Some(space) = space {
+                    if pending {
+                        this.toast(
+                            Some(("icons/check.svg", theme::text_soft())),
+                            "Join request sent — waiting for admin approval",
+                            cx,
+                        );
+                    } else if let Some(conv) = conversation {
+                        this.open_now(conv, "", cx);
+                        this.toast(Some(("icons/check.svg", theme::text_soft())), "Joined chat", cx);
+                    } else if let Some(space) = space {
                         this.go(Mode::Space(space), cx);
+                        this.toast(Some(("icons/check.svg", theme::text_soft())), "Joined server", cx);
+                    } else {
+                        this.toast(Some(("icons/check.svg", theme::text_soft())), "Joined", cx);
                     }
-                    this.toast(Some(("icons/check.svg", theme::text_soft())), "Joined server", cx);
                     cx.notify();
                 }
                 Ok(Response::Error { detail, .. }) => {
@@ -2322,6 +2383,16 @@ impl Shell {
                     box_el.child(div().type_small().text_color(theme::text_soft()).child(meta.join(" · ")))
                 })
         });
+        let is_telegram = modal.account.network == Network::Telegram;
+        let request_needed = modal.preview.as_ref().is_some_and(|p| p.request_needed);
+        let title = if is_telegram { "Join Telegram chat" } else { "Join a server" };
+        let join_label = if modal.busy {
+            if request_needed { "Requesting…" } else { "Joining…" }
+        } else if request_needed {
+            "Request to join"
+        } else {
+            "Join"
+        };
         let card = div()
             .id("join-server-card")
             .w(px(380.))
@@ -2335,7 +2406,7 @@ impl Shell {
             .flex_col()
             .gap(px(10.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(div().type_title().text_color(theme::text()).child("Join a server"))
+            .child(div().type_title().text_color(theme::text()).child(title))
             .child(
                 div()
                     .px(px(8.))
@@ -2368,7 +2439,7 @@ impl Shell {
                         button(
                             "join-server-submit",
                             ButtonKind::Primary,
-                            if modal.busy { "Joining…" } else { "Join" },
+                            join_label,
                         )
                         .when(ready, |b| {
                             b.on_click(cx.listener(|this, _, _, cx| this.submit_join_server(cx)))

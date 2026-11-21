@@ -414,6 +414,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         effects: false,
         view_once: false,
         blocks: true,
+        join_space_by_invite: true,
         share_contact: true,
         save_gif: true,
         ..Capabilities::default()

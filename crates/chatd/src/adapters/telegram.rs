@@ -280,6 +280,8 @@ struct Live {
     /// Cached `contacts.resolveUsername` lookups (lowercased bare username -> peer or miss),
     /// populated only on explicit clicks so repeated clicks never repeat flood-limited RPCs.
     resolved_usernames: HashMap<String, Option<Who>>,
+    /// Live pending join-request counts reported by `updatePendingJoinRequests`.
+    pending_requests: HashMap<Who, u32>,
 }
 
 /// Telegram's own send options, which Telegram carries out.
@@ -731,7 +733,16 @@ fn offline(ctx: &Context, command: Command) {
         | Command::CreateChannel { reply, .. }
         | Command::MembersAdd { reply, .. }
         | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
-        Command::SetProfile { reply, .. } | Command::SetAvatar { reply, .. } | Command::SetPresence { reply, .. } => {
+        Command::SetProfile { reply, .. }
+        | Command::SetAvatar { reply, .. }
+        | Command::SetPresence { reply, .. }
+        | Command::InvitePreview { reply, .. }
+        | Command::InviteJoin { reply, .. }
+        | Command::ChatInvites { reply, .. }
+        | Command::CreateInvite { reply, .. }
+        | Command::RevokeInvite { reply, .. }
+        | Command::JoinRequests { reply, .. }
+        | Command::HandleJoinRequest { reply, .. } => {
             drop(reply.send(Err(down())))
         }
         Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
@@ -866,6 +877,33 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::ConversationInfo { conversation_id, reply } => {
             let _ = reply.send(info::conversation(account, &conversation_id).map_err(refused));
+        }
+        Command::InvitePreview { code, reply } => {
+            let _ = reply.send(info::invite_preview(account, &code).map_err(refused));
+        }
+        Command::InviteJoin { code, reply } => {
+            let _ = reply.send(info::invite_join(account, &code).map_err(refused));
+        }
+        Command::ChatInvites { conversation_id, revoked, reply } => {
+            let _ = reply.send(info::chat_invites(account, &conversation_id, revoked).map_err(refused));
+        }
+        Command::CreateInvite { conversation_id, title, expire_date, usage_limit, request_needed, reply } => {
+            let _ = reply.send(
+                info::create_invite(account, &conversation_id, title, expire_date, usage_limit, request_needed)
+                    .map_err(refused),
+            );
+        }
+        Command::RevokeInvite { conversation_id, link, reply } => {
+            let _ = reply.send(info::revoke_invite(account, &conversation_id, &link).map_err(refused));
+        }
+        Command::JoinRequests { conversation_id, link, limit, reply } => {
+            let _ = reply.send(info::join_requests(account, &conversation_id, link, limit).map_err(refused));
+        }
+        Command::HandleJoinRequest { conversation_id, user_id, approved, link, reply } => {
+            let _ = reply.send(
+                info::handle_join_request(account, &conversation_id, user_id.as_deref(), approved, link)
+                    .map_err(refused),
+            );
         }
         Command::SetMute { conversation_id, notify, until, reply } => {
             let _ = reply.send(info::set_mute(account, &conversation_id, notify, until).map_err(refused));

@@ -1743,10 +1743,105 @@ impl Chat {
             return error(ErrorCode::Refused, "Enter an invite link or code.");
         }
         match self.ask(&account, |reply| Command::InviteJoin { code, reply }) {
-            Ok((space_id, channel_id)) => Response::InviteJoined {
+            Ok((space_id, channel_id, pending)) => Response::InviteJoined {
                 space: space_id.map(|id| Key::new(&account, id)),
                 conversation: channel_id.map(|id| Key::new(&account, id)),
+                pending,
             },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn chat_invites(&self, conversation: Key, revoked: bool) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&account, |reply| Command::ChatInvites { conversation_id, revoked, reply }) {
+            Ok(invites) => Response::ChatInvites { conversation, invites },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn create_invite(
+        &self,
+        conversation: Key,
+        title: Option<String>,
+        expire_date: Option<i64>,
+        usage_limit: Option<u32>,
+        request_needed: bool,
+    ) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&account, |reply| Command::CreateInvite {
+            conversation_id,
+            title,
+            expire_date,
+            usage_limit,
+            request_needed,
+            reply,
+        }) {
+            Ok(invite) => {
+                self.hub.infos.forget(&conversation);
+                Response::ChatInvite { invite }
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn revoke_invite(&self, conversation: Key, link: String) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let link = link.trim().to_owned();
+        if link.is_empty() {
+            return error(ErrorCode::Refused, "No invite link named to revoke.");
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&account, |reply| Command::RevokeInvite { conversation_id, link, reply }) {
+            Ok(invite) => {
+                self.hub.infos.forget(&conversation);
+                Response::ChatInvite { invite }
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn join_requests(&self, conversation: Key, link: Option<String>, limit: u32) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        let limit = if limit == 0 { 50 } else { limit.min(100) };
+        match self.ask(&account, |reply| Command::JoinRequests { conversation_id, link, limit, reply }) {
+            Ok(requests) => Response::JoinRequests { conversation, requests },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn handle_join_request(&self, conversation: Key, user_id: Option<String>, approved: bool, link: Option<String>) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&account, |reply| Command::HandleJoinRequest {
+            conversation_id,
+            user_id,
+            approved,
+            link,
+            reply,
+        }) {
+            Ok(()) => {
+                self.hub.infos.forget(&conversation);
+                Response::Ok
+            }
             Err(refused) => *refused,
         }
     }
@@ -2010,6 +2105,7 @@ impl Chat {
             external: about.external,
             link: about.link,
             bookmarks: about.bookmarks,
+            pending_requests: about.pending_requests,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.creator, 100);
@@ -3370,6 +3466,15 @@ impl Chat {
             Request::SetFriendNickname { person, nickname } => self.set_friend_nickname(person, nickname),
             Request::InvitePreview { account, code } => self.invite_preview(account, code),
             Request::InviteJoin { account, code } => self.invite_join(account, code),
+            Request::ChatInvites { conversation, revoked } => self.chat_invites(conversation, revoked),
+            Request::CreateInvite { conversation, title, expire_date, usage_limit, request_needed } => {
+                self.create_invite(conversation, title, expire_date, usage_limit, request_needed)
+            }
+            Request::RevokeInvite { conversation, link } => self.revoke_invite(conversation, link),
+            Request::JoinRequests { conversation, link, limit } => self.join_requests(conversation, link, limit),
+            Request::HandleJoinRequest { conversation, user_id, approved, link } => {
+                self.handle_join_request(conversation, user_id, approved, link)
+            }
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),

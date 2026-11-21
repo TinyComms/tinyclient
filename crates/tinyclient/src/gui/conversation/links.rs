@@ -148,6 +148,20 @@ impl Pane {
                 });
                 return;
             }
+            if protocol::link::telegram_invite_hash(url).is_some() {
+                let preferred = self
+                    .key()
+                    .filter(|k| k.network == protocol::Network::Telegram)
+                    .map(|k| k.account());
+                let owned = url.to_owned();
+                let opened = self
+                    .shell
+                    .update(cx, |shell, cx| shell.open_telegram_invite(preferred, owned, cx))
+                    .unwrap_or(false);
+                if opened {
+                    return;
+                }
+            }
         }
         if !external && protocol::link::parse_network_link(url).is_some() {
             let owned = url.to_owned();

@@ -198,6 +198,7 @@ pub struct ConversationAbout {
     pub link: String,
     pub disappearing: Option<u32>,
     pub bookmarks: Vec<protocol::Bookmark>,
+    pub pending_requests: u32,
 }
 
 /// What a Space's info says, as the network tells it.
@@ -548,7 +549,44 @@ pub enum Command {
     /// Join a Space from an invite link or code; returns `(space_id, channel_id)`.
     InviteJoin {
         code: String,
-        reply: Reply<(Option<String>, Option<String>)>,
+        /// `(space_id, conversation_id, pending_approval)`.
+        reply: Reply<(Option<String>, Option<String>, bool)>,
+    },
+    /// Lists exported invite links for a group or channel.
+    ChatInvites {
+        conversation_id: String,
+        revoked: bool,
+        reply: Reply<Vec<protocol::ChatInviteLink>>,
+    },
+    /// Creates a new invite link for a group or channel.
+    CreateInvite {
+        conversation_id: String,
+        title: Option<String>,
+        expire_date: Option<i64>,
+        usage_limit: Option<u32>,
+        request_needed: bool,
+        reply: Reply<protocol::ChatInviteLink>,
+    },
+    /// Revokes an exported invite link.
+    RevokeInvite {
+        conversation_id: String,
+        link: String,
+        reply: Reply<protocol::ChatInviteLink>,
+    },
+    /// Lists pending join requests for a group or channel.
+    JoinRequests {
+        conversation_id: String,
+        link: Option<String>,
+        limit: u32,
+        reply: Reply<Vec<protocol::JoinRequest>>,
+    },
+    /// Approves or declines one (`user_id: Some`) or all (`user_id: None`) pending join requests.
+    HandleJoinRequest {
+        conversation_id: String,
+        user_id: Option<String>,
+        approved: bool,
+        link: Option<String>,
+        reply: Reply<()>,
     },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
@@ -866,6 +904,11 @@ impl Command {
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChatInvites { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateInvite { reply, .. }
+            | Command::RevokeInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JoinRequests { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::HandleJoinRequest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }

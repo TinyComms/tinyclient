@@ -1734,10 +1734,50 @@ pub enum Request {
         account: AccountKey,
         code: String,
     },
-    /// Join a Space from an invite link or code (e.g. Discord `POST /invites/{code}`).
+    /// Join a Space or chat from an invite link or code (Discord `POST /invites/{code}`, Telegram `messages.importChatInvite`).
     InviteJoin {
         account: AccountKey,
         code: String,
+    },
+    /// Lists exported invite links for a group or channel (Telegram `messages.getExportedChatInvites`).
+    ChatInvites {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "is_false")]
+        revoked: bool,
+    },
+    /// Creates a new invite link for a group or channel (Telegram `messages.exportChatInvite`).
+    CreateInvite {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expire_date: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage_limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        request_needed: bool,
+    },
+    /// Revokes an exported invite link (Telegram `messages.editExportedChatInvite { revoked: true }`).
+    RevokeInvite {
+        conversation: Key,
+        link: String,
+    },
+    /// Lists pending join requests (or importers) for a group or channel (Telegram `messages.getChatInviteImporters`).
+    JoinRequests {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// Approves or declines one pending join request (`user_id: Some(..)`) or all pending requests (`user_id: None`).
+    HandleJoinRequest {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
+        approved: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
     },
     Watch(Watching),
 
@@ -2949,6 +2989,20 @@ pub enum Response {
         space: Option<Key>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<Key>,
+        /// True when joining submitted a pending join request (`INVITE_REQUEST_SENT`) awaiting admin approval.
+        #[serde(default, skip_serializing_if = "is_false")]
+        pending: bool,
+    },
+    ChatInvites {
+        conversation: Key,
+        invites: Vec<ChatInviteLink>,
+    },
+    ChatInvite {
+        invite: ChatInviteLink,
+    },
+    JoinRequests {
+        conversation: Key,
+        requests: Vec<JoinRequest>,
     },
     Pinned {
         conversation: Key,

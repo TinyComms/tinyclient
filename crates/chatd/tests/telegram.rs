@@ -4155,3 +4155,134 @@ fn create_group_channel_and_add_members_with_missing_invitees() {
         "expected privacy refusal naming invite link, got {privacy:?}"
     );
 }
+
+#[test]
+fn invite_links_join_preview_revoke_and_join_requests() {
+    let world = World::signed_in();
+    world.connected();
+
+    let account = key("u7001").account();
+
+    // 1. Preview a normal Telegram invite link without joining.
+    let Response::InvitePreview { preview } = world.ask(Request::InvitePreview {
+        account: account.clone(),
+        code: "https://t.me/+alpine_invite".into(),
+    }) else {
+        panic!("expected InvitePreview");
+    };
+    assert_eq!(preview.name, "Alpine Club");
+    assert_eq!(preview.members, Some(128));
+    assert!(!preview.request_needed);
+    assert_eq!(world.called("CheckChatInvite alpine_invite"), 1);
+
+    // 2. Join via the invite link: calls ImportChatInvite and records the new channel row.
+    let Response::InviteJoined { space, conversation, pending } = world.ask(Request::InviteJoin {
+        account: account.clone(),
+        code: "https://t.me/+alpine_invite".into(),
+    }) else {
+        panic!("expected InviteJoined");
+    };
+    assert_eq!(space, None);
+    assert_eq!(conversation, Some(key("c9201")));
+    assert!(!pending);
+    assert_eq!(world.called("ImportChatInvite alpine_invite"), 1);
+    let joined_row = world.conversation("c9201").expect("joined channel row recorded");
+    assert_eq!(joined_row.title, "Alpine Club");
+
+    // 3. Approval-gated invite link: preview sets request_needed, join reports pending=true on INVITE_REQUEST_SENT.
+    let Response::InvitePreview { preview: gated } = world.ask(Request::InvitePreview {
+        account: account.clone(),
+        code: "https://t.me/joinchat/approval_invite".into(),
+    }) else {
+        panic!("expected gated InvitePreview");
+    };
+    assert!(gated.request_needed);
+    let Response::InviteJoined { pending: req_sent, .. } = world.ask(Request::InviteJoin {
+        account: account.clone(),
+        code: "https://t.me/+approval_invite".into(),
+    }) else {
+        panic!("expected pending InviteJoined");
+    };
+    assert!(req_sent);
+
+    // 4. Expired invite returns a clear Refused error.
+    let expired = world.ask(Request::InvitePreview {
+        account: account.clone(),
+        code: "https://t.me/+expired_invite".into(),
+    });
+    assert!(
+        matches!(expired, Response::Error { code: ErrorCode::Refused, ref detail } if detail.contains("expired")),
+        "{expired:?}"
+    );
+
+    // 5. Admin invite management: create, list active, revoke, list revoked.
+    let Response::ChatInvite { invite: created } = world.ask(Request::CreateInvite {
+        conversation: key("g8001"),
+        title: Some("Trail guests".into()),
+        expire_date: Some(1_900_000_000),
+        usage_limit: Some(10),
+        request_needed: false,
+    }) else {
+        panic!("expected ChatInvite from CreateInvite");
+    };
+    assert!(created.link.starts_with("https://t.me/+"));
+    assert!(!created.revoked);
+    assert_eq!(created.usage_limit, Some(10));
+
+    let Response::ChatInvites { invites: active, .. } = world.ask(Request::ChatInvites {
+        conversation: key("g8001"),
+        revoked: false,
+    }) else {
+        panic!("expected ChatInvites");
+    };
+    assert!(active.iter().any(|i| i.link == created.link), "{active:?}");
+
+    let Response::ChatInvite { invite: revoked } = world.ask(Request::RevokeInvite {
+        conversation: key("g8001"),
+        link: created.link.clone(),
+    }) else {
+        panic!("expected ChatInvite from RevokeInvite");
+    };
+    assert!(revoked.revoked);
+
+    // 6. Admin join request management: list requests, approve one, decline remaining.
+    let Response::JoinRequests { requests, .. } = world.ask(Request::JoinRequests {
+        conversation: key("g8001"),
+        link: None,
+        limit: 50,
+    }) else {
+        panic!("expected JoinRequests");
+    };
+    assert_eq!(requests.len(), 2, "{requests:?}");
+
+    assert_eq!(
+        world.ask(Request::HandleJoinRequest {
+            conversation: key("g8001"),
+            user_id: Some("u7002".into()),
+            approved: true,
+            link: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("HideChatJoinRequest g8001 u7002 approved=true"), 1);
+
+    assert_eq!(
+        world.ask(Request::HandleJoinRequest {
+            conversation: key("g8001"),
+            user_id: None,
+            approved: false,
+            link: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("HideAllChatJoinRequests g8001 approved=false"), 1);
+
+    let Response::JoinRequests { requests: after, .. } = world.ask(Request::JoinRequests {
+        conversation: key("g8001"),
+        link: None,
+        limit: 50,
+    }) else {
+        panic!("expected empty JoinRequests");
+    };
+    assert!(after.is_empty());
+}

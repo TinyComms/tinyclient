@@ -1347,12 +1347,13 @@ impl Discord {
             online: parsed.get("approximate_presence_count").and_then(Value::as_u64).map(|n| n as u32),
             space_id,
             channel_id,
+            request_needed: false,
         })
     }
 
     /// Joins a Discord server from an invite code (`POST /invites/{code}`). Never retries on
     /// captcha or refusal; `GUILD_CREATE` on the gateway plants the server tree.
-    fn invite_join(&self, raw: &str) -> Result<(Option<String>, Option<String>), Refusal> {
+    fn invite_join(&self, raw: &str) -> Result<(Option<String>, Option<String>, bool), Refusal> {
         let code = parse_discord_invite_code(raw).map_err(Refusal::Refused)?;
         let context = base64::engine::general_purpose::STANDARD.encode(json!({"location": "Join Guild"}).to_string());
         let path = format!("/invites/{}", escaped(&code));
@@ -1371,7 +1372,7 @@ impl Discord {
             .and_then(|c| c.get("id"))
             .and_then(Value::as_str)
             .map(str::to_owned);
-        Ok((space_id, channel_id))
+        Ok((space_id, channel_id, false))
     }
 
     /// Our own presence, and the status line unless it is `None`. Both are settings: the web

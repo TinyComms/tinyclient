@@ -291,6 +291,9 @@ pub struct ConversationInfo {
     /// Channel bookmarks (links, canvases, folders; Slack `bookmarks.list`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bookmarks: Vec<Bookmark>,
+    /// Pending join requests awaiting admin approval (Telegram groups/channels).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pending_requests: u32,
 }
 
 /// Kind of a channel bookmark.
@@ -707,6 +710,44 @@ pub struct InvitePreview {
     pub space_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<String>,
+    /// True when joining via this invite submits a join request for admin approval (Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub request_needed: bool,
+}
+
+/// One exported invite link for a group or channel (Telegram `ChatInviteExported`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatInviteLink {
+    pub link: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub permanent: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub revoked: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub request_needed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire_date: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub usage: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pending_requests: u32,
+}
+
+/// One person who requested to join a chat via an approval-gated invite link (Telegram `ChatInviteImporter`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinRequest {
+    pub user_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub handle: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub about: String,
+    #[serde(default)]
+    pub date: i64,
 }
 
 /// One public channel returned by [`crate::Request::BrowseChannels`].

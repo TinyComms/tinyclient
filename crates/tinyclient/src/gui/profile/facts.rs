@@ -870,7 +870,10 @@ pub fn conversation_line(conversation: &Conversation, info: Option<&Conversation
         },
         (Network::Telegram, kind) => {
             let link = info.map(|info| info.link.as_str()).unwrap_or("");
-            let handle = link.rsplit('/').next().filter(|_| link.contains("t.me/")).map(|name| format!("@{name}"));
+            // A private invite (`t.me/+…`, `t.me/joinchat/…`) is not a public @username.
+            let handle = link.rsplit('/').next().filter(|name| {
+                !name.is_empty() && protocol::link::telegram_invite_hash(link).is_none() && link.contains("t.me/")
+            }).map(|name| format!("@{name}"));
             let (noun, people) = match kind {
                 ConversationKind::Announcement => ("Channel", "subscribers"),
                 _ => ("Group", "members"),
@@ -1260,9 +1263,13 @@ mod tests {
             link: "https://t.me/riverbend_news".into(),
             disappearing: None,
             bookmarks: Vec::new(),
+            pending_requests: 0,
         };
         let channel = info.conversation.clone();
         assert_eq!(conversation_line(&channel, Some(&info)), "@riverbend_news · Channel · 12,408 subscribers");
+        info.link = "https://t.me/+alpine_invite".into();
+        assert_eq!(conversation_line(&channel, Some(&info)), "Channel · 12,408 subscribers");
+        info.link = "https://t.me/riverbend_news".into();
         assert_eq!(members_shown(&channel, Some(&info)), MembersShown::None);
         assert_eq!(notify_control(&channel), NotifyControl::Switch);
         let group = row(Network::Discord, ConversationKind::Group);

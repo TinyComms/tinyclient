@@ -379,6 +379,7 @@ impl Demo {
             link: if self.ctx.account.network == Network::Telegram && !row.kind.is_direct() { format!("https://t.me/{}", row.title.to_lowercase().replace(' ', "_")) } else { String::new() },
             disappearing: row.disappearing,
             bookmarks: Vec::new(),
+            pending_requests: 0,
         })
     }
 
@@ -660,6 +661,7 @@ impl Demo {
             Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
                 let _ = reply.send(demo.edit(&conversation_id, &message_id, text));
             }
+            Command::EditMedia { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Delete { conversation_id, message_id, scope: _, reply } => {
                 let deleted = demo.ctx.deleted(&conversation_id, &message_id);
                 let _ = reply.send(deleted.map_err(|err| Refusal::Refused(err.to_string())));
@@ -883,6 +885,7 @@ impl Demo {
             }
             Command::StartThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchPeople(query) => demo.ctx.searched(&query),
+            Command::ResolveUsername { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Download { url, reply, .. } => drop(reply.send(Ok(Download { url, headers: Vec::new(), sealed: None }))),
             Command::Handoff { conversation_id, reply } => {
                 let account = &demo.ctx.account.account;
@@ -1031,6 +1034,10 @@ impl Demo {
             Command::SetFriendNickname { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChatInvites { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateInvite { reply, .. } | Command::RevokeInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JoinRequests { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::HandleJoinRequest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::LeaveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

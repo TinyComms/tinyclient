@@ -566,6 +566,54 @@ fn pct_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Extracts the invite hash from a Telegram invite link:
+/// `https://t.me/+<hash>`, `https://t.me/joinchat/<hash>`, `telegram.me/...`, `telegram.dog/...`,
+/// `tg://join?invite=<hash>`, or bare `+<hash>` pasted into the join dialog.
+pub fn telegram_invite_hash(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let valid = |h: &str| !h.is_empty() && h.len() <= 128 && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if let Some(rest) = trimmed.strip_prefix('+') {
+        let hash = rest.split(['/', '?', '#']).next().unwrap_or("");
+        return valid(hash).then(|| hash.to_owned());
+    }
+    if let Some(rest) = trimmed.strip_prefix("tg://").or_else(|| trimmed.strip_prefix("TG://")) {
+        if let Some((_, query)) = rest.split_once('?') {
+            for pair in query.split('&') {
+                if let Some(val) = pair.strip_prefix("invite=") {
+                    let hash = val.split('#').next().unwrap_or("");
+                    if valid(hash) {
+                        return Some(hash.to_owned());
+                    }
+                }
+            }
+        }
+        return None;
+    }
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_owned()
+    } else {
+        format!("https://{trimmed}")
+    };
+    let url = Url::parse(&with_scheme).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    if !matches!(host.as_str(), "t.me" | "www.t.me" | "telegram.me" | "www.telegram.me" | "telegram.dog") {
+        return None;
+    }
+    let segments: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
+    let hash = match segments.as_slice() {
+        [first, ..] if first.starts_with('+') => &first[1..],
+        [first, second, ..] if first.eq_ignore_ascii_case("joinchat") => second,
+        _ => return None,
+    };
+    valid(hash).then(|| hash.to_owned())
+}
+
 /// Parses a message or conversation link for any supported network (the inverse of `message_link`).
 /// Invite links (`discord.gg`, `t.me/+...`, `t.me/joinchat/...`, Slack invites) return `None`.
 pub fn parse_network_link(raw: &str) -> Option<NetworkLink> {
@@ -1146,5 +1194,14 @@ mod tests {
 
         // Non-network web links stay None
         assert_eq!(parse_network_link("https://example.com/channels/1/2/3"), None);
+
+        // Telegram invite hash parser handles +hash, joinchat, telegram.me, tg://, and bare +hash
+        assert_eq!(telegram_invite_hash("https://t.me/+AbCdEf_123"), Some("AbCdEf_123".into()));
+        assert_eq!(telegram_invite_hash("https://t.me/joinchat/LegacyHash-9"), Some("LegacyHash-9".into()));
+        assert_eq!(telegram_invite_hash("https://telegram.me/+TeamLink?fbclid=1"), Some("TeamLink".into()));
+        assert_eq!(telegram_invite_hash("tg://join?invite=DeepHash42"), Some("DeepHash42".into()));
+        assert_eq!(telegram_invite_hash("+BareHash"), Some("BareHash".into()));
+        assert_eq!(telegram_invite_hash("https://t.me/rustlang"), None);
+        assert_eq!(telegram_invite_hash("https://example.com/+not_tg"), None);
     }
 }

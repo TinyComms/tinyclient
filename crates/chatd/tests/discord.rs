@@ -4977,7 +4977,7 @@ fn invite_preview_join_and_error_translation() {
         account: account.clone(),
         code: "https://discord.com/invite/rustlang".into(),
     }) {
-        Response::InviteJoined { space, conversation } => {
+        Response::InviteJoined { space, conversation, .. } => {
             assert_eq!(space.map(|k| k.id), Some("9900".into()));
             assert_eq!(conversation.map(|k| k.id), Some("9901".into()));
         }
