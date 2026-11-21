@@ -3324,3 +3324,73 @@ fn full_user_call_flags_gate_call_support_and_video() {
     assert_eq!(row("u7002").call, protocol::CallSupport::Handoff);
     assert!(row("u7002").call_video);
 }
+
+#[test]
+fn call_service_rows_map_direction_reason_video_and_group_actions() {
+    use protocol::CallOutcome;
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+
+    // 1. Missed incoming voice call -> Missed, preview "Missed call", raises unread.
+    let unread_before = world.conversation("u7002").unwrap().unread;
+    world.steer("call-event in missed voice");
+    let missed = world.until("missed call", || {
+        world.messages("u7002").into_iter().find(|m| m.call.as_ref().is_some_and(|c| c.outcome == CallOutcome::Missed))
+    });
+    assert_eq!(missed.kind, MessageKind::System);
+    assert_eq!(missed.text, "Missed call");
+    assert!(!missed.outgoing);
+    assert!(!missed.call.as_ref().unwrap().video);
+    let conv = world.conversation("u7002").unwrap();
+    assert_eq!(conv.preview, "Missed call");
+    assert!(conv.unread > unread_before, "missed incoming call must count as unread");
+
+    // 2. Cancelled outgoing call (out + missed reason).
+    world.steer("call-event out missed voice");
+    let cancelled = world.until("cancelled call", || {
+        world.messages("u7002").into_iter().find(|m| m.call.as_ref().is_some_and(|c| c.outcome == CallOutcome::Cancelled))
+    });
+    assert!(cancelled.outgoing);
+    assert_eq!(cancelled.text, "Cancelled call");
+
+    // 3. Line busy (out + busy reason).
+    world.steer("call-event out busy voice");
+    let busy = world.until("busy call", || {
+        world.messages("u7002").into_iter().find(|m| m.call.as_ref().is_some_and(|c| c.outcome == CallOutcome::Busy))
+    });
+    assert!(busy.outgoing);
+    assert_eq!(busy.text, "Line busy");
+
+    // 4. Declined incoming call (in + busy reason).
+    world.steer("call-event in busy voice");
+    let declined = world.until("declined call", || {
+        world.messages("u7002").into_iter().find(|m| m.call.as_ref().is_some_and(|c| c.outcome == CallOutcome::Declined))
+    });
+    assert!(!declined.outgoing);
+    assert_eq!(declined.text, "Declined call");
+
+    // 5. Outgoing ended video call with duration (out + hangup + video + 95s).
+    world.steer("call-event out hangup video 95");
+    let ended_vid = world.until("ended video call", || {
+        world.messages("u7002").into_iter().find(|m| {
+            m.call.as_ref().is_some_and(|c| c.outcome == CallOutcome::Ended && c.video && c.seconds == Some(95))
+        })
+    });
+    assert!(ended_vid.outgoing);
+    assert!(ended_vid.text.starts_with("Outgoing video call"), "{}", ended_vid.text);
+
+    // 6. Group video chat started (Live) and ended, plus conference call.
+    world.steer("call-event in group-live video");
+    let group_live = world.until("group live", || {
+        world.messages("g8001").into_iter().find(|m| m.call.as_ref().is_some_and(|c| c.outcome == CallOutcome::Live))
+    });
+    assert!(group_live.text.contains("started a video chat"), "{}", group_live.text);
+
+    world.steer("call-event in conf-missed video");
+    let conf_missed = world.until("conf missed", || {
+        world.messages("g8001").into_iter().find(|m| m.call.as_ref().is_some_and(|c| c.outcome == CallOutcome::Missed))
+    });
+    assert_eq!(conf_missed.kind, MessageKind::System);
+    assert_eq!(conf_missed.text, "Missed group video call");
+}

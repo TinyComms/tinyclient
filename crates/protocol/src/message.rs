@@ -650,6 +650,7 @@ pub enum CallOutcome {
     Missed,
     Declined,
     Cancelled,
+    Busy,
     Ended,
     Live,
 }
@@ -662,6 +663,8 @@ pub struct CallNote {
     pub caller_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seconds: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub video: bool,
 }
 
 /// An earlier wording of one message, oldest first when several are kept. Only a network that

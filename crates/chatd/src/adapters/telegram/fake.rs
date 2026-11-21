@@ -1467,6 +1467,89 @@ impl World {
                 self.call_flags.insert(id, (avail, priv_, video));
                 Vec::new()
             }
+            "call-event" => {
+                // call-event <out|in> <missed|busy|hangup|disconnect|none|group-live|group-end|conf-live|conf-missed> [video] [duration]
+                let out = words.next() == Some("out");
+                let kind = words.next().unwrap_or("missed");
+                let video = words.next() == Some("video");
+                let duration: Option<i32> = words.next().and_then(|d| d.parse().ok());
+                let (peer, action): (Who, tl::enums::MessageAction) = match kind {
+                    "group-live" => (
+                        Who::Group(CREW),
+                        tl::types::MessageActionGroupCall {
+                            call: tl::types::InputGroupCall { id: 501, access_hash: 502 }.into(),
+                            duration: None,
+                        }
+                        .into(),
+                    ),
+                    "group-end" => (
+                        Who::Group(CREW),
+                        tl::types::MessageActionGroupCall {
+                            call: tl::types::InputGroupCall { id: 501, access_hash: 502 }.into(),
+                            duration: Some(duration.unwrap_or(185)),
+                        }
+                        .into(),
+                    ),
+                    "conf-live" => (
+                        Who::Group(CREW),
+                        tl::types::MessageActionConferenceCall {
+                            missed: false,
+                            active: true,
+                            video,
+                            call_id: 601,
+                            duration: None,
+                            other_participants: None,
+                        }
+                        .into(),
+                    ),
+                    "conf-missed" => (
+                        Who::Group(CREW),
+                        tl::types::MessageActionConferenceCall {
+                            missed: true,
+                            active: false,
+                            video,
+                            call_id: 602,
+                            duration: None,
+                            other_participants: None,
+                        }
+                        .into(),
+                    ),
+                    other => {
+                        let reason = match other {
+                            "missed" => Some(tl::enums::PhoneCallDiscardReason::Missed),
+                            "busy" => Some(tl::enums::PhoneCallDiscardReason::Busy),
+                            "hangup" => Some(tl::enums::PhoneCallDiscardReason::Hangup),
+                            "disconnect" => Some(tl::enums::PhoneCallDiscardReason::Disconnect),
+                            _ => None,
+                        };
+                        (
+                            odalys,
+                            tl::types::MessageActionPhoneCall {
+                                video,
+                                call_id: i64::from(self.next) + 900,
+                                reason,
+                                duration,
+                            }
+                            .into(),
+                        )
+                    }
+                };
+                self.next += 1;
+                let id = self.next;
+                let from_id = if out { Some(Who::User(ME).peer()) } else { Some(Who::User(ODALYS).peer()) };
+                let mut svc: tl::types::MessageService = blank(&[
+                    &put(0u32),
+                    &put(id),
+                    &put(peer.peer()),
+                    &put(t0() + id),
+                    &put(action),
+                ]);
+                svc.out = out;
+                svc.from_id = from_id;
+                let raw: tl::enums::Message = svc.into();
+                self.messages.entry(key(peer, None)).or_default().insert(id, raw.clone());
+                vec![update(tl::types::UpdateNewMessage { message: raw, pts: 0, pts_count: 0 }.into())]
+            }
             "peer-blocked" => {
                 let id = words.next().and_then(|id| id.parse().ok()).unwrap_or(ODALYS);
                 let blocked = words.next() != Some("off");

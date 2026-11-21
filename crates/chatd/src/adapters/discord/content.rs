@@ -859,6 +859,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
             outcome,
             caller_id: author.id.clone(),
             seconds,
+            video: false,
         })
     } else {
         None
