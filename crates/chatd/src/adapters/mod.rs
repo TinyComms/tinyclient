@@ -338,14 +338,17 @@ pub enum Command {
         limit: u32,
         reply: Reply<ReactorsPage>,
     },
-    /// Replace the text of one of our messages. Report the edited message through
-    /// [`Context::message`] before answering: nothing was changed locally. `spans` are the
-    /// styled ranges of `text`; an adapter that cannot send them leaves them unused.
+    /// Replace the text of one of our messages, suppress embeds, or keep a subset of attachments.
+    /// Report the edited message through [`Context::message`] before answering: nothing was
+    /// changed locally. `spans` are the styled ranges of `text`; an adapter that cannot send them
+    /// leaves them unused.
     Edit {
         conversation_id: String,
         message_id: String,
         text: String,
         spans: Vec<protocol::Span>,
+        suppress_embeds: bool,
+        keep_attachments: Option<Vec<String>>,
         reply: Reply<()>,
     },
     /// Fetch the raw source text of a message for lossless editing.

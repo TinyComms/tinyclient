@@ -1608,6 +1608,8 @@ fn nitro_plain_text_uses_the_four_thousand_character_limit() {
         message_id: "1300000000000000009".into(),
         text: three.clone(),
         spans: Vec::new(),
+        suppress_embeds: false,
+        keep_attachments: None,
     });
     match edit {
         Response::Error { detail, .. } => assert!(detail.contains("2000"), "{detail}"),
@@ -1643,7 +1645,7 @@ fn nitro_plain_text_uses_the_four_thousand_character_limit() {
     assert_eq!(posted.len(), 2);
     assert_eq!(posted.last().unwrap().body["content"].as_str().map(|text| text.chars().count()), Some(3000));
 
-    let edited = nitro.ask(Request::Edit { conversation: nitro.key("3002"), message_id: sent.id, text: three, spans: Vec::new() });
+    let edited = nitro.ask(Request::Edit { conversation: nitro.key("3002"), message_id: sent.id, text: three, spans: Vec::new(), suppress_embeds: false, keep_attachments: None });
     assert_eq!(edited, Response::Ok);
     let patched = nitro.discord.requests_to("PATCH", "/channels/3002/messages");
     assert_eq!(patched.last().unwrap().body["content"].as_str().map(|text| text.chars().count()), Some(3000));
@@ -2576,7 +2578,7 @@ fn reactions_edits_and_deletes_go_to_discord_and_the_store_follows_its_word() {
 
     // An edit changes nothing until Discord accepts it; then the store has Discord's version.
     let edit = |text: &str| {
-        world.ask(Request::Edit { conversation: world.key(dm), message_id: mine.to_owned(), text: text.to_owned(), spans: Vec::new() })
+        world.ask(Request::Edit { conversation: world.key(dm), message_id: mine.to_owned(), text: text.to_owned(), spans: Vec::new(), suppress_embeds: false, keep_attachments: None })
     };
     assert_eq!(edit("is the *deploy* done yet?"), Response::Ok);
     let patched = world.discord.requests_to("PATCH", &format!("{reactions}/{mine}"));
@@ -5306,5 +5308,125 @@ fn channel_mentions_message_links_and_special_tokens_resolve_in_app() {
     }) {
         Response::Resolved { conversation, .. } => assert_eq!(conversation, None),
         other => panic!("expected Response::Resolved, got {other:?}"),
+    }
+}
+
+#[test]
+fn edit_suppresses_embeds_merging_existing_flags_and_removes_attachments() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Grant MANAGE_MESSAGES (1 << 13 = 8192) on @everyone in guild 4000 so moderator suppress works.
+    let guild = ready["guilds"].as_array_mut().unwrap().iter_mut().find(|g| g["id"] == "4000").unwrap();
+    let everyone = guild["roles"].as_array_mut().unwrap().iter_mut().find(|r| r["id"] == "4000").unwrap();
+    let perms: u64 = everyone["permissions"].as_str().unwrap().parse().unwrap();
+    everyone["permissions"] = json!((perms | (1u64 << 13)).to_string());
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // 1. Seed another user's message with an embed and existing flags = 1 (CROSSPOSTED) | 4096 (SUPPRESS_NOTIFICATIONS).
+    let other_id = "1300000010000001300";
+    let other_msg = json!({
+        "id": other_id,
+        "channel_id": "4101",
+        "type": 0,
+        "author": {"id": "2001", "username": "mara", "global_name": "Mara", "discriminator": "0", "avatar": null},
+        "content": "see https://example.org",
+        "timestamp": "2026-10-13T09:20:00.000000+00:00",
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "embeds": [{"type": "link", "url": "https://example.org", "title": "Example"}],
+        "attachments": [],
+        "pinned": false,
+        "flags": 4097
+    });
+    world.discord.push("MESSAGE_CREATE", other_msg.clone());
+    wait("other user message with embed", || {
+        world.messages("4101").into_iter().find(|m| m.id == other_id && !m.previews.is_empty())
+    });
+
+    // Moderator suppresses embeds on another user's message: merges SUPPRESS_EMBEDS (4) with 4097 -> 4101,
+    // and omits "content" from the PATCH body.
+    world.discord.script("/channels/4101/messages", 200, json!([other_msg.clone()]));
+    let mut suppressed = other_msg.clone();
+    suppressed["flags"] = json!(4101);
+    suppressed["embeds"] = json!([]);
+    world.discord.script(&format!("/channels/4101/messages/{other_id}"), 200, suppressed);
+    assert_eq!(
+        world.ask(Request::Edit {
+            conversation: world.key("4101"),
+            message_id: other_id.into(),
+            text: String::new(),
+            spans: Vec::new(),
+            suppress_embeds: true,
+            keep_attachments: None,
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", &format!("/channels/4101/messages/{other_id}"));
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].body["flags"], json!(4097 | 4));
+    assert!(patches[0].body.get("content").is_none(), "suppress-only PATCH must omit content: {}", patches[0].body);
+
+    // 2. Own message with two attachments: removing one attachment and clearing text is allowed
+    //    because one attachment remains, and PATCH sends attachments: [{"id": "7002"}].
+    let own_id = "1300000010000001301";
+    let own_msg = json!({
+        "id": own_id,
+        "channel_id": "4101",
+        "type": 0,
+        "author": me(),
+        "content": "two files",
+        "timestamp": "2026-10-13T09:21:00.000000+00:00",
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "embeds": [],
+        "attachments": [
+            {"id": "7001", "filename": "a.txt", "size": 10, "url": "https://cdn.discordapp.com/attachments/4101/7001/a.txt"},
+            {"id": "7002", "filename": "b.txt", "size": 20, "url": "https://cdn.discordapp.com/attachments/4101/7002/b.txt"}
+        ],
+        "pinned": false,
+        "flags": 0
+    });
+    world.discord.push("MESSAGE_CREATE", own_msg.clone());
+    wait("own message with two attachments", || {
+        world.messages("4101").into_iter().find(|m| m.id == own_id && m.attachments.len() == 2)
+    });
+
+    let mut one_left = own_msg.clone();
+    one_left["content"] = json!("");
+    one_left["attachments"] = json!([
+        {"id": "7002", "filename": "b.txt", "size": 20, "url": "https://cdn.discordapp.com/attachments/4101/7002/b.txt"}
+    ]);
+    world.discord.script(&format!("/channels/4101/messages/{own_id}"), 200, one_left);
+    assert_eq!(
+        world.ask(Request::Edit {
+            conversation: world.key("4101"),
+            message_id: own_id.into(),
+            text: String::new(),
+            spans: Vec::new(),
+            suppress_embeds: false,
+            keep_attachments: Some(vec!["att:7002".into()]),
+        }),
+        Response::Ok
+    );
+    let att_patches = world.discord.requests_to("PATCH", &format!("/channels/4101/messages/{own_id}"));
+    assert_eq!(att_patches.len(), 1);
+    assert_eq!(att_patches[0].body["content"], json!(""));
+    assert_eq!(att_patches[0].body["attachments"], json!([{"id": "7002"}]));
+
+    // 3. Clearing both text AND all attachments is refused (offer Delete instead).
+    match world.ask(Request::Edit {
+        conversation: world.key("4101"),
+        message_id: own_id.into(),
+        text: String::new(),
+        spans: Vec::new(),
+        suppress_embeds: false,
+        keep_attachments: Some(Vec::new()),
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused for empty text + empty attachments, got {other:?}"),
     }
 }

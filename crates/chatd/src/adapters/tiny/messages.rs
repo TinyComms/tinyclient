@@ -527,6 +527,8 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             message_id,
             text,
             spans,
+            suppress_embeds: _,
+            keep_attachments: _,
             reply,
         } => edit(ctx, saved, &conversation_id, &message_id, &text, &spans, reply),
         Command::Delete {

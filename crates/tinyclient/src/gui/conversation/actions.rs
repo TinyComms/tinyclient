@@ -146,6 +146,8 @@ pub struct Can {
     pub pin: bool,
     /// Publish (crosspost) an announcement-channel message to following servers.
     pub publish: bool,
+    /// Suppress link previews / embeds on a message (own message or moderator on Discord).
+    pub suppress_embeds: bool,
     /// Forward this message natively (`Capabilities::forward`).
     pub forward: bool,
     /// May delete this message for everyone (own message or moderator with `rights.delete_others`).
@@ -324,6 +326,7 @@ pub fn can_with_network_topic(
         delete,
         pin: act && caps.pins && rights.pin,
         publish,
+        suppress_embeds: act && network == Network::Discord && caps.suppress_embeds && (own || rights.delete_others),
         forward: act && caps.forward,
         delete_everyone,
         delete_me,
@@ -1167,6 +1170,32 @@ impl Pane {
             });
         })
         .detach();
+    }
+
+    /// Opens the delete confirmation dialog for `message_id` (used when an edit leaves a message empty).
+    pub(super) fn confirm_delete_by_id(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        let Some(message) = self.find(message_id) else {
+            return;
+        };
+        self.confirm = Some(message);
+        self.wants_focus = true;
+        cx.notify();
+    }
+
+    /// Suppresses embeds / link previews on `message_id` via `Request::Edit { suppress_embeds: true }`.
+    pub(super) fn suppress_message_embeds(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        let request = Request::Edit {
+            conversation,
+            message_id: message_id.to_owned(),
+            text: String::new(),
+            spans: Vec::new(),
+            suppress_embeds: true,
+            keep_attachments: None,
+        };
+        self.act(request, "Couldn't remove preview", cx);
     }
 
     /// Publishes (crossposts) an announcement-channel message to all following servers.
@@ -3090,6 +3119,7 @@ mod tests {
             forward: true,
             polls: Some(protocol::PollCapabilities::default()),
             reactions: true,
+            suppress_embeds: true,
             announcement_follow: true,
             ..Capabilities::default()
         }
@@ -3432,5 +3462,19 @@ mod tests {
         // Others' unpublished messages require Manage Messages (`delete_others`).
         assert!(!can(&theirs, &caps, plain, ConversationKind::Announcement, false, 20).publish);
         assert!(can(&theirs, &caps, mod_rights, ConversationKind::Announcement, false, 20).publish);
+    }
+
+    #[test]
+    fn suppress_embeds_is_offered_on_own_messages_and_for_moderators_on_discord() {
+        let caps = discord_caps();
+        let plain = ConversationRights::default();
+        let mod_rights = ConversationRights { delete_others: true, ..ConversationRights::default() };
+        let mine = Message::plain("m1", "Me", "https://example.com", 10, true);
+        let theirs = Message::plain("m2", "Mara", "https://example.com", 11, false);
+
+        assert!(can_with_network(&mine, Network::Discord, &caps, plain, ConversationKind::Channel, false, 20).suppress_embeds);
+        assert!(!can_with_network(&theirs, Network::Discord, &caps, plain, ConversationKind::Channel, false, 20).suppress_embeds);
+        assert!(can_with_network(&theirs, Network::Discord, &caps, mod_rights, ConversationKind::Channel, false, 20).suppress_embeds);
+        assert!(!can_with_network(&mine, Network::Slack, &caps, plain, ConversationKind::Channel, false, 20).suppress_embeds);
     }
 }

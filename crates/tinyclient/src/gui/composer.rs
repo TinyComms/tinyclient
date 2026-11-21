@@ -446,6 +446,10 @@ struct Editing {
     id: String,
     /// The message as it was put in the field: saving this unchanged is a cancel.
     original: String,
+    /// Removable attachments present when edit mode started: `(file_id, display_name)`.
+    original_attachments: Vec<(String, String)>,
+    /// Remaining attachments kept by the user during this edit.
+    attachments: Vec<(String, String)>,
     /// What was in the field before, and the reply it was for. Back on save or cancel.
     stash: Draft,
     reply: Option<Reply>,
@@ -2223,7 +2227,23 @@ impl Composer {
             }
         };
         let (text, tokens) = mention::source(message);
-        self.editing = Some(Editing { id: message.id.clone(), original: text.clone(), stash, reply });
+        let removable: Vec<(String, String)> = message
+            .attachments
+            .iter()
+            .filter(|a| !a.sticker && a.file.id.starts_with("att:"))
+            .map(|a| {
+                let name = if a.name.is_empty() { a.file.id.clone() } else { a.name.clone() };
+                (a.file.id.clone(), name)
+            })
+            .collect();
+        self.editing = Some(Editing {
+            id: message.id.clone(),
+            original: text.clone(),
+            original_attachments: removable.clone(),
+            attachments: removable,
+            stash,
+            reply,
+        });
         self.set_field(&Draft { text, subject: String::new(), tokens, files: Vec::new(), note: None, reply: None }, cx);
         self.close_picker(cx);
         self.caption = None;
@@ -2299,18 +2319,24 @@ impl Composer {
     }
 
     fn save_edit(&mut self, target: &Target, cx: &mut Context<Self>) {
-        let Some((id, original)) = self.editing.as_ref().map(|editing| (editing.id.clone(), editing.original.clone())) else {
+        let Some((id, original, attachments_changed, kept_ids)) = self.editing.as_ref().map(|editing| {
+            let changed = editing.attachments != editing.original_attachments;
+            let ids: Vec<String> = editing.attachments.iter().map(|(id, _)| id.clone()).collect();
+            (editing.id.clone(), editing.original.clone(), changed, ids)
+        }) else {
             return;
         };
         self.follow_text(cx);
         let field = self.input.read(cx).text().to_owned();
-        if field.trim() == original.trim() {
+        if field.trim() == original.trim() && !attachments_changed {
             self.end_edit(cx);
             return;
         }
-        if field.trim().is_empty() {
-            self.caption = Some(("A message can't be saved empty. Delete it from its menu instead.".to_owned(), Tone::Note));
-            cx.notify();
+        if field.trim().is_empty() && kept_ids.is_empty() {
+            // Nothing left in the message: leave edit mode and offer Delete confirmation.
+            let delete_id = id.clone();
+            self.end_edit(cx);
+            let _ = self.shell.update(cx, |shell, cx| shell.confirm_delete_message(&delete_id, cx));
             return;
         }
         if !live() {
@@ -2328,6 +2354,8 @@ impl Composer {
             message_id: id.clone(),
             text: wire,
             spans,
+            suppress_embeds: false,
+            keep_attachments: attachments_changed.then_some(kept_ids),
         };
         self.sending = true;
         cx.notify();
@@ -3107,9 +3135,68 @@ impl Composer {
             }))
     }
 
+    fn edit_attachments_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let editing = self.editing.as_ref()?;
+        if editing.attachments.is_empty() {
+            return None;
+        }
+        let chips = editing.attachments.iter().enumerate().map(|(ix, (id, name))| {
+            let remove_id = id.clone();
+            div()
+                .h(px(24.))
+                .pl(px(8.))
+                .pr(px(4.))
+                .rounded(px(theme::R_CHIP))
+                .bg(theme::field())
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .type_small()
+                .text_color(theme::text())
+                .child(glyph("icons/paperclip.svg", 12., theme::text_soft()))
+                .child(div().max_w(px(180.)).truncate().child(name.clone()))
+                .child(
+                    div()
+                        .id(("edit-att-remove", ix))
+                        .size(px(18.))
+                        .rounded(px(theme::R_CONTROL))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::selected()))
+                        .tooltip(tip("Remove attachment", None))
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(editing) = this.editing.as_mut() {
+                                editing.attachments.retain(|(att_id, _)| att_id != &remove_id);
+                                cx.notify();
+                            }
+                        }))
+                        .child(glyph("icons/x.svg", 12., theme::text_soft())),
+                )
+        });
+        Some(
+            div()
+                .px(px(12.))
+                .py(px(6.))
+                .border_b_1()
+                .border_color(theme::hairline())
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.))
+                .children(chips),
+        )
+    }
+
     fn card(&mut self, focused: bool, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let controls = self.controls();
-        let ready = !self.sending && !self.scan_blocks_current() && (!self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty());
+        let ready = !self.sending
+            && !self.scan_blocks_current()
+            && (!self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty() || self.editing.is_some());
         let focus = self.input.focus_handle(cx);
         let open_tab = self.picking.as_ref().map(|picking| picking.picker.read(cx).tab());
         let send_icon = if self.editing.is_some() { "icons/check.svg" } else { "icons/send-horizontal.svg" };
@@ -3304,6 +3391,7 @@ impl Composer {
             // A click anywhere on the card is a click into the field.
             .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| window.focus(&focus, cx))
             .children(self.mode_bar(cx))
+            .children(self.edit_attachments_bar(cx))
             .children(self.subject_bar(cx))
             .children(self.tray(window, cx))
             .children(self.format_bar(cx))
@@ -3653,7 +3741,14 @@ impl Composer {
             }
         } else if staged("edit") {
             let original = "Sounds good. I'll keep the consumers paused until it finishes.";
-            self.editing = Some(Editing { id: "1".into(), original: original.into(), stash: Draft::default(), reply: None });
+            self.editing = Some(Editing {
+                id: "1".into(),
+                original: original.into(),
+                original_attachments: Vec::new(),
+                attachments: Vec::new(),
+                stash: Draft::default(),
+                reply: None,
+            });
             self.set_field(&field(original, Vec::new()), cx);
         } else if staged("complete") {
             let person = |name: &str, handle: &str, presence| Person {

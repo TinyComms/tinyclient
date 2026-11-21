@@ -1948,7 +1948,7 @@ fn sending_editing_deleting_and_reacting_wait_for_telegram() {
     assert!(world.calls().contains(&"SendMessage u7002 See you there".to_owned()));
 
     assert_eq!(
-        world.ask(Request::Edit { conversation: key("u7002"), message_id: "101".into(), text: "See you at seven".into(), spans: Vec::new() }),
+        world.ask(Request::Edit { conversation: key("u7002"), message_id: "101".into(), text: "See you at seven".into(), spans: Vec::new(), suppress_embeds: false, keep_attachments: None }),
         Response::Ok
     );
     let edited = world.message("u7002", "101").unwrap();
@@ -2766,7 +2766,7 @@ fn markers_are_sent_as_entities_and_an_edit_keeps_the_bold() {
         world.calls()
     );
     assert_eq!(
-        world.ask(Request::Edit { conversation: key("u7002"), message_id: sent.id.clone(), text: "hi there".into(), spans: Vec::new() }),
+        world.ask(Request::Edit { conversation: key("u7002"), message_id: sent.id.clone(), text: "hi there".into(), spans: Vec::new(), suppress_embeds: false, keep_attachments: None }),
         Response::Ok
     );
     let edited = world.until("the edit to keep the bold", || world.message("u7002", &sent.id).filter(|message| message.edited));

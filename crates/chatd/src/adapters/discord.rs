@@ -1123,14 +1123,41 @@ impl Discord {
         Ok(super::ReactorsPage { reactors, more })
     }
 
-    /// Replaces the text of one of our messages. The store changes with Discord's answer.
-    fn edit(&self, channel: &str, message: &str, text: &str) -> Result<(), Refusal> {
-        let premium = self.state.lock().unwrap().premium;
-        if let Some(why) = too_long(premium, text) {
-            return Err(Refusal::Refused(why));
+    /// Edits one of our messages, suppresses its embeds (preserving existing flag bits), or
+    /// removes attachments by listing the kept attachment ids. The store changes with Discord's
+    /// answer.
+    fn edit(
+        &self,
+        channel: &str,
+        message: &str,
+        text: &str,
+        suppress_embeds: bool,
+        keep_attachments: Option<&[String]>,
+    ) -> Result<(), Refusal> {
+        let suppress_only = suppress_embeds && text.is_empty() && keep_attachments.is_none();
+        let mut body = serde_json::Map::new();
+        if !suppress_only {
+            let premium = self.state.lock().unwrap().premium;
+            if let Some(why) = too_long(premium, text) {
+                return Err(Refusal::Refused(why));
+            }
+            body.insert("content".to_owned(), json!(text));
+        }
+        if suppress_embeds {
+            // Read current flags before patching so existing bits (e.g. IS_VOICE_MESSAGE,
+            // CROSSPOSTED, SUPPRESS_NOTIFICATIONS) are preserved rather than cleared.
+            let existing = self.message_flags(channel, message)?;
+            body.insert("flags".to_owned(), json!(existing | model::SUPPRESS_EMBEDS));
+        }
+        if let Some(keep) = keep_attachments {
+            let kept: Vec<Value> = keep
+                .iter()
+                .map(|id| json!({"id": id.strip_prefix("att:").unwrap_or(id)}))
+                .collect();
+            body.insert("attachments".to_owned(), Value::Array(kept));
         }
         let path = format!("/channels/{channel}/messages/{message}");
-        let edited = self.call("PATCH", &path, Some(json!({"content": text}))).map_err(refusal)?;
+        let edited = self.call("PATCH", &path, Some(Value::Object(body))).map_err(refusal)?;
         let unreadable = |err: String| Refusal::Refused(format!("Discord's answer was unreadable: {err}"));
         let mut posted: Posted = serde_json::from_str(&edited).map_err(|err| unreadable(err.to_string()))?;
         if posted.channel_id.is_empty() {
@@ -1139,6 +1166,15 @@ impl Discord {
         self.updated(posted).map_err(|failed| match failed {
             Failure::SignedOut(why) | Failure::Dropped(why) => unreadable(why),
         })
+    }
+
+    /// Reads the current `flags` bitmask of a message so PATCH merges rather than overwrites it.
+    fn message_flags(&self, channel: &str, message: &str) -> Result<u64, Refusal> {
+        let path = format!("/channels/{channel}/messages?around={message}&limit=1");
+        let body = self.call("GET", &path, None).map_err(refusal)?;
+        let found: Vec<Posted> = serde_json::from_str(&body)
+            .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        Ok(found.into_iter().find(|p| p.id == message).and_then(|p| p.flags).unwrap_or(0))
     }
 
     /// Fetches the raw markdown source of a single message for lossless editing.
@@ -1867,9 +1903,18 @@ impl Discord {
             Command::Reactors { conversation_id, message_id, emoji, burst, after, limit, reply } => {
                 answer(reply, self.reactors(&conversation_id, &message_id, &emoji, burst, after.as_deref(), limit))
             }
-            Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
-                answer(reply, self.edit(&conversation_id, &message_id, &text))
-            }
+            Command::Edit {
+                conversation_id,
+                message_id,
+                text,
+                spans: _,
+                suppress_embeds,
+                keep_attachments,
+                reply,
+            } => answer(
+                reply,
+                self.edit(&conversation_id, &message_id, &text, suppress_embeds, keep_attachments.as_deref()),
+            ),
             Command::Source { conversation_id, message_id, reply } => {
                 answer(reply, self.source(&conversation_id, &message_id))
             }

@@ -770,7 +770,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::ReactionRules { conversation_id, reply } => {
             let _ = reply.send(react::rules(account, &conversation_id).map_err(refused));
         }
-        Command::Edit { conversation_id, message_id, text, spans, reply } => {
+        Command::Edit { conversation_id, message_id, text, spans, suppress_embeds: _, keep_attachments: _, reply } => {
             let _ = reply.send(edit(account, &conversation_id, &message_id, &text, &spans).map_err(refused));
         }
         Command::Delete { conversation_id, message_id, scope, reply } => {

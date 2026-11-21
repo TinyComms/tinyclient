@@ -2196,6 +2196,14 @@ impl Shell {
         }
     }
 
+    /// Opens the delete confirmation dialog for a message in the open conversation (used when
+    /// editing a message down to empty text and zero attachments).
+    pub(super) fn confirm_delete_message(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        if let Some(pane) = self.conversation_state.pane.get().cloned() {
+            pane.update(cx, |pane, cx| pane.confirm_delete_by_id(message_id, cx));
+        }
+    }
+
     pub(super) fn conversation(&self, snapshot: &Snapshot, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let Some(open) = snapshot.open.as_ref() else {
             return div()

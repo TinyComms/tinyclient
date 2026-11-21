@@ -498,13 +498,13 @@ fn reactions_edits_deletes_and_receipts_land_on_the_right_message() {
     assert!(matches!(&custom, Response::Error { code: protocol::ErrorCode::Refused, .. }), "{custom:?}");
     assert!(!world.calls().iter().any(|call| call.contains(":party:")));
     assert_eq!(
-        world.ask(Request::Edit { conversation: key(GRACE), message_id: ours.id.clone(), text: "Sure!".into(), spans: Vec::new() }),
+        world.ask(Request::Edit { conversation: key(GRACE), message_id: ours.id.clone(), text: "Sure!".into(), spans: Vec::new(), suppress_embeds: false, keep_attachments: None }),
         Response::Ok
     );
 
     world.heard(&format!("send {GRACE} edit {ours_at} Sure!"));
     assert!(world.messages(GRACE).iter().any(|m| m.id == ours.id && m.edited && m.text == "Sure!"));
-    let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: again.id.clone(), text: "Not mine".into(), spans: Vec::new() });
+    let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: again.id.clone(), text: "Not mine".into(), spans: Vec::new(), suppress_embeds: false, keep_attachments: None });
     assert!(matches!(&refused, Response::Error { detail, .. } if detail.contains("own messages")), "{refused:?}");
     // Grace's phone has ours, then Grace read it.
     assert!(!world.conversation(GRACE).unwrap().delivered);
@@ -935,7 +935,7 @@ fn styled_text_is_sent_as_ranges_and_a_spoiler_stays_out_of_the_preview() {
         world.messages(GRACE).into_iter().find(|message| message.client_id.as_deref() == Some("5002") && message.id != "5002")
     });
     assert_eq!(answered.reply_to.as_ref().map(|reply| reply.snippet.as_str()), Some("Hold Spoiler"));
-    assert_eq!(world.ask(Request::Edit { conversation: key(GRACE), message_id: styled.id, text: "~~no~~".into(), spans: Vec::new() }), Response::Ok);
+    assert_eq!(world.ask(Request::Edit { conversation: key(GRACE), message_id: styled.id, text: "~~no~~".into(), spans: Vec::new(), suppress_embeds: false, keep_attachments: None }), Response::Ok);
     world.heard(&format!("send {GRACE} edit {styled_at} no ranges=Strike:0+2"));
     let edited = world.until("the strike", || {
         world.messages(GRACE).into_iter().find(|message| message.text == "no" && message.spans.iter().any(|span| span.style == protocol::Style::Strike))
@@ -1074,7 +1074,7 @@ fn deleting_an_old_message_is_delete_for_me() {
     world.connected();
     world.steer(&format!("mine {T0} From the phone"));
     let old = world.arrived(GRACE, &id(T0, ME));
-    let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: old.id.clone(), text: "Too late".into(), spans: Vec::new() });
+    let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: old.id.clone(), text: "Too late".into(), spans: Vec::new(), suppress_embeds: false, keep_attachments: None });
     assert!(matches!(&refused, Response::Error { detail, .. } if detail.contains("no longer")), "{refused:?}");
     assert!(!world.calls().iter().any(|call| call.contains(&format!("edit {T0}"))));
     assert_eq!(world.ask(Request::Delete { conversation: key(GRACE), message_id: old.id.clone(), scope: protocol::DeleteScope::Everyone }), Response::Ok);
@@ -2647,6 +2647,8 @@ fn group_at_mentions_send_and_edit_as_ufffc_with_utf16_body_ranges_and_echo_name
         message_id: echoed.id.clone(),
         text: format!("updated <@{ALAN}>"),
         spans: Vec::new(),
+        suppress_embeds: false,
+        keep_attachments: None,
     });
     assert!(matches!(edit_resp, Response::Ok), "expected edit Ok, got {edit_resp:?}");
     let edited = world.until("edited mention updated locally", || {

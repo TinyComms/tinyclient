@@ -3179,17 +3179,26 @@ impl Pane {
 
     fn cards(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let previews: Vec<Preview> = message.previews.iter().take(CARDS).cloned().collect();
+        let can_suppress = self.can(message).suppress_embeds;
         previews
             .iter()
             .enumerate()
             .map(|(ix, preview)| {
-                let card = self.card(ix, preview, window, cx);
+                let card = self.card(&message.id, ix, preview, can_suppress, window, cx);
                 div().pt(px(if ix == 0 { 5. } else { 4. })).flex().child(card).into_any_element()
             })
             .collect()
     }
 
-    fn card(&mut self, index: usize, preview: &Preview, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn card(
+        &mut self,
+        message_id: &str,
+        index: usize,
+        preview: &Preview,
+        can_suppress: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let preview = self.wikipedia_preview(preview, cx);
         let scale = window.scale_factor();
         let image = preview.image.as_ref();
@@ -3224,20 +3233,46 @@ impl Pane {
                 clamp(sized(div().type_ui(), 14., 20.), 20.).text_color(theme::text_soft()).child(preview.description.clone())
             }));
         let url = preview.url.clone();
+        let dismiss = can_suppress.then(|| {
+            let msg_id = message_id.to_owned();
+            div()
+                .id(SharedString::from(format!("suppress-preview-{message_id}-{index}")))
+                .absolute()
+                .top(px(6.))
+                .right(px(6.))
+                .size(px(20.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(tokens::card())
+                .hover(|s| s.bg(theme::selected()))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .tooltip(tip("Remove link preview", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.suppress_message_embeds(&msg_id, cx);
+                }))
+                .child(glyph("icons/x.svg", 12., theme::text_soft()))
+        });
         // A phone's card is exactly the column's width: wrapped words then measure against it,
         // not against the desktop's 440, and never run past its edge.
         let card = div()
             .id(("card", index))
+            .relative()
             .w(px(if phone { self.media_width() } else { 440. }))
             .max_w_full()
             .px(px(12.))
+            .when(can_suppress, |c| c.pr(px(30.)))
             .py(px(10.))
             .rounded(px(theme::R_FLOAT))
             .bg(tokens::card())
             .border_1()
             .border_color(theme::hairline())
             .cursor_pointer()
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| this.open_link(&url, event.modifiers().alt, window, cx)));
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| this.open_link(&url, event.modifiers().alt, window, cx)))
+            .children(dismiss);
         let Some(image) = image.cloned() else {
             return card.child(words).into_any_element();
         };
