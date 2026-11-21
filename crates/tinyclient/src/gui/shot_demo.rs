@@ -685,6 +685,7 @@ fn counts_of(rows: &[Conversation]) -> InboxCounts {
         unread: rows.iter().filter(|r| r.unread > 0 && !r.muted).count() as u32,
         mentions: rows.iter().filter(|r| r.mentions > 0).count() as u32,
         apps: 0,
+        activity: rows.iter().filter(|r| !r.muted && (r.mentions > 0 || (r.followed && r.unread > 0))).count() as u32,
     }
 }
 
@@ -705,6 +706,7 @@ fn inbox(network: Option<Network>, filter: InboxFilter) -> Vec<Conversation> {
             InboxFilter::All => true,
             InboxFilter::Unread => (row.unread > 0 && !row.muted) || row.mentions > 0,
             InboxFilter::Mentions => row.mentions > 0,
+            InboxFilter::Activity => !row.muted && (row.mentions > 0 || (row.followed && row.unread > 0)),
             InboxFilter::Directs => row.kind.is_direct(),
         })
         .cloned()

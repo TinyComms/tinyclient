@@ -1539,9 +1539,10 @@ impl Shell {
                     ("filter-all", "All", 0, filter == InboxFilter::All),
                     ("filter-unread", "Unread", counts.unread, filter == InboxFilter::Unread),
                     ("filter-mentions", "Mentions", counts.mentions, filter == InboxFilter::Mentions),
+                    ("filter-activity", "Activity", counts.activity, filter == InboxFilter::Activity),
                 ];
                 let pick = |this: &mut Shell, ix: usize, cx: &mut Context<Shell>| {
-                    this.set_filter([InboxFilter::All, InboxFilter::Unread, InboxFilter::Mentions][ix], cx);
+                    this.set_filter([InboxFilter::All, InboxFilter::Unread, InboxFilter::Mentions, InboxFilter::Activity][ix], cx);
                 };
                 let has_unread = counts.unread > 0 || counts.mentions > 0;
                 let fit = inbox_strip_fit(

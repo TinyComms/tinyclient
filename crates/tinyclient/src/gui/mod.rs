@@ -565,6 +565,7 @@ mod shot {
                 match flag("--filter").as_deref() {
                     Some("unread") => shell.set_filter(InboxFilter::Unread, cx),
                     Some("mentions") => shell.set_filter(InboxFilter::Mentions, cx),
+                    Some("activity") => shell.set_filter(InboxFilter::Activity, cx),
                     _ => {}
                 }
                 if let Some(scale) = flag("--text-scale").and_then(|n| n.parse::<f32>().ok()) {

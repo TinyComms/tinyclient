@@ -429,6 +429,8 @@ pub struct SettingsWindow {
     pub(super) loopback: bool,
     /// Shared by the page, scrollbar, and screenshot harness.
     pane_scroll: gpui::ScrollHandle,
+    /// Comma-separated keywords for Settings › Notifications › Keywords (NK).
+    pub(super) notify_keywords: Entity<TextInput>,
     /// The Linux passphrase for the screen lock. Other systems use the device prompt.
     #[cfg(target_os = "linux")]
     lock_phrase: Entity<TextInput>,
@@ -438,6 +440,17 @@ pub struct SettingsWindow {
 impl SettingsWindow {
     fn new(shell: WeakEntity<Shell>, section: Section, phone: bool, window: &mut Window, cx: &mut Context<Self>) -> SettingsWindow {
         let search = cx.new(|cx| TextInput::new("Search settings", cx));
+        let initial_kw = prefs::values()
+            .stored(protocol::settings::GLOBAL, protocol::settings::NOTIFY_KEYWORDS)
+            .unwrap_or("")
+            .to_owned();
+        let notify_keywords = cx.new(|cx| {
+            let mut input = TextInput::new("deploy, incident, your name", cx);
+            if !initial_kw.is_empty() {
+                input.insert(&initial_kw, cx);
+            }
+            input
+        });
         #[cfg(target_os = "linux")]
         let lock_phrase = cx.new(|cx| TextInput::secret("Passphrase", cx));
         let mut subscriptions = vec![
@@ -452,6 +465,11 @@ impl SettingsWindow {
             cx.subscribe_in(&search, window, |this, _, event: &InputKey, window, cx| {
                 if *event == InputKey::Escape {
                     this.dismiss(window, cx);
+                }
+            }),
+            cx.subscribe_in(&notify_keywords, window, |this, _, event: &InputEvent, _, cx| {
+                if let InputEvent::Submit = event {
+                    this.save_keywords(cx);
                 }
             }),
         ];
@@ -511,6 +529,7 @@ impl SettingsWindow {
             chord_clash: None,
             loopback: false,
             pane_scroll: gpui::ScrollHandle::new(),
+            notify_keywords,
             #[cfg(target_os = "linux")]
             lock_phrase,
             _subscriptions: subscriptions,

@@ -43,6 +43,9 @@ pub const ROWS: &[Row] = &[
     row("NG", Notifications, "Notify for", "Group chats", &[], &["group", "notify"]),
     row("NM", Notifications, "Notify for", "Mentions in channels", &[], &["mention", "@", "everyone", "here", "notify"]),
     row("NT", Notifications, "Notify for", "Tiny servers", &[], &["tiny", "server", "room", "notify"]),
+    row("NR", Notifications, "Notify for", "Reactions to my messages", &["Off", "In direct messages", "Everywhere"], &["reaction", "reactions", "emoji", "thumbs up", "notify"]),
+    row("NF", Notifications, "Notify for", "Replies in threads I follow", &[], &["thread", "threads", "reply", "replies", "followed", "notify"]),
+    row("NK", Notifications, "Notify for", "Keywords", &[], &["keyword", "keywords", "word", "words", "highlight", "watch", "notify"]),
     row("N4", Notifications, "Privacy", "Show in notifications", &["Sender and message", "Sender only", "Nothing"], &["preview", "privacy", "screen sharing", "hide", "text"]),
     row("NL", Notifications, "Privacy", "When the screen is locked", &["Sender and message", "Sender only", "Nothing"], &["lock", "locked", "lock screen", "privacy"]),
     row("N5", Notifications, "Calls", "Incoming calls", &["Ring", "Silently", "Don't notify"], &["ring", "ringtone", "call", "phone"]),
@@ -120,7 +123,6 @@ pub const ROWS: &[Row] = &[
 pub const NOT_YET: &[(&str, &str)] = &[
     ("proxy", "tinyclient has no proxy setting yet."),
     ("socks", "tinyclient has no proxy setting yet."),
-    ("reaction", "tinyclient does not notify about reactions yet."),
     ("accent", "tinyclient keeps one accent colour."),
     ("font", "tinyclient keeps the system font. Text size is in Appearance."),
     ("language", crate::host::FOLLOWS_LANGUAGE),
@@ -236,7 +238,7 @@ pub fn draws_label(id: &str) -> bool {
 pub fn kept_by_chatd(id: &str) -> bool {
     matches!(
         id,
-        "N1" | "N2" | "ND" | "NG" | "NM" | "NT" | "N4" | "NL" | "N5" | "N6" | "N7" | "N8" | "N9" | "N10" | "N11" | "N13" | "S2" | "S3" | "S4" | "SV" | "S13" | "S14"
+        "N1" | "N2" | "ND" | "NG" | "NM" | "NT" | "NR" | "NF" | "NK" | "N4" | "NL" | "N5" | "N6" | "N7" | "N8" | "N9" | "N10" | "N11" | "N13" | "S2" | "S3" | "S4" | "SV" | "S13" | "S14"
             | "G2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V22" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "V20" | "V21" | "D1" | "D2" | "D3"
     )
 }
@@ -370,11 +372,11 @@ mod tests {
     fn a_search_for_what_is_not_built_says_so() {
         assert!(search("proxy").is_empty());
         assert_eq!(not_yet("proxy"), Some("tinyclient has no proxy setting yet."));
-        // The words people reach for, not only the names in the product doc.
-        for words in ["reactions"] {
-            assert!(search(words).is_empty(), "{words} finds a row");
-            assert!(not_yet(words).is_some(), "{words} gets no line");
-        }
+        // Reactions, thread replies and keywords are built now.
+        assert!(search("reactions").iter().any(|row| row.id == "NR"));
+        assert!(search("threads").iter().any(|row| row.id == "NF"));
+        assert!(search("keywords").iter().any(|row| row.id == "NK"));
+        assert_eq!(not_yet("reactions"), None);
         assert!(search("spell").iter().any(|row| row.id == "M6"), "spell finds Check spelling");
         assert_eq!(not_yet("spell"), None);
         // Sounds of your own are built now: the words reach the row that adds one.

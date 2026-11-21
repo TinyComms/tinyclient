@@ -317,6 +317,7 @@ const IN_INBOX: &str = "(NOT c.hidden AND c.special != 'request'
 const IS_UNREAD: &str = "(((c.unread > 0 AND NOT c.bot AND NOT c.archived) OR c.mentions > 0) AND NOT c.muted)";
 const IS_MENTION: &str = "(c.mentions > 0)";
 const IS_APP: &str = "(c.bot AND c.unread > 0)";
+const IS_ACTIVITY: &str = "(NOT c.muted AND (c.mentions > 0 OR (c.kind = 'thread' AND c.followed AND c.unread > 0) OR EXISTS (SELECT 1 FROM message m WHERE m.network = c.network AND m.account = c.account AND m.conversation = c.id AND json_extract(m.body, '$.outgoing') = 1 AND json_array_length(json_extract(m.body, '$.reactions')) > 0)))";
 
 const PERSON: &str = "
     SELECT p.network, p.account, p.id, p.name, p.handle, p.bot, p.relation, p.status, p.link,
@@ -731,6 +732,7 @@ fn counts_from(row: &Row) -> rusqlite::Result<InboxCounts> {
         unread: row.get(1)?,
         mentions: row.get(2)?,
         apps: row.get(3)?,
+        activity: row.get(4)?,
     })
 }
 
@@ -1658,11 +1660,12 @@ impl Store {
             InboxFilter::All => "1",
             InboxFilter::Unread => IS_UNREAD,
             InboxFilter::Mentions => IS_MENTION,
+            InboxFilter::Activity => IS_ACTIVITY,
             InboxFilter::Directs => "c.kind IN ('direct', 'group')",
         };
         let belongs = format!("{IN_INBOX} AND (?1 IS NULL OR c.network = ?1) AND {narrowed}{}", not_these(hidden));
         let first = match filter {
-            InboxFilter::Unread | InboxFilter::Mentions => "c.mentions > 0",
+            InboxFilter::Unread | InboxFilter::Mentions | InboxFilter::Activity => "c.mentions > 0",
             InboxFilter::All | InboxFilter::Directs => "c.starred",
         };
         let network = network.map(|network| word(&network));
@@ -1688,7 +1691,7 @@ impl Store {
         self.db.query_row(
             &format!(
                 "SELECT COUNT(*), COALESCE(SUM({IS_UNREAD}), 0), COALESCE(SUM({IS_MENTION}), 0),
-                        COALESCE(SUM({IS_APP}), 0)
+                        COALESCE(SUM({IS_APP}), 0), COALESCE(SUM({IS_ACTIVITY}), 0)
                    FROM conversation c WHERE {IN_INBOX} AND (?1 IS NULL OR c.network = ?1){}",
                 not_these(hidden)
             ),

@@ -976,6 +976,8 @@ pub enum InboxFilter {
     Unread,
     /// Only what mentions me, muted or not: who is waiting on me.
     Mentions,
+    /// Reactions to my messages, replies in followed threads, and mentions.
+    Activity,
     /// Direct and group conversations only.
     Directs,
 }
@@ -989,6 +991,9 @@ pub struct InboxCounts {
     /// Bot and app rows with something unread: the Apps row's dot, never a number.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub apps: u32,
+    /// Unmuted rows with reactions to me, unread followed threads, or mentions.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub activity: u32,
 }
 
 /// Which messages of a conversation. Always oldest first in the answer.

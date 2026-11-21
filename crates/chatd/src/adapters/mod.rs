@@ -966,9 +966,35 @@ impl Context {
 
     /// One person added or removed one reaction. Set `reaction.mine` when it was us.
     pub fn reacted(&self, conversation_id: &str, message_id: &str, reaction: &Reaction, added: bool) -> Stores {
+        self.reacted_by(conversation_id, message_id, reaction, added, None)
+    }
+
+    /// Like [`reacted`], with the reactor's display name when the network reports who reacted.
+    pub fn reacted_by(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        reaction: &Reaction,
+        added: bool,
+        reactor: Option<&str>,
+    ) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().react(&conversation, message_id, reaction, added)? {
-            self.hub.changed(Change::Messages { conversation });
+            self.hub.changed(Change::Messages { conversation: conversation.clone() });
+            if added && !reaction.mine {
+                if let Ok(Some(target)) = self.hub.store().message(&conversation, message_id) {
+                    if target.outgoing {
+                        let snippet = crate::store::preview_text(&target);
+                        self.hub.notify(crate::notify::Event::Reaction {
+                            conversation,
+                            emoji: reaction.emoji.clone(),
+                            reactor: reactor.map(str::to_owned),
+                            snippet,
+                            outgoing_target: true,
+                        });
+                    }
+                }
+            }
         }
         Ok(())
     }
