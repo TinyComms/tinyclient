@@ -539,6 +539,8 @@ pub struct Composer {
     sending: bool,
     /// A join is already on its way. Another click does not send a second one.
     joining: bool,
+    /// Which click `joining` belongs to. A late answer for an older click does not clear a newer one.
+    join_epoch: u64,
     /// The conversation just joined, until the user leaves it or undoes the join.
     undo_join: Option<Key>,
     /// The conversation the network was last told we are typing in, and when.
@@ -675,6 +677,7 @@ impl Composer {
             caption: None,
             sending: false,
             joining: false,
+            join_epoch: 0,
             undo_join: None,
             told_typing: None,
             list: None,
@@ -2747,11 +2750,17 @@ impl Composer {
                             return;
                         }
                         let Some(conversation) = key.clone() else { return };
+                        this.join_epoch = this.join_epoch.wrapping_add(1);
+                        let epoch = this.join_epoch;
                         this.joining = true;
                         let joined = conversation.clone();
                         let entity = cx.weak_entity();
                         ask_later(cx, Request::Join { conversation }, move |answer, cx| {
                             let _ = entity.update(cx, |this, cx| {
+                                // A newer click, or a click after this one was superseded, owns the guard.
+                                if this.join_epoch != epoch {
+                                    return;
+                                }
                                 this.joining = false;
                                 this.note_join(joined, answer, cx);
                             });
