@@ -294,6 +294,12 @@ impl Shell {
         }
         let names = self.my_names(c);
         let preview = names.iter().map(|me| strip_me(&c.preview, me)).find(|stripped| stripped.len() != c.preview.len()).unwrap_or(&c.preview);
+        if preview.starts_with("Missed call") {
+            let tone = quiet(theme::danger());
+            return line
+                .child(glyph("icons/phone-missed.svg", 12., tone))
+                .child(div().min_w_0().truncate().text_color(tone).child("Missed call"));
+        }
         let ticks = c.receipt().filter(|_| matches!(c.kind, ConversationKind::Direct | ConversationKind::Group) && c.special == Special::None).map(|receipt| {
             let (icon, size, color) = tick(receipt);
             glyph(icon, size, quiet(color))

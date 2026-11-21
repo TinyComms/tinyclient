@@ -1457,6 +1457,78 @@ impl Pane {
         let blocks = rich::blocks(&message.text, &message.spans);
         Some(rich::plain(&blocks, (0, 0), (blocks.len(), usize::MAX)))
     }
+    fn live_call_row(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if self.thread {
+            return None;
+        }
+        let open = self.open.as_ref()?;
+        let (key, occupants) = self.shell.upgrade().and_then(|shell| {
+            let shell = shell.read(cx);
+            let conv = shell.snapshot.as_ref()?.open.as_ref()?;
+            if conv.key != open.key || conv.kind == protocol::ConversationKind::Voice {
+                return None;
+            }
+            let mine = shell.snapshot.as_ref()?.call.as_ref().is_some_and(|c| c.conversation == conv.key);
+            if mine {
+                return None;
+            }
+            let occ = conv.occupants.as_ref().filter(|o| o.total > 0)?;
+            Some((conv.key.clone(), occ.clone()))
+        })?;
+        let names: Vec<&str> = occupants.people.iter().take(3).map(|p| p.name.as_str()).collect();
+        let summary = if names.is_empty() {
+            format!("Call in progress · {}", occupants.total)
+        } else {
+            format!("Call in progress · {}", names.join(", "))
+        };
+        let shell = self.shell.clone();
+        Some(
+            div()
+                .absolute()
+                .left(px(self.metrics.inset))
+                .right(px(self.metrics.inset))
+                .bottom(px(10.))
+                .h(px(40.))
+                .px(px(12.))
+                .rounded(px(theme::R_CARD))
+                .bg(theme::raised())
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .size(px(26.))
+                        .rounded_full()
+                        .bg(theme::accent_soft())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(crate::gui::components::glyph("icons/phone.svg", 13., theme::accent())),
+                )
+                .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text()).child(summary))
+                .child(
+                    div()
+                        .id("live-call-join")
+                        .flex_none()
+                        .h(px(26.))
+                        .px(px(12.))
+                        .rounded_full()
+                        .bg(theme::accent())
+                        .text_color(theme::on_accent())
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .type_micro()
+                        .font_weight(theme::SEMIBOLD)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let _ = shell.update(cx, |shell, cx| shell.call_start(key.clone(), cx));
+                        }))
+                        .child("Join"),
+                ),
+        )
+    }
 }
 
 impl Render for Pane {
@@ -1548,6 +1620,7 @@ impl Render for Pane {
             }))
             .child(crate::gui::components::scroll_frame("message-scroll-frame", self.list.clone(), rows).keyboard(false))
             .child(after)
+            .children(self.live_call_row(cx))
             .children(self.history_banner(cx))
             .children(self.away.then(|| self.jump_button(cx)))
             .children(self.action_layers(window, cx))

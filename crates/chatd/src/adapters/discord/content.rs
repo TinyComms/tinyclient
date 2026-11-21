@@ -822,6 +822,45 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     let (avatar, avatar_url) = author.avatar();
     rich.files.push((avatar.clone(), avatar_url));
     let outgoing = !author.id.is_empty() && author.id == place.me;
+    let sent = seconds(&posted.id);
+    let call_note = if kind == 3 {
+        let (outcome, seconds) = match &posted.call {
+            Some(payload) => match payload.ended_timestamp.as_deref().and_then(model::iso_seconds) {
+                Some(ended) => {
+                    let dur = u32::try_from((ended - sent).max(0)).ok().filter(|&s| s > 0);
+                    let missed = payload.participants.len() <= 1 && !outgoing;
+                    let outcome = if missed { protocol::CallOutcome::Missed } else { protocol::CallOutcome::Ended };
+                    if missed {
+                        rich.text = format!("Missed call from {who}");
+                    } else if let Some(secs) = dur {
+                        let mins = secs / 60;
+                        rich.text = if mins >= 60 {
+                            format!("Call with {who} · {} hr {} min", mins / 60, mins % 60)
+                        } else if mins >= 1 {
+                            format!("Call with {who} · {mins} min")
+                        } else {
+                            format!("Call with {who} · {secs} sec")
+                        };
+                    } else {
+                        rich.text = format!("Call with {who}");
+                    }
+                    (outcome, dur)
+                }
+                None => {
+                    rich.text = "Call in progress".to_owned();
+                    (protocol::CallOutcome::Live, None)
+                }
+            },
+            None => (protocol::CallOutcome::Ended, None),
+        };
+        Some(protocol::CallNote {
+            outcome,
+            caller_id: author.id.clone(),
+            seconds,
+        })
+    } else {
+        None
+    };
     // Our own client's nonce is the shell's client id: digits, at most 25.
     let client_id = posted.nonce.clone().filter(|nonce| outgoing && digits(nonce) && nonce.len() <= 25);
     let message = Message {
@@ -839,7 +878,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
             avatar: Some(avatar),
             bot: author.bot || posted.webhook_id.is_some(),
         },
-        sent: seconds(&posted.id),
+        sent,
         seq: 0,
         expires_at: None,
         outgoing,
@@ -863,6 +902,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         client_id,
         deliveries: Vec::new(),
         receipt_note: String::new(),
+        call: call_note,
     };
     (message, rich.files)
 }
@@ -1075,5 +1115,43 @@ mod tests {
     fn unclosed_markup_stays_as_typed() {
         assert_eq!(parsed("2 ** 3 and a_b and `open").text, "2 ** 3 and a_b and `open");
         assert_eq!(parsed("\\*not italic\\*").text, "*not italic*");
+    }
+
+    #[test]
+    fn discord_call_message_maps_missed_ended_and_live_outcomes() {
+        struct Empty;
+        impl Names for Empty {
+            fn user(&self, _: &str) -> Option<String> { None }
+            fn role(&self, _: &str) -> Option<String> { None }
+            fn channel(&self, _: &str) -> Option<String> { None }
+            fn space(&self, _: &str) -> Option<String> { None }
+        }
+        let account = AccountKey { network: protocol::Network::Discord, account: "acct".into() };
+        let place = Place { account: &account, me: "me", guild: None, names: &Empty, author: None };
+        // Snowflake 1000000000000000000 -> (1000000000000000000 >> 22) + 1420070400000 = 1658489056s (2022-07-22T11:24:16Z)
+        let base = Posted {
+            id: "1000000000000000000".into(),
+            channel_id: "dm-1".into(),
+            author: Some(model::User { id: "peer".into(), username: "bea".into(), global_name: Some("Bea".into()), ..Default::default() }),
+            kind: Some(3),
+            ..Default::default()
+        };
+        let mut missed = base.clone();
+        missed.call = Some(model::CallPayload { participants: vec!["peer".into()], ended_timestamp: Some("2022-07-22T11:24:46Z".into()) });
+        let (m, _) = message(&missed, &place);
+        assert_eq!(m.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Missed));
+        assert_eq!(m.text, "Missed call from Bea");
+
+        let mut ended = base.clone();
+        ended.call = Some(model::CallPayload { participants: vec!["peer".into(), "me".into()], ended_timestamp: Some("2022-07-22T11:34:59Z".into()) });
+        let (m, _) = message(&ended, &place);
+        assert_eq!(m.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Ended));
+        assert_eq!(m.call.as_ref().and_then(|c| c.seconds), Some(720));
+        assert_eq!(m.text, "Call with Bea · 12 min");
+
+        let mut live = base;
+        live.call = Some(model::CallPayload { participants: vec!["peer".into()], ended_timestamp: None });
+        let (m, _) = message(&live, &place);
+        assert_eq!(m.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Live));
     }
 }
