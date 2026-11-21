@@ -711,3 +711,88 @@ fn a_passkey_already_gone_is_said_so_and_not_blamed_on_the_server() {
     });
     assert_eq!(PASSKEY_GONE, "That passkey is gone.");
 }
+
+#[test]
+fn abuse_reports_list_read_work_and_refusals() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let logged = log.clone();
+    let base = serve(move |request| {
+        logged.lock().unwrap().push(request.to_owned());
+        let first = request.lines().next().unwrap_or("");
+        if first.starts_with("GET /v1/capabilities ") {
+            http(200, "OK", r#"{"version":"0.6.0","features":["roles","abuse_reports"]}"#)
+        } else if first.starts_with("GET /v1/me ") {
+            http(200, "OK", OWNER)
+        } else if first.starts_with("GET /v1/reports?") {
+            http(
+                200,
+                "OK",
+                r#"[{"id":"r1","kind":"message","category":"spam","status":"open","preserve":false,"reported":{"user_id":"u2","display_name":"Bea"},"reporter":{"user_id":"u3","display_name":"Cy"},"message_id":"m1","channel_id":"c1","direct_id":null,"has_evidence":true,"evidence_unverified":true,"linked_audit_ids":[],"created_at":"2026-11-20T00:00:00Z","updated_at":"2026-11-20T00:00:00Z","resolved_at":null}]"#,
+            )
+        } else if first.starts_with("GET /v1/reports/r1 ") {
+            http(
+                200,
+                "OK",
+                r#"{"id":"r1","kind":"message","category":"spam","status":"open","preserve":false,"reported":{"user_id":"u2","display_name":"Bea"},"reporter":{"user_id":"u3","display_name":"Cy"},"message_id":"m1","channel_id":"c1","direct_id":null,"has_evidence":true,"evidence_unverified":true,"linked_audit_ids":[],"created_at":"2026-11-20T00:00:00Z","updated_at":"2026-11-20T00:00:00Z","resolved_at":null,"note":"Repeated spam","evidence":"buy now","preserved_by":null,"preserved_at":null,"notes":[]}"#,
+            )
+        } else if first.starts_with("PATCH /v1/reports/r1 ") {
+            http(
+                200,
+                "OK",
+                r#"{"id":"r1","kind":"message","category":"spam","status":"actioned","preserve":true,"reported":{"user_id":"u2","display_name":"Bea"},"reporter":{"user_id":"u3","display_name":"Cy"},"message_id":"m1","channel_id":"c1","direct_id":null,"has_evidence":true,"evidence_unverified":true,"linked_audit_ids":[42],"created_at":"2026-11-20T00:00:00Z","updated_at":"2026-11-20T00:05:00Z","resolved_at":"2026-11-20T00:05:00Z","note":"Repeated spam","evidence":"buy now","preserved_by":"u1","preserved_at":"2026-11-20T00:05:00Z","notes":[{"id":"n1","author":{"user_id":"u1","display_name":"Ada"},"body":"Banned user","created_at":"2026-11-20T00:05:00Z"}]}"#,
+            )
+        } else if first.starts_with("GET /v1/reports/self ") {
+            http(404, "Not Found", r#"{"error":"not_found"}"#)
+        } else if first.starts_with("GET /v1/reports/denied ") {
+            http(403, "Forbidden", r#"{"error":"forbidden"}"#)
+        } else {
+            http(404, "Not Found", r#"{"error":"not_found"}"#)
+        }
+    });
+    with_session(&base, "owner", |account| {
+        let filter = TinyReportFilter { status: "open".into(), kind: "message".into(), before: None, limit: 25 };
+        match reports_list(account.clone(), filter) {
+            Response::TinyReports { reports } => {
+                assert_eq!(reports.len(), 1);
+                assert_eq!(reports[0].id, "r1");
+                assert!(reports[0].has_evidence);
+            }
+            other => panic!("unexpected list response: {other:?}"),
+        }
+        assert!(last(&log, "GET /v1/reports?").contains("limit=25&status=open&kind=message"));
+
+        match report_read(account.clone(), "r1".into()) {
+            Response::TinyReport { report } => {
+                assert_eq!(report.note.as_deref(), Some("Repeated spam"));
+                assert_eq!(report.evidence.as_deref(), Some("buy now"));
+            }
+            other => panic!("unexpected read response: {other:?}"),
+        }
+
+        let update = TinyReportUpdate {
+            status: Some("actioned".into()),
+            note: Some("Banned user".into()),
+            link_audit_id: Some(42),
+            preserve: Some(true),
+        };
+        match report_work(account.clone(), "r1".into(), update) {
+            Response::TinyReport { report } => {
+                assert_eq!(report.summary.status, "actioned");
+                assert!(report.summary.preserve);
+                assert_eq!(report.summary.linked_audit_ids, vec![42]);
+                assert_eq!(report.notes.len(), 1);
+            }
+            other => panic!("unexpected work response: {other:?}"),
+        }
+        let patch_body = json_body(&last(&log, "PATCH /v1/reports/r1"));
+        assert_eq!(patch_body["status"], "actioned");
+        assert_eq!(patch_body["note"], "Banned user");
+        assert_eq!(patch_body["link_audit_id"], 42);
+        assert_eq!(patch_body["preserve"], true);
+
+        // 404 (including a hidden self-report) gives a neutral message with no hint.
+        assert_eq!(report_read(account.clone(), "self".into()), said(REPORT_GONE));
+        // 403 gives a permission refusal.
+        assert_eq!(report_read(account, "denied".into()), said(REPORT_FORBIDDEN));
+    });
+}

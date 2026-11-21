@@ -18,8 +18,8 @@ use super::{asked, endpoint, explain, open, refused, rows, safe_id, tiny_name, M
 use protocol::{
     tiny_allowed, AccountKey, Response, TinyAccess, TinyAuditFilter, TinyBan, TinyCapabilities, TinyCategory, TinyCode,
     TinyBot, TinyInviteOptions, TinyLayoutGroup, TinyRole, TinyRoleEdit, TinyRoom, TinyRoomEdit, TinySeat, TinyServerEdit, TinyServerInfo,
-    TinyClaimLink, TinyPasskeys, TinySetup, TinySetupApplied, TinySetupApply, TinySetupRefusal,
-    TINY_ALL, TINY_BITRATE_MAX, TINY_BITRATE_MIN, TINY_DESCRIPTION_MAX, TINY_FEATURE_AUDIT_QUERY, TINY_FEATURE_BANS,
+    TinyClaimLink, TinyPasskeys, TinyReportDetail, TinyReportFilter, TinyReportSummary, TinyReportUpdate, TinySetup, TinySetupApplied, TinySetupApply, TinySetupRefusal,
+    TINY_ALL, TINY_BITRATE_MAX, TINY_BITRATE_MIN, TINY_DESCRIPTION_MAX, TINY_FEATURE_ABUSE_REPORTS, TINY_FEATURE_AUDIT_QUERY, TINY_FEATURE_BANS,
     TINY_FEATURE_CATEGORIES, TINY_FEATURE_INVITE_OPTIONS, TINY_FEATURE_ROLES, TINY_FEATURE_SERVER, TINY_FEATURE_TIMEOUTS,
     TINY_FEATURE_FILE_SCAN, TINY_FEATURE_FIRST_RUN_SETUP, TINY_FEATURE_UPLOAD_LIMITS, TINY_ICON_MAX, TINY_SERVER_NAME_MAX, TINY_UPLOAD_MAX,
     TINY_WELCOME_MAX,
@@ -1132,6 +1132,123 @@ pub(crate) fn audit(account: AccountKey, filter: TinyAuditFilter) -> Response {
             Ok(audit) => Response::TinyAudit { audit },
             Err(()) => refused(UNREADABLE),
         },
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+const REPORT_STATUSES: [&str; 4] = ["open", "reviewing", "actioned", "dismissed"];
+const REPORT_KINDS: [&str; 3] = ["message", "member", "channel"];
+const REPORT_NOTE_MAX: usize = 2000;
+const REPORT_GONE: &str = "That report isn't available.";
+const REPORT_FORBIDDEN: &str = "You don't have permission to manage reports.";
+
+/// One page of the server's abuse reports (`GET /v1/reports`). Kept in memory only; never cached or logged.
+pub(crate) fn reports_list(account: AccountKey, filter: TinyReportFilter) -> Response {
+    let saved = match allowed(&account, Some(TINY_FEATURE_ABUSE_REPORTS), "community.reports.manage") {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    if !filter.status.is_empty() && !REPORT_STATUSES.contains(&filter.status.as_str()) {
+        return refused(CHECK);
+    }
+    if !filter.kind.is_empty() && !REPORT_KINDS.contains(&filter.kind.as_str()) {
+        return refused(CHECK);
+    }
+    if filter.before.as_deref().is_some_and(|id| !safe_id(id)) {
+        return refused(CHECK);
+    }
+    let limit = match filter.limit {
+        0 => 50,
+        limit => limit.min(200),
+    };
+    let mut path = format!("/v1/reports?limit={limit}");
+    if !filter.status.is_empty() {
+        path.push_str(&format!("&status={}", escape(&filter.status)));
+    }
+    if !filter.kind.is_empty() {
+        path.push_str(&format!("&kind={}", escape(&filter.kind)));
+    }
+    if let Some(before) = &filter.before {
+        path.push_str(&format!("&before={}", escape(before)));
+    }
+    match asked("GET", &saved, &path, None) {
+        Err(detail) => refused(detail),
+        Ok((200, body)) => match serde_json::from_value::<Vec<TinyReportSummary>>(body) {
+            Ok(reports) => Response::TinyReports { reports },
+            Err(_) => refused(UNREADABLE),
+        },
+        Ok((403, _)) => refused(REPORT_FORBIDDEN),
+        Ok((404, _)) => refused(REPORT_GONE),
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+/// Full abuse report (`GET /v1/reports/{id}`). Never cached or logged; 404 never hints that a
+/// report about the caller is hidden.
+pub(crate) fn report_read(account: AccountKey, report_id: String) -> Response {
+    if !safe_id(&report_id) {
+        return refused(CHECK);
+    }
+    let saved = match allowed(&account, Some(TINY_FEATURE_ABUSE_REPORTS), "community.reports.manage") {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    match asked("GET", &saved, &format!("/v1/reports/{report_id}"), None) {
+        Err(detail) => refused(detail),
+        Ok((200, body)) => match serde_json::from_value::<TinyReportDetail>(body) {
+            Ok(report) => Response::TinyReport { report: Box::new(report) },
+            Err(_) => refused(UNREADABLE),
+        },
+        Ok((403, _)) => refused(REPORT_FORBIDDEN),
+        Ok((404, _)) => refused(REPORT_GONE),
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+/// Update an abuse report (`PATCH /v1/reports/{id}`): status, moderator note, linked audit id, or
+/// legal hold (`preserve`, owners only).
+pub(crate) fn report_work(account: AccountKey, report_id: String, update: TinyReportUpdate) -> Response {
+    if !safe_id(&report_id) {
+        return refused(CHECK);
+    }
+    let saved = match allowed(&account, Some(TINY_FEATURE_ABUSE_REPORTS), "community.reports.manage") {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let mut body = Map::new();
+    if let Some(status) = update.status {
+        if !REPORT_STATUSES.contains(&status.as_str()) {
+            return refused(CHECK);
+        }
+        body.insert("status".to_owned(), Value::String(status));
+    }
+    if let Some(note) = update.note {
+        let trimmed = note.trim();
+        if trimmed.is_empty() || trimmed.chars().count() > REPORT_NOTE_MAX {
+            return refused("A note is 1 to 2000 characters.");
+        }
+        body.insert("note".to_owned(), Value::String(trimmed.to_owned()));
+    }
+    if let Some(audit_id) = update.link_audit_id {
+        if audit_id <= 0 {
+            return refused(CHECK);
+        }
+        body.insert("link_audit_id".to_owned(), json!(audit_id));
+    }
+    if let Some(preserve) = update.preserve {
+        body.insert("preserve".to_owned(), Value::Bool(preserve));
+    }
+    if body.is_empty() {
+        return refused(CHECK);
+    }
+    match asked("PATCH", &saved, &format!("/v1/reports/{report_id}"), Some(Value::Object(body))) {
+        Err(detail) => refused(detail),
+        Ok((200, body)) => match serde_json::from_value::<TinyReportDetail>(body) {
+            Ok(report) => Response::TinyReport { report: Box::new(report) },
+            Err(_) => refused(UNREADABLE),
+        },
+        Ok((403, _)) => refused(REPORT_FORBIDDEN),
+        Ok((404, _)) => refused(REPORT_GONE),
         Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
     }
 }

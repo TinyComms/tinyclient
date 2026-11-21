@@ -373,6 +373,8 @@ pub const TINY_FEATURE_UPLOAD_LIMITS: &str = "upload_limits";
 pub const TINY_FEATURE_FILE_SCAN: &str = "file_scan";
 /// Custom presence states (`online`, `idle`, `dnd`, `invisible`) and status text on the live socket.
 pub const TINY_FEATURE_PRESENCE_STATUS: &str = "presence_status";
+/// Abuse reports queue (`/v1/reports`) for moderators holding `manage_reports`.
+pub const TINY_FEATURE_ABUSE_REPORTS: &str = "abuse_reports";
 /// Images and GIFs, until an admin changes it.
 pub const TINY_IMAGE_MAX_DEFAULT: i64 = 8 * 1024 * 1024;
 /// Video and every other file, until an admin changes it.
@@ -726,6 +728,7 @@ fn tiny_bits(id: &str) -> Option<u64> {
         "community.members.ban" | "community.bans.read" => TINY_BAN_MEMBERS,
         "community.members.timeout" => TINY_TIMEOUT_MEMBERS,
         "community.audit.read" => TINY_VIEW_AUDIT_LOG,
+        "community.reports.manage" => TINY_MANAGE_REPORTS,
         "community.server.edit" | "community.bots.manage" => TINY_MANAGE_SERVER,
         "community.rooms.create" | "community.rooms.rename" | "community.rooms.delete" | "community.rooms.edit" | "community.categories.manage" => {
             TINY_MANAGE_CHANNELS
@@ -1157,6 +1160,108 @@ pub struct TinyAuditFilter {
     /// Only actions starting with this, as `member.` or `role.create`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub action: String,
+}
+
+/// A person named on an abuse report (reported member, reporter, or note author).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyReportPerson {
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub user_id: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub display_name: String,
+}
+
+/// A moderator annotation on an abuse report. Kept in memory only; never cached or logged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyReportNote {
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<TinyReportPerson>,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub body: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub created_at: String,
+}
+
+/// One row from `GET /v1/reports` (list view: no reporter note or evidence).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyReportSummary {
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub id: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub kind: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub category: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub status: String,
+    #[serde(default)]
+    pub preserve: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported: Option<TinyReportPerson>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reporter: Option<TinyReportPerson>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_id: Option<String>,
+    #[serde(default)]
+    pub has_evidence: bool,
+    #[serde(default)]
+    pub evidence_unverified: bool,
+    #[serde(default)]
+    pub linked_audit_ids: Vec<i64>,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub created_at: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
+}
+
+/// Full report from `GET /v1/reports/{id}` or `PATCH /v1/reports/{id}`. Kept in memory only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyReportDetail {
+    #[serde(flatten)]
+    pub summary: TinyReportSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserved_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserved_at: Option<String>,
+    #[serde(default)]
+    pub notes: Vec<TinyReportNote>,
+}
+
+/// Filters for `GET /v1/reports`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyReportFilter {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    #[serde(default)]
+    pub limit: u32,
+}
+
+/// Changes sent to `PATCH /v1/reports/{id}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyReportUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_audit_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserve: Option<bool>,
 }
 
 /// The most characters in a display name, after trimming.

@@ -2119,6 +2119,25 @@ pub enum Request {
         #[serde(default)]
         filter: TinyAuditFilter,
     },
+    /// One page of the server's abuse reports (`GET /v1/reports`). Answers `TinyReports`.
+    TinyReportsList {
+        account: AccountKey,
+        #[serde(default)]
+        filter: TinyReportFilter,
+    },
+    /// One abuse report with reporter note, unverified evidence, and moderator notes (`GET /v1/reports/{id}`).
+    /// Kept in memory only; never cached or logged. Answers `TinyReport`.
+    TinyReportRead {
+        account: AccountKey,
+        report_id: String,
+    },
+    /// Update an abuse report (`PATCH /v1/reports/{id}`): status, moderator note, linked audit id,
+    /// or legal hold (`preserve`, owners only). Answers `TinyReport`.
+    TinyReportWork {
+        account: AccountKey,
+        report_id: String,
+        update: TinyReportUpdate,
+    },
     /// What the owner is asked about the community's privacy (`GET /v1/setup`). Answers
     /// `TinySetup`; refused in words unless the server has `first_run_setup` and this account is
     /// an owner.
@@ -2596,6 +2615,14 @@ pub enum Response {
     /// One page of a Tiny server's audit, newest first. Fewer rows than the limit: the end.
     TinyAudit {
         audit: Vec<TinyAudit>,
+    },
+    /// One page of a Tiny server's abuse reports, newest first.
+    TinyReports {
+        reports: Vec<TinyReportSummary>,
+    },
+    /// One full abuse report (note, evidence, moderator notes). Kept in memory only.
+    TinyReport {
+        report: Box<TinyReportDetail>,
     },
     /// What `TinySetupRead` asked.
     TinySetup {

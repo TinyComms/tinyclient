@@ -29,6 +29,7 @@ mod members;
 mod overview;
 mod passkeys;
 mod privacy;
+mod reports;
 mod roles;
 mod signin;
 mod voice;
@@ -70,6 +71,7 @@ pub(in crate::gui) enum Page {
     Channels,
     Voice,
     Audit,
+    Reports,
     Privacy,
     SignIn,
     Encryption,
@@ -77,7 +79,7 @@ pub(in crate::gui) enum Page {
 }
 
 impl Page {
-    pub const ALL: [Page; 13] = [
+    pub const ALL: [Page; 14] = [
         Page::Overview,
         Page::Roles,
         Page::Members,
@@ -87,6 +89,7 @@ impl Page {
         Page::Channels,
         Page::Voice,
         Page::Audit,
+        Page::Reports,
         Page::Privacy,
         Page::SignIn,
         Page::Encryption,
@@ -104,6 +107,7 @@ impl Page {
             Page::Channels => "Channels",
             Page::Voice => "Voice & media",
             Page::Audit => "Audit log",
+            Page::Reports => "Reports",
             Page::Privacy => "Privacy",
             Page::SignIn => "Sign-in",
             Page::Encryption => "Encryption",
@@ -122,6 +126,7 @@ impl Page {
             Page::Channels => "icons/volume-2.svg",
             Page::Voice => "icons/signal.svg",
             Page::Audit => "icons/list.svg",
+            Page::Reports => "icons/flag.svg",
             Page::Privacy => "icons/eye-off.svg",
             Page::SignIn => "icons/key.svg",
             Page::Encryption => "icons/lock.svg",
@@ -135,7 +140,7 @@ impl Page {
             Page::Overview | Page::Roles => "Server",
             Page::Members | Page::Bots | Page::Invites | Page::Bans => "People",
             Page::Channels | Page::Voice => "Voice",
-            Page::Audit | Page::Privacy | Page::SignIn | Page::Encryption | Page::Danger => "Security",
+            Page::Audit | Page::Reports | Page::Privacy | Page::SignIn | Page::Encryption | Page::Danger => "Security",
         }
     }
 
@@ -155,6 +160,7 @@ impl Page {
             Page::Channels => may.make_room || may.edit_room || may.delete_room,
             Page::Voice => may.edit_server,
             Page::Audit => may.read_audit,
+            Page::Reports => community.has(protocol::TINY_FEATURE_ABUSE_REPORTS) && can("community.reports.manage"),
             // What the server keeps about everyone in it: every member may read it, an owner changes it.
             Page::Privacy => crate::tiny_setup::offered(community),
             // A member's own sign-in and passkeys, on a server new enough to have them (it has
@@ -178,6 +184,7 @@ pub(in crate::gui) struct Overlay {
     pub channels: channels::Draft,
     pub bots: bots::Draft,
     pub audit: audit::Draft,
+    pub reports: reports::Draft,
     pub danger: danger::Draft,
     pub encryption: encryption::Draft,
     /// A save is with the server.
@@ -201,6 +208,7 @@ impl Overlay {
             channels: Default::default(),
             bots: Default::default(),
             audit: Default::default(),
+            reports: Default::default(),
             danger: Default::default(),
             encryption: Default::default(),
             saving: false,
@@ -241,6 +249,8 @@ pub(in crate::gui) struct Fields {
     pub backup_passphrase: Entity<TextInput>,
     pub backup_again: Entity<TextInput>,
     pub backup_open: Entity<TextInput>,
+    /// Moderator note input on the Reports page.
+    pub report_note: Entity<TextInput>,
 }
 
 impl Fields {
@@ -265,7 +275,8 @@ impl Fields {
         let backup_passphrase = cx.new(|cx| TextInput::secret("Passphrase · 12+ characters", cx));
         let backup_again = cx.new(|cx| TextInput::secret("Confirm passphrase", cx));
         let backup_open = cx.new(|cx| TextInput::secret("Backup passphrase", cx));
-        for input in [&name, &description, &welcome, &image_max, &file_max, &role_name, &role_color, &member_search, &ban_search, &room_name, &room_topic, &category_name, &bot_name, &confirm, &link_code, &link_check, &recovery_check, &backup_passphrase, &backup_again, &backup_open] {
+        let report_note = cx.new(|cx| TextInput::new("Add a moderator note…", cx));
+        for input in [&name, &description, &welcome, &image_max, &file_max, &role_name, &role_color, &member_search, &ban_search, &room_name, &room_topic, &category_name, &bot_name, &confirm, &link_code, &link_check, &recovery_check, &backup_passphrase, &backup_again, &backup_open, &report_note] {
             cx.subscribe(input, |_, _, _: &crate::gui::input::InputEvent, cx| cx.notify()).detach();
             // Escape in a field leaves Server Settings, as it does anywhere else in it.
             cx.subscribe(input, |this, _, key: &crate::gui::input::InputKey, cx| {
@@ -275,7 +286,7 @@ impl Fields {
             })
             .detach();
         }
-        Fields { name, description, welcome, image_max, file_max, role_name, role_color, member_search, ban_search, room_name, room_topic, category_name, bot_name, confirm, link_code, link_check, recovery_check, backup_passphrase, backup_again, backup_open }
+        Fields { name, description, welcome, image_max, file_max, role_name, role_color, member_search, ban_search, room_name, room_topic, category_name, bot_name, confirm, link_code, link_check, recovery_check, backup_passphrase, backup_again, backup_open, report_note }
     }
 }
 
@@ -343,6 +354,9 @@ impl Shell {
     fn tiny_settings_enter(&mut self, page: Page, cx: &mut Context<Self>) {
         if page == Page::Audit && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.audit.asked) {
             self.tiny_audit_load(false, cx);
+        }
+        if page == Page::Reports && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.reports.asked) {
+            self.tiny_reports_load(false, cx);
         }
         if page == Page::Bots && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.bots.asked) {
             self.tiny_bots_load(cx);
@@ -620,6 +634,7 @@ impl Shell {
             Page::Channels => channels::channels(self, facts, window, cx),
             Page::Voice => voice::voice(self, facts, window, cx),
             Page::Audit => audit::audit(self, facts, window, cx),
+            Page::Reports => reports::reports(self, facts, window, cx),
             Page::Privacy => privacy::privacy(self, facts, window, cx),
             Page::SignIn => signin::signin(self, facts, window, cx),
             Page::Encryption => encryption::encryption(self, facts, window, cx),
@@ -722,6 +737,9 @@ mod tests {
         modern.capabilities.features.push("first_run_setup".to_owned());
         assert_eq!(shown(&modern), ["Overview", "Members", "Audit log", "Privacy", "Sign-in", "Encryption"]);
         modern.access = Some(TinyAccess { permissions: TINY_ALL, rank: 3, ..TinyAccess::default() });
+        assert!(!shown(&modern).contains(&"Reports"), "reports needs the abuse_reports server feature");
+        modern.capabilities.features.push("abuse_reports".to_owned());
+        assert!(shown(&modern).contains(&"Reports"), "a moderator with manage_reports sees Reports");
         assert!(!shown(&modern).contains(&"Danger zone"), "only owners see the danger zone");
         modern.access = Some(TinyAccess { owner: true, ..TinyAccess::default() });
         assert_eq!(shown(&modern).len(), Page::ALL.len());
