@@ -404,11 +404,19 @@ fn snow_list(items: &[String], max: usize, what: &str) -> Result<Vec<String>, Re
 
 fn trigger_metadata(trigger: &AutomodTrigger) -> Result<Value, Refusal> {
     match trigger {
-        AutomodTrigger::Keyword { keywords, regex, allow } | AutomodTrigger::Profile { keywords, regex, allow } => Ok(json!({
-            "keyword_filter": word_list(keywords, KEYWORD_LEN, KEYWORD_COUNT, "keyword")?,
-            "regex_patterns": word_list(regex, REGEX_LEN, REGEX_COUNT, "pattern")?,
-            "allow_list": word_list(allow, KEYWORD_LEN, ALLOW_KEYWORD, "allowed word")?,
-        })),
+        AutomodTrigger::Keyword { keywords, regex, allow } | AutomodTrigger::Profile { keywords, regex, allow } => {
+            let keywords = word_list(keywords, KEYWORD_LEN, KEYWORD_COUNT, "keyword")?;
+            let regex = word_list(regex, REGEX_LEN, REGEX_COUNT, "pattern")?;
+            // Discord rejects a keyword or profile rule whose word and pattern lists are both empty.
+            if keywords.is_empty() && regex.is_empty() {
+                return Err(Refusal::Refused("A keyword or profile rule needs a keyword or a pattern.".to_owned()));
+            }
+            Ok(json!({
+                "keyword_filter": keywords,
+                "regex_patterns": regex,
+                "allow_list": word_list(allow, KEYWORD_LEN, ALLOW_KEYWORD, "allowed word")?,
+            }))
+        }
         AutomodTrigger::Spam => Ok(json!({})),
         AutomodTrigger::Preset { presets, allow } => {
             let mut codes = Vec::new();
@@ -461,6 +469,9 @@ fn action_bodies(actions: &[AutomodAction], trigger: u8) -> Result<Vec<Value>, R
         seen.push(code);
         let body = match action {
             AutomodAction::Block { message } => {
+                if trigger == PROFILE {
+                    return Err(Refusal::Refused("A block message is not valid on a profile rule.".to_owned()));
+                }
                 // Display text only. It is never a command and never a content field.
                 let message = display_message(message)?;
                 let metadata = if message.is_empty() { json!({}) } else { json!({"custom_message": message}) };
@@ -479,7 +490,12 @@ fn action_bodies(actions: &[AutomodAction], trigger: u8) -> Result<Vec<Value>, R
                 }
                 json!({"type": TIMEOUT, "metadata": {"duration_seconds": seconds}})
             }
-            AutomodAction::Quarantine => json!({"type": QUARANTINE, "metadata": {}}),
+            AutomodAction::Quarantine => {
+                if trigger != PROFILE {
+                    return Err(Refusal::Refused("Blocking a member is only for a profile rule.".to_owned()));
+                }
+                json!({"type": QUARANTINE, "metadata": {}})
+            }
             AutomodAction::Other { .. } => return Err(Refusal::Refused(CANNOT_EDIT.to_owned())),
         };
         out.push(body);
@@ -541,16 +557,20 @@ fn editable_body(rule: &AutomodRule) -> Result<Value, Refusal> {
         return Err(Refusal::Refused("A rule name is 1 to 100 characters.".to_owned()));
     }
     let code = trigger_code(&rule.trigger)?;
-    Ok(json!({
+    // Discord's modify endpoint does not accept trigger_type. A create still sends it.
+    let mut body = json!({
         "name": name,
         "event_type": event_for(&rule.trigger),
-        "trigger_type": code,
         "trigger_metadata": trigger_metadata(&rule.trigger)?,
         "actions": action_bodies(&rule.actions, code)?,
         "enabled": rule.enabled,
         "exempt_roles": snow_list(&rule.exempt_roles, EXEMPT_ROLES, "An exempt role")?,
         "exempt_channels": snow_list(&rule.exempt_channels, EXEMPT_CHANNELS, "An exempt channel")?,
-    }))
+    });
+    if rule.id.is_empty() {
+        body.as_object_mut().expect("rule body").insert("trigger_type".to_owned(), json!(code));
+    }
+    Ok(body)
 }
 
 fn parse_saved(raw: &str, sent: &AutomodRule) -> Result<AutomodRule, Refusal> {
@@ -708,6 +728,59 @@ mod tests {
         assert!(matches!(newline, Err(Refusal::Refused(reason)) if reason.contains("control")));
         let long = editable_body(&keyword_rule(&"x".repeat(151)));
         assert!(matches!(long, Err(Refusal::Refused(reason)) if reason.contains("150")));
+    }
+
+    #[test]
+    fn actions_and_word_lists_stay_on_what_discord_accepts() {
+        let profile = |actions: Vec<AutomodAction>| AutomodRule {
+            name: "Names".into(),
+            enabled: true,
+            trigger: AutomodTrigger::Profile { keywords: vec!["spam".into()], regex: Vec::new(), allow: Vec::new() },
+            actions,
+            ..AutomodRule::default()
+        };
+        let blocked = profile(vec![AutomodAction::Block { message: String::new() }]);
+        assert!(matches!(editable_body(&blocked), Err(Refusal::Refused(reason)) if reason.contains("block message")));
+        let held = editable_body(&profile(vec![AutomodAction::Quarantine])).unwrap();
+        assert_eq!(held["trigger_type"], 6);
+        assert_eq!(held["actions"][0]["type"], 4);
+
+        let keyword = AutomodRule {
+            name: "Words".into(),
+            enabled: true,
+            trigger: AutomodTrigger::Keyword { keywords: vec!["spam".into()], regex: Vec::new(), allow: Vec::new() },
+            actions: vec![AutomodAction::Quarantine],
+            ..AutomodRule::default()
+        };
+        assert!(matches!(editable_body(&keyword), Err(Refusal::Refused(reason)) if reason.contains("member")));
+
+        let edit = editable_body(&keyword_rule("Stay")).unwrap();
+        assert!(edit.get("trigger_type").is_none());
+
+        let empty = AutomodRule {
+            name: "Words".into(),
+            enabled: true,
+            trigger: AutomodTrigger::Keyword { keywords: vec![], regex: vec![], allow: vec!["ok".into()] },
+            actions: vec![AutomodAction::Block { message: String::new() }],
+            ..AutomodRule::default()
+        };
+        assert!(matches!(editable_body(&empty), Err(Refusal::Refused(reason)) if reason.contains("pattern")));
+        let blank_pattern = AutomodRule {
+            name: "Names".into(),
+            enabled: true,
+            trigger: AutomodTrigger::Profile { keywords: vec![], regex: vec![" ".into()], allow: vec![] },
+            actions: vec![AutomodAction::Quarantine],
+            ..AutomodRule::default()
+        };
+        assert!(matches!(editable_body(&blank_pattern), Err(Refusal::Refused(reason)) if reason.contains("pattern")));
+        let regex_only = AutomodRule {
+            name: "Names".into(),
+            enabled: true,
+            trigger: AutomodTrigger::Profile { keywords: vec![], regex: vec!["spam".into()], allow: vec![] },
+            actions: vec![AutomodAction::Quarantine],
+            ..AutomodRule::default()
+        };
+        assert_eq!(editable_body(&regex_only).unwrap()["trigger_metadata"]["regex_patterns"], json!(["spam"]));
     }
 
     #[test]

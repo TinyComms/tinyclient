@@ -1298,13 +1298,13 @@ impl Shell {
                 event_type: if modal.draft_trigger == 6 { 2 } else { 1 },
                 trigger: trigger_from(modal.draft_trigger, &words, &patterns, &allow, modal.draft_presets, &mention, modal.draft_raid),
                 actions: actions_from(
-                    modal.draft_block,
+                    modal.draft_block && modal.draft_trigger != 6,
                     &block_message,
                     modal.draft_alert,
                     &alert_channel,
                     modal.draft_timeout && (modal.draft_trigger == 1 || modal.draft_trigger == 5),
                     &timeout_seconds,
-                    modal.draft_quarantine,
+                    modal.draft_quarantine && modal.draft_trigger == 6,
                 ),
                 exempt_roles: split_list(&exempt_roles),
                 exempt_channels: split_list(&exempt_channels),
@@ -1314,6 +1314,15 @@ impl Shell {
             Some((modal.space.clone(), rule))
         };
         let Some((space, rule)) = prepared else { return };
+        if let AutomodTrigger::Keyword { keywords, regex, .. } | AutomodTrigger::Profile { keywords, regex, .. } = &rule.trigger {
+            if keywords.is_empty() && regex.is_empty() {
+                if let Some(modal) = self.discord_admin_state.safety.as_mut() {
+                    modal.error = Some("A keyword or profile rule needs a keyword or a pattern.".to_owned());
+                }
+                cx.notify();
+                return;
+            }
+        }
         if let Some(modal) = self.discord_admin_state.safety.as_mut() {
             modal.busy = true;
             modal.error = None;
@@ -1519,21 +1528,29 @@ impl Shell {
             .collect();
 
         let mut triggers = Vec::new();
-        for (code, label) in AUTOMOD_TRIGGERS {
-            let code = *code;
-            let kind = if modal.draft_trigger == code { ButtonKind::Primary } else { ButtonKind::Ghost };
-            triggers.push(button(SharedString::from(format!("safety-trigger-{code}")), kind, *label).on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(m) = this.discord_admin_state.safety.as_mut() {
-                    if m.busy || m.loading || m.draft_read_only {
-                        return;
+        let trigger_label = AUTOMOD_TRIGGERS.iter().find(|pair| pair.0 == modal.draft_trigger).map(|pair| pair.1).unwrap_or("Trigger");
+        if modal.creating {
+            for (code, label) in AUTOMOD_TRIGGERS {
+                let code = *code;
+                let kind = if modal.draft_trigger == code { ButtonKind::Primary } else { ButtonKind::Ghost };
+                triggers.push(button(SharedString::from(format!("safety-trigger-{code}")), kind, *label).on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(m) = this.discord_admin_state.safety.as_mut() {
+                        if m.busy || m.loading || m.draft_read_only || !m.creating {
+                            return;
+                        }
+                        m.draft_trigger = code;
+                        if code != 1 && code != 5 {
+                            m.draft_timeout = false;
+                        }
+                        if code == 6 {
+                            m.draft_block = false;
+                        } else {
+                            m.draft_quarantine = false;
+                        }
+                        cx.notify();
                     }
-                    m.draft_trigger = code;
-                    if code != 1 && code != 5 {
-                        m.draft_timeout = false;
-                    }
-                    cx.notify();
-                }
-            })));
+                })));
+            }
         }
         let mut presets = Vec::new();
         for (ix, label) in PRESET_LABELS.iter().enumerate() {
@@ -1557,7 +1574,8 @@ impl Shell {
             .child(div().type_small().text_color(theme::text()).child(if modal.creating { "New rule" } else { "Edit rule" }))
             .child(field_box("Name", modal.name_input.clone()))
             .child(toggle_line(cx, "safety-enabled", "Enabled", modal.draft_enabled, |m| &mut m.draft_enabled))
-            .child(div().flex().flex_wrap().gap(px(6.)).children(triggers))
+            .when(modal.creating, |col| col.child(div().flex().flex_wrap().gap(px(6.)).children(triggers)))
+            .when(!modal.creating, |col| col.child(div().type_small().text_color(theme::text_faint()).child(trigger_label)))
             .when(modal.draft_trigger == 1 || modal.draft_trigger == 6, |col| {
                 col.child(field_box("Keywords", modal.words.clone())).child(field_box("Patterns", modal.patterns.clone())).child(field_box("Allow list", modal.allow.clone()))
             })
@@ -1569,16 +1587,17 @@ impl Shell {
                     .child(toggle_line(cx, "safety-raid", "Mention raid protection", modal.draft_raid, |m| &mut m.draft_raid))
             })
             .child(div().type_micro().text_color(theme::text_faint()).child("Actions"))
-            .child(toggle_line(cx, "safety-block", "Block message", modal.draft_block, |m| &mut m.draft_block))
-            .when(modal.draft_block, |col| {
-                col.child(field_box("Block message", modal.block_message.clone()))
-                    .child(div().type_micro().text_color(theme::text_faint()).child("Shown to the member. Not a command."))
+            .when(modal.draft_trigger != 6, |col| {
+                col.child(toggle_line(cx, "safety-block", "Block message", modal.draft_block, |m| &mut m.draft_block)).when(modal.draft_block, |col| {
+                    col.child(field_box("Block message", modal.block_message.clone()))
+                        .child(div().type_micro().text_color(theme::text_faint()).child("Shown to the member. Not a command."))
+                })
             })
             .child(toggle_line(cx, "safety-alert", "Alert a channel", modal.draft_alert, |m| &mut m.draft_alert))
             .when(modal.draft_alert, |col| col.child(field_box("Alert channel", modal.alert_channel.clone())))
             .when(can_timeout, |col| col.child(toggle_line(cx, "safety-timeout", "Time the member out", modal.draft_timeout, |m| &mut m.draft_timeout)))
             .when(can_timeout && modal.draft_timeout, |col| col.child(field_box("Timeout seconds", modal.timeout_seconds.clone())))
-            .child(toggle_line(cx, "safety-quarantine", "Block member", modal.draft_quarantine, |m| &mut m.draft_quarantine))
+            .when(modal.draft_trigger == 6, |col| col.child(toggle_line(cx, "safety-quarantine", "Block member", modal.draft_quarantine, |m| &mut m.draft_quarantine)))
             .child(field_box("Exempt roles", modal.exempt_roles.clone()))
             .child(field_box("Exempt channels", modal.exempt_channels.clone()))
             .child(
