@@ -521,6 +521,8 @@ struct Live {
     /// A group's members, including us, keyed by the conversation id. The read tick waits
     /// until every member but us has read.
     groups: HashMap<String, Vec<String>>,
+    /// A group's administrator ACIs, keyed by the conversation id.
+    group_admins: HashMap<String, Vec<String>>,
     /// Each person's reaction on a message: (message id, person) → emoji.
     /// Bounded to `REACTIONS_KEPT` in memory and on disk at `reactions_path`.
     reactions: HashMap<(String, String), String>,
@@ -1112,6 +1114,7 @@ fn apply(account: &Account, event: Event) {
                 {
                     let mut live = account.live();
                     live.groups.insert(conv.clone(), group.member_ids.clone());
+                    live.group_admins.insert(conv.clone(), group.admins.clone());
                     live.known_conversations.insert(conv.clone());
                     live.accepted.insert(conv.clone());
                     if group.timer_secs > 0 {
@@ -1732,7 +1735,8 @@ fn offline(ctx: &Context, command: Command) {
         | Command::File { reply, .. }
         | Command::Relate { reply, .. }
         | Command::AnswerMessageRequest { reply, .. }
-        | Command::Report { reply, .. } => drop(reply.send(Err(down()))),
+        | Command::Report { reply, .. }
+        | Command::Leave { reply, .. } => drop(reply.send(Err(down()))),
         Command::StartDirect { reply, .. } | Command::StartGroup { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
@@ -1956,6 +1960,7 @@ fn serve(account: &Arc<Account>, command: Command) {
                 {
                     let mut live = account.live();
                     live.groups.insert(conv.clone(), created.member_ids.clone());
+                    live.group_admins.insert(conv.clone(), created.admins.clone());
                     live.known_conversations.insert(conv.clone());
                     live.accepted.insert(conv.clone());
                 }
@@ -2067,6 +2072,36 @@ fn serve(account: &Arc<Account>, command: Command) {
                         let _ = ctx.relation(aci, Relation::Blocked);
                     }
                 }
+                Ok(())
+            })();
+            let _ = reply.send(outcome);
+        }
+        Command::Leave { conversation_id, reply } => {
+            let outcome = (|| -> Result<(), Refusal> {
+                let Peer::Group(group_id) = peer(&conversation_id).map_err(refused)? else {
+                    return Err(Refusal::Refused("Only a group can be left.".to_owned()));
+                };
+                {
+                    let live = account.live();
+                    let admins = live.group_admins.get(&conversation_id).map(Vec::as_slice).unwrap_or(&[]);
+                    let members = live.groups.get(&conversation_id).map(Vec::as_slice).unwrap_or(&[]);
+                    let me_admin = admins.iter().any(|id| id == &account.me);
+                    let other_admin = admins.iter().any(|id| id != &account.me);
+                    let others_remain = members.iter().any(|id| id != &account.me);
+                    if me_admin && !other_admin && others_remain {
+                        return Err(Refusal::Refused("Choose a new admin first.".to_owned()));
+                    }
+                }
+                account.wire.leave_group(&group_id).map_err(refused)?;
+                {
+                    let mut live = account.live();
+                    live.groups.remove(&conversation_id);
+                    live.group_admins.remove(&conversation_id);
+                    live.known_conversations.remove(&conversation_id);
+                    live.archived.remove(&conversation_id);
+                    live.pinned.retain(|id| id != &conversation_id);
+                }
+                let _ = ctx.conversation_gone(&conversation_id);
                 Ok(())
             })();
             let _ = reply.send(outcome);

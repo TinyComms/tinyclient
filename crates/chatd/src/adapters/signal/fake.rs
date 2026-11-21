@@ -115,6 +115,7 @@ impl Fake {
             members: 3,
             member: true,
             member_ids: vec![ME.into(), GRACE.into(), ALAN.into()],
+            admins: vec![ME.into(), GRACE.into()],
             timer_secs: 0,
         };
         let _ = events.send(Event::Groups(vec![club]));
@@ -572,6 +573,25 @@ fn steer(line: &str) -> Vec<Event> {
             };
             vec![Event::MessageRequestResponse { peer, action }]
         }
+        "group-admins" => {
+            let admins: Vec<String> = words
+                .filter_map(|w| match w {
+                    "me" => Some(ME.to_owned()),
+                    other => who(other).map(|(id, _)| id.to_owned()),
+                })
+                .collect();
+            let club = GroupInfo {
+                id: CLUB.into(),
+                title: "Bridge club".into(),
+                description: "Tuesdays, 7 pm".into(),
+                members: 3,
+                member: true,
+                member_ids: vec![ME.into(), GRACE.into(), ALAN.into()],
+                admins,
+                timer_secs: 0,
+            };
+            vec![Event::Groups(vec![club])]
+        }
         "drop" => vec![Event::Closed("the fake dropped the connection".into())],
         "unlinked" => vec![Event::Ended("This computer was removed from your Signal account.".into())],
         _ => Vec::new(),
@@ -766,8 +786,20 @@ impl Wire for Fake {
             members: member_ids.len() as u32,
             member: true,
             member_ids,
+            admins: vec![ME.to_owned()],
             timer_secs: 0,
         })
+    }
+
+    fn leave_group(&self, group_id: &str) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        record(&format!("leave-group {group_id}"));
+        if let Some(words) = self.refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+            return Err(Fault::Refused(words));
+        }
+        Ok(())
     }
 
     fn close(&self) {

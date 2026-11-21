@@ -66,6 +66,7 @@ enum Ask {
     SetBlocked { peer: Peer, blocked: bool, answer: Sender<Result<(), Fault>> },
     RespondMessageRequest { peer: Peer, action: MessageRequestAction, answer: Sender<Result<(), Fault>> },
     CreateGroup { title: String, members: Vec<String>, answer: Sender<Result<GroupInfo, Fault>> },
+    LeaveGroup { group_id: String, answer: Sender<Result<(), Fault>> },
 }
 
 pub struct Real {
@@ -440,6 +441,10 @@ impl Wire for Real {
         self.ask(|answer| Ask::CreateGroup { title: title.to_owned(), members: members.to_vec(), answer })
     }
 
+    fn leave_group(&self, group_id: &str) -> Result<(), Fault> {
+        self.ask(|answer| Ask::LeaveGroup { group_id: group_id.to_owned(), answer })
+    }
+
     fn close(&self) {
         if let Some(stop) = self.stop.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             let _ = stop.send(());
@@ -721,6 +726,12 @@ impl Session {
             let timer_secs = snap.timer_secs;
             let member = snap.members.iter().any(|member| member.id == self.me);
             let member_ids = group.members.iter().map(|member| ServiceId::from(member.aci).raw_uuid().to_string()).collect();
+            let admins = group
+                .members
+                .iter()
+                .filter(|member| member.role == Role::Administrator)
+                .map(|member| ServiceId::from(member.aci).raw_uuid().to_string())
+                .collect();
             self.groups.insert(id.clone(), key);
             self.known.seed(id.clone(), revision, snap);
             told.push(GroupInfo {
@@ -730,6 +741,7 @@ impl Session {
                 members: group.members.len() as u32,
                 member,
                 member_ids,
+                admins,
                 timer_secs,
             });
         }
@@ -1204,6 +1216,9 @@ impl Session {
             Ask::CreateGroup { title, members, answer } => {
                 let _ = answer.send(self.create_group(&title, &members).await);
             }
+            Ask::LeaveGroup { group_id, answer } => {
+                let _ = answer.send(self.leave_group(&group_id).await);
+            }
         }
     }
 
@@ -1285,8 +1300,53 @@ impl Session {
             members: member_ids.len() as u32,
             member: true,
             member_ids,
+            admins: vec![self.me.clone()],
             timer_secs: 0,
         })
+    }
+
+    async fn leave_group(&mut self, id: &str) -> Result<(), Fault> {
+        let key = *self
+            .groups
+            .get(id)
+            .ok_or_else(|| Fault::Refused("This group isn't one Signal still knows for you.".to_owned()))?;
+        let stored = self.vault.group(key).await.ok().flatten();
+        if let Some(group) = &stored {
+            let me_admin = group
+                .members
+                .iter()
+                .any(|m| ServiceId::from(m.aci).raw_uuid().to_string() == self.me && m.role == Role::Administrator);
+            let other_admin = group
+                .members
+                .iter()
+                .any(|m| ServiceId::from(m.aci).raw_uuid().to_string() != self.me && m.role == Role::Administrator);
+            let others_remain = group
+                .members
+                .iter()
+                .any(|m| ServiceId::from(m.aci).raw_uuid().to_string() != self.me);
+            if me_admin && !other_admin && others_remain {
+                return Err(Fault::Refused("Choose a new admin first.".to_owned()));
+            }
+        }
+        let next_rev = stored.as_ref().map_or(1, |g| g.revision.saturating_add(1));
+        let at = now_ms();
+        let update = ContentBody::DataMessage(DataMessage {
+            group_v2: Some(GroupContextV2 {
+                master_key: Some(key.to_vec()),
+                revision: Some(next_rev),
+                group_change: None,
+            }),
+            timestamp: Some(at),
+            ..Default::default()
+        });
+        let _ = self.manager.send_message_to_group(&key, update, at).await;
+        if let Some(mut group) = stored {
+            group.members.retain(|m| ServiceId::from(m.aci).raw_uuid().to_string() != self.me);
+            group.revision = next_rev;
+            let _ = self.vault.save_group(key, group).await;
+        }
+        self.groups.remove(id);
+        Ok(())
     }
 
     async fn set_blocked(&mut self, peer: &Peer, blocked: bool) -> Result<(), Fault> {

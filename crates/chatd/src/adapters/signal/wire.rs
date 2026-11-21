@@ -80,6 +80,8 @@ pub struct GroupInfo {
     pub member: bool,
     /// Account ids of the members, including us. Empty when the wire has not said who.
     pub member_ids: Vec<String>,
+    /// Account ids of group administrators.
+    pub admins: Vec<String>,
     /// Disappearing-message timer in seconds. 0 means off.
     pub timer_secs: u32,
 }
@@ -403,6 +405,8 @@ pub trait Wire: Send + Sync {
     fn respond_message_request(&self, peer: &Peer, action: MessageRequestAction) -> Result<(), Fault>;
     /// Creates a new Signal Groups v2 group with `title` and `members` (ACIs) and returns its info.
     fn create_group(&self, title: &str, members: &[String]) -> Result<GroupInfo, Fault>;
+    /// Leaves a Signal Groups v2 group by its public hex id.
+    fn leave_group(&self, group_id: &str) -> Result<(), Fault>;
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);
 }
