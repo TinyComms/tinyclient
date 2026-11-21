@@ -336,6 +336,8 @@ pub enum CallSupport {
     Native,
     /// The official app does: ask `Handoff` for the link and open it.
     Handoff,
+    /// The other person's privacy settings restrict calls from this account.
+    Restricted,
 }
 
 /// Someone in a voice channel, as its row in the tree shows them.
@@ -437,6 +439,9 @@ pub struct Conversation {
     pub last_read: Option<String>,
     #[serde(default)]
     pub call: CallSupport,
+    /// The other side supports video calls (Telegram's `video_calls_available`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub call_video: bool,
     /// Who is in it, for a voice channel someone is in. `None` when it is empty or unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occupants: Option<Occupants>,
@@ -578,6 +583,7 @@ impl Conversation {
             updated: 0,
             last_read: None,
             call: CallSupport::None,
+            call_video: false,
             occupants: None,
             limit: 0,
             read_only: false,

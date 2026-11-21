@@ -540,6 +540,8 @@ struct World {
     topic_reads: HashMap<(Who, i32), i32>,
     /// Users `contacts.block` has blocked. `getBlocked` and `userFull.blocked` read this.
     blocked: HashSet<i64>,
+    /// Per-user `(phone_calls_available, phone_calls_private, video_calls_available)` for `GetFullUser`.
+    call_flags: HashMap<i64, (bool, bool, bool)>,
     calls: PathBuf,
     /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
     dialogs_go: bool,
@@ -607,6 +609,7 @@ impl World {
             as_other: false,
             topic_reads: HashMap::new(),
             blocked: HashSet::new(),
+            call_flags: HashMap::new(),
             calls: protocol::support_dir().join("telegram.calls"),
             dialogs_go: false,
             peer_go: false,
@@ -1455,6 +1458,14 @@ impl World {
                 message.edit_date = Some(t0() + 30);
                 self.store(None, message.clone());
                 vec![update(tl::types::UpdateEditMessage { message: message.into(), pts: 0, pts_count: 0 }.into())]
+            }
+            "call-flags" => {
+                let id = words.next().and_then(|id| id.parse().ok()).unwrap_or(ODALYS);
+                let avail = words.next().is_some_and(|v| v == "1" || v == "true");
+                let priv_ = words.next().is_some_and(|v| v == "1" || v == "true");
+                let video = words.next().is_some_and(|v| v == "1" || v == "true");
+                self.call_flags.insert(id, (avail, priv_, video));
+                Vec::new()
             }
             "peer-blocked" => {
                 let id = words.next().and_then(|id| id.parse().ok()).unwrap_or(ODALYS);
@@ -2575,6 +2586,10 @@ impl World {
             let mut full: tl::types::UserFull = blank(&[&put(0u32), &put(0u32), &put(id), &put(tl::enums::PeerSettings::from(peer_settings)), &put(settings(None)), &put(1i32)]);
             full.about = Some("Maps, mostly.".to_owned());
             full.blocked = self.blocked.contains(&id);
+            let (phone_avail, phone_priv, video_avail) = self.call_flags.get(&id).copied().unwrap_or((true, false, false));
+            full.phone_calls_available = phone_avail;
+            full.phone_calls_private = phone_priv;
+            full.video_calls_available = video_avail;
             let mut people = users();
             if id == TOBIN {
                 full.birthday = Some(tl::types::Birthday { day: 14, month: 3, year: None }.into());

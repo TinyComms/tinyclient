@@ -236,6 +236,7 @@ mod tests {
             updated: 0,
             last_read: None,
             call: protocol::CallSupport::None,
+            call_video: false,
             occupants: None,
             limit: 0,
             read_only: false,

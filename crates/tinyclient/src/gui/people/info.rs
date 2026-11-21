@@ -697,10 +697,17 @@ impl InfoPane {
             );
         }
         if let Some(call) = &actions.call {
-            let enabled = seen.online;
+            let restricted = matches!(call, Call::Restricted);
+            let enabled = seen.online && !restricted;
             let (who, direct) = (person.clone(), self.row.as_ref().map(|row| row.key.clone()));
             let network = person.key.network;
-            let icon = if matches!(call, Call::Handoff(_)) && network == Network::Slack { "icons/headphones.svg" } else { "icons/phone.svg" };
+            let icon = if restricted {
+                "icons/phone-off.svg"
+            } else if matches!(call, Call::Handoff(_)) && network == Network::Slack {
+                "icons/headphones.svg"
+            } else {
+                "icons/phone.svg"
+            };
             let words = facts::call_label(call, network, actions.message);
             let button = draw::action("info-call", ButtonKind::Secondary, icon, words, matches!(call, Call::Handoff(_)));
             let button = match call {
@@ -719,6 +726,11 @@ impl InfoPane {
                         _ => {}
                     });
                 }))
+            } else if restricted {
+                button
+                    .opacity(0.4)
+                    .cursor_default()
+                    .tooltip(tip(format!("{} restricts calls", person.name), None))
             } else {
                 button
                     .opacity(0.4)

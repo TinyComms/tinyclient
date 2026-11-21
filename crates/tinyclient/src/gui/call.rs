@@ -2005,6 +2005,15 @@ impl Shell {
                         .children((!phone).then(|| icon("icons/arrow-up-right.svg", 12., theme::text_faint(), None))),
                 )
             }
+            CallSupport::Restricted => Some(
+                pill.border_color(theme::border())
+                    .text_color(theme::text_faint())
+                    .opacity(0.5)
+                    .cursor_default()
+                    .tooltip(tip(format!("{} restricts calls", open.title), None))
+                    .child(icon("icons/phone-off.svg", glyph(14.), theme::text_faint(), None))
+                    .children(words("Call".into())),
+            ),
         }
     }
 }

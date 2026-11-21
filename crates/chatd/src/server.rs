@@ -2370,6 +2370,9 @@ impl Chat {
             Ok(Some(row)) if row.call == CallSupport::Handoff => {
                 return error(ErrorCode::Unsupported, format!("{} calls open in its own app.", conversation.network.label()))
             }
+            Ok(Some(row)) if row.call == CallSupport::Restricted => {
+                return error(ErrorCode::Refused, "This person's privacy settings don't allow calls.")
+            }
             Ok(Some(_)) => return error(ErrorCode::Unsupported, "This conversation has no calls tinyclient can join."),
             Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
             Err(err) => return internal(err),

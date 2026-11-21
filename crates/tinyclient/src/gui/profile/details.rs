@@ -553,7 +553,7 @@ fn actions(
                     .child(glyph("icons/external-link.svg", 14., theme::text_soft())),
             )
         }
-        CallSupport::None => None,
+        CallSupport::None | CallSupport::Restricted => None,
     };
     let key = row.key.clone();
     let handoff = row.call == CallSupport::Handoff;

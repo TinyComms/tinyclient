@@ -3295,3 +3295,32 @@ fn sent_video_carries_dimensions_duration_streaming_flag_and_thumb() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn full_user_call_flags_gate_call_support_and_video() {
+    let world = World::signed_in();
+    world.connected();
+    let row = |id: &str| world.conversation(id).expect(id);
+    // Before users.getFullUser is asked, both people keep the optimistic hand-off button.
+    assert_eq!(row("u7002").call, protocol::CallSupport::Handoff);
+    assert!(!row("u7002").call_video);
+    assert_eq!(row("u7003").call, protocol::CallSupport::Handoff);
+
+    // 1. phone_calls_available = false, phone_calls_private = false -> CallSupport::None.
+    world.steer("call-flags 7002 0 0 0");
+    assert!(matches!(world.ask(Request::Profile { person: key("u7002"), space: None }), Response::Profile { .. }));
+    assert_eq!(row("u7002").call, protocol::CallSupport::None);
+    assert!(!row("u7002").call_video);
+
+    // 2. phone_calls_private = true -> CallSupport::Restricted (explained tooltip, not silently hidden).
+    world.steer("call-flags 7003 0 1 0");
+    assert!(matches!(world.ask(Request::ConversationInfo { conversation: key("u7003") }), Response::ConversationInfo { .. }));
+    assert_eq!(row("u7003").call, protocol::CallSupport::Restricted);
+    assert!(!row("u7003").call_video);
+
+    // 3. phone_calls_available = true, video_calls_available = true -> Handoff + call_video.
+    world.steer("call-flags 7002 1 0 1");
+    assert!(matches!(world.ask(Request::ConversationInfo { conversation: key("u7002") }), Response::ConversationInfo { .. }));
+    assert_eq!(row("u7002").call, protocol::CallSupport::Handoff);
+    assert!(row("u7002").call_video);
+}

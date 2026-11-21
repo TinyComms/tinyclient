@@ -45,6 +45,8 @@ pub enum Call {
     Native,
     /// The official app carries it: the button's words.
     Handoff(String),
+    /// The person's privacy settings restrict calls from this account.
+    Restricted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +74,7 @@ pub fn handoff_words(network: Network) -> String {
 pub fn call_label(call: &Call, network: Network, beside_message: bool) -> String {
     match (call, beside_message) {
         (Call::Native, _) => "Call".to_owned(),
+        (Call::Restricted, _) => "Call".to_owned(),
         (Call::Handoff(words), false) => words.clone(),
         (Call::Handoff(_), true) if network == Network::Slack => "Huddle".to_owned(),
         (Call::Handoff(_), true) if network == Network::Telegram => "Telegram".to_owned(),
@@ -91,6 +94,7 @@ pub fn actions(person: &Person, seen: &Seen, surface: Surface) -> Actions {
         (true, _) => None,
         (false, Some(CallSupport::Native)) => Some(Call::Native),
         (false, Some(CallSupport::Handoff)) => Some(Call::Handoff(handoff_words(network))),
+        (false, Some(CallSupport::Restricted)) => Some(Call::Restricted),
         (false, Some(CallSupport::None)) => None,
         // No direct conversation held yet: Discord rings from here; a Telegram person's call
         // opens in Telegram's own app, as their DM's does.
@@ -964,6 +968,7 @@ mod tests {
             updated: 0,
             last_read: None,
             call: CallSupport::None,
+            call_video: false,
             occupants: None,
             limit: 0,
             read_only: false,
@@ -1061,6 +1066,8 @@ mod tests {
         let nadia = person(Network::Telegram, Relation::Contact);
         assert_eq!(actions(&nadia, &unseen, Surface::Card).call, Some(Call::Handoff("Open chat in Telegram".into())));
         assert_eq!(actions(&nadia, &seen(CallSupport::Handoff), Surface::Pane).call, Some(Call::Handoff("Open chat in Telegram".into())));
+        assert_eq!(actions(&nadia, &seen(CallSupport::None), Surface::Pane).call, None);
+        assert_eq!(actions(&nadia, &seen(CallSupport::Restricted), Surface::Pane).call, Some(Call::Restricted));
         let mut service = nadia.clone();
         service.mark = Some(Mark::Verified);
         assert_eq!(actions(&service, &unseen, Surface::Card).call, None);

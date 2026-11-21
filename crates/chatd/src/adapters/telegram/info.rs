@@ -50,6 +50,18 @@ pub(super) fn birthday_line(day: i32, month: i32, year: Option<i32>) -> Option<S
     })
 }
 
+/// Records call capability flags from `users.getFullUser` and refreshes the DM row when changed.
+fn record_call_flags(account: &Account, who: Who, user: &tl::types::UserFull) {
+    let flags = peers::CallFlags {
+        phone_available: user.phone_calls_available,
+        phone_private: user.phone_calls_private,
+        video_available: user.video_calls_available,
+    };
+    if account.dir().set_call_flags(who, flags) {
+        sync::refresh_row(account, who);
+    }
+}
+
 /// A person's card: what `users.getFullUser` says, with what is already known of them.
 pub(super) fn profile(account: &Account, person_id: &str) -> Result<About, Fault> {
     let Some((who @ Who::User(user_id), None)) = Who::parse(person_id) else {
@@ -60,6 +72,7 @@ pub(super) fn profile(account: &Account, person_id: &str) -> Result<About, Fault
     let tl::enums::users::UserFull::Full(full) = account.ask(&tl::functions::users::GetFullUser { id: id.clone() })?;
     account.learn(&full.users, &full.chats);
     let tl::enums::UserFull::Full(user) = full.full_user;
+    record_call_flags(account, who, &user);
     if user.blocked {
         account.set_user_blocked(user_id, true);
         let _ = account.ctx.relation(person_id, protocol::Relation::Blocked);
@@ -186,6 +199,7 @@ pub(super) fn conversation(account: &Account, conversation: &str) -> Result<Conv
             let tl::enums::users::UserFull::Full(full) = account.ask(&tl::functions::users::GetFullUser { id })?;
             account.learn(&full.users, &full.chats);
             let tl::enums::UserFull::Full(user) = full.full_user;
+            record_call_flags(account, who, &user);
             about.description = user.about.unwrap_or_default();
             about.members = Some(2);
             about.disappearing = user.ttl_period.filter(|&s| s > 0).map(|s| s as u32);

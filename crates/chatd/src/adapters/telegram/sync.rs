@@ -111,9 +111,24 @@ fn row(account: &Account, who: Who, known: &Known) -> ConversationRow {
         }
         Who::User(_) => {
             row.peer = Some(who.text());
-            // Calls are a later stage: until then a person's call opens in Telegram's own app.
+            // Calls are a later stage: until then a person's call opens in Telegram's own app,
+            // gated by the full profile's call flags once fetched.
             if !known.bot && !known.deleted {
-                row.call = CallSupport::Handoff;
+                match known.call_flags {
+                    None => {
+                        row.call = CallSupport::Handoff;
+                    }
+                    Some(flags) if flags.phone_private => {
+                        row.call = CallSupport::Restricted;
+                    }
+                    Some(flags) if !flags.phone_available => {
+                        row.call = CallSupport::None;
+                    }
+                    Some(flags) => {
+                        row.call = CallSupport::Handoff;
+                        row.call_video = flags.video_available;
+                    }
+                }
             }
         }
         _ => {}
