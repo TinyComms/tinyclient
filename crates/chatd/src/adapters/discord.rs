@@ -313,6 +313,69 @@ impl GuildInfo {
         };
         self.resolve_role_style(roles)
     }
+
+    /// Computed guild-level permissions for our account (owner or ADMINISTRATOR => u64::MAX).
+    pub(super) fn guild_permissions(&self, guild_id: &str) -> u64 {
+        if self.owner {
+            return u64::MAX;
+        }
+        let everyone = number(guild_id);
+        let of = |role: &u64| self.roles.get(role).map_or(0, |r| r.permissions);
+        let perms = self.my_roles.iter().fold(of(&everyone), |acc, r| acc | of(r));
+        if perms & model::ADMINISTRATOR != 0 {
+            u64::MAX
+        } else {
+            perms
+        }
+    }
+
+    /// Highest role position among `role_ids`, or 0 when none.
+    pub(super) fn highest_role_position(&self, role_ids: &[u64]) -> i32 {
+        role_ids
+            .iter()
+            .filter_map(|id| self.roles.get(id).map(|r| r.position))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Checks whether our account has both the required permission bit and role hierarchy
+    /// to perform `action` on `target_id` in `guild_id`.
+    pub(super) fn can_moderate(
+        &self,
+        guild_id: &str,
+        me: &str,
+        target_id: &str,
+        action: &protocol::ModerateAction,
+    ) -> Result<(), &'static str> {
+        if target_id == me {
+            return Err("You cannot moderate yourself.");
+        }
+        if !self.owner_id.is_empty() && target_id == self.owner_id {
+            return Err("Cannot moderate the server owner.");
+        }
+        let perms = self.guild_permissions(guild_id);
+        let (needed, missing_msg) = match action {
+            protocol::ModerateAction::Kick => (model::KICK_MEMBERS, "You don't have permission to kick members."),
+            protocol::ModerateAction::Ban { .. } => (model::BAN_MEMBERS, "You don't have permission to ban members."),
+            protocol::ModerateAction::Timeout { .. } | protocol::ModerateAction::Untimeout => {
+                (model::MODERATE_MEMBERS, "You don't have permission to time out members.")
+            }
+            protocol::ModerateAction::Nick { .. } => (model::MANAGE_NICKNAMES, "You don't have permission to change nicknames."),
+        };
+        if perms & needed == 0 {
+            return Err(missing_msg);
+        }
+        if !self.owner {
+            if let Some(target_roles) = self.member_roles.get(target_id) {
+                let my_top = self.highest_role_position(&self.my_roles);
+                let their_top = self.highest_role_position(target_roles);
+                if my_top <= their_top {
+                    return Err("Cannot moderate a member with an equal or higher role.");
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The gateway session, to resume it after a dropped socket.
@@ -1821,6 +1884,12 @@ impl Discord {
                 }
             }
             Command::Relate { person_id, action, reply } => answer(reply, self.relate(&person_id, action)),
+            Command::Moderate { space_id, person_id, action, reason, reply } => {
+                answer(reply, self.moderate(&space_id, &person_id, action, &reason))
+            }
+            Command::Unban { space_id, person_id, reason, reply } => {
+                answer(reply, self.unban(&space_id, &person_id, &reason))
+            }
             Command::SetPresence { presence, status, status_emoji: _, clear_at: _, reply } => answer(reply, self.set_presence(presence, status)),
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id, None)),
             Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),

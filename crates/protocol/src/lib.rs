@@ -949,6 +949,27 @@ pub struct SharedItem {
     pub title: String,
 }
 
+/// Member moderation actions in a Space (`Request::Moderate`, Discord).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModerateAction {
+    Kick,
+    Ban {
+        #[serde(default, skip_serializing_if = "is_zero")]
+        delete_seconds: u32,
+    },
+    Timeout {
+        /// Unix seconds until the timeout expires.
+        until: i64,
+    },
+    Untimeout,
+    Nick {
+        /// New nickname; empty clears it.
+        #[serde(default)]
+        nick: String,
+    },
+}
+
 /// What the user does about a person. Never automated: only on a shell request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1640,6 +1661,22 @@ pub enum Request {
     Relate {
         person: Key,
         action: RelateAction,
+    },
+    /// Moderate a member inside a Space (kick, ban, timeout, untimeout, or change nickname).
+    /// Gated by computed permissions and role hierarchy; never sent without confirmation.
+    Moderate {
+        space: Key,
+        person: Key,
+        action: ModerateAction,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
+    /// Lift a ban on a person in a Space.
+    Unban {
+        space: Key,
+        person: Key,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
     },
     /// Report a message, person, or conversation to the network. Never sent without a confirm sheet.
     Report {

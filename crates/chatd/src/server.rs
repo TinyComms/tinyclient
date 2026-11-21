@@ -3110,6 +3110,37 @@ impl Chat {
             Request::GetPrivacy { account, key } => self.get_privacy(account, key),
             Request::SetPrivacy { account, key, policy } => self.set_privacy(account, key, policy),
             Request::Relate { person, action } => self.relate(person, action),
+            Request::Moderate { space, person, action, reason } => {
+                if let Err(refused) = self.online(&space.account()) {
+                    return *refused;
+                }
+                let (space_id, person_id) = (space.id.clone(), person.id.clone());
+                match self.ask(&space.account(), |reply| Command::Moderate {
+                    space_id,
+                    person_id,
+                    action,
+                    reason,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::Unban { space, person, reason } => {
+                if let Err(refused) = self.online(&space.account()) {
+                    return *refused;
+                }
+                let (space_id, person_id) = (space.id.clone(), person.id.clone());
+                match self.ask(&space.account(), |reply| Command::Unban {
+                    space_id,
+                    person_id,
+                    reason,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
             Request::ReportReasons { target } => self.report_reasons(target),
             Request::SetPresence { account, presence, status, status_emoji, clear_at } => self.set_presence(account, presence, status, status_emoji, clear_at),

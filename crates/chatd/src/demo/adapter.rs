@@ -744,6 +744,9 @@ impl Demo {
             Command::ProfileIn { person_id, space_id, reply } => drop(reply.send(Ok(demo.about(&person_id, Some(&space_id))))),
             Command::ConversationInfo { conversation_id, reply } => drop(reply.send(demo.conversation_about(&conversation_id))),
             Command::SpaceInfo { space_id, reply } => drop(reply.send(demo.space_about(&space_id))),
+            Command::Moderate { reply, .. } | Command::Unban { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
+            }
             Command::SetMute { conversation_id, notify, until: _, reply } => {
                 let muted = demo.ctx.muted(&conversation_id, notify == Notify::Nothing);
                 let _ = reply.send(muted.map_err(|err| Refusal::Refused(err.to_string())));

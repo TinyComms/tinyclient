@@ -488,6 +488,21 @@ pub enum Command {
     },
     /// A Space's info, opened from its name.
     SpaceInfo { space_id: String, reply: Reply<SpaceAbout> },
+    /// Moderate a member in a Space (kick, ban, timeout, untimeout, nickname).
+    Moderate {
+        space_id: String,
+        person_id: String,
+        action: protocol::ModerateAction,
+        reason: String,
+        reply: Reply<()>,
+    },
+    /// Lift a member ban in a Space.
+    Unban {
+        space_id: String,
+        person_id: String,
+        reason: String,
+        reply: Reply<()>,
+    },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
     /// ignores it. Report the new mute through [`Context::muted`] before answering.
@@ -744,6 +759,8 @@ impl Command {
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
+            | Command::Moderate { reply, .. }
+            | Command::Unban { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }
             | Command::CloseDirect { reply, .. }
