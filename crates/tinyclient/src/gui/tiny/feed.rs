@@ -135,6 +135,7 @@ impl Shell {
             if let Some(gone) = gone {
                 cx.drop_image(gone, None);
                 cx.notify();
+                self.call_refresh_popout(cx);
             }
             if let Some(read) = read {
                 self.feed_read(which, read, cx);
@@ -154,6 +155,7 @@ impl Shell {
                     cx.drop_image(gone, None);
                 }
                 cx.notify();
+                this.call_refresh_popout(cx);
                 if let Some(next) = next {
                     this.feed_read(which, next, cx);
                 }

@@ -282,6 +282,7 @@ impl Shell {
                 this.active = window.is_window_active();
                 super::lock::note_active(this.active);
                 this.focus_changed(this.active, cx);
+                this.call_auto_popout_on_blur(this.active, cx);
                 cx.notify();
             }),
             // A move draws nothing, so render never sees it: the frame is noted here.
@@ -343,6 +344,7 @@ impl Shell {
         shell.sidebar_state.pins = prefs.pins;
         shell.sidebar_state.remember_telegram_folder(prefs.telegram_folder.clone());
         shell.tiny_state.set_members_open(prefs.tiny_members);
+        shell.call_state.popout_frame = prefs.call_popout_frame;
         app::prefs::set_me(prefs.me.clone());
         shell.saved_prefs.replace(app::prefs::write(&shell.current_prefs()));
         if crate::update::announce().is_some() {

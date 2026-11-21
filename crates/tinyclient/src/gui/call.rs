@@ -11,6 +11,7 @@ pub(in crate::gui) mod health;
 mod people;
 mod permission;
 pub(crate) mod phone;
+pub(in crate::gui) mod popout;
 pub(in crate::gui) mod security;
 #[cfg(feature = "gui-shot")]
 mod shot;
@@ -45,7 +46,7 @@ use std::mem::{discriminant, Discriminant};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-gpui::actions!(call, [ToggleMute, ToggleDeafen, Leave, Accept, Decline, Jump]);
+gpui::actions!(call, [ToggleMute, ToggleDeafen, Leave, Accept, Decline, Jump, TogglePopout]);
 
 /// The call shortcuts of 07 §2. None of them is taken by `02-layout-navigation.md`, the text
 /// input or the window. They are bound the first time a call view is drawn (`ensure_keys`), so
@@ -64,6 +65,7 @@ pub(super) fn bind_keys(cx: &mut App) {
     bind!("accept", Accept);
     bind!("decline", Decline);
     bind!("go-to-call", Jump);
+    bind!("popout-call", TogglePopout);
 }
 
 /// Set once the shortcuts are bound and their handlers registered.
@@ -92,6 +94,7 @@ fn ensure_keys(cx: &mut Context<Shell>) {
     on::<Accept>(cx, &shell, Shell::call_accept);
     on::<Decline>(cx, &shell, Shell::call_decline);
     on::<Jump>(cx, &shell, Shell::call_jump);
+    on::<TogglePopout>(cx, &shell, Shell::call_toggle_popout);
 }
 
 fn now() -> i64 {
@@ -305,6 +308,25 @@ pub struct State {
     /// at 3 s and 10 s without waiting for a frame to arrive.
     pub(in crate::gui) watch_asked: Option<(String, Instant)>,
     watch_timer: Option<Task<()>>,
+    /// Always-on-top pop-out window showing the call's video (`#267`). While `Some`, the main
+    /// stage renders a placeholder so the decoded `RenderImage` is never drawn twice.
+    pub(in crate::gui) popout: Option<gpui::WindowHandle<popout::CallPopout>>,
+    /// Remembered `(x, y, width, height)` for the call pop-out window, persisted in `shell.prefs`.
+    pub(in crate::gui) popout_frame: Option<(f32, f32, f32, f32)>,
+}
+
+/// Snapshot of the active call and its already-decoded frames for [`popout::CallPopout`].
+pub(super) struct PopoutSnapshot {
+    pub title: String,
+    pub muted: bool,
+    pub camera_on: bool,
+    pub share_on: bool,
+    pub can_pictures: bool,
+    pub main_frame: Option<std::sync::Arc<gpui::RenderImage>>,
+    pub pip_frame: Option<std::sync::Arc<gpui::RenderImage>>,
+    pub speaker_name: String,
+    pub speaker_speaking: bool,
+    pub live_badge: bool,
 }
 
 const DISCORD_SPEAKER_DEBOUNCE: Duration = Duration::from_millis(800);
@@ -742,6 +764,7 @@ impl Shell {
         }
         match call {
             None => {
+                self.call_close_popout(cx);
                 self.call_menu_set(None, cx);
                 let state = &mut self.call_state;
                 state.device_notice = None;
@@ -788,6 +811,7 @@ impl Shell {
                 self.call_cue_join(call, cx);
                 self.call_auto_watch(call, cx);
                 self.call_discord_speaker(call, cx);
+                self.call_refresh_popout(cx);
                 if let Some((asked_id, _)) = &self.call_state.watch_asked {
                     if call.picture.as_ref().is_some_and(|p| !p.path.is_empty() && p.user_id == *asked_id) {
                         self.call_state.watch_asked = None;
@@ -1473,8 +1497,59 @@ impl Shell {
         if !has_peer && self_frame.is_none() {
             return None;
         }
-        let main_is_peer = has_peer;
         let height = if compact { 126. } else { 260. };
+        if self.call_popout_open() {
+            let placeholder = div()
+                .relative()
+                .w_full()
+                .h(px(if compact { 64. } else { 112. }))
+                .flex_none()
+                .rounded(px(if compact { theme::R_CARD } else { 10. }))
+                .bg(theme::raised())
+                .border_1()
+                .border_color(theme::hairline())
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .type_small()
+                        .text_color(theme::text_soft())
+                        .child(glyph("icons/picture-in-picture-2.svg", 14., theme::accent()))
+                        .child("Playing in a separate window"),
+                )
+                .child(
+                    div()
+                        .id(if compact { "call-picture-bring-back-compact" } else { "call-picture-bring-back" })
+                        .h(px(26.))
+                        .px(px(10.))
+                        .rounded(px(6.))
+                        .bg(theme::selected())
+                        .text_color(theme::text())
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::pressed()))
+                        .type_micro()
+                        .font_weight(theme::SEMIBOLD)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.call_close_popout(cx);
+                        }))
+                        .child("Bring back"),
+                );
+            return if compact {
+                Some(div().w_full().pb(px(6.)).child(placeholder))
+            } else {
+                Some(div().w_full().flex_none().px(px(16.)).pt(px(10.)).pb(px(4.)).child(placeholder))
+            };
+        }
+        let main_is_peer = has_peer;
 
         let main_body = if main_is_peer {
             if let Some(frame) = peer_frame {
@@ -1626,7 +1701,34 @@ impl Shell {
                     .children(badge)
                     .child(div().type_micro().text_color(theme::text()).child(caption)),
             )
-            .children(action_btn.map(|btn| div().absolute().top(px(8.)).right(px(8.)).child(btn)))
+            .child(
+                div()
+                    .absolute()
+                    .top(px(8.))
+                    .right(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .id(if compact { "call-picture-popout-compact" } else { "call-picture-popout" })
+                            .size(px(24.))
+                            .rounded(px(6.))
+                            .bg(theme::overlay())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::pressed()))
+                            .tooltip(tip("Pop out video", Some("⇧⌘O")))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.call_toggle_popout(cx);
+                            }))
+                            .child(glyph("icons/picture-in-picture-2.svg", 13., theme::text())),
+                    )
+                    .children(action_btn),
+            )
             .children(pip);
 
         if compact {
@@ -1634,6 +1736,138 @@ impl Shell {
         } else {
             Some(div().w_full().flex_none().px(px(16.)).pt(px(10.)).pb(px(4.)).child(box_div))
         }
+    }
+
+    /// True while the call's video is playing in its own always-on-top pop-out window (`#267`).
+    pub(in crate::gui) fn call_popout_open(&self) -> bool {
+        self.call_state.popout.is_some()
+    }
+
+    pub(in crate::gui) fn call_open_popout(&mut self, cx: &mut Context<Self>) {
+        if crate::gui::phone::active() || self.call_state.popout.is_some() {
+            return;
+        }
+        let active_call = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| self.call_shown(s))
+            .is_some_and(|c| in_call(&c));
+        if !active_call {
+            return;
+        }
+        let shell = cx.weak_entity();
+        let saved = self.call_state.popout_frame;
+        cx.defer(move |cx| {
+            if let Some(handle) = popout::open(shell.clone(), saved, cx) {
+                let _ = shell.update(cx, |this, cx| {
+                    this.call_state.popout = Some(handle);
+                    cx.notify();
+                });
+            }
+        });
+    }
+
+    pub(in crate::gui) fn call_close_popout(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.call_state.popout.take() else {
+            return;
+        };
+        cx.notify();
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        });
+    }
+
+    pub(in crate::gui) fn call_toggle_popout(&mut self, cx: &mut Context<Self>) {
+        if self.call_state.popout.is_some() {
+            self.call_close_popout(cx);
+        } else {
+            self.call_open_popout(cx);
+        }
+    }
+
+    pub(in crate::gui) fn call_refresh_popout(&self, cx: &mut Context<Self>) {
+        let Some(handle) = self.call_state.popout else {
+            return;
+        };
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, _, cx| cx.notify());
+        });
+    }
+
+    /// Optional setting (V26): automatically pop out the call video when the main window loses
+    /// focus while a remote screen share is being watched.
+    pub(in crate::gui) fn call_auto_popout_on_blur(&mut self, main_active: bool, cx: &mut Context<Self>) {
+        if crate::gui::phone::active() {
+            return;
+        }
+        let call = self.snapshot.as_ref().and_then(|s| self.call_shown(s));
+        if popout::should_auto_popout(
+            super::app::prefs::choices().auto_popout_call,
+            main_active,
+            self.call_state.popout.is_some(),
+            call.as_ref(),
+        ) {
+            self.call_open_popout(cx);
+        }
+    }
+
+    /// Reads the current call and its already-decoded frames from `call_state` for `CallPopout`.
+    pub(super) fn call_popout_snapshot(&self) -> Option<PopoutSnapshot> {
+        let snapshot = self.snapshot.as_ref()?;
+        let call = self.call_shown(snapshot).filter(|c| in_call(c))?;
+        let subject = Subject::of(self, snapshot, &call);
+        let focused = self.tiny_focused_stream();
+        let owner = popout::preferred_frame_owner(&call, focused);
+        let remote_frame = owner
+            .as_ref()
+            .and_then(|(id, _)| self.call_frame(Some(&call), id));
+        let my_share = self.call_self_frame(Some(&call), true);
+        let my_camera = self.call_self_frame(Some(&call), false);
+        let local_frame = my_share.clone().or(my_camera);
+
+        let (main_frame, pip_frame, live_badge, title) = if let Some(frame) = remote_frame {
+            let (owner_id, is_share) = owner.as_ref().map(|(id, s)| (id.as_str(), *s)).unwrap_or(("", false));
+            let name = call
+                .participants
+                .iter()
+                .find(|p| p.id == owner_id)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| subject.title.clone());
+            let label = format!("{name}'s {}", if is_share { "screen" } else { "camera" });
+            (Some(frame), local_frame, is_share, label)
+        } else if let Some(frame) = local_frame {
+            let is_share = my_share.is_some();
+            let label = if is_share { "Your screen".to_owned() } else { "Your camera".to_owned() };
+            (Some(frame), None, is_share, label)
+        } else {
+            (None, None, false, subject.title.clone())
+        };
+
+        let speaker = owner
+            .as_ref()
+            .and_then(|(id, _)| call.participants.iter().find(|p| p.id == *id));
+        let speaker_name = speaker
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| subject.title.clone());
+        let speaker_speaking = speaker.is_some_and(|p| p.speaking);
+        let camera_on = call.self_view.is_some()
+            || call.video.iter().any(|v| v.direction == protocol::Direction::Encode && v.content == protocol::Content::Camera);
+        let share_on = call.share_view.is_some()
+            || call.video.iter().any(|v| v.direction == protocol::Direction::Encode && v.content == protocol::Content::Share);
+        let can_pictures = call.state == CallState::Joined && matches!(call.conversation.network, Network::Tiny | Network::Discord);
+
+        Some(PopoutSnapshot {
+            title,
+            muted: call.muted || call.deafened,
+            camera_on,
+            share_on,
+            can_pictures,
+            main_frame,
+            pip_frame,
+            speaker_name,
+            speaker_speaking,
+            live_badge,
+        })
     }
 
     /// A join was asked for here: a new room that follows is not a moderator's move.

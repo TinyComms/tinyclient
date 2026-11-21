@@ -504,6 +504,14 @@ impl Shell {
         tiles
     }
 
+    /// The stream currently focused on the Tiny room stage, if any.
+    pub(in crate::gui) fn tiny_focused_stream(&self) -> Option<&str> {
+        match &self.tiny_state.focus {
+            Some(Focus::Stream(id)) => Some(id.as_str()),
+            _ => None,
+        }
+    }
+
     /// The frame on screen, when it is this person's.
     fn tiny_frame(&self, call: Option<&Call>, user_id: &str) -> Option<Arc<RenderImage>> {
         self.call_frame(call, user_id)
@@ -715,6 +723,10 @@ impl Shell {
                             })),
                     )
                 })
+                .child(stream_button("tiny-stream-popout", "icons/picture-in-picture-2.svg", if self.call_popout_open() { "Bring back from pop-out" } else { "Pop out" }).on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_toggle_popout(cx);
+                })))
                 .child(stream_button("tiny-stream-full", "icons/maximize.svg", "Full screen").on_click(cx.listener(|this, _, window: &mut Window, cx| {
                     cx.stop_propagation();
                     this.tiny_full(window, cx);
@@ -727,6 +739,37 @@ impl Shell {
                 this.tiny_stop_watching(window, cx);
             })));
         }
+        let body: AnyElement = if self.call_popout_open() {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .type_ui()
+                        .text_color(theme::text_soft())
+                        .child(glyph("icons/picture-in-picture-2.svg", 16., theme::accent()))
+                        .child("Playing in a separate window"),
+                )
+                .child(
+                    button("tiny-stream-bring-back", ButtonKind::Secondary, "Bring back")
+                        .h(px(30.))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.call_close_popout(cx);
+                        })),
+                )
+                .into_any_element()
+        } else {
+            self.tiny_stream_body(page, stream, call, Size::Big, cx)
+        };
         div()
             .id(if full { "tiny-stream-whole" } else { "tiny-stream-focused" })
             .relative()
@@ -742,7 +785,7 @@ impl Shell {
                     .tooltip(tip("Click to see everyone again (Esc)", None))
                     .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_stream(&user_id, mine, window, cx)))
             })
-            .child(self.tiny_stream_body(page, stream, call, Size::Big, cx))
+            .child(body)
             .child(caption(if mine { format!("Your {what}") } else { format!("{name}'s {what}") }, false))
             .child(tools)
     }
@@ -1167,6 +1210,12 @@ impl Shell {
                 .tooltip(tip(if camera_on { "Turn camera off" } else { "Turn camera on" }, None))
                 .on_click(cx.listener(move |this, _, _, cx| this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx)))
         });
+        let popout_open = self.call_popout_open();
+        let popout = pictures.then(|| {
+            bar_button("tiny-bar-popout", "icons/picture-in-picture-2.svg", if popout_open { Look::On } else { Look::Rest })
+                .tooltip(tip(if popout_open { "Bring video back" } else { "Pop out video" }, Some("⇧⌘O")))
+                .on_click(cx.listener(|this, _, _, cx| this.call_toggle_popout(cx)))
+        });
         let refused = self.call_refused().map(str::to_owned).or_else(|| call.and_then(|call| call.device_notice.clone()));
         let health = call.filter(|call| call.state == CallState::Joined).and_then(|_| self.tiny_health()).map(|health| {
             let grade = health.grade();
@@ -1210,6 +1259,7 @@ impl Shell {
                     .child(deafen)
                     .children(share)
                     .children(camera)
+                    .children(popout)
                     .child(
                         bar_button("tiny-bar-devices", "icons/settings.svg", Look::Rest)
                             .tooltip(tip("Microphone and speaker", None))

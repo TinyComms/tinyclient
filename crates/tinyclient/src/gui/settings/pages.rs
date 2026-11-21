@@ -420,7 +420,7 @@ impl SettingsWindow {
                 self.group(&["V2", "V5"], Some("Speaker"), window, cx)
                     .child(caption("Picking a device in a call's menu changes that call only. These are the defaults.")),
                 self.group(&["V22", "V23", "V24", "V25"], Some("Camera"), window, cx).child(self.camera_preview(cx)),
-                self.group(&["V4"], Some("Joining"), window, cx),
+                self.group(&["V4", "V26"], Some("Joining"), window, cx),
             ],
             Section::Voice => {
                 let values = prefs::values();
@@ -927,6 +927,10 @@ impl SettingsWindow {
             "V4" => {
                 let on = values.on(JOIN_MUTED);
                 self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, JOIN_MUTED, on, false, cx), cx)
+            }
+            "V26" => {
+                let second = Some("Automatically opens the always-on-top call video window when you switch to another app while watching a screen share.".to_owned());
+                self.switch_row(id, choices.auto_popout_call, false, second, |this, on, cx| this.choose(|c| c.auto_popout_call = on, cx), cx)
             }
             "D1" => self.usage(cx),
             "D2" => {

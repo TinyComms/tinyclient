@@ -96,6 +96,7 @@ pub const ROWS: &[Row] = &[
     row("V2", Audio, "Speaker", "Speaker", &[], &["output", "headphones", "device", "speakers"]),
     row("V5", Audio, "Speaker", "Call volume", &[], &["volume", "loud", "quiet", "voices"]),
     row("V4", Audio, "Joining", "Join calls with my microphone muted", &[], &["mute", "muted", "join"]),
+    row("V26", Audio, "Joining", "Pop out video when switching apps", &[], &["popout", "pop out", "pip", "picture in picture", "always on top", "share", "call"]),
     row("V8", Voice, "", "Microphone opens by", &["Voice activation", "Push to talk"], &["ptt", "push to talk", "voice activity", "vad", "open mic"]),
     row("V3", Voice, "", "Input level", &[], &["test", "meter", "mic", "level"]),
     row("V6", Voice, "", "Sensitivity", &[], &["gate", "threshold", "noise", "voice activity", "vad"]),
@@ -310,6 +311,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     key("Calls", "Accept a call", "⇧⌘A"),
     key("Calls", "Decline a call", "⇧⌘R"),
     key("Calls", "Go to the call", "⇧⌘J"),
+    key("Calls", "Pop out call video", "⇧⌘O"),
 ];
 
 /// Hiding an application is macOS's: GPUI ignores it on Linux and panics at Hide Others on

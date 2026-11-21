@@ -457,6 +457,7 @@ pub(crate) fn dispatch_binding(id: &str, window: &mut gpui::Window, cx: &mut App
         "accept" => go!(call::Accept),
         "decline" => go!(call::Decline),
         "go-to-call" => go!(call::Jump),
+        "popout-call" => go!(call::TogglePopout),
         "about" => go!(About),
         "check-updates" => go!(CheckForUpdates),
         "add-account" => go!(AddAccount),

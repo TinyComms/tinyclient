@@ -550,6 +550,7 @@ impl Shell {
             right: state.right_width,
             pins: self.sidebar_state.pins.clone(),
             frame: self.frame.get(),
+            call_popout_frame: self.call_state.popout_frame,
             // Until the first answer, the place of the last launch is still the one to keep.
             open: match &self.restore {
                 Some((open, _)) => open.clone(),
