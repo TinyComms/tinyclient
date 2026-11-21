@@ -907,6 +907,11 @@ impl Pane {
                         .person(&key)
                         .is_some_and(|p| p.relation == protocol::Relation::Blocked)
                 });
+        let sensitive_hidden = !message.deleted
+            && !blocked_hidden
+            && crate::gui::streamer::is_active()
+            && !self.revealed_sensitive.contains(&message.id)
+            && crate::gui::streamer::contains_sensitive(&message.text);
         let mut sent = div().flex().flex_col();
         if message.deleted {
             // What it said is gone; the row stays for the thread that hangs off it.
@@ -936,6 +941,38 @@ impl Pane {
                                 cx.notify();
                             }))
                             .child("Show"),
+                    ),
+            );
+        } else if sensitive_hidden {
+            let reveal_id = message.id.clone();
+            sent = sent.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(8.))
+                    .py(px(4.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(tokens::card())
+                    .border_1()
+                    .border_color(theme::border())
+                    .type_small()
+                    .text_color(theme::text_soft())
+                    .child(glyph("icons/eye-off.svg", 13., theme::text_faint()))
+                    .child("Hidden in Streamer mode (invite link or sign-in code).")
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("reveal-sensitive-{}", message.id)))
+                            .cursor_pointer()
+                            .font_weight(theme::MEDIUM)
+                            .text_color(theme::accent_text())
+                            .hover(|style| style.underline())
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.revealed_sensitive.insert(reveal_id.clone());
+                                cx.notify();
+                            }))
+                            .child("Reveal"),
                     ),
             );
         } else {
@@ -1067,7 +1104,7 @@ impl Pane {
             .flex_col()
             .children(head.then(|| self.header(message, in_header, cx)))
             .child(sent)
-            .children(self.otp_chip(message, cx))
+            .children((!sensitive_hidden).then(|| self.otp_chip(message, cx)).flatten())
             .children(self.views_line(message))
             .children(self.reactions(message, window, cx))
             .children(self.thread_line(message, window, cx))
@@ -2786,9 +2823,10 @@ impl Pane {
     fn contact_card(&self, message: &Rc<Message>, contact: &protocol::SharedContact, idx: usize, cx: &mut Context<Self>) -> AnyElement {
         let title = if contact.name.trim().is_empty() { "Shared contact" } else { contact.name.trim() };
         let mut rows: Vec<AnyElement> = Vec::new();
+        let streamer = crate::gui::streamer::is_active();
         for (p_idx, phone) in contact.phones.iter().enumerate() {
             let reveal_key = format!("{}:{idx}:{p_idx}", message.id);
-            let revealed = self.revealed_contacts.contains(&reveal_key);
+            let revealed = !streamer && self.revealed_contacts.contains(&reveal_key);
             let shown = if revealed { phone.clone() } else { crate::gui::people::mask(phone) };
             let copy_val = phone.clone();
             let toggle_key = reveal_key.clone();
@@ -2801,49 +2839,55 @@ impl Pane {
                     .child(
                         div()
                             .id(name_id(&format!("contact-phone-{}-{idx}-{p_idx}", message.id), ""))
-                            .cursor_pointer()
+                            .when(!streamer, |row| row.cursor_pointer().hover(|s| s.text_color(theme::text())))
                             .type_ui()
                             .text_color(theme::text_soft())
-                            .hover(|s| s.text_color(theme::text()))
-                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_contact_reveal(toggle_key.clone(), cx)))
-                            .child(if revealed { shown } else { format!("{shown} · Show") }),
+                            .when(!streamer, |row| {
+                                row.on_click(cx.listener(move |this, _, _, cx| this.toggle_contact_reveal(toggle_key.clone(), cx)))
+                            })
+                            .child(if streamer || revealed { shown } else { format!("{shown} · Show") }),
                     )
-                    .child(
-                        div()
-                            .id(name_id(&format!("contact-phone-copy-{}-{idx}-{p_idx}", message.id), ""))
-                            .cursor_pointer()
-                            .type_micro()
-                            .text_color(theme::accent())
-                            .hover(|s| s.underline())
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_val.clone()));
-                            }))
-                            .child("Copy"),
-                    )
+                    .when(!streamer, |row| {
+                        row.child(
+                            div()
+                                .id(name_id(&format!("contact-phone-copy-{}-{idx}-{p_idx}", message.id), ""))
+                                .cursor_pointer()
+                                .type_micro()
+                                .text_color(theme::accent())
+                                .hover(|s| s.underline())
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_val.clone()));
+                                }))
+                                .child("Copy"),
+                        )
+                    })
                     .into_any_element(),
             );
         }
         for (e_idx, email) in contact.emails.iter().enumerate() {
             let copy_val = email.clone();
+            let shown_email = if streamer { crate::gui::people::mask_email(email) } else { email.clone() };
             rows.push(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap(px(8.))
-                    .child(div().type_ui().text_color(theme::text_soft()).child(email.clone()))
-                    .child(
-                        div()
-                            .id(name_id(&format!("contact-email-copy-{}-{idx}-{e_idx}", message.id), ""))
-                            .cursor_pointer()
-                            .type_micro()
-                            .text_color(theme::accent())
-                            .hover(|s| s.underline())
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_val.clone()));
-                            }))
-                            .child("Copy"),
-                    )
+                    .child(div().type_ui().text_color(theme::text_soft()).child(shown_email))
+                    .when(!streamer, |row| {
+                        row.child(
+                            div()
+                                .id(name_id(&format!("contact-email-copy-{}-{idx}-{e_idx}", message.id), ""))
+                                .cursor_pointer()
+                                .type_micro()
+                                .text_color(theme::accent())
+                                .hover(|s| s.underline())
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_val.clone()));
+                                }))
+                                .child("Copy"),
+                        )
+                    })
                     .into_any_element(),
             );
         }

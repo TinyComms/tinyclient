@@ -66,6 +66,13 @@ pub const AUTO_WATCH_SHARE: &str = "auto_watch_share";
 /// ([`crate::incognito_host`]) or an `e2ee_required` room acts as on whatever this says. See
 /// `SECURITY.md`.
 pub const REQUIRE_CALL_E2EE: &str = "require_call_e2ee";
+/// PS1. Streamer mode: `off`, `on`, or `while_sharing` (default).
+pub const STREAMER_MODE: &str = "streamer_mode";
+pub const STREAMER_MODE_CHOICES: [&str; 3] = ["off", "on", "while_sharing"];
+/// PS2. Exclude tinyclient's own window from capture by other applications while Streamer mode is active.
+pub const STREAMER_HIDE_WINDOW: &str = "streamer_hide_window";
+/// PS3. Automatically activate Streamer mode while OBS Studio or Streamlabs Desktop is running.
+pub const STREAMER_DETECT_OBS: &str = "streamer_detect_obs";
 /// V5. Everyone's voice, 0 to 100.
 pub const VOICE_VOLUME: &str = "voice_volume";
 /// V6. The level, 0 to 100, from which our microphone counts as speech, and in voice
@@ -273,7 +280,8 @@ fn kind(key: &str) -> Option<Kind> {
         ECHO_CANCELLATION | AUTO_GAIN => Kind::Switch(true),
         NOISE_SUPPRESSION => Kind::Word(&NOISE_CHOICES, "enhanced"),
         VOICE_QUALITY => Kind::Word(&QUALITY_CHOICES, "standard"),
-        JOIN_MUTED | PUSH_TO_TALK | REQUIRE_CALL_E2EE | LINK_PREVIEWS_UNKNOWN => Kind::Switch(false),
+        JOIN_MUTED | PUSH_TO_TALK | REQUIRE_CALL_E2EE | LINK_PREVIEWS_UNKNOWN | STREAMER_HIDE_WINDOW | STREAMER_DETECT_OBS => Kind::Switch(false),
+        STREAMER_MODE => Kind::Word(&STREAMER_MODE_CHOICES, "while_sharing"),
         MUTED_TALK | AUTO_WATCH_SHARE => Kind::Switch(true),
         PTT_RELEASE_MS => Kind::Choice(&PTT_RELEASE_CHOICES, 200),
         CUE_VOLUME => Kind::Percent(50),
@@ -558,6 +566,16 @@ pub struct Values(BTreeMap<(String, String), String>);
 impl Values {
     pub fn new(settings: impl IntoIterator<Item = Setting>) -> Values {
         Values(settings.into_iter().map(|s| ((s.scope, s.key), s.value)).collect())
+    }
+
+    /// Whether Streamer mode is active given whether the user is sharing a screen
+    /// and whether a supported broadcast app (OBS / Streamlabs) is running.
+    pub fn streamer_active(&self, sharing: bool, obs_running: bool) -> bool {
+        match self.word(GLOBAL, STREAMER_MODE) {
+            "on" => true,
+            "while_sharing" => sharing || (self.on(STREAMER_DETECT_OBS) && obs_running),
+            _ => false,
+        }
     }
 
     /// The stored value, if one is.
@@ -1252,5 +1270,36 @@ mod tests {
         assert!(valid(GLOBAL, AUTO_WATCH_SHARE, "on"));
         assert!(valid(GLOBAL, AUTO_WATCH_SHARE, "off"));
         assert!(!valid(&account_scope(&account(Network::Tiny)), AUTO_WATCH_SHARE, "off"));
+    }
+
+    #[test]
+    fn streamer_mode_defaults_and_activation_rules() {
+        let mut values = Values::default();
+        assert_eq!(values.word(GLOBAL, STREAMER_MODE), "while_sharing");
+        assert!(!values.on(STREAMER_HIDE_WINDOW));
+        assert!(!values.on(STREAMER_DETECT_OBS));
+        for word in STREAMER_MODE_CHOICES {
+            assert!(valid(GLOBAL, STREAMER_MODE, word), "{word}");
+        }
+        assert!(!valid(GLOBAL, STREAMER_MODE, "always"));
+        assert!(valid(GLOBAL, STREAMER_HIDE_WINDOW, "on"));
+        assert!(valid(GLOBAL, STREAMER_DETECT_OBS, "on"));
+        assert!(!valid(&account_scope(&account(Network::Tiny)), STREAMER_MODE, "on"));
+
+        // Default "while_sharing": active only while sharing (unless OBS detection is enabled).
+        assert!(!values.streamer_active(false, false));
+        assert!(values.streamer_active(true, false));
+        assert!(!values.streamer_active(false, true));
+
+        // Enabling OBS detection activates "while_sharing" when OBS is running.
+        values.set(GLOBAL, STREAMER_DETECT_OBS, Some("on".into()));
+        assert!(values.streamer_active(false, true));
+        assert!(!values.streamer_active(false, false));
+
+        // Explicit "on" is always active; explicit "off" is never active even while sharing or OBS running.
+        values.set(GLOBAL, STREAMER_MODE, Some("on".into()));
+        assert!(values.streamer_active(false, false));
+        values.set(GLOBAL, STREAMER_MODE, Some("off".into()));
+        assert!(!values.streamer_active(true, true));
     }
 }

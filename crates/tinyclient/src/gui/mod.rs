@@ -37,6 +37,7 @@ mod shortcuts;
 #[cfg(any(feature = "gui-shot", feature = "demo"))]
 pub(crate) mod shot_demo;
 mod state;
+pub(in crate::gui) mod streamer;
 mod theme;
 mod tiny;
 mod time;

@@ -807,8 +807,10 @@ impl InfoPane {
     }
 
     fn contact_row(&self, ix: usize, contact: Contact, cx: &mut Context<Self>) -> impl IntoElement {
+        let streamer = crate::gui::streamer::is_active();
         let phone = contact.kind == ContactKind::Phone || contact.masked;
-        let masked = phone && !self.phones_shown;
+        let streamer_locked = streamer && (phone || contact.kind == ContactKind::Email);
+        let masked = streamer_locked || (phone && !self.phones_shown);
         let icon = match contact.kind {
             ContactKind::Email => "icons/mail.svg",
             ContactKind::Phone => "icons/phone.svg",
@@ -819,7 +821,7 @@ impl InfoPane {
             ContactKind::Phone => "Phone number",
             ContactKind::Other => "Contact",
         };
-        let words = facts::contact_words(&contact, self.phones_shown);
+        let words = facts::contact_words_for(&contact, self.phones_shown, streamer);
         let value = contact.value.clone();
         div()
             .id(("info-contact", ix))
@@ -831,11 +833,10 @@ impl InfoPane {
             .items_center()
             .gap(px(8.))
             .type_ui()
-            .cursor_pointer()
-            .hover(|row| row.bg(theme::hover()))
+            .when(!streamer_locked, |row| row.cursor_pointer().hover(|row| row.bg(theme::hover())))
             .child(glyph(icon, 16., theme::text_soft()))
             .child(div().flex_1().min_w_0().truncate().child(words))
-            .when(masked, |row| {
+            .when(masked && !streamer_locked, |row| {
                 row.child(
                     button(("info-show", ix), ButtonKind::Ghost, "Show").h(px(24.)).px(px(6.)).type_small().on_click(cx.listener(
                         |this, _, _, cx| {
@@ -847,7 +848,11 @@ impl InfoPane {
                 )
             })
             // A masked number is not copied: the click that shows it is the one that reveals it.
+            // In Streamer mode, phone numbers and emails stay masked and cannot be revealed or copied.
             .on_click(cx.listener(move |this, _, _, cx| {
+                if streamer_locked {
+                    return;
+                }
                 if masked {
                     this.phones_shown = true;
                     cx.notify();
