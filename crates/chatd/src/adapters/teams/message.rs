@@ -1814,6 +1814,42 @@ impl Teams {
         format!("/v1/users/ME/conversations/{}/messages/{}", escaped(conversation), escaped(id))
     }
 
+    /// Translates one stored message on demand through Teams' middle-tier translation service.
+    /// Ephemeral: never overwrites the stored original message.
+    pub(super) fn translate(&self, conversation: &str, message_id: &str, to: &str) -> Result<crate::adapters::Translation, Fault> {
+        if self.state().translation_disabled {
+            return Err(Fault::Refused {
+                status: 403,
+                message: "Message translation is disabled by your Teams organization.".to_owned(),
+            });
+        }
+        let Some(stored) = self.ctx.stored_message(conversation, message_id)? else {
+            return Err(Fault::Refused {
+                status: 404,
+                message: "Message not found.".to_owned(),
+            });
+        };
+        let original = stored.text.trim();
+        if original.is_empty() {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "This message has no text to translate.".to_owned(),
+            });
+        }
+        let place = self.place()?;
+        let url = format!("{}/v1/messages/translate", place.middle);
+        let body = json!({
+            "text": original,
+            "targetLanguage": to,
+            "conversationId": thread_of(conversation),
+            "messageId": message_id,
+        });
+        let answer = self.call("POST", &url, super::Auth::Both(Audience::Spaces), Body::Json(&body), false)?;
+        parse_translation_response(&answer.body).ok_or_else(|| {
+            Fault::Net("Teams returned no translated text.".to_owned())
+        })
+    }
+
     pub(super) fn edit(&self, conversation: &str, id: &str, text: &str, mention_spans: &[Span]) -> Result<(), Fault> {
         let raw_id = id.strip_prefix("scheduled:").unwrap_or(id);
         let stored = self.ctx.stored_message(conversation, id)?;
@@ -2074,6 +2110,41 @@ pub(super) fn prove_chain_paging() -> Result<(), String> {
     Ok(())
 }
 
+/// Reads a translated message body and optional detected language from Teams' translate response.
+fn parse_translation_response(body: &Value) -> Option<crate::adapters::Translation> {
+    let direct_text = [&body["translatedText"], &body["translation"], &body["text"]]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .find(|s| !s.is_empty());
+    if let Some(text) = direct_text {
+        let detected = [
+            &body["detectedLanguage"]["language"],
+            &body["detectedLanguage"],
+            &body["sourceLanguage"],
+            &body["from"],
+        ]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_owned();
+        return Some(crate::adapters::Translation { text: text.to_owned(), detected_language: detected });
+    }
+    let first = body.as_array()?.first()?;
+    let text = first["translations"].as_array()?.first()?["text"].as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let detected = first["detectedLanguage"]["language"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    Some(crate::adapters::Translation { text: text.to_owned(), detected_language: detected })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2319,5 +2390,18 @@ mod tests {
         assert_eq!(count_unread_against_horizon(&msgs, Some("1760000008000")), (0, 0));
         // No horizon -> counts only non-outgoing messages newer than latest outgoing (9000) -> 0.
         assert_eq!(count_unread_against_horizon(&msgs, None), (0, 0));
+    }
+
+    #[test]
+    fn parse_translation_response_reads_object_and_cognitive_array_shapes() {
+        let obj = json!({"translatedText": "Hello world", "detectedLanguage": "es"});
+        let t1 = parse_translation_response(&obj).unwrap();
+        assert_eq!((t1.text.as_str(), t1.detected_language.as_str()), ("Hello world", "es"));
+
+        let arr = json!([{"detectedLanguage": {"language": "ja"}, "translations": [{"text": "Good morning", "to": "en"}]}]);
+        let t2 = parse_translation_response(&arr).unwrap();
+        assert_eq!((t2.text.as_str(), t2.detected_language.as_str()), ("Good morning", "ja"));
+
+        assert!(parse_translation_response(&json!({"translatedText": "   "})).is_none());
     }
 }

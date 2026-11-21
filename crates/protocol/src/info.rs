@@ -681,6 +681,9 @@ pub struct Capabilities {
     /// This account supports following and unfollowing threads (`Request::FollowThread`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub follow_threads: bool,
+    /// This account supports on-demand in-place message translation (`Request::Translate`, Teams).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub translate: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).

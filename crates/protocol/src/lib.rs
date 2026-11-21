@@ -2014,6 +2014,14 @@ pub enum Request {
     Handoff {
         conversation: Key,
     },
+    /// Translates one message on demand into `to` (empty or `auto` uses the configured/default
+    /// language). Ephemeral: chatd never overwrites the stored original message.
+    Translate {
+        conversation: Key,
+        message_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        to: String,
+    },
     Media(MediaRequest),
     /// A voice message or audio file: play, pause, seek, speed, stop. Answers `Ok`; the rest is
     /// `Change::Playback`.
@@ -3062,6 +3070,12 @@ pub enum Response {
     /// What an encrypted backup file holds (`ExportBackup`) or added here (`ImportBackup`).
     TinyBackup {
         messages: u64,
+    },
+    /// Ephemeral result of [`Request::Translate`]. The stored original message is unchanged.
+    Translated {
+        text: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        detected_language: String,
     },
     /// What `E2eeAsk::Link` asked: the device link in progress on this device, if any.
     TinyE2eeLink {

@@ -648,6 +648,19 @@ impl Fake {
                 ]
             }));
         }
+        if call.path.ends_with("/v1/messages/translate") {
+            let asked = call.json();
+            let to = asked["targetLanguage"].as_str().unwrap_or("en");
+            let text = asked["text"].as_str().unwrap_or("");
+            let translated = match to {
+                "fr" => format!("Bonjour l'équipe ({text})"),
+                _ => "Good morning team!".to_owned(),
+            };
+            return ok(json!({
+                "translatedText": translated,
+                "detectedLanguage": "es"
+            }));
+        }
         if call.path.ends_with("/v1/urlpreview") {
             let asked = call.json();
             let url = asked["url"].as_str().unwrap_or("");
@@ -2730,6 +2743,64 @@ fn gif_search_and_stickers_work_in_catalog_and_send() {
     let gov_status = gov.account(HOME);
     assert!(!gov_status.can.gifs, "GCC High must not advertise worldwide Giphy");
     assert!(gov_status.can.stickers, "GCC High keeps Teams-hosted stickers");
+}
+
+#[test]
+fn translate_message_returns_ephemeral_translation_without_mutating_store() {
+    let world = World::start();
+    world.ready();
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+
+    // 1. Teams advertises message translation.
+    assert!(world.account(HOME).can.translate);
+
+    // 2. Receive a Spanish message.
+    let inbound = message(CHAT_ANA, None, 1_760_000_850_001, ANA, "Ana Ruiz", "<p>¡Buenos días equipo!</p>");
+    world.fake.push("NewMessage", inbound, false);
+    let orig = world.until("Spanish message arrives", || world.message(&ana, "1760000850001"));
+    assert_eq!(orig.text, "¡Buenos días equipo!");
+
+    // 3. Translate into English on demand.
+    let Response::Translated { text, detected_language } = world.ask(Request::Translate {
+        conversation: ana.clone(),
+        message_id: "1760000850001".to_owned(),
+        to: "en".to_owned(),
+    }) else {
+        panic!("expected Response::Translated");
+    };
+    assert_eq!(text, "Good morning team!");
+    assert_eq!(detected_language, "es");
+
+    // 4. Stored message in SQLite is completely unchanged (ephemeral translation).
+    let after = world.message(&ana, "1760000850001").unwrap();
+    assert_eq!(after.text, "¡Buenos días equipo!");
+
+    // 5. Configuring `translate_lang` in settings drives empty `to` requests, and invalid tags are refused.
+    assert!(matches!(
+        world.ask(Request::Set {
+            scope: protocol::settings::GLOBAL.to_owned(),
+            key: protocol::settings::TRANSLATE_LANG.to_owned(),
+            value: Some("fr".to_owned()),
+        }),
+        Response::Ok
+    ));
+    assert!(matches!(
+        world.ask(Request::Set {
+            scope: protocol::settings::GLOBAL.to_owned(),
+            key: protocol::settings::TRANSLATE_LANG.to_owned(),
+            value: Some("not a tag!!".to_owned()),
+        }),
+        Response::Error { .. }
+    ));
+    let Response::Translated { text: fr_text, .. } = world.ask(Request::Translate {
+        conversation: ana.clone(),
+        message_id: "1760000850001".to_owned(),
+        to: String::new(),
+    }) else {
+        panic!("expected Response::Translated with stored target language");
+    };
+    assert!(fr_text.starts_with("Bonjour"), "{fr_text}");
 }
 
 

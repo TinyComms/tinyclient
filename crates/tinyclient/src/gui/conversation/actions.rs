@@ -147,6 +147,8 @@ pub struct Can {
     pub unsent: bool,
     /// May report this message to the server's moderators (Tiny `abuse_reports`, other people's messages).
     pub report: bool,
+    /// May translate this message on demand (`Capabilities::translate` and non-empty text).
+    pub translate: bool,
 }
 
 /// What the menu and the toolbar call this message's thread.
@@ -310,6 +312,7 @@ pub fn can_with_network_topic(
         remind: act && caps.save_messages,
         unsent,
         report: act && network == Network::Tiny && !message.outgoing && caps.abuse_reports,
+        translate: act && caps.translate && !message.text.trim().is_empty(),
     }
 }
 
@@ -374,6 +377,8 @@ enum MenuAct {
     Remind,
     /// Report another person's message on a Tiny server.
     Report,
+    /// Translate message text in place, or restore the original (`Capabilities::translate`).
+    Translate,
     /// A sent message: ask, unless the click held Shift.
     Delete,
 }
@@ -544,6 +549,9 @@ fn menu_acts(
     }
     if has_text {
         acts.push(MenuAct::Copy);
+    }
+    if can.translate {
+        acts.push(MenuAct::Translate);
     }
     if has_link {
         acts.push(MenuAct::Link);
@@ -1217,6 +1225,7 @@ impl Pane {
                 });
             }
             MenuAct::Copy => self.copy_text(&message, cx),
+            MenuAct::Translate => self.toggle_translate(&message, cx),
             MenuAct::Drop => self.delete(&message, true, window, cx),
             MenuAct::Quick(_) => {
                 if let Some(emoji) = emoji {
@@ -1733,6 +1742,18 @@ impl Pane {
                     .child(menu_separator())
                     .child(menu_item("copy", Some("icons/copy.svg"), copy, Some("⌘C")).when(lit(MenuAct::Copy), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::Copy)));
+            }
+            if can.translate {
+                let label = if self.translations.contains_key(&message.id) {
+                    "Show original"
+                } else {
+                    "Translate"
+                };
+                items = items.child(
+                    menu_item("translate", None, label, None)
+                        .when(lit(MenuAct::Translate), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Translate)),
+                );
             }
             if self.link_of(&message, cx).is_some() {
                 items = items
@@ -2907,6 +2928,14 @@ mod tests {
             menu_acts(on, false, 0, false, false, false, false, true, false),
             vec![MenuAct::Reply, MenuAct::Thread, MenuAct::Forward, MenuAct::SaveAs, MenuAct::Unread, MenuAct::Select],
         );
+        // Translate appears only when the account supports it and the message has text.
+        let mut t_caps = discord_caps();
+        t_caps.translate = true;
+        let translatable = can(&said, &t_caps, rights, channel, false, 10);
+        assert!(translatable.translate);
+        assert!(menu_acts(translatable, false, 0, false, true, false, false, false, false).contains(&MenuAct::Translate));
+        let empty = Message::plain("3", "Mara", "   ", 3, false);
+        assert!(!can(&empty, &t_caps, rights, channel, false, 10).translate);
     }
 
     #[test]

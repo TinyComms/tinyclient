@@ -2725,6 +2725,37 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::Translate { conversation, message_id, to } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                let requested = to.trim();
+                let target = if !requested.is_empty() && requested != "auto" {
+                    if !protocol::settings::valid_language_tag(requested) {
+                        return error(ErrorCode::Refused, "Unsupported target language.");
+                    }
+                    requested.to_owned()
+                } else {
+                    let stored = self.hub.settings().translate_lang();
+                    if stored != "auto" { stored } else { "en".to_owned() }
+                };
+                match self.ask(&conversation.account(), |reply| Command::Translate {
+                    conversation_id: conversation.id.clone(),
+                    message_id,
+                    to: target,
+                    reply,
+                }) {
+                    Ok(mut translated) => {
+                        protocol::clip(&mut translated.text, 40_000);
+                        protocol::clip(&mut translated.detected_language, 32);
+                        Response::Translated {
+                            text: translated.text,
+                            detected_language: translated.detected_language,
+                        }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::ReadSessions => {
                 let denied = self.hub.keychain().denied;
                 if let Some(chat) = self.this.get().and_then(Weak::upgrade) {

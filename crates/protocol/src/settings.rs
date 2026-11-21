@@ -118,6 +118,8 @@ pub const LINK_PREVIEWS: &str = "link_previews";
 pub const LINK_PREVIEWS_UNKNOWN: &str = "link_previews_unknown";
 /// D2. The image and file cache's cap in MB: 250, 500, 1000 or 2000.
 pub const CACHE_MB: &str = "cache_mb";
+/// Preferred target language for on-demand message translation (`auto` or a short BCP-47 tag like `en`, `es`, `zh-Hans`).
+pub const TRANSLATE_LANG: &str = "translate_lang";
 /// The schema of these rows, for migrations. Not a setting anyone changes.
 pub const VERSION: &str = "version";
 
@@ -239,6 +241,8 @@ enum Kind {
     Port,
     /// An optional proxy username.
     User,
+    /// Preferred translation language (`auto` or a short BCP-47 tag).
+    Language,
 }
 
 fn kind(key: &str) -> Option<Kind> {
@@ -289,6 +293,7 @@ fn kind(key: &str) -> Option<Kind> {
         LOG_LEVEL => Kind::Word(&LOG_LEVEL_CHOICES, "info"),
         LOG_RING | LOG_EXPORT => Kind::Switch(true),
         CUSTOM_SOUND => Kind::CustomSound,
+        TRANSLATE_LANG => Kind::Language,
         _ => return None,
     })
 }
@@ -364,8 +369,27 @@ pub fn valid(scope: &str, key: &str, value: &str) -> bool {
         Some(Kind::Host) => !value.is_empty() && value.len() <= 253 && !value.chars().any(|c| c.is_control() || c.is_whitespace() || c == '/' || c == '@'),
         Some(Kind::Port) => value.parse::<u16>().is_ok_and(|p| p > 0),
         Some(Kind::User) => value.len() <= 128 && !value.chars().any(|c| c.is_control() || c == '@' || c == ':'),
+        Some(Kind::Language) => valid_language_tag(value),
         None => false,
     }
+}
+
+/// Validates `auto` or a short BCP-47 language tag (e.g. `en`, `es`, `pt-BR`, `zh-Hans`).
+pub fn valid_language_tag(value: &str) -> bool {
+    if value == "auto" {
+        return true;
+    }
+    if !(2..=15).contains(&value.len()) {
+        return false;
+    }
+    let mut parts = value.split('-');
+    let Some(primary) = parts.next() else {
+        return false;
+    };
+    if !(2..=3).contains(&primary.len()) || !primary.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    parts.all(|sub| (2..=4).contains(&sub.len()) && sub.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 /// What `notify_about` may be in a scope: the global one has no `off`, which is N1's.
@@ -640,6 +664,11 @@ impl Values {
     /// How clearly to encode on a Tiny call, within the room's bitrate.
     pub fn voice_quality(&self) -> crate::VoiceQuality {
         crate::VoiceQuality::parse(self.word(GLOBAL, VOICE_QUALITY)).unwrap_or_default()
+    }
+
+    /// Preferred target language for on-demand message translation (`auto` or a BCP-47 tag).
+    pub fn translate_lang(&self) -> String {
+        self.stored(GLOBAL, TRANSLATE_LANG).unwrap_or("auto").to_owned()
     }
 
     /// How the microphone opens, as the user chose. A room that requires push-to-talk asks
@@ -1242,5 +1271,21 @@ mod tests {
         assert!(telegram_relay_only(false, true));
         assert!(telegram_relay_only(true, true));
         assert!(!telegram_relay_only(true, false));
+    }
+
+    #[test]
+    fn translate_lang_validates_auto_and_bcp47_tags() {
+        assert!(valid(GLOBAL, TRANSLATE_LANG, "auto"));
+        assert!(valid(GLOBAL, TRANSLATE_LANG, "en"));
+        assert!(valid(GLOBAL, TRANSLATE_LANG, "pt-BR"));
+        assert!(valid(GLOBAL, TRANSLATE_LANG, "zh-Hans"));
+        assert!(!valid(GLOBAL, TRANSLATE_LANG, ""));
+        assert!(!valid(GLOBAL, TRANSLATE_LANG, "1"));
+        assert!(!valid(GLOBAL, TRANSLATE_LANG, "en US"));
+        assert!(!valid(&account_scope(&account(Network::Teams)), TRANSLATE_LANG, "en"));
+        let mut values = Values::default();
+        assert_eq!(values.translate_lang(), "auto");
+        values.set(GLOBAL, TRANSLATE_LANG, Some("es".into()));
+        assert_eq!(values.translate_lang(), "es");
     }
 }
