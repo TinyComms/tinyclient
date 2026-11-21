@@ -1,0 +1,12 @@
+{
+  "id": "wave-4-discord-teams",
+  "title": "Wave 4D Discord reactors, friends, invites & leave server and Teams pin/hide/delete, link previews, notifications, schedule & unread",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 4D Discord & Teams enhancements verified by unit and integration test suites.",
+    "ios": "Desktop Wave 4D Discord & Teams enhancements verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
