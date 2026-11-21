@@ -5912,6 +5912,59 @@ fn slack_records_and_sends_audio_and_video_clips() {
 }
 
 #[test]
+fn slack_refuses_a_pdf_voice_note_instead_of_uploading_it_as_audio() {
+    let world = World::start();
+    world.ready();
+
+    let dir = world.dir.with_extension("pdf-clip");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pdf_path = dir.join("report.pdf");
+    std::fs::write(&pdf_path, b"%PDF-1.4 not a clip").unwrap();
+    let with_pdf = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: pdf_path.to_string_lossy().into_owned(),
+            name: "report.pdf".into(),
+            ..Default::default()
+        }],
+        voice: Some(protocol::VoiceNote {
+            duration: 1_000,
+            waveform: vec![10, 20],
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: alpha("C0GEN"),
+            client_id: "56104".into(),
+            text: String::new(),
+            reply_to: None,
+            with: with_pdf,
+        }),
+        Response::Sent { .. }
+    ));
+    let refused = world.until("pdf voice note fails", || {
+        world
+            .messages(&alpha("C0GEN"))
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("56104") && m.state != SendState::Pending)
+    });
+    assert!(
+        matches!(&refused.state, SendState::Failed { reason } if reason == "Slack refused this clip. Only audio and video can be clips."),
+        "{:?}",
+        refused.state
+    );
+    let uploads = world.fake.calls(ALPHA, "files.getUploadURLExternal");
+    assert!(
+        uploads.iter().all(|call| call.params.get("subtype").map(String::as_str) != Some("slack_audio")),
+        "files.getUploadURLExternal must not be called with subtype=slack_audio: {uploads:?}"
+    );
+    assert!(
+        uploads.iter().all(|call| call.params.get("filename").map(String::as_str) != Some("report.pdf")),
+        "report.pdf must not be uploaded as a file: {uploads:?}"
+    );
+}
+
+#[test]
 fn slack_clip_transcript_vtt_and_transcoded_video() {
     let world = World::start();
     world.ready();

@@ -220,6 +220,13 @@ pub fn load_failed_message(message: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// True when a cookie domain is `slack.com` or a subdomain, including a leading dot.
+/// Same host rule as `page.cookie("slack.com", ...)`.
+pub fn slack_cookie_domain(domain: &str) -> bool {
+    let host = domain.trim_start_matches('.').to_ascii_lowercase();
+    host == "slack.com" || host.ends_with(".slack.com")
+}
+
 /// True when `url` is https on slack.com or a subdomain, with no user and no port.
 pub fn slack_page(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
@@ -292,8 +299,8 @@ pub fn finish(session: serde_json::Value) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocked, hands_off, origin, parse_at, parse_start, route, session, slack_page, slack_session, web_client, Route,
-        DISCORD,
+        blocked, hands_off, origin, parse_at, parse_start, route, session, slack_cookie_domain,
+        slack_page, slack_session, web_client, Route, DISCORD,
     };
 
     #[test]
@@ -339,6 +346,15 @@ mod tests {
             Some("https://app.slack.com/client/T1")
         );
         assert!(slack_page("https://slack.com/"));
+        assert!(slack_cookie_domain("slack.com"));
+        assert!(slack_cookie_domain(".slack.com"));
+        assert!(slack_cookie_domain("acme.slack.com"));
+        assert!(slack_cookie_domain(".Acme.Slack.com"));
+        assert!(!slack_cookie_domain(""));
+        assert!(!slack_cookie_domain("notslack.com"));
+        assert!(!slack_cookie_domain("slack.com.evil.example"));
+        assert!(!slack_cookie_domain(".slack.com.evil.example"));
+        assert!(!slack_cookie_domain("evil.example"));
         assert!(!slack_page("http://acme.slack.com/"));
         assert!(!slack_page("https://acme.slack.com:443/"));
         assert!(!slack_page("https://user@acme.slack.com/"));
@@ -425,6 +441,8 @@ mod tests {
         assert_eq!(route("https://glimmr.slack.com/", None), Route::Allow);
         assert_eq!(route("https://slack.com/signin#/signin", None), Route::Allow);
         assert_eq!(route("https://discord.com/login", None), Route::Allow);
+        assert_eq!(route("https://accounts.google.com/o/oauth2/v2/auth", Some("https://slack.com/signin")), Route::Allow);
+        assert_eq!(route("https://acme.okta.com/app/slack", Some("https://slack.com/signin")), Route::Allow);
         let url = "https://slack.com/checkcookie?redir=https://acme.slack.com/ssb/redirect";
         assert_eq!(route(url, None), Route::Allow);
         assert_eq!(route("https://slackers.example/x", None), Route::Allow);

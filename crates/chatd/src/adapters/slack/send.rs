@@ -49,6 +49,7 @@ impl ClipSpec {
 }
 
 /// Resolves whether a single-file send is a Slack audio or video clip and checks the 5-minute cap.
+/// A voice note is a clip only for `audio/*` or `video/*`. Anything else is refused and not uploaded.
 fn clip_spec(with: &Outgoing, up: &Upload) -> Result<Option<ClipSpec>, String> {
     if up.files().len() != 1 || with.snippet_type.is_some() {
         return Ok(None);
@@ -60,8 +61,10 @@ fn clip_spec(with: &Outgoing, up: &Upload) -> Result<Option<ClipSpec>, String> {
         }
         let kind = if file.mime.starts_with("video/") {
             ClipKind::Video
-        } else {
+        } else if file.mime.starts_with("audio/") {
             ClipKind::Audio
+        } else {
+            return Err("Slack refused this clip. Only audio and video can be clips.".to_owned());
         };
         return Ok(Some(ClipSpec {
             kind,

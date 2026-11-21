@@ -3589,6 +3589,9 @@ mod tests {
         );
         assert_eq!(reason(Fault::Limited(7)), "Slack is rate limiting you. Try again in 7 s.");
         assert_eq!(reason(Fault::Slack("fatal_error".into())), "Slack refused (fatal_error).");
+        let sso = reason(Fault::Slack("sso_required".into()));
+        assert_eq!(sso, "Slack refused (sso_required).");
+        assert!(!sso.contains("tinyclient"), "{sso}");
     }
 
     #[test]
