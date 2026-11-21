@@ -1294,7 +1294,7 @@ impl Pane {
             return None;
         }
         message.attachments.iter().find_map(|attachment| {
-            if attachment.gif && !attachment.sticker && !attachment.file.id.is_empty() {
+            if super::media::shape(attachment) == super::media::Shape::Gif && !attachment.file.id.is_empty() {
                 Some(attachment.file.id.clone())
             } else {
                 None

@@ -2422,11 +2422,14 @@ impl Pane {
         }
         let message_btn = contact.person_id.as_ref().and_then(|pid| {
             let open = self.open.as_ref()?;
-            let person = protocol::Key {
-                network: open.key.network,
-                account: open.key.account.clone(),
-                id: pid.clone(),
-            };
+            let person = protocol::Person::new(
+                protocol::Key {
+                    network: open.key.network,
+                    account: open.key.account.clone(),
+                    id: pid.clone(),
+                },
+                title.to_owned(),
+            );
             Some(
                 div()
                     .pt(px(4.))
