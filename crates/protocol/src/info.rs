@@ -351,6 +351,9 @@ pub struct Capabilities {
     /// (`Request::ClearHistory`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub clear_history: bool,
+    /// This account supports pinned messages (`Request::Pinned`, `Request::Pin`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pins: bool,
 }
 
 impl Capabilities {

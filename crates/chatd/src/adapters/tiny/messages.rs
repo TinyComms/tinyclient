@@ -91,6 +91,7 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         Vec::new()
     };
     let callable = directs_callable(saved);
+    let has_pins = super::manage::capabilities_of(saved).has(protocol::TINY_FEATURE_PINS);
     let mut people: Vec<PersonRow> = names
         .iter()
         .filter(|(id, _)| super::safe_id(id))
@@ -117,6 +118,7 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         row.topic = channel.topic.clone();
         row.position = channel.position;
         row.moderate = channel.my_permissions.unwrap_or(0) & protocol::TINY_MANAGE_MESSAGES != 0;
+        row.can_pin = has_pins && (channel.my_permissions.unwrap_or(0) & protocol::TINY_MANAGE_CHANNELS != 0);
         let (e2ee, history) =
             sealed_state(saved, &channel.id, channel.e2ee, channel.plaintext_history);
         row.encryption = encryption_of(saved, &channel.id, e2ee, history);
@@ -180,6 +182,7 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         if callable {
             row.call = CallSupport::Native;
         }
+        row.can_pin = has_pins;
         let (e2ee, history) =
             sealed_state(saved, &direct.id, direct.e2ee, direct.plaintext_history);
         row.encryption = encryption_of(saved, &direct.id, e2ee, history);
@@ -301,6 +304,20 @@ pub(crate) fn on_live(
                 }
             }
         }
+        "pin.added" | "message.pinned" => {
+            let conversation = nested_str(frame, "conversation_id");
+            let message = nested_id(frame, "message", "message_id").unwrap_or("");
+            if super::safe_id(conversation) && super::safe_id(message) {
+                let _ = ctx.pinned(conversation, message, true);
+            }
+        }
+        "pin.removed" | "message.unpinned" => {
+            let conversation = nested_str(frame, "conversation_id");
+            let message = nested_id(frame, "message", "message_id").unwrap_or("");
+            if super::safe_id(conversation) && super::safe_id(message) {
+                let _ = ctx.pinned(conversation, message, false);
+            }
+        }
         "reaction.updated" => merge_reaction(ctx, saved, frame),
         // The sealed kind: a reaction blob in an encrypted conversation, opaque to the server.
         // Off the socket's thread: the event only says the server's list moved; the list folds.
@@ -365,6 +382,10 @@ pub(crate) fn live_kind(kind: &str) -> bool {
             | "message.created"
             | "message.edited"
             | "message.deleted"
+            | "pin.added"
+            | "pin.removed"
+            | "message.pinned"
+            | "message.unpinned"
             | "reaction.updated"
             | "e2ee.reaction"
             | "read.updated"
@@ -437,6 +458,13 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             message_id,
             reply,
         } => delete(ctx, saved, &conversation_id, &message_id, reply),
+        Command::Pinned { conversation_id, reply } => pinned(ctx, saved, &conversation_id, reply),
+        Command::Pin {
+            conversation_id,
+            message_id,
+            on,
+            reply,
+        } => pin(ctx, saved, &conversation_id, &message_id, on, reply),
         Command::Typing { conversation_id, activity: _ } => {
             if super::safe_id(&conversation_id) {
                 live.ask(Ask::Type { conversation_id });
@@ -1816,6 +1844,77 @@ fn delete(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str,
     }
 }
 
+fn pinned(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    reply: crate::adapters::Reply<Vec<Message>>,
+) {
+    if !super::safe_id(conversation_id) {
+        let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
+        return;
+    }
+    let path = format!("/v1/conversations/{conversation_id}/pins");
+    match super::asked("GET", saved, &path, None) {
+        Ok((200, body)) => {
+            let Ok(wires) = list_of::<WireMessage>(body, "messages") else {
+                let _ = reply.send(Err(Refusal::Refused(super::UNREADABLE.to_owned())));
+                return;
+            };
+            let names = member_names(saved);
+            let mut media = Vec::new();
+            let opened = open_rows(ctx, saved, conversation_id, &wires.iter().collect::<Vec<_>>());
+            let mut messages = Vec::with_capacity(wires.len());
+            for wire in &wires {
+                let Some(mut msg) = map_message(saved, &names, wire, &opened, &mut media) else {
+                    continue;
+                };
+                msg.pinned = true;
+                if row_is_sealed(wire) && !matches!(opened.get(&wire.id), Some(Read::Opened(_) | Read::Legacy(_))) {
+                    msg.text = "Pinned message isn't available on this device".to_owned();
+                }
+                messages.push(msg);
+            }
+            if !media.is_empty() {
+                let _ = ctx.media(&media);
+            }
+            let _ = reply.send(Ok(messages));
+        }
+        Ok((404, _)) => {
+            let _ = reply.send(Err(Refusal::Unsupported));
+        }
+        Ok((status, body)) => {
+            let _ = reply.send(Err(Refusal::Refused(super::explain(status, &body, super::Missing::Plain).to_owned())));
+        }
+        Err(detail) => {
+            let _ = reply.send(Err(Refusal::Refused(detail.to_owned())));
+        }
+    }
+}
+
+fn pin(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    message_id: &str,
+    on: bool,
+    reply: crate::adapters::Reply<()>,
+) {
+    if !super::safe_id(conversation_id) || !super::safe_id(message_id) {
+        let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
+        return;
+    }
+    let method = if on { "PUT" } else { "DELETE" };
+    let path = format!("/v1/messages/{message_id}/pin");
+    match super::asked(method, saved, &path, None) {
+        Ok((200 | 204, _)) => {
+            let _ = ctx.pinned(conversation_id, message_id, on);
+            let _ = reply.send(Ok(()));
+        }
+        other => answer_ok(other, reply),
+    }
+}
+
 fn mark_read(saved: &Saved, conversation_id: &str, message_id: &str) {
     if !super::safe_id(conversation_id) || !super::safe_id(message_id) {
         return;
@@ -1971,6 +2070,7 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
             .deleted_by
             .as_deref()
             .is_some_and(|by| !by.is_empty() && by != wire.author_id);
+    message.pinned = !deleted && wire.pinned;
     message.client_id = wire.client_id.clone().filter(|id| !id.is_empty());
     message.seq = wire.seq;
     message.reply_to = reply_of(wire.reply_to.as_ref());
@@ -2022,6 +2122,7 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
             .deleted_by
             .as_deref()
             .is_some_and(|by| !by.is_empty() && by != wire.author_id);
+    message.pinned = !deleted && wire.pinned;
     message.client_id = wire.client_id.clone().filter(|id| !id.is_empty());
     message.seq = wire.seq;
     message.seal = Seal::Encrypted;
@@ -2158,13 +2259,15 @@ struct UploadLimits {
 /// What this account may send. `file_scan` is absent on an older server, which keeps today's upload.
 fn account_caps(saved: &Saved) -> Capabilities {
     let limits = upload_limits(saved);
-    let scans = super::manage::capabilities_of(saved).has(protocol::TINY_FEATURE_FILE_SCAN);
+    let caps = super::manage::capabilities_of(saved);
+    let scans = caps.has(protocol::TINY_FEATURE_FILE_SCAN);
     Capabilities {
         max_file_bytes: limits.image.max(limits.file),
         max_files: protocol::ATTACHMENTS_LIMIT as u32,
         direct_calls: directs_callable(saved),
         file_scan: scans,
         allow_archives: scans && limits.archives,
+        pins: caps.has(protocol::TINY_FEATURE_PINS),
         ..Capabilities::default()
     }
 }
@@ -2853,6 +2956,8 @@ struct WireMessage {
     deleted_at: Option<String>,
     #[serde(default)]
     deleted_by: Option<String>,
+    #[serde(default)]
+    pinned: bool,
     #[serde(default)]
     attachments: Vec<WireFile>,
     #[serde(default)]

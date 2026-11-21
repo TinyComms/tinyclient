@@ -374,6 +374,8 @@ pub enum Command {
     ClearHistory { conversation_id: String, delete_chat: bool, revoke: bool, reply: Reply<()> },
     /// The messages pinned in a conversation, newest first, at most 50.
     Pinned { conversation_id: String, reply: Reply<Vec<Message>> },
+    /// Pin (`on == true`) or unpin (`on == false`) a message in a conversation.
+    Pin { conversation_id: String, message_id: String, on: bool, reply: Reply<()> },
     /// What was shared in a conversation, from the network's own search, because the user
     /// clicked "Search all". `before` continues below an item already listed.
     SearchShared {
@@ -480,6 +482,7 @@ impl Command {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -969,6 +972,15 @@ impl Context {
     pub fn deleted_by_moderator(&self, conversation_id: &str, message_id: &str) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().delete_message_moderated(&conversation, message_id)? {
+            self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(())
+    }
+
+    /// Updates a stored message's pinned mark.
+    pub fn pinned(&self, conversation_id: &str, message_id: &str, pinned: bool) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_pinned(&conversation, message_id, pinned)? {
             self.hub.changed(Change::Messages { conversation });
         }
         Ok(())

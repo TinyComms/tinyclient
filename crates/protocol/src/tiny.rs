@@ -371,6 +371,8 @@ pub fn incognito_host(host: &str) -> bool {
 pub const TINY_FEATURE_UPLOAD_LIMITS: &str = "upload_limits";
 /// Uploads are scanned, and archives stay off until an owner allows them.
 pub const TINY_FEATURE_FILE_SCAN: &str = "file_scan";
+/// Conversations support pinning messages (`PUT`/`DELETE /v1/messages/{id}/pin`, `GET /v1/conversations/{id}/pins`).
+pub const TINY_FEATURE_PINS: &str = "pins";
 /// Images and GIFs, until an admin changes it.
 pub const TINY_IMAGE_MAX_DEFAULT: i64 = 8 * 1024 * 1024;
 /// Video and every other file, until an admin changes it.

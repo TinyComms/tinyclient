@@ -919,6 +919,7 @@ mod tests {
             read_only_reason: String::new(),
             spam: false,
             moderate: false,
+            can_pin: false,
         }
     }
 

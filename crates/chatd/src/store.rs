@@ -178,6 +178,7 @@ const TABLES: &str = "
         read_only_reason TEXT NOT NULL DEFAULT '',
         spam INTEGER NOT NULL DEFAULT 0,
         moderate INTEGER NOT NULL DEFAULT 0,
+        can_pin INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -297,7 +298,7 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.moderate
+           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.moderate, c.can_pin
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -393,6 +394,8 @@ pub struct ConversationRow {
     pub spam: bool,
     /// This account may delete other members' messages in this conversation.
     pub moderate: bool,
+    /// This account may pin and unpin messages in this conversation.
+    pub can_pin: bool,
     /// How the network files it. `None` leaves what is stored, so a tree that does not know
     /// (a Slack tree reload) never undoes a pin or a follow; `Some` replaces it.
     pub filing: Option<Filing>,
@@ -490,6 +493,7 @@ impl ConversationRow {
             read_only_reason: String::new(),
             spam: false,
             moderate: false,
+            can_pin: false,
         }
     }
 }
@@ -727,6 +731,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         read_only_reason: row.get(52)?,
         spam: row.get(53)?,
         moderate: row.get(54)?,
+        can_pin: row.get(55)?,
     })
 }
 
@@ -881,9 +886,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, moderate)
+              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, moderate, can_pin)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -898,6 +903,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              read_only_reason = excluded.read_only_reason,
              spam = excluded.spam,
              moderate = excluded.moderate,
+             can_pin = excluded.can_pin,
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -939,6 +945,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             row.read_only_reason,
             row.spam,
             row.moderate,
+            row.can_pin,
         ],
     )?;
     Ok(())
@@ -1010,6 +1017,9 @@ fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
     }
     if !column(db, "conversation", "moderate")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN moderate INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !column(db, "conversation", "can_pin")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN can_pin INTEGER NOT NULL DEFAULT 0")?;
     }
     Ok(true)
 }
@@ -1581,7 +1591,7 @@ impl Store {
         let mut stmt = self.db.prepare(
             "SELECT id, kind, title, space, section, position, avatar, peer, call, voice_limit,
                     listed, topic, read_only, private, encryption, bot, meeting, special, mark,
-                    opted_out, icon, max_file_bytes, read_only_reason, spam, moderate
+                    opted_out, icon, max_file_bytes, read_only_reason, spam, moderate, can_pin
                FROM conversation
               WHERE network = ?1 AND account = ?2 AND space = ?3 AND parent = ''
               ORDER BY position, id",
@@ -1629,6 +1639,7 @@ impl Store {
                         read_only_reason: row.get(22)?,
                         spam: row.get(23)?,
                         moderate: row.get(24)?,
+                        can_pin: row.get(25)?,
                     },
                 ))
             })?
@@ -3136,6 +3147,19 @@ impl Store {
                 self.ingest(conversation, &reply, false)?;
             }
         }
+        Ok(true)
+    }
+
+    /// Updates a stored message's `pinned` flag. Returns true if the stored message changed.
+    pub fn set_pinned(&mut self, conversation: &Key, id: &str, pinned: bool) -> rusqlite::Result<bool> {
+        let Some(mut message) = self.message(conversation, id)? else {
+            return Ok(false);
+        };
+        if message.pinned == pinned {
+            return Ok(false);
+        }
+        message.pinned = pinned;
+        self.ingest(conversation, &message, false)?;
         Ok(true)
     }
 

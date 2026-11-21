@@ -105,6 +105,8 @@ pub(in crate::gui) struct Scene {
     /// Tiny accounts that can ring any member, including before a direct exists.
     pub callable_accounts: Vec<AccountKey>,
     pub close_direct_accounts: Vec<AccountKey>,
+    /// Accounts whose server/network supports pinned messages (`Capabilities::pins`).
+    pub pins_accounts: Vec<AccountKey>,
 }
 
 /// True when this run only draws a state for `--shot`: nothing that changes the user's state on
@@ -370,6 +372,9 @@ impl Shell {
                 .map(|account| account.key.clone()).collect(),
             close_direct_accounts: snapshot.accounts.iter()
                 .filter(|account| account.can.close_direct)
+                .map(|account| account.key.clone()).collect(),
+            pins_accounts: snapshot.accounts.iter()
+                .filter(|account| account.can.pins)
                 .map(|account| account.key.clone()).collect(),
         }
     }
@@ -797,7 +802,7 @@ mod tests {
             private: false,
             encryption: protocol::Encryption::Unknown,
             draft: String::new(),
-            folders: Vec::new(), archived: false, pin: None, hidden: false, followed: false, bot: false, meeting: false, special: Default::default(), mark: None, topic_icon: None, opted_out: false, quiet: false, preview_from: String::new(), preview_mine: false, seen: false, delivered: false, sending: false, max_file_bytes: 0, read_only_reason: String::new(), spam: false, moderate: false,
+            folders: Vec::new(), archived: false, pin: None, hidden: false, followed: false, bot: false, meeting: false, special: Default::default(), mark: None, topic_icon: None, opted_out: false, quiet: false, preview_from: String::new(), preview_mine: false, seen: false, delivered: false, sending: false, max_file_bytes: 0, read_only_reason: String::new(), spam: false, moderate: false, can_pin: false,
         }
     }
 

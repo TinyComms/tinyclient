@@ -115,6 +115,7 @@ pub struct Can {
     pub thread: bool,
     pub edit: bool,
     pub delete: bool,
+    pub pin: bool,
     /// Never left: deleting it is local, and it can be sent again.
     pub unsent: bool,
 }
@@ -170,6 +171,7 @@ pub fn can_with(message: &Message, network: Network, kind: ConversationKind, in_
         // or deletes, so those items stay off.
         edit: sent && own && !message.saved_history && network != Network::Messages,
         delete: (own || (moderate && act)) && network != Network::Messages,
+        pin: false,
         unsent: !sent && message.outgoing,
     }
 }
@@ -247,6 +249,8 @@ enum MenuAct {
     SaveAs,
     /// This message becomes the first unread one.
     Unread,
+    /// Pin or unpin a message in the conversation.
+    Pin,
     /// A sent message: ask, unless the click held Shift.
     Delete,
 }
@@ -303,6 +307,9 @@ fn menu_acts(
     if !can.unsent {
         acts.push(MenuAct::Unread);
     }
+    if can.pin {
+        acts.push(MenuAct::Pin);
+    }
     if can.delete {
         acts.push(MenuAct::Delete);
     }
@@ -318,7 +325,10 @@ impl Pane {
         // No open conversation is not a place a thread can be started from.
         let kind = self.open.as_ref().map(|open| open.kind).unwrap_or(ConversationKind::Thread);
         let moderate = self.open.as_ref().is_some_and(|open| open.moderate);
-        can_with(message, self.network(), kind, self.is_thread(), moderate)
+        let can_pin = self.open.as_ref().is_some_and(|open| open.can_pin);
+        let mut allowed = can_with(message, self.network(), kind, self.is_thread(), moderate);
+        allowed.pin = allowed.act && can_pin;
+        allowed
     }
 
     // Reactions.
@@ -829,8 +839,18 @@ impl Pane {
                 }
             }
             MenuAct::Unread => self.mark_message_unread(&message, cx),
+            MenuAct::Pin => self.toggle_pin(&message, cx),
             MenuAct::Delete => self.delete(&message, at_once, window, cx),
         }
+    }
+
+    fn toggle_pin(&mut self, message: &Message, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        let on = !message.pinned;
+        let failed = if on { "Couldn't pin message" } else { "Couldn't unpin message" };
+        self.act(Request::Pin { conversation, message_id: message.id.clone(), on }, failed, cx);
     }
 
     /// A file attachment already on disk, as `(path, name)`, for Save as….
@@ -996,6 +1016,14 @@ impl Pane {
                 rows.push(
                     row("sheet-unread", "icons/mail.svg", "Mark unread".into(), false)
                         .on_click(then(|this, message, _, cx| this.mark_message_unread(message, cx)))
+                        .into_any_element(),
+                );
+            }
+            if can.pin {
+                let words = if message.pinned { "Unpin message" } else { "Pin message" };
+                rows.push(
+                    row("sheet-pin", "icons/pin.svg", words.into(), false)
+                        .on_click(then(|this, message, _, cx| this.toggle_pin(message, cx)))
                         .into_any_element(),
                 );
             }
@@ -1193,6 +1221,14 @@ impl Pane {
                     menu_item("unread", Some("icons/mail.svg"), "Mark unread", None)
                         .when(lit(MenuAct::Unread), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::Unread)),
+                );
+            }
+            if can.pin {
+                let words = if message.pinned { "Unpin message" } else { "Pin message" };
+                items = items.child(
+                    menu_item("pin", Some("icons/pin.svg"), words, None)
+                        .when(lit(MenuAct::Pin), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Pin)),
                 );
             }
             if can.delete {

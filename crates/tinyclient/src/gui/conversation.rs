@@ -149,6 +149,8 @@ struct Open {
     receipt: Option<protocol::Receipt>,
     /// This account may delete other members' messages in this conversation.
     moderate: bool,
+    /// This account may pin and unpin messages in this conversation.
+    can_pin: bool,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     started: Instant,
 }
@@ -464,11 +466,12 @@ impl Pane {
     fn show(&mut self, conversation: &Conversation, me: &str, picture: Option<MediaFile>, typing: bool, cx: &mut Context<Self>) {
         let receipt = conversation.receipt();
         if let Some(open) = self.open.as_mut().filter(|open| open.key == conversation.key) {
-            if open.title != conversation.title || open.picture != picture || open.receipt != receipt || open.moderate != conversation.moderate {
+            if open.title != conversation.title || open.picture != picture || open.receipt != receipt || open.moderate != conversation.moderate || open.can_pin != conversation.can_pin {
                 open.title.clone_from(&conversation.title);
                 open.picture = picture;
                 open.receipt = receipt;
                 open.moderate = conversation.moderate;
+                open.can_pin = conversation.can_pin;
                 cx.notify();
             }
             return;
@@ -485,6 +488,7 @@ impl Pane {
             open.picture = picture;
             open.receipt = receipt;
             open.moderate = conversation.moderate;
+            open.can_pin = conversation.can_pin;
         }
     }
 
@@ -522,6 +526,7 @@ impl Pane {
             reactions: None,
             receipt: None,
             moderate: false,
+            can_pin: false,
             started: Instant::now(),
         });
         self.window = pages::Window::default();

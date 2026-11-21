@@ -91,10 +91,17 @@ pub fn tab_count(page: &Page) -> Option<u32> {
     page.total
 }
 
-/// The tabs a network has. Pinned is hidden where the network does not serve it.
+/// The tabs a network has. Pinned is hidden where the network does not serve it
+/// (for Tiny, only shown when the server advertises the `pins` capability).
 pub fn tabs(network: Network) -> Vec<Tab> {
+    tabs_for(network, false)
+}
+
+pub fn tabs_for(network: Network, has_pins: bool) -> Vec<Tab> {
     let mut tabs = vec![Tab::Kind(SharedKind::Media), Tab::Kind(SharedKind::Files), Tab::Kind(SharedKind::Links)];
-    if !matches!(network, Network::Teams | Network::Messages | Network::Tiny | Network::Signal) {
+    if !matches!(network, Network::Teams | Network::Messages | Network::Tiny | Network::Signal)
+        || (network == Network::Tiny && has_pins)
+    {
         tabs.push(Tab::Pinned);
     }
     tabs
@@ -297,11 +304,11 @@ pub struct Hooks {
 }
 
 /// The tab bar, the source line and the list. `width` is the content width, for the tiles.
-pub fn draw(shared: &Shared, network: Network, hub: &Hub, width: f32, hooks: Hooks, cx: &mut App) -> Div {
+pub fn draw(shared: &Shared, network: Network, has_pins: bool, hub: &Hub, width: f32, hooks: Hooks, cx: &mut App) -> Div {
     let Hooks { pick, search, open_in } = hooks;
     let pick = std::rc::Rc::new(pick);
     let bar = div().h(px(32.)).px(px(theme::PANE_PAD)).flex().items_end().gap(px(16.)).border_b_1().border_color(theme::hairline()).children(
-        tabs(network).into_iter().enumerate().map(|(ix, tab)| {
+        tabs_for(network, has_pins).into_iter().enumerate().map(|(ix, tab)| {
             let on = shared.tab == tab;
             let words = match tab {
                 Tab::Kind(SharedKind::Media) => "Media",
@@ -518,6 +525,8 @@ mod tests {
         assert_eq!(source(Network::Telegram, links, &none).line, "No links in this chat");
         assert_eq!(tabs(Network::Teams).len(), 3);
         assert_eq!(tabs(Network::Messages).len(), 3);
+        assert_eq!(tabs(Network::Tiny).len(), 3);
+        assert_eq!(tabs_for(Network::Tiny, true).last(), Some(&Tab::Pinned));
         assert_eq!(tabs(Network::Slack).last(), Some(&Tab::Pinned));
         let slack_links = Page { items: vec![item()], read: true, ..Page::default() };
         assert!(!source(Network::Slack, Tab::Kind(SharedKind::Links), &slack_links).search);

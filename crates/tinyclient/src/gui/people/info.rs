@@ -869,7 +869,11 @@ impl InfoPane {
             // The pane's foot says "Open in" whenever it can; Shared does not say it again.
             open_in: link.filter(|_| !self.foot_opens(network)).map(|url| Box::new(move |_: &mut Window, cx: &mut App| cx.open_url(&url)) as shared::Hook),
         };
-        shared::draw(&self.shared, network, &self.hub, self.width, hooks, cx)
+        let has_pins = self
+            .row
+            .as_ref()
+            .is_some_and(|row| self.scene.pins_accounts.contains(&row.key.account()));
+        shared::draw(&self.shared, network, has_pins, &self.hub, self.width, hooks, cx)
     }
 }
 

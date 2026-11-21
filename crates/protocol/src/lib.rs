@@ -528,6 +528,9 @@ pub struct Conversation {
     /// This account may delete other members' messages in this conversation (Tiny `manage_messages`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub moderate: bool,
+    /// This account may pin and unpin messages in this conversation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_pin: bool,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -592,6 +595,7 @@ impl Conversation {
             read_only_reason: String::new(),
             spam: false,
             moderate: false,
+            can_pin: false,
         }
     }
 
@@ -1316,6 +1320,12 @@ pub enum Request {
     /// [`PINNED_LIMIT`].
     Pinned {
         conversation: Key,
+    },
+    /// Pin (`on == true`) or unpin (`on == false`) a message in a conversation.
+    Pin {
+        conversation: Key,
+        message_id: String,
+        on: bool,
     },
     /// The pictures, files or links said in a conversation, newest first, from what is cached:
     /// what the info pane lists under a person or a channel. `before` continues below a

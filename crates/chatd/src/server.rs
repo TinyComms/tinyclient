@@ -1827,6 +1827,18 @@ impl Chat {
         }
     }
 
+    fn pin(&self, conversation: Key, message_id: String, on: bool) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let conversation_id = conversation.id;
+        match self.ask(&account, |reply| Command::Pin { conversation_id, message_id, on, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
     fn source(&self, conversation: Key, message_id: String) -> Response {
         let account = conversation.account();
         if let Err(refused) = self.online(&account) {
@@ -2569,6 +2581,7 @@ impl Chat {
                 self.act(&conversation, |conversation_id, reply| Command::AnswerMessageRequest { conversation_id, accept, reply })
             }
             Request::Pinned { conversation } => self.pinned(conversation),
+            Request::Pin { conversation, message_id, on } => self.pin(conversation, message_id, on),
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::Relate { person, action } => self.relate(person, action),
             Request::SetPresence { account, presence, status } => self.set_presence(account, presence, status),
