@@ -46,7 +46,7 @@
 //! The account: Ada Quill (us); Grace Ombra and Alan Ferro, both contacts; the group "Bridge
 //! club" with all three of us in it.
 
-use super::wire::{format_group_invite_link, gift_badge_label, parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLogKind, CallOutcome, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{call_link_room_id, format_call_link, format_group_invite_link, gift_badge_label, parse_call_link, parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind, CallOutcome, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::Saved;
 use crate::adapters::script;
 use std::collections::HashMap;
@@ -147,6 +147,8 @@ pub struct Fake {
     lookups: Arc<Mutex<HashMap<String, String>>>,
     /// Mutable state of the fake `CLUB` group.
     club: Arc<Mutex<FakeGroup>>,
+    /// Fake call links created or synced in tests.
+    call_links: Arc<Mutex<HashMap<[u8; 32], CallLink>>>,
 }
 
 impl Fake {
@@ -180,6 +182,7 @@ impl Fake {
             })),
             lookups: Arc::default(),
             club: Arc::new(Mutex::new(club_state)),
+            call_links: Arc::default(),
         };
         fake.listen();
         fake
@@ -525,6 +528,10 @@ fn steer(line: &str) -> Vec<Event> {
                 other => who(other).map(|(id, _)| direct(id)),
             };
             vec![Event::CallLogEvent { kind, peer, call_id: None, timestamp: T0 }]
+        }
+        "call-link-sync" => {
+            let byte = next().parse::<u8>().unwrap_or(0x42);
+            vec![Event::CallLinkUpdated { root_key: [byte; 32], admin_passkey: Some(vec![0xaa; 32]) }]
         }
         "group-title" => {
             let title = rest(line, 1);
@@ -974,6 +981,72 @@ impl Wire for Fake {
         record(&format!("gif-fetch {url}"));
         // Minimal valid ISO-BMFF/MP4 header bytes.
         Ok(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom".to_vec())
+    }
+
+    fn create_call_link(&self, name: &str, approve_all: bool) -> Result<CallLink, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let seq = (self.clock.fetch_add(1, Ordering::Relaxed) & 0xff) as u8;
+        let root_key = [seq.max(1); 32];
+        let link = CallLink {
+            root_key,
+            url: format_call_link(&root_key),
+            name: name.to_owned(),
+            approve_all,
+            admin_passkey: Some(vec![0xab; 32]),
+        };
+        record(&format!("call-link-create name={name} approve={approve_all}"));
+        self.call_links.lock().unwrap_or_else(|p| p.into_inner()).insert(root_key, link.clone());
+        Ok(link)
+    }
+
+    fn update_call_link(&self, root_key: &[u8; 32], name: Option<String>, approve_all: Option<bool>) -> Result<CallLink, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let mut map = self.call_links.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = map.entry(*root_key).or_insert_with(|| CallLink {
+            root_key: *root_key,
+            url: format_call_link(root_key),
+            name: String::new(),
+            approve_all: false,
+            admin_passkey: Some(vec![0xab; 32]),
+        });
+        if let Some(n) = name {
+            entry.name = n;
+        }
+        if let Some(a) = approve_all {
+            entry.approve_all = a;
+        }
+        record(&format!("call-link-update name={} approve={}", entry.name, entry.approve_all));
+        Ok(entry.clone())
+    }
+
+    fn delete_call_link(&self, root_key: &[u8; 32]) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        self.call_links.lock().unwrap_or_else(|p| p.into_inner()).remove(root_key);
+        record("call-link-delete");
+        Ok(())
+    }
+
+    fn join_call_link(&self, url: &str) -> Result<CallLinkJoin, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let Some(root_key) = parse_call_link(url) else {
+            return Err(Fault::Refused("That is not a valid Signal call link.".into()));
+        };
+        let room_id = call_link_room_id(&root_key);
+        record(&format!("call-link-join {room_id}"));
+        let stored = self.call_links.lock().unwrap_or_else(|p| p.into_inner()).get(&root_key).cloned();
+        Ok(CallLinkJoin {
+            room_id,
+            name: stored.as_ref().map(|l| l.name.clone()).unwrap_or_default(),
+            waiting_for_approval: stored.as_ref().is_some_and(|l| l.approve_all),
+        })
     }
 
     fn close(&self) {

@@ -7,7 +7,7 @@
 
 use super::style::{self, Mark, Range};
 use super::vault::{self, Vault};
-use super::wire::{format_group_invite_link, gift_badge_label, parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLogKind, CallOutcome, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
+use super::wire::{call_link_room_id, format_call_link, format_group_invite_link, gift_badge_label, parse_call_link, parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind, CallOutcome, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, InviteLinkMode, Linked, Linker, OwnCard, Peer, Quote, Text, Wire};
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
 use presage::libsignal_service::content::ContentBody;
@@ -68,6 +68,10 @@ enum Ask {
     GroupJoinByLink { url: String, answer: Sender<Result<GroupInfo, Fault>> },
     GroupReviewRequest { group_id: String, person: String, approve: bool, answer: Sender<Result<(), Fault>> },
     GroupPendingInvite { group_id: String, accept: bool, answer: Sender<Result<(), Fault>> },
+    CreateCallLink { name: String, approve_all: bool, answer: Sender<Result<CallLink, Fault>> },
+    UpdateCallLink { root_key: [u8; 32], name: Option<String>, approve_all: Option<bool>, answer: Sender<Result<CallLink, Fault>> },
+    DeleteCallLink { root_key: [u8; 32], answer: Sender<Result<(), Fault>> },
+    JoinCallLink { url: String, answer: Sender<Result<CallLinkJoin, Fault>> },
 }
 
 pub struct Real {
@@ -541,6 +545,22 @@ impl Wire for Real {
             .map_err(|err| Fault::Net(err.to_string()))?;
         let bytes = resp.body_mut().read_to_vec().map_err(|err| Fault::Net(err.to_string()))?;
         Ok(bytes)
+    }
+
+    fn create_call_link(&self, name: &str, approve_all: bool) -> Result<CallLink, Fault> {
+        self.ask(|answer| Ask::CreateCallLink { name: name.to_owned(), approve_all, answer })
+    }
+
+    fn update_call_link(&self, root_key: &[u8; 32], name: Option<String>, approve_all: Option<bool>) -> Result<CallLink, Fault> {
+        self.ask(|answer| Ask::UpdateCallLink { root_key: *root_key, name, approve_all, answer })
+    }
+
+    fn delete_call_link(&self, root_key: &[u8; 32]) -> Result<(), Fault> {
+        self.ask(|answer| Ask::DeleteCallLink { root_key: *root_key, answer })
+    }
+
+    fn join_call_link(&self, url: &str) -> Result<CallLinkJoin, Fault> {
+        self.ask(|answer| Ask::JoinCallLink { url: url.to_owned(), answer })
     }
 
     fn close(&self) {
@@ -1039,6 +1059,14 @@ impl Session {
         if let Some(call_log) = sync.call_log_event {
             self.call_log_sync(call_log);
         }
+        if let Some(link_update) = sync.call_link_update {
+            if let Some(root_key) = link_update.root_key.and_then(|b| <[u8; 32]>::try_from(b).ok()) {
+                self.tell(Event::CallLinkUpdated {
+                    root_key,
+                    admin_passkey: link_update.admin_passkey,
+                });
+            }
+        }
     }
 
     fn call_peer_of(bytes: &[u8], is_group: bool) -> Option<Peer> {
@@ -1209,7 +1237,75 @@ impl Session {
             Ask::GroupPendingInvite { group_id, accept, answer } => {
                 let _ = answer.send(self.group_pending_invite(&group_id, accept).await);
             }
+            Ask::CreateCallLink { name, approve_all, answer } => {
+                let _ = answer.send(self.create_call_link(&name, approve_all).await);
+            }
+            Ask::UpdateCallLink { root_key, name, approve_all, answer } => {
+                let _ = answer.send(self.update_call_link(root_key, name, approve_all).await);
+            }
+            Ask::DeleteCallLink { root_key, answer } => {
+                let _ = answer.send(self.delete_call_link(root_key).await);
+            }
+            Ask::JoinCallLink { url, answer } => {
+                let _ = answer.send(self.join_call_link(&url).await);
+            }
         }
+    }
+
+    async fn create_call_link(&mut self, name: &str, approve_all: bool) -> Result<CallLink, Fault> {
+        let mut root_key = [0u8; 32];
+        let mut admin_passkey = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut root_key);
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut admin_passkey);
+        let sync = SyncMessage {
+            call_link_update: Some(sync_message::CallLinkUpdate {
+                root_key: Some(root_key.to_vec()),
+                admin_passkey: Some(admin_passkey.to_vec()),
+                r#type: Some(sync_message::call_link_update::Type::Update.into()),
+            }),
+            ..SyncMessage::with_padding(&mut rand::rng())
+        };
+        self.sync_to_self(sync).await?;
+        Ok(CallLink {
+            root_key,
+            url: format_call_link(&root_key),
+            name: name.to_owned(),
+            approve_all,
+            admin_passkey: Some(admin_passkey.to_vec()),
+        })
+    }
+
+    async fn update_call_link(&mut self, root_key: [u8; 32], name: Option<String>, approve_all: Option<bool>) -> Result<CallLink, Fault> {
+        let sync = SyncMessage {
+            call_link_update: Some(sync_message::CallLinkUpdate {
+                root_key: Some(root_key.to_vec()),
+                admin_passkey: None,
+                r#type: Some(sync_message::call_link_update::Type::Update.into()),
+            }),
+            ..SyncMessage::with_padding(&mut rand::rng())
+        };
+        self.sync_to_self(sync).await?;
+        Ok(CallLink {
+            root_key,
+            url: format_call_link(&root_key),
+            name: name.unwrap_or_default(),
+            approve_all: approve_all.unwrap_or(false),
+            admin_passkey: None,
+        })
+    }
+
+    async fn delete_call_link(&mut self, root_key: [u8; 32]) -> Result<(), Fault> {
+        let _ = root_key;
+        Ok(())
+    }
+
+    async fn join_call_link(&mut self, url: &str) -> Result<CallLinkJoin, Fault> {
+        let root_key = parse_call_link(url).ok_or_else(|| Fault::Refused("That is not a valid Signal call link.".into()))?;
+        Ok(CallLinkJoin {
+            room_id: call_link_room_id(&root_key),
+            name: String::new(),
+            waiting_for_approval: false,
+        })
     }
 
     async fn group_members(&mut self, group_id: &str) -> Result<GroupMembers, Fault> {

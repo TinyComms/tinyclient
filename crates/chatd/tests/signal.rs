@@ -1786,3 +1786,45 @@ fn synced_call_events_and_call_log_events_record_and_clear_call_history() {
     });
     assert!(world.messages(CLUB).iter().any(|m| m.id == "signal-call-9004"));
 }
+
+#[test]
+fn call_links_are_redacted_render_join_cards_and_can_be_created_synced_joined_and_deleted() {
+    let world = World::linked();
+    world.connected();
+
+    // Create a call link with approval required.
+    let Response::Link { url } = world.ask(Request::Handoff {
+        conversation: key("\u{1}signal-call-link-create\u{1}1|Weekly standup"),
+    }) else {
+        panic!("expected Link with call link URL");
+    };
+    assert!(url.starts_with("https://signal.link/call/#key="));
+    assert_eq!(protocol::redact(&url), "https://signal.link/call/#key=[redacted]");
+    world.heard("call-link-create name=Weekly standup approve=true");
+
+    // A message containing the call link renders a "Join call" card with its name and approval notice.
+    world.steer(&format!("incoming grace {} Join the call {url}", T0 + 60_000));
+    let msg = world.arrived(GRACE, &id(T0 + 60_000, GRACE));
+    let card = msg.card.expect("call link message must render a Join call card");
+    assert_eq!(card.title, "Weekly standup");
+    assert_eq!(card.text, "Admin approval required to join.");
+    assert_eq!(card.footer, "Join call");
+
+    // Joining the approval-required call link reports waiting:<room_id>.
+    let Response::Link { url: joined } = world.ask(Request::Handoff {
+        conversation: key(&format!("\u{1}signal-call-link-join\u{1}{url}")),
+    }) else {
+        panic!("expected Link join response");
+    };
+    assert!(joined.starts_with("waiting:"), "expected waiting room state, got {joined}");
+
+    // Synced call link from another device is accepted, and deleting our link removes it.
+    world.steer("call-link-sync 99");
+    let Response::Link { url: del } = world.ask(Request::Handoff {
+        conversation: key(&format!("\u{1}signal-call-link-delete\u{1}{url}")),
+    }) else {
+        panic!("expected delete response");
+    };
+    assert_eq!(del, "deleted");
+    world.heard("call-link-delete");
+}

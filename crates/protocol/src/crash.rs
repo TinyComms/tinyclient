@@ -48,10 +48,10 @@ const PREFIXED: [&str; 11] = ["xoxc-", "xoxd-", "xoxs-", "xoxp-", "xoxb-", "xoxe
 /// Headers whose value is a credential: the name stays, the value (scheme included) goes.
 const HEADERS: [&str; 5] = ["authorization:", "proxy-authorization:", "x-skypetoken:", "authentication:", "x-ms-skypetoken:"];
 /// URL or form parameters whose value is a credential or a signature: the name stays.
-const PARAMS: [&str; 18] = [
+const PARAMS: [&str; 19] = [
     "token=", "access_token=", "refresh_token=", "id_token=", "skypetoken=", "hm=", "tempauth=", "sig=",
     "x-amz-signature=", "x-amz-credential=", "x-amz-security-token=", "signature=", "code=", "password=", "pub_key=",
-    "a=ice-pwd:", "a=fingerprint:", "signal.group/#",
+    "a=ice-pwd:", "a=fingerprint:", "signal.group/#", "signal.link/call/#key=",
 ];
 /// JSON fields whose string value is a credential.
 const FIELDS: [&str; 8] = ["token", "access_token", "refresh_token", "id_token", "skypetoken", "authorization", "password", "vault"];
@@ -290,6 +290,10 @@ mod tests {
         assert_eq!(
             redact("join https://signal.group/#CjQKIFoXWhdaF1oXWhdaF1oXWhdaF1oXWhdaF1oXWhdaF1oXEhBwbGFjZWhvbGRlcl9wYXNz now"),
             "join https://signal.group/#[redacted] now"
+        );
+        assert_eq!(
+            redact("call https://signal.link/call/#key=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA now"),
+            "call https://signal.link/call/#key=[redacted] now"
         );
         assert_eq!(redact(r#"{"aci":"1b2c","vault":"00ff00ff"}"#), r#"{"aci":"1b2c","vault":"[redacted]"}"#);
         // Nothing ordinary is taken: versions, hosts, words ending like a key.

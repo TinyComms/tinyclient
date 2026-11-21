@@ -207,7 +207,7 @@ pub fn find_group_invite_link(text: &str) -> Option<(&str, GroupInviteLink)> {
     let start = text.find("https://signal.group/#").or_else(|| text.find("http://signal.group/#"))?;
     let rest = &text[start..];
     let end = rest.find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\'')).unwrap_or(rest.len());
-    let candidate = &rest[..end];
+    let candidate = rest[..end].trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | '!' | '?'));
     parse_group_invite_link(candidate).map(|parsed| (candidate, parsed))
 }
 
@@ -413,6 +413,11 @@ pub enum Event {
         call_id: Option<u64>,
         timestamp: u64,
     },
+    /// A call link created or updated on another device (`SyncMessage.callLinkUpdate`).
+    CallLinkUpdated {
+        root_key: [u8; 32],
+        admin_passkey: Option<Vec<u8>>,
+    },
     /// The user's own settings, as the phone shares them.
     Settings { read_receipts: bool, typing: bool },
     /// A conversation's disappearing-messages timer changed (0 turns it off).
@@ -450,6 +455,67 @@ pub enum CallLogKind {
     MarkedAsRead,
     MarkedAsReadInConversation,
     ClearInConversation,
+}
+
+/// A Signal call link (`https://signal.link/call/#key=...`) and its settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallLink {
+    pub root_key: [u8; 32],
+    pub url: String,
+    pub name: String,
+    pub approve_all: bool,
+    pub admin_passkey: Option<Vec<u8>>,
+}
+
+/// Result of joining a Signal call link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallLinkJoin {
+    pub room_id: String,
+    pub name: String,
+    pub waiting_for_approval: bool,
+}
+
+/// Formats a 32-byte call link root key into a `https://signal.link/call/#key=...` URL.
+pub fn format_call_link(root_key: &[u8; 32]) -> String {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(root_key);
+    format!("https://signal.link/call/#key={encoded}")
+}
+
+/// Parses a `https://signal.link/call/#key=...` URL into its 32-byte root key.
+pub fn parse_call_link(url: &str) -> Option<[u8; 32]> {
+    use base64::Engine as _;
+    let trimmed = url.trim();
+    let frag = trimmed
+        .strip_prefix("https://signal.link/call/#key=")
+        .or_else(|| trimmed.strip_prefix("http://signal.link/call/#key="))?;
+    if frag.is_empty() {
+        return None;
+    }
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(frag)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(frag))
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(frag))
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(frag))
+        .ok()?;
+    raw.try_into().ok()
+}
+
+/// Finds the first valid `https://signal.link/call/#key=...` URL in a message's text.
+pub fn find_call_link(text: &str) -> Option<(&str, [u8; 32])> {
+    let start = text.find("https://signal.link/call/#key=").or_else(|| text.find("http://signal.link/call/#key="))?;
+    let rest = &text[start..];
+    let end = rest.find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\'')).unwrap_or(rest.len());
+    let candidate = rest[..end].trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | '!' | '?'));
+    parse_call_link(candidate).map(|key| (candidate, key))
+}
+
+/// Derives a deterministic SFU room identifier from a call link's 32-byte root key using HKDF-SHA256.
+pub fn call_link_room_id(root_key: &[u8; 32]) -> String {
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, root_key);
+    let mut okm = [0u8; 32];
+    let _ = hk.expand(b"Signal_CallLink_RoomId_v1", &mut okm);
+    okm.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// One GIF returned by Signal's Giphy proxy search/trending endpoint.
@@ -614,6 +680,22 @@ pub trait Wire: Send + Sync {
     fn fetch_gif(&self, _url: &str) -> Result<Vec<u8>, Fault> {
         Err(Fault::Refused("Downloading GIFs is not available.".to_owned()))
     }
+    /// Creates a new Signal call link with an optional name and admin-approval switch.
+    fn create_call_link(&self, _name: &str, _approve_all: bool) -> Result<CallLink, Fault> {
+        Err(Fault::Refused("Call links are not available.".to_owned()))
+    }
+    /// Updates a Signal call link's name or admin-approval switch.
+    fn update_call_link(&self, _root_key: &[u8; 32], _name: Option<String>, _approve_all: Option<bool>) -> Result<CallLink, Fault> {
+        Err(Fault::Refused("Updating call links is not available.".to_owned()))
+    }
+    /// Deletes a Signal call link.
+    fn delete_call_link(&self, _root_key: &[u8; 32]) -> Result<(), Fault> {
+        Err(Fault::Refused("Deleting call links is not available.".to_owned()))
+    }
+    /// Joins a Signal call link and returns its derived SFU room id and approval state.
+    fn join_call_link(&self, _url: &str) -> Result<CallLinkJoin, Fault> {
+        Err(Fault::Refused("Joining call links is not available.".to_owned()))
+    }
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);
 }
@@ -700,5 +782,22 @@ mod tests {
 
         assert!(parse_group_invite_link("https://signal.group/#not-valid-base64!!!").is_none());
         assert!(parse_group_invite_link("https://example.com/#abc").is_none());
+    }
+
+    #[test]
+    fn call_link_round_trips_derives_room_id_and_extracts_from_text() {
+        let key = [0x42u8; 32];
+        let url = format_call_link(&key);
+        assert!(url.starts_with("https://signal.link/call/#key="));
+        assert_eq!(parse_call_link(&url), Some(key));
+        let room1 = call_link_room_id(&key);
+        let room2 = call_link_room_id(&[0x43u8; 32]);
+        assert_eq!(room1.len(), 64);
+        assert_ne!(room1, room2);
+        let msg = format!("Hop on: {url}");
+        let (found_url, found_key) = find_call_link(&msg).expect("found in text");
+        assert_eq!(found_url, url);
+        assert_eq!(found_key, key);
+        assert!(parse_call_link("https://signal.link/call/#key=too-short").is_none());
     }
 }

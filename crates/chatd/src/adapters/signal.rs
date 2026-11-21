@@ -103,6 +103,30 @@ const GROUP_JOIN_APPROVE: &str = "\u{1}signal-join-approve\u{1}";
 const GROUP_JOIN_DENY: &str = "\u{1}signal-join-deny\u{1}";
 /// Join a group from its `https://signal.group/#...` link packed into `StartDirect.person_id`.
 const GROUP_JOIN_LINK: &str = "\u{1}signal-join-link\u{1}";
+/// Signal call link commands packed into `Handoff.conversation_id`:
+/// - `\u{1}signal-call-link-create\u{1}<approve:0|1>|<name>` -> returns `https://signal.link/call/#key=...`
+/// - `\u{1}signal-call-link-update\u{1}<approve:0|1>|<url>|<name>` -> returns updated `https://signal.link/call/#key=...`
+/// - `\u{1}signal-call-link-join\u{1}<url>` -> returns `room:<hex>` or `waiting:<hex>`
+/// - `\u{1}signal-call-link-delete\u{1}<url>` -> returns `"deleted"`
+const CALL_LINK_CREATE: &str = "\u{1}signal-call-link-create\u{1}";
+const CALL_LINK_UPDATE: &str = "\u{1}signal-call-link-update\u{1}";
+const CALL_LINK_JOIN: &str = "\u{1}signal-call-link-join\u{1}";
+const CALL_LINK_DELETE: &str = "\u{1}signal-call-link-delete\u{1}";
+
+/// Packs a Signal call link creation request for `Request::Handoff`.
+pub fn call_link_create_command(name: &str, approve_all: bool) -> String {
+    format!("{CALL_LINK_CREATE}{}|{name}", u8::from(approve_all))
+}
+
+/// Packs a Signal call link join request for `Request::Handoff`.
+pub fn call_link_join_command(url: &str) -> String {
+    format!("{CALL_LINK_JOIN}{url}")
+}
+
+/// Packs a Signal call link delete request for `Request::Handoff`.
+pub fn call_link_delete_command(url: &str) -> String {
+    format!("{CALL_LINK_DELETE}{url}")
+}
 
 /// Packs a Signal group invite link mode change (`off`, `on`, `approval`, `reset`).
 pub fn group_link_command(mode: &str) -> String {
@@ -639,6 +663,8 @@ struct Live {
     gifs: HashMap<String, wire::GifEntry>,
     /// Synced call history rows (`(conversation_id, call_id)`), bounded to 500 entries.
     call_history: VecDeque<(String, u64)>,
+    /// Created or synced call links keyed by their 32-byte root key.
+    call_links: HashMap<[u8; 32], wire::CallLink>,
 }
 
 /// What [`Event::Call`] told of, for [`Event::CallEnded`] to end it.
@@ -1046,6 +1072,24 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
             footer: "Join group".to_owned(),
             ..protocol::Card::default()
         }));
+    } else if let Some((_, root_key)) = wire::find_call_link(&message.text) {
+        let known = account.live().call_links.get(&root_key).cloned();
+        let title = known
+            .as_ref()
+            .filter(|l| !l.name.is_empty())
+            .map(|l| l.name.clone())
+            .unwrap_or_else(|| "Signal call link".to_owned());
+        let text = if known.as_ref().is_some_and(|l| l.approve_all) {
+            "Admin approval required to join.".to_owned()
+        } else {
+            "Anyone with this link can join the call.".to_owned()
+        };
+        message.card = Some(Box::new(protocol::Card {
+            title,
+            text,
+            footer: "Join call".to_owned(),
+            ..protocol::Card::default()
+        }));
     }
     message.reply_to = text.quote.as_ref().map(|quote| reply_to(account, quote));
     message
@@ -1304,6 +1348,19 @@ fn apply(account: &Account, event: Event) {
         }
         Event::CallLogEvent { kind, peer, call_id, timestamp } => {
             apply_call_log_event(account, kind, peer.as_ref(), call_id, timestamp);
+        }
+        Event::CallLinkUpdated { root_key, admin_passkey } => {
+            let mut live = account.live();
+            let entry = live.call_links.entry(root_key).or_insert_with(|| wire::CallLink {
+                root_key,
+                url: wire::format_call_link(&root_key),
+                name: String::new(),
+                approve_all: false,
+                admin_passkey: None,
+            });
+            if admin_passkey.is_some() {
+                entry.admin_passkey = admin_passkey;
+            }
         }
         Event::Settings { read_receipts, typing } => {
             let mut live = account.live();
@@ -1821,6 +1878,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Catalog { kind, query, cursor, reply, .. } => {
             let _ = reply.send(catalog(account, kind, &query, cursor.as_deref()));
         }
+        Command::Handoff { conversation_id, reply } => {
+            let _ = reply.send(call_link_handoff(account, &conversation_id));
+        }
         Command::Watch(watching) => pictures(account, &watching),
         Command::SignOut(reply) => {
             if let Err(fault) = account.wire.unlink() {
@@ -2236,6 +2296,49 @@ fn catalog(account: &Account, kind: CatalogKind, query: &str, cursor: Option<&st
         let _ = account.ctx.media(&media);
     }
     Ok(CatalogPage { items, cursor: next_offset.map(|n| n.to_string()) })
+}
+
+fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
+    if let Some(rest) = raw.strip_prefix(CALL_LINK_CREATE) {
+        let (approve_str, name) = rest.split_once('|').unwrap_or(("0", rest));
+        let approve_all = approve_str == "1" || approve_str.eq_ignore_ascii_case("true");
+        let link = account.wire.create_call_link(name.trim(), approve_all).map_err(refused)?;
+        let url = link.url.clone();
+        account.live().call_links.insert(link.root_key, link);
+        return Ok(url);
+    }
+    if let Some(rest) = raw.strip_prefix(CALL_LINK_UPDATE) {
+        let mut parts = rest.splitn(3, '|');
+        let approve_str = parts.next().unwrap_or("");
+        let url = parts.next().unwrap_or("").trim();
+        let name = parts.next().map(|s| s.trim().to_owned());
+        let Some(root_key) = wire::parse_call_link(url) else {
+            return Err(Refusal::Refused("That is not a valid Signal call link.".into()));
+        };
+        let approve = match approve_str {
+            "1" | "true" => Some(true),
+            "0" | "false" => Some(false),
+            _ => None,
+        };
+        let updated = account.wire.update_call_link(&root_key, name, approve).map_err(refused)?;
+        let url = updated.url.clone();
+        account.live().call_links.insert(updated.root_key, updated);
+        return Ok(url);
+    }
+    if let Some(url) = raw.strip_prefix(CALL_LINK_JOIN) {
+        let joined = account.wire.join_call_link(url.trim()).map_err(refused)?;
+        let prefix = if joined.waiting_for_approval { "waiting" } else { "room" };
+        return Ok(format!("{prefix}:{}", joined.room_id));
+    }
+    if let Some(url) = raw.strip_prefix(CALL_LINK_DELETE) {
+        let Some(root_key) = wire::parse_call_link(url.trim()) else {
+            return Err(Refusal::Refused("That is not a valid Signal call link.".into()));
+        };
+        account.wire.delete_call_link(&root_key).map_err(refused)?;
+        account.live().call_links.remove(&root_key);
+        return Ok("deleted".to_owned());
+    }
+    Err(Refusal::Unsupported)
 }
 
 fn send_gif(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, pick_id: &str) -> Result<Message, Fault> {
