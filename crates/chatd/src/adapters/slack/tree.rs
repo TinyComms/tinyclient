@@ -839,12 +839,44 @@ impl Slack {
     /// `thread_marked`: a thread read, or marked unread, on another device. Unverified shape.
     pub(super) fn thread_marked(&self, event: &Value) -> Result<(), Failure> {
         let subscription = &event["subscription"];
-        let (Some(channel), Some(root)) = (subscription["channel"].as_str(), subscription["thread_ts"].as_str()) else {
+        let channel = subscription["channel"].as_str().or_else(|| event["channel"].as_str());
+        let root = subscription["thread_ts"].as_str().or_else(|| event["thread_ts"].as_str());
+        let (Some(channel), Some(root)) = (channel, root) else {
             return Ok(());
         };
-        let unread = subscription["unread_count"].as_u64().unwrap_or(0) as u32;
-        self.ctx.counts(&thread_id(channel, root), unread, 0, subscription["last_read"].as_str(), 0)?;
+        let unread = subscription["unread_count"]
+            .as_u64()
+            .or_else(|| event["unread_count"].as_u64())
+            .unwrap_or(0) as u32;
+        let last_read = subscription["last_read"].as_str().or_else(|| event["last_read"].as_str());
+        self.ctx.counts(&thread_id(channel, root), unread, 0, last_read, 0)?;
         self.thread_unread(channel, root, unread)
+    }
+
+    /// `thread_subscribed` / `thread_unsubscribed`: updates the followed thread set and store filing live.
+    pub(super) fn thread_subscription_changed(&self, event: &Value, followed: bool) -> Result<(), Failure> {
+        let subscription = &event["subscription"];
+        let channel = subscription["channel"].as_str().or_else(|| event["channel"].as_str());
+        let root = subscription["thread_ts"].as_str().or_else(|| event["thread_ts"].as_str());
+        let (Some(channel), Some(root)) = (channel, root) else {
+            return Ok(());
+        };
+        let id = thread_id(channel, root);
+        if followed {
+            if self.ctx.known(channel)?.is_none() {
+                return Ok(());
+            }
+            self.thread_known(channel, root)?;
+            self.state().followed_threads.insert(id.clone());
+        } else {
+            self.state().followed_threads.remove(&id);
+        }
+        self.ctx.filing(&id, &crate::store::Filing { followed, ..crate::store::Filing::default() })?;
+        if !followed {
+            self.ctx.counts(&id, 0, 0, None, 0)?;
+            self.thread_unread(channel, root, 0)?;
+        }
+        Ok(())
     }
 
     /// `channel_joined`, `group_joined`, `im_open`, `mpim_open`: a row to add. The event carries

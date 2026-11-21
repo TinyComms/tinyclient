@@ -558,6 +558,10 @@ struct World {
     cdn_reuploaded: bool,
     /// The first piece of `big-file` past the start has already been dropped once.
     large_broke: bool,
+    /// Chats marked as protected (`noforwards`) via `steer`.
+    noforwards: HashSet<Who>,
+    /// Saved GIF document IDs, newest first (`messages.getSavedGifs` / `messages.saveGif`).
+    saved_gifs: Vec<i64>,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -625,6 +629,8 @@ impl World {
             file_at_once: 0,
             cdn_reuploaded: false,
             large_broke: false,
+            noforwards: HashSet::new(),
+            saved_gifs: vec![6_200],
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -1226,6 +1232,12 @@ impl World {
             }
             "peer-go" => {
                 self.peer_go = true;
+                Vec::new()
+            }
+            "noforwards" => {
+                if let Some((who, None)) = words.next().and_then(Who::parse) {
+                    self.noforwards.insert(who);
+                }
                 Vec::new()
             }
             "file-go" => {
@@ -3076,8 +3088,21 @@ impl World {
         }
         if asked::<f::messages::GetSavedGifs>(body).is_some() {
             self.log("GetSavedGifs");
-            let found = tl::types::messages::SavedGifs { hash: 1, gifs: vec![gif(6_200).into()] };
+            let gifs = self.saved_gifs.iter().map(|&id| gif(id).into()).collect();
+            let found = tl::types::messages::SavedGifs { hash: 1, gifs };
             return Some(answer(tl::enums::messages::SavedGifs::Gifs(found)));
+        }
+        if let Some(request) = asked::<f::messages::SaveGif>(body) {
+            let doc_id = match &request.id {
+                tl::enums::InputDocument::Document(doc) => doc.id,
+                tl::enums::InputDocument::Empty => 0,
+            };
+            self.log(&format!("SaveGif d{doc_id} unsave={}", request.unsave));
+            self.saved_gifs.retain(|&id| id != doc_id);
+            if !request.unsave && doc_id != 0 {
+                self.saved_gifs.insert(0, doc_id);
+            }
+            return Some(answer(true));
         }
         if let Some(request) = asked::<f::contacts::ResolveUsername>(body) {
             self.log(&format!("ResolveUsername {}", request.username));
@@ -3206,6 +3231,129 @@ impl World {
             let (kind, media) = held_media(&request.media, self.next + 1_000);
             self.log(&format!("UploadMedia {kind}"));
             return Some(answer(media));
+        }
+        if let Some(request) = asked::<f::messages::Report>(body) {
+            let peer = input_who(&request.peer);
+            let opt = String::from_utf8_lossy(&request.option);
+            self.log(&format!("messages.report {} {:?} opt={opt}", peer.text(), request.id));
+            if request.option.is_empty() {
+                let choose = tl::types::ReportResultChooseOption {
+                    title: "Choose a reason".to_owned(),
+                    options: vec![
+                        tl::enums::MessageReportOption::Option(tl::types::MessageReportOption {
+                            text: "Spam".to_owned(),
+                            option: b"spam".to_vec(),
+                        }),
+                        tl::enums::MessageReportOption::Option(tl::types::MessageReportOption {
+                            text: "Violence".to_owned(),
+                            option: b"violence".to_vec(),
+                        }),
+                        tl::enums::MessageReportOption::Option(tl::types::MessageReportOption {
+                            text: "Other".to_owned(),
+                            option: b"other".to_vec(),
+                        }),
+                    ],
+                };
+                return Some(answer(tl::enums::ReportResult::ChooseOption(choose)));
+            }
+            return Some(answer(tl::enums::ReportResult::Reported));
+        }
+        if let Some(request) = asked::<f::account::ReportPeer>(body) {
+            let peer = input_who(&request.peer);
+            let reason = match request.reason {
+                tl::enums::ReportReason::InputReportReasonSpam => "spam",
+                tl::enums::ReportReason::InputReportReasonViolence => "violence",
+                tl::enums::ReportReason::InputReportReasonIllegalDrugs => "illegal",
+                tl::enums::ReportReason::InputReportReasonFake => "fake",
+                tl::enums::ReportReason::InputReportReasonPersonalDetails => "personal",
+                _ => "other",
+            };
+            self.log(&format!("account.reportPeer {} {reason} {}", peer.text(), request.message));
+            return Some(answer(true));
+        }
+        if let Some(request) = asked::<f::messages::SearchGlobal>(body) {
+            self.log(&format!("SearchGlobal {} rate={} id={}", request.q, request.offset_rate, request.offset_id));
+            let needle = request.q.to_lowercase();
+            let mut matched: Vec<(i32, i32, tl::enums::Message)> = Vec::new();
+            for msgs in self.messages.values() {
+                for raw in msgs.values() {
+                    if let tl::enums::Message::Message(m) = raw {
+                        if needle.is_empty() || m.message.to_lowercase().contains(&needle) {
+                            matched.push((m.date, m.id, raw.clone()));
+                        }
+                    }
+                }
+            }
+            matched.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+            let total = matched.len() as i32;
+            if request.offset_rate > 0 {
+                matched.retain(|(date, id, _)| {
+                    *date < request.offset_rate || (*date == request.offset_rate && *id < request.offset_id)
+                });
+            }
+            // Return 1 hit per page when more than 1 matches so pagination is exercised on the wire.
+            let page_size = if matched.len() > 1 { 1 } else { matched.len() };
+            let next_rate = (matched.len() > page_size).then(|| matched[page_size - 1].0);
+            let page: Vec<tl::enums::Message> = matched.into_iter().take(page_size).map(|(_, _, m)| m).collect();
+            let slice = tl::types::messages::MessagesSlice {
+                inexact: false,
+                count: total,
+                next_rate,
+                offset_id_offset: None,
+                search_flood: None,
+                messages: page,
+                topics: Vec::new(),
+                chats: chats(),
+                users: users(),
+            };
+            return Some(answer(tl::enums::messages::Messages::Slice(slice)));
+        }
+        if let Some(request) = asked::<f::messages::ForwardMessages>(body) {
+            let from_who = input_who(&request.from_peer);
+            let to_who = input_who(&request.to_peer);
+            let to_label = match request.to_peer {
+                tl::enums::InputPeer::PeerSelf => "self".to_owned(),
+                _ => to_who.text(),
+            };
+            self.log(&format!("ForwardMessages {} -> {} ids={:?}", from_who.text(), to_label, request.id));
+            if self.noforwards.contains(&from_who) {
+                return Some(Err(Fault::Rpc { code: 400, name: "CHAT_FORWARDS_RESTRICTED".to_owned(), value: None }));
+            }
+            let mut all = Vec::new();
+            for (idx, msg_id) in request.id.iter().enumerate() {
+                let text = self
+                    .messages
+                    .get(&from_who.text())
+                    .and_then(|map| map.get(msg_id))
+                    .and_then(|m| match m {
+                        tl::enums::Message::Message(m) => Some(m.message.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| format!("forwarded #{msg_id}"));
+                self.next += 1;
+                let id = self.next;
+                let mut sent = message(to_who, id, ME, crate::hub::now() as i32, &text);
+                if !request.drop_author {
+                    let mut fwd: tl::types::MessageFwdHeader = blank(&[&put(0u32), &put(t0())]);
+                    fwd.from_id = Some(from_who.peer());
+                    sent.fwd_from = Some(fwd.into());
+                }
+                if let Some(topic) = request.top_msg_id {
+                    sent = in_topic(sent, topic);
+                }
+                self.store(request.top_msg_id, sent.clone());
+                let random_id = request.random_id.get(idx).copied().unwrap_or(i64::from(id));
+                let named: tl::enums::Update = tl::types::UpdateMessageId { id, random_id }.into();
+                let new: tl::enums::Update = match to_who {
+                    Who::Channel(_) => tl::types::UpdateNewChannelMessage { message: sent.into(), pts: 0, pts_count: 0 }.into(),
+                    _ => tl::types::UpdateNewMessage { message: sent.into(), pts: 0, pts_count: 0 }.into(),
+                };
+                let _ = events.send(update(named.clone()));
+                let _ = events.send(update(new.clone()));
+                all.push(named);
+                all.push(new);
+            }
+            return Some(answer(updates(all)));
         }
         if let Some(request) = asked::<f::messages::SendMedia>(body) {
             let peer = input_who(&request.peer);
@@ -3439,6 +3587,17 @@ fn held_media(media: &tl::enums::InputMedia, id: i32) -> (String, tl::enums::Mes
             tl::enums::InputDocument::Document(kept) if kept.id >= 6_400 && kept.id < 6_500 => ("sticker".to_owned(), document_media(sticker(kept.id))),
             _ => ("kept-document".to_owned(), file("file", "application/octet-stream")),
         },
+        tl::enums::InputMedia::Contact(one) => (
+            format!("contact:{}:{}:{}", one.first_name, one.last_name, one.phone_number),
+            tl::types::MessageMediaContact {
+                phone_number: one.phone_number.clone(),
+                first_name: one.first_name.clone(),
+                last_name: one.last_name.clone(),
+                vcard: one.vcard.clone(),
+                user_id: if one.phone_number.contains("15550100777") { ODALYS } else { 0 },
+            }
+            .into(),
+        ),
         _ => ("other".to_owned(), tl::enums::MessageMedia::Empty),
     }
 }

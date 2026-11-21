@@ -699,6 +699,7 @@ impl Slack {
             let id = thread_id(channel, ts);
             let messages: Vec<Message> = entries.iter().filter_map(|entry| self.message(channel, entry)).collect();
             self.ctx.history(&id, &messages)?;
+            self.state().followed_threads.insert(id.clone());
             self.ctx.filing(&id, &Filing { followed: true, ..Filing::default() })?;
             let read = root["last_read"].as_str().unwrap_or(ts);
             let unread = replies.iter().filter_map(|reply| reply["ts"].as_str()).filter(|reply| *reply > read).count() as u32;

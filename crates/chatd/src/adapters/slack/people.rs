@@ -901,7 +901,7 @@ impl Slack {
         }
     }
 
-    fn apply_dnd(&self, id: &str, dnd: DndState, now: i64) {
+    pub(super) fn apply_dnd(&self, id: &str, dnd: DndState, now: i64) {
         let active = dnd.active(now);
         let was_active = {
             let mut state = self.state();

@@ -2693,10 +2693,32 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::FollowThread { conversation, on } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::FollowThread {
+                    conversation_id: conversation.id.clone(),
+                    on,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::Topics { forum, offset, limit, landing } => self.topics(forum, offset, limit, landing),
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),
             Request::Catalog { account, kind, space, query, cursor } => self.catalog(account, kind, space, query, cursor),
+            Request::SaveGif { account, id, unsave } => {
+                match self.ask(&account, |reply| Command::SaveGif { id, unsave, reply }) {
+                    Ok(()) => {
+                        self.hub.catalogs.forget_where(|(acct, kind, ..)| acct == &account && *kind == CatalogKind::Gifs);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::ReadSessions => {
                 let denied = self.hub.keychain().denied;
                 if let Some(chat) = self.this.get().and_then(Weak::upgrade) {
@@ -2952,6 +2974,46 @@ impl Chat {
                 match self.hub.store().reminders(&conversation) {
                     Ok(reminders) => Response::Reminders { conversation, reminders },
                     Err(err) => internal(err),
+                }
+            }
+            Request::ScheduledMessages { conversation } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::ScheduledList {
+                    conversation_id: conversation.id.clone(),
+                    reply,
+                }) {
+                    Ok(messages) => Response::ScheduledMessages { messages },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CancelScheduled { conversation, scheduled_id } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::CancelScheduled {
+                    conversation_id: conversation.id.clone(),
+                    scheduled_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::RescheduleMessage { conversation, scheduled_id, text, post_at } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::Reschedule {
+                    conversation_id: conversation.id.clone(),
+                    scheduled_id,
+                    text,
+                    post_at,
+                    reply,
+                }) {
+                    Ok(message) => Response::ScheduledMessage { message },
+                    Err(refused) => *refused,
                 }
             }
 

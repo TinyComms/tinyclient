@@ -1402,8 +1402,8 @@ impl Shell {
                     .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
             }
             Row::Drafts { count, .. } => {
-                let trailing = (*count > 0).then(|| super::components::badge_count(*count));
-                self.action_row(("drafts", ix), Some("icons/square-pen.svg"), "Drafts & sent".into(), *count > 0, trailing, focused)
+                let trailing = (*count > 0).then(|| super::components::badge_count_unread(*count));
+                self.action_row(("drafts", ix), Some("icons/pencil.svg"), "Drafts & sent".into(), false, trailing, focused)
                     .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
             }
             Row::Fold { words, depth, .. } => {

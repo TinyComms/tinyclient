@@ -341,7 +341,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         gifs: true,
         stickers: true,
         search: true,
-        search_global: false,
+        search_global: true,
         custom_emoji: EmojiScope::All,
         silent: true,
         schedule: true,
@@ -352,6 +352,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         edit_window: 48 * 3_600,
         file_scan: false,
         allow_archives: false,
+        abuse_reports: true,
         voice_notes: true,
         direct_calls: false,
         revisions: false,
@@ -376,6 +377,8 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         effects: false,
         view_once: false,
         blocks: true,
+        share_contact: true,
+        save_gif: true,
         ..Capabilities::default()
     }
 }
@@ -1262,6 +1265,13 @@ pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped,
     content::quote_pin(&mut mapped.message);
     account.place(mapped.peer, mapped.id, conversation);
     comment_thread(account, conversation, mapped);
+    for want in &mapped.wants {
+        if let tl::enums::InputFileLocation::InputDocumentFileLocation(loc) = &want.location {
+            if loc.thumb_size.is_empty() {
+                super::catalog::remember_document(account, loc);
+            }
+        }
+    }
 }
 
 /// The thread a channel post's comments hang off. The post carries the count; the row it opens

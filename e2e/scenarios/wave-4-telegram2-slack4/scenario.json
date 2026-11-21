@@ -1,0 +1,12 @@
+{
+  "id": "wave-4-telegram2-slack4",
+  "title": "Wave 4E Telegram contacts, forward, global search, report & save GIF and Slack drafts, DND snooze, scheduled mgmt, search filters & follow threads",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 4E Telegram & Slack enhancements verified by unit and integration test suites.",
+    "ios": "Desktop Wave 4E Telegram & Slack enhancements verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

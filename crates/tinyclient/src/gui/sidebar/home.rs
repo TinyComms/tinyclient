@@ -24,7 +24,7 @@ pub const MEETING_QUIET: i64 = 14 * 86_400;
 pub enum Drill {
     /// A Slack workspace's followed threads.
     Threads(Key),
-    /// A Slack workspace's Drafts & sent view.
+    /// A Slack workspace's active drafts.
     Drafts(Key),
     /// Telegram's archive.
     Archive,
