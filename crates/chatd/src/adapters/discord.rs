@@ -305,6 +305,7 @@ pub(super) fn renamed(known: &protocol::Conversation, title: &str) -> crate::sto
     row.max_file_bytes = known.max_file_bytes;
     row.read_only_reason = known.read_only_reason.clone();
     row.spam = known.spam;
+    row.age_restricted = known.age_restricted;
     row
 }
 
@@ -351,6 +352,10 @@ struct State {
     renewed: HashMap<String, String>,
     /// Our plan (`premium_type`), which says what may be sent.
     premium: u8,
+    /// `true` when Discord says this account cannot enter age-restricted channels (`nsfw_allowed == false`).
+    nsfw_blocked: bool,
+    /// `true` only when Discord's sensitive-media filter is set to Show (`0`); otherwise flagged media is blurred.
+    show_explicit_media: bool,
     /// Friends' status emoji and what they are doing, as their presence last said, so a voice
     /// state can be told beside it.
     doing: HashMap<String, (String, Option<protocol::Activity>)>,
@@ -654,12 +659,14 @@ impl Discord {
         // Outside a server a friend goes by the nickname the user gave them.
         let author = posted.author.as_ref().filter(|_| guild.is_none() && posted.webhook_id.is_none());
         let author = author.and_then(|author| crate::hub::lock(&self.state).users.get(&author.id).cloned());
+        let blur_explicit = !crate::hub::lock(&self.state).show_explicit_media;
         let place = Place {
             account: &self.ctx.account,
             me: &me,
             guild,
             names: &lookup,
             author,
+            blur_explicit,
         };
         let (mut message, files) = content::message(posted, &place);
         message.mentions_me = self.mentions_me(posted, guild, kind, &me);
@@ -875,6 +882,7 @@ impl Discord {
                     // A thread started from a message has that message's id on Discord. The
                     // note from `remember_starter` is what the chip follows when it differs.
                     root: Some(thread.id.clone()),
+                    age_restricted: thread.nsfw || conversation.age_restricted,
                     ..ConversationRow::new(&thread.id, ConversationKind::Thread, title)
                 })?;
             }
@@ -1652,6 +1660,7 @@ impl Discord {
         row.root = Some(root.to_owned());
         row.private = parent.private;
         row.read_only = parent.read_only;
+        row.age_restricted = parent.age_restricted;
         self.ctx.conversation(&row).map_err(refuse)
     }
 

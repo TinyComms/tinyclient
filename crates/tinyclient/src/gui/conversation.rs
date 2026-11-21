@@ -31,7 +31,7 @@ use protocol::highlight;
 pub(in crate::gui) use player::glyph as player_glyph;
 
 
-use super::components::empty_state;
+use super::components::{button, empty_state, glyph, ButtonKind};
 use super::layout::{drags_window, TOP_BAR};
 use super::state::{Shell, Snapshot};
 use super::theme::{self, Type};
@@ -64,6 +64,8 @@ pub struct State {
     listening: OnceCell<Subscription>,
     following: OnceCell<Subscription>,
     side: side::Side,
+    /// Age-restricted channels the user clicked Continue on during this session.
+    passed_age_gate: HashSet<Key>,
 }
 
 /// How often the network is told how far the user has read, at most.
@@ -158,6 +160,10 @@ struct Open {
     call: protocol::CallSupport,
     /// Conversation topic (e.g. "RCS message" / "Text message" for Google Messages).
     topic: String,
+    /// Channel is marked age-restricted by the network.
+    age_restricted: bool,
+    /// Waiting behind the session age-gate warning until the user clicks Continue.
+    gated: bool,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     started: Instant,
 }
@@ -410,6 +416,8 @@ pub struct Pane {
     /// A search hit asked for this message before its conversation opened; it wins over where
     /// reading stopped.
     landing: Option<String>,
+    /// Deferred initial load target held while an age-restricted channel waits behind the gate.
+    gated_open: Option<(Option<String>, Option<Place>, Option<String>)>,
     /// Nothing to type in: the messages take the focus on the next draw.
     wants_focus: bool,
     /// How far the files of each of my pending messages have gone, by `client_id`.
@@ -507,6 +515,7 @@ impl Pane {
             places: crate::gui::pane::Memory::default(),
             around: None,
             landing: None,
+            gated_open: None,
             wants_focus: false,
             uploads: HashMap::new(),
             pending_at: HashMap::new(),
@@ -574,10 +583,12 @@ impl Pane {
         can: protocol::Capabilities,
         picture: Option<MediaFile>,
         typing: bool,
+        gated: bool,
         cx: &mut Context<Self>,
     ) {
         let receipt = conversation.receipt();
         if let Some(open) = self.open.as_mut().filter(|open| open.key == conversation.key) {
+            let unlocked = open.gated && !gated;
             if open.title != conversation.title
                 || open.picture != picture
                 || open.receipt != receipt
@@ -587,6 +598,8 @@ impl Pane {
                 || open.can_pin != conversation.can_pin
                 || open.call != conversation.call
                 || open.topic != conversation.topic
+                || open.age_restricted != conversation.age_restricted
+                || open.gated != gated
             {
                 open.title.clone_from(&conversation.title);
                 open.picture = picture;
@@ -595,8 +608,14 @@ impl Pane {
                 open.rights = conversation.rights;
                 open.moderate = conversation.moderate;
                 open.can_pin = conversation.can_pin;
-            open.call = conversation.call;
+                open.call = conversation.call;
                 open.topic.clone_from(&conversation.topic);
+                open.age_restricted = conversation.age_restricted;
+                open.gated = gated;
+                if unlocked {
+                    let (landing, back, around) = self.gated_open.take().unwrap_or((None, None, None));
+                    self.load_opened(landing, back, around, cx);
+                }
                 cx.notify();
             }
             return;
@@ -607,7 +626,18 @@ impl Pane {
         if self.landing.is_none() {
             self.around = around;
         }
-        self.start(conversation.key.clone(), &conversation.title, conversation.kind, me, can, conversation.rights, None, cx);
+        self.start(
+            conversation.key.clone(),
+            &conversation.title,
+            conversation.kind,
+            me,
+            can,
+            conversation.rights,
+            None,
+            conversation.age_restricted,
+            gated,
+            cx,
+        );
         self.wants_focus = !typing;
         if let Some(open) = self.open.as_mut() {
             open.picture = picture;
@@ -631,9 +661,10 @@ impl Pane {
         cx: &mut Context<Self>,
     ) {
         let replies = root.thread.as_ref().map_or(0, |thread| thread.replies);
-        self.start(key, title, ConversationKind::Thread, me, can, rights, Some((root, replies)), cx);
+        self.start(key, title, ConversationKind::Thread, me, can, rights, Some((root, replies)), false, false, cx);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start(
         &mut self,
         key: Key,
@@ -643,6 +674,8 @@ impl Pane {
         can: protocol::Capabilities,
         rights: protocol::ConversationRights,
         root: Option<(Rc<Message>, u32)>,
+        age_restricted: bool,
+        gated: bool,
         cx: &mut Context<Self>,
     ) {
         let landing = self.landing.take();
@@ -672,6 +705,8 @@ impl Pane {
             can_pin: false,
             call: protocol::CallSupport::None,
             topic: String::new(),
+            age_restricted,
+            gated,
             started: Instant::now(),
         });
         self.window = pages::Window::default();
@@ -719,9 +754,29 @@ impl Pane {
         self.hold = None;
         self.land = false;
         self.opening = false;
+        self.gated_open = None;
         self.uploads.clear();
         self.pending_at.clear();
         self.relay(true, ListOffset::default());
+        if gated {
+            self.gated_open = Some((landing, back, around));
+        } else {
+            self.load_opened(landing, back, around, cx);
+        }
+        cx.notify();
+    }
+
+    fn is_gated(&self) -> bool {
+        self.open.as_ref().is_some_and(|open| open.gated)
+    }
+
+    fn load_opened(
+        &mut self,
+        landing: Option<String>,
+        back: Option<Place>,
+        around: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.ask_reactions(cx);
         // M2: a conversation opens at its newest message rather than the first unread. The
         // search hit is the user's own ask: it wins over where this conversation was left, and
@@ -737,7 +792,98 @@ impl Pane {
                 },
             },
         }
+    }
+
+    fn pass_age_gate(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        if !open.gated || open.can.age_restricted_blocked {
+            return;
+        }
+        open.gated = false;
+        let key = open.key.clone();
+        let (landing, back, around) = self.gated_open.take().unwrap_or((None, None, None));
+        let shell = self.shell.clone();
+        cx.defer(move |cx| {
+            let _ = shell.update(cx, |shell, cx| shell.pass_age_gate(key, cx));
+        });
+        self.load_opened(landing, back, around, cx);
         cx.notify();
+    }
+
+    fn age_gate_view(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let blocked = self.open.as_ref().is_some_and(|open| open.can.age_restricted_blocked);
+        let title = self.open.as_ref().map(|open| open.title.clone()).unwrap_or_default();
+        let shell = self.shell.clone();
+        let continue_btn = button("age-gate-continue", ButtonKind::Primary, "Continue")
+            .when(blocked, |btn| btn.opacity(0.45).cursor_default())
+            .when(!blocked, |btn| {
+                btn.on_click(cx.listener(|this, _, _, cx| this.pass_age_gate(cx)))
+            });
+        let nope_btn = button("age-gate-nope", ButtonKind::Secondary, "Nope").on_click(cx.listener(move |_, _, _, cx| {
+            let _ = shell.update(cx, |shell, cx| shell.leave_age_gated(cx));
+        }));
+        div()
+            .id("age-gate")
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .px(px(24.))
+            .child(
+                div()
+                    .max_w(px(380.))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .size(px(48.))
+                            .rounded_full()
+                            .bg(theme::danger_soft())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(glyph("icons/triangle-alert.svg", 22., theme::danger())),
+                    )
+                    .child(
+                        div()
+                            .type_title()
+                            .text_color(theme::text())
+                            .text_align(gpui::TextAlign::Center)
+                            .child(if title.is_empty() {
+                                "Age-restricted channel".to_owned()
+                            } else {
+                                format!("#{} is age-restricted", title.trim_start_matches('#'))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .type_ui()
+                            .text_color(theme::text_soft())
+                            .text_align(gpui::TextAlign::Center)
+                            .child("This channel may contain content not suitable for all ages."),
+                    )
+                    .children(blocked.then(|| {
+                        div()
+                            .type_small()
+                            .text_color(theme::danger())
+                            .text_align(gpui::TextAlign::Center)
+                            .child("Your account isn't permitted to view age-restricted channels.")
+                    }))
+                    .child(
+                        div()
+                            .pt(px(4.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(continue_btn)
+                            .child(nope_btn),
+                    ),
+            )
     }
 
     /// Where the user is in this conversation now: the first message on screen and how far
@@ -939,7 +1085,7 @@ impl Pane {
 
     /// Something in this conversation changed: what is on screen is read again.
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.open.is_none() {
+        if self.open.is_none() || self.is_gated() {
             return;
         }
         if self.refreshing > 0 {
@@ -1123,6 +1269,9 @@ impl Pane {
     // Changes.
 
     fn changed(&mut self, change: &Change, cx: &mut Context<Self>) {
+        if self.is_gated() {
+            return;
+        }
         let Some(key) = self.key() else {
             return;
         };
@@ -1174,6 +1323,9 @@ impl Pane {
     /// Notes that a row on screen shows `file` with its longest side `size` device pixels. A
     /// file that failed is never asked for here: only the user's Retry does that.
     fn want(&mut self, file: &MediaFile, size: u32) {
+        if self.is_gated() {
+            return;
+        }
         if file.failed.is_none() {
             self.want.push((file.id.clone(), size));
         }
@@ -1182,6 +1334,10 @@ impl Pane {
     /// Asks chatd for the files the rows on screen need, at the sizes they are drawn. Each is
     /// asked for once, and again only when a box grows or the window moves to a sharper screen.
     fn fetch_wanted(&mut self, cx: &mut Context<Self>) {
+        if self.is_gated() {
+            self.want.clear();
+            return;
+        }
         let wanted = pages::unasked(std::mem::take(&mut self.want), &mut self.asked);
         for (size, ids) in wanted {
             self.fetch(ids, Some(size), false, cx);
@@ -1189,6 +1345,9 @@ impl Pane {
     }
 
     fn fetch(&mut self, ids: Vec<String>, size: Option<u32>, retry: bool, cx: &mut Context<Self>) {
+        if self.is_gated() {
+            return;
+        }
         let Some(account) = self.key().map(Key::account) else {
             return;
         };
@@ -1830,6 +1989,9 @@ impl Render for Pane {
         if std::mem::take(&mut self.wants_focus) {
             window.focus(&self.focus, cx);
         }
+        if self.is_gated() {
+            return self.age_gate_view(cx);
+        }
         self.seen.borrow_mut().clear();
         let this = cx.entity();
         let rows = gpui::list(self.list.clone(), cx.processor(|this: &mut Pane, ix: usize, window, cx| this.row(ix, window, cx)))
@@ -1925,6 +2087,32 @@ impl Shell {
         accounts.filter(|status| status.key == account).map(|status| status.me.clone()).next().unwrap_or_default()
     }
 
+    /// Whether an age-restricted conversation is still behind this session's warning gate.
+    pub(in crate::gui) fn age_gated(&self, conversation: &Conversation) -> bool {
+        conversation.age_restricted && !self.conversation_state.passed_age_gate.contains(&conversation.key)
+    }
+
+    /// Whether the user already clicked Continue for `key` during this session.
+    pub(in crate::gui) fn age_gate_passed(&self, key: &Key) -> bool {
+        self.conversation_state.passed_age_gate.contains(key)
+    }
+
+    /// Remembers that the user confirmed the age warning for `key` for this session.
+    pub(in crate::gui) fn pass_age_gate(&mut self, key: Key, cx: &mut Context<Self>) {
+        self.conversation_state.passed_age_gate.insert(key.clone());
+        self.info_age_gate_passed(&key, cx);
+        cx.notify();
+    }
+
+    /// Leaves an age-restricted conversation when the user clicks Nope.
+    pub(in crate::gui) fn leave_age_gated(&mut self, cx: &mut Context<Self>) {
+        self.open = None;
+        if let Some(snapshot) = &mut self.snapshot {
+            snapshot.open = None;
+        }
+        cx.notify();
+    }
+
     /// The open conversation was marked unread from a row or the menu bar. The pane keeps the
     /// divider and does not read the messages already on screen.
     pub(super) fn hold_open_unread(&mut self, cx: &mut Context<Self>) {
@@ -2010,9 +2198,10 @@ impl Shell {
         let me = self.me(&open.key);
         let can = snapshot.account(&open.key.account()).map(|status| status.can).unwrap_or_default();
         let picture = self.conversation_picture(open, cx);
+        let gated = self.age_gated(open);
         // With no composer to type in, the messages take the keys after an open.
-        let typing = open.special != Special::Service;
-        pane.update(cx, |pane, cx| pane.show(open, &me, can, picture, typing, cx));
+        let typing = open.special != Special::Service && !gated;
+        pane.update(cx, |pane, cx| pane.show(open, &me, can, picture, typing, gated, cx));
         let keys = pane.clone();
         let phone = super::phone::active();
         let mut view = div()
@@ -2044,10 +2233,10 @@ impl Shell {
         })
         .children((!phone).then(|| self.call_conversation_picture(snapshot, open, cx)).flatten())
         .child(div().flex_1().min_h_0().child(pane))
-        .child(match open.special {
+        .children((!gated).then(|| match open.special {
             Special::Service => self.no_composer(open, cx),
             _ => self.composer(open, link, cx),
-        })
+        }))
         .children(phone.then(|| self.phone_edge(cx)))
     }
 
@@ -2296,5 +2485,19 @@ mod tests {
             "the button came up outside the pane"
         );
         assert!(!dragging);
+    }
+
+    #[test]
+    fn age_restricted_channel_gates_until_passed_for_the_session() {
+        let mut passed: HashSet<Key> = HashSet::new();
+        let nsfw = Key { network: protocol::Network::Discord, account: "1".into(), id: "4101".into() };
+        let normal = Key { network: protocol::Network::Discord, account: "1".into(), id: "4102".into() };
+        let mut row = Conversation::new(nsfw.clone(), ConversationKind::Channel, "nsfw");
+        row.age_restricted = true;
+        let is_gated = |conv: &Conversation, passed: &HashSet<Key>| conv.age_restricted && !passed.contains(&conv.key);
+        assert!(is_gated(&row, &passed));
+        assert!(!is_gated(&Conversation::new(normal, ConversationKind::Channel, "general"), &passed));
+        passed.insert(nsfw);
+        assert!(!is_gated(&row, &passed));
     }
 }

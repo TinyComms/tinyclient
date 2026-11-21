@@ -235,6 +235,22 @@ pub fn guild_order(settings: &str) -> Option<Vec<String>> {
     (!order.is_empty()).then_some(order)
 }
 
+/// Whether Discord's sensitive-media filter (`PreloadedUserSettings.text_and_images` field 6,
+/// `explicit_content_filter` field 14: 0 show, 1 blur, 2 block) blurs explicitly flagged media.
+/// Returns `false` only when the account explicitly chose `0` (Show); defaults to `true`.
+pub fn blur_explicit_media(settings: &str) -> bool {
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(settings.trim()) else {
+        return true;
+    };
+    let Some(text_and_images) = bytes_of(&bytes, 6) else {
+        return true;
+    };
+    let Some(filter) = bytes_of(text_and_images, 14) else {
+        return true;
+    };
+    wrapped_varint(filter).is_none_or(|value| value != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +316,23 @@ mod tests {
         let cleared = with_status(&idle, "online", Some(""));
         assert_eq!((own_status(&cleared).1.as_str(), bytes_of(&cleared, 2)), ("", None));
         assert_eq!(status_settings("AAAA"), None);
+    }
+
+    #[test]
+    fn explicit_content_filter_blurs_by_default_and_respects_show_setting() {
+        assert!(blur_explicit_media(""));
+        assert!(blur_explicit_media("not base64!"));
+        let encode_filter = |mode: u8| {
+            let mut wrapped = Vec::new();
+            wrapped.extend([0x08, mode]);
+            let mut text_and_images = Vec::new();
+            write(&mut text_and_images, 14, &wrapped);
+            let mut root = Vec::new();
+            write(&mut root, 6, &text_and_images);
+            base64::engine::general_purpose::STANDARD.encode(root)
+        };
+        assert!(!blur_explicit_media(&encode_filter(0)));
+        assert!(blur_explicit_media(&encode_filter(1)));
+        assert!(blur_explicit_media(&encode_filter(2)));
     }
 }

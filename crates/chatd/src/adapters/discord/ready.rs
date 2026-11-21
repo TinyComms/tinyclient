@@ -33,6 +33,8 @@ struct LegacySettings {
     guild_folders: Vec<Folder>,
     #[serde(default)]
     guild_positions: Vec<String>,
+    #[serde(default)]
+    explicit_content_filter: Option<u8>,
 }
 
 /// The parts of READY that are used. Everything else in it is skipped while parsing.
@@ -286,6 +288,7 @@ impl GuildInfo {
             private: self.private(guild, channel) || (channel.kind == model::VOICE && !can_connect),
             opted_out: self.quiet.opted_out(&channel.id, parent),
             max_file_bytes: super::send::tier_upload_limit(self.premium_tier),
+            age_restricted: channel.nsfw,
             ..ConversationRow::new(&channel.id, kind, name)
         })
     }
@@ -358,7 +361,7 @@ impl Discord {
     fn tree(&self, guild: &Guild, info: &mut GuildInfo, me: &str, read: &HashMap<String, ReadState>) -> Tree {
         let mut rows = Vec::new();
         let mut counts = Vec::new();
-        let mut placed: HashMap<&str, (Option<String>, i32)> = HashMap::new();
+        let mut placed: HashMap<&str, (Option<String>, i32, bool)> = HashMap::new();
         info.channels.clear();
         let standing = |channel: &Channel, joined: Option<i64>| {
             let state = read.get(&channel.id);
@@ -388,7 +391,7 @@ impl Discord {
             let Some(row) = info.row(&guild.id, me, channel) else {
                 continue;
             };
-            placed.insert(&channel.id, (row.group.clone(), row.position));
+            placed.insert(&channel.id, (row.group.clone(), row.position, row.age_restricted));
             info.remember(&channel.id, channel.parent_id.as_deref());
             // A voice channel's chat is not "unread" in the tree. A forum's own marker is:
             // its posts hold no row to carry a badge, so the forum itself counts them, and a
@@ -410,7 +413,7 @@ impl Discord {
         let mut under: HashMap<&str, i32> = HashMap::new();
         for thread in &guild.threads {
             let archived = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.archived);
-            let Some((group, position)) = thread.parent_id.as_deref().and_then(|parent| placed.get(parent)) else {
+            let Some((group, position, parent_nsfw)) = thread.parent_id.as_deref().and_then(|parent| placed.get(parent)) else {
                 continue;
             };
             if archived || !thread.is_thread() {
@@ -425,6 +428,7 @@ impl Discord {
                 root: Some(thread.id.clone()),
                 read_only: timed_out.is_some(),
                 read_only_reason: timed_out.map(|until| timeout_reason(until, clock)).unwrap_or_default(),
+                age_restricted: thread.nsfw || *parent_nsfw,
                 // A server's threads in READY are the ones we were added to.
                 filing: Some(Filing {
                     followed: true,
@@ -788,7 +792,7 @@ impl Discord {
     /// file limit is the documented 10 MiB (a press report says 20 MB since August 2026; the
     /// smaller one is used until a real session says otherwise), and a server's boosts, which
     /// raise it there, are not counted.
-    pub(super) fn capabilities(&self, premium: u8) {
+    pub(super) fn capabilities(&self, premium: u8, age_restricted_blocked: bool) {
         let (max_file_bytes, emoji) = match premium {
             2 => (500 << 20, protocol::EmojiScope::All),
             1 | 3 => (50 << 20, protocol::EmojiScope::All),
@@ -836,9 +840,12 @@ impl Discord {
             friend_nickname: true,
             join_space_by_invite: true,
             leave_space: true,
+            age_restricted_blocked,
             ..Default::default()
         });
-        self.state.lock().unwrap().premium = premium;
+        let mut state = self.state.lock().unwrap();
+        state.premium = premium;
+        state.nsfw_blocked = age_restricted_blocked;
     }
 
     /// The user's own order of servers: folders flattened, then anything they do not mention on
@@ -860,7 +867,13 @@ impl Discord {
     pub(super) fn ready(&self, ready: Ready) -> Result<(), Failure> {
         let me = ready.user.id.clone();
         self.myself(&ready.user)?;
-        self.capabilities(ready.user.premium_type);
+        self.capabilities(ready.user.premium_type, ready.user.nsfw_allowed == Some(false));
+        let blur_explicit = ready
+            .user_settings_proto
+            .as_deref()
+            .map(proto::blur_explicit_media)
+            .unwrap_or_else(|| ready.user_settings.as_ref().and_then(|s| s.explicit_content_filter).is_none_or(|v| v != 0));
+        self.state.lock().unwrap().show_explicit_media = !blur_explicit;
         let order = Self::order(&ready);
         let folders = Self::folders(&ready);
         let known: HashMap<String, User> = ready.users.into_iter().map(|user| (user.id.clone(), user)).collect();
@@ -1287,6 +1300,7 @@ impl Discord {
         let mut row = ConversationRow {
             parent: Some(parent.key.id.clone()),
             root: Some(thread.id.clone()),
+            age_restricted: thread.nsfw || parent.age_restricted,
             // Joined, or our membership came with it: followed. Otherwise left as it was.
             filing: (joined || thread.member.is_some()).then(|| Filing {
                 followed: true,

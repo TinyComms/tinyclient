@@ -481,7 +481,7 @@ fn waveform(encoded: Option<&str>) -> Vec<u8> {
     bars
 }
 
-fn attachment(rich: &mut Rich, attached: &Attached) -> Attachment {
+fn attachment(rich: &mut Rich, attached: &Attached, blur_explicit: bool) -> Attachment {
     let mime = attached.content_type.as_deref().unwrap_or("");
     let mime = mime.split(';').next().unwrap_or("").trim();
     let kind = media_kind(mime, &attached.filename);
@@ -509,7 +509,7 @@ fn attachment(rich: &mut Rich, attached: &Attached) -> Attachment {
         thumb
     });
     Attachment {
-        spoiler: attached.spoiler(),
+        spoiler: attached.spoiler() || (blur_explicit && attached.is_explicit()),
         sticker: false,
         waveform: waveform(attached.waveform.as_deref()),
         name: attached.filename.clone(),
@@ -574,7 +574,7 @@ fn embed_still(rich: &mut Rich, id: String, picture: &EmbedImage) -> Option<Medi
 /// A GIF from Tenor or Giphy (`gifv`, an MP4) or a video Discord's proxy serves, as an
 /// attachment: its still in the row, the moving picture fetched only when it is played. A
 /// video only its site can play (YouTube) has no proxy address and stays a link card.
-fn moving(rich: &mut Rich, message: &str, index: usize, embed: &Embed) -> Option<Attachment> {
+fn moving(rich: &mut Rich, message: &str, index: usize, embed: &Embed, blur_explicit: bool) -> Option<Attachment> {
     let kind = match embed.kind.as_deref() {
         Some("gifv") => MediaKind::Gif,
         Some("video") => MediaKind::Video,
@@ -597,11 +597,12 @@ fn moving(rich: &mut Rich, message: &str, index: usize, embed: &Embed) -> Option
     let mut attachment = Attachment::new(name, file);
     attachment.thumb = Some(thumb);
     attachment.mime = "video/mp4".to_owned();
+    attachment.spoiler = blur_explicit && embed.is_explicit();
     Some(attachment)
 }
 
 /// A card, with a picture only when Discord's own proxy serves it.
-fn preview(rich: &mut Rich, message: &str, index: usize, embed: &Embed) -> Preview {
+fn preview(rich: &mut Rich, message: &str, index: usize, embed: &Embed, blur_explicit: bool) -> Preview {
     let mut description = embed.description.clone().unwrap_or_default();
     for field in &embed.fields {
         if !description.is_empty() {
@@ -609,7 +610,9 @@ fn preview(rich: &mut Rich, message: &str, index: usize, embed: &Embed) -> Previ
         }
         description.push_str(&format!("{}: {}", field.name, field.value));
     }
-    let picture = embed.image.as_ref().or(embed.thumbnail.as_ref());
+    let picture = (!blur_explicit || !embed.is_explicit())
+        .then(|| embed.image.as_ref().or(embed.thumbnail.as_ref()))
+        .flatten();
     let image = picture.and_then(|picture| embed_still(rich, format!("embed:{message}:{index}"), picture));
     let site = embed.provider.as_ref().or(embed.author.as_ref());
     Preview {
@@ -719,6 +722,8 @@ pub struct Place<'a> {
     pub names: &'a dyn Names,
     /// What the author goes by here when it is not what the message says: a friend's nickname.
     pub author: Option<String>,
+    /// Whether explicitly flagged media (`CONTAINS_EXPLICIT_MEDIA`) should be blurred behind a spoiler cover.
+    pub blur_explicit: bool,
 }
 
 fn build_call_note(
@@ -806,11 +811,11 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
 
     let carried = forwarded.unwrap_or(posted);
     let attached = carried.attachments.as_deref().unwrap_or(&[]);
-    let mut attachments: Vec<Attachment> = attached.iter().map(|attached| attachment(&mut rich, attached)).collect();
+    let mut attachments: Vec<Attachment> = attached.iter().map(|attached| attachment(&mut rich, attached, place.blur_explicit)).collect();
     attachments.extend(carried.sticker_items.iter().map(|item| sticker(&mut rich, item)));
     let embeds = carried.embeds.as_deref().unwrap_or(&[]);
     let composed = carried.author.as_ref().is_some_and(|author| author.bot) || carried.webhook_id.is_some();
-    let (card, previews, moving_pictures) = cards(&mut rich, &posted.id, embeds, place.names, composed);
+    let (card, previews, moving_pictures) = cards(&mut rich, &posted.id, embeds, place.names, composed, place.blur_explicit);
     attachments.extend(moving_pictures);
     let reactions = reactions(&mut rich, posted.reactions.as_deref().unwrap_or(&[]));
     let origin = posted.message_reference.as_ref().filter(|reference| reference.kind == 1 && forwarded.is_some());
@@ -959,17 +964,18 @@ fn cards(
     embeds: &[Embed],
     names: &dyn Names,
     by_bot: bool,
+    blur_explicit: bool,
 ) -> (Option<Box<Card>>, Vec<Preview>, Vec<Attachment>) {
     let mut composed = None;
     let mut previews = Vec::new();
     let mut moving_pictures = Vec::new();
     for (index, embed) in embeds.iter().enumerate() {
-        if let Some(attachment) = moving(rich, message, index, embed) {
+        if let Some(attachment) = moving(rich, message, index, embed, blur_explicit) {
             moving_pictures.push(attachment);
             continue;
         }
         if !by_bot || composed.is_some() || embed.kind.as_deref() != Some("rich") {
-            previews.push(preview(rich, message, index, embed));
+            previews.push(preview(rich, message, index, embed, blur_explicit));
             continue;
         }
         composed = Some(Box::new(card(embed, names)));
@@ -984,7 +990,7 @@ fn cards(
                 ..embed.clone()
             };
             // Only when Discord's own proxy serves it: a picture elsewhere is never fetched.
-            let picture = preview(rich, message, index, &picture);
+            let picture = preview(rich, message, index, &picture, blur_explicit);
             if picture.image.is_some() {
                 previews.push(picture);
             }
@@ -1011,11 +1017,11 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
             .filter(|kept| kept.file.id.starts_with("sticker:") || kept.file.id.starts_with("embed:"))
             .cloned()
             .collect();
-        stored.attachments = attached.iter().map(|attached| attachment(&mut rich, attached)).collect();
+        stored.attachments = attached.iter().map(|attached| attachment(&mut rich, attached, place.blur_explicit)).collect();
         stored.attachments.extend(stickers);
     }
     if let Some(embeds) = &update.embeds {
-        let (card, previews, moving_pictures) = cards(&mut rich, &stored.id, embeds, place.names, stored.sender.bot);
+        let (card, previews, moving_pictures) = cards(&mut rich, &stored.id, embeds, place.names, stored.sender.bot, place.blur_explicit);
         stored.card = card;
         stored.previews = previews;
         stored.attachments.retain(|kept| !kept.file.id.starts_with("embed:"));
@@ -1087,7 +1093,7 @@ mod tests {
             "id": "100", "channel_id": "200", "type": 67, "content": "",
             "author": {"id": "300", "username": "casimir", "global_name": "Casimir Thorne"}
         })).unwrap();
-        let mut place = Place { account: &account, me: "400", guild: None, names: &Nobody, author: None };
+        let mut place = Place { account: &account, me: "400", guild: None, names: &Nobody, author: None, blur_explicit: true };
         let (decoded, _) = message(&posted, &place);
         assert_eq!(decoded.kind, MessageKind::System);
         assert_eq!(decoded.text, "Casimir Thorne accepted your friend request.");
@@ -1190,7 +1196,7 @@ mod tests {
             fn space(&self, _: &str) -> Option<String> { None }
         }
         let account = AccountKey { network: protocol::Network::Discord, account: "acct".into() };
-        let place = Place { account: &account, me: "me", guild: None, names: &Empty, author: None };
+        let place = Place { account: &account, me: "me", guild: None, names: &Empty, author: None, blur_explicit: true };
         // Snowflake 1000000000000000000 -> (1000000000000000000 >> 22) + 1420070400000 = 1658489056s (2022-07-22T11:24:16Z)
         let base = Posted {
             id: "1000000000000000000".into(),
@@ -1244,5 +1250,36 @@ mod tests {
         assert_eq!(m.call.as_ref().and_then(|c| c.seconds), Some(720));
         assert_eq!(m.call.as_ref().map(|c| c.participants.len()), Some(2));
         assert_eq!(m.text, "Call with Bea · 12 min");
+    }
+
+    #[test]
+    fn explicit_media_is_blurred_when_filter_is_on_and_shown_when_off() {
+        let account = AccountKey { network: protocol::Network::Discord, account: "acct".into() };
+        let posted = Posted {
+            id: "1000000000000000001".into(),
+            channel_id: "c1".into(),
+            author: Some(model::User { id: "2001".into(), username: "bea".into(), ..Default::default() }),
+            attachments: Some(vec![Attached {
+                id: "9001".into(),
+                filename: "pic.png".into(),
+                size: 1024,
+                url: "https://cdn.discordapp.com/attachments/1/9001/pic.png".into(),
+                proxy_url: Some("https://media.discordapp.net/attachments/1/9001/pic.png".into()),
+                width: 400,
+                height: 300,
+                content_type: Some("image/png".into()),
+                duration_secs: 0.0,
+                waveform: None,
+                flags: 1 << 4,
+            }]),
+            ..Default::default()
+        };
+        let blur = Place { account: &account, me: "me", guild: None, names: &Nobody, author: None, blur_explicit: true };
+        let (blurred, _) = message(&posted, &blur);
+        assert!(blurred.attachments[0].spoiler, "explicit attachment blurs when filter is active");
+
+        let show = Place { blur_explicit: false, ..blur };
+        let (shown, _) = message(&posted, &show);
+        assert!(!shown.attachments[0].spoiler, "explicit attachment unblurred when filter is set to show");
     }
 }

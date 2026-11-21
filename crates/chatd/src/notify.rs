@@ -185,7 +185,11 @@ pub fn decide(values: &Values, conversation: &Conversation, message: &Message, m
         || moment.sounded_here
         || moment.sounded_any;
     let sound = Some(sound_word(values, key, mention || urgent || keyword_hit)).filter(|word| !silent && word != "none");
-    Some(Verdict { banner: true, sound, preview: preview(values, moment.locked), mention: mention || urgent || keyword_hit })
+    let mut show = preview(values, moment.locked);
+    if conversation.age_restricted && show == Preview::Full {
+        show = Preview::Sender;
+    }
+    Some(Verdict { banner: true, sound, preview: show, mention: mention || urgent || keyword_hit })
 }
 
 /// Whether a reaction to one of my messages notifies. Respects mutes, focus, quiet hours,

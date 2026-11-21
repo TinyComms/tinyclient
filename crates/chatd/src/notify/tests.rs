@@ -61,6 +61,17 @@ fn by_default_direct_messages_and_mentions_notify_with_pebble_and_channel_chatte
     assert!(posts(&values, &channel(), &mention("Tom", "@me look"), &now));
     let group = row(Network::Slack, "G1", ConversationKind::Group, "Lisbon trip");
     assert!(posts(&values, &group, &message("Odile", "tickets"), &now));
+
+    // Age-restricted channels never show message text in notification previews (#351).
+    let nsfw = Conversation { age_restricted: true, ..channel() };
+    let mut full = Values::default();
+    set(&mut full, settings::GLOBAL, settings::PREVIEW, "full");
+    let verdict = decide(&full, &nsfw, &mention("Tom", "@me secret"), &now).expect("still notifies");
+    assert_eq!(verdict.preview, Preview::Sender);
+    let mut none = Values::default();
+    set(&mut none, settings::GLOBAL, settings::PREVIEW, "nothing");
+    let verdict_none = decide(&none, &nsfw, &mention("Tom", "@me secret"), &now).expect("still notifies");
+    assert_eq!(verdict_none.preview, Preview::Nothing);
 }
 
 #[test]

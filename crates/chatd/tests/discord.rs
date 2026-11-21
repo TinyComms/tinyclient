@@ -5045,3 +5045,87 @@ fn leave_space_sends_delete_refuses_owner_and_cleans_tree() {
         other => panic!("expected Response::Spaces, got {other:?}"),
     }
 }
+
+#[test]
+fn age_restricted_channels_threads_account_flag_and_explicit_media() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["user"]["nsfw_allowed"] = json!(false);
+    // Mark channel 4101 as age-restricted and attach a thread 4199 under it.
+    let guild = ready["guilds"].as_array_mut().unwrap().iter_mut().find(|g| g["id"] == "4000").unwrap();
+    for ch in guild["channels"].as_array_mut().unwrap() {
+        if ch["id"] == "4101" {
+            ch["nsfw"] = json!(true);
+        }
+    }
+    guild["threads"] = json!([{
+        "id": "4199",
+        "type": 11,
+        "guild_id": "4000",
+        "parent_id": "4101",
+        "name": "spoiler-thread",
+        "nsfw": false,
+        "thread_metadata": {"archived": false}
+    }]);
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Account reports age_restricted_blocked = true when Discord sends nsfw_allowed = false.
+    let status = world.ask(Request::Status);
+    let account = match status {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.network == Network::Discord).unwrap(),
+        other => panic!("expected status, got {other:?}"),
+    };
+    assert!(account.can.age_restricted_blocked, "nsfw_allowed=false must set age_restricted_blocked");
+
+    // Channel 4101 and its thread 4199 both carry age_restricted = true.
+    let ch = match world.ask(Request::Conversation { conversation: world.key("4101") }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("expected conversation 4101, got {other:?}"),
+    };
+    assert!(ch.age_restricted, "nsfw channel must be age_restricted");
+
+    let thread = match world.ask(Request::Conversation { conversation: world.key("4199") }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("expected thread 4199, got {other:?}"),
+    };
+    assert!(thread.age_restricted, "thread under nsfw channel must inherit age_restricted");
+
+    // Non-nsfw channel stays false.
+    let dm = match world.ask(Request::Conversation { conversation: world.key("3001") }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("expected dm 3001, got {other:?}"),
+    };
+    assert!(!dm.age_restricted);
+
+    // Live message with CONTAINS_EXPLICIT_MEDIA (flag bit 4) blurs behind spoiler cover.
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": "1300000010000000999",
+        "channel_id": "3001",
+        "type": 0,
+        "author": {"id": "2001", "username": "mara", "global_name": "Mara", "discriminator": "0", "avatar": null},
+        "content": "look",
+        "timestamp": "2026-10-13T08:15:00.000000+00:00",
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "embeds": [],
+        "pinned": false,
+        "attachments": [{
+            "id": "99001",
+            "filename": "flagged.png",
+            "size": 1024,
+            "url": "https://cdn.discordapp.com/attachments/3001/99001/flagged.png",
+            "proxy_url": "https://media.discordapp.net/attachments/3001/99001/flagged.png",
+            "width": 640,
+            "height": 480,
+            "content_type": "image/png",
+            "flags": 16
+        }]
+    }));
+    let flagged = wait("explicit attachment message", || {
+        world.messages("3001").into_iter().find(|m| m.id == "1300000010000000999")
+    });
+    assert!(flagged.attachments[0].spoiler, "explicit-flagged attachment must be blurred as spoiler");
+}

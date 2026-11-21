@@ -573,6 +573,9 @@ pub struct Conversation {
     /// Whether this account has joined the conversation (`false` when previewing an unjoined public channel).
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub joined: bool,
+    /// Marked age-restricted / NSFW by the network (Discord `channel.nsfw`, inherited by threads).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub age_restricted: bool,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -642,6 +645,7 @@ impl Conversation {
             moderate: false,
             can_pin: false,
             joined: true,
+            age_restricted: false,
         }
     }
 

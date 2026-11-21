@@ -122,6 +122,9 @@ pub struct User {
     /// Our own plan, on READY's user: 0 none, 1 Nitro Classic, 2 Nitro, 3 Nitro Basic.
     #[serde(default, deserialize_with = "nullable")]
     pub premium_type: u8,
+    /// On READY's user: `Some(false)` when the account is underage / not permitted in age-restricted channels.
+    #[serde(default)]
+    pub nsfw_allowed: Option<bool>,
     /// Present on the users of a message's `mentions`.
     #[serde(default)]
     pub member: Option<Box<Member>>,
@@ -348,6 +351,13 @@ pub struct Channel {
     pub is_message_request: bool,
     #[serde(default, deserialize_with = "nullable")]
     pub is_spam: bool,
+    /// Marked age-restricted (`nsfw`) by the server.
+    #[serde(default, deserialize_with = "nullable")]
+    pub nsfw: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// What is kept of a server's channel between connects, in a note: enough to work out again
@@ -375,6 +385,8 @@ pub struct Kept {
     pub topic: Option<String>,
     #[serde(rename = "o", default, skip_serializing_if = "Vec::is_empty")]
     pub overwrites: Vec<(String, bool, u64, u64)>,
+    #[serde(rename = "x", default, skip_serializing_if = "is_false")]
+    pub nsfw: bool,
 }
 
 /// A count that means "none" stays off a note.
@@ -395,6 +407,7 @@ impl Kept {
             parent: channel.parent_id.clone(),
             topic: channel.topic.clone().filter(|topic| !topic.is_empty()),
             overwrites: overwrites.map(|over| (over.id.clone(), over.member, over.allow, over.deny)).collect(),
+            nsfw: channel.nsfw,
         }
     }
 
@@ -410,6 +423,7 @@ impl Kept {
             parent_id: self.parent,
             topic: self.topic,
             permission_overwrites: overwrites.collect(),
+            nsfw: self.nsfw,
             ..Channel::default()
         }
     }
@@ -853,6 +867,11 @@ impl Attachment {
     pub fn spoiler(&self) -> bool {
         self.flags & (1 << 3) != 0 || self.filename.starts_with("SPOILER_")
     }
+
+    /// Flagged as explicit/sensitive media by Discord's scanner (`CONTAINS_EXPLICIT_MEDIA`, bit 4).
+    pub fn is_explicit(&self) -> bool {
+        self.flags & (1 << 4) != 0
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -914,6 +933,15 @@ pub struct Embed {
     pub video: Option<EmbedImage>,
     #[serde(default, deserialize_with = "nullable")]
     pub fields: Vec<EmbedField>,
+    /// Bit 4 marks explicit media (`CONTAINS_EXPLICIT_MEDIA`).
+    #[serde(default, deserialize_with = "nullable")]
+    pub flags: u32,
+}
+
+impl Embed {
+    pub fn is_explicit(&self) -> bool {
+        self.flags & (1 << 4) != 0
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]

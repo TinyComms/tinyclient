@@ -1012,6 +1012,7 @@ mod tests {
             moderate: false,
             can_pin: false,
             joined: true,
+            age_restricted: false,
         }
     }
 

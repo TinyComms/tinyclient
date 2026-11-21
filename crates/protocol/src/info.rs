@@ -681,6 +681,9 @@ pub struct Capabilities {
     /// This account supports following and unfollowing threads (`Request::FollowThread`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub follow_threads: bool,
+    /// The network marks this account as not permitted to enter age-restricted channels (`nsfw_allowed == false` on Discord).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub age_restricted_blocked: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).
